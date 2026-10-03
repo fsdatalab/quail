@@ -245,8 +245,8 @@ class _StageExecutor:
 
         # A frame's canvas occupies document pages after the frame.
         frame_max = max(len(f) + (len(self.canvas) if f else 0) for f in self.frames)
-        # A single suffix also occupies document pages on the unified path.
         self.capacity_extra = frame_max
+        # A single suffix also occupies document pages on the unified path.
         if self.paged and self.mode == "unified":
             self.capacity_extra = max(
                 [frame_max] + [len(frame) + len(stage.suffixes[0]) + rows
@@ -263,7 +263,7 @@ class _StageExecutor:
                            if s.append and f == frame)
                 self.capacity_extra = max(self.capacity_extra,
                                           len(frame) + kept)
-        # path tokens each document holds after its frame
+        # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
 
         resident = ({a: self._held_pages(self.keys[a], self.prefix_lengths[a])
@@ -301,7 +301,7 @@ class _StageExecutor:
         )
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
-        # Residents have detached because they pack no prefix.
+        # The admission detaches residents from borrowing: they pack no prefix.
         self.borrowers = self.borrowing.borrowers()
         self.lowest_borrow = lowest_borrows(self.borrowing)
         self.held = [self.keys[a] for a, n in enumerate(self.borrowers) if n]

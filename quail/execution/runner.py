@@ -180,9 +180,9 @@ def _check_ports(node, result) -> None:
 class GenericRunner:
     """Graph runner that executes operators after their inputs are ready.
 
-    When context.pipelines groups operators, the pipeline runs at its final
-    operator once all external inputs are ready. Results for every pipeline
-    member are recorded together.
+    When context.pipelines groups operators and context.run_pipeline is
+    set, a pipeline runs at its final operator once all external inputs
+    are ready. Results for every pipeline member are recorded together.
     """
 
     def run(
@@ -215,9 +215,6 @@ class GenericRunner:
         for node in graph.topological_nodes():
             pipeline = pipelines.get(node.node_id)
             if pipeline is not None and len(pipeline.members) > 1:
-                # a pipeline runs at its sink, once every member's
-                # outside inputs are ready; its members' results land
-                # together
                 if node is not pipeline.sink:
                     continue
                 inside = set(pipeline.node_ids)
@@ -442,8 +439,7 @@ def foreign_call(node, values, context):
 
     Args:
         node: The Foreign node.
-        values: alias -> the ids (or id table) it was given, for the
-            columns the function reads.
+        values: alias -> the ids, or id table, the node was given.
         context: The execution context holding the functions and
             column sources.
 
@@ -531,8 +527,8 @@ def foreign_outputs(node, result) -> dict:
 class ForeignRuntime:
     """Call a user function once over every id it was given.
 
-    A per-batch Foreign inside a pipeline is called by the pipeline
-    on each document instead (see the executor).
+    Inside a pipeline, the executor calls a per-batch Foreign on each
+    document.
     """
 
     def execute(self, node, inputs, context) -> NodeResult:

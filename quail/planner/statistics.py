@@ -232,7 +232,7 @@ def filter_orders(plan: LogicalPlan) -> dict:
 
 
 def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
-    """Expected live documents per alias once its filters have run.
+    """Return the expected live documents per alias after its filters run.
 
     A filter on a label of a table classified after the joins thins
     nothing before them.
@@ -268,7 +268,7 @@ def filter_alias_work(preds, stats, order, pre: int,
 
 def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
                  model: ModelSpec) -> dict:
-    """Expected Work of every table's filter chain, in its execution order."""
+    """Return the expected Work of each table's filter chain in execution order."""
     orders = filter_orders(plan)
     return {
         alias: filter_alias_work(

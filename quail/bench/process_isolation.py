@@ -56,11 +56,12 @@ def run_backend_group(
         suite_name: Directory name per method, defaulting to the query family.
             Separate groups from the same family need distinct names.
         canvas_draws: Comma-separated maximum diffusion draw counts, or None
-            to keep the default. Multiple counts create separate Quail suites.
+            to keep the default. Each count runs its own Quail suite, named
+            ``quail-draws<count>`` when there is more than one.
 
     Returns:
         A dictionary containing the family, queries, collection ID, GPU IDs,
-        method names, and per-method suite results.
+        suite names, and the suite result for each name.
 
     Raises:
         ValueError: No backend methods were supplied.
@@ -76,7 +77,6 @@ def run_backend_group(
     family = query_family_name(query_ids)
     run_dir = Path(run_dir)
     suites = {}
-    # Run each canvas draw count in the same process.
     draw_counts = [int(count) for count in (canvas_draws or "").split(",")
                    if count.strip()] or [None]
     for method in methods:

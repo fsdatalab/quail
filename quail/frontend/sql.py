@@ -114,7 +114,7 @@ def _score_comparison(node):
 
 
 def _label_test(node):
-    """Extract the classification call and categories from an equality or IN test."""
+    """Return the AI.CLASSIFY call and tested values of an = or IN test, or None."""
     if isinstance(node, exp.In) and isinstance(node.this, exp.AIClassify):
         return node.this, list(node.expressions)
     if isinstance(node, exp.EQ):
@@ -359,18 +359,19 @@ class _Binder:
         return model_call, options, aliases
 
     def parse_categories(self, node) -> tuple[tuple, tuple]:
-        """Read category strings and descriptions from a SQL expression.
+        """Read the labels and descriptions of an AI.CLASSIFY categories argument.
 
         Args:
             node: Array of strings, label-description pairs, category objects,
-                or an unqualified registered table name.
+                or an unqualified registered label table name.
 
         Returns:
-            A tuple of category strings and optional descriptions in category order.
+            The labels and their descriptions, in the same order. Descriptions
+            is empty when no label has one.
 
         Raises:
             CompileError: The categories have an invalid shape or value type,
-                or the registered category table is invalid.
+                or the registered label table is invalid.
         """
         if isinstance(node, exp.Column) and not node.table:
             return read_label_table(self.catalog, str(node.name))

@@ -17,12 +17,21 @@ def group_sequence(seq):
 
 
 def chained_aliases(groups, ask_aliases, barrier_aliases, workers: int) -> set:
-    """Aliases whose filter chain runs in the pipeline of the join anchored on it.
+    """Return the aliases whose filter chain feeds the join anchored on it.
 
     On one GPU, a chain whose first use is the join anchored on it
     streams its survivors into that join, so its KV needs no retention
-    pool. A chain a join reads as a partner first, or one a barrier
-    apply cuts, is not chained.
+    pool. A chain that a join reads first as a partner, or that a
+    barrier apply cuts, is not chained.
+
+    Args:
+        groups: Consecutive join groups, as from group_sequence.
+        ask_aliases: Aliases that have a filter chain.
+        barrier_aliases: Aliases whose chain a barrier apply cuts.
+        workers: Number of model copies.
+
+    Returns:
+        The chained aliases.
     """
     chained = set()
     partner_before = set()

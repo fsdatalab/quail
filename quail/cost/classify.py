@@ -24,11 +24,11 @@ from quail.labels import (
 
 def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
                    draws: int = 1) -> list[int]:
-    """Estimate the request lengths for a classification scoring method.
+    """Estimate the request lengths for a classification scoring rule.
 
     Args:
-        scoring: Method name: letters, trie_tree, or trie_decode.
-        labels: Token sequence for each category.
+        scoring: Label scoring rule: letters, trie_tree, or trie_decode.
+        labels: Token sequence for each label.
         canvas_rows: Number of diffusion answer canvas rows.
         draws: Maximum number of diffusion draws per document.
 
@@ -37,7 +37,7 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
         feeds one token per round, for as many rounds as the longest label.
 
     Raises:
-        ValueError: The scoring method is unknown.
+        ValueError: The scoring rule is unknown.
     """
     if scoring == LETTERS_SCORING:
         return [1 + canvas_rows] * (draws if canvas_rows else 1)
@@ -52,7 +52,7 @@ def readout_component(rows: float, model) -> CostComponent:
     """Estimate computation and memory reads for the full output head."""
     return CostComponent(
         name="readout", flops=2.0 * model.hidden * model.vocab * rows,
-        # the bf16 head streams from memory once per chunk that reads
+        # the bf16 head is read from memory once per chunk with answer rows
         bytes_moved=2.0 * model.hidden * model.vocab if rows else 0.0,
         precision="bf16")
 
@@ -93,9 +93,8 @@ class Simulated:
                          self.rounds)
 
 
-# The documents a replay prices: past this many, an even sample over
-# the lengths is replayed and scaled, which moves the estimate of
-# AGENT-4 at sf 1.0 (17,711 traces) by under 0.3%
+# Most documents a replay prices; past this many, it replays an even
+# sample over the sorted lengths and scales the result
 SAMPLE_DOCUMENTS = 1000
 
 
@@ -156,8 +155,8 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
         prefix = prefixes[document]
         if one_per_round:
             prefix += sum(chains[document][:round_])
-        # a canvas longer than one row reads the document a second
-        # time, in the non-causal call every canvas row runs
+        # a canvas longer than one row reads the document a second time
+        # in the non-causal call that every canvas row runs
         suffixes = stream(prefix + frame, round_chains(document, round_),
                           window=window)
         if canvas_rows > 1:
@@ -219,7 +218,8 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
             suffix_tokens += sum(round_chains(document, 0))
             launched.append((document, 0))
         if not launched:
-            # the waiting rounds' answers are read before anything packs
+            # with nothing to launch, the waiting answers are read now, so
+            # their next rounds may enter this chunk
             waiting = deque((min(ready, passes), document, round_)
                             for ready, document, round_ in waiting)
             continue
@@ -303,14 +303,14 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
 def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
              labels, *, lengths, shared, chunk: int, capacity: int,
              model, device, resident: bool = False, draws: int = 1) -> Simulated:
-    """Estimate the cost of one classification scoring method.
+    """Estimate the cost of one classification scoring rule.
 
     Args:
-        scoring: Scoring method name.
+        scoring: Label scoring rule name.
         live: Expected number of documents to classify.
         head_tokens: Number of prompt tokens before each document.
         frame_tokens: Number of prompt tokens written after each document.
-        labels: Token sequence for each category.
+        labels: Token sequence for each label.
         lengths: Document lengths in tokens.
         shared: Shared document prefix lengths.
         chunk: Maximum tokens per forward pass.
@@ -324,7 +324,7 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         Estimated execution time, work, and token counts.
 
     Raises:
-        ValueError: The scoring method is unknown.
+        ValueError: The scoring rule is unknown.
     """
     canvas = model.answer_canvas
     canvas_rows = canvas.rows if canvas is not None else 0

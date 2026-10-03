@@ -207,8 +207,8 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
 
     QUAIL-B sizes the prefix trie of the run's requests from these
     pieces and the saved answer tables, after the run; nothing is
-    tracked while the query runs. A classification's pieces are its
-    prompt with the labels by name, whichever rule read its labels.
+    tracked while the query runs. A classification's pieces come from
+    its prompt, which names every label, whatever rule reads the label.
 
     Args:
         query: The built query, with bound prompts.
@@ -284,9 +284,9 @@ def kernel_cache_files() -> dict[str, int]:
     """Count top-level entries in each kernel cache directory.
 
     Returns:
-        Entry counts for the Triton, DeepGEMM, and vLLM directories under
-        QUAIL_CACHE_DIR. Counts can be compared before and after a query to
-        detect compilation during execution.
+        The entry count of each subdirectory of QUAIL_CACHE_DIR (default
+        ``~/.cache/quail/kernels``), by name, or an empty dict when it is
+        missing. A count that grows across a query shows a compile inside it.
     """
     root = Path(os.path.expanduser(
         os.environ.get("QUAIL_CACHE_DIR", "~/.cache/quail/kernels")))

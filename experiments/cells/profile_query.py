@@ -292,8 +292,7 @@ def child(arguments: str) -> None:
     Args:
         arguments: JSON of query_id, sf, collection_id, model, modes
             (one per run: plain, cprofile, sample, trace, or timeline),
-            top, and
-            stats_prefix.
+            top, and stats_prefix.
     """
     import cProfile
     import io

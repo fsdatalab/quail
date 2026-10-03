@@ -1,8 +1,9 @@
-"""Score category tokens and match decoded text to categories.
+"""Score label tokens and match decoded text to labels.
 
-Letter scoring reads one token per category. Tree scoring sums token
-log probabilities for each complete category. GreedyDecoder selects
-one allowed token per round without comparing complete label scores.
+The letters rule reads one token per label. The trie_tree rule sums the
+token log probabilities of each complete label. The trie_decode rule
+(GreedyDecoder) picks one allowed token per round and never compares
+complete label scores.
 """
 
 import numpy as np
@@ -16,18 +17,18 @@ def trie_targets(trie) -> list[int]:
 
 
 def match_label(text: str, labels) -> str | None:
-    """Match the first answer line to a supplied category.
+    """Match the first answer line to a label.
 
     A leading "thought" line and "ANSWER:" prefix are removed before matching.
-    Matching ignores case and accepts text starting with a category. When
-    several categories match, the longest wins, then the first in the list.
+    Matching ignores case and accepts text that starts with a label. When
+    several labels match, the longest wins, then the first in the list.
 
     Args:
         text: Decoded model answer.
-        labels: Category strings in query order.
+        labels: Label strings in query order.
 
     Returns:
-        The matching category string, or None if no category matches.
+        The matching label, or None if no label matches.
     """
     answer = text.strip()
     first, _, rest = answer.partition("\n")
@@ -46,15 +47,15 @@ def match_label(text: str, labels) -> str | None:
 
 
 def letter_scores(label_ids, targets, logprobs) -> np.ndarray:
-    """Return each category letter's log probability at the answer position.
+    """Return each label letter's log probability at the answer position.
 
     Args:
-        label_ids: One single-token sequence per category.
+        label_ids: One single-token sequence per label.
         targets: Token IDs in readout-column order.
-        logprobs: One-dimensional array of values for the target tokens.
+        logprobs: One value per target token.
 
     Returns:
-        Scores in category order, using the same scale as logprobs.
+        Scores in label order, on the same scale as logprobs.
     """
     column = {token: index for index, token in enumerate(targets)}
     return np.asarray([float(logprobs[column[ids[0]]]) for ids in label_ids],
@@ -70,16 +71,16 @@ class GreedyDecoder:
     """Per-document state for choosing one allowed label token per round.
 
     Each round selects the highest-scoring child of the current trie node.
-    Decoding finishes at a complete category.
+    Decoding finishes at a complete label.
 
     Args:
-        label_ids: Token sequence for each category. No complete sequence may
-            be the prefix of another category's sequence.
+        label_ids: Token sequence for each label. No label's sequence may
+            be a proper prefix of another label's sequence.
         targets: Token IDs corresponding to the readout columns.
         documents: Number of documents to track.
 
     Raises:
-        ValueError: One category's token sequence is a prefix of another.
+        ValueError: One label's token sequence is a proper prefix of another.
     """
 
     def __init__(self, label_ids, targets, documents):
@@ -139,7 +140,7 @@ class GreedyDecoder:
 
 
 def trie_chains(label_ids) -> list:
-    """Split the label trie into chains that each compute every node once.
+    """Split the label trie into chains that together hold each node once.
 
     The first chain starts at the root, the answer cue's row, and
     follows each node's first child; every other child starts a new

@@ -75,8 +75,8 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
             register_tables(sess, tmp_path)
             qdefs = queries(sess)
             # every backend lists every query; SGLang refuses the
-            # classification queries at plan time, since it returns
-            # no named tokens' log probabilities.
+            # classification queries at plan time, since its engine
+            # returns no decoded answer text.
             assert set(qdefs) == expected | classify, backend
             for qid, (_, build) in qdefs.items():
                 case = f"{backend} {qid}"

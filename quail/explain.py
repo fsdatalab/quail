@@ -482,7 +482,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         if node.node_id not in visited:
             visit(node, 0)
     lines = _table(rows)
-    # the per-document operators of one table run as one pipeline
     seen = set()
     for member_id, pipeline in build_pipelines(graph).items():
         if id(pipeline) in seen or len(pipeline.members) < 2:

@@ -248,7 +248,7 @@ MAX_LETTERS = 255
 
 
 def letter_candidates() -> list[str]:
-    """Yield candidate category letters: A to Z, a to z, then AA to ZZ."""
+    """Return candidate label letters: A to Z, a to z, then AA to ZZ."""
     upper = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
     lower = [chr(code) for code in range(ord("a"), ord("z") + 1)]
     return upper + lower + [first + second for first in upper for second in upper]
@@ -256,16 +256,16 @@ def letter_candidates() -> list[str]:
 
 def choice_letters(count: int, tokenizer=None,
                    prefix: str = LABEL_PREFIX) -> tuple[str, ...]:
-    """Choose distinct one-token strings to represent the categories.
+    """Choose distinct one-token letters to stand for the labels.
 
     Args:
-        count: Number of category letters needed.
+        count: Number of letters needed, one per label.
         tokenizer: Optional callable mapping text to token IDs. Without one,
             candidate strings are returned in their original order.
-        prefix: Text immediately before the scored category letter.
+        prefix: Text immediately before the scored letter.
 
     Returns:
-        Category letters in order. The result may contain fewer than count
+        Letters in label order. The result may contain fewer than count
         entries if the tokenizer has too few distinct one-token candidates.
 
     Raises:
@@ -338,25 +338,26 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
                          task_description: str = "") -> Prompt:
     """Bind a classification prompt to one or two document columns.
 
-    Single-document prompts include both named categories and, when possible,
-    a lettered version for one-token scoring. Pair prompts use the join
-    document layout followed by the classification question and categories.
+    The prompt names the labels and, when every label gets a distinct
+    one-token letter, holds a lettered version for the letters rule. A
+    prompt over joined rows uses the join document layout, then the
+    classification question and the label list.
 
     Args:
         template: Prompt text with one placeholder per document column.
         args: One column reference, or two references for joined documents.
-        labels: Category strings in query order.
-        descriptions: Optional descriptions in category order.
+        labels: Labels in query order.
+        descriptions: Optional descriptions in label order.
         tokenizer: Optional callable mapping text to token IDs.
         turn: Chat text before the prompt and after the answer cue.
         task_description: Additional classification instructions.
 
     Returns:
-        A Prompt containing the document layout, category text, and token IDs.
+        A Prompt containing the document layout, label list, and token IDs.
 
     Raises:
         CompileError: The placeholders or number of document columns are
-            invalid, or the category count exceeds the supported maximum.
+            invalid, or there are more than MAX_LETTERS labels.
     """
     _check_placeholders(template, len(args))
     if len(args) == 2:

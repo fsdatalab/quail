@@ -1,4 +1,4 @@
-"""Prepare classification prompts and choose a scoring method.
+"""Prepare classification prompts and choose a scoring rule.
 
 The planner emits one AiClassify node for each classification; the
 label_scoring physical rule compares estimated execution times for
@@ -90,6 +90,9 @@ def classify_table(context, alias: str, backend_name: str,
         backend_name: The backend running the plan.
         shared: Per document, the prefix tokens an earlier document
             also has, when the plan shares prefixes; else empty.
+
+    Returns:
+        The table's document lengths, budgets, and model settings.
     """
     lengths = [int(length) for length in context.document_tokens[alias]]
     count = len(lengths)
@@ -132,7 +135,9 @@ class _Table:
         draws: Maximum diffusion draws per document; one for causal models.
         lengths: Document lengths in tokens.
         shared: Shared prefix length per document, or an empty tuple.
-        tree: Whether tree attention is available for packed label scoring.
+        tree: Whether the tree attention path, which trie_tree needs, is
+            available: an fp8 model without a canvas whose attention is not
+            forced to unified.
     """
 
     alias: str
@@ -148,8 +153,6 @@ class _Table:
     draws: int = 1
     lengths: tuple = ()
     shared: tuple = ()
-    # whether the model runs the tree attention path, which the
-    # packed trie needs: an fp8 model with the plan not forced unified
     tree: bool = False
 
     def head(self, call) -> tuple:
@@ -197,7 +200,7 @@ class _Table:
             and estimated seconds.
 
         Raises:
-            ClassifyRefusedError: No scoring method can run, or the document and
+            ClassifyRefusedError: No scoring rule can run, or the document and
                 prompt exceed a token or KV budget.
         """
         head, tail = spec.prompt_token_parts
@@ -222,8 +225,8 @@ class _Table:
                 f"{spec.name!r}: one label is a proper prefix of another",
                 1, 0)
         suffixes = classify_cost.suffix_lengths(scoring, labels, self.canvas_rows)
-        # head, document, and frame stay resident while the longest
-        # suffix and the frame entry's own rows are packed beside them
+        # the head, longest document, frame, and longest suffix must fit
+        # together within the forward pass and KV budget
         need = len(head) + self.longest + len(tail) + max(suffixes)
         if need > self.budget:
             raise ClassifyRefusedError(
@@ -244,14 +247,14 @@ class _Table:
 
     def simulate(self, scoring, live, head_tokens, frame_tokens, labels,
                  resident) -> classify_cost.Simulated:
-        """Estimate one scoring method using this table's lengths and budgets.
+        """Estimate one scoring rule using this table's lengths and budgets.
 
         Args:
-            scoring: Scoring method name.
+            scoring: Label scoring rule name.
             live: Expected number of documents to classify.
             head_tokens: Number of prompt tokens before each document.
             frame_tokens: Number of prompt tokens written after each document.
-            labels: Token sequence for each category.
+            labels: Token sequence for each label.
             resident: Whether document KV is already available.
 
         Returns:
@@ -292,31 +295,31 @@ class _Table:
     def choose(self, live, head_tokens, frame_tokens, labels, resident,
                lettered=None, probabilities=False
                ) -> tuple[str, classify_cost.Simulated]:
-        """Choose the supported scoring method with the lowest estimated time.
+        """Choose the supported scoring rule with the lowest estimated time.
 
-        Letters requires a prompt with one distinct token per category. Tree
-        scoring requires tree attention. Greedy decoding requires documents
-        without resident KV and labels that do not contain another label's
-        complete token sequence as a prefix. Greedy decoding is excluded when
-        probabilities are requested. Ties favor fewer suffix tokens, then the
-        first candidate.
+        The letters rule requires a prompt with one distinct token per
+        label. The trie_tree rule requires the tree attention path. The
+        trie_decode rule requires a model without a canvas, documents
+        without resident KV, no request for probabilities, and no label
+        whose token sequence is a prefix of another's. Ties favor fewer
+        suffix tokens, then the first candidate.
 
         Args:
             live: Expected number of documents to classify.
             head_tokens: Number of prompt tokens before the document.
             frame_tokens: Number of prompt tokens after the document, excluding
                 the final answer cue token.
-            labels: Token sequence for each category.
+            labels: Token sequence for each label.
             resident: Whether document KV is available from an earlier operator.
-            lettered: Tuple of head length, frame length, and category letter
+            lettered: Tuple of head length, frame length, and label letter
                 token sequences, or None if the prompt has no lettered form.
-            probabilities: Whether every category's probability is required.
+            probabilities: Whether every label's probability is required.
 
         Returns:
             A tuple containing the method name and its simulated cost.
 
         Raises:
-            ClassifyRefusedError: No supported scoring method can run.
+            ClassifyRefusedError: No supported scoring rule can run.
         """
         candidates = [LETTERS_SCORING] if lettered is not None else []
         if self.tree:

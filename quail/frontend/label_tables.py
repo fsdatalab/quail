@@ -1,4 +1,4 @@
-"""Registered label tables for AI.CLASSIFY categories."""
+"""Read AI.CLASSIFY labels from registered label tables."""
 
 import pyarrow as pa
 
@@ -7,13 +7,13 @@ from quail.logical import CompileError
 
 
 def read_label_table(catalog: Catalog, name: str) -> tuple[tuple, tuple]:
-    """Read category labels and descriptions from a registered table.
+    """Read labels and descriptions from a registered label table.
 
     Labels are sorted by ordinal when present, otherwise by label text.
     Null descriptions are converted to empty strings.
 
     Args:
-        catalog: Catalog containing the registered category table.
+        catalog: Catalog containing the registered label table.
         name: Registered table name.
 
     Returns:

@@ -116,10 +116,10 @@ class ProjectionPushdown:
 
 
 def _movable_filter_alias(node) -> str | None:
-    """The table a cheap one-table filter reads, or None for other nodes.
+    """Return the table a cheap one-table filter reads, or None for other nodes.
 
-    A cheap filter is an Apply returning ids, or a Filter on a label a
-    SemanticClassify below it computed. An AI.IF filter asks the model
+    A cheap filter is an Apply returning ids, or a Filter on a label that
+    a SemanticClassify below it computed. An AI.IF filter runs the model
     and is not moved.
     """
     if isinstance(node, Apply) and node.ids != "pairs":
@@ -130,13 +130,12 @@ def _movable_filter_alias(node) -> str | None:
 
 
 def _lets_through(node, alias: str) -> bool:
-    """Whether a filter on one table may sit below node instead of above.
+    """Return whether a filter on one table may move below node.
 
     True for a Join, a full SemanticJoin, a classification of joined
-    rows, and any node working on another table. False at the table's
-    own chain, at a gate (exists or anti join) and at an Apply
-    returning the pairs a join asks about, whose rows the filter would
-    change.
+    rows, and any node on another table. False for the table's own
+    chain, a gate (an exists or anti join), an Apply returning a join's
+    pairs, and any other node.
     """
     if isinstance(node, Join):
         return True
@@ -183,11 +182,10 @@ def push_down_filters(root: LogicalNode) -> LogicalNode | None:
     An Apply returning ids and a Filter on a label column read one
     table, so they commute with the joins, the classifications of
     joined rows, and the other tables' operators above that table.
-    Each moves down to the top of its own table's chain, below the
-    nodes it passed, keeping its order with the other filters of the
-    table. A filter stays where it is when a gate (an exists or anti
-    join) or an Apply returning a join's pairs sits between it and
-    the first Join below.
+    Each moves to the top of its own table's chain and keeps its order
+    with the table's other filters. A filter stays where it is when a
+    gate (an exists or anti join) or an Apply returning a join's pairs
+    sits between it and the first Join below.
 
     Returns:
         The rewritten root, or None when no filter moved.
@@ -216,10 +214,10 @@ class FilterPushdown:
     """Push cheap one-table filters below the joins above their table.
 
     Like Catalyst's PushDownPredicates, the move is unconditional: an
-    Apply returning ids and a Filter on a label column cost nothing
-    the model runs, so they thin a table before the joins read it. Both front
-    ends already place such filters on their table, so the rule
-    rewrites plans built another way.
+    Apply returning ids and a Filter on a label column run no model, so
+    they thin a table before the joins read it. Both front ends already
+    place such filters on their table; the rule rewrites plans built
+    another way.
     """
 
     name = "filter_pushdown"
@@ -243,7 +241,7 @@ def _label_chain(node) -> tuple:
 
 
 def _chain_alias(node) -> str:
-    """The table alias a classification or label filter node works on."""
+    """Return the table alias a classification or label filter node reads."""
     if isinstance(node, SemanticClassify):
         return node.alias
     return node.condition.column.alias
@@ -252,10 +250,10 @@ def _chain_alias(node) -> str:
 def lift_classifications(root: LogicalNode) -> LogicalNode | None:
     """Move every joined table's classifications above the joins.
 
-    Each one-table SemanticClassify of a table a SemanticJoin reads,
-    with the Filters on its label column, leaves the table's
-    chain and sits above the topmost join under the root Project, in
-    scan order. A classification of a table no join reads stays.
+    Each one-table SemanticClassify of a table that a SemanticJoin
+    reads, with the Filters on its label column, leaves the table's
+    chain and moves above the topmost join, under the root Project, in
+    scan order. A classification of a table that no join reads stays.
 
     Returns:
         The rewritten root, or None when no classification moved.
@@ -299,20 +297,15 @@ class ClassifyPlacement:
     """Classify a joined table before its joins or after them, by cost.
 
     Before the joins, a classification labels every document its
-    AI.IF filters kept and a filter on its label thins the join's
-    input; after the joins, it labels only the documents the joins
-    matched. The rule keeps the plan as written, with each
-    classification on its table, unless the plan with every joined
-    table's classifications above the joins (lift_classifications)
-    costs less.
+    AI.IF filters kept, and a filter on its label thins the join's
+    input. After the joins, it labels only the documents the joins
+    matched. The rule keeps the plan as written unless the plan with
+    every joined table's classifications above the joins
+    (lift_classifications) costs less.
 
-    The cost is a whole physical plan's estimated seconds
-    (quail.planner.pricing): build_physical_plan's plan for the
-    candidate, with the label_scoring rule applied so each
-    classification's scoring rule is counted. It reads the model and
-    device specs, the document token counts, and the pair fractions
-    from the logical planning context, so the rule does nothing on a
-    context without statistics or for another backend.
+    The cost is the estimated seconds of the candidate's physical plan
+    with the label_scoring rule applied (quail.planner.pricing). The
+    rule does nothing when prices() is false for the context.
     """
 
     name = "classify_placement"
@@ -341,13 +334,11 @@ class ClassifyPlacement:
 
 
 def prices(root, context) -> bool:
-    """Whether the Quail cost model applies to a plan and context.
+    """Return whether the Quail cost model applies to a plan and context.
 
-    It needs the statistics (a model and device), prices the Quail
-    backend's filter, join, and classification plans only (an
-    AI.SCORE plan is the reranker planner's), and has nothing to say
-    about a model whose weights do not fit one GPU, which the physical
-    planner refuses.
+    It applies when the context has a model, the backend is quail, the
+    model's weights fit one GPU, and the plan has no AI.SCORE, which the
+    reranker planner plans.
     """
     return (context.model is not None and context.backend == "quail"
             and budgets.minimum_weight_gpus(context.model, context.device) == 1
@@ -355,7 +346,7 @@ def prices(root, context) -> bool:
 
 
 def _statistics(root, context) -> PlanStatistics:
-    """The plan's statistics, shared through the context's memo."""
+    """Return the plan's statistics, shared through the context's memo."""
     return cached_statistics(
         LogicalPlan(root), context.memo, model=context.model,
         device=context.device, doc_tokens=context.document_tokens,
@@ -374,8 +365,8 @@ class FilterOrder:
     predicate scans every document's prefix, each later one asks over
     the KV the chain keeps, and a predicate's selectivity thins what
     follows. The rule records the order on the node when it differs
-    from the written order; with order="as_written" it leaves every
-    node as written. Both front ends put a table's AI.IF predicates in
+    from the written order. With order="as_written", it clears every
+    recorded order. Both front ends put a table's AI.IF predicates in
     one SemanticFilter, so the order covers the whole chain.
     """
 
@@ -414,14 +405,14 @@ class JoinOrder:
 
     The left-deep search (quail.planner.joins.search_joins) prices
     every connected stage order with every anchor choice together,
-    since a stage's cost depends on which table's KV is computed once
-    and on which documents' KV earlier stages left resident, and
-    ranks each candidate by the whole query's predicted seconds, the
-    filter chains in their decided order included. A written anchor
-    is honored; with order="as_written" only the anchors are chosen.
-    When no connected left-deep order exists the written order is
-    priced. The rule records each join's execution position and
-    anchor on its SemanticJoin.
+    because a stage's cost depends on which table's KV is computed once
+    and which documents' KV earlier stages left resident. It ranks each
+    candidate by the whole query's estimated seconds, including the
+    filter chains in their decided order. A written anchor is kept.
+    With order="as_written", only the anchors are chosen. When no
+    connected left-deep order exists, the written order is priced. The
+    rule records each join's execution position and anchor on its
+    SemanticJoin.
     """
 
     name = "join_order"

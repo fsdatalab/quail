@@ -114,7 +114,7 @@ class SpeedOfLightEstimate:
 
     @property
     def classification_evaluations(self) -> int:
-        """Documents and joined rows the classifications labeled."""
+        """Return the number of documents and joined rows classified."""
         return sum(stage["evaluated"] for stage in self.filter_stages
                    if stage["operator"] == CLASSIFY) + sum(
             classification["pairs"]
@@ -390,9 +390,9 @@ class _Search:
     def question_work(self, alias: str, live, tail: int, first: bool) -> Work:
         """Return the work of one question asked of every live document.
 
-        The first question on an alias computes each document's prefix
-        unless another alias of the column already did; later questions
-        attach the tail to the resident prefix.
+        The first question on an alias computes each document's prefix,
+        unless credit_shared is on and another alias of the column already
+        did. Later questions attach the tail to the resident prefix.
         """
         tokens = self.aliases[alias].tokens
         computed = self.computed_rows_by_column.setdefault(

@@ -162,11 +162,11 @@ class RequestFilterSpec:
 
 @dataclass(frozen=True)
 class RequestClassifySpec:
-    """Specification for one decoded classification answer per document.
+    """Specification for one decoded classification answer per document or row.
 
-    The tail_token_ids follow the document and contain the question,
-    categories, and answer cue. Tests contains (written position, accepted
-    labels) pairs applied in order after classification.
+    The tail_token_ids follow the document and contain the question, the
+    label list, and the answer cue. Tests contains (written position,
+    accepted labels) pairs applied in order after classification.
     """
 
     alias: str
@@ -479,8 +479,9 @@ class RequestExecution(PhysicalNode):
 class ScoreSpec:
     """Specification for a batched AI.SCORE computation.
 
-    The draws field limits diffusion draws per document. Low-entropy answers
-    can use fewer draws. Autoregressive models always use one answer.
+    draws is the most noise draws a diffusion model averages per answer;
+    an answer whose first draw is certain enough uses one. An
+    autoregressive model always uses one.
     """
 
     name: str
@@ -591,11 +592,12 @@ class ClassifySpec(ScoreSpec):
     """Specification for classifying individual documents or joined pairs.
 
     Attributes:
-        labels: Category strings in query order.
-        label_token_ids: Token sequence for each category. Letters scoring
-            uses the category's assigned letter; trie methods use its text.
-        scoring: Selected scoring method: letters, trie_tree, or trie_decode;
-            empty until the label_scoring rule picks one.
+        labels: Labels in query order.
+        label_token_ids: Token ids for each label: its letter for the
+            letters rule, its text for the trie rules.
+        scoring: The label scoring rule: letters, trie_tree, or trie_decode.
+            The planner leaves it empty until the label_scoring rule
+            picks one.
         share_prefixes: Whether documents may reuse shared prefix KV pages.
         probabilities: Whether to add a name + "_probabilities" map column.
         join_layout: Anchor note and partner label token sequences for pair
@@ -658,9 +660,9 @@ class ClassifySpec(ScoreSpec):
 
 @dataclass(frozen=True)
 class AiClassify(AiScore):
-    """Physical operator that appends a category string to each input row.
+    """Physical operator that appends a label to each input row.
 
-    ClassifySpec selects the scoring method. The backend executes any decoder
+    The spec names the label scoring rule. The backend runs any decode
     rounds within this node and returns the labels through its scores port.
     """
 
@@ -670,7 +672,7 @@ class AiClassify(AiScore):
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
-        """Return ports for category rows and the IDs of classified documents."""
+        """Return ports for label rows and the IDs of labeled documents."""
         ports = super().outputs
         if self.spec is not None and len(self.spec.aliases) == 1:
             (alias,) = self.spec.aliases
@@ -710,7 +712,7 @@ class InList:
     values: tuple[str, ...]
 
     def accepts(self, value) -> bool:
-        """Return whether the value is in the accepted category list."""
+        """Return whether the value is one of the accepted labels."""
         return value in self.values
 
     def to_dict(self) -> dict:
@@ -758,9 +760,9 @@ def predicate_from_mapping(value: Mapping[str, Any]) -> "InList | Comparison":
 
 @dataclass(frozen=True)
 class Filter(PhysicalNode):
-    """Physical operator that keeps rows matching a score or category condition.
+    """Physical operator that keeps rows matching a score or label condition.
 
-    InList tests a category produced by AI.CLASSIFY. Comparison tests a score
+    InList tests a label produced by AI.CLASSIFY. Comparison tests a score
     produced by AI.SCORE. Single-document filters also return the kept
     document IDs; filters over joined pairs return join answers.
     """

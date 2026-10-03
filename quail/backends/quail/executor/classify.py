@@ -1,6 +1,6 @@
 """Execute classification with the shared stage scheduler.
 
-Letters scores category letters in one pass. Tree scoring evaluates all
+Letter scoring reads label letters in one pass. Tree scoring evaluates all
 label token sequences. Greedy decoding chooses one allowed token per
 round, keeping the chosen path in the document's KV after the frame.
 """
@@ -43,7 +43,7 @@ class LabelRequests:
             request per target.
         targets: Sorted token IDs returned by the readout.
         read_all_rows: Whether every suffix row is read, rather than its last.
-        score: Callback converting one document's readout values to category
+        score: Callback converting one document's readout values to label
             scores. Values have shape (suffixes, rows, targets) when all rows
             are read, otherwise (suffixes, targets). None uses greedy decoding.
         chains: Optional trie chains packed into the sole suffix for tree scoring.
@@ -65,9 +65,9 @@ def label_requests(spec, targets=None) -> LabelRequests:
     """Build token requests and a score function for a classification.
 
     Args:
-        spec: ClassifySpec containing the prompt and category token sequences.
+        spec: ClassifySpec containing the prompt and label token sequences.
         targets: Sorted token IDs returned by the readout. None uses all token
-            IDs present in the category sequences.
+            IDs present in the label sequences.
 
     Returns:
         LabelRequests describing the frame, suffixes, and scoring procedure.
@@ -154,7 +154,7 @@ def _label_readout(state: QueryExecutionState, targets, rows: int, normalize: bo
 
 
 def _softmax(scores) -> np.ndarray:
-    """Normalize category scores into probabilities along the last axis."""
+    """Normalize label scores into probabilities along the last axis."""
     scores = np.asarray(scores, dtype=np.float64)
     scores = np.exp(scores - scores.max(axis=-1, keepdims=True))
     return scores / scores.sum(axis=-1, keepdims=True)
@@ -181,7 +181,7 @@ class ClassifyStages:
     canvas_rows = 0         # rows of a letters stage's canvas on a canvas model
     draws = 1               # noise draws a canvas letters read may average
     probabilities = None    # (documents, labels) label probabilities, when asked
-    seeds = None            # document index -> its canvas seed; the index itself
+    seeds = None            # document index -> canvas seed; None uses the index
     partners = None         # JoinPartners, for joined rows
     pair_labels = None      # (anchor index, partner index) -> label, for joined rows
 
@@ -204,8 +204,8 @@ class ClassifyStages:
             self.canvas_rows = answer_canvas.rows
             self.readout_rows = readout_rows = self.canvas_rows
             self.draws = max(1, spec.draws)
-        # every label read at the same row needs no normalizer: one-token
-        # labels at the cue row
+        # one-token labels are all read at the cue row, so their logits
+        # need no normalizer
         same_rows = all(len(ids) == 1 for ids in spec.label_token_ids)
         self.readout = readout = _label_readout(state, targets, readout_rows,
                                                 not same_rows)
@@ -325,7 +325,7 @@ class ClassifyStages:
         """Build a stage that repeats uncertain diffusion classifications.
 
         Documents labeled by the first draw skip this stage. Other documents
-        run the remaining draws and use the mean category probabilities.
+        run the remaining draws and use the mean label probabilities.
 
         Args:
             canvas: Callable taking a document index and draw number and returning
@@ -359,7 +359,7 @@ class ClassifyStages:
             canvas_rows=self.canvas_rows)
 
     def _probs(self, logits, draws) -> tuple[np.ndarray, np.ndarray]:
-        """Compute category probabilities and entropy for each draw.
+        """Compute label probabilities and entropy for each draw.
 
         Args:
             logits: Readout values for all draws, rows, and target tokens.
@@ -398,13 +398,13 @@ class ClassifyStages:
             on_label(anchor, label)
 
     def _choose(self, anchor, probs, on_label):
-        """Record the most probable category and optionally its probabilities."""
+        """Record the most probable label and optionally its probabilities."""
         if self.probabilities is not None:
             self.probabilities[anchor] = probs
         self._set(anchor, self.spec.labels[best_label(probs)], on_label)
 
     def _scores(self, logprobs):
-        """Compute one score per category from the readout values."""
+        """Compute one score per label from the readout values."""
         if self.read_all:
             # a one-row readout returns (suffixes, targets)
             logprobs = logprobs.reshape(
@@ -501,7 +501,7 @@ class QuailClassifier:
                 chunk's newly labeled rows.
 
         Returns:
-            A RerankerBatch containing labels, optional category probabilities,
+            A RerankerBatch containing labels, optional label probabilities,
             token counts, and execution metrics.
         """
         state = self.state
@@ -542,7 +542,7 @@ class QuailClassifier:
         state = self.state
         gpu_s = 0.0
         if state.gpu_timing:
-            # every chunk's answers were read, so its end event completed
+            # elapsed_time needs every end event to have completed
             state.torch.cuda.synchronize()
             gpu_s = sum(start.elapsed_time(end)
                         for _, _, start, end in spans) / 1000.0

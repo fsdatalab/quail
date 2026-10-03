@@ -199,16 +199,17 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                         context: PlanningContext | None = None):
     """Compile a decided LogicalPlan into a PhysicalPlan or Refusal.
 
-    The logical rules have made every choice the plan records: each
-    table's filter order, the joins' stage order and anchors, and
-    where each classification sits. A one-table classification above
-    a SemanticJoin runs after the joins, over the documents the joins
-    matched; one on its table runs after the table's AI.IF filters. A
-    plan without recorded orders and anchors runs as written. Each
-    classification's scoring rule is left for the label_scoring
-    physical rule and which KV stays resident for kv_retention, so the
-    estimate and ``search_seconds`` count the filters, the joins, and
-    the classifications of joined rows only.
+    The logical rules record each table's filter order, the joins'
+    stage order and anchors, and where each classification sits. A
+    plan without recorded orders and anchors runs as written. A
+    one-table classification above a SemanticJoin runs after the joins,
+    over the documents the joins matched. One on its table runs after
+    the table's AI.IF filters.
+
+    The label_scoring physical rule picks each classification's scoring
+    rule, and the kv_retention rule picks which KV stays resident. The
+    estimate and ``search_seconds`` count only the filters, the joins,
+    and the classifications of joined rows.
 
     Args:
         plan: The logical plan to compile.
@@ -292,7 +293,6 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     orders = filter_orders(plan)
 
     # ---- expected live counts after filters, and the filter work
-    # every stage's price sits on
     live0 = live_after_filters(plan, statistics)
     works = filter_works(plan, statistics, model)
     base_work = sum(works.values(), Work())

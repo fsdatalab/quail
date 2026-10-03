@@ -17,8 +17,7 @@ ACT_BYTES_PER_HIDDEN = 32
 # canvas, and a classified document's canvas with the document's row.
 CANVAS_SEED = 0
 # A canvas answer whose first draw is less certain than this, in nats,
-# takes the rest of its noise draws and averages them, as the
-# structured server of vLLM PR 57250 does by default.
+# takes the rest of its noise draws and averages them.
 CANVAS_ENTROPY_NATS = 0.1
 
 
