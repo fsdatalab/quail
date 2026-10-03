@@ -121,9 +121,8 @@ class TreeAttention:
     A join stage has every partner of an anchor reading the anchor's
     KV: under tree attention those reads are stacked into one, under
     unified attention each partner reads the anchor itself. The choice
-    is by roofline (choose_attention_path). Tree attention needs the
-    fp8 merge kernel and packs no canvas rows, so other models stay
-    unified.
+    is by roofline (choose_attention_path). Tree attention packs no
+    canvas rows, so a diffusion model stays unified.
 
     A filter sharing prefixes is annotated from its tree: the
     documents borrowing one parent's pages are that node's readers
@@ -140,8 +139,7 @@ class TreeAttention:
         if context is None:
             return None
         model, device = context.model, context.device
-        tree_available = (model.weight_precision == "fp8"
-                          and not model.canvas_tokens)
+        tree_available = not model.canvas_tokens
         nodes = []
         changed = False
         for node in graph.nodes:

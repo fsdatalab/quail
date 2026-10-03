@@ -14,7 +14,7 @@ class ModelPipeline:
     A subclass sets self.engine and self.max_chunk_tokens in __init__
     and implements forward_chunk; with gemm_warmup it also implements
     linears. tree_attention says the model's kernels can run the
-    tree attention path (two calls, fused merge and fp8 quant); a
+    tree attention path (two calls, then a fused merge); a
     chunk asked for it on a model without it runs unified, the one
     causal call every model has. A diffusion model also sets
     canvas_ids: the token ids the loop packs after every suffix, with

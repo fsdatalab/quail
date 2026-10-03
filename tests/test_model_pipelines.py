@@ -42,9 +42,9 @@ def _model(torch, dtype):
         layers=[layer], embed_tokens=None, norm=None))
 
 
-def test_tree_attention_follows_the_weight_precision():
+def test_fp8_and_bf16_qwen3_run_both_attention_paths():
     torch = pytest.importorskip("torch")
-    for dtype_name, expected in [("float8_e4m3fn", True), ("bfloat16", False)]:
+    for dtype_name, expected in [("float8_e4m3fn", True), ("bfloat16", True)]:
         engines = []
 
         def engine(arena, **kwargs):
@@ -53,6 +53,6 @@ def test_tree_attention_follows_the_weight_precision():
 
         pipeline = Qwen3Pipeline(_model(torch, getattr(torch, dtype_name)), None,
                                  spec=None, engine_class=engine)
-        assert engines[0]["fp8"] is expected, dtype_name
+        assert engines[0]["fp8"] is (dtype_name == "float8_e4m3fn")
         assert pipeline.tree_attention is expected, dtype_name
         assert pipeline.max_chunk_tokens == (2**31 - 1) // 4096, dtype_name
