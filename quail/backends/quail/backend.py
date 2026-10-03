@@ -273,12 +273,6 @@ class QuailBackend:
                 "true_ids": true_ids,
                 "false_ids": false_ids,
                 "pre_ids": pre_ids,
-                "filter_limit": (
-                    None if any(
-                        isinstance(node, AiJoin)
-                        for node in encoded_nodes
-                    ) else region.logical_plan.root.limit
-                ),
             },
         )
 

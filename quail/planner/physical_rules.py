@@ -25,13 +25,46 @@ from quail.physical import (
     AiClassify,
     AiFilter,
     AiJoin,
+    AiScore,
     Filter,
     Foreign,
+    Limit,
     PhysicalGraph,
+    Sort,
 )
 from quail.planner import retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
 from quail.planner.statistics import cached_statistics, live_after_filters
+
+
+class LimitPushdown:
+    """Let a LIMIT end the filter run once enough documents survived.
+
+    The rule puts the limit in the ``filter_limit`` setting, which the
+    executor reads to stop admitting documents once that many survived
+    the chain's last stage. The pushdown keeps the first survivors to
+    finish, so it is sound only when those are the rows the query
+    returns: the graph ends in a Limit and has no Sort (an ORDER BY,
+    DISTINCT, or OFFSET needs every survivor), no AiJoin (survivors are
+    settled per join round), and no AiScore (a score comparison after
+    the chain can drop survivors). Otherwise the rule removes the
+    setting.
+    """
+
+    name = "limit_pushdown"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None:
+            return None
+        limit = next((node for node in graph.nodes
+                      if isinstance(node, Limit)), None)
+        blocked = any(isinstance(node, (Sort, AiJoin, AiScore))
+                      for node in graph.nodes)
+        if limit is None or blocked:
+            context.settings.pop("filter_limit", None)
+        else:
+            context.settings["filter_limit"] = limit.count
+        return None
 
 
 class KvRetention:
@@ -374,10 +407,11 @@ class TreeAttention:
 def built_in_physical_rules() -> tuple:
     """Return the physical rules registered with the built in registry.
 
-    In order: kv_retention, label_scoring, prefix_sharing, and
-    tree_attention. prefix_sharing follows kv_retention because it
-    weighs the page writes a chain already makes, and tree_attention
-    follows prefix_sharing because a filter's attention path depends
-    on the prefixes it shares.
+    In order: limit_pushdown, kv_retention, label_scoring,
+    prefix_sharing, and tree_attention. prefix_sharing follows
+    kv_retention because it weighs the page writes a chain already
+    makes, and tree_attention follows prefix_sharing because a filter's
+    attention path depends on the prefixes it shares.
     """
-    return (KvRetention(), LabelScoring(), PrefixSharing(), TreeAttention())
+    return (LimitPushdown(), KvRetention(), LabelScoring(), PrefixSharing(),
+            TreeAttention())

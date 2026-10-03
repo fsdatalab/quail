@@ -24,9 +24,7 @@ from quail.physical import (
     Comparison,
     Filter,
     InList,
-    Limit,
     PortRef,
-    Project,
     Scan,
     ScoreSpec,
 )
@@ -39,6 +37,7 @@ from quail.planner.classify import (
 )
 from quail.planner.physical_optimizer import PhysicalCandidate
 from quail.planner.plan import PhysicalPlan, Refusal
+from quail.planner.results import result_nodes
 from quail.reranker import render_qwen3_reranker_input
 
 
@@ -624,17 +623,7 @@ def _plan_reranker(region, context, *, backend_name: str):
         else f"{expression.alias}.{expression.column}"
         for expression in logical.root.columns
     )
-    nodes.append(Project(
-        node_id="project",
-        inputs=input_ports((sink,)),
-        columns=columns,
-    ))
-    if logical.root.limit is not None:
-        nodes.append(Limit(
-            node_id="limit",
-            inputs=input_ports((PortRef("project", "rows"),)),
-            count=logical.root.limit,
-        ))
+    nodes.extend(result_nodes(logical.root, (sink,), columns))
 
     estimate = total_seconds
     true_ids, false_ids = answer_ids(context.model, context.tokenizer)

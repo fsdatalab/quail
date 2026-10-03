@@ -18,6 +18,7 @@ from quail.logical import (
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
+    SortKey,
     bind_join_prompt,
     bind_prompt,
     bind_score_prompt,
@@ -26,19 +27,16 @@ from quail.logical import (
 from quail.logical.nodes import validate_task_description
 from quail.logical.prompts import bind_classify_prompt
 
-# Every relational operator except the projection, named and refused.
+# Every relational operator outside the language, named and refused.
 # OR is rejected separately with its own message.
 FORBIDDEN = (
     (exp.Group, "GROUP BY"),
-    (exp.Order, "ORDER BY"),
-    (exp.Distinct, "DISTINCT"),
     (exp.Having, "HAVING"),
     (exp.Qualify, "QUALIFY"),
     (exp.Window, "window functions"),
     (exp.Union, "UNION"),
     (exp.Except, "EXCEPT"),
     (exp.Intersect, "INTERSECT"),
-    (exp.Offset, "OFFSET"),
 )
 
 # one option surface: anchor is rejected after parsing when the
@@ -551,6 +549,54 @@ def _parse_limit(tree) -> int | None:
     return value
 
 
+def _parse_offset(tree) -> int:
+    """Extract a plain OFFSET N from the parse tree; 0 when absent."""
+    offset_node = tree.args.get("offset")
+    if offset_node is None:
+        return 0
+    expr = offset_node.expression
+    if not isinstance(expr, exp.Literal) or expr.is_string:
+        raise CompileError("OFFSET must be a nonnegative integer")
+    value = int(expr.this)
+    if value < 0:
+        raise CompileError("OFFSET must be a nonnegative integer")
+    return value
+
+
+def _parse_distinct(tree) -> bool:
+    """Return whether the SELECT is DISTINCT; DISTINCT ON is refused."""
+    distinct = tree.args.get("distinct")
+    if distinct is None:
+        return False
+    if distinct.args.get("on") is not None:
+        raise CompileError("DISTINCT ON is not supported; use DISTINCT")
+    return True
+
+
+def _parse_order(tree, b: "_Binder", columns: list) -> tuple:
+    """Bind each ORDER BY term to a projected name or a source column."""
+    order = tree.args.get("order")
+    if order is None:
+        return ()
+    named = {column.name: column for column in columns
+             if isinstance(column, Alias)}
+    keys = []
+    for term in order.expressions:
+        target = term.this
+        if not isinstance(target, exp.Column):
+            raise CompileError(
+                f"ORDER BY {target.sql()} is not a column; give an "
+                f"expression an AS name in SELECT and order by that name")
+        if not target.table and target.name in named:
+            expression = named[target.name]
+        else:
+            expression = b.resolve_column(target)
+        keys.append(SortKey(expression,
+                            descending=bool(term.args.get("desc")),
+                            nulls_first=bool(term.args.get("nulls_first"))))
+    return tuple(keys)
+
+
 def compile_sql(sql: str, catalog: Catalog,
                 tokenizer=None,
                 dialect: SQLDialect | str = SQLDialect.SNOWFLAKE,
@@ -577,6 +623,8 @@ def compile_sql(sql: str, catalog: Catalog,
     _reject_forbidden(tree)
 
     limit = _parse_limit(tree)
+    offset = _parse_offset(tree)
+    distinct = _parse_distinct(tree)
 
     b = _Binder(catalog, tokenizer, turn)
 
@@ -730,6 +778,7 @@ def compile_sql(sql: str, catalog: Catalog,
         add_join_spec(predicate, options, aliases)
 
     columns = _compile_projection(b, tree.expressions)
+    order = _parse_order(tree, b, columns)
     projected = tuple(
         column for column in columns if isinstance(column, Alias)
     )
@@ -817,7 +866,8 @@ def compile_sql(sql: str, catalog: Catalog,
     for call, name in named.items():
         if len(call.aliases()) == 2:
             logical.add_classify(call, name)
-    return logical.project(tuple(columns), limit)
+    return logical.project(tuple(columns), limit, order=order,
+                           offset=offset, distinct=distinct)
 
 
 def _check_join_coverage(

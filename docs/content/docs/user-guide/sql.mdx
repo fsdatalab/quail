@@ -474,22 +474,47 @@ SELECT AI.MAP('Summarize this review in one sentence.\n\n{0}', r.body) AS summar
 FROM reviews r
 ```
 
-## SELECT, FROM, JOIN, LIMIT
+## SELECT, FROM, JOIN, ORDER BY, LIMIT
 
 Quail supports these SQL clauses with the following limits:
 
 - **`SELECT`** lists columns and `AI.SCORE` or `AI.CLASSIFY`
   outputs with column aliases. `*` expands to all table columns. Other computed expressions
-  are unsupported.
+  are unsupported. `SELECT DISTINCT` drops duplicate rows.
 - **`FROM`** names a registered table, with an optional alias.
 - **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
   `RIGHT`, `FULL`) are not.
-- **`LIMIT`** takes a positive integer.
+- **`ORDER BY`** sorts the result rows by table columns or by the
+  `AS` names of `AI.SCORE` and `AI.CLASSIFY` outputs, each `ASC` or
+  `DESC` with `NULLS FIRST` or `NULLS LAST`. Expressions are not
+  sort keys: name the expression in `SELECT` and order by that name.
+  With `DISTINCT`, every sort key must be in the `SELECT` list.
+- **`LIMIT`** takes a positive integer and **`OFFSET`** a nonnegative
+  one.
+
+The sort runs on the result rows after the model work, on the
+coordinator. A query with `ORDER BY`, `DISTINCT`, or `OFFSET` evaluates
+every document before it returns rows, so adding `LIMIT` to it does not
+shorten the run. A plain `LIMIT` stops the run once enough documents
+have passed every predicate. For example, this returns the ten
+documents with the highest score, after scoring all of them:
+
+```sql
+SELECT d.id,
+       AI.SCORE(PROMPT('Does the customer request a refund? {0}', d.body))
+           AS refund_score
+FROM documents d
+ORDER BY refund_score DESC
+LIMIT 10
+```
+
+`ORDER BY`, `DISTINCT`, and `OFFSET` run on the Quail backend; the stock
+vLLM and SGLang backends refuse them.
 
 ## Unsupported SQL operators (for now)
 
-- `GROUP BY`, `ORDER BY`, `DISTINCT`, `HAVING`, window functions
-- `UNION`, `EXCEPT`, `INTERSECT`, `OFFSET`
+- `GROUP BY`, `HAVING`, window functions
+- `UNION`, `EXCEPT`, `INTERSECT`
 - `OR` between AI predicates
 - Queries with no AI operator
 - `JOIN` with only relational predicates (no AI operator)

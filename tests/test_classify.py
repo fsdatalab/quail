@@ -427,7 +427,8 @@ def test_rules_place_and_score_classifications(session, tmp_path):
         "projection_pushdown", "filter_pushdown", "classify_placement",
         "filter_order", "join_order"]
     assert [rule.name for rule in built_in_physical_rules()] == [
-        "kv_retention", "label_scoring", "prefix_sharing", "tree_attention"]
+        "limit_pushdown", "kv_retention", "label_scoring", "prefix_sharing",
+        "tree_attention"]
     plan = _topic(session).plan()
     # label_scoring chose every classification's scoring rule
     assert all(node.spec.scoring for node in plan.nodes

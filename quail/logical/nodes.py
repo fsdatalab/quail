@@ -823,11 +823,49 @@ class Apply:
 
 
 @dataclass(frozen=True)
+class SortKey:
+    """One ORDER BY term: a column or a projected expression and its direction."""
+    expression: Any       # ColumnRef | Alias
+    descending: bool = False
+    nulls_first: bool = False
+
+    type_name: ClassVar[str] = "quail.sort_key"
+
+    @property
+    def name(self) -> str:
+        """Return the result column name the key sorts on."""
+        if isinstance(self.expression, ColumnRef):
+            return f"{self.expression.alias}.{self.expression.column}"
+        return self.expression.name
+
+    def validate(self) -> None:
+        if isinstance(self.expression, Alias):
+            self.expression.validate()
+        elif not isinstance(self.expression, ColumnRef):
+            raise CompileError(
+                f"a sort key is a column reference or a projected "
+                f"expression, got {type(self.expression).__name__}")
+
+    def __str__(self) -> str:
+        return (f"{self.name} {'DESC' if self.descending else 'ASC'} "
+                f"NULLS {'FIRST' if self.nulls_first else 'LAST'}")
+
+
+@dataclass(frozen=True)
 class Project:
-    """Column projection. Always the root operator."""
+    """Column projection. Always the root operator.
+
+    ``order`` sorts the result rows, ``distinct`` drops duplicate rows,
+    and ``offset`` and ``limit`` skip and keep a count of rows, applied
+    in that order. A sort key may name a source column the projection
+    does not return, unless the projection is distinct.
+    """
     input: LogicalNode
     columns: tuple    # tuple[ColumnRef | Alias, ...]
     limit: Optional[int] = None
+    order: tuple = ()    # tuple[SortKey, ...]
+    offset: int = 0
+    distinct: bool = False
 
     type_name: ClassVar[str] = "quail.logical_project"
 
@@ -869,6 +907,23 @@ class Project:
             raise CompileError(f"projection names must be unique, got {names}")
         if self.limit is not None and self.limit <= 0:
             raise CompileError("LIMIT must be a positive integer")
+        if self.offset < 0:
+            raise CompileError("OFFSET must be a nonnegative integer")
+        projected = set(names)
+        for key in self.order:
+            if not isinstance(key, SortKey):
+                raise CompileError(
+                    f"an ORDER BY term is a SortKey, got {type(key).__name__}")
+            key.validate()
+            if isinstance(key.expression, Alias) \
+                    and key.expression not in self.columns:
+                raise CompileError(
+                    f"ORDER BY {key.name!r} names an expression the "
+                    f"projection does not return")
+            if self.distinct and key.name not in projected:
+                raise CompileError(
+                    f"ORDER BY {key.name!r} with DISTINCT needs the "
+                    f"column in the SELECT list")
 
     def with_children(self, children: tuple[LogicalNode, ...]):
         if len(children) != 1:
@@ -888,6 +943,9 @@ class Project:
                 for column in self.columns
             ],
             "limit": self.limit,
+            "order": [str(key) for key in self.order],
+            "offset": self.offset,
+            "distinct": self.distinct,
         }
 
 
@@ -1267,10 +1325,13 @@ class LogicalPlanBuilder:
         self._root = Join(self._root, self._nodes[alias])
 
     def project(
-        self, columns: tuple, limit: int | None = None
+        self, columns: tuple, limit: int | None = None,
+        order: tuple = (), offset: int = 0, distinct: bool = False,
     ) -> LogicalPlan:
         if self._root is None:
             raise CompileError("a logical plan needs an input table")
-        plan = LogicalPlan(Project(self._root, tuple(columns), limit))
+        plan = LogicalPlan(Project(self._root, tuple(columns), limit,
+                                   order=tuple(order), offset=offset,
+                                   distinct=distinct))
         plan.validate()
         return plan
