@@ -47,14 +47,16 @@ the nodes shown in `explain()` output.
 | `fresh_tokens` | Input tokens this node processed. |
 | `evaluated_documents` | Documents evaluated by a filter, score, or classification node. |
 | `evaluated_document_pairs` | Pairs evaluated by a join or pair classifier. |
-| `suffix_tokens` | Question and label continuation tokens processed by score and classification nodes. |
+| `suffix_tokens` | Tokens after the document that score and classification nodes process: the question and the label tokens. |
 | `borrowed_prefix_tokens` | Token positions reused from another document's prefix KV. |
 
-With the vLLM and SGLang backends, `evaluated_documents` can exceed
-`output_rows` if a generated answer matches no supplied label.
-When a condition such as `sentiment IN ('negative', 'mixed')` removes
-rows, its metrics appear under a separate `Filter` node. Operators may
-also report extra fields such as packing time (`pack_s`).
+- With the vLLM and SGLang backends, `evaluated_documents` can be
+  larger than `output_rows`. A generated answer that matches no label
+  gives no row.
+- A condition on a label, such as `sentiment IN ('negative', 'mixed')`,
+  is a separate `Filter` node with its own metrics.
+- Some operators report more fields, for example `pack_s`, the packing
+  time.
 
 ## Boot details
 

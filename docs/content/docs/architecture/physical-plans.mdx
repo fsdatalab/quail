@@ -14,7 +14,7 @@ can be validated, serialized, and edited before execution.
 Each node has typed input and output ports. An `InputPort` reads
 from one `OutputPort` of another node. Value types include
 `DOCUMENT_IDS`, `FILTER_ANSWERS`, `JOIN_ANSWERS`, `SCORES`, and `ROWS`.
-`SCORES` tables contain numeric scores or string labels. The
+A `SCORES` table holds numeric scores or string labels. The
 graph validates that connected ports have matching types.
 
 ```python
@@ -43,7 +43,7 @@ All node types are defined in
 | [`Recombine`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Joins TRUE answer tables using Arrow. |
 | [`Project`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Reads the selected columns for surviving rows. |
 | [`Limit`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Truncates the result. |
-| `Filter` | Keeps rows matching a condition, such as `score >= 0.8` or `label IN ['refund']`. |
+| [`Filter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Keeps the rows that match a condition, such as `score >= 0.8` or `label IN ('refund')`. |
 
 **Quail backend nodes**:
 
@@ -51,8 +51,8 @@ All node types are defined in
 | --- | --- |
 | [`AiFilter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs filter stages on the GPU. |
 | [`AiJoin`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs join stages on the GPU. |
-| `AiScore` | Returns a numeric score for each document or document pair. |
-| `AiClassify` | Chooses one of the supplied labels for each document or document pair. |
+| [`AiScore`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Returns a score for each document or joined row. |
+| [`AiClassify`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Returns one of the supplied labels for each document or joined row. |
 
 ### Node ids
 
@@ -95,16 +95,17 @@ must have one output of the same value type as the edge.
 plan3 = plan2.remove("apply:same_page")
 ```
 
-Remove a node and rewire its consumers to its producer. Only
-`Foreign`, `Barrier`, and `Exchange` nodes can be removed — removing
-a `Scan`, `AiFilter`, or `AiJoin` would change what the query
+Remove a node and connect its consumers to its producer. Only
+`Foreign`, `Barrier`, and `Exchange` nodes can be removed. The removal
+of a `Scan`, an LLM node, or a `Filter` would change what the query
 computes.
 
 ```python
 plan4 = plan2.move("apply:same_page", between=("barrier:e", "ai_join:e"))
 ```
 
-Alternatively, move the node in `plan2` to a new edge instead of removing it.
+Move a node of `plan2` to a different edge. This is an alternative to
+the removal above.
 
 ```python
 result = query.run(plan=plan4)

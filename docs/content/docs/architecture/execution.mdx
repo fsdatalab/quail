@@ -19,9 +19,9 @@ walks the physical plan's nodes in topological order. For each node
 it calls the registered runtime, checks the output ports, records
 metrics, and notifies any observers.
 
-Relational nodes such as `Filter`, `Recombine`, `Project`, and `Limit`
-run on the CPU using Arrow. LLM nodes include `AiFilter`, `AiJoin`,
-`AiScore`, and `AiClassify`.
+Relational nodes (`Filter`, `Recombine`, `Project`, `Limit`) run on the
+CPU with Arrow. LLM nodes (`AiFilter`, `AiJoin`, `AiScore`,
+`AiClassify`) run on the GPU with the execution loop below.
 
 ## Operator execution
 
@@ -90,17 +90,17 @@ sharing one anchor's KV.
 
 ### Classification execution
 
-Classification uses the same token and KV page budgets as filters and
-joins. It can run after a filter in the same pipeline, reusing the
-document's KV. Greedy decoding may need several model passes to finish
-a label. All passes belong to one `AiClassify` node. See
+A classification uses the same token and KV page budgets as filters
+and joins. In a pipeline, it runs after the filters of its table and
+uses the document's KV again. With `trie_decode`, one label can need
+several model passes. All of them belong to one `AiClassify` node. See
 [scoring methods](/docs/architecture/planning#choosing-classification-scoring).
 
 #### Classifying joined rows
 
-For each match from the corresponding join, the classifier reuses the
-anchor's document KV and appends the partner document and question.
-The classifier runs in the same pipeline as the join.
+The classification of joined rows runs in the same pipeline as its
+join. For each pair that the join keeps, it uses the anchor's KV again
+and adds the partner label, the partner document, and the question.
 
 ## Model forward pass
 
@@ -161,14 +161,14 @@ RoPE, SiLU + FP8 quantize, and the attention merge + FP8 quantize
 for joins. These fused kernels reduce the number of GPU kernel
 launches per layer.
 
-For a Boolean condition, Quail compares the model's scores for TRUE
-and FALSE. Several spellings count, including forms with a leading
-space. The condition passes when the highest TRUE score exceeds the
-highest FALSE score.
+For a TRUE or FALSE condition, Quail compares the model's scores for
+TRUE and FALSE. Several spellings count, for example with a leading
+space. The condition passes when the best TRUE score is higher than the
+best FALSE score.
 
-Quail keeps the full vocabulary matrix so it can also score label
-tokens. For labels with several tokens, it computes token probabilities
-using scores for the entire vocabulary.
+Quail keeps the full output head of the model, because a label can
+start with any token. For a label with several tokens, it computes each
+token's probability over the full vocabulary.
 
 Quail uses [FlashAttention 3](https://arxiv.org/abs/2407.08608) on
 H100 and FlashAttention 2 on Blackwell GPUs.
