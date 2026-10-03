@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from quail.cost.budgets import choose_attention_path
+from quail.cost.budgets import choose_attention_path, tree_attention_allowed
 from quail.physical import AiFilter, AiJoin, PhysicalGraph
 from quail.planner.prefixes import page_tree
 
@@ -121,8 +121,9 @@ class TreeAttention:
     A join stage has every partner of an anchor reading the anchor's
     KV: under tree attention those reads are stacked into one, under
     unified attention each partner reads the anchor itself. The choice
-    is by roofline (choose_attention_path). Tree attention packs no
-    canvas rows, so a diffusion model stays unified.
+    is by roofline (choose_attention_path). A diffusion model and a
+    model under 2B dense parameters stay unified
+    (tree_attention_allowed).
 
     A filter sharing prefixes is annotated from its tree: the
     documents borrowing one parent's pages are that node's readers
@@ -139,7 +140,7 @@ class TreeAttention:
         if context is None:
             return None
         model, device = context.model, context.device
-        tree_available = not model.canvas_tokens
+        tree_available = tree_attention_allowed(model)
         nodes = []
         changed = False
         for node in graph.nodes:

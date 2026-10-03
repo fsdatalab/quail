@@ -9,6 +9,7 @@ architecture with bf16 weights and run through this file too.
 
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
+from quail.cost.budgets import tree_attention_allowed
 
 
 class Qwen3Pipeline(ModelPipeline):
@@ -33,6 +34,7 @@ class Qwen3Pipeline(ModelPipeline):
                          layer.mlp.gate_up_proj.weight.shape[0])
                      for layer in self.layers)
         self.max_chunk_tokens = (2**31 - 1) // widest
+        self.tree_attention = spec is None or tree_attention_allowed(spec)
         self.answer_offsets = tuple(answer_offsets)
         self._offsets = None
         if self.answer_offsets != (0,):
