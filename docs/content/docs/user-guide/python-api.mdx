@@ -181,6 +181,41 @@ query = (
 )
 ```
 
+### order_by
+
+`order_by(*keys)`
+
+Sort the result rows. A key is a column name, a name given to an
+`AI.SCORE` or `AI.CLASSIFY` output, or a tuple of the name and
+`"asc"` or `"desc"`, with an optional `"nulls first"` or
+`"nulls last"`. Ascending keys put nulls last and descending keys put
+them first unless told otherwise. A sorted query evaluates every
+document before returning rows, so a `limit()` after it does not
+shorten the run.
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .order_by(("r.stars", "desc"), "r.id")
+    .limit(10)
+    .select("r.id", "r.body")
+)
+```
+
+### offset
+
+`offset(n)`
+
+Skip the first `n` rows. Use it with `order_by`.
+
+### distinct
+
+`distinct()`
+
+Return each distinct row once. Every `order_by` key must then be a
+selected column.
+
 ### select
 
 `select(*cols)`

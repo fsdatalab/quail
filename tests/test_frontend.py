@@ -19,6 +19,7 @@ from quail.logical import (
     Scan,
     SemanticFilter,
     SemanticJoin,
+    SortKey,
     bind_join_prompt,
     canonicalize_template,
     join_applies,
@@ -356,11 +357,16 @@ REJECTED = [
     ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
      "r.review)) GROUP BY r.id", "GROUP BY"),
     ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
-     "r.review)) ORDER BY r.id", "ORDER BY"),
+     "r.review)) ORDER BY r.id + 1", "not a column"),
     ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
-     "r.review)) LIMIT 10 OFFSET 5", "OFFSET"),
+     "r.review)) ORDER BY AI_SCORE(PROMPT('x {0}', r.review))",
+     "not a column"),
     ("SELECT DISTINCT r.id FROM reviews r WHERE AI_FILTER("
-     "PROMPT('x {0}', r.review))", "DISTINCT"),
+     "PROMPT('x {0}', r.review)) ORDER BY r.review", "DISTINCT needs"),
+    ("SELECT DISTINCT ON (r.id) r.id FROM reviews r WHERE AI_FILTER("
+     "PROMPT('x {0}', r.review))", "DISTINCT ON"),
+    ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
+     "r.review)) LIMIT 10 OFFSET 'two'", "nonnegative"),
     ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
      "r.review)) OR AI_FILTER(PROMPT('y {0}', r.review))",
      "disjunction"),
@@ -442,6 +448,49 @@ def test_builder_and_sql_reject_invalid_queries(catalog):
     built = (reviews().ai_filter(prompt("x: {0}", col("r.review")))
              .limit(3).select("r.id"))
     assert built.root.limit == 3
+
+
+def test_sql_and_builder_parse_order_by_offset_and_distinct(catalog):
+    def reviews():
+        return docs(catalog, "reviews", tok).alias("r")
+
+    plan = compile_sql("""
+        SELECT r.id FROM reviews r
+        WHERE AI_FILTER(PROMPT('x: {0}', r.review))
+        ORDER BY r.review DESC, r.id
+        LIMIT 4 OFFSET 2
+    """, catalog, tok)
+    review = ColumnRef("r", "reviews", "review")
+    assert plan.root.order == (
+        SortKey(review, descending=True, nulls_first=True),
+        SortKey(ColumnRef("r", "reviews", "id")))
+    assert (plan.root.limit, plan.root.offset, plan.root.distinct) == (4, 2, False)
+    assert plan.root.explain_fields()["order"] == [
+        "r.review DESC NULLS FIRST", "r.id ASC NULLS LAST"]
+    built = (reviews().ai_filter(prompt("x: {0}", col("r.review")))
+             .order_by(("r.review", "desc"), "r.id").offset(2).limit(4)
+             .select("r.id"))
+    assert built == plan
+    # the sort column is loaded by the scan although it is not returned
+    optimized, _ = apply_logical_rules(
+        plan, built_in_logical_rules(), LogicalPlanningContext(catalog, None))
+    scan = next(node for node in optimized.walk() if isinstance(node, Scan))
+    assert "review" in scan.columns
+
+    scored = compile_sql("""
+        SELECT DISTINCT r.id, AI_SCORE(PROMPT('x {0}', r.review)) AS s
+        FROM reviews r ORDER BY s DESC NULLS LAST
+    """, catalog, tok)
+    assert scored.root.distinct
+    assert scored.root.order == (
+        SortKey(scored.root.columns[1], descending=True, nulls_first=False),)
+    with pytest.raises(CompileError, match="'asc' or 'desc'"):
+        reviews().order_by(("r.id", "sideways"))
+    with pytest.raises(CompileError, match="nonnegative"):
+        reviews().offset(-1)
+    with pytest.raises(CompileError, match="not in provider"):
+        reviews().ai_filter(prompt("x: {0}", col("r.review"))) \
+            .order_by("r.nope").select("r.id")
 
 
 def test_builder_places_apply_nodes_in_the_logical_tree():

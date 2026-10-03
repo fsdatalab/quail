@@ -28,12 +28,8 @@ from quail.physical import (
     HashJoin,
     InList,
     JoinStage,
-    Limit,
     PortRef,
     Recombine,
-)
-from quail.physical import (
-    Project as PhysicalProject,
 )
 from quail.physical import (
     Scan as PhysicalScan,
@@ -53,6 +49,7 @@ from quail.planner.physical_optimizer import (
     apply_physical_rules,
 )
 from quail.planner.plan import PhysicalPlan, Refusal
+from quail.planner.results import result_nodes
 from quail.planner.statistics import (
     cached_statistics,
     filter_orders,
@@ -637,16 +634,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                        else f"{c.alias}.{c.column}")
         if isinstance(c, Alias) and getattr(c.expression, "probabilities", False):
             columns.append(c.name + PROBABILITIES_SUFFIX)
-    nodes.append(PhysicalProject(
-        node_id="project",
-        inputs=input_ports(tuple(sink_inputs) + tuple(label_ports)),
-        columns=tuple(columns)))
-    if plan.root.limit is not None:
-        nodes.append(Limit(
-            node_id="limit",
-            inputs=input_ports((PortRef("project", "rows"),)),
-            count=plan.root.limit,
-        ))
+    nodes.extend(result_nodes(
+        plan.root, tuple(sink_inputs) + tuple(label_ports), tuple(columns)))
 
     estimate = (speed_of_light(base_work + stage_work, model, device,
                                chunk).seconds + _score_seconds(nodes))
