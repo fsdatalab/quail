@@ -53,7 +53,7 @@ VOLUMES = {"/root/.cache/huggingface": hf_cache,
 reference_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("torch", "transformers==5.17.0", "safetensors",
-                 "huggingface_hub", "numpy")
+                 "huggingface_hub", "numpy", "pyarrow")
 )
 
 
