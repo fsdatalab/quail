@@ -2,49 +2,50 @@
 title: Custom operators
 ---
 
-Adding a new operator requires a physical node, a runtime, and planning
-logic. If it introduces a new operation in SQL or the Python builder,
-it also needs a logical representation.
+To implement a custom operator, define a physical node class and a runtime
+class. The node stores your operation's settings and declares its outputs.
+The *runtime* is the code that executes the node.
 
-The example below defines `FirstDocuments`, a custom operator that
-keeps the first N document IDs. The
-[complete example](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py)
-includes a planner, registration, serialization, and execution without a GPU.
+The example below shows these classes for Quail's existing `Scan` operator.
+It explains the methods your operator must implement.
+After you implement the classes, register them and add the operator to a plan.
 
-## Logical node
+To call a Python function between existing operators, use
+[`apply()`](/docs/user-guide/python-api#apply).
 
-A logical node defines what the operator means in the query plan.
-For a new logical node, implement the inputs, expressions, output schema,
-validation, and immutable rewrite methods described in the
-[node protocol](/docs/architecture/logical-plans#the-node-protocol).
-SQL and Python syntax should produce the same logical representation.
+## Implement the classes
 
-See
-[`SemanticFilter`](https://github.com/fsdatalab/quail/blob/main/quail/logical/nodes.py)
-for how an existing logical node is built.
+In the example, `Scan` returns document IDs for a prepared table.
+Its node class stores the table alias and source identifier.
+For your operator, define the fields needed to perform your operation.
 
-## Physical node
+Quail uses these class settings to restore and execute the node:
 
-A physical node declares its input and output ports, where it runs,
-and how it is serialized. `FirstDocuments` runs on the CPU and has one
-output, `ids:<alias>`. Its runtime reads the document IDs and keeps the
-first `count` of them:
+- `type_name` identifies the node class in a saved plan. Quail uses it
+  to restore a node as an instance of the correct class.
+- `runtime_key` selects the registered runtime that executes the node.
+  `Scan` uses the same identifier for its node class and runtime.
+- `location` specifies where the operator runs. `COORDINATOR` runs it in
+  the process that manages query execution. `GPU_EXECUTOR` runs it in a
+  GPU worker process.
+
+Declare the outputs with `OutputPort`:
 
 ```python
 from dataclasses import dataclass
 from typing import ClassVar
 
-from quail.execution.runner import NodeResult
 from quail.physical import (
     ExecutionLocation, OutputPort, PhysicalNode, ValueType,
 )
 
-@dataclass(frozen=True)
-class FirstDocuments(PhysicalNode):
-    alias: str = ""
-    count: int = 1
 
-    type_name: ClassVar[str] = "example.first_documents"
+@dataclass(frozen=True)
+class Scan(PhysicalNode):
+    alias: str = ""
+    input_id: str = ""
+
+    type_name: ClassVar[str] = "quail.scan"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
@@ -52,75 +53,53 @@ class FirstDocuments(PhysicalNode):
     def outputs(self):
         return (OutputPort(f"ids:{self.alias}", ValueType.DOCUMENT_IDS,
                            schema=(self.alias,)),)
-
-    def attributes(self):
-        return {"alias": self.alias, "count": self.count}
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(node_id=node_id, inputs=inputs, alias=attributes["alias"],
-                   count=int(attributes["count"]))
-
-
-class FirstDocumentsRuntime:
-    def execute(self, node, inputs, context):
-        documents = next(iter(inputs.values()))
-        return NodeResult({f"ids:{node.alias}": documents[:node.count]})
 ```
 
-`attributes()` and `from_attributes()` save and restore the node's
-fields. `register_node()` gives a default `NodeCodec`. The runtime
-implements `execute(node, inputs, context)` and returns a `NodeResult`
-with the node's declared outputs.
-
-## Planning
-
-A planner constructs the physical graph and estimates its execution
-time. For an LLM operator:
-
-1. **Work counting.** Add a function that counts fresh tokens,
-   attention pairs, KV written, and KV read for the new operator.
-   Pass `window=model.sliding_window` to `scan`, `ask`, or `stream`
-   so you also count pairs and KV reads for sliding-window layers.
-   See
-   [`quail/cost/work.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py).
-2. **Cost estimation.** Pass the work counts through the
-   [roofline model](/docs/architecture/cost-model#the-roofline-model)
-   to get estimated seconds. See
-   [`quail/cost/sol.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py).
-3. **Graph construction.** Include the new physical node in the graph
-   the planner builds. The planner in
-   [`quail/planner/decide.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py)
-   constructs the full physical graph (scans, filters, joins,
-   barriers, projection) and returns a `PhysicalCandidate` with the
-   graph and estimated time. The new node would be placed in the
-   graph alongside the existing node types.
-
-## Pipelines
-
-An operator can run alone or in a pipeline with the operators next to
-it. A pipeline lets an operator use the document KV of the operator
-before it. To run in a pipeline, an operator must state which
-neighbors it can run with and which document state it uses again.
-
-[`execution/pipelines.py`](https://github.com/fsdatalab/quail/blob/main/quail/execution/pipelines.py)
-groups physical nodes.
-[`executor/pipeline.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pipeline.py)
-executes the groups using `executor/operators/`.
-
-## Optional: rules
-
-A logical or physical rule can place the new node in a plan or set
-its fields. See [Rules](/docs/extending/rules).
-
-## Registration
-
-Register the node and runtime on the session's `ExtensionRegistry`:
+An output *port* declares the name and value type of an output.
+Your runtime must return a value under each declared output name.
+In the example, `ScanRuntime` reads the prepared document IDs and returns
+them under the name declared by `Scan`:
 
 ```python
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.register_node(FirstDocuments, runtime=FirstDocumentsRuntime())
+from quail.execution.runner import NodeResult
+
+
+class ScanRuntime:
+    def execute(self, node, inputs, context):
+        value = context.sources[node.input_id]
+        return NodeResult({f"ids:{node.alias}": value})
 ```
 
-Register a planner with `register_physical_planner()`. See the
-[Overview](/docs/extending) for how to create and pass a registry.
+For your operator:
+
+- Subclass `PhysicalNode`. Define the settings and output ports.
+- Use a distinct `type_name` and `runtime_key`. Set `location` to the
+  process where the operator will run.
+- Implement `attributes()` and `from_attributes()` to save and restore
+  the node's settings.
+- Implement `execute(node, inputs, context)` in the runtime class.
+  Return a `NodeResult` with a value for each output port.
+
+See the complete implementations of
+[`Scan`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py)
+and
+[`ScanRuntime`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py).
+
+## Register the operator
+
+Create an [extension registry](/docs/extending#registration) with
+`ExtensionRegistry.with_built_ins()`. Register your node class and runtime
+instance with `registry.register_node(node_class, runtime=runtime_instance)`.
+Pass the registry to the session.
+
+Register the node and runtime in each process that executes the plan.
+
+## Add the operator to a plan
+
+Registration does not add the operator to queries.
+Implement a [physical rule or planner](/docs/extending/rules) that creates
+node instances and connects them to the physical plan.
+Register the rule or planner in the same registry.
+
+Use `PortRef` to connect an input to another node's output.
+The connected ports must have compatible value types and schemas.

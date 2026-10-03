@@ -5,7 +5,6 @@
     "logical-plans",
     "optimizer",
     "physical-plans",
-    "cost-model",
     "execution",
     "kv"
   ],

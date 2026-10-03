@@ -1,211 +1,95 @@
 ---
-title: Rules
+title: Custom Rules
 ---
 
-A rule rewrites a plan. Quail has two kinds:
+Here we show how to implement and register a custom optimizer rule.
+The rule must preserve the query's meaning.
+For Quail's existing rules, see the [optimizer](/docs/architecture/optimizer).
 
-- A **logical rule** rewrites the logical plan, for example the order
-  of the filters or joins.
-- A **physical rule** rewrites the physical graph, for example the
-  attention path of a node.
+## Choose the rule type
 
-Quail's own planner decisions are rules too. For the built-in rules
-and their order, see the [optimizer](/docs/architecture/optimizer).
+- A *logical rule* changes the logical plan, such as the order of filters.
+- A *physical rule* changes the physical plan, such as an operator's
+  execution settings.
 
-## Write a logical rule
+## Implement the rule
 
-A logical rule has a `name` and a `rewrite(root, context)` method.
-`rewrite` returns the new root node, or `None` when it changes
-nothing.
+You can define a class with a `name` and a `rewrite()` method.
+`name` identifies the rule in the registry and plan explanations.
+Use a name that differs from those of registered rules.
 
-For example, this rule runs each table's `AI.IF` predicates in the
-written order. It clears the order that the `filter_order` rule
-chose:
+For a logical rule, `rewrite(root, context)` receives the root node of
+the logical plan. Return a new root when you change the plan.
+Return `None` when no change is needed.
+
+The example below shows Quail's existing `ProjectionPushdown` rule.
+For example, imagine a `reviews` table with `id`, `body`, and `author`
+columns. A query returns `id` and uses `body` in a model filter.
+The rule tells the scan to retain `id` values for the result.
+Quail still tokenizes `body` for the filter. It does not need `author`.
 
 ```python
-from dataclasses import replace
-
-from quail.logical import SemanticFilter
+from quail.planner.logical_rules import push_down_projection
 
 
-class WrittenFilterOrder:
-    name = "written_filter_order"
+class ProjectionPushdown:
+    name = "projection_pushdown"
 
     def rewrite(self, root, context):
-        def visit(node):
-            children = tuple(visit(child) for child in node.children())
-            if children != node.children():
-                node = node.with_children(children)
-            if isinstance(node, SemanticFilter) and node.order:
-                node = replace(node, order=())
-            return node
-
-        rewritten = visit(root)
-        return None if rewritten == root else rewritten
+        rewritten = push_down_projection(root)
+        return None if rewritten is root else rewritten
 ```
 
-Logical nodes are frozen dataclasses. Change a node with
-`dataclasses.replace` or `with_children`. See
-[Logical plans](/docs/architecture/logical-plans) for the node types.
+The helper `push_down_projection()` updates the scans and returns the
+plan's root. It returns the original root when no change is needed.
+For your rule, implement the plan changes required by your operation.
+Return new nodes instead of changing existing nodes in place.
+See the [complete implementation](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py).
 
-## Write a physical rule
+For a physical rule, implement `rewrite(graph, context)`.
+Return a new `PhysicalGraph` when you change the plan, or `None` when
+no change is needed.
 
-A physical rule has a `name` and a `rewrite(graph, context)` method.
-`rewrite` returns a new `PhysicalGraph`, or `None` when it changes
-nothing.
+The *planning context* provides the engine configuration and input
+statistics available to a rule. See
+[`LogicalPlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)
+and
+[`PlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_optimizer.py)
+for their fields.
 
-For example, this rule puts every AI filter on the unified attention
-path:
+## Register the rule
 
-```python
-from dataclasses import replace
+Create an [extension registry](/docs/extending#registration) with
+`ExtensionRegistry.with_built_ins()`. Create an instance of your rule class
+and register it with the method for its type:
 
-from quail.physical import AiFilter, PhysicalGraph
-
-
-class UnifiedFilters:
-    name = "unified_filters"
-
-    def rewrite(self, graph, context):
-        nodes = tuple(
-            replace(node, attention="unified")
-            if isinstance(node, AiFilter) and node.attention != "unified"
-            else node
-            for node in graph.nodes)
-        if nodes == graph.nodes:
-            return None
-        return PhysicalGraph(nodes, graph.root)
-```
-
-See [Physical plans](/docs/architecture/physical-plans) for the node
-types and their fields.
-
-## Register and run
-
-Register the rules on an `ExtensionRegistry` and give it to the
-session:
-
-```python
-import pyarrow as pa
-
-import quail
-
-registry = (quail.ExtensionRegistry.with_built_ins()
-            .register_logical_rule(WrittenFilterOrder())
-            .register_physical_rule(UnifiedFilters()))
-session = quail.Session(
-    quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-    registry=registry)
-session.register("reviews", quail.DocumentProvider.from_table(
-    pa.table({"id": ["a", "b"], "body": ["A good film.", "A bad film."]}),
-    id_col="id"))
-query = session.sql(
-    "SELECT r.id FROM reviews r "
-    "WHERE AI_FILTER(PROMPT('Is it positive? {0}', r.body)) "
-    "AND AI_FILTER(PROMPT('Does it mention the ending? {0}', r.body))")
-print(query.explain(verbose=True))
-```
-
-The plan shows `attention=unified` on the `AiFilter` node. Planning
-does not need a GPU.
-
-- Your logical rules run after the built-in logical rules, in the
-  order you register them. All logical rules repeat until a pass
-  changes nothing, for a maximum of four passes.
-- Your physical rules run after the built-in physical rules, in the
-  order you register them, one time each.
-- Each rule name must be unique. A second rule with the same name
-  raises `ValueError`.
-
-## What a rule receives
-
-A logical rule receives a `LogicalPlanningContext`. A physical rule
-receives a `PlanningContext`. Both are frozen dataclasses.
-
-| Field | Contents |
+| Rule type | Registration method |
 | --- | --- |
-| `model`, `device` | The `ModelSpec` and `DeviceSpec`. `None` when no cost-based rule runs. |
-| `gpu_count` | The number of GPUs. Each GPU runs one model copy. |
-| `document_tokens` | Table alias → token count of each document. Exact when the column is tokenized, else estimated. |
-| `backend` | The backend name, for example `"quail"`. |
-| `order` | `"by_cost"`, `"as_written"`, or `None` for the default. |
-| `canvas_draws` | The most noise draws per answer on a diffusion model. |
-| `attention` | `"tree"` or `"unified"` when the session forces one path, else `None`. |
-| `tokenizer` | A function from text to token IDs. |
-| `pair_fractions` | Join position → the fraction of the cross product that its equality conditions keep. |
-| `memo` | A cache for one query, shared by all rules and passes. |
+| Logical | `registry.register_logical_rule(rule)` |
+| Physical | `registry.register_physical_rule(rule)` |
 
-Only the logical context has these fields:
+Pass the registry to the session.
+`ProjectionPushdown` is already registered in Quail's default registry.
+The example shows its interface; you do not need to register it again.
 
-| Field | Contents |
-| --- | --- |
-| `catalog` | The session catalog. |
-| `engine_config` | The session's `EngineConfig`. |
+### Rule execution order
 
-Only the physical context has these fields:
+- Your rules run after Quail's existing rules, in registration order.
+- For logical rules, one *pass* applies all rules once. Quail repeats
+  passes until a pass makes no changes, with a maximum of four passes.
+- Quail applies each physical rule once when it builds a physical plan.
+  It can apply physical rules again after tokenization.
 
-| Field | Contents |
-| --- | --- |
-| `logical_plan` | The logical plan of the graph. `None` when the rules run again on exact tokens. |
-| `settings` | The plan settings. A rule adds values that the executor reads, for example the KV retention schedule. |
+## Check the rule
 
-Selectivities are not in the context. They are on the predicates in
-the plan.
+Call `rewrite()` directly to test your rule without model inference.
+Check that:
 
-## Requirements
+- The intended nodes and fields change.
+- The original plan remains unchanged.
+- The revised plan preserves the query's meaning.
+- A second call on the revised plan returns `None` if no further change
+  is needed.
 
-- Return `None` when the plan already has the rule's change. A rule
-  that changes the plan on every pass makes the logical rules run
-  all four passes, and its last change wins.
-- Do not change the plan in place. Return new nodes.
-- A physical rule runs a second time when tokenization finishes. On
-  that run, do not apply a change that is already in the plan.
-- Quail validates the plan after the rules run.
-- A cost-based rule prices its candidates with
-  [`quail.planner.pricing`](https://github.com/fsdatalab/quail/blob/main/quail/planner/pricing.py).
-  Put results that other rules or passes can use again in `memo`.
-- A cost-based logical rule returns `None` when
-  `quail.planner.logical_rules.prices(root, context)` is false.
-
-## Where to put a rule
-
-**In your own package.** Write a `register_quail_extension(registry)`
-function in a module, and load the module:
-
-```python
-# my_rules.py
-def register_quail_extension(registry):
-    registry.register_logical_rule(WrittenFilterOrder())
-    registry.register_physical_rule(UnifiedFilters())
-```
-
-```python
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.load_extension("my_rules")
-```
-
-**As a built-in rule.** Put the class in
-[`planner/logical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py)
-or
-[`planner/physical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_rules.py).
-Add it to the tuple in `built_in_logical_rules()` or
-`built_in_physical_rules()`. Its position in the tuple is its run
-order. Add a row to the [rules table](/docs/architecture/optimizer#rules).
-
-## Test a rule
-
-Call the rule on a `LogicalPlan` without a session:
-
-```python
-from quail.planner.logical_optimizer import (
-    LogicalPlanningContext, apply_logical_rules)
-
-context = LogicalPlanningContext(catalog=None, engine_config=None)
-plan, changed = apply_logical_rules(plan, (WrittenFilterOrder(),), context)
-```
-
-`changed` lists the name of each rule that changed the plan.
-`apply_physical_rules(graph, rules, context)` does the same for
-physical rules. See
-[`tests/test_logical_extensions.py`](https://github.com/fsdatalab/quail/blob/main/tests/test_logical_extensions.py)
-for more examples.
+See the [logical rule tests](https://github.com/fsdatalab/quail/blob/main/tests/test_logical_extensions.py)
+for examples of repeated calls and rule execution order.

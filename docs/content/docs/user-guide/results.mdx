@@ -1,507 +1,219 @@
 ---
-title: Explain plans and runs
+title: Query results and plans
 ---
+
+You can read a query's result rows and inspect its execution metrics.
+You can also inspect the plan before you run the query.
+
+Here we use a `reviews` table with a movie review ID in `id` and review
+text in `body`. The table is already registered with a session. The query
+returns the IDs of reviews that discuss the movie's ending:
+
+```python
+query = session.sql("""
+    SELECT r.id
+    FROM reviews r
+    WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body))
+""", dialect="bq")
+```
+
+You can use the same methods with a query from the
+[Python builder](/docs/user-guide/python-api). For queries submitted to
+[Quail Server](/docs/user-guide/server), see the server guide.
+
+## Read the results
+
+Call `run()` to execute the query, then `collect()` to read its rows:
+
+```python
+result = query.run()
+rows = result.collect()
+print(rows.to_pydict())
+```
+
+`run()` returns a `QueryResult` with execution metrics and access to the
+result rows. `collect()` reads the rows into a `pyarrow.Table`.
+Calling `result.collect()` does not run the model again.
+
+Collect the rows before closing the session. On Modal, collect them
+before the GPU function returns. Result collection can read temporary
+files that are removed when the session closes.
+
+If you only need the rows, you can use `query.collect()` instead.
+It calls `run()` and then collects the rows. To read rows in batches,
+use `result.execute_stream()`. It returns an Arrow reader with batches of
+rows from the completed run. Read all batches or close the reader before
+closing the session:
+
+```python
+with result.execute_stream(batch_rows=1024) as reader:
+    for batch in reader:
+        print(batch.to_pydict())
+```
+
+You can pass `limit` to `collect()` or `execute_stream()` to read fewer
+result rows. The limit does not reduce the model execution already performed.
 
 ## Preview the plan
 
-Call `explain()` to see the query plan without running it:
+Call `explain()` to inspect the plan without running the model:
 
 ```python
-query = session.sql("...", dialect="snowflake")
 print(query.explain())
 ```
 
-Quail runs the query planner and produces the full execution plan,
-but does not load the model or run any GPU work.
+Quail plans the query but does not load the model onto the GPU.
+The output contains a logical plan and a physical plan.
 
-The output has two parts.
+### Read the logical plan
 
-**Logical plan** shows the query structure. Read it bottom-up: scans
-are at the leaves, the projection is at the root. Each predicate
-appears under the operator that evaluates it.
+A *logical plan* describes the operations requested by the query.
+For the review query, the logical plan has this structure:
 
 ```text
-Project: r.id, a.aspect
-  SemanticJoin (full)
-    PROMPT('...', r.body, a.aspect) (selectivity=15%)
-    Join
-      cross
-      SemanticFilter
-        PROMPT('...', r.body) (selectivity=60%)
-        Scan reviews as r [body, id]
-      Scan aspects as a [aspect]
+Project: r.id
+  SemanticFilter
+    PROMPT('DOCUMENT:\n{0}\n\nDoes this review discuss the ending?', r.body)
+    Scan reviews as r [body, id]
 ```
 
-**Physical plan** shows what the execution engine will do: the
-model and token budgets, then one line per operator with the
-planner's estimates in columns to the right. Each `AI.IF` or
-join predicate is listed under the operator that runs it, numbered
-by its position in the query text (`predicate 2` is the second
-`AI.IF` you wrote). When the planner reorders them, the output
-says which runs first.
+Read the plan from the bottom upward:
+
+- `Scan` reads the review text and IDs.
+- `SemanticFilter` uses the model to answer the question and keeps reviews
+  with a `TRUE` answer.
+- `Project` selects the ID column for the result.
+
+The planner can change the order of operations while preserving the
+query's meaning. See [Logical plans](/docs/architecture/logical-plans)
+for more detail.
+
+### Read the physical plan
+
+A *physical plan* specifies the operators Quail will execute.
+The output shows the backend, model, GPU count, and token budgets.
+It also shows estimated row counts and GPU times for the operators.
+
+For example, for three input reviews, the physical plan includes lines
+like these. The excerpt omits the token budgets and prompt text:
 
 ```text
 physical: backend=quail, model=qwen3-4b-fp8, workers=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,250 tokens
 
-                                                            est. rows   est. pass   est. time
-  Limit: 1                                                          1
-    Project: r.id                                                 1.5
-      AiFilter: r                                                 1.5                 1.09 ms
-        KV rewind=on
-        1st: predicate 2  PROMPT('DOCUMENT:\n{0}\n\nq2:')           6         50%
-        2nd: predicate 1  PROMPT('DOCUMENT:\n{0}\n\nq1:')           3         50%
-        Scan reviews as r                                           6
-          tokens=12, mean_doc_tokens=2
+                         est. rows   est. pass   est. time
+  Project: r.id                0.6
+    AiFilter: r                0.6                 1.09 ms
+      predicate 1                3        20%*
+      Scan reviews as r          3
+  * no selectivity was given; the planner assumes 20%
 ```
 
-<Callout type="info">
-The time estimates assume peak GPU throughput with no host overhead.
-Actual runtimes are longer, for many reasons, such as kernel launch
-latency and low MFU. Use `explain(analyze=True)` on a GPU to see
-measured times next to the estimates. We are working on better
-latency estimates.
-</Callout>
+Quail expects the filter to keep 20% of the three reviews, or 0.6 rows.
+An estimated row count can be fractional. The result of an executed
+query always has a whole number of rows.
 
-On an operator line, `est. rows` is how many rows the planner expects
-it to produce. On a predicate line, `est. rows` is how many documents
-or pairs the planner expects to reach that predicate, and `est. pass`
-is the selectivity it planned with. A selectivity you did not set
-shows as `20%*`, with a footnote.
+A *predicate* is a condition used to keep or remove rows. In the review
+query, the predicate is the question passed to `AI.IF`.
 
-`explain(verbose=True)` adds node ids, port connections, KV retention
-decisions, and planner remarks. It also shows `share_prefixes`
-(whether prefix caching is enabled) and `attention` (`unified` or
-`tree`) for each operator.
+On an operator line, `est. rows` is the estimated number of output rows.
+On a predicate line, it is the estimated number of documents or pairs
+that reach the predicate.
+
+*Selectivity* is the fraction of rows that pass a condition.
+The `est. pass` column shows the selectivity used by the planner.
+If you did not supply a selectivity, the output marks the default
+with `*` and explains it below the plan.
+
+Time estimates use peak GPU compute rates and memory bandwidth.
+They exclude CPU work and kernel launch time. Actual GPU execution
+can take longer. Operator time estimates do not add up to the query
+estimate because operators can share model execution.
+See [Cost estimates](/docs/architecture/optimizer#cost-estimates)
+for the assumptions.
+
+### Show execution settings
+
+Use `query.explain(verbose=True)` when you need to inspect execution
+settings or [edit a physical plan](/docs/user-guide/editing-plans).
+It adds operator IDs, connections, and KV retention settings.
+It also shows the prefix sharing and attention settings described
+in [Execution](/docs/architecture/execution).
 
 ## Measure the plan
 
-`explain(analyze=True)` works like `EXPLAIN ANALYZE` in a database:
-it runs the query, then prints actual rows, time, and tokens next to
-each estimate, followed by the query time, throughput, and GPU cost.
+After running the query, call `result.explain()` to compare measurements
+with the plan's estimates:
+
+```python
+print(result.explain())
+```
+
+The method uses the completed run. It does not run the model again.
+It returns the physical plan with measurement columns, as shown below.
+
+| Columns | Meaning |
+| --- | --- |
+| `est. rows`, `rows` | Estimated and measured output rows on an operator line, or documents and pairs evaluated on a predicate line. |
+| `est. pass`, `pass` | Estimated and measured fractions that passed a predicate. |
+| `est. time`, `time` | Estimated GPU time and measured operator time. |
+| `fresh tokens` | Token positions computed by the model. Computing a position again counts again. Reading saved KV does not count. |
+
+If a predicate passes more rows than expected, later operators may
+receive more input than the planner estimated. Compare the row counts
+and pass fractions before trying to explain a difference in time.
+
+For query time, model startup time, and token counts, read
+`result.report`. The [Metrics](/docs/user-guide/metrics) page explains
+the fields. Use `result.explain(verbose=True)` for additional operator
+metrics, including KV hits and misses.
+
+### Run a query to inspect its measurements
+
+If you do not need to keep the result rows, you can use:
 
 ```python
 print(query.explain(analyze=True))
 ```
 
+The method runs the query once and returns the logical plan, the
+physical plan with measurements, and a summary of the run.
+
+The excerpt below illustrates a run where the model keeps two of three
+reviews. The measured times and token counts are illustrative, rather
+than performance measurements:
+
 ```text
-                                                            est. rows   rows   est. pass    pass   est. time    time   fresh tokens
-  Limit: 1                                                          1      1                                   <1 ms
-    Project: r.id                                                 1.5      2                                   <1 ms
-      AiFilter: r                                                 1.5      2                         1.09 ms   <1 ms             60
-        KV rewind=on
-        1st: predicate 2  PROMPT('DOCUMENT:\n{0}\n\nq2:')           6      6         50%   66.7%
-        2nd: predicate 1  PROMPT('DOCUMENT:\n{0}\n\nq1:')           3      4         50%     50%
-        Scan reviews as r                                           6      6                                   <1 ms
-          tokens=12, mean_doc_tokens=2
+                         est. rows   rows   est. pass    pass   est. time    time   fresh tokens
+  Project: r.id                0.6      2                                   <1 ms
+    AiFilter: r                0.6      2                         1.09 ms     1 s             80
+      predicate 1                3      3        20%*   66.7%
+      Scan reviews as r          3      3                                   <1 ms
 
 run:
   query time   1 s (model startup excluded)
   startup      500 ms
-  throughput   6 documents/second over 6 input documents
-  tokens       1,234 fresh
-  GPU cost     $0.0011 per query (1 GPU at $3.9492/hour, startup excluded)
+  tokens       80 fresh
 ```
 
-Here is how to read the table:
+The filter kept two reviews, compared with the estimate of 0.6 rows.
+The predicate evaluated three reviews and passed 66.7%, compared with
+the estimated 20%. The `time` column shows the measured operator time;
+`est. time` shows the planner's estimate. The summary lists model startup
+separately from query time.
 
-- Each `est.` column is what the planner predicted. The column next
-  to it is what actually happened. Compare `est. rows` with `rows`,
-  `est. pass` with `pass`, `est. time` with `time`.
-- `rows` on a filter or join line is how many documents or pairs the
-  model evaluated. `pass` is the fraction that returned TRUE.
-- When `est. pass` and `pass` are far apart, the planner's
-  selectivity guess was wrong. That is the most common reason
-  a plan takes longer than its estimate.
-- `fresh tokens` is the total input tokens the model processed in
-  forward passes for that operator.
+`result.explain()` returns the physical plan portion of the output.
+Read the query totals from `result.report` when you use that method.
 
-`explain(analyze=True, verbose=True)` adds more detail per operator,
-including KV hits, KV misses, and GPU seconds.
-
-The query runs once for the measurement. To keep the result rows too,
-run the query yourself and print the plan from the result:
-
-```python
-result = query.run()
-rows = result.collect()
-print(result.explain())
-```
+Each call with `analyze=True` runs the query again.
+To keep the rows and metrics from the same run, use `query.run()`
+and inspect the returned result as shown above.
 
 ## Refusals
 
-If the planner cannot execute the query, `explain()` prints the
-reason instead of a plan, and `run()` raises `quail.RefusalError`.
-
-For example, if a document is too long to fit in one forward pass:
-
-```text
-Refused: a document in 'r' needs 131,072 tokens with its prompt,
-but the forward pass budget is 110,376 tokens
-```
-
-Other common refusals:
-
-- `the model needs 4 GPUs of memory, but Quail loads one complete copy per GPU`
-- `per-batch apply() requires one GPU; use apply_table() or set gpus=1`
-- `one join pair anchored on 'r' needs 150,000 tokens, but the forward pass budget is 110,376 tokens`
-
-## Running a query
-
-`session.sql` compiles the statement in this process and returns a
-`Query`. Running it executes the plan on the GPU. On Modal, collect
-the rows before the function returns, because a `QueryResult` reads
-its rows when you ask for them.
-
-```python
-result = query.run()
-```
-
-A session created with `endpoint` returns a
-[`RemoteQuery`](/docs/user-guide/server#remotequery) from `sql()`.
-
-<ApiClass />
-
-### Query
-
-A compiled query bound to the session that parsed it.
-
-#### Attributes
-
-<TypeTable
-  type={{
-    session: {
-      type: 'Session',
-      required: true,
-      description: 'The Session that compiled this query.',
-    },
-    logical: {
-      type: 'LogicalPlan',
-      required: true,
-      description: 'The compiled logical plan.',
-    },
-    order: {
-      type: 'str | None',
-      required: true,
-      description:
-        'Predicate order passed to sql, or None when the planner chooses the order.',
-    },
-  }}
-/>
-
-#### Methods
-
-##### plan
-
-<ApiMethod>Query.plan()</ApiMethod>
-
-Build the physical plan. The first call plans the query. Later calls
-return that same plan.
-
-**Returns**
-
-`PhysicalPlan | Refusal`. A `PhysicalPlan` is the plan that the executor
-runs, with the model, the worker count, and the estimated seconds. A
-`Refusal` tells why Quail cannot run the query. A run of a refused query
-raises `quail.RefusalError`.
-
-##### explain
-
-<ApiMethod>Query.explain(*, verbose=False, analyze=False)</ApiMethod>
-
-Print the plan. The shape of the text is the one in
-[Preview the plan](#preview-the-plan) and
-[Measure the plan](#measure-the-plan).
-
-**Parameters**
-
-<TypeTable
-  type={{
-    verbose: {
-      type: 'bool',
-      default: 'False',
-      description:
-        'When true, the text adds node ids, port connections, KV retention, and planner remarks.',
-    },
-    analyze: {
-      type: 'bool',
-      default: 'False',
-      description:
-        "When true, run the query first and print each node's measured rows, time, and tokens beside the estimates.",
-    },
-  }}
-/>
-
-**Returns**
-
-`str`.
-
-##### run
-
-<ApiMethod>Query.run(plan=None)</ApiMethod>
-
-Execute the query in this process.
-
-**Parameters**
-
-<TypeTable
-  type={{
-    plan: {
-      type: 'PhysicalPlan | None',
-      default: 'None',
-      description:
-        "A PhysicalPlan from plan(), or one edited with insert, remove, or move. Omit it to run the planner's plan.",
-    },
-  }}
-/>
-
-**Returns**
-
-`QueryResult`.
-
-##### collect
-
-<ApiMethod>Query.collect(limit=None, batch_rows=65536)</ApiMethod>
-
-Execute the query and return one Arrow table. This calls `run()`, then
-`QueryResult.collect`.
-
-**Parameters**
-
-<TypeTable
-  type={{
-    limit: {
-      type: 'int | None',
-      default: 'None',
-      description: 'Stop after this many rows. Omit it to read the full result.',
-    },
-    batch_rows: {
-      type: 'int',
-      default: '65536',
-      description: 'Rows per Arrow record batch while the table is built.',
-    },
-  }}
-/>
-
-**Returns**
-
-`pyarrow.Table`.
-
-##### execute_stream
-
-<ApiMethod>Query.execute_stream(batch_rows=65536, limit=None)</ApiMethod>
-
-Execute the query and stream the rows.
-
-**Parameters**
-
-<TypeTable
-  type={{
-    batch_rows: {
-      type: 'int',
-      default: '65536',
-      description: 'Rows per Arrow record batch.',
-    },
-    limit: {
-      type: 'int | None',
-      default: 'None',
-      description: 'Stop after this many rows.',
-    },
-  }}
-/>
-
-**Returns**
-
-`pyarrow.RecordBatchReader`.
-
-<ApiClass />
-
-### QueryResult
-
-The rows of a finished query, plus the report and the answer tables.
-The rows stay unread until `collect`, `to_rows`, or `execute_stream`
-asks for them.
-
-#### Attributes
-
-<TypeTable
-  type={{
-    schema: {
-      type: 'pyarrow.Schema',
-      required: true,
-      description: 'Arrow schema of the output columns.',
-    },
-    columns: {
-      type: 'list[str]',
-      required: true,
-      description: 'Output column names, in order.',
-    },
-    report: {
-      type: 'dict',
-      required: true,
-      description: (
-        <>
-          Execution metrics. The fields are on the{' '}
-          <a href="/docs/user-guide/metrics">Metrics</a> page.
-        </>
-      ),
-    },
-    plan: {
-      type: 'PhysicalPlan | None',
-      required: true,
-      description:
-        'The physical plan that ran. None until a plan was executed and decoded.',
-    },
-    node_metrics: {
-      type: 'dict',
-      required: true,
-      description: 'Measured metrics keyed by node id.',
-    },
-    answer_tables: {
-      type: 'dict',
-      required: true,
-      description:
-        "Per-predicate Arrow tables. filters is keyed by (alias, position). joins is keyed by the join's position in the query text. classifies is keyed by the label column name.",
-    },
-  }}
-/>
-
-#### Methods
-
-##### collect
-
-<ApiMethod>QueryResult.collect(limit=None, batch_rows=65536)</ApiMethod>
-
-Read the result into one Arrow table.
-
-**Parameters**
-
-<TypeTable
-  type={{
-    limit: {
-      type: 'int | None',
-      default: 'None',
-      description:
-        'Stop after this many rows. A limit already set on the result is also applied.',
-    },
-    batch_rows: {
-      type: 'int',
-      default: '65536',
-      description: 'Rows per record batch while the table is read.',
-    },
-  }}
-/>
-
-**Returns**
-
-`pyarrow.Table`.
-
-##### execute_stream
-
-<ApiMethod>
-  QueryResult.execute_stream(batch_rows=65536, limit=None)
-</ApiMethod>
-
-Stream the result as Arrow record batches.
-
-**Parameters**
-
-<TypeTable
-  type={{
-    batch_rows: {
-      type: 'int',
-      default: '65536',
-      description: 'Rows per record batch.',
-    },
-    limit: {
-      type: 'int | None',
-      default: 'None',
-      description: 'Stop after this many rows.',
-    },
-  }}
-/>
-
-**Returns**
-
-`pyarrow.RecordBatchReader`.
-
-##### to_rows
-
-<ApiMethod>QueryResult.to_rows(limit=None)</ApiMethod>
-
-Read the result as a list of tuples, one tuple per row, in column
-order.
-
-**Parameters**
-
-<TypeTable
-  type={{
-    limit: {
-      type: 'int | None',
-      default: 'None',
-      description: 'Stop after this many rows.',
-    },
-  }}
-/>
-
-**Returns**
-
-`list[tuple]`.
-
-##### count
-
-<ApiMethod>QueryResult.count()</ApiMethod>
-
-Return the number of rows. `len(result)` calls this.
-
-**Returns**
-
-`int`.
-
-##### explain
-
-<ApiMethod>QueryResult.explain(*, verbose=False)</ApiMethod>
-
-Print the executed plan with measured rows and time beside the
-operators.
-
-**Parameters**
-
-<TypeTable
-  type={{
-    verbose: {
-      type: 'bool',
-      default: 'False',
-      description:
-        'When true, include every measured field of each node, including KV hits, KV misses, and GPU seconds.',
-    },
-  }}
-/>
-
-**Returns**
-
-`str`. The text is `no physical plan was executed` when `plan` is
-`None`.
-
-### Classification answers
-
-`result.collect()` returns the selected label columns as Arrow strings.
-To see the labels before later filters remove rows, read the answer
-table:
-
-```python
-result = query.run()
-labels = result.answer_tables["classifies"]["sentiment"]
-print(labels.to_pydict())
-```
-
-The table has the zero-based document index in `r` and the label in
-`sentiment`. A classification of joined rows has the index of each
-table. An answer table keeps the rows that later filters remove, so it
-can have more rows than the query result.
-
-### Execution report
-
-`result.report` is a dict with query time, token counts, and
-per-stage metrics. See [Metrics](/docs/user-guide/metrics) for
-every field.
+A *refusal* explains why Quail cannot execute a query with the selected
+configuration. For example, a review and its prompt may exceed the
+number of tokens that fit in one model forward pass.
+
+When planning returns a refusal, `query.explain()` displays its reason
+instead of a plan. `query.run()` raises `quail.RefusalError`.
+Read the reason to identify which input or configuration needs to change.

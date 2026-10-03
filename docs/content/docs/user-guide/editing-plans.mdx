@@ -2,13 +2,12 @@
 title: Editing physical plans
 ---
 
-Quail's planner picks the filter order, join anchors, and KV retention
-for you. Sometimes you want to change the plan, e.g. run a user
-defined function between two operators.
+You can inspect and edit a physical plan before executing it. This
+example inserts a barrier between a filter and a join, then shows how
+to add a Python function through the query builder.
 
-In this example, we'll inspect a physical plan, edit it, and insert a
-user function. Note that we don't need a GPU here because we only plan
-the query, we don't execute it.
+The example runs on the CPU. It plans queries and prints their structure;
+it does not load model weights or run inference.
 
 The full example is in
 [`demos/plan_walkthrough.py`][demoscript].
@@ -21,18 +20,19 @@ uv run python demos/plan_walkthrough.py
 
 ## The query
 
-We'll use a small version of a
+The example uses a small version of a
 [FEVER](https://fever.ai/) query from
 [QUAIL-B](/docs/contributing/benchmark). In FEVER, each claim is a
 factual statement and each evidence passage is a Wikipedia paragraph.
 The goal is to find which passages support which claims.
 
-Here we have three claims and three evidence passages. We filter
-claims ("is the claim about a person?") and then check surviving
-claims against their evidence ("does the evidence support the
-claim?").
+The input contains three claims and three evidence passages. The query
+first keeps claims about a person. It then checks whether the evidence
+passages support those claims. A URL equality limits the pairs evaluated
+by the model.
 
-We build the query with the [Python builder API](/docs/user-guide/python-api):
+The script creates a session and registers both tables. It then builds
+this query with the [Python builder API](/docs/user-guide/python-api):
 
 ```python
 from quail import col, prompt
@@ -60,15 +60,13 @@ evidence the model evaluates.
 
 ## Inspect the plan
 
-We call `query.explain()`. The physical plan shows how the engine
-would execute the query:
+Call `query.explain()` to see the plan without executing it. The
+physical plan identifies each operator and its estimated work:
 
 <Callout type="info">
-The time estimates assume peak GPU throughput with no host overhead.
-Actual runtimes are longer, for many reasons, such as kernel launch
-latency and low MFU. Use `explain(analyze=True)` on a GPU to see
-measured times next to the estimates. We are working on better
-latency estimates.
+Time estimates assume peak GPU compute rates and memory bandwidth.
+They exclude CPU work and kernel launch time. Use `explain(analyze=True)`
+on a GPU to compare estimates with measured execution.
 </Callout>
 
 ```text
@@ -90,16 +88,16 @@ physical: backend=quail, model=qwen3-4b-fp8, workers=1
       HashJoin: c.evidence_wiki_url = e.id
 ```
 
-"survivors stream into the join with KV pinned" means: when a claim
-passes the filter, the engine keeps its KV in GPU memory and
-immediately starts evaluating evidence passages against it. The filter
-and the join overlap.
+The line "survivors stream into the join with KV pinned" means a claim
+can enter the join as soon as it passes the filter. KV is the model's
+saved key and value vectors for the claim's tokens. The engine keeps
+that KV in GPU memory and reuses it when evaluating evidence passages.
 
 ## Insert a barrier
 
-If we want the filter to finish *all* claims before the join starts,
-we insert a `Barrier`. A barrier is a synchronization point: the
-engine collects all filter survivors, then begins the join.
+Insert a `Barrier` to require the filter to finish over all claims before
+the join starts. The barrier collects the passing claim IDs, then supplies
+them to the join.
 
 ```python
 from quail.physical import Barrier
@@ -111,9 +109,9 @@ edited = plan.insert(
 )
 ```
 
-The barrier puts the filter and the join in two pipelines. The filter
-sets `keep_kv=True`, so the KV of the documents that pass stays in memory
-until the join starts:
+The barrier separates the filter and join into two pipelines. The edited
+plan sets `keep_kv=True` on the filter so passing claims' KV can be retained
+for the join. Retention is limited by available KV memory:
 
 ```text
       Barrier: next_anchor=c
@@ -136,12 +134,33 @@ PlanEditError: 'ai_filter:c' is a AiFilter; removing it would change
 what the query means
 ```
 
+## Plan editing API
+
+
+Start with `query.plan()` to inspect the plan without running inference.
+If planning returns a `Refusal`, resolve the reported constraint before
+editing it.
+
+| Method | Effect |
+| --- | --- |
+| `plan.insert(node, between=(producer_id, consumer_id))` | Insert a node on an existing edge. Its output must match the edge's value type. |
+| `plan.remove(node_id)` | Remove an eligible node and reconnect its consumers to its producer. |
+| `plan.move(node_id, between=(producer_id, consumer_id))` | Move an eligible node to another edge. |
+| `query.run(plan=edited)` | Execute the edited plan. |
+
+Each edit returns a new plan, validates port connections and cycles, and
+re-estimates the graph. An invalid edit raises `PlanEditError`.
+
+Only `Foreign`, `Barrier`, and `Exchange` nodes can be removed. Quail
+rejects removal of a scan, model operator, or filter. Removing a `Foreign`
+node can change results if its Python function filters rows.
+
 ## Insert a user function
 
 With `.apply()`, we can run our own Python function between operators.
 The full signature is:
 
-```python
+```text
 query.apply(fn, columns=(), *, name=None, ids=None, kind="per_batch")
 ```
 
@@ -181,9 +200,9 @@ query = (
 )
 ```
 
-We could do anything in `match_by_url`: filter by recency, sample a
-subset, or call an external service. Quail only sees the returned
-index table.
+The function determines which row pairs reach the model predicate.
+Quail uses the returned `c` and `e` index columns to identify those pairs;
+it does not inspect the function's internal logic.
 
 In the physical plan, `match_by_url` appears as a `Foreign` node:
 

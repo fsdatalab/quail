@@ -6,7 +6,6 @@
     "models",
     "operators",
     "rules",
-    "backends",
     "observers"
   ],
   "defaultOpen": false

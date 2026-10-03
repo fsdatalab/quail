@@ -3,21 +3,29 @@ title: Introduction
 ---
 
 Quail (QUery Aware Inference Layer) is an open-source, extensible
-execution engine for AI-SQL, being developed at
+query engine for AI functions in SQL. We develop Quail at
 [Full Stack Data Lab](https://fsdatalab.github.io/) at CMU.
 
-AI-SQL is a variant of SQL with operators that let you write logic
-in natural language for an LLM to evaluate on every row:
+You can use AI functions to write instructions in natural language
+for a language model to evaluate on your data.
+
+For example, imagine a `reviews` table with a movie review ID in `id`
+and review text in `body`. The query below returns the IDs of reviews
+that discuss the movie's ending:
 
 ```sql
 SELECT r.id
 FROM reviews r
-WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
+WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body));
 ```
 
-Quail currently supports AI-powered filters, joins, and
-`EXISTS` / `NOT EXISTS`. We are actively extending Quail with
-[more operators](/docs/user-guide/sql#ai-operators).
+The model answers the question for each review. Quail returns the
+review ID when the answer is `TRUE`.
+
+Quail supports AI functions for filtering rows, joining tables,
+scoring documents, and assigning classification labels. You can also
+use `EXISTS` and `NOT EXISTS` in queries. See the
+[SQL reference](/docs/user-guide/sql#ai-operators) for the supported functions.
 
 Quail supports two AI-SQL dialects
 ([Snowflake](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)

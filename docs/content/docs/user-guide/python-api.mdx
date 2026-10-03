@@ -2,14 +2,25 @@
 title: Python API
 ---
 
-You can build queries with Python method calls instead of writing
-SQL. Import `col` and `prompt` to get started:
+The Python builder supports the same query operations as SQL. Start
+with a table registered on a `Session`, add operators, and call `select()`
+to create a query. The model runs when you call `run()` or `collect()`.
+
+The examples below use an existing `session`. See
+[Sessions](/docs/user-guide/sessions) for session creation and
+[table registration](/docs/user-guide/sessions#registering-tables) for registering inputs.
+
+Import `col` to refer to columns and `prompt` to write model questions:
 
 ```python
 from quail import col, prompt
 ```
 
 ## Example
+
+For example, suppose `reviews` contains review text in `body`, and
+`aspects` contains movie aspects in `aspect`. This query keeps positive
+reviews, then returns each review paired with the aspects it discusses:
 
 ```python
 query = (
@@ -54,8 +65,9 @@ the written order.
 
 `ai_classify(prompt, labels, *, name, descriptions=None, task_description="", probabilities=False)`
 
-Gives each document one of the labels. `select()` returns the label
-column. `label_in()` keeps the documents with given labels.
+Assign one supplied label to each document. `name` sets the label column's
+name. Include that name in `select()` to return it, or use `label_in()`
+to keep only documents with selected labels.
 
 | Parameter | Type | Description |
 | --- | --- | --- |
@@ -79,15 +91,23 @@ query = (
 result = query.collect()
 ```
 
-Give descriptions in the label pairs or in `descriptions`, not in
-both. The [SQL reference](/docs/user-guide/sql#aiclassify) gives the
-rules for labels and label tables.
+In this example, Quail classifies each review once. It keeps negative
+and mixed reviews, then returns their IDs and sentiment labels. The
+`selectivity=0.3` hint estimates that 30% of reviews pass the label
+condition; it does not change which labels pass.
+
+Provide descriptions through either label pairs or `descriptions`.
+Using both raises a compilation error. The
+[SQL reference](/docs/user-guide/sql#aiclassify) lists label requirements,
+probability output, and limits on classifications of joined rows.
 
 ### label_in
 
 `label_in(name: str, labels: Iterable[str], selectivity: float | None = None)`
 
-Keeps the documents whose label is in `labels`, as SQL `IN` does.
+Keep documents whose computed label matches one of the supplied values.
+Call `ai_classify()` first to create the label column. `label_in()`
+tests that column without calling the model again.
 
 | Parameter | Type | Description |
 | --- | --- | --- |
@@ -95,8 +115,9 @@ Keeps the documents whose label is in `labels`, as SQL `IN` does.
 | `labels` | `Iterable[str]` | Labels to keep, such as `["negative", "mixed"]`. A list or tuple of strings works. |
 | `selectivity` | `float` or `None` | Estimated fraction of documents kept. `None` uses the default estimate of `0.2`. |
 
-For example, `label_in("sentiment", ["negative", "mixed"])` keeps only
-the reviews with the label "negative" or "mixed".
+For example, after classifying reviews into the `sentiment` column,
+`label_in("sentiment", ["negative", "mixed"])` keeps reviews with either
+of those labels.
 
 `label_in()` does not work on a classification of joined rows.
 
@@ -267,8 +288,8 @@ query = (
 result = query.collect()
 ```
 
-Note that `apply_table` fixes the execution order at that point in
-the query. The planner will not reorder operators across it.
+The planner preserves the order of operators around `apply_table()`.
+It does not move an operator across the function call.
 
 ## Errors
 
