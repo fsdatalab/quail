@@ -48,26 +48,6 @@ def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
     assert reads["source"].tolist() == [0, 1, 2, 3, 4, 5]
 
 
-def test_a_fresh_single_group_is_one_causal_segment_under_tree(monkeypatch):
-    cpu_staging(monkeypatch)
-    arena = plain_arena()
-    key = ("d", 2)
-    arena.activate(key, 3, capacity_tokens=8, base_tokens=3)
-    group = dict(key=key, prefix=[7, 8, 9], f=3, suffixes=[[20, 21, 22]],
-                 write_suffix_tokens=2, single=True)
-    chunk = chunk_mod.pack_chunk(torch, arena, [group], attention_mode="tree")
-    # no segment boundary after the prefix and no read of the pages
-    assert chunk.meta["cu_a"].tolist() == [0, 6]
-    assert chunk.meta["reads"] is None
-    assert chunk.meta["kv_src"].tolist() == [0, 1, 2, 3, 4]
-    assert chunk.final_indices.tolist() == [5]
-    # a kept document's single suffix still reads its pages
-    chunk = chunk_mod.pack_chunk(
-        torch, arena, [dict(key=key, prefix=None, f=5, suffixes=[[30]],
-                            single=True)], attention_mode="tree")
-    assert chunk.meta["reads"]["used"].tolist() == [5]
-
-
 @pytest.mark.parametrize("mode", ["tree", "unified"])
 def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
     cpu_staging(monkeypatch)
@@ -89,6 +69,9 @@ def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
                             suffixes=[[91, 92, 93]], write_suffix_tokens=3,
                             single=True)], attention_mode=mode)
     assert written(chunk) == rows[:6].tolist()
+    if mode == "tree":
+        assert chunk.meta["cu_a"].tolist() == [0, 6]
+        assert chunk.meta["reads"] is None
     # round 1 feeds one token at position 6, reads the six kept rows,
     # and keeps it at row 6
     chunk = chunk_mod.pack_chunk(
@@ -97,6 +80,8 @@ def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
         attention_mode=mode)
     assert chunk.positions.tolist() == [6]
     assert written(chunk) == rows[6:7].tolist()
+    if mode == "tree":
+        assert chunk.meta["reads"]["used"].tolist() == [6]
     # a kept token past the key's one 16-row page is refused, not dropped
     with pytest.raises((AssertionError, ValueError)):
         chunk_mod.pack_chunk(

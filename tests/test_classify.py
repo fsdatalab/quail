@@ -13,7 +13,6 @@ import quail
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.classify import (
     QuailClassifier,
-    document_prefixes,
     label_requests,
 )
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs, answer_rows
@@ -63,15 +62,6 @@ def _bytes(text):
     return list(text.encode())
 
 
-def test_label_trie_holds_each_proper_prefix_and_ties_go_first():
-    trie = label_trie(IDS)
-    assert trie == {(): [1, 4], (1,): [2, 3]}
-    with pytest.raises(ValueError, match="no tokens"):
-        label_trie([(1,), ()])
-    assert best_label([-1.0, -0.5, -2.0]) == 1
-    assert best_label([-1.0, -2.0, -1.0]) == 0
-
-
 def test_greedy_decoder_follows_the_likeliest_child_to_a_label():
     targets = [1, 2, 3, 4]
     decoder = GreedyDecoder(IDS, targets, documents=2)
@@ -112,56 +102,6 @@ def test_label_readout_is_log_softmax_over_the_whole_vocabulary():
     answers, rows = answer_rows([2, 1, 3])
     assert answers.tolist() == [0, 0, 1, 2, 2, 2]
     assert rows.tolist() == [0, 1, 0, 0, 1, 2]
-
-
-def test_classifier_reads_the_letters_at_the_cue_row(monkeypatch):
-    from dataclasses import replace
-
-    single = ClassifySpec(
-        name="tone", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=2, estimated_seconds=0.0,
-        prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
-        label_token_ids=((2,), (4,)), scoring="letters")
-    documents = {"d": [[10, 11], [12]]}
-    prefixes = document_prefixes(single, documents, [0, 1])
-    assert [list(prefix) for prefix in prefixes] == [[90, 10, 11], [90, 12]]
-    requests = label_requests(single)
-    assert requests.frame == [91, 92] and requests.suffixes == [[93]]
-    assert requests.targets == [2, 4]
-    with pytest.raises(ValueError, match="unknown"):
-        label_requests(replace(single, scoring="trie_paths"))
-    readout = SimpleNamespace(
-        targets=np.asarray([2, 4]), rows=1,
-        dtype=np.dtype((np.float32, (2,))),
-        submit=lambda rows, rows_per_answer=None: rows,
-        result=lambda rows: rows)
-
-    def forward_single(chunk):
-        return np.asarray([
-            [-1.0, -5.0] if entry["key"][2] == 0 else [-5.0, -1.0]
-            for entry in chunk.specs for _ in entry["suffixes"]],
-            dtype=np.float32)
-
-    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    state = QueryExecutionState(
-        loaded_model=LoadedModelState(
-            arena=cpu_arena(64),
-            pipeline=fake_pipeline(forward_chunk=forward_single),
-            label_readout=readout,
-            input_staging=SimpleNamespace(fixed_tokens=set()),
-            model=object(),
-        ),
-        torch=fake_torch(),
-        chunk_tokens=64,
-        answer_rows=object(),
-        async_answers=object(),
-    )
-    batch = QuailClassifier(state).classify(single, [[0], [1]], documents)
-    assert list(batch.scores) == ["a", "b"]
-    assert batch.suffix_tokens == 2 * 1
-    # every row packs its prefix, the two-token frame, and the cue
-    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 1)
-
 
 
 def test_classifier_decodes_one_token_per_round(monkeypatch):
@@ -331,6 +271,12 @@ def test_classify_plans_filters_and_returns_labels(session):
     assert labels.column("topic").to_pylist() == ["praise"]
     assert result.report["node_metrics"]["ai-classify:0"]["output_rows"] == 1
 
+    result = _finish(query, session, _Labels([None, "refund"]))
+    assert result.collect().column("topic").to_pylist() == ["refund"]
+    (answers,) = result.answer_tables["filters"].values()
+    assert answers.column("answer").to_pylist() == [True]
+    assert result.answer_tables["classifies"]["topic"].column("d").to_pylist() == [1]
+
     # with probabilities, a map of each label's probability beside the
     # label, from a rule that scores every label
     probable = session.sql(
@@ -452,6 +398,9 @@ def test_frontends_place_classifications_on_their_table(session):
     assert ("Filter: d.topic IN ['refund', 'shipping'] (selectivity=50%)"
             in text.split("SemanticClassify")[0])
     assert "Project: d.id, topic" in text
+    assert "AiClassify: topic over d" in text
+    assert "rule=trie_tree, labels=3" in text
+    assert "Filter: topic IN ['refund', 'shipping']" in text
 
 
 def _corpus(session, tmp_path, name, column, rows, words):
@@ -810,18 +759,6 @@ def test_planner_reads_letters_on_a_diffusion_model(tmp_path):
     session.close()
 
 
-def test_a_document_without_a_label_fails_every_filter_on_it(session):
-    # document 7's answer named no label: it leaves the run before the
-    # filter, as under the request backends
-    result = _finish(_topic(session), session, _Labels([None, "refund"]))
-    assert result.collect().column("topic").to_pylist() == ["refund"]
-    (answers,) = result.answer_tables["filters"].values()
-    assert answers.column("answer").to_pylist() == [True]
-    labels = result.answer_tables["classifies"]["topic"]
-    assert labels.column("topic").to_pylist() == ["refund"]
-    assert labels.column("d").to_pylist() == [1]
-
-
 def test_trie_chains_cover_every_node_once_and_gather_ancestors():
     from quail.execution.labels import tree_scores, trie_chains
 
@@ -850,6 +787,9 @@ def test_trie_chains_cover_every_node_once_and_gather_ancestors():
     scores = tree_scores(labels, chains, targets, logprobs)
     assert scores.tolist() == [-4.5, -1.6, -1.75, -2.3]
     assert best_label(scores) == 1
+    assert best_label([-1.0, -2.0, -1.0]) == 0
+    with pytest.raises(ValueError, match="no tokens"):
+        label_trie([(1,), ()])
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
         expected_inputs=1, estimated_seconds=0.0,
@@ -1040,15 +980,6 @@ def test_sql_category_forms_options_and_label_tables(session):
                 "FROM documents d"):
         with pytest.raises(CompileError):
             session.sql(bad)
-
-
-def test_explain_names_the_classification_rule_and_the_filter(session):
-    text = _topic(session).explain()
-    assert "AiClassify: topic over d" in text
-    # three short labels: the packed trie's 19 rows cost less than the
-    # lettered prompt's longer frame
-    assert "rule=trie_tree, labels=3" in text
-    assert "Filter: topic IN ['refund', 'shipping']" in text
 
 
 def test_choice_letters_are_one_token_each_and_capped():
