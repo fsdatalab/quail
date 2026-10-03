@@ -86,6 +86,9 @@ class PromptLayout:
             label. None keeps the separator a filter template wrote.
         answer_rows: The answer segments whose last token the readout
             reads, besides the prompt's last token.
+        choice_label: For a model that classifies by scoring one option
+            block per label, the text before an AI.CLASSIFY question;
+            None for a model that classifies with Quail's label prompt.
     """
 
     name: str
@@ -95,6 +98,7 @@ class PromptLayout:
     answer_segments: tuple[str, ...] = ()
     question_separator: str | None = None
     answer_rows: tuple[int, ...] = ()
+    choice_label: str | None = None
 
     def question_segments(self, question: str, separator: str) -> list[str]:
         """The text after a document: one entry per tokenized segment."""
@@ -104,7 +108,7 @@ class PromptLayout:
                 *self.answer_segments]
 
 
-def _decision2_option(key: str, description: str) -> str:
+def _decision2_option(key: str, description: str | None) -> str:
     option = json.dumps({"key": key, "description": description},
                         ensure_ascii=False, sort_keys=True,
                         separators=(",", ":"))
@@ -130,6 +134,7 @@ PROMPT_LAYOUTS = {layout.name: layout for layout in (
         ),
         question_separator="\n\n",
         answer_rows=(0, 1),
+        choice_label="Task type: choice\nQuestion:\n",
     ),
 )}
 
@@ -331,6 +336,8 @@ def bind_prompt(template: str, args: tuple, tokenizer=None,
     """
     import re
     _check_placeholders(template, len(args))
+    # the stored template names the predicate whatever the layout
+    canonical = canonicalize_template(template)
     frame, template = split_frame(template,
                                   PROMPT_LAYOUTS[layout].document_label)
     preamble, tail = split_template(template)
@@ -356,7 +363,7 @@ def bind_prompt(template: str, args: tuple, tokenizer=None,
             segments or (re.sub(r"\{\d+\}", "", tail),), tokenizer)
         tail_tok = len(tail_ids)
         frame_tok = len(tokenizer(f"\n\n{frame}")) if frame else 0
-    return Prompt(template=template, args=tuple(args), preamble=preamble,
+    return Prompt(template=canonical, args=tuple(args), preamble=preamble,
                   tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
                   frame=frame, frame_tokens=frame_tok,
                   preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
@@ -460,7 +467,8 @@ def label_text(label: str, prefix: str = LABEL_PREFIX) -> str:
 def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
                          tokenizer=None,
                          turn: tuple[str, str] = ("", ""),
-                         task_description: str = "") -> Prompt:
+                         task_description: str = "",
+                         layout: str = "ai-if") -> Prompt:
     """Bind a classification prompt to one or two document columns.
 
     The prompt names the labels and, when every label gets a distinct
@@ -476,6 +484,8 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
         tokenizer: Optional callable mapping text to token IDs.
         turn: Chat text before the prompt and after the answer cue.
         task_description: Additional classification instructions.
+        layout: The PROMPT_LAYOUTS name of the model's prompt text. A
+            layout with a choice_label writes one option block per label.
 
     Returns:
         A Prompt containing the document layout, label list, and token IDs.
@@ -485,6 +495,10 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
             invalid, or there are more than MAX_LETTERS labels.
     """
     _check_placeholders(template, len(args))
+    if PROMPT_LAYOUTS[layout].choice_label is not None:
+        return _bind_choice_classify_prompt(
+            template, args, labels, descriptions, tokenizer, turn,
+            task_description, layout)
     if len(args) == 2:
         return _bind_joined_classify_prompt(
             template, args, labels, descriptions, tokenizer, turn,
@@ -580,6 +594,85 @@ def _bind_joined_classify_prompt(template, args, labels, descriptions,
     if len(letters) < len(labels):
         return named
     return replace(named, lettered=bind(letters))
+
+
+CHOICE_QUESTION = "Which option best fits the context?"
+
+
+def choice_segments(question: str, labels, descriptions=(),
+                    layout: str = "decision2-noul") -> list[str]:
+    """The text after a document: the question, one block per label, the close.
+
+    Args:
+        question: The classification question; empty asks CHOICE_QUESTION.
+        labels: Labels in query order; each is an option's key.
+        descriptions: Optional descriptions in label order; a label
+            without one has a null description.
+        layout: A PROMPT_LAYOUTS name with a choice_label.
+    """
+    spec = PROMPT_LAYOUTS[layout]
+    descriptions = tuple(descriptions) or (None,) * len(labels)
+    return [JOIN_QUESTION_SEP + spec.choice_label + (question or CHOICE_QUESTION)
+            + spec.question_end,
+            *(_decision2_option(label, description or None)
+              for label, description in zip(labels, descriptions)),
+            spec.answer_segments[-1]]
+
+
+def _bind_choice_classify_prompt(template, args, labels, descriptions,
+                                 tokenizer, turn, task_description, layout):
+    """Bind AI.CLASSIFY in a layout that scores one option block per label.
+
+    One document: the document label, the document, then the question
+    and the option blocks. Joined rows: the anchor document, its note,
+    the partner's label and document, then the question and the blocks.
+    ``tail_segments`` holds the question, each block, and the close.
+    """
+    import re
+    if len(args) not in (1, 2):
+        raise CompileError("AI.CLASSIFY reads one document per row, or one "
+                           "from each side of a join")
+    spec = PROMPT_LAYOUTS[layout]
+    preamble = turn[0] + spec.document_label
+    label_ids = ()
+    if len(args) == 2:
+        if len({r.alias for r in args}) != 2:
+            raise CompileError(
+                "each placeholder of a classification of joined rows names a "
+                "distinct table")
+        stored, question, frame, head = template, template, join_anchor_note(0), ""
+        if tokenizer is not None:
+            label_ids = tuple(
+                (ref.alias, tuple(tokenizer(join_label(index))),
+                 tuple(tokenizer(join_anchor_note(index))))
+                for index, ref in enumerate(args))
+    else:
+        stored = canonicalize_template(template)
+        frame, template = split_frame(template, spec.document_label)
+        _, rest = split_template(template)
+        m = re.match(r"(\{\d+\})(.*)", rest, re.DOTALL)
+        if m is None:
+            raise CompileError(f"unexpected AI.CLASSIFY template: {template!r}")
+        head, question = m.group(1), m.group(2).strip()
+    if task_description:
+        question = (question + "\n" if question else "") + task_description
+    segments = choice_segments(question, labels, descriptions, layout)
+    segments[-1] += turn[1]
+    segments = tuple(segments)
+    tail = head + "".join(segments)
+    pre_ids = tail_ids = ()
+    pre_tok = tail_tok = frame_tok = None
+    if tokenizer is not None:
+        pre_ids = tuple(tokenizer(preamble))
+        tail_ids = tokenize_segments(segments, tokenizer)
+        pre_tok, tail_tok = len(pre_ids), len(tail_ids)
+        frame_tok = len(tokenizer(frame)) if frame else 0
+    return Prompt(template=stored, args=tuple(args), preamble=preamble,
+                  tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
+                  frame=frame, frame_tokens=frame_tok,
+                  preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
+                  label_token_ids=label_ids, layout=layout,
+                  tail_segments=segments)
 
 
 def render_joined_classify_prompt_text(prompt, anchor: str,

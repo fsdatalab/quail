@@ -108,7 +108,7 @@ def test_forward_warm_runs_a_classification_chunk(monkeypatch):
     monkeypatch.setattr(warmup, "_warm_row_classes",
                         lambda torch, arena, pipeline, mode: classes.append(mode))
     pipeline = SimpleNamespace(tree_attention=False, warm_tokens=(),
-                               canvas_ids=(), answer_offsets=(0,))
+                               canvas_ids=())
     warmup._forward_warm(None, None, pipeline, None, 2048, join_chunk=True)
     # the row-count classes run on each attention path the model has
     assert classes == ["unified"]
@@ -121,11 +121,10 @@ def test_forward_warm_runs_a_classification_chunk(monkeypatch):
     assert all(s == question[:len(s)] for s in suffixes)
     assert classify[1] == {"stage_frames": [question]}
 
-    # a decision pipeline reads rows before each answer row: its
-    # warmup question reaches past them, and it does not classify
+    # a decision readout reads 31 trailing rows: the warmup question is
+    # that long, and the classification chunk is left out
     joins.clear()
-    decision = SimpleNamespace(tree_attention=False, warm_tokens=(),
-                               canvas_ids=(), answer_offsets=(30, 15, 0))
-    warmup._forward_warm(None, None, decision, None, 2048, join_chunk=True)
+    readout = SimpleNamespace(trailing_rows=31)
+    warmup._forward_warm(None, None, pipeline, readout, 2048, join_chunk=True)
     ((stages, _),) = joins
     assert len(stages[0][0]) == 31

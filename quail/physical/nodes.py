@@ -612,6 +612,9 @@ class ClassifySpec(ScoreSpec):
         join_layout: Anchor note and partner label token sequences for pair
             classification, or None for individual documents. The question
             follows the partner document.
+        frame_tokens: For the decision_choice rule, the tokens of the
+            prompt tail before the first option block; the option
+            blocks and the closing line follow.
     """
 
     labels: tuple[str, ...] = ()
@@ -620,6 +623,7 @@ class ClassifySpec(ScoreSpec):
     share_prefixes: bool = False
     probabilities: bool = False
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    frame_tokens: int = 0
 
     @property
     def anchor(self) -> str:
@@ -652,6 +656,7 @@ class ClassifySpec(ScoreSpec):
             join_layout=(None if value.get("join_layout") is None else tuple(
                 tuple(int(token) for token in part)
                 for part in value["join_layout"])),
+            frame_tokens=int(value.get("frame_tokens", 0)),
         )
 
     def to_dict(self) -> dict:
@@ -664,6 +669,7 @@ class ClassifySpec(ScoreSpec):
             "probabilities": self.probabilities,
             "join_layout": (None if self.join_layout is None
                             else [list(part) for part in self.join_layout]),
+            "frame_tokens": self.frame_tokens,
         }
 
 

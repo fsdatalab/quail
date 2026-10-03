@@ -305,7 +305,8 @@ class _Binder:
         if classify is not None:
             prompt = bind_classify_prompt(template, tuple(refs),
                                           tokenizer=self.tokenizer,
-                                          turn=self.turn, **classify)
+                                          turn=self.turn, layout=self.layout,
+                                          **classify)
         else:
             if function == "AI_SCORE":
                 binder = bind_score_prompt

@@ -56,8 +56,9 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     unpaged causal fast path. join_chunk adds a join chunk and a
     classification chunk.
     """
-    reach = max(pipeline.answer_offsets)
-    warm_docs, question, doc = _warm_inputs(budget, max(16, reach + 1))
+    # a readout of several trailing rows needs a question that long
+    trailing = getattr(async_ans, "trailing_rows", 1)
+    warm_docs, question, doc = _warm_inputs(budget, max(16, trailing))
     q_max = len(question)
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
@@ -82,11 +83,10 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         logger.debug("kernels: warming join forward pass")
         run_join(torch, arena, pipeline, async_ans, warm_docs,
                  [[question] * 8], budget)
-    if join_chunk and not reach:
+    if join_chunk and trailing == 1:
         # a classification: the question as the frame after each
         # document, then many short suffixes of mixed lengths; a
-        # pipeline that reads rows before each answer row does not
-        # classify
+        # decision model classifies with its own readout
         logger.debug("kernels: warming classification forward pass")
         labels = [question[:1 + i % 6] for i in range(26)]
         run_join(torch, arena, pipeline, async_ans, warm_docs,

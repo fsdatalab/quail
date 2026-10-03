@@ -16,7 +16,7 @@ class Qwen3Pipeline(ModelPipeline):
     """Forward passes for Qwen3 checkpoints loaded by vLLM."""
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine, answer_offsets=(0,)):
+                 engine_class=Engine):
         import torch
 
         self.layers = model.model.layers
@@ -35,21 +35,6 @@ class Qwen3Pipeline(ModelPipeline):
                      for layer in self.layers)
         self.max_chunk_tokens = (2**31 - 1) // widest
         self.tree_attention = spec is None or tree_attention_allowed(spec)
-        self.answer_offsets = tuple(answer_offsets)
-        self._offsets = None
-        if self.answer_offsets != (0,):
-            self._offsets = torch.tensor(self.answer_offsets,
-                                         dtype=torch.int64,
-                                         device=self.embed.weight.device)
-
-    def answer_indices(self, final):
-        """The rows the readout reads: per final index, one per answer offset."""
-        if self._offsets is None:
-            return final
-        rows = (final[:, None] - self._offsets[None, :]).reshape(-1)
-        # a join's frame entry can start the chunk with fewer rows than
-        # the offsets reach; the loop discards its answer
-        return rows.clamp(min=0)
 
     def linears(self):
         # every layer has the same four shapes
@@ -83,7 +68,7 @@ class Qwen3Pipeline(ModelPipeline):
             gate_up = engine.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
             d_in, d_scale = engine.activation_quant(gate_up)
             hidden = engine.gemm(d_in, d_scale, layer.mlp.down_proj)
-        final = self.answer_indices(chunk.final_indices)
+        final = chunk.final_indices
         last_hidden = hidden.index_select(0, final)
         last_residual = residual.index_select(0, final)
         normed, _ = engine.fused_add_rms_norm(

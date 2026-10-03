@@ -29,6 +29,8 @@ class LoadedModelState:
     model_spec: ModelSpec | None = None
     input_staging: InputStaging | None = None
     label_readout: AsyncLabelLogprobs | None = None
+    # a decision model's option-scoring head; None for other models
+    decision_head: Any = None
 
 
 @dataclass

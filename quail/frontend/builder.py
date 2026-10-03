@@ -220,7 +220,8 @@ class Query:
         refs = tuple(self._resolve(c) for c in p.cols)
         bound = bind_classify_prompt(p.template, refs, labels, descriptions,
                                      self._tokenizer, turn=self._turn,
-                                     task_description=task_description)
+                                     task_description=task_description,
+                                     layout=self._layout)
         for ref in refs:
             self._note_doc_column(ref)
         call = ModelCall(bound, "label", labels, descriptions,

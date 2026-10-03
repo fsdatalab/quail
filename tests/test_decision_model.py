@@ -8,12 +8,11 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from fakes import cpu_arena, fake_pipeline, fake_torch
 
 import quail
-from quail.backends.quail.executor import loop, model
-from quail.backends.quail.executor.models.qwen3 import Qwen3Pipeline
-from quail.backends.quail.executor.readout import DecisionHead
+from quail.backends.quail.executor import model
+from quail.backends.quail.executor.readout import DecisionHead, DecisionRows
+from quail.backends.quail.executor.stages import Stage
 from quail.backends.request import RequestBackend
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (
@@ -25,7 +24,7 @@ from quail.logical import (
     render_join_prompt_ids,
     render_join_prompt_text,
 )
-from quail.physical import AiFilter, AiJoin, AiScore
+from quail.physical import AiClassify, AiFilter, AiJoin, AiScore
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import DECISION_2_KAI_0_6B_BF16, H100_SXM
 
@@ -92,36 +91,24 @@ def test_ai_if_layout_keeps_one_tail_segment():
     assert answer_row_offsets("ai-if", _tokens) == (0,)
 
 
-def test_pipeline_reads_each_answer_offset_and_clamps_at_the_chunk_start():
+def test_decision_rows_read_offsets_from_each_answers_trailing_rows():
     torch = pytest.importorskip("torch")
-    weight = SimpleNamespace(dtype=torch.bfloat16, shape=(4096, 1024))
-    attn = SimpleNamespace(num_heads=16, num_kv_heads=8, head_dim=128,
-                           rotary_emb=None, qkv_proj=SimpleNamespace(weight=weight))
-    layer = SimpleNamespace(self_attn=attn,
-                            mlp=SimpleNamespace(gate_up_proj=SimpleNamespace(
-                                weight=weight)))
-    embed = SimpleNamespace(weight=torch.zeros(1))
-    fake = SimpleNamespace(model=SimpleNamespace(
-        layers=[layer], embed_tokens=embed, norm=None))
-    pipeline = Qwen3Pipeline(fake, None, spec=None,
-                             engine_class=lambda arena, **kw: None,
-                             answer_offsets=(5, 2, 0))
-    final = torch.tensor([3, 20])
-    assert pipeline.answer_indices(final).tolist() == [0, 1, 3, 15, 18, 20]
-    plain = Qwen3Pipeline(fake, None, spec=None,
-                          engine_class=lambda arena, **kw: None)
-    assert plain.answer_indices(final) is final
+    seen = []
 
+    def scores(options, last):
+        seen.append((options[..., 0].tolist(), last[..., 0].tolist()))
+        return torch.zeros(options.shape[:2])
 
-def test_streams_refuse_suffixes_the_readout_reads_past():
-    pipeline = fake_pipeline(answer_offsets=(4, 2, 0))
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
-    with pytest.raises(ValueError, match="4 rows the readout reads back"):
-        loop.run_filter(fake_torch(), cpu_arena(64), pipeline, answers,
-                        [[5] * 20], [[40, 41, 42]], 200, arena_writes=True)
-    with pytest.raises(ValueError, match="4 rows the readout reads back"):
-        loop.run_join(fake_torch(), cpu_arena(64), pipeline, answers,
-                      [[5] * 20], [[[1, 2, 3, 4]]], 200)
+    rows = DecisionRows(torch, SimpleNamespace(scores=scores), (5, 2, 0))
+    assert rows.trailing_rows == 6
+    # two answers of six rows, then a frame entry's one row
+    normed = torch.arange(13, dtype=torch.float32)[:, None]
+    rows.scores(normed, rows_per_answer=[6, 6, 1])
+    assert seen == [([[0.0, 3.0], [6.0, 9.0], [12.0, 12.0]],
+                     [5.0, 11.0, 12.0])]
+    # a stage over this readout reads its trailing rows from every suffix
+    stage = Stage(suffixes=[[1] * 9, [2] * 7], readout=rows)
+    assert stage.read_rows == [6, 6] and stage.read_all_rows
 
 
 def _reference_scores(torch, weights, options, last):
@@ -226,8 +213,18 @@ def test_plans_carry_the_decision_layout(session):
     plan = session.sql(
         "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'other']) AS c "
         "FROM documents d").plan()
-    assert isinstance(plan, Refusal)
-    assert plan.constraint == "decision_no_classify"
+    (node,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    spec = node.spec
+    assert spec.scoring == "decision_choice"
+    _, tail = spec.prompt_token_parts
+    frame, request = "".join(tail[:spec.frame_tokens]), "".join(
+        tail[spec.frame_tokens:])
+    assert frame == ("\n\nTask type: choice\nQuestion:\nWhich option best "
+                     "fits the context?\nOptions:")
+    assert ["".join(block) for block in spec.label_token_ids] == [
+        '\n<option>\n{"description":null,"key":"refund"}\n</option>',
+        '\n<option>\n{"description":null,"key":"other"}\n</option>']
+    assert request == "".join("".join(b) for b in spec.label_token_ids) + CLOSING
 
     engine = SimpleNamespace(label="stock vLLM", kind="vllm")
     backend = RequestBackend(name="stock", engine=engine,

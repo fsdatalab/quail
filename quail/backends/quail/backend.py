@@ -50,12 +50,14 @@ class QuailModelExecution:
             raise RuntimeError("Quail model execution has no bound query")
         return self._query
 
-    def bind_loaded_model(self, *, model, arena, pipeline) -> None:
+    def bind_loaded_model(self, *, model, arena, pipeline,
+                          decision_head=None) -> None:
         """Attach the loaded model and discard the previous model's caches."""
         self.close()
         self.loaded_model = LoadedModelState(
             model=model, arena=arena, pipeline=pipeline,
-            model_spec=getattr(self.context, "model", None))
+            model_spec=getattr(self.context, "model", None),
+            decision_head=decision_head)
 
     def close(self) -> None:
         """Drop every reference to the loaded model so its memory can go."""
@@ -175,11 +177,6 @@ class QuailBackend:
                 return (PhysicalCandidate(None, Refusal(
                     reasons=("a reranker model cannot run AI.CLASSIFY",),
                     constraint="reranker_only_scores", needed=1, available=0,
-                    unit="AI.CLASSIFY expressions"), float("inf")),)
-            if context.model.role == "decision":
-                return (PhysicalCandidate(None, Refusal(
-                    reasons=("a decision model cannot run AI.CLASSIFY",),
-                    constraint="decision_no_classify", needed=0, available=1,
                     unit="AI.CLASSIFY expressions"), float("inf")),)
         scored = has_score(region.logical_plan)
         if context.model.role == "reranker":

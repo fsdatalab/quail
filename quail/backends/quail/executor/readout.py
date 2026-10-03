@@ -296,47 +296,93 @@ class DecisionHead:
         return bilinear / math.sqrt(self.head_dim) + mlp
 
 
-class AsyncDecisions:
-    """Non-blocking yes/no readout of a decision head, for AI_FILTER and AI_JOIN.
+class DecisionRows:
+    """The rows a decision head reads from each answer's trailing rows.
 
-    The forward pass returns three rows per answer: the row that ends
-    the no option, the row that ends the yes option, and the prompt's
-    last row. The bit is 1 when yes scores above no.
+    A stage reads the last ``trailing_rows`` rows of each suffix (its
+    ``read_rows``); the head reads, from each answer's rows, the rows at
+    ``offsets`` before its last row: one per option, then the last row.
+    An answer with another row count, such as a frame entry's single
+    row, reads its last row for every position; the stage discards it.
+
+    Args:
+        torch: The torch module.
+        head: The model's DecisionHead.
+        offsets: Distances before the last row, options first, ending in 0.
     """
 
-    dtype = None    # answers arrive as Python lists of bits
-
-    def __init__(self, torch, head):
+    def __init__(self, torch, head, offsets):
         self.torch = torch
         self.head = head
+        self.offsets = np.asarray(offsets, dtype=np.int64)
+        self.trailing_rows = int(self.offsets.max()) + 1
 
-    def submit(self, normed):
+    def scores(self, normed, rows_per_answer=None):
+        """Per answer, one float32 score per option."""
+        if rows_per_answer is None:
+            rows_per_answer = [self.trailing_rows] * (
+                normed.shape[0] // self.trailing_rows)
+        counts = np.asarray(rows_per_answer, dtype=np.int64)
+        last = np.cumsum(counts) - 1
+        full = counts == self.trailing_rows
+        index = last[:, None] - np.where(full[:, None], self.offsets[None, :], 0)
+        index = self.torch.from_numpy(index.reshape(-1)).to(
+            normed.device, non_blocking=True)
+        rows = normed.index_select(0, index).view(
+            len(counts), len(self.offsets), normed.shape[-1])
+        return self.head.scores(rows[:, :-1], rows[:, -1])
+
+    def _copy(self, values, dtype):
         torch = self.torch
-        rows = normed.view(-1, 3, normed.shape[-1])
-        scores = self.head.scores(rows[:, :2], rows[:, 2])
-        bits = (scores[:, 1] > scores[:, 0]).to(torch.uint8)
-        host = torch.empty(bits.shape[0], dtype=torch.uint8, pin_memory=True)
-        host.copy_(bits, non_blocking=True)
+        host = torch.empty(values.shape, dtype=dtype, pin_memory=True)
+        host.copy_(values, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
         return event, host
 
+
+class AsyncDecisions(DecisionRows):
+    """Non-blocking yes/no readout of a decision head, for AI_FILTER and AI_JOIN.
+
+    The options are No then Yes; the bit is 1 when Yes scores above No.
+    """
+
+    dtype = None    # answers arrive as Python lists of bits
+
+    def submit(self, normed, rows_per_answer=None):
+        scores = self.scores(normed, rows_per_answer)
+        return self._copy((scores[:, 1] > scores[:, 0]).to(self.torch.uint8),
+                          self.torch.uint8)
+
     result = staticmethod(AsyncAnswers.result)
 
 
-class AsyncDecisionScores(AsyncScores):
-    """Non-blocking AI.SCORE readout of a decision head: P(yes) over No and Yes.
+class AsyncDecisionScores(DecisionRows):
+    """Non-blocking AI.SCORE readout of a decision head: P(Yes) over No and Yes."""
 
-    Takes the same three rows per answer as AsyncDecisions.
-    """
+    dtype = np.float32
+    rows = None    # scores no answer rows of the output head
 
-    def __init__(self, torch, head):
-        self.torch = torch
-        self.head = head
-        self.rows = None
-        self.available = []
+    def submit(self, normed, rows_per_answer=None):
+        scores = self.scores(normed, rows_per_answer)
+        return self._copy(self.torch.sigmoid(scores[:, 1] - scores[:, 0]),
+                          self.torch.float32)
 
-    def submit(self, normed):
-        rows = normed.view(-1, 3, normed.shape[-1])
-        scores = self.head.scores(rows[:, :2], rows[:, 2])
-        return self._copy(self.torch.sigmoid(scores[:, 1] - scores[:, 0]))
+    @staticmethod
+    def result(handle):
+        event, host = handle
+        event.synchronize()
+        return host.numpy()
+
+
+class AsyncDecisionChoices(DecisionRows):
+    """Non-blocking AI.CLASSIFY readout of a decision head: one score per label."""
+
+    def __init__(self, torch, head, offsets):
+        super().__init__(torch, head, offsets)
+        self.dtype = np.dtype((np.float32, (len(self.offsets) - 1,)))
+
+    def submit(self, normed, rows_per_answer=None):
+        return self._copy(self.scores(normed, rows_per_answer), self.torch.float32)
+
+    result = AsyncDecisionScores.result

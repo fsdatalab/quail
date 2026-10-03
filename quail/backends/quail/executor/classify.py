@@ -3,6 +3,7 @@
 Letter scoring reads label letters in one pass. Tree scoring evaluates all
 label token sequences. Greedy decoding chooses one allowed token per
 round, keeping the chosen path in the document's KV after the frame.
+A decision model's head scores every label's option block in one pass.
 """
 
 import logging
@@ -14,7 +15,10 @@ import numpy as np
 
 from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.parts import input_staging
-from quail.backends.quail.executor.readout import AsyncLabelLogprobs
+from quail.backends.quail.executor.readout import (
+    AsyncDecisionChoices,
+    AsyncLabelLogprobs,
+)
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.labels import (
@@ -26,6 +30,7 @@ from quail.execution.labels import (
 )
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens, prefix_tree
+from quail.labels import DECISION_SCORING
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 
 logger = logging.getLogger("quail")
@@ -185,10 +190,15 @@ class ClassifyStages:
     partners = None         # JoinPartners, for joined rows
     pair_labels = None      # (anchor index, partner index) -> label, for joined rows
 
+    choice = None           # (frame, request) of a decision_choice rule
+
     def __init__(self, state: QueryExecutionState, spec, count, index_of, on_label=None,
                  partners=None):
         self.spec = spec
         self.index_of = index_of
+        if spec.scoring == DECISION_SCORING:
+            self._choice_stages(state, spec, count, on_label, partners)
+            return
         if spec.partner is not None:
             self._joined_stages(state, spec, count, partners)
             return
@@ -296,6 +306,58 @@ class ClassifyStages:
             frame=list(note) + list(partner_label),
             requests=ask, decide=score, read_all_rows=True,
             read_rows=[1] * len(suffixes), label=spec.name)]
+
+    def _choice_stages(self, state: QueryExecutionState, spec, count, on_label,
+                       partners):
+        """Initialize one stage whose decision head scores every option block.
+
+        For individual documents the question is the frame and the one
+        request is every option block and the closing line. For joined
+        rows the anchor's note and the partner's label are the frame and
+        each partner's request is its document and the whole tail.
+        """
+        head = state.loaded_model.decision_head
+        if head is None:
+            raise ValueError("the decision_choice rule needs a decision model")
+        _, tail = spec.prompt_token_parts
+        frame, request = list(tail[:spec.frame_tokens]), list(tail[spec.frame_tokens:])
+        ends = np.cumsum([len(block) for block in spec.label_token_ids])
+        offsets = [len(request) - int(end) for end in ends] + [0]
+        self.readout = readout = AsyncDecisionChoices(state.torch, head, offsets)
+        self.labels = np.full(count, None, dtype=object)
+        if spec.probabilities:
+            self.probabilities = np.full((count, len(spec.labels)), np.nan)
+        self.decoder = None
+        self.choice = (frame, request)
+        if partners is None:
+            def whole(anchor, row):
+                self._choose(anchor, _softmax(np.asarray(row).reshape(-1)), on_label)
+                return True
+
+            self.stages = [Stage(suffixes=[request], readout=readout, frame=frame,
+                                 decide=whole, label=spec.name)]
+            return
+        note, partner_label = spec.join_layout
+        self.partners = partners
+        self.pair_labels = {}
+        blocks = [list(document) + frame + request for document in partners.documents]
+        self.block_tokens = [len(tokens) - 1 for tokens in blocks]
+
+        def ask(key):
+            return list(partners.kept(self.index_of(key)))
+
+        def score(anchor, row):
+            kept = partners.kept(anchor)
+            scores = np.asarray(row).reshape(len(kept), -1)
+            for position, partner in enumerate(kept):
+                self.pair_labels[(anchor, partner)] = spec.labels[
+                    best_label(scores[position])]
+            return True
+
+        self.stages = [Stage(
+            suffixes=blocks, readout=readout,
+            frame=list(note) + list(partner_label),
+            requests=ask, decide=score, label=spec.name)]
 
     def _letter_canvas(
             self, state: QueryExecutionState) -> Callable[[int, int], np.ndarray]:
@@ -429,6 +491,13 @@ class ClassifyStages:
             streamed += len(anchors) * len(self.stages[0].frame)
             return len(self.pair_labels), streamed
         first = answers[0]
+        if self.choice is not None:
+            frame, request = self.choice
+            for anchor, scores in first.items():
+                if self.labels[anchor] is None:
+                    self._choose(anchor, _softmax(np.asarray(scores)), None)
+            suffix_tokens = len(first) * len(request)
+            return suffix_tokens, suffix_tokens + len(first) * len(frame)
         if self.decoder is not None:
             suffix_tokens = self.decoder.tokens
         else:

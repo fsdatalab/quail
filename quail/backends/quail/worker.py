@@ -101,18 +101,18 @@ class LoadedGpu:
 
         t0 = time.perf_counter()
         self.decision_head = None
-        options = {}
         if spec.role == "decision":
             path = checkpoint_path(model_path or spec.hf_name,
                                    None if model_path else spec.revision)
             self.decision_head = DecisionHead.load(torch, F, path)
-            options["answer_offsets"] = decision_offsets(spec, path)
-        self.pipeline = build_pipeline(spec, self.model, self.arena, **options)
+            self.decision_offsets = decision_offsets(spec, path)
+        self.pipeline = build_pipeline(spec, self.model, self.arena)
         self.pipeline_s = time.perf_counter() - t0
 
         self.execution = backend.start(context)
         self.execution.bind_loaded_model(
-            model=self.model, arena=self.arena, pipeline=self.pipeline)
+            model=self.model, arena=self.arena, pipeline=self.pipeline,
+            decision_head=self.decision_head)
 
         self.async_ans = None
         self.chunk_tokens = None
@@ -128,8 +128,10 @@ class LoadedGpu:
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
         if self.decision_head is not None:
-            self.async_ans = AsyncDecisions(self.torch, self.decision_head)
-            async_scores = AsyncDecisionScores(self.torch, self.decision_head)
+            self.async_ans = AsyncDecisions(
+                self.torch, self.decision_head, self.decision_offsets)
+            async_scores = AsyncDecisionScores(
+                self.torch, self.decision_head, self.decision_offsets)
         else:
             self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens
