@@ -19,7 +19,7 @@ from quail.progress import Progress, logger, quiet
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass.
-WARMUP_VERSION = 6
+WARMUP_VERSION = 7
 
 # Triton compiles one copy of a kernel for each class of its integer
 # arguments: equal to 1, a multiple of 16, or neither. Quail's row
@@ -173,11 +173,18 @@ def warm_label_readout(torch, head):
                     rows_per_answer=[1] * count if rows > 1 else None))
 
 
-def compile_kernels(torch, arena, pipeline, async_ans, budget):
-    """Build every DeepGEMM kernel configuration, then warm every path.
+def _triton_warmup_m_values(budget: int) -> list[int]:
+    """Token counts that compile the Ada block-FP8 GEMM tiles."""
+    return sorted({min(n, budget) for n in (1, 16, 64, 256, 1024, budget)})
 
-    Uses vLLM's warmup heuristic to list every token count up to the
-    budget at which the chosen GEMM configuration changes. A pipeline
+
+def compile_kernels(torch, arena, pipeline, async_ans, budget):
+    """Build every GEMM kernel configuration, then warm every path.
+
+    On DeepGEMM devices, uses vLLM's warmup heuristic to list every
+    token count up to the budget at which the chosen GEMM
+    configuration changes. On L40S, walks a few token counts through
+    the same Triton block-FP8 kernel Engine.gemm uses. A pipeline
     without gemm_warmup skips the GEMM sweep. Runs once per (software
     stack, GPU, model, budget).
     """
@@ -185,13 +192,17 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
         _forward_warm(torch, arena, pipeline, async_ans, budget,
                       join_chunk=True)
         return
-    from vllm.model_executor.warmup.deep_gemm_warmup import (
-        _generate_optimal_warmup_m_values,
-    )
     linears = pipeline.linears()
-    work = [(m, lin) for lin in linears
-            for m in _generate_optimal_warmup_m_values(
-                budget, lin.weight.shape[0], torch.device("cuda"))]
+    if pipeline.engine.use_deep_gemm:
+        from vllm.model_executor.warmup.deep_gemm_warmup import (
+            _generate_optimal_warmup_m_values,
+        )
+        work = [(m, lin) for lin in linears
+                for m in _generate_optimal_warmup_m_values(
+                    budget, lin.weight.shape[0], torch.device("cuda"))]
+    else:
+        counts = _triton_warmup_m_values(budget)
+        work = [(m, lin) for lin in linears for m in counts]
     progress = Progress("kernels: GEMM warmup", total=len(work),
                         unit="configurations", emit=logger.info)
     logger.info("kernels: starting %s GEMM warmup configurations", len(work))

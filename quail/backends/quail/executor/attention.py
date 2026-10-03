@@ -40,12 +40,32 @@ ATTENTION_PATHS = ("unified", "tree")
 
 
 def flash_attention_version(capability: tuple[int, int]) -> int:
-    """Select the attention implementation for a supported CUDA architecture."""
+    """Select the attention implementation for a supported CUDA architecture.
+
+    FlashAttention 3 is Hopper 9.x only. FlashAttention 4 covers 9.x,
+    10.x, and 11.x. FlashAttention 2 covers 8.0 and up. L40S (8.9)
+    uses 2; B200 (10.x) uses 4; H100 stays on 3; RTX PRO 6000 (12.0)
+    stays on 2.
+    """
+    major, _minor = capability
+    if capability == (8, 9):
+        return 2
     if capability == (9, 0):
         return 3
+    if major == 10:
+        return 4
     if capability == (12, 0):
         return 2
     raise ValueError(f"Quail does not support CUDA capability {capability}")
+
+
+def deep_gemm_supported(capability: tuple[int, int]) -> bool:
+    """Whether vLLM 0.26.0 enables DeepGEMM on this CUDA capability.
+
+    Matches CudaPlatform.support_deep_gemm: 9.0, 10.x, and 12.x.
+    """
+    major, _minor = capability
+    return capability == (9, 0) or major in (10, 12)
 
 
 def merge_partial(out, lse, index, out_c, lse_c) -> None:
@@ -97,7 +117,9 @@ class Engine:
                              f"got {kernels!r}")
         self.kernels = kernels
 
-        self.fa_version = flash_attention_version(torch.cuda.get_device_capability())
+        capability = torch.cuda.get_device_capability()
+        self.fa_version = flash_attention_version(capability)
+        self.use_deep_gemm = deep_gemm_supported(capability)
         self.torch = torch
         self.arena = arena
         self.rotary = rotary
@@ -121,16 +143,40 @@ class Engine:
     def gemm(self, q_input, input_scale, linear):
         if not self.is_fp8:
             return self.torch.nn.functional.linear(q_input, linear.weight)
-        # all linear projections (QKV, O, gate-up, down) run vLLM's
-        # DeepGEMM fp8 matmul; weights and scales are vLLM's layout
-        from vllm.utils.deep_gemm import fp8_gemm_nt
-        out = self.torch.empty(
-            (q_input.shape[0], linear.weight.shape[0]),
-            dtype=self.torch.bfloat16, device=q_input.device)
-        fp8_gemm_nt((q_input, input_scale),
-                    (linear.weight, self.weight_scale(linear)),
-                    out, is_deep_gemm_e8m0_used=self.use_ue8m0)
-        return out
+        weight_scale = self.weight_scale(linear)
+        if self.use_deep_gemm:
+            from vllm.utils.deep_gemm import fp8_gemm_nt
+            out = self.torch.empty(
+                (q_input.shape[0], linear.weight.shape[0]),
+                dtype=self.torch.bfloat16, device=q_input.device)
+            fp8_gemm_nt((q_input, input_scale),
+                        (linear.weight, weight_scale),
+                        out, is_deep_gemm_e8m0_used=self.use_ue8m0)
+            return out
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            w8a8_triton_block_scaled_mm,
+        )
+        return w8a8_triton_block_scaled_mm(
+            q_input, linear.weight,
+            self._triton_activation_scales(q_input, input_scale),
+            weight_scale, [GROUP, GROUP],
+            output_dtype=self.torch.bfloat16)
+
+    def _triton_activation_scales(self, q_input, input_scale):
+        """Return activation scales in the (tokens, groups) layout Triton wants.
+
+        Engine.quant writes column-major scales whose view is already
+        (tokens, K/128). A (groups, tokens) tensor is transposed.
+        """
+        groups = q_input.shape[-1] // GROUP
+        tokens = q_input.shape[0]
+        if input_scale.shape == (tokens, groups):
+            return input_scale
+        if input_scale.shape == (groups, tokens):
+            return input_scale.transpose(0, 1)
+        raise ValueError(
+            f"activation scales {tuple(input_scale.shape)} do not match "
+            f"tokens={tokens} groups={groups}")
 
     def quant(self, x):
         if not self.is_fp8:
@@ -794,7 +840,7 @@ class Engine:
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None, softmax_scale=None,
             window=None, version=None):
-        # vLLM's FA2 and FA3 both accept 16-token pages and return
+        # vLLM's FA2, FA3, and FA4 accept 16-token pages and return
         # LSE as [heads, total_queries] for the merge kernel.
         from vllm.vllm_flash_attn import flash_attn_varlen_func
         extra = {}
