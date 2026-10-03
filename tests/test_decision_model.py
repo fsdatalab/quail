@@ -284,7 +284,8 @@ def _package(tmp_path):
                "layers.0.mlp.down_proj.weight": torch.ones(2, 2,
                                                            dtype=torch.bfloat16)},
               str(src / "backbone" / "model.safetensors"))
-    for name in model.DECISION2_COPIED:
+    for name in ("tokenizer.json", "tokenizer_config.json", "decision_config.json",
+                 "decision_head.safetensors"):
         (src / name).write_text(name)
     return src
 
@@ -303,7 +304,7 @@ def test_decision2_package_converts_once_to_a_bf16_qwen3_checkpoint(
     finally:
         model.checkpoint_path.cache_clear()
     assert dest == str(tmp_path / "hf" / "quail-checkpoints"
-                       / model.DECISION2_FORMAT / "models--org--decision"
+                       / "qwen3-bf16-v1" / "models--org--decision"
                        / "abc123")
     config = json.loads((tmp_path / dest / "config.json").read_text())
     assert config["architectures"] == ["Qwen3ForCausalLM"]
@@ -312,12 +313,47 @@ def test_decision2_package_converts_once_to_a_bf16_qwen3_checkpoint(
     assert sorted(tensors) == ["model.embed_tokens.weight",
                                "model.layers.0.mlp.down_proj.weight"]
     assert {t.dtype for t in tensors.values()} == {torch.bfloat16}
-    for name, copy in model.DECISION2_COPIED.items():
-        assert (tmp_path / dest / copy).read_text() == name
+    for name in ("tokenizer.json", "tokenizer_config.json", "decision_config.json"):
+        assert (tmp_path / dest / name).read_text() == name
+    assert (tmp_path / dest / "head" / "decision_head.safetensors").read_text() == (
+        "decision_head.safetensors")
     # vLLM loads every top-level safetensors file as model weights
     assert sorted(p.name for p in (tmp_path / dest).glob("*.safetensors")) == [
         "model.safetensors"]
     assert not model.is_decision2(dest)
+    with monkeypatch.context() as patch:
+        def unexpected_conversion(*args):
+            pytest.fail("a saved checkpoint must not be converted again")
+
+        patch.setattr(model, "convert_decision2", unexpected_conversion)
+        assert model.checkpoint_path("org/decision", "abc123") == dest
+    with monkeypatch.context() as patch:
+        def unexpected_copy(*args):
+            pytest.fail("a completed conversion must not copy files again")
+
+        patch.setattr(model.shutil, "copyfile", unexpected_copy)
+        model.convert_decision2(src, dest)
+    model.checkpoint_path.cache_clear()
+
+
+def test_failed_checkpoint_conversion_cleans_up_and_can_retry(tmp_path, monkeypatch):
+    src = _package(tmp_path)
+    dest = tmp_path / "converted" / "checkpoint"
+    copy = model.shutil.copyfile
+
+    def fail_head(source, destination):
+        if source.name == "decision_head.safetensors":
+            raise OSError("head copy failed")
+        return copy(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(model.shutil, "copyfile", fail_head)
+        with pytest.raises(OSError, match="head copy failed"):
+            model.convert_decision2(src, dest)
+    assert not dest.exists()
+    assert not any(path.is_dir() for path in dest.parent.iterdir())
+    model.convert_decision2(src, dest)
+    assert (dest / "head" / "decision_head.safetensors").is_file()
 
 
 def test_a_decision_classification_is_reestimated(session):

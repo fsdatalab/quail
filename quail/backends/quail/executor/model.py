@@ -23,6 +23,7 @@ import os
 import shutil
 from functools import lru_cache
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from quail.backends.quail.executor.moe_configs import write_configs
 from quail.progress import say
@@ -45,17 +46,6 @@ def resolve_model_path(model_name: str, revision: str | None = None) -> str:
     return path
 
 
-# files a converted Decision 2.0 checkpoint keeps from the original;
-# vLLM loads every safetensors file at the top level as model weights,
-# so the head goes in a subfolder
-DECISION2_COPIED = {"tokenizer.json": "tokenizer.json",
-                    "tokenizer_config.json": "tokenizer_config.json",
-                    "decision_config.json": "decision_config.json",
-                    "decision_head.safetensors": "head/decision_head.safetensors"}
-# names the converted layout; a new layout converts again
-DECISION2_FORMAT = "qwen3-bf16-v1"
-
-
 def is_decision2(path) -> bool:
     """Whether a checkpoint directory holds a Decision 2.0 package."""
     config = Path(path) / "config.json"
@@ -71,7 +61,8 @@ def checkpoint_path(model_name: str, revision: str | None = None) -> str:
         return path
     hf_home = os.environ.get("HF_HOME", "~/.cache/huggingface")
     snapshot = Path(path).resolve()
-    dest = (Path(hf_home).expanduser() / "quail-checkpoints" / DECISION2_FORMAT
+    # Change the format version when converted checkpoints become incompatible.
+    dest = (Path(hf_home).expanduser() / "quail-checkpoints" / "qwen3-bf16-v1"
             / snapshot.parent.parent.name / snapshot.name)
     if not (dest / "model.safetensors").is_file():
         say(f"converting {model_name} to a Qwen3 checkpoint at {dest}")
@@ -88,29 +79,36 @@ def convert_decision2(src, dest) -> None:
         dest: The directory to create. It appears only once complete.
     """
     import torch
+    from huggingface_hub.utils import WeakFileLock
     from safetensors.torch import load_file, save_file
 
     src, dest = Path(src), Path(dest)
-    config = json.loads((src / "backbone" / "config.json").read_text())
-    if config.get("model_type") != "qwen3":
-        raise ValueError(
-            f"{src}: the backbone is {config.get('model_type')!r}, not 'qwen3'")
-    config.update(architectures=["Qwen3ForCausalLM"], torch_dtype="bfloat16",
-                  dtype="bfloat16")
-    tensors = {
-        f"model.{name}": tensor.to(torch.bfloat16).contiguous()
-        for name, tensor in load_file(
-            str(src / "backbone" / "model.safetensors")).items()}
-    tmp = dest.with_name(dest.name + ".tmp")
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True)
-    (tmp / "config.json").write_text(json.dumps(config, indent=2))
-    save_file(tensors, str(tmp / "model.safetensors"))
-    (tmp / "head").mkdir()
-    for name, copy in DECISION2_COPIED.items():
-        shutil.copyfile(src / name, tmp / copy)
-    shutil.rmtree(dest, ignore_errors=True)
-    tmp.rename(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with WeakFileLock(dest.with_suffix(".lock")):
+        if (dest / "model.safetensors").is_file():
+            return
+        config = json.loads((src / "backbone" / "config.json").read_text())
+        if config.get("model_type") != "qwen3":
+            raise ValueError(
+                f"{src}: the backbone is {config.get('model_type')!r}, not 'qwen3'")
+        config.update(architectures=["Qwen3ForCausalLM"], torch_dtype="bfloat16",
+                      dtype="bfloat16")
+        tensors = {
+            f"model.{name}": tensor.to(torch.bfloat16).contiguous()
+            for name, tensor in load_file(
+                str(src / "backbone" / "model.safetensors")).items()}
+        with TemporaryDirectory(dir=dest.parent, prefix=f"{dest.name}-") as folder:
+            staging = Path(folder)
+            (staging / "config.json").write_text(json.dumps(config, indent=2))
+            save_file(tensors, str(staging / "model.safetensors"))
+            for filename in ("tokenizer.json", "tokenizer_config.json",
+                             "decision_config.json"):
+                shutil.copyfile(src / filename, staging / filename)
+            # vLLM treats every top level safetensors file as backbone weights.
+            (staging / "head").mkdir()
+            shutil.copyfile(src / "decision_head.safetensors",
+                            staging / "head" / "decision_head.safetensors")
+            staging.rename(dest)
 
 
 class _SingleRank:
