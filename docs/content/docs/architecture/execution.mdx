@@ -6,7 +6,7 @@ All queries run inside a
 [session](/docs/user-guide/sessions). The session loads the model,
 allocates the KV arena, and keeps tokenized documents in memory.
 When `run()` or `collect()` is called, the
-[planner](/docs/architecture/planning) produces a physical plan and
+[optimizer](/docs/architecture/optimizer) produces a physical plan and
 the execution engine runs it.
 
 The engine overlaps CPU and GPU work: while the GPU processes the
@@ -39,34 +39,18 @@ token budget and a KV page budget.
   documents; the KV page budget is the bottleneck for queries with
   fewer long documents). A forward pass with short documents fits
   more documents than a forward pass with long documents.
-- **KV rewind.** Each predicate appends question tokens after the
-  document. Once the model answers, Quail drops the KV for the
-  question tokens and keeps only the KV for the document prefix.
-  The next predicate reuses the document prefix KV and appends its
-  own question tokens. A document that fails (returns FALSE) or
-  won't be used again in the query has all its KV freed.
-
-### Prefix sharing
-
-Quail uses **prefix caching** to avoid recomputing identical beginnings
-of documents. For example, agent traces saved after successive turns
-repeat earlier turns. Quail can reuse KV for those repeated tokens.
-
-- The planner enables caching automatically when its estimated compute
-  savings exceed the extra cost of writing KV.
-- Filters share document prefixes. Joins share prefixes between anchors.
-  Reuse is limited to documents on the same GPU.
-- If the needed KV is unavailable, Quail computes the tokens again.
-  Filters executing with a row limit skip sharing to preserve row order.
-
-See the [prefix caching design](/docs/architecture/prefix-caching)
-for the data structure, example, and precedents, and
-[Planning](/docs/architecture/planning#deciding-whether-to-share-prefixes)
-for the cost comparison.
+- **KV rewind.** Each predicate adds its question after the
+  document's KV. After the answer, Quail removes the question's KV
+  and keeps the document's KV for the next predicate. See
+  [KV rewind](/docs/architecture/kv#kv-rewind).
+- **Prefix sharing.** Documents that start with the same tokens
+  compute the shared part one time. Filters share document prefixes,
+  and joins share prefixes between anchors. See
+  [Prefix sharing](/docs/architecture/kv#prefix-sharing).
 
 ### Join execution
 
-Recall from [Planning](/docs/architecture/planning#deciding-join-order-and-anchors)
+Recall from the [optimizer](/docs/architecture/optimizer#join_order)
 that the planner picks one side of a join as the *anchor* (the table
 with longer documents, whose KV stays in GPU memory) and the other
 as the *partner* (the table whose documents stream past). During
@@ -82,11 +66,9 @@ sharing one anchor's KV.
   evaluating join partners against it right away.
 - **Gating.** After evaluating all partners for a group of anchors,
   Quail drops any anchor that matched no partner and frees its KV.
-- **KV retention across joins.** When a query has multiple joins in
-  sequence, Quail keeps anchor document KV from earlier joins so it
-  can be reused in later joins without reprocessing. If GPU memory
-  runs out, Quail evicts the least valuable KV and reprocesses the
-  document later.
+- **KV retention across joins.** Quail keeps the anchor KV of a join
+  when a later join uses the same anchors. See
+  [KV retention](/docs/architecture/kv#kv-retention).
 
 ### Classification execution
 
@@ -94,7 +76,7 @@ A classification uses the same token and KV page budgets as filters
 and joins. In a pipeline, it runs after the filters of its table and
 uses the document's KV again. With `trie_decode`, one label can need
 several model passes. All of them belong to one `AiClassify` node. See
-[scoring methods](/docs/architecture/planning#choosing-classification-scoring).
+[label scoring](/docs/architecture/optimizer#label_scoring).
 
 #### Classifying joined rows
 
@@ -148,7 +130,7 @@ that each KV value is read from GPU memory only once.
 The planner enables the tree path only for models with FP8 weights
 and no canvas tokens, the extra rows used by DiffusionGemma. Other
 models use unified attention. See the
-[attention cost comparison](/docs/architecture/planning#choosing-the-attention-path).
+[attention cost comparison](/docs/architecture/optimizer#tree_attention).
 
 The `tree` attention path is a choice of attention computation.
 SGLang's RadixAttention names a prefix caching mechanism; it is not

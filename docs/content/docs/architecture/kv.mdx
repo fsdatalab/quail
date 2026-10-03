@@ -1,0 +1,145 @@
+---
+title: KV
+---
+
+KV is the key and value vectors that attention stores for each token.
+Quail keeps a document's KV in GPU memory so that later questions on
+the same document do not compute the document again. This page
+describes how Quail stores KV and the three ways it uses KV again:
+KV rewind, prefix sharing, and KV retention.
+
+## Paged KV
+
+Quail stores KV in pages of 16 tokens. One arena holds all pages. It
+is allocated when the session starts.
+
+- Each document has a list of page IDs.
+- Each page has a count of the documents that hold it. A page is free
+  when its last holder releases it.
+- The number of pages comes from the GPU memory that is free after
+  the model weights. See
+  [physical plan settings](/docs/architecture/optimizer#physical-plan-settings).
+
+Code:
+[`PageArena` and `KVArena`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py).
+
+## KV rewind
+
+A filter with more than one predicate asks each question after the
+same document.
+
+1. The first predicate computes the document and its first question.
+2. After the model answers, Quail removes the KV of the question
+   tokens and keeps the KV of the document.
+3. The next predicate adds only its question tokens after the
+   document's KV.
+4. When a document fails a predicate, or no later operator reads it,
+   Quail frees all of its KV.
+
+For example, a query has two predicates over 5,000 IMDB reviews, each
+with a 51-token question. The first predicate computes 1,729,233
+tokens and passes 1,218 reviews. The second predicate computes only
+1,218 × 51 = 62,118 question tokens. Without KV rewind, it would also
+compute each review again.
+
+A join uses KV the same way: each partner is added after the anchor's
+KV, and then removed. A classification uses the KV of the filters
+before it.
+
+The code name of KV rewind is "chain mode".
+
+## Prefix sharing
+
+When documents start with the same tokens, Quail computes the shared
+part one time. For example, agent traces saved after each turn repeat
+the earlier turns.
+
+The [`prefix_sharing` rule](/docs/architecture/optimizer#prefix_sharing)
+turns this on when the saved compute is more than the cost of the
+extra KV writes.
+
+### The sharing plan
+
+Quail plans the sharing before execution, because it has all input
+documents.
+[`PrefixTree`](https://github.com/fsdatalab/quail/blob/main/quail/execution/tokens.py)
+holds the plan in three lists:
+
+| List | Contents |
+| --- | --- |
+| `order` | Document indices, sorted by token sequence. |
+| `parent` | For each document, the earlier document that supplies its shared KV, or `None`. |
+| `shared` | For each document, the number of prefix tokens it uses again. |
+
+Quail makes the lists in three steps:
+
+1. Sort the documents by token sequence.
+2. Find the common prefix of each document and the document before it.
+   Round its length down to full pages. The last token of each
+   document is always computed.
+3. Make the document before it the parent. If that document also
+   uses the full prefix again, follow its parent links to the document
+   that supplies the prefix.
+
+For example, documents 0, 1, and 2 hold the first 1,000, 1,400, and
+1,900 tokens of the same agent trace:
+
+```python
+order = [0, 1, 2]
+parent = [None, 0, 1]
+shared = [0, 992, 1392]
+```
+
+Quail computes 1,000 + 408 + 508 = 1,916 document tokens, compared
+with 4,300 without sharing.
+
+### Execution
+
+- The executor takes the documents in `order`. A document waits until
+  its parent has started.
+- A document that uses a prefix puts the parent's page IDs in its
+  own page list. The KV is not copied.
+- Quail keeps a parent's pages while a document that needs them is
+  still waiting.
+- If the parent's KV is not available, the document computes the
+  prefix again.
+- Sharing works only between documents on the same GPU. A filter with
+  a row limit does not share, so that the row order stays the same.
+
+Code:
+[`Borrowing`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pack.py).
+
+### Comparison with vLLM and SGLang
+
+The mechanism is the same prefix caching as
+[vLLM Automatic Prefix Caching](https://docs.vllm.ai/en/latest/design/prefix_caching/)
+and [SGLang RadixAttention](https://www.lmsys.org/blog/2024-01-17-sglang/).
+Only the lookup is different:
+
+- vLLM finds reusable blocks by a hash of their tokens and the prefix
+  before them
+  ([`get_computed_blocks`](https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/kv_cache_manager.py)).
+- SGLang searches and updates a radix tree while requests run
+  ([`RadixCache`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py)).
+- Quail makes parent links before execution, because it has all
+  input documents.
+
+## KV retention
+
+A document's KV can stay in GPU memory after its operator ends, so
+that a later operator uses it again. For example, the anchors of one
+join are the anchors of the next join.
+
+- The [`kv_retention` rule](/docs/architecture/optimizer#kv_retention)
+  chooses which operators keep KV, and for which later operator.
+- Retained KV can use all pages except the pages for two forward
+  passes.
+- When pages run out, Quail first removes the KV with the lowest
+  priority. The priority is the probability that a later operator
+  reads the document, times the seconds to compute it again, divided
+  by its pages.
+- A removed document is computed again when an operator needs it.
+
+Code:
+[`cost/retention.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/retention.py),
+[`planner/retention.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/retention.py).

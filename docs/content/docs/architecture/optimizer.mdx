@@ -1,0 +1,228 @@
+---
+title: Optimizer
+---
+
+The optimizer turns a logical plan into a physical plan. Named rules
+make each decision, for example the filter order or the anchor of a
+join. Most rules compare candidates by their estimated time from the
+[cost model](/docs/architecture/cost-model).
+
+To write your own rule, see [Rules](/docs/extending/rules).
+
+## Steps
+
+`Query.plan()` runs these steps:
+
+1. Get the token count of each document. If tokenization is not
+   finished, estimate each count from the tokens per byte of the
+   first 1,024 documents.
+2. Run the logical rules in order. Repeat them until a pass changes
+   nothing, for a maximum of four passes (`MAX_PASSES`).
+3. Build the physical plan from the logical plan
+   (`build_physical_plan`). This step also sets the token budget and
+   the KV capacity.
+4. Run the physical rules in order, one time each.
+5. When tokenization finishes, run the physical rules again on the
+   exact tokens (`refine_plan`). The logical decisions do not change.
+
+## Rules
+
+The rules run in this order. Extension rules run after the built-in
+rules of the same kind.
+
+| Rule | Kind | Decides | Cost-based |
+| --- | --- | --- | --- |
+| `projection_pushdown` | Logical | Which columns each `Scan` loads: only the columns that the query uses. | No |
+| `filter_pushdown` | Logical | Moves a filter that does not use the model, such as an `Apply` or a label `Filter`, below the joins, onto its table. | No |
+| `classify_placement` | Logical | Puts the classifications of a joined table before the joins or after them. | Yes |
+| `filter_order` | Logical | The order of each table's `AI.IF` predicates. | Yes |
+| `join_order` | Logical | The order of the joins and the anchor of each join. | Yes |
+| `kv_retention` | Physical | Which documents keep their KV between operators. | Yes |
+| `label_scoring` | Physical | How each classification reads its label. | Yes |
+| `prefix_sharing` | Physical | Whether documents use the KV of a shared prefix again. | Yes |
+| `tree_attention` | Physical | The attention path of each filter and join: unified or tree. | Yes |
+
+Code:
+[`logical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py),
+[`physical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_rules.py).
+
+A cost-based logical rule does nothing in these cases:
+
+- The session has no model spec.
+- The backend is not `quail`.
+- The model weights do not fit on one GPU.
+- The query has an `AI.SCORE`. The reranker planner plans it.
+
+`explain(verbose=True)` shows the decisions of the physical rules as
+plan settings, for example `share_prefixes` and `attention`.
+
+## classify_placement
+
+A classification of a joined table can run at one of two places:
+
+- **Before the joins.** It labels every document that the table's
+  `AI.IF` filters keep. A filter on its label then makes the join's
+  input smaller.
+- **After the joins.** It labels only the documents that the joins
+  keep.
+
+The rule keeps the plan as written unless the plan with the
+classifications after the joins has a lower estimated time.
+
+## filter_order
+
+When a table has more than one `AI.IF` predicate, the rule chooses
+their order.
+
+- The first predicate reads each full document.
+- Each later predicate reads only its question. The document's KV is
+  already in GPU memory.
+- A predicate's selectivity sets how many documents reach the next
+  predicate.
+
+The rule sorts the predicates by their cost per rejected document.
+Then it tries each predicate as the first one and keeps the order
+with the lowest expected time. The
+[blog post](https://fsdatalab.github.io/blog/ai-filter-cost-estimates/)
+gives the derivation.
+
+With `order="as_written"`, the predicates run in the written order.
+
+## join_order
+
+When a query has more than one join, the rule chooses the order of
+the joins and the anchor of each join. The anchor is the side whose
+document KV stays in GPU memory. Each partner document is added
+after it.
+
+- The rule searches left-deep plans only: each join adds one table.
+- For each join, it tries both anchors. A long anchor document is
+  computed one time. A long partner document is computed again for
+  each anchor that it pairs with.
+- The search uses dynamic programming, as in
+  [Selinger et al. (1979)](https://doi.org/10.1145/582095.582099).
+  A state is the set of joined tables and the tables whose KV is in
+  GPU memory. The search drops a state when another state with the
+  same tables does less work in all four work counts: tokens,
+  attention pairs, KV writes, and KV reads.
+- The rule ranks the plans by the estimated time of the whole query,
+  including the filters.
+
+A join with a written anchor keeps that anchor. With
+`order="as_written"`, the rule chooses only the anchors.
+
+## Physical plan settings
+
+`build_physical_plan` sets two limits:
+
+- **Token budget.** The most tokens in one forward pass. It is set
+  from the GPU memory that is free after the model weights, and from
+  the index limits of the kernels.
+- **KV capacity.** The number of KV pages in GPU memory.
+
+## kv_retention
+
+The rule chooses which documents keep their KV between operators.
+
+- A filter keeps the KV of the documents it passes when a later join
+  anchors on its table.
+- A join keeps the KV of its anchors when a later join anchors on the
+  same table.
+- When KV pages run out, Quail first removes the KV that saves the
+  least future work per page. A removed document is computed again
+  when an operator needs it.
+
+See [KV retention](/docs/architecture/kv#kv-retention).
+
+## label_scoring
+
+The rule chooses how each classification reads its label. It
+estimates the time of each scoring rule that the model supports and
+uses the fastest one.
+
+For example, a classification gives each customer message one of the
+labels `['refund', 'praise']`. For the message "Please refund my
+order":
+
+- `letters`: The prompt gives each label a letter: A for "refund" and
+  B for "praise". Quail compares the model's scores for A and B. If A
+  has 0.8 and B has 0.2, Quail returns "refund". Each letter must be
+  one token.
+- `trie_tree`: Quail scores each label as the product of the
+  probabilities of its tokens. If "refund" has two tokens with
+  probabilities 0.8 and 0.6, its score is 0.48. If "praise" has 0.3,
+  Quail returns "refund". Labels that start with the same tokens share
+  that part of the work. This rule needs the tree attention path.
+- `trie_decode`: Quail chooses the label one token at a time. At each
+  step it allows only the tokens that continue one of the labels. If
+  the tokenizer splits "refund" into "re" and "fund", and the model
+  chooses "re", Quail continues with "fund" and returns "refund". A
+  label cannot be the start of a longer label.
+
+These limits apply:
+
+- `trie_decode` needs a model without canvas tokens, and documents
+  whose KV is not already in GPU memory.
+- A classification of joined rows uses `letters`.
+- With `probabilities=true`, Quail scores every label, so it does not
+  use `trie_decode`.
+- For DiffusionGemma, see
+  [DiffusionGemma](/docs/user-guide/models#diffusiongemma).
+
+Code:
+[`planner/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/classify.py),
+[`cost/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/classify.py).
+
+## prefix_sharing
+
+The rule turns on [prefix sharing](/docs/architecture/kv#prefix-sharing)
+when the compute it saves is more than the cost of the KV writes it
+adds:
+
+```text
+saved_seconds = shared_tokens * 2 * model.params / device.peak_flops
+write_seconds = total_tokens * model.kappa / device.hbm_bw
+```
+
+- `shared_tokens` is the number of prefix tokens that Quail does not
+  compute again. It counts full KV pages only.
+- `total_tokens` is the number of document tokens of the filter.
+- `model.kappa` is the KV bytes per token, over all layers.
+- `write_seconds` is zero for an operator that writes KV anyway, such
+  as a join.
+
+The comparison leaves out sorting, scheduling, attention, and
+recomputation. Prefix matching needs the token sequences, so the
+rule gives its final answer when the rules run again on the exact
+tokens.
+
+## tree_attention
+
+The rule chooses the attention path of each filter and join. For a
+group of `r` documents that each add `q` tokens after a shared prefix
+of `s` tokens:
+
+```text
+unified_seconds = r * attention_seconds(q, s)
+tree_seconds = attention_seconds(r * q, s) + merge_seconds
+```
+
+- `attention_seconds(q, s)` is the larger of the compute time and the
+  memory time for `q` new tokens over `s` KV tokens, summed over the
+  layers.
+- `merge_seconds` is the time to read two partial outputs and write
+  one output, over all layers.
+- A join uses its estimated partners per anchor, its tokens per
+  partner, and its mean anchor length.
+- A filter compares the two paths for each group of documents with
+  the same parent. Each group votes for its cheaper path, weighted by
+  the tokens it uses again. Ties go to unified.
+- The tree path needs FP8 weights and no canvas tokens. Other models
+  use unified.
+
+The estimate uses the FP8 peak FLOP/s for attention, but attention
+runs in BF16. This makes the compute part of attention too low on an
+H100. The estimate does not count kernel launch time.
+
+Code:
+[`choose_attention_path`](https://github.com/fsdatalab/quail/blob/main/quail/cost/budgets.py).
