@@ -33,6 +33,7 @@ from quail.physical import (
 )
 from quail.planner import retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
+from quail.planner.reranker import score_fixed_tokens
 from quail.planner.statistics import cached_statistics, live_after_filters
 
 
@@ -298,7 +299,8 @@ class PrefixSharing:
                         context.model, context.device, shared_tokens=shared,
                         total_tokens=sum(lengths), writes_pages=False):
                     node = replace(node, spec=_shared_score_spec(
-                        node.spec, shared, lengths))
+                        node.spec, shared, lengths,
+                        context.model.canvas_tokens))
                     changed = True
             nodes.append(node)
         if not changed:
@@ -315,13 +317,15 @@ def _shared_classify_spec(node, context, store, *, resident=False):
     return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
 
 
-def _shared_score_spec(spec, shared_tokens, lengths):
+def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):
     """Enable prefix sharing and scale the score's estimate by its fresh tokens.
 
-    Assumes every document is scored, so each shared token is borrowed
-    once, and that time is proportional to fresh tokens.
+    Assumes time is proportional to the tokens the score computes, and
+    that the scored documents borrow the same share of their tokens as
+    the whole table.
     """
-    total = sum(lengths) + len(lengths) * sum(map(len, spec.prompt_token_parts))
+    fixed = score_fixed_tokens(spec.prompt_token_parts, canvas_tokens, spec.draws)
+    total = sum(lengths) + len(lengths) * fixed
     fresh = max(0.0, 1.0 - shared_tokens / total) if total else 1.0
     return replace(spec, share_prefixes=True,
                    estimated_seconds=spec.estimated_seconds * fresh)

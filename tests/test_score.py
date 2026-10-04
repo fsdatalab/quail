@@ -1,5 +1,6 @@
 """AI.SCORE parsing, planning, execution, and score semantics."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -639,11 +640,11 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     from quail.planner.plan import PhysicalPlan
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
-    def graph(aliases):
+    def graph(aliases, draws=1):
         spec = ScoreSpec(
             name="score", aliases=aliases, query_template="", arguments=(),
             expected_inputs=20, estimated_seconds=10.0,
-            prompt_token_parts=((1,),) * (len(aliases) + 1))
+            prompt_token_parts=((1,),) * (len(aliases) + 1), draws=draws)
         nodes = tuple(Scan(node_id=f"input:{alias}", alias=alias,
                            input_id=alias) for alias in aliases)
         score = AiScore(
@@ -681,6 +682,12 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
         (PrefixSharing(),), context)
     assert plan.estimated_seconds == pytest.approx(
         12.0 - 10.0 + spec.estimated_seconds)
+    # a 256-token canvas and four draws add 2 + 256 + 3 x 257 = 1,029
+    # tokens per document that sharing does not save
+    canvas = replace(context, model=replace(QWEN3_4B_FP8, canvas_tokens=256))
+    spec = scored(PrefixSharing().rewrite(graph(("d",), draws=4), canvas))
+    assert spec.estimated_seconds == pytest.approx(
+        10.0 * (1 - 19 * 400 / (8020 + 20 * 1029)))
     assert ScoreSpec.from_mapping(spec.to_dict()) == spec
     # documents with nothing in common share nothing
     assert PrefixSharing().rewrite(graph(("e",)), context) is None
