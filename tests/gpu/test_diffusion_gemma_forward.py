@@ -89,13 +89,13 @@ def test_expert_fusions_preserve_quantization(rows):
 
 
 def _prompt_ids():
-    from transformers import AutoTokenizer
+    from gigatoken import Tokenizer
 
     from quail.logical import bind_prompt, render_filter_prompt_ids
     from quail.specs import MODELS
 
     spec = MODELS[MODEL]
-    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    tokenizer = Tokenizer(spec.hf_name).as_hf()
 
     def ids(text):
         return tokenizer(text, add_special_tokens=False)["input_ids"]
@@ -254,7 +254,7 @@ def test_no_layer_departs_from_stock_vllm(stock_layers, quail):
 
 
 def test_answers_agree_with_stock_vllm(stock_layers, quail):
-    from transformers import AutoTokenizer
+    from gigatoken import Tokenizer
 
     from quail.logical import true_false_ids
     from quail.specs import MODELS
@@ -264,7 +264,7 @@ def test_answers_agree_with_stock_vllm(stock_layers, quail):
     rows = [rows[-1] for rows in quail_layers]
     spec = MODELS[MODEL]
     true_ids, false_ids = true_false_ids(
-        AutoTokenizer.from_pretrained(spec.hf_name))
+        Tokenizer(spec.hf_name).as_hf())
     columns = list(model.quail_answer_token_ids)
     weights = model.quail_answer_weights.float().cpu()
     norm = model.model.norm

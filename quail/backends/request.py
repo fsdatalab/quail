@@ -39,6 +39,7 @@ from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical import (
     Alias,
     Apply,
+    answer_row_offsets,
     effective_selectivity,
     filter_question_text,
     join_label,
@@ -146,7 +147,10 @@ def plan_request_backend(
     # a diffusion model's vLLM canvas is sized for a filter's one
     # answer token, not a label
     scores_labels = scores_labels and not context.model.canvas_tokens
-    if classifies and not (scores_labels and context.tokenizer is not None):
+    # a decision model scores one option block per label
+    decides = context.model.role == "decision"
+    if classifies and not ((scores_labels or decides)
+                           and context.tokenizer is not None):
         reason = (f"AI.CLASSIFY on {backend_name} decodes each answer as "
                   f"text, which its engine does not return for "
                   f"{context.model.name!r}"
@@ -301,6 +305,8 @@ def plan_request_backend(
                 (test.position, test.values)
                 for test in operators.label_filters.get(alias, ())
                 if test.call == call),
+            option_offsets=(_option_offsets(call.prompt, context.tokenizer)
+                            if decides else ()),
             **pair,
         ))
 
@@ -439,6 +445,9 @@ def plan_request_backend(
             "true_ids": true_ids,
             "false_ids": false_ids,
             "order_rule": rule,
+            **({"decision_offsets": list(answer_row_offsets(
+                context.model.prompt_layout, context.tokenizer,
+                context.model.turn_suffix))} if decides else {}),
         },
     )
     return (PhysicalCandidate(
@@ -446,6 +455,17 @@ def plan_request_backend(
         plan=plan,
         estimated_seconds=plan.estimated_seconds,
     ),)
+
+
+def _option_offsets(prompt, tokenizer) -> tuple[int, ...]:
+    """Distances before a choice prompt's last row of each option's end, then 0.
+
+    The tail's segments are the question, one block per option, and
+    the close, each tokenized apart.
+    """
+    lengths = [len(tokenizer(segment)) for segment in prompt.tail_segments]
+    return tuple(sum(lengths[index + 1:])
+                 for index in range(1, len(lengths) - 1)) + (0,)
 
 
 def _filter_answer_table(alias, written_positions, answers) -> pa.Table:
@@ -671,6 +691,41 @@ def _classify_documents(client, spec, bodies) -> dict:
     }
 
 
+def _choose_documents(client, spec, bodies) -> dict:
+    """Score one option block per label per prompt body; take the best label.
+
+    Args:
+        client: The decision engine client.
+        spec: The RequestClassifySpec with the labels, the prompt tail,
+            and the option offsets.
+        bodies: Token ids for each prompt before the tail, preamble included.
+
+    Returns:
+        The same fields as _classify_documents; no answer is unmatched
+        and none generates tokens.
+    """
+    from quail.backends.vllm_decision import choice_index, pooling_params
+
+    tail = _token_list(spec.tail_token_ids)
+    prompts = [{"prompt_token_ids": body + tail} for body in bodies]
+    started = time.perf_counter()
+    outputs = (client.generate(prompts, pooling_params(spec.option_offsets))
+               if prompts else [])
+    wall_s = time.perf_counter() - started
+    prompt_tokens = sum(len(output.prompt_token_ids) for output in outputs)
+    cached_tokens = sum(int(output.num_cached_tokens or 0) for output in outputs)
+    return {
+        "labels": [spec.labels[choice_index(output)] for output in outputs],
+        "wall_s": wall_s,
+        "requests": len(prompts),
+        "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
+        "fresh_tokens": prompt_tokens - cached_tokens,
+        "generated_tokens": 0,
+        "unmatched": 0,
+    }
+
+
 class RequestModelExecution:
     """Execute one request engine node with one loaded engine."""
 
@@ -690,10 +745,21 @@ class RequestModelExecution:
             self.read_answer = text_answer
         else:
             self.read_answer = partial(true_bit, true_ids=true_ids)
+        self.decides = context.model.role == "decision"
+        if self.decides:
+            from quail.backends.vllm_decision import decision_bit, pooling_params
+
+            self.sampling_params = pooling_params(settings["decision_offsets"])
+            self.read_answer = decision_bit
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
         self.join_submission = settings["join_submission"]
         self.submit_text = bool(getattr(self.client, "accepts_text", False))
+
+    def _classify(self, spec, bodies) -> dict:
+        if self.decides:
+            return _choose_documents(self.client, spec, bodies)
+        return _classify_documents(self.client, spec, bodies)
 
     def _join_submission(self, prefixes) -> str:
         """Suffix-major only when every anchor prefix fits in KV at once.
@@ -811,8 +877,8 @@ class RequestModelExecution:
             if spec.partner is not None:
                 continue
             document_ids = list(survivors[spec.alias])
-            result = _classify_documents(
-                self.client, spec, [
+            result = self._classify(
+                spec, [
                     _token_list(node.preamble_token_ids)
                     + _token_list(self.documents[spec.alias][document])
                     for document in document_ids])
@@ -1023,8 +1089,8 @@ class RequestModelExecution:
                              kept.column(spec.partner).to_pylist()))
             note, partner_label = (
                 _token_list(ids) for ids in spec.join_layout_token_ids)
-            result = _classify_documents(
-                self.client, spec, [
+            result = self._classify(
+                spec, [
                     _token_list(node.preamble_token_ids)
                     + _token_list(self.documents[spec.alias][anchor])
                     + note + partner_label
@@ -1192,10 +1258,11 @@ class RequestBackend:
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
         label = self.engine.label
-        if model.role != "generative":
+        roles = getattr(self.engine, "roles", frozenset({"generative"}))
+        if model.role not in roles:
             return SupportResult.reject(
                 f"{label} does not support model {model.name!r}: "
-                f"the request backends serve generative models only"
+                f"it serves {', '.join(sorted(roles))} models"
             )
         if device.name not in SUPPORTED_DEVICES:
             return SupportResult.reject(

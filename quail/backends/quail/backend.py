@@ -50,12 +50,14 @@ class QuailModelExecution:
             raise RuntimeError("Quail model execution has no bound query")
         return self._query
 
-    def bind_loaded_model(self, *, model, arena, pipeline) -> None:
+    def bind_loaded_model(self, *, model, arena, pipeline,
+                          decision_head=None) -> None:
         """Attach the loaded model and discard the previous model's caches."""
         self.close()
         self.loaded_model = LoadedModelState(
             model=model, arena=arena, pipeline=pipeline,
-            model_spec=getattr(self.context, "model", None))
+            model_spec=getattr(self.context, "model", None),
+            decision_head=decision_head)
 
     def close(self) -> None:
         """Drop every reference to the loaded model so its memory can go."""
@@ -64,11 +66,14 @@ class QuailModelExecution:
         self.loaded_model = None
 
     def bind_query(self, *, torch, async_answers, answer_rows,
-                   chunk_tokens: int) -> None:
+                   chunk_tokens: int, async_scores=None) -> None:
         """Attach state that is valid for the current query.
 
         answer_rows are the retained output rows every readout scores
         against; async_answers is the TRUE/FALSE readout over them.
+        async_scores is the AI.SCORE readout of a model that does not
+        score with answer rows, or None to score yes against no over
+        answer_rows.
         """
         loaded = self.loaded_model
         if loaded is None:
@@ -83,6 +88,7 @@ class QuailModelExecution:
             async_answers=async_answers,
             answer_rows=answer_rows,
             chunk_tokens=chunk_tokens,
+            score_readout=async_scores,
         )
 
     def execute(
@@ -260,7 +266,8 @@ class QuailBackend:
             else ([], []))
         prompts = operators.prompts
         pre_ids = (
-            list(tokenizer(shared_preamble(context.model.turn_prefix)))
+            list(tokenizer(shared_preamble(context.model.turn_prefix,
+                                           context.model.prompt_layout)))
             if tokenizer is not None else
             list(prompts[0].preamble_token_ids) if prompts else []
         )

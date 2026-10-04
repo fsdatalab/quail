@@ -30,16 +30,15 @@ Use a new output directory for each run.
 ### On Modal
 
 If you have not configured Modal, run `uv run modal setup` first.
-The following command runs the same query with Quail and stock vLLM.
-It uses two vLLM submission strategies: one operator at a time and
-pipelining. Each configuration uses one H100.
+The following command runs the same query with Quail on one H100.
 
 ```bash
 mkdir -p results/benchmark
 run_log="results/benchmark/quailb-$(date -u +%Y%m%dT%H%M%SZ).log"
 uv run modal run --detach -m quail.bench.quailb_parallel \
   --sf 0.1 --model qwen3-4b-fp8 --query IMDB-4 \
-  --no-include-sglang --output-dir /results/benchmarks/quailb \
+  --no-include-baselines --no-include-sglang \
+  --output-dir /results/benchmarks/quailb \
   2>&1 | tee "$run_log"
 ```
 
@@ -55,8 +54,7 @@ uv run modal volume get quail-results \
   "benchmarks/quailb/<run-id>/" "./results/<run-id>/"
 ```
 
-The Modal run has separate directories for Quail and each baseline.
-The downloaded Quail results are in `results/<run-id>/quail/`.
+The downloaded results are in `results/<run-id>/quail/`.
 
 ## Read the results
 
@@ -89,10 +87,8 @@ Include the input document and pair counts. Report agreement with the
 saved reference labels and identify the reference model.
 Report model startup separately if it affects the comparison.
 
-State the execution settings used by Quail and each baseline.
-If Quail uses a setting that the baseline supports, configure the baseline
-with the equivalent setting. Compare the measurements with your prediction
-and keep correctness differences visible.
+State the execution settings for each run. Compare the measurements with
+your prediction and report differences in query results.
 
 Link to the saved result paths in the pull request.
 Keep generated result files out of the repository.

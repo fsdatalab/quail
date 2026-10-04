@@ -45,6 +45,11 @@ class Prompt:
     preamble_token_ids: tuple = ()
     tail_token_ids: tuple = ()
     label_token_ids: tuple = ()
+    # the PROMPT_LAYOUTS name the prompt text was built with
+    layout: str = "ai-if"
+    # the text after a filter document or a join's last partner, one
+    # entry per separately tokenized segment; empty means one segment
+    tail_segments: tuple = ()
     label_prefix: str = LABEL_PREFIX
     letters: tuple = ()
     lettered: Optional["Prompt"] = None
