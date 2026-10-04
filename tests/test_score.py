@@ -633,7 +633,10 @@ def _shared_store(path, bodies):
 def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     from quail.physical import PhysicalGraph, PortRef, Scan, ScoreSpec
     from quail.physical.base import input_ports
+    from quail.planner.decide import _apply_rules
+    from quail.planner.physical_optimizer import PlanningContext
     from quail.planner.physical_rules import PrefixSharing
+    from quail.planner.plan import PhysicalPlan
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     def graph(aliases):
@@ -661,13 +664,23 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
                           [f"{shared} {9000 + r}" for r in range(20)])
     plain = _shared_store(tmp_path / "plain.arrow",
                           [f"{9000 + r} 1 2" for r in range(20)])
-    context = SimpleNamespace(model=QWEN3_4B_FP8, device=H100_SXM, gpu_count=2,
+    context = PlanningContext(model=QWEN3_4B_FP8, device=H100_SXM, gpu_count=2,
                               document_tokens={"d": store.lengths,
-                                               "e": plain.lengths})
+                                               "e": plain.lengths},
+                              backend="quail")
     spec = scored(PrefixSharing().rewrite(graph(("d",)), context))
     assert spec.share_prefixes
     # 19 x 400 of 20 x (401 + 2) tokens are borrowed
     assert spec.estimated_seconds == pytest.approx(10.0 * (1 - 19 * 400 / 8060))
+    # the plan's total moves by the score's change
+    unshared = graph(("d",))
+    plan = _apply_rules(
+        PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", workers=2,
+                     estimated_seconds=12.0, nodes=unshared.nodes,
+                     root=unshared.root),
+        (PrefixSharing(),), context)
+    assert plan.estimated_seconds == pytest.approx(
+        12.0 - 10.0 + spec.estimated_seconds)
     assert ScoreSpec.from_mapping(spec.to_dict()) == spec
     # documents with nothing in common share nothing
     assert PrefixSharing().rewrite(graph(("e",)), context) is None
