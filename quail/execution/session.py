@@ -806,6 +806,22 @@ class Query:
         selected = self._selected.get(ref.alias)
         return values if selected is None else values.take(selected)
 
+    def _source_positions(self, alias: str, positions):
+        """Return registered-table positions for an alias's scan positions."""
+        selected = self._selected.get(alias)
+        if selected is None:
+            return positions
+        return pc.take(selected, positions).cast(positions.type)
+
+    def _source_table(self, table: pa.Table, aliases) -> pa.Table:
+        """Return an answer table with its alias columns in source positions."""
+        for alias in aliases:
+            index = table.schema.get_field_index(alias)
+            table = table.set_column(
+                index, table.schema.field(alias),
+                self._source_positions(alias, table.column(alias)))
+        return table
+
     def explain(self, *, verbose: bool = False,
                 analyze: bool = False) -> str:
         """Return the optimized plan, optionally measured by running it.
@@ -1183,7 +1199,7 @@ class Query:
         # every classified document's label, before any filter on it;
         # a chain's later stages label the documents their gate passed
         answer_tables = {"filters": {}, "joins": {}, "classifies": {
-            name: table
+            name: self._source_table(table, table.column_names[:-1])
             for node in plan.nodes
             if isinstance(node, AiClassify)
             and PortRef(node.node_id, "scores") in response.outputs
@@ -1192,8 +1208,8 @@ class Query:
             ).items()
         }}
         survivors = {
-            scan.alias: pa.array(range(len(self._doc_tokens[scan.alias])),
-                                 pa.int32())
+            scan.alias: self._source_positions(scan.alias, pa.array(
+                range(len(self._doc_tokens[scan.alias])), pa.int32()))
             for scan in scans
         }
 
@@ -1219,7 +1235,8 @@ class Query:
             elif value_type is ValueType.LABEL_ANSWERS:
                 # the label column follows the alias columns: one, or
                 # the anchor and partner of a classification of joined rows
-                answer_tables["classifies"][table.column_names[-1]] = table
+                answer_tables["classifies"][table.column_names[-1]] = (
+                    self._source_table(table, table.column_names[:-1]))
             elif value_type is ValueType.JOIN_ANSWERS:
                 written_pos = metadata.get(b"quail.written_pos")
                 if written_pos is None:
@@ -1264,8 +1281,8 @@ class Query:
                         "a document id relation needs one alias column"
                     )
                 alias = table.column_names[0]
-                survivors[alias] = (
-                    table.column(alias).combine_chunks().cast(pa.int32()))
+                survivors[alias] = self._source_positions(
+                    alias, table.column(alias).combine_chunks().cast(pa.int32()))
 
         for alias, relations in filter_relations.items():
             table = relations[0] if len(relations) == 1 else \
@@ -1282,7 +1299,8 @@ class Query:
                 stage_table = table.filter(mask)
                 evaluated = stage_table.num_rows
                 passed = pc.sum(stage_table.column("answer")).as_py() or 0
-                answer_tables["filters"][(alias, written_pos)] = stage_table
+                answer_tables["filters"][(alias, written_pos)] = (
+                    self._source_table(stage_table, [alias]))
                 report["stages"].append(dict(
                     op="filter", alias=alias, stage=index,
                     written_pos=written_pos,
@@ -1335,6 +1353,7 @@ class Query:
                     f"{sorted(missing_columns)}"
                 )
             answers = table.column("answer")
+            table = self._source_table(table, logical_aliases)
             answer_tables["joins"][written_pos] = table
             report["stages"].append(dict(
                 op="join", written_pos=written_pos, anchor=anchor,
