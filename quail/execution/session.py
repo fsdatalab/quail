@@ -558,6 +558,10 @@ class BoundBuilder:
 
     ai_if = ai_filter
 
+    def ai_score(self, p, *, name):
+        self._inner.ai_score(p, name=name)
+        return self
+
     def ai_classify(self, p, labels, *, name, descriptions=None,
                     task_description="", probabilities=False):
         self._inner.ai_classify(p, labels, name=name,

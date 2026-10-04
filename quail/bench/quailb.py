@@ -172,12 +172,13 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
                for operator in plan.classifies}
     names = []
     for name in plan.select:
-        alias, column = name.split(".", 1)
-        if column != "id" and (alias, column) not in outputs:
+        alias, _, column = name.partition(".")
+        if column not in ("id", "") and (alias, column) not in outputs \
+                and not plan.relational:
             raise NotImplementedError(
                 "QUAIL-B output accuracy needs id and label columns in the "
                 "select list")
-        names.append(alias if column == "id" else column)
+        names.append(substrait.output_name(name))
     started = time.perf_counter()
     rows = result.collect()
     collection_s = time.perf_counter() - started
@@ -334,7 +335,10 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
         output.measurements["input_tokens"] = (
             result.report["fresh_tokens"] + result.report["cached_tokens"]
         )
-    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
+    # QUAIL-B's token minimum counts filters, joins, and classifications;
+    # a query with a score reports its tokens without a minimum
+    if not plan.scores:
+        output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
     return output
 
 
