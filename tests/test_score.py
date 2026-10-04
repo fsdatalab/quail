@@ -526,6 +526,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     # one table on a canvas model: each document's KV, then one draw; an
     # uncertain first score takes three more draws and their mean
     drawn = SimpleNamespace(name="score", aliases=("b",), draws=4,
+                            share_prefixes=False,
                             prompt_token_parts=((1,), (2, 3)))
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
@@ -616,6 +617,106 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     # each GPU scored its own query document's pairs in the same round
     assert len(rounds) == 1
     session.close()
+
+
+def _shared_store(path, bodies):
+    from quail.execution.tokens import TokenStore
+
+    schema = pa.schema({"body": pa.string()})
+    return TokenStore.write(
+        str(path), [pa.record_batch([bodies], schema=schema)],
+        document_column="body",
+        tokenizer=lambda text: [int(token) for token in text.split()],
+        token_type=pa.int32())
+
+
+def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
+    from quail.physical import PhysicalGraph, PortRef, Scan, ScoreSpec
+    from quail.physical.base import input_ports
+    from quail.planner.physical_rules import PrefixSharing
+    from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+    def graph(aliases):
+        spec = ScoreSpec(
+            name="score", aliases=aliases, query_template="", arguments=(),
+            expected_inputs=20, estimated_seconds=10.0,
+            prompt_token_parts=((1,),) * (len(aliases) + 1))
+        nodes = tuple(Scan(node_id=f"input:{alias}", alias=alias,
+                           input_id=alias) for alias in aliases)
+        score = AiScore(
+            node_id="score", backend_name="quail", model="qwen3-4b-fp8",
+            inputs=input_ports(tuple(PortRef(f"input:{alias}", f"ids:{alias}")
+                                     for alias in aliases)),
+            spec=spec)
+        return PhysicalGraph(nodes + (score,), PortRef("score", "scores"))
+
+    def scored(rewritten):
+        return next(node for node in rewritten.nodes
+                    if isinstance(node, AiScore)).spec
+
+    # 20 documents of 401 tokens whose first 400 are the same: each
+    # after the first borrows 400 tokens, 25 pages of 16
+    shared = " ".join(str(i) for i in range(400))
+    store = _shared_store(tmp_path / "shared.arrow",
+                          [f"{shared} {9000 + r}" for r in range(20)])
+    plain = _shared_store(tmp_path / "plain.arrow",
+                          [f"{9000 + r} 1 2" for r in range(20)])
+    context = SimpleNamespace(model=QWEN3_4B_FP8, device=H100_SXM, gpu_count=2,
+                              document_tokens={"d": store.lengths,
+                                               "e": plain.lengths})
+    spec = scored(PrefixSharing().rewrite(graph(("d",)), context))
+    assert spec.share_prefixes
+    # 19 x 400 of 20 x (401 + 2) tokens are borrowed
+    assert spec.estimated_seconds == pytest.approx(10.0 * (1 - 19 * 400 / 8060))
+    assert ScoreSpec.from_mapping(spec.to_dict()) == spec
+    # documents with nothing in common share nothing
+    assert PrefixSharing().rewrite(graph(("e",)), context) is None
+    # a pair score borrows each anchor's KV already
+    assert PrefixSharing().rewrite(graph(("d", "e")), context) is None
+
+
+def test_shared_score_borrows_prefixes_and_reads_the_cue(monkeypatch):
+    from quail.backends.quail.executor import score as module
+    from quail.execution.tokens import TokenView
+
+    documents = {"d": [TokenView(pa.array(tokens, type=pa.int32()))
+                       for tokens in ([10, 11, 12, 13], [10, 11, 12, 14], [20])]}
+    spec = SimpleNamespace(name="score", aliases=("d",), draws=1,
+                           share_prefixes=True,
+                           prompt_token_parts=((1,), (2, 3)))
+    state = QueryExecutionState(
+        loaded_model=LoadedModelState(
+            model=object(), arena=SimpleNamespace(page_tokens=2),
+            pipeline=SimpleNamespace(canvas_ids=())),
+        torch=object(), async_answers=object(), answer_rows=object(),
+        chunk_tokens=1234)
+    monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
+    seen = []
+
+    def run_stages(torch, arena, pipeline, stages, prefixes, budget, **kwargs):
+        (stage,) = stages
+        assert [list(prefix) for prefix in prefixes] == [
+            [1, 10, 11, 12, 14], [1, 10, 11, 12, 13], [1, 20]]
+        assert (stage.frame, stage.suffixes, stage.single) == ([2], [[3]], True)
+        # the second document borrows the first's two whole pages
+        tree = kwargs["prefix_tree"]
+        assert tree.shared_tokens == 4
+        for anchor, value in enumerate([0.25, 0.5, 0.75]):
+            stage.decide(anchor, [value])
+        kwargs["on_chunk"]([(0, 0, True), (2, 0, True)])
+        kwargs["stats"]["borrowed_tokens"] = 4
+        return [], [], 7
+
+    monkeypatch.setattr(module, "run_stages", run_stages)
+    result = module.QuailScorer(state).score(
+        spec, [(1,), (0,), (2,)], documents,
+        on_answers=lambda positions, values: seen.append(
+            (positions.tolist(), values)))
+    np.testing.assert_allclose(result.scores, [0.25, 0.5, 0.75])
+    # each document's head, tokens, frame, and cue: 7 + 7 + 4
+    assert (result.fresh_tokens, result.cached_tokens) == (7, 18 - 7)
+    assert result.borrowed_tokens == 4
+    assert seen == [([0, 2], [0.25, 0.75]), ([1], [0.5])]
 
 
 def test_score_query_shape_errors_are_compile_errors(catalog):

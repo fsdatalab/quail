@@ -511,6 +511,26 @@ class ClassifyStages:
         return suffix_tokens, suffix_tokens + len(first) * len(self.request.frame)
 
 
+def shared_prefix_tree(name, prefixes, arena):
+    """Build the prefix tree of an operator's document prefixes.
+
+    Args:
+        name: The operator's output name, for the log line.
+        prefixes: Token sequences, one per document.
+        arena: KVArena whose page size the shares round down to.
+
+    Returns:
+        The PrefixTree over prefixes.
+    """
+    started = time.perf_counter()
+    tree = prefix_tree(prefixes, arena.page_tokens)
+    logger.info(
+        "prefix sharing on %s: %s documents borrow %s tokens "
+        "(tree built in %.2f s)", name, len(prefixes),
+        tree.shared_tokens, time.perf_counter() - started)
+    return tree
+
+
 class AnswerStream:
     """Send documents' finished answers to a callback, each document once.
 
@@ -578,14 +598,8 @@ class QuailClassifier:
         prefixes = document_prefixes(spec, documents, rows)
         staging = input_staging(state)
         keys = [("classify", spec.name, index) for index in range(len(rows))]
-        tree = None
-        if spec.share_prefixes:
-            started = time.perf_counter()
-            tree = prefix_tree(prefixes, state.loaded_model.arena.page_tokens)
-            logger.info(
-                "prefix sharing on %s: %s documents borrow %s tokens "
-                "(tree built in %.2f s)", spec.name, len(prefixes),
-                tree.shared_tokens, time.perf_counter() - started)
+        tree = (shared_prefix_tree(spec.name, prefixes, state.loaded_model.arena)
+                if spec.share_prefixes else None)
         plan = ClassifyStages(state, spec, len(rows), lambda key: key[2])
         # a canvas is drawn from the document's row, so an answer is
         # the same in any batch
