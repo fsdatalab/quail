@@ -29,6 +29,8 @@ class LoadedModelState:
     model_spec: ModelSpec | None = None
     input_staging: InputStaging | None = None
     label_readout: AsyncLabelLogprobs | None = None
+    # a decision model's option-scoring head; None for other models
+    decision_head: Any = None
 
 
 @dataclass
@@ -41,4 +43,7 @@ class QueryExecutionState:
     answer_rows: AnswerRows
     chunk_tokens: int
     async_scores: AsyncScores | None = None
+    # the AI.SCORE readout of a model that does not score with answer
+    # rows; None scores yes against no over answer_rows
+    score_readout: Any = None
     gpu_timing: bool = False

@@ -257,7 +257,7 @@ def _boot_state(model):
     """
     import torch
     import torch.nn.functional as F
-    from transformers import AutoTokenizer
+    from gigatoken import Tokenizer
 
     from quail.backends.quail.executor.arena import KVArena
     from quail.backends.quail.executor.model import load_model
@@ -269,7 +269,7 @@ def _boot_state(model):
 
     spec = MODELS[model]
     device = DEVICES["h100-sxm"]
-    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    tokenizer = Tokenizer(spec.hf_name).as_hf()
     model_mod = load_model(spec.hf_name, revision=spec.revision)
     chunk_tokens = budgets.chunk_budget(spec, device)
     arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
@@ -557,7 +557,7 @@ def stock_kernels(model: str = "qwen3-4b-fp8",
 
     import pyarrow.parquet as pq
     import torch
-    from transformers import AutoTokenizer
+    from gigatoken import Tokenizer
     from vllm import LLM, SamplingParams
 
     from quail.logical import bind_prompt, render_filter_prompt_ids
@@ -566,7 +566,7 @@ def stock_kernels(model: str = "qwen3-4b-fp8",
     from quail_b.prompts import F1
 
     spec = MODELS[model]
-    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    tokenizer = Tokenizer(spec.hf_name).as_hf()
 
     def tok(text):
         return tokenizer(text, add_special_tokens=False)["input_ids"]
