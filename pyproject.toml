@@ -26,6 +26,13 @@ server = [
     "starlette==1.6.0",
     "uvicorn==0.52.4",
 ]
+# MLX execution on Apple silicon. The paged attention kernels come from
+# vllm-metal, whose wheel is on GitHub Releases and not on PyPI, so it
+# is installed apart from this extra. vllm-metal links mlx's private
+# headers and works with this mlx version only.
+mlx = [
+    "mlx==0.32.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [project.scripts]
 quail-server = "quail.server.__main__:main"
@@ -52,10 +59,19 @@ dev = [
     # downloads
     "pandas==3.0.5",
     "hf-transfer==0.1.9",
+    # MLX execution on Apple silicon: mlx, vllm-metal's paged attention
+    # kernels, and mlx-lm, whose Qwen3 model the MLX forward pass is
+    # tested against
+    "mlx==0.32.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "vllm-metal==0.30.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [tool.uv.sources]
 quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "4298e7a" }
+vllm-metal = { url = "https://github.com/vllm-project/vllm-metal/releases/download/v0.30.0/vllm_metal-0.30.0-cp312-cp312-macosx_15_0_arm64.whl" }
+# the commit vllm-metal 0.30.0 pins; it works with mlx 0.32.1
+mlx-lm = { git = "https://github.com/ml-explore/mlx-lm.git", rev = "9e6acca691e64d6d8bb808c328fcdea459099cca" }
 
 [build-system]
 requires = ["hatchling==1.32.0"]
@@ -80,6 +96,16 @@ exclude = [
 # uv's Python builds include the C headers Triton needs at startup
 python-preference = "only-managed"
 required-version = "==0.12.13"
+
+# vllm-metal's wheel declares what its vLLM server needs. Quail calls
+# only its Metal kernels, which need mlx and numpy.
+[[tool.uv.dependency-metadata]]
+name = "vllm-metal"
+version = "0.30.0"
+requires-dist = [
+    "mlx==0.32.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "numpy>=1.24.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
