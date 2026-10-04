@@ -649,7 +649,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         ))
 
     estimate = (speed_of_light(base_work + stage_work, model, device,
-                               chunk).seconds + _classify_seconds(nodes))
+                               chunk).seconds + _score_seconds(nodes))
     stage_works = {record["written_pos"]: record["work"]
                    for record in stage_records}
 
@@ -834,11 +834,6 @@ def _apply_rules(plan, rules, context):
     return replace(
         plan, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
         settings=context.settings)
-
-
-def _classify_seconds(nodes) -> float:
-    return sum(node.spec.estimated_seconds for node in nodes
-               if isinstance(node, AiClassify) and node.spec is not None)
 
 
 def _score_seconds(nodes) -> float:
