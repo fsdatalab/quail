@@ -54,6 +54,26 @@ with result.execute_stream(batch_rows=1024) as reader:
 You can pass `limit` to `collect()` or `execute_stream()` to read fewer
 result rows. The limit does not reduce the model execution already performed.
 
+### Classification answers
+
+For an `AI.CLASSIFY` query, `result.answer_tables` includes all computed
+labels, including those for rows removed by later filters.
+For example, classify sentiment in the registered `reviews` table:
+
+```python
+result = session.sql("""
+    SELECT r.id,
+           AI.CLASSIFY(r.body, ARRAY['positive', 'negative', 'mixed']) AS sentiment
+    FROM reviews r
+""", dialect="bq").run()
+labels = result.answer_tables["classifies"]["sentiment"]
+print(labels.to_pydict())
+```
+
+The table contains `r` and `sentiment`. The `r` values are input row
+indices starting at zero, rather than review IDs. For joined rows,
+there is an index column for each table alias.
+
 ## Preview the plan
 
 Call `explain()` to inspect the plan without running the model:

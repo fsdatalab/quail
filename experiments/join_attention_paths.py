@@ -12,7 +12,9 @@ ways in one session, and records runtime and fresh tokens.
 
 Each round is a QUAIL-B run under /results/ablations/join_attention_paths/
 so the answers are saved and scored; the summary goes to
-/results/ablations/join_attention_paths_qwen3-4b-fp8.json.
+/results/ablations/join_attention_paths_<model>.json. --model and
+--queries pick another model and query set; --prediction states the
+prediction for that run.
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ QUERIES = ("LEP-4", "FEV-4")
 ROUNDS = ("tree", "unified", "tree", "unified")
 DATA_DIR = "/results/quailb_data/sf0.1"
 RUNS_DIR = Path("/results/ablations/join_attention_paths")
-SUMMARY_PATH = Path("/results/ablations/join_attention_paths_qwen3-4b-fp8.json")
 FIELDS = ("runtime_s", "fresh_tokens", "answers_evaluated", "answers_correct",
           "predicted_rows", "expected_rows", "matching_rows", "cost_usd")
 
@@ -82,7 +83,8 @@ class ForceJoinAttention:
         "/results": results_vol,
     },
 )
-def measure(query_ids: list[str], stamp: str) -> dict:
+def measure(query_ids: list[str], stamp: str, model: str = "qwen3-4b-fp8",
+            prediction: str = PREDICTION_TEXT) -> dict:
     import pyarrow.parquet as pq
 
     import quail
@@ -92,7 +94,7 @@ def measure(query_ids: list[str], stamp: str) -> dict:
 
     force = ForceJoinAttention()
     registry = built_in_registry().register_physical_rule(force)
-    config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+    config = quail.EngineConfig(model=model, device="h100-sxm")
     runs = []
     with quail.Session(config, registry=registry) as session:
         for query_id in query_ids:
@@ -122,25 +124,31 @@ def measure(query_ids: list[str], stamp: str) -> dict:
         "model": config.model,
         "device": config.device,
         "scale_factor": 0.1,
-        "prediction": PREDICTION_TEXT,
+        "prediction": prediction,
         "rounds": list(ROUNDS),
         "runs": runs,
     }
-    SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SUMMARY_PATH.write_text(json.dumps(summary, indent=2))
+    path = summary_path(model)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(summary, indent=2))
     results_vol.commit()
     return summary
 
 
+def summary_path(model: str) -> Path:
+    return Path(f"/results/ablations/join_attention_paths_{model}.json")
+
+
 @app.local_entrypoint()
-def main(queries: str = ",".join(QUERIES)):
+def main(queries: str = ",".join(QUERIES), model: str = "qwen3-4b-fp8",
+         prediction: str = PREDICTION_TEXT):
     from datetime import datetime, timezone
 
-    print(f"prediction: {PREDICTION_TEXT}", flush=True)
+    print(f"prediction: {prediction}", flush=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    call = measure.spawn(queries.split(","), stamp)
+    call = measure.spawn(queries.split(","), stamp, model, prediction)
     print(f"function call id: {call.object_id}", flush=True)
     summary = call.get()
     for run in summary["runs"]:
         print(json.dumps(run), flush=True)
-    print(f"summary: {SUMMARY_PATH}", flush=True)
+    print(f"summary: {summary_path(model)}", flush=True)

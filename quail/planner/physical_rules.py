@@ -8,7 +8,8 @@
   (letters, trie_tree, or trie_decode) whose simulated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
-  computing it again.
+  computing it again, in filters, joins, classifications, and scores
+  of one table.
 - tree_attention: each join is annotated with the attention path the
   cost model prefers for its partners' reads of the anchor's KV.
 """
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from quail.cost.budgets import choose_attention_path
+from quail.cost.budgets import choose_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
 from quail.execution.pipelines import build_pipelines
 from quail.logical import classified_above_joins
@@ -34,6 +35,7 @@ from quail.physical import (
 )
 from quail.planner import retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
+from quail.planner.reranker import score_fixed_tokens
 from quail.planner.statistics import cached_statistics, live_after_filters
 
 
@@ -270,7 +272,9 @@ class PrefixSharing:
     on. The filter then writes pages even when it has one stage, since
     borrowed pages must exist. A join always writes its anchors' KV,
     so it fires for any join whose anchors share a whole page; a
-    classification writes its documents' KV the same way.
+    classification writes its documents' KV the same way. A score of
+    one table is priced like a filter that writes no pages, since
+    without sharing its documents follow one shared prompt head.
     """
 
     name = "prefix_sharing"
@@ -316,6 +320,20 @@ class PrefixSharing:
                     node = replace(node, spec=_shared_classify_spec(
                         node, context, store, resident=resident))
                     changed = True
+            elif (type(node) is AiScore and node.spec is not None
+                  and len(node.spec.aliases) == 1
+                  and not node.spec.share_prefixes):
+                lengths = context.document_tokens.get(node.spec.aliases[0])
+                store = _token_store(lengths)
+                shared = (0 if store is None
+                          else page_aligned_shared_tokens(store))
+                if store is not None and sharing_pays(
+                        context.model, context.device, shared_tokens=shared,
+                        total_tokens=sum(lengths), writes_pages=False):
+                    node = replace(node, spec=_shared_score_spec(
+                        node.spec, shared, lengths,
+                        context.model.canvas_tokens))
+                    changed = True
             nodes.append(node)
         if not changed:
             return None
@@ -331,6 +349,20 @@ def _shared_classify_spec(node, context, store, *, resident=False):
     return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
 
 
+def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):
+    """Enable prefix sharing and scale the score's estimate by its fresh tokens.
+
+    Assumes time is proportional to the tokens the score computes, and
+    that the scored documents borrow the same share of their tokens as
+    the whole table.
+    """
+    fixed = score_fixed_tokens(spec.prompt_token_parts, canvas_tokens, spec.draws)
+    total = sum(lengths) + len(lengths) * fixed
+    fresh = max(0.0, 1.0 - shared_tokens / total) if total else 1.0
+    return replace(spec, share_prefixes=True,
+                   estimated_seconds=spec.estimated_seconds * fresh)
+
+
 def _mean(values) -> float:
     values = list(values)
     return sum(values) / len(values) if values else 0.0
@@ -342,9 +374,9 @@ class TreeAttention:
     A join stage has every partner of an anchor reading the anchor's
     KV: under tree attention those reads are stacked into one, under
     unified attention each partner reads the anchor itself. The choice
-    is by roofline (choose_attention_path). Tree attention needs the
-    fp8 merge kernel and packs no canvas rows, so other models stay
-    unified.
+    is by roofline (choose_attention_path). A diffusion model and a
+    model under 2B dense parameters stay unified
+    (tree_attention_allowed).
 
     A filter sharing prefixes is annotated from its tree: the
     documents borrowing one parent's pages are that node's readers
@@ -365,8 +397,7 @@ class TreeAttention:
         if forced is not None and forced not in ("tree", "unified"):
             raise ValueError(
                 f"attention must be 'tree' or 'unified', got {forced!r}")
-        tree_available = (model.weight_precision == "fp8"
-                          and not model.canvas_tokens)
+        tree_available = tree_attention_allowed(model)
         nodes = []
         changed = False
         for node in graph.nodes:

@@ -5,9 +5,8 @@ title: SQL reference
 ## What is AI-SQL?
 
 AI-SQL extends standard SQL with operators that call a language model
-during query execution. You can filter rows, join tables, and match
-documents using natural language conditions instead of exact column
-comparisons.
+during query execution. You can filter rows, join tables, score documents,
+and assign labels using natural language instructions.
 
 For example, suppose you registered a `reviews` table with columns `id`
 and `body`. This query returns IDs of reviews that discuss the movie's
@@ -22,34 +21,26 @@ WHERE AI.IF(PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r
 The model reads each review and returns TRUE or FALSE. Quail keeps
 the rows where the answer is TRUE.
 
-Major database vendors define their own AI-SQL syntax, including
-[Snowflake Cortex AISQL](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql),
-[BigQuery AI functions](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions),
-and [Databricks AI Functions](https://docs.databricks.com/aws/en/large-language-models/ai-functions).
-Quail supports two of these dialects:
+Quail supports Snowflake and BigQuery syntax:
 
 ```python
 session.sql(text, dialect="snowflake")  # AI_FILTER syntax
 session.sql(text, dialect="bq")         # AI.IF syntax
 ```
 
-Both compile to the same plan. The rest of this page uses the
-BigQuery dialect.
+The examples below use the BigQuery dialect (`dialect="bq"`).
 
 ## PROMPT
 
 `PROMPT` combines a question template with document column references.
 The placeholders `{0}`, `{1}`, and so on identify the columns in argument
-order. Quail puts document text before the question in the model's input
-so it can reuse document computations across questions.
+order.
 
 For a filter, the prompt references one column:
 
 ```sql
 PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body)
 ```
-
-Here `{0}` identifies each review's `body` text.
 
 For a join, the prompt references one column from each table:
 
@@ -58,17 +49,14 @@ PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
        r.body, a.aspect)
 ```
 
-Here `{0}` is the review and `{1}` is the aspect, and the model
-answers for every pair.
+Here `{0}` is the review and `{1}` is the aspect.
 
-## AI operators
-
-### AI.IF
+## AI.IF
 
 `AI.IF` takes a `PROMPT` and evaluates it on each row or each pair
 of rows. The model returns TRUE or FALSE.
 
-#### Filtering
+### Filtering
 
 Use `AI.IF` in a `WHERE` clause to filter rows:
 
@@ -79,14 +67,12 @@ WHERE AI.IF(PROMPT('Does this review mention a positive aspect?\n\n{0}', r.body)
   AND AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 ```
 
-You can chain multiple filters with `AND`. Quail requires all
-filters on one table to read the same document column, so it can
-compute the document's model state once and reuse it across filters.
+Use `AND` to combine filters. All AI filters on one table must read the
+same document column.
 
-#### Joining
+### Joining
 
-Use `AI.IF` to join two tables with a natural language condition.
-The model evaluates the prompt on each pair of rows.
+Use `AI.IF` to join two tables with a natural language condition:
 
 ```sql
 SELECT r.id, a.aspect
@@ -95,8 +81,9 @@ WHERE AI.IF(PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect:
                    r.body, a.aspect))
 ```
 
-You can also add relational predicates on `ON` to restrict which
-pairs the model sees. You can add more than one.
+Add column comparisons in `ON` to restrict the pairs the model evaluates.
+For example, imagine that each claim has a `wiki_url` identifying its
+source passage in an `evidence` table:
 
 ```sql
 SELECT c.id, e.id
@@ -107,17 +94,14 @@ JOIN evidence e
                   c.claim, e.text))
 ```
 
-Here the model only evaluates pairs where `c.wiki_url = e.id`,
-instead of the full cross product.
+The model evaluates only pairs where `c.wiki_url = e.id`.
 
-#### EXISTS and NOT EXISTS
+### EXISTS and NOT EXISTS
 
-`EXISTS` and `NOT EXISTS` are semi-join operators. For each row in
-the outer table, the subquery runs against the inner table.
-`EXISTS` keeps the outer row if the subquery returns at least one
-match. `NOT EXISTS` keeps it if the subquery returns no matches.
+`EXISTS` keeps a row if the subquery returns at least one match.
+`NOT EXISTS` keeps it if the subquery returns no matches.
 
-This `EXISTS` query finds reviews that discuss at least one aspect:
+The following query finds reviews that discuss at least one aspect:
 
 ```sql
 SELECT r.id
@@ -128,8 +112,7 @@ WHERE EXISTS (
                        r.body, a.aspect)))
 ```
 
-This `NOT EXISTS` query finds reviews that do *not* discuss any of
-the listed aspects:
+Use `NOT EXISTS` to find reviews that discuss none of the listed aspects:
 
 ```sql
 SELECT r.id
@@ -142,7 +125,7 @@ WHERE NOT EXISTS (
 
 The subquery must be `SELECT 1 FROM <table> WHERE AI.IF(...)`.
 
-#### Options
+### Options
 
 Both `AI.IF` and `AI_FILTER` accept an optional second argument with
 planning hints:
@@ -153,44 +136,24 @@ AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
 ```
 
 - **`selectivity`** estimates the fraction of rows or pairs that pass.
-  Quail uses it to choose filter and join order. An inaccurate estimate
-  can produce a slower plan, but does not change predicate answers.
-  The default is `0.2`, meaning 20%.
-- **`anchor`** (joins only): optional. When evaluating a join, Quail
-  picks one side to process first and keep in GPU memory, so those
-  documents are not reprocessed for each pair. This side is called
-  the *anchor*. You usually want it to be the table with longer
-  documents. If omitted, Quail chooses automatically to minimize
-  query cost.
+  Quail uses it to choose filter and join order. The default is `0.2`,
+  meaning 20%. The hint does not change model answers.
+- **`anchor`** (joins only) sets the table alias whose document KV is
+  reused across pairs. This side is the *anchor*. If omitted, Quail
+  selects the anchor using estimated query time. See
+  [Joins](/docs/architecture/execution#joins).
 
-### AI.SCORE
+## AI.SCORE
 
-`AI.SCORE(PROMPT(...))` returns a score between 0 and 1 as a
-`FLOAT64`. Higher scores mean the model more strongly favors "yes" over
-"no" for the prompt. Use it in `SELECT` to return scores, or compare it
-with a threshold in `WHERE` or `JOIN ... ON`.
+Unlike `AI.IF`, which returns only TRUE or FALSE, `AI.SCORE(PROMPT(...))`
+returns a score between 0 and 1 as a `FLOAT64`. Higher scores indicate a
+stronger model preference for a positive answer to your question.
 
-All models on the [supported models page](/docs/user-guide/models) can
-run `AI.SCORE`. For example, select a reranker with:
+### Return scores
 
-```python
-config = quail.EngineConfig(
-    model="qwen3-reranker-0.6b-bf16",
-    device="h100-sxm",
-)
-```
-
-Rerankers score the model's preference for "yes" over "no". The Qwen3
-FP8 models and DiffusionGemma score TRUE against FALSE using the `AI.IF`
-prompt layout.
-
-`AI.SCORE(...) > 0.5` can select different rows from `AI.IF(...)`, because
-they use different execution paths. Validate the chosen operator and
-threshold on labeled examples for your task.
-
-#### Return scores
-
-Give the score column a name with `AS`:
+For example, imagine a `documents` table where each row is a customer
+support request. Its `body` column contains the request text. Return the
+score for whether each customer requests a refund:
 
 ```sql
 SELECT d.id,
@@ -199,10 +162,12 @@ SELECT d.id,
 FROM documents d
 ```
 
-#### Filter rows
+A score in `SELECT` requires a column alias with `AS`.
 
-Compare the score with `<`, `<=`, `>`, or `>=`. The threshold may be
-on either side of the comparison:
+### Filter rows
+
+Compare the score with `<`, `<=`, `>`, or `>=`. For the same support
+requests, keep rows with a refund score of at least 0.75:
 
 ```sql
 SELECT d.id
@@ -213,17 +178,18 @@ WHERE AI.SCORE(
 ) >= 0.75
 ```
 
+Choose the threshold using labeled examples from your task. A score of
+0.75 does not establish that the model is correct 75% of the time.
+
 The optional `selectivity` hint estimates the fraction of rows that pass
-the comparison. Quail uses it to order filters and assumes 20% if omitted.
-The hint does not change the scores or threshold.
+the comparison. It defaults to `0.2` and does not change the scores.
+See [Options](#options).
 
-#### Join tables
+### Join tables
 
-For a prompt with two document arguments, a reranker includes the first in
-its query and uses the second as its candidate document. A generative
-model reads the pair in the `AI.IF` join layout. The
-template mentions `{0}` once, where that document is inserted; refer to
-it again in words:
+For example, imagine a `queries` table of search queries and a `documents`
+table of articles. Match each query with articles whose relevance score
+is at least 0.8:
 
 ```sql
 SELECT q.id, d.id
@@ -233,42 +199,34 @@ JOIN documents d ON AI.SCORE(
 ) >= 0.8
 ```
 
-A pair score returned in `SELECT` without a comparison runs over
-every pair, so write the tables with `CROSS JOIN`. An `ON` column
-equality narrows the pairs only when the score is compared in `ON`.
+For a prompt that reads two documents, the template must contain `{0}`
+once. Refer to that document in words if you need to mention it again.
 
-In the reranker's query text, a placeholder that stands alone at the
-start or end of the template marks where the document goes and is
-left out, since the reranker holds the document in its own field. A
-placeholder inside a sentence reads "this document".
+To return a score for every pair without filtering, use `CROSS JOIN`
+and put `AI.SCORE` in `SELECT`.
 
-When the same score appears in `SELECT`, a filter, or a join condition,
-Quail computes it once. Two comparisons of one score, such as a range,
-share that one computation. A query cannot combine `AI.SCORE` with
-`AI.IF`.
+### Model behavior
 
-#### Score definition
+All [supported models](/docs/user-guide/models) can run `AI.SCORE`:
 
-Quail computes the score from the model's `yes` and `no` logits:
+- Qwen3 rerankers are trained to score a document's relevance to a query.
+  For a prompt with two documents, the first is the query and the second
+  is the candidate document.
+- [Decision 2.0 Kai](/docs/user-guide/models#decision-20-kai-06b) returns
+  its probability of "Yes" when choosing between "Yes" and "No".
+- Qwen3 generative models and DiffusionGemma compare their scores for
+  TRUE and FALSE answers. Quail converts that comparison to a value
+  between 0 and 1.
 
-```text
-score = exp(yes_logit) / (exp(yes_logit) + exp(no_logit))
-```
+Quail computes a repeated score once when it appears in `SELECT` and a
+condition, or in several comparisons. A query cannot combine `AI.SCORE`
+with `AI.IF`.
 
-A generative model uses its highest TRUE and FALSE logits, over the
-spellings `TRUE`, `True`, and their space-prefixed forms, in place of
-`yes` and `no`. A reranker is trained to give this score; a generative
-model is not, so the same threshold can select different fractions of
-rows on different models.
+## AI.CLASSIFY
 
-A score of 0.75 does not mean 75% accuracy. Choose the threshold using
-labeled examples for your task.
-
-### AI.CLASSIFY
-
-`AI.CLASSIFY` assigns one of your supplied categories to each input row.
-For example, for a `reviews` table with text in `body`, this query returns
-a sentiment label alongside each review ID:
+`AI.CLASSIFY` returns one of your supplied categories as a `STRING`.
+For example, imagine a `reviews` table with review text in `body`. Return
+a sentiment label for each review:
 
 ```sql
 SELECT r.id,
@@ -276,97 +234,54 @@ SELECT r.id,
 FROM reviews r;
 ```
 
-#### Syntax
+A classification in `SELECT` requires a column alias with `AS`. The call
+must be a separate item, rather than part of a larger expression.
+
+### Arguments
 
 `AI.CLASSIFY(input, categories[, options])`
 
-#### Arguments
-
 | Argument | Type | Description |
 | --- | --- | --- |
-| `input` | `STRING` column or `PROMPT` | The document to classify. A `PROMPT` can add a question or refer to two documents. |
-| `categories` | `ARRAY` or table name | 2 to 255 labels, each with an optional description. Labels must not be empty, and two labels must not differ only in case. |
-| `options` | Object | Optional settings, such as `{'probabilities': true}`. |
+| `input` | `STRING` column or `PROMPT` | The document to classify. Use `PROMPT` to add instructions or refer to two documents. |
+| `categories` | `ARRAY` or table name | 2 to 255 labels. Labels must not be empty or differ only in case. |
+| `options` | Object | Optional parameters listed below. |
 
-`categories` can have one of these forms:
+Each category can have a description of up to 25 words. For example,
+`ARRAY[('refund', 'asks for money back'), ('praise', 'expresses approval')]`.
+If labels have the same score, Quail returns the first in the list.
 
-- Strings: `ARRAY['refund', 'praise']`.
-- Label and description pairs: `ARRAY[('refund', 'asks for money back'), ('praise', NULL)]`.
-- Objects: `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]`.
-- A registered table name: `kinds`. The table has a `label` column, and
-  it can have a `description` column and an integer `ordinal` column.
-  Quail sorts the labels by `ordinal` if the column exists, and by label
-  text if not.
+<details>
+<summary>Other category formats</summary>
 
-A description tells what a category means, in 25 words or fewer. You
-can also name the argument: `categories => ARRAY['refund', 'praise']`.
-
-| Option | Type | Default | Description |
-| --- | --- | --- | --- |
-| `task_description` | `STRING` | Empty | Extra instructions, up to 50 words. |
-| `selectivity` | `FLOAT` | `0.2` | Estimated fraction of rows kept by a `WHERE` condition on the classification result. |
-| `probabilities` | `BOOLEAN` | `false` | Also returns the probability of each category. |
-
-#### Output
-
-The result is a `STRING` containing one supplied label. Use `AS` to name
-the result column. With `probabilities` set to `true`, Quail also returns
-`<name>_probabilities`, a `MAP<STRING, DOUBLE>` from each label to its
-probability. The probabilities sum to 1. They describe the model's relative preference
-among the supplied categories; they are not measured accuracy for your task.
-
-- When two labels have the same score, Quail returns the label that is
-  first in the list.
-- With vLLM or SGLang, a row whose generated answer matches no label is
-  not in the result.
-
-For how Quail reads the label, see
-[label scoring](/docs/architecture/execution#label-scoring).
-
-#### Inspect classification answers
-
-The result rows contain the classification columns selected by the query.
-You can also read the model's labels from `result.answer_tables`, including
-labels for rows removed by a later filter.
-
-For example, after running the sentiment query above, read its labels with:
-
-```python
-result = query.run()
-labels = result.answer_tables["classifies"]["sentiment"]
-print(labels.to_pydict())
-```
-
-The answer table contains `r` and `sentiment`. The `r` values are input row
-indices starting at zero, rather than the review IDs in `r.id`.
-For classifications of joined rows, the answer table includes an index
-column for each table alias. It can contain more rows than the final result
-because it includes labels computed before later filters.
-
-#### Examples
-
-##### Classify reviews
-
-Ask for each review's sentiment and return the label alongside its text:
+You can supply categories as objects:
 
 ```sql
-SELECT r.id, r.body,
-       AI.CLASSIFY(
-           PROMPT('What sentiment does this review express? {0}', r.body),
-           ARRAY['positive', 'negative', 'mixed']) AS sentiment
-FROM reviews r;
+ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]
 ```
 
-Example output:
+You can also use a registered table with a `label` column and optional
+`description` and integer `ordinal` columns. Quail sorts by `ordinal`
+if present, otherwise by label text.
 
-```text
-id  body                                     sentiment
-1   The food was delicious.                   positive
-2   My order arrived cold.                    negative
-3   Great food, but the delivery was late.    mixed
-```
+</details>
 
-##### Keep selected categories
+### Optional parameters
+
+Pass an object as the third argument, such as `{'probabilities': true}`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `task_description` | Empty | Extra instructions, up to 50 words. |
+| `selectivity` | `0.2` | Estimated fraction of rows kept by a condition on the label. Does not change model answers. |
+| `probabilities` | `false` | Return each category's probability in `<name>_probabilities`, a `MAP<STRING, DOUBLE>`. |
+
+The probabilities sum to 1. They are available for individual documents;
+classifications of joined rows return labels only.
+
+### Query examples
+
+#### Filter by category
 
 Use `IN` in `WHERE` to keep negative or mixed reviews:
 
@@ -380,52 +295,17 @@ WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body)
       IN ('negative', 'mixed');
 ```
 
-Example output for the same reviews:
-
-```text
-id  sentiment
-2   negative
-3   mixed
-```
-
 - `=` keeps one category. Other comparisons raise `CompileError`.
 - A category that is not in the list matches no rows.
-- Quail classifies each review one time. The same label decides the
-  `WHERE` condition and fills the `sentiment` column.
-- In `SELECT`, the call must be its own item, not part of a larger
-  expression.
+- Quail evaluates the repeated classification once and uses its label
+  in both `SELECT` and `WHERE`.
 
-##### Return probabilities
+#### Classify joined rows
 
-Set `probabilities` to `true` to include a probability for every category:
-
-```sql
-SELECT r.id,
-       AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
-                   ARRAY['positive', 'negative', 'mixed'],
-                   {'probabilities': true}) AS sentiment
-FROM reviews r;
-```
-
-One example output row:
-
-```text
-id  sentiment  sentiment_probabilities
-1   positive   {'positive': 0.90, 'negative': 0.03, 'mixed': 0.07}
-```
-
-Only the Quail backend returns probabilities, and only for a
-classification of one document. It does not return them for joined
-rows, or with vLLM or SGLang.
-
-##### Classify joined rows
-
-A classification can also label a pair of documents kept by an `AI.IF`
-join. Use a `PROMPT` that refers to both documents.
-
-For example, suppose a `reviews` table contains review text and an
-`aspects` table contains movie aspects. This query first finds the aspects
-each review discusses, then classifies its opinion of each matched aspect:
+Use a `PROMPT` that refers to both documents to classify joined rows.
+For example, imagine a `reviews` table of movie reviews and an `aspects`
+table of subjects such as acting or plot. Find the aspects each review
+discusses and classify its sentiment about each matched aspect:
 
 ```sql
 SELECT r.id, a.aspect,
@@ -440,47 +320,22 @@ JOIN aspects a ON AI.IF(
 
 These limits apply:
 
-- With the Quail backend, the classification and its `AI.IF` join run on
-  one GPU.
+- The classification and its `AI.IF` join run on one GPU.
 - A `WHERE` condition cannot test the label of a joined row.
 - A query cannot classify joined rows and also use `AI.SCORE`.
 
-See [classifying joined rows](/docs/architecture/execution#classifying-joined-rows).
-
-### AI.EXTRACT
-
-<Callout type="info">Coming soon</Callout>
-
-Pull structured fields out of each document, like Snowflake's
-[AI_EXTRACT](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql).
-Example:
-
-```sql
-SELECT AI.EXTRACT(r.body, 'movie_title', 'rating') AS extracted
-FROM reviews r
-```
-
-### AI.MAP
-
-<Callout type="info">Coming soon</Callout>
-
-Run a free-form instruction on each document and return the generated
-text, like Snowflake's
-[AI_COMPLETE](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql).
-Example:
-
-```sql
-SELECT AI.MAP('Summarize this review in one sentence.\n\n{0}', r.body) AS summary
-FROM reviews r
-```
+For labels computed before later filters, see
+[Classification answers](/docs/user-guide/results#classification-answers).
+For the scoring methods, see
+[Label scoring](/docs/architecture/execution#label-scoring).
 
 ## SELECT, FROM, JOIN, ORDER BY, LIMIT
 
 Quail supports these SQL clauses with the following limits:
 
 - **`SELECT`** lists columns and `AI.SCORE` or `AI.CLASSIFY`
-  outputs with column aliases. `*` expands to all table columns. Other computed expressions
-  are unsupported. `SELECT DISTINCT` drops duplicate rows.
+  outputs with column aliases. `*` expands to all table columns. Other
+  computed expressions are unsupported. `SELECT DISTINCT` drops duplicate rows.
 - **`FROM`** names a registered table, with an optional alias.
 - **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
   `RIGHT`, `FULL`) are not.
@@ -511,7 +366,7 @@ LIMIT 10
 `ORDER BY`, `DISTINCT`, and `OFFSET` run on the Quail backend; the stock
 vLLM and SGLang backends refuse them.
 
-## Unsupported SQL operators (for now)
+## Unsupported SQL
 
 - `GROUP BY`, `HAVING`, window functions
 - `UNION`, `EXCEPT`, `INTERSECT`
@@ -519,5 +374,6 @@ vLLM and SGLang backends refuse them.
 - Queries with no AI operator
 - `JOIN` with only relational predicates (no AI operator)
 - Outer joins (`LEFT`, `RIGHT`, `FULL`)
+- `AI.EXTRACT` and `AI.MAP`
 
 Using any of these raises `quail.logical.CompileError`.

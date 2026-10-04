@@ -178,6 +178,8 @@ class VLLMEngine:
     runtime_package = "vllm==0.26.0"
     # a request can decode an answer as text
     scores_labels = True
+    # a decision model runs on the pooling runner
+    roles = frozenset({"generative", "decision"})
 
     def llm_kwargs(self, spec) -> dict:
         """Return the LLM constructor arguments beyond the model name.
@@ -205,6 +207,10 @@ class VLLMEngine:
 
     def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
         """Load the spec's model and return the engine state and boot record."""
+        if spec.role == "decision":
+            from quail.backends.vllm_decision import boot_decision
+
+            return boot_decision(spec, self.llm_kwargs(spec))
         from vllm import LLM, SamplingParams
         from vllm.renderers.registry import RENDERER_REGISTRY
         from vllm.tokenizers import TokenizerRegistry

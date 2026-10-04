@@ -158,10 +158,12 @@ def _reject_forbidden(tree) -> None:
 
 
 class _Binder:
-    def __init__(self, catalog: Catalog, tokenizer, turn=("", "")):
+    def __init__(self, catalog: Catalog, tokenizer, turn=("", ""),
+                 layout="ai-if"):
         self.catalog = catalog
         self.tokenizer = tokenizer
         self.turn = turn
+        self.layout = layout
         self.tables = []          # (alias, provider) in appearance order
         self.doc_columns = {}     # alias -> document column
         self.filters = {}         # alias -> [FilterPredicate]
@@ -301,14 +303,15 @@ class _Binder:
         if classify is not None:
             prompt = bind_classify_prompt(template, tuple(refs),
                                           tokenizer=self.tokenizer,
-                                          turn=self.turn, **classify)
+                                          turn=self.turn, layout=self.layout,
+                                          **classify)
         else:
             if function == "AI_SCORE":
                 binder = bind_score_prompt
             else:
                 binder = bind_join_prompt if join else bind_prompt
             prompt = binder(template, tuple(refs), self.tokenizer,
-                            turn=self.turn)
+                            turn=self.turn, layout=self.layout)
         for r in refs:
             self.note_doc_column(r)
         return prompt, options, aliases
@@ -601,10 +604,12 @@ def compile_sql(sql: str, catalog: Catalog,
                 tokenizer=None,
                 dialect: SQLDialect | str = SQLDialect.SNOWFLAKE,
                 turn: tuple[str, str] = ("", ""),
+                layout: str = "ai-if",
                 ) -> LogicalPlan:
     """Compile AI SQL text into a LogicalPlan.
 
-    turn is the model's chat-turn text wrapped around every prompt.
+    turn is the model's chat-turn text wrapped around every prompt;
+    layout names the model's prompt text in PROMPT_LAYOUTS.
     """
     try:
         dialect = SQLDialect(dialect)
@@ -626,7 +631,7 @@ def compile_sql(sql: str, catalog: Catalog,
     offset = _parse_offset(tree)
     distinct = _parse_distinct(tree)
 
-    b = _Binder(catalog, tokenizer, turn)
+    b = _Binder(catalog, tokenizer, turn, layout)
 
     from_ = _from_clause(tree)
     if from_ is None or not isinstance(from_.this, exp.Table):

@@ -34,7 +34,8 @@ class Stage:
             stage. Without a callback, any true answer is sufficient.
         read_all_rows: Whether to read every suffix row rather than its last.
         read_rows: Optional count of trailing rows to read per suffix,
-            overriding read_all_rows.
+            overriding read_all_rows. None takes the readout's
+            trailing_rows for every suffix when it has more than one.
         single: Whether each document has one request that can be packed
             with its prefix and frame as one entry.
         append: Whether the request's tokens join the document's KV after
@@ -64,6 +65,12 @@ class Stage:
     chains: list | None = None
     canvas: Callable | None = None
     canvas_rows: int = 0
+
+    def __post_init__(self):
+        trailing = getattr(self.readout, "trailing_rows", 1)
+        if self.read_rows is None and trailing > 1:
+            self.read_rows = [trailing] * len(self.suffixes)
+            self.read_all_rows = True
 
 
 def shared_preamble_tokens(question_ids) -> int:

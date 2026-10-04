@@ -109,6 +109,21 @@ def _longest_input(spec, context) -> tuple[int, int]:
     return prefix, longest[1] + len(parts[2]) + canvas
 
 
+def score_fixed_tokens(token_parts, canvas_tokens: int, draws: int) -> int:
+    """Return the tokens a score adds to each input besides its documents.
+
+    Args:
+        token_parts: The prompt's tokenized pieces around the documents.
+        canvas_tokens: The model's canvas rows per answer; 0 without one.
+        draws: The noise draws averaged per answer.
+
+    Returns:
+        The prompt pieces, the canvas, and each later draw's cue and canvas.
+    """
+    return (sum(map(len, token_parts)) + canvas_tokens
+            + (draws - 1) * (1 + canvas_tokens))
+
+
 def _score_work(count, mean_tokens, fixed_tokens, *, variance=0.0,
                 prefix_tokens=0.0, prefix_variance=0.0, groups=0.0,
                 shared_tokens=0, copies=1) -> Work:
@@ -164,13 +179,16 @@ def _answer_token_parts(prompt, context) -> tuple[tuple[int, ...], ...]:
     prompt anchored on its first document.
     """
     tokenizer, turn = context.tokenizer, context.model.turn
+    layout = context.model.prompt_layout
     aliases = _prompt_aliases(prompt)
     if len(aliases) == 1:
-        bound = bind_prompt(prompt.template, prompt.args, tokenizer, turn)
+        bound = bind_prompt(prompt.template, prompt.args, tokenizer, turn,
+                            layout)
         return tuple(bound.preamble_token_ids), tuple(bound.tail_token_ids)
     if len(prompt.args) != 2:
         raise ValueError("AI.SCORE supports one document or one document pair")
-    bound = bind_join_prompt(prompt.template, prompt.args, tokenizer, turn)
+    bound = bind_join_prompt(prompt.template, prompt.args, tokenizer, turn,
+                             layout)
     pieces = {alias: (label, frame) for alias, label, frame in bound.label_token_ids}
     left, right = aliases
     return (tuple(bound.preamble_token_ids),
@@ -214,7 +232,7 @@ def _score_spec(
     # a one-table score on a canvas model may average noise draws, each
     # the cue and its canvas after the document's KV; every draw is priced
     draws = context.canvas_draws if canvas and len(aliases) == 1 else 1
-    fixed_tokens = sum(map(len, token_parts)) + canvas + (draws - 1) * (1 + canvas)
+    fixed_tokens = score_fixed_tokens(token_parts, canvas, draws)
     shared = len(token_parts[0])
     prefix = float(shared)
     prefix_variance = 0.0
@@ -647,10 +665,10 @@ def _plan_reranker(region, context, *, backend_name: str):
             "estimated_attention_pairs": total_work.pairs,
             "batching": "token_based_admission",
             "data_parallel_copies": context.gpu_count,
-            "score_normalization": (
-                "yes_no_softmax" if context.model.role == "reranker"
-                else "true_false_softmax"
-            ),
+            "score_normalization": {
+                "reranker": "yes_no_softmax",
+                "decision": "decision_head_softmax",
+            }.get(context.model.role, "true_false_softmax"),
             "order_rule": "cost_per_expected_rejection",
         },
     )

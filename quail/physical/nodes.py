@@ -189,6 +189,9 @@ class RequestClassifySpec:
     partner: str | None = None
     join_layout_token_ids: tuple[tuple[Any, ...], ...] = ()
     join_written_pos: int | None = None
+    # a decision model's scored options: distances before the prompt's
+    # last row of each option block's end, then 0
+    option_offsets: tuple[int, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestClassifySpec":
@@ -207,6 +210,8 @@ class RequestClassifySpec:
                                  for ids in value.get("join_layout_token_ids", ())),
             join_written_pos=(None if join_written_pos is None
                               else int(join_written_pos)),
+            option_offsets=tuple(int(offset)
+                                 for offset in value.get("option_offsets", ())),
         )
 
     def to_dict(self) -> dict:
@@ -221,6 +226,7 @@ class RequestClassifySpec:
             "partner": self.partner,
             "join_layout_token_ids": [list(ids) for ids in self.join_layout_token_ids],
             "join_written_pos": self.join_written_pos,
+            "option_offsets": list(self.option_offsets),
         }
 
 
@@ -490,7 +496,9 @@ class ScoreSpec:
 
     draws is the most noise draws a diffusion model averages per answer;
     an answer whose first draw is certain enough uses one. An
-    autoregressive model always uses one.
+    autoregressive model always uses one. share_prefixes lets each
+    document borrow the KV pages of a document sharing its prefix; it
+    applies to scores of one table.
     """
 
     name: str
@@ -502,6 +510,7 @@ class ScoreSpec:
     pair_fraction: float = 1.0
     prompt_token_parts: tuple[tuple[int, ...], ...] = ()
     draws: int = 1
+    share_prefixes: bool = False
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ScoreSpec":
@@ -520,6 +529,7 @@ class ScoreSpec:
                 tuple(part) for part in value.get("prompt_token_parts", ())
             ),
             draws=int(value.get("draws", 1)),
+            share_prefixes=bool(value.get("share_prefixes", False)),
         )
 
     def to_dict(self) -> dict:
@@ -533,6 +543,7 @@ class ScoreSpec:
             "pair_fraction": self.pair_fraction,
             "prompt_token_parts": [list(part) for part in self.prompt_token_parts],
             "draws": self.draws,
+            "share_prefixes": self.share_prefixes,
         }
 
 
@@ -582,6 +593,7 @@ class AiScore(PhysicalNode):
             "estimated_seconds": (
                 0 if spec is None else spec.estimated_seconds
             ),
+            "share_prefixes": False if spec is None else spec.share_prefixes,
         }
 
     @classmethod
@@ -607,19 +619,21 @@ class ClassifySpec(ScoreSpec):
         scoring: The label scoring rule: letters, trie_tree, or trie_decode.
             The planner leaves it empty until the label_scoring rule
             picks one.
-        share_prefixes: Whether documents may reuse shared prefix KV pages.
         probabilities: Whether to add a name + "_probabilities" map column.
         join_layout: Anchor note and partner label token sequences for pair
             classification, or None for individual documents. The question
             follows the partner document.
+        frame_tokens: For the decision_choice rule, the tokens of the
+            prompt tail before the first option block; the option
+            blocks and the closing line follow.
     """
 
     labels: tuple[str, ...] = ()
     label_token_ids: tuple[tuple[int, ...], ...] = ()
     scoring: str = "letters"
-    share_prefixes: bool = False
     probabilities: bool = False
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    frame_tokens: int = 0
 
     @property
     def anchor(self) -> str:
@@ -641,17 +655,17 @@ class ClassifySpec(ScoreSpec):
             **{name: getattr(base, name) for name in (
                 "name", "aliases", "query_template", "arguments",
                 "expected_inputs", "estimated_seconds", "pair_fraction",
-                "prompt_token_parts", "draws")},
+                "prompt_token_parts", "draws", "share_prefixes")},
             labels=tuple(str(label) for label in value["labels"]),
             label_token_ids=tuple(
                 tuple(int(token) for token in ids)
                 for ids in value["label_token_ids"]),
             scoring=str(value.get("scoring", "letters")),
-            share_prefixes=bool(value.get("share_prefixes", False)),
             probabilities=bool(value.get("probabilities", False)),
             join_layout=(None if value.get("join_layout") is None else tuple(
                 tuple(int(token) for token in part)
                 for part in value["join_layout"])),
+            frame_tokens=int(value.get("frame_tokens", 0)),
         )
 
     def to_dict(self) -> dict:
@@ -660,10 +674,10 @@ class ClassifySpec(ScoreSpec):
             "labels": list(self.labels),
             "label_token_ids": [list(ids) for ids in self.label_token_ids],
             "scoring": self.scoring,
-            "share_prefixes": self.share_prefixes,
             "probabilities": self.probabilities,
             "join_layout": (None if self.join_layout is None
                             else [list(part) for part in self.join_layout]),
+            "frame_tokens": self.frame_tokens,
         }
 
 
@@ -694,8 +708,6 @@ class AiClassify(AiScore):
             **super().explain_fields(),
             "labels": [] if self.spec is None else list(self.spec.labels),
             "scoring": None if self.spec is None else self.spec.scoring,
-            "share_prefixes": (False if self.spec is None
-                               else self.spec.share_prefixes),
             "draws": 1 if self.spec is None else self.spec.draws,
             "probabilities": (False if self.spec is None
                               else self.spec.probabilities),

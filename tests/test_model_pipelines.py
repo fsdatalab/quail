@@ -9,7 +9,15 @@ from quail.backends.quail.backend import QuailBackend
 from quail.backends.quail.executor.models import build_pipeline, supported_archs
 from quail.backends.quail.executor.models.qwen3 import Qwen3Pipeline
 from quail.backends.request import RequestBackend
-from quail.specs import H100_SXM, MODELS, QWEN3_4B_FP8, QWEN3_RERANKER_0_6B_BF16
+from quail.cost.budgets import tree_attention_allowed
+from quail.specs import (
+    DECISION_2_KAI_0_6B_BF16,
+    H100_SXM,
+    MODELS,
+    QWEN3_4B_FP8,
+    QWEN3_RERANKER_0_6B_BF16,
+    QWEN3_RERANKER_4B_BF16,
+)
 
 
 def test_backends_support_registered_generative_models_and_refuse_others():
@@ -42,9 +50,14 @@ def _model(torch, dtype):
         layers=[layer], embed_tokens=None, norm=None))
 
 
-def test_tree_attention_follows_the_weight_precision():
+def test_tree_attention_runs_at_either_precision_on_models_of_2b_and_up():
     torch = pytest.importorskip("torch")
-    for dtype_name, expected in [("float8_e4m3fn", True), ("bfloat16", False)]:
+    for dtype_name, spec, expected in [
+            ("float8_e4m3fn", None, True), ("bfloat16", None, True),
+            ("float8_e4m3fn", QWEN3_4B_FP8, True),
+            ("bfloat16", QWEN3_RERANKER_4B_BF16, True),
+            ("bfloat16", QWEN3_RERANKER_0_6B_BF16, False),
+            ("bfloat16", DECISION_2_KAI_0_6B_BF16, False)]:
         engines = []
 
         def engine(arena, **kwargs):
@@ -52,7 +65,10 @@ def test_tree_attention_follows_the_weight_precision():
             return SimpleNamespace(**kwargs)
 
         pipeline = Qwen3Pipeline(_model(torch, getattr(torch, dtype_name)), None,
-                                 spec=None, engine_class=engine)
-        assert engines[0]["fp8"] is expected, dtype_name
-        assert pipeline.tree_attention is expected, dtype_name
+                                 spec=spec, engine_class=engine)
+        assert engines[0]["fp8"] is (dtype_name == "float8_e4m3fn")
+        assert pipeline.tree_attention is expected, (dtype_name, spec)
         assert pipeline.max_chunk_tokens == (2**31 - 1) // 4096, dtype_name
+    assert {name for name, model in MODELS.items()
+            if tree_attention_allowed(model)} == {
+        "qwen3-4b-fp8", "qwen3-32b-fp8", "qwen3-reranker-4b-bf16"}

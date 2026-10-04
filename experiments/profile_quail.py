@@ -110,7 +110,7 @@ def _boot_state(model, **pipeline_kwargs):
     """
     import torch
     import torch.nn.functional as F
-    from transformers import AutoTokenizer
+    from gigatoken import Tokenizer
 
     from quail.backends.quail.executor.arena import KVArena
     from quail.backends.quail.executor.model import load_model
@@ -122,7 +122,7 @@ def _boot_state(model, **pipeline_kwargs):
 
     spec = MODELS[model]
     device = DEVICES["h100-sxm"]
-    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    tokenizer = Tokenizer(spec.hf_name).as_hf()
     chunk_tokens = budgets.chunk_budget(spec, device)
     model_mod = load_model(spec.hf_name, revision=spec.revision,
                            max_batched_tokens=chunk_tokens,

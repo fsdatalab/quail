@@ -2,7 +2,11 @@
 
 import numpy as np
 
-from quail.backends.quail.executor.classify import AnswerStream, QuailClassifier
+from quail.backends.quail.executor.classify import (
+    AnswerStream,
+    QuailClassifier,
+    shared_prefix_tree,
+)
 from quail.backends.quail.executor.loop import run_join
 from quail.backends.quail.executor.parts import input_staging
 from quail.backends.quail.executor.readout import AsyncScores
@@ -47,6 +51,8 @@ class QuailScorer:
         if (len(spec.aliases) == 1 and spec.draws > 1
                 and state.loaded_model.pipeline.canvas_ids):
             return self._drawn(spec, rows, documents, on_answers)
+        if len(spec.aliases) == 1 and spec.share_prefixes:
+            return self._shared(spec, rows, documents, on_answers)
         if len(spec.aliases) == 1:
             prefixes = [parts[0]]
             suffixes = [chain_tokens(documents[spec.aliases[0]][doc], parts[1])
@@ -96,6 +102,9 @@ class QuailScorer:
     def _scores(self) -> AsyncScores:
         """Return the cached score readout and clear its input staging cache."""
         state = self.state
+        if state.score_readout is not None:
+            input_staging(state)
+            return state.score_readout
         answer_rows = state.answer_rows
         async_scores = state.async_scores
         if async_scores is None or async_scores.rows is not answer_rows:
@@ -103,6 +112,62 @@ class QuailScorer:
             state.async_scores = async_scores
         input_staging(state)
         return async_scores
+
+    def _shared(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
+        """Score documents that borrow the KV pages of shared prefixes.
+
+        Each document's prompt head and tokens are its prefix; a
+        document whose prefix shares whole pages with another's reads
+        those pages instead of computing them. The prompt tail follows
+        each document, its last token read for the score.
+
+        Args:
+            spec: Single-document score specification.
+            rows: Input row indices with shape (documents, 1).
+            documents: Tokenized documents indexed by table alias and document ID.
+            on_answers: Optional callable(row positions, values) run with each
+                chunk's finished scores.
+
+        Returns:
+            A RerankerBatch of scores and execution metrics.
+
+        Raises:
+            ValueError: The prompt has no tokens after the document.
+        """
+        state = self.state
+        (alias,) = spec.aliases
+        head, tail = spec.prompt_token_parts
+        if not tail:
+            raise ValueError("AI.SCORE needs a question after the document")
+        docs = rows[:, 0]
+        scores = np.full(len(docs), np.nan, dtype=np.float32)
+
+        def keep(anchor, row):
+            scores[anchor] = float(row[0])
+            return True
+
+        prefixes = DocumentPrefixes(head, documents[alias], docs)
+        stages = [Stage(suffixes=[[tail[-1]]], readout=self._scores(),
+                        frame=list(tail[:-1]), decide=keep, single=True,
+                        label=f"score {spec.name}")]
+        stats = {}
+        stream = AnswerStream(on_answers)
+        _, _, fresh = run_stages(
+            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+            stages, prefixes, state.chunk_tokens,
+            anchor_keys=[("score", spec.name, index) for index in range(len(docs))],
+            staging=state.loaded_model.input_staging,
+            prefix_tree=shared_prefix_tree(
+                spec.name, prefixes, state.loaded_model.arena),
+            stats=stats, label=f"score {spec.name}",
+            on_chunk=stream.chunk(lambda anchor: (
+                None if np.isnan(scores[anchor]) else scores[anchor])))
+        stream.finish(range(len(docs)), lambda anchor: scores[anchor])
+        total = sum(len(head) + len(documents[alias][doc]) + len(tail)
+                    for doc in docs)
+        return RerankerBatch(scores, fresh_tokens=fresh,
+                             cached_tokens=total - fresh,
+                             borrowed_tokens=stats.get("borrowed_tokens", 0))
 
     def _drawn(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
         """Score documents with reproducible diffusion draws.
@@ -165,10 +230,13 @@ class QuailScorer:
                   canvas_rows=width),
         ]
         prefixes = DocumentPrefixes(head, documents[alias], docs)
+        tree = (shared_prefix_tree(spec.name, prefixes, state.loaded_model.arena)
+                if spec.share_prefixes else None)
+        stats = {}
         stream = AnswerStream(on_answers)
         _, _, fresh = run_stages(
             state.torch, state.loaded_model.arena, pipeline, stages, prefixes,
-            state.chunk_tokens,
+            state.chunk_tokens, prefix_tree=tree, stats=stats,
             anchor_keys=[("score", spec.name, index) for index in range(len(docs))],
             staging=state.loaded_model.input_staging, label=f"score {spec.name}",
             on_chunk=stream.chunk(lambda anchor: (
@@ -178,4 +246,5 @@ class QuailScorer:
         total = (sum(len(head) + len(documents[alias][doc]) for doc in docs)
                  + len(docs) * (len(tail) - 1 + read) + extended[0] * more * read)
         return RerankerBatch(scores, fresh_tokens=fresh,
-                             cached_tokens=total - fresh)
+                             cached_tokens=total - fresh,
+                             borrowed_tokens=stats.get("borrowed_tokens", 0))
