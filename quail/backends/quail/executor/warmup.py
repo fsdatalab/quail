@@ -32,14 +32,14 @@ ROW_CLASSES = ((1, 1), (32, 1), (32, 16), (32, 17),
 ROW_CLASS_CACHED = 64
 
 
-def _warm_inputs(budget):
+def _warm_inputs(budget, question_tokens=16):
     """Generate synthetic document and question tokens for kernel warmup.
 
     Cycled to any length the passes need. Fixed small ids; only the
     counts matter to the kernels.
     """
     doc = [10 + (i % 500) for i in range(512)]
-    question = list(range(10, 26))
+    question = [10 + (i % 500) for i in range(question_tokens)]
     q_max = len(question)
     warm_docs, used = [], 0
     while used + len(doc) + q_max <= budget:
@@ -56,7 +56,9 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     unpaged causal fast path. join_chunk adds a join chunk and a
     classification chunk.
     """
-    warm_docs, question, doc = _warm_inputs(budget)
+    # a readout of several trailing rows needs a question that long
+    trailing = getattr(async_ans, "trailing_rows", 1)
+    warm_docs, question, doc = _warm_inputs(budget, max(16, trailing))
     q_max = len(question)
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
@@ -81,8 +83,10 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         logger.debug("kernels: warming join forward pass")
         run_join(torch, arena, pipeline, async_ans, warm_docs,
                  [[question] * 8], budget)
+    if join_chunk and trailing == 1:
         # a classification: the question as the frame after each
-        # document, then many short suffixes of mixed lengths
+        # document, then many short suffixes of mixed lengths; a
+        # decision model classifies with its own readout
         logger.debug("kernels: warming classification forward pass")
         labels = [question[:1 + i % 6] for i in range(26)]
         run_join(torch, arena, pipeline, async_ans, warm_docs,

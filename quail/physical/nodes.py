@@ -189,6 +189,9 @@ class RequestClassifySpec:
     partner: str | None = None
     join_layout_token_ids: tuple[tuple[Any, ...], ...] = ()
     join_written_pos: int | None = None
+    # a decision model's scored options: distances before the prompt's
+    # last row of each option block's end, then 0
+    option_offsets: tuple[int, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestClassifySpec":
@@ -207,6 +210,8 @@ class RequestClassifySpec:
                                  for ids in value.get("join_layout_token_ids", ())),
             join_written_pos=(None if join_written_pos is None
                               else int(join_written_pos)),
+            option_offsets=tuple(int(offset)
+                                 for offset in value.get("option_offsets", ())),
         )
 
     def to_dict(self) -> dict:
@@ -221,6 +226,7 @@ class RequestClassifySpec:
             "partner": self.partner,
             "join_layout_token_ids": [list(ids) for ids in self.join_layout_token_ids],
             "join_written_pos": self.join_written_pos,
+            "option_offsets": list(self.option_offsets),
         }
 
 
@@ -612,6 +618,9 @@ class ClassifySpec(ScoreSpec):
         join_layout: Anchor note and partner label token sequences for pair
             classification, or None for individual documents. The question
             follows the partner document.
+        frame_tokens: For the decision_choice rule, the tokens of the
+            prompt tail before the first option block; the option
+            blocks and the closing line follow.
     """
 
     labels: tuple[str, ...] = ()
@@ -620,6 +629,7 @@ class ClassifySpec(ScoreSpec):
     share_prefixes: bool = False
     probabilities: bool = False
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    frame_tokens: int = 0
 
     @property
     def anchor(self) -> str:
@@ -652,6 +662,7 @@ class ClassifySpec(ScoreSpec):
             join_layout=(None if value.get("join_layout") is None else tuple(
                 tuple(int(token) for token in part)
                 for part in value["join_layout"])),
+            frame_tokens=int(value.get("frame_tokens", 0)),
         )
 
     def to_dict(self) -> dict:
@@ -664,6 +675,7 @@ class ClassifySpec(ScoreSpec):
             "probabilities": self.probabilities,
             "join_layout": (None if self.join_layout is None
                             else [list(part) for part in self.join_layout]),
+            "frame_tokens": self.frame_tokens,
         }
 
 

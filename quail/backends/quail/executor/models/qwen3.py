@@ -3,12 +3,13 @@
 Layer order: input RMSNorm, fused QKV projection, per-head Q and K
 RMSNorm with rotary, attention, output projection, post-attention
 RMSNorm, gate_up projection, SiLU-gated product, down projection.
-The Qwen3 rerankers are this architecture with bf16 weights and run
-through this file too.
+The Qwen3 rerankers and the Decision 2.0 backbone are this
+architecture with bf16 weights and run through this file too.
 """
 
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
+from quail.cost.budgets import tree_attention_allowed
 
 
 class Qwen3Pipeline(ModelPipeline):
@@ -27,15 +28,13 @@ class Qwen3Pipeline(ModelPipeline):
             arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
             fp8=fp8, kernels=kernels)
-        # the tree path's merge ends in an fp8 quant; a bf16 model
-        # (the rerankers) runs every chunk through unified attention
-        self.tree_attention = fp8
         # The fused kernels compute element offsets in 32-bit ints,
         # so a chunk needs rows x widest_row < 2^31.
         widest = max(max(layer.self_attn.qkv_proj.weight.shape[0],
                          layer.mlp.gate_up_proj.weight.shape[0])
                      for layer in self.layers)
         self.max_chunk_tokens = (2**31 - 1) // widest
+        self.tree_attention = spec is None or tree_attention_allowed(spec)
 
     def linears(self):
         # every layer has the same four shapes

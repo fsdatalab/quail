@@ -176,6 +176,22 @@ def _attention_time(model: ModelSpec, device: DeviceSpec,
                moved / device.hbm_bw) * model.layers
 
 
+# Below this many dense parameters a model runs unified attention only.
+# On Decision-2.0-Kai-0.6B (0.44e9) the tree path ran 4 to 7 percent
+# slower than unified on the QUAIL-B IMDB-2 and IMDB-8 joins, where the
+# roofline below picked tree.
+TREE_ATTENTION_MIN_PARAMS = 2e9
+
+
+def tree_attention_allowed(model: ModelSpec) -> bool:
+    """Whether the planner and the executor may run the model's tree path.
+
+    A diffusion model packs canvas rows, which the tree path does not.
+    """
+    return (not model.canvas_tokens
+            and model.params >= TREE_ATTENTION_MIN_PARAMS)
+
+
 def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
                           readers: float, reader_rows: float,
                           node_tokens: float) -> str:

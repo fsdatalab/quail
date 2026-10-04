@@ -34,8 +34,7 @@ FA_MAX_HEAD_DIM = 256
 # "tree" is two calls: a causal one over the chunk's rows and one in
 # which the readers of one resident KV (a join anchor, a shared
 # prefix) read it stacked, merged by the fused merge+quant kernel.
-# The tree path needs the fp8 kernels, so only pipelines that set
-# tree_attention run it.
+# Only pipelines that set tree_attention run the tree path.
 ATTENTION_PATHS = ("unified", "tree")
 
 
@@ -465,7 +464,8 @@ class Engine:
             tl.store(v_dst_ptr + d * ROW + offs, v, mask=mask)
 
         # the online-softmax LSE merge (Milakov & Gimelshein 2018)
-        # fused with vLLM's per-group fp8 quantize pattern
+        # fused with vLLM's per-group fp8 quantize pattern; with QUANT
+        # off it stores the bf16 merge and no scales
         @triton.jit
         def merge_attn_quant(a_ptr, b_ptr, la_ptr, lb_ptr, source_ptr,
                              q_ptr, s_ptr,
@@ -474,7 +474,7 @@ class Engine:
                              stride_lb_t, stride_lb_h,
                              stride_q_t, s_stride_g, s_stride_t,
                              D: tl.constexpr, GPB: tl.constexpr,
-                             UE8M0: tl.constexpr):
+                             UE8M0: tl.constexpr, QUANT: tl.constexpr):
             t = tl.program_id(0)
             block = tl.program_id(1)
             offs = tl.arange(0, D * GPB)
@@ -500,15 +500,19 @@ class Engine:
             merged = a2 + (b2 - a2) * w[:, None]
             merged = merged.to(tl.bfloat16).to(tl.float32)
             y = tl.where(has_b, merged, a2)
-            amax = tl.max(tl.abs(y), axis=1)
-            scale = tl.maximum(amax, 1e-10) / 448.0
-            if UE8M0:
-                scale = tl.math.exp2(tl.ceil(tl.math.log2(scale)))
-            q = y / scale[:, None]
-            q = tl.minimum(tl.maximum(q, -448.0), 448.0)
-            tl.store(q_ptr + t * stride_q_t + h0 * D + offs,
-                     tl.reshape(q, (D * GPB,)).to(q_ptr.dtype.element_ty))
-            tl.store(s_ptr + heads * s_stride_g + t * s_stride_t, scale)
+            if QUANT:
+                amax = tl.max(tl.abs(y), axis=1)
+                scale = tl.maximum(amax, 1e-10) / 448.0
+                if UE8M0:
+                    scale = tl.math.exp2(tl.ceil(tl.math.log2(scale)))
+                q = y / scale[:, None]
+                q = tl.minimum(tl.maximum(q, -448.0), 448.0)
+                tl.store(q_ptr + t * stride_q_t + h0 * D + offs,
+                         tl.reshape(q, (D * GPB,)).to(q_ptr.dtype.element_ty))
+                tl.store(s_ptr + heads * s_stride_g + t * s_stride_t, scale)
+            else:
+                tl.store(q_ptr + t * stride_q_t + h0 * D + offs,
+                         tl.reshape(y, (D * GPB,)).to(q_ptr.dtype.element_ty))
 
         # gelu_tanh_and_mul fused with the per-row fp8 quantization the
         # next linear would run on its output
@@ -774,26 +778,38 @@ class Engine:
             ROW=row, ROW_POW2=1 << (row - 1).bit_length())
 
     def merge_attn_quant(self, out_a, lse_a, out_b, lse_b, source):
-        """Merge cached and fresh attention and write FP8 GEMM input.
+        """Merge cached and fresh attention and write the o_proj input.
 
-        One 128-value FP8 group is one attention head for Qwen3 4B.
         The source vector maps each packed row to its row in out_b, or
-        contains -1 when out_a is already the complete answer.
+        contains -1 when out_a is already the complete answer. An fp8
+        model gets FP8 rows and their scales; one 128-value FP8 group
+        is one attention head. A bf16 model gets bf16 rows and None.
         """
         n, heads, dim = out_a.shape
-        assert dim == GROUP
-        q = self.torch.empty((n, heads * dim), dtype=self.fp8,
-                             device=out_a.device)
-        scales = self._col_major_scales(n, heads * dim)
         gpb = 4
+        if heads % gpb:
+            raise ValueError(
+                f"the merge kernel takes heads in groups of {gpb}, not {heads}")
+        if self.is_fp8:
+            assert dim == GROUP
+            q = self.torch.empty((n, heads * dim), dtype=self.fp8,
+                                 device=out_a.device)
+            scales = self._col_major_scales(n, heads * dim)
+            scale_strides = scales.stride(1), scales.stride(0)
+        else:
+            q = self.torch.empty((n, heads * dim), dtype=self.torch.bfloat16,
+                                 device=out_a.device)
+            scales = None
+            scale_strides = 0, 0
         self._triton_kernels()["merge_quant"][(n, heads // gpb)](
-            out_a, out_b, lse_a, lse_b, source, q, scales,
+            out_a, out_b, lse_a, lse_b, source, q,
+            q if scales is None else scales,
             out_a.stride(0), out_a.stride(1),
             out_b.stride(0), out_b.stride(1),
             lse_a.stride(0), lse_a.stride(1),
             lse_b.stride(0), lse_b.stride(1),
-            q.stride(0), scales.stride(1), scales.stride(0),
-            D=dim, GPB=gpb, UE8M0=self.use_ue8m0)
+            q.stride(0), *scale_strides,
+            D=dim, GPB=gpb, UE8M0=self.use_ue8m0, QUANT=self.is_fp8)
         return q, scales
 
     # ---- the primitives a forward loop calls -------------------------
@@ -830,8 +846,6 @@ class Engine:
         k3 = k.view(n, KH, D)
         v3 = v.contiguous().view(n, KH, D)
         if chunk.attention_mode == "tree":
-            if not self.is_fp8:
-                raise ValueError("BF16 forward passes require unified attention")
             return self.attention_tree(q3, k3, v3, chunk.meta)
         return self.quant(self.attention_unified(q3, k3, v3, chunk.meta))
 
@@ -871,7 +885,7 @@ class Engine:
         return out
 
     def attention_tree(self, q3, k3, v3, meta):
-        """The tree attention path: two calls, fused merge plus FP8 quantize.
+        """The tree attention path: two calls, then one fused merge.
 
         Takes (rows, heads, dim) tensors and returns the input pair
         for o_proj. Canvas rows are not packed for this path.

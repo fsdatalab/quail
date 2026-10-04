@@ -27,7 +27,7 @@ For measurements beside the plan's estimates, use
 | `worker_total_s` | Time in seconds from calling `run()` until it returns. Includes planning, input preparation, model startup, and preparing the result. Excludes result collection. |
 | `boot_kind` | `"cold"` when the model or kernels needed preparation; `"warm"` when they were already ready. |
 
-To inspect startup time with the Quail backend, read `report["boot"]`.
+To inspect startup time, read `report["boot"]`.
 It includes `load_model_s` for loading weights, `arena_s` for allocating
 KV memory, and `warm_kernels_s` for preparing kernels. Each is in seconds.
 
@@ -39,7 +39,7 @@ read from saved KV. Computing the same position again counts again.
 | Field | Meaning |
 | --- | --- |
 | `fresh_tokens` | Total token positions computed by the model. |
-| `cached_tokens` | Total token positions read from KV, when reported by the backend. |
+| `cached_tokens` | Total token positions read from KV, when available. |
 
 `fresh_tokens` counts model computation. It does not count every token
 in every prompt when the model reuses KV.
@@ -64,7 +64,7 @@ for operator_id, metrics in report["node_metrics"].items():
 | `evaluated_document_pairs` | Document pairs evaluated by a model join or classification operator. |
 | `fresh_tokens`, `cached_tokens` | Token counts for the operator, with the same definitions as the query totals. |
 
-The available measurements depend on the operator and backend.
+The available measurements depend on the operator.
 Use the query's `wall_s` for total execution time rather than adding
 operator times.
 

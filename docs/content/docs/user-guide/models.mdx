@@ -13,13 +13,14 @@ Set `model` to the model you want to run and `device` to your GPU type.
 | DiffusionGemma 26B-A4B | `"diffusion-gemma-26b-a4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
 | Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | BF16 | `AI.SCORE` |
 | Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | BF16 | `AI.SCORE` |
+| Decision 2.0 Kai 0.6B | `"decision-2.0-kai-0.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
 
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
 format. All listed models store KV in BF16.
 
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. See the
-[SQL reference](/docs/user-guide/sql#ai-operators) for examples.
+[SQL reference](/docs/user-guide/sql) for examples.
 
 ## GPUs
 
@@ -78,6 +79,39 @@ config = quail.EngineConfig(
 
 Classification of joined rows always uses one attempt.
 The setting does not change `AI.IF` execution.
+
+## Decision 2.0 Kai 0.6B
+
+[Decision 2.0 Kai 0.6B](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
+is a model from the vLLM Semantic Router team. It is fine tuned from
+Qwen3 0.6B to score supplied answers and return their probabilities in
+one forward pass.
+
+Quail uses the model for these functions:
+
+- `AI.IF` selects between "Yes" and "No" for a filter or join condition.
+- `AI.SCORE` returns the probability of "Yes" for that condition.
+- `AI.CLASSIFY` selects the supplied label with the highest score.
+
+```python
+config = quail.EngineConfig(
+    model="decision-2.0-kai-0.6b-bf16",
+    device="h100-sxm",
+)
+```
+
+Use the existing SQL and Python query syntax. Quail prepares the prompt
+for the model.
+
+*Calibration* describes how closely predicted probabilities match
+observed answer frequencies. Check calibration on labeled examples from
+your task before choosing a score threshold.
+
+See the vLLM Semantic Router team's
+[blog post introducing decision models](https://vllm-sr.ai/blog/decision-models/)
+for the approach. The post covers Decision 1.0; the
+[Kai 2.0 model card](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
+describes the model supported here.
 
 ## No local GPU? Use Modal
 
