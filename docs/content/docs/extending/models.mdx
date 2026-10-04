@@ -49,13 +49,8 @@ The checkpoint must use BF16 weights or FP8 weights stored in blocks of
 128 by 128 values. Models that use sliding window attention are not
 supported. See [weight formats](/docs/user-guide/models#models).
 
-`qwen3_spec` estimates the GPU memory the loaded weights use
-(`w_mem_bytes`) from the projections, the embedding table, and the
-output head when it is not tied to the embeddings. On the shipped
-Qwen3 models the estimate is within 3% of the measured value.
-
 You can pass additional `ModelSpec` fields to `qwen3_spec`. For example,
-set `w_mem_bytes` to a measured value to replace the estimate.
+set `w_mem_bytes` to the measured GPU memory used by the loaded weights.
 See [`qwen3_spec`](https://github.com/fsdatalab/quail/blob/main/quail/specs/qwen3.py)
 for its arguments.
 
