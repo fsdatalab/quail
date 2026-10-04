@@ -265,12 +265,7 @@ write_seconds = total_tokens * model.kappa / device.hbm_bw
 | `device.hbm_bw` | GPU memory bandwidth in bytes per second. |
 
 If the operator already writes KV, the additional write time is zero.
-Joins and classifications already write their document KV. A score of
-one table is priced like a filter that writes no KV. When the rule
-enables sharing for a score, it scales the score's estimated time by
-the fraction of tokens left to compute, assuming every document is
-scored. A score of two tables already reuses each anchor's KV, so the
-rule leaves it unchanged.
+Joins and classifications already write their document KV; a score of one table is priced like a filter that writes none.
 
 The comparison excludes sorting, scheduling, attention, and recomputation
 when shared KV is unavailable. Prefix matching requires token sequences,
