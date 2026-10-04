@@ -109,8 +109,7 @@ def classify_table(context, alias: str, backend_name: str,
         backend_name=backend_name, model=context.model,
         device=context.device, tokenizer=context.tokenizer,
         capacity=capacity, lengths=tuple(lengths), shared=tuple(shared),
-        tree=(context.model.weight_precision == "fp8"
-              and not context.model.canvas_tokens
+        tree=(budgets.tree_attention_allowed(context.model)
               and getattr(context, "attention", None) != "unified"))
 
 

@@ -444,3 +444,17 @@ def test_vllm_decision_client_reruns_a_request_without_its_rows():
     assert result.request_id == added[0][0]
     assert vllm_decision.decision_bit(result) == 1
     assert client.recomputed == 1
+
+
+def test_classification_tree_scoring_follows_the_executor_gate():
+    from quail.planner.classify import classify_table
+    from quail.specs import MODELS
+
+    def table(model):
+        context = SimpleNamespace(
+            document_tokens={"d": [100, 200]}, model=model, device=H100_SXM,
+            canvas_draws=1, tokenizer=_tokens)
+        return classify_table(context, "d", "quail")
+
+    assert not table(DECISION_2_KAI_0_6B_BF16).tree
+    assert table(MODELS["qwen3-4b-fp8"]).tree
