@@ -279,3 +279,7 @@ class EngineConfig:
     # one attention path, "tree" or "unified", forced for every filter
     # and join; None lets the planner choose per node
     attention: str | None = None
+    # on apple-gpu, the fraction of the GPU memory macOS recommends that
+    # Quail may hold, weights and KV together; None takes the device's
+    # default. No other device takes one
+    memory_fraction: float | None = None

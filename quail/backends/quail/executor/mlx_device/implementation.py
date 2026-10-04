@@ -25,6 +25,7 @@ class MlxImplementation(DeviceImplementation):
 
         self.mx = mx
         self.timing = False
+        self._limits_before = None
 
     @staticmethod
     def problem() -> str | None:
@@ -76,6 +77,41 @@ class MlxImplementation(DeviceImplementation):
 
     def peak_memory_bytes(self) -> int:
         return int(self.mx.get_peak_memory())
+
+    def hold_within(self, budget_bytes: float) -> None:
+        """Keep everything MLX holds inside a budget, and keep it in memory.
+
+        Call it once the weights and the KV pools are loaded. MLX keeps
+        the buffers it frees and reuses one only for a request of the
+        same size. Chunks differ in size, so without a limit the kept
+        buffers grow to many times a chunk's own. The limit is what the
+        budget leaves after the memory in use now.
+
+        The whole budget is wired, so macOS neither compresses nor
+        swaps it while other applications want memory.
+
+        Args:
+            budget_bytes: Everything Quail may hold on the device.
+        """
+        mx = self.mx
+        # MLX must not change the wired limit while it evaluates
+        mx.synchronize()
+        wired = mx.set_wired_limit(int(budget_bytes))
+        kept = mx.set_cache_limit(
+            max(0, int(budget_bytes) - mx.get_active_memory()))
+        if self._limits_before is None:
+            self._limits_before = wired, kept
+
+    def release_limits(self) -> None:
+        """Give MLX back the limits it had before hold_within."""
+        if self._limits_before is None:
+            return
+        mx = self.mx
+        mx.synchronize()
+        wired, kept = self._limits_before
+        mx.set_wired_limit(wired)
+        mx.set_cache_limit(kept)
+        self._limits_before = None
 
     # ---- readouts
 

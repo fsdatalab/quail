@@ -59,6 +59,9 @@ def test_a_session_scores_and_filters_as_mlx_lm_does(tmp_path, monkeypatch):
                 "SELECT r.id FROM reviews r "
                 f"WHERE AI_FILTER(PROMPT('{QUESTIONS[0]}', r.body)) "
                 f"AND AI_FILTER(PROMPT('{QUESTIONS[1]}', r.body))").run()
+            # the weights, the KV pools, and the buffers MLX keeps
+            held = mx.get_active_memory() + mx.get_cache_memory()
+            budget = session.device.mem_bytes
             ids = session.tokenizer
             prompts = [[render_filter_prompt_ids(
                 bind_prompt(question, ("body",), ids, turn=SPEC.turn,
@@ -75,6 +78,8 @@ def test_a_session_scores_and_filters_as_mlx_lm_does(tmp_path, monkeypatch):
 
     assert scored.report["boot_kind"] == "cold"
     assert chain.report["boot_kind"] == "warm"
+    # answers of the last query are still alive beside the pools
+    assert 0.5 * budget < held <= 1.01 * budget
     exact, half = margins[mx.float32], margins[mx.bfloat16]
     got = dict(scored.to_rows())
     probability = np.array([got[r] for r in range(len(REVIEWS))])

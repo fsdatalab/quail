@@ -123,9 +123,19 @@ class Session:
             raise RefusalError(model)
         self.config = config
         self.model = model
-        if config.device == APPLE_GPU and APPLE_GPU not in self.registry.devices:
-            # the spec depends on the machine, so it is built here
-            self.registry.register_device(local_apple_gpu())
+        if config.device == APPLE_GPU:
+            # the spec depends on the machine and the session's memory
+            # fraction, so it is built here
+            built = local_apple_gpu(config.memory_fraction)
+            if APPLE_GPU not in self.registry.devices:
+                self.registry.register_device(built)
+            elif self.registry.device(APPLE_GPU).mem_bytes != built.mem_bytes:
+                raise ValueError(
+                    "this registry's apple-gpu has another memory fraction; "
+                    "a session with a different one needs its own registry")
+        elif config.memory_fraction is not None:
+            raise ValueError(
+                f"memory_fraction applies to {APPLE_GPU}, not {config.device}")
         self.device = self.registry.device(config.device)
         try:
             backend = self.registry.backend(config.backend)

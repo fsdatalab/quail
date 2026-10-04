@@ -198,6 +198,7 @@ class LoadedMlx:
 
         spec, device = context.model, context.device
         self.spec = spec
+        self.device = device
         self.implementation = MlxImplementation()
         self._warmed = False
         self.prepared_boot = None
@@ -246,6 +247,9 @@ class LoadedMlx:
 
         if arena_pages is not None:
             self.arena.resize(*arena_pages, free_resident=True)
+        # the pools may have changed size, and with them what is left
+        # of the budget for the buffers MLX keeps
+        self.implementation.hold_within(self.device.mem_bytes)
         self.async_ans = MlxDecisions(self.decision_head, self.decision_offsets)
         self.chunk_tokens = chunk_tokens
         self.execution.bind_query(
@@ -280,6 +284,7 @@ class LoadedMlx:
         self.execution.close()
         self.model = self.arena = self.pipeline = self.decision_head = None
         self.async_ans = None
+        self.implementation.release_limits()
         self.implementation.mx.clear_cache()
 
 

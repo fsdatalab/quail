@@ -79,6 +79,11 @@ def test_the_apple_gpu_spec_is_built_from_this_machine():
     assert spec.name == APPLE_GPU == "apple-gpu"
     assert spec.implementation == "mlx" and H100_SXM.implementation == "cuda"
     assert spec.mem_bytes == recommended / 2
+    assert local_apple_gpu(0.25).mem_bytes == recommended / 4
+    assert local_apple_gpu(1).mem_bytes == recommended
+    for fraction in (0, -0.5, 1.5):
+        with pytest.raises(ValueError, match="memory_fraction"):
+            local_apple_gpu(fraction)
     assert spec.usd_per_hour == 0.0
     # the device caps the chunk below the model's own cap
     assert budgets.chunk_budget(DECISION_2_KAI_0_6B_BF16, spec) == 8192
@@ -118,6 +123,21 @@ def test_quail_runs_only_the_decision_model_on_one_apple_gpu():
     assert registry.device("apple-gpu") is session.device
     session.close()
 
+    # a session may take another share of the memory, with its own registry
+    quarter = quail.Session(
+        EngineConfig(model=DECISION_2_KAI_0_6B_BF16.name, device="apple-gpu",
+                     memory_fraction=0.25), tokenizer=str.split)
+    assert quarter.device.mem_bytes == session.device.mem_bytes / 2
+    quarter.close()
+    with pytest.raises(ValueError, match="another memory fraction"):
+        quail.Session(
+            EngineConfig(model=DECISION_2_KAI_0_6B_BF16.name, device="apple-gpu",
+                         memory_fraction=0.25),
+            tokenizer=str.split, registry=registry)
+    with pytest.raises(ValueError, match="applies to apple-gpu, not h100-sxm"):
+        quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
+                                   memory_fraction=0.5), tokenizer=str.split)
+
 
 def test_the_device_check_asks_the_device_implementation(monkeypatch):
     spec = local_apple_gpu()
@@ -146,6 +166,34 @@ def test_chunk_events_wait_for_the_device_only_when_timed():
     implementation.time_chunks(False)
     implementation.record_event()
     assert len(waits) == 2
+
+
+def test_the_implementation_holds_memory_in_a_budget_and_gives_the_limits_back():
+    def current(setter):
+        """An MLX limit, read by setting it and setting it back."""
+        value = setter(0)
+        setter(value)
+        return value
+
+    wired, kept = current(mx.set_wired_limit), current(mx.set_cache_limit)
+    implementation = MlxImplementation()
+    implementation.release_limits()        # nothing held yet
+    live = mx.zeros((1 << 20,), dtype=mx.float32)
+    mx.eval(live)
+    in_use = mx.get_active_memory()
+    assert in_use >= live.nbytes
+    implementation.hold_within(in_use + 1_000_000_000)
+    assert current(mx.set_wired_limit) == in_use + 1_000_000_000
+    # a few bytes of MLX's own arrays come and go between the two reads
+    assert abs(current(mx.set_cache_limit) - 1_000_000_000) < 1_000_000
+    # a smaller budget leaves less for the buffers MLX keeps
+    implementation.hold_within(in_use + 250_000_000)
+    assert abs(current(mx.set_cache_limit) - 250_000_000) < 1_000_000
+    implementation.hold_within(in_use // 2)
+    assert current(mx.set_cache_limit) == 0
+    implementation.release_limits()
+    assert current(mx.set_wired_limit) == wired
+    assert current(mx.set_cache_limit) == kept
 
 
 # ---- queries through a Session on a tiny decision model
@@ -308,5 +356,6 @@ def test_a_loaded_mlx_model_is_released_without_torch(tiny, monkeypatch):
     released = worker.release_booted_models(execute._BACKEND_STATE)
     assert released["models_released"] == 1
     assert released["cuda_allocated_bytes"] == 0
+    assert loaded.implementation._limits_before is None
     assert execute._BACKEND_STATE == {}
     assert loaded.model is None and loaded.arena is None
