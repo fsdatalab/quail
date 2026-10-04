@@ -901,26 +901,153 @@ class SortKey:
         return self.expression.name
 
     def validate(self) -> None:
-        if isinstance(self.expression, Alias):
+        if isinstance(self.expression, (Alias, AggregateCall)):
             self.expression.validate()
         elif not isinstance(self.expression, ColumnRef):
             raise CompileError(
-                f"a sort key is a column reference or a projected "
-                f"expression, got {type(self.expression).__name__}")
+                f"a sort key is a column reference, a projected "
+                f"expression, or an aggregate, got "
+                f"{type(self.expression).__name__}")
 
     def __str__(self) -> str:
         return (f"{self.name} {'DESC' if self.descending else 'ASC'} "
                 f"NULLS {'FIRST' if self.nulls_first else 'LAST'}")
 
 
+AGGREGATE_FUNCTIONS = ("count", "count_distinct", "sum", "avg", "min", "max")
+HAVING_COMPARISONS = ("=", "<>", "<", "<=", ">", ">=")
+
+
+@dataclass(frozen=True)
+class AggregateCall:
+    """One aggregate over the rows of a group, returned under a name.
+
+    ``argument`` names a projected column, or is None for ``count(*)``.
+    """
+    function: str
+    argument: Optional[str]
+    name: str
+
+    type_name: ClassVar[str] = "quail.aggregate_call"
+
+    def validate(self) -> None:
+        if self.function not in AGGREGATE_FUNCTIONS:
+            raise CompileError(
+                f"unsupported aggregate {self.function!r}; supported: "
+                f"{', '.join(AGGREGATE_FUNCTIONS)}")
+        if self.argument is None and self.function != "count":
+            raise CompileError(f"{self.function}(*) is not an aggregate")
+        if not self.name:
+            raise CompileError("an aggregate needs a name")
+
+    def __str__(self) -> str:
+        function = ("count(distinct " if self.function == "count_distinct"
+                    else f"{self.function}(")
+        return f"{self.name} = {function}{self.argument or '*'})"
+
+
+@dataclass(frozen=True)
+class HavingTest:
+    """A comparison of one aggregate with a literal, keeping the group."""
+    aggregate: AggregateCall
+    comparison: str
+    value: Any
+
+    type_name: ClassVar[str] = "quail.having_test"
+
+    def validate(self) -> None:
+        self.aggregate.validate()
+        if self.comparison not in HAVING_COMPARISONS:
+            raise CompileError(
+                f"HAVING compares with one of {HAVING_COMPARISONS}, got "
+                f"{self.comparison!r}")
+        if not isinstance(self.value, (int, float)) \
+                or isinstance(self.value, bool):
+            raise CompileError("HAVING compares an aggregate with a number")
+
+    def __str__(self) -> str:
+        return f"{self.aggregate.name} {self.comparison} {self.value!r}"
+
+
+@dataclass(frozen=True)
+class Aggregation:
+    """GROUP BY keys, the aggregates over each group, and the HAVING tests.
+
+    ``keys`` and each aggregate's argument name projected columns.
+    ``output`` lists the result columns in SELECT order: keys and
+    aggregate names. An aggregate only a HAVING test reads is absent
+    from ``output``.
+    """
+    keys: tuple    # tuple[str, ...]
+    aggregates: tuple    # tuple[AggregateCall, ...]
+    output: tuple    # tuple[str, ...]
+    having: tuple = ()    # tuple[HavingTest, ...]
+
+    type_name: ClassVar[str] = "quail.aggregation"
+
+    def validate(self, projected: tuple) -> None:
+        """Check the keys, arguments, output, and tests against the projection.
+
+        Args:
+            projected: The names of the projected columns.
+        """
+        for key in self.keys:
+            if key not in projected:
+                raise CompileError(
+                    f"GROUP BY {key!r} is not a projected column")
+        names = list(self.keys)
+        for aggregate in self.aggregates:
+            aggregate.validate()
+            if aggregate.argument is not None \
+                    and aggregate.argument not in projected:
+                raise CompileError(
+                    f"{aggregate} reads a column the projection does "
+                    f"not have")
+            names.append(aggregate.name)
+        if len(names) != len(set(names)):
+            raise CompileError(
+                f"GROUP BY keys and aggregate names must be unique, got "
+                f"{names}")
+        if not self.output:
+            raise CompileError("an aggregation returns at least one column")
+        for name in self.output:
+            if name not in names:
+                raise CompileError(
+                    f"{name!r} is neither a GROUP BY key nor an aggregate")
+        if len(self.output) != len(set(self.output)):
+            raise CompileError(f"output names must be unique, got {self.output}")
+        for test in self.having:
+            if not isinstance(test, HavingTest):
+                raise CompileError(
+                    f"a HAVING term is a HavingTest, got {type(test).__name__}")
+            test.validate()
+            if test.aggregate not in self.aggregates:
+                raise CompileError(
+                    f"HAVING {test} tests an aggregate the aggregation "
+                    f"does not compute")
+
+    def __str__(self) -> str:
+        parts = []
+        if self.keys:
+            parts.append("group by " + ", ".join(self.keys))
+        parts.append(", ".join(str(a) for a in self.aggregates))
+        if self.having:
+            parts.append("having " + " and ".join(str(t) for t in self.having))
+        return "; ".join(parts)
+
+
 @dataclass(frozen=True)
 class Project:
     """Column projection. Always the root operator.
 
+    ``columns`` are the columns the result reads: the source columns and
+    model outputs returned, and with an ``aggregation`` the columns its
+    keys and aggregates read, whose output then forms the result.
     ``order`` sorts the result rows, ``distinct`` drops duplicate rows,
     and ``offset`` and ``limit`` skip and keep a count of rows, applied
-    in that order. A sort key may name a source column the projection
-    does not return, unless the projection is distinct.
+    in that order after the aggregation. A sort key may name a source
+    column the projection does not return, unless the projection is
+    distinct or aggregated.
     """
     input: LogicalNode
     columns: tuple    # tuple[ColumnRef | Alias, ...]
@@ -928,6 +1055,7 @@ class Project:
     order: tuple = ()    # tuple[SortKey, ...]
     offset: int = 0
     distinct: bool = False
+    aggregation: Optional[Aggregation] = None
 
     type_name: ClassVar[str] = "quail.logical_project"
 
@@ -972,6 +1100,11 @@ class Project:
         if self.offset < 0:
             raise CompileError("OFFSET must be a nonnegative integer")
         projected = set(names)
+        if self.aggregation is not None:
+            if not isinstance(self.aggregation, Aggregation):
+                raise CompileError("aggregation is an Aggregation")
+            self.aggregation.validate(tuple(names))
+            projected = set(self.aggregation.output)
         for key in self.order:
             if not isinstance(key, SortKey):
                 raise CompileError(
@@ -982,10 +1115,23 @@ class Project:
                 raise CompileError(
                     f"ORDER BY {key.name!r} names an expression the "
                     f"projection does not return")
+            if self.aggregation is not None and key.name not in projected:
+                raise CompileError(
+                    f"ORDER BY {key.name!r} with GROUP BY names a key or "
+                    f"an aggregate in the SELECT list")
             if self.distinct and key.name not in projected:
                 raise CompileError(
                     f"ORDER BY {key.name!r} with DISTINCT needs the "
                     f"column in the SELECT list")
+
+    def result_columns(self) -> tuple[str, ...]:
+        """Return the result column names, after any aggregation."""
+        if self.aggregation is not None:
+            return tuple(self.aggregation.output)
+        return tuple(
+            f"{column.alias}.{column.column}"
+            if isinstance(column, ColumnRef) else column.name
+            for column in self.columns)
 
     def with_children(self, children: tuple[LogicalNode, ...]):
         if len(children) != 1:
@@ -1008,6 +1154,8 @@ class Project:
             "order": [str(key) for key in self.order],
             "offset": self.offset,
             "distinct": self.distinct,
+            "aggregation": (None if self.aggregation is None
+                            else str(self.aggregation)),
         }
 
 
@@ -1393,11 +1541,13 @@ class LogicalPlanBuilder:
     def project(
         self, columns: tuple, limit: int | None = None,
         order: tuple = (), offset: int = 0, distinct: bool = False,
+        aggregation: Aggregation | None = None,
     ) -> LogicalPlan:
         if self._root is None:
             raise CompileError("a logical plan needs an input table")
         plan = LogicalPlan(Project(self._root, tuple(columns), limit,
                                    order=tuple(order), offset=offset,
-                                   distinct=distinct))
+                                   distinct=distinct,
+                                   aggregation=aggregation))
         plan.validate()
         return plan

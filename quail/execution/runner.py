@@ -18,6 +18,7 @@ from quail.execution.result import (
     true_answer_rows,
 )
 from quail.physical import (
+    Aggregate,
     Barrier,
     Exchange,
     ExecutionLocation,
@@ -658,6 +659,84 @@ def _distinct_indices(table: pa.Table, columns) -> pa.Array:
     return pc.take(firsts, pc.sort_indices(firsts))
 
 
+_AGGREGATE_KERNELS = {
+    "count": "count", "count_distinct": "count_distinct", "sum": "sum",
+    "avg": "mean", "min": "min", "max": "max",
+}
+_HAVING_COMPARE = {
+    "=": pc.equal, "<>": pc.not_equal, "<": pc.less, "<=": pc.less_equal,
+    ">": pc.greater, ">=": pc.greater_equal,
+}
+
+
+def _rows_table(value) -> pa.Table:
+    """Return a node's rows input as one Arrow table."""
+    if isinstance(value, QueryResult):
+        return value.collect()
+    if isinstance(value, pa.RecordBatch):
+        return pa.Table.from_batches([value])
+    if isinstance(value, pa.Table):
+        return value
+    raise TypeError(f"expected rows, got {type(value).__name__}")
+
+
+def aggregate_table(table: pa.Table, node) -> pa.Table:
+    """Group a table by the node's keys and compute its aggregates.
+
+    Dictionary key columns are grouped by their values. A null argument
+    value is left out of every aggregate but count(*). Groups come out
+    in the order their first rows appear.
+    """
+    keyed = {name: _comparable(table.column(name), "GROUP BY")
+             for name in node.keys}
+    for _, _, argument in node.aggregates:
+        if argument is not None and argument not in keyed:
+            keyed[argument] = _comparable(table.column(argument),
+                                          "an aggregate")
+    keyed["__row"] = pa.array(np.arange(table.num_rows), pa.int64())
+    sources = {}    # (argument, kernel) -> the grouped column's name
+    specs = []
+    for name, function, argument in node.aggregates:
+        kernel = "count_all" if argument is None \
+            else _AGGREGATE_KERNELS[function]
+        if (argument, kernel) not in sources:
+            specs.append(([], "count_all") if argument is None
+                         else (argument, kernel))
+            sources[(argument, kernel)] = (
+                "count_all" if argument is None else f"{argument}_{kernel}")
+    grouped = pa.table(keyed).group_by(list(node.keys), use_threads=False) \
+        .aggregate(specs + [("__row", "min")])
+    order = pc.sort_indices(grouped.column("__row_min"))
+    columns = {name: grouped.column(name) for name in node.keys}
+    for name, function, argument in node.aggregates:
+        kernel = "count_all" if argument is None \
+            else _AGGREGATE_KERNELS[function]
+        columns[name] = grouped.column(sources[(argument, kernel)])
+    result = pa.table({name: pc.take(column, order)
+                       for name, column in columns.items()})
+    mask = None
+    for name, comparison, value in node.having:
+        test = _HAVING_COMPARE[comparison](result.column(name), value)
+        mask = test if mask is None else pc.and_kleene(mask, test)
+    if mask is not None:
+        result = result.filter(pc.fill_null(mask, False))
+    return result.select(list(node.columns))
+
+
+class AggregateRuntime:
+    """Group and aggregate a table or a materialized result."""
+
+    def execute(self, node, inputs, context) -> NodeResult:
+        if not isinstance(node, Aggregate):
+            raise TypeError(type(node).__name__)
+        if len(inputs) != 1:
+            raise ValueError("Aggregate needs one input")
+        table = _rows_table(next(iter(inputs.values())))
+        result = aggregate_table(table, node)
+        return NodeResult({"rows": QueryResult.from_table(result)}, NodeMetrics(
+            input_rows=table.num_rows, output_rows=result.num_rows))
+
+
 class SortRuntime:
     """Sort, deduplicate, and bound a table or a materialized result."""
 
@@ -666,15 +745,7 @@ class SortRuntime:
             raise TypeError(type(node).__name__)
         if len(inputs) != 1:
             raise ValueError("Sort needs one input")
-        value = next(iter(inputs.values()))
-        if isinstance(value, QueryResult):
-            table = value.collect()
-        elif isinstance(value, pa.RecordBatch):
-            table = pa.Table.from_batches([value])
-        elif isinstance(value, pa.Table):
-            table = value
-        else:
-            raise TypeError(f"Sort needs rows, got {type(value).__name__}")
+        table = _rows_table(next(iter(inputs.values())))
         rows = table.num_rows
         if node.distinct:
             table = table.take(_distinct_indices(table, node.columns))
@@ -749,6 +820,7 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
         HashJoin.runtime_key: HashJoinRuntime(),
         Recombine.runtime_key: RecombineRuntime(),
         Project.runtime_key: ProjectRuntime(),
+        Aggregate.runtime_key: AggregateRuntime(),
         Sort.runtime_key: SortRuntime(),
         Limit.runtime_key: LimitRuntime(),
     }
