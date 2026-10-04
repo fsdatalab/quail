@@ -3,7 +3,8 @@
 The planner emits one AiClassify node for each classification; the
 label_scoring physical rule compares estimated execution times for
 letters, trie_tree, and trie_decode and picks one. Decoder rounds are
-handled by the executor.
+handled by the executor. A decision model has one rule,
+decision_choice, set when the specification is prepared.
 """
 
 from dataclasses import dataclass, replace
@@ -12,6 +13,7 @@ from quail.cost import budgets
 from quail.cost import classify as classify_cost
 from quail.execution.pipelines import build_pipelines
 from quail.labels import (
+    DECISION_SCORING,
     DECODE_SCORING,
     LETTERS_SCORING,
     TREE_SCORING,
@@ -107,8 +109,7 @@ def classify_table(context, alias: str, backend_name: str,
         backend_name=backend_name, model=context.model,
         device=context.device, tokenizer=context.tokenizer,
         capacity=capacity, lengths=tuple(lengths), shared=tuple(shared),
-        tree=(context.model.weight_precision == "fp8"
-              and not context.model.canvas_tokens
+        tree=(budgets.tree_attention_allowed(context.model)
               and getattr(context, "attention", None) != "unified"))
 
 
@@ -171,6 +172,9 @@ class _Table:
             name: Result column name.
             live: Expected number of documents to classify.
         """
+        if self.model.role == "decision":
+            return self._choice_spec(call, name, live, (self.alias,),
+                                     self.head(call))
         prefix = call.prompt.label_prefix
         return ClassifySpec(
             name=name, aliases=(self.alias,),
@@ -203,6 +207,8 @@ class _Table:
             ClassifyRefusedError: No scoring rule can run, or the document and
                 prompt exceed a token or KV budget.
         """
+        if spec.scoring == DECISION_SCORING:
+            return spec
         head, tail = spec.prompt_token_parts
         labels = spec.label_token_ids
         prefix = call.prompt.label_prefix
@@ -275,6 +281,13 @@ class _Table:
             resident: Whether document KV is already available.
         """
         head, tail = spec.prompt_token_parts
+        if spec.scoring == DECISION_SCORING:
+            return classify_cost.estimate_chains(
+                len(head), spec.frame_tokens, [len(tail) - spec.frame_tokens],
+                live=spec.expected_inputs, lengths=self.lengths,
+                shared=self.shared, chunk=self.chunk,
+                capacity=self.capacity or self.budget, model=self.model,
+                device=self.device, resident=resident)
         return self.simulate(
             spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
             spec.label_token_ids, resident)
@@ -374,6 +387,9 @@ class _Table:
             raise ClassifyRefusedError(
                 f"a classification of joined rows returns its label only; "
                 f"{name!r} asks for the labels' probabilities", 1, 0)
+        if self.model.role == "decision":
+            return self._joined_choice_spec(call, name, partner, pairs,
+                                            partner_tokens)
         prompt = call.prompt.lettered
         if prompt is None:
             raise ClassifyRefusedError(
@@ -414,6 +430,77 @@ class _Table:
             label_token_ids=labels, scoring=LETTERS_SCORING,
             join_layout=(tuple(note), tuple(partner_label)),
         ), simulated.work
+
+
+    def _choice_parts(self, call):
+        """Return the tail's tokens, its frame length, and its option blocks."""
+        segments = call.prompt.tail_segments
+        frame = len(self.tokenizer(segments[0]))
+        blocks = tuple(tuple(self.tokenizer(block)) for block in segments[1:-1])
+        return tuple(call.prompt.tail_token_ids), frame, blocks
+
+    def _choice_spec(self, call, name, live, aliases, head) -> ClassifySpec:
+        """Build a decision_choice specification for one document per row.
+
+        Each document takes the question as its frame, then one request
+        of every option block and the closing line.
+        """
+        tail, frame, blocks = self._choice_parts(call)
+        request = len(tail) - frame
+        need = len(head) + self.longest + len(tail)
+        if need > self.budget:
+            raise ClassifyRefusedError(
+                f"a document in {self.alias!r} needs {need} tokens with its "
+                f"classification prompt, but the forward pass budget is "
+                f"{self.budget} tokens", need, self.budget)
+        simulated = classify_cost.estimate_chains(
+            len(head), frame, [request], live=live, lengths=self.lengths,
+            shared=self.shared, chunk=self.chunk,
+            capacity=self.capacity or self.budget, model=self.model,
+            device=self.device)
+        return ClassifySpec(
+            name=name, aliases=aliases,
+            query_template=call.prompt.template,
+            arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
+            expected_inputs=live, estimated_seconds=simulated.seconds,
+            prompt_token_parts=(head, tail), labels=tuple(call.labels),
+            label_token_ids=blocks, scoring=DECISION_SCORING,
+            probabilities=call.probabilities, frame_tokens=frame)
+
+    def _joined_choice_spec(self, call, name, partner, pairs, partner_tokens):
+        """Build a decision_choice specification for joined document pairs.
+
+        The anchor's KV ends in its note and the partner's label; each
+        pair's request is the partner document, the question, every
+        option block, and the closing line.
+        """
+        prompt = call.prompt
+        head = tuple(prompt.preamble_token_ids)
+        tail, frame, blocks = self._choice_parts(call)
+        parts = {alias: (label, note)
+                 for alias, label, note in prompt.label_token_ids}
+        note, partner_label = parts[self.alias][1], parts[partner][0]
+        request = int(round(partner_tokens)) + len(tail)
+        simulated = classify_cost.estimate_chains(
+            len(head), len(note) + len(partner_label), [request], live=pairs,
+            lengths=self.lengths, shared=self.shared, chunk=self.chunk,
+            capacity=self.capacity or self.budget, model=self.model,
+            device=self.device, resident=True)
+        need = len(head) + self.longest + len(note) + request
+        if need > self.budget:
+            raise ClassifyRefusedError(
+                f"a row of {self.alias!r} x {partner!r} needs {need} tokens "
+                f"with its classification prompt, but the forward pass "
+                f"budget is {self.budget} tokens", need, self.budget)
+        return ClassifySpec(
+            name=name, aliases=(self.alias, partner),
+            query_template=prompt.template,
+            arguments=tuple((ref.alias, ref.column) for ref in prompt.args),
+            expected_inputs=pairs, estimated_seconds=simulated.seconds,
+            prompt_token_parts=(head, tail), labels=tuple(call.labels),
+            label_token_ids=blocks, scoring=DECISION_SCORING,
+            join_layout=(tuple(note), tuple(partner_label)),
+            frame_tokens=frame), simulated.work
 
 
 class ClassifyRefusedError(Exception):

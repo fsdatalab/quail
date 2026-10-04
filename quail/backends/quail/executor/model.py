@@ -8,11 +8,15 @@ kernels), nothing more.
 After load, only the TRUE/FALSE output rows are retained. The full
 output head is discarded; shared input embeddings remain available.
 
+A Decision 2.0 checkpoint keeps its Qwen3 backbone in a subfolder
+under its own tensor names; `engine_args` points vLLM at it.
+
 get_model reads tensor-parallel group objects. Those collectives are
 no-ops at world size 1, so this path installs single-rank stubs
 instead of starting NCCL or gloo.
 """
 
+import json
 from functools import lru_cache
 from pathlib import Path
 
@@ -35,6 +39,37 @@ def resolve_model_path(model_name: str, revision: str | None = None) -> str:
     )
     say(f"model files ready: {path}")
     return path
+
+
+def is_decision2(path) -> bool:
+    """Whether a checkpoint directory holds a Decision 2.0 package."""
+    config = Path(path) / "config.json"
+    return (config.is_file()
+            and json.loads(config.read_text()).get("model_type") == "decision2")
+
+
+def engine_args(path, architecture: str = "") -> dict:
+    """Return the vLLM EngineArgs that load the checkpoint at path.
+
+    A Decision 2.0 package keeps its Qwen3 backbone in backbone/, in
+    fp32 and without the `model.` tensor prefix; vLLM loads it as bf16
+    through a class that maps the names, which the caller registers
+    with `vllm_decision.register()`. The tokenizer stays at the package
+    root.
+
+    Args:
+        path: The local checkpoint directory.
+        architecture: The registered class for a Decision 2.0 package;
+            empty uses the generative backbone class.
+    """
+    if not is_decision2(path):
+        return {"model": str(path)}
+    from quail.backends.vllm_decision import BACKBONE_ARCHITECTURE
+
+    return {"model": str(Path(path) / "backbone"), "tokenizer": str(path),
+            "dtype": "bfloat16",
+            "hf_overrides": {"architectures": [architecture
+                                               or BACKBONE_ARCHITECTURE]}}
 
 
 class _SingleRank:
@@ -177,7 +212,11 @@ def load_model(model_name: str, revision: str | None = None, *,
             Path(tempfile.gettempdir()) / "quail-moe-configs", base)
         os.environ["VLLM_TUNED_CONFIG_FOLDER"] = str(folder)
     model_path = resolve_model_path(model_name, revision)
-    args = dict(model=model_path, dtype="auto", enforce_eager=True)
+    if is_decision2(model_path):
+        from quail.backends.vllm_decision import register
+
+        register()
+    args = {"dtype": "auto", "enforce_eager": True} | engine_args(model_path)
     if max_batched_tokens is not None:
         args["max_num_batched_tokens"] = int(max_batched_tokens)
     if moe_backend is not None:
@@ -190,11 +229,11 @@ def load_model(model_name: str, revision: str | None = None, *,
     # built from this config
     model.quail_vllm_config = config
     if answer_token_ids is None:
-        from transformers import AutoTokenizer
+        from gigatoken import Tokenizer
 
         from quail.logical import true_false_ids
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+        tokenizer = Tokenizer(model_path).as_hf()
         true_ids, false_ids = true_false_ids(tokenizer)
         answer_token_ids = true_ids | false_ids
     retain_answer_head(torch, model, answer_token_ids)

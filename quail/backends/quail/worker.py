@@ -13,7 +13,13 @@ from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.model import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
-from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+from quail.backends.quail.executor.readout import (
+    AnswerRows,
+    AsyncAnswers,
+    AsyncDecisions,
+    AsyncDecisionScores,
+    DecisionHead,
+)
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import (
     _join_round_kv,
@@ -94,12 +100,19 @@ class LoadedGpu:
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()
+        self.decision_head = None
+        if spec.role == "decision":
+            path = resolve_model_path(model_path or spec.hf_name,
+                                      None if model_path else spec.revision)
+            self.decision_head = DecisionHead.load(torch, F, path)
+            self.decision_offsets = decision_offsets(spec, path)
         self.pipeline = build_pipeline(spec, self.model, self.arena)
         self.pipeline_s = time.perf_counter() - t0
 
         self.execution = backend.start(context)
         self.execution.bind_loaded_model(
-            model=self.model, arena=self.arena, pipeline=self.pipeline)
+            model=self.model, arena=self.arena, pipeline=self.pipeline,
+            decision_head=self.decision_head)
 
         self.async_ans = None
         self.chunk_tokens = None
@@ -113,13 +126,21 @@ class LoadedGpu:
         if arena_pages is not None:
             self.arena.resize(*arena_pages, free_resident=True)
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
-        self.async_ans = AsyncAnswers(self.torch, rows)
+        async_scores = None
+        if self.decision_head is not None:
+            self.async_ans = AsyncDecisions(
+                self.torch, self.decision_head, self.decision_offsets)
+            async_scores = AsyncDecisionScores(
+                self.torch, self.decision_head, self.decision_offsets)
+        else:
+            self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens
         self.execution.bind_query(
             torch=self.torch,
             async_answers=self.async_ans,
             answer_rows=rows,
             chunk_tokens=chunk_tokens,
+            async_scores=async_scores,
         )
 
     def warm(self):
@@ -146,6 +167,25 @@ class LoadedGpu:
         close_fn = getattr(self.execution, "close", None)
         if callable(close_fn):
             close_fn()
+
+
+def decision_offsets(spec, path) -> tuple[int, ...]:
+    """The rows a decision readout reads, as distances before the last row."""
+    from gigatoken import Tokenizer
+
+    from quail.logical import answer_row_offsets
+
+    tokenizer = Tokenizer(path).as_hf()
+    offsets = answer_row_offsets(
+        spec.prompt_layout,
+        lambda text: tokenizer(text, add_special_tokens=False)["input_ids"],
+        spec.turn_suffix)
+    if len(offsets) != 3:
+        raise ValueError(
+            f"{spec.name}: the decision readout reads a no row, a yes row, "
+            f"and the last row; layout {spec.prompt_layout!r} gives "
+            f"{len(offsets)} rows")
+    return offsets
 
 
 def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):

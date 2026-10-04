@@ -96,6 +96,9 @@ class QuailScorer:
     def _scores(self) -> AsyncScores:
         """Return the cached score readout and clear its input staging cache."""
         state = self.state
+        if state.score_readout is not None:
+            input_staging(state)
+            return state.score_readout
         answer_rows = state.answer_rows
         async_scores = state.async_scores
         if async_scores is None or async_scores.rows is not answer_rows:

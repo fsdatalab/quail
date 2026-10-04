@@ -165,13 +165,16 @@ def _answer_token_parts(prompt, context) -> tuple[tuple[int, ...], ...]:
     prompt anchored on its first document.
     """
     tokenizer, turn = context.tokenizer, context.model.turn
+    layout = context.model.prompt_layout
     aliases = _prompt_aliases(prompt)
     if len(aliases) == 1:
-        bound = bind_prompt(prompt.template, prompt.args, tokenizer, turn)
+        bound = bind_prompt(prompt.template, prompt.args, tokenizer, turn,
+                            layout)
         return tuple(bound.preamble_token_ids), tuple(bound.tail_token_ids)
     if len(prompt.args) != 2:
         raise ValueError("AI.SCORE supports one document or one document pair")
-    bound = bind_join_prompt(prompt.template, prompt.args, tokenizer, turn)
+    bound = bind_join_prompt(prompt.template, prompt.args, tokenizer, turn,
+                             layout)
     pieces = {alias: (label, frame) for alias, label, frame in bound.label_token_ids}
     left, right = aliases
     return (tuple(bound.preamble_token_ids),
@@ -658,10 +661,10 @@ def _plan_reranker(region, context, *, backend_name: str):
             "estimated_attention_pairs": total_work.pairs,
             "batching": "token_based_admission",
             "data_parallel_copies": context.gpu_count,
-            "score_normalization": (
-                "yes_no_softmax" if context.model.role == "reranker"
-                else "true_false_softmax"
-            ),
+            "score_normalization": {
+                "reranker": "yes_no_softmax",
+                "decision": "decision_head_softmax",
+            }.get(context.model.role, "true_false_softmax"),
             "order_rule": "cost_per_expected_rejection",
         },
     )

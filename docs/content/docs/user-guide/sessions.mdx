@@ -16,7 +16,7 @@ with quail.Session(config=config) as session:
     ...
 ```
 
-`gpus` defaults to 1 and `backend` to `"quail"`.
+`gpus` defaults to 1.
 
 The session is a context manager. Collect result rows before closing it:
 result collection reads from the session's temporary files. Those files
