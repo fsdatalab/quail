@@ -19,6 +19,7 @@ from quail.physical import (
     AiClassify,
     AiFilter,
     AiJoin,
+    AiScore,
     Barrier,
     Exchange,
     Filter,
@@ -648,7 +649,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         ))
 
     estimate = (speed_of_light(base_work + stage_work, model, device,
-                               chunk).seconds + _classify_seconds(nodes))
+                               chunk).seconds + _score_seconds(nodes))
     stage_works = {record["written_pos"]: record["work"]
                    for record in stage_records}
 
@@ -826,18 +827,18 @@ def _apply_rules(plan, rules, context):
         return refused.refusal()
     if not changed and context.settings == dict(plan.settings):
         return plan
-    # a rule that re-estimates a classification moves the plan's total
-    # by the same amount
+    # a rule that re-estimates a classification or score moves the
+    # plan's total by the same amount
     seconds = plan.estimated_seconds + (
-        _classify_seconds(graph.nodes) - _classify_seconds(plan.nodes))
+        _score_seconds(graph.nodes) - _score_seconds(plan.nodes))
     return replace(
         plan, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
         settings=context.settings)
 
 
-def _classify_seconds(nodes) -> float:
+def _score_seconds(nodes) -> float:
     return sum(node.spec.estimated_seconds for node in nodes
-               if isinstance(node, AiClassify) and node.spec is not None)
+               if isinstance(node, AiScore) and node.spec is not None)
 
 
 # ------------------------------------------------------------- explain
