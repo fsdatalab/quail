@@ -73,6 +73,12 @@ def logit(probability):
     return np.log(probability) - np.log1p(-probability)
 
 
+def current(setter):
+    """An MLX limit, read by setting it and setting it back."""
+    value = setter(0)
+    setter(value)
+    return value
+
 def test_the_apple_gpu_spec_is_built_from_this_machine():
     spec = local_apple_gpu()
     recommended = mx.device_info()["max_recommended_working_set_size"]
@@ -169,12 +175,6 @@ def test_chunk_events_wait_for_the_device_only_when_timed():
 
 
 def test_the_implementation_holds_memory_in_a_budget_and_gives_the_limits_back():
-    def current(setter):
-        """An MLX limit, read by setting it and setting it back."""
-        value = setter(0)
-        setter(value)
-        return value
-
     wired, kept = current(mx.set_wired_limit), current(mx.set_cache_limit)
     implementation = MlxImplementation()
     implementation.release_limits()        # nothing held yet
@@ -233,14 +233,16 @@ def tiny(tmp_path, monkeypatch):
     monkeypatch.setattr(backend_module, "MLX_MODELS", frozenset({spec.name}))
     # the tiny model takes the place of any model an earlier test loaded
     monkeypatch.setattr(execute, "_BACKEND_STATE", {})
-    registry = quail.ExtensionRegistry.with_built_ins()
-    registry.register_model(spec)
     for name, column, values in (("documents", "body", DOCUMENTS),
                                  ("queries", "text", QUERIES)):
         pq.write_table(pa.table({"id": list(range(len(values))), column: values}),
                        tmp_path / f"{name}.parquet")
 
     def session(**config):
+        # a registry holds one apple-gpu spec, and sessions here differ
+        # in memory fraction
+        registry = quail.ExtensionRegistry.with_built_ins()
+        registry.register_model(spec)
         value = quail.Session(
             EngineConfig(model=spec.name, device="apple-gpu", **config),
             registry=registry)
@@ -342,6 +344,26 @@ def test_a_session_runs_scores_filters_a_join_and_a_classification(tiny):
         assert timed.report["chunks"] >= 1
         assert 0 < timed.report["gpu_s"] <= timed.report["wall_s"] + 0.01
         assert {row[0] for row in timed.to_rows()} == survivors
+
+
+def test_a_later_session_gives_a_loaded_model_its_own_memory_budget(tiny):
+    open_session, _ = tiny
+    sql = (f"SELECT d.id FROM documents d "
+           f"WHERE AI_FILTER(PROMPT('{REFUND}', d.body))")
+    rows, boots = [], []
+    for fraction in (0.04, 0.02):
+        with open_session(memory_fraction=fraction) as session:
+            result = session.sql(sql).run()
+            rows.append(sorted(result.to_rows()))
+            boots.append(result.report["boot_kind"])
+            budget = int(session.device.mem_bytes)
+            mx.synchronize()
+            held = mx.get_active_memory() + mx.get_cache_memory()
+            assert current(mx.set_wired_limit) == budget
+            assert current(mx.set_cache_limit) < budget
+            assert 0.5 * budget < held <= 1.01 * budget, (fraction, held, budget)
+    assert boots == ["cold", "warm"]
+    assert rows[0] == rows[1]
 
 
 def test_a_loaded_mlx_model_is_released_without_torch(tiny, monkeypatch):

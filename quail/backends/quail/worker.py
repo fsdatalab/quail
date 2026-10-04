@@ -376,6 +376,9 @@ def _boot_for_query(runtime_state, backend, gpu_context,
         cold = True
     else:
         cold = False
+        # the session of this query may give the device another memory
+        # budget than the session that loaded the model
+        gpu.device = gpu_context.device
     gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
     warm_s, warm_tier = gpu.warm()
     boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
