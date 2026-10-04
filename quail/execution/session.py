@@ -30,9 +30,11 @@ from quail.execution.runner import (
     NodeMetrics,
     scalar_node_metrics,
 )
+from quail.execution.selection import selected_rows
 from quail.execution.tokens import (
     ColumnStoreWriter,
     ScanInput,
+    SelectedScanInput,
     TokenStoreWriter,
 )
 from quail.execution.types import PhysicalRequest, document_input
@@ -591,6 +593,10 @@ class BoundBuilder:
                             anchor=anchor, semantics=semantics)
         return self
 
+    def where(self, *tests):
+        self._inner.where(*tests)
+        return self
+
     def limit(self, n):
         self._inner.limit(n)
         return self
@@ -635,6 +641,7 @@ class Query:
         self._plan = None
         self._doc_tokens = None
         self._token_inputs = None
+        self._selected = {}
         self._token_futures = {}
         self._token_finished_at = {}
         self._estimated = ()
@@ -669,14 +676,16 @@ class Query:
             operators = self.logical.operators()
             self._doc_tokens = {}
             self._token_inputs = {}
+            self._selected = {}
             estimated = []
             for s in operators.scans:
+                self._selected[s.alias] = self._select_rows(s)
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
-                    self._doc_tokens[s.alias] = exact
+                    self._doc_tokens[s.alias] = self._restrict(s.alias, exact)
                     continue
-                self._doc_tokens[s.alias] = self.session.estimate_lengths(
-                    s.provider, s.column)
+                self._doc_tokens[s.alias] = self._restrict(
+                    s.alias, self.session.estimate_lengths(s.provider, s.column))
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
             pair_fractions = self._pair_fractions(
@@ -701,8 +710,9 @@ class Query:
                 }:
                     columns = tuple(dict.fromkeys((*columns, s.column)))
                 if s.alias not in self._estimated:
-                    self._token_inputs[s.alias] = self.session.tokenize(
-                        s.provider, s.column, columns)
+                    self._token_inputs[s.alias] = self._selection(
+                        s.alias, self.session.tokenize(
+                            s.provider, s.column, columns))
                     continue
                 future = self.session.tokenize_async(
                     s.provider, s.column, columns)
@@ -763,13 +773,11 @@ class Query:
                 continue
             left_alias, right_alias, conditions = oriented
             left_keys = [
-                self.session.column_values(
-                    providers[left.alias], left.column)
+                self._column(providers[left.alias], left)
                 for left, _ in conditions
             ]
             right_keys = [
-                self.session.column_values(
-                    providers[right.alias], right.column)
+                self._column(providers[right.alias], right)
                 for _, right in conditions
             ]
             fractions[position] = pair_fraction(
@@ -777,6 +785,37 @@ class Query:
                 len(self._doc_tokens[left_alias]),
                 len(self._doc_tokens[right_alias]))
         return fractions
+
+    def _select_rows(self, scan):
+        """Return the positions a scan's column predicates keep, or None."""
+        if not scan.predicates:
+            return None
+        columns = {
+            predicate.column.column: self.session.column_values(
+                scan.provider, predicate.column.column)
+            for predicate in scan.predicates
+        }
+        return selected_rows(columns, scan.predicates)
+
+    def _restrict(self, alias: str, lengths):
+        """Return the document lengths at the alias's selected positions."""
+        selected = self._selected.get(alias)
+        if selected is None:
+            return lengths
+        return [lengths[index] for index in selected.to_pylist()]
+
+    def _selection(self, alias: str, store):
+        """Return a scan input restricted to the alias's selected positions."""
+        selected = self._selected.get(alias)
+        if selected is None:
+            return store
+        return SelectedScanInput(store, selected)
+
+    def _column(self, provider: str, ref) -> pa.ChunkedArray:
+        """Return one source column at the alias's selected positions."""
+        values = self.session.column_values(provider, ref.column)
+        selected = self._selected.get(ref.alias)
+        return values if selected is None else values.take(selected)
 
     def explain(self, *, verbose: bool = False,
                 analyze: bool = False) -> str:
@@ -821,7 +860,7 @@ class Query:
         started = time.perf_counter()
         refine = bool(self._token_futures)
         for alias, future in list(self._token_futures.items()):
-            self._token_inputs[alias] = future.result()
+            self._token_inputs[alias] = self._selection(alias, future.result())
             self._doc_tokens[alias] = self._token_inputs[alias].lengths
             self._token_finished_at.setdefault(alias, time.perf_counter())
             del self._token_futures[alias]

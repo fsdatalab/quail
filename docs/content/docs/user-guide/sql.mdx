@@ -474,6 +474,31 @@ SELECT AI.MAP('Summarize this review in one sentence.\n\n{0}', r.body) AS summar
 FROM reviews r
 ```
 
+## Column tests in WHERE and ON
+
+A test of a table column against a literal keeps only the documents
+that pass it, before any model call. Supported tests are `=`, `<>`,
+`<`, `<=`, `>`, `>=`, `IN (...)`, `IS NULL`, and `IS NOT NULL`, with a
+number, string, or boolean literal, combined with `AND`. A row whose
+column is null fails every comparison. For example, this scores only
+the reviews from 2024 with at least four stars, and the model never
+reads the others:
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE r.year = 2024
+  AND r.stars >= 4
+  AND AI.IF(PROMPT('Does the review mention shipping? {0}', r.body))
+```
+
+The test runs on the coordinator over the column's values, so the
+planner, the GPU shards, and the result all see the smaller table.
+`explain()` shows the tests on the scan and the row count after them.
+A test in `ON` restricts the joined table the same way. A test that
+compares two columns is a join condition and belongs in `ON` as
+`column = column`.
+
 ## SELECT, FROM, JOIN, ORDER BY, LIMIT
 
 Quail supports these SQL clauses with the following limits:
@@ -547,6 +572,7 @@ a key or an aggregate.
 - Window functions, `QUALIFY`
 - `UNION`, `EXCEPT`, `INTERSECT`
 - `OR` between AI predicates
+- `BETWEEN`, `LIKE`, and arithmetic in column tests
 - Queries with no AI operator
 - `JOIN` with only relational predicates (no AI operator)
 - Outer joins (`LEFT`, `RIGHT`, `FULL`)
