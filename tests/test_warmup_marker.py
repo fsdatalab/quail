@@ -120,3 +120,11 @@ def test_forward_warm_runs_a_classification_chunk(monkeypatch):
     assert len(suffixes) == 26 and {len(s) for s in suffixes} == set(range(1, 7))
     assert all(s == question[:len(s)] for s in suffixes)
     assert classify[1] == {"stage_frames": [question]}
+
+    # a decision readout reads 31 trailing rows: the warmup question is
+    # that long, and the classification chunk is left out
+    joins.clear()
+    readout = SimpleNamespace(trailing_rows=31)
+    warmup._forward_warm(None, None, pipeline, readout, 2048, join_chunk=True)
+    ((stages, _),) = joins
+    assert len(stages[0][0]) == 31

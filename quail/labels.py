@@ -2,7 +2,7 @@
 
 # The label scoring rules the executor runs; each rule returns one of
 # the classification's labels.
-LABEL_SCORINGS = ("letters", "trie_tree", "trie_decode")
+LABEL_SCORINGS = ("letters", "trie_tree", "trie_decode", "decision_choice")
 
 # every label is one letter token, read at one row
 LETTERS_SCORING = "letters"
@@ -10,6 +10,8 @@ LETTERS_SCORING = "letters"
 TREE_SCORING = "trie_tree"
 # one token per round along the greedy path: fewest tokens, most rounds
 DECODE_SCORING = "trie_decode"
+# a decision model's head scores one option block per label, in one request
+DECISION_SCORING = "decision_choice"
 
 
 def decodable(labels) -> bool:
