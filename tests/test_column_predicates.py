@@ -112,6 +112,11 @@ def test_column_predicates_select_documents_before_the_model(session):
     assert result.to_rows() == [("r0",)]
     stage = next(s for s in result.report["stages"] if s["op"] == "filter")
     assert stage["evaluated"] == 3
+    # answer tables and survivors hold positions in the registered table,
+    # not in the selected scan
+    answers = result.answer_tables["filters"][("r", stage["written_pos"])]
+    assert answers.column("r").to_pylist() == [0, 2, 4]
+    assert result.survivor_indices["r"].to_pylist() == [0]
 
     built = (session.docs("reviews").alias("r")
              .ai_filter(prompt("q1: {0}", col("r.review")))
