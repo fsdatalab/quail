@@ -17,4 +17,6 @@ L40S = DeviceSpec(
     # GPU-only rate from Modal, checked 2026-10-03
     usd_per_hour=1.9512,
     price_source="https://modal.com/pricing",
+    cuda_name="L40S",
+    modal_gpu="L40S",
 )

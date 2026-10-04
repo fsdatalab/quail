@@ -19,4 +19,6 @@ RTX_PRO_6000_BLACKWELL_SERVER = DeviceSpec(
     # GPU-only per-second rate from Modal, checked 2026-09-07
     usd_per_hour=0.000842 * 3600,
     price_source="https://modal.com/pricing",
+    cuda_name="RTX PRO 6000 Blackwell",
+    modal_gpu="RTX-PRO-6000",
 )

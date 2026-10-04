@@ -28,6 +28,7 @@ from quail.planner.physical_optimizer import (
 )
 from quail.planner.plan import Refusal
 from quail.planner.reranker import plan_reranker
+from quail.specs import DEVICES
 
 
 class QuailModelExecution:
@@ -154,7 +155,7 @@ class QuailBackend:
     runtime_package = "vllm==0.26.0"
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
-        if device.name not in {"h100-sxm", "rtx-pro-6000-blackwell-server"}:
+        if device.name not in DEVICES:
             return SupportResult.reject(
                 f"Quail does not support device {device.name!r}")
         if model.arch not in supported_archs():

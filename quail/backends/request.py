@@ -74,6 +74,7 @@ from quail.planner.classify import has_label
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
+from quail.specs import DEVICES
 
 
 def _answer_ids(tokenizer) -> tuple[list[int], list[int]]:
@@ -1212,7 +1213,7 @@ def request_runtimes() -> dict:
     return {RequestExecution.runtime_key: ModelNodeRuntime()}
 
 
-SUPPORTED_DEVICES = frozenset({"h100-sxm", "rtx-pro-6000-blackwell-server"})
+SUPPORTED_DEVICES = frozenset(DEVICES)
 
 
 def _warm_boot() -> dict:

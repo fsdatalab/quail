@@ -30,7 +30,7 @@ from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
 from quail.logical.prompts import bind_classify_prompt
 from quail.planner.plan import Refusal
-from quail.specs import H100_USD_PER_HOUR, MODELS
+from quail.specs import DEVICES, MODELS
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     IN_LIST_SELECTIVITY_ESTIMATES,
@@ -358,12 +358,16 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
 
 def run_suite(only=None, *, sf=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
-              h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
+              usd_per_hour=None, root=None):
     """Run Quail queries through QUAIL-B and save the benchmark report.
 
     Queries the backend refuses to plan are left out of the run and
-    listed under `skipped_queries` in the returned record.
+    listed under `skipped_queries` in the returned record. Cost uses
+    ``DEVICES[config.device].usd_per_hour`` unless ``usd_per_hour``
+    is passed.
     """
+    if usd_per_hour is None:
+        usd_per_hour = DEVICES[config.device].usd_per_hour
     skipped = {}
     explicit = only is not None
     only = list(query_specs()) if only is None else list(only)
@@ -394,14 +398,14 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
         return _empty_record(skipped, sf=sf, data_dir=data_dir,
                              ground_truth_collection=ground_truth_collection,
                              root=root, config=config, metadata=metadata,
-                             h100_usd_per_hour=h100_usd_per_hour,
+                             usd_per_hour=usd_per_hour,
                              output_dir=output_dir)
     with quail.Session(config) as session:
         record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
             output_dir=output_dir, data_dir=data_dir,
             collection_id=ground_truth_collection, root=root,
-            gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
+            gpu_count=config.gpus, gpu_hourly_rate_usd=usd_per_hour,
             metadata=metadata)
         record["skipped_queries"] = skipped
         write_json(Path(output_dir) / "run.json", record)
@@ -410,7 +414,7 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
 
 
 def _empty_record(skipped, *, sf, data_dir, ground_truth_collection, root,
-                  config, metadata, h100_usd_per_hour, output_dir) -> dict:
+                  config, metadata, usd_per_hour, output_dir) -> dict:
     """Build a run record for a suite in which every query was skipped."""
     from quail_b import __version__
     from quail_b.run import RUN_SCHEMA_VERSION
@@ -425,7 +429,7 @@ def _empty_record(skipped, *, sf, data_dir, ground_truth_collection, root,
         "collection_id": suite.ground_truth.collection_id,
         "reference_model": suite.ground_truth.reference_model,
         "metadata": metadata, "gpu_count": config.gpus,
-        "gpu_hourly_rate_usd": h100_usd_per_hour,
+        "gpu_hourly_rate_usd": usd_per_hour,
         "started_at": started, "finished_at": started, "status": "complete",
         "queries": [], "skipped_queries": skipped,
     }

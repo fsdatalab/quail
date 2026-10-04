@@ -24,14 +24,21 @@ format. All listed models store KV in BF16.
 
 ## GPUs
 
-| GPU | `device` value |
-| --- | --- |
-| NVIDIA H100 SXM | `"h100-sxm"` |
-| NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` |
+| GPU | `device` value | Modal `gpu=` |
+| --- | --- | --- |
+| NVIDIA H100 SXM | `"h100-sxm"` | `H100!` |
+| NVIDIA L40S | `"l40s"` | `L40S` |
+| NVIDIA B200 | `"b200"` | `B200` |
+| NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` | `RTX-PRO-6000` |
+
+`device` is Quail's name. Modal's `gpu=` string can differ; use
+`modal_gpu_type(device)` from `quail.specs`. See
+[Configuration](/docs/user-guide/configuration).
 
 ## Configure a session
 
-For example, to run Qwen3 4B on one H100 SXM:
+For example, this session runs Qwen3 4B on one H100 SXM. Use
+`device="l40s"` or `device="b200"` for those GPUs.
 
 ```python
 import quail

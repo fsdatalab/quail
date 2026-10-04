@@ -70,7 +70,8 @@ CI runs these on every pull request. Run them before pushing:
 
 - Filter and join queries on Qwen3 4B fp8, Qwen3 32B fp8,
   DiffusionGemma 26B-A4B fp8, or Decision-2.0-Kai 0.6B bf16, on one
-  H100 per model copy. No tensor-parallel weight sharding.
+  GPU per model copy (H100 SXM, L40S, or B200). No tensor-parallel
+  weight sharding.
 - `AI.CLASSIFY`, `AI.EXTRACT`, and `AI.MAP` are on the roadmap.
   Open-ended generation, speculation, and forking are not supported.
 
@@ -154,8 +155,8 @@ how they release and explain changes.
     quail-b reports it as `input_tokens_per_second`. Give document and
     pair counts beside it as plain counts, not as throughput.
   - `$/query` is query time in hours times the number of GPUs times
-    `quail.specs.H100_USD_PER_HOUR` ($3.9492, from
-    https://modal.com/pricing).
+    `DEVICES[device].usd_per_hour`. On H100 that is
+    `H100_USD_PER_HOUR` ($3.9492, from https://modal.com/pricing).
   - Query time and `$/query` exclude model startup. Report startup
     separately if it matters.
 

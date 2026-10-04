@@ -13,17 +13,18 @@ import os
 from pathlib import Path
 
 from quail.server.scheduler import DEFAULT_TIMEOUT_S
+from quail.specs import DEVICES
 
 DEFAULT_DATA_DIR = Path("~/.quail/server")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 
-# a substring of the name CUDA reports for the GPU, and the registered
-# device it is. The H100 spec is the SXM part with HBM3; the PCIe and
-# NVL parts have other memory bandwidth and are not listed.
-GPU_NAMES = (
-    ("H100 80GB HBM3", "h100-sxm"),
-    ("RTX PRO 6000 Blackwell", "rtx-pro-6000-blackwell-server"),
+# CUDA name substring -> registered device. The H100 entry is the SXM
+# part with HBM3; the PCIe and NVL parts are not listed.
+GPU_NAMES = tuple(
+    (device.cuda_name, device.name)
+    for device in DEVICES.values()
+    if device.cuda_name
 )
 
 

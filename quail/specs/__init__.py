@@ -38,6 +38,28 @@ DEVICES = {device.name: device for device in (
 MODAL_GPU_USD_PER_HOUR = {
     name: device.usd_per_hour for name, device in DEVICES.items()}
 
+
+def modal_gpu_type(device: str, gpus: int = 1) -> str:
+    """Return the Modal ``gpu=`` string for a registered device.
+
+    One GPU is the spec's ``modal_gpu`` field. More than one appends
+    the count, as in ``H100!:8``.
+
+    Args:
+        device: Registered device name.
+        gpus: GPU count. Defaults to 1.
+
+    Returns:
+        The Modal ``gpu=`` value.
+    """
+    spec = DEVICES[device]
+    if not spec.modal_gpu:
+        raise ValueError(f"device {device!r} has no Modal GPU type")
+    if gpus == 1:
+        return spec.modal_gpu
+    return f"{spec.modal_gpu}:{gpus}"
+
+
 __all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "DeviceSpec", "ModelSpec",
            "Precision", "Role", "MODELS", "DEVICES", "QWEN3_4B_FP8", "QWEN3_32B_FP8",
            "QWEN3_RERANKER_0_6B_BF16",
@@ -45,4 +67,4 @@ __all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "DeviceSpec", "ModelSpec",
            "DECISION_2_KAI_0_6B_BF16",
            "H100_SXM", "H100_USD_PER_HOUR", "H100_PRICE_SOURCE",
            "L40S", "B200", "RTX_PRO_6000_BLACKWELL_SERVER",
-           "MODAL_GPU_USD_PER_HOUR", "qwen3_spec"]
+           "MODAL_GPU_USD_PER_HOUR", "modal_gpu_type", "qwen3_spec"]

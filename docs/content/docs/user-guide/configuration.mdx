@@ -1,0 +1,40 @@
+---
+title: Configuration
+---
+
+Every session takes an `EngineConfig` that names the model and GPU.
+Neither has a default.
+
+```python
+import quail
+
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `model` | required | Checkpoint name. See [Supported models and GPUs](/docs/user-guide/models). |
+| `device` | required | GPU name from the same page (`h100-sxm`, `l40s`, `b200`). |
+| `gpus` | `1` | Model copies on one machine. Use 1, 2, 4, or 8. Quail does not shard weights. |
+| `backend` | `"quail"` | Inference backend. |
+
+`device` is Quail's name for the GPU, not the string Modal or CUDA
+reports. For example, `device="h100-sxm"` is Modal `H100!` and the
+CUDA name `NVIDIA H100 80GB HBM3`.
+
+On Modal, map the device to `gpu=` with `modal_gpu_type`:
+
+```python
+from quail.specs import modal_gpu_type
+
+modal_gpu_type("h100-sxm")     # "H100!"
+modal_gpu_type("l40s")         # "L40S"
+modal_gpu_type("h100-sxm", 8)  # "H100!:8"
+```
+
+`$/query` uses that device's hourly price:
+`DEVICES[device].usd_per_hour`. On H100 that is `3.9492`. See
+[GPU cost](/docs/user-guide/metrics#gpu-cost).
+
+Pass `config` to `quail.Session`. See
+[Running queries](/docs/user-guide/sessions).
