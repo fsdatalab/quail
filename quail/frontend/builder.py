@@ -24,6 +24,7 @@ from quail.logical import (
     bind_classify_prompt,
     bind_join_prompt,
     bind_prompt,
+    bind_score_prompt,
 )
 from quail.logical.nodes import validate_task_description
 
@@ -185,6 +186,7 @@ class Query:
         self._applies = {}           # alias -> [(name, kind, ids, refs)]
         self._functions = {}         # name -> the Python function
         self._labels = {}            # name -> Alias of an AI.CLASSIFY call
+        self._scores = {}            # name -> Alias of an AI.SCORE call
         self._column_predicates = {}  # alias -> [ColumnPredicate]
         self._limit = None
         self._order = []             # (column or name, descending, nulls_first)
@@ -273,6 +275,29 @@ class Query:
         return self
 
     ai_if = ai_filter
+
+    def ai_score(self, p: PromptSpec, *, name: str) -> "Query":
+        """Add a named AI.SCORE column: the model's belief that a prompt is TRUE.
+
+        Args:
+            p: A prompt over one or two columns.
+            name: The score column's name, used in select(), order_by(),
+                group_by() arguments, and agg() arguments.
+        """
+        if not name or "." in name:
+            raise CompileError(
+                f"a score needs a column name without a dot, got {name!r}")
+        if name in self._labels or name in self._scores or name in self._scope():
+            raise CompileError(f"the name {name!r} is already used")
+        refs = tuple(self._resolve(c) for c in p.cols)
+        bound = bind_score_prompt(p.template, refs, self._tokenizer,
+                                  turn=self._turn)
+        for ref in refs:
+            self._note_doc_column(ref)
+        call = ModelCall(bound, "score")
+        call.validate()
+        self._scores[name] = Alias(call, name)
+        return self
 
     def ai_classify(self, p: PromptSpec, labels, *, name: str,
                     descriptions=None,
@@ -692,7 +717,7 @@ class Query:
                 f"join() of {self._pending_join[0]} has no AI predicate "
                 f"over its pairs; a plain join belongs in the database "
                 f"the ids came from")
-        if not self._joins and not self._filters and not self._labels:
+        if not (self._joins or self._filters or self._labels or self._scores):
             raise CompileError("the query has no AI predicate; a plain "
                                "scan belongs in the database the ids "
                                "came from")
@@ -703,6 +728,9 @@ class Query:
         for c in () if aggregation is not None else cols:
             if isinstance(c, str) and c in self._labels:
                 columns.append(self._labels[c])
+                continue
+            if isinstance(c, str) and c in self._scores:
+                columns.append(self._scores[c])
                 continue
             if isinstance(c, str) and c == "*":
                 for alias, provider in self._tables:
@@ -761,6 +789,8 @@ class Query:
         def project(c) -> str:
             if isinstance(c, str) and c in self._labels:
                 column = self._labels[c]
+            elif isinstance(c, str) and c in self._scores:
+                column = self._scores[c]
             else:
                 column = self._resolve(col(c) if isinstance(c, str) else c)
             if column not in columns:

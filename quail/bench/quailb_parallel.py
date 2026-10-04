@@ -58,11 +58,10 @@ def ensure_data(sf: float, query_ids: list[str], collection_id: str,
     import pyarrow.parquet as pq
 
     import quail_b as benchmark
-    from quail.bench.substrait import read_plan
 
     names = {
         relation.table for query_id in query_ids
-        for relation in read_plan(benchmark.get_query(query_id).plan).relations
+        for relation in benchmark.get_query(query_id).info.relations
     }
     directory = Path(DATA_DIR) / f"sf{sf}"
     directory.mkdir(parents=True, exist_ok=True)

@@ -18,7 +18,6 @@ from quail.backends.quail.executor.classify import (
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs, answer_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.bench.quailb import run_output
-from quail.bench.substrait import read_plan
 from quail.catalog import DocumentProvider
 from quail.execution.labels import (
     GreedyDecoder,
@@ -701,7 +700,7 @@ def test_classify_refusals_and_builder_errors(session):
 
 
 def test_bench_reads_classify_plans_and_reports_labels_by_operator():
-    plan = read_plan(get_query("IMDB-14").plan)
+    plan = get_query("IMDB-14").info
     (sentiment, complaint) = plan.classifies
     (critical,) = plan.in_lists
     assert (sentiment.output, complaint.output) == ("sentiment", "complaint")

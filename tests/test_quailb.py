@@ -10,6 +10,7 @@ from quail.bench.quailb import (
     queries,
     register_tables,
 )
+from quail.logical import has_score
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
 from quail_b.queries import QUERY_ORDER
@@ -65,7 +66,9 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
     }
     classify = {*(f"IMDB-{i}" for i in range(11, 16)), "BIO-5", "BIO-6",
                 "FEV-11", "LEP-6", "AGENT-3", "AGENT-4", "AGENT-5"}
-    assert set(QUERY_ORDER) == (expected | classify) - {"PRIV-1", "PRIV-2"}
+    relational = {f"REL-AGENT-{i}" for i in range(1, 8)}
+    assert set(QUERY_ORDER) == (
+        expected | classify | relational) - {"PRIV-1", "PRIV-2"}
     for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
         with quail.Session(
             EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
@@ -77,7 +80,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
             # every backend lists every query; SGLang refuses the
             # classification queries at plan time, since its engine
             # returns no decoded answer text.
-            assert set(qdefs) == expected | classify, backend
+            assert set(qdefs) == expected | classify | relational, backend
             for qid, (_, build) in qdefs.items():
                 case = f"{backend} {qid}"
                 query = build()
@@ -89,12 +92,20 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                 assert all((s is None) == qid.startswith("PRIV-")
                            for s in selectivities), case
                 plan = query.plan()
+                # a column test alone runs on every backend; a sort or
+                # an aggregate runs on Quail only
+                if backend != "quail" and qid in relational - {"REL-AGENT-1"}:
+                    assert isinstance(plan, Refusal), case
+                    assert plan.constraint == "sort_needs_quail_backend", case
+                    continue
                 if backend == "pipelined_sglang" and qid in classify:
                     assert isinstance(plan, Refusal), case
                     assert plan.constraint == "classify_needs_quail_backend", case
                     continue
                 assert not isinstance(plan, Refusal), f"{case} refused: {plan}"
-                assert plan.settings["order_rule"] == "by_cost", case
+                if not has_score(query.logical):
+                    # the reranker planner of a score query has its own rule
+                    assert plan.settings["order_rule"] == "by_cost", case
                 assert "physical:" in query.explain(), case
 
     report = {
