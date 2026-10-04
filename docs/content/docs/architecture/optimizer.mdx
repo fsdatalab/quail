@@ -264,8 +264,8 @@ write_seconds = total_tokens * model.kappa / device.hbm_bw
 | `model.kappa` | KV bytes per token across all layers. |
 | `device.hbm_bw` | GPU memory bandwidth in bytes per second. |
 
-If the operator already writes KV, the additional write time is zero.
-Joins and classifications always write KV, so the rule ignores `write_seconds` for them. A score of one table writes KV only when it shares prefixes, so the rule counts `write_seconds` against it.
+The rule sets `write_seconds` to zero for a filter that already writes KV, and for all joins and classifications.
+The rule calculates `write_seconds` for a score of one table, because this score writes KV only when it shares prefixes.
 
 The comparison excludes sorting, scheduling, attention, and recomputation
 when shared KV is unavailable. Prefix matching requires token sequences,
