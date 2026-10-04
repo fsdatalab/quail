@@ -29,8 +29,8 @@ from quail.backends.quail.executor.mlx_device.implementation import (  # noqa: E
     MlxImplementation,
 )
 from quail.backends.quail.executor.mlx_device.loader import (  # noqa: E402
+    load_decision_backbone,
     load_decision_head,
-    load_qwen3_weights,
 )
 from quail.backends.quail.executor.models import build_pipeline  # noqa: E402
 from quail.backends.quail.executor.stages import Stage, run_stages  # noqa: E402
@@ -105,7 +105,7 @@ def test_decision_scores_match_mlx_lm():
         prompts[1], ids(REVIEWS[0]), ids)
     offsets = decision_offsets(SPEC, path)
 
-    weights = load_qwen3_weights(path, mx.bfloat16)
+    weights = load_decision_backbone(path, mx.bfloat16)
     head = load_decision_head(path)
     assert abs(weights.nbytes / SPEC.w_mem_bytes - 1) < 0.02
     implementation = MlxImplementation()

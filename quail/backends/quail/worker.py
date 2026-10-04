@@ -192,8 +192,8 @@ class LoadedMlx:
             MlxImplementation,
         )
         from quail.backends.quail.executor.mlx_device.loader import (
+            load_decision_backbone,
             load_decision_head,
-            load_qwen3_weights,
         )
 
         spec, device = context.model, context.device
@@ -206,7 +206,7 @@ class LoadedMlx:
         t0 = time.perf_counter()
         path = resolve_model_path(model_path or spec.hf_name,
                                   None if model_path else spec.revision)
-        self.model = load_qwen3_weights(path, mx.bfloat16)
+        self.model = load_decision_backbone(path, mx.bfloat16)
         self.decision_head = load_decision_head(path)
         self.decision_offsets = decision_offsets(spec, path)
         self.load_model_s = time.perf_counter() - t0

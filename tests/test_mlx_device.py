@@ -35,8 +35,8 @@ from quail.backends.quail.executor.mlx_device.implementation import (  # noqa: E
     MlxImplementation,
 )
 from quail.backends.quail.executor.mlx_device.loader import (  # noqa: E402
+    load_decision_backbone,
     load_decision_head,
-    load_qwen3_weights,
 )
 from quail.backends.quail.executor.mlx_device.pools import MlxKVPools  # noqa: E402
 from quail.backends.quail.executor.mlx_device.readout import (  # noqa: E402
@@ -71,6 +71,12 @@ TOLERANCE = {"float32": 1e-4, "bf16": 0.1}
 def tiny(request):
     """A tiny model in one dtype."""
     return Tiny(request.param)
+
+
+def backbone_tensors(model):
+    """mlx-lm's weights under the names a Decision 2.0 backbone gives them."""
+    return {name.removeprefix("model."): array
+            for name, array in tree_flatten(model.parameters())}
 
 
 def reference_model(config=None):
@@ -114,8 +120,7 @@ class Tiny:
         self.model = reference_model()
         self.config = Qwen3Config.from_dict(CONFIG)
         self.weights = Qwen3Weights.from_tensors(
-            dict(tree_flatten(self.model.parameters())), self.config,
-            self.dtype, prefix="model.")
+            backbone_tensors(self.model), self.config, self.dtype)
         self.probe = Probe(self.config.hidden)
         self.implementation = MlxImplementation()
         self.spec = SimpleNamespace(arch="qwen3")
@@ -659,38 +664,39 @@ def test_decisions_through_the_scheduler_match_whole_sequences(tiny):
 
 # ---- the loader
 
-def write_package(directory, model, head, *, decision, config=None):
-    """Save the tiny model as a checkpoint directory."""
-    tensors = dict(tree_flatten(model.parameters()))
+def write_package(directory, model, head, config=None):
+    """Save the tiny model as a Decision 2.0 package."""
     config = dict(config or CONFIG)
     config["rope_parameters"] = {"rope_theta": config.pop("rope_theta")}
-    weights = directory
-    if decision:
-        (directory / "config.json").write_text(json.dumps({"model_type": "decision2"}))
-        weights = directory / "backbone"
-        weights.mkdir()
-        # the backbone's names lack the prefix, and its projections are bf16
-        tensors = {name.removeprefix("model."): (
-            array.astype(mx.bfloat16) if "proj" in name else array)
-            for name, array in tensors.items()}
-        mx.save_safetensors(str(directory / "decision_head.safetensors"), head)
-    (weights / "config.json").write_text(json.dumps(config))
-    mx.save_safetensors(str(weights / "model.safetensors"), tensors)
+    (directory / "config.json").write_text(json.dumps({"model_type": "decision2"}))
+    backbone = directory / "backbone"
+    backbone.mkdir()
+    (backbone / "config.json").write_text(json.dumps(config))
+    # the package stores its projections in bf16 and the rest in float32
+    mx.save_safetensors(str(backbone / "model.safetensors"), {
+        name: array.astype(mx.bfloat16) if "proj" in name else array
+        for name, array in backbone_tensors(model).items()})
+    mx.save_safetensors(str(directory / "decision_head.safetensors"), head)
 
 
-@pytest.mark.parametrize("decision", [True, False])
-def test_loader_reads_a_checkpoint_directory(tmp_path, decision):
+def test_loader_reads_a_decision_package(tmp_path):
     tiny = Tiny("bf16")
     saved = {k: mx.array(v)
              for k, v in head_weights(np.random.default_rng(6)).items()}
-    write_package(tmp_path, tiny.model, saved, decision=decision)
-    weights = load_qwen3_weights(tmp_path, mx.bfloat16)
+    write_package(tmp_path, tiny.model, saved)
+    weights = load_decision_backbone(tmp_path, mx.bfloat16)
     assert weights.config == tiny.config
     assert all(array.dtype == mx.bfloat16 for array in weights.arrays())
     assert weights.nbytes == tiny.weights.nbytes
     for ours, theirs in zip(weights.arrays(), tiny.weights.arrays()):
         assert mx.array_equal(ours, theirs)
-    if decision:
-        loaded = load_decision_head(tmp_path)
-        assert loaded.head_dim == 16
-        assert all(mx.array_equal(loaded.w[name], saved[name]) for name in saved)
+    loaded = load_decision_head(tmp_path)
+    assert loaded.head_dim == 16
+    assert all(mx.array_equal(loaded.w[name], saved[name]) for name in saved)
+
+    # any other checkpoint folder is refused
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+    with pytest.raises(ValueError, match="not a Decision 2.0 package"):
+        load_decision_backbone(plain, mx.bfloat16)

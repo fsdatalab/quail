@@ -176,7 +176,7 @@ def tiny(tmp_path, monkeypatch):
     model = reference_model(TINY)
     head = head_weights(np.random.default_rng(8))
     write_package(package, model, {k: mx.array(v) for k, v in head.items()},
-                  decision=True, config=TINY)
+                  config=TINY)
     write_tokenizer(package)
     spec = replace(
         DECISION_2_KAI_0_6B_BF16, name="tiny-decision", hf_name=str(package),

@@ -88,20 +88,19 @@ class Qwen3Weights:
     norm: object
 
     @classmethod
-    def from_tensors(cls, tensors, config: Qwen3Config, dtype,
-                     prefix: str = "") -> "Qwen3Weights":
-        """Build the weights from a checkpoint's tensors by name.
+    def from_tensors(cls, tensors, config: Qwen3Config, dtype) -> "Qwen3Weights":
+        """Build the weights from a Decision 2.0 backbone's tensors by name.
 
         Args:
-            tensors: Mapping from Hugging Face tensor name to MLX array.
+            tensors: Mapping from tensor name, such as
+                "layers.0.self_attn.q_proj.weight", to MLX array.
             config: The checkpoint's shape.
             dtype: MLX dtype every weight is cast to.
-            prefix: Text before every name, such as "model.".
         """
         import mlx.core as mx
 
         def get(name):
-            return tensors[prefix + name].astype(dtype)
+            return tensors[name].astype(dtype)
 
         layers = []
         for index in range(config.layers):

@@ -1,4 +1,4 @@
-"""Load Qwen3 weights and the Decision 2.0 head as MLX arrays."""
+"""Load a Decision 2.0 package's backbone and head as MLX arrays."""
 
 import json
 from pathlib import Path
@@ -11,30 +11,30 @@ from quail.backends.quail.executor.mlx_device.weights import (
 from quail.backends.quail.executor.model import is_decision2
 
 
-def load_qwen3_weights(path, dtype) -> Qwen3Weights:
-    """Load the Qwen3 weights in a checkpoint directory.
+def load_decision_backbone(path, dtype) -> Qwen3Weights:
+    """Load the Qwen3 backbone of a Decision 2.0 package.
 
-    A Decision 2.0 package keeps its backbone in backbone/, with tensor
-    names that lack the `model.` prefix of a plain Qwen3 checkpoint.
-    The weights are evaluated before this returns, so loading them is
-    part of startup.
+    The package keeps its backbone in backbone/. The weights are
+    evaluated before this returns, so loading them is part of startup.
 
     Args:
-        path: The local checkpoint directory.
+        path: The local package directory.
         dtype: MLX dtype every weight is cast to.
+
+    Raises:
+        ValueError: The directory is not a Decision 2.0 package.
     """
     import mlx.core as mx
 
-    directory = Path(path)
-    if is_decision2(directory):
-        directory = directory / "backbone"
+    if not is_decision2(path):
+        raise ValueError(f"{path} is not a Decision 2.0 package")
+    backbone = Path(path) / "backbone"
     config = Qwen3Config.from_dict(
-        json.loads((directory / "config.json").read_text()))
+        json.loads((backbone / "config.json").read_text()))
     tensors = {}
-    for file in sorted(directory.glob("*.safetensors")):
+    for file in sorted(backbone.glob("*.safetensors")):
         tensors.update(mx.load(str(file)))
-    prefix = "model." if "model.embed_tokens.weight" in tensors else ""
-    return Qwen3Weights.from_tensors(tensors, config, dtype, prefix=prefix)
+    return Qwen3Weights.from_tensors(tensors, config, dtype)
 
 
 def load_decision_head(path) -> MlxDecisionHead:
