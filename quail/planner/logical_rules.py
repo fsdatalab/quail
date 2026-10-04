@@ -25,6 +25,7 @@ from quail.logical import (
     SemanticClassify,
     SemanticFilter,
     SemanticJoin,
+    SortKey,
     has_score,
     model_call,
 )
@@ -53,6 +54,8 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return (expression.column,)
     if isinstance(expression, Equality):
         return (expression.left, expression.right)
+    if isinstance(expression, SortKey):
+        return _column_refs(expression.expression)
     return ()
 
 
@@ -72,6 +75,10 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         (ref.alias, ref.column)
         for ref in (root.output_schema() if isinstance(root, Project)
                     else ())
+    } | {
+        (ref.alias, ref.column)
+        for key in (root.order if isinstance(root, Project) else ())
+        for ref in _column_refs(key)
     }
     score_inputs = {
         (ref.alias, ref.column)
@@ -82,7 +89,10 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
 
     def descend(node, needed):
         needed = {alias: dict(columns) for alias, columns in needed.items()}
-        for expression in node.expressions():
+        expressions = node.expressions()
+        if isinstance(node, Project):
+            expressions += node.order
+        for expression in expressions:
             for ref in _column_refs(expression):
                 needed.setdefault(ref.alias, {})[ref.column] = None
         if isinstance(node, SemanticClassify):

@@ -496,7 +496,9 @@ class ScoreSpec:
 
     draws is the most noise draws a diffusion model averages per answer;
     an answer whose first draw is certain enough uses one. An
-    autoregressive model always uses one.
+    autoregressive model always uses one. share_prefixes lets each
+    document borrow the KV pages of a document sharing its prefix; it
+    applies to scores of one table.
     """
 
     name: str
@@ -508,6 +510,7 @@ class ScoreSpec:
     pair_fraction: float = 1.0
     prompt_token_parts: tuple[tuple[int, ...], ...] = ()
     draws: int = 1
+    share_prefixes: bool = False
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ScoreSpec":
@@ -526,6 +529,7 @@ class ScoreSpec:
                 tuple(part) for part in value.get("prompt_token_parts", ())
             ),
             draws=int(value.get("draws", 1)),
+            share_prefixes=bool(value.get("share_prefixes", False)),
         )
 
     def to_dict(self) -> dict:
@@ -539,6 +543,7 @@ class ScoreSpec:
             "pair_fraction": self.pair_fraction,
             "prompt_token_parts": [list(part) for part in self.prompt_token_parts],
             "draws": self.draws,
+            "share_prefixes": self.share_prefixes,
         }
 
 
@@ -588,6 +593,7 @@ class AiScore(PhysicalNode):
             "estimated_seconds": (
                 0 if spec is None else spec.estimated_seconds
             ),
+            "share_prefixes": False if spec is None else spec.share_prefixes,
         }
 
     @classmethod
@@ -613,7 +619,6 @@ class ClassifySpec(ScoreSpec):
         scoring: The label scoring rule: letters, trie_tree, or trie_decode.
             The planner leaves it empty until the label_scoring rule
             picks one.
-        share_prefixes: Whether documents may reuse shared prefix KV pages.
         probabilities: Whether to add a name + "_probabilities" map column.
         join_layout: Anchor note and partner label token sequences for pair
             classification, or None for individual documents. The question
@@ -626,7 +631,6 @@ class ClassifySpec(ScoreSpec):
     labels: tuple[str, ...] = ()
     label_token_ids: tuple[tuple[int, ...], ...] = ()
     scoring: str = "letters"
-    share_prefixes: bool = False
     probabilities: bool = False
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     frame_tokens: int = 0
@@ -651,13 +655,12 @@ class ClassifySpec(ScoreSpec):
             **{name: getattr(base, name) for name in (
                 "name", "aliases", "query_template", "arguments",
                 "expected_inputs", "estimated_seconds", "pair_fraction",
-                "prompt_token_parts", "draws")},
+                "prompt_token_parts", "draws", "share_prefixes")},
             labels=tuple(str(label) for label in value["labels"]),
             label_token_ids=tuple(
                 tuple(int(token) for token in ids)
                 for ids in value["label_token_ids"]),
             scoring=str(value.get("scoring", "letters")),
-            share_prefixes=bool(value.get("share_prefixes", False)),
             probabilities=bool(value.get("probabilities", False)),
             join_layout=(None if value.get("join_layout") is None else tuple(
                 tuple(int(token) for token in part)
@@ -671,7 +674,6 @@ class ClassifySpec(ScoreSpec):
             "labels": list(self.labels),
             "label_token_ids": [list(ids) for ids in self.label_token_ids],
             "scoring": self.scoring,
-            "share_prefixes": self.share_prefixes,
             "probabilities": self.probabilities,
             "join_layout": (None if self.join_layout is None
                             else [list(part) for part in self.join_layout]),
@@ -706,8 +708,6 @@ class AiClassify(AiScore):
             **super().explain_fields(),
             "labels": [] if self.spec is None else list(self.spec.labels),
             "scoring": None if self.spec is None else self.spec.scoring,
-            "share_prefixes": (False if self.spec is None
-                               else self.spec.share_prefixes),
             "draws": 1 if self.spec is None else self.spec.draws,
             "probabilities": (False if self.spec is None
                               else self.spec.probabilities),
@@ -1214,6 +1214,55 @@ class Project(PhysicalNode):
             node_id=node_id,
             inputs=inputs,
             columns=tuple(attributes["columns"]),
+        )
+
+
+@dataclass(frozen=True)
+class Sort(PhysicalNode):
+    """Order, deduplicate, and bound the result rows on the coordinator.
+
+    ``keys`` are (column, descending, nulls_first) triples over the
+    input columns. ``columns`` are the output columns; an input column
+    not among them is read by a key only. Distinct runs before the
+    sort, and ``offset`` and ``fetch`` after it.
+    """
+
+    keys: tuple[tuple[str, bool, bool], ...] = ()
+    columns: tuple[str, ...] = ()
+    distinct: bool = False
+    offset: int = 0
+    fetch: int | None = None
+
+    type_name: ClassVar[str] = "quail.sort"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
+
+    def attributes(self) -> dict:
+        return {
+            "keys": [list(key) for key in self.keys],
+            "columns": list(self.columns),
+            "distinct": self.distinct,
+            "offset": self.offset,
+            "fetch": self.fetch,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            keys=tuple((str(column), bool(descending), bool(nulls_first))
+                       for column, descending, nulls_first
+                       in attributes["keys"]),
+            columns=tuple(attributes["columns"]),
+            distinct=bool(attributes.get("distinct", False)),
+            offset=int(attributes.get("offset", 0)),
+            fetch=(None if attributes.get("fetch") is None
+                   else int(attributes["fetch"])),
         )
 
 

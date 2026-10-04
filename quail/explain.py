@@ -21,6 +21,7 @@ from quail.physical import (
     Recombine,
     RequestExecution,
     Scan,
+    Sort,
 )
 
 
@@ -63,6 +64,16 @@ def logical_tree(logical):
             title = f"Project: {columns}"
             if node.limit is not None:
                 lines.append(f"{'  ' * depth}Limit: {node.limit:,}")
+                depth += 1
+            if node.offset:
+                lines.append(f"{'  ' * depth}Offset: {node.offset:,}")
+                depth += 1
+            if node.order:
+                keys = ", ".join(str(key) for key in node.order)
+                lines.append(f"{'  ' * depth}Sort: {keys}")
+                depth += 1
+            if node.distinct:
+                lines.append(f"{'  ' * depth}Distinct")
                 depth += 1
         elif isinstance(node, logical_nodes.Scan):
             title = f"Scan {node.provider} as {node.alias}"
@@ -268,10 +279,15 @@ def _estimated_rows(graph):
             for stage in node.stages:
                 if value is not None:
                     value *= effective_selectivity(stage.selectivity)
-        elif isinstance(node, (Project, Limit, Exchange)) and len(inputs) == 1:
+        elif isinstance(node, (Project, Limit, Sort, Exchange)) \
+                and len(inputs) == 1:
             value = inputs[0]
             if isinstance(node, Limit) and value is not None:
                 value = min(value, node.count)
+            if isinstance(node, Sort) and value is not None:
+                value = max(value - node.offset, 0)
+                if node.fetch is not None:
+                    value = min(value, node.fetch)
         elif isinstance(node, Foreign) and node.ids == "preserve":
             value = inputs[0] if inputs else None
         # Join nodes expose both document ids and predicate answers.
@@ -336,6 +352,20 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             title += ": " + ", ".join(node.columns)
         elif isinstance(node, Limit):
             title += f": {node.count:,}"
+        elif isinstance(node, Sort):
+            title += ": " + ", ".join(
+                f"{column} {'DESC' if descending else 'ASC'} "
+                f"NULLS {'FIRST' if nulls_first else 'LAST'}"
+                for column, descending, nulls_first in node.keys)
+            bounds = []
+            if node.distinct:
+                bounds.append("distinct")
+            if node.offset:
+                bounds.append(f"offset={node.offset:,}")
+            if node.fetch is not None:
+                bounds.append(f"fetch={node.fetch:,}")
+            if bounds:
+                details.append(", ".join(bounds))
         elif isinstance(node, AiFilter):
             title += f": {node.alias}"
             kv = []

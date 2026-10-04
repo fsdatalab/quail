@@ -24,9 +24,7 @@ from quail.physical import (
     Comparison,
     Filter,
     InList,
-    Limit,
     PortRef,
-    Project,
     Scan,
     ScoreSpec,
 )
@@ -39,6 +37,7 @@ from quail.planner.classify import (
 )
 from quail.planner.physical_optimizer import PhysicalCandidate
 from quail.planner.plan import PhysicalPlan, Refusal
+from quail.planner.results import result_nodes
 from quail.reranker import render_qwen3_reranker_input
 
 
@@ -108,6 +107,21 @@ def _longest_input(spec, context) -> tuple[int, int]:
         return len(parts[0]), longest[0] + len(parts[1]) + canvas
     prefix = len(parts[0]) + longest[0] + len(parts[1])
     return prefix, longest[1] + len(parts[2]) + canvas
+
+
+def score_fixed_tokens(token_parts, canvas_tokens: int, draws: int) -> int:
+    """Return the tokens a score adds to each input besides its documents.
+
+    Args:
+        token_parts: The prompt's tokenized pieces around the documents.
+        canvas_tokens: The model's canvas rows per answer; 0 without one.
+        draws: The noise draws averaged per answer.
+
+    Returns:
+        The prompt pieces, the canvas, and each later draw's cue and canvas.
+    """
+    return (sum(map(len, token_parts)) + canvas_tokens
+            + (draws - 1) * (1 + canvas_tokens))
 
 
 def _score_work(count, mean_tokens, fixed_tokens, *, variance=0.0,
@@ -218,7 +232,7 @@ def _score_spec(
     # a one-table score on a canvas model may average noise draws, each
     # the cue and its canvas after the document's KV; every draw is priced
     draws = context.canvas_draws if canvas and len(aliases) == 1 else 1
-    fixed_tokens = sum(map(len, token_parts)) + canvas + (draws - 1) * (1 + canvas)
+    fixed_tokens = score_fixed_tokens(token_parts, canvas, draws)
     shared = len(token_parts[0])
     prefix = float(shared)
     prefix_variance = 0.0
@@ -627,17 +641,7 @@ def _plan_reranker(region, context, *, backend_name: str):
         else f"{expression.alias}.{expression.column}"
         for expression in logical.root.columns
     )
-    nodes.append(Project(
-        node_id="project",
-        inputs=input_ports((sink,)),
-        columns=columns,
-    ))
-    if logical.root.limit is not None:
-        nodes.append(Limit(
-            node_id="limit",
-            inputs=input_ports((PortRef("project", "rows"),)),
-            count=logical.root.limit,
-        ))
+    nodes.extend(result_nodes(logical.root, (sink,), columns))
 
     estimate = total_seconds
     true_ids, false_ids = answer_ids(context.model, context.tokenizer)
