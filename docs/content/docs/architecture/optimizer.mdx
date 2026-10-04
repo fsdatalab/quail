@@ -267,8 +267,8 @@ write_seconds = total_tokens * model.kappa / device.hbm_bw
 Joins and classifications always write KV.
 A filter writes KV when a later stage or operator reads the KV.
 The rule does not add `write_seconds` for these operators.
-A score of one table writes KV only for prefix sharing.
-For this score, the rule adds `write_seconds` to the cost.
+`AI.SCORE` writes KV only for prefix sharing.
+For `AI.SCORE`, the rule adds `write_seconds` to the cost.
 
 The comparison excludes sorting, scheduling, attention, and recomputation
 when shared KV is unavailable. Prefix matching requires token sequences,
