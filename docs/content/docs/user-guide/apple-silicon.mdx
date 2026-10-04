@@ -1,0 +1,173 @@
+---
+title: Run on a Mac
+---
+
+Quail runs Decision 2.0 Kai 0.6B on the GPU of an Apple silicon Mac.
+Set `device="apple-gpu"`. You write the same SQL, and Quail uses the
+same planner and KV reuse as on a CUDA GPU. No CUDA GPU or Modal
+account is needed.
+
+Use it to develop and test queries on small tables. A Mac is much
+slower than an H100; see [Speed](#speed).
+
+## Install
+
+You need an Apple silicon Mac with macOS 15 or later and Python 3.12.
+
+```bash
+uv pip install "quail-engine[mlx]"
+uv pip install --no-deps \
+  https://github.com/vllm-project/vllm-metal/releases/download/v0.30.0/vllm_metal-0.30.0-cp312-cp312-macosx_15_0_arm64.whl
+```
+
+The first command installs Quail with [MLX](https://github.com/ml-explore/mlx),
+Apple's array library for its GPUs. The second installs
+[vllm-metal](https://github.com/vllm-project/vllm-metal), the vLLM
+project's Apple silicon plugin. Quail uses its attention kernels.
+vllm-metal publishes its wheel on GitHub, not on PyPI, so it is a
+separate command. `--no-deps` skips the vLLM server, which Quail does
+not use.
+
+The `mlx` extra is not in Quail 0.1.0. Until a later release, install
+from a checkout of the repository: `uv sync` installs all three on a
+Mac.
+
+## Run a query
+
+This example keeps the reviews that praise the acting.
+
+```python
+import pyarrow as pa
+import quail
+
+reviews = pa.table({
+    "id": ["r1", "r2", "r3"],
+    "body": [
+        "The acting was excellent.",
+        "The plot was confusing.",
+        "A great cast, wasted on a weak script.",
+    ],
+})
+config = quail.EngineConfig(
+    model="decision-2.0-kai-0.6b-bf16",
+    device="apple-gpu",
+)
+with quail.Session(config=config) as session:
+    session.register("reviews", quail.DocumentProvider.from_table(
+        reviews, id_col="id"))
+    query = session.sql("""
+        SELECT r.id
+        FROM reviews r
+        WHERE AI.IF(
+            PROMPT('Does this review praise the acting? {0}', r.body))
+    """, dialect="bq")
+    print(query.run().collect())
+```
+
+The first run downloads the model, about 1.5 GB. The output is a
+PyArrow table:
+
+```
+pyarrow.Table
+r.id: string not null
+----
+r.id: [["r1","r3"]]
+```
+
+`query.explain(analyze=True)` runs the query and prints the plan with
+measured time and token counts:
+
+```
+run:
+  query time   100 ms (model startup excluded)
+  startup      2.6 s (cold)
+  throughput   30 documents/second over 3 input documents
+  tokens       215 fresh, 0 read from KV
+```
+
+There is no GPU cost line. A Mac has no rental price, so
+`report["usd_per_query"]` is `None`.
+
+## What runs
+
+| | On a Mac | On an H100 |
+| --- | --- | --- |
+| Models | Decision 2.0 Kai 0.6B | [Every supported model](/docs/user-guide/models#models) |
+| AI functions | `AI.IF` in filters and joins, `AI.SCORE`, `AI.CLASSIFY` | The same |
+| Model copies | 1 | 1, 2, 4, or 8 |
+| Longest document with its prompt, for this model | 8,192 tokens | 65,536 tokens |
+| Startup, for this model | About 2.6 s | About 20 s |
+
+Quail refuses any other model or `gpus` value before it loads weights,
+and the message names what is supported. It also refuses a query with
+a longer document when it plans the query.
+
+## Memory
+
+A Mac's GPU shares memory with every other application. macOS
+recommends a limit for GPU memory, and Quail takes half of that limit
+by default. For example, on a Mac with 34.4 GB of memory, macOS
+recommends 22.9 GB, and Quail takes 11.5 GB.
+
+That amount holds everything: the model weights, the KV, and working
+memory. Quail asks macOS to keep it in memory, so macOS does not
+compress it or move it to disk while a query runs.
+
+Set `memory_fraction` to take a different share:
+
+```python
+config = quail.EngineConfig(
+    model="decision-2.0-kai-0.6b-bf16",
+    device="apple-gpu",
+    memory_fraction=0.25,
+)
+```
+
+A larger share gives Quail more room for KV. It also takes memory
+from your other applications. These are two queries over 200 reviews
+on the Mac above, which had other applications open:
+
+| `memory_fraction` | Quail holds | Two filters | Join with 6 rows | Memory macOS compressed |
+| --- | ---: | ---: | ---: | ---: |
+| 0.25 | 5.7 GB | 27.6 s | 50.9 s | 0 GB |
+| 0.5, the default | 11.5 GB | 26.9 s | 50.9 s | 0 GB |
+| 0.9 | 20.6 GB | 31.8 s | 64.9 s | 20.4 GB and 10.5 GB |
+
+At 0.9 the queries were slower, because macOS had to compress other
+applications' memory to make room. All three gave the same answers.
+
+If the share is too small to hold a document's KV after the weights,
+Quail refuses the query when it plans it. The message gives the memory
+Quail has and the memory the weights take.
+
+## Speed
+
+A Mac is much slower than an H100. These are four
+[quail-b](/docs/contributing/benchmark) queries at scale factor 0.1,
+on an M4 MacBook with 34.4 GB of memory and on one H100:
+
+| Query | What it does | M4 | H100 | M4 input tokens per second |
+| --- | --- | ---: | ---: | ---: |
+| FEV-1 | Filter over 500 claims | 22.1 s | 0.18 s | 2,483 |
+| FEV-11 | Classify 500 claims | 47.5 s | 0.27 s | 2,333 |
+| LEP-1 | Filter over 500 posts | 80.2 s | 0.47 s | 1,913 |
+| FEV-4 | Two filters, then a join over 10,332 pairs | 530.1 s | 2.13 s | 10,742 |
+
+Times exclude model startup. *Input tokens per second* counts the full
+length of every prompt, so the join's number is higher: Quail computed
+each passage once and reused its KV for every claim paired with it.
+
+The answers agree with the H100's. On each query, the share of answers
+that match quail-b's saved reference labels differs by at most 0.2
+percentage points between the two.
+
+For the best speed:
+
+- Turn off Low Power Mode. With it on, the same query ran at 789
+  tokens per second, compared with 2,245 with it off.
+- Close applications that use the GPU, such as a browser playing
+  video.
+
+Quail's speed estimates for the Mac were measured on an M4. On another
+chip, `explain()` prints a note saying that its estimated times use
+the M4's speed.

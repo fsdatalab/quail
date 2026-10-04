@@ -26,7 +26,9 @@ The package is named `quail-engine`; in Python, import `quail`.
 uv pip install quail-engine
 ```
 
-Requires Python 3.12 and a CUDA GPU.
+Requires Python 3.12 and a CUDA GPU. One small model also runs on an
+Apple silicon Mac; see
+[Run on a Mac](https://fsdatalab.github.io/quail/docs/user-guide/apple-silicon).
 
 ## Example
 
@@ -120,6 +122,7 @@ plus a Python builder API.
 | Qwen3 4B fp8 | NVIDIA H100 SXM |
 | Qwen3 32B fp8 | NVIDIA RTX PRO 6000 Blackwell Server Edition |
 | DiffusionGemma 26B-A4B fp8 | NVIDIA H100 SXM |
+| Decision 2.0 Kai 0.6B bf16 | NVIDIA H100 SXM, or the GPU of an Apple silicon Mac |
 
 1, 2, 4, or 8 GPUs per query. We are actively adding more models
 and hardware.

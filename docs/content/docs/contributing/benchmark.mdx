@@ -27,6 +27,18 @@ uv run python -m quail.bench.quailb --sf 0.1 --only IMDB-4 \
 Results are saved in the specified output directory.
 Use a new output directory for each run.
 
+On an Apple silicon Mac, run Decision 2.0 Kai 0.6B with
+`--device apple-gpu`:
+
+```bash
+uv run python -m quail.bench.quailb --sf 0.1 --only FEV-1 \
+  --model decision-2.0-kai-0.6b-bf16 --device apple-gpu \
+  --output-dir results/quailb/fev-1
+```
+
+The report gives no GPU cost for a Mac. With each timing, record the
+chip, its memory, the power source, and whether Low Power Mode was on.
+
 ### On Modal
 
 If you have not configured Modal, run `uv run modal setup` first.

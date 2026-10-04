@@ -9,7 +9,8 @@
     "results",
     "server",
     "metrics",
-    "models"
+    "models",
+    "apple-silicon"
   ],
   "defaultOpen": true
 }

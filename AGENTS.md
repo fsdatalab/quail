@@ -65,12 +65,20 @@ CI runs these on every pull request. Run them before pushing:
 - Every `Session` takes an `EngineConfig` that names `model` and
   `device`; neither has a default. `gpus` defaults to 1 and `backend`
   to `"quail"`.
+- A "device implementation" is the code that runs a model on one kind
+  of device. There are two, CUDA and MLX, and both run the same
+  planner, scheduler, and page accounting. The Mac's device is
+  `"apple-gpu"`.
 
 # Scope
 
 - Filter and join queries on Qwen3 4B fp8, Qwen3 32B fp8,
   DiffusionGemma 26B-A4B fp8, or Decision-2.0-Kai 0.6B bf16, on one
   H100 per model copy. No tensor-parallel weight sharding.
+- Decision-2.0-Kai 0.6B bf16 also runs on one Apple GPU through MLX,
+  for local development: unified attention, one model copy, and
+  documents of at most 8,192 tokens with their prompt. The Mac is not
+  expected to match an H100.
 - `AI.CLASSIFY`, `AI.EXTRACT`, and `AI.MAP` are on the roadmap.
   Open-ended generation, speculation, and forking are not supported.
 
@@ -94,7 +102,10 @@ Built on:
 - **sqlglot**: SQL parsing.
 - **Hugging Face** (`transformers`, `huggingface_hub`, `datasets`):
   tokenizers, checkpoints, and benchmark data.
-- **Modal**: every GPU run and the result volumes.
+- **Modal**: every CUDA run and the result volumes.
+- **MLX**: arrays and kernels on an Apple GPU.
+- **vllm-metal**: the paged KV write and paged attention kernels for
+  MLX. Quail calls those two functions and nothing else of it.
 - **SGLang**: a second baseline.
 
 Learned from. Treat these as whole projects to study, not single
@@ -126,7 +137,7 @@ how they release and explain changes.
 
 # Experiments
 
-- Every engine run goes through Modal; there is no local GPU.
+- Every CUDA run goes through Modal; there is no local CUDA GPU.
 - Do not create Modal app names. Attach GPU cells to
   `quail-milestone1` and the worker to `quail-engine`; caches and warm
   state belong to those apps.
@@ -139,6 +150,17 @@ how they release and explain changes.
 - Results live on the `quail-results` volume, summaries and per-item
   records alike. Do not commit them. Cite them by volume path, such as
   `/results/ablations/<file>.json`.
+- A run on `apple-gpu` is local and saves to a local directory. Upload
+  it with `modal volume put quail-results <dir> mlx/<run>` and cite it
+  as `/results/mlx/<run>`.
+- Keep local runs small: one or two quail-b queries that finish in a
+  few minutes, not a set of them. The Mac is someone's laptop. For
+  example, FEV-1 takes 22 s on an M4, and IMDB-2 needs about 41 minutes.
+- With every local timing, give the chip, its memory, the power source,
+  and whether Low Power Mode was on. Check that nothing else is using
+  the GPU: on an M4, Low Power Mode cut 2,245 fresh tokens per second
+  to 789, and the same query took 30% to 50% longer while a browser
+  and a video decoder were running.
 - State the prediction before the run, then report the result against
   it.
 - Work from measured constants first. Run one confirming cell, not a
@@ -155,7 +177,8 @@ how they release and explain changes.
     pair counts beside it as plain counts, not as throughput.
   - `$/query` is query time in hours times the number of GPUs times
     `quail.specs.H100_USD_PER_HOUR` ($3.9492, from
-    https://modal.com/pricing).
+    https://modal.com/pricing). A run on `apple-gpu` has no rental
+    price: report `$/query` as not applicable, never as $0.
   - Query time and `$/query` exclude model startup. Report startup
     separately if it matters.
 
