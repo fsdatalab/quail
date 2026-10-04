@@ -25,6 +25,8 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
     `params` counts the weights every token multiplies: the attention
     and MLP projections and the norms, without the embedding table or
     the output head, which only reads its TRUE and FALSE rows.
+    `w_mem_bytes` adds the bf16 embedding table, and the output head
+    when it is not tied to the embeddings, to the projection bytes.
 
     Args:
         name: The `model=` value the spec is registered under.
@@ -34,7 +36,7 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
             `config_file` from `hf_name` at `revision`.
         config_file: The config's path inside the repo.
         **fields: ModelSpec fields to set after the derived ones, such
-            as a measured `w_mem_bytes` or `chunk_cap_tokens`.
+            as a measured `w_mem_bytes` or a `chunk_cap_tokens`.
 
     Returns:
         The ModelSpec.
@@ -61,9 +63,13 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
                  + n_q * d_head * hidden                # o_proj
                  + 3 * hidden * intermediate            # gate_up, down
                  + 2 * hidden + 2 * d_head)             # four norms
+    params = float(layers * per_layer + hidden)
+    tied_head = bool(config.get("tie_word_embeddings", False))
+    # vLLM keeps the embedding table and output head in bf16
+    embedding_bytes = config["vocab_size"] * hidden * 2
     spec = ModelSpec(
         name=name,
-        params=float(layers * per_layer + hidden),
+        params=params,
         layers=layers,
         hidden=hidden,
         n_q=n_q,
@@ -74,7 +80,9 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
         hf_name=hf_name,
         revision=revision,
         vocab=config["vocab_size"],
-        tied_head=bool(config.get("tie_word_embeddings", False)),
+        tied_head=tied_head,
+        w_mem_bytes=(params * w_bytes
+                     + embedding_bytes * (1 if tied_head else 2)),
         weight_precision=weight_precision,
         arch="qwen3",
     )

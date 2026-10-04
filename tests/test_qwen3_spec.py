@@ -28,6 +28,8 @@ def test_qwen3_spec_matches_built_in(name):
     if built_in.role != "reranker":
         # the reranker specs count the embedding table in params
         assert spec.params == pytest.approx(built_in.params, rel=0.01)
+        # the measured footprint also holds fp8 block scales and buffers
+        assert spec.w_mem_bytes == pytest.approx(built_in.w_mem_bytes, rel=0.03)
 
 
 def _config(**changes):
