@@ -65,6 +65,13 @@ class DeviceImplementation:
 
     # ---- timing and memory
 
+    def time_chunks(self, enabled: bool) -> None:
+        """Say whether the query reads the time between its chunks' events.
+
+        An implementation whose events cost something records exact
+        ones only while this is on.
+        """
+
     def record_event(self):
         """Mark this point in the device's work; returns the mark."""
         return time.perf_counter()

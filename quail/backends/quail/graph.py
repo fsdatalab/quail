@@ -449,6 +449,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         pipelines=build_pipelines(graph),
         run_pipeline=getattr(execution, "execute_pipeline", None),
     )
+    implementation.time_chunks(bool(state.get("gpu_timing")))
     started = time.perf_counter()
     with implementation.inference_mode():
         result = GenericRunner().run(compute_subgraph(graph), context)

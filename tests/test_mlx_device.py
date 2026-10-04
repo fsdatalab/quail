@@ -73,9 +73,9 @@ def tiny(request):
     return Tiny(request.param)
 
 
-def reference_model():
+def reference_model(config=None):
     mx.random.seed(7)
-    model = Model(ModelArgs(**CONFIG))
+    model = Model(ModelArgs(**(config or CONFIG)))
     mx.eval(model.parameters())
     return model
 
@@ -659,10 +659,10 @@ def test_decisions_through_the_scheduler_match_whole_sequences(tiny):
 
 # ---- the loader
 
-def write_package(directory, model, head, *, decision):
+def write_package(directory, model, head, *, decision, config=None):
     """Save the tiny model as a checkpoint directory."""
     tensors = dict(tree_flatten(model.parameters()))
-    config = dict(CONFIG)
+    config = dict(config or CONFIG)
     config["rope_parameters"] = {"rope_theta": config.pop("rope_theta")}
     weights = directory
     if decision:

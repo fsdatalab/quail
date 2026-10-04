@@ -1,7 +1,9 @@
 """Load and run Quail models on the process's GPUs.
 
 One GPU runs in the calling process. Several GPUs use one child process
-per GPU, each with its own CUDA context and arena.
+per GPU, each with its own CUDA context and arena. A device spec names
+the device implementation that loads the model: LoadedGpu for CUDA,
+LoadedMlx for MLX.
 """
 
 import gc
@@ -21,7 +23,7 @@ from quail.backends.quail.executor.readout import (
     AsyncDecisionScores,
     DecisionHead,
 )
-from quail.backends.quail.executor.warmup import warm_kernels
+from quail.backends.quail.executor.warmup import _forward_warm, warm_kernels
 from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
@@ -43,7 +45,7 @@ from quail.physical import (
     Scan,
     decode_graph,
 )
-from quail.progress import say, set_gpu_index
+from quail.progress import quiet, say, set_gpu_index
 
 # Children outlive sessions so later queries can reuse their loaded models.
 _CHILDREN: list = []
@@ -171,6 +173,122 @@ class LoadedGpu:
             close_fn()
 
 
+class LoadedMlx:
+    """One decision model loaded on the Mac's GPU with MLX, reusable across queries.
+
+    It has the attributes and methods of LoadedGpu that booting and
+    running a query use.
+    """
+
+    # Chunk tokens of the warm-up passes. MLX's kernels do not depend
+    # on a chunk's size, so small chunks load every one of them.
+    WARM_TOKENS = 1024
+
+    def __init__(self, backend, context, answer_token_ids, *,
+                 model_path=None):
+        import mlx.core as mx
+
+        from quail.backends.quail.executor.mlx_device.implementation import (
+            MlxImplementation,
+        )
+        from quail.backends.quail.executor.mlx_device.loader import (
+            load_decision_head,
+            load_qwen3_weights,
+        )
+
+        spec, device = context.model, context.device
+        self.spec = spec
+        self.implementation = MlxImplementation()
+        self._warmed = False
+        self.prepared_boot = None
+
+        say(f"loading {spec.hf_name} with MLX")
+        t0 = time.perf_counter()
+        path = resolve_model_path(model_path or spec.hf_name,
+                                  None if model_path else spec.revision)
+        self.model = load_qwen3_weights(path, mx.bfloat16)
+        self.decision_head = load_decision_head(path)
+        self.decision_offsets = decision_offsets(spec, path)
+        self.load_model_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        budget = budgets.chunk_budget(spec, device)
+        full_pages, _ = budgets.arena_pages(spec, device, budget)
+        self.arena = KVArena(n_layers=spec.layers, n_pages=full_pages,
+                             page_tokens=budgets.PAGE_TOKENS,
+                             n_kv=spec.n_kv, d_head=spec.d_head,
+                             pools=self.implementation.kv_pools(mx.bfloat16))
+        self.arena_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        self.pipeline = build_pipeline(spec, self.model, self.arena,
+                                       implementation=self.implementation.name)
+        self.pipeline_s = time.perf_counter() - t0
+
+        self.execution = backend.start(context)
+        self.execution.bind_loaded_model(
+            model=self.model, arena=self.arena, pipeline=self.pipeline,
+            decision_head=self.decision_head)
+        self.async_ans = None
+        self.chunk_tokens = None
+
+    def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None):
+        """Attach the decision readouts and chunk budget for one query.
+
+        arena_pages resizes the KV pools to the plan's split; nothing
+        survives in the arena between queries. A decision model reads no
+        answer rows, so true_ids and false_ids are unused.
+        """
+        from quail.backends.quail.executor.mlx_device.readout import (
+            MlxDecisions,
+            MlxDecisionScores,
+        )
+
+        if arena_pages is not None:
+            self.arena.resize(*arena_pages, free_resident=True)
+        self.async_ans = MlxDecisions(self.decision_head, self.decision_offsets)
+        self.chunk_tokens = chunk_tokens
+        self.execution.bind_query(
+            implementation=self.implementation,
+            async_answers=self.async_ans,
+            answer_rows=None,
+            chunk_tokens=chunk_tokens,
+            async_scores=MlxDecisionScores(
+                self.decision_head, self.decision_offsets),
+        )
+
+    def warm(self):
+        """Run every kernel once.
+
+        Returns:
+            Tuple of (seconds spent warming, "touch" the first time).
+        """
+        if self._warmed:
+            return 0.0, None
+        t0 = time.perf_counter()
+        with quiet():
+            _forward_warm(self.implementation, self.arena, self.pipeline,
+                          self.async_ans,
+                          min(self.chunk_tokens, self.WARM_TOKENS),
+                          join_chunk=True)
+        self.implementation.synchronize()
+        self._warmed = True
+        return time.perf_counter() - t0, "touch"
+
+    def close(self):
+        """Drop the model's weights and KV pools and free their memory."""
+        self.execution.close()
+        self.model = self.arena = self.pipeline = self.decision_head = None
+        self.async_ans = None
+        self.implementation.mx.clear_cache()
+
+
+def load_for_device(backend, context, answer_token_ids):
+    """Load the context's model with the device implementation its device names."""
+    loaded = LoadedMlx if context.device.implementation == "mlx" else LoadedGpu
+    return loaded(backend, context, answer_token_ids)
+
+
 def decision_offsets(spec, path) -> tuple[int, ...]:
     """The rows a decision readout reads, as distances before the last row."""
     from gigatoken import Tokenizer
@@ -248,7 +366,7 @@ def _boot_for_query(runtime_state, backend, gpu_context,
             # model cannot load beside them
             say(f"releasing {', '.join(loaded)} to load {key[1]}")
             release_booted_models(runtime_state)
-        gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids)
+        gpu = load_for_device(backend, gpu_context, true_ids + false_ids)
         runtime_state[key] = gpu
         cold = True
     else:
@@ -302,29 +420,29 @@ def _release_vllm_parallel_state() -> None:
 
 def release_booted_models(runtime_state: dict) -> dict:
     """Release Quail GPU state before another engine uses this process."""
-    import torch
+    try:
+        import torch
+    except ImportError:    # a process that runs MLX models only
+        torch = None
+    cuda = torch is not None and torch.cuda.is_available()
 
     released = len(runtime_state)
-    if torch.cuda.is_available():
+    if cuda:
         torch.cuda.synchronize()
     for state in runtime_state.values():
-        if isinstance(state, LoadedGpu):
+        if isinstance(state, (LoadedGpu, LoadedMlx)):
             state.close()
     runtime_state.clear()
     _release_vllm_parallel_state()
     gc.collect()
-    if torch.cuda.is_available():
+    if cuda:
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
     return {
         "models_released": released,
         "vllm_parallel_state_released": True,
-        "cuda_allocated_bytes": (
-            int(torch.cuda.memory_allocated())
-            if torch.cuda.is_available() else 0),
-        "cuda_reserved_bytes": (
-            int(torch.cuda.memory_reserved())
-            if torch.cuda.is_available() else 0),
+        "cuda_allocated_bytes": int(torch.cuda.memory_allocated()) if cuda else 0,
+        "cuda_reserved_bytes": int(torch.cuda.memory_reserved()) if cuda else 0,
     }
 
 
@@ -335,7 +453,7 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     key = (backend.name, gpu_context.model.name)
     gpu = runtime_state.get(key)
     boot = None
-    if isinstance(gpu, LoadedGpu):
+    if isinstance(gpu, (LoadedGpu, LoadedMlx)):
         boot = gpu.prepared_boot
         gpu.prepared_boot = None
     if boot is None:

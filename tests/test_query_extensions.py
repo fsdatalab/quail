@@ -68,7 +68,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
             {"wall_s": 1.0, "boot_s": 0.0, "fresh_tokens": 4},
         )
 
-    monkeypatch.setattr(runtime, "gpu_problem", lambda: None)
+    monkeypatch.setattr(runtime, "gpu_problem", lambda device: None)
     monkeypatch.setattr(runtime, "_execute_physical", execute)
     monkeypatch.setattr(runtime, "_prepare_backend", lambda plan, registry: None)
 

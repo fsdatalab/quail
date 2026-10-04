@@ -28,6 +28,10 @@ from quail.planner.physical_optimizer import (
 )
 from quail.planner.plan import Refusal
 from quail.planner.reranker import plan_reranker
+from quail.specs import DECISION_2_KAI_0_6B_BF16
+
+# the models the MLX device implementation runs
+MLX_MODELS = frozenset({DECISION_2_KAI_0_6B_BF16.name})
 
 
 class QuailModelExecution:
@@ -154,6 +158,15 @@ class QuailBackend:
     runtime_package = "vllm==0.26.0"
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
+        if device.implementation == "mlx":
+            if model.name not in MLX_MODELS:
+                return SupportResult.reject(
+                    f"Quail on {device.name} runs {', '.join(sorted(MLX_MODELS))}, "
+                    f"not {model.name!r}")
+            if gpu_count != 1:
+                return SupportResult.reject(
+                    f"Quail on {device.name} runs one model copy, not {gpu_count}")
+            return SupportResult.accept()
         if device.name not in {"h100-sxm", "rtx-pro-6000-blackwell-server"}:
             return SupportResult.reject(
                 f"Quail does not support device {device.name!r}")

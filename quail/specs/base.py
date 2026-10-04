@@ -210,6 +210,11 @@ class DeviceSpec:
     usd_per_hour: float = 0.0    # rental price of one device; 0 means
     #                              no price is known
     price_source: str = ""       # where usd_per_hour was read from
+    implementation: str = "cuda"    # the device implementation that
+    #                                 runs models on it: "cuda" or "mlx"
+    chunk_cap_tokens: int = 0    # upper bound on tokens per chunk on
+    #                              this device; 0 leaves the model's
+    #                              and the memory bounds
 
     @property
     def attn_flops(self) -> float:

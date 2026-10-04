@@ -51,6 +51,7 @@ from quail.planner import explain, plan_query, refine_plan
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
+from quail.specs import APPLE_GPU, local_apple_gpu
 
 
 def _node_metrics(metrics: dict) -> NodeMetrics:
@@ -122,6 +123,9 @@ class Session:
             raise RefusalError(model)
         self.config = config
         self.model = model
+        if config.device == APPLE_GPU and APPLE_GPU not in self.registry.devices:
+            # the spec depends on the machine, so it is built here
+            self.registry.register_device(local_apple_gpu())
         self.device = self.registry.device(config.device)
         try:
             backend = self.registry.backend(config.backend)

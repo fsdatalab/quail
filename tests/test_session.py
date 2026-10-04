@@ -410,7 +410,8 @@ assert "modal" not in sys.modules
 def test_engine_import_gpu_requirement_and_quickstart_demos(
         sess, monkeypatch, tmp_path):
     subprocess.run([sys.executable, "-c", IMPORT_TEXT], check=True)
-    monkeypatch.setattr(execution, "gpu_problem", lambda: "no CUDA GPU is visible")
+    monkeypatch.setattr(execution, "gpu_problem",
+                        lambda device: "no CUDA GPU is visible")
     with pytest.raises(RuntimeError, match="process with a CUDA GPU") as error:
         sess.sql(FILTER_SQL).run()
     assert "no CUDA GPU is visible" in str(error.value)
@@ -423,7 +424,7 @@ def test_engine_import_gpu_requirement_and_quickstart_demos(
     monkeypatch.setattr(quickstart_modal.volume, "commit",
                         lambda: commits.append("volume"))
     monkeypatch.setattr(quail.Session, "tokenizer", property(lambda self: str.split))
-    monkeypatch.setattr(execution, "gpu_problem", lambda: None)
+    monkeypatch.setattr(execution, "gpu_problem", lambda device: None)
     monkeypatch.setattr(execution, "_prepare_backend", lambda *args: None)
     executor = make_executor({"r": {"Instruction": [1, 0]}})
     monkeypatch.setattr(execution, "_execute_physical",

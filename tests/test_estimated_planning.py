@@ -34,7 +34,7 @@ def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
     assert session.estimate_lengths("docs", "body") is estimates
     session.close()
 
-    monkeypatch.setattr(execution, "gpu_problem", lambda: None)
+    monkeypatch.setattr(execution, "gpu_problem", lambda device: None)
     monkeypatch.setattr(execution, "_prepare_backend", lambda *args: None)
     executor = make_executor(TRUTH)
     monkeypatch.setattr(execution, "_execute_physical",

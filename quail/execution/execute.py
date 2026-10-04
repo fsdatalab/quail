@@ -16,8 +16,19 @@ from quail.planner.plan import Refusal
 # Loaded models outlive individual sessions.
 _BACKEND_STATE: dict = {}
 
-def gpu_problem() -> str | None:
-    """Return why this process cannot run a model, or None when it can."""
+def gpu_problem(device=None) -> str | None:
+    """Return why this process cannot run a model, or None when it can.
+
+    Args:
+        device: The session's DeviceSpec. Its device implementation is
+            asked; None asks for a CUDA GPU.
+    """
+    if getattr(device, "implementation", "cuda") == "mlx":
+        from quail.backends.quail.executor.mlx_device.implementation import (
+            MlxImplementation,
+        )
+
+        return MlxImplementation.problem()
     try:
         import torch
     except ImportError:
@@ -88,7 +99,11 @@ def execute_query(query, physical_executor=None, plan=None,
         query.plan()            # tokenization and pair tables first
         query._plan = plan
     if physical_executor is None:
-        problem = gpu_problem()
+        device = query.session.device
+        problem = gpu_problem(device)
+        if problem is not None and device.implementation == "mlx":
+            raise RuntimeError(
+                f"cannot run the model in this process: {problem}")
         if problem is not None:
             raise RuntimeError(
                 f"cannot run the model in this process: {problem}. "

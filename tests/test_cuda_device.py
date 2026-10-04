@@ -52,6 +52,7 @@ def test_the_base_implementation_keeps_arrays_on_the_host():
     assert host.select_rows(np.arange(6).reshape(3, 2), staged[0]).tolist() == [
         [2, 3], [4, 5]]
     assert host.input_staging() is None
+    host.time_chunks(True)
     start = host.record_event()
     host.synchronize()
     assert host.elapsed_ms(start, host.record_event()) >= 0

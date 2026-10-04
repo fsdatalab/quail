@@ -5,9 +5,12 @@ vllm-metal's kernels write and read in place, and the readouts are the
 Decision 2.0 ones. The forward pass is executor.models.qwen3_mlx.
 """
 
+import time
+
 import numpy as np
 
 from quail.backends.quail.executor.device import DeviceImplementation
+from quail.backends.quail.executor.mlx_device.kernels import INSTALL_TEXT, metal_ops
 from quail.backends.quail.executor.mlx_device.pools import MlxKVPools
 from quail.backends.quail.executor.mlx_device.readout import MlxDecisionChoices
 
@@ -21,6 +24,18 @@ class MlxImplementation(DeviceImplementation):
         import mlx.core as mx
 
         self.mx = mx
+        self.timing = False
+
+    @staticmethod
+    def problem() -> str | None:
+        """Return why this process cannot run MLX models, or None when it can."""
+        try:
+            import mlx.core  # noqa: F401
+
+            metal_ops()
+        except (ImportError, RuntimeError):
+            return INSTALL_TEXT
+        return None
 
     def kv_pools(self, dtype=None) -> MlxKVPools:
         """Return unbuilt KV pools; bf16 when no dtype is given."""
@@ -43,6 +58,18 @@ class MlxImplementation(DeviceImplementation):
         return rows[index]
 
     # ---- timing and memory
+
+    def time_chunks(self, enabled: bool) -> None:
+        self.timing = enabled
+
+    def record_event(self):
+        # MLX computes lazily, so a mark is exact only once the work
+        # before it has finished. Waiting stops the host from packing
+        # the next chunk while the GPU runs, so it waits only when the
+        # query reads chunk times.
+        if self.timing:
+            self.mx.synchronize()
+        return time.perf_counter()
 
     def synchronize(self) -> None:
         self.mx.synchronize()

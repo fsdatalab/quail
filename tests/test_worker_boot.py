@@ -181,7 +181,8 @@ def test_release_clears_cuda_state_and_a_new_model_boot_triggers_it(monkeypatch)
                             "boot_s": 0.0, "kind": "cold" if cold else "warm"})
     backend = SimpleNamespace(name="quail")
     state = {("quail", "qwen3-4b-fp8"): object()}
-    context = SimpleNamespace(model=SimpleNamespace(name="qwen3-reranker"))
+    context = SimpleNamespace(model=SimpleNamespace(name="qwen3-reranker"),
+                              device=SimpleNamespace(implementation="cuda"))
 
     gpu, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
     assert calls == [[("quail", "qwen3-4b-fp8")], ("load", "qwen3-reranker"),
