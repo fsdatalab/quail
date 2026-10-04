@@ -299,6 +299,52 @@ class LogicalNode(Protocol):
     def explain_fields(self) -> dict[str, Any]: ...
 
 
+COLUMN_COMPARISONS = ("=", "<>", "<", "<=", ">", ">=", "in", "is null",
+                      "is not null")
+
+
+@dataclass(frozen=True)
+class ColumnPredicate:
+    """A test of one source column against literals, decided without the model.
+
+    ``value`` is the literal compared with, a tuple of literals for
+    ``in``, and None for the null tests.
+    """
+    column: ColumnRef
+    comparison: str
+    value: Any = None
+
+    type_name: ClassVar[str] = "quail.column_predicate"
+
+    def aliases(self) -> tuple[str, ...]:
+        return (self.column.alias,)
+
+    def validate(self) -> None:
+        if not isinstance(self.column, ColumnRef):
+            raise CompileError("a column predicate tests a column reference")
+        if self.comparison not in COLUMN_COMPARISONS:
+            raise CompileError(
+                f"unsupported column comparison {self.comparison!r}; "
+                f"supported: {', '.join(COLUMN_COMPARISONS)}")
+        if self.comparison == "in":
+            if not isinstance(self.value, tuple) or not self.value:
+                raise CompileError("IN needs a non-empty list of literals")
+        elif self.comparison.startswith("is"):
+            if self.value is not None:
+                raise CompileError("a null test takes no value")
+        elif self.value is None or isinstance(self.value, (tuple, list)):
+            raise CompileError(
+                f"{self.comparison} compares with one literal")
+
+    def __str__(self) -> str:
+        name = f"{self.column.alias}.{self.column.column}"
+        if self.comparison == "in":
+            return f"{name} IN ({', '.join(repr(v) for v in self.value)})"
+        if self.comparison.startswith("is"):
+            return f"{name} {self.comparison.upper()}"
+        return f"{name} {self.comparison} {self.value!r}"
+
+
 @dataclass(frozen=True)
 class Scan:
     """Which column of which provider supplies the document text.
@@ -307,12 +353,14 @@ class Scan:
     columns kept as values for the result rows, and includes ``column``
     only when the query returns the document text itself. The
     projection pushdown rule fills ``columns``; before it runs the
-    tuple is empty.
+    tuple is empty. ``predicates`` are column tests, all of which a
+    document must pass before any operator reads it.
     """
     provider: str
     alias: str
     column: str
     columns: tuple = ()    # tuple[str, ...]
+    predicates: tuple = ()    # tuple[ColumnPredicate, ...]
 
     type_name: ClassVar[str] = "quail.scan"
 
@@ -320,7 +368,7 @@ class Scan:
         return ()
 
     def expressions(self) -> tuple:
-        return ()
+        return self.predicates
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
         fields = [ColumnRef(self.alias, self.provider, self.column)]
@@ -336,6 +384,16 @@ class Scan:
         if len(set(self.columns)) != len(self.columns):
             raise CompileError(
                 f"Scan {self.alias!r} lists a column twice: {self.columns}")
+        for predicate in self.predicates:
+            if not isinstance(predicate, ColumnPredicate):
+                raise CompileError(
+                    f"a Scan predicate is a ColumnPredicate, got "
+                    f"{type(predicate).__name__}")
+            predicate.validate()
+            if predicate.column.alias != self.alias:
+                raise CompileError(
+                    f"predicate {predicate} is on the Scan of "
+                    f"{self.alias!r}")
 
     def with_children(self, children: tuple) -> "Scan":
         if children:
@@ -343,9 +401,7 @@ class Scan:
         return self
 
     def with_expressions(self, expressions: tuple) -> "Scan":
-        if expressions:
-            raise CompileError("Scan has no expressions")
-        return self
+        return replace(self, predicates=tuple(expressions))
 
     def explain_fields(self) -> dict:
         return {
@@ -353,6 +409,7 @@ class Scan:
             "alias": self.alias,
             "column": self.column,
             "columns": list(self.columns),
+            "predicates": [str(predicate) for predicate in self.predicates],
         }
 
 
@@ -1208,6 +1265,7 @@ class LogicalPlanBuilder:
         applies: tuple = (),
         labels: tuple = (),
         label_filters: tuple = (),
+        column_predicates: tuple = (),
     ) -> None:
         """Add one table with its filters, applies, and classifications.
 
@@ -1216,6 +1274,8 @@ class LogicalPlanBuilder:
             provider: The registered provider name.
             column: The document column.
             predicates: The table's AI.IF predicates in written order.
+            column_predicates: ColumnPredicate tests the scan applies
+                before any operator reads a document.
             applies: (function, kind, ids, columns) per apply, in order.
             labels: (call, name) per one-table classification. A call
                 that a label filter tests sits below the first Filter
@@ -1230,7 +1290,8 @@ class LogicalPlanBuilder:
         """
         if alias in self._nodes:
             raise CompileError(f"duplicate table alias {alias!r}")
-        node = Scan(provider=provider, alias=alias, column=column)
+        node = Scan(provider=provider, alias=alias, column=column,
+                    predicates=tuple(column_predicates))
         if predicates:
             node = SemanticFilter(node, tuple(predicates))
         for function, kind, ids, columns in applies:

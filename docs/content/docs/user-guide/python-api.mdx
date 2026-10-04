@@ -166,6 +166,24 @@ query = (
 result = query.collect()
 ```
 
+### where
+
+`where(*tests)`
+
+Keep the documents that pass column tests, before any model call. A
+test compares a `col(...)` with a literal using `==`, `!=`, `<`, `<=`,
+`>`, or `>=`, or is `col(...).isin([...])`, `col(...).is_null()`, or
+`col(...).is_not_null()`. Several tests are combined with AND.
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .where(col("r.year") == 2024, col("r.stars") >= 4)
+    .ai_if(prompt('Does the review mention shipping?\n\n{0}', col("r.body")))
+    .select("r.id")
+)
+```
+
 ### limit
 
 `limit(n)`

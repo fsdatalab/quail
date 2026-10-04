@@ -79,6 +79,9 @@ def logical_tree(logical):
             title = f"Scan {node.provider} as {node.alias}"
             columns = ", ".join(dict.fromkeys((node.column, *node.columns)))
             title += f" [{columns}]"
+            if node.predicates:
+                title += " where " + " and ".join(
+                    str(predicate) for predicate in node.predicates)
         elif isinstance(node, logical_nodes.SemanticFilter):
             title = "SemanticFilter"
             details = [f"{_prompt(p.prompt)} "
@@ -342,6 +345,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             mean = node.total_tokens / node.n_docs if node.n_docs else 0
             details.append(f"tokens={node.total_tokens:,}, "
                            f"mean_doc_tokens={_number(mean)}")
+            if source is not None and source.predicates:
+                details.append("where " + " and ".join(
+                    str(predicate) for predicate in source.predicates))
         elif isinstance(node, Project):
             title += ": " + ", ".join(node.columns)
         elif isinstance(node, Limit):
