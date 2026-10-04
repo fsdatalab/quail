@@ -380,6 +380,39 @@ class ScanInput:
         return self._columns[name].values
 
 
+class SelectedScanInput:
+    """The rows of a ScanInput at selected positions, renumbered from zero.
+
+    Every reader sees a table of only the selected documents: the
+    tokens, the lengths, and the value columns. A column predicate on a
+    scan selects the positions once, before planning.
+    """
+
+    def __init__(self, source: ScanInput, indices):
+        self._source = source
+        self._indices = pa.array(indices, pa.int64())
+        self._lengths = None
+
+    @property
+    def tokens(self):
+        return select_documents(self._source.tokens, self._indices.to_pylist())
+
+    @property
+    def lengths(self) -> list[int]:
+        """Return the selected documents' token lengths."""
+        if self._lengths is None:
+            lengths = self._source.lengths
+            self._lengths = [lengths[index] for index in self._indices.to_pylist()]
+        return self._lengths
+
+    @property
+    def projected_columns(self) -> tuple[str, ...]:
+        return self._source.projected_columns
+
+    def column(self, name: str) -> pa.ChunkedArray:
+        return self._source.column(name).take(self._indices)
+
+
 class TokenSelection(Sequence):
     """Open selected token documents inside a child process."""
 
@@ -407,6 +440,11 @@ class TokenSelection(Sequence):
     def __setstate__(self, state):
         self._path, self._indices = state
         self._store = None
+
+    def select(self, indices) -> "TokenSelection":
+        """Return a file reference for positions of this selection."""
+        return TokenSelection(
+            self._path, [self._indices[index] for index in indices])
 
 
 class DocumentPrefixes(Sequence):
@@ -447,7 +485,7 @@ class DocumentKeys(Sequence):
 
 def select_documents(documents, indices):
     """Select documents without copying file backed token buffers."""
-    if isinstance(documents, TokenStore):
+    if isinstance(documents, (TokenStore, TokenSelection)):
         return documents.select(indices)
     return [documents[index] for index in indices]
 

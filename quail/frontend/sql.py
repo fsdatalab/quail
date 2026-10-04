@@ -11,6 +11,7 @@ from quail.logical import (
     AggregateCall,
     Aggregation,
     Alias,
+    ColumnPredicate,
     ColumnRef,
     Compare,
     CompileError,
@@ -112,6 +113,78 @@ def _score_comparison(node):
     return None
 
 
+_PLAIN_COMPARISONS = {
+    exp.EQ: "=", exp.NEQ: "<>", exp.LT: "<", exp.LTE: "<=",
+    exp.GT: ">", exp.GTE: ">=",
+}
+_FLIPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "<>": "<>"}
+
+
+def _literal(node):
+    """Return a Python value for a SQL literal, or raise."""
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return str(node.this)
+        text = str(node.this)
+        return float(text) if "." in text or "e" in text.lower() else int(text)
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if isinstance(node, exp.Neg) and isinstance(node.this, exp.Literal) \
+            and not node.this.is_string:
+        return -_literal(node.this)
+    raise CompileError(
+        f"a column is compared with a number, string, or boolean "
+        f"literal, got {node.sql()}")
+
+
+def _has_ai_call(term) -> bool:
+    return any(
+        _is_call(node, "AI_FILTER") or _is_call(node, "AI_SCORE")
+        or isinstance(node, (exp.AIClassify, exp.Exists))
+        for node in term.walk())
+
+
+def _column_predicate(b, term) -> ColumnPredicate | None:
+    """Parse a plain test of one column, or return None for an AI term.
+
+    Raises:
+        CompileError: The term has no AI call and is not a supported
+            column test.
+    """
+    if _has_ai_call(term):
+        return None
+    node, negated = term, False
+    if isinstance(node, exp.Not):
+        node, negated = node.this, True
+    if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null) \
+            and isinstance(node.this, exp.Column):
+        return ColumnPredicate(b.resolve_column(node.this),
+                               "is not null" if negated else "is null")
+    if negated:
+        raise CompileError(
+            f"NOT is supported as NOT EXISTS and IS NOT NULL, got "
+            f"NOT {node.sql()}")
+    if isinstance(node, exp.In) and isinstance(node.this, exp.Column) \
+            and node.expressions:
+        return ColumnPredicate(
+            b.resolve_column(node.this), "in",
+            tuple(_literal(item) for item in node.expressions))
+    comparison = _PLAIN_COMPARISONS.get(type(node))
+    if comparison is not None:
+        left, right = node.this, node.expression
+        if isinstance(left, exp.Column) and not isinstance(right, exp.Column):
+            return ColumnPredicate(b.resolve_column(left), comparison,
+                                   _literal(right))
+        if isinstance(right, exp.Column) and not isinstance(left, exp.Column):
+            return ColumnPredicate(b.resolve_column(right),
+                                   _FLIPPED[comparison], _literal(left))
+        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+            return None
+    raise CompileError(
+        f"{term.sql()} is not supported; a column test is =, <>, <, <=, "
+        f">, >=, IN (literals), IS NULL, or IS NOT NULL")
+
+
 def _label_test(node):
     """Return the AI.CLASSIFY call and tested values of an = or IN test, or None."""
     if isinstance(node, exp.In) and isinstance(node.this, exp.AIClassify):
@@ -164,6 +237,7 @@ class _Binder:
         self.tokenizer = tokenizer
         self.turn = turn
         self.tables = []          # (alias, provider) in appearance order
+        self.column_predicates = {}    # alias -> [ColumnPredicate]
         self.doc_columns = {}     # alias -> document column
         self.filters = {}         # alias -> [FilterPredicate]
         self.label_tests = {}     # alias -> [(call, labels, selectivity)]
@@ -674,6 +748,11 @@ def compile_sql(sql: str, catalog: Catalog,
                     raise CompileError(
                         "AI.SCORE must be compared with <, <=, >, or >="
                     )
+                plain = _column_predicate(b, term)
+                if plain is not None:
+                    b.column_predicates.setdefault(
+                        plain.column.alias, []).append(plain)
+                    continue
                 equalities.append(_parse_equality(b, term, alias))
         if len(predicates) > 1:
             raise CompileError(
@@ -725,6 +804,11 @@ def compile_sql(sql: str, catalog: Catalog,
 
     where = tree.args.get("where")
     for term in _conjuncts(where.this) if where else []:
+        plain = _column_predicate(b, term)
+        if plain is not None:
+            b.column_predicates.setdefault(
+                plain.column.alias, []).append(plain)
+            continue
         anti = False
         node = term
         if isinstance(node, exp.Not):
@@ -858,6 +942,7 @@ def compile_sql(sql: str, catalog: Catalog,
             provider,
             b.doc_columns.get(alias, ""),
             tuple(b.filters.get(alias, ())),
+            column_predicates=tuple(b.column_predicates.get(alias, ())),
             labels=tuple(labels.get(alias, {}).items()),
             label_filters=tuple(
                 (labels[alias][call], accepted, selectivity)
