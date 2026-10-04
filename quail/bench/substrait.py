@@ -20,14 +20,25 @@ from dataclasses import dataclass
 from substrait import algebra_pb2, plan_pb2
 
 import quail
+from quail.frontend.builder import AggSpec, HavingSpec, PredicateSpec
 
 AI_URN = "extension:org.fsdatalab.quail_b:functions_ai"
 AI_FILTER = "ai_filter:str_str"
 AI_JOIN = "ai_join:str_str_str"
 AI_CLASSIFY = "ai_classify:str_str_list_list"
 AI_CLASSIFY_JOINED = "ai_classify:str_str_str_list_list"
+AI_SCORE = "ai_score:str_str"
 EQUAL = "equal:any_any"
 AND = "and:bool"
+COMPARISONS = {
+    "equal:any_any": "=", "not_equal:any_any": "<>",
+    "lt:any_any": "<", "lte:any_any": "<=",
+    "gt:any_any": ">", "gte:any_any": ">=",
+}
+AGGREGATES = {
+    "count:any": "count", "sum:i32": "sum", "avg:i32": "avg",
+    "avg:fp64": "avg", "min:i32": "min", "max:i32": "max",
+}
 
 
 @dataclass(frozen=True)
@@ -111,19 +122,93 @@ class InList:
 
 
 @dataclass(frozen=True)
+class ColumnTest:
+    """A test of one source column against a literal, before the model."""
+
+    id: str
+    alias: str
+    column: str
+    comparison: str
+    value: int | float | str
+
+
+@dataclass(frozen=True)
+class Score:
+    """One `ai_score` that adds a number column to one relation."""
+
+    id: str
+    alias: str
+    column: str
+    prompt: str
+    output: str
+
+
+@dataclass(frozen=True)
+class Aggregate:
+    """Group the rows by key fields and compute (name, function, argument) measures.
+
+    No measures means DISTINCT.
+    """
+
+    id: str
+    keys: tuple[str, ...]
+    measures: tuple[tuple[str, str, str | None], ...]
+
+
+@dataclass(frozen=True)
+class Having:
+    """Keep the groups whose measures pass (name, comparison, value) tests."""
+
+    id: str
+    tests: tuple[tuple[str, str, int | float], ...]
+
+
+@dataclass(frozen=True)
+class Sort:
+    """Order the rows by (field, descending) keys, nulls last."""
+
+    id: str
+    keys: tuple[tuple[str, bool], ...]
+
+
+@dataclass(frozen=True)
+class Fetch:
+    """Skip `offset` rows and keep at most `count`."""
+
+    id: str
+    offset: int
+    count: int
+
+
+@dataclass(frozen=True)
 class QueryPlan:
     """A QUAIL-B query as its relations, operators, and projection.
 
     Attributes:
         relations: The scanned relations, in scan order.
-        operators: Every operator, in operator id order.
-        select: The projected columns, as "alias.column"; a label
-            column is its relation's alias and the column's name.
+        operators: Every operator under the AI tree, in operator id order.
+        select: The projected fields: "alias.column" for a source,
+            label, or score column, or a measure's bare name.
+        tail: The relational steps over the AI tree, bottom up.
     """
 
     relations: tuple[Relation, ...]
-    operators: tuple[Filter | Join | Classify | InList, ...]
+    operators: tuple[Filter | Join | Classify | InList | ColumnTest | Score, ...]
     select: tuple[str, ...]
+    tail: tuple[Aggregate | Having | Sort | Fetch, ...] = ()
+
+    @property
+    def relational(self) -> bool:
+        """Whether the plan has a column test, a score, or a tail step."""
+        return bool(self.tail or self.scores or self.column_tests)
+
+    @property
+    def scores(self) -> tuple[Score, ...]:
+        return tuple(op for op in self.operators if isinstance(op, Score))
+
+    @property
+    def column_tests(self) -> tuple[ColumnTest, ...]:
+        return tuple(op for op in self.operators if isinstance(op, ColumnTest))
 
     @property
     def filters(self) -> tuple[Filter, ...]:
@@ -159,7 +244,7 @@ def _functions(plan: plan_pb2.Plan) -> dict[int, str]:
             continue
         function = declaration.extension_function
         if function.name in (AI_FILTER, AI_JOIN, AI_CLASSIFY,
-                             AI_CLASSIFY_JOINED) and (
+                             AI_CLASSIFY_JOINED, AI_SCORE) and (
                 urns.get(function.extension_urn_reference) != AI_URN):
             raise ValueError(f"{function.name} must come from {AI_URN}")
         names[function.function_anchor] = function.name
@@ -210,6 +295,29 @@ def _conditions(expression, functions) -> list[tuple[str, list]]:
             for item in _conditions(argument, functions)]
 
 
+def _literal(expression: algebra_pb2.Expression):
+    """Return the value of a number or string literal."""
+    if not expression.HasField("literal"):
+        raise ValueError("expected a literal")
+    kind = expression.literal.WhichOneof("literal_type")
+    if kind not in ("i8", "i16", "i32", "i64", "fp32", "fp64", "string"):
+        raise ValueError(f"unsupported literal {kind!r}")
+    return getattr(expression.literal, kind)
+
+
+def _comparison(expression, functions) -> str | None:
+    """Return the comparison a call makes, or None when it is not one."""
+    if not expression.HasField("scalar_function"):
+        return None
+    name = functions.get(expression.scalar_function.function_reference)
+    if name == AND:
+        inner = [_comparison(argument, functions)
+                 for argument in [a.value for a in
+                                  expression.scalar_function.arguments]]
+        return inner[0] if all(inner) else None
+    return COMPARISONS.get(name)
+
+
 def _read(rel: algebra_pb2.Rel, functions):
     """Return (relations, operators, fields) of one relation subtree."""
     kind = rel.WhichOneof("rel_type")
@@ -220,12 +328,28 @@ def _read(rel: algebra_pb2.Rel, functions):
             raise ValueError("a scan needs a table name and an alias hint")
         fields = tuple((alias, name) for name in read.base_schema.names)
         return [Relation(alias, read.named_table.names[-1])], [], fields
+    if kind == "filter" and _comparison(rel.filter.condition, functions):
+        relations, operators, fields = _read(rel.filter.input, functions)
+        for name, arguments in _conditions(rel.filter.condition, functions):
+            alias, column = _field(fields, arguments[0])
+            operators.append(ColumnTest(
+                rel.filter.common.hint.alias, alias, column,
+                COMPARISONS[name], _literal(arguments[1])))
+        return relations, operators, fields
     if kind == "project":
         project = rel.project
         relations, operators, fields = _read(project.input, functions)
         if len(project.expressions) != 1:
             raise ValueError("an inner projection adds one ai_classify column")
         name, arguments = _call(project.expressions[0], functions)
+        if name == AI_SCORE:
+            if len(arguments) != 2:
+                raise ValueError("ai_score(prompt, document) takes two arguments")
+            alias, column = _field(fields, arguments[1])
+            output = project.common.hint.output_names[-1].partition(".")[2]
+            operators.append(Score(project.common.hint.alias, alias, column,
+                                   _string(arguments[0]), output))
+            return relations, operators, (*fields, (alias, output))
         documents = {AI_CLASSIFY: 1, AI_CLASSIFY_JOINED: 2}.get(name)
         if documents is None or len(arguments) != documents + 3:
             raise ValueError("an inner projection must call ai_classify("
@@ -293,6 +417,68 @@ def _read(rel: algebra_pb2.Rel, functions):
     raise ValueError(f"unsupported relation {kind!r}")
 
 
+def _index(expression: algebra_pb2.Expression) -> int:
+    if not expression.HasField("selection"):
+        raise ValueError("expected a field reference")
+    return expression.selection.direct_reference.struct_field.field
+
+
+def _read_tail(rel: algebra_pb2.Rel, functions):
+    """Return (relations, operators, steps, field names) over the AI tree."""
+    kind = rel.WhichOneof("rel_type")
+    if kind == "fetch":
+        fetch = rel.fetch
+        relations, operators, steps, names = _read_tail(fetch.input, functions)
+        offset = _literal(fetch.offset_expr) if fetch.HasField(
+            "offset_expr") else 0
+        steps.append(Fetch(fetch.common.hint.alias, int(offset),
+                           int(_literal(fetch.count_expr))))
+        return relations, operators, steps, names
+    if kind == "sort":
+        sort = rel.sort
+        relations, operators, steps, names = _read_tail(sort.input, functions)
+        descending = (algebra_pb2.SortField.SORT_DIRECTION_DESC_NULLS_FIRST,
+                      algebra_pb2.SortField.SORT_DIRECTION_DESC_NULLS_LAST)
+        steps.append(Sort(sort.common.hint.alias, tuple(
+            (names[_index(item.expr)], item.direction in descending)
+            for item in sort.sorts)))
+        return relations, operators, steps, names
+    if kind == "filter" and _comparison(rel.filter.condition, functions):
+        relations, operators, steps, names = _read_tail(
+            rel.filter.input, functions)
+        if not steps or not isinstance(steps[-1], Aggregate):
+            raise ValueError("a having filter sits over an aggregate")
+        tests = tuple(
+            (names[_index(arguments[0])], COMPARISONS[name],
+             _literal(arguments[1]))
+            for name, arguments in _conditions(rel.filter.condition, functions))
+        steps.append(Having(rel.filter.common.hint.alias, tests))
+        return relations, operators, steps, names
+    if kind == "aggregate":
+        aggregate = rel.aggregate
+        relations, operators, fields = _read(aggregate.input, functions)
+        names = tuple(".".join(field) for field in fields)
+        keys = tuple(
+            names[_index(aggregate.grouping_expressions[index])]
+            for index in aggregate.groupings[0].expression_references)
+        outputs = tuple(aggregate.common.hint.output_names)
+        measures = []
+        for name, measure in zip(outputs[len(keys):], aggregate.measures):
+            function = AGGREGATES[functions[measure.measure.function_reference]]
+            distinct = (measure.measure.invocation ==
+                        algebra_pb2.AggregateFunction
+                        .AGGREGATION_INVOCATION_DISTINCT)
+            if function == "count" and distinct:
+                function = "count_distinct"
+            arguments = [argument.value for argument in measure.measure.arguments]
+            measures.append((name, function,
+                             names[_index(arguments[0])] if arguments else None))
+        step = Aggregate(aggregate.common.hint.alias, keys, tuple(measures))
+        return relations, operators, [step], outputs
+    relations, operators, fields = _read(rel, functions)
+    return relations, operators, [], tuple(".".join(field) for field in fields)
+
+
 def read_plan(plan: plan_pb2.Plan) -> QueryPlan:
     """Return the relations, operators, and projection of a QUAIL-B plan."""
     if len(plan.relations) != 1 or not plan.relations[0].HasField("root"):
@@ -301,10 +487,19 @@ def read_plan(plan: plan_pb2.Plan) -> QueryPlan:
     if not root.input.HasField("project"):
         raise ValueError("a QUAIL-B plan projects its output under the root")
     functions = _functions(plan)
-    relations, operators, fields = _read(root.input.project.input, functions)
-    select = tuple(".".join(_field(fields, expression))
+    relations, operators, steps, names = _read_tail(
+        root.input.project.input, functions)
+    select = tuple(names[_index(expression)]
                    for expression in root.input.project.expressions)
-    return QueryPlan(tuple(relations), tuple(operators), select)
+    return QueryPlan(tuple(relations), tuple(operators), select, tuple(steps))
+
+
+def output_name(field: str) -> str:
+    """Return the result column name of a selected field."""
+    alias, separator, column = field.partition(".")
+    if not separator:
+        return field
+    return alias if column == "id" else column
 
 
 def build_query(session, plan: QueryPlan, selectivity=None,
@@ -326,15 +521,30 @@ def build_query(session, plan: QueryPlan, selectivity=None,
     for item in plan.operators:
         if isinstance(item, Classify) and item.partner is not None:
             continue    # labels a join's rows, so it follows the joins
-        if isinstance(item, (Filter, Classify, InList)):
+        if isinstance(item, (Filter, Classify, InList, ColumnTest, Score)):
             per_alias.setdefault(item.alias, []).append(item)
     prompts = {(item.alias, item.output): item.prompt
                for item in plan.classifies}
+    # a label or score field is a named output of the builder
+    named = {f"{item.alias}.{item.output}": item.output
+             for item in (*plan.classifies, *plan.scores)}
+
+    def field(name: str) -> str:
+        return named.get(name, name)
 
     def relation_query(alias):
         query = session.docs(by_alias[alias].table).alias(alias)
         for item in per_alias.get(alias, ()):
-            if isinstance(item, Filter):
+            if isinstance(item, ColumnTest):
+                query = query.where(PredicateSpec(
+                    quail.col(f"{alias}.{item.column}"), item.comparison,
+                    item.value))
+            elif isinstance(item, Score):
+                query = query.ai_score(
+                    quail.prompt(item.prompt,
+                                 quail.col(f"{alias}.{item.column}")),
+                    name=item.output)
+            elif isinstance(item, Filter):
                 query = query.ai_filter(
                     quail.prompt(item.prompt,
                                  quail.col(f"{alias}.{item.column}")),
@@ -374,8 +584,37 @@ def build_query(session, plan: QueryPlan, selectivity=None,
                              quail.col(f"{item.partner[0]}.{item.partner[1]}")),
                 item.labels, name=item.output,
                 descriptions=item.descriptions)
-    outputs = {(item.alias, item.output) for item in plan.classifies}
-    columns = [name.split(".", 1)[1]
-               if tuple(name.split(".", 1)) in outputs else name
-               for name in plan.select]
-    return query.select(*columns, order=order)
+    for step in plan.tail:
+        if isinstance(step, Aggregate):
+            query = query.group_by(*(field(key) for key in step.keys))
+            if step.measures:
+                query = query.agg(**{
+                    name: AggSpec(function, None if argument is None
+                                  else field(argument))
+                    for name, function, argument in step.measures})
+            else:
+                query = query.distinct()
+        elif isinstance(step, Having):
+            measures = {name: (function, argument)
+                        for name, function, argument
+                        in plan_aggregate(plan).measures}
+            query = query.having(*(
+                HavingSpec(AggSpec(measures[name][0],
+                                   None if measures[name][1] is None
+                                   else field(measures[name][1])),
+                           comparison, value)
+                for name, comparison, value in step.tests))
+        elif isinstance(step, Sort):
+            query = query.order_by(*(
+                (field(name), "desc" if descending else "asc", "nulls last")
+                for name, descending in step.keys))
+        elif isinstance(step, Fetch):
+            if step.offset:
+                query = query.offset(step.offset)
+            query = query.limit(step.count)
+    return query.select(*(field(name) for name in plan.select), order=order)
+
+
+def plan_aggregate(plan: QueryPlan) -> Aggregate:
+    """Return the plan's aggregate step."""
+    return next(step for step in plan.tail if isinstance(step, Aggregate))

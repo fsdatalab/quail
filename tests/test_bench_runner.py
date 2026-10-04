@@ -237,13 +237,107 @@ def test_read_plan_reads_operators_and_rejects_other_extensions():
         ids = [op.id for op in plan.operators]
         assert len(set(ids)) == len(ids), spec.id
         labels = {f"{op.alias}.{op.output}" for op in plan.classifies}
-        assert all(name.endswith(".id") or name in labels
-                   for name in plan.select), spec.id
+        assert plan.relational or all(
+            name.endswith(".id") or name in labels
+            for name in plan.select), spec.id
 
     plan = get_query("IMDB-1").plan
     plan.extension_urns[0].urn = AI_URN + ".other"
     with pytest.raises(ValueError, match="ai_filter"):
         read_plan(plan)
+
+
+TRACES = pa.table({
+    "id": [f"s{i}" for i in range(6)],
+    "trace": [f"trace {i} words" for i in range(6)],
+    "trajectory_id": ["A", "A", "B", "B", "B", "C"],
+    "turn_index": [5, 10, 10, 15, 20, 5],
+    "token_count": [2000, 4000, 5000, 7000, 9000, 1000],
+})
+
+
+def test_relational_plans_read_build_and_run(tmp_path):
+    from quail.bench.substrait import (
+        Aggregate,
+        ColumnTest,
+        Fetch,
+        Having,
+        Score,
+        Sort,
+    )
+    from quail_b.prompts import AGENT_IMPLEMENTED_FIX, AGENT_RECOVERED
+
+    plan = read_plan(get_query("REL-AGENT-6").plan)
+    assert plan.relational and plan.column_tests == ()
+    assert plan.operators == (Filter("filter-1", "t", "trace",
+                                     AGENT_IMPLEMENTED_FIX),)
+    assert plan.tail == (
+        Aggregate("aggregate-1", ("t.trajectory_id",), (
+            ("fixes", "count", None), ("first_fix", "min", "t.turn_index"),
+            ("longest", "max", "t.token_count"))),
+        Having("having-1", (("fixes", ">=", 2),)),
+        Sort("sort-1", (("first_fix", False), ("t.trajectory_id", False))),
+        Fetch("fetch-1", 0, 50))
+    assert plan.select == ("t.trajectory_id", "fixes", "first_fix", "longest")
+    tests = read_plan(get_query("REL-AGENT-1").plan).column_tests
+    assert tests == (ColumnTest("where-1", "t", "turn_index", ">=", 10),
+                     ColumnTest("where-2", "t", "token_count", "<=", 6000))
+    scored = read_plan(get_query("REL-AGENT-4").plan)
+    assert scored.scores == (Score("score-1", "t", "trace", AGENT_RECOVERED,
+                                   "recovered_score"),)
+
+    pq.write_table(TRACES, tmp_path / "agent_traces.parquet")
+    with quail.Session(_config("quail"), tokenizer=str.split) as sess:
+        sess.register("agent_traces", DocumentProvider.from_parquet(
+            str(tmp_path / "agent_traces.parquet"), id_col="id"))
+        logical = build_query(sess, get_query("REL-AGENT-6")).logical
+        root = logical.root
+        assert root.aggregation.keys == ("t.trajectory_id",)
+        assert [str(a) for a in root.aggregation.aggregates] == [
+            "fixes = count(*)", "first_fix = min(t.turn_index)",
+            "longest = max(t.token_count)"]
+        assert [str(t) for t in root.aggregation.having] == ["fixes >= 2"]
+        assert [str(key) for key in root.order] == [
+            "first_fix ASC NULLS LAST", "t.trajectory_id ASC NULLS LAST"]
+        assert (root.limit, root.offset) == (50, 0)
+        scan = next(node for node in logical.walk()
+                    if type(node).__name__ == "Scan")
+        tested = build_query(sess, get_query("REL-AGENT-1")).logical
+        scan = next(node for node in tested.walk()
+                    if type(node).__name__ == "Scan")
+        assert [str(p) for p in scan.predicates] == [
+            "t.turn_index >= 10", "t.token_count <= 6000"]
+        paged = build_query(sess, get_query("REL-AGENT-2")).logical.root
+        assert (paged.limit, paged.offset) == (10, 10)
+        top = build_query(sess, get_query("REL-AGENT-4")).logical.root
+        assert [column.name for column in top.columns
+                if hasattr(column, "name")] == ["recovered_score"]
+        assert top.order[0].name == "recovered_score" and top.limit == 20
+        distinct = build_query(sess, get_query("REL-AGENT-3")).logical.root
+        assert distinct.aggregation.keys == ("t.trajectory_id",)
+        assert distinct.aggregation.aggregates == ()
+
+        # the fixes: s0, s1 (A), s2, s4 (B), s5 (C): A and B twice
+        def nodes(graph, request):
+            filtered = next(node for node in graph.nodes
+                            if isinstance(node, AiFilter))
+            answers = {0: [1], 1: [1], 2: [1], 3: [0], 4: [1], 5: [1]}
+            return {
+                **{node.node_id: NodeResult({f"ids:{node.alias}": range(
+                    len(request.inputs[node.input_id].documents))})
+                   for node in graph.nodes if isinstance(node, PhysicalScan)},
+                filtered.node_id: NodeResult({
+                    "ids:t": [0, 1, 2, 4, 5], "filter_answers:t": answers}),
+            }
+
+        query = build_query(sess, get_query("REL-AGENT-6"))
+        result = _execute(query, nodes, store=None)
+        output = run_output(result, plan, {"agent_traces": TRACES})
+    assert output.rows.to_pydict() == {
+        "trajectory_id": ["A", "B"], "fixes": [2, 2], "first_fix": [5, 10],
+        "longest": [4000, 9000]}
+    assert output.filter_answers["filter-1"].column("t").to_pylist() == [
+        "s0", "s1", "s2", "s3", "s4", "s5"]
 
 
 def test_benchmark_results_and_scoring(tmp_path):
