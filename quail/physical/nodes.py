@@ -1218,6 +1218,55 @@ class Project(PhysicalNode):
 
 
 @dataclass(frozen=True)
+class Sort(PhysicalNode):
+    """Order, deduplicate, and bound the result rows on the coordinator.
+
+    ``keys`` are (column, descending, nulls_first) triples over the
+    input columns. ``columns`` are the output columns; an input column
+    not among them is read by a key only. Distinct runs before the
+    sort, and ``offset`` and ``fetch`` after it.
+    """
+
+    keys: tuple[tuple[str, bool, bool], ...] = ()
+    columns: tuple[str, ...] = ()
+    distinct: bool = False
+    offset: int = 0
+    fetch: int | None = None
+
+    type_name: ClassVar[str] = "quail.sort"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
+
+    def attributes(self) -> dict:
+        return {
+            "keys": [list(key) for key in self.keys],
+            "columns": list(self.columns),
+            "distinct": self.distinct,
+            "offset": self.offset,
+            "fetch": self.fetch,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            keys=tuple((str(column), bool(descending), bool(nulls_first))
+                       for column, descending, nulls_first
+                       in attributes["keys"]),
+            columns=tuple(attributes["columns"]),
+            distinct=bool(attributes.get("distinct", False)),
+            offset=int(attributes.get("offset", 0)),
+            fetch=(None if attributes.get("fetch") is None
+                   else int(attributes["fetch"])),
+        )
+
+
+@dataclass(frozen=True)
 class Limit(PhysicalNode):
     """Stop result output after a fixed number of rows."""
 

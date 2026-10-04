@@ -17,6 +17,7 @@ from quail.logical import (
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
+    SortKey,
     bind_classify_prompt,
     bind_join_prompt,
     bind_prompt,
@@ -120,6 +121,9 @@ class Query:
         self._labels = {}            # name -> Alias of an AI.CLASSIFY call
         self._column_predicates = {}  # alias -> [ColumnPredicate]
         self._limit = None
+        self._order = []             # (column or name, descending, nulls_first)
+        self._offset = 0
+        self._distinct = False
 
     # ---- scope -------------------------------------------------------
 
@@ -555,6 +559,42 @@ class Query:
         self._limit = n
         return self
 
+    def order_by(self, *keys) -> "Query":
+        """Sort the result rows.
+
+        Args:
+            keys: Each a column name such as ``"r.year"`` or a projected
+                name such as ``"score"``, or a tuple of the name and
+                ``"asc"`` or ``"desc"``, with an optional third item
+                ``"nulls first"`` or ``"nulls last"``.
+        """
+        for key in keys:
+            name, *rest = (key,) if isinstance(key, str) else tuple(key)
+            direction = rest[0].lower() if rest else "asc"
+            if direction not in {"asc", "desc"}:
+                raise CompileError(
+                    f"order_by direction is 'asc' or 'desc', got {rest[0]!r}")
+            nulls = rest[1].lower() if len(rest) > 1 else None
+            if nulls not in {None, "nulls first", "nulls last"}:
+                raise CompileError(
+                    f"order_by null placement is 'nulls first' or 'nulls "
+                    f"last', got {rest[1]!r}")
+            descending = direction == "desc"
+            nulls_first = (descending if nulls is None
+                           else nulls == "nulls first")
+            self._order.append((name, descending, nulls_first))
+        return self
+
+    def offset(self, n: int) -> "Query":
+        if not isinstance(n, int) or n < 0:
+            raise CompileError("OFFSET must be a nonnegative integer")
+        self._offset = n
+        return self
+
+    def distinct(self) -> "Query":
+        self._distinct = True
+        return self
+
     def select(self, *cols) -> LogicalPlan:
         if self._pending_join is not None:
             raise CompileError(
@@ -604,7 +644,14 @@ class Query:
         for column in wanted:
             if len(column.expression.aliases()) == 2:
                 logical.add_classify(column.expression, column.name)
-        return logical.project(tuple(columns), self._limit)
+        named = {column.name: column for column in columns
+                 if isinstance(column, Alias)}
+        order = tuple(
+            SortKey(named[name] if name in named else self._resolve(col(name)),
+                    descending=descending, nulls_first=nulls_first)
+            for name, descending, nulls_first in self._order)
+        return logical.project(tuple(columns), self._limit, order=order,
+                               offset=self._offset, distinct=self._distinct)
 
 
 def docs(catalog: Catalog, provider: str, tokenizer=None,
