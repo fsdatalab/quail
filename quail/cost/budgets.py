@@ -39,7 +39,8 @@ def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
 
     Uses resident weights after the full untied output head is discarded.
     """
-    free = device.mem_bytes * POOL_FRACTION - model.W_resident
+    free = (device.mem_bytes * POOL_FRACTION - model.W_resident
+            - device.scratch_bytes)
     return int(free // model.act_per_token) // CHUNK_SLACK
 
 
@@ -59,8 +60,13 @@ def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
 
 def arena_bytes(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int) -> float:
-    """Bytes left for KV after resident weights and the activation reserve."""
+    """Bytes left for KV after resident weights and the activation reserve.
+
+    The reserve is the device's scratch bytes and the activations of
+    ACT_RESERVE_CHUNKS chunks.
+    """
     return (device.mem_bytes * POOL_FRACTION - model.W_resident
+            - device.scratch_bytes
             - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
 
 

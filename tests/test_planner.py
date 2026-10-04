@@ -11,6 +11,7 @@ from fakes import keep_even, register_claims_evidence, two_alias_graph
 import quail
 from quail.backends.quail import expected_join_stages
 from quail.catalog import Catalog, DocumentProvider
+from quail.cost import budgets
 from quail.cost.sol import speed_of_light
 from quail.cost.work import ask, scan, stream
 from quail.execution.pipelines import build_pipelines
@@ -135,6 +136,17 @@ def test_gpu_copies_and_memory_refusals(catalog):
     r = _plan(logical, {"r": [150_000]})
     assert isinstance(r, Refusal)
     assert r.constraint == "suffix_over_chunk"
+
+    # a device whose memory holds the weights and no KV
+    tight = replace(
+        H100_SXM, mem_bytes=QWEN3_4B_FP8.W_mem / budgets.POOL_FRACTION + 1e6)
+    tokens = {"r": [100] * 10}
+    optimized, _ = _optimize(logical, tokens, QWEN3_4B_FP8)
+    r = plan_query(optimized, model=QWEN3_4B_FP8, device=tight, doc_tokens=tokens)
+    assert isinstance(r, Refusal)
+    assert r.constraint == "request_over_arena"
+    assert r.needed > 100 and r.available == 0
+    assert "the KV arena holds 0 tokens" in r.reasons[0]
 
 
 def test_filter_ordering_and_kv_writes(catalog):

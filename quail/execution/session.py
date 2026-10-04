@@ -801,6 +801,8 @@ class Query:
                      + ", ".join(repr(a) for a in self._estimated)
                      + f" are estimated from a {ESTIMATE_SAMPLE} document "
                      "sample")
+        for note in self.session.device.notes:
+            text += f"\n\n  note: {note}"
         return text
 
     def wait_for_tokens(self) -> None:

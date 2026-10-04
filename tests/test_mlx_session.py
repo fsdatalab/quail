@@ -53,6 +53,7 @@ from quail.specs import (  # noqa: E402
     DECISION_2_KAI_0_6B_BF16,
     H100_SXM,
     QWEN3_4B_FP8,
+    apple_gpu,
     local_apple_gpu,
 )
 
@@ -90,12 +91,44 @@ def test_the_apple_gpu_spec_is_built_from_this_machine():
     for fraction in (0, -0.5, 1.5):
         with pytest.raises(ValueError, match="memory_fraction"):
             local_apple_gpu(fraction)
+    # a local device has no rental price, so it reports no cost
     assert spec.usd_per_hour == 0.0
+    assert spec.usd(3600) is None
+    assert H100_SXM.usd(3600, gpus=2) == 2 * H100_SXM.usd_per_hour
     # the device caps the chunk below the model's own cap
     assert budgets.chunk_budget(DECISION_2_KAI_0_6B_BF16, spec) == 8192
     assert budgets.chunk_budget(DECISION_2_KAI_0_6B_BF16, H100_SXM) == 65_536
     # the weights, two chunks of activations, and some KV fit the budget
     assert budgets.arena_tokens(DECISION_2_KAI_0_6B_BF16, spec) > 8192
+    # the scratch memory MLX takes per chunk comes out of the KV arena
+    assert spec.scratch_bytes == apple_gpu.SCRATCH_BYTES > 0
+    assert H100_SXM.scratch_bytes == 0
+    bare = replace(spec, scratch_bytes=0.0)
+    assert (budgets.arena_bytes(DECISION_2_KAI_0_6B_BF16, bare, 8192)
+            - budgets.arena_bytes(DECISION_2_KAI_0_6B_BF16, spec, 8192)
+            == spec.scratch_bytes)
+
+
+def test_a_chip_that_was_not_measured_says_so_in_explain(tiny, monkeypatch):
+    assert apple_gpu.chip_notes(apple_gpu.MEASURED_CHIP) == ()
+    (note,) = apple_gpu.chip_notes("Apple M2 Max")
+    assert "measured on an Apple M4" in note and "this Mac has Apple M2 Max" in note
+    assert H100_SXM.notes == ()
+
+    open_session, _ = tiny
+    sql = (f"SELECT d.id FROM documents d "
+           f"WHERE AI_FILTER(PROMPT('{REFUND}', d.body))")
+    with open_session() as session:
+        measured = session.sql(sql).explain()
+    monkeypatch.setattr(apple_gpu, "MEASURED_CHIP", "another chip")
+    with open_session() as session:
+        fallback = session.sql(sql).explain()
+    this_chip = mx.device_info()["device_name"]
+    if this_chip == "Apple M4":
+        assert "speed constants" not in measured
+    assert fallback.endswith(
+        "note: apple-gpu speed constants were measured on an another chip; "
+        f"this Mac has {this_chip}, so estimated times use the M4's speed")
 
 
 def test_quail_runs_only_the_decision_model_on_one_apple_gpu():
@@ -300,6 +333,7 @@ def test_a_session_runs_scores_filters_a_join_and_a_classification(tiny):
         assert scored.report["boot"]["warm_tier"] == "touch"
         assert scored.report["fresh_tokens"] > 0
         assert scored.report["peak_gib"] > 0
+        assert scored.report["usd_per_query"] is None
 
         # the second filter reads each document's KV the first one kept
         chain = session.sql(
@@ -332,6 +366,13 @@ def test_a_session_runs_scores_filters_a_join_and_a_classification(tiny):
         labels = dict(labeled.to_rows())
         assert sorted(labels) == list(range(len(DOCUMENTS)))
         assert set(labels.values()) <= {"refund", "delivery", "praise"}
+
+        # the measured summary gives time and startup, and no cost
+        text = session.sql(
+            f"SELECT d.id FROM documents d "
+            f"WHERE AI_FILTER(PROMPT('{REFUND}', d.body))").explain(analyze=True)
+        assert "query time" in text and "startup" in text
+        assert "GPU cost" not in text and "$" not in text
 
     # another session finds the model loaded, and exact chunk times
     # add up to at most the query time

@@ -365,10 +365,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         cached_tokens=result.metrics.cached_tokens,
         evaluated_documents=result.metrics.evaluated_documents,
         evaluated_document_pairs=result.metrics.evaluated_document_pairs,
-        usd_per_query=(
-            None if device.usd_per_hour is None
-            else elapsed / 3600 * gpu_count * device.usd_per_hour
-        ),
+        usd_per_query=device.usd(elapsed, gpu_count),
         backend_metrics={"scores": [
             dict(value.metrics.extension)
             for node_id, value in result.nodes.items()

@@ -215,11 +215,31 @@ class DeviceSpec:
     chunk_cap_tokens: int = 0    # upper bound on tokens per chunk on
     #                              this device; 0 leaves the model's
     #                              and the memory bounds
+    scratch_bytes: float = 0.0   # memory a running chunk takes on this
+    #                              device whatever its size, beside the
+    #                              model's activation bytes per token
+    notes: tuple[str, ...] = ()  # what a reader of a plan should know
+    #                              about this spec; explain() prints them
 
     @property
     def attn_flops(self) -> float:
         """Dense peak for the attention kernels, FLOP/s."""
         return self.bf16_flops or self.peak_flops / 2
+
+    def usd(self, seconds: float, gpus: int = 1) -> float | None:
+        """Return the rental cost of some seconds on the device.
+
+        Args:
+            seconds: Time the devices were held.
+            gpus: Number of devices.
+
+        Returns:
+            The cost in dollars, or None for a device with no known
+            price, such as a local one.
+        """
+        if not self.usd_per_hour:
+            return None
+        return seconds / 3600 * gpus * self.usd_per_hour
 
     def arithmetic_bandwidth(self, precision: Precision) -> float:
         """Return arithmetic throughput for one component precision."""

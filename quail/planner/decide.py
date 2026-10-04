@@ -331,6 +331,19 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         sequence_groups, set(ask_filters), barrier_aliases, workers)
 
     # ---- refusal checks on the predicted plan
+    # a chunk floored at the compute knee can reserve more than is free
+    admission = max(0, statistics.admission)
+
+    def over_arena(what, need):
+        """Refuse a request whose KV does not fit the device's memory."""
+        return Refusal(
+            reasons=(f"{what} needs {need} tokens of KV, but the KV arena "
+                     f"holds {admission} tokens: {device.name} gives Quail "
+                     f"{device.mem_bytes / 1e9:.2f} GB, and the weights take "
+                     f"{model.W_resident / 1e9:.2f} GB",),
+            constraint="request_over_arena",
+            needed=need, available=admission, unit="tokens")
+
     anchors = {spec["written_pos"]: anchor for spec, anchor in seq}
     for s in scans:
         fq = max((question_tokens(p.prompt, model.canvas_tokens)
@@ -345,6 +358,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                          f"is {chunk} tokens",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
+        if need > admission:
+            return over_arena(f"a document in {s.alias!r} with its prompt", need)
     for spec in specs:
         anchor = anchors[spec["written_pos"]]
         need = (pre + stats[anchor].max_doc_tokens
@@ -359,6 +374,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                          f"is {chunk} tokens",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
+        if need > admission:
+            return over_arena(f"one join pair anchored on {anchor!r}", need)
 
     # ---- build the dataflow graph; ids_src tracks each table's
     # current producer node

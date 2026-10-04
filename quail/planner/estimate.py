@@ -100,7 +100,10 @@ class SpeedOfLightEstimate:
         return self.work.tokens
 
     @property
-    def usd_per_query(self) -> float:
+    def usd_per_query(self) -> float | None:
+        """Rental cost of the ideal time; None for a device with no price."""
+        if not self.usd_per_hour:
+            return None
         return self.seconds * self.usd_per_hour / 3600
 
     @property
@@ -189,7 +192,7 @@ class SpeedOfLightEstimate:
                 }
                 for component in latency.components
             ],
-            "usd_per_hour": self.usd_per_hour,
+            "usd_per_hour": self.usd_per_hour or None,
             "usd_per_query": self.usd_per_query,
             "alias_columns": dict(self.alias_columns),
             "documents_by_alias": dict(self.documents_by_alias),

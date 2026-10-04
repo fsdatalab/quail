@@ -476,10 +476,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "cached_tokens": result.metrics.cached_tokens,
         "evaluated_documents": result.metrics.evaluated_documents,
         "evaluated_document_pairs": result.metrics.evaluated_document_pairs,
-        "usd_per_query": (
-            None if state["device"].usd_per_hour is None
-            else wall / 3600 * state["device"].usd_per_hour
-        ),
+        "usd_per_query": state["device"].usd(wall),
         "backend_metrics": {"scores": [
             dict(value.metrics.extension)
             for node_id, value in result.nodes.items()
