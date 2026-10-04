@@ -12,9 +12,9 @@ H100_SXM = DeviceSpec(
     #                        (https://www.nvidia.com/en-us/data-center/h100/)
     usd_per_hour=3.9492,
     price_source="https://modal.com/pricing",
+    cuda_name="H100 80GB HBM3",
+    modal_gpu="H100!",
 )
 
-# The price every $/query number in reports uses: query hours times
-# GPU count times this rate.
 H100_USD_PER_HOUR = H100_SXM.usd_per_hour
 H100_PRICE_SOURCE = H100_SXM.price_source

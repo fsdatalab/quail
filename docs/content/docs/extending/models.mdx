@@ -78,17 +78,21 @@ compute rates. Quail represents it with `DeviceSpec`.
 | `hbm_bw` | GPU memory bandwidth in bytes per second. |
 | `peak_flops` | Peak dense FP8 operations per second. |
 | `bf16_flops` | Peak dense BF16 operations per second. |
+| `usd_per_hour` | Modal GPU-only hourly price. |
+| `cuda_name` | Substring of `torch.cuda.get_device_name`. |
+| `modal_gpu` | Modal `gpu=` string, such as `H100!`. |
 
 All values describe one GPU. Use compute rates without structured
 sparsity. The
 [H100 specification](https://github.com/fsdatalab/quail/blob/main/quail/specs/h100_sxm.py)
 is a complete example.
 
-Register a new specification with `registry.register_device(spec)`.
-The backend must accept its device name and provide compatible execution
-code. The Quail backend currently accepts `h100-sxm` and
-`rtx-pro-6000-blackwell-server`. Its checks are in
-[`backend.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/backend.py).
+Add a built-in device as a file under `quail/specs/` and a line in
+`DEVICES`. Backends, `quail-server` detection, `$/query`, and Modal
+`gpu=` read that registry. A custom session can also call
+`registry.register_device(spec)`. A new CUDA capability needs
+`flash_attention_version` and `deep_gemm_supported` in
+[`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py).
 
 ## Implementing a model architecture
 

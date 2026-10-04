@@ -3,6 +3,7 @@
   "pages": [
     "quickstart",
     "sessions",
+    "configuration",
     "sql",
     "python-api",
     "results",

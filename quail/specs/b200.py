@@ -22,4 +22,6 @@ B200 = DeviceSpec(
     # GPU-only rate from Modal, checked 2026-10-03
     usd_per_hour=6.2496,
     price_source="https://modal.com/pricing",
+    cuda_name="B200",
+    modal_gpu="B200",
 )

@@ -18,6 +18,7 @@ from quail.planner.optimizer.candidates import (
     SupportResult,
 )
 from quail.planner.optimizer.context import PlanningContext
+from quail.specs import DEVICES
 
 
 class QuailBackend:
@@ -30,7 +31,7 @@ class QuailBackend:
     locates_answers_in_text = True
 
     def supports(self, model, device, gpus: int) -> SupportResult:
-        if device.name not in {"h100-sxm", "rtx-pro-6000-blackwell-server"}:
+        if device.name not in DEVICES:
             return SupportResult.reject(
                 f"Quail does not support device {device.name!r}")
         if model.arch not in supported_archs():

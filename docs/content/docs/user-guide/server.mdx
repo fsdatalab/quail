@@ -172,13 +172,23 @@ Keep the server data directory to retain completed results.
 ## Run the server on Modal
 
 Use a repository checkout and an authenticated Modal CLI to deploy
-Quail Server on one H100 in the `quail-engine` app.
+Quail Server in the `quail-engine` app. The default GPU is one H100.
+Pass `--device` to rent another registered device, the same flag as
+`quail-server`.
 
 Create the access token secret before deployment:
 
 ```bash
 modal secret create quail-server-token QUAIL_SERVER_TOKEN='replace-with-your-token'
-modal deploy -m quail.server.modal_app 2>&1 | tee server-deploy.log
+uv run python -m quail.server.modal_app --device h100-sxm \
+  2>&1 | tee server-deploy.log
+```
+
+To rent an L40S:
+
+```bash
+uv run python -m quail.server.modal_app --device l40s \
+  2>&1 | tee server-deploy.log
 ```
 
 Set the same `QUAIL_SERVER_TOKEN` in your Python program's environment.

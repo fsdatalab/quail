@@ -39,6 +39,7 @@ def run_backend_group(
     gpu_timing: bool = False,
     suite_name: str | None = None,
     canvas_draws: str | None = None,
+    device: str = "h100-sxm",
 ) -> dict:
     """Run backend methods in one process, sharing a model when possible.
 
@@ -58,6 +59,7 @@ def run_backend_group(
         canvas_draws: Comma-separated maximum diffusion draw counts, or None
             to keep the default. Each count runs its own Quail suite, named
             ``quail-draws<count>`` when there is more than one.
+        device: Registered device name. Defaults to ``h100-sxm``.
 
     Returns:
         A dictionary containing the family, queries, collection ID, GPU IDs,
@@ -94,7 +96,7 @@ def run_backend_group(
                     gpus=1,
                     model=model,
                     backend=method,
-                    device="h100-sxm",
+                    device=device,
                     attention=attention,
                     gpu_timing=gpu_timing,
                     **({} if draws is None else {"canvas_draws": draws}),
