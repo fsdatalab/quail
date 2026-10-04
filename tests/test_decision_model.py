@@ -317,7 +317,7 @@ def test_decision_readouts_return_their_host_values():
 
 
 def test_choice_stage_reads_each_option_end_and_the_last_row(session):
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     from quail.backends.quail.executor.classify import ClassifyStages
 
     plan = session.sql(
@@ -325,8 +325,11 @@ def test_choice_stage_reads_each_option_end_and_the_last_row(session):
         "FROM documents d").plan()
     (node,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     spec = node.spec
-    state = SimpleNamespace(torch=torch, loaded_model=SimpleNamespace(
-        decision_head=object(), model_spec=None))
+    from quail.backends.quail.executor.cuda_device import CudaImplementation
+
+    state = SimpleNamespace(
+        implementation=CudaImplementation(),
+        loaded_model=SimpleNamespace(decision_head=object(), model_spec=None))
     labeled = []
     stages = ClassifyStages(state, spec, 2, lambda key: key,
                             on_label=lambda anchor, label: labeled.append(label))

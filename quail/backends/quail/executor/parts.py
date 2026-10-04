@@ -2,7 +2,6 @@
 
 import time
 
-from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.tokens import prefix_tree
@@ -11,11 +10,16 @@ from quail.progress import logger
 
 
 def input_staging(state: QueryExecutionState):
-    """Return reusable transfer buffers with an empty fixed-token cache."""
-    if state.loaded_model.input_staging is None:
-        state.loaded_model.input_staging = InputStaging(state.torch)
-    state.loaded_model.input_staging.fixed_tokens.clear()
-    return state.loaded_model.input_staging
+    """Return the model's reusable transfer buffers, or None without any.
+
+    The buffers' fixed-token cache is emptied.
+    """
+    loaded = state.loaded_model
+    if loaded.input_staging is None:
+        loaded.input_staging = state.implementation.input_staging()
+    if loaded.input_staging is not None:
+        loaded.input_staging.fixed_tokens.clear()
+    return loaded.input_staging
 
 
 class StagesPart:
@@ -102,7 +106,7 @@ def report_chain_transitions(parts, transitions) -> None:
             part.document_done(finished)
 
 
-def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
+def complete_chain(parts, every, spans, tokens, stats, implementation, inputs):
     """Finalize pipeline parts and store each operator's result.
 
     The first part with stages receives document token costs, prefix-sharing
@@ -115,7 +119,7 @@ def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
         spans: Per-chunk row counts and timing events.
         tokens: Fresh token count excluding the final consumer's own work.
         stats: Packing time and prefix-sharing counts.
-        torch: Torch module used to synchronize timing events.
+        implementation: The device implementation that timed the chunks.
         inputs: Execution settings, including whether GPU timing is enabled.
     """
     slices = _part_slices(parts)
@@ -127,7 +131,7 @@ def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
         part_spans = stage_spans(spans, low, high)
         part.result_value = part.result(
             remainder if staged and index == staged[0] else (own[index] or 0),
-            gpu_seconds(torch, part_spans, inputs),
+            gpu_seconds(implementation, part_spans, inputs),
             chunks(part_spans, inputs), stats if staged and index == staged[0]
             else {})
 
@@ -153,7 +157,7 @@ def stage_spans(spans, low, high) -> list:
     """Select chunk timing spans covering a range of stages.
 
     Args:
-        spans: Tuples of stage row counts, chunk tokens, and CUDA events.
+        spans: Tuples of stage row counts, chunk tokens, and timing events.
         low: First included stage index.
         high: First excluded stage index.
 
@@ -169,11 +173,11 @@ def stage_spans(spans, low, high) -> list:
     return narrowed
 
 
-def gpu_seconds(torch, spans, inputs) -> float:
+def gpu_seconds(implementation, spans, inputs) -> float:
     """Calculate GPU seconds attributable to the selected stage rows.
 
     Args:
-        torch: Torch module used to synchronize CUDA events.
+        implementation: The device implementation that recorded the events.
         spans: Selected stage row counts and timing events per chunk.
         inputs: Execution settings, including gpu_timing.
 
@@ -183,10 +187,11 @@ def gpu_seconds(torch, spans, inputs) -> float:
     """
     if not inputs.get("gpu_timing"):
         return 0.0
-    # elapsed_time needs every end event to have completed
-    torch.cuda.synchronize()
+    # an elapsed time needs every end event to have completed
+    implementation.synchronize()
     return sum(
-        start.elapsed_time(end) * min(1.0, sum(rows.values()) / tokens)
+        implementation.elapsed_ms(start, end)
+        * min(1.0, sum(rows.values()) / tokens)
         for rows, tokens, start, end in spans if tokens) / 1000.0
 
 

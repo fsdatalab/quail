@@ -182,6 +182,7 @@ def quail(prompts, stock_layers):
     """
     from quail.backends.quail.executor.arena import KVArena
     from quail.backends.quail.executor.chunk import pack_chunk
+    from quail.backends.quail.executor.cuda_device import CudaImplementation
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.cost.budgets import PAGE_TOKENS
@@ -190,9 +191,11 @@ def quail(prompts, stock_layers):
     spec = MODELS[MODEL]
     model = load_model(spec.hf_name, max_batched_tokens=8192,
                        moe_backend=spec.moe_backend)
+    implementation = CudaImplementation()
     arena = KVArena(n_layers=spec.layers, n_pages=2048,
                     page_tokens=PAGE_TOKENS, n_kv=spec.n_kv,
-                    d_head=spec.d_head, dtype=torch.bfloat16,
+                    d_head=spec.d_head,
+                    pools=implementation.kv_pools(torch.bfloat16),
                     layer_kv=spec.kv_shapes,
                     sliding_layers=spec.sliding_layer_set,
                     sliding_window=spec.sliding_window,
@@ -208,7 +211,7 @@ def quail(prompts, stock_layers):
                        base_tokens=split)
         groups.append(dict(key=key, prefix=ids[:split], f=split,
                            suffixes=[ids[split:]]))
-    chunk = pack_chunk(torch, arena, groups, attention_mode="unified",
+    chunk = pack_chunk(implementation, arena, groups, attention_mode="unified",
                        canvas=pipeline.canvas_ids,
                        answer_row=pipeline.canvas_answer_row)
     layers = list(pipeline.layers)

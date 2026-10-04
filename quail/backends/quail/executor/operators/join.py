@@ -20,7 +20,7 @@ from quail.execution.tokens import DocumentKeys
 
 def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
     """Run a join with any preceding and following pipeline parts."""
-    torch = state.torch
+    implementation = state.implementation
     arena = state.loaded_model.arena
     pipeline = state.loaded_model.pipeline
     async_answers = state.async_answers
@@ -93,7 +93,7 @@ def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
         report_chain_transitions(parts, transitions)
 
     every, spans, tokens = run_stages(
-        torch, arena, pipeline, stages, prefixes, chunk_tokens,
+        implementation, arena, pipeline, stages, prefixes, chunk_tokens,
         anchor_keys=anchor_keys, on_settled=on_settled,
         attention_mode=attention, prefix_tree=tree, stats=join_stats,
         on_chunk=on_chunk, label=f"join ({len(join_stages)} stages)",
@@ -107,7 +107,7 @@ def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
             own = part.finish(every[low:high]) or 0
             part_spans = stage_spans(spans, low, high)
             part.result_value = part.result(
-                own, gpu_seconds(torch, part_spans, inputs),
+                own, gpu_seconds(implementation, part_spans, inputs),
                 chunks(part_spans, inputs), {})
             after_tokens += own
             low = high
@@ -129,7 +129,8 @@ def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
         if parts:
             kv_round = {"hits": len(reached), "misses": 0}
             complete_chain(parts, every[:leading], spans,
-                           tokens - join_tokens, join_stats, torch, inputs)
+                           tokens - join_tokens, join_stats, implementation,
+                           inputs)
             for part in parts:
                 if part.result_value is None:
                     raise RuntimeError(
@@ -184,7 +185,7 @@ def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
             kv_hits=kv_round.get("hits", 0),
             kv_misses=kv_round.get("misses", 0),
             fresh_tokens=tokens,
-            gpu_s=gpu_seconds(torch, spans, inputs),
+            gpu_s=gpu_seconds(implementation, spans, inputs),
             chunks=chunks(spans, inputs),
             extension={
                 "answers": answers,

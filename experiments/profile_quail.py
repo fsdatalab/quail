@@ -113,6 +113,7 @@ def _boot_state(model, **pipeline_kwargs):
     from gigatoken import Tokenizer
 
     from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.cuda_device import CudaImplementation
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
@@ -123,6 +124,7 @@ def _boot_state(model, **pipeline_kwargs):
     spec = MODELS[model]
     device = DEVICES["h100-sxm"]
     tokenizer = Tokenizer(spec.hf_name).as_hf()
+    implementation = CudaImplementation()
     chunk_tokens = budgets.chunk_budget(spec, device)
     model_mod = load_model(spec.hf_name, revision=spec.revision,
                            max_batched_tokens=chunk_tokens,
@@ -132,7 +134,8 @@ def _boot_state(model, **pipeline_kwargs):
                     n_pages=full_pages,
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
-                    dtype=torch.bfloat16, layer_kv=spec.kv_shapes,
+                    pools=implementation.kv_pools(torch.bfloat16),
+                    layer_kv=spec.kv_shapes,
                     sliding_layers=spec.sliding_layer_set,
                     sliding_window=spec.sliding_window,
                     n_sliding_pages=sliding_pages)
@@ -153,13 +156,14 @@ def _boot_state(model, **pipeline_kwargs):
     answerer = AnswerRows.from_tokenizer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     with torch.inference_mode():
-        warm = warm_kernels(torch, arena, pipeline, async_ans,
+        warm = warm_kernels(implementation, arena, pipeline, async_ans,
                             chunk_tokens, model_name=spec.hf_name)
     torch.cuda.synchronize()
     kernel_cache.commit()
     state = dict(model_execution=execution,
                  model=model_mod, arena=arena, pipeline=pipeline,
-                 spec=spec, torch=torch, F=F)
+                 spec=spec, torch=torch, F=F,
+                 implementation=implementation)
     return state, chunk_tokens, warm
 
 
@@ -207,7 +211,7 @@ def _run_query(state, build, captured):
         if arena_pages is not None:
             state["arena"].resize(*arena_pages, free_resident=True)
         state["model_execution"].bind_query(
-            torch=state["torch"],
+            implementation=state["implementation"],
             async_answers=AsyncAnswers(state["torch"], rows),
             answer_rows=rows,
             chunk_tokens=payload["chunk_tokens"],
@@ -416,14 +420,14 @@ class LoopRecorder:
               f"chunks {record['n_chunks']} tokens {record['tokens']}",
               flush=True)
 
-    def _run_filter(self, torch, arena, pipeline, async_ans, doc_ids,
+    def _run_filter(self, implementation, arena, pipeline, async_ans, doc_ids,
                     question_ids, budget, **kw):
         keys = kw.get("arena_keys") or list(range(len(doc_ids)))
         record, t_call = self._open_phase(
             "filter", f"{len(doc_ids)} docs x {len(question_ids)} stages")
         kw.setdefault("timing", {})
         out = self._orig["run_filter"](
-            torch, arena, pipeline, async_ans, doc_ids, question_ids,
+            implementation, arena, pipeline, async_ans, doc_ids, question_ids,
             budget, **kw)
         answers, spans, tokens = out
         record["timing"] = {k: round(v, 4) if isinstance(v, float)
@@ -435,7 +439,7 @@ class LoopRecorder:
         self._close_phase(record, t_call, spans, tokens)
         return out
 
-    def _run_join(self, torch, arena, pipeline, async_ans,
+    def _run_join(self, implementation, arena, pipeline, async_ans,
                   anchor_prefixes, stage_suffixes, budget, **kw):
         keys = kw.get("anchor_keys") or list(range(len(anchor_prefixes)))
         kv = dict(anchors=len(keys), hits=0, hit_tokens=0,
@@ -452,7 +456,7 @@ class LoopRecorder:
         record, t_call = self._open_phase(
             "join", f"{len(keys)} anchors, {tuples} tuples", kv)
         out = self._orig["run_join"](
-            torch, arena, pipeline, async_ans, anchor_prefixes,
+            implementation, arena, pipeline, async_ans, anchor_prefixes,
             stage_suffixes, budget, **kw)
         _, spans, tokens = out
         for k, p in zip(keys, anchor_prefixes):

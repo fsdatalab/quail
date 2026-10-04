@@ -13,12 +13,7 @@ from typing import Callable
 
 import numpy as np
 
-from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.parts import input_staging
-from quail.backends.quail.executor.readout import (
-    AsyncDecisionChoices,
-    AsyncLabelLogprobs,
-)
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.labels import (
@@ -145,16 +140,9 @@ def _label_readout(state: QueryExecutionState, targets, rows: int, normalize: bo
     if (readout is None or list(readout.targets.tolist()) != targets
             or readout.rows != rows
             or getattr(readout, "normalize", normalize) != normalize):
-        torch = state.torch
-        head = full_output_head(state.loaded_model.model)
-        readout = AsyncLabelLogprobs(
-            torch, torch.nn.functional, head, targets, rows=rows,
-            normalize=normalize)
+        readout = state.implementation.label_readout(
+            state.loaded_model.model, targets, rows=rows, normalize=normalize)
         state.loaded_model.label_readout = readout
-        logger.info("label readout: head %s x %s in %s, %s targets, "
-                    "%s rows per request, %s", *head.shape,
-                    str(head.dtype).replace("torch.", ""), len(targets),
-                    rows, "normalized" if normalize else "targets' logits")
     return readout
 
 
@@ -323,7 +311,8 @@ class ClassifyStages:
         frame, request = list(tail[:spec.frame_tokens]), list(tail[spec.frame_tokens:])
         ends = np.cumsum([len(block) for block in spec.label_token_ids])
         offsets = [len(request) - int(end) for end in ends] + [0]
-        self.readout = readout = AsyncDecisionChoices(state.torch, head, offsets)
+        self.readout = readout = state.implementation.decision_choices(
+            head, offsets)
         self.labels = np.full(count, None, dtype=object)
         if spec.probabilities:
             self.probabilities = np.full((count, len(spec.labels)), np.nan)
@@ -593,8 +582,8 @@ class QuailClassifier:
         stats = {}
         stream = AnswerStream(on_answers)
         answers, spans, fresh = run_stages(
-            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
-            plan.stages,
+            state.implementation, state.loaded_model.arena,
+            state.loaded_model.pipeline, plan.stages,
             prefixes, state.chunk_tokens, anchor_keys=keys,
             staging=staging, prefix_tree=tree, stats=stats,
             label=f"classify {spec.name}",
@@ -611,9 +600,9 @@ class QuailClassifier:
         state = self.state
         gpu_s = 0.0
         if state.gpu_timing:
-            # elapsed_time needs every end event to have completed
-            state.torch.cuda.synchronize()
-            gpu_s = sum(start.elapsed_time(end)
+            # an elapsed time needs every end event to have completed
+            state.implementation.synchronize()
+            gpu_s = sum(state.implementation.elapsed_ms(start, end)
                         for _, _, start, end in spans) / 1000.0
         return RerankerBatch(
             labels, fresh_tokens=fresh, cached_tokens=cached,

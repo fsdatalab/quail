@@ -260,6 +260,7 @@ def _boot_state(model):
     from gigatoken import Tokenizer
 
     from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.cuda_device import CudaImplementation
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
@@ -273,11 +274,12 @@ def _boot_state(model):
     model_mod = load_model(spec.hf_name, revision=spec.revision)
     chunk_tokens = budgets.chunk_budget(spec, device)
     arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
+    implementation = CudaImplementation()
     arena = KVArena(n_layers=spec.layers,
                     n_pages=arena_tok // budgets.PAGE_TOKENS,
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
-                    dtype=torch.bfloat16)
+                    pools=implementation.kv_pools(torch.bfloat16))
     pipeline = build_pipeline(spec, model_mod, arena,
                               engine_class=KernelSourceEngine)
     from quail.backends import GpuContext, QuailBackend
@@ -296,13 +298,14 @@ def _boot_state(model):
     answerer = AnswerRows.from_tokenizer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     with torch.inference_mode():
-        warm = warm_kernels(torch, arena, pipeline, async_ans,
+        warm = warm_kernels(implementation, arena, pipeline, async_ans,
                             chunk_tokens, model_name=spec.hf_name)
     torch.cuda.synchronize()
     kernel_cache.commit()
     state = dict(model_execution=execution,
                  model=model_mod, arena=arena, pipeline=pipeline,
-                 spec=spec, torch=torch, F=F)
+                 spec=spec, torch=torch, F=F,
+                 implementation=implementation)
     return state, tokenizer, chunk_tokens, warm
 
 
@@ -347,7 +350,7 @@ def _run_query(state, build, captured):
             payload["true_ids"], payload["false_ids"],
         )
         state["model_execution"].bind_query(
-            torch=state["torch"],
+            implementation=state["implementation"],
             async_answers=AsyncAnswers(state["torch"], rows),
             answer_rows=rows,
             chunk_tokens=payload["chunk_tokens"],

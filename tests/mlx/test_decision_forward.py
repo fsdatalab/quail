@@ -20,25 +20,19 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 pytest.importorskip("vllm_metal")
 pytest.importorskip("mlx_lm")
-torch = pytest.importorskip("torch")
 
-from fakes import cpu_staging  # noqa: E402
 from huggingface_hub import try_to_load_from_cache  # noqa: E402
-from kv_checker import Setup, cpu_torch, make_arena  # noqa: E402
 from mlx_lm.models.qwen3 import Model, ModelArgs  # noqa: E402
 
+from quail.backends.quail.executor.arena import KVArena  # noqa: E402
+from quail.backends.quail.executor.mlx_device.implementation import (  # noqa: E402
+    MlxImplementation,
+)
 from quail.backends.quail.executor.mlx_device.loader import (  # noqa: E402
     load_decision_head,
     load_qwen3_weights,
 )
-from quail.backends.quail.executor.mlx_device.pools import MlxKVPools  # noqa: E402
-from quail.backends.quail.executor.mlx_device.qwen3 import (  # noqa: E402
-    MlxQwen3Pipeline,
-)
-from quail.backends.quail.executor.mlx_device.readout import (  # noqa: E402
-    MlxDecisionChoices,
-)
-from quail.backends.quail.executor.readout import DecisionHead  # noqa: E402
+from quail.backends.quail.executor.models import build_pipeline  # noqa: E402
 from quail.backends.quail.executor.stages import Stage, run_stages  # noqa: E402
 from quail.backends.quail.worker import decision_offsets  # noqa: E402
 from quail.logical import bind_prompt, render_filter_prompt_ids  # noqa: E402
@@ -89,16 +83,14 @@ def reference_scores(path, dtype, head, offsets, prompts):
     for tokens in prompts:
         hidden = model.model(mx.array([tokens]))[0].astype(mx.float32)
         last = hidden.shape[0] - 1
-        rows = torch.from_numpy(np.array(
-            hidden[mx.array([last - offset for offset in offsets])]))
-        scores.append(head.scores(rows[None, :-1], rows[None, -1])[0].numpy())
+        rows = hidden[mx.array([last - offset for offset in offsets])]
+        scores.append(np.array(head.scores(rows[None, :-1], rows[None, -1])[0]))
     return np.stack(scores)
 
 
-def test_decision_scores_match_mlx_lm(monkeypatch):
+def test_decision_scores_match_mlx_lm():
     from gigatoken import Tokenizer
 
-    cpu_staging(monkeypatch)
     path = str(Path(WEIGHTS).parents[1])
     tokenizer = Tokenizer(path).as_hf()
 
@@ -116,26 +108,25 @@ def test_decision_scores_match_mlx_lm(monkeypatch):
     weights = load_qwen3_weights(path, mx.bfloat16)
     head = load_decision_head(path)
     assert abs(weights.nbytes / SPEC.w_mem_bytes - 1) < 0.02
-    config = weights.config
-    pools = MlxKVPools(config.layers, 256, 16, config.n_kv, config.head_dim,
-                       mx.bfloat16)
-    readout = MlxDecisionChoices(head, offsets)
+    implementation = MlxImplementation()
+    arena = KVArena(n_layers=SPEC.layers, n_pages=256, page_tokens=16,
+                    n_kv=SPEC.n_kv, d_head=SPEC.d_head,
+                    pools=implementation.kv_pools())
+    readout = implementation.decision_choices(head, offsets)
     stages = [Stage(suffixes=[tail], readout=readout, single=True,
                     decide=lambda a, row: True) for tail in tails]
     answers, _, tokens = run_stages(
-        cpu_torch(), make_arena(Setup(path="unified", pages=256)),
-        MlxQwen3Pipeline(weights, pools), stages, docs, 2048,
-        attention_mode="unified", default_attention="unified")
+        implementation, arena,
+        build_pipeline(SPEC, weights, arena, implementation="mlx"), stages,
+        docs, 2048, attention_mode="unified", default_attention="unified")
     # the second question reads each review's retained KV
     assert tokens == sum(map(len, docs)) + len(docs) * sum(map(len, tails))
     got = np.stack([answers[stage][d][0] for d in range(len(docs))
                     for stage in range(len(tails))])
 
-    torch_head = DecisionHead(torch, torch.nn.functional, {
-        name: torch.from_numpy(np.array(array)) for name, array in head.w.items()})
     whole = [doc + tail for doc in docs for tail in tails]
-    exact = reference_scores(path, mx.float32, torch_head, offsets, whole)
-    half = reference_scores(path, mx.bfloat16, torch_head, offsets, whole)
+    exact = reference_scores(path, mx.float32, head, offsets, whole)
+    half = reference_scores(path, mx.bfloat16, head, offsets, whole)
     ours = np.abs(got - exact).max()
     theirs = np.abs(half - exact).max()
     assert ours < 2 * theirs + 0.02, (ours, theirs)

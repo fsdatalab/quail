@@ -13,9 +13,9 @@ from fakes import (
     SETTINGS,
     FakeModel,
     cpu_arena,
+    fake_implementation,
     fake_pack,
     fake_pipeline,
-    fake_torch,
 )
 
 from quail.backends.quail import QuailModelExecution
@@ -184,7 +184,6 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     """
     from dataclasses import replace
 
-    from quail.backends.quail.executor import classify as classify_module
     from quail.execution.pipelines import build_pipelines
     from quail.specs.base import AnswerCanvas
 
@@ -329,15 +328,9 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
             return rows
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    monkeypatch.setattr(classify_module, "full_output_head",
-                        lambda model: SimpleNamespace(shape=(1, 1),
-                                                      dtype="fake"))
-    monkeypatch.setattr(
-        classify_module, "AsyncLabelLogprobs",
-        lambda torch, F, head, targets, rows, normalize: FakeReadout(
+    implementation = fake_implementation(
+        label_readout=lambda model, targets, rows, normalize: FakeReadout(
             targets, rows))
-    torch = fake_torch()
-    torch.nn = SimpleNamespace(functional=None)
     pipeline = fake_pipeline(forward_chunk=forward, canvas_ids=(7,),
                              tree_attention=False)
     arena = cpu_arena(64)
@@ -346,7 +339,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         model=model_spec, gpu_index=0, gpu_count=1, device=DEVICES["h100-sxm"]))
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.bind_query(
-        torch=torch,
+        implementation=implementation,
         async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
                                       dtype=None),
         answer_rows=object(), chunk_tokens=64)
@@ -355,7 +348,8 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     docs = {"r": [[DOC + d] * (3 + d) for d in range(4)],
             "p": [[PARTNER + d] for d in range(2)]}
     state = {
-        "torch": torch, "arena": arena, "pipeline": pipeline,
+        "implementation": implementation, "arena": arena,
+        "pipeline": pipeline,
         "model_execution": execution,
         "runtimes": built_in_registry().runtimes,
         "model_spec": model_spec, "device": DEVICES["h100-sxm"],
@@ -451,7 +445,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
                   for d in range(n_docs)}
     model = LabelingModel([] if classify_only else filter_truth,
                           join_truth, label_truth)
-    torch = fake_torch()
+    implementation = fake_implementation()
     arena = cpu_arena(64)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace(
@@ -459,7 +453,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         device=DEVICES["h100-sxm"]))
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.bind_query(
-        torch=torch,
+        implementation=implementation,
         async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
                                       dtype=None),
         answer_rows=object(), chunk_tokens=120)
@@ -483,7 +477,8 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         dtype=np.dtype((np.float32, (1, len(TARGETS)))), submit=submit,
         result=lambda rows: rows)
     state = {
-        "torch": torch, "arena": arena, "pipeline": pipeline,
+        "implementation": implementation, "arena": arena,
+        "pipeline": pipeline,
         "model_execution": execution,
         "runtimes": built_in_registry().runtimes,
         "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
@@ -596,8 +591,7 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
         join_truth = {key: values + [1] for key, values in join_truth.items()}
     joined_truth = {(0, 0): 0, (0, 1): 1, (1, 1): 0}
     model = LabelingModel([], join_truth, [], joined_truth)
-    torch = fake_torch()
-    torch.nn = SimpleNamespace(functional=None)
+    implementation = fake_implementation()
     arena = cpu_arena(64)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace(
@@ -605,11 +599,10 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
         device=DEVICES["h100-sxm"]))
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.bind_query(
-        torch=torch,
+        implementation=implementation,
         async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
                                       dtype=None),
         answer_rows=object(), chunk_tokens=120)
-    from quail.backends.quail.executor import classify as classify_module
 
     class FakeReadout:
         def __init__(self, targets, rows):
@@ -631,15 +624,11 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
         def result(self, rows):
             return rows
 
-    monkeypatch.setattr(classify_module, "full_output_head",
-                        lambda model: SimpleNamespace(shape=(1, 1),
-                                                      dtype="fake"))
-    monkeypatch.setattr(
-        classify_module, "AsyncLabelLogprobs",
-        lambda torch, F, head, targets, rows, normalize: FakeReadout(
-            targets, rows))
+    implementation.label_readout = (
+        lambda model, targets, rows, normalize: FakeReadout(targets, rows))
     state = {
-        "torch": torch, "arena": arena, "pipeline": pipeline,
+        "implementation": implementation, "arena": arena,
+        "pipeline": pipeline,
         "model_execution": execution,
         "runtimes": built_in_registry().runtimes,
         "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],

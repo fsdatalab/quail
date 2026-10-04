@@ -405,7 +405,7 @@ def record_model_result(node, result: NodeResult,
 
 def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     """Execute one Quail model graph on one GPU executor."""
-    torch = state["torch"]
+    implementation = state["implementation"]
     arena = state["arena"]
     for key in arena.resident_keys():
         arena.free_key(key)
@@ -450,9 +450,9 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         run_pipeline=getattr(execution, "execute_pipeline", None),
     )
     started = time.perf_counter()
-    with torch.inference_mode():
+    with implementation.inference_mode():
         result = GenericRunner().run(compute_subgraph(graph), context)
-    torch.cuda.synchronize()
+    implementation.synchronize()
     wall = time.perf_counter() - started
 
     filters, joins = model_answers(graph, result)
@@ -487,7 +487,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),
         "kv_manager": kv_manager,
-        "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+        "peak_gib": round(implementation.peak_memory_bytes() / 2**30, 2),
     }
     report.update(throughput(graph, result.metrics, wall))
     if state.get("gpu_timing"):

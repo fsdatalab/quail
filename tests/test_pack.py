@@ -195,9 +195,9 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
         QUESTION,
         FakeModel,
         cpu_arena,
+        fake_implementation,
         fake_pack,
         fake_pipeline,
-        fake_torch,
     )
 
     from quail.backends.quail.executor import chunk as chunk_mod
@@ -219,7 +219,7 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
                           shared=[0, 32, 0])
     stats = {}
     got, _, tokens = loop.run_filter(
-        fake_torch(), arena, pipeline, answers, docs, [[QUESTION]], budget,
+        fake_implementation(), arena, pipeline, answers, docs, [[QUESTION]], budget,
         arena_writes=True, arena_keys=[("r", d) for d in range(len(docs))],
         prefix_tree=tree, retain_survivors=retain, limit=limit,
         attention_mode=attention_mode, stats=stats)
@@ -354,9 +354,9 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
         FRAME,
         PARTNER,
         cpu_arena,
+        fake_implementation,
         fake_pack,
         fake_pipeline,
-        fake_torch,
     )
 
     from quail.backends.quail.executor import chunk as chunk_mod
@@ -386,7 +386,7 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
     arena = cpu_arena(64)
     stats = {}
     out, _, tokens = loop.run_join(
-        fake_torch(), arena, pipeline, answers, prefixes,
+        fake_implementation(), arena, pipeline, answers, prefixes,
         [[[PARTNER + 0], [PARTNER + 1]]], 500, stage_frames=[[FRAME]],
         anchor_keys=keys, prefix_tree=tree, stats=stats)
     assert out == [{0: [1, 0], 1: [1, 0], 2: [1, 0]}]
@@ -402,7 +402,7 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
     packed.clear()
     arena = cpu_arena(64)
     out, _, tokens = loop.run_join(
-        fake_torch(), arena, pipeline, answers, prefixes,
+        fake_implementation(), arena, pipeline, answers, prefixes,
         [[[PARTNER + 0], [PARTNER + 1]]], 67, stage_frames=[[FRAME]],
         anchor_keys=keys, stats=stats,
         prefix_tree=PrefixTree(order=[0, 2, 1], parent=[None, 0, None],

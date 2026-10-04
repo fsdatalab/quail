@@ -1,23 +1,22 @@
 """Test packed token rows, positions, and answer rows from flattened suffixes."""
 
 import pytest
-from fakes import cpu_staging
 from test_sliding_kv import plain_arena
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.chunk import Suffixes
+from quail.backends.quail.executor.device import DeviceImplementation
 
-torch = pytest.importorskip("torch")
+HOST = DeviceImplementation()
 
 
-def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
-    cpu_staging(monkeypatch)
+def test_pack_chunk_rows_for_many_suffixes():
     arena = plain_arena()
     key = ("d", 0)
     arena.activate(key, 4, capacity_tokens=8, base_tokens=4)
     sufs = Suffixes.of([[10, 11], [12], [13, 14, 15]])
     chunk = chunk_mod.pack_chunk(
-        torch, arena,
+        HOST, arena,
         [dict(key=key, prefix=[1, 2, 3, 4], f=4, suffixes=sufs,
               read_all_rows=True)],
         attention_mode="tree")
@@ -35,7 +34,7 @@ def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
     # a kept document: the last row of each suffix answers, and every
     # suffix row reads the kept prefix
     chunk = chunk_mod.pack_chunk(
-        torch, arena, [dict(key=key, prefix=None, f=4, suffixes=sufs)],
+        HOST, arena, [dict(key=key, prefix=None, f=4, suffixes=sufs)],
         attention_mode="tree")
     assert chunk.input_ids.tolist() == [10, 11, 12, 13, 14, 15]
     assert chunk.final_indices.tolist() == [1, 2, 5]
@@ -49,8 +48,7 @@ def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["tree", "unified"])
-def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
-    cpu_staging(monkeypatch)
+def test_decode_rounds_keep_each_fed_token_after_the_frame(mode):
     arena = plain_arena()
     key = ("d", 3)
     # a three-token document, a two-token frame, the cue, and room for
@@ -65,7 +63,7 @@ def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
 
     # round 0 packs the document, frame, and cue and keeps all six rows
     chunk = chunk_mod.pack_chunk(
-        torch, arena, [dict(key=key, prefix=[7, 8, 9], f=3,
+        HOST, arena, [dict(key=key, prefix=[7, 8, 9], f=3,
                             suffixes=[[91, 92, 93]], write_suffix_tokens=3,
                             single=True)], attention_mode=mode)
     assert written(chunk) == rows[:6].tolist()
@@ -75,7 +73,7 @@ def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
     # round 1 feeds one token at position 6, reads the six kept rows,
     # and keeps it at row 6
     chunk = chunk_mod.pack_chunk(
-        torch, arena, [dict(key=key, prefix=None, f=6, suffixes=[[40]],
+        HOST, arena, [dict(key=key, prefix=None, f=6, suffixes=[[40]],
                             write_suffix_tokens=1, single=True)],
         attention_mode=mode)
     assert chunk.positions.tolist() == [6]
@@ -85,7 +83,7 @@ def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
     # a kept token past the key's one 16-row page is refused, not dropped
     with pytest.raises((AssertionError, ValueError)):
         chunk_mod.pack_chunk(
-            torch, arena, [dict(key=key, prefix=None, f=16, suffixes=[[41]],
+            HOST, arena, [dict(key=key, prefix=None, f=16, suffixes=[[41]],
                                 write_suffix_tokens=1, single=True)],
             attention_mode=mode)
 
@@ -94,7 +92,6 @@ def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
 def test_warmup_runs_every_row_count_class(monkeypatch, mode):
     from quail.backends.quail.executor import loop, warmup
 
-    cpu_staging(monkeypatch)
     arena = plain_arena(pages=256)
     shapes = []
 
@@ -104,7 +101,7 @@ def test_warmup_runs_every_row_count_class(monkeypatch, mode):
                        0 if reads is None else len(reads["rows"])))
 
     monkeypatch.setattr(loop, "_forward", forward)
-    warmup._warm_row_classes(torch, arena, None, mode)
+    warmup._warm_row_classes(HOST, arena, None, mode)
     # the first chunk writes the cached documents' KV, each with a
     # one-token question so the chunk has answer rows
     assert shapes[0][0] == 17 * (warmup.ROW_CLASS_CACHED + 1)

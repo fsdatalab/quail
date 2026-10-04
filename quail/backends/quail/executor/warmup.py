@@ -48,7 +48,7 @@ def _warm_inputs(budget, question_tokens=16):
     return warm_docs or [doc[:max(8, budget - q_max)]], question, doc
 
 
-def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
+def _forward_warm(implementation, arena, pipeline, async_ans, budget, *,
                   join_chunk):
     """Run real forward passes over every attention path.
 
@@ -63,7 +63,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
-        run_filter(torch, arena, pipeline, async_ans, warm_docs,
+        run_filter(implementation, arena, pipeline, async_ans, warm_docs,
                    [question], budget, arena_writes=True,
                    attention_mode=mode)
         # small chunks, one document each: the trailing-chunk shapes
@@ -73,15 +73,15 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                 continue
             logger.debug("kernels: warming %s attention, %s tokens", mode, t)
             body = (doc * (t // len(doc) + 1))[:max(8, t - q_max)]
-            run_filter(torch, arena, pipeline, async_ans, [body],
+            run_filter(implementation, arena, pipeline, async_ans, [body],
                        [question], budget, arena_writes=True,
                        attention_mode=mode)
         if not pipeline.canvas_ids:
             logger.debug("kernels: warming %s attention row classes", mode)
-            _warm_row_classes(torch, arena, pipeline, mode)
+            _warm_row_classes(implementation, arena, pipeline, mode)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
-        run_join(torch, arena, pipeline, async_ans, warm_docs,
+        run_join(implementation, arena, pipeline, async_ans, warm_docs,
                  [[question] * 8], budget)
     if join_chunk and trailing == 1:
         # a classification: the question as the frame after each
@@ -89,14 +89,14 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         # decision model classifies with its own readout
         logger.debug("kernels: warming classification forward pass")
         labels = [question[:1 + i % 6] for i in range(26)]
-        run_join(torch, arena, pipeline, async_ans, warm_docs,
+        run_join(implementation, arena, pipeline, async_ans, warm_docs,
                  [labels], budget, stage_frames=[question])
     logger.debug("kernels: warming filter without KV writes")
-    run_filter(torch, arena, pipeline, async_ans, warm_docs,
+    run_filter(implementation, arena, pipeline, async_ans, warm_docs,
                [question], budget, arena_writes=False)
 
 
-def _warm_row_classes(torch, arena, pipeline, mode):
+def _warm_row_classes(implementation, arena, pipeline, mode):
     """Run one chunk for each row-count class pair in ROW_CLASSES.
 
     Each chunk holds m one-token rows that read a cached document and
@@ -104,7 +104,7 @@ def _warm_row_classes(torch, arena, pipeline, mode):
     filler document that brings the chunk to n rows.
 
     Args:
-        torch: The torch module.
+        implementation: The device implementation the chunks run on.
         arena: The KV arena the passes write.
         pipeline: The model pipeline.
         mode: The attention path, "tree" or "unified".
@@ -124,8 +124,9 @@ def _warm_row_classes(torch, arena, pipeline, mode):
         # fails with a CUDA error when there are none: each document
         # takes a one-token question whose answer is not read
         _forward(pipeline, arena, pack_chunk(
-            torch, arena, [dict(key=key, prefix=prefix, f=cached, suffixes=[[11]])
-                           for key in keys], attention_mode=mode))
+            implementation, arena,
+            [dict(key=key, prefix=prefix, f=cached, suffixes=[[11]])
+             for key in keys], attention_mode=mode))
         for n, m in ROW_CLASSES:
             groups = [dict(key=key, prefix=None, f=cached, suffixes=[[11]],
                            write_suffix_tokens=1, single=True)
@@ -137,7 +138,7 @@ def _warm_row_classes(torch, arena, pipeline, mode):
                                    f=n - m, suffixes=[]))
             try:
                 _forward(pipeline, arena, pack_chunk(
-                    torch, arena, groups, attention_mode=mode))
+                    implementation, arena, groups, attention_mode=mode))
             finally:
                 if arena.is_resident(filler):
                     arena.free_key(filler)
@@ -177,7 +178,7 @@ def warm_label_readout(torch, head):
                     rows_per_answer=[1] * count if rows > 1 else None))
 
 
-def compile_kernels(torch, arena, pipeline, async_ans, budget):
+def compile_kernels(implementation, arena, pipeline, async_ans, budget):
     """Build every DeepGEMM kernel configuration, then warm every path.
 
     Uses vLLM's warmup heuristic to list every token count up to the
@@ -186,12 +187,13 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
     stack, GPU, model, budget).
     """
     if not pipeline.gemm_warmup:
-        _forward_warm(torch, arena, pipeline, async_ans, budget,
+        _forward_warm(implementation, arena, pipeline, async_ans, budget,
                       join_chunk=True)
         return
     from vllm.model_executor.warmup.deep_gemm_warmup import (
         _generate_optimal_warmup_m_values,
     )
+    torch = implementation.torch
     linears = pipeline.linears()
     work = [(m, lin) for lin in linears
             for m in _generate_optimal_warmup_m_values(
@@ -216,16 +218,16 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
         torch.cuda.synchronize()
     progress.finish("kernels: GEMM warmup done")
     logger.info("kernels: warming filter and join forward passes")
-    _forward_warm(torch, arena, pipeline, async_ans, budget,
+    _forward_warm(implementation, arena, pipeline, async_ans, budget,
                   join_chunk=True)
 
 
-def touch_kernels(torch, arena, pipeline, async_ans, budget):
+def touch_kernels(implementation, arena, pipeline, async_ans, budget):
     """Run each hot kernel once per GPU process.
 
     Cached binaries then load at boot instead of mid-run.
     """
-    _forward_warm(torch, arena, pipeline, async_ans, budget,
+    _forward_warm(implementation, arena, pipeline, async_ans, budget,
                   join_chunk=True)
 
 
@@ -249,12 +251,12 @@ def _marker_identity(torch, model_name, budget):
                 gpu=torch.cuda.get_device_name())
 
 
-def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
+def warm_kernels(implementation, arena, pipeline, async_ans, budget, *,
                  model_name, force_compile=False, model=None):
     """Compile once under a file lock, then warm each GPU process.
 
     Args:
-        torch: The torch module.
+        implementation: The CUDA device implementation.
         arena: The KV arena the warm passes write.
         pipeline: The model pipeline.
         async_ans: The TRUE/FALSE readout of the warm passes.
@@ -272,6 +274,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
     import json
     import os
 
+    torch = implementation.torch
     with quiet():
         path = _marker_path(model_name, budget)
         identity = _marker_identity(torch, model_name, budget)
@@ -295,7 +298,8 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
                 pass
             if force_compile or on_disk != identity:
                 logger.info("kernels: starting compile pass")
-                compile_kernels(torch, arena, pipeline, async_ans, budget)
+                compile_kernels(implementation, arena, pipeline, async_ans,
+                                budget)
                 torch.cuda.synchronize()
                 tmp = path + ".tmp"
                 with open(tmp, "w") as f:
@@ -304,7 +308,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
                 tier = "compile"
         if tier == "touch":
             logger.info("kernels: warming cached filter and join kernels")
-            touch_kernels(torch, arena, pipeline, async_ans, budget)
+            touch_kernels(implementation, arena, pipeline, async_ans, budget)
         if model is not None:
             warm_label_readout(torch, full_output_head(model))
         torch.cuda.synchronize()

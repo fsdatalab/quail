@@ -9,7 +9,6 @@ runs at. See kv_checker for the check.
 import random
 
 import pytest
-from fakes import cpu_staging
 from kv_checker import (
     Setup,
     check_feed,
@@ -18,15 +17,12 @@ from kv_checker import (
     check_join_after_join,
 )
 
-pytest.importorskip("torch")
-
 
 @pytest.fixture(params=[("unified", False, False), ("tree", False, False),
                         ("unified", True, False), ("unified", True, True)],
                 ids=["unified", "tree", "sliding", "sliding-canvas"])
-def arena_kind(request, monkeypatch):
-    """(attention path, sliding layers, canvas row), with CPU staging."""
-    cpu_staging(monkeypatch)
+def arena_kind(request):
+    """(attention path, sliding layers, canvas row)."""
     return request.param
 
 

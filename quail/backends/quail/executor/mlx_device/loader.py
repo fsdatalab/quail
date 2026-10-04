@@ -3,8 +3,11 @@
 import json
 from pathlib import Path
 
-from quail.backends.quail.executor.mlx_device.qwen3 import Qwen3Config, Qwen3Weights
 from quail.backends.quail.executor.mlx_device.readout import MlxDecisionHead
+from quail.backends.quail.executor.mlx_device.weights import (
+    Qwen3Config,
+    Qwen3Weights,
+)
 from quail.backends.quail.executor.model import is_decision2
 
 

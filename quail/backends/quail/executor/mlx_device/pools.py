@@ -6,52 +6,50 @@ from quail.backends.quail.executor.mlx_device.kernels import write_rows
 class MlxKVPools:
     """One K pool and one V pool of KV pages per layer, as MLX arrays.
 
-    A pool has shape (pages, page tokens, KV heads, head dim). A slot is
-    a pool row: page * page tokens + the offset in the page, the row
-    index the page accounting hands out.
+    A layer's pool has shape (pages, page tokens, KV heads, head dim). A
+    slot is a pool row: page * page tokens + the offset in the page, the
+    row index the page accounting hands out. The KVArena builds the
+    pools.
 
     Writes happen in place and replace the pool arrays with the arrays
     the write returns. Read a layer's pools with paged_kv after its
     writes, not before.
 
     Args:
-        n_layers: Layers of the model.
-        n_pages: Pages per pool.
-        page_tokens: Tokens per page.
-        n_kv: KV heads.
-        d_head: Head dimension.
         dtype: MLX dtype of K and V.
     """
 
-    def __init__(self, n_layers: int, n_pages: int, page_tokens: int,
-                 n_kv: int, d_head: int, dtype):
-        self.n_layers = n_layers
-        self.page_tokens = page_tokens
-        self.n_kv = n_kv
-        self.d_head = d_head
+    def __init__(self, dtype):
         self.dtype = dtype
-        self._build(n_pages)
+        self.page_tokens = None
+        self.k = self.v = None
 
-    def _build(self, n_pages: int) -> None:
+    def build(self, page_tokens: int, layers) -> None:
+        """Allocate the pools; nothing of earlier pools survives.
+
+        Args:
+            page_tokens: Tokens per page.
+            layers: Per layer, (pages, KV heads, head dim).
+        """
         import mlx.core as mx
 
-        self.n_pages = n_pages
-        shape = (n_pages, self.page_tokens, self.n_kv, self.d_head)
-        self.k = [mx.zeros(shape, dtype=self.dtype) for _ in range(self.n_layers)]
-        self.v = [mx.zeros(shape, dtype=self.dtype) for _ in range(self.n_layers)]
-        mx.eval(self.k, self.v)
-
-    def resize(self, n_pages: int) -> None:
-        """Rebuild the pools at a new size; nothing survives."""
-        if n_pages == self.n_pages:
-            return
+        # the earlier pools go before the new ones are allocated
         self.k = self.v = None
-        self._build(n_pages)
+        self.page_tokens = page_tokens
+        shapes = [(pages, page_tokens, heads, dim) for pages, heads, dim in layers]
+        self.k = [mx.zeros(shape, dtype=self.dtype) for shape in shapes]
+        self.v = [mx.zeros(shape, dtype=self.dtype) for shape in shapes]
+        mx.eval(self.k, self.v)
 
     @property
     def nbytes(self) -> int:
         """Bytes the pools hold."""
         return sum(pool.nbytes for pool in self.k + self.v)
+
+    def layer_kv(self, layer: int):
+        """Flat K and V pools of one layer, shape (rows, n_kv, d_head)."""
+        rows = (-1, *self.k[layer].shape[2:])
+        return self.k[layer].reshape(rows), self.v[layer].reshape(rows)
 
     def paged_kv(self, layer: int):
         """Return the K and V pools of one layer for paged attention."""
@@ -77,11 +75,8 @@ class MlxKVPools:
             source_slots: int32 slots to read, written before this call.
             slots: int64 slots to write, as many.
         """
-        rows = (-1, self.n_kv, self.d_head)
-        self.write(layer,
-                   self.k[layer].reshape(rows)[source_slots],
-                   self.v[layer].reshape(rows)[source_slots],
-                   slots)
+        k_rows, v_rows = self.layer_kv(layer)
+        self.write(layer, k_rows[source_slots], v_rows[source_slots], slots)
 
     def arrays(self) -> list:
         """Return every pool array, to evaluate with a chunk's answers."""

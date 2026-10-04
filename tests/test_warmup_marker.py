@@ -9,11 +9,12 @@ import pytest
 from quail.backends.quail.executor import warmup
 
 
-def _stub_torch():
-    return SimpleNamespace(
+def _stub_implementation():
+    """A CUDA device implementation whose torch reports an H100."""
+    return SimpleNamespace(torch=SimpleNamespace(
         __version__="2.9.0", version=SimpleNamespace(cuda="13.0"),
         cuda=SimpleNamespace(get_device_name=lambda: "NVIDIA H100",
-                             synchronize=lambda: None))
+                             synchronize=lambda: None)))
 
 
 def _concurrent_warmup(path, start, touch, compiles, results):
@@ -31,7 +32,7 @@ def _concurrent_warmup(path, start, touch, compiles, results):
     warmup.compile_kernels = compile_once
     warmup.touch_kernels = touch_together
     start.wait(timeout=10)
-    result = warmup.warm_kernels(_stub_torch(), None, None, None, 100,
+    result = warmup.warm_kernels(_stub_implementation(), None, None, None, 100,
                                  model_name="model")
     results.put(result["tier"])
 
@@ -73,18 +74,19 @@ def test_warmup_failure_writes_no_marker_and_touch_warms_the_join_chunk(
         raise RuntimeError("GPU failed")
 
     for failure in ("compile", "synchronize"):
-        torch = _stub_torch()
+        implementation = _stub_implementation()
         monkeypatch.setattr(warmup, "compile_kernels",
                             fail if failure == "compile" else lambda *args: None)
         if failure == "synchronize":
-            torch.cuda.synchronize = fail
+            implementation.torch.cuda.synchronize = fail
         with pytest.raises(RuntimeError, match="GPU failed"):
-            warmup.warm_kernels(torch, None, None, None, 100, model_name="model")
+            warmup.warm_kernels(implementation, None, None, None, 100,
+                                model_name="model")
         assert not path.exists(), failure
 
-        torch.cuda.synchronize = lambda: None
+        implementation.torch.cuda.synchronize = lambda: None
         monkeypatch.setattr(warmup, "compile_kernels", lambda *args: None)
-        assert warmup.warm_kernels(torch, None, None, None, 100,
+        assert warmup.warm_kernels(implementation, None, None, None, 100,
                                    model_name="model")["tier"] == "compile", failure
         path.unlink()
 
@@ -102,11 +104,12 @@ def test_forward_warm_runs_a_classification_chunk(monkeypatch):
     monkeypatch.setattr(warmup, "run_filter", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         warmup, "run_join",
-        lambda torch, arena, pipeline, ans, docs, stages, budget, **kw:
+        lambda implementation, arena, pipeline, ans, docs, stages, budget, **kw:
         joins.append((stages, kw)))
     classes = []
     monkeypatch.setattr(warmup, "_warm_row_classes",
-                        lambda torch, arena, pipeline, mode: classes.append(mode))
+                        lambda implementation, arena, pipeline, mode:
+                        classes.append(mode))
     pipeline = SimpleNamespace(tree_attention=False, warm_tokens=(),
                                canvas_ids=())
     warmup._forward_warm(None, None, pipeline, None, 2048, join_chunk=True)

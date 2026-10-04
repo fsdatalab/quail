@@ -17,7 +17,7 @@ from quail.execution.tokens import DocumentKeys
 
 def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
     """Run one model filter and collect its results."""
-    torch = state.torch
+    implementation = state.implementation
     arena = state.loaded_model.arena
     pipeline = state.loaded_model.pipeline
     async_answers = state.async_answers
@@ -32,7 +32,7 @@ def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
             else execution_prefix_tree(node, inputs["documents"], arena))
     stats = {}
     answers, spans, tokens = loop.run_filter(
-        torch,
+        implementation,
         arena,
         pipeline,
         async_answers,
@@ -50,7 +50,7 @@ def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
     )
     return filter_result(
         node, answers, tokens, document_ids,
-        gpu_s=gpu_seconds(torch, spans, inputs),
+        gpu_s=gpu_seconds(implementation, spans, inputs),
         chunks=chunks(spans, inputs),
         borrowed_tokens=stats.get("borrowed_tokens", 0),
         pack_s=stats.get("pack_s", 0.0))

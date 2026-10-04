@@ -11,6 +11,7 @@ import time
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.cuda_device import CudaImplementation
 from quail.backends.quail.executor.model import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import (
@@ -60,6 +61,7 @@ class LoadedGpu:
         gpu_index = context.gpu_index
         self.torch = torch
         self.F = F
+        self.implementation = CudaImplementation()
         self.spec = spec
         self._warmed = False
         self.prepared_boot = None
@@ -92,7 +94,7 @@ class LoadedGpu:
                              n_pages=full_pages,
                              page_tokens=budgets.PAGE_TOKENS,
                              n_kv=spec.n_kv, d_head=spec.d_head,
-                             dtype=torch.bfloat16,
+                             pools=self.implementation.kv_pools(torch.bfloat16),
                              layer_kv=spec.kv_shapes,
                              sliding_layers=spec.sliding_layer_set,
                              sliding_window=spec.sliding_window,
@@ -136,7 +138,7 @@ class LoadedGpu:
             self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens
         self.execution.bind_query(
-            torch=self.torch,
+            implementation=self.implementation,
             async_answers=self.async_ans,
             answer_rows=rows,
             chunk_tokens=chunk_tokens,
@@ -153,7 +155,7 @@ class LoadedGpu:
             return 0.0, None
         t0 = time.perf_counter()
         with self.torch.inference_mode():
-            warm = warm_kernels(self.torch, self.arena, self.pipeline,
+            warm = warm_kernels(self.implementation, self.arena, self.pipeline,
                                 self.async_ans, self.chunk_tokens,
                                 model_name=self.spec.hf_name,
                                 model=self.model)
@@ -357,7 +359,7 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
 def _gpu_state(gpu):
     """Build a state dict from a LoadedGpu for graph execution."""
     return {
-        "torch": gpu.torch, "F": gpu.F,
+        "implementation": gpu.implementation,
         "model_execution": gpu.execution,
         "model": gpu.model, "arena": gpu.arena,
         "pipeline": gpu.pipeline, "spec": gpu.spec,
@@ -413,9 +415,9 @@ def _child_main(gpu_idx, conn):
                 if "documents" in inputs:
                     state["score_documents"] = inputs["documents"]
                 inputs["documents"] = state["score_documents"]
-                with gpu.torch.inference_mode():
+                with gpu.implementation.inference_mode():
                     result = gpu.execution.execute(data["node"], inputs)
-                gpu.torch.cuda.synchronize()
+                gpu.implementation.synchronize()
                 conn.send(("ok", result))
             elif kind == "joins":
                 conn.send(("ok", _child_joins(state, data)))
@@ -455,7 +457,7 @@ def _child_boot(state, sub):
 
 def _child_filters(state, sub):
     gpu = state.get("gpu")
-    torch = gpu.torch if gpu else state["torch"]
+    implementation = gpu.implementation if gpu else state["implementation"]
     arena = gpu.arena if gpu else state["arena"]
     if sub.get("start_query", True):
         _reset_child_query(state)
@@ -465,7 +467,7 @@ def _child_filters(state, sub):
     pre = sub.get("pre_ids") or []
     filter_limit = sub.get("filter_limit")
     t0 = time.perf_counter()
-    with torch.inference_mode():
+    with implementation.inference_mode():
         node_id = sub.get("node_id")
         if node_id is not None:
             graph = decode_graph(
@@ -509,16 +511,16 @@ def _child_filters(state, sub):
         out["retained"].setdefault(alias, []).append(document)
     out["retained"] = {alias: sorted(set(documents))
                        for alias, documents in out["retained"].items()}
-    torch.cuda.synchronize()
+    implementation.synchronize()
     out["wall_s"] = round(time.perf_counter() - t0, 2)
     out["peak_gib"] = round(
-        torch.cuda.max_memory_allocated() / 2**30, 2)
+        implementation.peak_memory_bytes() / 2**30, 2)
     return out
 
 
 def _child_joins(state, sub):
     gpu = state.get("gpu")
-    torch = gpu.torch if gpu else state["torch"]
+    implementation = gpu.implementation if gpu else state["implementation"]
     arena = gpu.arena if gpu else state["arena"]
     if sub.get("start_query", False):
         _reset_child_query(state)
@@ -540,7 +542,7 @@ def _child_joins(state, sub):
     retain_anchor = bool(sub.get("retain_anchor"))
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
-    with torch.inference_mode():
+    with implementation.inference_mode():
         stage_suffixes, tuple_globs = [], []
         for j in group:
             locals_ = [range(len(sub["partners"][p]["index"]))
@@ -622,7 +624,7 @@ def _child_joins(state, sub):
     if sub.get("final_group"):
         for key in arena.resident_keys():
             arena.free_key(key)
-    torch.cuda.synchronize()
+    implementation.synchronize()
     retained = {}
     for alias, document in arena.retained_keys():
         retained.setdefault(alias, []).append(document)

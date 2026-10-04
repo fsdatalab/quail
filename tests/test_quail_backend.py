@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pytest
 from fakes import (
-    fake_torch,
+    fake_implementation,
     keep_even,
     run_graph_on_arena,
     same_key,
@@ -77,7 +77,8 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     execution = QuailModelExecution(SimpleNamespace())
     execution.bind_loaded_model(
         model=object(), arena=SimpleNamespace(), pipeline=SimpleNamespace())
-    execution.bind_query(torch=fake_torch(), async_answers=object(),
+    execution.bind_query(implementation=fake_implementation(),
+                         async_answers=object(),
                          answer_rows=object(), chunk_tokens=8192)
     result = execution.execute(filtered, {
         "documents": [[1]], "document_ids": [10], "retain_survivors": False})
@@ -134,7 +135,7 @@ class FakeArena:
 
 def graph_state(model_execution, docs):
     return {
-        "torch": fake_torch(),
+        "implementation": fake_implementation(),
         "arena": FakeArena(),
         "pipeline": SimpleNamespace(),
         "model_execution": model_execution,
@@ -212,7 +213,7 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
     # join chunks run before the filter chain finishes: one pipeline
     kinds = [kind for kind, _ in model.launched]
     assert kinds.index("join") < len(kinds) - 1 - kinds[::-1].index("filter")
-    # the fake torch reports 2 ms per event pair, one pair per chunk; a
+    # the fake implementation reports 2 ms per event pair, one pair per chunk; a
     # chunk that packed rows of two nodes counts for each, and its time
     # is split between them by rows, so the nodes' seconds sum to the
     # pipeline's and their chunks to at least its chunk count

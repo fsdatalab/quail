@@ -1,8 +1,8 @@
-"""Build one chunk's tensors and stage its inputs for the forward pass.
+"""Build one chunk's arrays and stage its inputs for the forward pass.
 
 The admission scheduler in pack.py selects the groups. This module lays out
-those groups for attention, KV writes, and answer readouts. Torch is supplied
-by the caller so importing the executor does not load it.
+those groups for attention, KV writes, and answer readouts as host arrays, and
+the device implementation the caller supplies copies them to the device.
 """
 
 import time
@@ -56,24 +56,6 @@ def _tick(timing, key, t0):
     if timing is not None:
         timing[key] = timing.get(key, 0.0) + time.perf_counter() - t0
     return time.perf_counter()
-
-
-def _staged(torch, data, dtype, pinned=True):
-    """Copy host data to the device.
-
-    With pinned=True the copy goes through pinned memory and does not
-    block; with pinned=False it is a pageable, blocking copy.
-    """
-    if isinstance(data, np.ndarray):
-        data = torch.as_tensor(data, dtype=dtype)
-    if torch.is_tensor(data):
-        if pinned:
-            return data.pin_memory().to("cuda", non_blocking=True)
-        return data.to("cuda")
-    if pinned:
-        return torch.tensor(data, dtype=dtype, pin_memory=True).to(
-            "cuda", non_blocking=True)
-    return torch.tensor(data, dtype=dtype, device="cuda")
 
 
 def _token_parts(sequence):
@@ -155,66 +137,19 @@ class Suffixes:
         return Suffixes(self.ids[rows], lengths)
 
 
-class InputStaging:
-    """Reuse CPU and GPU input buffers on the current CUDA stream."""
-
-    def __init__(self, torch):
-        self.torch = torch
-        self.buffers = {}
-        self.fixed_tokens = {}
-
-    def host(self, name, count, dtype):
-        torch = self.torch
-        previous = self.buffers.get(name)
-        if previous is not None:
-            host, device, event = previous
-            # The CPU must not overwrite a buffer while its transfer is pending.
-            event.synchronize()
-        if previous is None or host.numel() < count or host.dtype != dtype:
-            host = torch.empty(count, dtype=dtype, pin_memory=True)
-            device = torch.empty(count, dtype=dtype, device="cuda")
-            event = torch.cuda.Event()
-        self.buffers[name] = host, device, event
-        return host[:count]
-
-    def upload(self, name, count):
-        host, device, event = self.buffers[name]
-        # Reusing the device buffer is ordered after its previous readers.
-        device[:count].copy_(host[:count], non_blocking=True)
-        event.record()
-        return device[:count]
-
-    def copy(self, name, data, dtype):
-        source = self.torch.as_tensor(data)
-        host = self.host(name, source.numel(), dtype)
-        host.copy_(source.reshape(-1))
-        return self.upload(name, source.numel())
-
-    def fixed(self, tokens):
-        key = id(tokens)
-        if key not in self.fixed_tokens:
-            self.fixed_tokens[key] = tokens, self.torch.as_tensor(tokens)
-        return self.fixed_tokens[key][1]
-
-
-def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
-    """Copy the chunk's token parts into one GPU input tensor.
+def _token_ids(sequences, total: int):
+    """Join the chunk's token parts into one host int64 array.
 
     The parts are joined on the host first, so the chunk takes one
-    copy into pinned memory however many suffixes it packs.
+    copy to the device however many suffixes it packs.
     """
-    host = (torch.empty(total, dtype=torch.int64, pin_memory=pinned)
-            if staging is None else staging.host("tokens", total, torch.int64))
     arrays = [_int64(part) for sequence in sequences
               for part in _token_parts(sequence) if len(part)]
     ids = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.int64)
     if len(ids) != total:
         raise AssertionError(
             f"packed {len(ids)} token ids into a {total}-token chunk")
-    host.copy_(torch.from_numpy(ids))
-    if staging is not None:
-        return staging.upload("tokens", total)
-    return host.to("cuda", non_blocking=pinned)
+    return ids
 
 
 # ------------------------------------------------------- chunk packing
@@ -261,48 +196,40 @@ class _PoolBuilder:
             return
         self.src.append(np.arange(r0 + skip, r1, dtype=np.int64))
         offset = first - view.start
-        self.dst.append(view.rows[offset:offset + (r1 - r0 - skip)].numpy())
+        self.dst.append(view.rows[offset:offset + (r1 - r0 - skip)])
 
     def scatter_suffix(self, view, temp, s0, s1, f, remainder, page_tokens):
         """Map suffix rows to temporary pages and copy any retained partial page."""
         suffix_tokens = s1 - s0
         self.src.append(np.arange(s0, s1, dtype=np.int64))
-        self.dst.append(temp.rows[remainder:remainder + suffix_tokens].numpy())
+        self.dst.append(temp.rows[remainder:remainder + suffix_tokens])
         if remainder:
             anchor_page = view.pages[(f - view.start) // page_tokens]
             base = anchor_page * page_tokens
             self.tail_src.append(np.arange(base, base + remainder, dtype=np.int64))
-            self.tail_dst.append(temp.rows[:remainder].numpy())
+            self.tail_dst.append(temp.rows[:remainder])
 
-    def build(self, arena, stage, torch, staging, index):
+    def build(self, arena, stage, index):
         def concatenate(parts):
             return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
 
         tag = "" if index == 0 else "_sliding"
-        if staging is None:
-            table = arena.block_table_rows(self.page_rows)
-        else:
-            width = max(map(len, self.page_rows))
-            block_table = np.zeros((len(self.page_rows), width), dtype=np.int32)
-            for row, pages in enumerate(self.page_rows):
-                block_table[row, :len(pages)] = pages
-            table = stage(f"block_table{tag}", block_table, torch.int32).view(
-                len(self.page_rows), width)
         return dict(
-            src=stage(f"unified_src{tag}", concatenate(self.src), torch.int64),
-            dst=stage(f"unified_dst{tag}", concatenate(self.dst), torch.int64),
+            src=stage(f"unified_src{tag}", concatenate(self.src), np.int64),
+            dst=stage(f"unified_dst{tag}", concatenate(self.dst), np.int64),
             tail_src=(stage(f"tail_src{tag}", concatenate(self.tail_src),
-                            torch.int64) if self.tail_src else None),
+                            np.int64) if self.tail_src else None),
             tail_dst=(stage(f"tail_dst{tag}", concatenate(self.tail_dst),
-                            torch.int64) if self.tail_dst else None),
-            used=stage(f"unified_lengths{tag}", self.lengths, torch.int32),
-            table=table,
+                            np.int64) if self.tail_dst else None),
+            used=stage(f"unified_lengths{tag}", self.lengths, np.int32),
+            table=stage(f"block_table{tag}",
+                        arena.block_table_rows(self.page_rows), np.int32),
             max_used=max(self.lengths))
 
 
-def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
+def pack_chunk(implementation, arena, groups, timing=None, *,
                attention_mode, staging=None, canvas=(), answer_row=0):
-    """Pack scheduled document groups into tensors for one forward pass.
+    """Pack scheduled document groups into arrays for one forward pass.
 
     Groups remain in scheduler order. Each group contains key, prefix, f
     (retained context length), and suffixes. Optional group fields are:
@@ -322,27 +249,27 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     attention and their KV is not retained.
 
     Args:
-        torch: Torch module.
+        implementation: The device implementation the arrays are staged on.
         arena: KV arena holding document pages.
         groups: Scheduled group mappings with the fields described above.
         timing: Optional mapping receiving elapsed packing times.
-        pinned: Whether host-to-device copies use pinned memory.
         attention_mode: Attention path, either tree or unified.
-        staging: Optional reusable host and device transfer buffers.
+        staging: Optional reusable transfer buffers of the implementation.
         canvas: Default diffusion answer canvas token IDs.
         answer_row: Canvas row used for the answer when not reading all rows.
 
     Returns:
-        A Chunk containing token tensors, attention metadata, and readout rows.
+        A Chunk containing token arrays, attention metadata, and readout rows.
 
     Raises:
         ValueError: The attention path, canvas row, or group layout is invalid.
         ArenaFullError: The arena has too few free pages for suffixes.
     """
     def stage(name, values, dtype):
-        if staging is not None:
-            return staging.copy(name, values, dtype)
-        return _staged(torch, values, dtype, pinned)
+        return implementation.stage(values, dtype, name=name, staging=staging)
+
+    def copy(values, dtype):
+        return implementation.stage(values, dtype)
 
     def concatenate(parts):
         return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
@@ -577,6 +504,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     reads = None
     if read_keys:
         table, _ = arena.block_table(read_keys)
+        table = copy(table, np.int32)
         t = _tick(timing, "pack_blocktable", t)
         rows = np.concatenate(reader_rows)
         # row -> its index in call B's output, -1 for rows that read
@@ -584,23 +512,22 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         source = np.full(token_count, -1, dtype=np.int32)
         source[rows] = np.arange(len(rows), dtype=np.int32)
         reads = dict(
-            rows=_staged(torch, rows, torch.int64, pinned),
-            cu_q=stage("unified_cu_q", cu_q, torch.int32),
-            max_q=max_q, used=_staged(torch, read_used, torch.int32, pinned),
+            rows=copy(rows, np.int64),
+            cu_q=stage("unified_cu_q", cu_q, np.int32),
+            max_q=max_q, used=copy(read_used, np.int32),
             max_used=max(read_used), table=table,
-            source=_staged(torch, source, torch.int32, pinned))
+            source=copy(source, np.int32))
         if node_q:
             q_rows = np.concatenate(node_q)
             reads["nodes"] = dict(
-                rows=_staged(torch, q_rows, torch.int64, pinned),
-                key_rows=_staged(torch, np.concatenate(node_k), torch.int64,
-                                 pinned),
-                cu_q=_staged(torch, node_cu_q, torch.int32, pinned),
-                cu_k=_staged(torch, node_cu_k, torch.int32, pinned),
+                rows=copy(q_rows, np.int64),
+                key_rows=copy(np.concatenate(node_k), np.int64),
+                cu_q=copy(node_cu_q, np.int32),
+                cu_k=copy(node_cu_k, np.int32),
                 max_q=int(np.diff(node_cu_q).max()),
                 max_k=int(np.diff(node_cu_k).max()),
                 # each node row's index among call B's rows
-                b_index=_staged(torch, source[q_rows], torch.int64, pinned))
+                b_index=copy(source[q_rows], np.int64))
     elif node_q:
         raise ValueError("chain rows read their document in call B; "
                          "the document needs arena pages")
@@ -640,13 +567,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                         arena.owned_sliding_pages(key),
                         arena.sliding_start(key)))
                 direct = len(begins) == 1 and all(
-                    logical_start + count - view.start <= view.rows.numel()
+                    logical_start + count - view.start <= len(view.rows)
                     for view in views)
                 suffix_total = int((ends - begins).sum())
                 if spec["keeps"] and not direct:
                     raise ValueError(
                         f"group {key!r} keeps suffix KV but its pages hold "
-                        f"{views[0].rows.numel()} rows, not "
+                        f"{len(views[0].rows)} rows, not "
                         f"{logical_start + count}")
                 if direct:
                     for pool, view in zip(pools, views):
@@ -704,11 +631,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     if spec["canvas"]:
                         canvas_seq.append(len(cu_q) - 2)
 
-            built = [pool.build(arena, stage, torch, staging, index)
+            built = [pool.build(arena, stage, index)
                      for index, pool in enumerate(pools)]
             unified = dict(
                 built[0],
-                cu_q=stage("unified_cu_q", cu_q, torch.int32),
+                cu_q=stage("unified_cu_q", cu_q, np.int32),
                 max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])))
             if sliding:
                 unified["sliding"] = built[1]
@@ -726,12 +653,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         for key, r0, r1, dest in kv_writes:
             src.append(np.arange(r0, r1, dtype=np.int64))
             rows = arena.capacity_rows(key)[dest:dest + (r1 - r0)]
-            if rows.numel() != r1 - r0:
+            if len(rows) != r1 - r0:
                 raise AssertionError("KV write exceeds reserved rows")
             dst_parts.append(rows)
-        kv_src = _staged(torch, np.concatenate(src), torch.int64, pinned)
-        kv_dst = _staged(torch, torch.cat(dst_parts), torch.int64,
-                         pinned)
+        kv_src = copy(np.concatenate(src), np.int64)
+        kv_dst = copy(np.concatenate(dst_parts), np.int64)
     t = _tick(timing, "pack_kv", t)
 
     canvas_meta = None
@@ -747,33 +673,34 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         canvas_meta = dict(
             rows=stage("canvas_rows", np.repeat(starts, widths)
                        + np.arange(int(cum[-1]), dtype=np.int64)
-                       - np.repeat(cum - widths, widths), torch.int64),
+                       - np.repeat(cum - widths, widths), np.int64),
             cu_q=stage("canvas_cu_q", np.concatenate([[0], cum]),
-                       torch.int32),
+                       np.int32),
             # the readouts slice canvases by their row offsets on the host
             cu_q_host=np.concatenate([[0], cum]),
             max_q=int(widths.max()))
         if unified is not None:
-            seq = stage("canvas_seq", canvas_seq, torch.int64)
-            canvas_meta["table"] = unified["table"].index_select(0, seq)
-            canvas_meta["used"] = unified["used"].index_select(0, seq)
+            seq = stage("canvas_seq", canvas_seq, np.int64)
+            select = implementation.select_rows
+            canvas_meta["table"] = select(unified["table"], seq)
+            canvas_meta["used"] = select(unified["used"], seq)
             canvas_meta["max_used"] = max(
                 pools[0].lengths[i] for i in canvas_seq)
             if "sliding" in unified:
                 canvas_meta["sliding"] = dict(
-                    table=unified["sliding"]["table"].index_select(0, seq),
-                    used=unified["sliding"]["used"].index_select(0, seq),
+                    table=select(unified["sliding"]["table"], seq),
+                    used=select(unified["sliding"]["used"], seq),
                     max_used=max(pools[1].lengths[i] for i in canvas_seq))
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads,
         unified=unified, canvas=canvas_meta,
-        cu_a=stage("cu_a", cu_a, torch.int32),
+        cu_a=stage("cu_a", cu_a, np.int32),
         max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)
     out = Chunk(
-        input_ids=_staged_token_parts(
-            torch, id_parts, token_count, pinned, staging),
-        positions=stage("positions", concatenate(pos), torch.int64),
-        final_indices=stage("finals", concatenate(finals), torch.int64),
+        input_ids=implementation.stage_tokens(
+            _token_ids(id_parts, token_count), staging=staging),
+        positions=stage("positions", concatenate(pos), np.int64),
+        final_indices=stage("finals", concatenate(finals), np.int64),
         meta=meta, attention_mode=attention_mode, tokens=token_count,
         layout=layout, temporary_keys=tuple(temporary_keys),
         fresh_keys=tuple(fresh_keys),

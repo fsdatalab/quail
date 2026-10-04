@@ -13,8 +13,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
-import torch
-from fakes import fake_pipeline, fake_torch
+from fakes import fake_implementation, fake_pipeline
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
@@ -282,22 +281,11 @@ def make_arena(setup):
     if setup.window is not None:
         return KVArena(n_layers=2, n_pages=setup.pages,
                        page_tokens=setup.page_tokens, n_kv=1, d_head=1,
-                       dtype=torch.float32, device="cpu",
                        layer_kv=[(1, 1), (1, 1)], sliding_layers=(1,),
                        sliding_window=setup.window,
                        n_sliding_pages=setup.sliding_pages)
     return KVArena(n_layers=1, n_pages=setup.pages,
-                   page_tokens=setup.page_tokens, n_kv=1, d_head=1,
-                   dtype=torch.float32, device="cpu")
-
-
-def cpu_torch():
-    """Real CPU tensors with fake CUDA events."""
-    fake = fake_torch()
-    real = SimpleNamespace(**{n: getattr(torch, n) for n in dir(torch)
-                              if not n.startswith("_")})
-    real.cuda, real.inference_mode = fake.cuda, fake.inference_mode
-    return real
+                   page_tokens=setup.page_tokens, n_kv=1, d_head=1)
 
 
 def passthrough():
@@ -320,7 +308,7 @@ class Run:
         self.pipeline = fake_pipeline(forward_chunk=self.model.forward_chunk,
                                       tree_attention=True,
                                       canvas_ids=setup.canvas)
-        self.torch = cpu_torch()
+        self.implementation = fake_implementation()
 
     def tree(self, docs):
         return prefix_tree(docs, self.setup.page_tokens)
@@ -336,7 +324,7 @@ def check_filter(docs, questions, setup):
             answers[h] = answer(h)
     run = Run(setup, answers)
     got, _, _ = loop.run_filter(
-        run.torch, run.arena, run.pipeline, passthrough(), docs, questions,
+        run.implementation, run.arena, run.pipeline, passthrough(), docs, questions,
         setup.budget, arena_writes=True,
         arena_keys=[("d", i) for i in range(len(docs))],
         attention_mode=setup.path, prefix_tree=run.tree(docs))
@@ -385,7 +373,7 @@ def check_join(anchors, frame, partners, setup, retain=False):
             run.arena.free_key(keys[a])
 
     loop.run_join(
-        run.torch, run.arena, run.pipeline, passthrough(), anchors,
+        run.implementation, run.arena, run.pipeline, passthrough(), anchors,
         [partners], setup.budget, stage_frames=[frame], anchor_keys=keys,
         anchor_done=anchor_done, attention_mode=setup.path,
         prefix_tree=run.tree(anchors))
@@ -408,7 +396,7 @@ def check_feed(docs, question, frame, partners, setup):
     stage_list = filter_stages([question], passthrough()) + [
         Stage(suffixes=partners, readout=passthrough(), frame=frame)]
     out, _, _ = run_stages(
-        run.torch, run.arena, run.pipeline, stage_list, docs, setup.budget,
+        run.implementation, run.arena, run.pipeline, stage_list, docs, setup.budget,
         anchor_keys=keys, prefix_tree=run.tree(docs),
         attention_mode=setup.path)
     survivors = {d for d, doc in enumerate(docs)
@@ -439,7 +427,7 @@ def check_join_after_join(anchors, frame, partners, setup):
         run.arena.retain(keys[a], len(anchors[a]))
 
     loop.run_join(
-        run.torch, run.arena, run.pipeline, passthrough(), first,
+        run.implementation, run.arena, run.pipeline, passthrough(), first,
         [partners], setup.budget, stage_frames=[frame], anchor_keys=keys[:1],
         anchor_done=retain, attention_mode=setup.path,
         prefix_tree=run.tree(first))
@@ -451,7 +439,7 @@ def check_join_after_join(anchors, frame, partners, setup):
         run.arena.free_key(keys[a])
 
     loop.run_join(
-        run.torch, run.arena, run.pipeline, passthrough(), anchors,
+        run.implementation, run.arena, run.pipeline, passthrough(), anchors,
         [partners], setup.budget, stage_frames=[frame], anchor_keys=keys,
         anchor_done=free, attention_mode=setup.path,
         prefix_tree=run.tree(anchors))

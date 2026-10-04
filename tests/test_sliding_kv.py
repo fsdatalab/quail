@@ -1,28 +1,29 @@
 """The sliding-layer KV pool: window origins, trimming, and one page currency."""
 
+from types import SimpleNamespace
+
 import pytest
-from fakes import cpu_staging
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.device import DeviceImplementation
 
-torch = pytest.importorskip("torch")
+HOST = DeviceImplementation()
 
 WINDOW = 32     # tokens, two pages
 
 
-def cpu_arena(pages=64, sliding_pages=16):
+def cpu_arena(pages=64, sliding_pages=16, pools=None):
     # layer 0 keeps every token, layer 1 slides
     return KVArena(n_layers=2, n_pages=pages, page_tokens=16, n_kv=1, d_head=2,
-                   dtype=torch.float32, device="cpu",
+                   pools=pools,
                    layer_kv=[(1, 2), (1, 2)], sliding_layers=(1,),
                    sliding_window=WINDOW, n_sliding_pages=sliding_pages)
 
 
 def plain_arena(pages=64):
-    return KVArena(n_layers=1, n_pages=pages, page_tokens=16, n_kv=1, d_head=2,
-                   dtype=torch.float32, device="cpu")
+    return KVArena(n_layers=1, n_pages=pages, page_tokens=16, n_kv=1, d_head=2)
 
 
 def test_window_origin_and_trim():
@@ -44,8 +45,8 @@ def test_window_origin_and_trim():
     assert arena.sliding_start(key) == 64
     assert freed == arena.free_pages - min(64 - 8, (16 - 8) * 4)
     assert arena.trim_window(key) == 0
-    assert arena.capacity_rows_sliding(key).numel() == 4 * 16
-    assert arena.capacity_rows(key).numel() == 8 * 16
+    assert arena.capacity_rows_sliding(key).size == 4 * 16
+    assert arena.capacity_rows(key).size == 8 * 16
     assert arena.activate(key, 110, capacity_tokens=140) is not None
     assert len(arena.owned_pages(key)) == 9
     assert len(arena.owned_sliding_pages(key)) == 5     # (140 - 64) / 16
@@ -89,7 +90,10 @@ def test_page_costs_allocation_temporaries_and_resize():
     assert not arena.accounting.owned and not arena.sliding.owned
     assert arena.alloc(("d", 1), 40) is not None
 
-    arena = cpu_arena(pages=64, sliding_pages=16)
+    built = []
+    pools = SimpleNamespace(
+        build=lambda page_tokens, layers: built.append((page_tokens, layers)))
+    arena = cpu_arena(pages=64, sliding_pages=16, pools=pools)
     temp, pages = arena.alloc_temporary(40, sliding_tokens=20)
     assert len(pages) == 3
     assert len(arena.owned_sliding_pages(temp)) == 2
@@ -100,8 +104,11 @@ def test_page_costs_allocation_temporaries_and_resize():
     arena.free_key(("d", 2))
     arena.resize(32, 8)
     assert arena.n_pages == 32 and arena.n_sliding_pages == 8
-    assert arena.k[1].shape[0] == 8 * 16 and arena.k[0].shape[0] == 32 * 16
+    # the pools are rebuilt: 32 pages on layer 0, 8 on the sliding layer
+    assert built == [(16, [(64, 1, 2), (16, 1, 2)]),
+                     (16, [(32, 1, 2), (8, 1, 2)])]
     arena.resize(32, 8)     # a no-op at the same sizes
+    assert len(built) == 2
 
 
 def test_holds_and_the_window_floor():
@@ -161,8 +168,7 @@ def test_holds_and_the_window_floor():
     assert arena.free_pages == 64
 
 
-def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
-    cpu_staging(monkeypatch)
+def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages():
     arena = cpu_arena(pages=64, sliding_pages=32)
     key = ("d", 0)
     doc = list(range(100))
@@ -170,7 +176,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     canvas = (900, 901)
     arena.activate(key, 100, capacity_tokens=120, base_tokens=100)
     chunk = chunk_mod.pack_chunk(
-        torch, arena, [dict(key=key, prefix=doc, f=100, suffixes=[tail])],
+        HOST, arena, [dict(key=key, prefix=doc, f=100, suffixes=[tail])],
         attention_mode="unified", canvas=canvas)
     assert chunk.fresh_keys == (key,)
     full = chunk.meta["unified"]
@@ -183,7 +189,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     arena.trim_window(key)
     # a later stage reads the kept rows: the sliding pool from row 64
     chunk = chunk_mod.pack_chunk(
-        torch, arena, [dict(key=key, prefix=None, f=100, suffixes=[[600]])],
+        HOST, arena, [dict(key=key, prefix=None, f=100, suffixes=[[600]])],
         attention_mode="unified", canvas=canvas)
     assert chunk.fresh_keys == ()
     full = chunk.meta["unified"]
@@ -199,7 +205,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     assert chunk.meta["canvas"]["sliding"]["used"].tolist() == [39]
     # two suffixes take temporaries after a copy of each partial last page
     chunk = chunk_mod.pack_chunk(
-        torch, arena, [dict(key=key, prefix=None, f=100,
+        HOST, arena, [dict(key=key, prefix=None, f=100,
                             suffixes=[[600], [601, 602]])],
         attention_mode="unified")
     full = chunk.meta["unified"]
@@ -207,13 +213,13 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     assert len(chunk.temporary_keys) == 2
     assert full["used"].tolist() == [101, 102]
     assert sliding["used"].tolist() == [37, 38]
-    assert full["tail_src"].numel() == 2 * (100 % 16)
-    assert sliding["tail_src"].numel() == 2 * (36 % 16)
+    assert full["tail_src"].size == 2 * (100 % 16)
+    assert sliding["tail_src"].size == 2 * (36 % 16)
     for temp in chunk.temporary_keys:
         arena.free_key(temp)
     # each suffix may carry its own canvas
     chunk = chunk_mod.pack_chunk(
-        torch, arena, [dict(key=key, prefix=None, f=100,
+        HOST, arena, [dict(key=key, prefix=None, f=100,
                             suffixes=[[600], [601, 602]],
                             canvas=[[900, 901], [910, 911]])],
         attention_mode="unified", canvas=canvas)
@@ -225,7 +231,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
         arena.free_key(temp)
     with pytest.raises(ValueError, match="1 canvases for 2 suffixes"):
         chunk_mod.pack_chunk(
-            torch, arena, [dict(key=key, prefix=None, f=100,
+            HOST, arena, [dict(key=key, prefix=None, f=100,
                                 suffixes=[[600], [601]], canvas=[[900, 901]])],
             attention_mode="unified", canvas=canvas)
     arena.free_key(key)
@@ -240,7 +246,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
                    borrow=(parent, 64))
     assert arena.owned_pages(child)[:4] == arena.owned_pages(parent)[:4]
     chunk = chunk_mod.pack_chunk(
-        torch, arena,
+        HOST, arena,
         [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
          dict(key=child, prefix=doc[64:94], start=64, f=94, suffixes=[tail])],
         attention_mode="unified")
@@ -262,7 +268,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     # child's own first 64 rows (the borrowed pages) and the suffix
     # reads all 94
     chunk = chunk_mod.pack_chunk(
-        torch, arena,
+        HOST, arena,
         [dict(key=child, prefix=doc[64:94], start=64, f=94,
               suffixes=[tail, [501]])],
         attention_mode="tree")
@@ -283,7 +289,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     arena.activate(b, 70, capacity_tokens=80, base_tokens=70,
                    borrow=(parent, 64))
     chunk = chunk_mod.pack_chunk(
-        torch, arena,
+        HOST, arena,
         [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
          dict(key=a, prefix=doc[64:74], start=64, read_key=parent, f=74,
               suffixes=[tail], write_suffix_tokens=1),
@@ -315,8 +321,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     assert arena.free_pages == 64
 
 
-def test_borrowing_in_the_arena_and_can_borrow(monkeypatch):
-    cpu_staging(monkeypatch)
+def test_borrowing_in_the_arena_and_can_borrow():
     arena = plain_arena(pages=8)
     parent, other, child = ("d", 0), ("d", 1), ("d", 2)
     assert arena.activate(parent, 64, base_tokens=64)          # 4 pages
@@ -350,7 +355,7 @@ def test_borrowing_in_the_arena_and_can_borrow(monkeypatch):
     # the child's sliding pages: 2 borrowed + pages for [64, 104) = 3 own
     assert len(arena.owned_sliding_pages(child)) == 5
     chunk = chunk_mod.pack_chunk(
-        torch, arena,
+        HOST, arena,
         [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
          dict(key=child, prefix=doc[64:94], start=64, f=94, suffixes=[tail])],
         attention_mode="unified")
@@ -409,14 +414,11 @@ def test_borrowing_in_the_arena_and_can_borrow(monkeypatch):
     assert arena.free_pages == 64
 
 
-def test_join_anchor_keeps_its_window_for_a_later_child(monkeypatch):
-    from types import SimpleNamespace
-
-    from fakes import fake_pipeline, fake_torch
+def test_join_anchor_keeps_its_window_for_a_later_child():
+    from fakes import fake_implementation, fake_pipeline
 
     from quail.execution.tokens import prefix_tree
 
-    cpu_staging(monkeypatch)
     # anchor 1 shares 80 tokens with anchor 0, anchor 2 only the first
     # 32; anchor 2 borrows from anchor 0, whose window below row 32
     # must outlive the first chunk
@@ -427,16 +429,12 @@ def test_join_anchor_keeps_its_window_for_a_later_child(monkeypatch):
     def forward(chunk):
         return [0] * sum(n for _, n in chunk.layout)
 
-    # real tensors, fake CUDA events
-    fake = fake_torch()
-    cpu = SimpleNamespace(**{n: getattr(torch, n) for n in dir(torch)
-                             if not n.startswith("_")})
-    cpu.cuda, cpu.inference_mode = fake.cuda, fake.inference_mode
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
     arena = cpu_arena(pages=64, sliding_pages=32)
     stats = {}
     _, _, tokens = loop.run_join(
-        cpu, arena, fake_pipeline(forward_chunk=forward), answers,
+        fake_implementation(), arena, fake_pipeline(forward_chunk=forward),
+        answers,
         prefixes, [[[9], [10]]], 130, stage_frames=[[5]],
         anchor_keys=[("a", d) for d in range(3)], prefix_tree=tree,
         stats=stats)

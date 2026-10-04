@@ -292,7 +292,7 @@ def child(arguments: str) -> None:
     Args:
         arguments: JSON of query_id, sf, collection_id, model, modes
             (one per run: plain, cprofile, sample, trace, or timeline),
-            top, and stats_prefix.
+            top, stats_prefix, and gpus.
     """
     import cProfile
     import io
@@ -354,8 +354,9 @@ def child(arguments: str) -> None:
     spec = suite.queries[0]
     tables = {relation.table: suite.tables[relation.table]
               for relation in spec._info.relations}
-    config = quail.EngineConfig(gpus=1, model=args["model"], backend="quail",
-                                device="h100-sxm", gpu_timing=True)
+    config = quail.EngineConfig(gpus=args.get("gpus", 1), model=args["model"],
+                                backend="quail", device="h100-sxm",
+                                gpu_timing=True)
     with quail.Session(config) as session:
         for run, mode in enumerate(modes):
             profiler = cProfile.Profile() if mode == "cprofile" else None
@@ -414,7 +415,7 @@ def child(arguments: str) -> None:
               volumes=VOLUMES)
 def profile_query(query_ids: list[str], sf: float, collection_id: str,
                   model: str, modes: list[str], top: int, repeats: int,
-                  tag: str, env: str = "") -> str:
+                  tag: str, env: str = "", gpus: int = 1) -> str:
     """Profile each query in fresh processes and return its RESULT lines.
 
     Args:
@@ -427,6 +428,7 @@ def profile_query(query_ids: list[str], sf: float, collection_id: str,
         repeats: Number of repetitions per query and code version.
         tag: Prefix for saved profile filenames.
         env: Comma-separated KEY=VALUE variables for child processes.
+        gpus: Model copies the query runs on, one GPU each.
 
     Returns:
         Collected RESULT lines from all query processes.
@@ -445,7 +447,8 @@ def profile_query(query_ids: list[str], sf: float, collection_id: str,
                           f"-r{repeat}")
                 arguments = json.dumps(dict(
                     query_id=query_id, sf=sf, collection_id=collection_id,
-                    model=model, modes=modes, top=top, stats_prefix=prefix))
+                    model=model, modes=modes, top=top, stats_prefix=prefix,
+                    gpus=gpus))
                 command = [sys.executable, "-c",
                            "import sys, profile_query; "
                            "profile_query.child(sys.argv[1])", arguments]
@@ -475,13 +478,15 @@ def profile_query(query_ids: list[str], sf: float, collection_id: str,
 def profile(queries: str = "BIO-5,FEV-11", sf: float = 0.1,
             model: str = "qwen3-4b-fp8", modes: str = "plain,cprofile",
             top: int = 30, repeats: int = 1, tag: str = "window",
-            env: str = ""):
+            env: str = "", gpus: int = 1):
     query_ids = [query.strip() for query in queries.split(",") if query.strip()]
     data = ensure_data.spawn(sf, query_ids, "")
     print(f"function call id: {data.object_id} (data)", flush=True)
     collection = data.get()
-    call = profile_query.spawn(query_ids, sf, collection, model,
-                               modes.split(","), top, repeats, tag, env)
+    function = (profile_query if gpus == 1
+                else profile_query.with_options(gpu=f"H100!:{gpus}"))
+    call = function.spawn(query_ids, sf, collection, model,
+                          modes.split(","), top, repeats, tag, env, gpus)
     print(f"function call id: {call.object_id} (profile {queries})", flush=True)
     for line in call.get().splitlines():
         print("SUMMARY " + line, flush=True)

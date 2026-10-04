@@ -501,12 +501,12 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
             pipeline=object(),
             model=object(),
         ),
-        torch=object(),
+        implementation=SimpleNamespace(
+            scores=lambda rows: object(), input_staging=lambda: None),
         answer_rows=object(),
         chunk_tokens=1234,
         async_answers=object(),
     )
-    monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
 
     def run_join(*args, **kwargs):
         prefixes, suffixes, budget = args[4:7]
@@ -532,10 +532,12 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
             model=object(), arena=object(),
             pipeline=SimpleNamespace(canvas_ids=(7,)),
             model_spec=SimpleNamespace(vocab=50)),
-        torch=object(), async_answers=object(), answer_rows=object(),
-        chunk_tokens=1234)
+        implementation=SimpleNamespace(
+            scores=lambda rows: object(), input_staging=lambda: None),
+        async_answers=object(), answer_rows=object(), chunk_tokens=1234)
 
-    def run_stages(torch, arena, pipeline, stages, prefixes, budget, **kwargs):
+    def run_stages(implementation, arena, pipeline, stages, prefixes, budget,
+                   **kwargs):
         first, more = stages
         assert [list(prefix) for prefix in prefixes] == [[1, 30], [1, 20]]
         assert (first.frame, first.suffixes, more.suffixes) == (

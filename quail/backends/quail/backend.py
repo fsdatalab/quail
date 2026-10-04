@@ -65,7 +65,7 @@ class QuailModelExecution:
         self._query = None
         self.loaded_model = None
 
-    def bind_query(self, *, torch, async_answers, answer_rows,
+    def bind_query(self, *, implementation, async_answers, answer_rows,
                    chunk_tokens: int, async_scores=None) -> None:
         """Attach state that is valid for the current query.
 
@@ -84,7 +84,7 @@ class QuailModelExecution:
         self._reranker = None
         self._query = QueryExecutionState(
             loaded_model=loaded,
-            torch=torch,
+            implementation=implementation,
             async_answers=async_answers,
             answer_rows=answer_rows,
             chunk_tokens=chunk_tokens,

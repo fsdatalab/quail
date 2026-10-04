@@ -96,8 +96,8 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
         stages = gated_stages(parts + [own])
         stats = {}
         every, spans, tokens = run_stages(
-            state.torch, state.loaded_model.arena, state.loaded_model.pipeline, stages,
-            prefixes, state.chunk_tokens,
+            state.implementation, state.loaded_model.arena,
+            state.loaded_model.pipeline, stages, prefixes, state.chunk_tokens,
             anchor_keys=DocumentKeys(alias, ids),
             attention_mode=getattr(first, "attention", None) or None,
             prefix_tree=execution_prefix_tree(
@@ -107,7 +107,7 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
                 parts + [own], transitions),
             label=f"pipeline {alias} ({len(stages)} stages)")
         complete_chain(parts + [own], every, spans, tokens, stats,
-                       state.torch, gpu_inputs)
+                       state.implementation, gpu_inputs)
     for part in parts:
         results[part.node.node_id] = part.result_value
     if not joins:

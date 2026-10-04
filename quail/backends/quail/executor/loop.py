@@ -34,7 +34,7 @@ def _forward(pipeline, arena, chunk):
 
 # ------------------------------------------------------------ the join
 
-def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
+def run_join(implementation, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None,
              anchor_partners=None, staging=None,
@@ -45,7 +45,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     Survivors are gated between stages.
 
     Args:
-        torch: The torch module, imported by the caller.
+        implementation: The device implementation the chunks run on.
         arena: KVArena holding the anchors' KV pages.
         pipeline: ModelPipeline that runs each packed forward chunk.
         async_ans: Readout that turns final hidden states into answer
@@ -107,7 +107,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         def on_settled(anchor, survived, row):
             anchor_done(anchor, row)
     return run_stages(
-        torch, arena, pipeline, stages, anchor_prefixes, budget,
+        implementation, arena, pipeline, stages, anchor_prefixes, budget,
         anchor_keys=anchor_keys, on_settled=on_settled,
         staging=staging, attention_mode=attention_mode,
         prefix_tree=prefix_tree, stats=stats,
@@ -145,7 +145,7 @@ def lowest_borrows(borrowing):
     return lowest
 
 
-def run_filter(torch, arena, pipeline, async_ans, doc_ids,
+def run_filter(implementation, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=(), attention_mode=None,
@@ -154,7 +154,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     """Run a sequence of Boolean filters with the shared stage scheduler.
 
     Args:
-        torch: The torch module, imported by the caller.
+        implementation: The device implementation the chunks run on.
         arena: KVArena holding the documents' KV pages.
         pipeline: ModelPipeline that runs each packed forward chunk.
         async_ans: AsyncAnswers readout for TRUE/FALSE bits.
@@ -225,7 +225,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             document_done(finished)
 
     answers, spans, tokens = run_stages(
-        torch, arena, pipeline, stages, doc_ids, budget,
+        implementation, arena, pipeline, stages, doc_ids, budget,
         anchor_keys=keys, on_settled=on_settled,
         attention_mode=attention_mode, prefix_tree=prefix_tree,
         stats=stats, limit=limit, paged=arena_writes, staging=staging,

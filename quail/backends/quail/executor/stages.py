@@ -127,7 +127,7 @@ def _advance_stage(stages, a, j, row):
     return bool(stage.decide(a, row))
 
 
-def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
+def run_stages(implementation, arena, pipeline, stages, anchor_prefixes, budget, *,
                anchor_keys=None, on_settled=None, staging=None,
                attention_mode=None, prefix_tree=None, stats=None,
                limit=None, paged=True, unit="documents", count_answers=False,
@@ -136,7 +136,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     """Run every stage over the documents with one admission.
 
     Args:
-        torch: The torch module, imported by the caller.
+        implementation: The device implementation the chunks run on.
         arena: KVArena holding the documents' KV pages.
         pipeline: ModelPipeline that runs each packed forward chunk.
         stages: The Stage list, in order.
@@ -179,12 +179,12 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         A tuple of answers, timing spans, and fresh token count. Answers is
         one document-indexed mapping per stage. Each span contains a mapping
         of stage indices to packed row counts, the chunk token count, and
-        start and end CUDA events.
+        the device implementation's start and end events.
     """
     if not stages:
         return [], [], 0
     return _StageExecutor(
-        torch, arena, pipeline, stages, anchor_prefixes, budget,
+        implementation, arena, pipeline, stages, anchor_prefixes, budget,
         anchor_keys=anchor_keys, on_settled=on_settled, staging=staging,
         attention_mode=attention_mode, prefix_tree=prefix_tree, stats=stats,
         limit=limit, paged=paged, unit=unit, count_answers=count_answers,
@@ -196,7 +196,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
 class _StageExecutor:
     """Admission state, packed inputs, pending answers, and metrics for one run."""
 
-    def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
+    def __init__(self, implementation, arena, pipeline, stages, anchor_prefixes,
+                 budget, *,
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers):
@@ -207,7 +208,7 @@ class _StageExecutor:
             lowest_borrows,
         )
 
-        self.torch = torch
+        self.implementation = implementation
         self.arena = arena
         self.pipeline = pipeline
         self.stages = stages
@@ -455,7 +456,7 @@ class _StageExecutor:
                     chains=self.stages[j].chains, **own))
             entries.append((j, rows))
         chunk = pack_chunk(
-            self.torch, self.arena, specs, attention_mode=self.mode,
+            self.implementation, self.arena, specs, attention_mode=self.mode,
             staging=self.staging, canvas=self.canvas, answer_row=self.answer_row)
         for a, tokens in appended.items():
             self.appended[a] = tokens
@@ -481,10 +482,7 @@ class _StageExecutor:
     def _select_rows(self, normed, spans_j):
         index = np.concatenate([np.arange(start, end, dtype=np.int64)
                                 for start, end in spans_j])
-        if hasattr(normed, "index_select"):
-            return normed.index_select(
-                0, self.torch.from_numpy(index).to(normed.device, non_blocking=True))
-        return [normed[r] for r in index]
+        return self.implementation.select_rows(normed, index)
 
     def _submit(self, normed, entries, chunk):
         """Submit answer rows to readouts and return handles by readout group.
@@ -578,11 +576,9 @@ class _StageExecutor:
         chunk, entries = self._build(part)
         self.pack_s += time.perf_counter() - started
         self.tokens += chunk.tokens
-        e0 = self.torch.cuda.Event(enable_timing=True)
-        e1 = self.torch.cuda.Event(enable_timing=True)
-        e0.record()
+        e0 = self.implementation.record_event()
         normed = _forward(self.pipeline, self.arena, chunk)
-        e1.record()
+        e1 = self.implementation.record_event()
         for key in chunk.fresh_keys:
             self.arena.trim_window(key)
         by_stage = {}

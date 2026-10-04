@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.chunk import InputStaging
+    from quail.backends.quail.executor.device import DeviceImplementation
     from quail.backends.quail.executor.models.base import ModelPipeline
     from quail.backends.quail.executor.readout import (
         AnswerRows,
@@ -27,7 +26,8 @@ class LoadedModelState:
     arena: KVArena
     pipeline: ModelPipeline
     model_spec: ModelSpec | None = None
-    input_staging: InputStaging | None = None
+    # the device implementation's reusable transfer buffers, when it has any
+    input_staging: Any = None
     label_readout: AsyncLabelLogprobs | None = None
     # a decision model's option-scoring head; None for other models
     decision_head: Any = None
@@ -38,7 +38,7 @@ class QueryExecutionState:
     """Readouts and execution settings replaced at each query binding."""
 
     loaded_model: LoadedModelState
-    torch: ModuleType
+    implementation: DeviceImplementation
     async_answers: AsyncAnswers
     answer_rows: AnswerRows
     chunk_tokens: int

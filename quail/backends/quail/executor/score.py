@@ -5,7 +5,6 @@ import numpy as np
 from quail.backends.quail.executor.classify import AnswerStream, QuailClassifier
 from quail.backends.quail.executor.loop import run_join
 from quail.backends.quail.executor.parts import input_staging
-from quail.backends.quail.executor.readout import AsyncScores
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.reranker import RerankerBatch
@@ -80,8 +79,8 @@ class QuailScorer:
             on_answers(order[first + start:first + end], np.asarray(values))
 
         answers, _, fresh = run_join(
-            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
-            async_scores,
+            state.implementation, state.loaded_model.arena,
+            state.loaded_model.pipeline, async_scores,
             prefixes, [suffixes], state.chunk_tokens, anchor_keys=keys,
             anchor_partners=(None if partners is None
                              else lambda key: [partners[key[2]]]),
@@ -93,7 +92,7 @@ class QuailScorer:
             scores[order[offsets[anchor]:offsets[anchor + 1]]] = values
         return RerankerBatch(scores, fresh_tokens=fresh, cached_tokens=total - fresh)
 
-    def _scores(self) -> AsyncScores:
+    def _scores(self):
         """Return the cached score readout and clear its input staging cache."""
         state = self.state
         if state.score_readout is not None:
@@ -102,7 +101,7 @@ class QuailScorer:
         answer_rows = state.answer_rows
         async_scores = state.async_scores
         if async_scores is None or async_scores.rows is not answer_rows:
-            async_scores = AsyncScores(state.torch, answer_rows)
+            async_scores = state.implementation.scores(answer_rows)
             state.async_scores = async_scores
         input_staging(state)
         return async_scores
@@ -170,8 +169,8 @@ class QuailScorer:
         prefixes = DocumentPrefixes(head, documents[alias], docs)
         stream = AnswerStream(on_answers)
         _, _, fresh = run_stages(
-            state.torch, state.loaded_model.arena, pipeline, stages, prefixes,
-            state.chunk_tokens,
+            state.implementation, state.loaded_model.arena, pipeline, stages,
+            prefixes, state.chunk_tokens,
             anchor_keys=[("score", spec.name, index) for index in range(len(docs))],
             staging=state.loaded_model.input_staging, label=f"score {spec.name}",
             on_chunk=stream.chunk(lambda anchor: (

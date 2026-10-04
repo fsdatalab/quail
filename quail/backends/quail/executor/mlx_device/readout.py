@@ -82,8 +82,6 @@ class MlxDecisionRows:
         """Per answer, one float32 score per option."""
         import mlx.core as mx
 
-        if isinstance(normed, list):
-            normed = mx.stack(normed)
         if rows_per_answer is None:
             rows_per_answer = [self.trailing_rows] * (
                 normed.shape[0] // self.trailing_rows)

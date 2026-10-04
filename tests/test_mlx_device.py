@@ -7,12 +7,14 @@ sequence: a row that reads a wrong page, a page reused too early, or a
 wrong rotary position changes it. In float32 the two agree to rounding;
 in bf16, the dtype the Decision model runs in, to bf16 rounding.
 
-Packing a chunk needs torch on the CPU. Runs on Apple silicon with mlx,
-vllm-metal, and mlx-lm installed; skipped elsewhere.
+Runs on Apple silicon with mlx, vllm-metal, and mlx-lm installed;
+skipped elsewhere.
 """
 
 import json
+import math
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,27 +22,23 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 pytest.importorskip("vllm_metal")
 pytest.importorskip("mlx_lm")
-torch = pytest.importorskip("torch")
 
-from fakes import cpu_staging  # noqa: E402
-from kv_checker import Setup, cpu_torch, make_arena  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 from mlx_lm.models.qwen3 import Model, ModelArgs  # noqa: E402
 from test_kv_reads import corpus  # noqa: E402
 
 from quail.backends.quail.executor import chunk as chunk_mod  # noqa: E402
 from quail.backends.quail.executor import loop  # noqa: E402
+from quail.backends.quail.executor.arena import KVArena  # noqa: E402
 from quail.backends.quail.executor.mlx_device import kernels  # noqa: E402
+from quail.backends.quail.executor.mlx_device.implementation import (  # noqa: E402
+    MlxImplementation,
+)
 from quail.backends.quail.executor.mlx_device.loader import (  # noqa: E402
     load_decision_head,
     load_qwen3_weights,
 )
 from quail.backends.quail.executor.mlx_device.pools import MlxKVPools  # noqa: E402
-from quail.backends.quail.executor.mlx_device.qwen3 import (  # noqa: E402
-    MlxQwen3Pipeline,
-    Qwen3Config,
-    Qwen3Weights,
-)
 from quail.backends.quail.executor.mlx_device.readout import (  # noqa: E402
     MlxDecisionChoices,
     MlxDecisionHead,
@@ -48,10 +46,11 @@ from quail.backends.quail.executor.mlx_device.readout import (  # noqa: E402
     MlxDecisions,
     MlxDecisionScores,
 )
-from quail.backends.quail.executor.readout import (  # noqa: E402
-    DecisionHead,
-    DecisionRows,
+from quail.backends.quail.executor.mlx_device.weights import (  # noqa: E402
+    Qwen3Config,
+    Qwen3Weights,
 )
+from quail.backends.quail.executor.models import build_pipeline  # noqa: E402
 from quail.backends.quail.executor.stages import Stage, run_stages  # noqa: E402
 from quail.execution.tokens import prefix_tree  # noqa: E402
 
@@ -69,9 +68,8 @@ TOLERANCE = {"float32": 1e-4, "bf16": 0.1}
 
 
 @pytest.fixture(params=sorted(DTYPES))
-def tiny(request, monkeypatch):
-    """A tiny model in one dtype, with CPU chunk staging."""
-    cpu_staging(monkeypatch)
+def tiny(request):
+    """A tiny model in one dtype."""
     return Tiny(request.param)
 
 
@@ -97,8 +95,6 @@ class Probe:
         self.vector = mx.array(vector / np.linalg.norm(vector))
 
     def submit(self, normed, rows_per_answer=None):
-        if isinstance(normed, list):
-            normed = mx.stack(normed)
         scores = normed.astype(mx.float32) @ self.vector
         mx.async_eval(scores)
         return scores
@@ -121,15 +117,19 @@ class Tiny:
             dict(tree_flatten(self.model.parameters())), self.config,
             self.dtype, prefix="model.")
         self.probe = Probe(self.config.hidden)
-        self.torch = cpu_torch()
+        self.implementation = MlxImplementation()
+        self.spec = SimpleNamespace(arch="qwen3")
         self._scores = {}
 
     def run(self, pages):
-        """Return an accounting arena and a pipeline over fresh pools."""
-        arena = make_arena(Setup(path="unified", pages=pages))
-        pools = MlxKVPools(self.config.layers, pages, PAGE, self.config.n_kv,
-                           self.config.head_dim, self.dtype)
-        return arena, MlxQwen3Pipeline(self.weights, pools)
+        """Return a fresh arena and the forward pass over it."""
+        config = self.config
+        arena = KVArena(
+            n_layers=config.layers, n_pages=pages, page_tokens=PAGE,
+            n_kv=config.n_kv, d_head=config.head_dim,
+            pools=self.implementation.kv_pools(self.dtype))
+        return arena, build_pipeline(self.spec, self.weights, arena,
+                                     implementation="mlx")
 
     def hidden(self, tokens):
         """mlx-lm's final hidden states of one whole sequence, in float32."""
@@ -168,7 +168,7 @@ def check_filter(tiny, docs, frame, tails, pages, budget, gated=True):
     arena, pipeline = tiny.run(pages)
     stats = {}
     answers, _, tokens = run_stages(
-        tiny.torch, arena, pipeline, filter_stages(tiny, frame, tails, gated),
+        tiny.implementation, arena, pipeline, filter_stages(tiny, frame, tails, gated),
         docs, budget, anchor_keys=[("d", i) for i in range(len(docs))],
         prefix_tree=prefix_tree(docs, PAGE), attention_mode="unified",
         default_attention="unified", stats=stats)
@@ -213,7 +213,7 @@ def test_a_read_of_the_wrong_pages_changes_the_score(tiny, monkeypatch):
         return attention(q, k_pool, v_pool, table=table, **reads)
 
     monkeypatch.setattr(
-        "quail.backends.quail.executor.mlx_device.qwen3.paged_attention", swapped)
+        "quail.backends.quail.executor.models.qwen3_mlx.paged_attention", swapped)
     rng = random.Random(0)
     docs = corpus(rng, 40, (0, 5, 16, 20), (1, 7, 16, 30, 45))
     with pytest.raises(AssertionError, match="mlx-lm scores"):
@@ -244,7 +244,7 @@ def check_join(tiny, anchors, pages, budget, retain, monkeypatch):
     monkeypatch.setattr(pipeline.pools, "copy",
                         lambda *args: (copies.append(args[0]), copy(*args)))
     loop.run_join(
-        tiny.torch, arena, pipeline, tiny.probe, anchors, [partners], budget,
+        tiny.implementation, arena, pipeline, tiny.probe, anchors, [partners], budget,
         stage_frames=[frame], anchor_keys=keys, anchor_done=anchor_done,
         attention_mode="unified", prefix_tree=prefix_tree(anchors, PAGE))
     for a, anchor in enumerate(anchors):
@@ -281,10 +281,12 @@ def test_filter_survivors_feed_a_join(tiny):
     rng = random.Random(200)
     docs = corpus(rng, 40, (0, 5, 16, 20), (1, 7, 16, 30, 45))
     arena, pipeline = tiny.run(80)
+    # the join has its own readout, so each chunk's answer rows are
+    # selected per readout on the device
     stages = filter_stages(tiny, [], [question]) + [
-        Stage(suffixes=partners, readout=tiny.probe, frame=frame)]
+        Stage(suffixes=partners, readout=Probe(tiny.config.hidden), frame=frame)]
     out, _, _ = run_stages(
-        tiny.torch, arena, pipeline, stages, docs, max(map(len, docs)) + 60,
+        tiny.implementation, arena, pipeline, stages, docs, max(map(len, docs)) + 60,
         anchor_keys=[("d", i) for i in range(len(docs))],
         prefix_tree=prefix_tree(docs, PAGE), attention_mode="unified")
     survivors = {d for d, doc in enumerate(docs) if tiny.score(doc + question) > 0}
@@ -307,7 +309,7 @@ def test_a_join_reads_kv_an_earlier_join_retained(tiny):
 
     def run(subset, done):
         loop.run_join(
-            tiny.torch, arena, pipeline, tiny.probe, subset, [partners], 200,
+            tiny.implementation, arena, pipeline, tiny.probe, subset, [partners], 200,
             stage_frames=[frame], anchor_keys=keys[:len(subset)],
             anchor_done=done, attention_mode="unified",
             prefix_tree=prefix_tree(subset, PAGE))
@@ -335,17 +337,16 @@ def test_rows_far_into_a_document_keep_their_rotary_position(tiny):
     check_filter(tiny, docs, [], [[121, 122], [123]], 420, 3200, gated=False)
 
 
-def test_bf16_error_is_the_size_of_mlx_lm_in_bf16(monkeypatch):
+def test_bf16_error_is_the_size_of_mlx_lm_in_bf16():
     """Quail in bf16 is as close to float32 as mlx-lm in bf16 is."""
-    cpu_staging(monkeypatch)
     tiny = Tiny("bf16")
     rng = random.Random(9)
     docs = [[rng.randrange(120) for _ in range(n)] for n in (40, 200, 333, 90)]
     tail = [121, 122, 123]
     arena, pipeline = tiny.run(80)
     answers, _, _ = run_stages(
-        tiny.torch, arena, pipeline, filter_stages(tiny, [], [tail]), docs, 800,
-        attention_mode="unified", default_attention="unified")
+        tiny.implementation, arena, pipeline, filter_stages(tiny, [], [tail]),
+        docs, 800, attention_mode="unified", default_attention="unified")
     half = reference_model()
     half.set_dtype(mx.bfloat16)
     ours = theirs = 0.0
@@ -387,7 +388,8 @@ def test_paged_attention_reads_a_shared_prefix_in_place(dtype_name, geometry):
         return np.array(mx.array(values).astype(dtype).astype(mx.float32))
 
     prefix, fresh = 48, [20, 9, 33]
-    pools = MlxKVPools(1, 16, PAGE, n_kv, dim, dtype)
+    pools = MlxKVPools(dtype)
+    pools.build(PAGE, [(16, n_kv, dim)])
     prefix_k, prefix_v = rows(prefix, n_kv), rows(prefix, n_kv)
     pools.write(0, mx.array(prefix_k).astype(dtype), mx.array(prefix_v).astype(dtype),
                 mx.array(np.arange(prefix), dtype=mx.int64))
@@ -424,19 +426,20 @@ def test_paged_attention_reads_a_shared_prefix_in_place(dtype_name, geometry):
         row += len(q)
 
 
-def test_pools_copy_rows_and_resize():
-    pools = MlxKVPools(2, 8, PAGE, 2, 64, mx.float32)
+def test_pools_copy_rows_and_rebuild():
+    pools = MlxKVPools(mx.float32)
+    pools.build(PAGE, [(8, 2, 64)] * 2)
     k = mx.arange(3 * 2 * 64, dtype=mx.float32).reshape(3, 2, 64)
     pools.write(1, k, k + 1, mx.array([5, 6, 40], dtype=mx.int64))
     pools.copy(1, mx.array([5, 40], dtype=mx.int32), mx.array([17, 18], dtype=mx.int64))
-    k_rows = pools.paged_kv(1)[0].reshape(-1, 2, 64)
-    v_rows = pools.paged_kv(1)[1].reshape(-1, 2, 64)
+    k_rows, v_rows = pools.layer_kv(1)
     assert mx.array_equal(k_rows[mx.array([5, 6, 40, 17, 18])],
                           k[mx.array([0, 1, 2, 0, 2])])
     assert mx.array_equal(v_rows[18], k[2] + 1)
     assert not mx.any(k_rows[7]) and not mx.any(pools.paged_kv(0)[0])
     assert pools.nbytes == 2 * 2 * 8 * PAGE * 2 * 64 * 4
-    pools.resize(4)
+    pools.build(PAGE, [(8, 2, 64), (4, 2, 64)])
+    assert pools.paged_kv(0)[0].shape == (8, PAGE, 2, 64)
     assert pools.paged_kv(1)[0].shape == (4, PAGE, 2, 64)
     assert not mx.any(pools.paged_kv(1)[0])
 
@@ -446,21 +449,62 @@ def test_a_geometry_without_a_kernel_is_refused():
         kernels.check_geometry(4, 2, 16, PAGE, mx.bfloat16)
 
 
-def test_only_paged_unified_chunks_run(monkeypatch):
-    cpu_staging(monkeypatch)
+def test_only_paged_unified_chunks_run():
     tiny = Tiny("float32")
     arena, pipeline = tiny.run(16)
     key = ("d", 0)
     arena.activate(key, 4, capacity_tokens=8, base_tokens=4)
     group = dict(key=key, prefix=[1, 2, 3, 4], f=4, suffixes=[[5, 6]], single=True)
-    tree = chunk_mod.pack_chunk(torch, arena, [group], attention_mode="tree")
+    tree = chunk_mod.pack_chunk(
+        tiny.implementation, arena, [group], attention_mode="tree")
     with pytest.raises(ValueError, match="unified attention only"):
         pipeline.forward_chunk(tree)
     unpaged = chunk_mod.pack_chunk(
-        torch, arena, [dict(group, key=("d", 1))], attention_mode="unified")
+        tiny.implementation, arena, [dict(group, key=("d", 1))],
+        attention_mode="unified")
     with pytest.raises(ValueError, match="paged KV only"):
         pipeline.forward_chunk(unpaged)
     assert not pipeline.tree_attention and pipeline.needs_pages
+    with pytest.raises(ValueError, match="no mlx forward pass"):
+        build_pipeline(SimpleNamespace(arch="diffusion_gemma"), tiny.weights,
+                       arena, implementation="mlx")
+
+
+def test_the_pipeline_refuses_an_arena_of_another_shape():
+    tiny = Tiny("float32")
+    config = tiny.config
+    arena = KVArena(n_layers=config.layers, n_pages=4, page_tokens=PAGE,
+                    n_kv=config.n_kv + 1, d_head=config.head_dim,
+                    pools=MlxKVPools(mx.float32))
+    with pytest.raises(ValueError, match="KV shape"):
+        build_pipeline(tiny.spec, tiny.weights, arena, implementation="mlx")
+    arena = KVArena(n_layers=config.layers, n_pages=4, page_tokens=PAGE,
+                    n_kv=config.n_kv, d_head=config.head_dim,
+                    pools=MlxKVPools(mx.bfloat16))
+    with pytest.raises(ValueError, match="dtype"):
+        build_pipeline(tiny.spec, tiny.weights, arena, implementation="mlx")
+
+
+def test_the_implementation_stages_selects_and_measures():
+    implementation = MlxImplementation()
+    staged = implementation.stage([[1, 2], [3, 4]], np.int32)
+    assert staged.dtype == mx.int32 and staged.shape == (2, 2)
+    ids = implementation.stage_tokens(np.array([5, 6, 7], dtype=np.int64))
+    assert ids.tolist() == [5, 6, 7]
+    rows = mx.arange(12).reshape(6, 2)
+    assert implementation.select_rows(rows, np.array([4, 1])).tolist() == [
+        [8, 9], [2, 3]]
+    assert implementation.select_rows(rows, mx.array([0])).tolist() == [[0, 1]]
+    # a test model's list of answers is selected on the host
+    assert implementation.select_rows([10, 11, 12], np.array([2, 0])) == [12, 10]
+    assert implementation.input_staging() is None
+    start = implementation.record_event()
+    implementation.synchronize()
+    assert implementation.elapsed_ms(start, implementation.record_event()) >= 0
+    assert implementation.peak_memory_bytes() > 0
+    assert implementation.kv_pools().dtype == mx.bfloat16
+    with pytest.raises(NotImplementedError, match="mlx has no score readout"):
+        implementation.scores(object())
 
 
 # ---- the decision head and its readouts
@@ -483,43 +527,88 @@ def head_weights(rng, hidden=64, width=16):
     }
 
 
-def heads(rng):
-    """The same decision head in MLX and in torch."""
+def reference_scores(w, options, last):
+    """The decision head in numpy float64, from its definition."""
+    def layer_norm(x, weight, bias):
+        centered = x - x.mean(-1, keepdims=True)
+        return centered / np.sqrt(x.var(-1, keepdims=True) + 1e-5) * weight + bias
+
+    option = layer_norm(options.astype(np.float64), w["candidate_norm.weight"],
+                        w["candidate_norm.bias"])
+    query = layer_norm(last.astype(np.float64), w["query_norm.weight"],
+                       w["query_norm.bias"])
+    bilinear = ((option @ w["key.weight"].T)
+                * (query @ w["query.weight"].T)[:, None, :]).sum(-1)
+    hidden = (option @ w["candidate_mlp.weight"].T + w["candidate_mlp.bias"]
+              + (query @ w["query_mlp.weight"].T)[:, None, :])
+    gelu = 0.5 * hidden * (1 + np.vectorize(math.erf)(hidden / math.sqrt(2)))
+    mlp = (gelu @ w["scalar.weight"].T)[..., 0]
+    return bilinear / math.sqrt(w["key.weight"].shape[0]) + mlp
+
+
+def head(rng):
+    """A decision head in MLX and its weights in numpy."""
     weights = head_weights(rng)
-    return (MlxDecisionHead({k: mx.array(v) for k, v in weights.items()}),
-            DecisionHead(torch, torch.nn.functional,
-                         {k: torch.from_numpy(v) for k, v in weights.items()}))
+    return MlxDecisionHead({k: mx.array(v) for k, v in weights.items()}), weights
 
 
-def test_decision_head_and_rows_match_the_torch_head():
+def test_decision_head_matches_its_definition():
     rng = np.random.default_rng(1)
-    ours, theirs = heads(rng)
-    options = rng.standard_normal((5, 2, 64)).astype(np.float32)
-    last = rng.standard_normal((5, 64)).astype(np.float32)
+    ours, weights = head(rng)
+    assert ours.head_dim == 16
+    options = np.array(mx.array(rng.standard_normal((5, 2, 64))).astype(
+        mx.bfloat16).astype(mx.float32))
+    last = np.array(mx.array(rng.standard_normal((5, 64))).astype(
+        mx.bfloat16).astype(mx.float32))
     got = ours.scores(mx.array(options).astype(mx.bfloat16),
                       mx.array(last).astype(mx.bfloat16))
-    want = theirs.scores(torch.from_numpy(options).to(torch.bfloat16),
-                         torch.from_numpy(last).to(torch.bfloat16))
     assert got.dtype == mx.float32
-    assert np.allclose(np.array(got), want.numpy(), atol=1e-4)
+    assert np.allclose(np.array(got), reference_scores(weights, options, last),
+                       atol=1e-4)
 
-    # answers of 6 trailing rows, and a frame entry's single row
+
+def test_decision_head_matches_the_cuda_head():
+    torch = pytest.importorskip("torch")
+    from quail.backends.quail.executor.readout import DecisionHead, DecisionRows
+
+    rng = np.random.default_rng(1)
+    ours, weights = head(rng)
+    theirs = DecisionHead(torch, torch.nn.functional,
+                          {k: torch.from_numpy(v) for k, v in weights.items()})
     offsets, counts = (5, 2, 0), [6, 1, 6]
     normed = rng.standard_normal((13, 64)).astype(np.float32)
     got = MlxDecisionRows(ours, offsets).scores(mx.array(normed), counts)
     want = DecisionRows(torch, theirs, offsets).scores(
         torch.from_numpy(normed), counts)
     assert np.allclose(np.array(got), want.numpy(), atol=1e-4)
-    assert MlxDecisionRows(ours, offsets).trailing_rows == 6
+
+
+def test_decision_rows_read_offsets_from_each_answers_trailing_rows():
+    rng = np.random.default_rng(1)
+    ours, weights = head(rng)
+    # answers of 6 trailing rows, and a frame entry's single row
+    offsets, counts = (5, 2, 0), [6, 1, 6]
+    normed = rng.standard_normal((13, 64)).astype(np.float32)
+    rows = MlxDecisionRows(ours, offsets)
+    assert rows.trailing_rows == 6
+    got = np.array(rows.scores(mx.array(normed), counts))
+    read = np.array([[0, 3, 5], [6, 6, 6], [7, 10, 12]])
+    want = reference_scores(weights, normed[read[:, :2]], normed[read[:, 2]])
+    assert np.allclose(got, want, atol=1e-4)
+    # every answer has the trailing rows when no counts are given
+    got = np.array(rows.scores(mx.array(normed[:12])))
+    read = np.array([[0, 3, 5], [6, 9, 11]])
+    want = reference_scores(weights, normed[read[:, :2]], normed[read[:, 2]])
+    assert np.allclose(got, want, atol=1e-4)
 
 
 def test_decision_readouts_return_host_values():
     rng = np.random.default_rng(2)
-    ours, theirs = heads(rng)
+    ours, weights = head(rng)
     offsets = (4, 2, 0)
     normed = rng.standard_normal((15, 64)).astype(np.float32)
-    want = DecisionRows(torch, theirs, offsets).scores(
-        torch.from_numpy(normed)).numpy()
+    read = np.array([[0, 2, 4], [5, 7, 9], [10, 12, 14]])
+    want = reference_scores(weights, normed[read[:, :2]], normed[read[:, 2]])
     rows = mx.array(normed)
 
     bits = MlxDecisions(ours, offsets)
@@ -529,19 +618,19 @@ def test_decision_readouts_return_host_values():
     scores = MlxDecisionScores(ours, offsets)
     got = scores.result(scores.submit(rows))
     assert got.dtype == np.float32 == scores.dtype
-    assert np.allclose(got, torch.sigmoid(torch.from_numpy(
-        want[:, 1] - want[:, 0])).numpy(), atol=1e-4)
+    yes = 1 / (1 + np.exp(np.clip(want[:, 0] - want[:, 1], -700, 700)))
+    assert np.allclose(got, yes, atol=1e-4)
 
-    choices = MlxDecisionChoices(ours, offsets)
+    choices = MlxImplementation().decision_choices(ours, offsets)
+    assert isinstance(choices, MlxDecisionChoices)
     assert choices.dtype == np.dtype((np.float32, (2,)))
-    # the stage executor hands a readout a list of rows when stages differ
-    got = choices.result(choices.submit([rows[i] for i in range(15)]))
+    got = choices.result(choices.submit(rows))
     assert got.shape == (3, 2) and np.allclose(got, want, atol=1e-4)
 
 
 def test_decisions_through_the_scheduler_match_whole_sequences(tiny):
     """Yes/no answers read three trailing rows of each request."""
-    ours, theirs = heads(np.random.default_rng(4))
+    ours, weights = head(np.random.default_rng(4))
     offsets = (4, 2, 0)
     readout = MlxDecisions(ours, offsets)
     rng = random.Random(11)
@@ -549,7 +638,7 @@ def test_decisions_through_the_scheduler_match_whole_sequences(tiny):
     tails = [[110, 111, 112, 113, 114, 115], [116, 117, 118, 119, 120]]
     arena, pipeline = tiny.run(120)
     got, _, _ = loop.run_filter(
-        tiny.torch, arena, pipeline, readout, docs, tails,
+        tiny.implementation, arena, pipeline, readout, docs, tails,
         max(map(len, docs)) + 100, arena_writes=True, attention_mode="unified",
         prefix_tree=prefix_tree(docs, PAGE))
     margin = 5 * tiny.tolerance
@@ -557,8 +646,7 @@ def test_decisions_through_the_scheduler_match_whole_sequences(tiny):
     for d, doc in enumerate(docs):
         for stage, tail in enumerate(tails):
             rows = np.array(tiny.hidden(doc + tail))[[-5, -3, -1]]
-            scores = theirs.scores(torch.from_numpy(rows[None, :2]),
-                                   torch.from_numpy(rows[None, 2]))[0]
+            scores = reference_scores(weights, rows[None, :2], rows[None, 2])[0]
             difference = float(scores[1] - scores[0])
             if abs(difference) > margin:
                 assert got[d][stage] == int(difference > 0), (d, stage)
@@ -591,11 +679,11 @@ def write_package(directory, model, head, *, decision):
 
 
 @pytest.mark.parametrize("decision", [True, False])
-def test_loader_reads_a_checkpoint_directory(tmp_path, monkeypatch, decision):
-    cpu_staging(monkeypatch)
+def test_loader_reads_a_checkpoint_directory(tmp_path, decision):
     tiny = Tiny("bf16")
-    head = {k: mx.array(v) for k, v in head_weights(np.random.default_rng(6)).items()}
-    write_package(tmp_path, tiny.model, head, decision=decision)
+    saved = {k: mx.array(v)
+             for k, v in head_weights(np.random.default_rng(6)).items()}
+    write_package(tmp_path, tiny.model, saved, decision=decision)
     weights = load_qwen3_weights(tmp_path, mx.bfloat16)
     assert weights.config == tiny.config
     assert all(array.dtype == mx.bfloat16 for array in weights.arrays())
@@ -605,4 +693,4 @@ def test_loader_reads_a_checkpoint_directory(tmp_path, monkeypatch, decision):
     if decision:
         loaded = load_decision_head(tmp_path)
         assert loaded.head_dim == 16
-        assert all(mx.array_equal(loaded.w[name], head[name]) for name in head)
+        assert all(mx.array_equal(loaded.w[name], saved[name]) for name in saved)

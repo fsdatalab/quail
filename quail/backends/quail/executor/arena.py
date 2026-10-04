@@ -2,14 +2,15 @@
 
 Pages are handed out from a free list and reached through block tables.
 
-PageArena is the accounting (pure Python, CPU-tested); KVArena is the
-tensor backing and runs only where torch and a GPU exist.
+PageArena is the accounting of one pool (pure Python). KVArena adds the
+two pools of a model with sliding layers, the rows each key holds, and
+the K and V storage, which a device implementation supplies as a pools
+object. KVArena itself imports neither torch nor MLX.
 
 KVArena is the whole surface the chunk loop, the packer, the attention
 paths, and the operator runtimes use. Everything they need is a method
 or property on it; nothing outside this module reads the accounting
-object or the K and V tensors directly. A replacement arena implements
-the same methods:
+object directly. Its methods:
 
 - allocation: alloc, activate, alloc_temporary, free_key, pin, grow
 - retention: retain, evict_retained, evict_key, configure_retention,
@@ -295,10 +296,12 @@ def _evict_event(key, prefix_tokens):
 
 
 class KVArena:
-    """The tensor backing for the arena, plus the accounting above.
+    """The arena's page accounting, row indices, and K and V storage.
 
-    Per-layer K and V pools of shape (n_pages, page_tokens, n_kv,
-    d_head). Torch is imported when the tensor pools are created.
+    pools is the device implementation's storage: per-layer K and V
+    pools of n_pages pages. It implements build(page_tokens, layers),
+    layer_kv(layer), and paged_kv(layer). Without pools the arena does
+    the accounting alone and has no K or V to read.
 
     layer_kv gives each layer its own (n_kv, d_head) when the layers
     differ, as Gemma 4's sliding and full-attention layers do.
@@ -317,14 +320,10 @@ class KVArena:
     """
 
     def __init__(self, n_layers: int, n_pages: int, page_tokens: int,
-                 n_kv: int, d_head: int, dtype=None, device="cuda",
+                 n_kv: int, d_head: int, pools=None,
                  layer_kv=None, sliding_layers=(), sliding_window=0,
                  n_sliding_pages=0):
-        import torch
-        self.torch = torch
-        self.dtype = dtype or torch.bfloat16
-        self.device = device
-        self.pinned = str(device).startswith("cuda")
+        self.pools = pools
         shapes = ([(n_kv, d_head)] * n_layers if layer_kv is None
                   else [tuple(shape) for shape in layer_kv])
         if len(shapes) != n_layers:
@@ -341,19 +340,15 @@ class KVArena:
         self.reset_stats()
 
     def _build(self, n_pages, page_tokens, n_sliding_pages):
-        torch = self.torch
         self.accounting = PageArena(n_pages, page_tokens)
         self.sliding = (PageArena(n_sliding_pages, page_tokens)
                         if self.sliding_layers else None)
-        self.k, self.v = [], []
-        for layer, (heads, dim) in enumerate(self.shapes):
-            pages = n_sliding_pages if layer in self.sliding_layers else n_pages
-            shape = (pages * page_tokens, heads, dim)
-            self.k.append(torch.empty(shape, dtype=self.dtype, device=self.device))
-            self.v.append(torch.empty(shape, dtype=self.dtype, device=self.device))
-        # row indices stay on the host: pageable H2D copies block the
-        # CPU behind the running stream
-        self._rows = {}       # key -> row-index tensor on CPU
+        if self.pools is not None:
+            self.pools.build(page_tokens, [
+                (n_sliding_pages if layer in self.sliding_layers else n_pages,
+                 heads, dim)
+                for layer, (heads, dim) in enumerate(self.shapes)])
+        self._rows = {}       # key -> its logical rows, a host int64 array
         self._capacity_rows = {}  # key -> every row in the claimed pages
         self._sliding_rows = {}   # key -> every row in its sliding pages
         self._base = {}       # key -> tokens the window is anchored below
@@ -378,9 +373,7 @@ class KVArena:
             raise RuntimeError("the arena holds keys; free them before resizing")
         if (n_pages, n_sliding_pages) == (self.n_pages, self.n_sliding_pages):
             return
-        page_tokens = self.page_tokens
-        self.k = self.v = None
-        self._build(n_pages, page_tokens, n_sliding_pages)
+        self._build(n_pages, self.page_tokens, n_sliding_pages)
 
     def reset_stats(self):
         self.evicted_keys = 0
@@ -520,14 +513,14 @@ class KVArena:
         pages = np.asarray(arena.table_pages(key), dtype=np.int64)
         rows = (pages[:, None] * self.page_tokens
                 + np.arange(self.page_tokens, dtype=np.int64))
-        return self.torch.from_numpy(rows.reshape(-1)[:tokens])
+        return rows.reshape(-1)[:tokens]
 
     def _refresh_rows(self, key, logical_tokens=None):
         logical = (self.accounting.tokens[key]
                    if logical_tokens is None else logical_tokens)
         capacity = len(self.accounting.table_pages(key)) * self.page_tokens
         cap = self._capacity_rows.get(key)
-        if cap is None or cap.numel() != capacity:
+        if cap is None or len(cap) != capacity:
             cap = self._page_rows(self.accounting, key, capacity)
         self._capacity_rows[key] = cap
         self._rows[key] = cap[:logical]
@@ -850,38 +843,29 @@ class KVArena:
 
     def layer_kv(self, layer: int):
         """Flat K and V pools of one layer, shape (rows, n_kv, d_head)."""
-        return self.k[layer], self.v[layer]
+        return self.pools.layer_kv(layer)
 
     def paged_kv(self, layer: int):
         """Pools as (n_pages, page_tokens, n_kv, d_head) for paged attention."""
-        n_kv, d = self.k[layer].shape[-2], self.k[layer].shape[-1]
-        shape = (-1, self.page_tokens, n_kv, d)
-        return self.k[layer].view(shape), self.v[layer].view(shape)
+        return self.pools.paged_kv(layer)
 
     def block_table(self, keys, pad_to=None):
         """Block table and seqused_k for groups reading these documents' KV.
 
-        Built flat on the host and staged through pinned memory.
+        Both are host int32 arrays; the packer copies them to the device.
         """
         pages = [self.accounting.table_pages(k) for k in keys]
         table = self.block_table_rows(pages, pad_to=pad_to)
-        torch = self.torch
-        used = torch.tensor([self.accounting.tokens[k] for k in keys],
-                            dtype=torch.int32, pin_memory=self.pinned) \
-            .to(self.device, non_blocking=self.pinned)
+        used = np.asarray([self.accounting.tokens[k] for k in keys],
+                          dtype=np.int32)
         return table, used
 
     def block_table_rows(self, pages, pad_to=None):
-        """A block table from explicit physical page rows."""
-        torch = self.torch
+        """A block table from explicit physical page rows, as a host array."""
         width = max(len(p) for p in pages)
         if pad_to:
             width = max(width, pad_to)
-        flat = []
-        for p in pages:
-            flat.extend(p)
-            flat.extend([0] * (width - len(p)))
-        table = torch.tensor(flat, dtype=torch.int32,
-                             pin_memory=self.pinned).view(len(pages), width) \
-            .to(self.device, non_blocking=self.pinned)
+        table = np.zeros((len(pages), width), dtype=np.int32)
+        for row, p in enumerate(pages):
+            table[row, :len(p)] = p
         return table

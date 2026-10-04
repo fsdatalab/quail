@@ -6,7 +6,6 @@ length, and the join frame is [FRAME] * length.
 """
 
 import random
-from contextlib import nullcontext
 from itertools import takewhile
 from types import SimpleNamespace
 
@@ -17,6 +16,7 @@ import quail
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena, PageArena
+from quail.backends.quail.executor.device import DeviceImplementation
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
@@ -69,26 +69,6 @@ def letter_tokens(text):
     if re.fullmatch(r" [A-Za-z]{1,2}", text):
         return [10_000 * (len(text) - 1) + sum(map(ord, text[1:]))]
     return list(text.encode())
-
-
-def cpu_staging(monkeypatch):
-    """Stage packed chunks as plain CPU tensors; returns torch."""
-    import torch
-
-    def staged(torch_, data, dtype, pinned=True):
-        if isinstance(data, np.ndarray) or torch.is_tensor(data):
-            return torch.as_tensor(data, dtype=dtype)
-        return torch.tensor(data, dtype=dtype)
-
-    def token_parts(torch_, sequences, total, pinned=True, staging=None):
-        ids = [int(t) for seq in sequences for part in chunk_mod._token_parts(seq)
-               for t in part]
-        assert len(ids) == total
-        return torch.tensor(ids, dtype=torch.int64)
-
-    monkeypatch.setattr(chunk_mod, "_staged", staged)
-    monkeypatch.setattr(chunk_mod, "_staged_token_parts", token_parts)
-    return torch
 
 
 def fake_pipeline(**attributes):
@@ -148,14 +128,38 @@ class FakeModel:
         return bits
 
 
-def fake_torch():
-    return SimpleNamespace(
-        inference_mode=nullcontext,
-        cuda=SimpleNamespace(
-            Event=lambda **kw: SimpleNamespace(
-                record=lambda: None, elapsed_time=lambda other: 2.0),
-            synchronize=lambda: None,
-            max_memory_allocated=lambda: 0))
+class FakeImplementation(DeviceImplementation):
+    """A host device implementation whose events are 2 ms apart.
+
+    Keyword arguments replace methods, such as a readout factory.
+    """
+
+    def __init__(self, **methods):
+        for name, method in methods.items():
+            setattr(self, name, method)
+
+    def elapsed_ms(self, start, end):
+        return 2.0
+
+
+def fake_implementation(**methods):
+    return FakeImplementation(**methods)
+
+
+def cpu_implementation():
+    """The CUDA device implementation with its chunk arrays on the CPU."""
+    import torch
+
+    from quail.backends.quail.executor.cuda_device import CudaImplementation
+
+    class CpuImplementation(CudaImplementation):
+        def stage(self, values, dtype, name=None, staging=None):
+            return torch.as_tensor(np.asarray(values, dtype=dtype))
+
+        def stage_tokens(self, ids, staging=None):
+            return torch.from_numpy(ids)
+
+    return CpuImplementation()
 
 
 def fake_pack(torch, arena, specs, **kw):
@@ -288,20 +292,21 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
     join_truth = {("r", d): [1 if rng.random() < 0.5 else 0
                              for _ in range(n_partners)] for d in range(n_docs)}
     model = FakeModel(filter_truth, join_truth)
-    torch = fake_torch()
+    implementation = fake_implementation()
     arena = cpu_arena(pages)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
     execution.bind_loaded_model(model=object(), arena=arena,
                                 pipeline=pipeline)
     execution.bind_query(
-        torch=torch,
+        implementation=implementation,
         async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
                                       dtype=None),
         answer_rows=object(),
         chunk_tokens=120)
     state = {
-        "torch": torch, "arena": arena, "pipeline": pipeline,
+        "implementation": implementation, "arena": arena,
+        "pipeline": pipeline,
         "model_execution": execution,
         "runtimes": built_in_registry().runtimes,
         "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],

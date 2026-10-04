@@ -6,7 +6,13 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
+from fakes import (
+    cpu_arena,
+    fake_implementation,
+    fake_pack,
+    fake_pipeline,
+    letter_tokens,
+)
 from test_score import _finish
 
 import quail
@@ -159,7 +165,7 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
             input_staging=SimpleNamespace(fixed_tokens=set()),
             model=object(),
         ),
-        torch=fake_torch(),
+        implementation=fake_implementation(),
         chunk_tokens=64,
         answer_rows=object(),
         async_answers=object(),
@@ -801,20 +807,18 @@ def test_trie_chains_cover_every_node_once_and_gather_ancestors():
     assert requests.chains == chains
 
 
-def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
-    from fakes import cpu_staging
-    from test_sliding_kv import plain_arena
+def test_pack_chunk_packs_chains_as_segments_reading_ancestors():
+    from test_sliding_kv import HOST, plain_arena
 
     from quail.execution.labels import trie_chains
 
-    torch = cpu_staging(monkeypatch)
     arena = plain_arena()
     key = ("d", 0)
     arena.activate(key, 4, capacity_tokens=16, base_tokens=4)
     chains = trie_chains(((1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8)))
     group = dict(key=key, prefix=None, f=4, suffixes=[[93, 1, 2, 5, 7]],
                  read_all_rows=True, chains=chains)
-    chunk = chunk_mod.pack_chunk(torch, arena, [group], attention_mode="tree")
+    chunk = chunk_mod.pack_chunk(HOST, arena, [group], attention_mode="tree")
     # rows: cue, (1,), (1,2) | (1,5) | (7,): positions past the frame
     assert chunk.positions.tolist() == [4, 5, 6, 6, 5]
     assert chunk.meta["cu_a"].tolist() == [0, 3, 4, 5]
@@ -829,7 +833,7 @@ def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
     assert chunk.final_indices.tolist() == [0, 1, 2, 3, 4]
     assert chunk.rows_per_answer == (5,)
     with pytest.raises(ValueError, match="tree attention"):
-        chunk_mod.pack_chunk(torch, arena, [group], attention_mode="unified")
+        chunk_mod.pack_chunk(HOST, arena, [group], attention_mode="unified")
 
 
 def test_merge_partial_equals_attention_over_the_union_of_keys():
@@ -907,7 +911,7 @@ def test_classifier_scores_the_packed_trie(monkeypatch):
             input_staging=SimpleNamespace(fixed_tokens=set()),
             model=object(),
         ),
-        torch=fake_torch(),
+        implementation=fake_implementation(),
         chunk_tokens=64,
         answer_rows=object(),
         async_answers=object(),
@@ -1078,7 +1082,7 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
             input_staging=SimpleNamespace(fixed_tokens=set()),
             model=object(),
         ),
-        torch=fake_torch(),
+        implementation=fake_implementation(),
         chunk_tokens=64,
         answer_rows=object(),
         async_answers=object(),
