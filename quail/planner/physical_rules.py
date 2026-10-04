@@ -8,7 +8,8 @@
   (letters, trie_tree, or trie_decode) whose simulated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
-  computing it again.
+  computing it again, in filters, joins, classifications, and scores
+  of one table.
 - tree_attention: each join is annotated with the attention path the
   cost model prefers for its partners' reads of the anchor's KV.
 """
@@ -35,6 +36,7 @@ from quail.physical import (
 )
 from quail.planner import retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
+from quail.planner.reranker import score_fixed_tokens
 from quail.planner.statistics import cached_statistics, live_after_filters
 
 
@@ -271,7 +273,9 @@ class PrefixSharing:
     on. The filter then writes pages even when it has one stage, since
     borrowed pages must exist. A join always writes its anchors' KV,
     so it fires for any join whose anchors share a whole page; a
-    classification writes its documents' KV the same way.
+    classification writes its documents' KV the same way. A score of
+    one table is priced like a filter that writes no pages, since
+    without sharing its documents follow one shared prompt head.
     """
 
     name = "prefix_sharing"
@@ -317,6 +321,20 @@ class PrefixSharing:
                     node = replace(node, spec=_shared_classify_spec(
                         node, context, store, resident=resident))
                     changed = True
+            elif (type(node) is AiScore and node.spec is not None
+                  and len(node.spec.aliases) == 1
+                  and not node.spec.share_prefixes):
+                lengths = context.document_tokens.get(node.spec.aliases[0])
+                store = _token_store(lengths)
+                shared = (0 if store is None
+                          else page_aligned_shared_tokens(store))
+                if store is not None and sharing_pays(
+                        context.model, context.device, shared_tokens=shared,
+                        total_tokens=sum(lengths), writes_pages=False):
+                    node = replace(node, spec=_shared_score_spec(
+                        node.spec, shared, lengths,
+                        context.model.canvas_tokens))
+                    changed = True
             nodes.append(node)
         if not changed:
             return None
@@ -330,6 +348,20 @@ def _shared_classify_spec(node, context, store, *, resident=False):
     table = classify_table(context, node.spec.aliases[0], node.backend_name,
                            shared=document_shared_tokens(store))
     return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
+
+
+def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):
+    """Enable prefix sharing and scale the score's estimate by its fresh tokens.
+
+    Assumes time is proportional to the tokens the score computes, and
+    that the scored documents borrow the same share of their tokens as
+    the whole table.
+    """
+    fixed = score_fixed_tokens(spec.prompt_token_parts, canvas_tokens, spec.draws)
+    total = sum(lengths) + len(lengths) * fixed
+    fresh = max(0.0, 1.0 - shared_tokens / total) if total else 1.0
+    return replace(spec, share_prefixes=True,
+                   estimated_seconds=spec.estimated_seconds * fresh)
 
 
 def _mean(values) -> float:
