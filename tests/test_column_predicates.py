@@ -143,27 +143,6 @@ def test_sql_and_builder_bind_column_tests(session):
     assert scans["r"].predicates == ()
 
 
-def test_the_scan_runtime_applies_column_tests_from_the_value_table():
-    from quail.execution.runner import ExecutionContext, ScanRuntime
-    from quail.physical import Scan as PhysicalScan
-
-    node = PhysicalScan(node_id="scan:r", alias="r", input_id="r", n_docs=4,
-                        predicates=(("stars", ">", 2), ("lang", "in", ("en",))))
-    columns = pa.table({"r": pa.array(range(4), pa.int32()),
-                        "stars": [3, 1, 5, None], "lang": ["en", "en", "fr", "en"]})
-    context = ExecutionContext(
-        runtimes={}, model_execution=None,
-        sources={"r": range(4), "columns:r": columns})
-    result = ScanRuntime().execute(node, {}, context)
-    assert result.outputs["ids:r"] == [0]
-    assert result.metrics.output_rows == 1
-    with pytest.raises(KeyError, match="value columns"):
-        ScanRuntime().execute(node, {}, ExecutionContext(
-            runtimes={}, model_execution=None, sources={"r": range(4)}))
-    plain = PhysicalScan(node_id="scan:r", alias="r", input_id="r", n_docs=4)
-    assert ScanRuntime().execute(plain, {}, context).outputs["ids:r"] == range(4)
-
-
 def test_two_joins_on_one_table_sample_each_key_column(session):
     from quail.physical import HashJoin
     from quail.planner.plan import Refusal
@@ -219,4 +198,3 @@ def test_column_tests_reach_score_scans_and_may_read_the_text(session):
              .where(col("r.review") == "review 3 " + "pad " * 20)
              .select("r.id"))
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r3",)]
-

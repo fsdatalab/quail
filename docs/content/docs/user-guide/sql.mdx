@@ -356,11 +356,7 @@ WHERE r.year = 2024
   AND AI.IF(PROMPT('Does the review mention shipping? {0}', r.body))
 ```
 
-Quail checks the year and rating before evaluating `AI.IF`. The
-executor applies the conditions when it reads the table, so no model
-sees a row that fails one. The planner does not run them; it estimates
-how many rows they keep from a sample of the table, and `EXPLAIN`
-shows that estimate.
+Quail checks the year and rating before evaluating `AI.IF`.
 
 A condition in `ON` filters the table containing the referenced column.
 Comparisons between columns from different tables require `column = column`
@@ -410,13 +406,6 @@ The example query uses `d.id ASC` to order documents with equal scores by ID.
 `SELECT DISTINCT` removes duplicate rows by comparing all selected
 columns. Quail removes duplicates before sorting and applying `OFFSET`
 or `LIMIT`. Every sorting column must appear in `SELECT`.
-
-When `SELECT` includes the id column of every table, the rows are
-already unique and the planner drops the `DISTINCT`. When the selected
-columns all come from the rows of the one table an `AI.IF` filters,
-directly or through a join equality, the filter reads one document per
-key value at a time and skips the rest once one passes. `EXPLAIN` shows
-this as `stop per key`.
 
 ## OFFSET
 

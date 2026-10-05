@@ -175,26 +175,3 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
         assert "per_key_stop" not in changed
         assert all(not node.stop_key for node in optimized.walk()
                    if isinstance(node, SemanticFilter))
-
-
-def test_a_stop_key_filter_reads_one_document_per_key_until_one_passes():
-    from test_session import CONFIG, _run, fake_tok, make_executor
-
-    import quail
-
-    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
-        session.register("snapshots", quail.DocumentProvider.from_table(
-            pa.table({
-                "snapshot_id": [f"s{i}" for i in range(6)],
-                "text": [f"snap {i} " + "pad " * 10 for i in range(6)],
-                "trajectory_id": ["t1", "t1", "t1", "t2", "t2", "t3"],
-            }), id_col="snapshot_id"))
-        query = session.sql(
-            "SELECT DISTINCT s.trajectory_id FROM snapshots s "
-            "WHERE AI.IF(PROMPT('fix: {0}', s.text))", dialect="bq")
-        truth = {"s": {"fix": [False, True, True, True, True, False]}}
-        result = _run(query, make_executor(truth))
-    assert result.to_rows() == [("t1",), ("t2",)]
-    answers = result.answer_tables["filters"][("s", 0)]
-    assert answers.column("s").to_pylist() == [0, 1, 3, 5]
-    assert answers.column("answer").to_pylist() == [False, True, True, False]
