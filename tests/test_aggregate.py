@@ -67,7 +67,7 @@ def test_group_by_ends_the_plan_in_an_aggregate(catalog):
                .ai_filter(prompt("flag: {0}", col("r.review")), selectivity=0.5)
                .group_by("r.lang").agg(n=count(), s=avg("r.stars"))
                .having(count() > 1, max_("r.stars") < 5)
-               .order_by(("n", "desc")).limit(2).select("r.lang", "n", "s"))
+               .order_by(col("n").desc()).limit(2).select("r.lang", "n", "s"))
     root = logical.root
     assert [str(column) for column in root.aggregation.aggregates] == [
         "n = count(*)", "s = avg(r.stars)", "__having_1 = max(r.stars)"]

@@ -126,7 +126,8 @@ def build_query(session, info: PlanInfo, selectivity=None,
                 for name, comparison, value in step.tests))
         elif isinstance(step, Sort):
             query = query.order_by(*(
-                (field(name), "desc" if descending else "asc", "nulls last")
+                (quail.col(field(name)).desc() if descending
+                 else quail.col(field(name)).asc()).nulls_last()
                 for name, descending in step.keys))
         elif isinstance(step, Fetch):
             if step.offset:
