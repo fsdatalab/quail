@@ -123,9 +123,9 @@ and
 
 Logical rules that compare costs leave the plan unchanged when model
 specifications are unavailable or the model does not fit on one GPU.
-`AI.SCORE` uses the same logical rules and physical graph builder as
-`AI.IF` and `AI.CLASSIFY`. Each operator supplies its own prompt preparation,
-execution constraints, and costs. Score operators support both generative
+
+Each operator supplies its own prompt preparation, execution constraints,
+and costs. Score operators support both generative
 models and reranker models. A score join keeps the first prompt document
 as its anchor because swapping the documents changes the score's meaning.
 
