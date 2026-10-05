@@ -5,7 +5,7 @@ from collections.abc import Mapping
 
 from quail import logical as logical_nodes
 from quail.execution.pipelines import build_pipelines
-from quail.logical import DEFAULT_SELECTIVITY, effective_selectivity
+from quail.logical import DEFAULT_SELECTIVITY, LogicalPlan, effective_selectivity
 from quail.physical import (
     Aggregate,
     AiClassify,
@@ -557,4 +557,67 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                      "resident)")
     if used_default:
         lines.append(DEFAULT_NOTE)
+    return "\n".join(lines)
+
+
+def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
+            result=None, usd_per_hour: float | None = None) -> str:
+    """Format the logical and physical operator trees.
+
+    Args:
+        logical: The optimized logical plan.
+        physical: The physical plan or planning refusal.
+        verbose: Include runtime settings and internal node fields.
+        result: The QueryResult of running the plan. When given, each
+            node shows its measured rows, time, and tokens next to the
+            estimates, and the measured totals follow the tree.
+        usd_per_hour: Price of one GPU, for the measured cost per query.
+    """
+    from quail.planner.plan import Refusal
+
+    lines = ["logical:"]
+    lines.extend("  " + line for line in logical_tree(logical).splitlines())
+    if isinstance(physical, Refusal):
+        lines.append(f"refusal: {physical.constraint}: needed "
+                     f"{physical.needed} {physical.unit}, available "
+                     f"{physical.available}")
+        lines.extend(f"  {reason}" for reason in physical.reasons)
+        return "\n".join(lines)
+    lines.append("")
+    lines.append(f"physical: backend={physical.backend}, "
+                 f"model={physical.model}, workers={physical.workers}")
+    if physical.backend == "quail":
+        chunk = physical.settings.get("chunk_tokens")
+        admission = physical.settings.get("admission_tokens")
+        budgets = ["KV=bf16"]
+        if chunk is not None:
+            budgets.append(f"chunk budget={chunk:,} tokens")
+        if admission is not None:
+            budgets.append(f"admission budget={admission:,} tokens")
+        lines.append("  " + ", ".join(budgets))
+    lines.append("")
+    lines.extend("  " + line for line in physical_tree(
+        physical.graph, logical=logical, verbose=verbose,
+        estimates=getattr(physical, "estimates", None),
+        metrics=None if result is None else result.node_metrics,
+        stages=None if result is None else measured_stages(result.report),
+    ).splitlines())
+    if getattr(physical, "estimates", None):
+        lines.append("  est. time is each node's work alone; node times do "
+                     "not add up to the plan estimate")
+        lines.append("  because chunk packing shares forward passes across "
+                     "nodes")
+    if result is not None:
+        lines.append("")
+        lines.append("run:")
+        lines.extend("  " + line for line in run_summary(
+            result.report, physical.graph, physical.workers, usd_per_hour))
+    if verbose:
+        lines.append("")
+        lines.append("settings:")
+        lines.extend(_fields({"model": physical.model,
+                              "device": physical.device,
+                              **physical.settings}, 1))
+        if physical.backend == "quail":
+            lines.append("  KV dtype=bf16")
     return "\n".join(lines)

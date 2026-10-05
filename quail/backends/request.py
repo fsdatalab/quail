@@ -72,10 +72,11 @@ from quail.planner import (
 from quail.planner import (
     join_specs as logical_join_specs,
 )
-from quail.planner.classify import has_label
-from quail.planner.joins import search_joins, summarize_alias
+from quail.planner.join_order import search_joins
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
+from quail.planner.statistics import prepare_filter_costs, summarize_alias
+from quail.planner.validation import has_label
 
 
 def _answer_ids(tokenizer) -> tuple[list[int], list[int]]:
@@ -210,16 +211,15 @@ def plan_request_backend(
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
     preamble_count = preamble_tokens(ask_filters, joins)
     filter_orders = {
-        alias: order_filters_indexed(
+        alias: order_filters_indexed(prepare_filter_costs(
             predicates,
-            rule,
             prefix_tokens=(
                 preamble_count + stats[alias].mean_doc_tokens
             ),
             model=context.model,
             device=context.device,
             chunk_tokens=chunk_tokens,
-        )
+        ), rule)
         for alias, predicates in ask_filters.items()
     }
     live = {

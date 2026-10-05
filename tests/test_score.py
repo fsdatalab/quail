@@ -261,10 +261,10 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
 
 def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     from quail.backends.quail.graph import throughput
+    from quail.cost.score import score_work
     from quail.cost.work import ask, scan
     from quail.execution.runner import NodeMetrics
     from quail.explain import run_summary
-    from quail.planner.score import _score_work
 
     for model, canvas in (("qwen3-4b-fp8", 0), ("diffusion-gemma-26b-a4b-fp8", 1)):
         session = _session(catalog, model=model, tokenizer=list)
@@ -283,12 +283,12 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
             pytest.approx(expected), model
 
     # Two query documents, three candidates each, and a shared prompt.
-    work = _score_work(
+    work = score_work(
         6, 15, 9, prefix_tokens=17, groups=2, shared_tokens=3,
     )
     expected = scan(0, 24) + ask(3, 21) + ask(17, 7) * 4
     assert work == expected
-    assert _score_work(0, 15, 9).tokens == 0
+    assert score_work(0, 15, 9).tokens == 0
 
     session = _session(catalog)
     query = session.sql(
@@ -685,7 +685,7 @@ def _shared_store(path, bodies):
 def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     from quail.physical import PhysicalGraph, PortRef, Scan, ScoreSpec
     from quail.physical.base import input_ports
-    from quail.planner.decide import _apply_rules
+    from quail.planner.api import _apply_rules
     from quail.planner.physical_optimizer import PlanningContext
     from quail.planner.physical_rules import PrefixSharing
     from quail.planner.plan import PhysicalPlan
@@ -831,15 +831,13 @@ def test_score_refusals_name_oversized_documents_and_missing_scores(
 
 def test_reranker_prompts_render_stored_documents_and_the_ai_if_frame(catalog):
     from quail.logical.prompts import (
+        QWEN3_RERANKER_SYSTEM_TEXT,
         bind_join_prompt,
         bind_prompt,
         render_filter_prompt_ids,
         render_join_prompt_ids,
-        true_false_token_ids,
-    )
-    from quail.reranker import (
-        QWEN3_RERANKER_SYSTEM_TEXT,
         render_qwen3_reranker_input,
+        true_false_token_ids,
     )
     from quail.specs import MODELS
 

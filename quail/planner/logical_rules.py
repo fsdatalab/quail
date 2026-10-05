@@ -32,15 +32,16 @@ from quail.logical import (
     is_score,
     model_call,
 )
-from quail.planner import joins as joinsearch
+from quail.planner import join_order as joinsearch
 from quail.planner import pricing
-from quail.planner.filters import default_order_rule, order_filters_indexed
+from quail.planner.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.statistics import (
     PlanStatistics,
     cached_statistics,
     filter_orders,
     filter_works,
     live_after_filters,
+    prepare_filter_costs,
     undecided,
 )
 
@@ -405,12 +406,14 @@ class FilterOrder:
             if rule == "as_written":
                 return node if not node.order else replace(node, order=())
             (alias,) = model_call(node.predicates[0].expression).aliases()
-            ordered = order_filters_indexed(
-                list(node.predicates), rule,
+            costs = prepare_filter_costs(
+                node.predicates,
                 prefix_tokens=(statistics.pre
                                + statistics.stats[alias].mean_doc_tokens),
                 model=model, device=device, chunk_tokens=statistics.chunk,
-                context=context, count=statistics.stats[alias].n_docs)
+                context=context)
+            ordered = order_filters_indexed(
+                costs, rule, count=statistics.stats[alias].n_docs)
             order = () if ordered == list(range(len(ordered))) else tuple(ordered)
             return node if order == node.order else replace(node, order=order)
 
@@ -421,7 +424,7 @@ class FilterOrder:
 class JoinOrder:
     """Choose the joins' stage order and each stage's anchor by cost.
 
-    The left-deep search (quail.planner.joins.search_joins) prices
+    The left-deep search (quail.planner.join_order.search_joins) prices
     every connected stage order with every anchor choice together,
     because a stage's cost depends on which table's KV is computed once
     and which documents' KV earlier stages left resident. It ranks each

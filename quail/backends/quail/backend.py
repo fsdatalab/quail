@@ -16,9 +16,9 @@ from quail.backends.quail.executor.state import LoadedModelState, QueryExecution
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.execution.reranker import RerankerModelExecution
 from quail.logical import has_score, shared_preamble
+from quail.logical.prompts import answer_ids
 from quail.physical import AiFilter, AiJoin, AiScore, Barrier, PhysicalNode
 from quail.planner import build_physical_plan
-from quail.planner.classify import has_label, joined_classification_refusal
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PhysicalCandidate,
@@ -26,7 +26,7 @@ from quail.planner.physical_optimizer import (
     SupportResult,
 )
 from quail.planner.plan import Refusal
-from quail.planner.score import answer_ids
+from quail.planner.validation import has_label, joined_classification_refusal
 
 
 class QuailModelExecution:

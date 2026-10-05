@@ -767,3 +767,121 @@ def bind_join_prompt(template: str, args: tuple,
                   preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
                   label_token_ids=label_ids, layout=layout,
                   tail_segments=segments)
+
+
+def prompt_aliases(prompt) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(argument.alias for argument in prompt.args))
+
+
+def _without_document(template: str, marker: str) -> str:
+    """Return the query text with the scored document's placeholder gone.
+
+    The reranker gives the document its own field, so a placeholder
+    standing alone at either end of the template only marks where the
+    document goes and is dropped. A placeholder inside a sentence
+    becomes "this document".
+    """
+    text = template.strip()
+    if text.startswith(marker):
+        text = text[len(marker):].lstrip()
+    if text.endswith(marker):
+        text = text[:-len(marker)].rstrip()
+    return text.replace(marker, "this document")
+
+
+def score_query_template(prompt) -> str:
+    aliases = prompt_aliases(prompt)
+    if len(aliases) == 1:
+        return _without_document(prompt.template, "{0}")
+    if len(aliases) == 2 and len(prompt.args) == 2:
+        return _without_document(prompt.template, "{1}")
+    raise ValueError("AI.SCORE supports one document or one document pair")
+
+
+def score_token_parts(prompt, model, tokenizer) -> tuple[tuple[int, ...], ...]:
+    """Tokenize the fixed pieces of the rendered prompt around the documents."""
+    if model.role != "reranker":
+        return _answer_token_parts(prompt, model, tokenizer)
+    query_template = score_query_template(prompt)
+    rendered = render_qwen3_reranker_input(query_template, "{document}")
+    before, after = rendered.split("{document}")
+    parts = (before, after)
+    if len(prompt_aliases(prompt)) == 2:
+        first, middle = before.split("{0}")
+        parts = (first, middle, after)
+    # Documents are tokenized separately; tokens cannot span these boundaries.
+    # These ids can differ from tokenizing the complete prompt string.
+    return tuple(tuple(tokenizer(part)) for part in parts)
+
+
+def _answer_token_parts(prompt, model, tokenizer) -> tuple[tuple[int, ...], ...]:
+    """Tokenize the AI.IF layout around the documents, for a generative model.
+
+    A document gets the AI.IF filter prompt and a pair the AI.IF join
+    prompt anchored on its first document.
+    """
+    turn = model.turn
+    layout = model.prompt_layout
+    aliases = prompt_aliases(prompt)
+    if len(aliases) == 1:
+        bound = bind_prompt(prompt.template, prompt.args, tokenizer, turn,
+                            layout)
+        return tuple(bound.preamble_token_ids), tuple(bound.tail_token_ids)
+    if len(prompt.args) != 2:
+        raise ValueError("AI.SCORE supports one document or one document pair")
+    bound = bind_join_prompt(prompt.template, prompt.args, tokenizer, turn,
+                             layout)
+    pieces = {alias: (label, frame) for alias, label, frame in bound.label_token_ids}
+    left, right = aliases
+    return (tuple(bound.preamble_token_ids),
+            tuple(pieces[left][1]) + tuple(pieces[right][0]),
+            tuple(bound.tail_token_ids))
+
+
+def answer_ids(model, tokenizer) -> tuple[list[int], list[int]]:
+    """The token ids a score compares: yes and no, or TRUE and FALSE.
+
+    Args:
+        model: The ModelSpec; a reranker answers yes or no.
+        tokenizer: Callable text -> token ids.
+    """
+    if model.role == "reranker":
+        return list(tokenizer("yes")), list(tokenizer("no"))
+    return true_false_token_ids(tokenizer)
+
+
+def classify_prompt_tokens(prompt, labels, tokenizer) -> tuple:
+    """Return a classification's head, tail, and label token sequences."""
+    return (
+        tuple(tokenizer(prompt.preamble)), tuple(prompt.tail_token_ids),
+        tuple(tuple(tokenizer(label_text(label, prompt.label_prefix)))
+              for label in labels))
+
+
+def choice_token_parts(prompt, tokenizer) -> tuple:
+    """Return decision classification tail tokens, frame length, and option blocks."""
+    segments = prompt.tail_segments
+    frame = len(tokenizer(segments[0]))
+    blocks = tuple(tuple(tokenizer(block)) for block in segments[1:-1])
+    return tuple(prompt.tail_token_ids), frame, blocks
+
+
+QWEN3_RERANKER_INSTRUCTION = (
+    "Judge whether the document meets the requirements in the query."
+)
+QWEN3_RERANKER_SYSTEM_TEXT = (
+    f"{DATA_PROCESSING_INSTRUCTION} "
+    "Judge whether the Document meets the requirements based on the Query "
+    "and the Instruct provided. Note that the answer can only be \"yes\" "
+    "or \"no\"."
+)
+
+
+def render_qwen3_reranker_input(query: str, document: str) -> str:
+    """Render a complete Qwen3 reranker prompt."""
+    return (
+        f"<|im_start|>system\n{QWEN3_RERANKER_SYSTEM_TEXT}<|im_end|>\n"
+        f'<|im_start|>user\n<Instruct>: {QWEN3_RERANKER_INSTRUCTION}\n'
+        f'<Query>: {query}\n<Document>: {document}<|im_end|>\n'
+        '<|im_start|>assistant\n<think>\n\n</think>\n\n'
+    )

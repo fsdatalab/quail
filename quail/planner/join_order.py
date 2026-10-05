@@ -7,12 +7,13 @@ of that KV as the arena holds and recomputes the rest.
 """
 
 import itertools
-from collections import Counter
 from dataclasses import dataclass
 
+from quail.cost.joins import stage_work as join_work
 from quail.cost.sol import speed_of_light
-from quail.cost.work import Work, triangle
-from quail.logical import effective_selectivity
+from quail.cost.work import Work
+from quail.planner.statistics import AliasStats, alias_stats, cross_tuples, thin
+from quail.planner.validation import anchor_candidates, join_input_tokens
 
 
 @dataclass(frozen=True)
@@ -22,139 +23,6 @@ class KVState:
     pending_anchor: str | None = None
     group_open: bool = False
     used_anchors: frozenset[str] = frozenset()
-
-
-@dataclass(frozen=True)
-class AliasStats:
-    """Length sums and counts below the attention window for one alias."""
-
-    count: int
-    total: int
-    squared: int
-    maximum: int
-    window: int = 0
-    short_counts: tuple[tuple[int, int], ...] = ()
-
-    @property
-    def mean(self) -> float:
-        return self.total / self.count if self.count else 0.0
-
-    def window_pairs(self, offset: float) -> float:
-        """Sum sliding pairs for document lengths plus an offset."""
-        window = self.window
-        linear = window * (self.total + offset * self.count)
-        linear -= self.count * window * (window - 1) / 2
-        return linear + sum(
-            count * (triangle(length + offset)
-                     - window * (length + offset) + window * (window - 1) / 2)
-            for length, count in self.short_counts if length + offset < window)
-
-    def window_reads(self, offset: float) -> float:
-        """Sum retained prefix keys visible to the first suffix token."""
-        cap = self.window - 1
-        return self.count * cap - sum(
-            count * (cap - length - offset)
-            for length, count in self.short_counts if length + offset < cap)
-
-
-def summarize_alias(lengths, window: int = 0) -> AliasStats:
-    """Summarize document lengths in one pass."""
-    count = total = squared = maximum = 0
-    short_counts = Counter()
-    for raw in lengths:
-        length = int(raw)
-        count += 1
-        total += length
-        squared += length * length
-        maximum = max(maximum, length)
-        if length < window:
-            short_counts[length] += 1
-    return AliasStats(
-        count=count,
-        total=total,
-        squared=squared,
-        maximum=maximum,
-        window=window,
-        short_counts=tuple(sorted(short_counts.items())),
-    )
-
-
-def scale_alias(stats: AliasStats, fraction: float) -> AliasStats:
-    """Return the summary of the fraction of the documents expected to remain."""
-    return AliasStats(
-        count=round(stats.count * fraction),
-        total=round(stats.total * fraction),
-        squared=round(stats.squared * fraction),
-        maximum=stats.maximum,
-        window=stats.window,
-        short_counts=tuple((length, round(count * fraction))
-                           for length, count in stats.short_counts),
-    )
-
-
-def _alias_stats(lengths: dict, window: int = 0) -> dict[str, AliasStats]:
-    """Normalize raw length lists or accept summaries from a caller."""
-    return {
-        alias: (values if isinstance(values, AliasStats)
-                else summarize_alias(values, window))
-        for alias, values in lengths.items()
-    }
-
-
-def surviving_docs(n_docs: float, n_partners: float,
-                   tuple_selectivity) -> float:
-    """Expected distinct documents with at least one matching tuple."""
-    tuple_selectivity = effective_selectivity(tuple_selectivity)
-    return n_docs * (1.0 - (1.0 - tuple_selectivity)
-                     ** max(1.0, n_partners))
-
-
-def thin(live: dict, spec: dict) -> None:
-    """Update live document counts after one join's selectivity."""
-    sel = spec["selectivity"]
-    aliases = spec["aliases"]
-
-    def others(x):
-        out = 1.0
-        for a in aliases:
-            if a != x:
-                out *= live[a]
-        return out
-
-    if spec["semantics"] == "full":
-        new = {a: surviving_docs(live[a], others(a), sel)
-               for a in aliases}
-        live.update(new)
-    else:
-        anchor = spec["anchor"]
-        matched = surviving_docs(live[anchor], others(anchor), sel)
-        live[anchor] = (matched if spec["semantics"] == "exists"
-                        else live[anchor] - matched)
-
-
-def cross_tuples(spec: dict, live: dict) -> float:
-    """Expected tuples of one join.
-
-    The live cross product, or the fraction of it the join's equality
-    conditions keep.
-    """
-    tuples = 1.0
-    for a in spec["aliases"]:
-        tuples *= live[a]
-    return tuples * spec.get("pair_fraction", 1.0)
-
-
-def anchor_candidates(spec: dict, honor_forced: bool = True) -> list:
-    """Candidate anchors for one join.
-
-    Gates keep their outer table, a forced full anchor is honored, a
-    free full join offers every table.
-    """
-    if spec["semantics"] != "full":
-        return [spec["anchor"]]
-    if honor_forced and not spec.get("anchor_free"):
-        return [spec["anchor"]]
-    return list(spec["aliases"])
 
 
 def anchor_fits(spec: dict, anchor: str, lengths: dict, pre: int,
@@ -172,10 +40,8 @@ def anchor_fits(spec: dict, anchor: str, lengths: dict, pre: int,
 
     if any(count(a) == 0 for a in spec["aliases"]):
         return True
-    need = (pre + maximum(anchor) + spec["frame_tokens"][anchor]
-            + spec["tail_tokens"]
-            + sum(spec["label_tokens"][p] + maximum(p)
-                  for p in spec["aliases"] if p != anchor))
+    need = join_input_tokens(
+        spec, anchor, {alias: maximum(alias) for alias in spec["aliases"]}, pre)
     return need <= chunk_tokens
 
 
@@ -205,74 +71,12 @@ def residency(anchor: str, state: KVState, resident_aliases,
     return "none"
 
 
-def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
-               pre: int, *, resident: bool = False, window: int = 0) -> Work:
-    """Expected Work of one stage at the current live counts.
-
-    The length sums make the calculation constant time in the number
-    of documents without a window. With a window, it also visits the
-    distinct lengths below that window. A resident prefix pays its
-    frame only. A missing prefix scans the preamble, document, and frame;
-    the frame includes the first partner's label. Every tuple then
-    carries the other partner labels, partner documents, and the answer
-    cue.
-    """
+def stage_work(spec, anchor, live, lengths, pre, *, resident=False, window=0):
+    """Evaluate a prepared join's work at the current survivor counts."""
     if "cost" in spec:
         return spec["cost"].work(live)
-    stats = lengths[anchor]
-    if window != stats.window:
-        raise ValueError("length summaries must use the model attention window")
-    n = live[anchor]
-    tuples = cross_tuples(spec, live)
-    if stats.count == 0 or n <= 0:
-        return Work()
-    partners = [a for a in spec["aliases"] if a != anchor]
-    # matches JoinStage.runtime_spec: the first label is in the frame
-    u = spec["tail_tokens"] + sum(
-        spec["label_tokens"][p] + lengths[p].mean for p in partners[1:]
-    ) + (lengths[partners[0]].mean if partners else 0.0)
-    frame = spec["frame_tokens"][anchor] + (
-        spec["label_tokens"][partners[0]] if partners else 0)
-    per_anchor = tuples / n
-    frac = n / stats.count
-
-    count = stats.count
-    prefix_sum = stats.total + pre * count
-    prefix_squared = (
-        stats.squared + 2 * pre * stats.total + pre * pre * count)
-    if resident:
-        start = Work(
-            tokens=count * frame,
-            pairs=frame * prefix_sum + count * triangle(frame),
-            kv_written=count * frame,
-            kv_read=prefix_sum,
-            sliding_pairs=(stats.window_pairs(pre + frame) - stats.window_pairs(pre)
-                           if window else 0.0),
-            sliding_kv_read=stats.window_reads(pre) if window else 0.0,
-        )
-    else:
-        scan_sum = prefix_sum + count * frame
-        scan_squared = (
-            prefix_squared + 2 * frame * prefix_sum + count * frame * frame)
-        start = Work(
-            tokens=scan_sum,
-            pairs=(scan_squared + scan_sum) / 2,
-            kv_written=scan_sum,
-            sliding_pairs=stats.window_pairs(pre + frame) if window else 0.0,
-        )
-    stream = Work(
-        tokens=count * per_anchor * u,
-        pairs=per_anchor * (
-            u * (prefix_sum + count * frame)
-            + count * triangle(u)),
-        kv_written=count * per_anchor * u,
-        kv_read=prefix_sum + count * frame,
-        sliding_pairs=(per_anchor * (stats.window_pairs(pre + frame + u)
-                                    - stats.window_pairs(pre + frame))
-                       if window else 0.0),
-        sliding_kv_read=stats.window_reads(pre + frame) if window else 0.0,
-    )
-    return (start + stream) * frac
+    return join_work(spec, anchor, live[anchor], cross_tuples(spec, live),
+                     lengths, pre, resident=resident, window=window)
 
 
 def walk(seq, live0: dict, lengths: dict, resident, pre: int,
@@ -284,7 +88,7 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
     position, the anchor, the residency its cost assumed, and expected
     tuples and tokens.
     """
-    lengths = _alias_stats(lengths, model.sliding_window)
+    lengths = alias_stats(lengths, model.sliding_window)
     resident = set(resident or ())
     state = KVState()
     total = Work()
@@ -352,7 +156,7 @@ def search_joins(specs, live: dict, lengths: dict, resident,
         return dict(seq=[], records=[], work=Work(), states=0,
                     generated=0)
 
-    lengths = _alias_stats(lengths, model.sliding_window)
+    lengths = alias_stats(lengths, model.sliding_window)
     resident = set(resident or ())
 
     def rank(work):

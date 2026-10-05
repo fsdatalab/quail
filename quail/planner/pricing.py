@@ -12,7 +12,8 @@ decisions cleared, so each candidate is built once per query.
 from __future__ import annotations
 
 from quail.logical import LogicalPlan
-from quail.planner.decide import _apply_rules, build_physical_plan
+from quail.planner.api import _apply_rules
+from quail.planner.build import build_physical_plan
 from quail.planner.logical_optimizer import apply_logical_rules
 from quail.planner.physical_rules import LabelScoring
 from quail.planner.plan import Refusal

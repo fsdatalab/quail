@@ -51,10 +51,11 @@ from quail.logical import (
     SemanticJoin,
     oriented_join_conditions,
 )
-from quail.planner.filters import default_order_rule, order_filters_indexed
+from quail.planner.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
 from quail.planner.prefixes import document_shared_tokens
+from quail.planner.statistics import prepare_filter_costs
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
@@ -511,10 +512,11 @@ class _Search:
             tokens = self.aliases[alias].tokens
             mean_tokens = sum(tokens) / len(tokens) if tokens else 0
             order = [asks[index] for index in order_filters_indexed(
-                [predicates[position] for position in asks], rule,
-                prefix_tokens=self.pre + mean_tokens,
-                model=self.model, device=self.device,
-                chunk_tokens=self.chunk_tokens)] if asks else []
+                prepare_filter_costs(
+                    [predicates[position] for position in asks],
+                    prefix_tokens=self.pre + mean_tokens,
+                    model=self.model, device=self.device,
+                    chunk_tokens=self.chunk_tokens), rule)] if asks else []
             live = survivors[alias]
             first = True
             for written_pos in order:

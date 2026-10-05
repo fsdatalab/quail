@@ -1,10 +1,12 @@
 """Build the physical plan of a decided logical plan."""
 
-from dataclasses import replace
+from dataclasses import dataclass
 
 from quail.cost import budgets
+from quail.cost import classify as classify_cost
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, scan
+from quail.labels import DECISION_SCORING, LETTERS_SCORING
 from quail.logical import (
     PROBABILITIES_SUFFIX,
     Alias,
@@ -17,12 +19,20 @@ from quail.logical import (
     is_score,
     oriented_join_conditions,
 )
+from quail.logical.prompts import (
+    choice_token_parts,
+    classify_prompt_tokens,
+    prompt_aliases,
+    score_query_template,
+)
 from quail.physical import (
     AiClassify,
     AiFilter,
     AiJoin,
     AiScore,
     Barrier,
+    ClassifySpec,
+    Comparison,
     Exchange,
     Filter,
     FilterStage,
@@ -32,41 +42,39 @@ from quail.physical import (
     JoinStage,
     PortRef,
     Recombine,
+    ScoreSpec,
 )
 from quail.physical import (
     Scan as PhysicalScan,
 )
 from quail.physical.base import input_ports
-from quail.planner import joins as joinsearch
+from quail.planner import join_order as joinsearch
 from quail.planner import retention
-from quail.planner.classify import (
-    ClassifyRefusedError,
-    classification_refusal,
-    classify_table,
-)
-from quail.planner.filters import default_order_rule
-from quail.planner.physical_optimizer import (
-    ModelRegion,
-    PlanningContext,
-    apply_physical_rules,
-)
-from quail.planner.plan import PhysicalPlan, Refusal
+from quail.planner.filter_order import default_order_rule
+from quail.planner.physical_optimizer import PlanningContext
+from quail.planner.plan import PhysicalPlan, Refusal, score_seconds
 from quail.planner.results import result_nodes
-from quail.planner.score import (
-    ScoreLowering,
-    ScoreRefusedError,
-    pair_counts,
-    score_projections,
-    score_refusal,
-)
 from quail.planner.statistics import (
+    ClassifyStatistics,
     cached_statistics,
+    classify_statistics,
     filter_orders,
     filter_stop_keys,
     filter_works,
     live_after_filters,
+    pair_counts,
     question_tokens,
+    score_statistics,
     sequence_specs,
+)
+from quail.planner.validation import (
+    ClassifyRefusedError,
+    ScoreRefusedError,
+    classification_refusal,
+    join_input_tokens,
+    score_input_tokens,
+    score_projections,
+    score_refusal,
 )
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -101,7 +109,6 @@ def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
             left=left, right=right, on=on, written_pos=position,
             pair_fraction=pair_fractions.get(position, 1.0)))
     return nodes
-
 
 
 def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
@@ -144,6 +151,7 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
 
 
 # ----------------------------------------------- KV keep (residency)
+
 
 def balanced_shards(doc_tokens, workers: int):
     """Greedily partition documents into shards balanced by token count."""
@@ -194,6 +202,7 @@ def contiguous_shards(doc_tokens, workers: int):
 
 
 # ---------------------------------------------------------- the planner
+
 
 def joined_calls(labels: LabelWork) -> list:
     """Return classifications of document pairs and their table aliases."""
@@ -376,11 +385,9 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         if "cost" in spec:
             continue
         anchor = anchors[spec["written_pos"]]
-        need = (pre + stats[anchor].max_doc_tokens
-                + spec["frame_tokens"][anchor]
-                + sum(spec["label_tokens"][p] + stats[p].max_doc_tokens
-                      for p in spec["aliases"] if p != anchor)
-                + spec["tail_tokens"])
+        need = join_input_tokens(
+            spec, anchor, {alias: stats[alias].max_doc_tokens
+                           for alias in spec["aliases"]}, pre)
         if need > chunk:
             return Refusal(
                 reasons=(f"one join pair anchored on {anchor!r} needs "
@@ -498,7 +505,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                  if owner == alias and len(call.aliases()) == 1]
         if not calls or (alias in after_joins and live is None):
             return
-        table = classify_table(context, alias, "quail")
+        table = classify_builder(context, alias, "quail")
         if live is None:
             live = live_asked.get(alias, float(stats[alias].n_docs))
         steps = [(test.call, test)
@@ -508,9 +515,9 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         scores = None
         for call, test in steps:
             if call not in classified_calls:
-                spec = table.prepare(call, labels.names[call], live)
-                if scoring is not None and spec.scoring:
-                    scoring.work += table.simulated(spec).work
+                spec, work = table.prepare(call, labels.names[call], live)
+                if scoring is not None:
+                    scoring.work += work
                 node = table.node(spec, scores or rows_src.get(alias, ids_src[alias]),
                                   sum(isinstance(n, AiClassify) for n in nodes))
                 nodes.append(node)
@@ -676,7 +683,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 raise AssertionError(
                     "a classification of joined rows without its join")
             partner = next(alias for alias in aliases if alias != anchor)
-            table = classify_table(context, anchor, "quail")
+            table = classify_builder(context, anchor, "quail")
             join = joins[stage["written_pos"]]
             pairs = (effective_selectivity(join.selectivity)
                      * live0[anchor] * live0[partner])
@@ -745,7 +752,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     stage_work = sum((record["work"] for record in stage_records
                       if not is_score(joins[record["written_pos"]].predicate)), Work())
     estimate = (speed_of_light(base_work + stage_work, model, device,
-                               chunk).seconds + _score_seconds(nodes))
+                               chunk).seconds + score_seconds(nodes))
     stage_works = {record["written_pos"]: record["work"]
                    for record in stage_records}
 
@@ -788,238 +795,268 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         estimator=estimator)
 
 
-def plan_query(plan: LogicalPlan, *, model: ModelSpec,
-               device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-               order: str | None = None, backend: str = "quail",
-               registry=None, tokenizer=None, pair_fractions=None,
-               scan_fractions=None,
-               canvas_draws: int = 4,
-               attention: str | None = None, memo=None):
-    """Plan one query with the selected model backend.
-
-    Args:
-        plan: The logical plan to plan, as the logical rules left it.
-        model: Model spec.
-        device: Device spec.
-        doc_tokens: Per document token counts for each table alias.
-        gpus: GPU count handed to the backend as gpu_count.
-        order: Stage order rule, 'by_cost' or 'as_written'; None picks
-            the default rule.
-        backend: Registered model backend name.
-        canvas_draws: Maximum diffusion draws per individual-document
-            classification or score. One disables repeated draws.
-        attention: An attention path, "tree" or "unified", forced for
-            every filter and join; None lets the planner choose.
-        registry: Optional session extension registry.
-        tokenizer: Optional callable (text -> token list) handed to the
-            planning context.
-        scan_fractions: alias -> the fraction of its documents the
-            column tests are expected to keep.
-        pair_fractions: join written position -> the fraction of the
-            cross product its equality conditions keep.
-        memo: Results the logical rules computed for this plan, such
-            as its statistics, for the physical planner to reuse.
-
-    Returns:
-        A PhysicalPlan, or a Refusal explaining why the query cannot run.
-    """
-    if canvas_draws < 1:
-        return Refusal(
-            reasons=(f"canvas_draws must be at least 1, got {canvas_draws}",),
-            constraint="canvas_draws", needed=1, available=canvas_draws)
-    if registry is None:
-        # the built in registry imports every backend, and backends
-        # import this planner; build it only when no session gave one
-        from quail.builtins import built_in_registry
-        registry = built_in_registry()
-    try:
-        selected = registry.backend(backend)
-    except ValueError as error:
-        return Refusal(
-            reasons=(str(error),),
-            constraint="unknown_backend",
-            needed=1,
-            available=0,
-            unit="backends",
-        )
-    support = selected.supports(model, device, gpus)
-    if not support.supported:
-        return Refusal(
-            reasons=(support.reason or "unsupported backend configuration",),
-            constraint="unsupported_backend_configuration",
-            needed=1,
-            available=0,
-            unit="configurations",
-        )
-
-    context = PlanningContext(
-        model=model,
-        device=device,
-        gpu_count=gpus,
-        document_tokens=doc_tokens,
-        backend=backend,
-        order=order,
-        canvas_draws=canvas_draws,
-        attention=attention,
-        tokenizer=tokenizer,
-        pair_fractions=dict(pair_fractions or {}),
-        scan_fractions=dict(scan_fractions or {}),
-        logical_plan=plan,
-        memo={} if memo is None else memo,
-    )
-    region = ModelRegion(plan)
-    candidates = tuple(selected.plan(region, context))
-    for physical_planner in registry.physical_planners.values():
-        candidates += tuple(physical_planner.plan(region, context))
-    if not candidates:
-        return Refusal(
-            reasons=(f"backend {backend!r} could not produce a plan",),
-            constraint="no_physical_plan",
-            needed=1,
-            available=0,
-            unit="plans",
-        )
-    selected_candidate = min(
-        candidates,
-        key=lambda candidate: candidate.estimated_seconds,
-    )
-    selected_plan = selected_candidate.plan
-    if isinstance(selected_plan, Refusal):
-        return selected_plan
-    if selected_plan.backend != backend:
-        raise ValueError(
-            f"physical planner returned backend {selected_plan.backend!r} "
-            f"for selected backend {backend!r}")
-    return _apply_rules(selected_plan, tuple(registry.physical_rules.values()),
-                        context)
+def _pages(tokens: int) -> int:
+    return -(-tokens // budgets.PAGE_TOKENS)
 
 
-def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
-                doc_tokens: dict, gpus: int = 1, backend: str = "quail",
-                registry=None, order: str | None = None,
-                tokenizer=None, pair_fractions=None,
-                canvas_draws: int = 4,
-                attention: str | None = None):
-    """Run the physical rules again over a plan once its inputs are exact.
-
-    A plan made on estimated document lengths never saw the token
-    stores, which some rules read (prefix_sharing measures the shared
-    prefixes of a corpus). Takes the same inputs as plan_query and
-    returns the plan with any rule's rewrite applied.
-    """
-    if isinstance(plan, Refusal):
-        return plan
-    if registry is None:
-        from quail.builtins import built_in_registry
-        registry = built_in_registry()
-    context = PlanningContext(
-        model=model,
-        device=device,
-        gpu_count=gpus,
-        document_tokens=doc_tokens,
-        backend=backend,
-        order=order,
-        canvas_draws=canvas_draws,
-        attention=attention,
-        tokenizer=tokenizer,
-        pair_fractions=dict(pair_fractions or {}),
-    )
-    return _apply_rules(plan, tuple(registry.physical_rules.values()), context)
-
-
-def _apply_rules(plan, rules, context):
-    """Apply physical rules in order.
-
-    The rules see the plan's settings on the context and may add to
-    them; a classification no rule can score refuses the plan.
-    """
-    context = replace(context, settings=dict(plan.settings))
-    try:
-        graph, changed = apply_physical_rules(plan.graph, rules, context)
-    except ClassifyRefusedError as refused:
-        return refused.refusal()
-    if not changed and context.settings == dict(plan.settings):
-        return plan
-    # a rule that re-estimates a classification or score moves the
-    # plan's total by the same amount
-    seconds = plan.estimated_seconds + (
-        _score_seconds(graph.nodes) - _score_seconds(plan.nodes))
-    return replace(
-        plan, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
-        settings=context.settings)
-
-
-def _score_seconds(nodes) -> float:
-    return sum(node.spec.estimated_seconds for node in nodes
-               if isinstance(node, AiScore) and node.spec is not None)
-
-
-# ------------------------------------------------------------- explain
-
-def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
-            result=None, usd_per_hour: float | None = None) -> str:
-    """Format the logical and physical operator trees.
-
-    Args:
-        logical: The optimized logical plan.
-        physical: The physical plan or planning refusal.
-        verbose: Include runtime settings and internal node fields.
-        result: The QueryResult of running the plan. When given, each
-            node shows its measured rows, time, and tokens next to the
-            estimates, and the measured totals follow the tree.
-        usd_per_hour: Price of one GPU, for the measured cost per query.
-    """
-    from quail.explain import (
-        _fields,
-        logical_tree,
-        measured_stages,
-        physical_tree,
-        run_summary,
+def score_name(prompt, projected, fallback: str) -> str:
+    # the front end rejects one prompt projected under two names
+    return next(
+        (item.name for item in projected if item.expression.prompt == prompt),
+        fallback,
     )
 
-    lines = ["logical:"]
-    lines.extend("  " + line for line in logical_tree(logical).splitlines())
-    if isinstance(physical, Refusal):
-        lines.append(f"refusal: {physical.constraint}: needed "
-                     f"{physical.needed} {physical.unit}, available "
-                     f"{physical.available}")
-        lines.extend(f"  {reason}" for reason in physical.reasons)
-        return "\n".join(lines)
-    lines.append("")
-    lines.append(f"physical: backend={physical.backend}, "
-                 f"model={physical.model}, workers={physical.workers}")
-    if physical.backend == "quail":
-        chunk = physical.settings.get("chunk_tokens")
-        admission = physical.settings.get("admission_tokens")
-        budgets = ["KV=bf16"]
-        if chunk is not None:
-            budgets.append(f"chunk budget={chunk:,} tokens")
-        if admission is not None:
-            budgets.append(f"admission budget={admission:,} tokens")
-        lines.append("  " + ", ".join(budgets))
-    lines.append("")
-    lines.extend("  " + line for line in physical_tree(
-        physical.graph, logical=logical, verbose=verbose,
-        estimates=getattr(physical, "estimates", None),
-        metrics=None if result is None else result.node_metrics,
-        stages=None if result is None else measured_stages(result.report),
-    ).splitlines())
-    if getattr(physical, "estimates", None):
-        lines.append("  est. time is each node's work alone; node times do "
-                     "not add up to the plan estimate")
-        lines.append("  because chunk packing shares forward passes across "
-                     "nodes")
-    if result is not None:
-        lines.append("")
-        lines.append("run:")
-        lines.extend("  " + line for line in run_summary(
-            result.report, physical.graph, physical.workers, usd_per_hour))
-    if verbose:
-        lines.append("")
-        lines.append("settings:")
-        lines.extend(_fields({"model": physical.model,
-                              "device": physical.device,
-                              **physical.settings}, 1))
-        if physical.backend == "quail":
-            lines.append("  KV dtype=bf16")
-    return "\n".join(lines)
+
+def score_spec(prompt, *, name, expected_inputs, mean_tokens, context,
+               chunk_tokens, pair_fraction=1.0, prefix_groups=None):
+    """Build a score specification from prepared prompt tokens and costs."""
+    parts, cost = score_statistics(
+        prompt, context, chunk_tokens, mean_tokens=mean_tokens)
+    work, seconds = cost.estimate(expected_inputs, prefix_groups=prefix_groups)
+    return ScoreSpec(
+        name=name, aliases=prompt_aliases(prompt),
+        query_template=score_query_template(prompt),
+        arguments=tuple((ref.alias, ref.column) for ref in prompt.args),
+        expected_inputs=expected_inputs, estimated_seconds=seconds,
+        pair_fraction=pair_fraction, prompt_token_parts=parts, draws=cost.draws), work
+
+
+class ScoreLowering:
+    """Append score and comparison operators to a shared physical graph."""
+
+    def __init__(self, context, nodes, projected, chunk):
+        self.context = context
+        self.nodes = nodes
+        self.projected = projected
+        self.chunk = chunk
+        self.capacity = budgets.arena_tokens(context.model, context.device, chunk)
+        self.names = {}
+        self.work = Work()
+        self.index = 0
+
+    def score(self, prompt, fallback, inputs, expected, mean,
+              *, pair_fraction=1.0, prefix_groups=None) -> PortRef:
+        name = score_name(prompt, self.projected, fallback)
+        spec, work = score_spec(
+            prompt, name=name, expected_inputs=expected, mean_tokens=mean,
+            context=self.context, chunk_tokens=self.chunk,
+            pair_fraction=pair_fraction, prefix_groups=prefix_groups)
+        prefix, suffix = score_input_tokens(spec, self.context)
+        what = (f"a document in {spec.aliases[0]!r}" if len(spec.aliases) == 1
+                else f"one pair of {spec.aliases[0]!r} and {spec.aliases[1]!r}")
+        needed, available, unit = prefix + suffix, self.chunk, "tokens"
+        if needed <= available:
+            needed = _pages(prefix) + _pages(suffix)
+            available, unit = self.capacity // budgets.PAGE_TOKENS, "pages"
+        if needed > available:
+            raise ScoreRefusedError(Refusal(
+                reasons=(f"{what} needs {needed} {unit} with its prompt, "
+                         f"but the execution budget is {available} {unit}",),
+                constraint="suffix_over_chunk", needed=needed,
+                available=available, unit=unit))
+        node = AiScore(
+            node_id=f"ai-score:{self.index}", inputs=input_ports(tuple(inputs)),
+            backend_name=self.context.backend, model=self.context.model.name,
+            spec=spec)
+        self.index += 1
+        self.nodes.append(node)
+        self.names[prompt] = name
+        self.work += work
+        return PortRef(node.node_id, "scores")
+
+    def comparison(self, predicate, source, aliases, position) -> PortRef:
+        alias = aliases[0] if len(aliases) == 1 else "join"
+        expression = (predicate.expression if len(aliases) == 1
+                      else predicate.predicate)
+        node = Filter(
+            node_id=f"filter:{alias}:{position}",
+            inputs=input_ports((source,)),
+            predicate=Comparison(self.names[predicate.prompt],
+                                 expression.comparison, expression.threshold),
+            aliases=tuple(aliases), selectivity=predicate.selectivity,
+            written_pos=position)
+        self.nodes.append(node)
+        return PortRef(node.node_id, "scores")
+
+
+def classify_builder(context, alias, backend_name):
+    """Prepare the inputs for constructing classification operators."""
+    stats = classify_statistics(context, alias)
+    return ClassifyBuilder(**vars(stats), tokenizer=context.tokenizer,
+                           backend_name=backend_name)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ClassifyBuilder(ClassifyStatistics):
+    """Construct classification specifications and operators."""
+
+    tokenizer: object
+    backend_name: str
+
+    def prepare(self, call, name, live) -> tuple[ClassifySpec, Work]:
+        """Build a classification specification and work for a required method.
+
+        The specification carries the prompt that names the labels; the
+        label_scoring rule picks the scoring rule, swaps in the
+        lettered prompt when it picks letters, and fills the estimate.
+
+        Args:
+            call: Logical AI.CLASSIFY call.
+            name: Result column name.
+            live: Expected number of documents to classify.
+
+        Returns:
+            The specification and its work when the model requires a scoring
+            method. Otherwise, the physical label_scoring rule chooses the
+            method and fills in its work later.
+        """
+        if self.model.role == "decision":
+            return self._choice_spec(call, name, live, (self.alias,),
+                                     tuple(self.tokenizer(call.prompt.preamble)))
+        head, tail, labels = classify_prompt_tokens(
+            call.prompt, call.labels, self.tokenizer)
+        return ClassifySpec(
+            name=name, aliases=(self.alias,),
+            query_template=call.prompt.template,
+            arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
+            expected_inputs=live, estimated_seconds=0.0,
+            prompt_token_parts=(head, tail),
+            labels=tuple(call.labels),
+            label_token_ids=labels,
+            scoring="", probabilities=call.probabilities,
+        ), Work()
+
+    def node(self, spec, input_port, index, *ports) -> AiClassify:
+        """Build the physical node for one classification."""
+        return AiClassify(node_id=f"ai-classify:{index}",
+                          inputs=input_ports((input_port, *ports)),
+                          backend_name=self.backend_name,
+                          model=self.model.name, spec=spec)
+
+    def classify_joined(self, call, name, partner, pairs, partner_tokens):
+        """Build a classification specification for joined document pairs.
+
+        Pair classification uses letters and reuses the anchor document's KV.
+
+        Args:
+            call: Logical AI.CLASSIFY call referring to both documents.
+            name: Result column name.
+            partner: Partner table alias.
+            pairs: Expected number of joined pairs to classify.
+            partner_tokens: Mean partner document length in tokens.
+
+        Returns:
+            A tuple containing the ClassifySpec and estimated Work.
+
+        Raises:
+            ClassifyRefusedError: Probabilities are requested, the prompt lacks
+                a lettered form, or its tokens exceed an execution budget.
+        """
+        if call.probabilities:
+            raise ClassifyRefusedError(
+                f"a classification of joined rows returns its label only; "
+                f"{name!r} asks for the labels' probabilities", 1, 0)
+        if self.model.role == "decision":
+            return self._joined_choice_spec(call, name, partner, pairs,
+                                            partner_tokens)
+        prompt = call.prompt.lettered
+        if prompt is None:
+            raise ClassifyRefusedError(
+                "the letters rule needs a one-token letter for every "
+                "label, which the tokenizer does not have", 1, 0)
+        _, tail, labels = classify_prompt_tokens(
+            prompt, prompt.letters, self.tokenizer)
+        head = tuple(prompt.preamble_token_ids)
+        parts = {alias: (label, frame)
+                 for alias, label, frame in prompt.label_token_ids}
+        note, partner_label = parts[self.alias][1], parts[partner][0]
+        block = int(round(partner_tokens)) + len(tail) - 1
+        chains = [
+            block + length
+            for length in classify_cost.suffix_lengths(LETTERS_SCORING, labels)
+        ]
+        simulated = classify_cost.estimate_chains(
+            len(head), len(note) + len(partner_label), chains, live=pairs,
+            lengths=self.lengths,
+            shared=self.shared, chunk=self.chunk,
+            capacity=self.capacity or self.budget, model=self.model,
+            device=self.device, resident=True,
+            canvas_rows=self.model.canvas_tokens)
+        need = len(head) + self.longest + len(note) + max(chains)
+        if need > self.budget:
+            raise ClassifyRefusedError(
+                f"a row of {self.alias!r} x {partner!r} needs {need} tokens "
+                f"with its classification prompt, but the forward pass "
+                f"budget is {self.budget} tokens", need, self.budget)
+        return ClassifySpec(
+            name=name, aliases=(self.alias, partner),
+            query_template=call.prompt.template,
+            arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
+            expected_inputs=pairs, estimated_seconds=simulated.seconds,
+            prompt_token_parts=(head, tail), labels=tuple(call.labels),
+            label_token_ids=labels, scoring=LETTERS_SCORING,
+            join_layout=(tuple(note), tuple(partner_label)),
+        ), simulated.work
+
+    def _choice_spec(self, call, name, live, aliases, head):
+        """Build a decision_choice specification for one document per row.
+
+        Each document takes the question as its frame, then one request
+        of every option block and the closing line.
+        """
+        tail, frame, blocks = choice_token_parts(call.prompt, self.tokenizer)
+        request = len(tail) - frame
+        need = len(head) + self.longest + len(tail)
+        if need > self.budget:
+            raise ClassifyRefusedError(
+                f"a document in {self.alias!r} needs {need} tokens with its "
+                f"classification prompt, but the forward pass budget is "
+                f"{self.budget} tokens", need, self.budget)
+        simulated = classify_cost.estimate_chains(
+            len(head), frame, [request], live=live, lengths=self.lengths,
+            shared=self.shared, chunk=self.chunk,
+            capacity=self.capacity or self.budget, model=self.model,
+            device=self.device)
+        return ClassifySpec(
+            name=name, aliases=aliases,
+            query_template=call.prompt.template,
+            arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
+            expected_inputs=live, estimated_seconds=simulated.seconds,
+            prompt_token_parts=(head, tail), labels=tuple(call.labels),
+            label_token_ids=blocks, scoring=DECISION_SCORING,
+            probabilities=call.probabilities, frame_tokens=frame), simulated.work
+
+    def _joined_choice_spec(self, call, name, partner, pairs, partner_tokens):
+        """Build a decision_choice specification for joined document pairs.
+
+        The anchor's KV ends in its note and the partner's label; each
+        pair's request is the partner document, the question, every
+        option block, and the closing line.
+        """
+        prompt = call.prompt
+        head = tuple(prompt.preamble_token_ids)
+        tail, frame, blocks = choice_token_parts(call.prompt, self.tokenizer)
+        parts = {alias: (label, note)
+                 for alias, label, note in prompt.label_token_ids}
+        note, partner_label = parts[self.alias][1], parts[partner][0]
+        request = int(round(partner_tokens)) + len(tail)
+        simulated = classify_cost.estimate_chains(
+            len(head), len(note) + len(partner_label), [request], live=pairs,
+            lengths=self.lengths, shared=self.shared, chunk=self.chunk,
+            capacity=self.capacity or self.budget, model=self.model,
+            device=self.device, resident=True)
+        need = len(head) + self.longest + len(note) + request
+        if need > self.budget:
+            raise ClassifyRefusedError(
+                f"a row of {self.alias!r} x {partner!r} needs {need} tokens "
+                f"with its classification prompt, but the forward pass "
+                f"budget is {self.budget} tokens", need, self.budget)
+        return ClassifySpec(
+            name=name, aliases=(self.alias, partner),
+            query_template=prompt.template,
+            arguments=tuple((ref.alias, ref.column) for ref in prompt.args),
+            expected_inputs=pairs, estimated_seconds=simulated.seconds,
+            prompt_token_parts=(head, tail), labels=tuple(call.labels),
+            label_token_ids=blocks, scoring=DECISION_SCORING,
+            join_layout=(tuple(note), tuple(partner_label)),
+            frame_tokens=frame), simulated.work

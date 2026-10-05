@@ -11,9 +11,11 @@ from fakes import keep_even, register_claims_evidence, two_alias_graph
 import quail
 from quail.backends.quail import expected_join_stages
 from quail.catalog import Catalog, DocumentProvider
+from quail.cost.filters import filter_cost
 from quail.cost.sol import speed_of_light
 from quail.cost.work import ask, scan, stream
 from quail.execution.pipelines import build_pipelines
+from quail.explain import explain
 from quail.frontend.builder import col, docs, prompt
 from quail.logical import ModelCall, SemanticJoin
 from quail.physical import (
@@ -27,16 +29,21 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
-from quail.planner.decide import explain, plan_query, refine_plan
-from quail.planner.filters import filter_cost, order_filters
+from quail.planner.api import plan_query, refine_plan
+from quail.planner.filter_order import order_filters_indexed
 from quail.planner.logical_optimizer import (
     LogicalPlanningContext,
     apply_logical_rules,
 )
 from quail.planner.logical_rules import built_in_logical_rules
 from quail.planner.plan import EngineConfig, Refusal
+from quail.planner.statistics import AliasStats, prepare_filter_costs, summarize_alias
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
+
+def order_filters(predicates, rule, **kwargs):
+    costs = prepare_filter_costs(predicates, **kwargs)
+    return [predicates[i] for i in order_filters_indexed(costs, rule)]
 
 def filter_chain(plan, alias=None):
     return next(n for n in plan.nodes if isinstance(n, AiFilter)
@@ -182,9 +189,9 @@ def test_filter_ordering_and_kv_writes(catalog):
 
     predicates = [Predicate(12, 0.8), Predicate(50, 0.1), Predicate(8, 1.0),
                   Predicate(25, 0.0)]
-    ask_costs = [filter_cost(predicate, first=False, **kwargs)
+    ask_costs = [filter_cost(predicate.prompt.tail_tokens, first=False, **kwargs)
                  for predicate in predicates]
-    scan_costs = [filter_cost(predicate, first=True, **kwargs)
+    scan_costs = [filter_cost(predicate.prompt.tail_tokens, first=True, **kwargs)
                   for predicate in predicates]
 
     candidates = []
@@ -440,7 +447,7 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
 
 def test_kv_retention_rule_schedules_the_kv_later_stages_read(
         catalog, monkeypatch):
-    import quail.planner.joins as joinsearch
+    import quail.planner.join_order as joinsearch
 
     searches = []
     search_joins = joinsearch.search_joins
@@ -522,11 +529,9 @@ def _join_search_spec(position, aliases, anchor):
 
 
 def test_join_search_matches_enumeration_and_tracks_residency():
-    from quail.planner.joins import (
-        AliasStats,
+    from quail.planner.join_order import (
         anchor_fits,
         search_joins,
-        summarize_alias,
         walk,
     )
 

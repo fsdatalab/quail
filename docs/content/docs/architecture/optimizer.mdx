@@ -32,6 +32,30 @@ execution, `refine_plan` applies the physical rules with exact token
 counts and sequences. It preserves the logical decisions and choices
 already made by rules such as `label_scoring` and `kv_retention`.
 
+### Code organization
+
+The planner modules separate decisions from prompt preparation, cost
+calculations, and graph construction:
+
+| Module | Responsibility |
+| --- | --- |
+| `planner/api.py` | Select backend candidates and apply physical rules. |
+| `planner/logical_rules.py` | Run logical decisions and record them on the plan. |
+| `planner/filter_order.py` | Search predicate orders using prepared costs, selectivities, and score reuse identities. |
+| `planner/join_order.py` | Search join orders and anchors using prepared statistics and costs. |
+| `planner/statistics.py` | Prepare document summaries, survivor counts, and operator cost inputs. |
+| `logical/prompts.py` | Format and tokenize operator prompts. |
+| `cost/filters.py`, `cost/joins.py`, `cost/score.py`, `cost/classify.py` | Calculate work and time from prepared inputs. |
+| `planner/validation.py` | Check operator support and join input limits. |
+| `planner/build.py` | Construct physical operators from the recorded logical decisions. |
+| `planner/physical_rules.py`, `planner/label_scoring.py` | Choose physical execution settings and classification scoring methods. |
+| `explain.py` | Format the logical and physical plans for inspection. |
+
+Filter ordering receives cost functions that accept the expected survivor
+count. Join ordering receives document summaries and prepared join costs.
+The graph builder reads their recorded orders and anchors. Classification
+methods with alternatives are chosen by the `label_scoring` physical rule.
+
 ## Cost estimates
 
 The *cost model* estimates GPU time from the computation and memory
