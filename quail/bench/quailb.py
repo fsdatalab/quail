@@ -28,6 +28,7 @@ import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.results import write_json
 from quail.logical.prompts import bind_classify_prompt
+from quail.physical import AiClassify, AiScore
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
@@ -168,6 +169,14 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
                for alias in join.relations},
             "answer": table.column("answer"),
         })
+    score_answers = {}
+    for operator in info.scores:
+        table = result.answer_tables["scores"][operator.output]
+        score_answers[operator.id] = pa.table({
+            operator.relation: id_column(
+                operator.relation, table.column(operator.relation)),
+            "score": table.column(operator.output).cast(pa.float64()),
+        })
     # quail-b checks that a plan selects ids, labels, scores, and measures
     names = [output_name(name) for name in info.select]
     started = time.perf_counter()
@@ -176,7 +185,8 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
     return RunOutput(
         filter_answers, join_answers, rows.rename_columns(names),
         result.report["wall_s"], dict(result.report, collection_s=collection_s),
-        classify_answers=classify_answers or None)
+        classify_answers=classify_answers or None,
+        score_answers=score_answers or None)
 
 
 def _alias_filters(info: PlanInfo, alias: str) -> list:
@@ -213,7 +223,7 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict:
                      for prompt in operators.prompts
                      if prompt.preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
-              "filters": [], "joins": [], "classifies": []}
+              "filters": [], "joins": [], "classifies": [], "scores": []}
     for alias, predicates in filters.items():
         written = _alias_filters(info, alias)
         for position, predicate in enumerate(predicates):
@@ -239,6 +249,21 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict:
                 anchor = call.aliases()[0]
                 piece = {"anchor": anchor, **_pair_pieces(call.prompt, anchor)}
             pieces["classifies"].append({"id": operator.id, **piece})
+    # the planner lays a score out as the AI.IF prompt of its document,
+    # so its head is the preamble and its tail follows the document
+    for operator in info.scores:
+        node = next(node for node in query.plan().nodes
+                    if isinstance(node, AiScore)
+                    and not isinstance(node, AiClassify)
+                    and node.spec.name == operator.output)
+        head, tail = node.spec.prompt_token_parts
+        if not pieces["preamble"]:
+            pieces["preamble"] = list(head)
+        elif list(head) != pieces["preamble"]:
+            raise ValueError(
+                f"score {operator.id!r} has its own prompt head; QUAIL-B "
+                f"pieces describe one preamble")
+        pieces["scores"].append({"id": operator.id, "tail": list(tail)})
     return pieces
 
 
@@ -326,10 +351,7 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
         output.measurements["input_tokens"] = (
             result.report["fresh_tokens"] + result.report["cached_tokens"]
         )
-    # QUAIL-B's token minimum counts filters, joins, and classifications;
-    # a query with a score reports its tokens without a minimum
-    if not info.scores:
-        output.prompt_pieces = prompt_pieces(query, info, join_anchors(result))
+    output.prompt_pieces = prompt_pieces(query, info, join_anchors(result))
     return output
 
 

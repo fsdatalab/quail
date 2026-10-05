@@ -1214,7 +1214,7 @@ class Query:
         result.report = report
 
         from quail.execution.reranker import classify_label_tables
-        from quail.physical import AiClassify
+        from quail.physical import AiClassify, AiScore
 
         # every classified document's label, before any filter on it;
         # a chain's later stages label the documents their gate passed
@@ -1226,6 +1226,15 @@ class Query:
             for name, table in classify_label_tables(
                 node.spec, response.outputs[PortRef(node.node_id, "scores")]
             ).items()
+        }, "scores": {
+            # every scored document's score, before any sort or fetch
+            node.spec.name: self._source_table(
+                response.outputs[PortRef(node.node_id, "scores")].select(
+                    [*node.spec.aliases, node.spec.name]),
+                list(node.spec.aliases))
+            for node in plan.nodes
+            if isinstance(node, AiScore) and not isinstance(node, AiClassify)
+            and PortRef(node.node_id, "scores") in response.outputs
         }}
         survivors = {
             scan.alias: self._source_positions(scan.alias, pa.array(
