@@ -200,18 +200,24 @@ def test_a_stop_key_filter_reads_one_document_per_key_until_one_passes():
     assert answers.column("answer").to_pylist() == [False, True, True, False]
 
 
-def test_registration_rejects_an_id_column_that_is_not_a_key():
+def test_the_first_scan_rejects_an_id_column_that_is_not_a_key():
+    from test_session import CONFIG, fake_tok
+
+    import quail
     from quail.logical import CompileError
 
-    cat = Catalog()
-    with pytest.raises(CompileError, match="repeats 1 value"):
-        cat.register("twice", DocumentProvider.from_table(
+    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+        session.register("twice", DocumentProvider.from_table(
             pa.table({"id": ["same", "same", "other"], "review": ["a", "b", "c"]}),
             id_col="id"))
-    with pytest.raises(CompileError, match="null"):
-        cat.register("gap", DocumentProvider.from_table(
+        session.register("gap", DocumentProvider.from_table(
             pa.table({"id": ["x", None], "review": ["a", "b"]}), id_col="id"))
-    cat.register("empty", DocumentProvider.from_table(
-        pa.table({"id": pa.array([], pa.string()),
-                  "review": pa.array([], pa.string())}), id_col="id"))
+        session.register("empty", DocumentProvider.from_table(
+            pa.table({"id": pa.array([], pa.string()),
+                      "review": pa.array([], pa.string())}), id_col="id"))
+        with pytest.raises(CompileError, match="repeats 1 value"):
+            session.tokenize("twice", "review")
+        with pytest.raises(CompileError, match="null"):
+            session.tokenize("gap", "review")
+        assert len(session.tokenize("empty", "review").lengths) == 0
 

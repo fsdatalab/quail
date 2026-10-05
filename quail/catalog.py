@@ -284,27 +284,17 @@ class DocumentProvider:
         return MemoryTableProvider(table, id_col, identity)
 
 
-def check_id_column(name: str, provider: TableProvider) -> None:
-    """Raise unless the provider's id column is a key.
+def check_ids(name: str, id_col: str, ids: pa.ChunkedArray) -> None:
+    """Raise unless a table's id column is a key.
 
     Every id is non-null and appears once, so a row is named by its id:
     answer tables, benchmark ids, and the planner's DISTINCT rule rely
-    on it. The check reads that one column once, at registration.
+    on it. The session checks the column on the scan that first reads
+    the table.
 
     Raises:
         CompileError: The id column has a null or a repeated value.
     """
-    id_col = provider.id_col
-    if not hasattr(provider, "scan"):
-        # a provider a remote session only forwards is checked by the
-        # server that reads it
-        return
-    reader = provider.scan(ScanRequest(columns=(id_col,)))
-    try:
-        ids = pa.chunked_array([batch.column(0) for batch in reader],
-                               type=provider.schema().field(id_col).type)
-    finally:
-        reader.close()
     if ids.null_count:
         raise CompileError(
             f"id column {id_col!r} of {name!r} has {ids.null_count} null "
@@ -323,7 +313,6 @@ class Catalog:
     def register(self, name: str, provider: TableProvider) -> None:
         if name in self.providers:
             raise CompileError(f"provider {name!r} is already registered")
-        check_id_column(name, provider)
         self.providers[name] = provider
 
     def get(self, name: str) -> TableProvider:
