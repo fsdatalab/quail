@@ -21,6 +21,7 @@ from .nodes import (
     Recombine,
     RequestExecution,
     Scan,
+    Sort,
 )
 
 
@@ -148,6 +149,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         AiJoin,
         Recombine,
         Project,
+        Sort,
         Limit,
     ))
 

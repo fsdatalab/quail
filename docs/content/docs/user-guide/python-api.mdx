@@ -181,6 +181,58 @@ query = (
 )
 ```
 
+### order_by
+
+`order_by(*keys)`
+
+Sort result rows by table columns or AI output columns. Pass each column
+as a string or a `col()` expression.
+
+Use `.asc()` or `.desc()` on a `col()` expression to set the direction.
+The default is ascending. Use `.nulls_first()` or `.nulls_last()` to set
+where nulls appear. By default, ascending order puts nulls last and
+descending order puts them first.
+
+E.g., imagine a `reviews` table with text in `body` and ratings in `stars`.
+The query below returns up to ten positive reviews with the highest ratings:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .order_by(col("r.stars").desc().nulls_last(), "r.id")
+    .limit(10)
+    .select("r.id", "r.body")
+)
+result = query.collect()
+```
+
+Quail evaluates every review before sorting the positive reviews. In this
+query, Quail uses `"r.id"` to order reviews with equal ratings. The limit
+applies after sorting.
+
+Sorting columns need not appear in `select()`, except when using
+`distinct()`.
+
+### offset
+
+`offset(n)`
+
+Skip `n` rows before applying `limit()`. The argument must be an integer
+greater than or equal to zero. Use `order_by()` to specify which rows to
+skip. Without an explicit order, the skipped rows can differ between runs.
+
+### distinct
+
+`distinct()`
+
+Remove duplicate rows by comparing all columns passed to `select()`.
+Quail removes duplicates before sorting and applying `offset()` or
+`limit()`. Every sorting column must appear in `select()`.
+
+Sorting or removing duplicates prevents `limit()` from stopping AI
+evaluation early. An offset greater than zero has the same effect.
+
 ### select
 
 `select(*cols)`

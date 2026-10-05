@@ -318,6 +318,46 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
     assert not hasattr(result, "rows")
 
 
+def test_order_by_offset_and_distinct_run_on_the_result():
+    registry = quail.ExtensionRegistry.with_built_ins().register_observer(
+        NodeTypes)
+    session = quail.Session(CONFIG, tokenizer=fake_tok, registry=registry)
+    session.register("reviews", quail.DocumentProvider.from_table(
+        pa.table({"id": [f"r{i}" for i in range(6)],
+                  "review": [f"review {i} " + "pad " * 20 for i in range(6)],
+                  "stars": [3, 1, 4, 5, None, 2]}), id_col="id"))
+    # survivors of both predicates are r0 and r3; sorted by a column the
+    # query does not return, so the first survivor to finish is not first
+    result = _run(session.sql(FILTER_SQL + " ORDER BY r.stars DESC LIMIT 1"),
+                  make_executor(TRUTH))
+    assert result.to_rows() == [("r3",)]
+    assert result.count() == 1
+    assert result.observer(NodeTypes)["types"] == [
+        "quail.scan", "quail.ai_filter", "quail.project", "quail.sort"]
+    assert "Sort: r.stars DESC NULLS FIRST" in result.explain()
+
+    result = _run(session.sql(
+        "SELECT r.id, r.stars FROM reviews r WHERE AI_FILTER(PROMPT("
+        "'q1: {0}', r.review)) ORDER BY r.stars NULLS FIRST OFFSET 1"
+    ), make_executor(TRUTH))
+    assert result.to_rows() == [("r1", 1), ("r0", 3), ("r3", 5)]
+
+    result = _run(session.sql(
+        "SELECT DISTINCT r.stars FROM reviews r WHERE AI_FILTER(PROMPT("
+        "'q2: {0}', r.review)) ORDER BY r.stars LIMIT 2"
+    ), make_executor({"r": {"q2:": [1, 1, 1, 1, 1, 1]}}))
+    assert result.to_rows() == [(1,), (2,)]
+
+    from quail.frontend.builder import col, prompt
+    built = (session.docs("reviews").alias("r")
+             .ai_filter(prompt("q2: {0}", col("r.review")))
+             .order_by(col("r.stars").desc().nulls_last()).offset(1).distinct()
+             .limit(2).select("r.stars"))
+    result = _run(built, make_executor({"r": {"q2:": [1, 1, 1, 1, 1, 1]}}))
+    assert result.to_rows() == [(4,), (3,)]
+    session.close()
+
+
 class NodeTypes:
     """Observer that records the node types it saw."""
 

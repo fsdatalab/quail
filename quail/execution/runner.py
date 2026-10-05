@@ -6,6 +6,10 @@ import time
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, Mapping, Protocol
 
+import numpy as np
+import pyarrow as pa
+from pyarrow import compute as pc
+
 from quail.execution.pairs import columns_key, pair_ids_table, pair_table
 from quail.execution.result import (
     IndexRelation,
@@ -27,6 +31,7 @@ from quail.physical import (
     Project,
     Recombine,
     Scan,
+    Sort,
     ValueType,
 )
 
@@ -631,6 +636,62 @@ class LimitRuntime:
             input_rows=rows, output_rows=_row_count(value) or 0))
 
 
+def _comparable(column, clause: str):
+    """Return a column as a type Arrow can sort or group by."""
+    if pa.types.is_dictionary(column.type):
+        column = column.cast(column.type.value_type)
+    if pa.types.is_nested(column.type):
+        raise TypeError(
+            f"{clause} cannot compare values of type {column.type}")
+    return column
+
+
+def _distinct_indices(table: pa.Table, columns) -> pa.Array:
+    """Return the first row of each distinct value of the columns, in order."""
+    keyed = pa.table({
+        **{name: _comparable(table.column(name), "DISTINCT")
+           for name in columns},
+        "__row": pa.array(np.arange(table.num_rows), pa.int64()),
+    })
+    firsts = keyed.group_by(list(columns), use_threads=False).aggregate(
+        [("__row", "min")]).column("__row_min")
+    return pc.take(firsts, pc.sort_indices(firsts))
+
+
+class SortRuntime:
+    """Sort, deduplicate, and bound a table or a materialized result."""
+
+    def execute(self, node, inputs, context) -> NodeResult:
+        if not isinstance(node, Sort):
+            raise TypeError(type(node).__name__)
+        if len(inputs) != 1:
+            raise ValueError("Sort needs one input")
+        value = next(iter(inputs.values()))
+        if isinstance(value, QueryResult):
+            table = value.collect()
+        elif isinstance(value, pa.RecordBatch):
+            table = pa.Table.from_batches([value])
+        elif isinstance(value, pa.Table):
+            table = value
+        else:
+            raise TypeError(f"Sort needs rows, got {type(value).__name__}")
+        rows = table.num_rows
+        if node.distinct:
+            table = table.take(_distinct_indices(table, node.columns))
+        if node.keys:
+            keyed = pa.table({
+                column: _comparable(table.column(column), "ORDER BY")
+                for column, _, _ in node.keys})
+            indices = pc.sort_indices(keyed, sort_keys=[
+                (column, "descending" if descending else "ascending",
+                 "at_start" if nulls_first else "at_end")
+                for column, descending, nulls_first in node.keys])
+            table = table.take(indices)
+        table = table.slice(node.offset, node.fetch).select(list(node.columns))
+        return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
+            input_rows=rows, output_rows=table.num_rows))
+
+
 class ModelNodeRuntime:
     """Delegate one model node to the shared model execution object."""
 
@@ -688,5 +749,6 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
         HashJoin.runtime_key: HashJoinRuntime(),
         Recombine.runtime_key: RecombineRuntime(),
         Project.runtime_key: ProjectRuntime(),
+        Sort.runtime_key: SortRuntime(),
         Limit.runtime_key: LimitRuntime(),
     }

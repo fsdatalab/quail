@@ -16,6 +16,7 @@ from quail.logical import (
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
+    SortKey,
     bind_classify_prompt,
     bind_join_prompt,
     bind_prompt,
@@ -34,8 +35,48 @@ class ColSpec:
             return NotImplemented
         return EqualsSpec(self, other)
 
+    def asc(self) -> "SortSpec":
+        return SortSpec(self)
+
+    def desc(self) -> "SortSpec":
+        return SortSpec(self, descending=True)
+
+    def nulls_first(self) -> "SortSpec":
+        return SortSpec(self, nulls="first")
+
+    def nulls_last(self) -> "SortSpec":
+        return SortSpec(self, nulls="last")
+
     def __hash__(self):
         return hash((self.alias, self.column))
+
+
+@dataclass(frozen=True)
+class SortSpec:
+    """A sort key for ``order_by()``: ``col("r.stars").desc().nulls_last()``.
+
+    Attributes:
+        col: The column or projected name to sort by.
+        descending: Whether to sort from the largest value down.
+        nulls: ``"first"`` or ``"last"``, or None for the default: nulls
+            last when ascending and first when descending.
+    """
+
+    col: ColSpec
+    descending: bool = False
+    nulls: Optional[str] = None
+
+    def asc(self) -> "SortSpec":
+        return SortSpec(self.col, False, self.nulls)
+
+    def desc(self) -> "SortSpec":
+        return SortSpec(self.col, True, self.nulls)
+
+    def nulls_first(self) -> "SortSpec":
+        return SortSpec(self.col, self.descending, "first")
+
+    def nulls_last(self) -> "SortSpec":
+        return SortSpec(self.col, self.descending, "last")
 
 
 @dataclass(frozen=True)
@@ -83,6 +124,9 @@ class Query:
         self._functions = {}         # name -> the Python function
         self._labels = {}            # name -> Alias of an AI.CLASSIFY call
         self._limit = None
+        self._order = []             # (column or name, descending, nulls_first)
+        self._offset = 0
+        self._distinct = False
 
     # ---- scope -------------------------------------------------------
 
@@ -499,6 +543,41 @@ class Query:
         self._limit = n
         return self
 
+    def order_by(self, *keys) -> "Query":
+        """Sort the result rows.
+
+        Args:
+            keys: Each a column name such as ``"r.year"`` or a projected
+                name such as ``"score"``, sorted ascending, or a
+                ``col(...)`` with ``.asc()`` or ``.desc()`` and an
+                optional ``.nulls_first()`` or ``.nulls_last()``.
+        """
+        for key in keys:
+            if isinstance(key, str):
+                key = col(key)
+            if isinstance(key, ColSpec):
+                key = SortSpec(key)
+            if not isinstance(key, SortSpec):
+                raise CompileError(
+                    "order_by takes a column name or col(...).asc() or "
+                    f".desc(), got {key!r}")
+            name = (key.col.column if key.col.alias is None
+                    else f"{key.col.alias}.{key.col.column}")
+            nulls_first = (key.descending if key.nulls is None
+                           else key.nulls == "first")
+            self._order.append((name, key.descending, nulls_first))
+        return self
+
+    def offset(self, n: int) -> "Query":
+        if not isinstance(n, int) or n < 0:
+            raise CompileError("OFFSET must be a nonnegative integer")
+        self._offset = n
+        return self
+
+    def distinct(self) -> "Query":
+        self._distinct = True
+        return self
+
     def select(self, *cols) -> LogicalPlan:
         if self._pending_join is not None:
             raise CompileError(
@@ -546,7 +625,14 @@ class Query:
         for column in wanted:
             if len(column.expression.aliases()) == 2:
                 logical.add_classify(column.expression, column.name)
-        return logical.project(tuple(columns), self._limit)
+        named = {column.name: column for column in columns
+                 if isinstance(column, Alias)}
+        order = tuple(
+            SortKey(named[name] if name in named else self._resolve(col(name)),
+                    descending=descending, nulls_first=nulls_first)
+            for name, descending, nulls_first in self._order)
+        return logical.project(tuple(columns), self._limit, order=order,
+                               offset=self._offset, distinct=self._distinct)
 
 
 def docs(catalog: Catalog, provider: str, tokenizer=None,

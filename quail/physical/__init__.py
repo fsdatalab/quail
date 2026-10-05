@@ -42,6 +42,7 @@ from .nodes import (
     RequestJoinSpec,
     Scan,
     ScoreSpec,
+    Sort,
 )
 
 __all__ = [
@@ -65,6 +66,7 @@ __all__ = [
     "InputPort",
     "JoinStage",
     "Limit",
+    "Sort",
     "NodeCodec",
     "OutputPort",
     "AiFilter",
