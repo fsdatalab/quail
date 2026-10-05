@@ -498,10 +498,11 @@ class DistinctElimination:
 
     A filter returns each document at most once and a join pairs each
     row pair once, so the result rows are unique when the projection
-    returns the id column of every scanned table. The rule reads the id
-    columns from the catalog and leaves a plan alone without one, or
-    when an apply() supplies the rows. A GROUP BY whose output returns
-    every key is unique as well.
+    returns the id column of every scanned table; registration checks
+    that an id column is a key (``check_id_column``). The rule reads
+    the id columns from the catalog and leaves a plan alone without
+    one, or when an apply() supplies the rows. A GROUP BY whose output
+    returns every key is unique as well.
     """
 
     name = "distinct_elimination"

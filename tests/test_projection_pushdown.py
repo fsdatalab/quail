@@ -155,8 +155,9 @@ class _UnstableProvider:
         return TableStatistics(row_count=3)
 
     def scan(self, request):
+        # registration reads the id column once before any tokenization
         self.scans += 1
-        rows = 3 if self.scans == 1 else 2
+        rows = 3 if self.scans <= 2 else 2
         table = pa.table({
             "id": [f"r{i}" for i in range(rows)],
             "body": ["one two"] * rows,

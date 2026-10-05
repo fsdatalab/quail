@@ -199,3 +199,19 @@ def test_a_stop_key_filter_reads_one_document_per_key_until_one_passes():
     assert answers.column("s").to_pylist() == [0, 1, 3, 5]
     assert answers.column("answer").to_pylist() == [False, True, True, False]
 
+
+def test_registration_rejects_an_id_column_that_is_not_a_key():
+    from quail.logical import CompileError
+
+    cat = Catalog()
+    with pytest.raises(CompileError, match="repeats 1 value"):
+        cat.register("twice", DocumentProvider.from_table(
+            pa.table({"id": ["same", "same", "other"], "review": ["a", "b", "c"]}),
+            id_col="id"))
+    with pytest.raises(CompileError, match="null"):
+        cat.register("gap", DocumentProvider.from_table(
+            pa.table({"id": ["x", None], "review": ["a", "b"]}), id_col="id"))
+    cat.register("empty", DocumentProvider.from_table(
+        pa.table({"id": pa.array([], pa.string()),
+                  "review": pa.array([], pa.string())}), id_col="id"))
+
