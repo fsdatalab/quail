@@ -7,6 +7,7 @@ from quail import logical as logical_nodes
 from quail.execution.pipelines import build_pipelines
 from quail.logical import DEFAULT_SELECTIVITY, effective_selectivity
 from quail.physical import (
+    Aggregate,
     AiClassify,
     AiFilter,
     AiJoin,
@@ -59,9 +60,7 @@ def logical_tree(logical):
 
     def visit(node, depth):
         details = []
-        if isinstance(node, logical_nodes.Project):
-            columns = ", ".join(node.explain_fields()["columns"])
-            title = f"Project: {columns}"
+        if isinstance(node, logical_nodes.Result):
             if node.limit is not None:
                 lines.append(f"{'  ' * depth}Limit: {node.limit:,}")
                 depth += 1
@@ -75,6 +74,13 @@ def logical_tree(logical):
             if node.distinct:
                 lines.append(f"{'  ' * depth}Distinct")
                 depth += 1
+            visit(node.input, depth)
+            return
+        if isinstance(node, logical_nodes.Aggregate):
+            title = f"Aggregate: {node.specification()}"
+        elif isinstance(node, logical_nodes.Project):
+            columns = ", ".join(node.explain_fields()["columns"])
+            title = f"Project: {columns}"
         elif isinstance(node, logical_nodes.Scan):
             title = f"Scan {node.provider} as {node.alias}"
             columns = ", ".join(dict.fromkeys((node.column, *node.columns)))
@@ -290,6 +296,9 @@ def _estimated_rows(graph):
                     value = min(value, node.fetch)
         elif isinstance(node, Foreign) and node.ids == "preserve":
             value = inputs[0] if inputs else None
+        elif isinstance(node, Aggregate):
+            # the group count is not estimated
+            value = None
         # Join nodes expose both document ids and predicate answers.
         # Their evaluated tuple counts are not output row estimates.
         for output in node.outputs:
@@ -352,6 +361,17 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             title += ": " + ", ".join(node.columns)
         elif isinstance(node, Limit):
             title += f": {node.count:,}"
+        elif isinstance(node, Aggregate):
+            title += ": " + ", ".join(node.columns)
+            if node.keys:
+                details.append("group by " + ", ".join(node.keys))
+            details.append(", ".join(
+                f"{name} = {function}({argument or '*'})"
+                for name, function, argument in node.aggregates))
+            if node.having:
+                details.append("having " + " and ".join(
+                    f"{name} {comparison} {value!r}"
+                    for name, comparison, value in node.having))
         elif isinstance(node, Sort):
             title += ": " + ", ".join(
                 f"{column} {'DESC' if descending else 'ASC'} "

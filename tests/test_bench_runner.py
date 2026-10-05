@@ -13,7 +13,6 @@ from quail.bench.quailb import (
     queries,
     run_output,
 )
-from quail.bench.substrait import AI_URN, Filter, Join, Relation, read_plan
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
 from quail.execution.execute import execute_query
@@ -28,9 +27,8 @@ from quail.specs import QWEN3_4B_FP8
 from quail_b.labels import GroundTruthCollection, PredicateLabels
 from quail_b.minimum import DocumentTokens, token_metrics
 from quail_b.predicates import PREDICATE_BY_KEY, PREDICATES, predicate_payload
-from quail_b.prompts import DISCUSS_ASPECT, F1, F4, F11, F13, REFUTE, SUPPORT
+from quail_b.prompts import DISCUSS_ASPECT, F1, F11, F13, REFUTE, SUPPORT
 from quail_b.queries import get_query
-from quail_b.queries import queries as query_specs
 from quail_b.rendering import render_filter_prompt, render_join_prompt
 from quail_b.scoring import evaluate
 
@@ -205,52 +203,75 @@ def _run_request_backend(query, join_answers):
     return _execute(query, nodes, cached_tokens=0)
 
 
-def test_read_plan_reads_operators_and_rejects_other_extensions():
-    plan = read_plan(get_query("IMDB-4").plan)
-    assert plan.relations == (Relation("r", "reviews"), Relation("a", "aspects"))
-    assert plan.operators == (
-        Filter("filter-1", "r", "body", F1),
-        Filter("filter-2", "r", "body", F4),
-        Join("join-1", ("r", "a"), ("body", "aspect"), DISCUSS_ASPECT),
-    )
-    assert plan.select == ("r.id", "a.id")
-    assert plan.filter_id("r", 1) == "filter-2"
-    assert plan.join_id(0) == "join-1"
+TRACES = pa.table({
+    "id": [f"s{i}" for i in range(6)],
+    "trace": [f"trace {i} words" for i in range(6)],
+    "trajectory_id": ["A", "A", "B", "B", "B", "C"],
+    "turn_index": [5, 10, 10, 15, 20, 5],
+    "token_count": [2000, 4000, 5000, 7000, 9000, 1000],
+})
 
-    # IMDB-15 labels the pairs its join keeps: the anchor and its partner
-    pairs = read_plan(get_query("IMDB-15").plan)
-    sentiment, pair = pairs.classifies
-    assert sentiment.partner is None and sentiment.relations == ("r",)
-    assert pair.alias == "r" and pair.column == "body"
-    assert pair.partner == ("a", "aspect") and pair.relations == ("r", "a")
-    assert pairs.operators.index(pair) > pairs.operators.index(pairs.joins[0])
-    assert pairs.select == ("r.id", "r.sentiment", "a.id", "r.aspect_sentiment")
 
-    # FEV-10 asks SUPPORT only of a claim and its own Wikipedia page
-    (join,) = read_plan(get_query("FEV-10").plan).joins
-    assert join.aliases == ("c", "e")
-    assert join.on == (("evidence_wiki_url", "id"),)
+def test_relational_plans_build_and_run(tmp_path):
+    pq.write_table(TRACES, tmp_path / "agent_traces.parquet")
+    with quail.Session(_config("quail"), tokenizer=str.split) as sess:
+        sess.register("agent_traces", DocumentProvider.from_parquet(
+            str(tmp_path / "agent_traces.parquet"), id_col="id"))
+        logical = build_query(sess, get_query("REL-AGENT-6")).logical
+        root = logical.root
+        assert root.input.keys == ("t.trajectory_id",)
+        assert [str(a) for a in root.input.aggregates] == [
+            "fixes = count(*)", "first_fix = min(t.turn_index)",
+            "longest = max(t.token_count)"]
+        assert [str(t) for t in root.input.having] == ["fixes >= 2"]
+        assert [str(key) for key in root.order] == [
+            "first_fix ASC NULLS LAST", "t.trajectory_id ASC NULLS LAST"]
+        assert (root.limit, root.offset) == (50, 0)
+        scan = next(node for node in logical.walk()
+                    if type(node).__name__ == "Scan")
+        tested = build_query(sess, get_query("REL-AGENT-1")).logical
+        scan = next(node for node in tested.walk()
+                    if type(node).__name__ == "Scan")
+        assert [str(p) for p in scan.predicates] == [
+            "t.turn_index >= 10", "t.token_count <= 6000"]
+        paged = build_query(sess, get_query("REL-AGENT-2")).logical.root
+        assert (paged.limit, paged.offset) == (10, 10)
+        top = build_query(sess, get_query("REL-AGENT-4")).logical.root
+        assert [column.name for column in top.input.columns
+                if hasattr(column, "name")] == ["recovered_score"]
+        assert top.order[0].name == "recovered_score" and top.limit == 20
+        distinct = build_query(sess, get_query("REL-AGENT-3")).logical.root
+        assert distinct.input.keys == ("t.trajectory_id",)
+        assert distinct.input.aggregates == ()
 
-    for spec in query_specs(include_privacy=True).values():
-        plan = read_plan(spec.plan)
-        assert len(plan.relations) == len(plan.joins) + 1, spec.id
-        ids = [op.id for op in plan.operators]
-        assert len(set(ids)) == len(ids), spec.id
-        labels = {f"{op.alias}.{op.output}" for op in plan.classifies}
-        assert all(name.endswith(".id") or name in labels
-                   for name in plan.select), spec.id
+        # the fixes: s0, s1 (A), s2, s4 (B), s5 (C): A and B twice
+        def nodes(graph, request):
+            filtered = next(node for node in graph.nodes
+                            if isinstance(node, AiFilter))
+            answers = {0: [1], 1: [1], 2: [1], 3: [0], 4: [1], 5: [1]}
+            return {
+                **{node.node_id: NodeResult({f"ids:{node.alias}": range(
+                    len(request.inputs[node.input_id].documents))})
+                   for node in graph.nodes if isinstance(node, PhysicalScan)},
+                filtered.node_id: NodeResult({
+                    "ids:t": [0, 1, 2, 4, 5], "filter_answers:t": answers}),
+            }
 
-    plan = get_query("IMDB-1").plan
-    plan.extension_urns[0].urn = AI_URN + ".other"
-    with pytest.raises(ValueError, match="ai_filter"):
-        read_plan(plan)
+        query = build_query(sess, get_query("REL-AGENT-6"))
+        result = _execute(query, nodes, store=None)
+        output = run_output(result, get_query("REL-AGENT-6").info,
+                            {"agent_traces": TRACES})
+    assert output.rows.to_pydict() == {
+        "trajectory_id": ["A", "B"], "fixes": [2, 2], "first_fix": [5, 10],
+        "longest": [4000, 9000]}
+    assert output.filter_answers["filter-1"].column("t").to_pylist() == [
+        "s0", "s1", "s2", "s3", "s4", "s5"]
 
 
 def test_benchmark_results_and_scoring(tmp_path):
-    plan = read_plan(SPEC.plan)
     with _session(tmp_path) as sess:
         quail_result = _run(_query(sess), [1, 0])
-    output = run_output(quail_result, plan, CORPUS)
+    output = run_output(quail_result, SPEC.info, CORPUS)
 
     assert output.filter_answers["filter-1"].to_pydict() == {
         "r": ["r0", "r1"], "answer": [True, False]}
@@ -264,8 +285,9 @@ def test_benchmark_results_and_scoring(tmp_path):
     with _session(tmp_path, backend="stock_vllm") as sess:
         query = _query(sess)
         result = _run_request_backend(query, [0, 0])
-        output = run_output(result, plan, CORPUS)
-        output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
+        output = run_output(result, SPEC.info, CORPUS)
+        output.prompt_pieces = prompt_pieces(query, SPEC.info,
+                                             join_anchors(result))
         tokenizer_name = sess.model.hf_name
 
     evaluation = evaluate(SPEC, output, _truth(), CORPUS)
@@ -287,21 +309,12 @@ def test_benchmark_results_and_scoring(tmp_path):
     assert measured["minimum_tokens"] > 0
     assert measured["regret_tokens"] == 2000 - measured["minimum_tokens"]
 
-    # a plan that projects the review text instead of its id
-    text_plan = SPEC.plan
-    project = text_plan.relations[0].root.input.project
-    project.expressions[0].selection.direct_reference.struct_field.field = 1
-    text_plan = read_plan(text_plan)
-    assert text_plan.select == ("r.body", "a.id")
-    with pytest.raises(NotImplementedError):
-        run_output(quail_result, text_plan, CORPUS)
-
 
 def test_benchmark_query_prompts_labels_and_raw_rendering():
     for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
         corpus, truth = fever_truth()
         spec = get_query("FEV-9")
-        plan = read_plan(spec.plan)
+        info = spec.info
         answer = answer_oracle(truth, corpus)
         with quail.Session(
             _config(backend), tokenizer=lambda text: list(text.encode("utf-8"))
@@ -312,18 +325,19 @@ def test_benchmark_query_prompts_labels_and_raw_rendering():
             assert not isinstance(query.plan(), Refusal), backend
             operators = query.logical.operators()
             filters, joins = operators.filters, operators.joins
-            tables = {relation.alias: relation.table for relation in plan.relations}
+            tables = {relation.alias: relation.table for relation in info.relations}
             assert [scan.alias for scan in operators.scans] == list(tables), backend
             assert {alias: [p.prompt.template for p in chain]
                     for alias, chain in filters.items()} == {
                 alias: [
                     quail.bind_prompt(item.prompt, (quail.ColumnRef(
-                        alias, tables[alias], item.column),)).template
-                    for item in plan.filters if item.alias == alias]
+                        alias, tables[alias],
+                        info.relation(alias).text_column),)).template
+                    for item in info.filters if item.relation == alias]
                 for alias in tables if any(
-                    item.alias == alias for item in plan.filters)}, backend
+                    item.relation == alias for item in info.filters)}, backend
             assert [tuple(arg.alias for arg in join.prompt.args)
-                    for join in joins] == [join.aliases for join in plan.joins]
+                    for join in joins] == [join.relations for join in info.joins]
             # c0 is about a person and e0 supports it; c2 is not about a person
             assert answer(filters["c1"][0].prompt, {"c1": 0}) is True, backend
             assert answer(filters["c1"][0].prompt, {"c1": 2}) is False, backend
@@ -365,15 +379,15 @@ def test_classification_pieces_are_the_named_reference_prompt(tmp_path, case):
     # IMDB-11 only projects labels; IMDB-14 also filters them;
     # IMDB-15 includes a classification over joined rows.
     spec = get_query(case)
-    plan = read_plan(spec.plan)
+    info = spec.info
     with _session(tmp_path, backend="stock_vllm") as sess:
         # the byte tokenizer, so the pieces decode back to text
         query = build_query(sess, spec)
-        pieces = prompt_pieces(query, plan, {0: "r"})
+        pieces = prompt_pieces(query, info, {0: "r"})
     # the estimate's oracle returns each classification's reference label
     calls = [call for call, _ in query.logical.operators().labels.calls]
     predicates = {}
-    for operator in plan.classifies:
+    for operator in info.classifies:
         (item,) = [item for item in PREDICATE_BY_KEY.values()
                    if item.template == operator.prompt]
         partners = (CORPUS[item.right_table]["id"].to_pylist()
@@ -386,8 +400,8 @@ def test_classification_pieces_are_the_named_reference_prompt(tmp_path, case):
     answer = answer_oracle(
         GroundTruthCollection("gt_classify", "c_classify", 0.1, None, predicates),
         CORPUS)
-    assert len(calls) == len(plan.classifies)
-    for call, operator in zip(calls, plan.classifies):
+    assert len(calls) == len(info.classifies)
+    for call, operator in zip(calls, info.classifies):
         assignment = {alias: 1 for alias in call.aliases()}
         assert answer(call.prompt, assignment) == operator.labels[-1]
     assert validate_prompt_pieces(spec, pieces)["classifies"] == pieces[
@@ -396,13 +410,13 @@ def test_classification_pieces_are_the_named_reference_prompt(tmp_path, case):
     def text(ids):
         return bytes(token - 1 for token in ids).decode("utf-8")
 
-    assert len(pieces["classifies"]) == len(plan.classifies)
-    for operator, piece in zip(plan.classifies, pieces["classifies"]):
+    assert len(pieces["classifies"]) == len(info.classifies)
+    for operator, piece in zip(info.classifies, pieces["classifies"]):
         assert piece["id"] == operator.id
         rendered = text(pieces["preamble"]) + "good film"
         partner = None
         if operator.partner is not None:
-            assert piece["anchor"] == operator.alias
+            assert piece["anchor"] == operator.relation
             partner = "the acting"
             rendered += text(piece["frame"]) + text(piece["label"]) + partner
         assert rendered + text(piece["tail"]) == render_classify_prompt(

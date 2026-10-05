@@ -559,6 +559,10 @@ class BoundBuilder:
 
     ai_if = ai_filter
 
+    def ai_score(self, p, *, name):
+        self._inner.ai_score(p, name=name)
+        return self
+
     def ai_classify(self, p, labels, *, name, descriptions=None,
                     task_description="", probabilities=False):
         self._inner.ai_classify(p, labels, name=name,
@@ -604,6 +608,18 @@ class BoundBuilder:
 
     def order_by(self, *keys):
         self._inner.order_by(*keys)
+        return self
+
+    def group_by(self, *keys):
+        self._inner.group_by(*keys)
+        return self
+
+    def agg(self, **aggregates):
+        self._inner.agg(**aggregates)
+        return self
+
+    def having(self, *tests):
+        self._inner.having(*tests)
         return self
 
     def offset(self, n):
@@ -1046,7 +1062,7 @@ class Query:
                             f"label column {name!r} belongs to the joined "
                             f"rows of {aliases}, not all in the result")
                     call = next((column.expression
-                                 for column in self.logical.root.columns
+                                 for column in self.logical.projection.columns
                                  if isinstance(column, Alias)
                                  and column.name == name), None)
                     order = (None if call is None
@@ -1093,7 +1109,7 @@ class Query:
                         pa.concat_arrays([labeled, pa.array([None], labeled.type)]),
                         pa.array(slots))
                     call = next((column.expression
-                                 for column in self.logical.root.columns
+                                 for column in self.logical.projection.columns
                                  if isinstance(column, Alias)
                                  and column.name == name), None)
                     if call is not None:

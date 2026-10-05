@@ -278,7 +278,7 @@ def _score_spec(
 def _projection_scores(logical) -> tuple[Alias, ...]:
     return tuple(
         expression
-        for expression in logical.root.columns
+        for expression in logical.projection.columns
         if isinstance(expression, Alias) and expression.expression.kind == "score"
     )
 
@@ -639,9 +639,9 @@ def _plan_reranker(region, context, *, backend_name: str):
         expression.name
         if isinstance(expression, Alias)
         else f"{expression.alias}.{expression.column}"
-        for expression in logical.root.columns
+        for expression in logical.projection.columns
     )
-    nodes.extend(result_nodes(logical.root, (sink,), columns))
+    nodes.extend(result_nodes(logical.result, (sink,), columns))
 
     estimate = total_seconds
     true_ids, false_ids = answer_ids(context.model, context.tokenizer)

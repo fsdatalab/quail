@@ -265,7 +265,7 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
         assert "admission_tokens=" in verbose and "expected_docs=" in verbose, sels
 
     logical = _five_filter_plan(catalog, (0.25,))
-    logical = replace(logical, root=replace(logical.root, limit=10))
+    logical = replace(logical, root=replace(logical.result, limit=10))
     plan = _plan(logical, {"r": [400] * 100})
     physical = explain(logical, plan).split("physical:", 1)[1]
     assert _cell(physical, "Limit: 10") == ["10"]

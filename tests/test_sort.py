@@ -83,7 +83,7 @@ def test_order_by_ends_the_plan_in_a_sort_and_keeps_every_survivor(catalog):
                .select("r.review"))
     optimized, _ = _optimize(logical, tokens)
     scan = next(node for node in optimized.walk() if isinstance(node, Scan))
-    assert scan.columns == ("review", "id")
+    assert scan.columns == ("id", "review")
     plan = _plan(logical, tokens)
     assert node_kinds(plan)[-2:] == ["Project", "Sort"]
     assert "filter_limit" not in plan.settings

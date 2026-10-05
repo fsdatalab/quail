@@ -3,7 +3,7 @@
 import json
 from dataclasses import dataclass, replace
 
-from quail.logical.nodes import LABEL_PREFIX, CompileError, Prompt
+from quail.logical.expressions import LABEL_PREFIX, CompileError, Prompt
 
 # Fixed preamble before every document. Must be a formatting label,
 # not an instruction; instruction text here biases short-document

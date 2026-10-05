@@ -36,6 +36,7 @@ from quail.execution.runner import (
     scalar_node_metrics,
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
+from quail.logical import Aggregate as LogicalAggregate
 from quail.logical import (
     Alias,
     Apply,
@@ -119,13 +120,14 @@ def plan_request_backend(
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),
         ),)
-    root = region.logical_plan.root
-    if root.order or root.distinct or root.offset:
+    root = region.logical_plan.result
+    if root.order or root.distinct or root.offset \
+            or isinstance(root.input, LogicalAggregate):
         return (PhysicalCandidate(
             graph=None,
             plan=Refusal(
-                reasons=("ORDER BY, DISTINCT, and OFFSET run on the Quail "
-                         "backend only",),
+                reasons=("ORDER BY, DISTINCT, OFFSET, and GROUP BY run on "
+                         "the Quail backend only",),
                 constraint="sort_needs_quail_backend",
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),
@@ -133,7 +135,7 @@ def plan_request_backend(
     classifies = has_label(region.logical_plan)
     if any(isinstance(column, Alias)
            and getattr(column.expression, "probabilities", False)
-           for column in region.logical_plan.root.columns):
+           for column in region.logical_plan.projection.columns):
         return (PhysicalCandidate(
             graph=None,
             plan=Refusal(
@@ -420,14 +422,14 @@ def plan_request_backend(
         columns=tuple(
             column.name if isinstance(column, Alias)
             else f"{column.alias}.{column.column}"
-            for column in region.logical_plan.root.columns
+            for column in region.logical_plan.projection.columns
         ),
     ))
-    if region.logical_plan.root.limit is not None:
+    if region.logical_plan.result.limit is not None:
         nodes.append(Limit(
             node_id="limit",
             inputs=input_ports((PortRef("project", "rows"),)),
-            count=region.logical_plan.root.limit,
+            count=region.logical_plan.result.limit,
         ))
 
     true_ids, false_ids = _answer_ids(context.tokenizer)

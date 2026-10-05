@@ -6,12 +6,15 @@ from typing import Optional
 from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
 from quail.logical import (
+    AggregateCall,
+    Aggregation,
     Alias,
     ColumnPredicate,
     ColumnRef,
     CompileError,
     Equality,
     FilterPredicate,
+    HavingTest,
     InList,
     JoinSpec,
     LogicalPlan,
@@ -21,8 +24,9 @@ from quail.logical import (
     bind_classify_prompt,
     bind_join_prompt,
     bind_prompt,
+    bind_score_prompt,
 )
-from quail.logical.nodes import validate_task_description
+from quail.logical.expressions import validate_task_description
 
 
 @dataclass(frozen=True, eq=False)
@@ -128,6 +132,70 @@ class PromptSpec:
     cols: tuple
 
 
+@dataclass(frozen=True)
+class AggSpec:
+    """An unresolved aggregate for ``agg()``."""
+    function: str
+    col: object = None    # ColSpec, a label or score name, or None
+
+    def _test(self, comparison, value):
+        return HavingSpec(self, comparison, value)
+
+    def __eq__(self, other):
+        return self._test("=", other)
+
+    def __ne__(self, other):
+        return self._test("<>", other)
+
+    def __lt__(self, other):
+        return self._test("<", other)
+
+    def __le__(self, other):
+        return self._test("<=", other)
+
+    def __gt__(self, other):
+        return self._test(">", other)
+
+    def __ge__(self, other):
+        return self._test(">=", other)
+
+    def __hash__(self):
+        return hash((self.function, self.col))
+
+
+@dataclass(frozen=True)
+class HavingSpec:
+    """An unresolved ``having()`` test of an aggregate against a number."""
+    agg: AggSpec
+    comparison: str
+    value: object
+
+
+def count(c=None) -> AggSpec:
+    """``count()`` counts rows; ``count("r.id")`` counts non-null values."""
+    return AggSpec("count", c)
+
+
+def count_distinct(c) -> AggSpec:
+    return AggSpec("count_distinct", c)
+
+
+def sum_(c) -> AggSpec:
+    return AggSpec("sum", c)
+
+
+def avg(c) -> AggSpec:
+    return AggSpec("avg", c)
+
+
+def min_(c) -> AggSpec:
+    return AggSpec("min", c)
+
+
+def max_(c) -> AggSpec:
+    return AggSpec("max", c)
+
+
 def col(ref: str) -> ColSpec:
     """"r.review" or "review" (unqualified resolves when unambiguous)."""
     if "." in ref:
@@ -159,11 +227,15 @@ class Query:
         self._applies = {}           # alias -> [(name, kind, ids, refs)]
         self._functions = {}         # name -> the Python function
         self._labels = {}            # name -> Alias of an AI.CLASSIFY call
+        self._scores = {}            # name -> Alias of an AI.SCORE call
         self._column_predicates = {}  # alias -> [ColumnPredicate]
         self._limit = None
         self._order = []             # (column or name, descending, nulls_first)
         self._offset = 0
         self._distinct = False
+        self._group = []             # key columns or names
+        self._aggs = {}              # name -> AggSpec
+        self._having = []            # HavingSpec
 
     # ---- scope -------------------------------------------------------
 
@@ -245,6 +317,29 @@ class Query:
         return self
 
     ai_if = ai_filter
+
+    def ai_score(self, p: PromptSpec, *, name: str) -> "Query":
+        """Add a named AI.SCORE column: the model's belief that a prompt is TRUE.
+
+        Args:
+            p: A prompt over one or two columns.
+            name: The score column's name, used in select(), order_by(),
+                group_by() arguments, and agg() arguments.
+        """
+        if not name or "." in name:
+            raise CompileError(
+                f"a score needs a column name without a dot, got {name!r}")
+        if name in self._labels or name in self._scores or name in self._scope():
+            raise CompileError(f"the name {name!r} is already used")
+        refs = tuple(self._resolve(c) for c in p.cols)
+        bound = bind_score_prompt(p.template, refs, self._tokenizer,
+                                  turn=self._turn)
+        for ref in refs:
+            self._note_doc_column(ref)
+        call = ModelCall(bound, "score")
+        call.validate()
+        self._scores[name] = Alias(call, name)
+        return self
 
     def ai_classify(self, p: PromptSpec, labels, *, name: str,
                     descriptions=None,
@@ -624,6 +719,30 @@ class Query:
             self._order.append((name, key.descending, nulls_first))
         return self
 
+    def group_by(self, *keys) -> "Query":
+        """Group the result rows by columns or by named AI outputs."""
+        self._group.extend(keys)
+        return self
+
+    def agg(self, **aggregates) -> "Query":
+        """Add named aggregates, such as ``n=count()`` or ``s=avg("r.stars")``."""
+        for name, spec in aggregates.items():
+            if not isinstance(spec, AggSpec):
+                raise CompileError(
+                    f"agg() takes count(), count_distinct(), sum_(), avg(), "
+                    f"min_(), or max_(), got {spec!r} for {name!r}")
+            self._aggs[name] = spec
+        return self
+
+    def having(self, *tests) -> "Query":
+        """Keep the groups whose aggregates pass tests such as ``count() > 2``."""
+        for test in tests:
+            if not isinstance(test, HavingSpec):
+                raise CompileError(
+                    f"having() takes tests such as count() > 2, got {test!r}")
+            self._having.append(test)
+        return self
+
     def offset(self, n: int) -> "Query":
         if not isinstance(n, int) or n < 0:
             raise CompileError("OFFSET must be a nonnegative integer")
@@ -640,14 +759,20 @@ class Query:
                 f"join() of {self._pending_join[0]} has no AI predicate "
                 f"over its pairs; a plain join belongs in the database "
                 f"the ids came from")
-        if not self._joins and not self._filters and not self._labels:
+        if not (self._joins or self._filters or self._labels or self._scores):
             raise CompileError("the query has no AI predicate; a plain "
                                "scan belongs in the database the ids "
                                "came from")
         columns = []
-        for c in cols:
+        aggregation = None
+        if self._group or self._aggs or self._having:
+            columns, aggregation = self._aggregation(cols)
+        for c in () if aggregation is not None else cols:
             if isinstance(c, str) and c in self._labels:
                 columns.append(self._labels[c])
+                continue
+            if isinstance(c, str) and c in self._scores:
+                columns.append(self._scores[c])
                 continue
             if isinstance(c, str) and c == "*":
                 for alias, provider in self._tables:
@@ -685,12 +810,60 @@ class Query:
                 logical.add_classify(column.expression, column.name)
         named = {column.name: column for column in columns
                  if isinstance(column, Alias)}
+        if aggregation is not None:
+            named.update({a.name: a for a in aggregation.aggregates})
         order = tuple(
             SortKey(named[name] if name in named else self._resolve(col(name)),
                     descending=descending, nulls_first=nulls_first)
             for name, descending, nulls_first in self._order)
         return logical.project(tuple(columns), self._limit, order=order,
-                               offset=self._offset, distinct=self._distinct)
+                               offset=self._offset, distinct=self._distinct,
+                               aggregation=aggregation)
+
+    def _aggregation(self, cols) -> tuple:
+        """Bind group_by(), agg(), and having() to the selected names.
+
+        Returns:
+            The projected columns and the Aggregation.
+        """
+        columns = []
+
+        def project(c) -> str:
+            if isinstance(c, str) and c in self._labels:
+                column = self._labels[c]
+            elif isinstance(c, str) and c in self._scores:
+                column = self._scores[c]
+            else:
+                column = self._resolve(col(c) if isinstance(c, str) else c)
+            if column not in columns:
+                columns.append(column)
+            return (column.name if isinstance(column, Alias)
+                    else f"{column.alias}.{column.column}")
+
+        keys = tuple(project(c) for c in self._group)
+        aggregates = []
+        for name, spec in self._aggs.items():
+            argument = None if spec.col is None else project(spec.col)
+            aggregates.append(AggregateCall(spec.function, argument, name))
+        tests = []
+        for index, test in enumerate(self._having):
+            argument = None if test.agg.col is None else project(test.agg.col)
+            same = next((a for a in aggregates
+                         if (a.function, a.argument)
+                         == (test.agg.function, argument)), None)
+            if same is None:
+                same = AggregateCall(test.agg.function, argument,
+                                     f"__having_{index}")
+                aggregates.append(same)
+            tests.append(HavingTest(same, test.comparison, test.value))
+        output = []
+        for c in cols:
+            if isinstance(c, str) and c in self._aggs:
+                output.append(c)
+            else:
+                output.append(project(c))
+        return columns, Aggregation(keys, tuple(aggregates), tuple(output),
+                                    tuple(tests))
 
 
 def docs(catalog: Catalog, provider: str, tokenizer=None,

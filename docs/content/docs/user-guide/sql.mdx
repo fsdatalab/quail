@@ -417,9 +417,54 @@ rows can differ between runs.
 Sorting or removing duplicates prevents `LIMIT` from stopping AI
 evaluation early. An offset greater than zero has the same effect.
 
+## GROUP BY and HAVING
+
+`GROUP BY` accepts table columns and names assigned to AI outputs with
+`AS`. Return grouping columns and aggregate results in `SELECT`.
+Give each aggregate in `SELECT` an `AS` name.
+
+`HAVING` filters groups by comparing an aggregate with a number. Refer
+to the aggregate by its name or write the function call. Combine
+conditions with `AND`.
+
+E.g., the following SQL query returns the review count and average star
+rating for each sentiment. It keeps sentiments with more than ten reviews:
+
+```sql
+SELECT AI.CLASSIFY(PROMPT('What is the sentiment of this review? {0}', r.body),
+                   ['positive', 'negative', 'mixed']) AS sentiment,
+       COUNT(*) AS review_count,
+       AVG(r.stars) AS avg_stars
+FROM reviews r
+GROUP BY sentiment
+HAVING review_count > 10
+ORDER BY review_count DESC
+```
+
+Quail classifies every review before computing the counts and averages.
+Adding `LIMIT` reduces the number of returned groups, not the reviews
+that Quail classifies.
+
+### Aggregate functions
+
+| SQL | Python | Returns |
+| --- | --- | --- |
+| `COUNT(*)` | `count()` | Number of rows |
+| `COUNT(column)` | `count(column)` | Number of non-null values |
+| `COUNT(DISTINCT column)` | `count_distinct(column)` | Number of distinct non-null values |
+| `SUM(column)` | `sum_(column)` | Sum |
+| `AVG(column)` | `avg(column)` | Average |
+| `MIN(column)` | `min_(column)` | Smallest value |
+| `MAX(column)` | `max_(column)` | Largest value |
+
+Functions that take a column ignore null values. The column can contain
+stored values or AI outputs. In SQL, an aggregate can also take an
+`AI.SCORE` call directly. Without `GROUP BY`, aggregates operate on all
+rows that pass `WHERE`.
+
 ## Unsupported SQL
 
-- `GROUP BY`, `HAVING`, window functions
+- Window functions, `QUALIFY`
 - `UNION`, `EXCEPT`, `INTERSECT`
 - `OR` between conditions
 - `BETWEEN`, `LIKE`, and arithmetic in column comparisons
