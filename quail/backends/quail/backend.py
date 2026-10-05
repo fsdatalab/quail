@@ -16,7 +16,6 @@ from quail.backends.quail.executor.state import LoadedModelState, QueryExecution
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.execution.reranker import RerankerModelExecution
 from quail.logical import has_score, shared_preamble
-from quail.logical.prompts import true_false_token_ids
 from quail.physical import AiFilter, AiJoin, AiScore, Barrier, PhysicalNode
 from quail.planner import build_physical_plan
 from quail.planner.classify import has_label, joined_classification_refusal
@@ -27,7 +26,7 @@ from quail.planner.physical_optimizer import (
     SupportResult,
 )
 from quail.planner.plan import Refusal
-from quail.planner.reranker import plan_reranker
+from quail.planner.score import answer_ids
 
 
 class QuailModelExecution:
@@ -189,9 +188,6 @@ class QuailBackend:
                     unit="AI.SCORE expressions",
                 )
                 return (PhysicalCandidate(None, refusal, float("inf")),)
-        if scored:
-            return plan_reranker(region, context, backend_name=self.name)
-
         plan = build_physical_plan(
             region.logical_plan,
             model=context.model,
@@ -262,7 +258,7 @@ class QuailBackend:
             encoded_nodes.append(node)
 
         true_ids, false_ids = (
-            true_false_token_ids(tokenizer) if tokenizer is not None
+            answer_ids(context.model, tokenizer) if tokenizer is not None
             else ([], []))
         prompts = operators.prompts
         pre_ids = (
@@ -279,7 +275,9 @@ class QuailBackend:
                 **plan.settings,
                 "true_ids": true_ids,
                 "false_ids": false_ids,
-                "pre_ids": pre_ids,
+                **({"pre_ids": pre_ids} if any(
+                    isinstance(node, (AiFilter, AiJoin)) for node in plan.nodes
+                ) else {}),
             },
         )
 

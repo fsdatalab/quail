@@ -36,7 +36,7 @@ from quail.physical import (
 )
 from quail.planner import retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
-from quail.planner.reranker import score_fixed_tokens
+from quail.planner.score import score_fixed_tokens
 from quail.planner.statistics import cached_statistics, live_after_filters
 
 
@@ -103,7 +103,7 @@ class KvRetention:
             logical, context.memo, model=context.model, device=context.device,
             doc_tokens=context.document_tokens,
             pair_fractions=context.pair_fractions,
-            scan_fractions=context.scan_fractions)
+            scan_fractions=context.scan_fractions, context=context)
         joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
         groups = [[(statistics.specs[stage.written_pos], stage.anchor)
                    for stage in node.stages] for node in joins]
@@ -188,6 +188,10 @@ class LabelScoring:
             resident = _resident(node, graph, context, calls, after_joins, table)
             chosen[node.node_id] = replace(node, spec=table.choose_scoring(
                 node.spec, calls[node.spec.name], resident))
+            if "estimated_fresh_tokens" in context.settings:
+                work = table.simulated(chosen[node.node_id].spec, resident).work
+                context.settings["estimated_fresh_tokens"] += work.tokens
+                context.settings["estimated_attention_pairs"] += work.pairs
         context.settings["search_seconds"] = (
             context.settings.get("search_seconds", 0.0)
             + sum(node.spec.estimated_seconds for node in chosen.values())

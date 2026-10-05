@@ -18,11 +18,13 @@ from quail.logical import (
     SemanticJoin,
     classified_above_joins,
     effective_selectivity,
+    is_score,
     join_conditions,
     model_call,
 )
 from quail.planner import joins as joinsearch
 from quail.planner.plan import CorpusStats
+from quail.planner.score import ScoreJoinCost, score_spec
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -66,7 +68,8 @@ def _label_counts(join) -> dict:
     return out
 
 
-def join_specs(joins, pair_fractions=None, canvas: int = 0) -> list:
+def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
+               context=None, chunk: int = 0) -> list:
     """The joins as the search's spec dicts, in written order.
 
     pair_fractions maps a written position to the fraction of the
@@ -77,8 +80,25 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0) -> list:
     pair_fractions = pair_fractions or {}
     out = []
     for i, j in enumerate(joins):
-        labels = _label_counts(j)
         conditions = join_conditions(j)
+        fraction = pair_fractions.get(i, 1.0) if conditions else 1.0
+        if is_score(j.predicate):
+            spec, _ = score_spec(
+                j.prompt, name="", expected_inputs=0, mean_tokens=0,
+                context=context, chunk_tokens=chunk)
+            left, right = spec.aliases
+            head, middle, tail = map(len, spec.prompt_token_parts)
+            out.append(dict(
+                written_pos=i, aliases=list(spec.aliases), anchor=left,
+                anchor_free=False, semantics=j.semantics,
+                selectivity=j.selectivity,
+                frame_tokens={left: head + middle, right: 0},
+                label_tokens={left: 0, right: 0}, tail_tokens=tail + canvas,
+                on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
+                    for c in conditions], pair_fraction=fraction,
+                cost=ScoreJoinCost(j.prompt, context, chunk, fraction)))
+            continue
+        labels = _label_counts(j)
         out.append(dict(
             written_pos=i, aliases=_join_aliases(j), anchor=j.anchor,
             anchor_free=(j.anchor is None and j.semantics == "full"),
@@ -88,8 +108,7 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0) -> list:
             tail_tokens=question_tokens(j.prompt, canvas),
             on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
                 for c in conditions],
-            pair_fraction=(pair_fractions.get(i, 1.0) if conditions
-                           else 1.0)))
+            pair_fraction=fraction))
     return out
 
 
@@ -123,13 +142,15 @@ class PlanStatistics:
 
 def ask_positions(filters) -> dict:
     """Return alias -> written positions of its AI.IF predicates."""
-    return {alias: list(range(len(predicates)))
+    return {alias: [i for i, p in enumerate(predicates)
+                   if not is_score(p.expression)]
             for alias, predicates in filters.items()}
 
 
 def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
                     device: DeviceSpec, doc_tokens: dict,
-                    pair_fractions=None, scan_fractions=None) -> PlanStatistics:
+                    pair_fractions=None, scan_fractions=None,
+                    context=None) -> PlanStatistics:
     """Gather the statistics of one logical plan.
 
     Args:
@@ -143,6 +164,7 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
         scan_fractions: alias -> the fraction of its documents the
             column tests are expected to keep; the alias's counts and
             sums are scaled by it.
+        context: Prompt preparation and model settings for score operators.
 
     Raises:
         ValueError: A scanned alias has no document token counts.
@@ -177,7 +199,8 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
         cap_pages=retention_pages(admission, chunk, budgets.PAGE_TOKENS),
         pre=preamble_tokens(ask_filters, operators.joins),
         specs=tuple(join_specs(operators.joins, pair_fractions,
-                               model.canvas_tokens)),
+                               model.canvas_tokens, context=context,
+                               chunk=chunk)),
         asks=asks)
 
 
@@ -199,7 +222,8 @@ def undecided(root) -> object:
 
 def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
                       device: DeviceSpec, doc_tokens: dict,
-                      pair_fractions=None, scan_fractions=None) -> PlanStatistics:
+                      pair_fractions=None, scan_fractions=None,
+                      context=None) -> PlanStatistics:
     """Return plan_statistics, computed once per memo and undecided plan root.
 
     The decisions the rules record do not change the statistics, so
@@ -210,7 +234,8 @@ def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
     if key not in memo:
         memo[key] = plan_statistics(
             plan, model=model, device=device, doc_tokens=doc_tokens,
-            pair_fractions=pair_fractions, scan_fractions=scan_fractions)
+            pair_fractions=pair_fractions, scan_fractions=scan_fractions,
+            context=context)
     return memo[key]
 
 
@@ -225,7 +250,7 @@ def filter_stop_keys(plan: LogicalPlan) -> dict:
 
 
 def filter_orders(plan: LogicalPlan) -> dict:
-    """Return alias -> written positions of its AI.IF predicates in execution order.
+    """Return alias -> written positions of model predicates in execution order.
 
     Reads the ``order`` the filter_order rule recorded on each
     SemanticFilter; a node without one runs its predicates as written.
@@ -289,7 +314,8 @@ def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
     orders = filter_orders(plan)
     return {
         alias: filter_alias_work(
-            predicates, statistics.stats[alias], orders.get(alias, []),
+            predicates, statistics.stats[alias],
+            [i for i in orders.get(alias, []) if i in statistics.asks[alias]],
             statistics.pre, model.canvas_tokens, model.sliding_window)
         for alias, predicates in plan.operators().filters.items()
     }

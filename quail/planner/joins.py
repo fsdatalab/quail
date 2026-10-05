@@ -217,6 +217,8 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
     carries the other partner labels, partner documents, and the answer
     cue.
     """
+    if "cost" in spec:
+        return spec["cost"].work(live)
     stats = lengths[anchor]
     if window != stats.window:
         raise ValueError("length summaries must use the model attention window")

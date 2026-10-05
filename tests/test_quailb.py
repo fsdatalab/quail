@@ -10,7 +10,6 @@ from quail.bench.quailb import (
     queries,
     register_tables,
 )
-from quail.logical import has_score
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
 from quail_b.queries import QUERY_ORDER
@@ -103,9 +102,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                     assert plan.constraint == "classify_needs_quail_backend", case
                     continue
                 assert not isinstance(plan, Refusal), f"{case} refused: {plan}"
-                if not has_score(query.logical):
-                    # the reranker planner of a score query has its own rule
-                    assert plan.settings["order_rule"] == "by_cost", case
+                assert plan.settings["order_rule"] == "by_cost", case
                 assert "physical:" in query.explain(), case
 
     report = {

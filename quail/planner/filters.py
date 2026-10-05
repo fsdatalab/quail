@@ -1,8 +1,9 @@
-"""Order one table's AI.IF predicates by expected cost."""
+"""Order one table's model predicates by expected cost."""
 
 from quail.cost.sol import unrounded_seconds
 from quail.cost.work import ask, scan
-from quail.logical import DEFAULT_SELECTIVITY, effective_selectivity
+from quail.logical import DEFAULT_SELECTIVITY, effective_selectivity, is_score
+from quail.planner.score import score_spec
 from quail.planner.statistics import question_tokens
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -34,57 +35,65 @@ def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
 
 def order_filters_indexed(predicates, rule: str, *, prefix_tokens: float,
                           model: ModelSpec, device: DeviceSpec,
-                          chunk_tokens: int):
+                          chunk_tokens: int, context=None, count: float = 1):
     """Return written positions of predicates in execution order.
 
-    'by_cost' minimizes ideal expected time. It sorts the asks once,
-    then prices each predicate as the first scan. Written order breaks
-    ties.
+    Try each first predicate, then rank remaining predicates by their
+    cost per expected rejection. AI.IF charges the first predicate for
+    its document and later predicates for their questions over KV.
+    AI.SCORE supplies its prompt and prefix reuse cost at each survivor
+    count. Repeated comparisons of a computed score cost no model work.
+    Written order breaks ties; as_written bypasses the search.
     """
-    idx = list(range(len(predicates)))
-    if rule == "as_written":
-        return idx
+    indices = list(range(len(predicates)))
+    if rule == "as_written" or len(indices) < 2:
+        return indices
+    token_parts = {}
+    costs = {}
 
-    def selectivity(i):
-        return effective_selectivity(predicates[i].selectivity)
+    def cost(i, live, first):
+        key = (i, live, first)
+        if key not in costs:
+            p = predicates[i]
+            if is_score(p.expression):
+                spec, _ = score_spec(
+                    p.prompt, name="", expected_inputs=live,
+                    mean_tokens=prefix_tokens, context=context,
+                    chunk_tokens=chunk_tokens,
+                    token_parts_by_prompt=token_parts)
+                costs[key] = spec.estimated_seconds
+            else:
+                costs[key] = live * filter_cost(
+                    p, prefix_tokens, model, device, chunk_tokens, first=first)
+        return costs[key]
 
-    ask_costs = [
-        filter_cost(p, prefix_tokens, model, device, chunk_tokens,
-                    first=False)
-        for p in predicates
-    ]
-    scan_costs = [
-        filter_cost(p, prefix_tokens, model, device, chunk_tokens,
-                    first=True)
-        for p in predicates
-    ]
-
-    def score(i):
-        killed = 1.0 - selectivity(i)
-        if killed <= 0:
-            return float("inf")
-        return ask_costs[i] / killed
-
-    ask_order = sorted(idx, key=score)
-    prefix_live = [1.0]
-    prefix_cost = [0.0]
-    for i in ask_order:
-        prefix_cost.append(
-            prefix_cost[-1] + prefix_live[-1] * ask_costs[i])
-        prefix_live.append(prefix_live[-1] * selectivity(i))
-
-    total_ask_cost = prefix_cost[-1]
     candidates = []
-    for position, first in enumerate(ask_order):
-        expected = (
-            scan_costs[first]
-            + selectivity(first) * prefix_cost[position]
-            + total_ask_cost - prefix_cost[position + 1]
-        )
-        candidates.append((expected, first))
-
-    first = min(candidates)[1]
-    return [first, *(i for i in ask_order if i != first)]
+    for first in indices:
+        ordered = [first]
+        total = cost(first, count, True)
+        live = count * effective_selectivity(predicates[first].selectivity)
+        scored = ({predicates[first].prompt}
+                  if is_score(predicates[first].expression) else set())
+        remaining = [i for i in indices if i != first]
+        while remaining:
+            choices = []
+            for i in remaining:
+                p = predicates[i]
+                seconds = (0.0 if p.prompt in scored else
+                           cost(i, live if live > 0 else 1.0, False))
+                rejected = 1.0 - effective_selectivity(p.selectivity)
+                rank = (seconds / rejected if rejected > 0 else
+                        0.0 if seconds == 0 else float("inf"))
+                choices.append((rank, i, seconds if live > 0 else 0.0))
+            _, selected, seconds = min(choices)
+            total += seconds
+            ordered.append(selected)
+            live *= effective_selectivity(predicates[selected].selectivity)
+            if is_score(predicates[selected].expression):
+                scored.add(predicates[selected].prompt)
+            remaining.remove(selected)
+        candidates.append((total, first, ordered))
+    return min(candidates)[2]
 
 
 def order_filters(predicates, rule: str, *, prefix_tokens: float,

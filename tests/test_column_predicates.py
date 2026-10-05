@@ -173,7 +173,6 @@ def test_two_joins_on_one_table_sample_each_key_column(session):
 def test_column_tests_reach_score_scans_and_may_read_the_text(session):
     from quail.physical import Scan as PhysicalScan
 
-    # the score planner builds its own scans; they keep the tests
     scored = (session.docs("reviews").alias("r")
               .where(col("r.stars") >= 4)
               .ai_score(prompt("q: {0}", col("r.review")), name="s")

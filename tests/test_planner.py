@@ -15,7 +15,7 @@ from quail.cost.sol import speed_of_light
 from quail.cost.work import ask, scan, stream
 from quail.execution.pipelines import build_pipelines
 from quail.frontend.builder import col, docs, prompt
-from quail.logical import SemanticJoin
+from quail.logical import ModelCall, SemanticJoin
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -168,6 +168,7 @@ def test_filter_ordering_and_kv_writes(catalog):
         def __init__(self, tail, selectivity):
             self.prompt = type("Prompt", (), {
                 "tail_tokens": tail, "preamble_tokens": 0})()
+            self.expression = ModelCall(self.prompt)
             self.selectivity = selectivity
 
     first, second = Predicate(10, 0.5), Predicate(10, 0.5)

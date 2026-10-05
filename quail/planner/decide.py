@@ -13,6 +13,8 @@ from quail.logical import (
     LogicalPlan,
     classified_above_joins,
     effective_selectivity,
+    has_score,
+    is_score,
     oriented_join_conditions,
 )
 from quail.physical import (
@@ -50,6 +52,13 @@ from quail.planner.physical_optimizer import (
 )
 from quail.planner.plan import PhysicalPlan, Refusal
 from quail.planner.results import result_nodes
+from quail.planner.score import (
+    ScoreLowering,
+    ScoreRefusedError,
+    pair_counts,
+    score_projections,
+    score_refusal,
+)
 from quail.planner.statistics import (
     cached_statistics,
     filter_orders,
@@ -243,6 +252,12 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     labels = operators.labels
     classified = {alias for _, alias in labels.calls}
     after_joins = classified_above_joins(plan.root)
+    scored = has_score(plan)
+    projected_scores = score_projections(plan)
+    if scored:
+        refusal = score_refusal(plan, context)
+        if refusal is not None:
+            return refusal
     if labels.calls:
         if context is None:
             return Refusal(
@@ -293,7 +308,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     statistics = cached_statistics(
         plan, {} if context is None else context.memo, model=model,
         device=device, doc_tokens=doc_tokens, pair_fractions=pair_fractions,
-        scan_fractions=scan_fractions)
+        scan_fractions=scan_fractions, context=context)
     stats, chunk, pre = statistics.stats, statistics.chunk, statistics.pre
     specs = statistics.specs
     asks = statistics.asks
@@ -358,6 +373,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
     for spec in specs:
+        if "cost" in spec:
+            continue
         anchor = anchors[spec["written_pos"]]
         need = (pre + stats[anchor].max_doc_tokens
                 + spec["frame_tokens"][anchor]
@@ -376,6 +393,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     # current producer node
     nodes = []
     ids_src = {}
+    rows_src = {}
+    scoring = ScoreLowering(context, nodes, projected_scores, chunk) if scored else None
     for s in scans:
         shard_ranges, loads = contiguous_shards(
             doc_tokens[s.alias], workers
@@ -429,6 +448,28 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         ids_src[alias] = PortRef(fid, f"ids:{alias}")
         emit_applies(alias)
 
+    def emit_scores(alias):
+        live = float(stats[alias].n_docs)
+        for position in orders.get(alias, ()):
+            predicate = filters[alias][position]
+            source = rows_src.get(alias, ids_src[alias])
+            if predicate.prompt not in scoring.names:
+                source = scoring.score(
+                    predicate.prompt, f"__score_{alias}_{position}", (source,),
+                    live, stats[alias].mean_doc_tokens)
+            source = scoring.comparison(predicate, source, (alias,), position)
+            rows_src[alias] = source
+            ids_src[alias] = PortRef(source.node_id, f"ids:{alias}")
+            live *= effective_selectivity(predicate.selectivity)
+        for expression in projected_scores:
+            call = expression.expression
+            if call.aliases() != (alias,) or call.prompt in scoring.names:
+                continue
+            rows_src[alias] = scoring.score(
+                call.prompt, expression.name,
+                (rows_src.get(alias, ids_src[alias]),), live,
+                stats[alias].mean_doc_tokens)
+
     def emit_applies(alias):
         for apply in alias_applies.get(alias, ()):
             aid = f"apply:{apply.function}"
@@ -441,13 +482,13 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 aliases=(alias,)))
             ids_src[alias] = PortRef(aid, f"ids:{alias}")
 
-    # documents expected after a table's AI.IF filters, before its
+    # documents expected after a table's model predicates, before its
     # filters on labels
     live_asked = {}
     for alias, predicates in filters.items():
         survival = 1.0
-        for position in asks[alias]:
-            survival *= effective_selectivity(predicates[position].selectivity)
+        for predicate in predicates:
+            survival *= effective_selectivity(predicate.selectivity)
         live_asked[alias] = float(stats[alias].n_docs) * survival
     label_ports = []
 
@@ -468,7 +509,9 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         for call, test in steps:
             if call not in classified_calls:
                 spec = table.prepare(call, labels.names[call], live)
-                node = table.node(spec, scores or ids_src[alias],
+                if scoring is not None and spec.scoring:
+                    scoring.work += table.simulated(spec).work
+                node = table.node(spec, scores or rows_src.get(alias, ids_src[alias]),
                                   sum(isinstance(n, AiClassify) for n in nodes))
                 nodes.append(node)
                 scores = PortRef(node.node_id, "scores")
@@ -486,16 +529,31 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 scores = PortRef(lid, "scores")
                 ids_src[alias] = PortRef(lid, f"ids:{alias}")
                 live *= effective_selectivity(test.selectivity)
+        if scores is not None:
+            rows_src[alias] = scores
 
     try:
         for s in scans:
-            if s.alias in ask_filters:
+            if scoring is not None:
+                emit_scores(s.alias)
+            elif s.alias in ask_filters:
                 emit_filter(s.alias)
             else:
                 emit_applies(s.alias)
             emit_classify(s.alias)
     except ClassifyRefusedError as refused:
         return refused.refusal()
+    except ScoreRefusedError as refused:
+        return refused.refusal
+
+    def emit_score_pair(prompt, position, fraction, pair_inputs):
+        aliases = tuple(dict.fromkeys(ref.alias for ref in prompt.args))
+        expected, prefixes = pair_counts(live0, aliases, fraction)
+        return scoring.score(
+            prompt, f"__score_join_{position}",
+            tuple(rows_src.get(a, ids_src[a]) for a in aliases) + pair_inputs,
+            expected, sum(stats[a].mean_doc_tokens for a in aliases),
+            pair_fraction=fraction, prefix_groups=prefixes)
 
     # group consecutive full stages on the same anchor; gates run
     # alone; anchor switches become barriers
@@ -505,8 +563,26 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     exec_idx = 0
     pairs_edges = []     # every full stage's passing-pairs edge
     out_aliases = []     # recombination's output order
+    score_pairs = None
     for g, group in enumerate(groups):
         anchor = sequence_groups[g][0][1]
+        if "cost" in group[0][0]:
+            try:
+                for spec, _ in group:
+                    position = spec["written_pos"]
+                    join = joins[position]
+                    pair_inputs = ()
+                    if position in pairs_src:
+                        producer = pairs_src[position]
+                        pair_inputs = (PortRef(producer.node_id, f"pairs:{position}"),)
+                    if score_pairs is None:
+                        score_pairs = emit_score_pair(
+                            join.prompt, position, spec["pair_fraction"], pair_inputs)
+                    score_pairs = scoring.comparison(
+                        join, score_pairs, spec["aliases"], position)
+            except ScoreRefusedError as refused:
+                return refused.refusal
+            continue
         if g > 0:
             ahead = [scan.alias for scan in scans]
             bid = unique_id("barrier", anchor)
@@ -631,7 +707,17 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     except ClassifyRefusedError as refused:
         return refused.refusal()
 
-    if len(pairs_edges) == 1 and len(seq) == 1 and not after_joins:
+    try:
+        for expression in projected_scores:
+            call = expression.expression
+            if len(call.aliases()) == 2 and call.prompt not in scoring.names:
+                score_pairs = emit_score_pair(call.prompt, 0, 1.0, ())
+    except ScoreRefusedError as refused:
+        return refused.refusal
+
+    if score_pairs is not None:
+        sink_inputs = (score_pairs,)
+    elif len(pairs_edges) == 1 and len(seq) == 1 and not after_joins:
         # one full join and nothing after it: its true pairs are the
         # result rows, so no recombination is needed
         sink_inputs = (pairs_edges[0],)
@@ -645,7 +731,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             alias_order=tuple(out_aliases)))
         sink_inputs = (PortRef("recombine", "tuples"),)
     else:
-        sink_inputs = (ids_src[scans[0].alias],)
+        alias = scans[0].alias
+        sink_inputs = (rows_src.get(alias, ids_src[alias]),)
     columns = []
     for c in plan.projection.columns:
         columns.append(c.name if isinstance(c, Alias)
@@ -655,6 +742,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     nodes.extend(result_nodes(
         plan.result, tuple(sink_inputs) + tuple(label_ports), tuple(columns)))
 
+    stage_work = sum((record["work"] for record in stage_records
+                      if not is_score(joins[record["written_pos"]].predicate)), Work())
     estimate = (speed_of_light(base_work + stage_work, model, device,
                                chunk).seconds + _score_seconds(nodes))
     stage_works = {record["written_pos"]: record["work"]
@@ -677,6 +766,19 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             "order_rule": rule,
             "order_source": source,
             "search_seconds": estimate,
+            **({
+                "retained_kv_tokens": scoring.capacity,
+                "prefix_reuse": "fixed prompt and first document within each score",
+                "survivor_assumption": "uniform independent selection",
+                "estimated_fresh_tokens": scoring.work.tokens,
+                "estimated_attention_pairs": scoring.work.pairs,
+                "batching": "token_based_admission",
+                "data_parallel_copies": workers,
+                "score_normalization": {
+                    "reranker": "yes_no_softmax",
+                    "decision": "decision_head_softmax",
+                }.get(model.role, "true_false_softmax"),
+            } if scoring is not None else {}),
             **({"classify_placement": ("after joins" if after_joins
                                        else "before joins")}
                if labels.calls else {}),
