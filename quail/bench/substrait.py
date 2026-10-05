@@ -106,14 +106,16 @@ def build_query(session, info: PlanInfo, selectivity=None,
                 descriptions=item.descriptions)
     for step in info.tail:
         if isinstance(step, Aggregate):
+            if not step.measures and set(step.keys) == set(info.select):
+                # an aggregate with no measures is a DISTINCT
+                query = query.distinct()
+                continue
             query = query.group_by(*(field(key) for key in step.keys))
             if step.measures:
                 query = query.agg(**{
                     name: AggSpec(function, None if argument is None
                                   else field(argument))
                     for name, function, argument in step.measures})
-            else:
-                query = query.distinct()
         elif isinstance(step, Having):
             measures = {name: (function, argument)
                         for name, function, argument

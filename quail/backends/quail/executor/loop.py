@@ -150,7 +150,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                pinned=True, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=(), attention_mode=None,
                document_done=None, prefix_tree=None, stats=None,
-               staging=None):
+               staging=None, stop_groups=None):
     """Run a sequence of Boolean filters with the shared stage scheduler.
 
     Args:
@@ -179,6 +179,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             arena_writes.
         stats: When given, receives borrowed_tokens and pack_s.
         staging: Optional reusable input transfer buffers.
+        stop_groups: Per document, its stop key group, or None. One
+            document of a group runs at a time, and once one survives
+            the group's queued documents never run.
 
     Returns:
         A tuple of per-document Boolean answers, chunk timing spans, and
@@ -228,7 +231,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         torch, arena, pipeline, stages, doc_ids, budget,
         anchor_keys=keys, on_settled=on_settled,
         attention_mode=attention_mode, prefix_tree=prefix_tree,
-        stats=stats, limit=limit, paged=arena_writes, staging=staging,
+        stats=stats, limit=limit, stop_groups=stop_groups,
+        paged=arena_writes, staging=staging,
         label=f"filter ({k} stages)", default_attention="unified",
         on_chunk=on_chunk if document_done is not None else None)
     by_document = {}

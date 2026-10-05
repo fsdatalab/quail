@@ -332,6 +332,13 @@ Remove duplicate rows by comparing all columns passed to `select()`.
 Quail removes duplicates before sorting and applying `offset()` or
 `limit()`. Every sorting column must appear in `select()`.
 
+When `select()` includes the id column of every table, the rows are
+already unique and the planner drops the `distinct()`. When the
+selected columns all come from the rows of the one table an
+`ai_filter()` filters, directly or through a join equality, the filter
+reads one document per key value at a time and skips the rest once one
+passes.
+
 Sorting or removing duplicates prevents `limit()` from stopping AI
 evaluation early. An offset greater than zero has the same effect.
 

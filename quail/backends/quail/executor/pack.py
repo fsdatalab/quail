@@ -247,6 +247,10 @@ class JoinAdmission:
             before packs no frame rows. None writes every frame.
         limit: Stop admitting anchors once this many survived the last
             stage; None runs every anchor.
+        stop_groups: Per anchor, its stop key group, or None. One
+            anchor of a group is admitted at a time, and once one
+            survives the last stage the group's queued anchors are
+            skipped: they never run and take_skipped() lists them.
         extra_tokens: Rows past the prefix an anchor's pages must
             cover, when more than its largest frame: a stage whose
             one suffix is written into the anchor's own pages.
@@ -270,7 +274,8 @@ class JoinAdmission:
                  resident=None, anchor_partners=None, temporary_suffix_pages=False,
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
-                 frame_writes=None, limit=None, extra_tokens=None):
+                 frame_writes=None, limit=None, extra_tokens=None,
+                 stop_groups=None):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -280,6 +285,12 @@ class JoinAdmission:
         self.limit = limit
         self.survivors = 0
         n = len(prefix_tokens)
+        self.groups = None if stop_groups is None else list(stop_groups)
+        if self.groups is not None and len(self.groups) != n:
+            raise ValueError("stop_groups must match prefix_tokens")
+        self._group_busy = set()    # groups with an anchor admitted, unsettled
+        self._group_done = set()    # groups with a survivor
+        self._skipped = []          # queued anchors a done group skipped
         self.borrowing = Borrowing(n, tree, can_borrow)
         # page_cost(tokens, base_tokens) prices a key in the arena's
         # every-token pages; the default is one pool of page_tokens pages
@@ -539,6 +550,8 @@ class JoinAdmission:
             Settlement records, using the same format as report().settlements.
         """
         events, self._settled = self._settled, []
+        for event in events:
+            self._settle_group(event.anchor, event.survived)
         return events
 
     def buildable_tokens(self):
@@ -636,6 +649,9 @@ class JoinAdmission:
         admitted = set()
         while self.pending and room >= self._min_fresh:
             a = self.pending.popleft()
+            if self.groups is not None and self.groups[a] in self._group_busy:
+                held.append(a)      # one anchor of a group at a time
+                continue
             borrow = self.borrowing.decide(a, admitted)
             if borrow == Borrowing.WAIT:
                 held.append(a)      # its parent is still queued
@@ -675,6 +691,8 @@ class JoinAdmission:
                 self._zero_cost -= 1
             self._stage[a] = 0
             admitted.add(a)
+            if self.groups is not None:
+                self._group_busy.add(self.groups[a])
             self.borrowing.record(a, borrow)
             if self._launch(a, 0, end):
                 continued.append(a)
@@ -745,7 +763,31 @@ class JoinAdmission:
             survived = bool(self._true[a][j])
             transitions.append((a, j, survived))
             settlements.append(Settlement("finished", a, survived))
+        for settlement in settlements:
+            self._settle_group(settlement.anchor, settlement.survived)
         return AdmissionReport(tuple(settlements), tuple(transitions))
+
+    def _settle_group(self, a, survived):
+        """Free the anchor's group for its next anchor, or skip the rest."""
+        if self.groups is None:
+            return
+        group = self.groups[a]
+        self._group_busy.discard(group)
+        if not survived or group in self._group_done:
+            return
+        self._group_done.add(group)
+        skipped = [b for b in self.pending if self.groups[b] == group]
+        if skipped:
+            self.pending = deque(
+                b for b in self.pending if self.groups[b] != group)
+            for b in skipped:
+                self._stage[b] = _DONE
+            self._skipped.extend(skipped)
+
+    def take_skipped(self):
+        """Remove and return the queued anchors a done group skipped."""
+        skipped, self._skipped = self._skipped, []
+        return skipped
 
     def limit_reached(self) -> bool:
         """Return whether enough documents survived to stop new admissions."""

@@ -107,7 +107,13 @@ def make_executor(filter_truth, join_truth=None):
             def execute(self, node, inputs):
                 if isinstance(node, AiFilter):
                     rows = {}
-                    for document in inputs["document_ids"]:
+                    groups = inputs.get("stop_groups")
+                    done = set()
+                    for position, document in enumerate(inputs["document_ids"]):
+                        # a stop key skips a group's documents once one
+                        # passed, as the scheduler reads them in order
+                        if groups is not None and groups[position] in done:
+                            continue
                         row = []
                         for question in node.question_token_ids:
                             bit = filter_truth[node.alias][
@@ -117,6 +123,9 @@ def make_executor(filter_truth, join_truth=None):
                             if not bit:
                                 break
                         rows[document] = row
+                        if groups is not None and all(row) and len(
+                                row) == len(node.stages):
+                            done.add(groups[position])
                     survivors = [d for d, row in rows.items()
                                  if len(row) == len(node.stages) and all(row)]
                     # the real loop reports a chunk's finished documents

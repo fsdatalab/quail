@@ -407,6 +407,13 @@ The example query uses `d.id ASC` to order documents with equal scores by ID.
 columns. Quail removes duplicates before sorting and applying `OFFSET`
 or `LIMIT`. Every sorting column must appear in `SELECT`.
 
+When `SELECT` includes the id column of every table, the rows are
+already unique and the planner drops the `DISTINCT`. When the selected
+columns all come from the rows of the one table an `AI.IF` filters,
+directly or through a join equality, the filter reads one document per
+key value at a time and skips the rest once one passes. `EXPLAIN` shows
+this as `stop per key`.
+
 ## OFFSET
 
 `OFFSET n` skips `n` rows after sorting and before applying `LIMIT`.

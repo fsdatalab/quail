@@ -207,6 +207,16 @@ def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
     return memo[key]
 
 
+def filter_stop_keys(plan: LogicalPlan) -> dict:
+    """Return alias -> the stop key the per_key_stop rule put on its filters."""
+    keys = {}
+    for node in plan.walk():
+        if isinstance(node, SemanticFilter) and node.stop_key:
+            (alias,) = model_call(node.predicates[0].expression).aliases()
+            keys[alias] = tuple(node.stop_key)
+    return keys
+
+
 def filter_orders(plan: LogicalPlan) -> dict:
     """Return alias -> written positions of its AI.IF predicates in execution order.
 

@@ -240,9 +240,14 @@ def test_relational_plans_build_and_run(tmp_path):
         assert [column.name for column in top.input.columns
                 if hasattr(column, "name")] == ["recovered_score"]
         assert top.order[0].name == "recovered_score" and top.limit == 20
-        distinct = build_query(sess, get_query("REL-AGENT-3")).logical.root
-        assert distinct.input.keys == ("t.trajectory_id",)
-        assert distinct.input.aggregates == ()
+        # an aggregate with no measures is a DISTINCT, which the filter
+        # stops per trajectory
+        query = build_query(sess, get_query("REL-AGENT-3"))
+        distinct = query.logical.root
+        assert distinct.distinct and [
+            column.column for column in distinct.input.columns
+        ] == ["trajectory_id"]
+        assert "stop per key: trajectory_id" in query.explain()
 
         # the fixes: s0, s1 (A), s2, s4 (B), s5 (C): A and B twice
         def nodes(graph, request):

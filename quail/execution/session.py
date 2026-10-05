@@ -52,6 +52,7 @@ from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
 from quail.planner import explain, plan_query, refine_plan
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
+from quail.planner.statistics import filter_stop_keys
 from quail.progress import Progress, say
 
 
@@ -954,7 +955,7 @@ class Query:
         return PhysicalRequest(envelope, inputs, self._column_tables())
 
     def _column_tables(self) -> dict:
-        """One value table per alias a HashJoin or an apply() reads."""
+        """One value table per alias a HashJoin, an apply(), or a stop key reads."""
         needed = {}
         operators = self.logical.operators()
         for join in operators.joins:
@@ -964,6 +965,9 @@ class Query:
         for apply in operators.applies:
             for ref in apply.columns:
                 needed.setdefault(ref.alias, {})[ref.column] = None
+        for alias, key in filter_stop_keys(self.logical).items():
+            for column in key:
+                needed.setdefault(alias, {})[column] = None
         tables = {}
         for alias, columns in needed.items():
             store = self._token_inputs[alias]

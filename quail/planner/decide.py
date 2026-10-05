@@ -53,6 +53,7 @@ from quail.planner.results import result_nodes
 from quail.planner.statistics import (
     cached_statistics,
     filter_orders,
+    filter_stop_keys,
     filter_works,
     live_after_filters,
     question_tokens,
@@ -289,6 +290,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(operators.all_filters(), joins)
     orders = filter_orders(plan)
+    stop_keys = filter_stop_keys(plan)
 
     # ---- expected live counts after filters, and the filter work
     live0 = live_after_filters(plan, statistics)
@@ -407,7 +409,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             node_id=fid,
             inputs=input_ports((ids_src[alias],)),
             alias=alias, arena_writes=writes,
-            stages=tuple(stages)))
+            stages=tuple(stages),
+            stop_key=stop_keys.get(alias, ())))
         ids_src[alias] = PortRef(fid, f"ids:{alias}")
         emit_applies(alias)
 

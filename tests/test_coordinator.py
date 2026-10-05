@@ -6,6 +6,7 @@ from quail.backends.quail.coordinator import (
     filter_node_payloads,
     gate_group,
     join_group_payloads,
+    keyed_shards,
     merge_filter_round,
     merge_join_round,
     thin_survivors,
@@ -180,3 +181,21 @@ def test_join_merge_gates_thins_and_ships_partner_lists():
     assert [sub["anchor_index"] for sub in subs] == [[0, 2], [3, 5]]
     assert [sub["pairs"] for sub in subs] == [
         {0: {0: [3], 2: [1]}}, {0: {3: [], 5: [3]}}]
+
+
+def test_stop_key_groups_ride_the_filter_payload_and_shard_together():
+    p = payload()
+    p["columns"] = {"r": pa.table({
+        "r": pa.array(range(6), pa.int32()),
+        "key": ["a", "b", "a", "c", "b", "a"]})}
+    node = AiFilter(node_id="filter:r", alias="r", arena_writes=True,
+                    question_token_ids=((7, 7),), stop_key=("key",))
+    subs = filter_node_payloads(p, node, p["shards"], 2, has_joins=False)
+    assert [sub["stop_groups"] for sub in subs] == [[0, 0, 1], [0, 1, 2]]
+    plain = filter_node_payloads(p, filter_node(), p["shards"], 2,
+                                 has_joins=False)
+    assert all(sub["stop_groups"] is None for sub in plain)
+    # every document of a key lands on one worker
+    shards = keyed_shards([0, 1, 0, 2, 1, 0], [10, 11, 12, 13, 14, 15], 2)
+    assert shards == ((0, 2, 5), (1, 3, 4))
+

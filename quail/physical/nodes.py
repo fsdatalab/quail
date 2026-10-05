@@ -860,6 +860,9 @@ class AiFilter(PhysicalNode):
     # "unified" or "tree": the attention path the tree_attention rule
     # chose; empty leaves the executor's default
     attention: str = ""
+    # value columns of the alias; the executor reads one document of
+    # each key value at a time and skips the rest once one survives
+    stop_key: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.ai_filter"
     runtime_key: ClassVar[str] = type_name
@@ -892,6 +895,7 @@ class AiFilter(PhysicalNode):
             ],
             "share_prefixes": self.share_prefixes,
             "attention": self.attention,
+            "stop_key": list(self.stop_key),
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -917,6 +921,8 @@ class AiFilter(PhysicalNode):
             ),
             share_prefixes=bool(attributes.get("share_prefixes", False)),
             attention=str(attributes.get("attention", "")),
+            stop_key=tuple(str(column)
+                           for column in attributes.get("stop_key", ())),
         )
 
 
