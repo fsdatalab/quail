@@ -185,16 +185,16 @@ query = (
 
 `order_by(*keys)`
 
-Sort result rows by table columns or named AI outputs. A key is a
-column name as a string, for ascending order, or a `col()` with a
-direction: `col("r.stars").desc()` or `col("r.stars").asc()`. Add
-`.nulls_first()` or `.nulls_last()` to place nulls. By default,
-ascending order puts nulls last and descending order puts them first.
-A name assigned to an AI output sorts the same way: `col("score").desc()`.
+Sort result rows by table columns or AI output columns. Pass each column
+as a string or a `col()` expression.
 
-E.g., imagine a `reviews` table with review text in `body` and ratings
-in `stars`. This query returns ten positive reviews with the
-highest ratings:
+Use `.asc()` or `.desc()` on a `col()` expression to set the direction.
+The default is ascending. Use `.nulls_first()` or `.nulls_last()` to set
+where nulls appear. By default, ascending order puts nulls last and
+descending order puts them first.
+
+E.g., imagine a `reviews` table with text in `body` and ratings in `stars`.
+The query below returns up to ten positive reviews with the highest ratings:
 
 ```python
 query = (
@@ -207,9 +207,12 @@ query = (
 result = query.collect()
 ```
 
-The example query uses `"r.id"` as its second sorting column to order
-reviews with equal ratings. Sorting columns need not appear in `select()`,
-except when using `distinct()`.
+Quail evaluates every review before sorting the positive reviews. In this
+query, Quail uses `"r.id"` to order reviews with equal ratings. The limit
+applies after sorting.
+
+Sorting columns need not appear in `select()`, except when using
+`distinct()`.
 
 ### offset
 
