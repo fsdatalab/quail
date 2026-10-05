@@ -18,11 +18,7 @@ from pyarrow import compute as pc
 
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
-from quail.execution.pairs import (
-    columns_key,
-    pair_fraction,
-    pair_table,
-)
+from quail.execution.pairs import columns_key, estimate_pair_fraction
 from quail.execution.result import IndexRelation, QueryResult, true_answer_rows
 from quail.execution.runner import (
     ExecutionContext,
@@ -34,7 +30,6 @@ from quail.execution.selection import selected_rows
 from quail.execution.tokens import (
     ColumnStoreWriter,
     ScanInput,
-    SelectedScanInput,
     TokenStoreWriter,
 )
 from quail.execution.types import PhysicalRequest, document_input
@@ -52,6 +47,7 @@ from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
 from quail.planner import explain, plan_query, refine_plan
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
+from quail.planner.statistics import filter_stop_keys
 from quail.progress import Progress, say
 
 
@@ -337,25 +333,33 @@ class Session:
                     f"function on this session")
             self.registry.register_function(function, name=name)
 
-    def column_values(self, provider_name: str, column: str) -> pa.ChunkedArray:
-        """Return one source column in scan order.
+    def sample_columns(self, provider_name: str, columns) -> dict:
+        """Return the first ESTIMATE_SAMPLE rows of some source columns.
 
-        Reads the column store when the column is loaded, else scans
-        the provider for that one column.
+        The planner estimates selectivities from this sample; it never
+        reads a whole column.
         """
         provider = self.catalog.get(provider_name)
-        with self._lock:
-            store = self._column_stores.get(
-                (provider.content_identity(), column))
-        if store is not None:
-            return store.values
-        reader = provider.scan(ScanRequest(columns=(column,)))
+        columns = tuple(dict.fromkeys(columns))
+        reader = provider.scan(ScanRequest(columns=columns,
+                                           limit=ESTIMATE_SAMPLE))
+        batches = []
+        rows = 0
         try:
-            batches = [batch.column(0) for batch in reader]
+            for batch in reader:
+                batches.append(batch.slice(0, ESTIMATE_SAMPLE - rows))
+                rows += batches[-1].num_rows
+                if rows >= ESTIMATE_SAMPLE:
+                    break
         finally:
             reader.close()
-        return pa.chunked_array(
-            batches, type=provider.schema().field(column).type)
+        schema = provider.schema()
+        return {
+            column: pa.chunked_array(
+                [batch.column(index) for batch in batches],
+                type=schema.field(column).type)
+            for index, column in enumerate(columns)
+        }
 
     def token_lengths(self, provider_name: str, column: str):
         """Return the exact token counts when the column is tokenized."""
@@ -366,37 +370,38 @@ class Session:
     def estimate_lengths(self, provider_name: str, column: str) -> list[int]:
         """Estimate document token counts from a tokenized sample.
 
-        Reads the column's byte lengths and scales them by the tokens
-        per byte measured on the first ESTIMATE_SAMPLE documents.
+        Tokenizes the first ESTIMATE_SAMPLE documents and repeats their
+        lengths over the provider's row count, so the planner sees the
+        sample's length distribution without a pass over the table. A
+        provider that reports no row count is scanned for its byte
+        lengths, which the sample's tokens per byte scale.
         """
         provider = self.catalog.get(provider_name)
         key = (provider.content_identity(), column)
         if key in self._length_estimates:
             return self._length_estimates[key]
         started = time.perf_counter()
-        reader = provider.scan(ScanRequest(columns=(column,)))
-        byte_lengths = []
-        sample = []
-        try:
-            for batch in reader:
-                texts = batch.column(0)
-                byte_lengths.append(pc.binary_length(texts).cast(pa.int64()))
-                if len(sample) < ESTIMATE_SAMPLE:
-                    sample.extend(
-                        texts.slice(0, ESTIMATE_SAMPLE - len(sample)).to_pylist()
-                    )
-        finally:
-            reader.close()
+        row_count = provider.statistics().row_count
+        sample = self.sample_columns(provider_name, (column,))[column].to_pylist()
         # Defer fast-tokenizer initialization to the background tokenization pass.
         tok = self.tokenizer
-        sample_tokens = sum(len(tok(text)) for text in sample)
-        sample_bytes = sum(len(text.encode("utf-8")) for text in sample)
-        ratio = sample_tokens / sample_bytes if sample_bytes else 0.0
-        lengths = []
-        for chunk in byte_lengths:
-            lengths.extend(
-                max(1, round(n * ratio)) for n in chunk.to_pylist()
-            )
+        sample_lengths = [max(1, len(tok(text))) for text in sample]
+        if row_count is not None:
+            lengths = [sample_lengths[index % len(sample_lengths)]
+                       for index in range(row_count)] if sample_lengths else []
+        else:
+            sample_tokens = sum(sample_lengths)
+            sample_bytes = sum(len(text.encode("utf-8")) for text in sample)
+            ratio = sample_tokens / sample_bytes if sample_bytes else 0.0
+            lengths = []
+            reader = provider.scan(ScanRequest(columns=(column,)))
+            try:
+                for batch in reader:
+                    lengths.extend(
+                        max(1, round(n * ratio)) for n in pc.binary_length(
+                            batch.column(0)).cast(pa.int64()).to_pylist())
+            finally:
+                reader.close()
         self._length_estimates[key] = lengths
         say(f"estimated {provider_name}.{column}: {len(lengths):,} documents, "
             f"about {sum(lengths):,} tokens from a {len(sample)} document "
@@ -646,7 +651,6 @@ class Query:
         self._plan = None
         self._doc_tokens = None
         self._token_inputs = None
-        self._selected = {}
         self._token_futures = {}
         self._token_finished_at = {}
         self._estimated = ()
@@ -681,18 +685,19 @@ class Query:
             operators = self.logical.operators()
             self._doc_tokens = {}
             self._token_inputs = {}
-            self._selected = {}
             estimated = []
             for s in operators.scans:
-                self._selected[s.alias] = self._select_rows(s)
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
-                    self._doc_tokens[s.alias] = self._restrict(s.alias, exact)
+                    self._doc_tokens[s.alias] = exact
                     continue
-                self._doc_tokens[s.alias] = self._restrict(
-                    s.alias, self.session.estimate_lengths(s.provider, s.column))
+                self._doc_tokens[s.alias] = self.session.estimate_lengths(
+                    s.provider, s.column)
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
+            # the planner estimates what the column tests and the join
+            # equalities keep from samples; the executor applies them
+            scan_fractions = self._scan_fractions(operators.scans)
             pair_fractions = self._pair_fractions(
                 operators.scans, operators.joins)
             context = LogicalPlanningContext(
@@ -703,7 +708,8 @@ class Query:
                 canvas_draws=config.canvas_draws,
                 attention=config.attention,
                 tokenizer=self.session.tokenizer,
-                pair_fractions=pair_fractions)
+                pair_fractions=pair_fractions,
+                scan_fractions=scan_fractions)
             self.logical, changed = apply_logical_rules(
                 self.logical,
                 tuple(self.session.registry.logical_rules.values()),
@@ -715,9 +721,8 @@ class Query:
                 }:
                     columns = tuple(dict.fromkeys((*columns, s.column)))
                 if s.alias not in self._estimated:
-                    self._token_inputs[s.alias] = self._selection(
-                        s.alias, self.session.tokenize(
-                            s.provider, s.column, columns))
+                    self._token_inputs[s.alias] = self.session.tokenize(
+                        s.provider, s.column, columns)
                     continue
                 future = self.session.tokenize_async(
                     s.provider, s.column, columns)
@@ -739,6 +744,7 @@ class Query:
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
+                scan_fractions=scan_fractions,
                 memo=context.memo)
             extra = {}
             if config.gpu_timing:
@@ -769,74 +775,46 @@ class Query:
         return max(finished) - self._planning_started_at
 
     def _pair_fractions(self, scans, joins) -> dict:
-        """Pairs kept over the cross product, per join with conditions."""
+        """Estimated pairs over the cross product, per join with conditions."""
         providers = {scan.alias: scan.provider for scan in scans}
+        samples = {}
+
+        def keys(refs):
+            out = []
+            for ref in refs:
+                key = (ref.alias, ref.column)
+                if key not in samples:
+                    samples[key] = self.session.sample_columns(
+                        providers[ref.alias], [ref.column])[ref.column]
+                out.append(samples[key])
+            return out
+
         fractions = {}
         for position, join in enumerate(joins):
             oriented = oriented_join_conditions(join)
             if oriented is None:
                 continue
-            left_alias, right_alias, conditions = oriented
-            left_keys = [
-                self._column(providers[left.alias], left)
-                for left, _ in conditions
-            ]
-            right_keys = [
-                self._column(providers[right.alias], right)
-                for _, right in conditions
-            ]
-            fractions[position] = pair_fraction(
-                pair_table(left_alias, left_keys, right_alias, right_keys),
-                len(self._doc_tokens[left_alias]),
-                len(self._doc_tokens[right_alias]))
+            _, _, conditions = oriented
+            fractions[position] = estimate_pair_fraction(
+                keys([left for left, _ in conditions]),
+                keys([right for _, right in conditions]))
         return fractions
 
-    def _select_rows(self, scan):
-        """Return the positions a scan's column predicates keep, or None."""
-        if not scan.predicates:
-            return None
-        columns = {
-            predicate.column.column: self.session.column_values(
-                scan.provider, predicate.column.column)
-            for predicate in scan.predicates
-        }
-        return selected_rows(columns, scan.predicates)
-
-    def _restrict(self, alias: str, lengths):
-        """Return the document lengths at the alias's selected positions."""
-        selected = self._selected.get(alias)
-        if selected is None:
-            return lengths
-        return [lengths[index] for index in selected.to_pylist()]
-
-    def _selection(self, alias: str, store):
-        """Return a scan input restricted to the alias's selected positions."""
-        selected = self._selected.get(alias)
-        if selected is None:
-            return store
-        return SelectedScanInput(store, selected)
-
-    def _column(self, provider: str, ref) -> pa.ChunkedArray:
-        """Return one source column at the alias's selected positions."""
-        values = self.session.column_values(provider, ref.column)
-        selected = self._selected.get(ref.alias)
-        return values if selected is None else values.take(selected)
-
-    def _source_positions(self, alias: str, positions):
-        """Return registered-table positions for an alias's scan positions."""
-        selected = self._selected.get(alias)
-        if selected is None:
-            return positions
-        return pc.take(selected, positions).cast(positions.type)
-
-    def _source_table(self, table: pa.Table, aliases) -> pa.Table:
-        """Return an answer table with its alias columns in source positions."""
-        for alias in aliases:
-            index = table.schema.get_field_index(alias)
-            table = table.set_column(
-                index, table.schema.field(alias),
-                self._source_positions(alias, table.column(alias)))
-        return table
+    def _scan_fractions(self, scans) -> dict:
+        """Estimated fraction of each tested scan's documents its tests keep."""
+        fractions = {}
+        for scan in scans:
+            if not scan.predicates:
+                continue
+            columns = self.session.sample_columns(
+                scan.provider,
+                [predicate.column.column for predicate in scan.predicates])
+            sampled = len(next(iter(columns.values())))
+            kept = len(selected_rows(columns, scan.predicates))
+            # a sample that keeps nothing, or everything, says little
+            # about the rest, so the estimate stays off 0 and 1
+            fractions[scan.alias] = (kept + 1) / (sampled + 2)
+        return fractions
 
     def explain(self, *, verbose: bool = False,
                 analyze: bool = False) -> str:
@@ -881,7 +859,7 @@ class Query:
         started = time.perf_counter()
         refine = bool(self._token_futures)
         for alias, future in list(self._token_futures.items()):
-            self._token_inputs[alias] = self._selection(alias, future.result())
+            self._token_inputs[alias] = future.result()
             self._doc_tokens[alias] = self._token_inputs[alias].lengths
             self._token_finished_at.setdefault(alias, time.perf_counter())
             del self._token_futures[alias]
@@ -954,7 +932,11 @@ class Query:
         return PhysicalRequest(envelope, inputs, self._column_tables())
 
     def _column_tables(self) -> dict:
-        """One value table per alias a HashJoin or an apply() reads."""
+        """One value table per alias whose columns the executor reads.
+
+        A scan's column tests, a HashJoin, an apply(), and a stop key
+        read values; the tables carry the columns they name.
+        """
         needed = {}
         operators = self.logical.operators()
         for join in operators.joins:
@@ -964,6 +946,12 @@ class Query:
         for apply in operators.applies:
             for ref in apply.columns:
                 needed.setdefault(ref.alias, {})[ref.column] = None
+        for scan in operators.scans:
+            for predicate in scan.predicates:
+                needed.setdefault(scan.alias, {})[predicate.column.column] = None
+        for alias, key in filter_stop_keys(self.logical).items():
+            for column in key:
+                needed.setdefault(alias, {})[column] = None
         tables = {}
         for alias, columns in needed.items():
             store = self._token_inputs[alias]
@@ -1210,22 +1198,30 @@ class Query:
         result.report = report
 
         from quail.execution.reranker import classify_label_tables
-        from quail.physical import AiClassify
+        from quail.physical import AiClassify, AiScore
 
         # every classified document's label, before any filter on it;
         # a chain's later stages label the documents their gate passed
         answer_tables = {"filters": {}, "joins": {}, "classifies": {
-            name: self._source_table(table, table.column_names[:-1])
+            name: table
             for node in plan.nodes
             if isinstance(node, AiClassify)
             and PortRef(node.node_id, "scores") in response.outputs
             for name, table in classify_label_tables(
                 node.spec, response.outputs[PortRef(node.node_id, "scores")]
             ).items()
+        }, "scores": {
+            # every scored document's score, before any sort or fetch
+            node.spec.name: response.outputs[
+                PortRef(node.node_id, "scores")
+            ].select([*node.spec.aliases, node.spec.name])
+            for node in plan.nodes
+            if isinstance(node, AiScore) and not isinstance(node, AiClassify)
+            and PortRef(node.node_id, "scores") in response.outputs
         }}
         survivors = {
-            scan.alias: self._source_positions(scan.alias, pa.array(
-                range(len(self._doc_tokens[scan.alias])), pa.int32()))
+            scan.alias: pa.array(
+                range(len(self._doc_tokens[scan.alias])), pa.int32())
             for scan in scans
         }
 
@@ -1251,8 +1247,7 @@ class Query:
             elif value_type is ValueType.LABEL_ANSWERS:
                 # the label column follows the alias columns: one, or
                 # the anchor and partner of a classification of joined rows
-                answer_tables["classifies"][table.column_names[-1]] = (
-                    self._source_table(table, table.column_names[:-1]))
+                answer_tables["classifies"][table.column_names[-1]] = table
             elif value_type is ValueType.JOIN_ANSWERS:
                 written_pos = metadata.get(b"quail.written_pos")
                 if written_pos is None:
@@ -1297,8 +1292,8 @@ class Query:
                         "a document id relation needs one alias column"
                     )
                 alias = table.column_names[0]
-                survivors[alias] = self._source_positions(
-                    alias, table.column(alias).combine_chunks().cast(pa.int32()))
+                survivors[alias] = (
+                    table.column(alias).combine_chunks().cast(pa.int32()))
 
         for alias, relations in filter_relations.items():
             table = relations[0] if len(relations) == 1 else \
@@ -1315,8 +1310,7 @@ class Query:
                 stage_table = table.filter(mask)
                 evaluated = stage_table.num_rows
                 passed = pc.sum(stage_table.column("answer")).as_py() or 0
-                answer_tables["filters"][(alias, written_pos)] = (
-                    self._source_table(stage_table, [alias]))
+                answer_tables["filters"][(alias, written_pos)] = stage_table
                 report["stages"].append(dict(
                     op="filter", alias=alias, stage=index,
                     written_pos=written_pos,
@@ -1369,7 +1363,6 @@ class Query:
                     f"{sorted(missing_columns)}"
                 )
             answers = table.column("answer")
-            table = self._source_table(table, logical_aliases)
             answer_tables["joins"][written_pos] = table
             report["stages"].append(dict(
                 op="join", written_pos=written_pos, anchor=anchor,

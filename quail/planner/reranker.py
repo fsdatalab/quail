@@ -29,7 +29,7 @@ from quail.physical import (
     ScoreSpec,
 )
 from quail.physical.base import input_ports
-from quail.planner import hash_join_nodes
+from quail.planner import column_tests, hash_join_nodes
 from quail.planner.classify import (
     ClassifyRefusedError,
     classification_refusal,
@@ -408,7 +408,9 @@ def _plan_reranker(region, context, *, backend_name: str):
         lengths = context.document_tokens[scan.alias]
         count = len(lengths)
         total = sum(int(length) for length in lengths)
-        counts[scan.alias] = count
+        # the column tests keep an estimated fraction of the documents
+        fraction = context.scan_fractions.get(scan.alias, 1.0)
+        counts[scan.alias] = count * fraction
         means[scan.alias] = total / max(1, count)
         node = Scan(
             node_id=f"scan:{scan.alias}",
@@ -418,6 +420,8 @@ def _plan_reranker(region, context, *, backend_name: str):
             total_tokens=total,
             shard_ranges=((0, count),),
             shard_token_loads=(total,),
+            predicates=column_tests(scan),
+            expected_docs=count * fraction if scan.predicates else None,
         )
         nodes.append(node)
         scan_refs[scan.alias] = PortRef(node.node_id, f"ids:{scan.alias}")

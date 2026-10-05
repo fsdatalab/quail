@@ -53,6 +53,7 @@ from quail.planner.results import result_nodes
 from quail.planner.statistics import (
     cached_statistics,
     filter_orders,
+    filter_stop_keys,
     filter_works,
     live_after_filters,
     question_tokens,
@@ -191,10 +192,17 @@ def joined_calls(labels: LabelWork) -> list:
             if len(call.aliases()) == 2]
 
 
+def column_tests(scan) -> tuple:
+    """Return a logical scan's column tests as (column, comparison, value)."""
+    return tuple((predicate.column.column, predicate.comparison,
+                  predicate.value) for predicate in scan.predicates)
+
+
 def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                         device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                         order: str | None = None, pair_fractions=None,
-                        context: PlanningContext | None = None):
+                        context: PlanningContext | None = None,
+                        scan_fractions=None):
     """Compile a decided LogicalPlan into a PhysicalPlan or Refusal.
 
     The logical rules record each table's filter order, the joins'
@@ -221,6 +229,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             cross product its equality conditions keep.
         context: The planning context, needed when the plan classifies
             documents.
+        scan_fractions: alias -> the fraction of its documents the
+            column tests are expected to keep; the context's when None.
 
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
@@ -228,6 +238,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     applies = operators.applies
+    if scan_fractions is None and context is not None:
+        scan_fractions = context.scan_fractions
     labels = operators.labels
     classified = {alias for _, alias in labels.calls}
     after_joins = classified_above_joins(plan.root)
@@ -280,7 +292,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
 
     statistics = cached_statistics(
         plan, {} if context is None else context.memo, model=model,
-        device=device, doc_tokens=doc_tokens, pair_fractions=pair_fractions)
+        device=device, doc_tokens=doc_tokens, pair_fractions=pair_fractions,
+        scan_fractions=scan_fractions)
     stats, chunk, pre = statistics.stats, statistics.chunk, statistics.pre
     specs = statistics.specs
     asks = statistics.asks
@@ -289,6 +302,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(operators.all_filters(), joins)
     orders = filter_orders(plan)
+    stop_keys = filter_stop_keys(plan)
 
     # ---- expected live counts after filters, and the filter work
     live0 = live_after_filters(plan, statistics)
@@ -370,10 +384,13 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         nodes.append(PhysicalScan(
             node_id=sid,
             alias=s.alias, input_id=s.alias,
-            n_docs=stats[s.alias].n_docs,
-            total_tokens=stats[s.alias].total_tokens,
+            n_docs=len(doc_tokens[s.alias]),
+            total_tokens=sum(doc_tokens[s.alias]),
             shard_ranges=shard_ranges,
-            shard_token_loads=tuple(loads)))
+            shard_token_loads=tuple(loads),
+            predicates=column_tests(s),
+            expected_docs=(float(stats[s.alias].n_docs)
+                           if s.predicates else None)))
         ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
     # the hash join reads the scans; survivors thin its pairs at the AI join
     pairs_src = {}
@@ -407,7 +424,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             node_id=fid,
             inputs=input_ports((ids_src[alias],)),
             alias=alias, arena_writes=writes,
-            stages=tuple(stages)))
+            stages=tuple(stages),
+            stop_key=stop_keys.get(alias, ())))
         ids_src[alias] = PortRef(fid, f"ids:{alias}")
         emit_applies(alias)
 
@@ -672,6 +690,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
                registry=None, tokenizer=None, pair_fractions=None,
+               scan_fractions=None,
                canvas_draws: int = 4,
                attention: str | None = None, memo=None):
     """Plan one query with the selected model backend.
@@ -692,6 +711,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         registry: Optional session extension registry.
         tokenizer: Optional callable (text -> token list) handed to the
             planning context.
+        scan_fractions: alias -> the fraction of its documents the
+            column tests are expected to keep.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
         memo: Results the logical rules computed for this plan, such
@@ -740,6 +761,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         attention=attention,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
+        scan_fractions=dict(scan_fractions or {}),
         logical_plan=plan,
         memo={} if memo is None else memo,
     )

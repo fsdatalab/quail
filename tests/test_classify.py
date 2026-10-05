@@ -423,8 +423,8 @@ def test_rules_place_and_score_classifications(session, tmp_path):
     from quail.planner.statistics import undecided
 
     assert [rule.name for rule in built_in_logical_rules()] == [
-        "projection_pushdown", "filter_pushdown", "classify_placement",
-        "filter_order", "join_order"]
+        "distinct_elimination", "per_key_stop", "projection_pushdown",
+        "filter_pushdown", "classify_placement", "filter_order", "join_order"]
     assert [rule.name for rule in built_in_physical_rules()] == [
         "limit_pushdown", "kv_retention", "label_scoring", "prefix_sharing",
         "tree_attention"]

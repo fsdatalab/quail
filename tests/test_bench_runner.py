@@ -240,9 +240,14 @@ def test_relational_plans_build_and_run(tmp_path):
         assert [column.name for column in top.input.columns
                 if hasattr(column, "name")] == ["recovered_score"]
         assert top.order[0].name == "recovered_score" and top.limit == 20
-        distinct = build_query(sess, get_query("REL-AGENT-3")).logical.root
-        assert distinct.input.keys == ("t.trajectory_id",)
-        assert distinct.input.aggregates == ()
+        # an aggregate with no measures is a DISTINCT, which the filter
+        # stops per trajectory
+        query = build_query(sess, get_query("REL-AGENT-3"))
+        distinct = query.logical.root
+        assert distinct.distinct and [
+            column.column for column in distinct.input.columns
+        ] == ["trajectory_id"]
+        assert "stop per key: trajectory_id" in query.explain()
 
         # the fixes: s0, s1 (A), s2, s4 (B), s5 (C): A and B twice
         def nodes(graph, request):
@@ -266,6 +271,47 @@ def test_relational_plans_build_and_run(tmp_path):
         "longest": [4000, 9000]}
     assert output.filter_answers["filter-1"].column("t").to_pylist() == [
         "s0", "s1", "s2", "s3", "s4", "s5"]
+
+
+def test_a_score_query_reports_every_scored_document_and_its_pieces(tmp_path):
+    from quail.physical import AiScore
+
+    spec = get_query("REL-AGENT-4")
+    scores = [0.9, 0.1, 0.8, 0.2, 0.7, 0.3]
+
+    def nodes(graph, request):
+        scored = next(node for node in graph.nodes if isinstance(node, AiScore))
+        return {
+            **{node.node_id: NodeResult({f"ids:{node.alias}": range(
+                len(request.inputs[node.input_id].documents))})
+               for node in graph.nodes if isinstance(node, PhysicalScan)},
+            scored.node_id: NodeResult({"scores": pa.table({
+                "t": pa.array(range(6), pa.int32()),
+                "recovered_score": pa.array(scores, pa.float32())})}),
+        }
+
+    with _session(tmp_path) as sess:
+        sess.register("agent_traces", DocumentProvider.from_table(
+            TRACES, id_col="id"))
+        query = build_query(sess, spec)
+        result = _execute(query, nodes, store=None)
+        output = run_output(result, spec.info, {"agent_traces": TRACES})
+        output.prompt_pieces = prompt_pieces(query, spec.info, {})
+    # the rows keep the fetch; the answers keep every scored document
+    assert output.rows.num_rows == 6
+    answers = output.score_answers["score-1"]
+    assert answers.column("t").to_pylist() == [
+        "s0", "s1", "s2", "s3", "s4", "s5"]
+    assert answers.column("score").type == pa.float64()
+    assert [round(score, 3) for score in answers.column("score").to_pylist()
+            ] == scores
+    # the word tokenizer keeps the pieces readable: the score is laid out
+    # as the AI.IF prompt, so its head is the preamble
+    pieces = output.prompt_pieces
+    assert pieces["preamble"] == (sess.model.turn_prefix + quail.SHARED_PRE).split()
+    assert [item["id"] for item in pieces["scores"]] == ["score-1"]
+    assert pieces["scores"][0]["tail"][0] == "Evaluate"
+    assert not pieces["filters"] and not pieces["classifies"]
 
 
 def test_benchmark_results_and_scoring(tmp_path):

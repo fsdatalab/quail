@@ -123,12 +123,16 @@ class SemanticFilter:
 
     ``order`` is the predicates' execution order, as positions in
     ``predicates``, once the filter_order rule has chosen one; empty
-    means as written.
+    means as written. ``stop_key`` names columns of the filtered table
+    once the per_key_stop rule has found that the query asks only
+    whether any document of each key value passes; the executor then
+    skips a key's remaining documents once one survives.
     """
 
     input: LogicalNode
     predicates: tuple  # tuple[FilterPredicate, ...], written order
     order: tuple = ()  # tuple[int, ...]
+    stop_key: tuple = ()  # tuple[str, ...]
 
     type_name: ClassVar[str] = "quail.semantic_filter"
 
@@ -170,6 +174,7 @@ class SemanticFilter:
             "selectivities": [p.selectivity for p in self.predicates],
             "expressions": [_explain(p.expression) for p in self.predicates],
             "order": list(self.order),
+            "stop_key": list(self.stop_key),
         }
 
 

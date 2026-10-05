@@ -16,7 +16,7 @@ from fakes import register_claims_evidence
 import quail
 from demos import quickstart, quickstart_modal
 from quail.execution import execute as execution
-from quail.execution.pairs import pair_fraction, pair_table, partner_map
+from quail.execution.pairs import estimate_pair_fraction, pair_table, partner_map
 from quail.execution.result import (
     QueryResult,
     build_result_declaration,
@@ -389,7 +389,13 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
         "c", [pa.array(["u1", "u2", None, "u1"])],
         "e", [pa.array(["u2", "u1", "u1"])])
     assert pairs.to_pydict() == {"c": [0, 0, 1, 3, 3], "e": [1, 2, 0, 1, 2]}
-    assert pair_fraction(pairs, 4, 3) == 5 / 12
+    # the planner estimates the fraction from key samples: u1 twice
+    # against twice, u2 once against once, and a null never matches
+    assert estimate_pair_fraction(
+        [pa.array(["u1", "u2", None, "u1"])], [pa.array(["u2", "u1", "u1"])]
+    ) == 5 / 12
+    assert estimate_pair_fraction(
+        [pa.array(["u1"])], [pa.array([], pa.string())]) == 0.0
     assert partner_map(pairs, "e", "c") == {0: [1], 1: [0, 3], 2: [0, 3]}
     # two equalities: both key columns must match; integer keys on one
     # side are cast to the other side's type

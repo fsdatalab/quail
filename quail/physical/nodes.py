@@ -299,7 +299,13 @@ class RequestJoinSpec:
 
 @dataclass(frozen=True)
 class Scan(PhysicalNode):
-    """Read one tokenized document input supplied by the coordinator."""
+    """Read one tokenized document input supplied by the coordinator.
+
+    ``predicates`` are the column tests, as (column, comparison, value)
+    triples; the runtime keeps the documents that pass every one and
+    reads nothing else for the rest. ``expected_docs`` is the planner's
+    estimate of how many pass, from a sample; None without tests.
+    """
 
     alias: str = ""
     input_id: str = ""
@@ -307,6 +313,8 @@ class Scan(PhysicalNode):
     total_tokens: int = 0
     shard_ranges: tuple[tuple[int, int], ...] = ()
     shard_token_loads: tuple[int, ...] = ()
+    predicates: tuple[tuple[str, str, Any], ...] = ()
+    expected_docs: float | None = None
 
     type_name: ClassVar[str] = "quail.scan"
     runtime_key: ClassVar[str] = type_name
@@ -345,6 +353,11 @@ class Scan(PhysicalNode):
             "total_tokens": self.total_tokens,
             "shard_token_loads": list(self.shard_token_loads),
             "shard_ranges": [list(bounds) for bounds in self.shard_ranges],
+            "predicates": [
+                [column, comparison,
+                 list(value) if isinstance(value, tuple) else value]
+                for column, comparison, value in self.predicates],
+            "expected_docs": self.expected_docs,
         }
 
     @property
@@ -361,6 +374,10 @@ class Scan(PhysicalNode):
             "shard_token_loads": list(self.shard_token_loads),
             "shard_docs": [stop - start
                            for start, stop in self.shard_ranges],
+            "predicates": [
+                f"{column} {comparison}" + ("" if value is None else f" {value!r}")
+                for column, comparison, value in self.predicates],
+            "expected_docs": self.expected_docs,
         }
 
     @classmethod
@@ -377,6 +394,13 @@ class Scan(PhysicalNode):
                 for start, stop in attributes["shard_ranges"]
             ),
             shard_token_loads=tuple(attributes["shard_token_loads"]),
+            predicates=tuple(
+                (str(column), str(comparison),
+                 tuple(value) if isinstance(value, list) else value)
+                for column, comparison, value
+                in attributes.get("predicates", ())),
+            expected_docs=(None if attributes.get("expected_docs") is None
+                           else float(attributes["expected_docs"])),
         )
 
 
@@ -860,6 +884,9 @@ class AiFilter(PhysicalNode):
     # "unified" or "tree": the attention path the tree_attention rule
     # chose; empty leaves the executor's default
     attention: str = ""
+    # value columns of the alias; the executor reads one document of
+    # each key value at a time and skips the rest once one survives
+    stop_key: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.ai_filter"
     runtime_key: ClassVar[str] = type_name
@@ -892,6 +919,7 @@ class AiFilter(PhysicalNode):
             ],
             "share_prefixes": self.share_prefixes,
             "attention": self.attention,
+            "stop_key": list(self.stop_key),
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -917,6 +945,8 @@ class AiFilter(PhysicalNode):
             ),
             share_prefixes=bool(attributes.get("share_prefixes", False)),
             attention=str(attributes.get("attention", "")),
+            stop_key=tuple(str(column)
+                           for column in attributes.get("stop_key", ())),
         )
 
 

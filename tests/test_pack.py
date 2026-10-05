@@ -183,7 +183,7 @@ def test_admission_invariants_over_random_shapes():
 
 def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
                  pages=64, cap=None, order=(0, 1, 2), attention_mode=None,
-                 docs=None, tree=None):
+                 docs=None, tree=None, stop_groups=None):
     """Run a one-question filter over three documents.
 
     By default, document 1 shares its first 32 tokens with document 0.
@@ -222,7 +222,7 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
         fake_torch(), arena, pipeline, answers, docs, [[QUESTION]], budget,
         arena_writes=True, arena_keys=[("r", d) for d in range(len(docs))],
         prefix_tree=tree, retain_survivors=retain, limit=limit,
-        attention_mode=attention_mode, stats=stats)
+        attention_mode=attention_mode, stats=stats, stop_groups=stop_groups)
     return got, tokens, stats["borrowed_tokens"], arena
 
 
@@ -344,6 +344,54 @@ def test_join_admission_limit_ends_the_run_and_drains_the_queue():
     sched.report(0, 1, 0, 1, [1])
     assert sched.done()
     assert sched.drain() == [1, 2]
+
+
+def test_stop_groups_admit_one_anchor_per_group_and_skip_the_rest():
+    # groups {0, 1, 2} and {3, 4}: one anchor of each runs at a time
+    sched = JoinAdmission([50] * 5, [[10]], 250, arena_pages=100,
+                          page_tokens=16, stop_groups=[0, 0, 0, 1, 1])
+    assert [a for a, *_ in sched.next_chunk(100)] == [0, 3]
+    assert sched.next_chunk(100) == []
+    sched.report(3, 0, 0, 1, [0])
+    assert [a for a, *_ in sched.next_chunk(100)] == [4]
+    sched.report(0, 0, 0, 1, [1])
+    # the group's queued anchors are skipped without an answer
+    assert sched.take_skipped() == [1, 2] and sched.take_skipped() == []
+    assert sched.next_chunk(100) == [] and not sched.done()
+    sched.report(4, 0, 0, 1, [1])
+    assert sched.done() and sched.survivors == 2
+    assert sorted(sched.answers[0]) == [0, 3, 4]
+    assert sched.drain() == []
+    with pytest.raises(ValueError, match="stop_groups"):
+        JoinAdmission([50] * 2, [[10]], 250, arena_pages=100,
+                      page_tokens=16, stop_groups=[0])
+    # a wider stop admits that many anchors of a group at once
+    sched = JoinAdmission([50] * 5, [[10]], 250, arena_pages=100,
+                          page_tokens=16, stop_groups=[0, 0, 0, 1, 1],
+                          stop_width=2)
+    assert [a for a, *_ in sched.next_chunk(100)] == [0, 1, 3, 4]
+    sched.report(0, 0, 0, 1, [1])
+    assert sched.take_skipped() == [2] and not sched.done()
+
+
+def test_filter_stop_groups_skip_a_queued_child_and_release_its_parent(
+        monkeypatch):
+    # document 1 borrows from 0 and passes; document 2, queued behind
+    # them in the same group, never runs and the parent's hold goes
+    # a 70 token budget holds one document per chunk, so one group's
+    # documents run one at a time
+    got, tokens, borrowed, arena = _tree_filter(
+        monkeypatch, truth=[[0], [1], [1]], budget=70,
+        stop_groups=[0, 0, 0])
+    assert got == {0: [0], 1: [1]}
+    assert borrowed == 32 and tokens == 64 + 32 + 2
+    assert not arena.resident_keys() and not arena._holds
+    # a parent in another group still serves its child
+    got, _, borrowed, _ = _tree_filter(
+        monkeypatch, truth=[[1], [1], [1]], budget=70,
+        stop_groups=[0, 1, 0])
+    assert got == {0: [1], 1: [1]}
+    assert borrowed == 32
 
 
 def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):

@@ -209,6 +209,33 @@ def filter_document_sink(node, document_ids):
     return document_done
 
 
+def stop_groups(node, columns, document_ids) -> list | None:
+    """Return each document's stop key group, or None without a stop key.
+
+    Documents with equal values in the node's ``stop_key`` columns
+    share a group number; the scheduler reads one document of a group
+    at a time and skips the rest once one survives.
+
+    Args:
+        node: The AiFilter.
+        columns: The alias's value table, one row per document.
+        document_ids: The documents' positions in that table.
+    """
+    if not node.stop_key:
+        return None
+    if columns is None:
+        raise KeyError(
+            f"the stop key of {node.alias!r} needs its value columns")
+    import pyarrow as pa
+
+    positions = pa.array([int(document) for document in document_ids],
+                         pa.int64())
+    values = zip(*(columns.column(name).take(positions).to_pylist()
+                   for name in node.stop_key))
+    groups = {}
+    return [groups.setdefault(value, len(groups)) for value in values]
+
+
 def filter_inputs(state, node, document_ids) -> dict:
     """Scheduler inputs for one filter chain over the given documents."""
     return {
@@ -217,6 +244,8 @@ def filter_inputs(state, node, document_ids) -> dict:
         ),
         "document_ids": document_ids,
         "limit": state["filter_limit"],
+        "stop_groups": stop_groups(
+            node, state.get("columns", {}).get(node.alias), document_ids),
         "retain_survivors": node.keep_kv,
         "document_done": filter_document_sink(node, document_ids),
     }

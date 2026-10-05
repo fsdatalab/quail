@@ -96,6 +96,8 @@ def logical_tree(logical):
             if node.order:
                 title += " order=" + ",".join(
                     str(position + 1) for position in node.order)
+            if node.stop_key:
+                title += " stop_key=" + ",".join(node.stop_key)
         elif isinstance(node, logical_nodes.Filter):
             title = (f"Filter: {node.explain_fields()['condition']} "
                      f"(selectivity={_selectivity(node.selectivity)})")
@@ -279,7 +281,8 @@ def _estimated_rows(graph):
         inputs = [rows.get(port.source) for port in node.inputs]
         value = None
         if isinstance(node, Scan):
-            value = node.n_docs
+            value = (node.n_docs if node.expected_docs is None
+                     else node.expected_docs)
         elif isinstance(node, AiFilter):
             value = inputs[0] if inputs else None
             for stage in node.stages:
@@ -395,6 +398,11 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 kv.append("retain KV for later joins")
             details.append(", ".join(kv) if kv else
                            "KV: stored" if node.arena_writes else "KV: not stored")
+            if node.stop_key:
+                details.append(
+                    f"stop per key: {', '.join(node.stop_key)} "
+                    f"(one document at a time, the rest skipped once "
+                    f"one survives)")
             written = filters.get(node.alias, ())
             order = [stage.written_pos for stage in node.stages]
             reordered = order != sorted(order)

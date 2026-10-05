@@ -40,6 +40,7 @@ def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
         [list(question) for question in node.question_token_ids],
         chunk_tokens,
         limit=inputs.get("limit"),
+        stop_groups=inputs.get("stop_groups"),
         arena_writes=node.arena_writes,
         arena_keys=DocumentKeys(node.alias, document_ids),
         retain_survivors=retain_survivors,

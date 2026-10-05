@@ -132,7 +132,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                attention_mode=None, prefix_tree=None, stats=None,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
-               on_answers=None):
+               on_answers=None, stop_groups=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -157,6 +157,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             host seconds spent building chunks.
         limit: Stop admitting documents once this many survived the
             last stage; the rest never run.
+        stop_groups: Per document, its stop key group, or None. One
+            document of a group runs at a time, and once one survives
+            the last stage the group's queued documents never run.
         paged: Whether documents' KV is written to arena pages. False
             runs one stage of one suffix per document as a single
             causal segment without pages: the filter fast path.
@@ -189,7 +192,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         attention_mode=attention_mode, prefix_tree=prefix_tree, stats=stats,
         limit=limit, paged=paged, unit=unit, count_answers=count_answers,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
-        on_answers=on_answers,
+        on_answers=on_answers, stop_groups=stop_groups,
     ).run()
 
 
@@ -199,7 +202,7 @@ class _StageExecutor:
     def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
-                 default_attention, on_chunk, on_answers):
+                 default_attention, on_chunk, on_answers, stop_groups=None):
         from quail.backends.quail.executor.chunk import Suffixes
         from quail.backends.quail.executor.loop import (
             attention_path,
@@ -304,6 +307,8 @@ class _StageExecutor:
             advance=partial(_advance_stage, stages),
             frame_writes=self.writes,
             limit=limit,
+            stop_groups=stop_groups,
+            stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,
         )
         self.borrowing = self.sched.borrowing
@@ -340,6 +345,21 @@ class _StageExecutor:
                            for j, stage in enumerate(self.stages)}
         self.read_all_of = {self.group_key[j]: stage.read_all_rows
                             for j, stage in enumerate(self.stages)}
+
+    def _stop_width(self, stop_groups, budget) -> int:
+        """Anchors of one stop key group in flight at once.
+
+        One per group is the most a group can save, but with fewer
+        groups than a chunk holds it would leave the chunk mostly
+        empty, so the width grows to keep about one chunk in flight.
+        """
+        if stop_groups is None or not self.prefixes:
+            return 1
+        groups = len(set(stop_groups)) or 1
+        mean = (sum(self.prefix_lengths) / len(self.prefix_lengths)
+                + float(np.mean(self.suffixes[0].lengths)))
+        per_chunk = max(1, int(budget // max(1.0, mean)))
+        return max(1, -(-per_chunk // groups))
 
     def _entry_rows(self, a, j, start, end, carried):
         f = self.prefix_lengths[a]
@@ -549,6 +569,26 @@ class _StageExecutor:
             if self.counting_answers else self.finished)
         if transitions and self.on_chunk is not None:
             self.on_chunk(transitions)
+        self._release_skipped()
+
+    def _release_skipped(self):
+        """Let go of what the documents a stop key skipped would have used.
+
+        A skipped document never packs, so its parent's hold for it is
+        released, or not counted when the parent is still queued, and
+        its own borrowers pack their whole prefix.
+        """
+        for a in self.sched.take_skipped():
+            self.borrowing.skip(a)
+            parent = (self.borrowing.tree_parent[a]
+                      if a < len(self.borrowing.tree_parent) else None)
+            if parent is not None:
+                if parent in self.borrowing.admitted:
+                    self.arena.release(self.keys[parent])
+                else:
+                    self.borrowers[parent] -= 1
+            if self.arena.is_resident(self.keys[a]):
+                self.arena.free_key(self.keys[a])
 
     def _run_part(self, part):
         """Run one chunk of groups, halving it when its pages do not fit."""
@@ -630,6 +670,7 @@ class _StageExecutor:
                     self.arena.release(self.keys[parent])
         while self.outstanding:
             self._report(self.outstanding.pop(0))
+        self._release_skipped()
         # a limit ends the run with documents still queued
         for anchor in self.sched.drain():
             if self.arena.is_resident(self.keys[anchor]):
