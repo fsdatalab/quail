@@ -16,7 +16,7 @@ from quail.logical import (
     bind_prompt,
     bind_score_prompt,
 )
-from quail.logical.nodes import validate_task_description
+from quail.logical.expressions import validate_task_description
 from quail.logical.prompts import bind_classify_prompt
 
 JOIN_OPTION_KEYS = {"selectivity", "anchor"}

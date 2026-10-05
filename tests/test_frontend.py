@@ -481,7 +481,7 @@ def test_sql_and_builder_parse_order_by_offset_and_distinct(catalog):
     """, catalog, tok)
     assert scored.root.distinct
     assert scored.root.order == (
-        SortKey(scored.root.columns[1], descending=True, nulls_first=False),)
+        SortKey(scored.projection.columns[1], descending=True, nulls_first=False),)
     with pytest.raises(CompileError, match="column name or col"):
         reviews().order_by(("r.id", "desc"))
     with pytest.raises(CompileError, match="nonnegative"):

@@ -219,11 +219,11 @@ def test_relational_plans_build_and_run(tmp_path):
             str(tmp_path / "agent_traces.parquet"), id_col="id"))
         logical = build_query(sess, get_query("REL-AGENT-6")).logical
         root = logical.root
-        assert root.aggregation.keys == ("t.trajectory_id",)
-        assert [str(a) for a in root.aggregation.aggregates] == [
+        assert root.input.keys == ("t.trajectory_id",)
+        assert [str(a) for a in root.input.aggregates] == [
             "fixes = count(*)", "first_fix = min(t.turn_index)",
             "longest = max(t.token_count)"]
-        assert [str(t) for t in root.aggregation.having] == ["fixes >= 2"]
+        assert [str(t) for t in root.input.having] == ["fixes >= 2"]
         assert [str(key) for key in root.order] == [
             "first_fix ASC NULLS LAST", "t.trajectory_id ASC NULLS LAST"]
         assert (root.limit, root.offset) == (50, 0)
@@ -237,12 +237,12 @@ def test_relational_plans_build_and_run(tmp_path):
         paged = build_query(sess, get_query("REL-AGENT-2")).logical.root
         assert (paged.limit, paged.offset) == (10, 10)
         top = build_query(sess, get_query("REL-AGENT-4")).logical.root
-        assert [column.name for column in top.columns
+        assert [column.name for column in top.input.columns
                 if hasattr(column, "name")] == ["recovered_score"]
         assert top.order[0].name == "recovered_score" and top.limit == 20
         distinct = build_query(sess, get_query("REL-AGENT-3")).logical.root
-        assert distinct.aggregation.keys == ("t.trajectory_id",)
-        assert distinct.aggregation.aggregates == ()
+        assert distinct.input.keys == ("t.trajectory_id",)
+        assert distinct.input.aggregates == ()
 
         # the fixes: s0, s1 (A), s2, s4 (B), s5 (C): A and B twice
         def nodes(graph, request):

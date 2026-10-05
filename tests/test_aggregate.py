@@ -69,9 +69,18 @@ def test_group_by_ends_the_plan_in_an_aggregate(catalog):
                .having(count() > 1, max_("r.stars") < 5)
                .order_by(col("n").desc()).limit(2).select("r.lang", "n", "s"))
     root = logical.root
-    assert [str(column) for column in root.aggregation.aggregates] == [
+    assert [type(node).__name__ for node in logical.walk()][-3:] == [
+        "Project", "Aggregate", "Result"]
+    aggregate_node = root.input
+    assert aggregate_node.children() == (logical.projection,)
+    assert aggregate_node.with_expressions(
+        aggregate_node.expressions()) == aggregate_node
+    assert aggregate_node.with_children((logical.projection,)) == aggregate_node
+    assert tuple(ref.column for ref in aggregate_node.output_schema()) == (
+        "lang", "n", "s")
+    assert [str(column) for column in root.input.aggregates] == [
         "n = count(*)", "s = avg(r.stars)", "__having_1 = max(r.stars)"]
-    assert [str(test) for test in root.aggregation.having] == [
+    assert [str(test) for test in root.input.having] == [
         "n > 1", "__having_1 < 5"]
     assert root.result_columns() == ("r.lang", "n", "s")
     plan = _plan(logical, {"r": [400] * 100})

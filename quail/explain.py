@@ -60,9 +60,7 @@ def logical_tree(logical):
 
     def visit(node, depth):
         details = []
-        if isinstance(node, logical_nodes.Project):
-            columns = ", ".join(node.explain_fields()["columns"])
-            title = f"Project: {columns}"
+        if isinstance(node, logical_nodes.Result):
             if node.limit is not None:
                 lines.append(f"{'  ' * depth}Limit: {node.limit:,}")
                 depth += 1
@@ -76,9 +74,13 @@ def logical_tree(logical):
             if node.distinct:
                 lines.append(f"{'  ' * depth}Distinct")
                 depth += 1
-            if node.aggregation is not None:
-                lines.append(f"{'  ' * depth}Aggregate: {node.aggregation}")
-                depth += 1
+            visit(node.input, depth)
+            return
+        if isinstance(node, logical_nodes.Aggregate):
+            title = f"Aggregate: {node.specification()}"
+        elif isinstance(node, logical_nodes.Project):
+            columns = ", ".join(node.explain_fields()["columns"])
+            title = f"Project: {columns}"
         elif isinstance(node, logical_nodes.Scan):
             title = f"Scan {node.provider} as {node.alias}"
             columns = ", ".join(dict.fromkeys((node.column, *node.columns)))

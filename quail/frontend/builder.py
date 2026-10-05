@@ -26,7 +26,7 @@ from quail.logical import (
     bind_prompt,
     bind_score_prompt,
 )
-from quail.logical.nodes import validate_task_description
+from quail.logical.expressions import validate_task_description
 
 
 @dataclass(frozen=True, eq=False)

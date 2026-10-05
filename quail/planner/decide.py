@@ -629,13 +629,13 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     else:
         sink_inputs = (ids_src[scans[0].alias],)
     columns = []
-    for c in plan.root.columns:
+    for c in plan.projection.columns:
         columns.append(c.name if isinstance(c, Alias)
                        else f"{c.alias}.{c.column}")
         if isinstance(c, Alias) and getattr(c.expression, "probabilities", False):
             columns.append(c.name + PROBABILITIES_SUFFIX)
     nodes.extend(result_nodes(
-        plan.root, tuple(sink_inputs) + tuple(label_ports), tuple(columns)))
+        plan.result, tuple(sink_inputs) + tuple(label_ports), tuple(columns)))
 
     estimate = (speed_of_light(base_work + stage_work, model, device,
                                chunk).seconds + _score_seconds(nodes))

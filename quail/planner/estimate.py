@@ -39,10 +39,12 @@ from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan, triangle
 from quail.execution.pairs import pair_table
 from quail.logical import (
+    Aggregate,
     Filter,
     Join,
     ModelCall,
     Project,
+    Result,
     Scan,
     SemanticClassify,
     SemanticFilter,
@@ -68,7 +70,7 @@ CLASSIFY = "AI.CLASSIFY"
 LABEL_IN = "IN"
 
 _PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, Filter, Join,
-                 SemanticJoin, Project)
+                 SemanticJoin, Project, Aggregate, Result)
 
 
 @dataclass(frozen=True)
@@ -241,9 +243,9 @@ def _refuse_unpriced(logical) -> None:
         if not isinstance(node, _PRICED_NODES):
             raise NotImplementedError(
                 f"the speed of light estimate does not price {node.type_name}")
-        if isinstance(node, Project) and node.limit is not None \
+        if isinstance(node, Result) and node.limit is not None \
                 and not (node.order or node.distinct or node.offset
-                         or node.aggregation is not None):
+                         or isinstance(node.input, Aggregate)):
             # a sorted, distinct, offset, or grouped result runs every
             # document, which the estimate prices; a bare LIMIT stops early
             raise NotImplementedError(

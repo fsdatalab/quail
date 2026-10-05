@@ -1062,7 +1062,7 @@ class Query:
                             f"label column {name!r} belongs to the joined "
                             f"rows of {aliases}, not all in the result")
                     call = next((column.expression
-                                 for column in self.logical.root.columns
+                                 for column in self.logical.projection.columns
                                  if isinstance(column, Alias)
                                  and column.name == name), None)
                     order = (None if call is None
@@ -1109,7 +1109,7 @@ class Query:
                         pa.concat_arrays([labeled, pa.array([None], labeled.type)]),
                         pa.array(slots))
                     call = next((column.expression
-                                 for column in self.logical.root.columns
+                                 for column in self.logical.projection.columns
                                  if isinstance(column, Alias)
                                  and column.name == name), None)
                     if call is not None:

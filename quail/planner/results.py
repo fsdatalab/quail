@@ -1,11 +1,12 @@
 """The result nodes a physical plan ends with."""
 
-from quail.logical import Project as LogicalProject
+from quail.logical import Aggregate as LogicalAggregate
+from quail.logical import Result as LogicalResult
 from quail.physical import Aggregate, Limit, PortRef, Project, Sort
 from quail.physical.base import input_ports
 
 
-def result_nodes(root: LogicalProject, inputs: tuple[PortRef, ...],
+def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
                  columns: tuple[str, ...]) -> tuple:
     """Return the Project, Aggregate, and Sort or Limit that end a plan.
 
@@ -16,12 +17,12 @@ def result_nodes(root: LogicalProject, inputs: tuple[PortRef, ...],
     Sort carrying the limit; a plain LIMIT ends in a Limit.
 
     Args:
-        root: The logical projection.
+        root: The result modifiers above a projection or aggregation.
         inputs: The ports the projection reads, the relation first.
         columns: The result column names, in the projection's order.
     """
     # with an aggregation the sort keys name its outputs, not inputs
-    hidden = () if root.aggregation is not None else tuple(dict.fromkeys(
+    hidden = () if isinstance(root.input, LogicalAggregate) else tuple(dict.fromkeys(
         key.name for key in root.order if key.name not in columns))
     nodes = [Project(
         node_id="project",
@@ -30,8 +31,8 @@ def result_nodes(root: LogicalProject, inputs: tuple[PortRef, ...],
     )]
     rows = (PortRef("project", "rows"),)
     result = tuple(columns)
-    if root.aggregation is not None:
-        aggregation = root.aggregation
+    if isinstance(root.input, LogicalAggregate):
+        aggregation = root.input
         nodes.append(Aggregate(
             node_id="aggregate",
             inputs=input_ports(rows),

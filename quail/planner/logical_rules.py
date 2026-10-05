@@ -7,6 +7,7 @@ from dataclasses import replace
 from quail.cost import budgets
 from quail.cost.work import Work
 from quail.logical import (
+    Aggregate,
     Alias,
     Apply,
     ColumnPredicate,
@@ -21,6 +22,7 @@ from quail.logical import (
     LogicalPlan,
     ModelCall,
     Project,
+    Result,
     Scan,
     SemanticClassify,
     SemanticFilter,
@@ -71,18 +73,21 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     The document column is always tokenized. It is kept as a value too
     only when the root projection returns it.
     """
+    plan = LogicalPlan(root)
+    projection = next((node for node in reversed(plan.walk())
+                       if isinstance(node, Project)), None)
+    result = plan.result
     returned = {
         (ref.alias, ref.column)
-        for ref in (root.output_schema() if isinstance(root, Project)
-                    else ())
+        for ref in (projection.output_schema() if projection is not None else ())
     } | {
         (ref.alias, ref.column)
-        for key in (root.order if isinstance(root, Project) else ())
+        for key in result.order
         for ref in _column_refs(key)
     }
     score_inputs = {
         (ref.alias, ref.column)
-        for expression in (root.columns if isinstance(root, Project) else ())
+        for expression in (projection.columns if projection is not None else ())
         if isinstance(expression, Alias)
         for ref in _column_refs(expression)
     }
@@ -90,8 +95,6 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     def descend(node, needed):
         needed = {alias: dict(columns) for alias, columns in needed.items()}
         expressions = node.expressions()
-        if isinstance(node, Project):
-            expressions += node.order
         for expression in expressions:
             for ref in _column_refs(expression):
                 needed.setdefault(ref.alias, {})[ref.column] = None
@@ -269,6 +272,9 @@ def lift_classifications(root: LogicalNode) -> LogicalNode | None:
     Returns:
         The rewritten root, or None when no classification moved.
     """
+    if isinstance(root, (Result, Aggregate)):
+        rewritten = lift_classifications(root.input)
+        return None if rewritten is None else root.with_children((rewritten,))
     joined = {alias for node in LogicalPlan(root).walk()
               if isinstance(node, SemanticJoin)
               for alias in model_call(node.predicate).aliases()}
