@@ -569,16 +569,16 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
 
 def test_planner_prices_the_rules_and_takes_the_cheapest():
     from quail.cost import budgets
-    from quail.planner.classify import ClassifyRefusedError, _Table
+    from quail.planner.label_scoring import ClassifyScoring
+    from quail.planner.validation import ClassifyRefusedError
 
     chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
     capacity = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM, chunk)
     long_labels = tuple(tuple(range(100 + 5 * i, 104 + 5 * i))
                         for i in range(30))
     letters = tuple((200 + i,) for i in range(30))
-    table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
-                   chunk=chunk, backend_name="quail",
-                   model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes,
+    table = ClassifyScoring(alias="d", mean=200.0, longest=300, budget=chunk,
+                   chunk=chunk, model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes,
                    capacity=capacity, lengths=(200,) * 1000, tree=True)
     # thirty four-token labels sharing nothing, on resident documents
     # (no decode): the packed trie streams 91 tokens a document, the
@@ -611,7 +611,7 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
     assert table.choose(1000, 20, 30, prefixed, False)[0] == "trie_tree"
     # without tree attention or a lettered prompt, the decode alone;
     # with neither and no decode, nothing can run
-    unified = _Table(**{**table.__dict__, "tree": False})
+    unified = ClassifyScoring(**{**table.__dict__, "tree": False})
     assert unified.choose(1000, 20, 30, long_labels, False)[0] == "trie_decode"
     with pytest.raises(ClassifyRefusedError, match="no label scoring rule"):
         unified.choose(1000, 20, 30, prefixed, True)

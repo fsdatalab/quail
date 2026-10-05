@@ -30,7 +30,7 @@ from quail.execution.runner import (
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.frontend.sql import compile_sql
-from quail.logical import CompileError, SemanticJoin
+from quail.logical import CompileError, SemanticFilter, SemanticJoin
 from quail.physical import (
     AiClassify,
     AiScore,
@@ -261,10 +261,10 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
 
 def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     from quail.backends.quail.graph import throughput
+    from quail.cost.score import score_work
     from quail.cost.work import ask, scan
     from quail.execution.runner import NodeMetrics
     from quail.explain import run_summary
-    from quail.planner.reranker import _score_work
 
     for model, canvas in (("qwen3-4b-fp8", 0), ("diffusion-gemma-26b-a4b-fp8", 1)):
         session = _session(catalog, model=model, tokenizer=list)
@@ -283,12 +283,12 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
             pytest.approx(expected), model
 
     # Two query documents, three candidates each, and a shared prompt.
-    work = _score_work(
+    work = score_work(
         6, 15, 9, prefix_tokens=17, groups=2, shared_tokens=3,
     )
     expected = scan(0, 24) + ask(3, 21) + ask(17, 7) * 4
     assert work == expected
-    assert _score_work(0, 15, 9).tokens == 0
+    assert score_work(0, 15, 9).tokens == 0
 
     session = _session(catalog)
     query = session.sql(
@@ -358,6 +358,57 @@ def test_score_filters_compare_values_and_keep_pair_answers(catalog):
     assert result.schema.field("s").type == pa.float64()
     assert result.report["estimated_seconds"] > 0
     assert reranker.calls == 1
+    session.close()
+
+
+@pytest.mark.parametrize("model", ["qwen3-reranker-0.6b-bf16", "qwen3-4b-fp8"])
+def test_score_filter_order_uses_logical_rules_and_honors_override(catalog, model):
+    session = _session(catalog, model=model)
+    sql = (
+        "SELECT d.id FROM documents d WHERE "
+        f"AI.SCORE(PROMPT('{'long ' * 100}{{0}}', d.body)) > 0.5 AND "
+        "AI.SCORE(PROMPT('Short? {0}', d.body)) > 0.5")
+    for rule, expected in (("by_cost", [1, 0]), ("as_written", [0, 1])):
+        query = session.sql(sql, order=rule)
+        physical = query.plan()
+        logical = next(node for node in query.logical.walk()
+                       if isinstance(node, SemanticFilter))
+        assert list(logical.order or range(2)) == expected
+        assert [node.written_pos for node in physical.nodes
+                if isinstance(node, Filter)] == expected
+        assert physical.settings["order_rule"] == rule
+        scores = [node for node in physical.nodes if isinstance(node, AiScore)]
+        assert [node.spec.expected_inputs for node in scores] == [2.0, 0.4]
+
+    class WrittenOrder:
+        name = "written_score_order"
+
+        def rewrite(self, root, context):
+            def visit(node):
+                node = node.with_children(tuple(visit(c) for c in node.children()))
+                return (replace(node, order=(0, 1))
+                        if isinstance(node, SemanticFilter) else node)
+            return visit(root)
+
+    session.registry.register_logical_rule(WrittenOrder())
+    query = session.sql(sql)
+    physical = query.plan()
+    assert [node.written_pos for node in physical.nodes
+            if isinstance(node, Filter)] == [0, 1]
+    session.close()
+
+
+def test_score_join_records_its_legal_anchor_in_the_shared_rule(catalog):
+    session = _session(catalog)
+    query = session.sql(
+        "SELECT q.id, d.id FROM queries q JOIN documents d ON "
+        "AI.SCORE(PROMPT('Is {1} relevant to {0}?', q.text, d.body)) > 0.5")
+    physical = query.plan()
+    join = query.logical.operators().joins[0]
+    assert (join.exec_idx, join.exec_anchor) == (0, "q")
+    score = next(node for node in physical.nodes if isinstance(node, AiScore))
+    assert score.spec.aliases == ("q", "d")
+    assert physical.estimated_seconds == pytest.approx(score.spec.estimated_seconds)
     session.close()
 
 
@@ -634,7 +685,7 @@ def _shared_store(path, bodies):
 def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     from quail.physical import PhysicalGraph, PortRef, Scan, ScoreSpec
     from quail.physical.base import input_ports
-    from quail.planner.decide import _apply_rules
+    from quail.planner.api import _apply_rules
     from quail.planner.physical_optimizer import PlanningContext
     from quail.planner.physical_rules import PrefixSharing
     from quail.planner.plan import PhysicalPlan
@@ -780,15 +831,13 @@ def test_score_refusals_name_oversized_documents_and_missing_scores(
 
 def test_reranker_prompts_render_stored_documents_and_the_ai_if_frame(catalog):
     from quail.logical.prompts import (
+        QWEN3_RERANKER_SYSTEM_TEXT,
         bind_join_prompt,
         bind_prompt,
         render_filter_prompt_ids,
         render_join_prompt_ids,
-        true_false_token_ids,
-    )
-    from quail.reranker import (
-        QWEN3_RERANKER_SYSTEM_TEXT,
         render_qwen3_reranker_input,
+        true_false_token_ids,
     )
     from quail.specs import MODELS
 

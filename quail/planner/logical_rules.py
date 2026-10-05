@@ -29,18 +29,19 @@ from quail.logical import (
     SemanticFilter,
     SemanticJoin,
     SortKey,
-    has_score,
+    is_score,
     model_call,
 )
-from quail.planner import joins as joinsearch
+from quail.planner import join_order as joinsearch
 from quail.planner import pricing
-from quail.planner.filters import default_order_rule, order_filters_indexed
+from quail.planner.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.statistics import (
     PlanStatistics,
     cached_statistics,
     filter_orders,
     filter_works,
     live_after_filters,
+    prepare_filter_costs,
     undecided,
 )
 
@@ -357,12 +358,10 @@ def prices(root, context) -> bool:
     """Return whether the Quail cost model applies to a plan and context.
 
     It applies when the context has a model, the backend is quail, the
-    model's weights fit one GPU, and the plan has no AI.SCORE, which the
-    reranker planner plans.
+    model's weights fit one GPU.
     """
     return (context.model is not None and context.backend == "quail"
-            and budgets.minimum_weight_gpus(context.model, context.device) == 1
-            and not has_score(LogicalPlan(root)))
+            and budgets.minimum_weight_gpus(context.model, context.device) == 1)
 
 
 def _statistics(root, context) -> PlanStatistics:
@@ -371,7 +370,7 @@ def _statistics(root, context) -> PlanStatistics:
         LogicalPlan(root), context.memo, model=context.model,
         device=context.device, doc_tokens=context.document_tokens,
         pair_fractions=context.pair_fractions,
-        scan_fractions=context.scan_fractions)
+        scan_fractions=context.scan_fractions, context=context)
 
 
 def _order_rule(context) -> str:
@@ -379,16 +378,14 @@ def _order_rule(context) -> str:
 
 
 class FilterOrder:
-    """Order each table's AI.IF predicates by expected cost.
+    """Order each table's model predicates by expected cost.
 
-    Each SemanticFilter's predicates get the order that minimizes the
-    chain's ideal expected time (order_filters_indexed): the first
-    predicate scans every document's prefix, each later one asks over
-    the KV the chain keeps, and a predicate's selectivity thins what
-    follows. The rule records the order on the node when it differs
-    from the written order. With order="as_written", it clears every
-    recorded order. Both front ends put a table's AI.IF predicates in
-    one SemanticFilter, so the order covers the whole chain.
+    Each SemanticFilter uses order_filters_indexed to compare first
+    predicates and rank later predicates by cost per rejection. Each
+    operator supplies its own cost and reuse behavior. The rule records
+    the chosen order on the node when it differs from the written order.
+    With order="as_written", it clears every recorded order. Both front
+    ends put a table's model predicates in one SemanticFilter.
     """
 
     name = "filter_order"
@@ -409,11 +406,14 @@ class FilterOrder:
             if rule == "as_written":
                 return node if not node.order else replace(node, order=())
             (alias,) = model_call(node.predicates[0].expression).aliases()
-            ordered = order_filters_indexed(
-                list(node.predicates), rule,
+            costs = prepare_filter_costs(
+                node.predicates,
                 prefix_tokens=(statistics.pre
                                + statistics.stats[alias].mean_doc_tokens),
-                model=model, device=device, chunk_tokens=statistics.chunk)
+                model=model, device=device, chunk_tokens=statistics.chunk,
+                context=context)
+            ordered = order_filters_indexed(
+                costs, rule, count=statistics.stats[alias].n_docs)
             order = () if ordered == list(range(len(ordered))) else tuple(ordered)
             return node if order == node.order else replace(node, order=order)
 
@@ -424,7 +424,7 @@ class FilterOrder:
 class JoinOrder:
     """Choose the joins' stage order and each stage's anchor by cost.
 
-    The left-deep search (quail.planner.joins.search_joins) prices
+    The left-deep search (quail.planner.join_order.search_joins) prices
     every connected stage order with every anchor choice together,
     because a stage's cost depends on which table's KV is computed once
     and which documents' KV earlier stages left resident. It ranks each
@@ -539,6 +539,8 @@ def _filtered_alias(operators: Operators) -> str | None:
             or len(operators.filters) != 1):
         return None
     (alias,) = operators.filters
+    if any(is_score(p.expression) for p in operators.filters[alias]):
+        return None
     return alias
 
 

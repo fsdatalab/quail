@@ -7,12 +7,12 @@ from test_planner import _optimize, _plan, node_kinds, tok
 from quail.catalog import Catalog, DocumentProvider
 from quail.execution.result import QueryResult
 from quail.execution.runner import NodeResult, SortRuntime
+from quail.explain import explain
 from quail.frontend.builder import col, count, docs, prompt
 from quail.logical import Result, Scan, SemanticFilter
 from quail.physical import AiFilter, Project, Sort
 from quail.physical.base import input_ports
 from quail.planner import plan_query
-from quail.planner.decide import explain
 from quail.planner.logical_optimizer import (
     LogicalPlanningContext,
     apply_logical_rules,

@@ -20,8 +20,10 @@ from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
+from quail.cost.score import score_fixed_tokens
 from quail.execution.pipelines import build_pipelines
 from quail.logical import classified_above_joins
+from quail.logical.prompts import classify_prompt_tokens
 from quail.physical import (
     Aggregate,
     AiClassify,
@@ -36,7 +38,6 @@ from quail.physical import (
 )
 from quail.planner import retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
-from quail.planner.reranker import score_fixed_tokens
 from quail.planner.statistics import cached_statistics, live_after_filters
 
 
@@ -103,7 +104,7 @@ class KvRetention:
             logical, context.memo, model=context.model, device=context.device,
             doc_tokens=context.document_tokens,
             pair_fractions=context.pair_fractions,
-            scan_fractions=context.scan_fractions)
+            scan_fractions=context.scan_fractions, context=context)
         joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
         groups = [[(statistics.specs[stage.written_pos], stage.anchor)
                    for stage in node.stages] for node in joins]
@@ -151,7 +152,7 @@ class LabelScoring:
     leaves chosen ones alone, so a later pass keeps the first choice.
     The candidates are letters, when the prompt has a one-token letter
     per label; trie_tree, under the tree attention path; and
-    trie_decode, over documents without resident KV (_Table.choose).
+    trie_decode, over documents without resident KV.
     The documents count as resident, with their KV in the arena, when
     the classification continues its table's filter chain on one GPU
     before any join, or follows a classification with the same prompt
@@ -177,17 +178,21 @@ class LabelScoring:
             raise ValueError(
                 "label_scoring needs the logical plan on the planning context "
                 "to score a classification without a scoring rule")
-        from quail.planner.classify import classify_table
+        from quail.planner.label_scoring import classify_scoring
 
         logical = context.logical_plan
         calls = {node.name: node.call for node in logical.operators().classifies}
         after_joins = classified_above_joins(logical.root)
         chosen = {}
         for node in pending:
-            table = classify_table(context, node.spec.anchor, node.backend_name)
-            resident = _resident(node, graph, context, calls, after_joins, table)
+            table = classify_scoring(context, node.spec.anchor)
+            resident = _resident(node, graph, context, calls, after_joins)
             chosen[node.node_id] = replace(node, spec=table.choose_scoring(
                 node.spec, calls[node.spec.name], resident))
+            if "estimated_fresh_tokens" in context.settings:
+                work = table.simulated(chosen[node.node_id].spec, resident).work
+                context.settings["estimated_fresh_tokens"] += work.tokens
+                context.settings["estimated_attention_pairs"] += work.pairs
         context.settings["search_seconds"] = (
             context.settings.get("search_seconds", 0.0)
             + sum(node.spec.estimated_seconds for node in chosen.values())
@@ -197,7 +202,7 @@ class LabelScoring:
             graph.root)
 
 
-def _resident(node, graph, context, calls, after_joins, table) -> bool:
+def _resident(node, graph, context, calls, after_joins) -> bool:
     """Return whether a classification's documents have their KV in the arena.
 
     True on one GPU when the classification continues its table's
@@ -211,8 +216,11 @@ def _resident(node, graph, context, calls, after_joins, table) -> bool:
     while isinstance(source, (Filter, Foreign)):
         source = graph.node(source.inputs[0].source.node_id)
     if isinstance(source, AiClassify) and source.spec is not None:
-        return (table.head(calls[source.spec.name])
-                == table.head(calls[node.spec.name]))
+        previous = classify_prompt_tokens(
+            calls[source.spec.name].prompt, (), context.tokenizer)[0]
+        current = classify_prompt_tokens(
+            calls[node.spec.name].prompt, (), context.tokenizer)[0]
+        return previous == current
     return isinstance(source, AiFilter) and node.spec.anchor not in after_joins
 
 
@@ -344,9 +352,9 @@ class PrefixSharing:
 
 def _shared_classify_spec(node, context, store, *, resident=False):
     """Enable prefix sharing and update the classification cost estimate."""
-    from quail.planner.classify import classify_table
+    from quail.planner.label_scoring import classify_scoring
 
-    table = classify_table(context, node.spec.aliases[0], node.backend_name,
+    table = classify_scoring(context, node.spec.aliases[0],
                            shared=document_shared_tokens(store))
     return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
 
@@ -358,7 +366,8 @@ def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):
     that the scored documents borrow the same share of their tokens as
     the whole table.
     """
-    fixed = score_fixed_tokens(spec.prompt_token_parts, canvas_tokens, spec.draws)
+    fixed = score_fixed_tokens(tuple(map(len, spec.prompt_token_parts)),
+                               canvas_tokens, spec.draws)
     total = sum(lengths) + len(lengths) * fixed
     fresh = max(0.0, 1.0 - shared_tokens / total) if total else 1.0
     return replace(spec, share_prefixes=True,

@@ -9,11 +9,11 @@ import quail
 from quail.catalog import Catalog, DocumentProvider
 from quail.execution.result import QueryResult
 from quail.execution.runner import AggregateRuntime, aggregate_table
+from quail.explain import explain
 from quail.frontend.builder import avg, col, count, docs, max_, prompt, sum_
 from quail.logical import AggregateCall, Aggregation, CompileError, HavingTest
 from quail.physical import Aggregate, Sort
 from quail.physical.base import input_ports
-from quail.planner.decide import explain
 
 
 def _node(**fields):

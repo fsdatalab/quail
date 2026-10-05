@@ -103,11 +103,14 @@ built-in rules of the same kind, in registration order.
 
 | Rule | Kind | Decision | Uses cost estimates |
 | --- | --- | --- | --- |
+| `distinct_elimination` | Logical | Remove DISTINCT when the returned keys are unique. | No |
+| `per_key_stop` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
 | `projection_pushdown` | Logical | Load only columns the query uses. | No |
 | `filter_pushdown` | Logical | Move eligible CPU filters and Python functions before joins. | No |
 | `classify_placement` | Logical | Classify a table's documents before or after its joins. | Yes |
-| `filter_order` | Logical | Order each table's `AI.IF` predicates. | Yes |
+| `filter_order` | Logical | Order each table's `AI.IF` or `AI.SCORE` predicates. | Yes |
 | `join_order` | Logical | Choose join order and anchors. | Yes |
+| `limit_pushdown` | Physical | Stop an eligible filter chain after enough documents pass. | No |
 | `kv_retention` | Physical | Keep selected document KV for later operators. | Yes |
 | `label_scoring` | Physical | Choose a classification's label scoring method. | Yes |
 | `prefix_sharing` | Physical | Reuse KV between documents with a shared prefix. | Yes |
@@ -120,7 +123,12 @@ and
 
 Logical rules that compare costs leave the plan unchanged when model
 specifications are unavailable or the model does not fit on one GPU.
-Queries containing `AI.SCORE` use the reranker planner instead.
+
+Each operator supplies its own prompt preparation, execution constraints,
+and costs. Score operators support both generative
+models and reranker models. Score joins preserve the document order in the
+model prompt. The executor reuses the first document's KV across its
+partners, so that document is the anchor.
 
 Call `explain(verbose=True)` to inspect physical settings, including
 `share_prefixes` and `attention`.
@@ -154,18 +162,23 @@ unless moving classifications after the joins has a lower estimate.
 ### Filter order
 
 The `filter_order` rule chooses predicate order within a table.
-When a table has several `AI.IF` predicates, their order affects how much
+When a table has several model predicates, their order affects how much
 work the query does. *Selectivity* is the estimated fraction of rows
 that pass a predicate. A predicate that keeps fewer rows can reduce the work of later predicates.
 
-The first predicate processes each full document. With KV rewind, later
+For `AI.IF`, the first predicate processes each full document. With KV rewind, later
 predicates process only their question tokens for documents that passed.
 The rule accounts for that difference when comparing orders.
 
-It first sorts predicates by cost per rejected document. It then tries
-each predicate as the first one and keeps the order with the lowest
+The rule tries each predicate first. It orders the remaining predicates
+by cost per rejected document and keeps the candidate with the lowest
 expected time. [Our blog post on filter cost estimates](https://fsdatalab.github.io/blog/ai-filter-cost-estimates/)
-gives the derivation.
+gives the derivation for `AI.IF`.
+
+For `AI.SCORE`, the rule prices each prompt at the expected survivor count.
+It accounts for prefix reuse within a score evaluation. Later comparisons
+of a score already computed for those rows need no model work. The physical
+graph builder reads the chosen order and reuses the computed score column.
 
 Set `order="as_written"` to preserve predicate order.
 
