@@ -104,11 +104,13 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
             for field in node.output_schema()[len(node.input.output_schema()):]:
                 needed.get(field.alias, {}).pop(field.column, None)
         if isinstance(node, Scan):
+            tested = {predicate.column.column for predicate in node.predicates}
             columns = tuple(
                 column for column in needed.get(node.alias, ())
                 if column != node.column
                 or (node.alias, column) in returned
                 or (node.alias, column) in score_inputs
+                or column in tested
             )
             return node if columns == node.columns else replace(
                 node, columns=columns)
@@ -498,11 +500,12 @@ class DistinctElimination:
 
     A filter returns each document at most once and a join pairs each
     row pair once, so the result rows are unique when the projection
-    returns the id column of every scanned table; registration checks
-    that an id column is a key (``check_id_column``). The rule reads
-    the id columns from the catalog and leaves a plan alone without
-    one, or when an apply() supplies the rows. A GROUP BY whose output
-    returns every key is unique as well.
+    returns the id column of every scanned table. The id column is
+    taken as a key: nothing checks it, since that would read the
+    whole column, and a table that repeats an id gets the repeated
+    rows back. The rule reads the id columns from the catalog and
+    leaves a plan alone without one, or when an apply() supplies the
+    rows. A GROUP BY whose output returns every key is unique as well.
     """
 
     name = "distinct_elimination"

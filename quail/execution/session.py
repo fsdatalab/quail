@@ -17,7 +17,7 @@ from pyarrow import acero
 from pyarrow import compute as pc
 
 from quail.builtins import built_in_registry
-from quail.catalog import Catalog, ScanRequest, TableProvider, check_ids
+from quail.catalog import Catalog, ScanRequest, TableProvider
 from quail.execution.pairs import columns_key, estimate_pair_fraction
 from quail.execution.result import IndexRelation, QueryResult, true_answer_rows
 from quail.execution.runner import (
@@ -147,7 +147,6 @@ class Session:
         self.notes = []            # tokenizer picks etc., for reports
         self._token_stores = {}
         self._column_stores = {}
-        self._checked_ids = set()
         self._store_count = 0
         self._token_directory = None
         self._corpus_tokenizers = {}
@@ -468,11 +467,8 @@ class Session:
         """
         provider = self.catalog.get(provider_name)
         identity = provider.content_identity()
-        # the first scan of a table also checks that its ids are a key
-        check_ids_now = identity not in self._checked_ids
         scan_columns = tuple(dict.fromkeys(
             ((column,) if column is not None else ()) + value_columns
-            + ((provider.id_col,) if check_ids_now else ())
         ))
         scan_reader = provider.scan(ScanRequest(columns=scan_columns))
         reader = iter(scan_reader)
@@ -503,10 +499,7 @@ class Session:
                     f"({self.notes[-1].split(': ', 1)[-1]})")
                 progress = Progress(f"tokenizing {provider_name}.{column}")
             rows = 0
-            ids = []
             for batch in batches:
-                if check_ids_now:
-                    ids.append(batch.column(provider.id_col))
                 for start in range(0, batch.num_rows, TOKENIZE_ROWS):
                     piece = batch.slice(start, TOKENIZE_ROWS)
                     for writer in writers:
@@ -514,10 +507,6 @@ class Session:
                     rows += piece.num_rows
                     if progress is not None:
                         progress.update(rows)
-            if check_ids_now:
-                check_ids(provider_name, provider.id_col, pa.chunked_array(
-                    ids, type=provider.schema().field(provider.id_col).type))
-                self._checked_ids.add(identity)
         except Exception:
             for writer in writers:
                 writer.abort()

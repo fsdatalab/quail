@@ -190,3 +190,33 @@ def test_two_joins_on_one_table_sample_each_key_column(session):
     # langs en x4, fr, de against en, fr: five of twelve
     assert fractions == {0: 3 / 12, 1: 5 / 12}
 
+
+def test_column_tests_reach_score_scans_and_may_read_the_text(session):
+    from quail.physical import Scan as PhysicalScan
+
+    # the score planner builds its own scans; they keep the tests
+    scored = (session.docs("reviews").alias("r")
+              .where(col("r.stars") >= 4)
+              .ai_score(prompt("q: {0}", col("r.review")), name="s")
+              .select("r.id", "s"))
+    plan = scored.plan()
+    scan = next(node for node in plan.nodes if isinstance(node, PhysicalScan))
+    assert scan.predicates == (("stars", ">=", 4),)
+    assert (scan.n_docs, scan.expected_docs) == (6, 3.0)
+    # a test on the document column keeps the text as a value column
+    text = "review 2 " + "pad " * 20
+    query = (session.docs("reviews").alias("r")
+             .ai_filter(prompt("q1: {0}", col("r.review")))
+             .where(col("r.review") == text)
+             .select("r.id"))
+    query.plan()
+    logical_scan = next(node for node in query.logical.walk()
+                        if isinstance(node, Scan))
+    assert "review" in logical_scan.columns
+    assert _run(query, make_executor(TRUTH)).to_rows() == []
+    query = (session.docs("reviews").alias("r")
+             .ai_filter(prompt("q1: {0}", col("r.review")))
+             .where(col("r.review") == "review 3 " + "pad " * 20)
+             .select("r.id"))
+    assert _run(query, make_executor(TRUTH)).to_rows() == [("r3",)]
+

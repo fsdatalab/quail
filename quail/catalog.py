@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import pyarrow as pa
-import pyarrow.compute as pc
 
 from quail.logical import CompileError
 
@@ -282,28 +281,6 @@ class DocumentProvider:
                 f"id column {id_col!r} not in table schema "
                 f"{tuple(table.schema.names)}")
         return MemoryTableProvider(table, id_col, identity)
-
-
-def check_ids(name: str, id_col: str, ids: pa.ChunkedArray) -> None:
-    """Raise unless a table's id column is a key.
-
-    Every id is non-null and appears once, so a row is named by its id:
-    answer tables, benchmark ids, and the planner's DISTINCT rule rely
-    on it. The session checks the column on the scan that first reads
-    the table.
-
-    Raises:
-        CompileError: The id column has a null or a repeated value.
-    """
-    if ids.null_count:
-        raise CompileError(
-            f"id column {id_col!r} of {name!r} has {ids.null_count} null "
-            f"values; every document needs an id")
-    repeated = len(ids) - pc.count_distinct(ids).as_py()
-    if repeated:
-        raise CompileError(
-            f"id column {id_col!r} of {name!r} repeats {repeated} values; "
-            f"every document needs its own id")
 
 
 @dataclass
