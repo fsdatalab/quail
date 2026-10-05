@@ -329,42 +329,60 @@ For labels computed before later filters, see
 For the scoring methods, see
 [Label scoring](/docs/architecture/execution#label-scoring).
 
-## SELECT, FROM, JOIN, ORDER BY, LIMIT
+## SELECT, FROM, JOIN, LIMIT
 
 Quail supports these SQL clauses with the following limits:
 
 - **`SELECT`** lists columns and `AI.SCORE` or `AI.CLASSIFY`
-  outputs with column aliases. `*` expands to all table columns. Other computed expressions
-  are unsupported. `SELECT DISTINCT` drops duplicate rows.
+  outputs with column aliases. `*` expands to all table columns. Other
+  computed expressions are unsupported.
 - **`FROM`** names a registered table, with an optional alias.
 - **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
   `RIGHT`, `FULL`) are not.
-- **`ORDER BY`** sorts the result rows by table columns or by the
-  `AS` names of `AI.SCORE` and `AI.CLASSIFY` outputs, each `ASC` or
-  `DESC` with `NULLS FIRST` or `NULLS LAST`. Expressions are not
-  sort keys: name the expression in `SELECT` and order by that name.
-  With `DISTINCT`, every sort key must be in the `SELECT` list.
-- **`LIMIT`** takes a positive integer and **`OFFSET`** a nonnegative
-  one.
+- **`LIMIT`** takes a positive integer.
 
-The sort runs on the result rows after the model work, on the
-coordinator. A query with `ORDER BY`, `DISTINCT`, or `OFFSET` evaluates
-every document before it returns rows, so adding `LIMIT` to it does not
-shorten the run. A plain `LIMIT` stops the run once enough documents
-have passed every predicate. For example, this returns the ten
-documents with the highest score, after scoring all of them:
+## ORDER BY
+
+`ORDER BY` sorts result rows by table columns or names assigned to AI
+outputs with `AS`. AI expressions cannot appear directly in `ORDER BY`.
+Sorting columns need not appear in `SELECT`, except when using
+`SELECT DISTINCT`.
+
+The default direction is `ASC`. Use `DESC` for descending order.
+`NULLS FIRST` or `NULLS LAST` overrides the dialect's default null placement:
+
+- BigQuery puts nulls first for `ASC` and last for `DESC`.
+- Snowflake puts nulls last for `ASC` and first for `DESC`.
+
+E.g., imagine a `documents` table with customer messages in `body`.
+This query returns ten documents with the highest refund-request scores:
 
 ```sql
 SELECT d.id,
        AI.SCORE(PROMPT('Does the customer request a refund? {0}', d.body))
            AS refund_score
 FROM documents d
-ORDER BY refund_score DESC
+ORDER BY refund_score DESC NULLS LAST, d.id ASC
 LIMIT 10
 ```
 
-`ORDER BY`, `DISTINCT`, and `OFFSET` run on the Quail backend; the stock
-vLLM and SGLang backends refuse them.
+The example query uses `d.id ASC` to order documents with equal scores by ID.
+
+## SELECT DISTINCT
+
+`SELECT DISTINCT` removes duplicate rows by comparing all selected
+columns. Quail removes duplicates before sorting and applying `OFFSET`
+or `LIMIT`. Every sorting column must appear in `SELECT`.
+
+## OFFSET
+
+`OFFSET n` skips `n` rows after sorting and before applying `LIMIT`.
+The count must be an integer greater than or equal to zero. Use `ORDER BY`
+to specify which rows to skip. Without an explicit order, the skipped
+rows can differ between runs.
+
+Sorting or removing duplicates prevents `LIMIT` from stopping AI
+evaluation early. An offset greater than zero has the same effect.
 
 ## Unsupported SQL
 

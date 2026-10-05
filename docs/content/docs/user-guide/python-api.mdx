@@ -185,36 +185,49 @@ query = (
 
 `order_by(*keys)`
 
-Sort the result rows. A key is a column name, a name given to an
-`AI.SCORE` or `AI.CLASSIFY` output, or a tuple of the name and
-`"asc"` or `"desc"`, with an optional `"nulls first"` or
-`"nulls last"`. Ascending keys put nulls last and descending keys put
-them first unless told otherwise. A sorted query evaluates every
-document before returning rows, so a `limit()` after it does not
-shorten the run.
+Sort result rows by table columns or named AI outputs. Pass a column name
+as a string for ascending order. A tuple `(name, direction)` accepts
+`"asc"` or `"desc"` as the direction. An optional third string specifies
+`"nulls first"` or `"nulls last"`. By default, ascending order puts nulls
+last and descending order puts them first.
+
+E.g., imagine a `reviews` table with review text in `body` and ratings
+in `stars`. This query returns ten positive reviews with the
+highest ratings:
 
 ```python
 query = (
     session.docs("reviews").alias("r")
     .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
-    .order_by(("r.stars", "desc"), "r.id")
+    .order_by(("r.stars", "desc", "nulls last"), "r.id")
     .limit(10)
     .select("r.id", "r.body")
 )
+result = query.collect()
 ```
+
+The example query uses `"r.id"` as its second sorting column to order
+reviews with equal ratings. Sorting columns need not appear in `select()`,
+except when using `distinct()`.
 
 ### offset
 
 `offset(n)`
 
-Skip the first `n` rows. Use it with `order_by`.
+Skip `n` rows before applying `limit()`. The argument must be an integer
+greater than or equal to zero. Use `order_by()` to specify which rows to
+skip. Without an explicit order, the skipped rows can differ between runs.
 
 ### distinct
 
 `distinct()`
 
-Return each distinct row once. Every `order_by` key must then be a
-selected column.
+Remove duplicate rows by comparing all columns passed to `select()`.
+Quail removes duplicates before sorting and applying `offset()` or
+`limit()`. Every sorting column must appear in `select()`.
+
+Sorting or removing duplicates prevents `limit()` from stopping AI
+evaluation early. An offset greater than zero has the same effect.
 
 ### select
 
