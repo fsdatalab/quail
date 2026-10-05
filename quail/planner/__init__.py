@@ -11,6 +11,7 @@ The names below are the planning interface a model backend uses.
 from .decide import (
     balanced_shards,
     build_physical_plan,
+    column_tests,
     explain,
     hash_join_nodes,
     plan_query,
@@ -26,6 +27,7 @@ __all__ = [
     "PhysicalPlan",
     "Refusal",
     "balanced_shards",
+    "column_tests",
     "build_physical_plan",
     "default_order_rule",
     "hash_join_nodes",

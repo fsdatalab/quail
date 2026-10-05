@@ -129,16 +129,20 @@ def ask_positions(filters) -> dict:
 
 def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
                     device: DeviceSpec, doc_tokens: dict,
-                    pair_fractions=None) -> PlanStatistics:
+                    pair_fractions=None, scan_fractions=None) -> PlanStatistics:
     """Gather the statistics of one logical plan.
 
     Args:
         plan: The logical plan.
         model: Model spec.
         device: Device spec.
-        doc_tokens: alias -> per-document token counts.
+        doc_tokens: alias -> per-document token counts, of every
+            document in the table.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
+        scan_fractions: alias -> the fraction of its documents the
+            column tests are expected to keep; the alias's counts and
+            sums are scaled by it.
 
     Raises:
         ValueError: A scanned alias has no document token counts.
@@ -150,6 +154,9 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
                    for alias, positions in asks.items() if positions}
     lengths = {a: joinsearch.summarize_alias(t, model.sliding_window)
                for a, t in doc_tokens.items()}
+    for alias, fraction in (scan_fractions or {}).items():
+        if alias in lengths:
+            lengths[alias] = joinsearch.scale_alias(lengths[alias], fraction)
     stats = {
         a: CorpusStats(n_docs=s.count, total_tokens=s.total,
                        max_doc_tokens=s.maximum)
@@ -192,7 +199,7 @@ def undecided(root) -> object:
 
 def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
                       device: DeviceSpec, doc_tokens: dict,
-                      pair_fractions=None) -> PlanStatistics:
+                      pair_fractions=None, scan_fractions=None) -> PlanStatistics:
     """Return plan_statistics, computed once per memo and undecided plan root.
 
     The decisions the rules record do not change the statistics, so
@@ -203,7 +210,7 @@ def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
     if key not in memo:
         memo[key] = plan_statistics(
             plan, model=model, device=device, doc_tokens=doc_tokens,
-            pair_fractions=pair_fractions)
+            pair_fractions=pair_fractions, scan_fractions=scan_fractions)
     return memo[key]
 
 

@@ -6,12 +6,6 @@ from test_session import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
 from quail.execution.selection import evaluate_predicate, selected_rows
-from quail.execution.tokens import (
-    ScanInput,
-    SelectedScanInput,
-    TokenSelection,
-    select_documents,
-)
 from quail.frontend.builder import col, prompt
 from quail.logical import ColumnPredicate, ColumnRef, CompileError, Scan
 
@@ -37,31 +31,6 @@ def test_predicates_evaluate_with_nulls_rejected():
                          ).to_pylist() == [2, 3]
     with pytest.raises(CompileError, match="cannot be evaluated"):
         evaluate_predicate(stars, _predicate("=", "five"))
-
-
-def test_selected_scan_input_renumbers_documents(tmp_path):
-    from quail.execution.tokens import ColumnStore, TokenStore
-
-    table = pa.table({"id": ["a", "b", "c", "d"],
-                      "text": ["x", "y y", "z z z", "w"]})
-    tokens = TokenStore.write(
-        str(tmp_path / "tokens.arrow"), table.to_batches(),
-        document_column="text", tokenizer=lambda text: [
-            ord(word) for word in text.split()], token_type=pa.int32())
-    ids = ColumnStore.write(str(tmp_path / "id.arrow"), table.to_batches(),
-                            field=table.schema.field("id"))
-    source = ScanInput(tokens, {"id": ids})
-    selected = SelectedScanInput(source, [1, 3])
-    assert selected.lengths == [2, 1]
-    assert selected.column("id").to_pylist() == ["b", "d"]
-    assert selected.projected_columns == ("id",)
-    documents = selected.tokens
-    assert isinstance(documents, TokenSelection)
-    assert [list(document) for document in documents] == [[121, 121], [119]]
-    # a shard of the selection reads the right documents from the file
-    shard = select_documents(documents, [1])
-    assert isinstance(shard, TokenSelection)
-    assert [list(document) for document in shard] == [[119]]
 
 
 @pytest.fixture()
@@ -99,21 +68,25 @@ def test_column_predicates_select_documents_before_the_model(session):
         return make_executor(TRUTH)(request)
 
     # the AI predicates keep r0 and r3 of all six; the column tests keep
-    # r0, r2, and r4 before the model sees any document
+    # r0, r2, and r4. The planner only estimates that from a sample; the
+    # scan's runtime applies the tests, so the executor gets every
+    # document and the model sees three
     query = session.sql(
         FILTER_SQL + " AND r.stars >= 3 AND r.lang IN ('en', 'fr') "
         "AND r.stars IS NOT NULL")
     plan = query.plan()
     scan = next(node for node in plan.nodes if type(node).__name__ == "Scan")
-    assert scan.n_docs == 3
+    assert (scan.n_docs, scan.expected_docs) == (6, 3.0)
+    assert scan.predicates == (
+        ("stars", ">=", 3), ("lang", "in", ("en", "fr")),
+        ("stars", "is not null", None))
     assert "where r.stars >= 3 and r.lang IN ('en', 'fr')" in query.explain()
     result = _run(query, execute)
-    assert seen == [3]
+    assert seen == [6]
     assert result.to_rows() == [("r0",)]
     stage = next(s for s in result.report["stages"] if s["op"] == "filter")
     assert stage["evaluated"] == 3
-    # answer tables and survivors hold positions in the registered table,
-    # not in the selected scan
+    # answer tables and survivors hold positions in the registered table
     answers = result.answer_tables["filters"][("r", stage["written_pos"])]
     assert answers.column("r").to_pylist() == [0, 2, 4]
     assert result.survivor_indices["r"].to_pylist() == [0]
@@ -168,3 +141,25 @@ def test_sql_and_builder_bind_column_tests(session):
     scans = {node.alias: node for node in plan.walk() if isinstance(node, Scan)}
     assert [str(p) for p in scans["p"].predicates] == ["p.price > 15"]
     assert scans["r"].predicates == ()
+
+
+def test_the_scan_runtime_applies_column_tests_from_the_value_table():
+    from quail.execution.runner import ExecutionContext, ScanRuntime
+    from quail.physical import Scan as PhysicalScan
+
+    node = PhysicalScan(node_id="scan:r", alias="r", input_id="r", n_docs=4,
+                        predicates=(("stars", ">", 2), ("lang", "in", ("en",))))
+    columns = pa.table({"r": pa.array(range(4), pa.int32()),
+                        "stars": [3, 1, 5, None], "lang": ["en", "en", "fr", "en"]})
+    context = ExecutionContext(
+        runtimes={}, model_execution=None,
+        sources={"r": range(4), "columns:r": columns})
+    result = ScanRuntime().execute(node, {}, context)
+    assert result.outputs["ids:r"] == [0]
+    assert result.metrics.output_rows == 1
+    with pytest.raises(KeyError, match="value columns"):
+        ScanRuntime().execute(node, {}, ExecutionContext(
+            runtimes={}, model_execution=None, sources={"r": range(4)}))
+    plain = PhysicalScan(node_id="scan:r", alias="r", input_id="r", n_docs=4)
+    assert ScanRuntime().execute(plain, {}, context).outputs["ids:r"] == range(4)
+

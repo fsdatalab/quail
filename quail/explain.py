@@ -281,7 +281,8 @@ def _estimated_rows(graph):
         inputs = [rows.get(port.source) for port in node.inputs]
         value = None
         if isinstance(node, Scan):
-            value = node.n_docs
+            value = (node.n_docs if node.expected_docs is None
+                     else node.expected_docs)
         elif isinstance(node, AiFilter):
             value = inputs[0] if inputs else None
             for stage in node.stages:

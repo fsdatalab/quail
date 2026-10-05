@@ -79,6 +79,19 @@ def summarize_alias(lengths, window: int = 0) -> AliasStats:
     )
 
 
+def scale_alias(stats: AliasStats, fraction: float) -> AliasStats:
+    """Return the summary of the fraction of the documents expected to remain."""
+    return AliasStats(
+        count=round(stats.count * fraction),
+        total=round(stats.total * fraction),
+        squared=round(stats.squared * fraction),
+        maximum=stats.maximum,
+        window=stats.window,
+        short_counts=tuple((length, round(count * fraction))
+                           for length, count in stats.short_counts),
+    )
+
+
 def _alias_stats(lengths: dict, window: int = 0) -> dict[str, AliasStats]:
     """Normalize raw length lists or accept summaries from a caller."""
     return {

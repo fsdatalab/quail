@@ -368,7 +368,8 @@ def _statistics(root, context) -> PlanStatistics:
     return cached_statistics(
         LogicalPlan(root), context.memo, model=context.model,
         device=context.device, doc_tokens=context.document_tokens,
-        pair_fractions=context.pair_fractions)
+        pair_fractions=context.pair_fractions,
+        scan_fractions=context.scan_fractions)
 
 
 def _order_rule(context) -> str:

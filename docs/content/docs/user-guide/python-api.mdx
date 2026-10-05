@@ -218,7 +218,9 @@ result = query.collect()
 ```
 
 Quail applies `where()` before AI operators even if it appears later
-in the builder chain. To compare columns from different tables, use
+in the builder chain. The executor applies the conditions when it reads
+the table; the planner only estimates how many rows they keep, from a
+sample. To compare columns from different tables, use
 [`join()`](#join).
 
 ### limit

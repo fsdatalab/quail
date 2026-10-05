@@ -63,6 +63,7 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.planner import (
+    column_tests,
     default_order_rule,
     hash_join_nodes,
     order_filters_indexed,
@@ -183,14 +184,17 @@ def plan_request_backend(
         if scan.alias not in stats:
             raise ValueError(f"no document tokens for alias {scan.alias!r}")
         summary = stats[scan.alias]
+        n_docs = len(context.document_tokens[scan.alias])
         node = Scan(
             node_id=f"scan:{scan.alias}",
             alias=scan.alias,
             input_id=scan.alias,
-            n_docs=summary.n_docs,
-            total_tokens=summary.total_tokens,
-            shard_ranges=((0, summary.n_docs),),
+            n_docs=n_docs,
+            total_tokens=sum(context.document_tokens[scan.alias]),
+            shard_ranges=((0, n_docs),),
             shard_token_loads=(summary.total_tokens,),
+            predicates=column_tests(scan),
+            expected_docs=float(summary.n_docs) if scan.predicates else None,
         )
         nodes.append(node)
         input_refs.append(PortRef(node.node_id, f"ids:{scan.alias}"))
@@ -790,10 +794,17 @@ class RequestModelExecution:
                 position = int(port.source.port.split(":", 1)[1])
                 self.pairs[position] = inputs[port.name]
         started = time.perf_counter()
+        # the scans supply the documents their column tests kept
         survivors = {
             alias: list(range(len(self.documents[alias])))
             for alias in node.aliases
         }
+        for port in node.inputs:
+            if port.source.port.startswith("ids:"):
+                alias = port.source.port.split(":", 1)[1]
+                if alias in survivors:
+                    survivors[alias] = [int(document)
+                                        for document in inputs[port.name]]
         outputs = {}
         steps = []
         fresh_tokens = cached_tokens = requests = 0

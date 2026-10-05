@@ -356,7 +356,11 @@ WHERE r.year = 2024
   AND AI.IF(PROMPT('Does the review mention shipping? {0}', r.body))
 ```
 
-Quail checks the year and rating before evaluating `AI.IF`.
+Quail checks the year and rating before evaluating `AI.IF`. The
+executor applies the conditions when it reads the table, so no model
+sees a row that fails one. The planner does not run them; it estimates
+how many rows they keep from a sample of the table, and `EXPLAIN`
+shows that estimate.
 
 A condition in `ON` filters the table containing the referenced column.
 Comparisons between columns from different tables require `column = column`

@@ -70,10 +70,25 @@ def pair_partner(anchor: str, partners) -> str:
     return partners[0]
 
 
-def pair_fraction(pairs: pa.Table, n_left: int, n_right: int) -> float:
-    """The pair count as a fraction of the cross product."""
-    total = n_left * n_right
-    return pairs.num_rows / total if total else 0.0
+def estimate_pair_fraction(left_keys, right_keys) -> float:
+    """Estimate the equality pairs over the cross product from key samples.
+
+    Each side is a list of key arrays sampled from its table; a row's
+    key is the tuple of its values, and a null never matches. The
+    estimate sums, over the keys seen on both sides, the product of
+    the two sides' frequencies.
+    """
+    def frequencies(arrays):
+        counts = {}
+        for key in zip(*(array.to_pylist() for array in arrays)):
+            if None not in key:
+                counts[key] = counts.get(key, 0) + 1
+        return counts, max(1, len(arrays[0]) if arrays else 0)
+
+    left, n_left = frequencies(left_keys)
+    right, n_right = frequencies(right_keys)
+    return sum(count * right.get(key, 0) for key, count in left.items()) / (
+        n_left * n_right)
 
 
 def partner_map(pairs: pa.Table, anchor_alias: str,

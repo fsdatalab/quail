@@ -102,7 +102,8 @@ class KvRetention:
         statistics = cached_statistics(
             logical, context.memo, model=context.model, device=context.device,
             doc_tokens=context.document_tokens,
-            pair_fractions=context.pair_fractions)
+            pair_fractions=context.pair_fractions,
+            scan_fractions=context.scan_fractions)
         joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
         groups = [[(statistics.specs[stage.written_pos], stage.anchor)
                    for stage in node.stages] for node in joins]

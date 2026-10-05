@@ -52,6 +52,9 @@ class PlanningContext:
     # join written position -> its equality pairs as a fraction of
     # the cross product; joins without conditions are absent
     pair_fractions: Mapping[int, float] = field(default_factory=dict)
+    # alias -> the fraction of its documents the column tests are
+    # expected to keep; aliases without tests are absent
+    scan_fractions: Mapping[str, float] = field(default_factory=dict)
     # the logical plan the graph was planned from; None when the rules
     # run again over a finished plan
     logical_plan: Any = None
