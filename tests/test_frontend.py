@@ -468,7 +468,7 @@ def test_sql_and_builder_parse_order_by_offset_and_distinct(catalog):
     assert plan.root.explain_fields()["order"] == [
         "r.review DESC NULLS FIRST", "r.id ASC NULLS LAST"]
     built = (reviews().ai_filter(prompt("x: {0}", col("r.review")))
-             .order_by(("r.review", "desc"), "r.id").offset(2).limit(4)
+             .order_by(col("r.review").desc(), "r.id").offset(2).limit(4)
              .select("r.id"))
     assert built == plan
     # the sort column is loaded by the scan although it is not returned
@@ -484,8 +484,8 @@ def test_sql_and_builder_parse_order_by_offset_and_distinct(catalog):
     assert scored.root.distinct
     assert scored.root.order == (
         SortKey(scored.root.columns[1], descending=True, nulls_first=False),)
-    with pytest.raises(CompileError, match="'asc' or 'desc'"):
-        reviews().order_by(("r.id", "sideways"))
+    with pytest.raises(CompileError, match="column name or col"):
+        reviews().order_by(("r.id", "desc"))
     with pytest.raises(CompileError, match="nonnegative"):
         reviews().offset(-1)
     with pytest.raises(CompileError, match="not in provider"):

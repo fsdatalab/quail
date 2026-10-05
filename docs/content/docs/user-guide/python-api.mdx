@@ -185,11 +185,12 @@ query = (
 
 `order_by(*keys)`
 
-Sort result rows by table columns or named AI outputs. Pass a column name
-as a string for ascending order. A tuple `(name, direction)` accepts
-`"asc"` or `"desc"` as the direction. An optional third string specifies
-`"nulls first"` or `"nulls last"`. By default, ascending order puts nulls
-last and descending order puts them first.
+Sort result rows by table columns or named AI outputs. A key is a
+column name as a string, for ascending order, or a `col()` with a
+direction: `col("r.stars").desc()` or `col("r.stars").asc()`. Add
+`.nulls_first()` or `.nulls_last()` to place nulls. By default,
+ascending order puts nulls last and descending order puts them first.
+A name assigned to an AI output sorts the same way: `col("score").desc()`.
 
 E.g., imagine a `reviews` table with review text in `body` and ratings
 in `stars`. This query returns ten positive reviews with the
@@ -199,7 +200,7 @@ highest ratings:
 query = (
     session.docs("reviews").alias("r")
     .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
-    .order_by(("r.stars", "desc", "nulls last"), "r.id")
+    .order_by(col("r.stars").desc().nulls_last(), "r.id")
     .limit(10)
     .select("r.id", "r.body")
 )

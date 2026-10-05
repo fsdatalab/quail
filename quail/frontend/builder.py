@@ -35,8 +35,48 @@ class ColSpec:
             return NotImplemented
         return EqualsSpec(self, other)
 
+    def asc(self) -> "SortSpec":
+        return SortSpec(self)
+
+    def desc(self) -> "SortSpec":
+        return SortSpec(self, descending=True)
+
+    def nulls_first(self) -> "SortSpec":
+        return SortSpec(self, nulls="first")
+
+    def nulls_last(self) -> "SortSpec":
+        return SortSpec(self, nulls="last")
+
     def __hash__(self):
         return hash((self.alias, self.column))
+
+
+@dataclass(frozen=True)
+class SortSpec:
+    """A sort key for ``order_by()``: ``col("r.stars").desc().nulls_last()``.
+
+    Attributes:
+        col: The column or projected name to sort by.
+        descending: Whether to sort from the largest value down.
+        nulls: ``"first"`` or ``"last"``, or None for the default: nulls
+            last when ascending and first when descending.
+    """
+
+    col: ColSpec
+    descending: bool = False
+    nulls: Optional[str] = None
+
+    def asc(self) -> "SortSpec":
+        return SortSpec(self.col, False, self.nulls)
+
+    def desc(self) -> "SortSpec":
+        return SortSpec(self.col, True, self.nulls)
+
+    def nulls_first(self) -> "SortSpec":
+        return SortSpec(self.col, self.descending, "first")
+
+    def nulls_last(self) -> "SortSpec":
+        return SortSpec(self.col, self.descending, "last")
 
 
 @dataclass(frozen=True)
@@ -508,25 +548,24 @@ class Query:
 
         Args:
             keys: Each a column name such as ``"r.year"`` or a projected
-                name such as ``"score"``, or a tuple of the name and
-                ``"asc"`` or ``"desc"``, with an optional third item
-                ``"nulls first"`` or ``"nulls last"``.
+                name such as ``"score"``, sorted ascending, or a
+                ``col(...)`` with ``.asc()`` or ``.desc()`` and an
+                optional ``.nulls_first()`` or ``.nulls_last()``.
         """
         for key in keys:
-            name, *rest = (key,) if isinstance(key, str) else tuple(key)
-            direction = rest[0].lower() if rest else "asc"
-            if direction not in {"asc", "desc"}:
+            if isinstance(key, str):
+                key = col(key)
+            if isinstance(key, ColSpec):
+                key = SortSpec(key)
+            if not isinstance(key, SortSpec):
                 raise CompileError(
-                    f"order_by direction is 'asc' or 'desc', got {rest[0]!r}")
-            nulls = rest[1].lower() if len(rest) > 1 else None
-            if nulls not in {None, "nulls first", "nulls last"}:
-                raise CompileError(
-                    f"order_by null placement is 'nulls first' or 'nulls "
-                    f"last', got {rest[1]!r}")
-            descending = direction == "desc"
-            nulls_first = (descending if nulls is None
-                           else nulls == "nulls first")
-            self._order.append((name, descending, nulls_first))
+                    "order_by takes a column name or col(...).asc() or "
+                    f".desc(), got {key!r}")
+            name = (key.col.column if key.col.alias is None
+                    else f"{key.col.alias}.{key.col.column}")
+            nulls_first = (key.descending if key.nulls is None
+                           else key.nulls == "first")
+            self._order.append((name, key.descending, nulls_first))
         return self
 
     def offset(self, n: int) -> "Query":
