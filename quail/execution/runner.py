@@ -687,30 +687,31 @@ def aggregate_table(table: pa.Table, node) -> pa.Table:
     value is left out of every aggregate but count(*). Groups come out
     in the order their first rows appear.
     """
-    keyed = {name: _comparable(table.column(name), "GROUP BY")
-             for name in node.keys}
-    for _, _, argument in node.aggregates:
-        if argument is not None and argument not in keyed:
-            keyed[argument] = _comparable(table.column(argument),
-                                          "an aggregate")
-    keyed["__row"] = pa.array(np.arange(table.num_rows), pa.int64())
-    sources = {}    # (argument, kernel) -> the grouped column's name
+    arguments = list(dict.fromkeys((*node.keys, *(
+        argument for _, _, argument in node.aggregates
+        if argument is not None))))
+    # Arrow derives aggregate output names from input names. Use private
+    # names throughout the intermediate table to avoid user-name collisions.
+    names = {name: f"column_{index}" for index, name in enumerate(arguments)}
+    keyed = {names[name]: _comparable(table.column(name), "an aggregate")
+             for name in arguments}
+    keyed["row_position"] = pa.array(np.arange(table.num_rows), pa.int64())
+    sources = {}
     specs = []
-    for name, function, argument in node.aggregates:
-        kernel = "count_all" if argument is None \
-            else _AGGREGATE_KERNELS[function]
+    for _, function, argument in node.aggregates:
+        kernel = "count_all" if argument is None else _AGGREGATE_KERNELS[function]
         if (argument, kernel) not in sources:
+            sources[(argument, kernel)] = len(node.keys) + len(specs)
             specs.append(([], "count_all") if argument is None
-                         else (argument, kernel))
-            sources[(argument, kernel)] = (
-                "count_all" if argument is None else f"{argument}_{kernel}")
-    grouped = pa.table(keyed).group_by(list(node.keys), use_threads=False) \
-        .aggregate(specs + [("__row", "min")])
-    order = pc.sort_indices(grouped.column("__row_min"))
-    columns = {name: grouped.column(name) for name in node.keys}
+                         else (names[argument], kernel))
+    grouped = pa.table(keyed).group_by(
+        [names[key] for key in node.keys], use_threads=False
+    ).aggregate(specs + [("row_position", "min")])
+    order = pc.sort_indices(grouped.column(len(node.keys) + len(specs)))
+    columns = {name: grouped.column(index)
+               for index, name in enumerate(node.keys)}
     for name, function, argument in node.aggregates:
-        kernel = "count_all" if argument is None \
-            else _AGGREGATE_KERNELS[function]
+        kernel = "count_all" if argument is None else _AGGREGATE_KERNELS[function]
         columns[name] = grouped.column(sources[(argument, kernel)])
     result = pa.table({name: pc.take(column, order)
                        for name, column in columns.items()})

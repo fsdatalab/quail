@@ -596,8 +596,6 @@ class Project:
         return tuple(column for column in self.columns if isinstance(column, ColumnRef))
 
     def validate(self) -> None:
-        if not self.columns:
-            raise CompileError("Project needs at least one column")
         computed = {(node.call, node.name) for node in classifications(self.input)}
         for column in self.columns:
             if isinstance(column, Alias):
@@ -634,8 +632,6 @@ class Project:
         return replace(self, input=children[0])
 
     def with_expressions(self, expressions: tuple) -> "Project":
-        if not expressions:
-            raise CompileError("Project needs at least one column")
         return replace(self, columns=expressions)
 
     def explain_fields(self) -> dict:

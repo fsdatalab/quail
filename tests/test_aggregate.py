@@ -180,3 +180,52 @@ def test_group_by_runs_on_the_result(session):
     ):
         with pytest.raises(CompileError, match=fragment):
             session.sql(sql)
+
+
+def test_aggregate_internal_columns_do_not_replace_user_values():
+    table = pa.table({
+        "__row": [0.9, 0.9],
+        "count_all": ["a", "a"],
+        "row_position": [2, 4],
+    })
+    node = _node(
+        keys=("count_all",),
+        aggregates=(("mean", "avg", "__row"), ("n", "count", None),
+                    ("first", "min", "row_position")),
+        columns=("count_all", "mean", "n", "first"))
+    assert aggregate_table(table, node).to_pydict() == {
+        "count_all": ["a"], "mean": [0.9], "n": [2], "first": [2]}
+
+
+@pytest.mark.parametrize("answers, expected", [([1, 1, 1, 0, 1, 1], 5),
+                                                ([0] * 6, 0)])
+def test_count_star_without_value_columns(session, answers, expected):
+    sql = session.sql("""
+        SELECT COUNT(*) AS n FROM reviews r
+        WHERE AI_FILTER(PROMPT('q: {0}', r.review))
+    """)
+    python = (session.docs("reviews").alias("r")
+              .ai_filter(prompt("q: {0}", col("r.review")))
+              .agg(n=count()).select("n"))
+    for query in (sql, python):
+        result = _run(query, make_executor({"r": {"q:": answers}}))
+        assert result.to_rows() == [(expected,)]
+
+
+def test_grouped_select_order_does_not_duplicate_input_columns(session):
+    results = []
+    for columns in ("COUNT(r.lang) AS n, r.lang", "r.lang, COUNT(r.lang) AS n"):
+        query = session.sql(f"""
+            SELECT {columns} FROM reviews r
+            WHERE AI_FILTER(PROMPT('q: {{0}}', r.review))
+            GROUP BY r.lang ORDER BY r.lang
+        """)
+        result = _run(query, make_executor(TRUTH)).collect()
+        results.append(result.select(["r.lang", "n"]).to_pydict())
+    assert results[0] == results[1] == {"r.lang": ["de", "en", "fr"],
+                                      "n": [1, 3, 1]}
+    with pytest.raises(CompileError, match="projection names must be unique"):
+        session.sql("""
+            SELECT r.id, r.id FROM reviews r
+            WHERE AI_FILTER(PROMPT('q: {0}', r.review))
+        """)

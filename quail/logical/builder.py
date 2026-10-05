@@ -224,6 +224,8 @@ class LogicalPlanBuilder:
     ) -> LogicalPlan:
         if self._root is None:
             raise CompileError("a logical plan needs an input table")
+        if not columns and aggregation is None:
+            raise CompileError("Project needs at least one column")
         node = Project(self._root, tuple(columns))
         if aggregation is not None:
             node = Aggregate(

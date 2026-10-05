@@ -324,6 +324,10 @@ class QueryResult:
         def batches():
             try:
                 for batch in indices:
+                    if not self._projection:
+                        yield batch.select([]).replace_schema_metadata(
+                            self.schema.metadata)
+                        continue
                     arrays = []
                     for alias, values in self._projection:
                         if isinstance(alias, tuple):

@@ -191,10 +191,12 @@ class SelectBinder:
                     "an aggregate in SELECT is a direct COUNT, SUM, AVG, MIN, "
                     "or MAX call with an AS name"
                 )
-            before = len(columns)
-            columns.extend(_compile_projection(b, [e]))
-            self.plain.extend(_column_name(column) for column in columns[before:])
-            self.output.extend(_column_name(column) for column in columns[before:])
+            selected = _compile_projection(b, [e])
+            for column in selected:
+                if column not in columns:
+                    columns.append(column)
+            self.plain.extend(_column_name(column) for column in selected)
+            self.output.extend(_column_name(column) for column in selected)
 
     def bind_group(self, tree: exp.Select) -> list[str]:
         """Resolve GROUP BY expressions and SELECT positions."""
@@ -256,6 +258,9 @@ class SelectBinder:
         keys = self.bind_group(tree)
         tests = self.bind_having(tree)
         if not self.aggregates and not keys and not tests:
+            if len(self.output) != len(set(self.output)):
+                raise CompileError(
+                    f"projection names must be unique, got {self.output}")
             return BoundSelect(tuple(self.columns), None)
         for name in self.plain:
             if name not in keys:
