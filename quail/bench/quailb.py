@@ -30,6 +30,7 @@ from quail.bench.results import write_json
 from quail.logical.prompts import bind_classify_prompt
 from quail.physical import AiClassify, AiScore
 from quail.planner.plan import Refusal
+from quail.progress import say
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
@@ -204,13 +205,15 @@ def join_anchors(result) -> dict:
     }
 
 
-def prompt_pieces(query, info: PlanInfo, anchors) -> dict:
+def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
     """Return the prompt token ids around each document, for QUAIL-B.
 
     QUAIL-B sizes the prefix trie of the run's requests from these
     pieces and the saved answer tables, after the run; nothing is
     tracked while the query runs. A classification's pieces come from
     its prompt, which names every label, whatever rule reads the label.
+    A score laid out with its own head cannot be described with one
+    preamble, so the query reports no pieces and no token minimum.
 
     Args:
         query: The built query, with bound prompts.
@@ -260,9 +263,9 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict:
         if not pieces["preamble"]:
             pieces["preamble"] = list(head)
         elif list(head) != pieces["preamble"]:
-            raise ValueError(
-                f"score {operator.id!r} has its own prompt head; QUAIL-B "
-                f"pieces describe one preamble")
+            say(f"score {operator.id} has its own prompt head; the query "
+                f"reports no prompt pieces")
+            return None
         pieces["scores"].append({"id": operator.id, "tail": list(tail)})
     return pieces
 

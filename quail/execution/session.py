@@ -370,37 +370,38 @@ class Session:
     def estimate_lengths(self, provider_name: str, column: str) -> list[int]:
         """Estimate document token counts from a tokenized sample.
 
-        Reads the column's byte lengths and scales them by the tokens
-        per byte measured on the first ESTIMATE_SAMPLE documents.
+        Tokenizes the first ESTIMATE_SAMPLE documents and repeats their
+        lengths over the provider's row count, so the planner sees the
+        sample's length distribution without a pass over the table. A
+        provider that reports no row count is scanned for its byte
+        lengths, which the sample's tokens per byte scale.
         """
         provider = self.catalog.get(provider_name)
         key = (provider.content_identity(), column)
         if key in self._length_estimates:
             return self._length_estimates[key]
         started = time.perf_counter()
-        reader = provider.scan(ScanRequest(columns=(column,)))
-        byte_lengths = []
-        sample = []
-        try:
-            for batch in reader:
-                texts = batch.column(0)
-                byte_lengths.append(pc.binary_length(texts).cast(pa.int64()))
-                if len(sample) < ESTIMATE_SAMPLE:
-                    sample.extend(
-                        texts.slice(0, ESTIMATE_SAMPLE - len(sample)).to_pylist()
-                    )
-        finally:
-            reader.close()
+        row_count = provider.statistics().row_count
+        sample = self.sample_columns(provider_name, (column,))[column].to_pylist()
         # Defer fast-tokenizer initialization to the background tokenization pass.
         tok = self.tokenizer
-        sample_tokens = sum(len(tok(text)) for text in sample)
-        sample_bytes = sum(len(text.encode("utf-8")) for text in sample)
-        ratio = sample_tokens / sample_bytes if sample_bytes else 0.0
-        lengths = []
-        for chunk in byte_lengths:
-            lengths.extend(
-                max(1, round(n * ratio)) for n in chunk.to_pylist()
-            )
+        sample_lengths = [max(1, len(tok(text))) for text in sample]
+        if row_count is not None:
+            lengths = [sample_lengths[index % len(sample_lengths)]
+                       for index in range(row_count)] if sample_lengths else []
+        else:
+            sample_tokens = sum(sample_lengths)
+            sample_bytes = sum(len(text.encode("utf-8")) for text in sample)
+            ratio = sample_tokens / sample_bytes if sample_bytes else 0.0
+            lengths = []
+            reader = provider.scan(ScanRequest(columns=(column,)))
+            try:
+                for batch in reader:
+                    lengths.extend(
+                        max(1, round(n * ratio)) for n in pc.binary_length(
+                            batch.column(0)).cast(pa.int64()).to_pylist())
+            finally:
+                reader.close()
         self._length_estimates[key] = lengths
         say(f"estimated {provider_name}.{column}: {len(lengths):,} documents, "
             f"about {sum(lengths):,} tokens from a {len(sample)} document "
@@ -779,11 +780,14 @@ class Query:
         samples = {}
 
         def keys(refs):
-            (alias,) = {ref.alias for ref in refs}
-            if alias not in samples:
-                samples[alias] = self.session.sample_columns(
-                    providers[alias], [ref.column for ref in refs])
-            return [samples[alias][ref.column] for ref in refs]
+            out = []
+            for ref in refs:
+                key = (ref.alias, ref.column)
+                if key not in samples:
+                    samples[key] = self.session.sample_columns(
+                        providers[ref.alias], [ref.column])[ref.column]
+                out.append(samples[key])
+            return out
 
         fractions = {}
         for position, join in enumerate(joins):
@@ -807,7 +811,9 @@ class Query:
                 [predicate.column.column for predicate in scan.predicates])
             sampled = len(next(iter(columns.values())))
             kept = len(selected_rows(columns, scan.predicates))
-            fractions[scan.alias] = kept / sampled if sampled else 1.0
+            # a sample that keeps nothing, or everything, says little
+            # about the rest, so the estimate stays off 0 and 1
+            fractions[scan.alias] = (kept + 1) / (sampled + 2)
         return fractions
 
     def explain(self, *, verbose: bool = False,

@@ -247,10 +247,12 @@ class JoinAdmission:
             before packs no frame rows. None writes every frame.
         limit: Stop admitting anchors once this many survived the last
             stage; None runs every anchor.
-        stop_groups: Per anchor, its stop key group, or None. One
-            anchor of a group is admitted at a time, and once one
-            survives the last stage the group's queued anchors are
-            skipped: they never run and take_skipped() lists them.
+        stop_groups: Per anchor, its stop key group, or None. At most
+            stop_width anchors of a group are admitted at a time, and
+            once one survives the last stage the group's queued anchors
+            are skipped: they never run and take_skipped() lists them.
+        stop_width: Anchors of one group in flight at once; the caller
+            widens it when the groups are too few to fill a chunk.
         extra_tokens: Rows past the prefix an anchor's pages must
             cover, when more than its largest frame: a stage whose
             one suffix is written into the anchor's own pages.
@@ -275,7 +277,7 @@ class JoinAdmission:
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, extra_tokens=None,
-                 stop_groups=None):
+                 stop_groups=None, stop_width=1):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -288,9 +290,12 @@ class JoinAdmission:
         self.groups = None if stop_groups is None else list(stop_groups)
         if self.groups is not None and len(self.groups) != n:
             raise ValueError("stop_groups must match prefix_tokens")
-        self._group_busy = set()    # groups with an anchor admitted, unsettled
+        self._group_width = max(1, int(stop_width))
+        self._group_busy = {}       # group -> its anchors admitted, unsettled
         self._group_done = set()    # groups with a survivor
+        self._group_members = {}    # group -> its anchors still queued
         self._skipped = []          # queued anchors a done group skipped
+        self._dead = 0              # skipped anchors still in the pending deque
         self.borrowing = Borrowing(n, tree, can_borrow)
         # page_cost(tokens, base_tokens) prices a key in the arena's
         # every-token pages; the default is one pool of page_tokens pages
@@ -366,6 +371,9 @@ class JoinAdmission:
                             if a not in resident and self._stage[a] == -1)
         for a in resident:
             self.borrowing.detach(a)
+        if self.groups is not None:
+            for a in self.pending:
+                self._group_members.setdefault(self.groups[a], set()).add(a)
 
 
     def partner_count(self, a, j):
@@ -569,6 +577,8 @@ class JoinAdmission:
             if total >= self.chunk_budget:
                 return self.chunk_budget
         for a in self.pending:
+            if self._stage[a] == _DONE:
+                continue
             total += (self._carried[a] + self.frame_rows[0]
                       + self._cum_of(a, 0)[-1])
             if total >= self.chunk_budget:
@@ -649,8 +659,12 @@ class JoinAdmission:
         admitted = set()
         while self.pending and room >= self._min_fresh:
             a = self.pending.popleft()
-            if self.groups is not None and self.groups[a] in self._group_busy:
-                held.append(a)      # one anchor of a group at a time
+            if self._stage[a] == _DONE:
+                self._dead -= 1     # skipped by its group's survivor
+                continue
+            if self.groups is not None and self._group_busy.get(
+                    self.groups[a], 0) >= self._group_width:
+                held.append(a)      # the group's anchors in flight are enough
                 continue
             borrow = self.borrowing.decide(a, admitted)
             if borrow == Borrowing.WAIT:
@@ -692,7 +706,9 @@ class JoinAdmission:
             self._stage[a] = 0
             admitted.add(a)
             if self.groups is not None:
-                self._group_busy.add(self.groups[a])
+                group = self.groups[a]
+                self._group_busy[group] = self._group_busy.get(group, 0) + 1
+                self._group_members[group].discard(a)
             self.borrowing.record(a, borrow)
             if self._launch(a, 0, end):
                 continued.append(a)
@@ -768,21 +784,29 @@ class JoinAdmission:
         return AdmissionReport(tuple(settlements), tuple(transitions))
 
     def _settle_group(self, a, survived):
-        """Free the anchor's group for its next anchor, or skip the rest."""
+        """Free the anchor's group for its next anchor, or skip the rest.
+
+        A skipped anchor stays in the pending deque until the admission
+        pops it, so a skip costs the group's size, not the queue's.
+        """
         if self.groups is None:
             return
         group = self.groups[a]
-        self._group_busy.discard(group)
+        busy = self._group_busy.get(group, 0) - 1
+        if busy > 0:
+            self._group_busy[group] = busy
+        else:
+            self._group_busy.pop(group, None)
         if not survived or group in self._group_done:
             return
         self._group_done.add(group)
-        skipped = [b for b in self.pending if self.groups[b] == group]
-        if skipped:
-            self.pending = deque(
-                b for b in self.pending if self.groups[b] != group)
-            for b in skipped:
-                self._stage[b] = _DONE
-            self._skipped.extend(skipped)
+        skipped = sorted(self._group_members.pop(group, ()))
+        for b in skipped:
+            self._stage[b] = _DONE
+            if not self._page_cost[b]:
+                self._zero_cost -= 1
+        self._dead += len(skipped)
+        self._skipped.extend(skipped)
 
     def take_skipped(self):
         """Remove and return the queued anchors a done group skipped."""
@@ -806,6 +830,7 @@ class JoinAdmission:
             self._stage[a] = _DONE
         self.ready.clear()
         self.pending.clear()
+        self._dead = 0
         return out
 
     # ---- progress ------------------------------------------------------
@@ -813,5 +838,5 @@ class JoinAdmission:
     def done(self):
         if self.limit_reached():
             return not self.in_flight and not self._settled
-        return not self.pending and not self.ready \
+        return len(self.pending) == self._dead and not self.ready \
             and not self.in_flight and not self._settled

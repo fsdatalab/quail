@@ -365,21 +365,30 @@ def test_stop_groups_admit_one_anchor_per_group_and_skip_the_rest():
     with pytest.raises(ValueError, match="stop_groups"):
         JoinAdmission([50] * 2, [[10]], 250, arena_pages=100,
                       page_tokens=16, stop_groups=[0])
+    # a wider stop admits that many anchors of a group at once
+    sched = JoinAdmission([50] * 5, [[10]], 250, arena_pages=100,
+                          page_tokens=16, stop_groups=[0, 0, 0, 1, 1],
+                          stop_width=2)
+    assert [a for a, *_ in sched.next_chunk(100)] == [0, 1, 3, 4]
+    sched.report(0, 0, 0, 1, [1])
+    assert sched.take_skipped() == [2] and not sched.done()
 
 
 def test_filter_stop_groups_skip_a_queued_child_and_release_its_parent(
         monkeypatch):
     # document 1 borrows from 0 and passes; document 2, queued behind
     # them in the same group, never runs and the parent's hold goes
+    # a 70 token budget holds one document per chunk, so one group's
+    # documents run one at a time
     got, tokens, borrowed, arena = _tree_filter(
-        monkeypatch, truth=[[0], [1], [1]], budget=200,
+        monkeypatch, truth=[[0], [1], [1]], budget=70,
         stop_groups=[0, 0, 0])
     assert got == {0: [0], 1: [1]}
     assert borrowed == 32 and tokens == 64 + 32 + 2
     assert not arena.resident_keys() and not arena._holds
     # a parent in another group still serves its child
     got, _, borrowed, _ = _tree_filter(
-        monkeypatch, truth=[[1], [1], [1]], budget=200,
+        monkeypatch, truth=[[1], [1], [1]], budget=70,
         stop_groups=[0, 1, 0])
     assert got == {0: [1], 1: [1]}
     assert borrowed == 32

@@ -308,6 +308,7 @@ class _StageExecutor:
             frame_writes=self.writes,
             limit=limit,
             stop_groups=stop_groups,
+            stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,
         )
         self.borrowing = self.sched.borrowing
@@ -344,6 +345,21 @@ class _StageExecutor:
                            for j, stage in enumerate(self.stages)}
         self.read_all_of = {self.group_key[j]: stage.read_all_rows
                             for j, stage in enumerate(self.stages)}
+
+    def _stop_width(self, stop_groups, budget) -> int:
+        """Anchors of one stop key group in flight at once.
+
+        One per group is the most a group can save, but with fewer
+        groups than a chunk holds it would leave the chunk mostly
+        empty, so the width grows to keep about one chunk in flight.
+        """
+        if stop_groups is None or not self.prefixes:
+            return 1
+        groups = len(set(stop_groups)) or 1
+        mean = (sum(self.prefix_lengths) / len(self.prefix_lengths)
+                + float(np.mean(self.suffixes[0].lengths)))
+        per_chunk = max(1, int(budget // max(1.0, mean)))
+        return max(1, -(-per_chunk // groups))
 
     def _entry_rows(self, a, j, start, end, carried):
         f = self.prefix_lengths[a]

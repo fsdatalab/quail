@@ -225,14 +225,12 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         gpus: GPU count; one model copy runs per GPU.
         order: Stage order rule, 'by_cost' or 'as_written'; None picks
             the default rule. Reported in the plan's settings.
-        scan_fractions: alias -> the fraction of its documents the
-            column tests are expected to keep.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
         context: The planning context, needed when the plan classifies
             documents.
         scan_fractions: alias -> the fraction of its documents the
-            column tests are expected to keep.
+            column tests are expected to keep; the context's when None.
 
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.

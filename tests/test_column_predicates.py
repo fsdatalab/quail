@@ -163,3 +163,30 @@ def test_the_scan_runtime_applies_column_tests_from_the_value_table():
     plain = PhysicalScan(node_id="scan:r", alias="r", input_id="r", n_docs=4)
     assert ScanRuntime().execute(plain, {}, context).outputs["ids:r"] == range(4)
 
+
+def test_two_joins_on_one_table_sample_each_key_column(session):
+    from quail.physical import HashJoin
+    from quail.planner.plan import Refusal
+
+    session.register("products", quail.DocumentProvider.from_table(pa.table({
+        "asin": ["p0", "p1"], "description": ["d0", "d1"],
+        "price": [5, 2]}), id_col="asin"))
+    session.register("authors", quail.DocumentProvider.from_table(pa.table({
+        "name": ["n0", "n1"], "bio": ["b0", "b1"],
+        "lang": ["en", "fr"]}), id_col="name"))
+    query = session.sql("""
+        SELECT r.id FROM reviews r
+        JOIN products p ON r.stars = p.price
+         AND AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
+        JOIN authors a ON r.lang = a.lang
+         AND AI_FILTER(PROMPT('y {0} {1}', r.review, a.bio))
+        WHERE AI_FILTER(PROMPT('q: {0}', r.review))
+    """)
+    plan = query.plan()
+    assert not isinstance(plan, Refusal)
+    fractions = {node.written_pos: node.pair_fraction for node in plan.nodes
+                 if isinstance(node, HashJoin)}
+    # stars 5, 2, 4, null, 3, 5 against prices 5, 2: three of twelve;
+    # langs en x4, fr, de against en, fr: five of twelve
+    assert fractions == {0: 3 / 12, 1: 5 / 12}
+

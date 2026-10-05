@@ -99,7 +99,9 @@ def estimate_pair_fraction(left_keys, right_keys) -> float:
         value_counts(right_keys, "right"), keys=names, join_type="inner")
     pairs = pc.sum(pc.multiply(matched.column("left"),
                                matched.column("right"))).as_py() or 0
-    return pairs / (n_left * n_right)
+    # samples that share no key still say little about the tables, so
+    # the estimate stays off zero
+    return max(pairs, 1) / (n_left * n_right)
 
 
 def partner_map(pairs: pa.Table, anchor_alias: str,

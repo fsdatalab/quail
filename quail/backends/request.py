@@ -169,10 +169,13 @@ def plan_request_backend(
     operators = region.logical_plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     ask_filters = {alias: list(ps) for alias, ps in filters.items() if ps}
+    # the column tests keep an estimated fraction of each table, as
+    # the Quail planner's statistics do
     stats = {
         alias: CorpusStats(
-            n_docs=len(lengths),
-            total_tokens=sum(int(length) for length in lengths),
+            n_docs=round(len(lengths) * context.scan_fractions.get(alias, 1.0)),
+            total_tokens=round(sum(int(length) for length in lengths)
+                               * context.scan_fractions.get(alias, 1.0)),
             max_doc_tokens=max((int(length) for length in lengths), default=0),
         )
         for alias, lengths in context.document_tokens.items()
