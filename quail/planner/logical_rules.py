@@ -9,6 +9,7 @@ from quail.cost.work import Work
 from quail.logical import (
     Alias,
     Apply,
+    ColumnPredicate,
     ColumnRef,
     Compare,
     Equality,
@@ -49,7 +50,7 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return _column_refs(expression.expression)
     if isinstance(expression, (ModelCall, Compare, Alias)):
         return tuple(model_call(expression).prompt.args)
-    if isinstance(expression, InList):
+    if isinstance(expression, (InList, ColumnPredicate)):
         return (expression.column,)
     if isinstance(expression, Equality):
         return (expression.left, expression.right)

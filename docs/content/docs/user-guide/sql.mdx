@@ -329,6 +329,39 @@ For labels computed before later filters, see
 For the scoring methods, see
 [Label scoring](/docs/architecture/execution#label-scoring).
 
+## WHERE and ON
+
+`WHERE` keeps rows that satisfy the given conditions. `ON` specifies
+which rows to join. Both support the following conditions on table columns:
+
+| Condition | SQL |
+| --- | --- |
+| Compare with a value | `=`, `<>`, `<`, `<=`, `>`, `>=` |
+| Match a value in a list | `IN (...)` |
+| Keep null values | `IS NULL` |
+| Keep non-null values | `IS NOT NULL` |
+
+Values can be numbers, strings, or booleans. `IN` requires a non-empty
+list of constant values. Combine conditions with `AND`.
+Comparisons exclude null values. Use `IS NULL` to keep them.
+
+E.g., the following SQL query returns the IDs of reviews from 2024 with
+at least four stars that mention shipping:
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE r.year = 2024
+  AND r.stars >= 4
+  AND AI.IF(PROMPT('Does the review mention shipping? {0}', r.body))
+```
+
+Quail checks the year and rating before evaluating `AI.IF`.
+
+A condition in `ON` filters the table containing the referenced column.
+Comparisons between columns from different tables require `column = column`
+in `ON`. See [Joining](#joining).
+
 ## SELECT, FROM, JOIN, LIMIT
 
 Quail supports these SQL clauses with the following limits:
@@ -388,7 +421,8 @@ evaluation early. An offset greater than zero has the same effect.
 
 - `GROUP BY`, `HAVING`, window functions
 - `UNION`, `EXCEPT`, `INTERSECT`
-- `OR` between AI predicates
+- `OR` between conditions
+- `BETWEEN`, `LIKE`, and arithmetic in column comparisons
 - Queries with no AI operator
 - `JOIN` with only relational predicates (no AI operator)
 - Outer joins (`LEFT`, `RIGHT`, `FULL`)

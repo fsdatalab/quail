@@ -166,6 +166,40 @@ query = (
 result = query.collect()
 ```
 
+### where
+
+`where(*tests)`
+
+Keep rows that satisfy all the given conditions. Use `col("name")` to
+refer to a column in a condition.
+
+| Condition | Syntax |
+| --- | --- |
+| Compare with a value | `==`, `!=`, `<`, `<=`, `>`, `>=` |
+| Match a value in a collection | `col(...).isin(values)` |
+| Keep null values | `col(...).is_null()` |
+| Keep non-null values | `col(...).is_not_null()` |
+
+`isin()` takes a non-empty iterable of values. Use `is_null()` to test
+for nulls rather than comparing with `None`.
+
+E.g., the following query returns the IDs of reviews from 2024 with at
+least four stars that mention shipping:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .where(col("r.year") == 2024, col("r.stars") >= 4)
+    .ai_if(prompt('Does the review mention shipping?\n\n{0}', col("r.body")))
+    .select("r.id")
+)
+result = query.collect()
+```
+
+Quail applies `where()` before AI operators even if it appears later
+in the builder chain. To compare columns from different tables, use
+[`join()`](#join).
+
 ### limit
 
 `limit(n)`
