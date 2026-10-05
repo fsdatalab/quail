@@ -126,8 +126,9 @@ specifications are unavailable or the model does not fit on one GPU.
 
 Each operator supplies its own prompt preparation, execution constraints,
 and costs. Score operators support both generative
-models and reranker models. A score join keeps the first prompt document
-as its anchor because swapping the documents changes the score's meaning.
+models and reranker models. Score joins preserve the document order in the
+model prompt. The executor reuses the first document's KV across its
+partners, so that document is the anchor.
 
 Call `explain(verbose=True)` to inspect physical settings, including
 `share_prefixes` and `attention`.
