@@ -419,34 +419,48 @@ evaluation early. An offset greater than zero has the same effect.
 
 ## GROUP BY and HAVING
 
-`GROUP BY` groups the result rows and `COUNT`, `SUM`, `AVG`, `MIN`,
-and `MAX` compute one value per group. Each aggregate needs an `AS`
-name. A group key is a table column or the `AS` name of an
-`AI.CLASSIFY` output, and every plain column in `SELECT` must be a
-key. An aggregate's argument is a column, a named `AI.SCORE` or
-`AI.CLASSIFY` output, or an `AI.SCORE` call written inline. `HAVING`
-compares an aggregate, by name or as a call, with a number. For
-example, this counts the reviews per predicted sentiment and keeps the
-sentiments with more than ten reviews:
+`GROUP BY` accepts table columns and names assigned to AI outputs with
+`AS`. Return grouping columns and aggregate results in `SELECT`.
+Give each aggregate in `SELECT` an `AS` name.
+
+`HAVING` filters groups by comparing an aggregate with a number. Refer
+to the aggregate by its name or write the function call. Combine
+conditions with `AND`.
+
+E.g., the following SQL query returns the review count and average star
+rating for each sentiment. It keeps sentiments with more than ten reviews:
 
 ```sql
 SELECT AI.CLASSIFY(PROMPT('What is the sentiment of this review? {0}', r.body),
                    ['positive', 'negative', 'mixed']) AS sentiment,
-       COUNT(*) AS n,
-       AVG(r.stars) AS mean_stars
+       COUNT(*) AS review_count,
+       AVG(r.stars) AS avg_stars
 FROM reviews r
-WHERE AI.IF(PROMPT('Is this review about a purchase? {0}', r.body))
 GROUP BY sentiment
-HAVING COUNT(*) > 10
-ORDER BY n DESC
+HAVING review_count > 10
+ORDER BY review_count DESC
 ```
 
-The aggregation runs on the coordinator after the model work, so a
-`LIMIT` on a grouped query does not shorten the run. A null argument
-value is left out of every aggregate but `COUNT(*)`. `COUNT(DISTINCT
-column)` is supported; other `DISTINCT` aggregates are not. Groups
-come out in the order their first rows appear unless `ORDER BY` names
-a key or an aggregate.
+Quail classifies every review before computing the counts and averages.
+Adding `LIMIT` reduces the number of returned groups, not the reviews
+that Quail classifies.
+
+### Aggregate functions
+
+| SQL | Python | Returns |
+| --- | --- | --- |
+| `COUNT(*)` | `count()` | Number of rows |
+| `COUNT(column)` | `count(column)` | Number of non-null values |
+| `COUNT(DISTINCT column)` | `count_distinct(column)` | Number of distinct non-null values |
+| `SUM(column)` | `sum_(column)` | Sum |
+| `AVG(column)` | `avg(column)` | Average |
+| `MIN(column)` | `min_(column)` | Smallest value |
+| `MAX(column)` | `max_(column)` | Largest value |
+
+Functions that take a column ignore null values. The column can contain
+stored values or AI outputs. In SQL, an aggregate can also take an
+`AI.SCORE` call directly. Without `GROUP BY`, aggregates operate on all
+rows that pass `WHERE`.
 
 ## Unsupported SQL
 

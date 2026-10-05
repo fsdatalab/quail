@@ -105,9 +105,11 @@ probability output, and limits on classifications of joined rows.
 
 `ai_score(prompt, name=...)`
 
-Add a named `AI.SCORE` column: the model's belief, between 0 and 1,
-that the prompt is true of the row. Use the name in `select()`,
-`order_by()`, and as an `agg()` argument.
+Add an [`AI.SCORE`](/docs/user-guide/sql#aiscore) column with the given
+`name`. Use that name to select, sort, or aggregate the scores.
+
+E.g., the following query returns up to ten reviews with the highest
+scores for requesting a refund:
 
 ```python
 query = (
@@ -267,30 +269,51 @@ applies after sorting.
 Sorting columns need not appear in `select()`, except when using
 `distinct()`.
 
-### group_by, agg, having
+### group_by
 
-`group_by(*keys)`, `agg(**aggregates)`, `having(*tests)`
+`group_by(*keys)`
 
-Group the result rows by columns or by the names of `ai_classify`
-outputs, compute named aggregates with `count()`, `count_distinct()`,
-`sum_()`, `avg()`, `min_()`, and `max_()` from `quail.frontend.builder`,
-and keep the groups whose aggregates pass tests. `select()` then lists
-keys and aggregate names.
+Group rows by the given columns. Each column can be a name or a `col()`
+expression, including a name assigned by `ai_classify()` or `ai_score()`.
+
+### agg
+
+`agg(**aggregates)`
+
+Compute aggregates for each group. Without `group_by()`, compute them
+over all rows that pass the query's filters.
+
+Use `count()`, `count_distinct()`, `sum_()`, `avg()`, `min_()`, or `max_()`
+from `quail.frontend.builder`. Each keyword argument names an output
+column. In `select()`, use grouping columns or those output names.
+See [aggregate functions](/docs/user-guide/sql#aggregate-functions)
+for the supported functions and their treatment of nulls.
+
+### having
+
+`having(*tests)`
+
+Keep groups that satisfy all the given conditions. Compare an aggregate
+with a number using `==`, `!=`, `<`, `<=`, `>`, or `>=`.
+
+E.g., the following query returns the review count and average star rating
+for each sentiment. It keeps sentiments with more than ten reviews:
 
 ```python
-from quail.frontend.builder import avg, col, count, prompt
+from quail.frontend.builder import avg, count
 
 query = (
     session.docs("reviews").alias("r")
-    .ai_classify(prompt('What is the sentiment of this review?\n\n{0}',
-                        col("r.body")),
-                 ["positive", "negative", "mixed"], name="sentiment")
+    .ai_classify(
+        prompt('What is the sentiment of this review?\n\n{0}', col("r.body")),
+        ["positive", "negative", "mixed"], name="sentiment")
     .group_by("sentiment")
-    .agg(n=count(), mean_stars=avg("r.stars"))
+    .agg(review_count=count(), avg_stars=avg("r.stars"))
     .having(count() > 10)
-    .order_by(col("n").desc())
-    .select("sentiment", "n", "mean_stars")
+    .order_by(col("review_count").desc())
+    .select("sentiment", "review_count", "avg_stars")
 )
+result = query.collect()
 ```
 
 ### offset
