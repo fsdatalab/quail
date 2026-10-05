@@ -74,21 +74,32 @@ def estimate_pair_fraction(left_keys, right_keys) -> float:
     """Estimate the equality pairs over the cross product from key samples.
 
     Each side is a list of key arrays sampled from its table; a row's
-    key is the tuple of its values, and a null never matches. The
-    estimate sums, over the keys seen on both sides, the product of
-    the two sides' frequencies.
+    key is its values across them, and a null never matches. The
+    estimate is the sum, over the keys seen on both sides, of the
+    product of the two sides' value counts, over the product of the
+    sample sizes.
     """
-    def frequencies(arrays):
-        counts = {}
-        for key in zip(*(array.to_pylist() for array in arrays)):
-            if None not in key:
-                counts[key] = counts.get(key, 0) + 1
-        return counts, max(1, len(arrays[0]) if arrays else 0)
+    if len(left_keys) != len(right_keys) or not left_keys:
+        raise ValueError("a pair estimate needs one key column per side "
+                         "and at least one equality")
+    names = [f"key{index}" for index in range(len(left_keys))]
+    n_left, n_right = len(left_keys[0]), len(right_keys[0])
+    if not n_left or not n_right:
+        return 0.0
 
-    left, n_left = frequencies(left_keys)
-    right, n_right = frequencies(right_keys)
-    return sum(count * right.get(key, 0) for key, count in left.items()) / (
-        n_left * n_right)
+    def value_counts(columns, count):
+        table = pa.table(dict(zip(names, columns))).drop_null()
+        return table.group_by(names).aggregate(
+            [([], "count_all")]).rename_columns([*names, count])
+
+    # integer keys on one side are cast to the other side's type
+    right_keys = [right if right.type == left.type else pc.cast(right, left.type)
+                  for left, right in zip(left_keys, right_keys)]
+    matched = value_counts(left_keys, "left").join(
+        value_counts(right_keys, "right"), keys=names, join_type="inner")
+    pairs = pc.sum(pc.multiply(matched.column("left"),
+                               matched.column("right"))).as_py() or 0
+    return pairs / (n_left * n_right)
 
 
 def partner_map(pairs: pa.Table, anchor_alias: str,
