@@ -329,15 +329,24 @@ For labels computed before later filters, see
 For the scoring methods, see
 [Label scoring](/docs/architecture/execution#label-scoring).
 
-## Column tests in WHERE and ON
+## WHERE and ON
 
-A test of a table column against a literal keeps only the documents
-that pass it, before any model call. Supported tests are `=`, `<>`,
-`<`, `<=`, `>`, `>=`, `IN (...)`, `IS NULL`, and `IS NOT NULL`, with a
-number, string, or boolean literal, combined with `AND`. A row whose
-column is null fails every comparison. For example, this scores only
-the reviews from 2024 with at least four stars, and the model never
-reads the others:
+`WHERE` keeps rows that satisfy the given conditions. `ON` specifies
+which rows to join. Both support the following conditions on table columns:
+
+| Condition | SQL |
+| --- | --- |
+| Compare with a value | `=`, `<>`, `<`, `<=`, `>`, `>=` |
+| Match a value in a list | `IN (...)` |
+| Keep null values | `IS NULL` |
+| Keep non-null values | `IS NOT NULL` |
+
+Values can be numbers, strings, or booleans. `IN` requires a non-empty
+list of constant values. Combine conditions with `AND`.
+Comparisons exclude null values. Use `IS NULL` to keep them.
+
+E.g., the following SQL query returns the IDs of reviews from 2024 with
+at least four stars that mention shipping:
 
 ```sql
 SELECT r.id
@@ -347,12 +356,11 @@ WHERE r.year = 2024
   AND AI.IF(PROMPT('Does the review mention shipping? {0}', r.body))
 ```
 
-The test runs on the coordinator over the column's values, so the
-planner, the GPU shards, and the result all see the smaller table.
-`explain()` shows the tests on the scan and the row count after them.
-A test in `ON` restricts the joined table the same way. A test that
-compares two columns is a join condition and belongs in `ON` as
-`column = column`.
+Quail checks the year and rating before evaluating `AI.IF`.
+
+A condition in `ON` filters the table containing the referenced column.
+Comparisons between columns from different tables require `column = column`
+in `ON`. See [Joining](#joining).
 
 ## SELECT, FROM, JOIN, LIMIT
 
@@ -413,8 +421,8 @@ evaluation early. An offset greater than zero has the same effect.
 
 - `GROUP BY`, `HAVING`, window functions
 - `UNION`, `EXCEPT`, `INTERSECT`
-- `OR` between AI predicates
-- `BETWEEN`, `LIKE`, and arithmetic in column tests
+- `OR` between conditions
+- `BETWEEN`, `LIKE`, and arithmetic in column comparisons
 - Queries with no AI operator
 - `JOIN` with only relational predicates (no AI operator)
 - Outer joins (`LEFT`, `RIGHT`, `FULL`)
