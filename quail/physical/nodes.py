@@ -301,7 +301,7 @@ class RequestJoinSpec:
 class Scan(PhysicalNode):
     """Read one tokenized document input supplied by the coordinator.
 
-    ``predicates`` are the column tests, as (column, comparison, value)
+    ``predicates`` are the regular predicates, as (column, comparison, value)
     triples; the runtime keeps the documents that pass every one and
     reads nothing else for the rest. ``expected_docs`` is the planner's
     estimate of how many pass, from a sample; None without tests.

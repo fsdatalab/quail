@@ -301,7 +301,7 @@ COLUMN_COMPARISONS = ("=", "<>", "<", "<=", ">", ">=", "in", "is null", "is not 
 
 
 @dataclass(frozen=True)
-class ColumnPredicate:
+class RegularPredicate:
     """A test of one source column against literals, decided without the model.
 
     ``value`` is the literal compared with, a tuple of literals for
@@ -312,7 +312,7 @@ class ColumnPredicate:
     comparison: str
     value: Any = None
 
-    type_name: ClassVar[str] = "quail.column_predicate"
+    type_name: ClassVar[str] = "quail.regular_predicate"
 
     def aliases(self) -> tuple[str, ...]:
         return (self.column.alias,)

@@ -63,11 +63,11 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.planner import (
-    column_tests,
     default_order_rule,
     hash_join_nodes,
     order_filters_indexed,
     preamble_tokens,
+    regular_predicates,
 )
 from quail.planner import (
     join_specs as logical_join_specs,
@@ -170,7 +170,7 @@ def plan_request_backend(
     operators = region.logical_plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     ask_filters = {alias: list(ps) for alias, ps in filters.items() if ps}
-    # the column tests keep an estimated fraction of each table, as
+    # the regular predicates keep an estimated fraction of each table, as
     # the Quail planner's statistics do
     stats = {
         alias: CorpusStats(
@@ -197,7 +197,7 @@ def plan_request_backend(
             total_tokens=sum(context.document_tokens[scan.alias]),
             shard_ranges=((0, n_docs),),
             shard_token_loads=(summary.total_tokens,),
-            predicates=column_tests(scan),
+            predicates=regular_predicates(scan),
             expected_docs=float(summary.n_docs) if scan.predicates else None,
         )
         nodes.append(node)
@@ -797,7 +797,7 @@ class RequestModelExecution:
                 position = int(port.source.port.split(":", 1)[1])
                 self.pairs[position] = inputs[port.name]
         started = time.perf_counter()
-        # the scans supply the documents their column tests kept
+        # the scans supply the documents their regular predicates kept
         survivors = {
             alias: list(range(len(self.documents[alias])))
             for alias in node.aliases

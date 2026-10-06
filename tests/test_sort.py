@@ -152,7 +152,7 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
     logical = (_filtered(catalog).distinct().order_by("r.author").limit(2)
                .select("r.author"))
     optimized, changed = _optimize_with(catalog, logical, tokens)
-    assert "per_key_stop" in changed
+    assert "distinct_pushdown" in changed
     node = next(node for node in optimized.walk()
                 if isinstance(node, SemanticFilter))
     assert node.stop_key == ("author",)
@@ -172,6 +172,6 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
             _filtered(catalog).distinct().select("r.id", "r.author"),
             _filtered(catalog).select("r.author")):
         optimized, changed = _optimize_with(catalog, logical, tokens)
-        assert "per_key_stop" not in changed
+        assert "distinct_pushdown" not in changed
         assert all(not node.stop_key for node in optimized.walk()
                    if isinstance(node, SemanticFilter))

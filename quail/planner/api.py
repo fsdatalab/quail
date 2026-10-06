@@ -39,7 +39,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         tokenizer: Optional callable (text -> token list) handed to the
             planning context.
         scan_fractions: alias -> the fraction of its documents the
-            column tests are expected to keep.
+            regular predicates are expected to keep.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
         memo: Results the logical rules computed for this plan, such

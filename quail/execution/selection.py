@@ -3,7 +3,7 @@
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.logical import ColumnPredicate, CompileError
+from quail.logical import CompileError, RegularPredicate
 
 _COMPARE = {
     "=": pc.equal, "<>": pc.not_equal,
@@ -12,7 +12,7 @@ _COMPARE = {
 }
 
 
-def evaluate_predicate(values, predicate: ColumnPredicate) -> pa.ChunkedArray:
+def evaluate_predicate(values, predicate: RegularPredicate) -> pa.ChunkedArray:
     """Return a boolean array of the rows a column predicate accepts.
 
     A null compared with a literal is neither accepted nor rejected and
@@ -44,7 +44,7 @@ def selected_rows(columns: dict, predicates) -> pa.Array:
 
     Args:
         columns: Each predicate's column values, keyed by column name.
-        predicates: The ColumnPredicate tests, combined with AND.
+        predicates: The RegularPredicate tests, combined with AND.
     """
     mask = None
     for predicate in predicates:

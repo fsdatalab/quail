@@ -258,7 +258,7 @@ def compile_sql(
             provider,
             b.doc_columns.get(alias, ""),
             tuple(b.filters.get(alias, ())),
-            column_predicates=tuple(b.column_predicates.get(alias, ())),
+            regular_predicates=tuple(b.regular_predicates.get(alias, ())),
             labels=tuple(labels.get(alias, {}).items()),
             label_filters=tuple(
                 (labels[alias][call], accepted, selectivity)

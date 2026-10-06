@@ -91,7 +91,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                 assert all((s is None) == qid.startswith("PRIV-")
                            for s in selectivities), case
                 plan = query.plan()
-                # a column test alone runs on every backend; a sort or
+                # a regular predicate alone runs on every backend; a sort or
                 # an aggregate runs on Quail only
                 if backend != "quail" and qid in relational - {"REL-AGENT-1"}:
                     assert isinstance(plan, Refusal), case
