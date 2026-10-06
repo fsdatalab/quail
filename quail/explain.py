@@ -567,9 +567,9 @@ def rule_lines(logical_rules, physical_rules) -> list[str]:
 
     return ["rules, in run order (* cost-based, others heuristic):",
             f"  logical: {names(logical_rules)}",
-            "  physical planning*: filter order, join order and anchors, "
-            "and, on Quail, classification placement",
-            f"  physical: {names(physical_rules)}"]
+            "  physical: building the plan (filter order*, join order and "
+            "anchors*, and on Quail classification placement*), then "
+            f"{names(physical_rules)}"]
 
 
 def explain(logical: LogicalPlan, physical, *, verbose: bool = False,

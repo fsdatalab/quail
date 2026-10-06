@@ -51,10 +51,8 @@ For a physical rule, implement `rewrite(graph, context)`.
 Return a new `PhysicalGraph` when you change the plan, or `None` when
 no change is needed.
 
-Set `cost_based = True` on a rule that compares alternatives using cost
-estimates. `explain(verbose=True)` lists every rule in run order and
-marks the cost-based ones; a rule without the attribute is listed as
-heuristic.
+Set `cost_based = True` on a rule that compares costs; `explain(verbose=True)`
+marks such rules.
 
 The *planning context* provides the engine configuration and input
 statistics available to a rule. See
