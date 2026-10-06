@@ -51,6 +51,7 @@ from quail.physical.base import input_ports
 from quail.planner import join_order as joinsearch
 from quail.planner import retention
 from quail.planner.filter_order import default_order_rule
+from quail.planner.ordering import choose_filter_orders, choose_join_sequence
 from quail.planner.physical_optimizer import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal, score_seconds
 from quail.planner.results import result_nodes
@@ -58,14 +59,12 @@ from quail.planner.statistics import (
     ClassifyStatistics,
     cached_statistics,
     classify_statistics,
-    filter_orders,
     filter_stop_keys,
     filter_works,
     live_after_filters,
     pair_counts,
     question_tokens,
     score_statistics,
-    sequence_specs,
 )
 from quail.planner.validation import (
     ClassifyRefusedError,
@@ -221,14 +220,13 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                         order: str | None = None, pair_fractions=None,
                         context: PlanningContext | None = None,
                         scan_fractions=None):
-    """Compile a decided LogicalPlan into a PhysicalPlan or Refusal.
+    """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
-    The logical rules record each table's filter order, the joins'
-    stage order and anchors, and where each classification sits. A
-    plan without recorded orders and anchors runs as written. A
-    one-table classification above a SemanticJoin runs after the joins,
-    over the documents the joins matched. One on its table runs after
-    the table's AI.IF filters.
+    The builder chooses each table's filter order and the joins' stage
+    order and anchors by cost (quail.planner.ordering), unless order
+    is "as_written". A one-table classification above a SemanticJoin
+    runs after the joins, over the documents the joins matched. One on
+    its table runs after the table's AI.IF filters.
 
     The label_scoring physical rule picks each classification's scoring
     rule, and the kv_retention rule picks which KV stays resident. The
@@ -325,16 +323,20 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                    for alias, positions in asks.items() if positions}
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(operators.all_filters(), joins)
-    orders = filter_orders(plan)
+    orders = choose_filter_orders(
+        plan, statistics, model=model, device=device, rule=rule,
+        context=context)
     stop_keys = filter_stop_keys(plan)
 
     # ---- expected live counts after filters, and the filter work
     live0 = live_after_filters(plan, statistics)
-    works = filter_works(plan, statistics, model)
+    works = filter_works(plan, statistics, model, orders)
     base_work = sum(works.values(), Work())
 
-    # ---- the stages as decided: their work and expected tuples
-    seq = sequence_specs(plan, statistics)
+    # ---- the stages in the chosen order: their work and expected tuples
+    seq = [(specs[position], anchor) for position, anchor in
+           choose_join_sequence(plan, statistics, orders, model=model,
+                                device=device, rule=rule)]
     stage_work, stage_records = joinsearch.walk(
         seq, live0, statistics.lengths, set(operators.all_filters()), pre,
         model, device)

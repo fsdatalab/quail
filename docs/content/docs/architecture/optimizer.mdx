@@ -6,13 +6,23 @@ The optimizer chooses how Quail will execute a query. It starts with a
 logical plan, which describes the requested operations, and produces a
 physical plan, which specifies the executable operators and their settings.
 
-Quail makes each planning decision through an optimizer rule. Some rules remove
-unnecessary work, such as loading columns the query does not use. Other
-rules compare alternatives using the [cost estimates](#cost-estimates)
-and choose the one with the lowest estimated GPU time.
+Each planning decision is either *heuristic* or *cost-based*. A
+heuristic decision always applies, such as not loading columns the query
+does not use. A cost-based decision compares alternatives using the
+[cost estimates](#cost-estimates) and keeps the one with the lowest
+estimated GPU time.
 
-This page describes the built-in rules. See [Rules](/docs/extending/rules)
-to write and register an extension rule.
+- *Logical rules* rewrite the logical plan. They change what the plan
+  computes into an equivalent form. All built-in logical rules are
+  heuristic.
+- *Physical planning* turns the logical plan into a physical plan. It
+  makes the cost-based choices about how the plan runs: filter order,
+  join order and anchors, and where classifications run.
+- *Physical rules* then adjust the physical plan's operators and
+  settings. Some are heuristic and some are cost-based.
+
+This page describes the built-in rules and planning decisions. See
+[Rules](/docs/extending/rules) to write and register an extension rule.
 
 ## Planning process
 
@@ -23,14 +33,21 @@ to write and register an extension rule.
    documents.
 2. Run the logical rules in order. Repeat the sequence until a pass makes
    no change, or four passes have run.
-3. Build the physical graph with `build_physical_plan`. Set the token
-   budget and KV capacity from the model and device specifications.
-4. Run the physical rules once, in order.
+3. Ask the backend for candidate physical plans. The Quail backend builds
+   each candidate with `build_physical_plan`, which sets the token budget
+   and KV capacity from the model and device specifications and chooses
+   [filter order](#filter-order) and [join order](#join-order). When a
+   joined table is classified, the backend builds a second candidate
+   that [classifies after the joins](#classification-placement).
+4. Keep the candidate with the lowest estimated time. On a tie, keep the
+   plan as written.
+5. Run the physical rules once, in order.
 
 Tokenization can continue in the background while planning runs. Before
 execution, `refine_plan` applies the physical rules with exact token
-counts and sequences. It preserves the logical decisions and choices
-already made by rules such as `label_scoring` and `kv_retention`.
+counts and sequences. It keeps the choices already made: filter and join
+order, classification placement, and the choices of rules such as
+`label_scoring` and `kv_retention`.
 
 ## Cost estimates
 
@@ -99,30 +116,29 @@ rows and perform different amounts of work.
 ## Built-in rules
 
 Built-in rules run in the order below. Extension rules run after the
-built-in rules of the same kind, in registration order.
+built-in rules of the same phase, in registration order.
 
-| Rule | Kind | Decision | Uses cost estimates |
+| Rule | Phase | Decision | Kind |
 | --- | --- | --- | --- |
-| `distinct_elimination` | Logical | Remove DISTINCT when the returned keys are unique. | No |
-| `per_key_stop` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
-| `projection_pushdown` | Logical | Load only columns the query uses. | No |
-| `filter_pushdown` | Logical | Move eligible CPU filters and Python functions before joins. | No |
-| `classify_placement` | Logical | Classify a table's documents before or after its joins. | Yes |
-| `filter_order` | Logical | Order each table's `AI.IF` or `AI.SCORE` predicates. | Yes |
-| `join_order` | Logical | Choose join order and anchors. | Yes |
-| `limit_pushdown` | Physical | Stop an eligible filter chain after enough documents pass. | No |
-| `kv_retention` | Physical | Keep selected document KV for later operators. | Yes |
-| `label_scoring` | Physical | Choose a classification's label scoring method. | Yes |
-| `prefix_sharing` | Physical | Reuse KV between documents with a shared prefix. | Yes |
-| `tree_attention` | Physical | Choose unified or tree attention for filters and joins. | Yes |
+| `distinct_elimination` | Logical | Remove DISTINCT when the returned keys are unique. | Heuristic |
+| `per_key_stop` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | Heuristic |
+| `projection_pushdown` | Logical | Load only columns the query uses. | Heuristic |
+| `filter_pushdown` | Logical | Move eligible CPU filters and Python functions before joins. | Heuristic |
+| `limit_pushdown` | Physical | Stop an eligible filter chain after enough documents pass. | Heuristic |
+| `kv_retention` | Physical | Keep selected document KV for later operators. | Heuristic; its eviction priority uses cost estimates |
+| `label_scoring` | Physical | Choose a classification's label scoring method. | Cost-based |
+| `prefix_sharing` | Physical | Reuse KV between documents with a shared prefix. | Cost-based |
+| `tree_attention` | Physical | Choose unified or tree attention for filters and joins. | Cost-based |
+
+Physical planning, between the two phases, makes three cost-based
+choices: [classification placement](#classification-placement),
+[filter order](#filter-order), and [join order](#join-order).
 
 The implementations are in
-[`logical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py)
+[`logical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py),
+[`ordering.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/ordering.py),
 and
 [`physical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_rules.py).
-
-Logical rules that compare costs leave the plan unchanged when model
-specifications are unavailable or the model does not fit on one GPU.
 
 Each operator supplies its own prompt preparation, execution constraints,
 and costs. Score operators support both generative
@@ -131,16 +147,18 @@ model prompt. The executor reuses the first document's KV across its
 partners, so that document is the anchor.
 
 Call `explain(verbose=True)` to inspect physical settings, including
-`share_prefixes` and `attention`.
+`share_prefixes` and `attention`. It also lists the rules in run order
+and marks the cost-based ones.
 
-## Logical rules
+## Physical planning
 
-Logical rules change the operation tree before Quail builds the physical
-graph. The rules below compare alternatives using estimated query work.
+Physical planning chooses how the logical plan runs. The choices below
+compare alternatives using estimated query work. They change the
+physical plan only; the logical plan keeps the query as written.
 
 ### Classification placement
 
-The `classify_placement` rule decides when to classify a table's documents.
+The Quail backend decides when to classify a table's documents.
 A classification that reads one table's document can run before or after
 joins involving that table. This differs from classifying a joined pair,
 where the classification reads both documents.
@@ -156,35 +174,37 @@ negative reviews, and joins them with movie aspects. Classifying first
 can save join work if few reviews are negative. Joining first can save
 classification work if few reviews match an aspect.
 
-The rule compares the estimated query times. It keeps the written plan
-unless moving classifications after the joins has a lower estimate.
+The backend builds both plans and gives each estimate the scoring method
+the `label_scoring` rule would choose for it. The planner keeps the
+written plan unless moving classifications after the joins has a lower
+estimate. The plan's `classify_placement` setting records the choice.
 
 ### Filter order
 
-The `filter_order` rule chooses predicate order within a table.
+`build_physical_plan` chooses predicate order within a table.
 When a table has several model predicates, their order affects how much
 work the query does. *Selectivity* is the estimated fraction of rows
 that pass a predicate. A predicate that keeps fewer rows can reduce the work of later predicates.
 
 For `AI.IF`, the first predicate processes each full document. With KV rewind, later
 predicates process only their question tokens for documents that passed.
-The rule accounts for that difference when comparing orders.
+The planner accounts for that difference when comparing orders.
 
-The rule tries each predicate first. It orders the remaining predicates
+The planner tries each predicate first. It orders the remaining predicates
 by cost per rejected document and keeps the candidate with the lowest
 expected time. [Our blog post on filter cost estimates](https://fsdatalab.github.io/blog/ai-filter-cost-estimates/)
 gives the derivation for `AI.IF`.
 
-For `AI.SCORE`, the rule prices each prompt at the expected survivor count.
-It accounts for prefix reuse within a score evaluation. Later comparisons
-of a score already computed for those rows need no model work. The physical
-graph builder reads the chosen order and reuses the computed score column.
+For `AI.SCORE`, the planner prices each prompt at the expected survivor
+count. It accounts for prefix reuse within a score evaluation. Later
+comparisons of a score already computed for those rows need no model work,
+so they reuse the computed score column.
 
 Set `order="as_written"` to preserve predicate order.
 
 ### Join order
 
-The `join_order` rule chooses the sequence and anchors of joins.
+`build_physical_plan` chooses the sequence and anchors of joins.
 The *anchor* is the side whose document KV stays in GPU memory while its pairs are
 evaluated. The *partner* is added after the anchor for each pair.
 
@@ -192,8 +212,8 @@ A long anchor document can be processed once and reused for many partners.
 A long partner document must be processed for each anchor it pairs with.
 The planner considers this work along with filtering and KV retention.
 
-The rule compares join orders and anchors by estimated time for the whole
-query, including filters. It considers only plans where each join adds
+The planner compares join orders and anchors by estimated time for the
+whole query, including filters in their chosen order. It considers only plans where each join adds
 one table to the preceding result.
 
 <details>
@@ -213,8 +233,11 @@ complete query.
 
 </details>
 
-An explicitly supplied anchor is preserved. With `order="as_written"`,
-the rule preserves join order and chooses only the unspecified anchors.
+Join order and anchors are chosen together because a stage's cost depends
+on which table's KV is computed once and which KV earlier stages left in
+GPU memory. An explicitly supplied anchor is preserved. With
+`order="as_written"`, the planner preserves join order and chooses only
+the unspecified anchors.
 
 ## Physical rules
 

@@ -9,7 +9,7 @@ on the plan's nodes: each table's filter order and the join sequence.
 
 import math
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from operator import mul
 
@@ -21,7 +21,6 @@ from quail.cost.work import Work, triangle
 from quail.logical import (
     LogicalPlan,
     SemanticFilter,
-    SemanticJoin,
     classified_above_joins,
     effective_selectivity,
     is_score,
@@ -328,33 +327,16 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
         asks=asks)
 
 
-def undecided(root) -> object:
-    """Return the plan root with the filter_order and join_order decisions cleared."""
-
-    def visit(node):
-        children = tuple(visit(child) for child in node.children())
-        if children != node.children():
-            node = node.with_children(children)
-        if isinstance(node, SemanticFilter) and node.order:
-            return replace(node, order=())
-        if isinstance(node, SemanticJoin) and node.exec_idx is not None:
-            return replace(node, exec_idx=None, exec_anchor=None)
-        return node
-
-    return visit(root)
-
-
 def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
                       device: DeviceSpec, doc_tokens: dict,
                       pair_fractions=None, scan_fractions=None,
                       context=None) -> PlanStatistics:
-    """Return plan_statistics, computed once per memo and undecided plan root.
+    """Return plan_statistics, computed once per memo and plan root.
 
-    The decisions the rules record do not change the statistics, so
-    every rule and the physical planner of one query share one
-    summary of each table's lengths.
+    Every logical rule and physical planner of one query that prices
+    the same plan share one summary of each table's lengths.
     """
-    key = ("statistics", undecided(plan.root))
+    key = ("statistics", plan.root)
     if key not in memo:
         memo[key] = plan_statistics(
             plan, model=model, device=device, doc_tokens=doc_tokens,
@@ -371,30 +353,6 @@ def filter_stop_keys(plan: LogicalPlan) -> dict:
             (alias,) = model_call(node.predicates[0].expression).aliases()
             keys[alias] = tuple(node.stop_key)
     return keys
-
-
-def filter_orders(plan: LogicalPlan) -> dict:
-    """Return alias -> written positions of model predicates in execution order.
-
-    Reads the ``order`` the filter_order rule recorded on each
-    SemanticFilter; a node without one runs its predicates as written.
-    A written position counts the alias's predicates over every
-    SemanticFilter, lowest node first, as Operators lists them.
-    """
-    counted = {}
-    orders = {}
-    for node in plan.walk():
-        if not isinstance(node, SemanticFilter):
-            continue
-        positions = []
-        for predicate in node.predicates:
-            (alias,) = model_call(predicate.expression).aliases()
-            positions.append((alias, counted.get(alias, 0)))
-            counted[alias] = counted[alias] + 1 if alias in counted else 1
-        for index in node.order or range(len(node.predicates)):
-            alias, position = positions[index]
-            orders.setdefault(alias, []).append(position)
-    return orders
 
 
 def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
@@ -428,9 +386,16 @@ def filter_alias_work(preds, stats, order, pre: int,
 
 
 def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
-                 model: ModelSpec) -> dict:
-    """Return the expected Work of each table's filter chain in execution order."""
-    orders = filter_orders(plan)
+                 model: ModelSpec, orders: dict) -> dict:
+    """Return the expected Work of each table's filter chain in run order.
+
+    Args:
+        plan: The logical plan.
+        statistics: The plan's statistics.
+        model: Model spec.
+        orders: alias -> written positions of its model predicates in
+            run order.
+    """
     return {
         alias: filter_alias_work(
             predicates, statistics.stats[alias],
@@ -438,28 +403,6 @@ def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
             statistics.pre, model.canvas_tokens, model.sliding_window)
         for alias, predicates in plan.operators().filters.items()
     }
-
-
-def join_sequence(plan: LogicalPlan) -> list:
-    """Return [(written position, anchor)] in execution order.
-
-    Reads the ``exec_idx`` and ``exec_anchor`` the join_order rule
-    recorded on each SemanticJoin. When any join has none, the joins
-    run as written, each on its written anchor or, for a free full
-    join, on its first table.
-    """
-    joins = plan.operators().joins
-    if any(join.exec_idx is None for join in joins):
-        return [(position, join.anchor or _join_aliases(join)[0])
-                for position, join in enumerate(joins)]
-    ordered = sorted(enumerate(joins), key=lambda item: item[1].exec_idx)
-    return [(position, join.exec_anchor) for position, join in ordered]
-
-
-def sequence_specs(plan: LogicalPlan, statistics: PlanStatistics) -> list:
-    """Return [(spec, anchor)] in execution order, for walk and schedule."""
-    return [(statistics.specs[position], anchor)
-            for position, anchor in join_sequence(plan)]
 
 
 @dataclass(frozen=True)

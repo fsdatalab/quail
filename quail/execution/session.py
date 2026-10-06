@@ -839,8 +839,11 @@ class Query:
                 output_rows=rows)
             result.report.setdefault("node_metrics", {}).setdefault(
                 root, {})["output_rows"] = rows
+        registry = self.session.registry
         text = explain(self.logical, physical, verbose=verbose,
                        result=result,
+                       rules=(tuple(registry.logical_rules.values()),
+                              tuple(registry.physical_rules.values())),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
         if self._estimated:

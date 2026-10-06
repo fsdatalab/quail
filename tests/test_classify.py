@@ -411,20 +411,30 @@ def _corpus(session, tmp_path, name, column, rows, words):
     session.register(name, DocumentProvider.from_parquet(str(path), id_col="id"))
 
 
-def test_rules_place_and_score_classifications(session, tmp_path):
+def _candidates(session, query):
+    """Return the Quail backend's candidates for a planned query."""
+    from quail.planner.physical_optimizer import ModelRegion, PlanningContext
+
+    query.plan()
+    context = PlanningContext(
+        model=session.model, device=session.device, gpu_count=1,
+        document_tokens=query._doc_tokens, backend="quail",
+        tokenizer=session.tokenizer)
+    return session.registry.backend("quail").plan(
+        ModelRegion(query.logical), context)
+
+
+def test_planner_places_and_scores_classifications(session, tmp_path):
     from quail.logical import classified_above_joins
     from quail.planner.logical_rules import (
-        ClassifyPlacement,
         built_in_logical_rules,
         lift_classifications,
-        push_down_projection,
     )
     from quail.planner.physical_rules import built_in_physical_rules
-    from quail.planner.statistics import undecided
 
     assert [rule.name for rule in built_in_logical_rules()] == [
         "distinct_elimination", "per_key_stop", "projection_pushdown",
-        "filter_pushdown", "classify_placement", "filter_order", "join_order"]
+        "filter_pushdown"]
     assert [rule.name for rule in built_in_physical_rules()] == [
         "limit_pushdown", "kv_retention", "label_scoring", "prefix_sharing",
         "tree_attention"]
@@ -466,31 +476,31 @@ def test_rules_place_and_score_classifications(session, tmp_path):
     assert classify.spec.expected_inputs == pytest.approx(1.8)
     assert round(plan.estimated_seconds, 3) == 0.063
     assert plan.settings["search_seconds"] == plan.estimated_seconds
-    # the query's logical plan is the one the rules left: the
-    # classification sits above the join, which carries its stage
+    (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
+    assert [(stage.exec_idx, stage.anchor) for stage in staged.stages] == [
+        (0, "r")]
+    # the logical plan keeps the classification where it was written;
+    # the backend priced it there and above the join, and the lifted
+    # candidate was cheaper
+    assert classified_above_joins(after.logical.root) == frozenset()
+    written_candidate, lifted_candidate = _candidates(session, after)
+    assert written_candidate.logical_plan.root == after.logical.root
+    assert classified_above_joins(lifted_candidate.logical_plan.root) == {"r"}
+    assert (lifted_candidate.estimated_seconds
+            < written_candidate.estimated_seconds)
+    logical_text, physical_text = after.explain().split("physical:")
+    assert "SemanticClassify: topic" in logical_text
+    assert "AiClassify: topic over r" in physical_text
     lifted = lift_classifications(written)
-    assert undecided(after.logical.root) == lift_classifications(
-        push_down_projection(written))
-    staged = after.logical.root.input.input.input
-    assert (staged.exec_idx, staged.exec_anchor) == (0, "r")
     assert [type(node).__name__ for node in LogicalPlan(lifted).walk()] == [
         "Scan", "Scan", "Join", "SemanticJoin", "SemanticClassify",
         "Filter", "Project"]
     assert classified_above_joins(lifted) == {"r"}
     assert classified_above_joins(written) == frozenset()
     assert lift_classifications(lifted) is None
+    # a query without a join gets one candidate
     assert lift_classifications(_topic(session).logical.root) is None
-
-    # the rule moves the classifications only when the lifted plan
-    # prices lower, and never onto a refused plan
-    def cost(above, below):
-        return lambda plan, context: (
-            above if classified_above_joins(plan.root) else below)
-
-    assert ClassifyPlacement(cost(1.0, 2.0)).rewrite(written, None) == lifted
-    assert ClassifyPlacement(cost(2.0, 1.0)).rewrite(written, None) is None
-    assert ClassifyPlacement(cost(1.0, 1.0)).rewrite(written, None) is None
-    assert ClassifyPlacement(cost(None, 2.0)).rewrite(written, None) is None
+    assert len(_candidates(session, _topic(session))) == 1
 
     # a filtered partner on a forced anchor stays classified before the
     # join, over the filter's survivors with their KV resident
@@ -508,6 +518,9 @@ def test_rules_place_and_score_classifications(session, tmp_path):
     assert (classify.spec.scoring, classify.spec.expected_inputs) == (
         "trie_tree", 30.0)
     assert round(plan.estimated_seconds, 3) == 0.410
+    written_candidate, lifted_candidate = _candidates(session, before)
+    assert (written_candidate.estimated_seconds
+            <= lifted_candidate.estimated_seconds)
 
 
 def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):

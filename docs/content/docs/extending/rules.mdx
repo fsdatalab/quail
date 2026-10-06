@@ -8,7 +8,8 @@ For Quail's existing rules, see the [optimizer](/docs/architecture/optimizer).
 
 ## Choose the rule type
 
-- A *logical rule* changes the logical plan, such as the order of filters.
+- A *logical rule* changes the logical plan, such as which columns a
+  scan loads.
 - A *physical rule* changes the physical plan, such as an operator's
   execution settings.
 
@@ -49,6 +50,11 @@ See the [complete implementation](https://github.com/fsdatalab/quail/blob/main/q
 For a physical rule, implement `rewrite(graph, context)`.
 Return a new `PhysicalGraph` when you change the plan, or `None` when
 no change is needed.
+
+Set `cost_based = True` on a rule that compares alternatives using cost
+estimates. `explain(verbose=True)` lists every rule in run order and
+marks the cost-based ones; a rule without the attribute is listed as
+heuristic.
 
 The *planning context* provides the engine configuration and input
 statistics available to a rule. See

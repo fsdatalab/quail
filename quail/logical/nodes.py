@@ -121,17 +121,15 @@ class Scan:
 class SemanticFilter:
     """Predicates over one table's documents, in written order.
 
-    ``order`` is the predicates' execution order, as positions in
-    ``predicates``, once the filter_order rule has chosen one; empty
-    means as written. ``stop_key`` names columns of the filtered table
-    once the per_key_stop rule has found that the query asks only
-    whether any document of each key value passes; the executor then
-    skips a key's remaining documents once one survives.
+    The physical planner chooses the order they run in. ``stop_key``
+    names columns of the filtered table once the per_key_stop rule has
+    found that the query asks only whether any document of each key
+    value passes; the executor then skips a key's remaining documents
+    once one survives.
     """
 
     input: LogicalNode
     predicates: tuple  # tuple[FilterPredicate, ...], written order
-    order: tuple = ()  # tuple[int, ...]
     stop_key: tuple = ()  # tuple[str, ...]
 
     type_name: ClassVar[str] = "quail.semantic_filter"
@@ -148,11 +146,6 @@ class SemanticFilter:
     def validate(self) -> None:
         if not self.predicates:
             raise CompileError("SemanticFilter needs at least one predicate")
-        if self.order and sorted(self.order) != list(range(len(self.predicates))):
-            raise CompileError(
-                f"a filter's order lists each predicate position once, "
-                f"got {list(self.order)} for {len(self.predicates)} predicates"
-            )
         for predicate in self.predicates:
             validate_predicate(predicate.expression)
             if len(model_call(predicate.expression).aliases()) != 1:
@@ -173,7 +166,6 @@ class SemanticFilter:
             "predicates": len(self.predicates),
             "selectivities": [p.selectivity for p in self.predicates],
             "expressions": [_explain(p.expression) for p in self.predicates],
-            "order": list(self.order),
             "stop_key": list(self.stop_key),
         }
 
@@ -290,11 +282,9 @@ class SemanticJoin:
     """One model predicate over the pairs its input Join produces.
 
     A query that joins three or more tables has one SemanticJoin per
-    pair, each feeding the Join of the next. ``exec_idx`` and
-    ``exec_anchor`` are the join_order rule's decision: the join's
-    position among the query's joins in execution order and the table
-    whose KV its stage keeps, ``anchor`` when one was written. Both
-    are None before the rule runs.
+    pair, each feeding the Join of the next. The physical planner
+    chooses the joins' run order and each join's anchor, the table
+    whose KV its stage keeps; it keeps ``anchor`` when one was written.
     """
 
     input: LogicalNode  # a Join, under any Apply that
@@ -304,8 +294,6 @@ class SemanticJoin:
     selectivity: Optional[float] = None  # fraction of tuples that pass
     anchor: Optional[str] = None  # table alias whose KV is kept;
     #                                    None = planner picks
-    exec_idx: Optional[int] = None
-    exec_anchor: Optional[str] = None
 
     type_name: ClassVar[str] = "quail.semantic_join"
 
@@ -335,15 +323,6 @@ class SemanticJoin:
                 f"the join predicate reads {sorted(missing)}, which its "
                 f"input does not produce ({sorted(present)})"
             )
-        if (self.exec_idx is None) != (self.exec_anchor is None):
-            raise CompileError(
-                "a planned join has both an execution position and an anchor"
-            )
-        if self.exec_anchor is not None and self.exec_anchor not in aliases:
-            raise CompileError(
-                f"the planned anchor {self.exec_anchor!r} is not a table "
-                f"of the join ({list(aliases)})"
-            )
 
     def with_children(self, children: tuple[LogicalNode, ...]):
         if len(children) != 1:
@@ -361,8 +340,6 @@ class SemanticJoin:
             "selectivity": self.selectivity,
             "anchor": self.anchor,
             "expression": _explain(self.predicate),
-            "exec_idx": self.exec_idx,
-            "exec_anchor": self.exec_anchor,
         }
 
 
@@ -374,11 +351,11 @@ class SemanticClassify:
     ``name``; with ``probabilities`` a second column, ``name`` plus
     PROBABILITIES_SUFFIX, holds each label's probability. A call over
     one table starts on that table above its AI.IF SemanticFilter and
-    below any join; the lift_classifications rule moves it above the
-    joins when a join reads the table. A call over two tables sits
-    above the SemanticJoin of the two. A Filter testing the label
-    column sits above this node, and the root Project returns the
-    column through an Alias of the same call.
+    below any join; when a join reads the table, the physical planner
+    also prices running it above the joins (lift_classifications). A
+    call over two tables sits above the SemanticJoin of the two. A
+    Filter testing the label column sits above this node, and the root
+    Project returns the column through an Alias of the same call.
     """
 
     input: LogicalNode

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from quail.cost import budgets
-from quail.cost.work import Work
 from quail.logical import (
     Aggregate,
     Alias,
@@ -31,18 +29,6 @@ from quail.logical import (
     SortKey,
     is_score,
     model_call,
-)
-from quail.planner import join_order as joinsearch
-from quail.planner import pricing
-from quail.planner.filter_order import default_order_rule, order_filters_indexed
-from quail.planner.statistics import (
-    PlanStatistics,
-    cached_statistics,
-    filter_orders,
-    filter_works,
-    live_after_filters,
-    prepare_filter_costs,
-    undecided,
 )
 
 
@@ -127,6 +113,7 @@ class ProjectionPushdown:
     """Push the projected column set down to each Scan."""
 
     name = "projection_pushdown"
+    cost_based = False
 
     def rewrite(self, root, context):
         rewritten = push_down_projection(root)
@@ -239,6 +226,7 @@ class FilterPushdown:
     """
 
     name = "filter_pushdown"
+    cost_based = False
 
     def rewrite(self, root, context):
         return push_down_filters(root)
@@ -314,187 +302,6 @@ def lift_classifications(root: LogicalNode) -> LogicalNode | None:
     return None if lifted == root else lifted
 
 
-class ClassifyPlacement:
-    """Classify a joined table before its joins or after them, by cost.
-
-    Before the joins, a classification labels every document its
-    AI.IF filters kept, and a filter on its label thins the join's
-    input. After the joins, it labels only the documents the joins
-    matched. The rule keeps the plan as written unless the plan with
-    every joined table's classifications above the joins
-    (lift_classifications) costs less.
-
-    The cost is the estimated seconds of the candidate's physical plan
-    with the label_scoring rule applied (quail.planner.pricing). The
-    rule does nothing when prices() is false for the context.
-    """
-
-    name = "classify_placement"
-
-    def __init__(self, cost=None):
-        """Make the rule with a cost function.
-
-        Args:
-            cost: Callable mapping a LogicalPlan and the context to the
-                plan's estimated seconds, or None when the plan is
-                refused. The default prices build_physical_plan's plan.
-        """
-        self.cost = pricing.estimated_seconds if cost is None else cost
-
-    def rewrite(self, root, context):
-        if context is not None and not prices(root, context):
-            return None
-        lifted = lift_classifications(root)
-        if lifted is None:
-            return None
-        before = self.cost(LogicalPlan(root), context)
-        after = self.cost(LogicalPlan(lifted), context)
-        if before is None or after is None or not after < before:
-            return None
-        return lifted
-
-
-def prices(root, context) -> bool:
-    """Return whether the Quail cost model applies to a plan and context.
-
-    It applies when the context has a model, the backend is quail, the
-    model's weights fit one GPU.
-    """
-    return (context.model is not None and context.backend == "quail"
-            and budgets.minimum_weight_gpus(context.model, context.device) == 1)
-
-
-def _statistics(root, context) -> PlanStatistics:
-    """Return the plan's statistics, shared through the context's memo."""
-    return cached_statistics(
-        LogicalPlan(root), context.memo, model=context.model,
-        device=context.device, doc_tokens=context.document_tokens,
-        pair_fractions=context.pair_fractions,
-        scan_fractions=context.scan_fractions, context=context)
-
-
-def _order_rule(context) -> str:
-    return context.order or default_order_rule({}, ())[0]
-
-
-class FilterOrder:
-    """Order each table's model predicates by expected cost.
-
-    Each SemanticFilter uses order_filters_indexed to compare first
-    predicates and rank later predicates by cost per rejection. Each
-    operator supplies its own cost and reuse behavior. The rule records
-    the chosen order on the node when it differs from the written order.
-    With order="as_written", it clears every recorded order. Both front
-    ends put a table's model predicates in one SemanticFilter.
-    """
-
-    name = "filter_order"
-
-    def rewrite(self, root, context):
-        if not prices(root, context):
-            return None
-        rule = _order_rule(context)
-        statistics = _statistics(root, context)
-        model, device = context.model, context.device
-
-        def visit(node):
-            children = tuple(visit(child) for child in node.children())
-            if children != node.children():
-                node = node.with_children(children)
-            if not isinstance(node, SemanticFilter):
-                return node
-            if rule == "as_written":
-                return node if not node.order else replace(node, order=())
-            (alias,) = model_call(node.predicates[0].expression).aliases()
-            costs = prepare_filter_costs(
-                node.predicates,
-                prefix_tokens=(statistics.pre
-                               + statistics.stats[alias].mean_doc_tokens),
-                model=model, device=device, chunk_tokens=statistics.chunk,
-                context=context)
-            ordered = order_filters_indexed(
-                costs, rule, count=statistics.stats[alias].n_docs)
-            order = () if ordered == list(range(len(ordered))) else tuple(ordered)
-            return node if order == node.order else replace(node, order=order)
-
-        rewritten = visit(root)
-        return None if rewritten == root else rewritten
-
-
-class JoinOrder:
-    """Choose the joins' stage order and each stage's anchor by cost.
-
-    The left-deep search (quail.planner.join_order.search_joins) prices
-    every connected stage order with every anchor choice together,
-    because a stage's cost depends on which table's KV is computed once
-    and which documents' KV earlier stages left resident. It ranks each
-    candidate by the whole query's estimated seconds, including the
-    filter chains in their decided order. A written anchor is kept.
-    With order="as_written", only the anchors are chosen. When no
-    connected left-deep order exists, the written order is priced. The
-    rule records each join's execution position and anchor on its
-    SemanticJoin.
-    """
-
-    name = "join_order"
-
-    def rewrite(self, root, context):
-        if not prices(root, context):
-            return None
-        plan = LogicalPlan(root)
-        joins = plan.operators().joins
-        if not joins:
-            return None
-        found = self._search(plan, context)
-        decided = {position: anchor for position, anchor in found["seq"]}
-        exec_idx = {position: index
-                    for index, (position, _) in enumerate(found["seq"])}
-        position = 0
-
-        def visit(node):
-            nonlocal position
-            children = tuple(visit(child) for child in node.children())
-            if children != node.children():
-                node = node.with_children(children)
-            if isinstance(node, SemanticJoin):
-                stage = (exec_idx[position], decided[position])
-                position += 1
-                if (node.exec_idx, node.exec_anchor) != stage:
-                    node = replace(node, exec_idx=stage[0], exec_anchor=stage[1])
-            return node
-
-        rewritten = visit(root)
-        if rewritten == root:
-            return None
-        return rewritten
-
-    def _search(self, plan, context) -> dict:
-        """Run the search once per plan and filter order; return its result."""
-        key = ("join_order", undecided(plan.root),
-               tuple(sorted((alias, tuple(order)) for alias, order
-                            in filter_orders(plan).items())))
-        if key in context.memo:
-            return context.memo[key]
-        statistics = _statistics(plan.root, context)
-        model, device = context.model, context.device
-        base_work = sum(filter_works(plan, statistics, model).values(), Work())
-        live = live_after_filters(plan, statistics)
-        filtered = set(plan.operators().all_filters())
-        fixed = _order_rule(context) == "as_written"
-
-        found = joinsearch.search_joins(
-            statistics.specs, live, statistics.lengths, filtered,
-            statistics.pre, statistics.chunk, model, device,
-            base_work=base_work, fixed_order=fixed)
-        if found is None:
-            found = joinsearch.search_joins(
-                statistics.specs, live, statistics.lengths, filtered,
-                statistics.pre, statistics.chunk, model, device,
-                base_work=base_work, fixed_order=True)
-        context.memo[key] = found
-        return found
-
-
 class DistinctElimination:
     """Clear a DISTINCT that cannot remove rows.
 
@@ -509,6 +316,7 @@ class DistinctElimination:
     """
 
     name = "distinct_elimination"
+    cost_based = False
 
     def rewrite(self, root, context):
         if not isinstance(root, Result) or not root.distinct:
@@ -568,6 +376,7 @@ class PerKeyStop:
     """
 
     name = "per_key_stop"
+    cost_based = False
 
     def rewrite(self, root, context):
         if not isinstance(root, Result) or not root.distinct:
@@ -597,10 +406,10 @@ def built_in_logical_rules() -> tuple:
     """Return the logical rules registered with the built in registry.
 
     In order: distinct_elimination, per_key_stop, projection_pushdown,
-    filter_pushdown, classify_placement, filter_order, and join_order.
-    join_order follows filter_order because it ranks candidates by the
-    whole query's seconds, the filter chains in their decided order
-    included.
+    and filter_pushdown. Every one is heuristic: it rewrites the plan
+    without pricing it. The cost-based choices (where classifications
+    run, filter order, join order and anchors) are physical planning
+    (quail.planner.ordering and the Quail backend's candidates).
     """
     return (DistinctElimination(), PerKeyStop(), ProjectionPushdown(),
-            FilterPushdown(), ClassifyPlacement(), FilterOrder(), JoinOrder())
+            FilterPushdown())
