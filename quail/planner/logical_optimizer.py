@@ -37,7 +37,7 @@ class LogicalPlanningContext:
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
         scan_fractions: alias -> the fraction of its documents the
-            column tests are expected to keep.
+            regular predicates are expected to keep.
         memo: Results a rule computed for one plan root, so a later
             pass or another rule pricing the same root reuses them.
     """

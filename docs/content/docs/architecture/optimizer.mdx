@@ -106,7 +106,7 @@ built-in rules of the same kind, in registration order.
 | Rule | Kind | Decision | Uses cost estimates |
 | --- | --- | --- | --- |
 | `distinct_elimination` | Logical | Remove DISTINCT when the returned keys are unique. | No |
-| `per_key_stop` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
+| `distinct_pushdown` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
 | `projection_pushdown` | Logical | Load only columns the query uses. | No |
 | `filter_pushdown` | Logical | Move eligible CPU filters and Python functions before joins. | No |
 | `limit_pushdown` | Physical | Stop an eligible filter chain after enough documents pass. | No |

@@ -695,7 +695,7 @@ class Query:
                     s.provider, s.column)
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
-            # the planner estimates what the column tests and the join
+            # the planner estimates what the regular predicates and the join
             # equalities keep from samples; the executor applies them
             scan_fractions = self._scan_fractions(operators.scans)
             pair_fractions = self._pair_fractions(
@@ -937,7 +937,7 @@ class Query:
     def _column_tables(self) -> dict:
         """One value table per alias whose columns the executor reads.
 
-        A scan's column tests, a HashJoin, an apply(), and a stop key
+        A scan's regular predicates, a HashJoin, an apply(), and a stop key
         read values; the tables carry the columns they name.
         """
         needed = {}

@@ -14,8 +14,8 @@ from .api import plan_query, refine_plan
 from .build import (
     balanced_shards,
     build_physical_plan,
-    column_tests,
     hash_join_nodes,
+    regular_predicates,
 )
 from .filter_order import default_order_rule, order_filters_indexed
 from .plan import CorpusStats, EngineConfig, PhysicalPlan, Refusal
@@ -27,7 +27,7 @@ __all__ = [
     "PhysicalPlan",
     "Refusal",
     "balanced_shards",
-    "column_tests",
+    "regular_predicates",
     "build_physical_plan",
     "default_order_rule",
     "hash_join_nodes",

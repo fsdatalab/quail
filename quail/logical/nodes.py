@@ -10,13 +10,13 @@ from quail.logical.expressions import (
     AggregateCall,
     Aggregation,
     Alias,
-    ColumnPredicate,
     ColumnRef,
     CompileError,
     HavingTest,
     InList,
     ModelCall,
     Prompt,
+    RegularPredicate,
     SortKey,
     _explain,
     column_name,
@@ -53,7 +53,7 @@ class Scan:
     columns kept as values for the result rows, and includes ``column``
     only when the query returns the document text itself. The
     projection pushdown rule fills ``columns``; before it runs the
-    tuple is empty. ``predicates`` are column tests, all of which a
+    tuple is empty. ``predicates`` are regular predicates, all of which a
     document must pass before any operator reads it.
     """
 
@@ -61,7 +61,7 @@ class Scan:
     alias: str
     column: str
     columns: tuple = ()  # tuple[str, ...]
-    predicates: tuple = ()  # tuple[ColumnPredicate, ...]
+    predicates: tuple = ()  # tuple[RegularPredicate, ...]
 
     type_name: ClassVar[str] = "quail.scan"
 
@@ -88,9 +88,9 @@ class Scan:
                 f"Scan {self.alias!r} lists a column twice: {self.columns}"
             )
         for predicate in self.predicates:
-            if not isinstance(predicate, ColumnPredicate):
+            if not isinstance(predicate, RegularPredicate):
                 raise CompileError(
-                    f"a Scan predicate is a ColumnPredicate, got "
+                    f"a Scan predicate is a RegularPredicate, got "
                     f"{type(predicate).__name__}"
                 )
             predicate.validate()
@@ -122,8 +122,8 @@ class SemanticFilter:
     """Predicates over one table's documents, in written order.
 
     The physical planner chooses the order they run in. ``stop_key``
-    names columns of the filtered table once the per_key_stop rule has
-    found that the query asks only whether any document of each key
+    names columns of the filtered table once the distinct_pushdown rule
+    has found that the query asks only whether any document of each key
     value passes; the executor then skips a key's remaining documents
     once one survives.
     """

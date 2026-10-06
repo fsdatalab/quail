@@ -280,7 +280,7 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     rules = (built_in_logical_rules(), built_in_physical_rules())
     assert "rules" not in explain(logical, plan, rules=rules)
     text = explain(logical, plan, verbose=True, rules=rules)
-    assert ("  logical: distinct_elimination, per_key_stop, "
+    assert ("  logical: distinct_elimination, distinct_pushdown, "
             "projection_pushdown, filter_pushdown\n") in text
     assert ("then limit_pushdown, kv_retention, label_scoring*, "
             "prefix_sharing*, tree_attention*") in text

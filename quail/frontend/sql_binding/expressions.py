@@ -5,13 +5,13 @@ from sqlglot import exp
 from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
 from quail.logical import (
-    ColumnPredicate,
     ColumnRef,
     Compare,
     CompileError,
     FilterPredicate,
     JoinSpec,
     ModelCall,
+    RegularPredicate,
     bind_join_prompt,
     bind_prompt,
     bind_score_prompt,
@@ -92,12 +92,12 @@ def _has_ai_call(term) -> bool:
     )
 
 
-def _column_predicate(b, term) -> ColumnPredicate | None:
+def _regular_predicate(b, term) -> RegularPredicate | None:
     """Parse a plain test of one column, or return None for an AI term.
 
     Raises:
         CompileError: The term has no AI call and is not a supported
-            column test.
+            regular predicate.
     """
     if _has_ai_call(term):
         return None
@@ -109,7 +109,7 @@ def _column_predicate(b, term) -> ColumnPredicate | None:
         and isinstance(node.expression, exp.Null)
         and isinstance(node.this, exp.Column)
     ):
-        return ColumnPredicate(
+        return RegularPredicate(
             b.resolve_column(node.this), "is not null" if negated else "is null"
         )
     if negated:
@@ -121,7 +121,7 @@ def _column_predicate(b, term) -> ColumnPredicate | None:
         and isinstance(node.this, exp.Column)
         and node.expressions
     ):
-        return ColumnPredicate(
+        return RegularPredicate(
             b.resolve_column(node.this),
             "in",
             tuple(_literal(item) for item in node.expressions),
@@ -130,15 +130,15 @@ def _column_predicate(b, term) -> ColumnPredicate | None:
     if comparison is not None:
         left, right = node.this, node.expression
         if isinstance(left, exp.Column) and not isinstance(right, exp.Column):
-            return ColumnPredicate(b.resolve_column(left), comparison, _literal(right))
+            return RegularPredicate(b.resolve_column(left), comparison, _literal(right))
         if isinstance(right, exp.Column) and not isinstance(left, exp.Column):
-            return ColumnPredicate(
+            return RegularPredicate(
                 b.resolve_column(right), _FLIPPED[comparison], _literal(left)
             )
         if isinstance(left, exp.Column) and isinstance(right, exp.Column):
             return None
     raise CompileError(
-        f"{term.sql()} is not supported; a column test is =, <>, <, <=, "
+        f"{term.sql()} is not supported; a regular predicate is =, <>, <, <=, "
         f">, >=, IN (literals), IS NULL, or IS NOT NULL"
     )
 
@@ -167,7 +167,7 @@ class ExpressionBinder:
         self.turn = turn
         self.layout = layout
         self.tables: list[tuple[str, str]] = []
-        self.column_predicates: dict[str, list[ColumnPredicate]] = {}
+        self.regular_predicates: dict[str, list[RegularPredicate]] = {}
         self.doc_columns: dict[str, str] = {}
         self.filters: dict[str, list[FilterPredicate]] = {}
         self.label_tests: dict[

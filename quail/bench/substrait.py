@@ -3,7 +3,7 @@
 quail-b reads each query's Substrait plan into relations, operators,
 and relational steps (`QuerySpec.info`). `build_query` maps that
 reading to builder calls: a filter, join, classification, label test,
-column test, or score per operator, then the aggregate, having, sort,
+regular predicate, or score per operator, then the aggregate, having, sort,
 and fetch steps, then the projection.
 """
 

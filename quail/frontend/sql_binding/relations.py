@@ -8,11 +8,11 @@ from quail.frontend.sql_binding.expressions import (
     JOIN_OPTION_KEYS,
     SCORE_OPTION_KEYS,
     ExpressionBinder,
-    _column_predicate,
     _conjuncts,
     _is_ai_score_comparison,
     _is_call,
     _label_test,
+    _regular_predicate,
 )
 from quail.logical import (
     Alias,
@@ -96,9 +96,9 @@ class JoinBinder:
                         raise CompileError(
                             "AI.SCORE must be compared with <, <=, >, or >="
                         )
-                    plain = _column_predicate(b, term)
+                    plain = _regular_predicate(b, term)
                     if plain is not None:
-                        b.column_predicates.setdefault(plain.column.alias, []).append(
+                        b.regular_predicates.setdefault(plain.column.alias, []).append(
                             plain
                         )
                         continue
@@ -164,9 +164,9 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
     """Bind WHERE conditions to scans and joins."""
     where = tree.args.get("where")
     for term in _conjuncts(where.this) if where else []:
-        plain = _column_predicate(b, term)
+        plain = _regular_predicate(b, term)
         if plain is not None:
-            b.column_predicates.setdefault(plain.column.alias, []).append(plain)
+            b.regular_predicates.setdefault(plain.column.alias, []).append(plain)
             continue
         anti = False
         node = term

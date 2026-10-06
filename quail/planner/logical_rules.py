@@ -8,7 +8,6 @@ from quail.logical import (
     Aggregate,
     Alias,
     Apply,
-    ColumnPredicate,
     ColumnRef,
     Compare,
     Equality,
@@ -21,6 +20,7 @@ from quail.logical import (
     ModelCall,
     Operators,
     Project,
+    RegularPredicate,
     Result,
     Scan,
     SemanticClassify,
@@ -40,7 +40,7 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return _column_refs(expression.expression)
     if isinstance(expression, (ModelCall, Compare, Alias)):
         return tuple(model_call(expression).prompt.args)
-    if isinstance(expression, (InList, ColumnPredicate)):
+    if isinstance(expression, (InList, RegularPredicate)):
         return (expression.column,)
     if isinstance(expression, Equality):
         return (expression.left, expression.right)
@@ -363,8 +363,8 @@ def _stop_key(columns, alias) -> tuple[str, ...] | None:
     return tuple(key)
 
 
-class PerKeyStop:
-    """Stop a filter per key once one of the key's documents passes.
+class DistinctPushdown:
+    """Push a DISTINCT into a filter: stop a key once one document passes.
 
     A DISTINCT over columns of one table asks only whether any document
     of each key value passes. When that table's AI.IF predicates are
@@ -375,7 +375,7 @@ class PerKeyStop:
     change: each key value appears once either way.
     """
 
-    name = "per_key_stop"
+    name = "distinct_pushdown"
     cost_based = False
 
     def rewrite(self, root, context):
@@ -405,11 +405,11 @@ class PerKeyStop:
 def built_in_logical_rules() -> tuple:
     """Return the logical rules registered with the built in registry.
 
-    In order: distinct_elimination, per_key_stop, projection_pushdown,
+    In order: distinct_elimination, distinct_pushdown, projection_pushdown,
     and filter_pushdown. Every one is heuristic: it rewrites the plan
     without pricing it. The cost-based choices (where classifications
     run, filter order, join order and anchors) are made in the physical
     phase (quail.planner.ordering and the Quail backend's candidates).
     """
-    return (DistinctElimination(), PerKeyStop(), ProjectionPushdown(),
+    return (DistinctElimination(), DistinctPushdown(), ProjectionPushdown(),
             FilterPushdown())

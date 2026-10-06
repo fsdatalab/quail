@@ -433,7 +433,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     from quail.planner.physical_rules import built_in_physical_rules
 
     assert [rule.name for rule in built_in_logical_rules()] == [
-        "distinct_elimination", "per_key_stop", "projection_pushdown",
+        "distinct_elimination", "distinct_pushdown", "projection_pushdown",
         "filter_pushdown"]
     assert [rule.name for rule in built_in_physical_rules()] == [
         "limit_pushdown", "kv_retention", "label_scoring", "prefix_sharing",

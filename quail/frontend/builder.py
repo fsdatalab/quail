@@ -9,7 +9,6 @@ from quail.logical import (
     AggregateCall,
     Aggregation,
     Alias,
-    ColumnPredicate,
     ColumnRef,
     CompileError,
     Equality,
@@ -20,6 +19,7 @@ from quail.logical import (
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
+    RegularPredicate,
     SortKey,
     bind_classify_prompt,
     bind_join_prompt,
@@ -37,7 +37,7 @@ class ColSpec:
     def __eq__(self, other):
         """``col("c.url") == col("e.url")`` is a join condition.
 
-        Compared with a literal, it is a column test for ``where()``.
+        Compared with a literal, it is a regular predicate for ``where()``.
         """
         if isinstance(other, ColSpec):
             return EqualsSpec(self, other)
@@ -120,7 +120,7 @@ class EqualsSpec:
 
 @dataclass(frozen=True)
 class PredicateSpec:
-    """An unresolved column test for ``where()``."""
+    """An unresolved regular predicate for ``where()``."""
     col: ColSpec
     comparison: str
     value: object = None
@@ -228,7 +228,7 @@ class Query:
         self._functions = {}         # name -> the Python function
         self._labels = {}            # name -> Alias of an AI.CLASSIFY call
         self._scores = {}            # name -> Alias of an AI.SCORE call
-        self._column_predicates = {}  # alias -> [ColumnPredicate]
+        self._regular_predicates = {}  # alias -> [RegularPredicate]
         self._limit = None
         self._order = []             # (column or name, descending, nulls_first)
         self._offset = 0
@@ -670,7 +670,7 @@ class Query:
         return self
 
     def where(self, *tests) -> "Query":
-        """Keep the documents that pass column tests, before any model call.
+        """Keep the documents that pass regular predicates, before any model call.
 
         Args:
             tests: Comparisons of a ``col(...)`` with a literal, such as
@@ -680,12 +680,12 @@ class Query:
         for test in tests:
             if not isinstance(test, PredicateSpec):
                 raise CompileError(
-                    f"where() takes column tests such as col('r.year') > "
+                    f"where() takes regular predicates such as col('r.year') > "
                     f"2020, got {test!r}")
             ref = self._resolve(test.col)
-            predicate = ColumnPredicate(ref, test.comparison, test.value)
+            predicate = RegularPredicate(ref, test.comparison, test.value)
             predicate.validate()
-            self._column_predicates.setdefault(ref.alias, []).append(predicate)
+            self._regular_predicates.setdefault(ref.alias, []).append(predicate)
         return self
 
     def limit(self, n: int) -> "Query":
@@ -800,8 +800,8 @@ class Query:
                 tuple((column.expression, column.name) for column in wanted
                       if column.expression.aliases() == (alias,)),
                 tuple(self._label_filters.get(alias, ())),
-                column_predicates=tuple(
-                    self._column_predicates.get(alias, ())),
+                regular_predicates=tuple(
+                    self._regular_predicates.get(alias, ())),
             )
         for join in self._joins:
             logical.add_join(join)

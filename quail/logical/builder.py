@@ -68,7 +68,7 @@ class LogicalPlanBuilder:
         applies: tuple = (),
         labels: tuple = (),
         label_filters: tuple = (),
-        column_predicates: tuple = (),
+        regular_predicates: tuple = (),
     ) -> None:
         """Add one table with its filters, applies, and classifications.
 
@@ -77,7 +77,7 @@ class LogicalPlanBuilder:
             provider: The registered provider name.
             column: The document column.
             predicates: The table's AI.IF predicates in written order.
-            column_predicates: ColumnPredicate tests the scan applies
+            regular_predicates: RegularPredicate tests the scan applies
                 before any operator reads a document.
             applies: (function, kind, ids, columns) per apply, in order.
             labels: (call, name) per one-table classification. A call
@@ -97,7 +97,7 @@ class LogicalPlanBuilder:
             provider=provider,
             alias=alias,
             column=column,
-            predicates=tuple(column_predicates),
+            predicates=tuple(regular_predicates),
         )
         if predicates:
             node = SemanticFilter(node, tuple(predicates))

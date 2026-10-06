@@ -209,8 +209,8 @@ def joined_calls(labels: LabelWork) -> list:
             if len(call.aliases()) == 2]
 
 
-def column_tests(scan) -> tuple:
-    """Return a logical scan's column tests as (column, comparison, value)."""
+def regular_predicates(scan) -> tuple:
+    """Return a logical scan's regular predicates as (column, comparison, value)."""
     return tuple((predicate.column.column, predicate.comparison,
                   predicate.value) for predicate in scan.predicates)
 
@@ -246,7 +246,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         context: The planning context, needed when the plan classifies
             documents.
         scan_fractions: alias -> the fraction of its documents the
-            column tests are expected to keep; the context's when None.
+            regular predicates are expected to keep; the context's when None.
 
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
@@ -416,7 +416,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             total_tokens=sum(doc_tokens[s.alias]),
             shard_ranges=shard_ranges,
             shard_token_loads=tuple(loads),
-            predicates=column_tests(s),
+            predicates=regular_predicates(s),
             expected_docs=(float(stats[s.alias].n_docs)
                            if s.predicates else None)))
         ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")

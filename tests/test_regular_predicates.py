@@ -7,13 +7,13 @@ from test_session import CONFIG, TRUTH, _run, fake_tok, make_executor
 import quail
 from quail.execution.selection import evaluate_predicate, selected_rows
 from quail.frontend.builder import col, prompt
-from quail.logical import ColumnPredicate, ColumnRef, CompileError, Scan
+from quail.logical import ColumnRef, CompileError, RegularPredicate, Scan
 
 REF = ColumnRef("r", "reviews", "stars")
 
 
 def _predicate(comparison, value=None):
-    return ColumnPredicate(REF, comparison, value)
+    return RegularPredicate(REF, comparison, value)
 
 
 def test_predicates_evaluate_with_nulls_rejected():
@@ -53,7 +53,7 @@ FILTER_SQL = """
 """
 
 
-def test_column_predicates_select_documents_before_the_model(session):
+def test_regular_predicates_select_documents_before_the_model(session):
     seen = []
 
     def execute(request):
@@ -67,7 +67,7 @@ def test_column_predicates_select_documents_before_the_model(session):
                 seen.append(len(request.inputs[node.input_id].documents))
         return make_executor(TRUTH)(request)
 
-    # the AI predicates keep r0 and r3 of all six; the column tests keep
+    # the AI predicates keep r0 and r3 of all six; the regular predicates keep
     # r0, r2, and r4. The planner only estimates that from a sample; the
     # scan's runtime applies the tests, so the executor gets every
     # document and the model sees three
@@ -98,7 +98,7 @@ def test_column_predicates_select_documents_before_the_model(session):
     assert _run(built, make_executor(TRUTH)).to_rows() == [("r1", 2), ("r4", 3)]
 
 
-def test_sql_and_builder_bind_column_tests(session):
+def test_sql_and_builder_bind_regular_predicates(session):
     plan = session.sql("""
         SELECT r.id FROM reviews r
         WHERE 4 <= r.stars AND r.lang <> 'de' AND r.stars IS NULL
@@ -107,8 +107,8 @@ def test_sql_and_builder_bind_column_tests(session):
     scan = next(node for node in plan.walk() if isinstance(node, Scan))
     lang = ColumnRef("r", "reviews", "lang")
     assert scan.predicates == (
-        ColumnPredicate(REF, ">=", 4), ColumnPredicate(lang, "<>", "de"),
-        ColumnPredicate(REF, "is null"))
+        RegularPredicate(REF, ">=", 4), RegularPredicate(lang, "<>", "de"),
+        RegularPredicate(REF, "is null"))
     assert [str(p) for p in scan.predicates] == [
         "r.stars >= 4", "r.lang <> 'de'", "r.stars IS NULL"]
     built = (session.docs("reviews").alias("r")
@@ -127,7 +127,7 @@ def test_sql_and_builder_bind_column_tests(session):
         with pytest.raises(CompileError, match=fragment):
             session.sql(f"SELECT r.id FROM reviews r WHERE {sql} AND "
                         f"AI_FILTER(PROMPT('q: {{0}}', r.review))")
-    with pytest.raises(CompileError, match="column tests"):
+    with pytest.raises(CompileError, match="regular predicates"):
         session.docs("reviews").alias("r").where("r.stars > 3")
     # a plain test in ON restricts the joined table
     session.register("products", quail.DocumentProvider.from_table(pa.table({
@@ -170,7 +170,7 @@ def test_two_joins_on_one_table_sample_each_key_column(session):
     assert fractions == {0: 3 / 12, 1: 5 / 12}
 
 
-def test_column_tests_reach_score_scans_and_may_read_the_text(session):
+def test_regular_predicates_reach_score_scans_and_may_read_the_text(session):
     from quail.physical import Scan as PhysicalScan
 
     scored = (session.docs("reviews").alias("r")

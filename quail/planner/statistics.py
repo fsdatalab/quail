@@ -285,7 +285,7 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
         scan_fractions: alias -> the fraction of its documents the
-            column tests are expected to keep; the alias's counts and
+            regular predicates are expected to keep; the alias's counts and
             sums are scaled by it.
         context: Prompt preparation and model settings for score operators.
 
@@ -346,7 +346,7 @@ def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
 
 
 def filter_stop_keys(plan: LogicalPlan) -> dict:
-    """Return alias -> the stop key the per_key_stop rule put on its filters."""
+    """Return alias -> the stop key the distinct_pushdown rule put on its filters."""
     keys = {}
     for node in plan.walk():
         if isinstance(node, SemanticFilter) and node.stop_key:
