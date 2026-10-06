@@ -56,6 +56,7 @@ class LimitPushdown:
     """
 
     name = "limit_pushdown"
+    cost_based = False
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -94,6 +95,7 @@ class KvRetention:
     """
 
     name = "kv_retention"
+    cost_based = False
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None or context.logical_plan is None \
@@ -165,6 +167,7 @@ class LabelScoring:
     """
 
     name = "label_scoring"
+    cost_based = True
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -288,6 +291,7 @@ class PrefixSharing:
     """
 
     name = "prefix_sharing"
+    cost_based = True
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -399,6 +403,7 @@ class TreeAttention:
     """
 
     name = "tree_attention"
+    cost_based = True
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:

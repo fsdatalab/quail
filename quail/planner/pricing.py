@@ -1,52 +1,52 @@
 """Price a logical plan by the estimated seconds of its physical plan.
 
-Cost-based logical rules compare candidate plans with these functions.
-The filter_order and join_order rules decide each candidate's filter
-orders, stage order, and anchors. build_physical_plan builds the
-physical plan, and the label_scoring rule picks each classification's
-scoring rule so its seconds are counted. Plans are memoized on the
-logical planning context, keyed by the candidate's root with those
-decisions cleared, so each candidate is built once per query.
+build_physical_plan builds the physical plan, choosing filter order and
+join order and anchors, and the label_scoring rule picks each
+classification's scoring rule so its seconds are counted. The Quail
+backend prices its candidates this way, and a cost-based logical rule
+can compare plans with the same functions. Plans are memoized on the
+context, keyed by the logical plan's root, so each is built once per
+query.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from quail.logical import LogicalPlan
-from quail.planner.api import _apply_rules
+from quail.planner.api import apply_plan_rules
 from quail.planner.build import build_physical_plan
-from quail.planner.logical_optimizer import apply_logical_rules
+from quail.planner.logical_optimizer import LogicalPlanningContext
 from quail.planner.physical_rules import LabelScoring
 from quail.planner.plan import Refusal
 
 
 def physical_plan(logical: LogicalPlan, context):
-    """Return build_physical_plan's plan for a logical plan.
+    """Return a logical plan's physical plan with its classifications scored.
 
     The plan carries every classification's scoring rule; the other
-    physical rules, which refine a finished plan, are not applied.
+    physical rules, which refine a chosen plan, are not applied.
 
     Args:
         logical: The logical plan to price.
-        context: The LogicalPlanningContext with the statistics.
+        context: A PlanningContext, or a LogicalPlanningContext from a
+            logical rule.
 
     Returns:
         A PhysicalPlan, or a Refusal when the plan cannot run.
     """
-    from quail.planner.logical_rules import FilterOrder, JoinOrder, undecided
-
-    key = ("physical_plan", undecided(logical.root))
+    if isinstance(context, LogicalPlanningContext):
+        context = context.physical_context(logical)
+    key = ("physical_plan", logical.root)
     if key not in context.memo:
-        decided, _ = apply_logical_rules(
-            logical, (FilterOrder(), JoinOrder()), context)
-        physical_context = context.physical_context(decided)
+        context = replace(context, logical_plan=logical)
         physical = build_physical_plan(
-            decided, model=context.model, device=context.device,
+            logical, model=context.model, device=context.device,
             doc_tokens=context.document_tokens, gpus=context.gpu_count,
             order=context.order, pair_fractions=context.pair_fractions,
-            context=physical_context)
+            context=context)
         if not isinstance(physical, Refusal):
-            physical = _apply_rules(
-                physical, (LabelScoring(),), physical_context)
+            physical = apply_plan_rules(physical, (LabelScoring(),), context)
         context.memo[key] = physical
     return context.memo[key]
 

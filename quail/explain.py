@@ -93,9 +93,6 @@ def logical_tree(logical):
             details = [f"{_prompt(p.prompt)} "
                        f"(selectivity={_selectivity(p.selectivity)})"
                        for p in node.predicates]
-            if node.order:
-                title += " order=" + ",".join(
-                    str(position + 1) for position in node.order)
             if node.stop_key:
                 title += " stop_key=" + ",".join(node.stop_key)
         elif isinstance(node, logical_nodes.Filter):
@@ -107,9 +104,6 @@ def logical_tree(logical):
                        f"(selectivity={_selectivity(node.selectivity)})"]
             if node.anchor is not None:
                 title += f" anchor={node.anchor}"
-            if node.exec_idx is not None:
-                title += (f" stage={node.exec_idx + 1}"
-                          f" exec_anchor={node.exec_anchor}")
         elif isinstance(node, logical_nodes.SemanticClassify):
             title = f"SemanticClassify: {node.name}"
             if node.probabilities:
@@ -560,18 +554,40 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
     return "\n".join(lines)
 
 
+def rule_lines(logical_rules, physical_rules) -> list[str]:
+    """Return the optimizer rules in run order, each marked by kind.
+
+    A rule is cost-based when its ``cost_based`` attribute is true and
+    heuristic otherwise.
+    """
+    def names(rules):
+        return ", ".join(
+            rule.name + ("*" if getattr(rule, "cost_based", False) else "")
+            for rule in rules) or "none"
+
+    return ["rules, in run order (* cost-based, others heuristic):",
+            f"  logical: {names(logical_rules)}",
+            "  physical: building the plan (filter order*, join order and "
+            "anchors*, and on Quail classification placement*), then "
+            f"{names(physical_rules)}"]
+
+
 def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
-            result=None, usd_per_hour: float | None = None) -> str:
+            result=None, usd_per_hour: float | None = None,
+            rules=None) -> str:
     """Format the logical and physical operator trees.
 
     Args:
         logical: The optimized logical plan.
         physical: The physical plan or planning refusal.
-        verbose: Include runtime settings and internal node fields.
+        verbose: Include runtime settings, internal node fields, and
+            the optimizer rules.
         result: The QueryResult of running the plan. When given, each
             node shows its measured rows, time, and tokens next to the
             estimates, and the measured totals follow the tree.
         usd_per_hour: Price of one GPU, for the measured cost per query.
+        rules: The registered logical rules and physical rules, as a
+            pair of sequences, listed when verbose.
     """
     from quail.planner.plan import Refusal
 
@@ -620,4 +636,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
                               **physical.settings}, 1))
         if physical.backend == "quail":
             lines.append("  KV dtype=bf16")
+        if rules is not None:
+            lines.append("")
+            lines.extend(rule_lines(*rules))
     return "\n".join(lines)

@@ -72,6 +72,10 @@ class LogicalPlanningContext:
 class LogicalOptimizerRule(Protocol):
     """Rewrite a whole logical plan without changing query meaning.
 
+    A rule may set ``cost_based = True`` when it prices the plans it
+    chooses between; explain lists every other rule as heuristic. The
+    built in logical rules are all heuristic.
+
     A rule walks the plan itself, in the direction its rewrite needs:
     from the root toward the scans when it pushes information down,
     from the scans toward the root when it simplifies a node once its

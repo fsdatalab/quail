@@ -16,6 +16,7 @@ from quail.catalog import DocumentProvider
 from quail.execution.execute import _execute_physical
 from quail.execution.runner import NodeResult
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
+from quail.logical import LogicalPlan
 from quail.physical import (
     ExecutionLocation,
     InputPort,
@@ -116,6 +117,66 @@ class KeepFirstDocument:
             tuple(replace(node, count=1) if isinstance(node, FirstDocuments)
                   else node for node in graph.nodes),
             graph.root)
+
+
+class TwoCandidatesBackend:
+    """Offers the plan as written and an alternative, at chosen estimates."""
+
+    name = "local_filter"
+
+    def __init__(self, written, alternative):
+        self.estimates = (written, alternative)
+        self.alternative = None
+
+    def supports(self, model, device, gpu_count):
+        return SupportResult.accept()
+
+    def plan(self, region, context):
+        written, alternative = self.estimates
+        self.alternative = LogicalPlan(region.logical_plan.root)
+        return (
+            local_plan(context, count=1, estimate=written, source="written"),
+            replace(local_plan(context, count=1, estimate=alternative,
+                               source="alternative"),
+                    logical_plan=self.alternative),
+        )
+
+
+class RecordLogicalPlan:
+    name = "record_logical_plan"
+
+    def __init__(self):
+        self.seen = []
+
+    def rewrite(self, graph, context):
+        self.seen.append(context.logical_plan)
+        return None
+
+
+@pytest.mark.parametrize("estimates, chosen", [
+    ((1.0, 1.0), "written"), ((2.0, 1.0), "alternative")])
+def test_plan_query_keeps_the_cheapest_candidate_and_its_logical_plan(
+        estimates, chosen):
+    registry = quail.ExtensionRegistry.with_built_ins()
+    backend = TwoCandidatesBackend(*estimates)
+    registry.register_backend(backend)
+    rule = RecordLogicalPlan()
+    registry.register_physical_rule(rule)
+    session = quail.Session(
+        EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",
+                     device="h100-sxm"),
+        tokenizer=str.split, registry=registry)
+    session.register("docs", DocumentProvider.from_table(
+        pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
+        id_col="id", identity="two-candidate-docs"))
+    query = session.sql(
+        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
+    plan = query.plan()
+    # on a tie the first candidate wins; the physical rules read the
+    # chosen candidate's logical plan
+    assert plan.settings["planner_source"] == chosen
+    (seen,) = rule.seen
+    assert (seen is backend.alternative) == (chosen == "alternative")
 
 
 def test_physical_extensions_plan_validate_and_execute(monkeypatch):

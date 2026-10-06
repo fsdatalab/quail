@@ -104,6 +104,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             available=0,
             unit="plans",
         )
+    # min keeps the first of equal candidates, so a backend lists the
+    # plan as written first
     selected_candidate = min(
         candidates,
         key=lambda candidate: candidate.estimated_seconds,
@@ -115,8 +117,10 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         raise ValueError(
             f"physical planner returned backend {selected_plan.backend!r} "
             f"for selected backend {backend!r}")
-    return _apply_rules(selected_plan, tuple(registry.physical_rules.values()),
-                        context)
+    if selected_candidate.logical_plan is not None:
+        context = replace(context, logical_plan=selected_candidate.logical_plan)
+    return apply_plan_rules(
+        selected_plan, tuple(registry.physical_rules.values()), context)
 
 
 def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
@@ -149,14 +153,25 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
     )
-    return _apply_rules(plan, tuple(registry.physical_rules.values()), context)
+    return apply_plan_rules(
+        plan, tuple(registry.physical_rules.values()), context)
 
 
-def _apply_rules(plan, rules, context):
-    """Apply physical rules in order.
+def apply_plan_rules(plan, rules, context):
+    """Apply physical rules in order to a plan and return the result.
 
     The rules see the plan's settings on the context and may add to
-    them; a classification no rule can score refuses the plan.
+    them. A rule that re-estimates a classification or score moves the
+    plan's estimated seconds by the same amount.
+
+    Args:
+        plan: A PhysicalPlan.
+        rules: The physical rules, in the order to apply them.
+        context: The PlanningContext.
+
+    Returns:
+        The rewritten PhysicalPlan, or a Refusal when a classification
+        no rule can score refuses the plan.
     """
     context = replace(context, settings=dict(plan.settings))
     try:

@@ -15,10 +15,11 @@ from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.execution.reranker import RerankerModelExecution
-from quail.logical import has_score, shared_preamble
+from quail.logical import LogicalPlan, has_score, shared_preamble
 from quail.logical.prompts import answer_ids
 from quail.physical import AiFilter, AiJoin, AiScore, Barrier, PhysicalNode
-from quail.planner import build_physical_plan
+from quail.planner import pricing
+from quail.planner.logical_rules import lift_classifications
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PhysicalCandidate,
@@ -188,35 +189,32 @@ class QuailBackend:
                     unit="AI.SCORE expressions",
                 )
                 return (PhysicalCandidate(None, refusal, float("inf")),)
-        plan = build_physical_plan(
-            region.logical_plan,
-            model=context.model,
-            device=context.device,
-            doc_tokens=context.document_tokens,
-            gpus=context.gpu_count,
-            order=context.order,
-            pair_fractions=context.pair_fractions,
-            context=context,
-        )
-        if not hasattr(plan, "graph"):
-            return (
-                PhysicalCandidate(
-                    graph=None,
-                    plan=plan,
-                    estimated_seconds=float("inf"),
-                ),
-            )
+        candidates = [self._candidate(region, context)]
+        # classifying a joined table after its joins is the second
+        # candidate; on a tie the plan as written wins
+        lifted = lift_classifications(region.logical_plan.root)
+        if lifted is not None:
+            candidates.append(self._candidate(
+                ModelRegion(LogicalPlan(lifted)), context))
+        return tuple(candidates)
+
+    def _candidate(self, region, context) -> PhysicalCandidate:
+        """Price one logical plan (quail.planner.pricing) as a candidate.
+
+        The candidate's estimate includes the label_scoring rule's
+        choice, so candidates that place classifications differently
+        compare on the scoring each would run.
+        """
+        logical = region.logical_plan
+        plan = pricing.physical_plan(logical, context)
+        if isinstance(plan, Refusal):
+            return PhysicalCandidate(None, plan, float("inf"), logical)
         refusal = joined_classification_refusal(plan.graph, context.gpu_count)
         if refusal is not None:
-            return (PhysicalCandidate(None, refusal, float("inf")),)
+            return PhysicalCandidate(None, refusal, float("inf"), logical)
         plan = self._bind_runtime_data(plan, region, context)
-        return (
-            PhysicalCandidate(
-                graph=plan.graph,
-                plan=plan,
-                estimated_seconds=plan.estimated_seconds,
-            ),
-        )
+        return PhysicalCandidate(
+            plan.graph, plan, plan.estimated_seconds, logical)
 
     def start(self, context: GpuContext) -> QuailModelExecution:
         return QuailModelExecution(context)

@@ -36,6 +36,7 @@ from quail.planner.logical_optimizer import (
     apply_logical_rules,
 )
 from quail.planner.logical_rules import built_in_logical_rules
+from quail.planner.physical_rules import built_in_physical_rules
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.statistics import AliasStats, prepare_filter_costs, summarize_alias
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
@@ -155,21 +156,15 @@ def test_filter_ordering_and_kv_writes(catalog):
     assert by_cost.settings["order_rule"] == "by_cost"
     assert chain.stages[0].selectivity == 0.2
     assert chain.stages[1].expected_docs == pytest.approx(20.0)
-    # the filter_order rule records the order on the logical node; the
-    # physical planner reads it
-    optimized, changed = _optimize(logical, toks)
-    assert "filter_order" in changed
-    assert optimized.root.input.order == tuple(
-        stage.written_pos for stage in chain.stages)
-    assert optimized.root.input.order[0] == 2
-    assert "SemanticFilter order=3," in explain(optimized, by_cost)
+    # the physical planner chooses the order; the logical plan keeps
+    # the predicates as written
+    optimized, _ = _optimize(logical, toks)
+    assert chain.stages[0].written_pos == 2
+    assert "1st: predicate 3" in explain(optimized, by_cost)
 
     as_written = _plan(logical, toks, order="as_written")
     assert [stage.selectivity for stage in filter_chain(as_written).stages] \
         == list(sels)
-    optimized, changed = _optimize(logical, toks, order="as_written")
-    assert "filter_order" not in changed
-    assert optimized.root.input.order == ()
 
     class Predicate:
         def __init__(self, tail, selectivity):
@@ -280,6 +275,16 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     assert _cell(physical, "Project: r.id") == ["25"]
     assert "KV: not stored" in physical
 
+    # verbose explain lists the rules in run order, marking the
+    # cost-based ones
+    rules = (built_in_logical_rules(), built_in_physical_rules())
+    assert "rules" not in explain(logical, plan, rules=rules)
+    text = explain(logical, plan, verbose=True, rules=rules)
+    assert ("  logical: distinct_elimination, per_key_stop, "
+            "projection_pushdown, filter_pushdown\n") in text
+    assert ("then limit_pushdown, kv_retention, label_scoring*, "
+            "prefix_sharing*, tree_attention*") in text
+
 
 def mask_pairs(prefix, suffix, window):
     """Count allowed keys for every new query position."""
@@ -378,16 +383,14 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     stages = join_stages(plan)
     assert [s["anchor"] for s in stages] == ["r", "p"]
     assert [s["written_pos"] for s in stages] == [0, 1]
-    # the join_order rule records the stage order and anchors on the
-    # SemanticJoins; the physical planner reads them
-    optimized, changed = _optimize(_chain(catalog), toks, order="as_written")
-    assert "join_order" in changed
+    # the physical planner chooses the stage order and anchors; the
+    # logical plan keeps the joins as written
+    optimized, _ = _optimize(_chain(catalog), toks, order="as_written")
     joins = [node for node in optimized.walk() if isinstance(node, SemanticJoin)]
-    assert [(join.exec_idx, join.exec_anchor) for join in joins] == [
-        (0, "r"), (1, "p")]
     assert [join.anchor for join in joins] == [None, None]
+    assert [(s["exec_idx"], s["anchor"]) for s in stages] == [(0, "r"), (1, "p")]
     text = explain(optimized, plan)
-    assert "stage=1 exec_anchor=r" in text and "stage=2 exec_anchor=p" in text
+    assert "AiJoin: anchor=r" in text and "AiJoin: anchor=p" in text
     assert stages[0]["partners"] == stages[1]["partners"] == ["t"]
     assert stages[0]["expected_tuples"] == 10 * 8
     assert stages[1]["expected_tuples"] < 8 * 6
@@ -427,11 +430,8 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
                .select("r.id"))
     toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
     plan = _plan(logical, toks)
-    assert join_stages(plan)[0]["selectivity"] == 0.01
-    optimized, _ = _optimize(logical, toks)
-    joins = [node for node in optimized.walk() if isinstance(node, SemanticJoin)]
-    assert [(join.exec_idx, join.exec_anchor) for join in joins] == [
-        (1, "r"), (0, "r")]
+    assert [(s["written_pos"], s["exec_idx"], s["anchor"])
+            for s in join_stages(plan)] == [(1, 0, "r"), (0, 1, "r")]
 
     as_written = _plan(logical, toks, order="as_written")
     assert join_stages(as_written)[0]["selectivity"] == 0.9
@@ -472,8 +472,7 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
                .select("r.id"))
     toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
     plan = _plan(logical, toks)
-    # one search decides the plan: pricing its candidates and the
-    # registered rule share the context's memo
+    # the physical planner runs the join search once
     assert searches == [True]
     retention = plan.settings["retention"]
     assert set(retention) >= {"initial", "before", "after", "cap_pages",

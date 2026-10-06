@@ -69,15 +69,31 @@ class PlanningContext:
 
 @dataclass(frozen=True)
 class PhysicalCandidate:
-    """One physical plan offered by a backend."""
+    """One physical plan offered by a backend.
+
+    Attributes:
+        graph: The plan's graph; None for a refusal.
+        plan: A PhysicalPlan or a Refusal.
+        estimated_seconds: The plan's estimated seconds; infinite for
+            a refusal.
+        logical_plan: The logical plan the candidate lowers, when it
+            differs from the region's, such as one with its
+            classifications moved above the joins. The physical rules
+            read it when this candidate is chosen.
+    """
 
     graph: PhysicalGraph | None
     plan: Any
     estimated_seconds: float
+    logical_plan: Any = None
 
 
 class PhysicalOptimizerRule(Protocol):
-    """Rewrite a complete typed physical graph."""
+    """Rewrite a complete typed physical graph.
+
+    A rule may set ``cost_based = True`` when it prices the plans it
+    chooses between; explain lists every other rule as heuristic.
+    """
 
     name: str
 
