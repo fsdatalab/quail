@@ -163,15 +163,20 @@ def _batch_cost(batch, frame, chains, probabilities, model, device,
         suffixes = [chains[round_]] if one_per_round else chains
         work = Work()
         for prefix, shared in batch:
-            work += _suffix_work(prefix + frame + previous, suffixes,
-                                 canvas_rows, window)
+            first_tail = frame
+            if round_ == 0 and one_per_round:
+                # Decode packs the frame and cue into the prefix's causal request.
+                first_tail += sum(suffixes)
+            else:
+                work += _suffix_work(prefix + frame + previous, suffixes,
+                                     canvas_rows, window)
             if round_ == 0:
                 if resident:
-                    work += ask(prefix, frame, window=window)
+                    work += ask(prefix, first_tail, window=window)
                 elif shared:
-                    work += ask(shared, prefix - shared + frame, window=window)
+                    work += ask(shared, prefix - shared + first_tail, window=window)
                 else:
-                    work += scan(prefix + frame, 0, window=window)
+                    work += scan(prefix, first_tail, window=window)
         work *= probability
         nonempty = (1.0 if probability == 1 else
                     -math.expm1(count * math.log1p(-probability)))

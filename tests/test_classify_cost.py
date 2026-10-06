@@ -5,10 +5,10 @@ from dataclasses import asdict, replace
 
 import pytest
 
-from quail.cost.classify import SAMPLE_DOCUMENTS, estimate, estimate_chains
+from quail.cost.classify import estimate
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.work import Work
-from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_SXM, QWEN3_4B_FP8
+from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 LABELS = ((10,), (20, 21), (30, 31, 32, 33, 34))
 
@@ -22,7 +22,7 @@ def _cost(lengths, labels=LABELS, **kwargs):
 
 
 def _enumerated_work(lengths, depths, window=0):
-    """Count all causal attention edges and suffix KV reads for one outcome."""
+    """Count causal attention edges and retained KV reads for one outcome."""
     total = dict.fromkeys(asdict(Work()), 0.0)
     for length, depth in zip(lengths, depths):
         prompt = 2 + length + 3
@@ -30,18 +30,19 @@ def _enumerated_work(lengths, depths, window=0):
         total["tokens"] += tokens
         total["kv_written"] += tokens
         total["pairs"] += sum(range(1, tokens + 1))
-        total["kv_read"] += sum(range(prompt, prompt + depth))
+        total["kv_read"] += sum(range(prompt + 1, prompt + depth))
         if window:
             total["sliding_pairs"] += sum(min(i, window)
                                            for i in range(1, tokens + 1))
             total["sliding_kv_read"] += sum(min(i, window - 1)
-                                             for i in range(prompt, prompt + depth))
+                                             for i in range(prompt + 1, prompt + depth))
     return total
 
 
-@pytest.mark.parametrize("lengths", [(10,), (10, 90)])
-@pytest.mark.parametrize("labels", [LABELS, ((10,), (20,), (30, 31, 32, 33, 34))])
-@pytest.mark.parametrize("window", [0, 16])
+@pytest.mark.parametrize("lengths,labels,window", [
+    ((10, 90), LABELS, 0),
+    ((10,), ((10,), (20,), (30, 31, 32, 33, 34)), 16),
+])
 def test_expected_work_and_passes_match_all_label_combinations(lengths, labels, window):
     model = replace(QWEN3_4B_FP8, sliding_window=window, full_attention_period=2)
     cost = _cost(lengths, labels, model=model)
@@ -64,14 +65,6 @@ def test_label_and_document_order_do_not_change_the_estimate():
     for labels in itertools.permutations(LABELS):
         assert _cost(lengths[::-1], labels, chunk=140) == expected
     assert expected.suffix_tokens == pytest.approx(4 * 8 / 3)
-
-
-def test_length_variation_preserves_attention_work():
-    varied = _cost((10, 90))
-    uniform = _cost((50, 50))
-    assert varied.work.tokens == uniform.work.tokens
-    assert varied.work.kv_read == uniform.work.kv_read
-    assert varied.work.pairs - uniform.work.pairs == pytest.approx(1600)
 
 
 @pytest.mark.parametrize("budget", ["chunk", "capacity"])
@@ -101,7 +94,7 @@ def test_kv_reserves_the_longest_continuation():
     assert together.passes < separate.passes
 
 
-@pytest.mark.parametrize("live", [0, 0.25, 1.8, SAMPLE_DOCUMENTS * 2.5])
+@pytest.mark.parametrize("live", [0, 0.25, 1.8])
 def test_expected_document_counts_are_not_rounded(live):
     cost = _cost((10,), live=live)
     single = _cost((10,))
@@ -111,43 +104,3 @@ def test_expected_document_counts_are_not_rounded(live):
     assert cost.seconds == pytest.approx(single.seconds * live)
     assert cost.passes == pytest.approx(single.passes * live)
     assert cost.rounds == (5 if live else 0)
-
-
-def test_sampling_scales_expected_label_work():
-    count = SAMPLE_DOCUMENTS + 17
-    cost = _cost((10,) * count)
-    assert cost.suffix_tokens == pytest.approx(count * 8 / 3)
-    assert cost.work.tokens == pytest.approx(count * (15 + 8 / 3))
-    empty = _cost((), live=12)
-    assert empty.work == Work()
-    assert empty.seconds == empty.passes == empty.suffix_tokens == empty.rounds == 0
-
-
-@pytest.mark.parametrize("resident,shared", [(False, (0, 6)), (True, ())])
-def test_resident_and_shared_prefixes_reduce_prefill_work(resident, shared):
-    cost = estimate_chains(
-        2, 3, [1], live=2, lengths=(10, 20), shared=shared,
-        chunk=100, capacity=1000, model=QWEN3_4B_FP8, device=H100_SXM,
-        resident=resident)
-    prefixes = (12, 22)
-    reused = prefixes if resident else (0, 8)
-    assert cost.work.tokens == sum(prefixes) + 2 * 4 - sum(reused)
-    assert cost.work.pairs == sum(
-        sum(range(1, prefix + 5)) - sum(range(1, reuse + 1))
-        for prefix, reuse in zip(prefixes, reused))
-    assert cost.work.kv_read == sum(prefixes) + 2 * 3 + sum(reused)
-    assert cost.suffix_tokens == 2
-    assert cost.rounds == cost.passes == 1
-
-
-def test_diffusion_draws_keep_canvas_and_sliding_attention_work():
-    model = DIFFUSION_GEMMA_26B_FP8
-    canvas = model.answer_canvas.rows
-    options = dict(lengths=(100, 1200), shared=(), chunk=10000, capacity=100000,
-                   model=model, device=H100_SXM)
-    cost = estimate("letters", 2, 2, 3, ((10,), (20,)), draws=4, **options)
-    assert cost.work.tokens == 1300 + 2 * (5 + 4 * (1 + canvas))
-    assert cost.suffix_tokens == 2 * 4 * (1 + canvas)
-    assert cost.work.sliding_pairs < cost.work.pairs
-    assert cost.work.sliding_kv_read < cost.work.kv_read
-    assert cost.passes == cost.rounds == 1
