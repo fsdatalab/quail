@@ -68,7 +68,7 @@ def test_label_and_document_order_do_not_change_the_estimate():
 
 
 @pytest.mark.parametrize("budget", ["chunk", "capacity"])
-def test_smaller_batches_pay_more_weight_reads_without_changing_work(budget):
+def test_tighter_limits_pay_more_weight_reads_without_changing_work(budget):
     device = replace(H100_SXM, peak_flops=float("inf"), bf16_flops=float("inf"))
     large = _cost((10, 20, 30), device=device)
     small = _cost((10, 20, 30), device=device, **{budget: 40})
@@ -101,6 +101,24 @@ def test_expected_document_counts_are_not_rounded(live):
     assert asdict(cost.work) == pytest.approx(
         {key: value * live for key, value in asdict(single.work).items()})
     assert cost.suffix_tokens == pytest.approx(live * 8 / 3)
-    assert cost.seconds == pytest.approx(single.seconds * live)
-    assert cost.passes == pytest.approx(single.passes * live)
+    if live <= 1:
+        assert cost.seconds == pytest.approx(single.seconds * live)
+        assert cost.passes == pytest.approx(single.passes * live)
+    else:
+        assert single.seconds < cost.seconds < single.seconds * live
+        assert single.passes < cost.passes < single.passes * live
     assert cost.rounds == (5 if live else 0)
+
+
+def test_aggregate_overlap_respects_kv_and_charges_the_terminal_drain_once():
+    labels = ((10, 11, 12), (20, 21, 22))
+    mixed = _cost((80,), labels, live=5000, chunk=1000)
+    serial = _cost((80,), labels, live=5000, chunk=1000, capacity=88)
+    twice = _cost((80,), labels, live=10000, chunk=1000)
+    assert serial.work == mixed.work
+    assert serial.passes == 5000 * 3
+    assert mixed.passes < serial.passes
+    assert mixed.seconds < serial.seconds
+    assert twice.work == mixed.work * 2
+    assert twice.seconds < mixed.seconds * 2
+    assert twice.passes < mixed.passes * 2

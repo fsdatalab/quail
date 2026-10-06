@@ -1,9 +1,9 @@
 """Analytical classification costs from document lengths and label probabilities.
 
-Fixed batches obey the fresh-token and KV budgets. Every label is equally
-likely, independently of document length and other documents. Each round
-prices expected work and weight reads with the shared component roofline.
-Batches do not admit new documents as earlier documents finish decoding.
+Every label is equally likely, independently of document length. Work is
+averaged over the document-length sample before scaling to the input count.
+Token and KV capacity determine analytical pass counts and an overlap fraction;
+no batches, request queues, or per-document execution states are constructed.
 """
 
 import math
@@ -65,8 +65,8 @@ class ClassifyCost:
     """Estimated classification time, work, and token counts.
 
     Attributes:
-        seconds: Summed component roofline time across batches and rounds.
-        passes: Expected number of nonempty forward passes.
+        seconds: Component roofline time with estimated prefill/decode overlap.
+        passes: Estimated forward passes, including the final decode work.
         work: Expected token, attention, and KV work.
         suffix_tokens: Expected suffix tokens streamed after the documents.
         rounds: Maximum number of rounds needed by any label.
@@ -78,60 +78,17 @@ class ClassifyCost:
     suffix_tokens: float
     rounds: int
 
-    def scaled(self, factor: float) -> "ClassifyCost":
-        """Scale the estimate by the expected document-count factor."""
-        return ClassifyCost(self.seconds * factor, self.passes * factor,
-                            self.work * factor, self.suffix_tokens * factor,
-                            self.rounds)
-
 
 SAMPLE_DOCUMENTS = 1000
 
 
-def sample_documents(
-        lengths, shared, live: float) -> tuple[list[tuple[int, int]], float]:
-    """Sample documents across the table's sorted length distribution.
-
-    Args:
-        lengths: Document lengths in tokens.
-        shared: Shared prefix length per document, or an empty sequence.
-        live: Expected number of documents reaching the classification.
-
-    Returns:
-        Sampled (length, shared prefix length) pairs and the number of expected
-        documents represented by each sample, preserving fractional counts.
-        The sample contains at most SAMPLE_DOCUMENTS entries.
-    """
-    if live <= 0 or not len(lengths):
-        return [], 1.0
+def sample_documents(lengths, shared) -> list[tuple[int, int]]:
+    """Sample document and shared-prefix lengths across the sorted distribution."""
     shared = shared or (0,) * len(lengths)
     ordered = sorted(zip(lengths, shared))
-    count = min(len(ordered), math.ceil(live), SAMPLE_DOCUMENTS)
+    count = min(len(ordered), SAMPLE_DOCUMENTS)
     picks = np.linspace(0, len(ordered) - 1, count).round().astype(int)
-    return [ordered[i] for i in picks], live / count
-
-
-def _batches(documents, head, frame, chains, chunk, capacity, resident,
-             one_per_round):
-    """Group whole first requests within the fresh-token and KV limits."""
-    first = chains[0] if one_per_round else sum(chains)
-    extra = frame + (sum(chains) if one_per_round else max(chains))
-    batch = []
-    tokens = held = 0
-    for length, shared in documents:
-        prefix = head + length
-        shared_prefix = head + shared if shared else 0
-        fresh = frame + first + (0 if resident else prefix - shared_prefix)
-        reservation = prefix + extra
-        if batch and (tokens + fresh > chunk or held + reservation > capacity):
-            yield batch
-            batch = []
-            tokens = held = 0
-        batch.append((prefix, shared_prefix))
-        tokens += fresh
-        held += reservation
-    if batch:
-        yield batch
+    return [ordered[i] for i in picks]
 
 
 def _suffix_work(prefix, chains, canvas_rows, window):
@@ -145,49 +102,96 @@ def _suffix_work(prefix, chains, canvas_rows, window):
     return suffixes
 
 
-def _batch_cost(batch, frame, chains, probabilities, model, device,
-                resident, canvas_rows, one_per_round) -> ClassifyCost:
-    """Price a fixed batch using each round's expected work and weight reads.
-
-    A round runs if at least one document still needs it. For b documents
-    with independent continuation probability p, that probability is
-    1 - (1 - p)**b. The roofline prices expected work, an approximation to
-    averaging the roofline time over every possible set of surviving rows.
-    """
+def _mean_work(documents, head, frame, chains, model, resident,
+               canvas_rows, one_per_round) -> tuple[list[Work], float]:
+    """Return per-document work by label depth and mean KV reservation."""
     window = model.sliding_window
-    count = len(batch)
-    total = Work()
-    seconds = passes = suffix_tokens = 0.0
-    previous = 0
-    for round_, probability in enumerate(probabilities):
-        suffixes = [chains[round_]] if one_per_round else chains
-        work = Work()
-        for prefix, shared in batch:
+    rounds = len(chains) if one_per_round else 1
+    work = [Work() for _ in range(rounds)]
+    reservation = 0.0
+    for length, shared in documents:
+        prefix = head + length
+        shared_prefix = head + shared if shared else 0
+        reservation += prefix + frame + (
+            sum(chains) if one_per_round else max(chains))
+        previous = 0
+        for round_ in range(rounds):
+            suffixes = [chains[round_]] if one_per_round else chains
             first_tail = frame
             if round_ == 0 and one_per_round:
                 # Decode packs the frame and cue into the prefix's causal request.
                 first_tail += sum(suffixes)
             else:
-                work += _suffix_work(prefix + frame + previous, suffixes,
-                                     canvas_rows, window)
+                work[round_] += _suffix_work(prefix + frame + previous, suffixes,
+                                             canvas_rows, window)
             if round_ == 0:
                 if resident:
-                    work += ask(prefix, first_tail, window=window)
+                    work[0] += ask(prefix, first_tail, window=window)
                 elif shared:
-                    work += ask(shared, prefix - shared + first_tail, window=window)
+                    work[0] += ask(shared_prefix, prefix - shared_prefix + first_tail,
+                                   window=window)
                 else:
-                    work += scan(prefix, first_tail, window=window)
-        work *= probability
-        nonempty = (1.0 if probability == 1 else
-                    -math.expm1(count * math.log1p(-probability)))
-        rows = 1 if one_per_round else canvas_rows or sum(chains)
-        seconds += _seconds(work, count * rows * probability, nonempty,
-                            model, device)
-        passes += nonempty
-        total += work
-        suffix_tokens += count * sum(suffixes) * probability
-        previous += sum(suffixes)
-    return ClassifyCost(seconds, passes, total, suffix_tokens, len(probabilities))
+                    work[0] += scan(prefix, first_tail, window=window)
+            previous += sum(suffixes)
+    count = len(documents)
+    return [value * (1 / count) for value in work], reservation / count
+
+
+def _nonempty(probability, count):
+    """Return the probability of at least one independent continuing document."""
+    if count <= 0:
+        return 0.0
+    return (1.0 if probability == 1 else
+            -math.expm1(count * math.log1p(-probability)))
+
+
+def _aggregate_cost(work, probabilities, reservation, count, chunk, capacity,
+                    rows, model, device) -> tuple[float, float]:
+    """Price aggregate work with KV-limited overlap and a single terminal drain.
+
+    Mean request size estimates documents per prefill pass. Spare KV divided
+    by the expected KV of unfinished documents estimates the overlap fraction.
+    The executor reads answers after launching another chunk, so two passes
+    separate successive decode rounds when admission can continue.
+
+    At decode depth r, estimate the remaining documents as 2*r times the
+    admissions per pass, capped by the estimated resident population. Their
+    work is removed from the aggregate and priced separately, once per query.
+    Both occupancy and the final population are estimates, not a schedule.
+    """
+    slots = max(1, capacity // reservation)
+    width = min(count, slots, max(1, chunk // max(1, work[0].tokens)))
+    prefill_passes = count / width
+    pending = 2 * width * sum(probabilities[1:])
+    overlap = min(1.0, max(0.0, (slots - width) / pending)) if pending else 0.0
+    residents = min(count, slots, width + pending)
+    mixed_work = work[0] * count
+    mixed_rows = rows * count
+    separate_seconds = _seconds(mixed_work, mixed_rows, prefill_passes, model, device)
+    separate_passes = prefill_passes
+    tail_seconds = tail_passes = 0.0
+    for depth, (value, probability) in enumerate(zip(work[1:], probabilities[1:]), 1):
+        tail_count = min(residents, 2 * depth * width)
+        remaining = count - tail_count
+        bulk_work = value * (probability * remaining)
+        bulk_rows = probability * remaining
+        bulk_passes = max(
+            remaining / width * _nonempty(probability, width), bulk_work.tokens / chunk)
+        separate_seconds += _seconds(bulk_work, bulk_rows, bulk_passes, model, device)
+        separate_passes += bulk_passes
+        mixed_work += bulk_work
+        mixed_rows += bulk_rows
+        tail_work = value * (probability * tail_count)
+        passes = max(_nonempty(probability, tail_count), tail_work.tokens / chunk)
+        tail_seconds += _seconds(tail_work, probability * tail_count, passes,
+                                 model, device)
+        tail_passes += passes
+    mixed_passes = max(prefill_passes, mixed_work.tokens / chunk)
+    mixed_seconds = _seconds(mixed_work, mixed_rows, mixed_passes, model, device)
+    return (
+        overlap * mixed_seconds + (1 - overlap) * separate_seconds + tail_seconds,
+        overlap * mixed_passes + (1 - overlap) * separate_passes + tail_passes,
+    )
 
 
 def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
@@ -195,7 +199,7 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0,
                     one_per_round: bool = False, depths=None) -> ClassifyCost:
-    """Estimate classification work and roofline time over fixed batches.
+    """Estimate aggregate classification work and roofline time.
 
     Args:
         head_tokens: Number of prompt tokens before each document.
@@ -215,27 +219,29 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
             None runs every round for every document.
 
     Returns:
-        Expected cost scaled to the expected document count.
+        Expected work and time, with one terminal drain for the whole query.
     """
-    documents, weight = sample_documents(lengths, shared, live)
-    if not documents or not chains:
+    if live <= 0 or not len(lengths) or not chains:
         return ClassifyCost(0.0, 0.0, Work(), 0.0, 0)
-    rounds = len(chains) if one_per_round else 1
-    probabilities = [1.0] * rounds
+    documents = sample_documents(lengths, shared)
+    work, reservation = _mean_work(documents, head_tokens, frame_tokens, chains,
+                                   model, resident, canvas_rows, one_per_round)
+    probabilities = [1.0] * len(work)
     if one_per_round and depths is not None:
         probabilities = [sum(depth > round_ for depth in depths) / len(depths)
-                         for round_ in range(rounds)]
+                         for round_ in range(len(work))]
     total = Work()
-    seconds = passes = suffix_tokens = 0.0
-    for batch in _batches(documents, head_tokens, frame_tokens, chains, chunk,
-                          capacity, resident, one_per_round):
-        cost = _batch_cost(batch, frame_tokens, chains, probabilities,
-                           model, device, resident, canvas_rows, one_per_round)
-        seconds += cost.seconds
-        passes += cost.passes
-        total += cost.work
-        suffix_tokens += cost.suffix_tokens
-    return ClassifyCost(seconds, passes, total, suffix_tokens, rounds).scaled(weight)
+    for value, probability in zip(work, probabilities):
+        total += value * (live * probability)
+    rows = 1 if one_per_round else canvas_rows or sum(chains)
+    seconds, passes = _aggregate_cost(
+        work, probabilities, reservation, max(1.0, live), chunk, capacity,
+        rows, model, device)
+    suffix_tokens = live * (sum(length * probability for length, probability
+                               in zip(chains, probabilities))
+                            if one_per_round else sum(chains))
+    return ClassifyCost(seconds * min(1.0, live), passes * min(1.0, live),
+                        total, suffix_tokens, len(work))
 
 
 def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
