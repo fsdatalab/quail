@@ -1,12 +1,12 @@
-"""Estimate classification work and time by replaying sampled requests on the CPU.
+"""Analytical classification costs from document lengths and label probabilities.
 
-The cost helpers take prepared token counts and model and device specs.
-Prompt preparation, scoring rule selection, and plan construction belong
-in the planner.
+Fixed batches obey the fresh-token and KV budgets. Every label is equally
+likely, independently of document length and other documents. Each round
+prices expected work and weight reads with the shared component roofline.
+Batches do not admit new documents as earlier documents finish decoding.
 """
 
 import math
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -48,191 +48,44 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
     raise ValueError(f"unknown label scoring rule {scoring!r}")
 
 
-def readout_component(rows: float, model) -> CostComponent:
-    """Estimate computation and memory reads for the full output head."""
-    return CostComponent(
+def _seconds(work: Work, rows: float, passes: float, model, device) -> float:
+    """Price expected work and forward passes with the component roofline."""
+    components = dense_decoder_components(work, model, passes=passes)
+    components += (CostComponent(
         name="readout", flops=2.0 * model.hidden * model.vocab * rows,
-        # the bf16 head is read from memory once per chunk with answer rows
-        bytes_moved=2.0 * model.hidden * model.vocab if rows else 0.0,
-        precision="bf16")
-
-
-def chunk_seconds(work: Work, rows: float, model, device) -> float:
-    """Estimate one forward pass in seconds using the GPU roofline model."""
-    components = dense_decoder_components(work, model, passes=1.0)
-    components += (readout_component(rows, model),)
+        # The bf16 output head is read once per nonempty forward pass.
+        bytes_moved=2.0 * model.hidden * model.vocab * passes,
+        precision="bf16"),)
     return sum(component.seconds
                for component in component_latencies(components, device))
 
 
 @dataclass(frozen=True)
-class Simulated:
-    """Estimated time, work, and token counts from a scheduler replay.
+class ClassifyCost:
+    """Estimated classification time, work, and token counts.
 
     Attributes:
-        seconds: The summed roofline time of every chunk.
-        passes: Forward chunks launched.
-        work: The token, attention, and KV work of every chunk.
-        suffix_tokens: Suffix tokens streamed after the documents.
-        rounds: The most rounds any document ran.
+        seconds: Summed component roofline time across batches and rounds.
+        passes: Expected number of nonempty forward passes.
+        work: Expected token, attention, and KV work.
+        suffix_tokens: Expected suffix tokens streamed after the documents.
+        rounds: Maximum number of rounds needed by any label.
     """
 
     seconds: float
-    passes: int
+    passes: float
     work: Work
     suffix_tokens: float
     rounds: int
 
-    def scaled(self, factor: float) -> "Simulated":
-        """Scale estimated time, work, and passes by the document-count factor."""
-        if factor == 1:
-            return self
-        return Simulated(self.seconds * factor,
-                         int(math.ceil(self.passes * factor)),
-                         self.work * factor, self.suffix_tokens * factor,
-                         self.rounds)
+    def scaled(self, factor: float) -> "ClassifyCost":
+        """Scale the estimate by the expected document-count factor."""
+        return ClassifyCost(self.seconds * factor, self.passes * factor,
+                            self.work * factor, self.suffix_tokens * factor,
+                            self.rounds)
 
 
-# Most documents a replay prices; past this many, it replays an even
-# sample over the sorted lengths and scales the result
 SAMPLE_DOCUMENTS = 1000
-
-
-def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
-             model, device, resident: bool = False, canvas_rows: int = 0,
-             one_per_round: bool = False, shared=None) -> Simulated:
-    """Replay classification scheduling on the CPU and estimate execution time.
-
-    Requests are kept whole within chunks. Documents reserve KV until their
-    last round finishes. Waiting rounds run before new documents. Each
-    chunk's estimate includes one read of the model weights and the output
-    head work for its answer rows.
-
-    Args:
-        prefixes: Prompt head and document lengths, in tokens, per document.
-        frame: Number of tokens written after each document before requests.
-        chains: Request lengths in tokens for each document.
-        chunk: Maximum tokens per forward pass.
-        capacity: KV arena capacity in tokens.
-        model: Model specification.
-        device: Device specification.
-        resident: Whether document prefixes are already in KV.
-        canvas_rows: Number of answer canvas rows. Zero uses suffix rows
-            for the readout.
-        one_per_round: Whether to send one chain per round and read its last
-            row, instead of sending all chains in one round. Each round's
-            tokens stay in KV, so later rounds read them as context.
-        shared: Shared prefix length per document. None means no sharing.
-
-    Returns:
-        Simulated execution time, forward-pass count, work, and suffix tokens.
-    """
-    window = model.sliding_window
-    n = len(prefixes)
-    shared = [0] * n if shared is None else shared
-    if one_per_round:
-        longest = max(map(sum, chains), default=0)
-    else:
-        longest = max((length for document in chains for length in document),
-                      default=0)
-    extra = frame + longest
-
-    def round_chains(document, round_):
-        if one_per_round:
-            return [chains[document][round_]]
-        return chains[document]
-
-    def round_count(document):
-        return len(chains[document]) if one_per_round else 1
-
-    def first_tokens(document):
-        tokens = sum(round_chains(document, 0)) + frame
-        if not resident:
-            tokens += prefixes[document] - shared[document]
-        return tokens
-
-    def suffix_work(document, round_):
-        prefix = prefixes[document]
-        if one_per_round:
-            prefix += sum(chains[document][:round_])
-        # a canvas longer than one row reads the document a second time
-        # in the non-causal call that every canvas row runs
-        suffixes = stream(prefix + frame, round_chains(document, round_),
-                          window=window)
-        if canvas_rows > 1:
-            suffixes = suffixes + Work(
-                pairs=suffixes.pairs, kv_read=suffixes.kv_read,
-                sliding_pairs=suffixes.sliding_pairs,
-                sliding_kv_read=suffixes.sliding_kv_read)
-        return suffixes
-
-    def first_work(document):
-        prefix = prefixes[document]
-        suffixes = suffix_work(document, 0)
-        if resident:
-            return ask(prefix, frame, window=window) + suffixes
-        if shared[document]:
-            return ask(shared[document], prefix - shared[document] + frame,
-                       window=window) + suffixes
-        return scan(prefix + frame, 0, window=window) + suffixes
-
-    def read_rows(document, round_):
-        if one_per_round:
-            return 1
-        return canvas_rows or sum(chains[document])
-
-    next_document = 0
-    seconds = 0.0
-    passes = 0
-    total = Work()
-    suffix_tokens = 0.0
-    most_rounds = 0
-    held = 0
-    waiting = deque()    # (first chunk it may enter, document, round)
-    while next_document < n or waiting:
-        room = chunk
-        work = Work()
-        rows = 0.0
-        launched = []
-        while waiting and waiting[0][0] <= passes:
-            _, document, round_ = waiting[0]
-            tokens = sum(round_chains(document, round_))
-            if tokens > room and room != chunk:
-                break
-            waiting.popleft()
-            room -= tokens
-            work += suffix_work(document, round_)
-            rows += read_rows(document, round_)
-            suffix_tokens += tokens
-            launched.append((document, round_))
-        while (next_document < n
-               and (held + prefixes[next_document] + extra <= capacity
-                    or not held)
-               and (first_tokens(next_document) <= room or room == chunk)):
-            document = next_document
-            next_document += 1
-            held += prefixes[document] + extra
-            room -= first_tokens(document)
-            work += first_work(document)
-            rows += read_rows(document, 0)
-            suffix_tokens += sum(round_chains(document, 0))
-            launched.append((document, 0))
-        if not launched:
-            # with nothing to launch, the waiting answers are read now, so
-            # their next rounds may enter this chunk
-            waiting = deque((min(ready, passes), document, round_)
-                            for ready, document, round_ in waiting)
-            continue
-        seconds += chunk_seconds(work, rows, model, device)
-        for document, round_ in launched:
-            most_rounds = max(most_rounds, round_ + 1)
-            if round_ + 1 < round_count(document):
-                waiting.append((passes + 2, document, round_ + 1))
-            else:
-                held -= prefixes[document] + extra
-        passes += 1
-        total += work
-    return Simulated(seconds, passes, total, suffix_tokens, most_rounds)
 
 
 def sample_documents(
@@ -245,26 +98,99 @@ def sample_documents(
         live: Expected number of documents reaching the classification.
 
     Returns:
-        A tuple of sampled (length, shared prefix length) pairs and the
-        number of expected documents represented by each sample. The sample
-        contains at most SAMPLE_DOCUMENTS entries.
+        Sampled (length, shared prefix length) pairs and the number of expected
+        documents represented by each sample, preserving fractional counts.
+        The sample contains at most SAMPLE_DOCUMENTS entries.
     """
+    if live <= 0 or not len(lengths):
+        return [], 1.0
     shared = shared or (0,) * len(lengths)
     ordered = sorted(zip(lengths, shared))
-    if not ordered:
-        return [], 1.0
-    expected = max(1, int(round(live)))
-    count = min(len(ordered), expected, SAMPLE_DOCUMENTS)
+    count = min(len(ordered), math.ceil(live), SAMPLE_DOCUMENTS)
     picks = np.linspace(0, len(ordered) - 1, count).round().astype(int)
-    return [ordered[i] for i in picks], max(1.0, expected / count)
+    return [ordered[i] for i in picks], live / count
+
+
+def _batches(documents, head, frame, chains, chunk, capacity, resident,
+             one_per_round):
+    """Group whole first requests within the fresh-token and KV limits."""
+    first = chains[0] if one_per_round else sum(chains)
+    extra = frame + (sum(chains) if one_per_round else max(chains))
+    batch = []
+    tokens = held = 0
+    for length, shared in documents:
+        prefix = head + length
+        shared_prefix = head + shared if shared else 0
+        fresh = frame + first + (0 if resident else prefix - shared_prefix)
+        reservation = prefix + extra
+        if batch and (tokens + fresh > chunk or held + reservation > capacity):
+            yield batch
+            batch = []
+            tokens = held = 0
+        batch.append((prefix, shared_prefix))
+        tokens += fresh
+        held += reservation
+    if batch:
+        yield batch
+
+
+def _suffix_work(prefix, chains, canvas_rows, window):
+    """Count suffix work, including a canvas's second attention read."""
+    suffixes = stream(prefix, chains, window=window)
+    if canvas_rows > 1:
+        suffixes += Work(
+            pairs=suffixes.pairs, kv_read=suffixes.kv_read,
+            sliding_pairs=suffixes.sliding_pairs,
+            sliding_kv_read=suffixes.sliding_kv_read)
+    return suffixes
+
+
+def _batch_cost(batch, frame, chains, probabilities, model, device,
+                resident, canvas_rows, one_per_round) -> ClassifyCost:
+    """Price a fixed batch using each round's expected work and weight reads.
+
+    A round runs if at least one document still needs it. For b documents
+    with independent continuation probability p, that probability is
+    1 - (1 - p)**b. The roofline prices expected work, an approximation to
+    averaging the roofline time over every possible set of surviving rows.
+    """
+    window = model.sliding_window
+    count = len(batch)
+    total = Work()
+    seconds = passes = suffix_tokens = 0.0
+    previous = 0
+    for round_, probability in enumerate(probabilities):
+        suffixes = [chains[round_]] if one_per_round else chains
+        work = Work()
+        for prefix, shared in batch:
+            work += _suffix_work(prefix + frame + previous, suffixes,
+                                 canvas_rows, window)
+            if round_ == 0:
+                if resident:
+                    work += ask(prefix, frame, window=window)
+                elif shared:
+                    work += ask(shared, prefix - shared + frame, window=window)
+                else:
+                    work += scan(prefix + frame, 0, window=window)
+        work *= probability
+        nonempty = (1.0 if probability == 1 else
+                    -math.expm1(count * math.log1p(-probability)))
+        rows = 1 if one_per_round else canvas_rows or sum(chains)
+        seconds += _seconds(work, count * rows * probability, nonempty,
+                            model, device)
+        passes += nonempty
+        total += work
+        suffix_tokens += count * sum(suffixes) * probability
+        previous += sum(suffixes)
+    return ClassifyCost(seconds, passes, total, suffix_tokens, len(probabilities))
 
 
 def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
                     live: float, lengths, shared, chunk: int, capacity: int,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0,
-                    one_per_round: bool = False, depths=None) -> Simulated:
-    """Estimate classification cost from a sample of document lengths.
+                    one_per_round: bool = False, depths=None) -> ClassifyCost:
+    """Estimate classification work and roofline time over fixed batches.
 
     Args:
         head_tokens: Number of prompt tokens before each document.
@@ -280,29 +206,36 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
         resident: Whether document KV is already available.
         canvas_rows: Number of answer canvas rows.
         one_per_round: Whether each request runs in a separate decoder round.
-        depths: Optional rounds per document, given to the sampled
-            documents in turn. None runs every round for every document.
+        depths: Label lengths in rounds, with each label equally likely.
+            None runs every round for every document.
 
     Returns:
-        Simulated cost scaled to the expected document count.
+        Expected cost scaled to the expected document count.
     """
     documents, weight = sample_documents(lengths, shared, live)
-    prefixes = [head_tokens + length for length, _ in documents]
-    # a borrowed prefix includes the prompt head the documents share
-    shared_prefixes = [head_tokens + tokens if tokens else 0
-                       for _, tokens in documents]
-    rounds = ([chains] * len(prefixes) if depths is None
-              else [chains[:depths[i % len(depths)]]
-                    for i in range(len(prefixes))])
-    return simulate(prefixes, frame_tokens, rounds,
-                    chunk, capacity, model, device, resident=resident,
-                    canvas_rows=canvas_rows, one_per_round=one_per_round,
-                    shared=shared_prefixes).scaled(weight)
+    if not documents or not chains:
+        return ClassifyCost(0.0, 0.0, Work(), 0.0, 0)
+    rounds = len(chains) if one_per_round else 1
+    probabilities = [1.0] * rounds
+    if one_per_round and depths is not None:
+        probabilities = [sum(depth > round_ for depth in depths) / len(depths)
+                         for round_ in range(rounds)]
+    total = Work()
+    seconds = passes = suffix_tokens = 0.0
+    for batch in _batches(documents, head_tokens, frame_tokens, chains, chunk,
+                          capacity, resident, one_per_round):
+        cost = _batch_cost(batch, frame_tokens, chains, probabilities,
+                           model, device, resident, canvas_rows, one_per_round)
+        seconds += cost.seconds
+        passes += cost.passes
+        total += cost.work
+        suffix_tokens += cost.suffix_tokens
+    return ClassifyCost(seconds, passes, total, suffix_tokens, rounds).scaled(weight)
 
 
 def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
              labels, *, lengths, shared, chunk: int, capacity: int,
-             model, device, resident: bool = False, draws: int = 1) -> Simulated:
+             model, device, resident: bool = False, draws: int = 1) -> ClassifyCost:
     """Estimate the cost of one classification scoring rule.
 
     Args:
@@ -336,6 +269,5 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         canvas_rows=(canvas_rows if scoring == LETTERS_SCORING
                      else model.canvas_tokens),
         one_per_round=scoring == DECODE_SCORING,
-        # a document stops decoding at its label's last token
         depths=([len(ids) for ids in labels] if scoring == DECODE_SCORING
                 else None))

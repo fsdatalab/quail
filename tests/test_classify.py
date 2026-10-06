@@ -474,7 +474,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     assert classify.inputs[0].source.node_id == "ai_join:r"
     assert classify.spec.scoring == "trie_tree"
     assert classify.spec.expected_inputs == pytest.approx(1.8)
-    assert round(plan.estimated_seconds, 3) == 0.063
+    assert round(plan.estimated_seconds, 3) == 0.062
     assert plan.settings["search_seconds"] == plan.estimated_seconds
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
     assert [(stage.exec_idx, stage.anchor) for stage in staged.stages] == [
@@ -627,7 +627,7 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
                                     lettered=(20, 60, letters))
     assert scoring == "trie_decode"
     assert decoded.suffix_tokens == 1000 * 4
-    fresh_trie = table.simulate("trie_tree", 1000, 20, 30, long_labels, False)
+    fresh_trie = table.estimate("trie_tree", 1000, 20, 30, long_labels, False)
     assert decoded.rounds == 4 and decoded.seconds < fresh_trie.seconds
     # a decode cannot end at a label that is another label's prefix
     prefixed = long_labels[:-1] + (long_labels[0][:2],)

@@ -977,7 +977,7 @@ class ClassifyBuilder(ClassifyStatistics):
             block + length
             for length in classify_cost.suffix_lengths(LETTERS_SCORING, labels)
         ]
-        simulated = classify_cost.estimate_chains(
+        estimated = classify_cost.estimate_chains(
             len(head), len(note) + len(partner_label), chains, live=pairs,
             lengths=self.lengths,
             shared=self.shared, chunk=self.chunk,
@@ -994,11 +994,11 @@ class ClassifyBuilder(ClassifyStatistics):
             name=name, aliases=(self.alias, partner),
             query_template=call.prompt.template,
             arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
-            expected_inputs=pairs, estimated_seconds=simulated.seconds,
+            expected_inputs=pairs, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=labels, scoring=LETTERS_SCORING,
             join_layout=(tuple(note), tuple(partner_label)),
-        ), simulated.work
+        ), estimated.work
 
     def _choice_spec(self, call, name, live, aliases, head):
         """Build a decision_choice specification for one document per row.
@@ -1014,7 +1014,7 @@ class ClassifyBuilder(ClassifyStatistics):
                 f"a document in {self.alias!r} needs {need} tokens with its "
                 f"classification prompt, but the forward pass budget is "
                 f"{self.budget} tokens", need, self.budget)
-        simulated = classify_cost.estimate_chains(
+        estimated = classify_cost.estimate_chains(
             len(head), frame, [request], live=live, lengths=self.lengths,
             shared=self.shared, chunk=self.chunk,
             capacity=self.capacity or self.budget, model=self.model,
@@ -1023,10 +1023,10 @@ class ClassifyBuilder(ClassifyStatistics):
             name=name, aliases=aliases,
             query_template=call.prompt.template,
             arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
-            expected_inputs=live, estimated_seconds=simulated.seconds,
+            expected_inputs=live, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=blocks, scoring=DECISION_SCORING,
-            probabilities=call.probabilities, frame_tokens=frame), simulated.work
+            probabilities=call.probabilities, frame_tokens=frame), estimated.work
 
     def _joined_choice_spec(self, call, name, partner, pairs, partner_tokens):
         """Build a decision_choice specification for joined document pairs.
@@ -1042,7 +1042,7 @@ class ClassifyBuilder(ClassifyStatistics):
                  for alias, label, note in prompt.label_token_ids}
         note, partner_label = parts[self.alias][1], parts[partner][0]
         request = int(round(partner_tokens)) + len(tail)
-        simulated = classify_cost.estimate_chains(
+        estimated = classify_cost.estimate_chains(
             len(head), len(note) + len(partner_label), [request], live=pairs,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             capacity=self.capacity or self.budget, model=self.model,
@@ -1057,8 +1057,8 @@ class ClassifyBuilder(ClassifyStatistics):
             name=name, aliases=(self.alias, partner),
             query_template=prompt.template,
             arguments=tuple((ref.alias, ref.column) for ref in prompt.args),
-            expected_inputs=pairs, estimated_seconds=simulated.seconds,
+            expected_inputs=pairs, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=blocks, scoring=DECISION_SCORING,
             join_layout=(tuple(note), tuple(partner_label)),
-            frame_tokens=frame), simulated.work
+            frame_tokens=frame), estimated.work
