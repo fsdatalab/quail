@@ -232,6 +232,9 @@ how they release and explain changes.
 - Every axis label is the unit alone, such as "microseconds per fresh
   token"; other context goes in the title. Every plot has a title,
   naming the query when it shows one.
+- No footnotes or captions under the plot. Put notes such as "SoL is
+  an estimate" or the reference model in the report or PR text, not
+  in the figure.
 - Put compared things side by side on one axis, and write the
   difference next to them.
 - One color per category. Use a log scale only across more than one
@@ -246,44 +249,27 @@ how they release and explain changes.
   commit, for numbers; a mermaid diagram for a design or dataflow
   change.
 
-## PR description format
+## PR descriptions
 
 Write for a reviewer who has not followed the conversation. Explain
 the problem, the reasoning behind the solution, and the evidence
 needed to assess it. Describe the final change, not the history of
-implementing it. Use these sections in order, omitting sections that
-add nothing for a small change:
+implementing it.
 
-- **Problem.** State what is broken, missing, or unnecessarily costly.
-  Give a concrete example when it helps explain the need.
-- **Solution.** Explain the resulting behavior and the approach. For
-  a design or dataflow change, include a Mermaid diagram with precise
-  labels. If a decision uses a cost model, give the actual comparison,
-  define its inputs and units, and state its assumptions and omitted
-  costs. "Does sharing save time?" is not a sufficient explanation.
-- **Precedents.** Link to relevant existing designs and implementations.
-  Explain what Quail shares with them, what differs, and why the
-  differences fit the task. Using the same approach is fine. Do not
-  invent novelty or claim an advantage without evidence. For prefix
-  caching, discuss vLLM Automatic Prefix Caching and SGLang
-  RadixAttention, with links to their documentation and code.
-- **Scope and design decisions.** Explain important choices and
-  tradeoffs. Identify cleanup or other changes beyond the main
-  behavior. Keep each PR focused on a coherent change; recommend
-  separating unrelated work instead of hiding it in the description.
-- **Impact and risks.** Show the useful before-and-after evidence and
-  its source. State the configurations being compared. Keep unresolved
-  correctness or accuracy differences visible, and distinguish a
-  possible explanation from a demonstrated cause.
-- **Testing.** State what was checked, the results, and what those
-  checks establish. Distinguish checks run on the current change from
-  results copied from earlier runs. Do not imply that passing tests
-  establish more than they cover.
-- **Limits and follow-ups.** State remaining limitations and what
-  evidence or work would resolve open questions.
-- **Review order.** For a large change, give a short path through the
-  relevant code with links and concrete questions for the reviewer.
-
+- Start with the main change and why it is needed. Give a concrete
+  example when it helps explain the resulting behavior.
+- Use headings only when they help the reader. There are no required
+  sections or section order. A small change may need only a paragraph
+  and a sentence about testing.
+- Include design decisions, comparisons, and references only when
+  they help assess the change. Put them beside the behavior they
+  explain. Do not claim an advantage without evidence.
+- Give the source and configuration for measurements. Distinguish
+  current results from earlier runs, and estimates from measurements.
+- State what was checked and what remains uncertain. Do not imply
+  that passing tests establish more than they cover.
+- For a large change, give a short path through the relevant code
+  when it helps the reviewer.
 - Use established terminology throughout the description. Define it
   where needed; do not add a terminology section or rename an existing
   technique to make Quail sound different.
@@ -292,7 +278,7 @@ add nothing for a small change:
 - A clearer description does not make a large, mixed change small.
   Prefer focused changes that can be reviewed and integrated promptly.
 
-## Guidance behind the format
+## Guidance for review
 
 - [Why we need pull request descriptions, and how to craft them][pr-writing]
   explains why descriptions should preserve intent, decisions, risks,
@@ -301,8 +287,8 @@ add nothing for a small change:
   contributions, small PRs, and timely review.
 - Fowler's [Patterns for Managing Source Code Branches][fowler-branches]
   explains frequent integration and the cost of delaying it. These
-  articles guide scope and review practice; they do not prescribe the
-  section template above.
+  articles guide scope and review practice; they do not prescribe a
+  description template.
 
 [pr-writing]: https://wsbctechnicalblog.github.io/pull-request-descriptions-empowered-by-engineering-practices.html
 [fowler-pr]: https://martinfowler.com/bliki/PullRequest.html
