@@ -52,7 +52,8 @@ Return a new `PhysicalGraph` when you change the plan, or `None` when
 no change is needed.
 
 Set `cost_based = True` on a rule that compares costs; `explain(verbose=True)`
-marks such rules.
+marks such rules. `quail.planner.pricing.estimated_seconds(plan, context)`
+prices a logical plan the way the planner does.
 
 The *planning context* provides the engine configuration and input
 statistics available to a rule. See

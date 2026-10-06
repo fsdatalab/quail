@@ -488,6 +488,18 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     assert classified_above_joins(lifted_candidate.logical_plan.root) == {"r"}
     assert (lifted_candidate.estimated_seconds
             < written_candidate.estimated_seconds)
+    # a cost-based logical rule prices a plan the same way the backend
+    # prices its candidates
+    from quail.planner import pricing
+    from quail.planner.logical_optimizer import LogicalPlanningContext
+
+    logical_context = LogicalPlanningContext(
+        session.catalog, session.config, model=session.model,
+        device=session.device, document_tokens=after._doc_tokens,
+        tokenizer=session.tokenizer)
+    assert pricing.estimated_seconds(
+        lifted_candidate.logical_plan, logical_context) == (
+        lifted_candidate.estimated_seconds)
     logical_text, physical_text = after.explain().split("physical:")
     assert "SemanticClassify: topic" in logical_text
     assert "AiClassify: topic over r" in physical_text
