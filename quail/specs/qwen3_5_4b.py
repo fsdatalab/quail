@@ -36,4 +36,9 @@ QWEN3_5_4B_BF16 = ModelSpec(
     gdn_key_dim=128,
     gdn_value_dim=128,
     conv_width=4,
+    # the chat template's turn with thinking off; a raw prompt makes the
+    # model open a <think> block, and no answer names a label
+    turn_prefix="<|im_start|>user\n",
+    turn_suffix="<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    prompt_format="qwen3_5-chat-nonthinking-v1",
 )

@@ -88,3 +88,9 @@ def test_vllm_sequences_stay_under_the_state_blocks_it_holds():
 
     assert VLLMEngine().llm_kwargs(SPEC)["max_num_seqs"] == 3_000 < MAX_SEQUENCES
     assert VLLMEngine().llm_kwargs(QWEN3_4B_FP8)["max_num_seqs"] == MAX_SEQUENCES
+
+
+def test_turn_closes_the_empty_thinking_block_the_chat_template_writes():
+    assert SPEC.turn_prefix == "<|im_start|>user\n"
+    assert SPEC.turn_suffix == (
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
