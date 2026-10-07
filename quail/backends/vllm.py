@@ -233,6 +233,11 @@ class VLLMEngine:
         if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
             RENDERER_REGISTRY.register("gigatoken", *renderer)
 
+        if spec.vision_tower:
+            # the engine core of a multimodal architecture starts without
+            # the tokenizer registered above and fails building its
+            # structured-output manager
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         if spec.canvas_tokens == 1:
             # vLLM's engine core in its own process returns the canvas
             # row's logprobs unreliably under the step loop on long
