@@ -72,3 +72,12 @@ def test_dense_components_price_gdn_projections_with_the_attention_ones():
     assert attn_proj.bytes_moved == 2.0 * (8 * 36_700_160 + 24 * 42_106_880)
     assert mlp.flops == 2.0 * 1_000 * 32 * 3 * 2560 * 9216
     assert attention.flops == 0
+
+
+def test_vllm_takes_no_images_for_the_vision_checkpoint_only():
+    from quail.backends.vllm import DefaultVLLMEngine, VLLMEngine
+
+    off = {"image": 0, "video": 0}
+    for engine in (VLLMEngine(), DefaultVLLMEngine()):
+        assert engine.llm_kwargs(SPEC)["limit_mm_per_prompt"] == off
+        assert "limit_mm_per_prompt" not in engine.llm_kwargs(QWEN3_4B_FP8)

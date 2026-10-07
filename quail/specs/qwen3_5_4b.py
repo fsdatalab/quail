@@ -27,6 +27,7 @@ QWEN3_5_4B_BF16 = ModelSpec(
     weight_precision="bf16",
     arch="qwen3_5",
     layer_kinds=_LAYER_KINDS * 8,
+    vision_tower=True,
     attn_output_gate=True,
     gdn_key_heads=16,
     gdn_value_heads=32,

@@ -115,6 +115,11 @@ class ModelSpec:
     #                                            empty leaves layer_kind
     #                                            to full_attention_period
     #                                            and sliding_window
+    vision_tower: bool = False    # the checkpoint ships a vision tower;
+    #                               vLLM must be told to take no images
+    #                               or video, or it builds an image
+    #                               processor that cannot copy Quail's
+    #                               tokenizer
     attn_output_gate: bool = False    # q_proj also emits a gate the width
     #                                   of the queries, which scales the
     #                                   attention output
