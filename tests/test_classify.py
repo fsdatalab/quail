@@ -398,7 +398,7 @@ def test_frontends_place_classifications_on_their_table(session):
             in text.split("SemanticClassify")[0])
     assert "Project: d.id, topic" in text
     assert "AiClassify: topic over d" in text
-    assert "rule=trie_tree, labels=3" in text
+    assert "rule=trie_decode, labels=3" in text
     assert "Filter: topic IN ['refund', 'shipping']" in text
 
 

@@ -979,10 +979,8 @@ class ClassifyBuilder(ClassifyStatistics):
         ]
         estimated = classify_cost.estimate_chains(
             len(head), len(note) + len(partner_label), chains, live=pairs,
-            lengths=self.lengths,
-            shared=self.shared, chunk=self.chunk,
-            capacity=self.capacity or self.budget, model=self.model,
-            device=self.device, resident=True,
+            lengths=self.lengths, shared=self.shared, chunk=self.chunk,
+            model=self.model, device=self.device, resident=True,
             canvas_rows=self.model.canvas_tokens)
         need = len(head) + self.longest + len(note) + max(chains)
         if need > self.budget:
@@ -1016,8 +1014,7 @@ class ClassifyBuilder(ClassifyStatistics):
                 f"{self.budget} tokens", need, self.budget)
         estimated = classify_cost.estimate_chains(
             len(head), frame, [request], live=live, lengths=self.lengths,
-            shared=self.shared, chunk=self.chunk,
-            capacity=self.capacity or self.budget, model=self.model,
+            shared=self.shared, chunk=self.chunk, model=self.model,
             device=self.device)
         return ClassifySpec(
             name=name, aliases=aliases,
@@ -1045,8 +1042,7 @@ class ClassifyBuilder(ClassifyStatistics):
         estimated = classify_cost.estimate_chains(
             len(head), len(note) + len(partner_label), [request], live=pairs,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
-            capacity=self.capacity or self.budget, model=self.model,
-            device=self.device, resident=True)
+            model=self.model, device=self.device, resident=True)
         need = len(head) + self.longest + len(note) + request
         if need > self.budget:
             raise ClassifyRefusedError(

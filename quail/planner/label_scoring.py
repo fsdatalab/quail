@@ -103,8 +103,8 @@ class ClassifyScoring(ClassifyStatistics):
         return classify_cost.estimate(
             scoring, live, head_tokens, frame_tokens, labels,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
-            capacity=self.capacity or self.budget, model=self.model,
-            device=self.device, resident=resident, draws=self.draws)
+            model=self.model, device=self.device, resident=resident,
+            draws=self.draws)
 
     def estimate_spec(self, spec: ClassifySpec,
                       resident=False) -> classify_cost.ClassifyCost:
@@ -119,8 +119,7 @@ class ClassifyScoring(ClassifyStatistics):
             return classify_cost.estimate_chains(
                 len(head), spec.frame_tokens, [len(tail) - spec.frame_tokens],
                 live=spec.expected_inputs, lengths=self.lengths,
-                shared=self.shared, chunk=self.chunk,
-                capacity=self.capacity or self.budget, model=self.model,
+                shared=self.shared, chunk=self.chunk, model=self.model,
                 device=self.device, resident=resident)
         return self.estimate(
             spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,

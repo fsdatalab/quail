@@ -123,7 +123,7 @@ def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared):
         fresh_tokens += len(chunk.input_ids)
         cost = estimate(
             "trie_decode", 1, 0, 2, [(10,) * (round_ + 1)], lengths=(32,),
-            shared=(shared,), chunk=100, capacity=1000,
+            shared=(shared,), chunk=100,
             model=QWEN3_4B_FP8, device=H100_SXM)
         assert cost.work.tokens == fresh_tokens
         assert cost.work.kv_read == retained_reads

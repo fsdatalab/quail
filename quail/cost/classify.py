@@ -1,19 +1,20 @@
-"""Analytical classification costs from document lengths and label probabilities.
+"""Classification costs: expected work priced like a filter's work.
 
-Every label is equally likely, independently of document length. Work is
-averaged over the document-length sample before scaling to the input count.
-Token and KV capacity determine analytical pass counts and an overlap fraction;
-no batches, request queues, or per-document execution states are constructed.
+The estimate sums each document's work (quail/cost/work.py) over every
+document, weights each greedy decode round by the share of labels that
+reach it, and prices the total with the component roofline at ideal
+packing: forward passes are tokens divided by the chunk, as in
+quail/cost/sol.py. KV capacity, the two-pass round delay, and admission
+order do not enter, just as they do not enter filter and join costs.
 """
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
 
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.roofline import CostComponent, component_latencies
-from quail.cost.work import Work, ask, scan, stream
+from quail.cost.work import Work
 from quail.labels import (
     DECODE_SCORING,
     LETTERS_SCORING,
@@ -49,11 +50,10 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
 
 
 def _seconds(work: Work, rows: float, passes: float, model, device) -> float:
-    """Price expected work and forward passes with the component roofline."""
+    """Price work and forward passes with the component roofline."""
     components = dense_decoder_components(work, model, passes=passes)
     components += (CostComponent(
         name="readout", flops=2.0 * model.hidden * model.vocab * rows,
-        # The bf16 output head is read once per nonempty forward pass.
         bytes_moved=2.0 * model.hidden * model.vocab * passes,
         precision="bf16"),)
     return sum(component.seconds
@@ -65,8 +65,8 @@ class ClassifyCost:
     """Estimated classification time, work, and token counts.
 
     Attributes:
-        seconds: Component roofline time with estimated prefill/decode overlap.
-        passes: Estimated forward passes, including the final decode work.
+        seconds: Component roofline time of the expected work at ideal packing.
+        passes: Expected fresh tokens divided by the chunk.
         work: Expected token, attention, and KV work.
         suffix_tokens: Expected suffix tokens streamed after the documents.
         rounds: Maximum number of rounds needed by any label.
@@ -79,127 +79,65 @@ class ClassifyCost:
     rounds: int
 
 
-SAMPLE_DOCUMENTS = 1000
+def _triangle(n, window: int = 0):
+    """Vectorized causal pair count, within the window when one is set."""
+    n = np.asarray(n, dtype=float)
+    full = n * (n + 1) / 2
+    if not window:
+        return full
+    return np.where(n > window, window * n - window * (window - 1) / 2, full)
 
 
-def sample_documents(lengths, shared) -> list[tuple[int, int]]:
-    """Sample document and shared-prefix lengths across the sorted distribution."""
-    shared = shared or (0,) * len(lengths)
-    ordered = sorted(zip(lengths, shared))
-    count = min(len(ordered), SAMPLE_DOCUMENTS)
-    picks = np.linspace(0, len(ordered) - 1, count).round().astype(int)
-    return [ordered[i] for i in picks]
+def _total(tokens, pairs, written, read, sliding_pairs, sliding_read) -> Work:
+    """Sum per-document work arrays into one Work record."""
+    return Work(float(np.sum(tokens)), float(np.sum(pairs)), float(np.sum(written)),
+                float(np.sum(read)), float(np.sum(sliding_pairs)),
+                float(np.sum(sliding_read)))
 
 
-def _suffix_work(prefix, chains, canvas_rows, window):
-    """Count suffix work, including a canvas's second attention read."""
-    suffixes = stream(prefix, chains, window=window)
+def _first_work(prefix, shared, tail: int, resident: bool, window: int) -> Work:
+    """Sum every document's prefix-and-tail work: scan, or ask on resident KV."""
+    if resident:
+        # ask(prefix, tail)
+        suffix = np.full_like(prefix, tail)
+        return _total(
+            suffix, tail * prefix + _triangle(tail), suffix, prefix,
+            _triangle(prefix + tail, window) - _triangle(prefix, window)
+            if window else 0.0,
+            np.minimum(prefix, window - 1) if window else 0.0)
+    # scan(prefix, tail) without a shared prefix, ask(shared, rest) with one
+    fresh = prefix - shared + tail
+    return _total(
+        fresh, fresh * shared + _triangle(fresh), fresh, shared,
+        _triangle(prefix + tail, window) - _triangle(shared, window)
+        if window else 0.0,
+        np.minimum(shared, window - 1) if window else 0.0)
+
+
+def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:
+    """Sum every document's stream of the suffixes after its context tokens."""
+    total = sum(suffixes)
+    pairs = sum(s * context + _triangle(s) for s in suffixes)
+    sliding_pairs = (sum(_triangle(context + s, window) - _triangle(context, window)
+                         for s in suffixes) if window else 0.0)
+    work = _total(
+        np.full_like(context, total), pairs, np.full_like(context, total),
+        context, sliding_pairs,
+        np.minimum(context, window - 1) if window else 0.0)
     if canvas_rows > 1:
-        suffixes += Work(
-            pairs=suffixes.pairs, kv_read=suffixes.kv_read,
-            sliding_pairs=suffixes.sliding_pairs,
-            sliding_kv_read=suffixes.sliding_kv_read)
-    return suffixes
-
-
-def _mean_work(documents, head, frame, chains, model, resident,
-               canvas_rows, one_per_round) -> tuple[list[Work], float]:
-    """Return per-document work by label depth and mean KV reservation."""
-    window = model.sliding_window
-    rounds = len(chains) if one_per_round else 1
-    work = [Work() for _ in range(rounds)]
-    reservation = 0.0
-    for length, shared in documents:
-        prefix = head + length
-        shared_prefix = head + shared if shared else 0
-        reservation += prefix + frame + (
-            sum(chains) if one_per_round else max(chains))
-        previous = 0
-        for round_ in range(rounds):
-            suffixes = [chains[round_]] if one_per_round else chains
-            first_tail = frame
-            if round_ == 0 and one_per_round:
-                # Decode packs the frame and cue into the prefix's causal request.
-                first_tail += sum(suffixes)
-            else:
-                work[round_] += _suffix_work(prefix + frame + previous, suffixes,
-                                             canvas_rows, window)
-            if round_ == 0:
-                if resident:
-                    work[0] += ask(prefix, first_tail, window=window)
-                elif shared:
-                    work[0] += ask(shared_prefix, prefix - shared_prefix + first_tail,
-                                   window=window)
-                else:
-                    work[0] += scan(prefix, first_tail, window=window)
-            previous += sum(suffixes)
-    count = len(documents)
-    return [value * (1 / count) for value in work], reservation / count
-
-
-def _nonempty(probability, count):
-    """Return the probability of at least one independent continuing document."""
-    if count <= 0:
-        return 0.0
-    return (1.0 if probability == 1 else
-            -math.expm1(count * math.log1p(-probability)))
-
-
-def _aggregate_cost(work, probabilities, reservation, count, chunk, capacity,
-                    rows, model, device) -> tuple[float, float]:
-    """Price aggregate work with KV-limited overlap and a single terminal drain.
-
-    Mean request size estimates documents per prefill pass. Spare KV divided
-    by the expected KV of unfinished documents estimates the overlap fraction.
-    The executor reads answers after launching another chunk, so two passes
-    separate successive decode rounds when admission can continue.
-
-    At decode depth r, estimate the remaining documents as 2*r times the
-    admissions per pass, capped by the estimated resident population. Their
-    work is removed from the aggregate and priced separately, once per query.
-    Both occupancy and the final population are estimates, not a schedule.
-    """
-    slots = max(1, capacity // reservation)
-    width = min(count, slots, max(1, chunk // max(1, work[0].tokens)))
-    prefill_passes = count / width
-    pending = 2 * width * sum(probabilities[1:])
-    overlap = min(1.0, max(0.0, (slots - width) / pending)) if pending else 0.0
-    residents = min(count, slots, width + pending)
-    mixed_work = work[0] * count
-    mixed_rows = rows * count
-    separate_seconds = _seconds(mixed_work, mixed_rows, prefill_passes, model, device)
-    separate_passes = prefill_passes
-    tail_seconds = tail_passes = 0.0
-    for depth, (value, probability) in enumerate(zip(work[1:], probabilities[1:]), 1):
-        tail_count = min(residents, 2 * depth * width)
-        remaining = count - tail_count
-        bulk_work = value * (probability * remaining)
-        bulk_rows = probability * remaining
-        bulk_passes = max(
-            remaining / width * _nonempty(probability, width), bulk_work.tokens / chunk)
-        separate_seconds += _seconds(bulk_work, bulk_rows, bulk_passes, model, device)
-        separate_passes += bulk_passes
-        mixed_work += bulk_work
-        mixed_rows += bulk_rows
-        tail_work = value * (probability * tail_count)
-        passes = max(_nonempty(probability, tail_count), tail_work.tokens / chunk)
-        tail_seconds += _seconds(tail_work, probability * tail_count, passes,
-                                 model, device)
-        tail_passes += passes
-    mixed_passes = max(prefill_passes, mixed_work.tokens / chunk)
-    mixed_seconds = _seconds(mixed_work, mixed_rows, mixed_passes, model, device)
-    return (
-        overlap * mixed_seconds + (1 - overlap) * separate_seconds + tail_seconds,
-        overlap * mixed_passes + (1 - overlap) * separate_passes + tail_passes,
-    )
+        # a canvas longer than one row reads the document a second time
+        work += Work(pairs=work.pairs, kv_read=work.kv_read,
+                     sliding_pairs=work.sliding_pairs,
+                     sliding_kv_read=work.sliding_kv_read)
+    return work
 
 
 def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
-                    live: float, lengths, shared, chunk: int, capacity: int,
+                    live: float, lengths, shared, chunk: int,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0,
                     one_per_round: bool = False, depths=None) -> ClassifyCost:
-    """Estimate aggregate classification work and roofline time.
+    """Estimate expected classification work and its roofline time.
 
     Args:
         head_tokens: Number of prompt tokens before each document.
@@ -207,45 +145,59 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
         chains: Request lengths in tokens, shared by all documents.
         live: Expected number of documents to classify.
         lengths: Document lengths in tokens.
-        shared: Shared document prefix lengths.
+        shared: Shared document prefix lengths, or an empty sequence.
         chunk: Maximum tokens per forward pass.
-        capacity: KV arena capacity in tokens.
         model: Model specification.
         device: Device specification.
         resident: Whether document KV is already available.
         canvas_rows: Number of answer canvas rows.
-        one_per_round: Whether each request runs in a separate decoder round.
+        one_per_round: Whether each request runs in a separate decoder round,
+            packed with the frame into the prefix's request in the first.
         depths: Label lengths in rounds, with each label equally likely.
             None runs every round for every document.
 
     Returns:
-        Expected work and time, with one terminal drain for the whole query.
+        Expected work over the documents, scaled to live, priced at
+        ideal packing.
     """
-    if live <= 0 or not len(lengths) or not chains:
+    n = len(lengths)
+    if live <= 0 or n == 0 or not chains:
         return ClassifyCost(0.0, 0.0, Work(), 0.0, 0)
-    documents = sample_documents(lengths, shared)
-    work, reservation = _mean_work(documents, head_tokens, frame_tokens, chains,
-                                   model, resident, canvas_rows, one_per_round)
-    probabilities = [1.0] * len(work)
+    window = model.sliding_window
+    prefix = np.asarray(lengths, dtype=float) + head_tokens
+    shared = np.asarray(shared if len(shared) else np.zeros(n), dtype=float)
+    # a borrowed prefix includes the prompt head the documents share
+    shared = np.where(shared > 0, shared + head_tokens, 0.0)
+    rounds = len(chains) if one_per_round else 1
+    reach = np.ones(rounds)
     if one_per_round and depths is not None:
-        probabilities = [sum(depth > round_ for depth in depths) / len(depths)
-                         for round_ in range(len(work))]
-    total = Work()
-    for value, probability in zip(work, probabilities):
-        total += value * (live * probability)
-    rows = 1 if one_per_round else canvas_rows or sum(chains)
-    seconds, passes = _aggregate_cost(
-        work, probabilities, reservation, max(1.0, live), chunk, capacity,
-        rows, model, device)
-    suffix_tokens = live * (sum(length * probability for length, probability
-                               in zip(chains, probabilities))
-                            if one_per_round else sum(chains))
-    return ClassifyCost(seconds * min(1.0, live), passes * min(1.0, live),
-                        total, suffix_tokens, len(work))
+        reach = np.array([sum(depth > round_ for depth in depths) / len(depths)
+                          for round_ in range(rounds)])
+    first_tail = frame_tokens + (chains[0] if one_per_round else 0)
+    work = _first_work(prefix, shared, first_tail, resident, window)
+    context = prefix + first_tail
+    if one_per_round:
+        for round_ in range(1, rounds):
+            work += _stream_work(context, [chains[round_]], window,
+                                 canvas_rows) * float(reach[round_])
+            context = context + chains[round_]
+    else:
+        work += _stream_work(context, chains, window, canvas_rows)
+    scale = live / n
+    total = work * scale
+    if one_per_round:
+        suffix_tokens = float(np.dot(reach, chains))
+        rows = float(reach.sum())
+    else:
+        suffix_tokens = float(sum(chains))
+        rows = float(canvas_rows or sum(chains))
+    passes = total.tokens / chunk
+    seconds = _seconds(total, rows * live, passes, model, device)
+    return ClassifyCost(seconds, passes, total, suffix_tokens * live, rounds)
 
 
 def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
-             labels, *, lengths, shared, chunk: int, capacity: int,
+             labels, *, lengths, shared, chunk: int,
              model, device, resident: bool = False, draws: int = 1) -> ClassifyCost:
     """Estimate the cost of one classification scoring rule.
 
@@ -258,7 +210,6 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         lengths: Document lengths in tokens.
         shared: Shared document prefix lengths.
         chunk: Maximum tokens per forward pass.
-        capacity: KV arena capacity in tokens.
         model: Model specification.
         device: Device specification.
         resident: Whether document KV is already available.
@@ -275,10 +226,11 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
     chains = suffix_lengths(scoring, labels, canvas_rows, draws)
     return estimate_chains(
         head_tokens, frame_tokens, chains, live=live, lengths=lengths,
-        shared=shared, chunk=chunk, capacity=capacity, model=model,
-        device=device, resident=resident,
+        shared=shared, chunk=chunk, model=model, device=device,
+        resident=resident,
         canvas_rows=(canvas_rows if scoring == LETTERS_SCORING
                      else model.canvas_tokens),
         one_per_round=scoring == DECODE_SCORING,
+        # a document stops decoding at its label's last token
         depths=([len(ids) for ids in labels] if scoring == DECODE_SCORING
                 else None))
