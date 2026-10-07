@@ -16,6 +16,7 @@ RTX_PRO_6000_BLACKWELL_SERVER = DeviceSpec(
     hbm_bw=1.597e12,
     peak_flops=1e15,
     bf16_flops=0.5e15,
+    fp32_flops=120e12,    # FP32 on the CUDA cores, from the server page
     # GPU-only per-second rate from Modal, checked 2026-09-07
     usd_per_hour=0.000842 * 3600,
     price_source="https://modal.com/pricing",

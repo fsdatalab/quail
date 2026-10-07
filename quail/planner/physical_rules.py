@@ -5,7 +5,7 @@
   KV for a join anchored on its table, and a join keeps its anchor's
   KV for a later group on the same anchor.
 - label_scoring: each classification gets the label scoring rule
-  (letters, trie_tree, or trie_decode) whose simulated time is lowest.
+  (letters, trie_tree, or trie_decode) whose estimated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
   computing it again, in filters, joins, classifications, and scores
@@ -148,7 +148,7 @@ class KvRetention:
 
 
 class LabelScoring:
-    """Pick each classification's label scoring rule by simulated time.
+    """Pick each classification's label scoring rule by estimated time.
 
     Fires for every AiClassify whose spec has no scoring rule yet and
     leaves chosen ones alone, so a later pass keeps the first choice.
@@ -193,7 +193,7 @@ class LabelScoring:
             chosen[node.node_id] = replace(node, spec=table.choose_scoring(
                 node.spec, calls[node.spec.name], resident))
             if "estimated_fresh_tokens" in context.settings:
-                work = table.simulated(chosen[node.node_id].spec, resident).work
+                work = table.estimate_spec(chosen[node.node_id].spec, resident).work
                 context.settings["estimated_fresh_tokens"] += work.tokens
                 context.settings["estimated_attention_pairs"] += work.pairs
         context.settings["search_seconds"] = (

@@ -6,6 +6,8 @@ from test_sliding_kv import plain_arena
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.chunk import Suffixes
+from quail.cost.classify import estimate
+from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 torch = pytest.importorskip("torch")
 
@@ -88,6 +90,43 @@ def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
             torch, arena, [dict(key=key, prefix=None, f=16, suffixes=[[41]],
                                 write_suffix_tokens=1, single=True)],
             attention_mode=mode)
+
+
+@pytest.mark.parametrize("mode", ["tree", "unified"])
+@pytest.mark.parametrize("shared", [0, 16])
+def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared):
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    parent, key = ("d", 0), ("d", 1)
+    arena.activate(parent, 32, capacity_tokens=40, base_tokens=32)
+    arena.activate(key, 32, capacity_tokens=40, base_tokens=32,
+                   borrow=(parent, shared) if shared else None)
+    retained_reads = fresh_tokens = 0
+    for round_ in range(2):
+        first = round_ == 0
+        chunk = chunk_mod.pack_chunk(
+            torch, arena, [dict(
+                key=key, prefix=list(range(shared, 32)) if first else None,
+                f=32 if first else 35, start=shared if first else 0,
+                read_key=parent if first and shared else None,
+                suffixes=[[91, 92, 93]] if first else [[40]],
+                write_suffix_tokens=3 if first else 1, single=True)],
+            attention_mode=mode)
+        if mode == "tree":
+            reads = chunk.meta["reads"]
+            retained = 0 if reads is None else int(reads["used"].sum())
+        else:
+            pool = chunk.meta["unified"]
+            retained = int((pool["used"] - pool["cu_q"].diff()).sum())
+        assert retained == (shared if first else 35)
+        retained_reads += retained
+        fresh_tokens += len(chunk.input_ids)
+        cost = estimate(
+            "trie_decode", 1, 0, 2, [(10,) * (round_ + 1)], lengths=(32,),
+            shared=(shared,), chunk=100,
+            model=QWEN3_4B_FP8, device=H100_SXM)
+        assert cost.work.tokens == fresh_tokens
+        assert cost.work.kv_read == retained_reads
 
 
 @pytest.mark.parametrize("mode", ["tree", "unified"])

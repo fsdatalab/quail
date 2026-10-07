@@ -3,7 +3,7 @@
 from dataclasses import dataclass, replace
 from typing import Literal
 
-Precision = Literal["fp8", "bf16"]
+Precision = Literal["fp8", "bf16", "fp32"]
 # What a model answers with: a generative model scores TRUE against
 # FALSE for AI_FILTER and AI_JOIN; a reranker scores yes against no
 # for AI.SCORE; a decision model scores its yes and no options with
@@ -66,6 +66,9 @@ class ModelSpec:
     attention_precision: Precision = "bf16"
     arch: str = "qwen3"    # forward pass in executor/models/<arch>.py
     role: Role = "generative"
+    decision_head_dim: int = 0    # width of a decision model's option
+    #                               head (its key, query, and MLP rows);
+    #                               the head's FLOPs and bytes follow
     # Layers that keep every token of KV, when the model mixes them
     # with sliding layers: every full_attention_period-th layer, with
     # its own KV geometry. 0 means every layer looks like n_kv x d_head.
@@ -207,6 +210,9 @@ class DeviceSpec:
     #                            back to half of peak_flops, the fp8-
     #                            to-bf16 ratio on every tensor core
     #                            generation we run on.
+    fp32_flops: float = 0.0    # fp32 peak on the CUDA cores, not the
+    #                            tensor cores: the decision head runs
+    #                            there. 0 means no rate is known.
     usd_per_hour: float = 0.0    # rental price of one device; 0 means
     #                              no price is known
     price_source: str = ""       # where usd_per_hour was read from
@@ -222,4 +228,6 @@ class DeviceSpec:
             return self.peak_flops
         if precision == "bf16":
             return self.attn_flops
+        if precision == "fp32" and self.fp32_flops:
+            return self.fp32_flops
         raise ValueError(f"unsupported precision: {precision}")

@@ -54,10 +54,9 @@ class ClassifyScoring(ClassifyStatistics):
             letter_head, letter_tail, letter_ids = classify_prompt_tokens(
                 call.prompt.lettered, call.prompt.lettered.letters, self.tokenizer)
             lettered = (len(letter_head), len(letter_tail) - 1, letter_ids)
-        scoring, simulated = self.choose(spec.expected_inputs, len(head),
-                                         len(tail) - 1, labels, resident,
-                                         lettered,
-                                         probabilities=spec.probabilities)
+        scoring, estimated = self.choose(
+            spec.expected_inputs, len(head), len(tail) - 1, labels, resident,
+            lettered, probabilities=spec.probabilities)
         if scoring == LETTERS_SCORING:
             head, tail, labels = letter_head, letter_tail, letter_ids
         if scoring == DECODE_SCORING and not decodable(labels):
@@ -75,7 +74,7 @@ class ClassifyScoring(ClassifyStatistics):
                 f"classification prompt, but the forward pass budget is "
                 f"{self.budget} tokens", need, self.budget)
         return replace(
-            spec, estimated_seconds=simulated.seconds,
+            spec, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), label_token_ids=labels,
             scoring=scoring,
             draws=self.draws if scoring == LETTERS_SCORING else 1)
@@ -86,8 +85,8 @@ class ClassifyScoring(ClassifyStatistics):
         canvas = self.model.answer_canvas
         return canvas.rows if canvas is not None else 0
 
-    def simulate(self, scoring, live, head_tokens, frame_tokens, labels,
-                 resident) -> classify_cost.Simulated:
+    def estimate(self, scoring, live, head_tokens, frame_tokens, labels,
+                 resident) -> classify_cost.ClassifyCost:
         """Estimate one scoring rule using this table's lengths and budgets.
 
         Args:
@@ -104,12 +103,12 @@ class ClassifyScoring(ClassifyStatistics):
         return classify_cost.estimate(
             scoring, live, head_tokens, frame_tokens, labels,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
-            capacity=self.capacity or self.budget, model=self.model,
-            device=self.device, resident=resident, draws=self.draws)
+            model=self.model, device=self.device, resident=resident,
+            draws=self.draws)
 
-    def simulated(self, spec: ClassifySpec,
-                  resident=False) -> classify_cost.Simulated:
-        """Simulate a specification's chosen scoring rule on this table.
+    def estimate_spec(self, spec: ClassifySpec,
+                      resident=False) -> classify_cost.ClassifyCost:
+        """Estimate a specification's chosen scoring rule on this table.
 
         Args:
             spec: Classification specification with its scoring rule.
@@ -120,10 +119,10 @@ class ClassifyScoring(ClassifyStatistics):
             return classify_cost.estimate_chains(
                 len(head), spec.frame_tokens, [len(tail) - spec.frame_tokens],
                 live=spec.expected_inputs, lengths=self.lengths,
-                shared=self.shared, chunk=self.chunk,
-                capacity=self.capacity or self.budget, model=self.model,
-                device=self.device, resident=resident)
-        return self.simulate(
+                shared=self.shared, chunk=self.chunk, model=self.model,
+                device=self.device, resident=resident,
+                answer_rows=len(spec.label_token_ids) + 1)
+        return self.estimate(
             spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
             spec.label_token_ids, resident)
 
@@ -138,11 +137,11 @@ class ClassifyScoring(ClassifyStatistics):
             A copy of spec with estimated_seconds recalculated.
         """
         return replace(spec,
-                       estimated_seconds=self.simulated(spec, resident).seconds)
+                       estimated_seconds=self.estimate_spec(spec, resident).seconds)
 
     def choose(self, live, head_tokens, frame_tokens, labels, resident,
                lettered=None, probabilities=False
-               ) -> tuple[str, classify_cost.Simulated]:
+               ) -> tuple[str, classify_cost.ClassifyCost]:
         """Choose the supported scoring rule with the lowest estimated time.
 
         The letters rule requires a prompt with one distinct token per
@@ -164,7 +163,7 @@ class ClassifyScoring(ClassifyStatistics):
             probabilities: Whether every label's probability is required.
 
         Returns:
-            A tuple containing the method name and its simulated cost.
+            A tuple containing the method name and its estimated cost.
 
         Raises:
             ClassifyRefusedError: No supported scoring rule can run.
@@ -185,9 +184,8 @@ class ClassifyScoring(ClassifyStatistics):
         for scoring in candidates:
             head, frame, ids = ((head_tokens, frame_tokens, labels)
                                 if scoring != LETTERS_SCORING else lettered)
-            simulated = self.simulate(scoring, live, head, frame, ids,
-                                      resident)
-            key = (simulated.seconds, simulated.suffix_tokens)
+            estimated = self.estimate(scoring, live, head, frame, ids, resident)
+            key = (estimated.seconds, estimated.suffix_tokens)
             if best is None or key < best[0]:
-                best = (key, scoring, simulated)
+                best = (key, scoring, estimated)
         return best[1], best[2]
