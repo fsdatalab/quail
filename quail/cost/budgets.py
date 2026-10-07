@@ -187,8 +187,9 @@ def tree_attention_allowed(model: ModelSpec) -> bool:
     """Whether the planner and the executor may run the model's tree path.
 
     A diffusion model packs canvas rows, which the tree path does not.
+    A hybrid model's Gated DeltaNet layers have no tree path.
     """
-    return (not model.canvas_tokens
+    return (not model.canvas_tokens and not model.gdn_layers
             and model.params >= TREE_ATTENTION_MIN_PARAMS)
 
 

@@ -4,7 +4,9 @@ Any pre-norm decoder with grouped-query attention and a gated MLP
 is priced from its ModelSpec shape; nothing here is Qwen3-specific.
 A mixture-of-experts model names its experts on the spec: FLOPs
 follow the params one token multiplies, weight bytes follow the
-params a full chunk reads.
+params a full chunk reads. A hybrid model adds its Gated DeltaNet
+projections to the attention projections; the state update, the
+convolution, and the state's movement are not priced here yet.
 """
 
 from __future__ import annotations
@@ -17,9 +19,25 @@ from quail.specs import ModelSpec
 def attention_projection_params(model: ModelSpec) -> int:
     """Return Q, K, V, and output projection parameters over the layers."""
     h = model.hidden
-    return sum(h * model.n_q * head + 2 * h * n_kv * head
+    query_width = 2 if model.attn_output_gate else 1
+    return sum(h * query_width * model.n_q * head + 2 * h * n_kv * head
                + model.n_q * head * h
                for n_kv, head in model.kv_shapes)
+
+
+def gdn_projection_params(model: ModelSpec) -> int:
+    """Return Gated DeltaNet input and output projection parameters.
+
+    Per layer: the query, key, and value projection, the z gate, the
+    two per-head gates, and the output projection. The state update and
+    the convolution are priced separately from these matrix multiplies.
+    """
+    key_width = model.gdn_key_heads * model.gdn_key_dim
+    value_width = model.gdn_value_heads * model.gdn_value_dim
+    per_layer = model.hidden * (2 * key_width + 2 * value_width
+                                + 2 * model.gdn_value_heads) \
+        + value_width * model.hidden
+    return per_layer * len(model.gdn_layers)
 
 
 def mlp_params(model: ModelSpec) -> int:
@@ -41,7 +59,8 @@ def _mlp_params(model: ModelSpec, experts: int) -> int:
 
 def dense_params(model: ModelSpec) -> int:
     """Return parameters used by the modeled dense components."""
-    return attention_projection_params(model) + mlp_params(model)
+    return (attention_projection_params(model) + gdn_projection_params(model)
+            + mlp_params(model))
 
 
 def attention_pair_flops(model: ModelSpec) -> tuple[int, int]:
@@ -61,7 +80,8 @@ def dense_decoder_components(work: Work, model: ModelSpec,
     """Build the modeled decoder components for one work record."""
     if passes < 0:
         raise ValueError("passes must be nonnegative")
-    attn_proj = attention_projection_params(model)
+    attn_proj = (attention_projection_params(model)
+                 + gdn_projection_params(model))
     mlp = mlp_params(model)
     full_flops, sliding_flops = attention_pair_flops(model)
     return (

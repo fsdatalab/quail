@@ -9,6 +9,12 @@ Precision = Literal["fp8", "bf16", "fp32"]
 # for AI.SCORE; a decision model scores its yes and no options with
 # its own head for AI_FILTER and AI_JOIN.
 Role = Literal["generative", "reranker", "decision"]
+# What a layer keeps for a sequence. Full and sliding attention keep KV
+# (every token, or the last sliding_window tokens); Gated DeltaNet and
+# short convolution keep a fixed-size state that does not grow with
+# the tokens read.
+LayerKind = Literal[
+    "full_attention", "sliding_attention", "gated_delta_net", "short_conv"]
 
 # Peak per-token activation bytes per hidden dim.
 ACT_BYTES_PER_HIDDEN = 32
@@ -104,6 +110,46 @@ class ModelSpec:
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);
     #                                   None lets vLLM pick
+    layer_kinds: tuple[LayerKind, ...] = ()    # one kind per layer, for a
+    #                                            model that mixes kinds;
+    #                                            empty leaves layer_kind
+    #                                            to full_attention_period
+    #                                            and sliding_window
+    attn_output_gate: bool = False    # q_proj also emits a gate the width
+    #                                   of the queries, which scales the
+    #                                   attention output
+    # Gated DeltaNet layers, for a model whose layer_kinds name them.
+    # Each layer keeps a (value heads x value dim x key dim) state and
+    # the last conv_width - 1 columns of its convolution input.
+    gdn_key_heads: int = 0
+    gdn_value_heads: int = 0
+    gdn_key_dim: int = 0
+    gdn_value_dim: int = 0
+    conv_width: int = 0
+
+    def __post_init__(self):
+        if self.layer_kinds and len(self.layer_kinds) != self.layers:
+            raise ValueError(
+                f"{self.name}: layer_kinds has {len(self.layer_kinds)} "
+                f"entries for {self.layers} layers")
+
+    def layer_kind(self, layer: int) -> LayerKind:
+        """Return the kind of one layer."""
+        if self.layer_kinds:
+            return self.layer_kinds[layer]
+        if self.sliding_window and not self.is_full_layer(layer):
+            return "sliding_attention"
+        return "full_attention"
+
+    def keeps_kv(self, layer: int) -> bool:
+        """Whether the layer stores KV; Gated DeltaNet and convolution layers do not."""
+        return self.layer_kind(layer) in ("full_attention", "sliding_attention")
+
+    @property
+    def gdn_layers(self) -> tuple[int, ...]:
+        """The layers that keep a Gated DeltaNet state."""
+        return tuple(i for i in range(self.layers)
+                     if self.layer_kind(i) == "gated_delta_net")
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""
@@ -114,8 +160,10 @@ class ModelSpec:
     def kv_shapes(self) -> tuple:
         """Per layer, the (KV heads, head dim) its KV stores."""
         full = (self.full_n_kv or self.n_kv, self.full_d_head or self.d_head)
-        return tuple(full if self.is_full_layer(i) else (self.n_kv, self.d_head)
-                     for i in range(self.layers))
+        return tuple(
+            (0, 0) if not self.keeps_kv(i)
+            else full if self.is_full_layer(i) else (self.n_kv, self.d_head)
+            for i in range(self.layers))
 
     @property
     def widest_projection(self) -> int:

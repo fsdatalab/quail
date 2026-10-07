@@ -15,6 +15,7 @@ from quail.specs import (
     H100_SXM,
     MODELS,
     QWEN3_4B_FP8,
+    QWEN3_5_4B_BF16,
     QWEN3_RERANKER_0_6B_BF16,
     QWEN3_RERANKER_4B_BF16,
 )
@@ -22,8 +23,15 @@ from quail.specs import (
 
 def test_backends_support_registered_generative_models_and_refuse_others():
     for model in MODELS.values():
+        if model.arch == "qwen3_5":
+            continue
         assert model.arch in supported_archs()
         assert QuailBackend().supports(model, H100_SXM, 1).supported
+
+    # Quail has no hybrid forward pass yet; stock vLLM runs the model
+    hybrid = QuailBackend().supports(QWEN3_5_4B_BF16, H100_SXM, 1)
+    assert not hybrid.supported
+    assert "qwen3_5" in hybrid.reason
 
     spec = replace(QWEN3_4B_FP8, name="other", arch="other")
     with pytest.raises(ValueError, match="other"):
