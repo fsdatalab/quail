@@ -8,6 +8,8 @@ H100_SXM = DeviceSpec(
     #                        sparsity, halved)
     bf16_flops=0.9895e15,  # bf16 dense ceiling (1979 TFLOPS with
     #                        sparsity, halved)
+    fp32_flops=67e12,      # FP32 on the CUDA cores, no sparsity
+    #                        (https://www.nvidia.com/en-us/data-center/h100/)
     usd_per_hour=3.9492,
     price_source="https://modal.com/pricing",
 )

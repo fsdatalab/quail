@@ -120,7 +120,8 @@ class ClassifyScoring(ClassifyStatistics):
                 len(head), spec.frame_tokens, [len(tail) - spec.frame_tokens],
                 live=spec.expected_inputs, lengths=self.lengths,
                 shared=self.shared, chunk=self.chunk, model=self.model,
-                device=self.device, resident=resident)
+                device=self.device, resident=resident,
+                answer_rows=len(spec.label_token_ids) + 1)
         return self.estimate(
             spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
             spec.label_token_ids, resident)

@@ -49,13 +49,32 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
     raise ValueError(f"unknown label scoring rule {scoring!r}")
 
 
-def _seconds(work: Work, rows: float, passes: float, model, device) -> float:
-    """Price work and forward passes with the component roofline."""
+def _readout(model, rows: float, passes: float, head_rows: int) -> CostComponent:
+    """Price the answer readout: the decision head, or output-head rows.
+
+    A decision model passes each option row and the prompt's last row
+    through its fp32 head: four projections of the hidden size to the
+    head width per row, and the head's weights once per pass. Any other
+    model multiplies each answer row by head_rows rows of the bf16
+    output head, the whole vocabulary when head_rows is 0, read once per
+    pass.
+    """
+    if model.role == "decision":
+        width, hidden = model.decision_head_dim, model.hidden
+        return CostComponent(
+            name="readout", flops=4.0 * width * hidden * rows,
+            bytes_moved=4.0 * (4 * width * hidden + 2 * width + 4 * hidden) * passes,
+            precision="fp32")
+    head = 2.0 * model.hidden * (head_rows or model.vocab)
+    return CostComponent(name="readout", flops=head * rows,
+                         bytes_moved=head * passes, precision="bf16")
+
+
+def _seconds(work: Work, rows: float, passes: float, model, device,
+             head_rows: int) -> float:
+    """Price work, answer rows, and forward passes with the component roofline."""
     components = dense_decoder_components(work, model, passes=passes)
-    components += (CostComponent(
-        name="readout", flops=2.0 * model.hidden * model.vocab * rows,
-        bytes_moved=2.0 * model.hidden * model.vocab * passes,
-        precision="bf16"),)
+    components += (_readout(model, rows, passes, head_rows),)
     return sum(component.seconds
                for component in component_latencies(components, device))
 
@@ -136,7 +155,9 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
                     live: float, lengths, shared, chunk: int,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0,
-                    one_per_round: bool = False, depths=None) -> ClassifyCost:
+                    one_per_round: bool = False, depths=None,
+                    answer_rows: float | None = None,
+                    head_rows: int = 0) -> ClassifyCost:
     """Estimate expected classification work and its roofline time.
 
     Args:
@@ -155,6 +176,11 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
             packed with the frame into the prefix's request in the first.
         depths: Label lengths in rounds, with each label equally likely.
             None runs every round for every document.
+        answer_rows: Rows the readout processes per document. None reads
+            the canvas rows or every request token in one round, and one
+            row per decode round.
+        head_rows: Output-head rows each answer row multiplies; 0 is the
+            whole vocabulary. A decision model ignores it.
 
     Returns:
         Expected work over the documents, scaled to live, priced at
@@ -191,8 +217,10 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
     else:
         suffix_tokens = float(sum(chains))
         rows = float(canvas_rows or sum(chains))
+    if answer_rows is not None:
+        rows = answer_rows
     passes = total.tokens / chunk
-    seconds = _seconds(total, rows * live, passes, model, device)
+    seconds = _seconds(total, rows * live, passes, model, device, head_rows)
     return ClassifyCost(seconds, passes, total, suffix_tokens * live, rounds)
 
 
@@ -224,10 +252,14 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
     canvas = model.answer_canvas
     canvas_rows = canvas.rows if canvas is not None else 0
     chains = suffix_lengths(scoring, labels, canvas_rows, draws)
+    # one-token labels are all read at the cue row from their target
+    # rows of the head; longer labels normalize over the vocabulary
+    targets = {token for ids in labels for token in ids}
     return estimate_chains(
         head_tokens, frame_tokens, chains, live=live, lengths=lengths,
         shared=shared, chunk=chunk, model=model, device=device,
         resident=resident,
+        head_rows=len(targets) if all(len(ids) == 1 for ids in labels) else 0,
         canvas_rows=(canvas_rows if scoring == LETTERS_SCORING
                      else model.canvas_tokens),
         one_per_round=scoring == DECODE_SCORING,

@@ -22,6 +22,8 @@ DECISION_2_KAI_0_6B_BF16 = ModelSpec(
     weight_precision="bf16",
     attention_precision="bf16",
     role="decision",
+    decision_head_dim=256,    # decision_head.safetensors: key, query,
+    #                           candidate_mlp, query_mlp are 256 x 1024
     prompt_layout="decision2-noul",
     prompt_format="decision2-noul-v1",
     # the same shapes as the 0.6B reranker, whose warm-up OOMed at its
