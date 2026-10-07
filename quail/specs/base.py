@@ -162,6 +162,8 @@ class ModelSpec:
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""
+        if self.layer_kinds:
+            return self.layer_kinds[layer] == "full_attention"
         period = self.full_attention_period
         return bool(period) and (layer + 1) % period == 0
 
@@ -196,7 +198,7 @@ class ModelSpec:
         if not self.sliding_window:
             return frozenset()
         return frozenset(i for i in range(self.layers)
-                         if not self.is_full_layer(i))
+                         if self.layer_kind(i) == "sliding_attention")
 
     @property
     def kappa_sliding(self) -> float:

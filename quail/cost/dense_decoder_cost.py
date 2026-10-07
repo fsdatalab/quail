@@ -29,8 +29,8 @@ def gdn_projection_params(model: ModelSpec) -> int:
     """Return Gated DeltaNet input and output projection parameters.
 
     Per layer: the query, key, and value projection, the z gate, the
-    two per-head gates, and the output projection. The state update and
-    the convolution are priced separately from these matrix multiplies.
+    two per-head gates, and the output projection. The state update, the
+    convolution, and the state's movement are not priced here.
     """
     key_width = model.gdn_key_heads * model.gdn_key_dim
     value_width = model.gdn_value_heads * model.gdn_value_dim

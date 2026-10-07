@@ -94,3 +94,14 @@ def test_turn_closes_the_empty_thinking_block_the_chat_template_writes():
     assert SPEC.turn_prefix == "<|im_start|>user\n"
     assert SPEC.turn_suffix == (
         "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+
+def test_a_sliding_hybrid_slides_only_its_attention_layers():
+    from dataclasses import replace
+
+    sliding = replace(
+        SPEC, sliding_window=128,
+        layer_kinds=tuple("sliding_attention" if kind == "full_attention" else kind
+                          for kind in SPEC.layer_kinds))
+    assert sliding.sliding_layer_set == frozenset(range(3, 32, 4))
+    assert not any(sliding.is_full_layer(i) for i in range(32))
