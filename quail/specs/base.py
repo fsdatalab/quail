@@ -120,6 +120,10 @@ class ModelSpec:
     #                               or video, or it builds an image
     #                               processor that cannot copy Quail's
     #                               tokenizer
+    max_num_seqs: int = 0    # sequences vLLM may run at once; 0 keeps the
+    #                          engine setting. A hybrid model holds one
+    #                          recurrent-state block per running sequence,
+    #                          and vLLM refuses a larger setting.
     attn_output_gate: bool = False    # q_proj also emits a gate the width
     #                                   of the queries, which scales the
     #                                   attention output

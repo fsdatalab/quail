@@ -27,6 +27,8 @@ QWEN3_5_4B_BF16 = ModelSpec(
     weight_precision="bf16",
     arch="qwen3_5",
     layer_kinds=_LAYER_KINDS * 8,
+    max_num_seqs=3_000,    # vLLM 0.26 on an H100 at 0.91 memory holds 3,052
+    #                        state blocks; 4,096 sequences raised ValueError
     vision_tower=True,
     attn_output_gate=True,
     gdn_key_heads=16,

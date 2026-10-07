@@ -81,3 +81,10 @@ def test_vllm_takes_no_images_for_the_vision_checkpoint_only():
     for engine in (VLLMEngine(), DefaultVLLMEngine()):
         assert engine.llm_kwargs(SPEC)["limit_mm_per_prompt"] == off
         assert "limit_mm_per_prompt" not in engine.llm_kwargs(QWEN3_4B_FP8)
+
+
+def test_vllm_sequences_stay_under_the_state_blocks_it_holds():
+    from quail.backends.vllm import MAX_SEQUENCES, VLLMEngine
+
+    assert VLLMEngine().llm_kwargs(SPEC)["max_num_seqs"] == 3_000 < MAX_SEQUENCES
+    assert VLLMEngine().llm_kwargs(QWEN3_4B_FP8)["max_num_seqs"] == MAX_SEQUENCES

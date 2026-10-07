@@ -207,7 +207,8 @@ class VLLMEngine:
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
-                             else MAX_SEQUENCES),
+                             else min(MAX_SEQUENCES,
+                                      spec.max_num_seqs or MAX_SEQUENCES)),
         }
         kwargs.update(diffusion_kwargs(spec))
         kwargs.update(text_only_kwargs(spec))
