@@ -300,7 +300,7 @@ def child(arguments: str) -> None:
                            collection_id=args["collection_id"] or None)
     spec = suite.queries[0]
     tables = {relation.table: suite.tables[relation.table]
-              for relation in spec._info.relations}
+              for relation in spec.info.relations}
     config = quail.EngineConfig(gpus=1, model=args["model"], backend=backend,
                                 device="h100-sxm")
     window = Window(args["offset"], args["seconds"])
