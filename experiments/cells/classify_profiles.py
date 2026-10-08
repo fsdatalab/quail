@@ -1,19 +1,22 @@
 r"""Capture torch.profiler snapshots of QUAIL-B classification queries.
 
 Each (query, model, backend) runs in a fresh process on one H100, through
-the benchmark's own `run_query`. The profiler covers one short window of
-the query: it arms `offset` seconds after the first AI.CLASSIFY stage
-starts and runs for `seconds`. It starts and stops at forward-pass
-boundaries (Quail's chunks, vLLM's engine steps), on the thread that
-runs them, so a window holds whole passes. Model loading, planning, and
-the filter or join stages before the classification run unprofiled. The
-run's own wall time includes profiler overhead; take headline seconds
-from the benchmark runs.
+the benchmark's own `run_query`. The profiler covers short windows of the
+query's model execution: the first arms `offset` seconds after the first
+model node starts, each stays open for `seconds`, and another arms
+`every` seconds after the previous one started. Windows start and stop
+at forward-pass boundaries (Quail's chunks, vLLM's engine steps), on the
+thread that runs them, so a window holds whole passes. Model loading and
+planning run unprofiled. Each window is saved with the stages it fell
+in, so a report can pick the window in the stage that dominates the
+query. The run's own wall time includes profiler overhead; take headline
+seconds from the benchmark runs.
 
 Stock vLLM runs its engine core in the client process
 (VLLM_ENABLE_V1_MULTIPROCESSING=0) so the profiler sees its kernels. The
 benchmark runs keep the engine core in its own process for Qwen3 and
-Kai; DiffusionGemma already runs it in the client process.
+Kai; DiffusionGemma already runs it in the client process. Stock vLLM
+refuses AI.CLASSIFY on DiffusionGemma, whose engine returns no text.
 
 One container per model, the models in parallel. The defaults are the
 three classification queries farthest from SoL, the three models, and
@@ -22,16 +25,16 @@ both engines:
     log="results/profiles/$(date -u +%Y%m%dT%H%M%SZ)-classify-profiles.log"
     uv run modal run --detach experiments/cells/classify_profiles.py::profile \
       --queries IMDB-11,IMDB-14,BIO-6 --backends quail,stock_vllm \
-      --sf 0.5 --offset 10 --seconds 5 2>&1 | tee "$log"
+      --sf 0.5 --offset 10 --every 120 --seconds 5 2>&1 | tee "$log"
 
 Fetch a container's summary later with
 `modal.FunctionCall.from_id("<fc-...>").get()`. Each run writes, under
 `/results/ablations/classify-profiles/<tag>/<model>/<backend>/<query>/`:
 
-    trace.json.gz   the window's chrome trace (CPU and CUDA activity)
-    window.json     stage times, where the window sits, GPU busy and
-                    idle seconds in the window, and the kernels with
-                    the most GPU time
+    trace-<n>.json.gz   window n's chrome trace (CPU and CUDA activity)
+    window.json         stage times, each window's placement and
+                        stages, its GPU busy and idle seconds, and the
+                        kernels with the most GPU time
 """
 
 import json
@@ -56,86 +59,110 @@ TOP_KERNELS = 25
 TOP_GAPS = 10
 MEASUREMENT_FIELDS = ("wall_s", "model_wall_s", "gpu_s", "chunks",
                       "planning_s", "fresh_tokens", "input_tokens")
+# CUPTI records the launch queue being full as a device event; it is
+# not a kernel
+QUEUE_MARKER = "Command Buffer Full"
 image = gpu_image()
 
 
-class Window:
-    """Decide at pass boundaries when a timed capture starts and stops.
+class Windows:
+    """Decide at pass boundaries when timed captures start and stop.
 
-    The window arms `offset` seconds after the first classification
-    stage starts and closes once `seconds` have passed since it
-    started. Both edges land on a pass boundary, so the capture holds
-    whole passes and runs a little longer than `seconds`. A window
-    still open when the query ends is closed there and marked cut.
+    The first window arms `offset` seconds after model execution starts.
+    A window closes once `seconds` have passed since it started, and the
+    next arms `every` seconds after the previous one started; `every` of
+    zero means one window. Both edges land on a pass boundary, so a
+    capture holds whole passes and runs a little longer than `seconds`.
+    A window still open when the query ends is closed there and marked
+    cut.
     """
 
-    def __init__(self, offset: float, seconds: float):
+    def __init__(self, offset: float, every: float, seconds: float):
         self.offset = offset
+        self.every = every
         self.seconds = seconds
         self.phase_started = None
-        self.started = None
-        self.ended = None
-        self.passes = 0
-        self.cut = False
+        self.windows = []
+        self.open = None
 
     def phase(self, now: float) -> None:
-        """Record the start of a classification stage."""
+        """Record the start of model execution."""
         if self.phase_started is None:
             self.phase_started = now
 
     def boundary(self, now: float) -> str | None:
-        """Return "start" or "stop" when the capture changes at this boundary."""
-        if self.phase_started is None or self.ended is not None:
+        """Return "start" or "stop" when a capture changes at this boundary."""
+        if self.phase_started is None:
             return None
-        if self.started is None:
-            if now - self.phase_started >= self.offset:
-                self.started = now
+        if self.open is None:
+            if not self.windows:
+                due = self.phase_started + self.offset
+            elif self.every:
+                due = self.windows[-1]["started"] + self.every
+            else:
+                return None
+            if now >= due:
+                self.open = {"index": len(self.windows), "started": now,
+                             "ended": None, "passes": 0, "cut": False}
+                self.windows.append(self.open)
                 return "start"
             return None
-        if now - self.started >= self.seconds:
-            self.ended = now
+        if now - self.open["started"] >= self.seconds:
+            self.open["ended"] = now
+            self.open = None
             return "stop"
-        self.passes += 1
+        self.open["passes"] += 1
         return None
 
     def finish(self, now: float) -> str | None:
         """Close a capture the query ended before `seconds` had passed."""
-        if self.started is not None and self.ended is None:
-            self.ended = now
-            self.cut = True
+        if self.open is not None:
+            self.open.update(ended=now, cut=True)
+            self.open = None
             return "stop"
         return None
 
-    def summary(self, origin: float) -> dict:
-        """Describe the window in seconds after `origin`."""
-        return {
-            "offset_s": self.offset,
-            "seconds": self.seconds,
-            "armed": self.started is not None,
-            "start_s": (None if self.started is None
-                        else round(self.started - origin, 3)),
-            "end_s": None if self.ended is None else round(self.ended - origin, 3),
-            "passes": self.passes,
-            "cut": self.cut,
-        }
+    def summary(self, origin: float, phases: list) -> list[dict]:
+        """Describe each window in seconds after `origin`, with its stages.
+
+        Args:
+            origin: The time the query started.
+            phases: Stage records with `stage`, `start_s`, and `end_s`
+                in seconds after `origin`; a window lists the ones it
+                overlaps.
+        """
+        rows = []
+        for window in self.windows:
+            start = window["started"] - origin
+            end = window["ended"] - origin
+            rows.append({
+                "index": window["index"], "start_s": round(start, 3),
+                "end_s": round(end, 3), "passes": window["passes"],
+                "cut": window["cut"],
+                "stages": [phase["stage"] for phase in phases
+                           if phase["start_s"] < end
+                           and phase.get("end_s", end) > start],
+            })
+        return rows
 
 
 class Capture:
-    """One torch.profiler session driven by a Window."""
+    """The torch.profiler sessions a Windows schedule drives."""
 
-    def __init__(self, torch, window: Window):
+    def __init__(self, torch, windows: Windows, out_dir: Path):
         self.torch = torch
-        self.window = window
+        self.windows = windows
+        self.out_dir = out_dir
         self.profiler = None
-        self.result = None
+        self.results = {}
 
     def boundary(self) -> None:
-        """Start or stop the profiler if the window says so at this boundary."""
-        self._apply(self.window.boundary(time.perf_counter()))
+        """Start or stop the profiler if a window begins or ends here."""
+        self._apply(self.windows.boundary(time.perf_counter()))
 
     def finish(self) -> None:
         """Stop a profiler still running when the query ends."""
-        self._apply(self.window.finish(time.perf_counter()))
+        self._apply(self.windows.finish(time.perf_counter()))
 
     def _apply(self, action: str | None) -> None:
         if action == "start":
@@ -147,8 +174,17 @@ class Capture:
             # enqueued kernels must finish before collection stops
             self.torch.cuda.synchronize()
             self.profiler.__exit__(None, None, None)
-            self.result = self.profiler
+            index = self.windows.windows[-1]["index"]
+            path = self.out_dir / f"trace-{index}.json.gz"
+            self.profiler.export_chrome_trace(str(path))
+            self.results[index] = {
+                "trace": str(path),
+                "gpu": gpu_activity(self.profiler.events(), TOP_GAPS),
+                "kernels": top_kernels(self.profiler.key_averages(),
+                                       TOP_KERNELS),
+            }
             self.profiler = None
+            print(f"[profile] window {index} -> {path}", flush=True)
 
 
 def gpu_activity(events, top: int) -> dict:
@@ -163,7 +199,8 @@ def gpu_activity(events, top: int) -> dict:
 
     kernels = sorted((event.time_range.start, event.time_range.end, event.name)
                      for event in events
-                     if event.device_type == DeviceType.CUDA)
+                     if event.device_type == DeviceType.CUDA
+                     and not event.name.startswith(QUEUE_MARKER))
     if not kernels:
         return {}
     start = kernels[0][0]
@@ -206,7 +243,8 @@ def top_kernels(averages, top: int) -> list[dict]:
     for average in averages:
         device_us = getattr(average, "self_device_time_total",
                             getattr(average, "self_cuda_time_total", 0))
-        if average.device_type == DeviceType.CUDA and device_us > 0:
+        if (average.device_type == DeviceType.CUDA and device_us > 0
+                and not average.key.startswith(QUEUE_MARKER)):
             rows.append((device_us, average.count, average.key))
     total = sum(device_us for device_us, _, _ in rows) or 1
     rows.sort(reverse=True)
@@ -225,65 +263,94 @@ def _cupti_preinit(torch) -> None:
     torch.cuda.synchronize()
 
 
-def _hook_quail(capture: Capture, phases: list, origin: float) -> None:
-    """Mark Quail's classification stages and its forward passes."""
-    import quail.backends.quail.executor.classify as classify_module
-    import quail.backends.quail.executor.loop as loop_module
+def _timed(capture, phases: list, origin: float, name, function,
+           start_phase: bool):
+    """Wrap `function` to record a stage named by `name(args)`.
 
-    classify = classify_module.QuailClassifier.classify
-    forward = loop_module._forward
-
-    def classify_hook(self, spec, *args, **kwargs):
-        capture.window.phase(time.perf_counter())
-        phase = {"stage": f"classify {spec.name}",
-                 "start_s": round(time.perf_counter() - origin, 3)}
+    Args:
+        capture: The capture whose windows learn when execution starts.
+        phases: The stage records to append to.
+        origin: The time the query started.
+        name: Callable from the wrapped function's arguments to the
+            stage name.
+        function: The function to wrap.
+        start_phase: Whether this stage starts model execution.
+    """
+    def wrapper(*args, **kwargs):
+        now = time.perf_counter()
+        if start_phase:
+            capture.windows.phase(now)
+        phase = {"stage": name(*args, **kwargs),
+                 "start_s": round(now - origin, 3)}
         phases.append(phase)
         try:
-            return classify(self, spec, *args, **kwargs)
+            return function(*args, **kwargs)
         finally:
             phase["end_s"] = round(time.perf_counter() - origin, 3)
+
+    return wrapper
+
+
+def _hook_quail(capture: Capture, phases: list, origin: float) -> None:
+    """Mark Quail's model nodes, its stage loops, and its forward passes."""
+    import quail.backends.quail.backend as backend_module
+    import quail.backends.quail.executor.classify as classify_module
+    import quail.backends.quail.executor.loop as loop_module
+    import quail.backends.quail.executor.pipeline as pipeline_module
+    import quail.backends.quail.executor.stages as stages_module
+
+    backend_module.QuailModelExecution.execute = _timed(
+        capture, phases, origin, lambda self, node, inputs: node.type_name,
+        backend_module.QuailModelExecution.execute, True)
+    backend_module.QuailModelExecution.execute_pipeline = _timed(
+        capture, phases, origin, lambda self, pipeline, *rest: "pipeline",
+        backend_module.QuailModelExecution.execute_pipeline, True)
+    run_stages = _timed(
+        capture, phases, origin,
+        lambda *args, label=None, **kwargs: f"stages: {label}",
+        stages_module.run_stages, False)
+    # loop.py imports run_stages at call time; these two at import time
+    stages_module.run_stages = run_stages
+    pipeline_module.run_stages = run_stages
+    classify_module.run_stages = run_stages
+    forward = loop_module._forward
 
     def forward_hook(*args, **kwargs):
         capture.boundary()
         return forward(*args, **kwargs)
 
-    classify_module.QuailClassifier.classify = classify_hook
     loop_module._forward = forward_hook
 
 
 def _hook_vllm(capture: Capture, phases: list, origin: float) -> None:
-    """Mark the vLLM baseline's classification calls and its engine steps."""
+    """Mark the vLLM baseline's nodes, its classifications, and its steps."""
     from vllm.v1.engine.llm_engine import LLMEngine
 
     import quail.backends.request as request_module
 
-    classify = request_module.RequestModelExecution._classify
+    execution = request_module.RequestModelExecution
+    execution.execute = _timed(
+        capture, phases, origin, lambda self, node, inputs: node.type_name,
+        execution.execute, True)
+    execution._classify = _timed(
+        capture, phases, origin,
+        lambda self, spec, bodies: f"classify {spec.output}",
+        execution._classify, False)
     step = LLMEngine.step
-
-    def classify_hook(self, spec, bodies):
-        capture.window.phase(time.perf_counter())
-        phase = {"stage": f"classify {spec.output}",
-                 "start_s": round(time.perf_counter() - origin, 3)}
-        phases.append(phase)
-        try:
-            return classify(self, spec, bodies)
-        finally:
-            phase["end_s"] = round(time.perf_counter() - origin, 3)
 
     def step_hook(self, *args, **kwargs):
         capture.boundary()
         return step(self, *args, **kwargs)
 
-    request_module.RequestModelExecution._classify = classify_hook
     LLMEngine.step = step_hook
 
 
 def child(arguments: str) -> None:
-    """Run one query under the windowed profiler and save its trace.
+    """Run one query under the windowed profiler and save its traces.
 
     Args:
         arguments: JSON of query_id, model, backend, sf, collection_id,
-            offset, seconds, and out_dir.
+            offset, every, seconds, and out_dir.
     """
     import torch
 
@@ -308,8 +375,8 @@ def child(arguments: str) -> None:
               for relation in spec.info.relations}
     config = quail.EngineConfig(gpus=1, model=args["model"], backend=backend,
                                 device="h100-sxm")
-    window = Window(args["offset"], args["seconds"])
-    capture = Capture(torch, window)
+    windows = Windows(args["offset"], args["every"], args["seconds"])
+    capture = Capture(torch, windows, out_dir)
     phases = []
     with quail.Session(config) as session:
         origin = time.perf_counter()
@@ -329,14 +396,11 @@ def child(arguments: str) -> None:
         "measurements": {name: output.measurements.get(name)
                          for name in MEASUREMENT_FIELDS},
         "phases": phases,
-        "window": window.summary(origin),
+        "schedule": {"offset_s": args["offset"], "every_s": args["every"],
+                     "seconds": args["seconds"]},
+        "windows": [{**window, **capture.results.get(window["index"], {})}
+                    for window in windows.summary(origin, phases)],
     }
-    if capture.result is not None:
-        record["gpu"] = gpu_activity(capture.result.events(), TOP_GAPS)
-        record["kernels"] = top_kernels(capture.result.key_averages(),
-                                        TOP_KERNELS)
-        capture.result.export_chrome_trace(str(out_dir / "trace.json.gz"))
-        record["trace"] = str(out_dir / "trace.json.gz")
     write_json(out_dir / "window.json", record)
     print("RESULT " + json.dumps(record, default=str), flush=True)
 
@@ -344,7 +408,7 @@ def child(arguments: str) -> None:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=4 * 3600,
               volumes=VOLUMES)
 def profile_model(model: str, query_ids: list[str], backends: list[str],
-                  sf: float, collection_id: str, offset: float,
+                  sf: float, collection_id: str, offset: float, every: float,
                   seconds: float, tag: str) -> str:
     """Profile every backend and query of one model, each in a fresh process.
 
@@ -354,9 +418,9 @@ def profile_model(model: str, query_ids: list[str], backends: list[str],
         backends: Backend names, such as quail and stock_vllm.
         sf: Dataset scale factor.
         collection_id: Reference label collection.
-        offset: Seconds into the first classification stage before the
-            window arms.
-        seconds: Seconds the window stays open, at least.
+        offset: Seconds into model execution before the first window arms.
+        every: Seconds between window starts; zero for one window.
+        seconds: Seconds a window stays open, at least.
         tag: Output directory name under the profile root.
 
     Returns:
@@ -371,8 +435,8 @@ def profile_model(model: str, query_ids: list[str], backends: list[str],
             out_dir = f"{PROFILE_ROOT}/{tag}/{model}/{backend}/{query_id}"
             arguments = json.dumps(dict(
                 query_id=query_id, model=model, backend=backend, sf=sf,
-                collection_id=collection_id, offset=offset, seconds=seconds,
-                out_dir=out_dir))
+                collection_id=collection_id, offset=offset, every=every,
+                seconds=seconds, out_dir=out_dir))
             command = [sys.executable, "-c",
                        "import sys, classify_profiles; "
                        "classify_profiles.child(sys.argv[1])", arguments]
@@ -398,7 +462,8 @@ def profile(queries: str = "IMDB-11,IMDB-14,BIO-6",
             models: str = "qwen3-4b-fp8,diffusion-gemma-26b-a4b-fp8,"
                           "decision-2.0-kai-0.6b-bf16",
             backends: str = "quail,stock_vllm", sf: float = 0.5,
-            offset: float = 10.0, seconds: float = 5.0, tag: str = ""):
+            offset: float = 10.0, every: float = 120.0, seconds: float = 5.0,
+            tag: str = ""):
     query_ids = [query.strip() for query in queries.split(",") if query.strip()]
     backend_names = [name.strip() for name in backends.split(",")
                      if name.strip()]
@@ -409,8 +474,8 @@ def profile(queries: str = "IMDB-11,IMDB-14,BIO-6",
     calls = {}
     for model in [name.strip() for name in models.split(",") if name.strip()]:
         calls[model] = profile_model.spawn(
-            model, query_ids, backend_names, sf, collection, offset, seconds,
-            tag)
+            model, query_ids, backend_names, sf, collection, offset, every,
+            seconds, tag)
         print(f"function call id: {calls[model].object_id} ({model})",
               flush=True)
     print(f"outputs under {PROFILE_ROOT}/{tag}/", flush=True)
