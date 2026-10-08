@@ -6,8 +6,10 @@ import pytest
 
 from quail.cost import budgets
 from quail.specs import (
+    DIFFUSION_GEMMA_26B_FP8,
     H100_SXM,
     QWEN3_4B_FP8,
+    QWEN3_5_4B_BF16,
     QWEN3_32B_FP8,
     RTX_PRO_6000_BLACKWELL_SERVER,
 )
@@ -87,3 +89,90 @@ def test_layer_kinds_must_name_every_layer():
 def test_a_sliding_window_needs_layer_kinds():
     with pytest.raises(ValueError, match="sliding_window needs layer_kinds"):
         replace(QWEN3_4B_FP8, sliding_window=128)
+
+
+def test_tree_attention_is_refused_for_a_model_with_a_gdn_layer():
+    # one Gated DeltaNet layer is the only difference from Qwen3-4B
+    kinds = ("gated_delta_net",) + ("full_attention",) * 35
+    hybrid = replace(QWEN3_4B_FP8, layer_kinds=kinds)
+    assert hybrid.params == QWEN3_4B_FP8.params
+    assert not hybrid.canvas_tokens
+    assert budgets.tree_attention_allowed(QWEN3_4B_FP8)
+    assert not budgets.tree_attention_allowed(hybrid)
+
+
+def test_attention_layers_are_the_layers_that_store_kv():
+    assert QWEN3_5_4B_BF16.attention_layers == tuple(range(3, 32, 4))
+    assert QWEN3_4B_FP8.attention_layers == tuple(range(36))
+
+
+def test_budgets_of_models_without_gdn_layers_keep_their_values():
+    for model, knee, crossover in [
+            (QWEN3_4B_FP8, 416.4278836608033, 12321.0),
+            (QWEN3_32B_FP8, 343.53425314744567, 29760.0),
+            (DIFFUSION_GEMMA_26B_FP8, 445.28202599846264, 6402.0)]:
+        assert budgets.compute_knee(model, H100_SXM) == knee
+        assert budgets.attention_crossover(model, H100_SXM) == crossover
+
+
+def _hybrid_projections():
+    """(in, out, layers) of Qwen3.5-4B's dense projections, from its config."""
+    return [(2560, (2 * 16 + 2 * 4) * 256, 8),    # qkv with the query gate
+            (4096, 2560, 8),                       # attention output
+            (2560, 2 * 9216, 32), (9216, 2560, 32),    # MLP
+            (2560, 2 * 2048 + 2 * 4096 + 2 * 32, 24),  # GDN qkv, z, b, a
+            (4096, 2560, 24)]                      # GDN output
+
+
+def test_compute_knee_counts_each_projection_in_the_layers_that_have_it():
+    ridge = H100_SXM.peak_flops / H100_SXM.hbm_bw
+    tot_p = sum(layers * i * o for i, o, layers in _hybrid_projections()) / 32
+    tot_io = sum(layers * (i + o) for i, o, layers in _hybrid_projections()) / 32
+    expected = ridge * tot_p * 2.0 / (2.0 * tot_p - ridge * tot_io * 2)
+    assert budgets.compute_knee(QWEN3_5_4B_BF16, H100_SXM) == pytest.approx(
+        expected, rel=1e-12)
+
+
+def test_projection_time_sums_each_projection_over_its_layers():
+    chunk = 4096
+    expected = 0.0
+    for din, dout, layers in _hybrid_projections():
+        params = din * dout
+        moved = params * 2.0 + chunk * (din + dout) * budgets.ACT_BYTES
+        expected += layers * max(2.0 * params * chunk / H100_SXM.peak_flops,
+                                 moved / H100_SXM.hbm_bw)
+    assert budgets._projection_time(
+        QWEN3_5_4B_BF16, H100_SXM, chunk) == pytest.approx(expected, rel=1e-12)
+
+
+def test_attention_time_covers_only_the_attention_layers():
+    model, chunk, context = QWEN3_5_4B_BF16, 1024, 4000
+    flops = 4.0 * chunk * context * 16 * 256
+    moved = context * 32_768 / 8 + 2.0 * chunk * 16 * 256 * budgets.ACT_BYTES
+    expected = max(flops / H100_SXM.peak_flops, moved / H100_SXM.hbm_bw) * 8
+    assert budgets._attention_time(
+        model, H100_SXM, chunk, context) == pytest.approx(expected, rel=1e-12)
+    # the same layers with all 32 storing KV take 4 times as long
+    dense = replace(model, layer_kinds=())
+    assert budgets._attention_time(dense, H100_SXM, chunk, context) \
+        == pytest.approx(4 * expected, rel=1e-12)
+
+
+def test_attention_path_choice_does_not_depend_on_how_many_layers_are_gdn():
+    # attention, tree, and merge times all scale with the attention layers
+    dense = replace(QWEN3_5_4B_BF16, layer_kinds=())
+    for readers, rows, node in [(2, 16, 4000), (64, 8, 20_000), (500, 2, 3000),
+                                (8, 512, 100_000), (1000, 1, 500),
+                                (2, 16, 500), (4, 64, 2000)]:
+        kwargs = dict(readers=readers, reader_rows=rows, node_tokens=node)
+        assert budgets.choose_attention_path(
+            QWEN3_5_4B_BF16, H100_SXM, **kwargs) == budgets.choose_attention_path(
+            dense, H100_SXM, **kwargs)
+
+
+def test_the_tree_merge_is_charged_for_the_attention_layers_only():
+    # tree takes 0.73 of the unified time with the merge over 8 layers,
+    # and 1.24 of it if the merge were charged over all 32
+    assert budgets.choose_attention_path(
+        QWEN3_5_4B_BF16, H100_SXM, readers=2, reader_rows=16,
+        node_tokens=500) == "tree"

@@ -128,13 +128,29 @@ def arena_tokens(model: ModelSpec, device: DeviceSpec,
 # ---- roofline arithmetic
 
 def _projection_shapes(model: ModelSpec):
-    """Return (in_dim, out_dim) of every dense projection in a layer."""
-    qkv_out = (model.n_q + 2 * model.n_kv) * model.d_head
+    """Return (in_dim, out_dim, layers) of every dense projection.
+
+    `layers` counts the layers that have the projection: the attention
+    projections sit in the layers that store KV, the Gated DeltaNet
+    projections in its layers, and the MLP in every layer.
+    """
+    query_width = 2 if model.attn_output_gate else 1
+    qkv_out = (query_width * model.n_q + 2 * model.n_kv) * model.d_head
     inter = model.intermediate
-    return ((model.hidden, qkv_out),
-            (model.n_q * model.d_head, model.hidden),
-            (model.hidden, model.ffn_width),
-            (inter, model.hidden))
+    attention = len(model.attention_layers)
+    shapes = [(model.hidden, qkv_out, attention),
+              (model.n_q * model.d_head, model.hidden, attention),
+              (model.hidden, model.ffn_width, model.layers),
+              (inter, model.hidden, model.layers)]
+    if model.gdn_layers:
+        key_width = model.gdn_key_heads * model.gdn_key_dim
+        value_width = model.gdn_value_heads * model.gdn_value_dim
+        gdn = len(model.gdn_layers)
+        shapes += [(model.hidden,
+                    2 * key_width + 2 * value_width + 2 * model.gdn_value_heads,
+                    gdn),
+                   (value_width, model.hidden, gdn)]
+    return tuple(shapes)
 
 
 def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
@@ -144,9 +160,10 @@ def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
     """
     ridge = device.peak_flops / device.hbm_bw
     tot_p = tot_io = 0.0
-    for din, dout in _projection_shapes(model):
-        tot_p += din * dout
-        tot_io += din + dout
+    for din, dout, layers in _projection_shapes(model):
+        share = layers / model.layers
+        tot_p += share * din * dout
+        tot_io += share * (din + dout)
     denom = 2.0 * tot_p - ridge * tot_io * ACT_BYTES
     if denom <= 0:
         raise ValueError("projections never cross the ridge")
@@ -157,23 +174,25 @@ def _projection_time(model: ModelSpec, device: DeviceSpec,
                      chunk: int) -> float:
     """Ideal seconds for all dense projections in one chunk, all layers."""
     t = 0.0
-    for din, dout in _projection_shapes(model):
+    for din, dout, layers in _projection_shapes(model):
+        share = layers / model.layers
         params = din * dout
         flops = 2.0 * params * chunk
         moved = (params * model.w_bytes
                  + chunk * (din + dout) * ACT_BYTES)
-        t += max(flops / device.peak_flops, moved / device.hbm_bw)
+        t += share * max(flops / device.peak_flops, moved / device.hbm_bw)
     return t * model.layers
 
 
 def _attention_time(model: ModelSpec, device: DeviceSpec,
                     chunk: int, context: int) -> float:
     """Ideal seconds for the attention kernels in one chunk, all layers."""
+    layers = len(model.attention_layers)
     flops = 4.0 * chunk * context * model.n_q * model.d_head
-    moved = (context * model.kappa / model.layers
+    moved = (context * model.kappa / layers
              + 2.0 * chunk * model.n_q * model.d_head * ACT_BYTES)
     return max(flops / device.peak_flops,
-               moved / device.hbm_bw) * model.layers
+               moved / device.hbm_bw) * layers
 
 
 # Below this many dense parameters a model runs unified attention only.
@@ -224,7 +243,7 @@ def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
     # the merge kernel reads two partial outputs and writes one, in
     # bf16, once per layer
     merge = 3 * rows * model.n_q * model.d_head * ACT_BYTES / device.hbm_bw
-    tree += merge * model.layers
+    tree += merge * len(model.attention_layers)
     return "tree" if tree < unified else "unified"
 
 

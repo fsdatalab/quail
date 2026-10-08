@@ -105,3 +105,14 @@ def test_a_sliding_hybrid_slides_only_its_attention_layers():
                           for kind in SPEC.layer_kinds))
     assert sliding.sliding_layer_set == frozenset(range(3, 32, 4))
     assert not any(sliding.is_full_layer(i) for i in range(32))
+
+
+def test_chunk_size_follows_the_plan():
+    from quail.cost import budgets
+    from quail.specs import H100_SXM
+
+    # equation 22: 2^31 - 1 over the widest projection, 18,432 columns
+    assert budgets.kernel_index_cap(SPEC) == 116_508
+    # the memory bound before it, 412,529 tokens
+    assert budgets.chunk_memory_bound(SPEC, H100_SXM) == 412_529
+    assert budgets.chunk_budget(SPEC, H100_SXM) == 116_508

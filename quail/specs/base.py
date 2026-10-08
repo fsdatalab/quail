@@ -152,6 +152,11 @@ class ModelSpec:
         return self.layer_kind(layer) in ("full_attention", "sliding_attention")
 
     @property
+    def attention_layers(self) -> tuple[int, ...]:
+        """The layers that store KV."""
+        return tuple(i for i in range(self.layers) if self.keeps_kv(i))
+
+    @property
     def gdn_layers(self) -> tuple[int, ...]:
         """The layers that keep a Gated DeltaNet state."""
         return tuple(i for i in range(self.layers)
