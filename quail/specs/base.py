@@ -75,10 +75,8 @@ class ModelSpec:
     decision_head_dim: int = 0    # width of a decision model's option
     #                               head (its key, query, and MLP rows);
     #                               the head's FLOPs and bytes follow
-    # Layers that keep every token of KV, when the model mixes them
-    # with sliding layers: every full_attention_period-th layer, with
-    # its own KV geometry. 0 means every layer looks like n_kv x d_head.
-    full_attention_period: int = 0
+    # KV geometry of the full_attention layers, when it differs from the
+    # sliding layers' n_kv x d_head; 0 means the same as theirs.
     full_n_kv: int = 0         # KV heads of a full-attention layer
     full_d_head: int = 0       # head dim of a full-attention layer
     sliding_window: int = 0    # tokens the other layers see behind each
@@ -110,11 +108,10 @@ class ModelSpec:
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);
     #                                   None lets vLLM pick
-    layer_kinds: tuple[LayerKind, ...] = ()    # one kind per layer, for a
-    #                                            model that mixes kinds;
-    #                                            empty leaves layer_kind
-    #                                            to full_attention_period
-    #                                            and sliding_window
+    layer_kinds: tuple[LayerKind, ...] = ()    # one kind per layer; required
+    #                                            when sliding_window is set;
+    #                                            empty means every layer is
+    #                                            full_attention
     vision_tower: bool = False    # the checkpoint ships a vision tower;
     #                               vLLM must be told to take no images
     #                               or video, or it builds an image
@@ -141,14 +138,14 @@ class ModelSpec:
             raise ValueError(
                 f"{self.name}: layer_kinds has {len(self.layer_kinds)} "
                 f"entries for {self.layers} layers")
+        if self.sliding_window and not self.layer_kinds:
+            raise ValueError(
+                f"{self.name}: sliding_window needs layer_kinds to say which "
+                f"layers slide")
 
     def layer_kind(self, layer: int) -> LayerKind:
         """Return the kind of one layer."""
-        if self.layer_kinds:
-            return self.layer_kinds[layer]
-        if self.sliding_window and not self.is_full_layer(layer):
-            return "sliding_attention"
-        return "full_attention"
+        return self.layer_kinds[layer] if self.layer_kinds else "full_attention"
 
     def keeps_kv(self, layer: int) -> bool:
         """Whether the layer stores KV; Gated DeltaNet and convolution layers do not."""
@@ -162,10 +159,7 @@ class ModelSpec:
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""
-        if self.layer_kinds:
-            return self.layer_kinds[layer] == "full_attention"
-        period = self.full_attention_period
-        return bool(period) and (layer + 1) % period == 0
+        return self.layer_kind(layer) == "full_attention"
 
     @property
     def kv_shapes(self) -> tuple:

@@ -68,7 +68,8 @@ def _decode_outcome_work(lengths, depths, window=0, shared=None):
 ])
 def test_expected_work_matches_every_label_assignment(lengths, labels, window,
                                                       shared):
-    model = replace(QWEN3_4B_FP8, sliding_window=window, full_attention_period=2)
+    kinds = ("sliding_attention", "full_attention") * 18 if window else ()
+    model = replace(QWEN3_4B_FP8, sliding_window=window, layer_kinds=kinds)
     cost = _cost(lengths, labels, model=model, shared=shared or ())
     outcomes = list(itertools.product(map(len, labels), repeat=len(lengths)))
     expected = dict.fromkeys(asdict(Work()), 0.0)

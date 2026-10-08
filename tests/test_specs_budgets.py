@@ -84,12 +84,6 @@ def test_layer_kinds_must_name_every_layer():
         replace(QWEN3_4B_FP8, layer_kinds=("full_attention", "short_conv"))
 
 
-def test_gemma_layer_kinds_agree_with_its_period_and_window():
-    from quail.specs import DIFFUSION_GEMMA_26B_FP8
-
-    gemma = DIFFUSION_GEMMA_26B_FP8
-    implicit = replace(gemma, layer_kinds=())
-    assert gemma.layer_kinds == tuple(
-        implicit.layer_kind(i) for i in range(gemma.layers))
-    assert gemma.kv_shapes == implicit.kv_shapes
-    assert gemma.sliding_layer_set == implicit.sliding_layer_set
+def test_a_sliding_window_needs_layer_kinds():
+    with pytest.raises(ValueError, match="sliding_window needs layer_kinds"):
+        replace(QWEN3_4B_FP8, sliding_window=128)

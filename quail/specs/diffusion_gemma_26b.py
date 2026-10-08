@@ -14,7 +14,6 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     n_q=16,
     n_kv=8,
     d_head=256,
-    full_attention_period=6,
     layer_kinds=_LAYER_KINDS * 5,
     full_n_kv=2,
     full_d_head=512,
