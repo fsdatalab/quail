@@ -1,10 +1,10 @@
 r"""Plot the classification profile windows and capture their Perfetto views.
 
 Reads the torch.profiler windows that experiments/cells/classify_profiles.py
-saved for IMDB-11, IMDB-14, and BIO-6 on three models, Quail and stock
-vLLM. Writes two PNG plots, the GPU busy share of the profiled windows
-and the longest GPU idle gap in them, and, with --screenshots, one
-Perfetto screenshot per window in SHOTS. Pull the two run directories,
+saved for IMDB-11 and IMDB-14 on three models, Quail and stock vLLM.
+Writes two PNG plots, the GPU busy share of the profiled windows and
+the longest GPU idle gap in them, and, with --screenshots, one Perfetto
+screenshot per window in SHOTS. Pull the two run directories,
 then run from the repository root:
 
     W=/tmp/classify-profiles; mkdir -p "$W"
@@ -36,23 +36,24 @@ VOLUME_ROOT = "/results/ablations/classify-profiles/"
 MODELS = [("qwen3-4b-fp8", "Qwen3 4B FP8"),
           ("diffusion-gemma-26b-a4b-fp8", "DiffusionGemma 26B-A4B FP8"),
           ("decision-2.0-kai-0.6b-bf16", "Decision-2.0-Kai 0.6B BF16")]
-QUERIES = ["IMDB-11", "IMDB-14", "BIO-6"]
+QUERIES = ["IMDB-11", "IMDB-14"]
 METHODS = [("quail", "Quail", BLUE),
            ("stock_vllm", "Stock vLLM (operator-at-a-time)", ORANGE)]
 # stock vLLM's planner refuses AI.CLASSIFY on this model
 REFUSED = {("diffusion-gemma-26b-a4b-fp8", "stock_vllm")}
 # (model, backend, query, window index): pairs of the same model and
-# query, plus Quail's window with the lowest busy share
+# query, plus DiffusionGemma, which has no stock vLLM run
 SHOTS = [
     ("decision-2.0-kai-0.6b-bf16", "stock_vllm", "IMDB-11", 0),
     ("decision-2.0-kai-0.6b-bf16", "quail", "IMDB-11", 0),
-    ("decision-2.0-kai-0.6b-bf16", "stock_vllm", "BIO-6", 2),
-    ("decision-2.0-kai-0.6b-bf16", "quail", "BIO-6", 0),
-    ("qwen3-4b-fp8", "stock_vllm", "BIO-6", 2),
-    ("qwen3-4b-fp8", "quail", "BIO-6", 1),
+    ("decision-2.0-kai-0.6b-bf16", "stock_vllm", "IMDB-14", 0),
+    ("decision-2.0-kai-0.6b-bf16", "quail", "IMDB-14", 0),
     ("qwen3-4b-fp8", "stock_vllm", "IMDB-11", 0),
     ("qwen3-4b-fp8", "quail", "IMDB-11", 0),
-    ("diffusion-gemma-26b-a4b-fp8", "quail", "BIO-6", 0),
+    ("qwen3-4b-fp8", "stock_vllm", "IMDB-14", 0),
+    ("qwen3-4b-fp8", "quail", "IMDB-14", 0),
+    ("diffusion-gemma-26b-a4b-fp8", "quail", "IMDB-11", 0),
+    ("diffusion-gemma-26b-a4b-fp8", "quail", "IMDB-14", 0),
 ]
 SHORT = {"qwen3-4b-fp8": "qwen3_4b", "diffusion-gemma-26b-a4b-fp8": "dgemma",
          "decision-2.0-kai-0.6b-bf16": "kai"}
@@ -82,6 +83,8 @@ def load(workdir):
     for tag in TAGS:
         for path in sorted((workdir / tag).glob("*/*/*/window.json")):
             model, backend, query = path.parent.relative_to(workdir / tag).parts
+            if query not in QUERIES:
+                continue
             record = json.loads(path.read_text())
             record["windows"] = windows(record)
             if record["windows"]:
@@ -139,7 +142,7 @@ def draw(axis, values, key, unit, log=False):
     axis.set_xticks([x for _, _, x in xs], [query for _, query, _ in xs])
     if log:
         axis.set_yscale("log")
-        axis.set_ylim(0.005, 30000)
+        axis.set_ylim(0.005, 3000)
         axis.set_ylabel(f"{unit} (log scale)")
     else:
         axis.set_ylim(0, 112)
@@ -166,8 +169,8 @@ def legend(axis):
 
 def plot(values):
     """Write the busy-share plot and the busy-share-and-gap plot."""
-    title = ("GPU busy share of profiled 5 s windows, QUAIL-B IMDB-11, "
-             "IMDB-14, and BIO-6, sf 0.5, one H100")
+    title = ("GPU busy share of profiled 5 s windows, QUAIL-B IMDB-11 "
+             "and IMDB-14, sf 0.5, one H100")
     figure, axis = plt.subplots(figsize=(11, 4.6))
     draw(axis, values, "busy", "percent")
     axis.set_title(title, pad=36)
