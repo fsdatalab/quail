@@ -72,12 +72,19 @@ def test_gpu_activity_unions_device_events_and_lists_the_longest_gaps():
     assert cell.gpu_activity([events[0]], top=1) == {}
 
 
-def test_top_kernels_rank_by_device_time_with_shares():
+def test_top_kernels_rank_device_entries_by_device_time_with_shares():
+    from torch.autograd import DeviceType
+
+    def average(key, count, device_us, device=DeviceType.CUDA):
+        return SimpleNamespace(key=key, count=count, device_type=device,
+                               self_device_time_total=device_us)
+
     averages = [
-        SimpleNamespace(key="gemm", count=4, self_device_time_total=3_000_000.0),
-        SimpleNamespace(key="aten::copy_", count=9, self_device_time_total=0.0),
-        SimpleNamespace(key="attention", count=2,
-                        self_device_time_total=1_000_000.0),
+        average("gemm", 4, 3_000_000.0),
+        # the host operator that launched gemm: its device time is gemm's
+        average("aten::mm", 4, 3_000_000.0, DeviceType.CPU),
+        average("aten::copy_", 9, 0.0, DeviceType.CPU),
+        average("attention", 2, 1_000_000.0),
     ]
     assert cell.top_kernels(averages, top=5) == [
         {"name": "gemm", "calls": 4, "device_s": 3.0, "share": 0.75},

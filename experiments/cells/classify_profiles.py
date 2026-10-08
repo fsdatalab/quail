@@ -193,15 +193,20 @@ def gpu_activity(events, top: int) -> dict:
 def top_kernels(averages, top: int) -> list[dict]:
     """List the kernels with the most device time and their share of it.
 
+    Host operators also carry device time, the time of the kernels they
+    launched, so only device-side entries count.
+
     Args:
         averages: The profiler's key averages.
         top: Number of kernels to list.
     """
+    from torch.autograd import DeviceType
+
     rows = []
     for average in averages:
         device_us = getattr(average, "self_device_time_total",
                             getattr(average, "self_cuda_time_total", 0))
-        if device_us > 0:
+        if average.device_type == DeviceType.CUDA and device_us > 0:
             rows.append((device_us, average.count, average.key))
     total = sum(device_us for device_us, _, _ in rows) or 1
     rows.sort(reverse=True)
