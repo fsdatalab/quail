@@ -19,12 +19,12 @@ Kai; DiffusionGemma already runs it in the client process. Stock vLLM
 refuses AI.CLASSIFY on DiffusionGemma, whose engine returns no text.
 
 One container per model, the models in parallel. The defaults are the
-three classification queries farthest from SoL, the three models, and
-both engines:
+two classify-only queries farthest from SoL, the three models, and both
+engines:
 
     log="results/profiles/$(date -u +%Y%m%dT%H%M%SZ)-classify-profiles.log"
     uv run modal run --detach experiments/cells/classify_profiles.py::profile \
-      --queries IMDB-11,IMDB-14,BIO-6 --backends quail,stock_vllm \
+      --queries IMDB-11,IMDB-14 --backends quail,stock_vllm \
       --sf 0.5 --offset 10 --every 120 --seconds 5 2>&1 | tee "$log"
 
 Fetch a container's summary later with
@@ -458,7 +458,7 @@ def profile_model(model: str, query_ids: list[str], backends: list[str],
 
 
 @app.local_entrypoint()
-def profile(queries: str = "IMDB-11,IMDB-14,BIO-6",
+def profile(queries: str = "IMDB-11,IMDB-14",
             models: str = "qwen3-4b-fp8,diffusion-gemma-26b-a4b-fp8,"
                           "decision-2.0-kai-0.6b-bf16",
             backends: str = "quail,stock_vllm", sf: float = 0.5,
