@@ -62,6 +62,16 @@ def arena_bytes(model: ModelSpec, device: DeviceSpec,
             - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
 
 
+# Questions one pass may start from checkpoints at once; each needs a
+# temporary copy of the checkpoint state.
+CHECKPOINT_PASS_QUESTIONS = 1_024
+# Document length a hybrid model's retained pool is split for when the
+# mean is unknown.
+CHECKPOINT_DEFAULT_DOC_TOKENS = 1_000
+MIB = 2**20
+INTERMEDIATE_BLOCK_TOKENS = 64
+
+
 # Rows past a document that its pages also cover: the shared question
 # preamble and a stage tail, taken as a round number for the split.
 SPLIT_EXTRA_TOKENS = 64
@@ -76,10 +86,74 @@ def transient_sliding_pages(chunk_tokens: int, window: int) -> int:
     return -(-chunk_tokens // PAGE_TOKENS) + -(-chunk_tokens // window)
 
 
+def checkpoint_pages(model: ModelSpec) -> float:
+    """KV pages of memory one document checkpoint takes."""
+    return model.checkpoint_bytes / (model.kappa * PAGE_TOKENS)
+
+
+def checkpoint_pass_bytes(model: ModelSpec, questions: int,
+                          chunk_tokens: int) -> int:
+    """Temporary bytes a pass of `questions` starts from checkpoints.
+
+    Each question copies one layer's state and its convolution columns.
+    The pass also holds a 1 MiB intermediate buffer per question and
+    one per 64 tokens of the chunk.
+    """
+    buffers = questions + -(-chunk_tokens // INTERMEDIATE_BLOCK_TOKENS)
+    return (questions * (model.gdn_state_bytes + model.conv_state_bytes)
+            + buffers * MIB)
+
+
+def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec,
+                      chunk_tokens: int) -> int:
+    """Pages a hybrid model shares between retained KV and checkpoints.
+
+    The arena after weights and two chunks of activations, less the
+    temporary copies of one pass of questions and two chunks of KV
+    kept free for execution.
+    """
+    free = (arena_bytes(model, device, chunk_tokens)
+            - checkpoint_pass_bytes(model, CHECKPOINT_PASS_QUESTIONS,
+                                  chunk_tokens))
+    page_bytes = model.kappa * PAGE_TOKENS
+    return int(free // page_bytes) - 2 * -(-chunk_tokens // PAGE_TOKENS)
+
+
+def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
+                     kv_pages: int) -> int:
+    """Checkpoints the pool holds beside `kv_pages` of KV; 0 without them."""
+    pages = checkpoint_pages(model)
+    if not pages:
+        return 0
+    return int((hybrid_pool_pages(model, device, chunk_tokens) - kv_pages)
+               // pages)
+
+
+def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
+                       mean_doc_tokens: float | None) -> int:
+    """KV pages left once the pool holds one checkpoint per retained document.
+
+    A retained document of `l` tokens costs ceil(l / 16) KV pages plus
+    its checkpoint, so the pool holds floor(pool / that) documents.
+    """
+    mean = CHECKPOINT_DEFAULT_DOC_TOKENS if mean_doc_tokens is None else max(
+        1.0, mean_doc_tokens)
+    pool = hybrid_pool_pages(model, device, chunk_tokens)
+    ckpt = checkpoint_pages(model)
+    slots = int(pool // (-(-mean // PAGE_TOKENS) + ckpt))
+    kv_pages = int(pool - slots * ckpt)
+    if kv_pages <= 0:
+        raise ValueError("the pool cannot hold one chunk's KV beside a checkpoint")
+    return kv_pages
+
+
 def arena_pages(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int | None = None,
                 mean_doc_tokens: float | None = None) -> tuple[int, int]:
     """Pages of the two KV pools: (every-token pool, sliding-layer pool).
+
+    A model with Gated DeltaNet layers gets the KV pages left beside its
+    checkpoints (see hybrid_arena_pages) and 0 sliding pages.
 
     A model without sliding layers gets one pool and 0 sliding pages.
     With sliding layers, a document holds its whole prefix on the
@@ -92,6 +166,9 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
     """
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
+    if model.gdn_layers:
+        return hybrid_arena_pages(model, device, chunk_tokens,
+                                  mean_doc_tokens), 0
     free = arena_bytes(model, device, chunk_tokens)
     page_bytes_full = model.kappa_full * PAGE_TOKENS
     page_bytes_sliding = model.kappa_sliding * PAGE_TOKENS

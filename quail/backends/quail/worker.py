@@ -88,6 +88,7 @@ class LoadedGpu:
 
         t0 = time.perf_counter()
         full_pages, sliding_pages = budgets.arena_pages(spec, device, budget)
+        self.device = device
         self.arena = KVArena(n_layers=spec.layers,
                              n_pages=full_pages,
                              page_tokens=budgets.PAGE_TOKENS,
@@ -96,7 +97,9 @@ class LoadedGpu:
                              layer_kv=spec.kv_shapes,
                              sliding_layers=spec.sliding_layer_set,
                              sliding_window=spec.sliding_window,
-                             n_sliding_pages=sliding_pages)
+                             n_sliding_pages=sliding_pages,
+                             **checkpoint_arena_args(spec, device, budget,
+                                                     full_pages))
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -124,7 +127,11 @@ class LoadedGpu:
         survives in the arena between queries.
         """
         if arena_pages is not None:
-            self.arena.resize(*arena_pages, free_resident=True)
+            slots = checkpoint_arena_args(
+                self.spec, self.device, chunk_tokens, arena_pages[0])
+            self.arena.resize(*arena_pages, free_resident=True,
+                              **{k: v for k, v in slots.items()
+                                 if k == "n_state_slots"})
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
         if self.decision_head is not None:
@@ -167,6 +174,20 @@ class LoadedGpu:
         close_fn = getattr(self.execution, "close", None)
         if callable(close_fn):
             close_fn()
+
+
+def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages) -> dict:
+    """KVArena arguments for the checkpoint slots; empty without GDN layers."""
+    if not spec.gdn_layers:
+        return {}
+    layers = len(spec.gdn_layers)
+    return {
+        "n_state_slots": budgets.checkpoint_slots(
+            spec, device, chunk_tokens, kv_pages),
+        "gdn_state_shape": (layers, spec.gdn_value_heads,
+                            spec.gdn_value_dim, spec.gdn_key_dim),
+        "conv_state_shape": (layers, spec.conv_width - 1, spec.conv_channels),
+    }
 
 
 def decision_offsets(spec, path) -> tuple[int, ...]:

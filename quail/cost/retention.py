@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 
+from quail.cost.budgets import checkpoint_pages
 from quail.cost.dense_decoder_cost import attention_pair_flops, dense_params
 from quail.cost.work import triangle
 
@@ -15,6 +16,8 @@ class RetentionPolicy:
     uses: dict = field(default_factory=dict)
     sliding_pair_seconds: float = 0.0
     sliding_window: int = 0
+    checkpoint_pages: float = 0.0    # pages of the state a hybrid model's
+    #                                  document keeps beside its KV
 
     def priority(self, key, tokens: int, pages: int) -> tuple:
         alias, document = key
@@ -22,7 +25,8 @@ class RetentionPolicy:
         seconds = (self.linear_seconds * tokens
                    + self.pair_seconds * triangle(tokens)
                    + self.sliding_pair_seconds * triangle(tokens, self.sliding_window))
-        return (probability * seconds / pages, -next_use, -document)
+        held = pages + self.checkpoint_pages
+        return (probability * seconds / held, -next_use, -document)
 
 
 def retention_pages(arena_tokens: int, chunk_tokens: int, page_tokens: int) -> int:
@@ -35,10 +39,13 @@ def coefficients(model, device) -> dict:
     """Return the model's ideal prefix computation coefficients."""
     full, sliding = attention_pair_flops(model)
     bandwidth = device.arithmetic_bandwidth(model.attention_precision)
-    return {
+    config = {
         "linear_seconds": 2 * dense_params(model) / device.arithmetic_bandwidth(
             model.weight_precision),
         "pair_seconds": full / bandwidth,
         "sliding_pair_seconds": sliding / bandwidth,
         "sliding_window": model.sliding_window,
     }
+    if model.gdn_layers:
+        config["checkpoint_pages"] = checkpoint_pages(model)
+    return config

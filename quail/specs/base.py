@@ -16,6 +16,11 @@ Role = Literal["generative", "reranker", "decision"]
 LayerKind = Literal[
     "full_attention", "sliding_attention", "gated_delta_net", "short_conv"]
 
+# The recurrent state is kept in fp32 and the convolution columns in
+# bf16.
+GDN_STATE_ELEMENT_BYTES = 4
+CONV_STATE_ELEMENT_BYTES = 2
+
 # Peak per-token activation bytes per hidden dim.
 ACT_BYTES_PER_HIDDEN = 32
 
@@ -161,6 +166,33 @@ class ModelSpec:
         """The layers that keep a Gated DeltaNet state."""
         return tuple(i for i in range(self.layers)
                      if self.layer_kind(i) == "gated_delta_net")
+
+    @property
+    def conv_channels(self) -> int:
+        """Channels of a Gated DeltaNet layer's convolution: q, k, and v joined."""
+        return (2 * self.gdn_key_heads * self.gdn_key_dim
+                + self.gdn_value_heads * self.gdn_value_dim)
+
+    @property
+    def gdn_state_bytes(self) -> int:
+        """Bytes of one layer's recurrent state, a matrix per value head."""
+        return (self.gdn_value_heads * self.gdn_value_dim * self.gdn_key_dim
+                * GDN_STATE_ELEMENT_BYTES)
+
+    @property
+    def conv_state_bytes(self) -> int:
+        """Bytes of one layer's convolution input columns kept between tokens."""
+        return (self.conv_channels * (self.conv_width - 1)
+                * CONV_STATE_ELEMENT_BYTES)
+
+    @property
+    def checkpoint_bytes(self) -> int:
+        """Bytes of the state a sequence leaves in every Gated DeltaNet layer.
+
+        Zero for a model without Gated DeltaNet layers.
+        """
+        return len(self.gdn_layers) * (self.gdn_state_bytes
+                                       + self.conv_state_bytes)
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""
