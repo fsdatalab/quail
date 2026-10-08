@@ -262,7 +262,7 @@ def _hook_vllm(capture: Capture, phases: list, origin: float) -> None:
 
     def classify_hook(self, spec, bodies):
         capture.window.phase(time.perf_counter())
-        phase = {"stage": f"classify {spec.name}",
+        phase = {"stage": f"classify {spec.output}",
                  "start_s": round(time.perf_counter() - origin, 3)}
         phases.append(phase)
         try:
