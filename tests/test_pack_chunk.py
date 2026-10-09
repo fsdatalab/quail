@@ -94,7 +94,8 @@ def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
 
 @pytest.mark.parametrize("mode", ["tree", "unified"])
 @pytest.mark.parametrize("shared", [0, 16])
-def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared):
+@pytest.mark.parametrize("run", [1, 2])
+def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared, run):
     cpu_staging(monkeypatch)
     arena = plain_arena()
     parent, key = ("d", 0), ("d", 1)
@@ -109,8 +110,8 @@ def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared):
                 key=key, prefix=list(range(shared, 32)) if first else None,
                 f=32 if first else 35, start=shared if first else 0,
                 read_key=parent if first and shared else None,
-                suffixes=[[91, 92, 93]] if first else [[40]],
-                write_suffix_tokens=3 if first else 1, single=True)],
+                suffixes=[[91, 92, 93]] if first else [[40, 41][:run]],
+                write_suffix_tokens=3 if first else run, single=True)],
             attention_mode=mode)
         if mode == "tree":
             reads = chunk.meta["reads"]
@@ -122,8 +123,10 @@ def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared):
         retained_reads += retained
         fresh_tokens += len(chunk.input_ids)
         # the one label decides at the cue; the four decide at a second
-        # choice that one fed token reaches
-        labels = [(10,)] if first else [(10, 11), (10, 12), (20, 21), (20, 22)]
+        # choice that a run of one or two fed tokens reaches
+        labels = ([(10,)] if first else
+                  [(10, *range(11, 10 + run), 1), (10, *range(11, 10 + run), 2),
+                   (20, *range(21, 20 + run), 1), (20, *range(21, 20 + run), 2)])
         cost = estimate(
             "trie_decode", 1, 0, 2, labels, lengths=(32,),
             shared=(shared,), chunk=100,
