@@ -1,14 +1,15 @@
 """Build the QUAIL-B reference labels with Quail, one H100 per workload.
 
 Each predicate runs as a Quail query over the corpus with Qwen3 32B
-fp8: a filter over every document, a full join over every pair. FEVER
-and LePaRD supply source truth where the dataset gives the exact
-answer. Every part file is written under a content-addressed path on
-the `quail-results` volume and skipped when it already exists, so an
-interrupted pass resumes where it stopped. Scale factors 0.1, 0.5 and
-1.0 are supported; a smaller one samples a prefix of a larger one's
-documents, so its labels are derived from the larger pass on the CPU
-by matching document content.
+fp8: a filter over every document, a full join over every pair, or,
+for a join whose predicate names pair columns, over the pairs whose
+columns are equal. FEVER and LePaRD supply source truth where the
+dataset gives the exact answer. Every part file is written under a
+content-addressed path on the `quail-results` volume and skipped when
+it already exists, so an interrupted pass resumes where it stopped.
+Scale factors 0.1, 0.5 and 1.0 are supported; a smaller one samples a
+prefix of a larger one's documents, so its labels are derived from the
+larger pass on the CPU by matching document content.
 
     uv run modal run --detach -m quail.bench.labeling --sf 1.0
     uv run modal run --detach -m quail.bench.labeling --sf 0.1 \
@@ -197,8 +198,12 @@ def _load_corpus(corpus_id: str) -> tuple[Path, dict, dict]:
     return target, manifest, _read_rows(target)
 
 
-# Every table here feeds corpus_id, so adding or removing one
-# invalidates every label-set identity and forces a full relabel.
+# Every table here feeds corpus_id, so adding or removing one mints a
+# new corpus id; a collection for the new corpus reuses the label sets
+# of the predicates whose tables did not change.
+MESSAGE_COLUMNS = ("id", "trace_id", "turn_index", "role", "content",
+                   "tool_call_id", "prev_id", "prev_user_id",
+                   "prev_assistant_id")
 CORPUS_COLUMNS = {
     "reviews": ("id", "body"),
     "aspects": ("id", "aspect"),
@@ -211,7 +216,42 @@ CORPUS_COLUMNS = {
     "citation_passages": ("id", "passage_text", "passage_ids"),
     "agent_traces": ("id", "trace", "trajectory_id", "turn_index",
                      "token_count"),
+    "support_traces": ("id", "request", "transcript", "message_count",
+                       "task_id", "domain", "model", "trial", "reward"),
+    "support_messages": MESSAGE_COLUMNS,
+    "issue_runs": ("id", "request", "transcript", "message_count",
+                   "instance_id", "repo", "resolved", "token_count"),
+    "issue_messages": MESSAGE_COLUMNS,
 }
+
+
+def _pair_columns(spec: PredicateSpec):
+    """The (left, right) columns a join's labeled pairs must agree on, or None.
+
+    Older quail-b releases have no such field, so every pair is labeled.
+    """
+    return getattr(spec, "pair_columns", None)
+
+
+def _matching_pairs(spec: PredicateSpec, left_rows: list[dict],
+                    right_rows: list[dict]) -> list[tuple[int, int]]:
+    """(left index, right index) of the pairs whose pair columns are equal."""
+    left_column, right_column = spec.pair_columns
+    partners = {}
+    for j, right in enumerate(right_rows):
+        value = right.get(right_column)
+        if value is not None:
+            partners.setdefault(value, []).append(j)
+    return [(i, j) for i, left in enumerate(left_rows)
+            for j in partners.get(left.get(left_column), ())]
+
+
+def _join_step(spec: PredicateSpec, identity: dict, right_rows: int) -> int:
+    """Left rows per join part: by pairs, or by left rows for a restricted join."""
+    if _pair_columns(spec):
+        return rows_per_call(1, identity.get("prompts_per_call",
+                                             LEGACY_PROMPTS_PER_CALL))
+    return join_anchor_batch(identity, right_rows)
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -378,8 +418,7 @@ def _part_bounds(spec: PredicateSpec, identity: dict,
     elif spec.source_policy == "lepard_citation_edge":
         step = 50
     else:
-        step = join_anchor_batch(identity,
-                                 len(corpus_rows[spec.right_table]))
+        step = _join_step(spec, identity, len(corpus_rows[spec.right_table]))
     return [(start, min(start + step, left))
             for start in range(0, left, step)]
 
@@ -478,7 +517,8 @@ class QuailJudge:
     def close(self) -> None:
         self.session.close()
 
-    def _register(self, rows: list[dict], column: str) -> str:
+    def _register(self, rows: list[dict], column: str,
+                  extra: tuple[str, ...] = ()) -> str:
         import quail
 
         self._tables += 1
@@ -486,6 +526,8 @@ class QuailJudge:
         table = pa.table({
             "id": pa.array([str(row["id"]) for row in rows], pa.string()),
             column: pa.array([row[column] for row in rows], pa.string()),
+            **{name: pa.array([row[name] for row in rows])
+               for name in extra if name not in ("id", column)},
         })
         self.session.register(
             name, quail.DocumentProvider.from_table(table, id_col="id"))
@@ -524,21 +566,37 @@ class QuailJudge:
 
     def join(self, spec: PredicateSpec, left_rows: list[dict],
              right_rows: list[dict]) -> dict[tuple[int, int], bool]:
-        """Answers for every (left index, right index) pair."""
+        """Answers by (left index, right index) pair.
+
+        Every pair is asked, or, when the predicate names pair columns,
+        only the pairs whose columns are equal.
+        """
         import quail
 
         if not left_rows or not right_rows:
             return {}
-        left = self._register(left_rows, spec.left_column)
-        right = self._register(right_rows, spec.right_column)
-        query = (self.session.docs(left).alias("l")
-                 .ai_join(self.session.docs(right).alias("r"),
-                          quail.prompt(spec.template,
-                                       quail.col(f"l.{spec.left_column}"),
-                                       quail.col(f"r.{spec.right_column}")),
-                          anchor="l", semantics="full")
-                 .select("l.id", "r.id"))
-        expected = len(left_rows) * len(right_rows)
+        pairs = _pair_columns(spec)
+        prompt = quail.prompt(spec.template,
+                              quail.col(f"l.{spec.left_column}"),
+                              quail.col(f"r.{spec.right_column}"))
+        if pairs:
+            left = self._register(left_rows, spec.left_column, (pairs[0],))
+            right = self._register(right_rows, spec.right_column, (pairs[1],))
+            query = (self.session.docs(left).alias("l")
+                     .join(self.session.docs(right).alias("r"),
+                           on=quail.col(f"l.{pairs[0]}")
+                           == quail.col(f"r.{pairs[1]}"))
+                     .ai_filter(prompt)
+                     .select("l.id", "r.id"))
+            expected = len(_matching_pairs(spec, left_rows, right_rows))
+        else:
+            left = self._register(left_rows, spec.left_column)
+            right = self._register(right_rows, spec.right_column)
+            query = (self.session.docs(left).alias("l")
+                     .ai_join(self.session.docs(right).alias("r"), prompt,
+                              anchor="l", semantics="full")
+                     .select("l.id", "r.id"))
+            expected = len(left_rows) * len(right_rows)
         result = self._run(query, expected)
         table = result.answer_tables["joins"][0]
         answers = {
@@ -653,32 +711,39 @@ def _write_qwen_join_parts(judge: QuailJudge,
                            spec: PredicateSpec, left_rows: list[dict],
                            right_rows: list[dict], identity: dict,
                            corpus_id: str, source_label=None) -> None:
-    anchor_batch = join_anchor_batch(identity, len(right_rows))
+    anchor_batch = _join_step(spec, identity, len(right_rows))
     for start in range(0, len(left_rows), anchor_batch):
         end = min(start + anchor_batch, len(left_rows))
         part = _part_path(spec, identity, start, end)
         if part.exists():
             continue
-        # every pair goes through the model; a source label, where the
-        # dataset gives one, replaces the model's answer for that pair
-        answers = judge.join(spec, left_rows[start:end], right_rows)
+        # every pair goes through the model, or every pair the pair
+        # columns allow; a source label, where the dataset gives one,
+        # replaces the model's answer for that pair
+        batch = left_rows[start:end]
+        answers = judge.join(spec, batch, right_rows)
+        if _pair_columns(spec):
+            asked = _matching_pairs(spec, batch, right_rows)
+        else:
+            asked = [(i, j) for i in range(len(batch))
+                     for j in range(len(right_rows))]
         output_rows = []
         model_rows = 0
-        for i, left in enumerate(left_rows[start:end]):
-            for j, right in enumerate(right_rows):
-                known = source_label(left, right) if source_label else None
-                if known is not None:
-                    label, source = known
-                    output_rows.append(_answer_row(
-                        spec, identity, corpus_id, left, right,
-                        label, source, None))
-                    continue
-                answer = answers[(i, j)]
+        for i, j in asked:
+            left, right = batch[i], right_rows[j]
+            known = source_label(left, right) if source_label else None
+            if known is not None:
+                label, source = known
                 output_rows.append(_answer_row(
                     spec, identity, corpus_id, left, right,
-                    answer, MODEL_NAME, None))
-                verification.add(spec, left, right, answer)
-                model_rows += 1
+                    label, source, None))
+                continue
+            answer = answers[(i, j)]
+            output_rows.append(_answer_row(
+                spec, identity, corpus_id, left, right,
+                answer, MODEL_NAME, None))
+            verification.add(spec, left, right, answer)
+            model_rows += 1
         output_rows.sort(key=lambda row: (row["left_id"], row["right_id"]))
         _atomic_parquet(part, output_rows)
         after_write()
@@ -718,6 +783,9 @@ def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
 def _expected_rows(spec: PredicateSpec,
                    corpus_rows: dict[str, list[dict]]) -> int:
     count = len(corpus_rows[spec.left_table])
+    if spec.kind == "join" and _pair_columns(spec):
+        return len(_matching_pairs(spec, corpus_rows[spec.left_table],
+                                   corpus_rows[spec.right_table]))
     if spec.kind == "join":
         count *= len(corpus_rows[spec.right_table])
     return count

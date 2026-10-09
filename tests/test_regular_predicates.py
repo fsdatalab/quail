@@ -141,6 +141,17 @@ def test_sql_and_builder_bind_regular_predicates(session):
     scans = {node.alias: node for node in plan.walk() if isinstance(node, Scan)}
     assert [str(p) for p in scans["p"].predicates] == ["p.price > 15"]
     assert scans["r"].predicates == ()
+    # the builder keeps a where() on the joined side of join()
+    built = (session.docs("reviews").alias("r").where(col("r.stars") >= 4)
+             .join(session.docs("products").alias("p")
+                   .where(col("p.price") > 15),
+                   on=col("r.lang") == col("p.asin"))
+             .ai_filter(prompt("x {0} {1}", col("r.review"),
+                               col("p.description")))
+             .select("r.id", "p.asin")).logical
+    scans = {node.alias: node for node in built.walk() if isinstance(node, Scan)}
+    assert [str(p) for p in scans["p"].predicates] == ["p.price > 15"]
+    assert [str(p) for p in scans["r"].predicates] == ["r.stars >= 4"]
 
 
 def test_two_joins_on_one_table_sample_each_key_column(session):

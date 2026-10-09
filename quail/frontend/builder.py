@@ -583,6 +583,8 @@ class Query:
             self._tables.append((alias, provider))
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
+            for a, preds in other._regular_predicates.items():
+                self._regular_predicates.setdefault(a, []).extend(preds)
             for a, tests in other._label_filters.items():
                 self._label_filters.setdefault(a, []).extend(tests)
             for a, applies in other._applies.items():

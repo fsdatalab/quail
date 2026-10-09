@@ -76,11 +76,13 @@ def build_query(session, spec: QuerySpec):
 def queries(session) -> dict:
     """Id -> (description, callable() -> Query), for every registered table.
 
-    A query is listed when every table it reads is registered. Fresh
-    Query objects per call so each pass re-plans.
+    A query is listed when every table it reads is registered, whether
+    or not its reference labels are published. Fresh Query objects per
+    call so each pass re-plans.
     """
     listed = {}
-    for spec in query_specs(include_privacy=True).values():
+    for spec in query_specs(include_privacy=True,
+                            include_pending=True).values():
         info = spec.info
         if all(relation.table in session.catalog for relation in info.relations):
             listed[spec.id] = (
