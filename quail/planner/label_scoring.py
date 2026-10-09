@@ -149,10 +149,10 @@ class ClassifyScoring(ClassifyStatistics):
 
         The letters rule requires a prompt with one distinct token per
         label. The trie_tree rule requires the tree attention path. The
-        trie_decode rule requires a model without a canvas, documents
-        without resident KV, no request for probabilities, and no label
-        whose token sequence is a prefix of another's. Ties favor fewer
-        suffix tokens, then the first candidate.
+        trie_decode rule requires a model without a canvas, no request
+        for probabilities, and no label whose token sequence is a prefix
+        of another's. Ties favor fewer suffix tokens, then the first
+        candidate.
 
         Args:
             live: Expected number of documents to classify.
@@ -175,14 +175,14 @@ class ClassifyScoring(ClassifyStatistics):
         candidates = [LETTERS_SCORING] if lettered is not None else []
         if self.tree:
             candidates.append(TREE_SCORING)
-        if (not self.model.canvas_tokens and not resident
-                and not probabilities and decodable(labels)):
+        if (not self.model.canvas_tokens and not probabilities
+                and decodable(labels)):
             candidates.append(DECODE_SCORING)
         if not candidates:
             raise ClassifyRefusedError(
                 "no label scoring rule can run: no one-token letter for "
                 "every label, no tree attention for the packed trie, and "
-                "no greedy decode (resident documents, or a label that is "
+                "no greedy decode (an answer canvas, or a label that is "
                 "another's prefix)", 1, 0)
         best = None
         for scoring in candidates:

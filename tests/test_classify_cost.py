@@ -38,31 +38,32 @@ def _readout_seconds(rows, passes):
                _head_bytes() * passes / H100_SXM.hbm_bw)
 
 
-def _decode_outcome_work(lengths, runs, window=0, shared=None):
+def _decode_outcome_work(lengths, runs, window=0, shared=None, resident=False):
     """Count one label outcome's decode work from the first principles.
 
     The first request is the prefix, frame, cue, and the forced tokens
     to the first choice as one causal segment; each later round feeds
     one run that attends to everything before it and reads the
-    document's KV. A shared prefix is read instead of computed.
+    document's KV. A shared or resident prefix is read instead of
+    computed.
     """
     total = dict.fromkeys(asdict(Work()), 0.0)
     shared = shared or (0,) * len(lengths)
     for length, fed, borrowed in zip(lengths, runs, shared):
         prompt = HEAD + length + FRAME
-        fresh = range((HEAD + borrowed if borrowed else 0) + 1,
-                      prompt + sum(fed) + 1)
+        kept = HEAD + length if resident else HEAD + borrowed if borrowed else 0
+        fresh = range(kept + 1, prompt + sum(fed) + 1)
         total["tokens"] += len(fresh)
         total["kv_written"] += len(fresh)
         total["pairs"] += sum(fresh)
         contexts = [prompt + sum(fed[:round_]) for round_ in range(1, len(fed))]
-        total["kv_read"] += (HEAD + borrowed if borrowed else 0) + sum(contexts)
+        total["kv_read"] += kept + sum(contexts)
         if window:
             total["sliding_pairs"] += sum(min(i, window) for i in fresh)
             total["sliding_kv_read"] += sum(
                 min(context, window - 1) for context in contexts)
-            if borrowed:
-                total["sliding_kv_read"] += min(HEAD + borrowed, window - 1)
+            if kept:
+                total["sliding_kv_read"] += min(kept, window - 1)
     return total
 
 
@@ -70,21 +71,24 @@ def test_decode_feeds_one_run_per_choice():
     assert decode_round_tokens(LABELS) == list(RUNS)
 
 
-@pytest.mark.parametrize("lengths,labels,window,shared", [
-    ((10, 90), LABELS, 0, None),
-    ((10,), ((10,), (20,), (30, 31, 32, 33, 34)), 16, None),
-    ((40, 7, 25), LABELS, 16, (30, 0, 20)),
+@pytest.mark.parametrize("lengths,labels,window,shared,resident", [
+    ((10, 90), LABELS, 0, None, False),
+    ((10,), ((10,), (20,), (30, 31, 32, 33, 34)), 16, None, False),
+    ((40, 7, 25), LABELS, 16, (30, 0, 20), False),
+    ((10, 90), LABELS, 0, None, True),
+    ((40, 7, 25), LABELS, 16, None, True),
 ])
 def test_expected_work_matches_every_label_assignment(lengths, labels, window,
-                                                      shared):
+                                                      shared, resident):
     model = replace(QWEN3_4B_FP8, sliding_window=window, full_attention_period=2)
-    cost = _cost(lengths, labels, model=model, shared=shared or ())
+    cost = _cost(lengths, labels, model=model, shared=shared or (),
+                 resident=resident)
     runs = decode_round_tokens(labels)
     outcomes = list(itertools.product(runs, repeat=len(lengths)))
     expected = dict.fromkeys(asdict(Work()), 0.0)
     for picked in outcomes:
         for key, value in _decode_outcome_work(lengths, picked, window,
-                                               shared).items():
+                                               shared, resident).items():
             expected[key] += value / len(outcomes)
     assert asdict(cost.work) == pytest.approx(expected)
     assert cost.passes == pytest.approx(cost.work.tokens / CHUNK)

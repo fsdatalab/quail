@@ -645,22 +645,24 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
     table = ClassifyScoring(alias="d", mean=200.0, longest=300, budget=chunk,
                    chunk=chunk, model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes,
                    capacity=capacity, lengths=(200,) * 1000, tree=True)
-    # thirty four-token labels sharing nothing, on resident documents
-    # (no decode): the packed trie streams 91 tokens a document, the
-    # letters one after a frame 30 tokens longer
+    # thirty four-token labels sharing nothing, on resident documents:
+    # the greedy decode asks the cue with the frame and decides at its
+    # row; the letters read one row after a frame 30 tokens longer;
+    # the packed trie streams 91 tokens a document
     scoring, chosen = table.choose(1000, 20, 30, long_labels, True,
                                    lettered=(20, 60, letters))
-    assert scoring == "letters" and chosen.suffix_tokens == 1000
-    scoring, packed = table.choose(1000, 20, 30, long_labels, True)
-    assert scoring == "trie_tree"
+    assert scoring == "trie_decode" and chosen.suffix_tokens == 1000
+    lettered = table.estimate("letters", 1000, 20, 60, letters, True)
+    packed = table.estimate("trie_tree", 1000, 20, 30, long_labels, True)
     assert packed.suffix_tokens == 1000 * len(label_trie(long_labels))
-    assert chosen.seconds < packed.seconds
-    # one-token labels: the trie reads the cue row too, after the
-    # shorter prompt that names the labels
+    assert chosen.seconds < lettered.seconds < packed.seconds
+    # one-token labels: the decode and the trie read the cue row after
+    # the shorter prompt that names the labels; the decode asks it with
+    # the frame instead of streaming it after
     ones = tuple((300 + i,) for i in range(3))
     scoring, _ = table.choose(1000, 20, 30, ones, True,
                               lettered=(20, 60, letters[:3]))
-    assert scoring == "trie_tree"
+    assert scoring == "trie_decode"
     # fresh documents: a greedy decode feeds the cue and decides at its
     # row, as no two labels share a first token, and costs least
     scoring, decoded = table.choose(1000, 20, 30, long_labels, False,
@@ -677,10 +679,10 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
     # word starts let the packed trie stop at the word that tells a
     # label apart: here its first, so only the cue row is fed and read
     worded = tuple((False, True, True, True) for _ in long_labels)
-    scoring, decided = table.choose(1000, 20, 30, long_labels, True,
-                                    lettered=(20, 60, letters), starts=worded)
-    assert scoring == "trie_tree" and decided.suffix_tokens == 1000
-    assert decided.seconds < chosen.seconds
+    decided = table.estimate("trie_tree", 1000, 20, 30, long_labels, True,
+                             worded)
+    assert decided.suffix_tokens == 1000
+    assert decided.seconds < lettered.seconds < packed.seconds
     # a decode cannot end at a label that is another label's prefix
     prefixed = long_labels[:-1] + (long_labels[0][:2],)
     assert table.choose(1000, 20, 30, prefixed, False,

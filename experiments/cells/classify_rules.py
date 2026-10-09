@@ -93,7 +93,7 @@ def _summary(record) -> dict:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=5400,
               volumes=VOLUMES)
-def run_rules(run: str) -> dict:
+def run_rules(run: str, queries=QUERIES, rules=RULES) -> dict:
     """Run each query under each rule and save the records and a summary."""
     from pathlib import Path
 
@@ -105,9 +105,9 @@ def run_rules(run: str) -> dict:
     root = Path(f"/results/ablations/classify-rules-{run}")
     summary = {"run": run, "model": MODEL, "queries": {}}
     started = time.perf_counter()
-    for query_id, sf in QUERIES:
+    for query_id, sf in queries:
         summary["queries"][query_id] = {"sf": sf, "rules": {}}
-        for rule in RULES:
+        for rule in rules:
             name = rule or "planner"
             _force(rule, original)
             output = root / query_id / name
@@ -128,8 +128,13 @@ def run_rules(run: str) -> dict:
 
 
 @app.local_entrypoint()
-def main():
+def main(queries: str = "", rules: str = ""):
+    """Run the cell; queries "BIO-5:0.5,AGENT-5:0.1", rules "planner,trie_tree"."""
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    call = run_rules.spawn(run)
+    picked = [(q.split(":")[0], float(q.split(":")[1]))
+              for q in queries.split(",") if q] or list(QUERIES)
+    forced = ([None if r == "planner" else r for r in rules.split(",") if r]
+              or list(RULES))
+    call = run_rules.spawn(run, picked, forced)
     print(f"run {run} function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=2), flush=True)
