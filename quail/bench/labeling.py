@@ -222,6 +222,9 @@ CORPUS_COLUMNS = {
     "issue_runs": ("id", "request", "transcript", "message_count",
                    "instance_id", "repo", "resolved", "token_count"),
     "issue_messages": MESSAGE_COLUMNS,
+    "wrench_runs": ("id", "task_id", "model", "mode", "transcript",
+                    "step_count", "token_count"),
+    "wrench_steps": ("id", "run_id", "step_index", "model", "text"),
 }
 
 

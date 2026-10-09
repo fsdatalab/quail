@@ -12,7 +12,8 @@ from quail.bench.quailb import (
 )
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
-from quail_b.queries import QUERY_ORDER, get_query, pending_query_ids
+from quail_b.queries import QUERY_ORDER, pending_query_ids
+from quail_b.queries import queries as query_specs
 
 
 def _standin_sets(tmp_path):
@@ -64,6 +65,20 @@ def _standin_sets(tmp_path):
             "token_count": pa.array([3] * 6, pa.int32()),
         },
         "issue_messages": _messages("issue_messages"),
+        "wrench_runs": {
+            "task_id": [f"task{i // 2}" for i in six],
+            "model": ["gpt-5.4", "gemini-3.1-pro"] * 3,
+            "mode": ["hack", "baseline"] * 3,
+            "transcript": [f"agent run {i}" for i in six],
+            "step_count": pa.array([3] * 6, pa.int32()),
+            "token_count": pa.array([40] * 6, pa.int32()),
+        },
+        "wrench_steps": {
+            "run_id": [f"wrench_runs{i // 2}" for i in six],
+            "step_index": pa.array([1, 2] * 3, pa.int32()),
+            "model": ["gpt-5.4"] * 6,
+            "text": [f"agent step {i}" for i in six],
+        },
     }
     for name, columns in tables.items():
         rows = len(next(iter(columns.values())))
@@ -103,9 +118,10 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
     assert set(QUERY_ORDER) == (
         expected | classify | relational) - {"PRIV-1", "PRIV-2"}
     # queries whose labels are pending are listed and built like the rest
+    specs = query_specs(include_privacy=True, include_pending=True)
     pending = set(pending_query_ids())
     for qid in pending:
-        info = get_query(qid).info
+        info = specs[qid].info
         if info.relational:
             relational.add(qid)
         elif info.classifies:
@@ -138,7 +154,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                 plan = query.plan()
                 # a regular predicate alone runs on every backend; a sort or
                 # an aggregate runs on Quail only
-                if backend != "quail" and qid in relational - {"REL-AGENT-1"}:
+                if backend != "quail" and specs[qid].info.tail:
                     assert isinstance(plan, Refusal), case
                     assert plan.constraint == "sort_needs_quail_backend", case
                     continue

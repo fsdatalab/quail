@@ -235,6 +235,13 @@ def _corpus_rows(reviews, reports, terms, claims, evidence, contexts,
             "message_count": 1, "instance_id": "a__b-1", "repo": "a/b",
             "resolved": 1, "token_count": 1}],
         "issue_messages": [_message("ir00000/0")],
+        "wrench_runs": [{
+            "id": "wr00000", "task_id": "t1", "model": "gpt-5.4",
+            "mode": "hack", "transcript": "yes", "step_count": 1,
+            "token_count": 1}],
+        "wrench_steps": [{"id": "wr00000/1", "run_id": "wr00000",
+                          "step_index": 1, "model": "gpt-5.4",
+                          "text": "yes"}],
     }
 
 
