@@ -1,10 +1,12 @@
 """Score label tokens and match decoded text to labels.
 
-The letters rule reads one token per label. The trie_tree rule sums the
-token log probabilities of each complete label. The trie_decode rule
-(GreedyDecoder) picks one allowed token per round and never compares
-complete label scores.
+The letters rule reads one token per label. The trie_tree rule gives each
+label the probability of the answers whose longest matching label it is.
+The trie_decode rule (GreedyDecoder) picks one allowed token per round and
+never compares complete label scores.
 """
+
+import math
 
 import numpy as np
 
@@ -186,7 +188,11 @@ def trie_chains(label_ids) -> list:
 
 
 def tree_scores(label_ids, chains, targets, logprobs) -> np.ndarray:
-    """Return every label's summed log probability from packed trie chains.
+    """Return every label's log probability from packed trie chains.
+
+    A label's probability is that of the answers whose longest matching
+    label it is, as in ``match_label``: the probability of its tokens,
+    minus that of each label that extends it with no label in between.
 
     Args:
         label_ids: One token id sequence per label.
@@ -194,6 +200,10 @@ def tree_scores(label_ids, chains, targets, logprobs) -> np.ndarray:
         targets: The token ids, one per column of ``logprobs``.
         logprobs: Shape (rows, targets): the chains' rows back to back,
             each read after the trie node it holds.
+
+    Returns:
+        One log probability per label, in label order. A label whose
+        extensions hold all of its probability scores minus infinity.
     """
     row_of = {}
     row = 0
@@ -202,8 +212,21 @@ def tree_scores(label_ids, chains, targets, logprobs) -> np.ndarray:
             row_of[node] = row
             row += 1
     column = {token: index for index, token in enumerate(targets)}
-    scores = np.zeros(len(label_ids), dtype=np.float64)
-    for label, ids in enumerate(label_ids):
-        for depth, token in enumerate(ids):
-            scores[label] += logprobs[row_of[tuple(ids[:depth])], column[token]]
+
+    def logprob(ids, start=0):
+        return sum(float(logprobs[row_of[ids[:depth]], column[ids[depth]]])
+                   for depth in range(start, len(ids)))
+
+    paths = [tuple(ids) for ids in label_ids]
+    taken = dict.fromkeys(paths, 0.0)   # share held by the nearest extensions
+    for ids in taken:
+        for depth in range(len(ids) - 1, 0, -1):
+            if ids[:depth] in taken:
+                taken[ids[:depth]] += math.exp(logprob(ids, depth))
+                break
+    scores = np.empty(len(paths), dtype=np.float64)
+    for label, ids in enumerate(paths):
+        # rounding can push the extensions' share to 1 or past it
+        scores[label] = (logprob(ids) + math.log1p(-taken[ids])
+                         if taken[ids] < 1.0 else -math.inf)
     return scores

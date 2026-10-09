@@ -826,6 +826,40 @@ def test_trie_chains_cover_every_node_once_and_gather_ancestors():
     assert requests.chains == chains
 
 
+def test_tree_scores_give_a_prefix_label_only_its_longest_matches():
+    from quail.execution.labels import tree_scores, trie_chains
+
+    # yes=[1], "yes, partly"=[1,2,3], no=[4]; rows (), (1,), (1, 2)
+    labels = ((1,), (1, 2, 3), (4,))
+    chains = trie_chains(labels)
+    targets = [1, 2, 3, 4]
+    logprobs = np.full((3, 4), -9.0)
+    logprobs[0, 0] = np.log(0.7)     # () -> yes
+    logprobs[0, 3] = np.log(0.3)     # () -> no
+    logprobs[1, 1] = np.log(0.8)     # yes -> ,
+    logprobs[2, 2] = np.log(0.9)     # yes, -> partly
+    scores = tree_scores(labels, chains, targets, logprobs)
+    assert np.exp(scores) == pytest.approx([0.196, 0.504, 0.3])
+    assert best_label(scores) == 1
+
+    # a=[1], ab=[1,2], abc=[1,2,3]: a gives up only ab's share, which
+    # already holds abc's
+    labels = ((1,), (1, 2), (1, 2, 3))
+    chains = trie_chains(labels)
+    logprobs = np.full((3, 4), -9.0)
+    logprobs[0, 0] = np.log(0.5)
+    logprobs[1, 1] = np.log(0.6)
+    logprobs[2, 2] = np.log(0.5)
+    scores = tree_scores(labels, chains, targets, logprobs)
+    assert np.exp(scores) == pytest.approx([0.2, 0.15, 0.15])
+
+    # an extension that holds all of a label's probability leaves it none
+    logprobs[1, 1] = 0.0
+    scores = tree_scores(labels, chains, targets, logprobs)
+    assert scores[0] == -np.inf
+    assert np.exp(scores[1:]) == pytest.approx([0.25, 0.25])
+
+
 def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
     from fakes import cpu_staging
     from test_sliding_kv import plain_arena

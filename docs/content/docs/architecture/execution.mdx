@@ -129,6 +129,13 @@ For example, suppose `refund` has two tokens. The first has probability
 probability is 0.48. If the single token label `praise` has probability
 0.3, `trie_tree` selects `refund`.
 
+When one label starts another, `trie_tree` gives each label the answers
+whose longest matching label it is, so the probabilities do not overlap.
+For example, imagine the labels `yes`, `yes, partly`, and `no`. Suppose
+`yes` has probability 0.7, and `, partly` has probability 0.72 after it.
+`yes, partly` gets 0.7 × 0.72 = 0.504. `yes` gets the rest of its 0.7:
+answers such as `yes.` or `yes, mostly`, which add up to 0.196.
+
 Additional requirements apply:
 
 - `trie_decode` requires a model without extra answer positions and a
