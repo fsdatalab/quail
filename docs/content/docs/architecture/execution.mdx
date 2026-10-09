@@ -116,11 +116,11 @@ The generative models can select between these labels in three ways:
 | Method | How it selects a label | Requirement |
 | --- | --- | --- |
 | `letters` | Give each label a distinct letter in the prompt, then compare the model's scores for those letters. | Each letter must be one token. |
-| `trie_tree` | Score each label through the end of the word that tells it apart from the other labels, and choose the highest score. Labels with common starting tokens share computation. | [Tree attention](#attention-paths) must be available. |
+| `trie_tree` | Score each label's token sequence and choose the highest sequence probability. Labels with common starting tokens share computation. | [Tree attention](#attention-paths) must be available. |
 | `trie_decode` | Choose the allowed token with the highest score at each step until a label is complete. Only tokens that continue a supplied label are allowed. | No label's token sequence can be the start of another label's token sequence. |
 
 A *trie* is a tree of token sequences in which common starting tokens are
-stored together. `trie_tree` evaluates every label.
+stored together. `trie_tree` evaluates every label sequence.
 `trie_decode` follows one sequence, so it can choose a different label
 from the one with the highest probability for its complete sequence.
 
@@ -128,29 +128,6 @@ For example, suppose `refund` has two tokens. The first has probability
 0.8, and the second has probability 0.6 after the first. The sequence
 probability is 0.48. If the single token label `praise` has probability
 0.3, `trie_tree` selects `refund`.
-
-`trie_tree` reads a label's tokens only through the end of the word
-that tells it apart, so a label's length past that point does not
-lower its score. For example, imagine the labels `hello my name is
-shreya` and `elephant in the room`. They split at their first word, so
-`trie_tree` compares ` hello` with ` elephant` at one row and never
-reads the words after them. The deciding word is read to its end, not
-only its first token: suppose ` spam` is the two tokens ` sp` and
-`am`, and ` ham` is one token. If ` sp` has probability 0.45 and
-` ham` 0.40, but `am` follows ` sp` only 60% of the time, `spam`
-scores 0.45 × 0.6 = 0.27 and `ham` wins; the rest of ` sp` went to
-words such as ` special`. Punctuation joins the word after it, so
-`yes, partly` is read through ` partly`. A token begins a word when
-its text starts with a space and the token before it holds a letter
-or digit, so a label without spaces, such as a number, is read to its
-end.
-
-When one label starts another, `trie_tree` gives each label the answers
-whose longest matching label it is, so the probabilities do not overlap.
-For example, imagine the labels `yes`, `yes, partly`, and `no`. Suppose
-`yes` has probability 0.7, and `, partly` has probability 0.72 after it.
-`yes, partly` gets 0.7 × 0.72 = 0.504. `yes` gets the rest of its 0.7:
-answers such as `yes.` or `yes, mostly`, which add up to 0.196.
 
 Additional requirements apply:
 
