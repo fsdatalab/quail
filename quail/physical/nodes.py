@@ -640,6 +640,10 @@ class ClassifySpec(ScoreSpec):
         labels: Labels in query order.
         label_token_ids: Token ids for each label: its letter for the
             letters rule, its text for the trie rules.
+        label_word_starts: Per label, which of its tokens begin a new
+            word, from ``quail.labels.word_starts``; empty marks none.
+            The trie_tree rule reads a label through the end of the
+            word that tells it apart.
         scoring: The label scoring rule: letters, trie_tree, or trie_decode.
             The planner leaves it empty until the label_scoring rule
             picks one.
@@ -654,6 +658,7 @@ class ClassifySpec(ScoreSpec):
 
     labels: tuple[str, ...] = ()
     label_token_ids: tuple[tuple[int, ...], ...] = ()
+    label_word_starts: tuple[tuple[bool, ...], ...] = ()
     scoring: str = "letters"
     probabilities: bool = False
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
@@ -684,6 +689,9 @@ class ClassifySpec(ScoreSpec):
             label_token_ids=tuple(
                 tuple(int(token) for token in ids)
                 for ids in value["label_token_ids"]),
+            label_word_starts=tuple(
+                tuple(bool(flag) for flag in flags)
+                for flags in value.get("label_word_starts", ())),
             scoring=str(value.get("scoring", "letters")),
             probabilities=bool(value.get("probabilities", False)),
             join_layout=(None if value.get("join_layout") is None else tuple(
@@ -697,6 +705,7 @@ class ClassifySpec(ScoreSpec):
             **super().to_dict(),
             "labels": list(self.labels),
             "label_token_ids": [list(ids) for ids in self.label_token_ids],
+            "label_word_starts": [list(flags) for flags in self.label_word_starts],
             "scoring": self.scoring,
             "probabilities": self.probabilities,
             "join_layout": (None if self.join_layout is None

@@ -121,8 +121,11 @@ def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared):
         assert retained == (shared if first else 35)
         retained_reads += retained
         fresh_tokens += len(chunk.input_ids)
+        # the one label decides at the cue; the four decide at a second
+        # choice that one fed token reaches
+        labels = [(10,)] if first else [(10, 11), (10, 12), (20, 21), (20, 22)]
         cost = estimate(
-            "trie_decode", 1, 0, 2, [(10,) * (round_ + 1)], lengths=(32,),
+            "trie_decode", 1, 0, 2, labels, lengths=(32,),
             shared=(shared,), chunk=100,
             model=QWEN3_4B_FP8, device=H100_SXM)
         assert cost.work.tokens == fresh_tokens

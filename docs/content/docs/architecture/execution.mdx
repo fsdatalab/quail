@@ -116,18 +116,37 @@ The generative models can select between these labels in three ways:
 | Method | How it selects a label | Requirement |
 | --- | --- | --- |
 | `letters` | Give each label a distinct letter in the prompt, then compare the model's scores for those letters. | Each letter must be one token. |
-| `trie_tree` | Score each label's token sequence and choose the highest sequence probability. Labels with common starting tokens share computation. | [Tree attention](#attention-paths) must be available. |
-| `trie_decode` | Choose the allowed token with the highest score at each step until a label is complete. Only tokens that continue a supplied label are allowed. | No label's token sequence can be the start of another label's token sequence. |
+| `trie_tree` | Score each label through the end of the word that tells it apart from the others, and choose the highest score. Labels with common starting tokens share computation. | [Tree attention](#attention-paths) must be available. |
+| `trie_decode` | At each point where the labels split, choose the allowed token with the highest score, until one label remains. Only tokens that continue a supplied label are allowed. | No label's token sequence can be the start of another label's token sequence. |
 
 A *trie* is a tree of token sequences in which common starting tokens are
-stored together. `trie_tree` evaluates every label sequence.
-`trie_decode` follows one sequence, so it can choose a different label
-from the one with the highest probability for its complete sequence.
+stored together. The two trie methods look only at the trie nodes where
+the labels split. A token with one allowed continuation is fed to the
+model when a later split needs it, but its row is never read, and the
+tokens after a label's last split are never fed.
 
-For example, suppose `refund` has two tokens. The first has probability
-0.8, and the second has probability 0.6 after the first. The sequence
-probability is 0.48. If the single token label `praise` has probability
-0.3, `trie_tree` selects `refund`.
+For example, imagine the labels `hello my name is shreya` and `elephant
+in the room`. They split at their first word, so both methods read one
+row, after the answer cue, and compare the scores of ` hello` and
+` elephant` there. The seven words after those are never fed. Suppose
+` hello` has probability 0.5 and ` elephant` 0.4. `trie_tree` returns
+0.56 and 0.44 after normalizing over the labels.
+
+`trie_tree` reads to the end of the deciding word, not only its first
+token, so a word that starts like a label does not count for it. For
+example, suppose ` spam` is the two tokens ` sp` and `am`, and ` ham`
+is one token. The model gives ` sp` probability 0.45 and ` ham` 0.40,
+and after ` sp` it continues with `am` 60% of the time; the rest goes
+to words such as ` special`. `trie_tree` reads the row after ` sp` too
+and scores `spam` at 0.45 × 0.6 = 0.27, so `ham` wins. Punctuation
+joins the word after it: `yes, partly` is scored through ` partly`.
+
+`trie_tree` scores every label at each split, so the label with the
+highest sequence probability wins. `trie_decode` follows one path, so
+it can choose a different label. For example, suppose `refund request`
+and `refund status` share their first token with probability 0.8, and
+`praise` has 0.3. `trie_decode` takes ` refund` and never compares
+`praise` against the complete sequences.
 
 When one label starts another, `trie_tree` gives each label the answers
 whose longest matching label it is, so the probabilities do not overlap.
@@ -135,6 +154,11 @@ For example, imagine the labels `yes`, `yes, partly`, and `no`. Suppose
 `yes` has probability 0.7, and `, partly` has probability 0.72 after it.
 `yes, partly` gets 0.7 × 0.72 = 0.504. `yes` gets the rest of its 0.7:
 answers such as `yes.` or `yes, mostly`, which add up to 0.196.
+
+The planner finds word boundaries with the tokenizer: a token begins a
+word when its text starts with a space and the token before it holds a
+letter or digit. A label written without spaces, such as a number or a
+word in a script without them, is read to its end.
 
 Additional requirements apply:
 

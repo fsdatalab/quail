@@ -63,8 +63,10 @@ def _bytes(text):
 
 def test_greedy_decoder_follows_the_likeliest_child_to_a_label():
     targets = [1, 2, 3, 4]
-    decoder = GreedyDecoder(IDS, targets, documents=2)
+    decoder = GreedyDecoder(IDS, targets, documents=2, cue=93)
     assert decoder.rounds == 2
+    # the cue's request, then the run from token 1 to the next choice
+    assert decoder.suffixes == [[93], [1]]
     # round 0 feeds the cue, request 0, for both documents
     assert [decoder.requests(doc) for doc in range(2)] == [[0], [0]]
     assert decoder.tokens == 2
@@ -72,19 +74,54 @@ def test_greedy_decoder_follows_the_likeliest_child_to_a_label():
     decoder.update(0, np.array([-1.0, -9.0, -9.0, -3.0]))
     decoder.update(1, np.array([-2.0, -9.0, -9.0, -0.5]))
     assert decoder.label.tolist() == [-1, 2]
-    # round 1 feeds only token 1, request 1 plus its target column 0
+    # round 1 feeds only token 1, request 1
     assert decoder.requests(1) is None and decoder.requests(0) == [1]
     assert decoder.tokens == 2 + 1
     # after token 1, token 3 beats token 2: "refund status"
     decoder.update(0, np.array([-9.0, -5.0, -1.0, -9.0]))
     assert decoder.label.tolist() == [1, 2]
     # a tie goes to the earlier label's token
-    tied = GreedyDecoder(IDS, targets, documents=1)
+    tied = GreedyDecoder(IDS, targets, documents=1, cue=93)
     tied.requests(0)
     tied.update(0, np.array([-1.0, -9.0, -9.0, -1.0]))
     assert tied.node[0] == (1,)
     with pytest.raises(ValueError, match="prefix"):
-        GreedyDecoder(((1, 2), (1,)), [1, 2], documents=1)
+        GreedyDecoder(((1, 2), (1,)), [1, 2], documents=1, cue=93)
+
+
+def test_greedy_decoder_feeds_forced_tokens_with_the_next_choice():
+    from quail.labels import decode_round_tokens, decode_runs
+
+    # "the cat sat" / "the cat ran": the one choice comes after two
+    # forced tokens, fed with the cue; the chosen label's last token
+    # is never fed
+    labels = ((1, 2, 3), (1, 2, 4))
+    decoder = GreedyDecoder(labels, [1, 2, 3, 4], documents=1, cue=93)
+    assert decoder.suffixes == [[93, 1, 2]] and decoder.rounds == 1
+    assert decoder.requests(0) == [0] and decoder.tokens == 3
+    # a forced token is taken whatever its row says
+    decoder.update(0, np.array([-1e9, -1e9, -0.5, -0.1]))
+    assert decoder.label.tolist() == [1] and decoder.requests(0) is None
+    # "hello my name is shreya" / "elephant in the room" decide at the
+    # cue's row: one round, one token fed
+    long = ((1, 2, 3, 4, 5, 6, 7), (8, 9, 10, 11))
+    decoder = GreedyDecoder(long, list(range(1, 12)), documents=1, cue=93)
+    assert decoder.suffixes == [[93]] and decoder.rounds == 1
+    decoder.requests(0)
+    decoder.update(0, np.array([-0.7] + [-9.0] * 6 + [-0.9] + [-9.0] * 3))
+    assert decoder.label.tolist() == [0] and decoder.tokens == 1
+    # "a b c d" / "a b c e" / "a f" / "g": a request per choice on the
+    # path, each feeding the run to the next choice
+    deep = ((1, 2, 3, 4), (1, 2, 3, 5), (1, 6), (7,))
+    runs = decode_runs(deep)
+    assert runs.runs == [[], [1], [2, 3]] and runs.rounds == 3
+    assert decode_round_tokens(deep) == [[1, 1, 2], [1, 1, 2], [1, 1], [1]]
+    # the only label is decided at the cue, with nothing fed
+    decoder = GreedyDecoder(((1, 2, 3),), [1, 2, 3], documents=1, cue=93)
+    assert decoder.suffixes == [[93]] and decoder.rounds == 1
+    decoder.requests(0)
+    decoder.update(0, np.array([-9.0, -9.0, -9.0]))
+    assert decoder.label.tolist() == [0]
 
 
 def test_label_readout_is_log_softmax_over_the_whole_vocabulary():
@@ -103,7 +140,7 @@ def test_label_readout_is_log_softmax_over_the_whole_vocabulary():
     assert rows.tolist() == [0, 1, 0, 0, 1, 2]
 
 
-def test_classifier_decodes_one_token_per_round(monkeypatch):
+def test_classifier_decodes_one_choice_per_round(monkeypatch):
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
         expected_inputs=3, estimated_seconds=0.0,
@@ -111,7 +148,7 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
         label_token_ids=IDS, scoring="trie_decode")
     requests = label_requests(spec)
     assert requests.rounds == 2 and requests.score is None
-    assert requests.suffixes == [[93], [1], [2], [3], [4]]
+    assert requests.suffixes == [[93], [1]]
     assert not requests.read_all_rows
     documents = {"d": [[10, 11], [12], [13]]}
     targets = [1, 2, 3, 4]
@@ -244,6 +281,9 @@ def test_classify_plans_filters_and_returns_labels(session):
     (test,) = [n for n in plan.nodes if isinstance(n, Filter)]
     assert classify.spec.labels == ("refund", "shipping", "praise")
     assert classify.spec.label_token_ids[0] == tuple(_bytes(" refund"))
+    # a tokenizer without decode marks no word start
+    assert classify.spec.label_word_starts == tuple(
+        (False,) * len(ids) for ids in classify.spec.label_token_ids)
     assert test.predicate == InList("topic", ("refund", "shipping"))
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
@@ -621,14 +661,26 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
     scoring, _ = table.choose(1000, 20, 30, ones, True,
                               lettered=(20, 60, letters[:3]))
     assert scoring == "trie_tree"
-    # fresh documents: a greedy decode feeds the cue and then one token
-    # a round, kept in KV, four tokens over four rounds, and costs least
+    # fresh documents: a greedy decode feeds the cue and decides at its
+    # row, as no two labels share a first token, and costs least
     scoring, decoded = table.choose(1000, 20, 30, long_labels, False,
                                     lettered=(20, 60, letters))
     assert scoring == "trie_decode"
-    assert decoded.suffix_tokens == 1000 * 4
+    assert decoded.suffix_tokens == 1000 * 1
     fresh_trie = table.estimate("trie_tree", 1000, 20, 30, long_labels, False)
-    assert decoded.rounds == 4 and decoded.seconds < fresh_trie.seconds
+    assert decoded.rounds == 1 and decoded.seconds < fresh_trie.seconds
+    # labels that share a first token decide at a second choice; the
+    # decode feeds a run of their shared tokens with the cue
+    shared = tuple((100, 101) + ids[2:] for ids in long_labels)
+    decoded = table.estimate("trie_decode", 1000, 20, 30, shared, False)
+    assert decoded.rounds == 1 and decoded.suffix_tokens == 1000 * 3
+    # word starts let the packed trie stop at the word that tells a
+    # label apart: here its first, so only the cue row is fed and read
+    worded = tuple((False, True, True, True) for _ in long_labels)
+    scoring, decided = table.choose(1000, 20, 30, long_labels, True,
+                                    lettered=(20, 60, letters), starts=worded)
+    assert scoring == "trie_tree" and decided.suffix_tokens == 1000
+    assert decided.seconds < chosen.seconds
     # a decode cannot end at a label that is another label's prefix
     prefixed = long_labels[:-1] + (long_labels[0][:2],)
     assert table.choose(1000, 20, 30, prefixed, False,
@@ -860,6 +912,64 @@ def test_tree_scores_give_a_prefix_label_only_its_longest_matches():
     assert np.exp(scores[1:]) == pytest.approx([0.25, 0.25])
 
 
+def test_trie_tree_reads_through_the_deciding_word():
+    from quail.execution.labels import chain_reads, tree_scores, trie_chains
+    from quail.labels import fed_nodes, read_nodes, word_starts
+
+    pieces = {1: b" hello", 2: b" my", 3: b" name", 4: b" is", 5: b" sh",
+              6: b"re", 7: b"ya", 8: b" elephant", 9: b" in", 10: b" the",
+              11: b" room"}
+    hello = ((1, 2, 3, 4, 5, 6, 7), (8, 9, 10, 11))
+    starts = word_starts(hello, lambda ids: pieces[ids[0]])
+    assert starts == ((False, True, True, True, True, False, False),
+                      (False, True, True, True))
+    # the labels differ at their first word: only the cue row is read,
+    # and no label token is fed
+    read = read_nodes(hello, starts)
+    assert read == {()} and fed_nodes(read) == {()}
+    chains = trie_chains(hello, read)
+    assert chains == [([()], 0, [])] and chain_reads(chains, read) == [True]
+    scores = tree_scores(hello, chains, [1, 8], np.log([[0.5, 0.4]]), read)
+    assert np.exp(scores) == pytest.approx([0.5, 0.4])
+    # " sp" + "am" against " ham": the deciding token is part of a
+    # word, so the word is read to its end, and " special" does not
+    # count as spam
+    spam = ((1, 2), (3,))
+    starts = word_starts(spam, lambda ids: {1: b" sp", 2: b"am", 3: b" ham"}[ids[0]])
+    read = read_nodes(spam, starts)
+    assert read == {(), (1,)}
+    chains = trie_chains(spam, read)
+    logprobs = np.log([[0.45, 1e-9, 0.40], [1e-9, 0.6, 1e-9]])
+    scores = tree_scores(spam, chains, [1, 2, 3], logprobs, read)
+    assert np.exp(scores) == pytest.approx([0.27, 0.40])
+    # " category" ":" " alpha" / " beta" / " other": the punctuation
+    # joins the word after it; " alpha" and " beta" are whole words
+    pieces = {1: b" category", 2: b":", 3: b" alpha", 4: b" beta", 5: b" other"}
+    labels = ((1, 2, 3), (1, 2, 4), (5,))
+    starts = word_starts(labels, lambda ids: pieces[ids[0]])
+    assert starts == ((False, False, False), (False, False, False), (False,))
+    assert read_nodes(labels, starts) == {(), (1,), (1, 2)}
+    # a word after the deciding one is fed only when a later read needs
+    # it: " the cat sat" / " the cat ran" feed " the cat" and read once
+    pieces = {1: b" the", 2: b" cat", 3: b" sat", 4: b" ran"}
+    cat = ((1, 2, 3), (1, 2, 4))
+    read = read_nodes(cat, word_starts(cat, lambda ids: pieces[ids[0]]))
+    assert read == {(), (1, 2)} and fed_nodes(read) == {(), (1,), (1, 2)}
+    chains = trie_chains(cat, read)
+    assert chains == [([(), (1,), (1, 2)], 0, [])]
+    assert chain_reads(chains, read) == [True, False, True]
+    logprobs = np.log([[0.9, 1e-9, 1e-9, 1e-9], [1e-9, 1e-9, 0.3, 0.6]])
+    scores = tree_scores(cat, chains, [1, 2, 3, 4], logprobs, read)
+    assert np.exp(scores) == pytest.approx([0.27, 0.54])
+    # digits after a lone space token continue its word
+    year = ((1, 2, 3), (1, 2, 4))
+    starts = word_starts(year, lambda ids: {1: b" ", 2: b"2", 3: b"4", 4: b"5"}[ids[0]])
+    assert starts == ((False, False, False), (False, False, False))
+    # without word starts every node is read, as before
+    assert read_nodes(hello) == set(label_trie(hello))
+    assert word_starts(hello, None) == tuple((False,) * len(ids) for ids in hello)
+
+
 def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
     from fakes import cpu_staging
     from test_sliding_kv import plain_arena
@@ -889,6 +999,15 @@ def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
     assert chunk.rows_per_answer == (5,)
     with pytest.raises(ValueError, match="tree attention"):
         chunk_mod.pack_chunk(torch, arena, [group], attention_mode="unified")
+    # a read mask keeps every row in the pass and reads the marked ones
+    masked = dict(group, read_mask=[True, False, True, True, False])
+    chunk = chunk_mod.pack_chunk(torch, arena, [masked], attention_mode="tree")
+    assert chunk.positions.tolist() == [4, 5, 6, 6, 5]
+    assert chunk.final_indices.tolist() == [0, 2, 3]
+    assert chunk.rows_per_answer == (3,)
+    with pytest.raises(ValueError, match="read_mask"):
+        chunk_mod.pack_chunk(torch, arena, [dict(group, read_mask=[True])],
+                             attention_mode="tree")
 
 
 def test_merge_partial_equals_attention_over_the_union_of_keys():
@@ -915,18 +1034,31 @@ def test_merge_partial_equals_attention_over_the_union_of_keys():
     assert torch.allclose(out_b[0], attend(slice(0, 1), slice(0, 4))[0][0])
 
 
-def test_classifier_scores_the_packed_trie(monkeypatch):
+@pytest.mark.parametrize("worded", [False, True])
+def test_classifier_scores_the_packed_trie(monkeypatch, worded):
     from quail.execution.labels import trie_chains
+    from quail.labels import read_nodes
 
+    # "a b c" / "a b d" / "a e f" / "g h": with word starts the shared
+    # " a" is fed unread, and nothing after a label's deciding word
     labels = ((1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8))
-    chains = trie_chains(labels)
+    starts = tuple((False,) + (True,) * (len(ids) - 1) for ids in labels)
+    read = read_nodes(labels, starts if worded else ())
+    chains = trie_chains(labels, read)
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
         expected_inputs=2, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 93)), labels=("a", "b", "c", "d"),
-        label_token_ids=labels, scoring="trie_tree")
-    targets = label_requests(spec).targets
+        label_token_ids=labels, scoring="trie_tree",
+        label_word_starts=starts if worded else ())
+    requests = label_requests(spec)
+    targets = requests.targets
     nodes = [node for chain, _, _ in chains for node in chain]
+    # "a e" and "g" are decided at their first word, so " e" and " g"
+    # are never fed
+    assert requests.suffixes == ([[93, 1, 2]] if worded else [[93, 1, 2, 5, 7]])
+    assert requests.read_mask == [True] * (3 if worded else 5)
+    read_count = sum(requests.read_mask)
 
     # document 0 prefers label b, document 1 label d
     def forward(chunk):
@@ -938,16 +1070,18 @@ def test_classifier_scores_the_packed_trie(monkeypatch):
                 rows.append([0.0] * len(targets))     # the frame entry
                 continue
             assert entry["chains"] == chains
-            for node in nodes:
-                rows.append([
-                    -1.0 if node + (token,) == wanted[:len(node) + 1] else -5.0
-                    for token in targets])
+            for node, is_read in zip(nodes, requests.read_mask):
+                if is_read:
+                    rows.append([
+                        -1.0 if node + (token,) == wanted[:len(node) + 1]
+                        else -5.0 for token in targets])
         return np.asarray(rows, dtype=np.float32)
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     def submit(rows, rows_per_answer=None):
-        # one record per answer: the frame entry's one row, a suffix's five
-        out = np.full((len(rows_per_answer), len(nodes), len(targets)), np.nan)
+        # one record per answer: the frame entry's one row, a suffix's
+        # read rows
+        out = np.full((len(rows_per_answer), read_count, len(targets)), np.nan)
         row = 0
         for index, count in enumerate(rows_per_answer):
             out[index, :count] = rows[row:row + count]
@@ -955,8 +1089,8 @@ def test_classifier_scores_the_packed_trie(monkeypatch):
         return out
 
     readout = SimpleNamespace(
-        targets=np.asarray(targets), rows=len(nodes),
-        dtype=np.dtype((np.float32, (len(nodes), len(targets)))),
+        targets=np.asarray(targets), rows=read_count,
+        dtype=np.dtype((np.float32, (read_count, len(targets)))),
         submit=submit, result=lambda rows: rows)
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
@@ -974,8 +1108,8 @@ def test_classifier_scores_the_packed_trie(monkeypatch):
     batch = QuailClassifier(state).classify(
         spec, [[0], [1]], {"d": [[10, 11], [12]]})
     assert list(batch.scores) == ["b", "d"]
-    # the trie's five rows once per document
-    assert batch.suffix_tokens == 2 * 5
+    # the trie's fed rows once per document
+    assert batch.suffix_tokens == 2 * (3 if worded else 5)
 
 
 def test_sql_category_forms_options_and_label_tables(session):

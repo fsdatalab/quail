@@ -10,10 +10,14 @@ from quail.cost.classify import estimate, estimate_chains
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.sol import unrounded_seconds
 from quail.cost.work import Work, ask, scan, stream
-from quail.labels import label_trie
+from quail.labels import decode_round_tokens, label_trie
 from quail.specs import DECISION_2_KAI_0_6B_BF16, H100_SXM, QWEN3_4B_FP8
 
-LABELS = ((10,), (20, 21), (30, 31, 32, 33, 34))
+# a one-token label; two that share a first token and split there; two
+# that split after a forced token
+LABELS = ((10,), (20, 21, 22), (20, 25, 26, 27, 28), (30, 31, 32), (30, 31, 33))
+# the tokens a greedy decode feeds for each label, per round
+RUNS = ([1], [1, 1], [1, 1], [1, 2], [1, 2])
 HEAD, FRAME, CHUNK = 2, 3, 10000
 
 
@@ -34,31 +38,36 @@ def _readout_seconds(rows, passes):
                _head_bytes() * passes / H100_SXM.hbm_bw)
 
 
-def _decode_outcome_work(lengths, depths, window=0, shared=None):
+def _decode_outcome_work(lengths, runs, window=0, shared=None):
     """Count one label outcome's decode work from the first principles.
 
-    The first request is the prefix, frame, and cue as one causal segment;
-    each later round feeds one token that attends to everything before it
-    and reads the document's KV. A shared prefix is read instead of
-    computed.
+    The first request is the prefix, frame, cue, and the forced tokens
+    to the first choice as one causal segment; each later round feeds
+    one run that attends to everything before it and reads the
+    document's KV. A shared prefix is read instead of computed.
     """
     total = dict.fromkeys(asdict(Work()), 0.0)
     shared = shared or (0,) * len(lengths)
-    for length, depth, borrowed in zip(lengths, depths, shared):
+    for length, fed, borrowed in zip(lengths, runs, shared):
         prompt = HEAD + length + FRAME
-        fresh = range((HEAD + borrowed if borrowed else 0) + 1, prompt + depth + 1)
+        fresh = range((HEAD + borrowed if borrowed else 0) + 1,
+                      prompt + sum(fed) + 1)
         total["tokens"] += len(fresh)
         total["kv_written"] += len(fresh)
         total["pairs"] += sum(fresh)
-        total["kv_read"] += (HEAD + borrowed if borrowed else 0) + sum(
-            range(prompt + 1, prompt + depth))
+        contexts = [prompt + sum(fed[:round_]) for round_ in range(1, len(fed))]
+        total["kv_read"] += (HEAD + borrowed if borrowed else 0) + sum(contexts)
         if window:
             total["sliding_pairs"] += sum(min(i, window) for i in fresh)
             total["sliding_kv_read"] += sum(
-                min(i, window - 1) for i in range(prompt + 1, prompt + depth))
+                min(context, window - 1) for context in contexts)
             if borrowed:
                 total["sliding_kv_read"] += min(HEAD + borrowed, window - 1)
     return total
+
+
+def test_decode_feeds_one_run_per_choice():
+    assert decode_round_tokens(LABELS) == list(RUNS)
 
 
 @pytest.mark.parametrize("lengths,labels,window,shared", [
@@ -70,17 +79,18 @@ def test_expected_work_matches_every_label_assignment(lengths, labels, window,
                                                       shared):
     model = replace(QWEN3_4B_FP8, sliding_window=window, full_attention_period=2)
     cost = _cost(lengths, labels, model=model, shared=shared or ())
-    outcomes = list(itertools.product(map(len, labels), repeat=len(lengths)))
+    runs = decode_round_tokens(labels)
+    outcomes = list(itertools.product(runs, repeat=len(lengths)))
     expected = dict.fromkeys(asdict(Work()), 0.0)
-    for depths in outcomes:
-        for key, value in _decode_outcome_work(lengths, depths, window,
+    for picked in outcomes:
+        for key, value in _decode_outcome_work(lengths, picked, window,
                                                shared).items():
             expected[key] += value / len(outcomes)
     assert asdict(cost.work) == pytest.approx(expected)
     assert cost.passes == pytest.approx(cost.work.tokens / CHUNK)
     assert cost.suffix_tokens == pytest.approx(
-        sum(sum(depths) for depths in outcomes) / len(outcomes))
-    assert cost.rounds == 5
+        sum(sum(map(sum, picked)) for picked in outcomes) / len(outcomes))
+    assert cost.rounds == max(map(len, runs))
 
 
 def test_sampled_label_draws_average_to_the_expected_work():
@@ -92,7 +102,7 @@ def test_sampled_label_draws_average_to_the_expected_work():
     for _ in range(draws):
         picks = rng.integers(0, len(LABELS), len(lengths))
         for key, value in _decode_outcome_work(
-                lengths, [len(LABELS[i]) for i in picks]).items():
+                lengths, [RUNS[i] for i in picks]).items():
             mean[key] += value / draws
     assert asdict(cost.work) == pytest.approx(mean, rel=0.02)
 
@@ -102,7 +112,7 @@ def test_label_and_document_order_do_not_change_the_estimate():
     expected = _cost(lengths, chunk=140)
     for labels in itertools.permutations(LABELS):
         assert _cost(lengths[::-1], labels, chunk=140) == expected
-    assert expected.suffix_tokens == pytest.approx(4 * 8 / 3)
+    assert expected.suffix_tokens == pytest.approx(4 * 11 / 5)
 
 
 def test_one_round_rules_are_priced_like_filters():
@@ -165,15 +175,20 @@ def test_smaller_chunks_pay_more_weight_reads_without_changing_work():
             ((weights + _head_bytes()) * cost.passes + kv) / device.hbm_bw)
 
 
-def test_time_falls_with_chunk_size_and_rises_with_label_length():
+def test_time_falls_with_chunk_size_and_rises_with_label_choices():
     lengths = (10, 20, 30, 300)
     seconds = [_cost(lengths, chunk=chunk).seconds for chunk in (50, 400, 4000, 40000)]
     assert seconds == sorted(seconds, reverse=True)
-    longer = (LABELS[0], LABELS[1] + (22,), LABELS[2] + (35, 36))
-    short, long = _cost(lengths), _cost(lengths, longer)
+    # tokens after a label's last choice are never fed, so they cost
+    # nothing; a choice below it adds a round
+    longer = (LABELS[0], LABELS[1] + (23,), LABELS[2] + (29, 30), *LABELS[3:])
+    assert _cost(lengths, longer) == _cost(lengths)
+    deeper = (*LABELS[:4], (30, 31, 33, 34), (30, 31, 33, 35))
+    short, long = _cost(lengths), _cost(lengths, deeper)
     assert short.work.dominates(long.work)
     assert short.seconds < long.seconds
     assert short.suffix_tokens < long.suffix_tokens
+    assert (short.rounds, long.rounds) == (2, 3)
 
 
 def test_kv_capacity_does_not_enter_the_estimate():
@@ -196,7 +211,7 @@ def test_kv_capacity_does_not_enter_the_estimate():
 def test_the_estimate_is_linear_in_the_expected_document_count(live):
     cost = _cost((10,), live=live)
     single = _cost((10,))
-    assert cost.rounds == (5 if live else 0)
+    assert cost.rounds == (2 if live else 0)
     assert asdict(cost.work) == pytest.approx(
         {key: value * live for key, value in asdict(single.work).items()})
     for name in ("seconds", "passes", "suffix_tokens"):

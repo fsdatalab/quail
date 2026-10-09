@@ -1,16 +1,18 @@
 """Score label tokens and match decoded text to labels.
 
-The letters rule reads one token per label. The trie_tree rule gives each
-label the probability of the answers whose longest matching label it is.
-The trie_decode rule (GreedyDecoder) picks one allowed token per round and
-never compares complete label scores.
+The letters rule reads one token per label. The trie_tree rule scores
+each label through the end of the word that tells it apart, and gives
+a label that starts another the answers whose longest matching label
+it is. The trie_decode rule (GreedyDecoder) picks one allowed token at
+each node where the labels split and never compares complete label
+scores.
 """
 
 import math
 
 import numpy as np
 
-from quail.labels import label_trie
+from quail.labels import decode_runs, fed_nodes, label_trie
 
 
 def trie_targets(trie) -> list[int]:
@@ -70,22 +72,24 @@ def best_label(scores) -> int:
 
 
 class GreedyDecoder:
-    """Per-document state for choosing one allowed label token per round.
+    """Per-document state for choosing one allowed label token per read.
 
-    Each round selects the highest-scoring child of the current trie node.
-    Decoding finishes at a complete label.
+    Each read selects the highest-scoring child of a choice node and
+    feeds the run to the next choice node. Decoding finishes when a
+    choice leads to a label.
 
     Args:
         label_ids: Token sequence for each label. No label's sequence may
             be a proper prefix of another label's sequence.
         targets: Token IDs corresponding to the readout columns.
         documents: Number of documents to track.
+        cue: The answer cue token.
 
     Raises:
         ValueError: One label's token sequence is a proper prefix of another.
     """
 
-    def __init__(self, label_ids, targets, documents):
+    def __init__(self, label_ids, targets, documents, cue):
         self.label_ids = [tuple(ids) for ids in label_ids]
         self.trie = label_trie(label_ids)
         self.leaf = {}
@@ -93,62 +97,77 @@ class GreedyDecoder:
             self.leaf.setdefault(ids, label)
         if any(node in self.leaf for node in self.trie):
             raise ValueError("a label is a proper prefix of another label")
+        self.runs = decode_runs(label_ids)
+        self.suffixes = [[cue, *self.runs.runs[0]], *self.runs.runs[1:]]
+        self.rounds = self.runs.rounds
         # a tie between children goes to the earlier label's token
         self.order = {}
         for label, ids in enumerate(self.label_ids):
             for token in ids:
                 self.order.setdefault(token, label)
         self.column = {token: i for i, token in enumerate(targets)}
-        self.rounds = max(len(ids) for ids in self.label_ids)
-        self.node = [()] * documents
+        self.node = [self.runs.first] * documents
+        self.pending = [0] * documents
         self.label = np.full(documents, -1, dtype=np.int64)
         self.tokens = 0     # tokens requested so far
 
     def requests(self, doc):
-        """Return the request that feeds the document's next token.
+        """Return the request that feeds the document's next run.
 
-        Round 0 feeds the answer cue. Each later round feeds only the token
-        chosen in the round before; the earlier path is already in KV.
+        The first request feeds the answer cue and the forced tokens
+        to the first choice node. Each later request feeds the run the
+        last choice picked; the earlier path is already in KV.
 
         Args:
             doc: Document index.
 
         Returns:
-            A one-element list holding 0 for the cue, or 1 plus the chosen
-            token's target column, or None if the document already has a
-            label.
+            A one-element list holding the run's suffix index, or None
+            if the document already has a label.
         """
         if self.label[doc] >= 0:
             return None
-        node = self.node[doc]
-        self.tokens += 1
-        return [0 if not node else 1 + self.column[node[-1]]]
+        index = self.pending[doc]
+        self.tokens += len(self.suffixes[index])
+        return [index]
 
     def update(self, doc, row):
         """Advance a document to its highest-scoring allowed token.
 
         Args:
             doc: Document index.
-            row: Token log probabilities in target-column order.
+            row: Token log probabilities in target-column order, read at
+                the document's current choice node.
         """
         node = self.node[doc]
+        if node in self.leaf:
+            self.label[doc] = self.leaf[node]
+            return
         best = min(self.trie[node],
                    key=lambda token: (-float(row[self.column[token]]),
                                       self.order[token]))
-        child = node + (best,)
-        self.node[doc] = child
-        if child in self.leaf:
-            self.label[doc] = self.leaf[child]
+        target, run = self.runs.after[node, best]
+        if run is None:
+            self.label[doc] = self.leaf[target]
+        else:
+            self.node[doc] = target
+            self.pending[doc] = run
 
 
-def trie_chains(label_ids) -> list:
-    """Split the label trie into chains that together hold each node once.
+def trie_chains(label_ids, read=None) -> list:
+    """Split the fed trie nodes into chains that together hold each once.
 
-    The first chain starts at the root, the answer cue's row, and
-    follows each node's first child; every other child starts a new
-    chain. A chain is one causal segment of the forward pass, so a
-    row sees the chain's earlier rows; the rows above the chain's
-    first node lie in earlier chains and are gathered separately.
+    The fed nodes are the read nodes and their ancestors. The first
+    chain starts at the root, the answer cue's row, and follows each
+    node's first fed child; every other fed child starts a new chain.
+    A chain is one causal segment of the forward pass, so a row sees
+    the chain's earlier rows; the rows above the chain's first node
+    lie in earlier chains and are gathered separately.
+
+    Args:
+        label_ids: One token id sequence per label.
+        read: The nodes whose rows are read, from ``read_nodes``.
+            None reads every node with children.
 
     Returns:
         One (nodes, start, gathers) per chain: the trie nodes whose
@@ -157,16 +176,18 @@ def trie_chains(label_ids) -> list:
         ancestor rows outside it as (chain, leading rows) pairs.
     """
     trie = label_trie(label_ids)
+    if read is None:
+        read = set(trie)
+    fed = fed_nodes(read)
     chains = []
     placed = {}       # node -> (chain, row)
 
     def extend(chain, node):
         placed[node] = (chain, len(chains[chain][0]))
         chains[chain][0].append(node)
-        # a full label's row is never read: only nodes with children
-        internal = [node + (token,) for token in trie[node]
-                    if node + (token,) in trie]
-        for index, child in enumerate(internal):
+        children = [node + (token,) for token in trie[node]
+                    if node + (token,) in fed]
+        for index, child in enumerate(children):
             if index == 0:
                 extend(chain, child)
             else:
@@ -187,35 +208,48 @@ def trie_chains(label_ids) -> list:
     return chains
 
 
-def tree_scores(label_ids, chains, targets, logprobs) -> np.ndarray:
+def chain_reads(chains, read=None) -> list[bool]:
+    """Return which chain rows, in chain order, are read.
+
+    Args:
+        chains: The chains ``trie_chains`` built.
+        read: The read nodes, from ``read_nodes``; None reads every row.
+    """
+    return [read is None or node in read
+            for nodes, _, _ in chains for node in nodes]
+
+
+def tree_scores(label_ids, chains, targets, logprobs, read=None) -> np.ndarray:
     """Return every label's log probability from packed trie chains.
 
-    A label's probability is that of the answers whose longest matching
-    label it is, as in ``match_label``: the probability of its tokens,
-    minus that of each label that extends it with no label in between.
+    A label's probability is the product of its tokens' probabilities
+    at the read nodes on its path. A label that starts another gets
+    that minus the probability of each label that extends it with no
+    label in between, as ``match_label`` gives decoded text to its
+    longest matching label.
 
     Args:
         label_ids: One token id sequence per label.
         chains: The chains ``trie_chains`` built.
         targets: The token ids, one per column of ``logprobs``.
-        logprobs: Shape (rows, targets): the chains' rows back to back,
-            each read after the trie node it holds.
+        logprobs: Shape (read rows, targets): the chains' read rows
+            back to back, each read after the trie node it holds.
+        read: The read nodes, from ``read_nodes``; None reads every row.
 
     Returns:
         One log probability per label, in label order. A label whose
         extensions hold all of its probability scores minus infinity.
     """
     row_of = {}
-    row = 0
-    for nodes, _, _ in chains:
-        for node in nodes:
-            row_of[node] = row
-            row += 1
+    for node, is_read in zip((node for nodes, _, _ in chains for node in nodes),
+                             chain_reads(chains, read)):
+        if is_read:
+            row_of[node] = len(row_of)
     column = {token: index for index, token in enumerate(targets)}
 
     def logprob(ids, start=0):
         return sum(float(logprobs[row_of[ids[:depth]], column[ids[depth]]])
-                   for depth in range(start, len(ids)))
+                   for depth in range(start, len(ids)) if ids[:depth] in row_of)
 
     paths = [tuple(ids) for ids in label_ids]
     taken = dict.fromkeys(paths, 0.0)   # share held by the nearest extensions
