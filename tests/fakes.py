@@ -178,6 +178,7 @@ def fake_pack(torch, arena, specs, **kw):
 
     rows_per_answer = tuple(
         int(spec["read_rows"][index]) if spec.get("read_rows") is not None
+        else int(np.sum(spec["read_mask"])) if spec.get("read_mask") is not None
         else (canvas_rows(spec) or len(suffix)) if spec.get("read_all_rows")
         else 1
         for spec in specs for index, suffix in enumerate(spec["suffixes"]))

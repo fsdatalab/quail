@@ -154,7 +154,7 @@ class LabelScoring:
     leaves chosen ones alone, so a later pass keeps the first choice.
     The candidates are letters, when the prompt has a one-token letter
     per label; trie_tree, under the tree attention path; and
-    trie_decode, over documents without resident KV.
+    trie_decode, when no label starts another.
     The documents count as resident, with their KV in the arena, when
     the classification continues its table's filter chain on one GPU
     before any join, or follows a classification with the same prompt

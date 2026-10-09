@@ -48,7 +48,7 @@ class ClassifyScoring(ClassifyStatistics):
         if spec.scoring == DECISION_SCORING:
             return spec
         head, tail = spec.prompt_token_parts
-        labels = spec.label_token_ids
+        labels, starts = spec.label_token_ids, spec.label_word_starts
         lettered = None
         if call.prompt.lettered is not None:
             letter_head, letter_tail, letter_ids = classify_prompt_tokens(
@@ -56,15 +56,17 @@ class ClassifyScoring(ClassifyStatistics):
             lettered = (len(letter_head), len(letter_tail) - 1, letter_ids)
         scoring, estimated = self.choose(
             spec.expected_inputs, len(head), len(tail) - 1, labels, resident,
-            lettered, probabilities=spec.probabilities)
+            lettered, probabilities=spec.probabilities, starts=starts)
         if scoring == LETTERS_SCORING:
             head, tail, labels = letter_head, letter_tail, letter_ids
+            starts = ()
         if scoring == DECODE_SCORING and not decodable(labels):
             raise ClassifyRefusedError(
                 f"the {scoring!r} rule cannot decode the labels of "
                 f"{spec.name!r}: one label is a proper prefix of another",
                 1, 0)
-        suffixes = classify_cost.suffix_lengths(scoring, labels, self.canvas_rows)
+        suffixes = classify_cost.suffix_lengths(scoring, labels, self.canvas_rows,
+                                                starts=starts)
         # the head, longest document, frame, and longest suffix must fit
         # together within the forward pass and KV budget
         need = len(head) + self.longest + len(tail) + max(suffixes)
@@ -76,7 +78,7 @@ class ClassifyScoring(ClassifyStatistics):
         return replace(
             spec, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), label_token_ids=labels,
-            scoring=scoring,
+            label_word_starts=starts, scoring=scoring,
             draws=self.draws if scoring == LETTERS_SCORING else 1)
 
     @property
@@ -86,7 +88,7 @@ class ClassifyScoring(ClassifyStatistics):
         return canvas.rows if canvas is not None else 0
 
     def estimate(self, scoring, live, head_tokens, frame_tokens, labels,
-                 resident) -> classify_cost.ClassifyCost:
+                 resident, starts=()) -> classify_cost.ClassifyCost:
         """Estimate one scoring rule using this table's lengths and budgets.
 
         Args:
@@ -96,6 +98,7 @@ class ClassifyScoring(ClassifyStatistics):
             frame_tokens: Number of prompt tokens written after each document.
             labels: Token sequence for each label.
             resident: Whether document KV is already available.
+            starts: Per label, which tokens begin a new word.
 
         Returns:
             Estimated execution time, work, and token counts.
@@ -104,7 +107,7 @@ class ClassifyScoring(ClassifyStatistics):
             scoring, live, head_tokens, frame_tokens, labels,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=resident,
-            draws=self.draws)
+            draws=self.draws, starts=starts)
 
     def estimate_spec(self, spec: ClassifySpec,
                       resident=False) -> classify_cost.ClassifyCost:
@@ -124,7 +127,7 @@ class ClassifyScoring(ClassifyStatistics):
                 answer_rows=len(spec.label_token_ids) + 1)
         return self.estimate(
             spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
-            spec.label_token_ids, resident)
+            spec.label_token_ids, resident, spec.label_word_starts)
 
     def reestimate(self, spec: ClassifySpec, *, resident=False) -> ClassifySpec:
         """Update a classification's estimated time for this table.
@@ -140,16 +143,16 @@ class ClassifyScoring(ClassifyStatistics):
                        estimated_seconds=self.estimate_spec(spec, resident).seconds)
 
     def choose(self, live, head_tokens, frame_tokens, labels, resident,
-               lettered=None, probabilities=False
+               lettered=None, probabilities=False, starts=()
                ) -> tuple[str, classify_cost.ClassifyCost]:
         """Choose the supported scoring rule with the lowest estimated time.
 
         The letters rule requires a prompt with one distinct token per
         label. The trie_tree rule requires the tree attention path. The
-        trie_decode rule requires a model without a canvas, documents
-        without resident KV, no request for probabilities, and no label
-        whose token sequence is a prefix of another's. Ties favor fewer
-        suffix tokens, then the first candidate.
+        trie_decode rule requires a model without a canvas, no request
+        for probabilities, and no label whose token sequence is a prefix
+        of another's. Ties favor fewer suffix tokens, then the first
+        candidate.
 
         Args:
             live: Expected number of documents to classify.
@@ -161,6 +164,7 @@ class ClassifyScoring(ClassifyStatistics):
             lettered: Tuple of head length, frame length, and label letter
                 token sequences, or None if the prompt has no lettered form.
             probabilities: Whether every label's probability is required.
+            starts: Per label, which tokens begin a new word.
 
         Returns:
             A tuple containing the method name and its estimated cost.
@@ -171,20 +175,22 @@ class ClassifyScoring(ClassifyStatistics):
         candidates = [LETTERS_SCORING] if lettered is not None else []
         if self.tree:
             candidates.append(TREE_SCORING)
-        if (not self.model.canvas_tokens and not resident
-                and not probabilities and decodable(labels)):
+        if (not self.model.canvas_tokens and not probabilities
+                and decodable(labels)):
             candidates.append(DECODE_SCORING)
         if not candidates:
             raise ClassifyRefusedError(
                 "no label scoring rule can run: no one-token letter for "
                 "every label, no tree attention for the packed trie, and "
-                "no greedy decode (resident documents, or a label that is "
+                "no greedy decode (an answer canvas, or a label that is "
                 "another's prefix)", 1, 0)
         best = None
         for scoring in candidates:
-            head, frame, ids = ((head_tokens, frame_tokens, labels)
-                                if scoring != LETTERS_SCORING else lettered)
-            estimated = self.estimate(scoring, live, head, frame, ids, resident)
+            head, frame, ids, flags = (
+                (head_tokens, frame_tokens, labels, starts)
+                if scoring != LETTERS_SCORING else (*lettered, ()))
+            estimated = self.estimate(scoring, live, head, frame, ids, resident,
+                                      flags)
             key = (estimated.seconds, estimated.suffix_tokens)
             if best is None or key < best[0]:
                 best = (key, scoring, estimated)

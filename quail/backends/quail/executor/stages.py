@@ -43,6 +43,8 @@ class Stage:
             next append stage reads them instead of feeding them again.
         label: Name displayed in progress messages.
         chains: Optional trie chains and ancestor references from trie_chains().
+        read_mask: Optional mask of the rows read in the sole chains
+            suffix, in chain order; None reads every row.
         canvas: Optional callback from document index to diffusion canvas
             tokens, shared by its suffixes or supplied per suffix. None uses
             the pipeline's default canvas.
@@ -63,6 +65,7 @@ class Stage:
     append: bool = False
     label: str = ""
     chains: list | None = None
+    read_mask: Any = None
     canvas: Callable | None = None
     canvas_rows: int = 0
 
@@ -243,6 +246,9 @@ class _StageExecutor:
         self.read_rows = [None if stage.read_rows is None
                           else np.asarray(stage.read_rows, dtype=np.int64)
                           for stage in self.stages]
+        self.read_masks = [None if stage.read_mask is None
+                           else np.asarray(stage.read_mask, dtype=bool)
+                           for stage in self.stages]
         # Stages packing label chains always need tree attention.
         if any(stage.chains is not None for stage in self.stages):
             attention_mode = "tree"
@@ -429,6 +435,9 @@ class _StageExecutor:
             if self.read_rows[j] is not None:
                 own["read_rows"] = self.read_rows[j][np.asarray(list(indices))]
                 rows = int(own["read_rows"].sum())
+            if self.read_masks[j] is not None:
+                own["read_mask"] = self.read_masks[j]
+                rows = int(own["read_mask"].sum())
             if self.stages[j].canvas is not None:
                 ids = np.asarray(self.stages[j].canvas(a))
                 if ids.ndim == 2:
