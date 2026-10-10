@@ -219,7 +219,7 @@ CORPUS_COLUMNS = {
     "support_traces": ("id", "request", "transcript", "message_count",
                        "task_id", "domain", "model", "trial", "reward"),
     "support_messages": MESSAGE_COLUMNS,
-    "issue_runs": ("id", "request", "transcript", "message_count",
+    "issue_runs": ("id", "request", "transcript", "patch", "message_count",
                    "instance_id", "repo", "resolved", "token_count"),
     "issue_messages": MESSAGE_COLUMNS,
     "wrench_runs": ("id", "task_id", "model", "mode", "transcript",

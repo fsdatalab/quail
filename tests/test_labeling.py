@@ -232,7 +232,7 @@ def _corpus_rows(reviews, reports, terms, claims, evidence, contexts,
         "support_messages": [_message("sp0000/0")],
         "issue_runs": [{
             "id": "ir00000", "request": "yes", "transcript": "yes",
-            "message_count": 1, "instance_id": "a__b-1", "repo": "a/b",
+            "patch": "yes", "message_count": 1, "instance_id": "a__b-1", "repo": "a/b",
             "resolved": 1, "token_count": 1}],
         "issue_messages": [_message("ir00000/0")],
         "wrench_runs": [{

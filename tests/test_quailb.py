@@ -59,6 +59,7 @@ def _standin_sets(tmp_path):
         "issue_runs": {
             "request": [f"issue {i}" for i in six],
             "transcript": [f"run {i}" for i in six],
+            "patch": [f"patch {i}" for i in six],
             "message_count": pa.array([5] * 6, pa.int32()),
             "instance_id": [f"issue{i // 2}" for i in six], "repo": ["r"] * 6,
             "resolved": pa.array([1, 0] * 3, pa.int32()),
