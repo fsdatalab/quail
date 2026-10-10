@@ -32,6 +32,8 @@ Prediction:
     QUAIL_BENCH_DIR=../quail-bench uv run modal run --detach \
         experiments/cells/sales_quailb.py 2>&1 | tee results/sales_quailb.log
 
+`--queries SALES-4,SALES-5` runs a subset.
+
 The summary is written to /results/sales/<run>_sales_quailb.json and each
 query's answers to /results/sales/<run>_<query>_<operator>.parquet.
 """
@@ -75,8 +77,8 @@ def _rate(answers):
 
 @app.function(image=quail_image, gpu="H100!", memory=98304, timeout=7200,
               volumes=VOLUMES)
-def run_sales(run: str) -> dict:
-    """Run the five SALES queries and save their answers."""
+def run_sales(run: str, query_ids: tuple = QUERIES) -> dict:
+    """Run the given SALES queries and save their answers."""
     import sys
 
     if os.path.isdir(REMOTE_BENCH):
@@ -104,7 +106,7 @@ def run_sales(run: str) -> dict:
     out = {"run": run, "model": MODEL, "input": INPUT,
            "quail_b": sys.modules["quail_b"].__file__, "queries": {}}
     os.makedirs("/results/sales", exist_ok=True)
-    for qid in QUERIES:
+    for qid in query_ids:
         spec = specs[qid]
         output = run_query(session, spec, tables)
         report = output.measurements
@@ -184,8 +186,9 @@ def run_sales(run: str) -> dict:
 
 
 @app.local_entrypoint()
-def main():
+def main(queries: str = ",".join(QUERIES)):
     """Spawn the run and print its function call id."""
-    call = run_sales.spawn(time.strftime("%Y%m%d-%H%M%S"))
+    call = run_sales.spawn(time.strftime("%Y%m%d-%H%M%S"),
+                           tuple(queries.split(",")))
     print(f"[sales] run_sales function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=2, default=str), flush=True)
