@@ -41,10 +41,22 @@ the reference span for at least 75% of questions and matches its line
 range exactly for at least 60%, with text F1 near 20 to 25.
 
     uv run modal run --detach -m experiments.cells.extract_spans \
-        --model qwen3-4b-fp8 2>&1 | tee /tmp/extract_spans_qwen3_4b_fp8.log
+        --model qwen3-4b-fp8 --dataset squad \
+        2>&1 | tee /tmp/extract_spans_qwen3_4b_fp8_squad.log
+
+The datasets are SQuAD (short answers in paragraphs) and CUAD (contract
+clauses, 31 words at the median, in a 2,500-character window of the
+contract around the first reference). Every setting and the prompt are
+the same on both. Prediction for CUAD on Qwen3 4B fp8: free generation
+and scored both land under 50 F1, within 5 points of each other; the
+gold start is among the 8 candidates for at least 60% of questions;
+about a third of the references are longer than the 48 fed tokens; the
+lines baseline contains the reference for at least 60% of questions
+but matches its line range exactly for under 40%.
 
 The per-question records and the summary are written to
-/results/extract_spans/<run>_<model>.json on the quail-results volume.
+/results/extract_spans/<run>_<model>_<dataset>.json on the
+quail-results volume.
 """
 
 import json
@@ -72,6 +84,11 @@ MODELS = {
 }
 SQUAD = ("https://huggingface.co/datasets/rajpurkar/squad/resolve/main/"
          "plain_text/validation-00000-of-00001.parquet")
+CUAD = ("theatticusproject/cuad", "CUAD_v1/CUAD_v1.json")
+# a CUAD question sees this many characters of its contract around the
+# first reference clause, which starts at least CUAD_MARGIN in
+CUAD_WINDOW = 2500
+CUAD_MARGIN = 200
 N_ITEMS = 300
 SEED = 20261010
 TOP_TOKENS = 8      # start tokens read at the cue
@@ -101,7 +118,7 @@ LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\nAnswer the question 
 RAW_LINE_TEMPLATE = "{0}\nANSWER: "
 
 
-def _questions(n: int) -> list[dict]:
+def _squad_questions(n: int) -> list[dict]:
     """A seeded sample of SQuAD validation questions."""
     import io
     import urllib.request
@@ -117,6 +134,53 @@ def _questions(n: int) -> list[dict]:
              "answers": rows[i]["answers"]["text"],
              "answer_start": rows[i]["answers"]["answer_start"][0]}
             for i in order]
+
+
+def _cuad_questions(n: int) -> list[dict]:
+    """A seeded sample of answerable CUAD questions on contract windows.
+
+    Each question's document is a CUAD_WINDOW-character window of its
+    contract holding the first reference clause, cut at whitespace,
+    with the clause starting at a seeded offset into it. The references
+    kept are those inside the window, the first one first. The
+    question is the category name and the dataset's question text.
+    """
+    import numpy as np
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(CUAD[0], CUAD[1], repo_type="dataset")
+    with open(path) as f:
+        contracts = json.load(f)["data"]
+    pairs = [(para["context"], qa) for doc in contracts
+             for para in doc["paragraphs"] for qa in para["qas"] if qa["answers"]]
+    rng = np.random.default_rng(SEED)
+    out = []
+    for i in rng.permutation(len(pairs))[:n]:
+        context, qa = pairs[i]
+        first = qa["answers"][0]
+        a0, a1 = first["answer_start"], first["answer_start"] + len(first["text"])
+        width = max(CUAD_WINDOW, a1 - a0 + 2 * CUAD_MARGIN)
+        before = int(rng.integers(CUAD_MARGIN, width - (a1 - a0) - CUAD_MARGIN + 1))
+        lo = max(0, a0 - before)
+        hi = min(len(context), lo + width)
+        while lo > 0 and not context[lo - 1].isspace():
+            lo -= 1
+        while hi < len(context) and not context[hi].isspace():
+            hi += 1
+        answers = [a["text"] for a in qa["answers"]
+                   if lo <= a["answer_start"]
+                   and a["answer_start"] + len(a["text"]) <= hi]
+        category = qa["question"].split('"')[1]
+        question = qa["question"].split("Details:")[-1].strip()
+        out.append({"id": qa["id"], "context": context[lo:hi],
+                    "question": f"{category}: {question}", "answers": answers,
+                    "answer_start": a0 - lo})
+    return out
+
+
+def _questions(dataset: str, n: int) -> list[dict]:
+    """A seeded sample of a dataset's questions."""
+    return _squad_questions(n) if dataset == "squad" else _cuad_questions(n)
 
 
 def _normalize(text: str) -> list[str]:
@@ -448,13 +512,13 @@ def _close_at(branch, best_other: float) -> int:
 
 @app.function(image=image, gpu="H100!", memory=65536, timeout=7200,
               volumes=VOLUMES)
-def measure(model: str, n: int, run: str) -> dict:
-    """Score every question three ways and summarize."""
+def measure(model: str, dataset: str, n: int, run: str) -> dict:
+    """Score every question four ways and summarize."""
     import os
     import statistics
 
     scorer = Scorer(model)
-    questions = _questions(n)
+    questions = _questions(dataset, n)
     prompts = [scorer.prompt(q["context"], q["question"]) for q in questions]
     t0 = time.perf_counter()
     free_texts = scorer.free([ids for ids, _ in prompts])
@@ -548,9 +612,12 @@ def measure(model: str, n: int, run: str) -> dict:
 
     past = [r["past_gold_end"] for r in items if "past_gold_end" in r]
     summary = {
-        "run": run, "model": model, "spec": MODELS[model]["spec"], "n": len(items),
-        "seconds": seconds, "feed": FEED, "top_tokens": TOP_TOKENS,
-        "max_starts": MAX_STARTS,
+        "run": run, "model": model, "spec": MODELS[model]["spec"],
+        "dataset": dataset, "n": len(items), "seconds": seconds, "feed": FEED,
+        "top_tokens": TOP_TOKENS, "max_starts": MAX_STARTS,
+        "answer_words_mean": mean([len(q["answers"][0].split()) for q in questions]),
+        "answer_tokens_mean": mean([r["gold_len"] for r in items]),
+        "answers_longer_than_feed": sum(r["gold_len"] > FEED for r in items),
         "prompt_tokens_mean": mean([r["prompt_tokens"] for r in items]),
         "doc_tokens_mean": mean([r["doc_tokens"] for r in items]),
         "free": em_f1(lambda r: r["free"]["em_f1"]),
@@ -579,7 +646,7 @@ def measure(model: str, n: int, run: str) -> dict:
         "passes_mean": {str(m): mean([r["passes"][str(m)] for r in items])
                         for m in CHUNKS},
     }
-    path = f"/results/extract_spans/{run}_{model}.json"
+    path = f"/results/extract_spans/{run}_{model}_{dataset}.json"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump({"summary": summary, "items": items}, f, indent=1)
@@ -588,14 +655,15 @@ def measure(model: str, n: int, run: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(model: str = "qwen3-4b-fp8", n: int = N_ITEMS):
-    """Measure one model.
+def main(model: str = "qwen3-4b-fp8", dataset: str = "squad", n: int = N_ITEMS):
+    """Measure one model on one dataset.
 
     Args:
         model: A key of MODELS.
+        dataset: "squad" or "cuad".
         n: Questions to sample.
     """
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    call = measure.spawn(model, n, run)
+    call = measure.spawn(model, dataset, n, run)
     print(f"measure function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=2), flush=True)
