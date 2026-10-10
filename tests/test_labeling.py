@@ -242,6 +242,11 @@ def _corpus_rows(reviews, reports, terms, claims, evidence, contexts,
         "wrench_steps": [{"id": "wr00000/1", "run_id": "wr00000",
                           "step_index": 1, "model": "gpt-5.4",
                           "text": "yes"}],
+        "sales_calls": [{
+            "id": "sc00000", "domain": "b2b", "deal_id": "sdb2b0000",
+            "call_index": 1, "prev_call_id": None,
+            "deal_stage": "Negotiation", "deal_amount": 10.0,
+            "transcript": "yes"}],
     }
 
 

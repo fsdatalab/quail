@@ -225,6 +225,8 @@ CORPUS_COLUMNS = {
     "wrench_runs": ("id", "task_id", "model", "mode", "transcript",
                     "step_count", "token_count"),
     "wrench_steps": ("id", "run_id", "step_index", "model", "text"),
+    "sales_calls": ("id", "domain", "deal_id", "call_index", "prev_call_id",
+                    "deal_stage", "deal_amount", "transcript"),
 }
 
 

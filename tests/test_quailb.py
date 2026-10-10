@@ -79,6 +79,16 @@ def _standin_sets(tmp_path):
             "model": ["gpt-5.4"] * 6,
             "text": [f"agent step {i}" for i in six],
         },
+        "sales_calls": {
+            "domain": ["b2b"] * 6,
+            "deal_id": [f"deal{i // 3}" for i in six],
+            "call_index": pa.array([i % 3 + 1 for i in six], pa.int32()),
+            "prev_call_id": [None if i % 3 == 0 else f"sales_calls{i - 1}"
+                             for i in six],
+            "deal_stage": ["Negotiation", "Closed"] * 3,
+            "deal_amount": [100.0] * 6,
+            "transcript": [f"sales call {i}" for i in six],
+        },
     }
     for name, columns in tables.items():
         rows = len(next(iter(columns.values())))
