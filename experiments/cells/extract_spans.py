@@ -1,4 +1,4 @@
-"""Span extraction by scoring document tokens, measured on SQuAD.
+"""Span extraction by scoring document tokens, measured on SQuAD through vLLM.
 
 Three ways to answer an extractive question with a decoder model, on
 the same prompt, with no training:
@@ -18,27 +18,23 @@ the same prompt, with no training:
   the copy product falls below it" is replayed offline for each chunk
   size in CHUNKS to count the passes the engine would make.
 
-Every method sees one model and one prompt per question. The scored
-method is recorded under the model's full-vocabulary probabilities
-and under probabilities renormalized over copy and stop.
+Every method sees one model and one prompt per question, through
+vLLM's public API on the checkpoint Quail runs. The copy probabilities
+are vLLM's prompt logprobs of the document tokens fed after the start;
+the stop probability at each position is the prompt logprob of one
+closing-quote token appended there, so a merged token such as `".` is
+not counted as a stop. The scored method is recorded under the
+model's full-vocabulary probabilities and under probabilities
+renormalized over copy and stop.
 
-The Kai model is a decision model: its backbone is Qwen3 0.6B with a
-tied embedding, so it has next-token logits, but its fine-tuning
-trained the decision head, not those logits. Qwen3 0.6B is the
-same-size control.
-
-Prediction (Qwen3 0.6B, 300 questions): scored with k=8 lands within
-2 F1 points of greedy copy and at least 5 points above free
-generation; the gold start token is among the 8 candidates for at
-least 85% of questions; the bound closes within 3 tokens of the gold
-end for half the questions; with 16-token chunks, at least 90% of
-questions finish in one end pass. Kai scores lower on every number;
-if its scored F1 is under 30, the executor work targets Qwen3.
+Prediction (Qwen3 4B fp8, 300 questions): scored with k=8 lands
+within 2 F1 points of free generation; the gold start token is among
+the 8 candidates for at least 70% of questions; the bound closes at
+the gold end for half the questions; with 16-token chunks, at least
+85% of questions finish in one end pass.
 
     uv run modal run --detach -m experiments.cells.extract_spans \
-        --model kai 2>&1 | tee /tmp/extract_spans_kai.log
-    uv run modal run --detach -m experiments.cells.extract_spans \
-        --model qwen3-0.6b 2>&1 | tee /tmp/extract_spans_qwen3_0_6b.log
+        --model qwen3-4b-fp8 2>&1 | tee /tmp/extract_spans_qwen3_4b_fp8.log
 
 The per-question records and the summary are written to
 /results/extract_spans/<run>_<model>.json on the quail-results volume.
@@ -59,16 +55,13 @@ app = modal.App("quail-milestone1")
 VOLUMES = {
     "/root/.cache/huggingface": modal.Volume.from_name(
         "quail-hf-cache", create_if_missing=True),
+    "/root/.cache/kernels": modal.Volume.from_name(
+        "quail-kernel-cache", create_if_missing=True),
     "/results": modal.Volume.from_name("quail-results", create_if_missing=True),
 }
 MODELS = {
-    "kai": {"hf": "vllm-sr/Decision-2.0-Kai-0.6B",
-            "revision": "881bee413681d80ebeac86afcda8b4138dae516e",
-            "backbone": "backbone", "chat": False},
-    "qwen3-0.6b": {"hf": "Qwen/Qwen3-0.6B", "revision": "",
-                   "backbone": "", "chat": True},
-    "qwen3-4b": {"hf": "Qwen/Qwen3-4B", "revision": "",
-                 "backbone": "", "chat": True},
+    "qwen3-4b-fp8": {"spec": "qwen3-4b-fp8", "chat": True},
+    "kai": {"spec": "decision-2.0-kai-0.6b-bf16", "chat": False},
 }
 SQUAD = ("https://huggingface.co/datasets/rajpurkar/squad/resolve/main/"
          "plain_text/validation-00000-of-00001.parquet")
@@ -76,7 +69,8 @@ N_ITEMS = 300
 SEED = 20261010
 TOP_TOKENS = 8      # start tokens read at the cue
 MAX_STARTS = 8      # candidate start positions kept after expansion
-FEED = 64           # document tokens fed after each candidate start
+CUE_LOGPROBS = 1024    # vocabulary entries read at the cue
+FEED = 48           # document tokens fed after each candidate start
 FREE_MAX_TOKENS = 48
 CHUNKS = (8, 16, 32)
 TOP_K = (1, 4, 8)
@@ -150,57 +144,56 @@ def _align(text: str, context: str) -> tuple[str, str]:
     return "none", text
 
 
+def _same_word(token) -> str:
+    """The key under which tokens differing only in a leading space or case meet."""
+    if not isinstance(token, str):
+        return ""
+    text = token[1:] if token.startswith("Ġ") else token
+    return text.lower() if text and "Ġ" not in text and "Ċ" not in text else ""
+
+
 class Scorer:
-    """One model's backbone and output head on the GPU.
+    """One model on vLLM, with the tokenizer and the token tables.
 
     Args:
         name: A key of MODELS.
     """
 
     def __init__(self, name: str):
-        import torch
-        from huggingface_hub import snapshot_download
-        from transformers import (
-            AutoModelForCausalLM,
-            AutoTokenizer,
-            Qwen2TokenizerFast,
-            Qwen3Model,
-        )
+        from transformers import AutoTokenizer
+        from vllm import LLM
 
-        spec = MODELS[name]
-        path = snapshot_download(spec["hf"], revision=spec["revision"] or None)
-        if spec["backbone"]:
-            # the package root's config names custom model code, which
-            # AutoTokenizer would ask to run; the tokenizer itself is
-            # Qwen's, so load it by class from tokenizer.json
-            self.tok = Qwen2TokenizerFast.from_pretrained(path)
-            self.backbone = Qwen3Model.from_pretrained(
-                f"{path}/{spec['backbone']}", dtype=torch.bfloat16).cuda().eval()
-            self.head = self.backbone.embed_tokens.weight
-        else:
-            self.tok = AutoTokenizer.from_pretrained(path)
-            model = AutoModelForCausalLM.from_pretrained(
-                path, dtype=torch.bfloat16).cuda().eval()
-            self.backbone, self.head = model.model, model.lm_head.weight
-        self.chat = spec["chat"]
+        from quail.backends.quail.executor.model import engine_args, resolve_model_path
+        from quail.specs import MODELS as SPECS
+
+        spec = SPECS[MODELS[name]["spec"]]
+        path = resolve_model_path(spec.hf_name, spec.revision)
+        args = engine_args(path)
+        if "hf_overrides" in args:    # a Decision 2.0 package's backbone
+            from quail.backends.vllm_decision import register
+
+            register()
+        self.llm = LLM(**args, max_model_len=4096, enable_prefix_caching=True,
+                       gpu_memory_utilization=0.85, max_logprobs=CUE_LOGPROBS,
+                       max_num_seqs=512, max_num_batched_tokens=32768,
+                       disable_log_stats=True)
+        self.tok = AutoTokenizer.from_pretrained(args.get("tokenizer", args["model"]))
+        self.chat = MODELS[name]["chat"]
         vocab = self.tok.convert_ids_to_tokens(list(range(len(self.tok))))
-        self.quote_ids = [i for i, t in enumerate(vocab)
-                          if isinstance(t, str) and t.startswith('"')]
+        self.vocab = vocab
+        self.quote_id = self.tok.convert_tokens_to_ids('"')
         self.none_id = self.tok.encode("none", add_special_tokens=False)[0]
-        self.eos_ids = {self.tok.eos_token_id,
-                        self.tok.convert_tokens_to_ids("<|im_end|>")}
         # a document token may be written without its leading space or
         # in another case after the opening quote; every vocabulary
         # token with the same text up to those counts as the same start
-        self.vocab = vocab
         self.variants = {}
         for i, t in enumerate(vocab):
             key = _same_word(t)
             if key:
                 self.variants.setdefault(key, []).append(i)
 
-    def prompt(self, context: str, question: str) -> tuple[list[int], list, int]:
-        """Token ids, the document's (token index, char offsets), prompt chars."""
+    def prompt(self, context: str, question: str) -> tuple[list[int], list]:
+        """Token ids and the document's (token index, char offsets)."""
         body = BODY_TEMPLATE.format(context, question)
         text = (CHAT_PROMPT_TEMPLATE if self.chat else RAW_PROMPT_TEMPLATE).format(body)
         enc = self.tok(text, return_offsets_mapping=True, add_special_tokens=False)
@@ -209,57 +202,38 @@ class Scorer:
         doc = [(i, (a - start, b - start))
                for i, (a, b) in enumerate(enc["offset_mapping"])
                if a < end and b > start]
-        return enc["input_ids"], doc, len(text)
+        return enc["input_ids"], doc
 
-    def rows(self, sequences: list[list[int]], rows: list[list[int]]):
-        """Log-probabilities over the vocabulary at the given rows."""
-        import torch
+    def _run(self, sequences: list[list[int]], **params) -> list:
+        from vllm import SamplingParams
+        from vllm.inputs import TokensPrompt
 
-        width = max(len(s) for s in sequences)
-        pad = self.tok.pad_token_id or 0
-        ids = torch.full((len(sequences), width), pad, dtype=torch.long)
-        mask = torch.zeros_like(ids)
-        for b, s in enumerate(sequences):
-            ids[b, :len(s)] = torch.tensor(s)
-            mask[b, :len(s)] = 1
-        with torch.no_grad():
-            hidden = self.backbone(input_ids=ids.cuda(), attention_mask=mask.cuda()
-                                   ).last_hidden_state
-            out = []
-            for b, wanted in enumerate(rows):
-                logits = hidden[b, wanted].float() @ self.head.float().T
-                out.append(torch.log_softmax(logits, -1).cpu())
-        return out
+        return self.llm.generate(
+            [TokensPrompt(prompt_token_ids=s) for s in sequences],
+            SamplingParams(temperature=0.0, **params), use_tqdm=False)
 
-    def generate(self, ids: list[int]) -> str:
-        """Greedy text after the prompt, cut at the closing quote or line end."""
-        import torch
+    def free(self, prompts: list[list[int]]) -> list[str]:
+        """Greedy text after each prompt, cut at the closing quote or line end."""
+        outputs = self._run(prompts, max_tokens=FREE_MAX_TOKENS, stop=['"', "\n"])
+        return [o.outputs[0].text for o in outputs]
 
-        out, past = [], None
-        step = torch.tensor([ids]).cuda()
-        with torch.no_grad():
-            for _ in range(FREE_MAX_TOKENS):
-                result = self.backbone(input_ids=step, past_key_values=past,
-                                       use_cache=True)
-                past = result.past_key_values
-                logits = result.last_hidden_state[0, -1].float() @ self.head.float().T
-                token = int(logits.argmax())
-                if token in self.eos_ids:
-                    break
-                out.append(token)
-                step = torch.tensor([[token]]).cuda()
-        text = self.tok.decode(out)
-        for stop in ('"', "\n"):
-            text = text.split(stop)[0]
-        return text
+    def cue(self, prompt_ids: list[int]) -> dict:
+        """Logprobs of the CUE_LOGPROBS likeliest tokens after the open quote."""
+        from collections import defaultdict
 
+        (output,) = self._run([prompt_ids], max_tokens=1, logprobs=CUE_LOGPROBS,
+                              detokenize=False)
+        lp = defaultdict(lambda: float("-inf"))
+        lp.update({t: v.logprob for t, v in output.outputs[0].logprobs[0].items()})
+        return lp
 
-def _same_word(token) -> str:
-    """The key under which tokens differing only in a leading space or case meet."""
-    if not isinstance(token, str):
-        return ""
-    text = token[1:] if token.startswith("Ġ") else token
-    return text.lower() if text and "Ġ" not in text and "Ċ" not in text else ""
+    def teacher_forced(self, sequences: list[list[int]]) -> list[list[float]]:
+        """The logprob of each token given the ones before it, per sequence."""
+        outputs = self._run(sequences, max_tokens=1, prompt_logprobs=0,
+                            detokenize=False)
+        return [[float("nan") if entry is None else entry[token].logprob
+                 for token, entry in zip(seq, o.prompt_logprobs)]
+                for seq, o in zip(sequences, outputs)]
 
 
 def _candidates(scorer, lp, doc_ids) -> tuple[list[tuple[int, int, float]],
@@ -288,23 +262,27 @@ def _candidates(scorer, lp, doc_ids) -> tuple[list[tuple[int, int, float]],
 
 
 def _spans(scorer, prompt_ids, doc_ids, candidates):
-    """Per candidate: start, copy and stop logprobs along the fed tokens."""
-    import torch
+    """Per candidate: start, copy and stop logprobs along the fed tokens.
 
-    sequences, rows = [], []
-    for pos, first, _ in candidates:
-        fed = [first, *doc_ids[pos + 1:pos + 1 + FEED]]
-        sequences.append(prompt_ids + fed)
-        rows.append(list(range(len(prompt_ids) - 1, len(prompt_ids) + len(fed))))
-    quote = torch.tensor(scorer.quote_ids)
-    out = []
-    for (pos, first, _), lp in zip(candidates, scorer.rows(sequences, rows)):
-        fed = [first, *doc_ids[pos + 1:pos + 1 + FEED]]
-        nxt = doc_ids[pos + 1:pos + 1 + len(fed)]
-        copy = [float(lp[i + 1, nxt[i]]) if i < len(nxt) else float("-inf")
+    One teacher-forced sequence per candidate gives the start and copy
+    logprobs; one more per fed position, ending in the closing quote,
+    gives the stop logprob there.
+    """
+    n = len(prompt_ids)
+    feeds = [[first, *doc_ids[pos + 1:pos + 1 + FEED]] for pos, first, _ in candidates]
+    copies = scorer.teacher_forced([
+        prompt_ids + fed + doc_ids[pos + len(fed):pos + len(fed) + 1]
+        for (pos, _, _), fed in zip(candidates, feeds)])
+    stops = scorer.teacher_forced([
+        prompt_ids + fed[:i + 1] + [scorer.quote_id]
+        for fed in feeds for i in range(len(fed))])
+    out, at = [], 0
+    for (pos, first, _), fed, lp in zip(candidates, feeds, copies):
+        copy = [lp[n + i + 1] if n + i + 1 < len(lp) else float("-inf")
                 for i in range(len(fed))]
-        stop = [float(torch.logsumexp(lp[i + 1, quote], 0)) for i in range(len(fed))]
-        out.append({"pos": pos, "first": first, "start": float(lp[0, first]),
+        stop = [stops[at + i][-1] for i in range(len(fed))]
+        at += len(fed)
+        out.append({"pos": pos, "first": first, "start": lp[n],
                     "copy": copy, "stop": stop, "fed": len(fed)})
     return out
 
@@ -367,10 +345,12 @@ def measure(model: str, n: int, run: str) -> dict:
     import statistics
 
     scorer = Scorer(model)
-    items = []
+    questions = _questions(n)
+    prompts = [scorer.prompt(q["context"], q["question"]) for q in questions]
     t0 = time.perf_counter()
-    for q in _questions(n):
-        prompt_ids, doc, _ = scorer.prompt(q["context"], q["question"])
+    free_texts = scorer.free([ids for ids, _ in prompts])
+    items = []
+    for q, (prompt_ids, doc), text in zip(questions, prompts, free_texts):
         doc_ids = [prompt_ids[i] for i, _ in doc]
         offsets = [span for _, span in doc]
         gold_lo = q["answer_start"]
@@ -378,25 +358,23 @@ def measure(model: str, n: int, run: str) -> dict:
         gold = [p for p, (a, b) in enumerate(offsets) if a < gold_hi and b > gold_lo]
         gold_start, gold_end = (gold[0], gold[-1]) if gold else (-1, -1)
 
-        text = scorer.generate(prompt_ids)
         how, aligned = _align(text, q["context"])
         rec = {"id": q["id"], "answers": q["answers"], "prompt_tokens": len(prompt_ids),
                "doc_tokens": len(doc_ids), "gold_start": gold_start,
                "gold_len": gold_end - gold_start + 1,
+               "gold_token": scorer.vocab[doc_ids[gold_start]] if gold else "",
                "free": {"text": text, "aligned": aligned, "how": how,
                         "em_f1": _f1(aligned, q["answers"])}}
 
-        (lp,) = scorer.rows([prompt_ids], [[len(prompt_ids) - 1]])
-        candidates, none_lp, best_lp = _candidates(scorer, lp[0], doc_ids)
+        lp = scorer.cue(prompt_ids)
+        candidates, none_lp, best_lp = _candidates(scorer, lp, doc_ids)
         rec["none_wins"] = none_lp > best_lp
         rec["gold_rank"] = next((i for i, (p, _, _) in enumerate(candidates)
                                  if p == gold_start), -1)
-        top = lp[0].topk(TOP_TOKENS)
-        rec["cue_top"] = [(scorer.vocab[int(i)], round(float(v), 2))
-                          for v, i in zip(top.values, top.indices)]
+        rec["cue_top"] = [(scorer.vocab[t], round(v, 2)) for t, v in
+                          sorted(lp.items(), key=lambda kv: -kv[1])[:TOP_TOKENS]]
         rec["candidates"] = [(p, scorer.vocab[t], round(v, 2))
                              for p, t, v in candidates]
-        rec["gold_token"] = scorer.vocab[doc_ids[gold_start]] if gold else ""
         branches = _spans(scorer, prompt_ids, doc_ids, candidates)
 
         def span_text(pos, length):
@@ -437,7 +415,7 @@ def measure(model: str, n: int, run: str) -> dict:
 
     past = [r["past_gold_end"] for r in items if "past_gold_end" in r]
     summary = {
-        "run": run, "model": model, "hf": MODELS[model]["hf"], "n": len(items),
+        "run": run, "model": model, "spec": MODELS[model]["spec"], "n": len(items),
         "seconds": seconds, "feed": FEED, "top_tokens": TOP_TOKENS,
         "max_starts": MAX_STARTS,
         "prompt_tokens_mean": mean([r["prompt_tokens"] for r in items]),
@@ -470,7 +448,7 @@ def measure(model: str, n: int, run: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(model: str = "kai", n: int = N_ITEMS):
+def main(model: str = "qwen3-4b-fp8", n: int = N_ITEMS):
     """Measure one model.
 
     Args:
