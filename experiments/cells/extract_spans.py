@@ -110,7 +110,7 @@ CHAT_PROMPT_TEMPLATE = CHAT_TURN_TEMPLATE + '"'
 # the lines baseline: the document is shown as numbered lines of at
 # most LINE_WIDTH characters, and the model answers with line numbers
 LINE_WIDTH = 100
-LINE_MAX_TOKENS = 8
+LINE_MAX_TOKENS = 24    # a chat model answers in a sentence
 LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\nAnswer the question with "
                       "the line numbers of the fewest lines that contain the "
                       "answer, as START-END, for example 3-3 or 5-6. If the "
@@ -251,10 +251,11 @@ def _parse_lines(text: str, count: int) -> tuple[int, int] | None:
     """The START-END line range in an answer, 1-based and within the document."""
     import re
 
-    # only a bare range counts: an answer that writes the span's text
-    # also contains numbers, and those are not line numbers
-    match = re.fullmatch(r"\s*(?:lines?\s*)?(\d+)(?:\s*(?:-|to|–)\s*(\d+))?\s*[.]?\s*",
-                         text, re.I)
+    # a bare range, or a range named as lines inside a sentence; a
+    # number that is not attached to "line" may be the span's text
+    span = r"(\d+)(?:\s*(?:-|to|–|and)\s*(\d+))?"
+    match = (re.fullmatch(rf"\s*{span}\s*[.]?\s*", text)
+             or re.search(rf"\blines?\s+{span}", text, re.I))
     if not match:
         return None
     a, b = int(match.group(1)), int(match.group(2) or match.group(1))
