@@ -32,7 +32,8 @@ Prediction:
     QUAIL_BENCH_DIR=../quail-bench uv run modal run --detach \
         experiments/cells/sales_quailb.py 2>&1 | tee results/sales_quailb.log
 
-`--queries SALES-4,SALES-5` runs a subset.
+`--queries SALES-4,SALES-5` runs a subset, and `--model qwen3-4b-fp8` runs
+another model.
 
 The summary is written to /results/sales/<run>_sales_quailb.json and each
 query's answers to /results/sales/<run>_<query>_<operator>.parquet.
@@ -77,8 +78,8 @@ def _rate(answers):
 
 @app.function(image=quail_image, gpu="H100!", memory=98304, timeout=7200,
               volumes=VOLUMES)
-def run_sales(run: str, query_ids: tuple = QUERIES) -> dict:
-    """Run the given SALES queries and save their answers."""
+def run_sales(run: str, query_ids: tuple = QUERIES, model: str = MODEL) -> dict:
+    """Run the given SALES queries on a model and save their answers."""
     import sys
 
     if os.path.isdir(REMOTE_BENCH):
@@ -99,11 +100,11 @@ def run_sales(run: str, query_ids: tuple = QUERIES) -> dict:
     domain_of = dict(zip(frame.id, frame.domain))
     stage_of = dict(zip(frame.id, frame.deal_stage))
 
-    session = quail.Session(EngineConfig(model=MODEL, device="h100-sxm"))
+    session = quail.Session(EngineConfig(model=model, device="h100-sxm"))
     tok = session.tokenizer
     doc_tokens = dict(zip(frame.id, (len(tok(text))
                                      for text in frame.transcript)))
-    out = {"run": run, "model": MODEL, "input": INPUT,
+    out = {"run": run, "model": model, "input": INPUT,
            "quail_b": sys.modules["quail_b"].__file__, "queries": {}}
     os.makedirs("/results/sales", exist_ok=True)
     for qid in query_ids:
@@ -186,9 +187,9 @@ def run_sales(run: str, query_ids: tuple = QUERIES) -> dict:
 
 
 @app.local_entrypoint()
-def main(queries: str = ",".join(QUERIES)):
+def main(queries: str = ",".join(QUERIES), model: str = MODEL):
     """Spawn the run and print its function call id."""
     call = run_sales.spawn(time.strftime("%Y%m%d-%H%M%S"),
-                           tuple(queries.split(",")))
+                           tuple(queries.split(",")), model)
     print(f"[sales] run_sales function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=2, default=str), flush=True)
