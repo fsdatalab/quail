@@ -251,12 +251,13 @@ def _parse_lines(text: str, count: int) -> tuple[int, int] | None:
     """The START-END line range in an answer, 1-based and within the document."""
     import re
 
-    match = re.search(r"(\d+)\s*(?:-|to|–)\s*(\d+)|(\d+)", text)
+    # only a bare range counts: an answer that writes the span's text
+    # also contains numbers, and those are not line numbers
+    match = re.fullmatch(r"\s*(?:lines?\s*)?(\d+)(?:\s*(?:-|to|–)\s*(\d+))?\s*[.]?\s*",
+                         text, re.I)
     if not match:
         return None
-    a, b = (match.group(1), match.group(2)) if match.group(1) else (
-        match.group(3), match.group(3))
-    a, b = int(a), int(b)
+    a, b = int(match.group(1)), int(match.group(2) or match.group(1))
     if not 1 <= a <= b <= count:
         return None
     return a, b
