@@ -189,12 +189,15 @@ class Scorer:
         self.none_id = self.tok.encode("none", add_special_tokens=False)[0]
         self.eos_ids = {self.tok.eos_token_id,
                         self.tok.convert_tokens_to_ids("<|im_end|>")}
-        self.stripped = {}
+        # a document token may be written without its leading space or
+        # in another case after the opening quote; every vocabulary
+        # token with the same text up to those counts as the same start
+        self.vocab = vocab
+        self.variants = {}
         for i, t in enumerate(vocab):
-            if isinstance(t, str) and t.startswith("Ġ") and len(t) > 1:
-                j = self.tok.convert_tokens_to_ids(t[1:])
-                if j is not None and j != self.tok.unk_token_id:
-                    self.stripped[i] = j
+            key = _same_word(t)
+            if key:
+                self.variants.setdefault(key, []).append(i)
 
     def prompt(self, context: str, question: str) -> tuple[list[int], list, int]:
         """Token ids, the document's (token index, char offsets), prompt chars."""
@@ -251,26 +254,37 @@ class Scorer:
         return text
 
 
-def _candidates(scorer, lp, doc_ids) -> tuple[list[tuple[int, int]], float, float]:
-    """Start candidates as (position, token id), with the none and best logprobs.
+def _same_word(token) -> str:
+    """The key under which tokens differing only in a leading space or case meet."""
+    if not isinstance(token, str):
+        return ""
+    text = token[1:] if token.startswith("Ġ") else token
+    return text.lower() if text and "Ġ" not in text and "Ċ" not in text else ""
 
-    The allowed tokens are the document's tokens and, for a token that
-    starts with a space, the same text without it; each maps back to
-    every position it occurs at, in document order.
+
+def _candidates(scorer, lp, doc_ids) -> tuple[list[tuple[int, int, float]],
+                                              float, float]:
+    """Start candidates as (position, token id, logprob), none and best logprobs.
+
+    Every document token is scored as the best of its variants (same
+    text up to a leading space and case); each variant group maps back
+    to every position it occurs at, in document order.
     """
-    allowed = {}
+    groups = {}
     for pos, token in enumerate(doc_ids):
-        allowed.setdefault(token, []).append((pos, token))
-        if token in scorer.stripped:
-            allowed.setdefault(scorer.stripped[token], []).append((pos, token))
-    ranked = sorted(allowed, key=lambda t: -float(lp[t]))[:TOP_TOKENS]
-    out, seen = [], set()
-    for token in ranked:
-        for pos, _ in allowed[token]:
-            if pos not in seen and len(out) < MAX_STARTS:
-                seen.add(pos)
-                out.append((pos, token))
-    return out, float(lp[scorer.none_id]), float(lp[ranked[0]])
+        key = _same_word(scorer.vocab[token]) or token
+        groups.setdefault(key, []).append(pos)
+    best = {}
+    for key in groups:
+        ids = scorer.variants.get(key, [key]) if isinstance(key, str) else [key]
+        best[key] = max(ids, key=lambda i: float(lp[i]))
+    ranked = sorted(groups, key=lambda k: -float(lp[best[k]]))[:TOP_TOKENS]
+    out = []
+    for key in ranked:
+        for pos in groups[key]:
+            if len(out) < MAX_STARTS:
+                out.append((pos, best[key], float(lp[best[key]])))
+    return out, float(lp[scorer.none_id]), float(lp[best[ranked[0]]])
 
 
 def _spans(scorer, prompt_ids, doc_ids, candidates):
@@ -278,13 +292,13 @@ def _spans(scorer, prompt_ids, doc_ids, candidates):
     import torch
 
     sequences, rows = [], []
-    for pos, first in candidates:
+    for pos, first, _ in candidates:
         fed = [first, *doc_ids[pos + 1:pos + 1 + FEED]]
         sequences.append(prompt_ids + fed)
         rows.append(list(range(len(prompt_ids) - 1, len(prompt_ids) + len(fed))))
     quote = torch.tensor(scorer.quote_ids)
     out = []
-    for (pos, first), lp in zip(candidates, scorer.rows(sequences, rows)):
+    for (pos, first, _), lp in zip(candidates, scorer.rows(sequences, rows)):
         fed = [first, *doc_ids[pos + 1:pos + 1 + FEED]]
         nxt = doc_ids[pos + 1:pos + 1 + len(fed)]
         copy = [float(lp[i + 1, nxt[i]]) if i < len(nxt) else float("-inf")
@@ -375,8 +389,14 @@ def measure(model: str, n: int, run: str) -> dict:
         (lp,) = scorer.rows([prompt_ids], [[len(prompt_ids) - 1]])
         candidates, none_lp, best_lp = _candidates(scorer, lp[0], doc_ids)
         rec["none_wins"] = none_lp > best_lp
-        rec["gold_rank"] = next((i for i, (p, _) in enumerate(candidates)
+        rec["gold_rank"] = next((i for i, (p, _, _) in enumerate(candidates)
                                  if p == gold_start), -1)
+        top = lp[0].topk(TOP_TOKENS)
+        rec["cue_top"] = [(scorer.vocab[int(i)], round(float(v), 2))
+                          for v, i in zip(top.values, top.indices)]
+        rec["candidates"] = [(p, scorer.vocab[t], round(v, 2))
+                             for p, t, v in candidates]
+        rec["gold_token"] = scorer.vocab[doc_ids[gold_start]] if gold else ""
         branches = _spans(scorer, prompt_ids, doc_ids, candidates)
 
         def span_text(pos, length):
