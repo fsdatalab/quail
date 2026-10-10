@@ -10,6 +10,11 @@ the same prompt, with no training:
   first token must come from the document, each later token is the
   next document token or a closing quote, and the answer stops at the
   first step where the quote beats the copy.
+- lines: the document is shown as numbered lines of at most 100
+  characters, and the model answers with a START-END line range; the
+  answer is the text of those lines. Recorded as text F1, as whether
+  the range contains the reference span, and as whether it is exactly
+  the reference's line range.
 - scored: the top-k start tokens are read in one step; after each
   candidate start the next FEED document tokens are fed in one pass,
   and every (start, end) span is scored as the product of its copy
@@ -31,7 +36,9 @@ Prediction (Qwen3 4B fp8, 300 questions): scored with k=8 lands
 within 2 F1 points of free generation; the gold start token is among
 the 8 candidates for at least 70% of questions; the bound closes at
 the gold end for half the questions; with 16-token chunks, at least
-85% of questions finish in one end pass.
+85% of questions finish in one end pass. The lines baseline contains
+the reference span for at least 75% of questions and matches its line
+range exactly for at least 60%, with text F1 near 20 to 25.
 
     uv run modal run --detach -m experiments.cells.extract_spans \
         --model qwen3-4b-fp8 2>&1 | tee /tmp/extract_spans_qwen3_4b_fp8.log
@@ -80,8 +87,18 @@ BODY_TEMPLATE = ("DOCUMENT:\n{0}\n\nAnswer the question with the shortest exact 
                  "few words, never a whole sentence. If the document does not "
                  "answer it, answer none.\nQuestion: {1}")
 RAW_PROMPT_TEMPLATE = "{0}\nANSWER: \""
-CHAT_PROMPT_TEMPLATE = ("<|im_start|>user\n{0}<|im_end|>\n<|im_start|>assistant\n"
-                        "<think>\n\n</think>\n\n\"")
+CHAT_TURN_TEMPLATE = ("<|im_start|>user\n{0}<|im_end|>\n<|im_start|>assistant\n"
+                      "<think>\n\n</think>\n\n")
+CHAT_PROMPT_TEMPLATE = CHAT_TURN_TEMPLATE + '"'
+# the lines baseline: the document is shown as numbered lines of at
+# most LINE_WIDTH characters, and the model answers with line numbers
+LINE_WIDTH = 100
+LINE_MAX_TOKENS = 8
+LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\nAnswer the question with "
+                      "the line numbers of the fewest lines that contain the "
+                      "answer, as START-END, for example 3-3 or 5-6. If the "
+                      "document does not answer it, answer none.\nQuestion: {1}")
+RAW_LINE_TEMPLATE = "{0}\nANSWER: "
 
 
 def _questions(n: int) -> list[dict]:
@@ -144,6 +161,41 @@ def _align(text: str, context: str) -> tuple[str, str]:
     if match.size >= len(text) / 2:
         return "fuzzy", context[match.a:match.a + match.size]
     return "none", text
+
+
+def _lines(context: str) -> list[tuple[int, int]]:
+    """Character ranges of the context cut into lines of at most LINE_WIDTH.
+
+    A cut falls at the last space before the limit when there is one,
+    so words stay whole; the text itself is unchanged.
+    """
+    out, start = [], 0
+    while start < len(context):
+        end = min(start + LINE_WIDTH, len(context))
+        if end < len(context):
+            space = context.rfind(" ", start + 1, end + 1)
+            if space > start:
+                end = space
+        out.append((start, end))
+        start = end
+        while start < len(context) and context[start] == " ":
+            start += 1
+    return out
+
+
+def _parse_lines(text: str, count: int) -> tuple[int, int] | None:
+    """The START-END line range in an answer, 1-based and within the document."""
+    import re
+
+    match = re.search(r"(\d+)\s*(?:-|to|–)\s*(\d+)|(\d+)", text)
+    if not match:
+        return None
+    a, b = (match.group(1), match.group(2)) if match.group(1) else (
+        match.group(3), match.group(3))
+    a, b = int(a), int(b)
+    if not 1 <= a <= b <= count:
+        return None
+    return a, b
 
 
 def _same_word(token) -> str:
@@ -221,10 +273,20 @@ class Scorer:
             [TokensPrompt(prompt_token_ids=s) for s in sequences],
             SamplingParams(temperature=0.0, **params), use_tqdm=False)
 
-    def free(self, prompts: list[list[int]]) -> list[str]:
-        """Greedy text after each prompt, cut at the closing quote or line end."""
-        outputs = self._run(prompts, max_tokens=FREE_MAX_TOKENS, stop=['"', "\n"])
+    def free(self, prompts: list[list[int]], max_tokens: int = FREE_MAX_TOKENS,
+             stop=('"', "\n")) -> list[str]:
+        """Greedy text after each prompt, cut at a stop string."""
+        outputs = self._run(prompts, max_tokens=max_tokens, stop=list(stop))
         return [o.outputs[0].text for o in outputs]
+
+    def line_prompt(self, context: str, question: str) -> list[int]:
+        """Token ids of the lines-baseline prompt for one question."""
+        lines = _lines(context)
+        numbered = "\n".join(f"{i + 1}: {context[a:b]}"
+                             for i, (a, b) in enumerate(lines))
+        body = LINE_BODY_TEMPLATE.format(numbered, question)
+        text = (CHAT_TURN_TEMPLATE if self.chat else RAW_LINE_TEMPLATE).format(body)
+        return self.tok.encode(text, add_special_tokens=False)
 
     def cues(self, sequences: list[list[int]]) -> list[dict]:
         """Logprobs of the CUE_LOGPROBS likeliest next tokens, per sequence."""
@@ -396,8 +458,12 @@ def measure(model: str, n: int, run: str) -> dict:
     prompts = [scorer.prompt(q["context"], q["question"]) for q in questions]
     t0 = time.perf_counter()
     free_texts = scorer.free([ids for ids, _ in prompts])
+    line_prompts = [scorer.line_prompt(q["context"], q["question"])
+                    for q in questions]
+    line_texts = scorer.free(line_prompts, LINE_MAX_TOKENS, ("\n",))
     items = []
-    for q, (prompt_ids, doc), text in zip(questions, prompts, free_texts):
+    for q, (prompt_ids, doc), text, line_ids, line_text in zip(
+            questions, prompts, free_texts, line_prompts, line_texts):
         doc_ids = [prompt_ids[i] for i, _ in doc]
         offsets = [span for _, span in doc]
         gold_lo = q["answer_start"]
@@ -412,6 +478,21 @@ def measure(model: str, n: int, run: str) -> dict:
                "gold_token": scorer.vocab[doc_ids[gold_start]] if gold else "",
                "free": {"text": text, "aligned": aligned, "how": how,
                         "em_f1": _f1(aligned, q["answers"])}}
+        lines = _lines(q["context"])
+        gold_lines = [i + 1 for i, (a, b) in enumerate(lines)
+                      if a < gold_hi and b > gold_lo]
+        gold_range = (gold_lines[0], gold_lines[-1]) if gold_lines else None
+        chosen = _parse_lines(line_text, len(lines))
+        line_answer = (q["context"][lines[chosen[0] - 1][0]:lines[chosen[1] - 1][1]]
+                       if chosen else "")
+        rec["lines"] = {
+            "text": line_text, "range": chosen, "gold_range": gold_range,
+            "prompt_tokens": len(line_ids), "parsed": chosen is not None,
+            "contains": bool(chosen and gold_range
+                             and chosen[0] <= gold_range[0]
+                             and gold_range[1] <= chosen[1]),
+            "exact": chosen is not None and chosen == gold_range,
+            "em_f1": _f1(line_answer, q["answers"])}
 
         (lp,) = scorer.cues([prompt_ids])
         candidates, none_lp, best_lp, rounds = _candidates(
@@ -475,6 +556,13 @@ def measure(model: str, n: int, run: str) -> dict:
         "free": em_f1(lambda r: r["free"]["em_f1"]),
         "free_alignment": {how: sum(r["free"]["how"] == how for r in items)
                            for how in ("exact", "case", "fuzzy", "none", "empty")},
+        "lines": em_f1(lambda r: r["lines"]["em_f1"]),
+        "lines_contains_gold": mean([r["lines"]["contains"] for r in items]),
+        "lines_exact_range": mean([r["lines"]["exact"] for r in items]),
+        "lines_unparsed": sum(not r["lines"]["parsed"] for r in items),
+        "lines_prompt_tokens_mean": mean([r["lines"]["prompt_tokens"] for r in items]),
+        "lines_per_document_mean": mean([len(_lines(q["context"]))
+                                         for q in questions]),
         "greedy": em_f1(lambda r: r["greedy"]["em_f1"]),
         "greedy_rounds_mean": mean([r["greedy"]["rounds"] for r in items]),
         "scored": {key: em_f1(lambda r, key=key: r["scored"][key]["em_f1"])
