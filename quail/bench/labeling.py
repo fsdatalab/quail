@@ -238,17 +238,35 @@ def _pair_columns(spec: PredicateSpec):
     return getattr(spec, "pair_columns", None)
 
 
+def _where_rows(rows: list[dict], condition) -> list[int]:
+    """Indices of the rows whose column equals the condition's value.
+
+    Args:
+        rows: The rows of one join side.
+        condition: (column, value), or None to keep every row.
+    """
+    if condition is None:
+        return list(range(len(rows)))
+    column, value = condition
+    return [i for i, row in enumerate(rows) if row.get(column) == value]
+
+
 def _matching_pairs(spec: PredicateSpec, left_rows: list[dict],
                     right_rows: list[dict]) -> list[tuple[int, int]]:
-    """(left index, right index) of the pairs whose pair columns are equal."""
+    """(left index, right index) of the pairs a restricted join labels.
+
+    A pair's columns are equal, and each row passes its side's WHERE
+    condition when the predicate names one.
+    """
     left_column, right_column = spec.pair_columns
     partners = {}
-    for j, right in enumerate(right_rows):
-        value = right.get(right_column)
+    for j in _where_rows(right_rows, getattr(spec, "right_where", None)):
+        value = right_rows[j].get(right_column)
         if value is not None:
             partners.setdefault(value, []).append(j)
-    return [(i, j) for i, left in enumerate(left_rows)
-            for j in partners.get(left.get(left_column), ())]
+    return [(i, j)
+            for i in _where_rows(left_rows, getattr(spec, "left_where", None))
+            for j in partners.get(left_rows[i].get(left_column), ())]
 
 
 def _join_step(spec: PredicateSpec, identity: dict, right_rows: int) -> int:
@@ -574,7 +592,8 @@ class QuailJudge:
         """Answers by (left index, right index) pair.
 
         Every pair is asked, or, when the predicate names pair columns,
-        only the pairs whose columns are equal.
+        only the pairs whose columns are equal and whose rows pass the
+        predicate's WHERE conditions.
         """
         import quail
 
@@ -584,9 +603,21 @@ class QuailJudge:
         prompt = quail.prompt(spec.template,
                               quail.col(f"l.{spec.left_column}"),
                               quail.col(f"r.{spec.right_column}"))
+        keep_left = list(range(len(left_rows)))
+        keep_right = list(range(len(right_rows)))
         if pairs:
-            left = self._register(left_rows, spec.left_column, (pairs[0],))
-            right = self._register(right_rows, spec.right_column, (pairs[1],))
+            # Quail answers by position in the registered rows, so the
+            # rows a WHERE condition drops are left out and mapped back
+            keep_left = _where_rows(left_rows,
+                                    getattr(spec, "left_where", None))
+            keep_right = _where_rows(right_rows,
+                                     getattr(spec, "right_where", None))
+            if not keep_left or not keep_right:
+                return {}
+            left = self._register([left_rows[i] for i in keep_left],
+                                  spec.left_column, (pairs[0],))
+            right = self._register([right_rows[j] for j in keep_right],
+                                   spec.right_column, (pairs[1],))
             query = (self.session.docs(left).alias("l")
                      .join(self.session.docs(right).alias("r"),
                            on=quail.col(f"l.{pairs[0]}")
@@ -605,7 +636,8 @@ class QuailJudge:
         result = self._run(query, expected)
         table = result.answer_tables["joins"][0]
         answers = {
-            (int(left_index), int(right_index)): bool(answer)
+            (keep_left[int(left_index)], keep_right[int(right_index)]):
+                bool(answer)
             for left_index, right_index, answer in zip(
                 table.column("l").to_pylist(),
                 table.column("r").to_pylist(),

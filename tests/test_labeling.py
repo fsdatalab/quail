@@ -462,7 +462,8 @@ def test_pair_columns_restrict_the_pairs_a_join_labels(monkeypatch, tmp_path):
         left_table="support_messages", left_column="content",
         right_role="customer_message", right_table="support_messages",
         right_column="content", source_policy="qwen3_32b", labels=(),
-        descriptions=(), pair_columns=("id", "prev_assistant_id"))
+        descriptions=(), pair_columns=("id", "prev_assistant_id"),
+        left_where=None, right_where=None)
     agents = [{"id": "a1", "content": "yes", "prev_assistant_id": None},
               {"id": "a2", "content": "no", "prev_assistant_id": None}]
     replies = [{"id": "u1", "content": "yes", "prev_assistant_id": "a1"},
@@ -488,3 +489,26 @@ def test_pair_columns_restrict_the_pairs_a_join_labels(monkeypatch, tmp_path):
     assert part.select(["left_id", "right_id", "answer"]).to_pylist() == [
         {"left_id": "a1", "right_id": "u1", "answer": True},
         {"left_id": "a2", "right_id": "u2", "answer": False}]
+
+
+def test_where_conditions_restrict_a_join_to_matching_sides(monkeypatch):
+    monkeypatch.setattr(quail, "Session", _FakeSession)
+    spec = SimpleNamespace(
+        key="quailb.runs.run.different_approach", workload="runs",
+        slug="different_approach", kind="join",
+        template="Does {1} differ from {0}?", left_role="successful_run",
+        left_table="issue_runs", left_column="transcript",
+        right_role="failed_run", right_table="issue_runs",
+        right_column="transcript", source_policy="qwen3_32b", labels=(),
+        descriptions=(), pair_columns=("instance_id", "instance_id"),
+        left_where=("resolved", 1), right_where=("resolved", 0))
+    runs = [{"id": "ir0", "transcript": "yes", "instance_id": "a", "resolved": 1},
+            {"id": "ir1", "transcript": "no", "instance_id": "a", "resolved": 0},
+            {"id": "ir2", "transcript": "yes", "instance_id": "a", "resolved": 0},
+            {"id": "ir3", "transcript": "yes", "instance_id": "b", "resolved": 1}]
+
+    # only the successful run of issue a pairs, with its two failed runs
+    assert labeling._matching_pairs(spec, runs, runs) == [(0, 1), (0, 2)]
+    assert labeling._expected_rows(spec, {"issue_runs": runs}) == 2
+    judge = labeling.QuailJudge()
+    assert judge.join(spec, runs, runs) == {(0, 1): False, (0, 2): True}
