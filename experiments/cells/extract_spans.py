@@ -110,12 +110,16 @@ CHAT_PROMPT_TEMPLATE = CHAT_TURN_TEMPLATE + '"'
 # the lines baseline: the document is shown as numbered lines of at
 # most LINE_WIDTH characters, and the model answers with line numbers
 LINE_WIDTH = 100
-LINE_MAX_TOKENS = 24    # a chat model answers in a sentence
+LINE_MAX_TOKENS = 8
 LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\nAnswer the question with "
                       "the line numbers of the fewest lines that contain the "
                       "answer, as START-END, for example 3-3 or 5-6. If the "
                       "document does not answer it, answer none.\nQuestion: {1}")
-RAW_LINE_TEMPLATE = "{0}\nANSWER: "
+# the answer is begun for the model, as the open quote begins the
+# other methods' answers, so it writes the range and nothing else
+LINE_CUE = "The answer is in lines "
+RAW_LINE_TEMPLATE = "{0}\nANSWER: " + LINE_CUE
+CHAT_LINE_TEMPLATE = CHAT_TURN_TEMPLATE + LINE_CUE
 
 
 def _squad_questions(n: int) -> list[dict]:
@@ -251,10 +255,10 @@ def _parse_lines(text: str, count: int) -> tuple[int, int] | None:
     """The START-END line range in an answer, 1-based and within the document."""
     import re
 
-    # a bare range, or a range named as lines inside a sentence; a
-    # number that is not attached to "line" may be the span's text
+    # the range the cue begins, or one named as lines in a sentence; a
+    # number elsewhere may be the span's text
     span = r"(\d+)(?:\s*(?:-|to|–|and)\s*(\d+))?"
-    match = (re.fullmatch(rf"\s*{span}\s*[.]?\s*", text)
+    match = (re.match(rf"\s*{span}(?!\d)", text)
              or re.search(rf"\blines?\s+{span}", text, re.I))
     if not match:
         return None
@@ -351,7 +355,7 @@ class Scorer:
         numbered = "\n".join(f"{i + 1}: {context[a:b]}"
                              for i, (a, b) in enumerate(lines))
         body = LINE_BODY_TEMPLATE.format(numbered, question)
-        text = (CHAT_TURN_TEMPLATE if self.chat else RAW_LINE_TEMPLATE).format(body)
+        text = (CHAT_LINE_TEMPLATE if self.chat else RAW_LINE_TEMPLATE).format(body)
         return self.tok.encode(text, add_special_tokens=False)
 
     def cues(self, sequences: list[list[int]]) -> list[dict]:
