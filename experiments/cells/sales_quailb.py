@@ -189,7 +189,8 @@ def run_sales(run: str, query_ids: tuple = QUERIES, model: str = MODEL) -> dict:
 @app.local_entrypoint()
 def main(queries: str = ",".join(QUERIES), model: str = MODEL):
     """Spawn the run and print its function call id."""
-    call = run_sales.spawn(time.strftime("%Y%m%d-%H%M%S"),
+    # two runs spawned in the same second must not share result paths
+    call = run_sales.spawn(f"{time.strftime('%Y%m%d-%H%M%S')}_{model}",
                            tuple(queries.split(",")), model)
     print(f"[sales] run_sales function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=2, default=str), flush=True)
