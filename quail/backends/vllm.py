@@ -239,6 +239,13 @@ class VLLMEngine:
             # 92 to 73 percent on agent traces,
             # /results/ablations/diffusion_gemma_readout_probe_agent_k0_corpus_mp.json)
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        if spec.linear_attention_params:
+            # Constructing vLLM for a linear-attention model initializes
+            # CUDA in this process (Modal call fc-01M4KZVR87K0SV97B5926CNNY8
+            # logged vLLM's "CUDA is initialized" spawn override), so vLLM
+            # spawns the engine core, and the spawned process has no
+            # Gigatoken registration. The in-process engine core keeps it.
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         started = time.perf_counter()
         with diffusion_canvas(spec) as canvas_ids:
             llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
