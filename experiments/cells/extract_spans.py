@@ -269,7 +269,8 @@ def _best_start(scorer, lp, key, token) -> tuple[int, list[int]]:
     return first, rest
 
 
-def _candidates(scorer, prompt_ids, lp, doc_ids) -> tuple[list[dict], float, float, int]:
+def _candidates(scorer, prompt_ids, lp, doc_ids
+                ) -> tuple[list[dict], float, float, int]:
     """Start candidates, the none and best logprobs, and the rounds taken.
 
     Every document token is scored as the best of the tokens that can
