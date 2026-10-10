@@ -15,11 +15,20 @@ from quail.specs import ModelSpec
 
 
 def attention_projection_params(model: ModelSpec) -> int:
-    """Return Q, K, V, and output projection parameters over the layers."""
+    """Return the attention projection parameters over the layers.
+
+    A full-attention layer counts its Q, K, V, and output projections;
+    a linear-attention layer counts the spec's figure for its own.
+    """
     h = model.hidden
-    return sum(h * model.n_q * head + 2 * h * n_kv * head
-               + model.n_q * head * h
-               for n_kv, head in model.kv_shapes)
+    total = 0
+    for layer, (n_kv, head) in enumerate(model.kv_shapes):
+        if model.is_linear_layer(layer):
+            total += model.linear_attention_params
+        else:
+            total += (h * model.n_q * head + 2 * h * n_kv * head
+                      + model.n_q * head * h)
+    return total
 
 
 def mlp_params(model: ModelSpec) -> int:

@@ -187,8 +187,10 @@ def tree_attention_allowed(model: ModelSpec) -> bool:
     """Whether the planner and the executor may run the model's tree path.
 
     A diffusion model packs canvas rows, which the tree path does not.
+    A linear-attention layer has no partial attention to merge.
     """
     return (not model.canvas_tokens
+            and not model.linear_attention_params
             and model.params >= TREE_ATTENTION_MIN_PARAMS)
 
 

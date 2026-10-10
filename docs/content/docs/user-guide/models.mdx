@@ -10,6 +10,7 @@ Set `model` to the model you want to run and `device` to your GPU type.
 | --- | --- | --- | --- |
 | Qwen3 4B | `"qwen3-4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
 | Qwen3 32B | `"qwen3-32b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
+| Qwen3.8 27B | `"qwen3.8-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` on the `stock_vllm` backend only |
 | DiffusionGemma 26B-A4B | `"diffusion-gemma-26b-a4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
 | Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | BF16 | `AI.SCORE` |
 | Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | BF16 | `AI.SCORE` |
@@ -53,6 +54,21 @@ config = quail.EngineConfig(
     model="qwen3-4b-fp8",
     device="h100-sxm",
     gpus=4,
+)
+```
+
+## Qwen3.8 27B
+
+Qwen3.8 27B runs on the `stock_vllm` backend only. Three of every four
+of its layers run linear attention, which keeps a fixed-size state per
+sequence instead of KV, and Quail's executor has no forward pass for
+that layout. The Quail backend refuses the model.
+
+```python
+config = quail.EngineConfig(
+    model="qwen3.8-27b-fp8",
+    device="h100-sxm",
+    backend="stock_vllm",
 )
 ```
 

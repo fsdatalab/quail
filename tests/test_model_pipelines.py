@@ -22,8 +22,13 @@ from quail.specs import (
 
 def test_backends_support_registered_generative_models_and_refuse_others():
     for model in MODELS.values():
-        assert model.arch in supported_archs()
-        assert QuailBackend().supports(model, H100_SXM, 1).supported
+        support = QuailBackend().supports(model, H100_SXM, 1)
+        if model.arch in supported_archs():
+            assert support.supported
+        else:
+            # registered for the request backends alone
+            assert not support.supported
+            assert model.arch in support.reason
 
     spec = replace(QWEN3_4B_FP8, name="other", arch="other")
     with pytest.raises(ValueError, match="other"):

@@ -77,6 +77,11 @@ class ModelSpec:
     full_d_head: int = 0       # head dim of a full-attention layer
     sliding_window: int = 0    # tokens the other layers see behind each
     #                            row; 0 means no layer slides
+    # Projection parameters of one linear-attention layer, when the
+    # layers between the full-attention layers run linear attention: a
+    # fixed-size state per sequence instead of KV rows, so those layers
+    # keep no KV. 0 means no layer runs linear attention.
+    linear_attention_params: int = 0
     # Experts beside the dense MLP, for a mixture-of-experts model;
     # 0 means the dense MLP alone.
     experts: int = 0
@@ -104,18 +109,34 @@ class ModelSpec:
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);
     #                                   None lets vLLM pick
+    language_model_only: bool = False    # the checkpoint carries a
+    #                                      vision encoder beside the text
+    #                                      model; vLLM's setting of the
+    #                                      same name runs the text model
+    #                                      alone
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""
         period = self.full_attention_period
         return bool(period) and (layer + 1) % period == 0
 
+    def is_linear_layer(self, layer: int) -> bool:
+        """Whether the layer runs linear attention and keeps no KV."""
+        return bool(self.linear_attention_params) and not self.is_full_layer(layer)
+
     @property
     def kv_shapes(self) -> tuple:
-        """Per layer, the (KV heads, head dim) its KV stores."""
+        """Per layer, the (KV heads, head dim) its KV stores; (0, 0) for none."""
         full = (self.full_n_kv or self.n_kv, self.full_d_head or self.d_head)
-        return tuple(full if self.is_full_layer(i) else (self.n_kv, self.d_head)
-                     for i in range(self.layers))
+        shapes = []
+        for i in range(self.layers):
+            if self.is_full_layer(i):
+                shapes.append(full)
+            elif self.is_linear_layer(i):
+                shapes.append((0, 0))
+            else:
+                shapes.append((self.n_kv, self.d_head))
+        return tuple(shapes)
 
     @property
     def widest_projection(self) -> int:

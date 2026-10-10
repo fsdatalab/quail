@@ -25,7 +25,12 @@ from quail.physical import (
     decode_graph,
 )
 from quail.planner.plan import EngineConfig
-from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_SXM, QWEN3_4B_FP8
+from quail.specs import (
+    DIFFUSION_GEMMA_26B_FP8,
+    H100_SXM,
+    QWEN3_4B_FP8,
+    QWEN3_8_27B_FP8,
+)
 
 CAPACITY = {"kv_cache_size_tokens": 1_000, "block_size": 1, "max_num_seqs": 16}
 
@@ -297,6 +302,9 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
     assert qwen["max_num_batched_tokens"] == 25_305
     assert qwen["tokenizer_mode"] == "gigatoken"
     assert "diffusion_config" not in qwen
+    assert "language_model_only" not in qwen
+    # the vision-language checkpoint runs its text model alone
+    assert engine.llm_kwargs(QWEN3_8_27B_FP8)["language_model_only"] is True
     # the mixture-of-experts model batches its own chunk cap; its
     # one-row canvas commits after one denoising step, and stays under
     # vLLM's eight-sequence cap trigger

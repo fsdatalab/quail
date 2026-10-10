@@ -187,7 +187,9 @@ class VLLMEngine:
         A spec with its own chunk cap (a mixture-of-experts model)
         batches at least that many tokens per step. A one-row-canvas
         diffusion model runs more sequences per step than vLLM's
-        default for its 256-row canvas.
+        default for its 256-row canvas. A checkpoint with a vision
+        encoder runs its text model alone, which also skips the
+        multimodal processor.
         """
         batched = max(MAX_BATCHED_TOKENS, spec.chunk_cap_tokens)
         kwargs = {
@@ -202,6 +204,8 @@ class VLLMEngine:
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
                              else MAX_SEQUENCES),
         }
+        if spec.language_model_only:
+            kwargs["language_model_only"] = True
         kwargs.update(diffusion_kwargs(spec))
         return kwargs
 
