@@ -105,6 +105,10 @@ class ModelSpec:
     #                                  prompts are written in
     chunk_cap_tokens: int = 0    # upper bound on tokens per chunk; 0
     #                              leaves the memory and kernel bounds
+    context_tokens: int = 0    # longest prompt the engines accept; 0
+    #                            takes the checkpoint's limit
+    max_sequences: int = 0     # sequences an engine keeps in flight at
+    #                            once; 0 takes the engine's default
     moe_backend: str | None = None    # vLLM's moe_backend setting, one
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);

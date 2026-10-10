@@ -303,8 +303,14 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
     assert qwen["tokenizer_mode"] == "gigatoken"
     assert "diffusion_config" not in qwen
     assert "language_model_only" not in qwen
-    # the vision-language checkpoint runs its text model alone
-    assert engine.llm_kwargs(QWEN3_8_27B_FP8)["language_model_only"] is True
+    assert "max_model_len" not in qwen
+    assert qwen["max_num_seqs"] == 4_096
+    # the vision-language checkpoint runs its text model alone, with
+    # its own sequence and context limits
+    hybrid = engine.llm_kwargs(QWEN3_8_27B_FP8)
+    assert hybrid["language_model_only"] is True
+    assert hybrid["max_num_seqs"] == 128
+    assert hybrid["max_model_len"] == 32_768
     # the mixture-of-experts model batches its own chunk cap; its
     # one-row canvas commits after one denoising step, and stays under
     # vLLM's eight-sequence cap trigger
