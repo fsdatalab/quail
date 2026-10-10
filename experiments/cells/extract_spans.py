@@ -160,16 +160,25 @@ class Scorer:
     def __init__(self, name: str):
         import torch
         from huggingface_hub import snapshot_download
-        from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Model
+        from transformers import (
+            AutoModelForCausalLM,
+            AutoTokenizer,
+            Qwen2TokenizerFast,
+            Qwen3Model,
+        )
 
         spec = MODELS[name]
         path = snapshot_download(spec["hf"], revision=spec["revision"] or None)
-        self.tok = AutoTokenizer.from_pretrained(path)
         if spec["backbone"]:
+            # the package root's config names custom model code, which
+            # AutoTokenizer would ask to run; the tokenizer itself is
+            # Qwen's, so load it by class from tokenizer.json
+            self.tok = Qwen2TokenizerFast.from_pretrained(path)
             self.backbone = Qwen3Model.from_pretrained(
                 f"{path}/{spec['backbone']}", dtype=torch.bfloat16).cuda().eval()
             self.head = self.backbone.embed_tokens.weight
         else:
+            self.tok = AutoTokenizer.from_pretrained(path)
             model = AutoModelForCausalLM.from_pretrained(
                 path, dtype=torch.bfloat16).cuda().eval()
             self.backbone, self.head = model.model, model.lm_head.weight
