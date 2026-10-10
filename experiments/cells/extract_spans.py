@@ -217,15 +217,19 @@ class Scorer:
         outputs = self._run(prompts, max_tokens=FREE_MAX_TOKENS, stop=['"', "\n"])
         return [o.outputs[0].text for o in outputs]
 
-    def cue(self, prompt_ids: list[int]) -> dict:
-        """Logprobs of the CUE_LOGPROBS likeliest tokens after the open quote."""
+    def cues(self, sequences: list[list[int]]) -> list[dict]:
+        """Logprobs of the CUE_LOGPROBS likeliest next tokens, per sequence."""
         from collections import defaultdict
 
-        (output,) = self._run([prompt_ids], max_tokens=1, logprobs=CUE_LOGPROBS,
-                              detokenize=False)
-        lp = defaultdict(lambda: float("-inf"))
-        lp.update({t: v.logprob for t, v in output.outputs[0].logprobs[0].items()})
-        return lp
+        outputs = self._run(sequences, max_tokens=1, logprobs=CUE_LOGPROBS,
+                            detokenize=False)
+        result = []
+        for output in outputs:
+            lp = defaultdict(lambda: float("-inf"))
+            lp.update({t: v.logprob
+                       for t, v in output.outputs[0].logprobs[0].items()})
+            result.append(lp)
+        return result
 
     def teacher_forced(self, sequences: list[list[int]]) -> list[list[float]]:
         """The logprob of each token given the ones before it, per sequence."""
@@ -236,13 +240,17 @@ class Scorer:
                 for seq, o in zip(sequences, outputs)]
 
 
-def _candidates(scorer, lp, doc_ids) -> tuple[list[tuple[int, int, float]],
-                                              float, float]:
-    """Start candidates as (position, token id, logprob), none and best logprobs.
+def _candidates(scorer, prompt_ids, lp, doc_ids) -> tuple[
+        list[tuple[int, int, float]], float, float, int]:
+    """Start candidates as (position, token id, score), none and best logprobs.
 
     Every document token is scored as the best of its variants (same
-    text up to a leading space and case); each variant group maps back
-    to every position it occurs at, in document order.
+    text up to a leading space and case). A start token that occurs at
+    several positions gets one more step: the logprob of each
+    position's next document token after it, so the positions are
+    told apart as a trie walk would. Positions rank by start logprob
+    plus that step. The last value is the number of decode rounds the
+    start took: 1, or 2 when any start token was ambiguous.
     """
     groups = {}
     for pos, token in enumerate(doc_ids):
@@ -253,12 +261,21 @@ def _candidates(scorer, lp, doc_ids) -> tuple[list[tuple[int, int, float]],
         ids = scorer.variants.get(key, [key]) if isinstance(key, str) else [key]
         best[key] = max(ids, key=lambda i: float(lp[i]))
     ranked = sorted(groups, key=lambda k: -float(lp[best[k]]))[:TOP_TOKENS]
-    out = []
+    ambiguous = [key for key in ranked if len(groups[key]) > 1]
+    follow = dict(zip(ambiguous, scorer.cues(
+        [prompt_ids + [best[key]] for key in ambiguous]))) if ambiguous else {}
+    scored = []
     for key in ranked:
+        first = best[key]
         for pos in groups[key]:
-            if len(out) < MAX_STARTS:
-                out.append((pos, best[key], float(lp[best[key]])))
-    return out, float(lp[scorer.none_id]), float(lp[best[ranked[0]]])
+            score = float(lp[first])
+            if key in follow:
+                after = doc_ids[pos + 1] if pos + 1 < len(doc_ids) else scorer.quote_id
+                score += float(follow[key][after])
+            scored.append((pos, first, score))
+    scored.sort(key=lambda t: -t[2])
+    return (scored[:MAX_STARTS], float(lp[scorer.none_id]),
+            float(lp[best[ranked[0]]]), 2 if ambiguous else 1)
 
 
 def _spans(scorer, prompt_ids, doc_ids, candidates):
@@ -366,9 +383,11 @@ def measure(model: str, n: int, run: str) -> dict:
                "free": {"text": text, "aligned": aligned, "how": how,
                         "em_f1": _f1(aligned, q["answers"])}}
 
-        lp = scorer.cue(prompt_ids)
-        candidates, none_lp, best_lp = _candidates(scorer, lp, doc_ids)
+        (lp,) = scorer.cues([prompt_ids])
+        candidates, none_lp, best_lp, rounds = _candidates(
+            scorer, prompt_ids, lp, doc_ids)
         rec["none_wins"] = none_lp > best_lp
+        rec["start_rounds"] = rounds
         rec["gold_rank"] = next((i for i, (p, _, _) in enumerate(candidates)
                                  if p == gold_start), -1)
         rec["cue_top"] = [(scorer.vocab[t], round(v, 2)) for t, v in
