@@ -177,7 +177,14 @@ class Scorer:
                        gpu_memory_utilization=0.85, max_logprobs=CUE_LOGPROBS,
                        max_num_seqs=512, max_num_batched_tokens=32768,
                        disable_log_stats=True)
-        self.tok = AutoTokenizer.from_pretrained(args.get("tokenizer", args["model"]))
+        if "tokenizer" in args:
+            # the package root's config names custom model code, which
+            # AutoTokenizer would ask to run; the tokenizer is Qwen's
+            from transformers import Qwen2TokenizerFast
+
+            self.tok = Qwen2TokenizerFast.from_pretrained(args["tokenizer"])
+        else:
+            self.tok = AutoTokenizer.from_pretrained(args["model"])
         self.chat = MODELS[name]["chat"]
         vocab = self.tok.convert_ids_to_tokens(list(range(len(self.tok))))
         self.vocab = vocab
