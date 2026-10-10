@@ -7,6 +7,7 @@ import pytest
 from fakes import (
     fake_torch,
     keep_even,
+    pair_join_graph,
     run_graph_on_arena,
     same_key,
     two_alias_graph,
@@ -225,6 +226,24 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
     assert on["chunks"] >= len(model.launched)
     assert all(0 < metrics["gpu_s"] <= metrics["chunks"] * 0.002 + 1e-9
                for metrics in per_node.values())
+
+
+def test_a_join_without_a_filter_settles_anchors_with_no_pairs(monkeypatch):
+    # document d has key d % 4 and partner i key i % 3: a document with
+    # key 3 has no pairs, so it settles without a forward pass
+    columns = _key_columns([d % 4 for d in range(14)], [0, 1, 2, 0])
+    allowed = {d: [i for i in range(4) if d % 4 == i % 3] for d in range(14)}
+    result, _, _, join_truth = run_graph_on_arena(
+        monkeypatch, pair_join_graph(), columns=columns,
+        streamed_anchors=False)
+    stage = result["joins"][0]
+    assert sorted(stage["anchor_index"]) == list(range(14))
+    for local, document in enumerate(stage["anchor_index"]):
+        assert stage["rows"].get(local, []) == [
+            join_truth[("r", document)][i] for i in allowed[document]]
+    table = result["_outputs"][PortRef("group:0", "join_answers:0")]
+    assert _pairs(table) == sorted(
+        (d, i) for d in range(14) for i in allowed[d])
 
 
 def _foreign_run(monkeypatch, graph, functions):

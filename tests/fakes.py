@@ -121,9 +121,10 @@ def cpu_arena(pages):
 class FakeModel:
     """Answer packed suffixes from planted truth tables."""
 
-    def __init__(self, filter_truth, join_truth):
+    def __init__(self, filter_truth, join_truth, streamed_anchors=True):
         self.filter_truth = filter_truth
         self.join_truth = join_truth
+        self.streamed_anchors = streamed_anchors
         self.launched = []      # ("filter" | "join", specs)
 
     def forward_chunk(self, chunk):
@@ -142,7 +143,8 @@ class FakeModel:
                     document = spec["key"][1]
                     bits.append(self.filter_truth[document][head - QUESTION])
                     kind = "filter"
-            if kind == "join" and spec["prefix"] is not None:
+            if (self.streamed_anchors and kind == "join"
+                    and spec["prefix"] is not None):
                 raise AssertionError("a streamed anchor packed its prefix")
         self.launched.append((kind, chunk.specs))
         return bits
@@ -268,9 +270,36 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None):
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
+def pair_join_graph():
+    """A join of r with p over the pairs a HashJoin on "key" keeps, no filter."""
+    nodes = (
+        Scan(node_id="input:r", alias="r", input_id="r"),
+        Scan(node_id="input:p", alias="p", input_id="p"),
+        HashJoin(
+            node_id="hash_join:r-p",
+            inputs=input_ports((PortRef("input:r", "ids:r"),
+                                PortRef("input:p", "ids:p"))),
+            left="r", right="p", on=(("key", "key"),), written_pos=0),
+        AiJoin(
+            node_id="group:0", anchor="r", anchor_resident="none",
+            inputs=input_ports((PortRef("input:r", "ids:r"),
+                                PortRef("input:p", "ids:p"),
+                                PortRef("hash_join:r-p", "pairs:0"))),
+            stages=(JoinStage(
+                written_pos=0, exec_idx=0, anchor="r", partners=("p",),
+                semantics="full", selectivity=0.5, expected_tuples=1,
+                anchor_frame_tokens=1, pair_tail_tokens=0,
+                anchor_resident="none", tuple_tokens=0,
+                pairs_from="hash_join:r-p",
+                frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
+                tail_token_ids=()),)),
+    )
+    return PhysicalGraph(nodes, PortRef("group:0", "ids:r"))
+
+
 def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
                        seed=5, pages=64, stages=1, partner_tokens=20,
-                       **extra):
+                       streamed_anchors=True, **extra):
     """Run a graph over random documents through the real graph runtime.
 
     Returns:
@@ -287,7 +316,7 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
                      for p in (0.8, 0.7)[:stages]] for _ in range(n_docs)]
     join_truth = {("r", d): [1 if rng.random() < 0.5 else 0
                              for _ in range(n_partners)] for d in range(n_docs)}
-    model = FakeModel(filter_truth, join_truth)
+    model = FakeModel(filter_truth, join_truth, streamed_anchors)
     torch = fake_torch()
     arena = cpu_arena(pages)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
