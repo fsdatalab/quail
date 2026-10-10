@@ -121,9 +121,10 @@ def cpu_arena(pages):
 class FakeModel:
     """Answer packed suffixes from planted truth tables."""
 
-    def __init__(self, filter_truth, join_truth):
+    def __init__(self, filter_truth, join_truth, streamed_anchors=True):
         self.filter_truth = filter_truth
         self.join_truth = join_truth
+        self.streamed_anchors = streamed_anchors
         self.launched = []      # ("filter" | "join", specs)
 
     def forward_chunk(self, chunk):
@@ -142,7 +143,8 @@ class FakeModel:
                     document = spec["key"][1]
                     bits.append(self.filter_truth[document][head - QUESTION])
                     kind = "filter"
-            if kind == "join" and spec["prefix"] is not None:
+            if (self.streamed_anchors and kind == "join"
+                    and spec["prefix"] is not None):
                 raise AssertionError("a streamed anchor packed its prefix")
         self.launched.append((kind, chunk.specs))
         return bits
@@ -199,7 +201,8 @@ def expected_filter_rows(filter_truth):
     return rows
 
 
-def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None):
+def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
+                    filtered=True, semantics="full", keep_anchor_kv=False):
     """R's filter chain into a join with p.
 
     Args:
@@ -211,18 +214,24 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None):
             over the scans that feeds the join its pairs port.
         foreign: (kind, ids) of a Foreign node between the chain and
             the join; ids "pairs" feeds the join its pairs port.
+        filtered: Whether r's filter chain runs at all; otherwise the
+            join reads r's scan and loads every anchor itself.
+        semantics: The join stage's semantics, "full" or "anti".
+        keep_anchor_kv: Whether the join retains surviving anchors' KV.
     """
-    chain = AiFilter(
-        node_id="filter:r",
-        inputs=input_ports((PortRef("input:r", "ids:r"),)),
-        alias="r", arena_writes=True, keep_kv=not pipelined,
-        stages=tuple(FilterStage(s, 1, 0, 0.8 - 0.1 * s, 14 * 0.8 ** s)
-                     for s in range(stages)),
-        question_token_ids=tuple((QUESTION + s,) for s in range(stages)))
-    nodes = [Scan(node_id="input:r", alias="r", input_id="r"), chain,
+    nodes = [Scan(node_id="input:r", alias="r", input_id="r"),
              Scan(node_id="input:p", alias="p", input_id="p")]
-    anchor_src = PortRef("filter:r", "ids:r")
-    if not pipelined:
+    anchor_src = PortRef("input:r", "ids:r")
+    if filtered:
+        nodes.insert(1, AiFilter(
+            node_id="filter:r",
+            inputs=input_ports((PortRef("input:r", "ids:r"),)),
+            alias="r", arena_writes=True, keep_kv=not pipelined,
+            stages=tuple(FilterStage(s, 1, 0, 0.8 - 0.1 * s, 14 * 0.8 ** s)
+                         for s in range(stages)),
+            question_token_ids=tuple((QUESTION + s,) for s in range(stages))))
+        anchor_src = PortRef("filter:r", "ids:r")
+    if filtered and not pipelined:
         nodes.append(Barrier(node_id="barrier:r",
                              inputs=input_ports((anchor_src,)),
                              next_anchor="r", aliases=("r",)))
@@ -253,14 +262,15 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None):
             function="keep_even", kind=foreign[0], ids=foreign[1],
             columns=(), aliases=("r",)))
         anchor_src = PortRef("apply:keep_even", "ids:r")
-    resident = "filter" if pipelined else "none"
+    resident = "filter" if filtered and pipelined else "none"
     nodes.append(AiJoin(
         node_id="group:0", anchor="r", anchor_resident=resident,
+        keep_anchor_kv=keep_anchor_kv,
         inputs=input_ports((anchor_src, PortRef("input:p", "ids:p"),
                             *join_inputs)),
         stages=(JoinStage(
             written_pos=0, exec_idx=0, anchor="r", partners=("p",),
-            semantics="full", selectivity=0.5, expected_tuples=1,
+            semantics=semantics, selectivity=0.5, expected_tuples=1,
             anchor_frame_tokens=1, pair_tail_tokens=0,
             anchor_resident=resident, tuple_tokens=0,
             pairs_from=pairs_from,
@@ -271,7 +281,7 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None):
 
 def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
                        seed=5, pages=64, stages=1, partner_tokens=20,
-                       **extra):
+                       streamed_anchors=True, **extra):
     """Run a graph over random documents through the real graph runtime.
 
     Returns:
@@ -288,7 +298,7 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
                      for p in (0.8, 0.7)[:stages]] for _ in range(n_docs)]
     join_truth = {("r", d): [1 if rng.random() < 0.5 else 0
                              for _ in range(n_partners)] for d in range(n_docs)}
-    model = FakeModel(filter_truth, join_truth)
+    model = FakeModel(filter_truth, join_truth, streamed_anchors)
     torch = fake_torch()
     arena = cpu_arena(pages)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)

@@ -227,6 +227,29 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
                for metrics in per_node.values())
 
 
+@pytest.mark.parametrize("semantics, keep_anchor_kv",
+                         [("full", False), ("anti", True)])
+def test_a_join_without_a_filter_settles_anchors_with_no_pairs(
+        monkeypatch, semantics, keep_anchor_kv):
+    # document d has key d % 4 and partner i key i % 3: a document with
+    # key 3 has no pairs and settles without loading its KV
+    columns = _key_columns([d % 4 for d in range(14)], [0, 1, 2, 0])
+    allowed = {d: [i for i in range(4) if d % 4 == i % 3] for d in range(14)}
+    result, _, _, join_truth = run_graph_on_arena(
+        monkeypatch, two_alias_graph(
+            False, hash_join=True, filtered=False, semantics=semantics,
+            keep_anchor_kv=keep_anchor_kv),
+        columns=columns, streamed_anchors=False)
+    stage = result["joins"][0]
+    assert sorted(stage["anchor_index"]) == list(range(14))
+    for local, document in enumerate(stage["anchor_index"]):
+        assert stage["rows"].get(local, []) == [
+            join_truth[("r", document)][i] for i in allowed[document]]
+    table = result["_outputs"][PortRef("group:0", "join_answers:0")]
+    assert _pairs(table) == sorted(
+        (d, i) for d in range(14) for i in allowed[d])
+
+
 def _foreign_run(monkeypatch, graph, functions):
     # document d has key d % 4; partner i has key i
     result, _, filter_truth, join_truth = run_graph_on_arena(
