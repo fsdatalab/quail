@@ -75,8 +75,10 @@ FREE_MAX_TOKENS = 48
 CHUNKS = (8, 16, 32)
 TOP_K = (1, 4, 8)
 
-BODY_TEMPLATE = ("DOCUMENT:\n{0}\n\nQuote the exact words from the document "
-                 "that answer the question, or answer none.\nQuestion: {1}")
+BODY_TEMPLATE = ("DOCUMENT:\n{0}\n\nAnswer the question with the shortest exact "
+                 "phrase copied from the document: a name, a number, a date, or a "
+                 "few words, never a whole sentence. If the document does not "
+                 "answer it, answer none.\nQuestion: {1}")
 RAW_PROMPT_TEMPLATE = "{0}\nANSWER: \""
 CHAT_PROMPT_TEMPLATE = ("<|im_start|>user\n{0}<|im_end|>\n<|im_start|>assistant\n"
                         "<think>\n\n</think>\n\n\"")
@@ -247,40 +249,57 @@ class Scorer:
                 for seq, o in zip(sequences, outputs)]
 
 
-def _candidates(scorer, prompt_ids, lp, doc_ids) -> tuple[
-        list[tuple[int, int, float]], float, float, int]:
-    """Start candidates as (position, token id, score), none and best logprobs.
+def _best_start(scorer, lp, key, token) -> tuple[int, list[int]]:
+    """The likeliest token that begins this document token, and the rest.
 
-    Every document token is scored as the best of its variants (same
-    text up to a leading space and case). A start token that occurs at
-    several positions gets one more step: the logprob of each
-    position's next document token after it, so the positions are
-    told apart as a trie walk would. Positions rank by start logprob
-    plus that step. The last value is the number of decode rounds the
-    start took: 1, or 2 when any start token was ambiguous.
+    The model may write a word without its leading space, in another
+    case, or split differently from the document: any token whose text
+    is a prefix of the word, up to case, can start it. A shorter one
+    is followed by the rest of the word as the document writes it.
+    """
+    if not isinstance(key, str) or not key.isascii():
+        ids = scorer.variants.get(key, [token]) if isinstance(key, str) else [token]
+        return max(ids, key=lambda i: float(lp[i])), []
+    options = [(i, j) for j in range(1, len(key) + 1)
+               for i in scorer.variants.get(key[:j], [])]
+    first, j = max(options, key=lambda o: float(lp[o[0]]))
+    text = scorer.vocab[token]
+    text = text[1:] if text.startswith("Ġ") else text
+    rest = scorer.tok.encode(text[j:], add_special_tokens=False) if j < len(key) else []
+    return first, rest
+
+
+def _candidates(scorer, prompt_ids, lp, doc_ids) -> tuple[list[dict], float, float, int]:
+    """Start candidates, the none and best logprobs, and the rounds taken.
+
+    Every document token is scored as the best of the tokens that can
+    begin it (`_best_start`). A start token that occurs at several
+    positions gets one more step: the logprob of each position's next
+    token after it, so the positions are told apart as a trie walk
+    would. Positions rank by start logprob plus that step. The rounds
+    are 1, or 2 when any start token was ambiguous.
     """
     groups = {}
     for pos, token in enumerate(doc_ids):
         key = _same_word(scorer.vocab[token]) or token
         groups.setdefault(key, []).append(pos)
-    best = {}
-    for key in groups:
-        ids = scorer.variants.get(key, [key]) if isinstance(key, str) else [key]
-        best[key] = max(ids, key=lambda i: float(lp[i]))
+    best, filler = {}, {}
+    for key, positions in groups.items():
+        best[key], filler[key] = _best_start(scorer, lp, key, doc_ids[positions[0]])
     ranked = sorted(groups, key=lambda k: -float(lp[best[k]]))[:TOP_TOKENS]
     ambiguous = [key for key in ranked if len(groups[key]) > 1]
     follow = dict(zip(ambiguous, scorer.cues(
         [prompt_ids + [best[key]] for key in ambiguous]))) if ambiguous else {}
     scored = []
     for key in ranked:
-        first = best[key]
         for pos in groups[key]:
-            score = float(lp[first])
+            score = float(lp[best[key]])
             if key in follow:
-                after = doc_ids[pos + 1] if pos + 1 < len(doc_ids) else scorer.quote_id
+                after = (filler[key] + doc_ids[pos + 1:pos + 2] + [scorer.quote_id])[0]
                 score += float(follow[key][after])
-            scored.append((pos, first, score))
-    scored.sort(key=lambda t: -t[2])
+            scored.append({"pos": pos, "first": best[key], "score": score,
+                           "filler": filler[key]})
+    scored.sort(key=lambda c: -c["score"])
     return (scored[:MAX_STARTS], float(lp[scorer.none_id]),
             float(lp[best[ranked[0]]]), 2 if ambiguous else 1)
 
@@ -293,21 +312,24 @@ def _spans(scorer, prompt_ids, doc_ids, candidates):
     gives the stop logprob there.
     """
     n = len(prompt_ids)
-    feeds = [[first, *doc_ids[pos + 1:pos + 1 + FEED]] for pos, first, _ in candidates]
+    feeds = [[c["first"], *c["filler"],
+              *doc_ids[c["pos"] + 1:c["pos"] + 1 + FEED - len(c["filler"])]]
+             for c in candidates]
     copies = scorer.teacher_forced([
-        prompt_ids + fed + doc_ids[pos + len(fed):pos + len(fed) + 1]
-        for (pos, _, _), fed in zip(candidates, feeds)])
+        prompt_ids + fed + doc_ids[c["pos"] + len(fed) - len(c["filler"]):][:1]
+        for c, fed in zip(candidates, feeds)])
     stops = scorer.teacher_forced([
         prompt_ids + fed[:i + 1] + [scorer.quote_id]
         for fed in feeds for i in range(len(fed))])
     out, at = [], 0
-    for (pos, first, _), fed, lp in zip(candidates, feeds, copies):
+    for c, fed, lp in zip(candidates, feeds, copies):
         copy = [lp[n + i + 1] if n + i + 1 < len(lp) else float("-inf")
                 for i in range(len(fed))]
         stop = [stops[at + i][-1] for i in range(len(fed))]
         at += len(fed)
-        out.append({"pos": pos, "first": first, "start": lp[n],
-                    "copy": copy, "stop": stop, "fed": len(fed)})
+        out.append({"pos": c["pos"], "first": c["first"], "start": lp[n],
+                    "copy": copy, "stop": stop, "fed": len(fed),
+                    "extra": len(c["filler"])})
     return out
 
 
@@ -395,30 +417,33 @@ def measure(model: str, n: int, run: str) -> dict:
             scorer, prompt_ids, lp, doc_ids)
         rec["none_wins"] = none_lp > best_lp
         rec["start_rounds"] = rounds
-        rec["gold_rank"] = next((i for i, (p, _, _) in enumerate(candidates)
-                                 if p == gold_start), -1)
+        rec["gold_rank"] = next((i for i, c in enumerate(candidates)
+                                 if c["pos"] == gold_start), -1)
         rec["cue_top"] = [(scorer.vocab[t], round(v, 2)) for t, v in
                           sorted(lp.items(), key=lambda kv: -kv[1])[:TOP_TOKENS]]
-        rec["candidates"] = [(p, scorer.vocab[t], round(v, 2))
-                             for p, t, v in candidates]
+        rec["candidates"] = [(c["pos"], scorer.vocab[c["first"]],
+                              round(c["score"], 2), len(c["filler"]))
+                             for c in candidates]
         branches = _spans(scorer, prompt_ids, doc_ids, candidates)
 
-        def span_text(pos, length):
-            return q["context"][offsets[pos][0]:offsets[pos + length - 1][1]].strip()
+        def span_text(branch, j):
+            """The document text of the span ending after fed token j."""
+            end = branch["pos"] + max(0, j - branch["extra"])
+            return q["context"][offsets[branch["pos"]][0]:offsets[end][1]].strip()
 
         greedy = branches[0]
         j = next((i for i, (c, s) in enumerate(zip(greedy["copy"], greedy["stop"]))
                   if s > c), greedy["fed"] - 1)
-        rec["greedy"] = {"text": span_text(greedy["pos"], j + 1),
+        rec["greedy"] = {"text": span_text(greedy, j),
                          "rounds": j + 2}
         rec["greedy"]["em_f1"] = _f1(rec["greedy"]["text"], q["answers"])
         rec["scored"] = {}
         for renormalized in (False, True):
             for k in TOP_K:
-                best = max(((s, b["pos"], j) for b in branches[:k]
+                best = max(((s, b, j) for b in branches[:k]
                             for j, s in enumerate(_scores(b, renormalized))),
                            key=lambda t: t[0])
-                answer = span_text(best[1], best[2] + 1)
+                answer = span_text(best[1], best[2])
                 rec["scored"][f"{'renorm' if renormalized else 'full'}_k{k}"] = {
                     "text": answer, "em_f1": _f1(answer, q["answers"])}
         rec["passes"] = {str(m): _passes(branches, m) for m in CHUNKS}
@@ -427,7 +452,7 @@ def measure(model: str, n: int, run: str) -> dict:
             others = [max(_scores(b, False)) for i, b in enumerate(branches)
                       if i != rec["gold_rank"]]
             close = _close_at(branch, max(others) if others else float("-inf"))
-            rec["past_gold_end"] = close - rec["gold_len"]
+            rec["past_gold_end"] = close - rec["gold_len"] - branch["extra"]
         items.append(rec)
     seconds = time.perf_counter() - t0
 
