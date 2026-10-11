@@ -314,6 +314,102 @@ def test_a_score_query_reports_every_scored_document_and_its_pieces(tmp_path):
     assert not pieces["filters"] and not pieces["classifies"]
 
 
+CONTRACTS = pa.table({
+    "id": [f"ct{i}" for i in range(3)],
+    "title": ["A", "B", "C"],
+    "text": ["audit yearly", "no audit", "audit at will"],
+    "token_count": pa.array([2, 2, 3], pa.int32()),
+})
+
+
+def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
+    from quail.physical import AiExtract
+
+    spec = get_query("CUAD-7")
+
+    def nodes(graph, request):
+        filtered = next(node for node in graph.nodes if isinstance(node, AiFilter))
+        extracted = next(node for node in graph.nodes
+                         if isinstance(node, AiExtract))
+        return {
+            **{node.node_id: NodeResult({f"ids:{node.alias}": range(
+                len(request.inputs[node.input_id].documents))})
+               for node in graph.nodes if isinstance(node, PhysicalScan)},
+            filtered.node_id: NodeResult({
+                "ids:c": [0, 2],
+                "filter_answers:c": {0: [1], 1: [0], 2: [1]},
+            }),
+            extracted.node_id: NodeResult({
+                "ids:c": [0, 2],
+                "scores": pa.table({
+                    "c": pa.array([0, 2], pa.int32()),
+                    "audit_rights": pa.array(["audit yearly", None],
+                                             pa.string()),
+                    "audit_rights_span": pa.array(
+                        [{"start": 0, "end": 12}, None],
+                        pa.struct([("start", pa.int64()),
+                                   ("end", pa.int64())])),
+                }),
+            }),
+        }
+
+    with _session(tmp_path) as sess:
+        sess.register("contracts", DocumentProvider.from_table(
+            CONTRACTS, id_col="id"))
+        query = build_query(sess, spec)
+        result = _execute(query, nodes, store=None)
+        output = run_output(result, spec.info, {"contracts": CONTRACTS})
+        output.prompt_pieces = prompt_pieces(query, spec.info, {})
+        turn = sess.model.extract_turn
+    assert output.filter_answers["filter-1"].to_pydict() == {
+        "c": ["ct0", "ct1", "ct2"], "answer": [True, False, True]}
+    assert output.extract_answers["extract-1"].to_pydict() == {
+        "c": ["ct0", "ct2"], "answer": ["audit yearly", None]}
+    assert output.rows.to_pydict() == {
+        "c": ["ct0", "ct2"], "audit_rights": ["audit yearly", None]}
+    # the extraction's head is the document label inside the chat turn,
+    # not the raw AI.IF preamble, so the query reports no pieces
+    assert turn[0] and output.prompt_pieces is None
+
+    alone = get_query("CUAD-1")
+    with _session(tmp_path) as sess:
+        sess.register("contracts", DocumentProvider.from_table(
+            CONTRACTS, id_col="id"))
+        query = build_query(sess, alone)
+
+        def extract_nodes(graph, request):
+            extracted = next(node for node in graph.nodes
+                             if isinstance(node, AiExtract))
+            return {
+                **{node.node_id: NodeResult({f"ids:{node.alias}": range(
+                    len(request.inputs[node.input_id].documents))})
+                   for node in graph.nodes
+                   if isinstance(node, PhysicalScan)},
+                extracted.node_id: NodeResult({
+                    "ids:c": [0, 1, 2],
+                    "scores": pa.table({
+                        "c": pa.array([0, 1, 2], pa.int32()),
+                        "governing_law": pa.array(["x", None, "y"],
+                                                  pa.string()),
+                        "governing_law_span": pa.array(
+                            [{"start": 0, "end": 1}, None,
+                             {"start": 0, "end": 1}],
+                            pa.struct([("start", pa.int64()),
+                                       ("end", pa.int64())])),
+                    }),
+                }),
+            }
+
+        result = _execute(query, extract_nodes, store=None)
+        output = run_output(result, alone.info, {"contracts": CONTRACTS})
+        pieces = prompt_pieces(query, alone.info, {})
+    assert output.rows.num_rows == 3
+    assert pieces["preamble"] == (turn[0] + quail.SHARED_PRE).split()
+    assert [item["id"] for item in pieces["extracts"]] == ["extract-1"]
+    assert pieces["extracts"][0]["tail"][:2] == ["Question:", "Which"]
+    assert pieces["extracts"][0]["tail"][-1] == 'Phrase: "'.split()[-1]
+
+
 def test_benchmark_results_and_scoring(tmp_path):
     with _session(tmp_path) as sess:
         quail_result = _run(_query(sess), [1, 0])

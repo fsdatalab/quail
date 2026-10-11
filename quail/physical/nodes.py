@@ -1068,8 +1068,7 @@ class ExtractSpec(ScoreSpec):
             trim=bool(value.get("trim", True)),
             locate=bool(value.get("locate", True)),
             numbered_token_parts=tuple(
-                tuple(int(token) for token in part)
-                for part in value.get("numbered_token_parts", ())),
+                tuple(part) for part in value.get("numbered_token_parts", ())),
         )
 
     def to_dict(self) -> dict:
