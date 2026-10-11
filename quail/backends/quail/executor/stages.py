@@ -317,10 +317,11 @@ class _StageExecutor:
                                 and bool(getattr(self.arena, "n_state_slots", 0)))
         if self.paged and getattr(self.arena, "n_state_slots", 0):
             # a document holds a checkpoint slot, and a second one once
-            # a later stage extends it
+            # a later stage extends it; the scheduler's count of active
+            # anchors already includes the resident ones
             per_document = 2 if len(self.stages) > 1 else 1
             self.sched.active_limit = max(
-                1, (self.arena.n_state_slots - len(resident)) // per_document)
+                1, self.arena.n_state_slots // per_document)
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         # The admission detaches residents from borrowing: they pack no prefix.

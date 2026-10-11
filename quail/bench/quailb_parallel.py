@@ -187,8 +187,7 @@ def run_query_family(
     Returns:
         Path to the saved family result on the results volume.
     """
-    if recompute_state:
-        os.environ["QUAIL_RECOMPUTE_STATE"] = "1"
+    os.environ["QUAIL_RECOMPUTE_STATE"] = "1" if recompute_state else "0"
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
         process_groups.append(tuple(_methods(baselines)))

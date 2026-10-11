@@ -43,7 +43,6 @@ def estimate(model: str, sf: float, query_ids: list[str],
     import quail
     import quail_b
     from quail.bench.quailb import answer_oracle, build_query
-    from quail.bench.substrait import read_plan
 
     directory = f"/results/quailb_data/sf{sf}"
     suite = quail_b.load_benchmark(list(query_ids), scale_factor=sf,
@@ -55,7 +54,7 @@ def estimate(model: str, sf: float, query_ids: list[str],
     session = quail.Session(quail.EngineConfig(model=model, device="h100-sxm"))
     for query_id in query_ids:
         spec = quail_b.get_query(query_id)
-        names = {r.table for r in read_plan(spec.plan).relations}
+        names = {r.table for r in spec.info.relations}
         tables = {name: pq.read_table(f"{directory}/{name}.parquet")
                   for name in names}
         for name, table in tables.items():
