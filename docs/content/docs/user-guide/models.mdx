@@ -64,9 +64,9 @@ of its layers run linear attention, which keeps a fixed-size state per
 sequence instead of KV, and Quail's executor has no forward pass for
 that layout. The Quail backend refuses the model.
 
-Each sequence in flight keeps about 150 MB of that state, so the
-engine runs at most 128 sequences at once and accepts prompts up to
-32,768 tokens.
+Each sequence in flight keeps about 154 MB of that state, so the
+`stock_vllm` backend runs at most 128 sequences at once and accepts
+prompts up to 32,768 tokens.
 
 ```python
 config = quail.EngineConfig(

@@ -105,10 +105,13 @@ class ModelSpec:
     #                                  prompts are written in
     chunk_cap_tokens: int = 0    # upper bound on tokens per chunk; 0
     #                              leaves the memory and kernel bounds
-    context_tokens: int = 0    # longest prompt the engines accept; 0
-    #                            takes the checkpoint's limit
-    max_sequences: int = 0     # sequences an engine keeps in flight at
-    #                            once; 0 takes the engine's default
+    context_tokens: int = 0    # longest prompt the vLLM request
+    #                            backends accept; 0 takes the
+    #                            checkpoint's limit
+    max_sequences: int = 0     # sequences the vLLM request backends keep
+    #                            in flight at once; 0 takes
+    #                            MAX_SEQUENCES. The Quail executor admits
+    #                            by tokens and ignores both fields.
     moe_backend: str | None = None    # vLLM's moe_backend setting, one
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);

@@ -43,11 +43,12 @@ QWEN3_8_27B_FP8 = ModelSpec(
     # backend runs it
     arch="qwen3_5",
     language_model_only=True,
-    # Each sequence in flight keeps 48 x 128 x 128 fp32 of recurrent
-    # state on every linear-attention layer, about 151 MB over the 48
-    # layers, as much as 2,300 tokens of KV; vLLM also pads the
-    # attention layers' pages to that size. The 4,096-sequence default
-    # and the 262,144-token context would each need more than one H100.
+    # Limits for the stock vLLM backend. vLLM keeps one state block per
+    # sequence slot: 48 x 128 x 128 fp32 plus the convolution window on
+    # each of the 48 linear-attention layers, about 154 MB, as much as
+    # 2,350 tokens of KV. The request backends' MAX_SEQUENCES of 4,096
+    # and the checkpoint's 262,144-token context would each need more
+    # than one H100.
     max_sequences=128,
     context_tokens=32_768,
 )
