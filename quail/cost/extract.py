@@ -19,8 +19,12 @@ from quail.cost.roofline import CostComponent, component_latencies
 from quail.cost.work import Work, ask, scan, stream
 
 # the executor's settings
-MAX_STARTS = 8          # candidate start positions fed
+MAX_STARTS = 8          # candidate start positions kept
 CHUNK = 16              # document tokens fed per pass from each start
+# starts fed as a mean: the likeliest, with a tied position, and a
+# later one when it ends before the located lines; a placeholder until
+# the next GPU check measures it
+STARTS_FED = 2
 LOCATE_MIN_LINES = 3    # documents with fewer lines are shown plain
 # the lines answer "a-b" and its line break, one token each
 RANGE_TOKENS = 4
@@ -105,9 +109,9 @@ def document_work(length: int, lines: int, head_tokens: int, tail_tokens: int,
     work += stream(context, [1] * START_STEP_TOKENS, window=window)
     fed += START_STEP_TOKENS
     rows += START_STEP_TOKENS
-    work += stream(context, [FED_PER_START] * MAX_STARTS, window=window)
-    fed += FED_PER_START * MAX_STARTS
-    rows += FED_PER_START * MAX_STARTS
+    work += stream(context, [FED_PER_START] * STARTS_FED, window=window)
+    fed += FED_PER_START * STARTS_FED
+    rows += FED_PER_START * STARTS_FED
     return work, fed, rows
 
 

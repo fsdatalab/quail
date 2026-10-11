@@ -184,7 +184,7 @@ class Candidate:
 
 @dataclass
 class Branch:
-    """The spans from one start, scored along the document's tokens."""
+    """The span from one start, read along the document's tokens."""
 
     char: int
     first: int
@@ -192,17 +192,37 @@ class Branch:
     ends: list          # the document character each stream token ends at
     skip: int           # tokens before the last line, whose ends are not scored
     start: float = NEG  # the first token's log probability at the cue
+    rank: float = NEG   # the candidate's score, which orders the starts
     copy: list = field(default_factory=list)
     stop: list = field(default_factory=list)
     fed: int = 0
 
-    def scores(self) -> list:
-        """Return the score of the span ending after each fed token."""
-        total, out = self.start, []
-        for copy, stop in zip(self.copy, self.stop):
-            out.append(total + stop)
-            total += copy
-        return out
+    @property
+    def order(self) -> tuple:
+        """The branch's place in the model's order of starts."""
+        return self.start, self.rank
+
+    def end(self, force: bool = False) -> int | None:
+        """Return the fed token the span ends after, or None while it copies on.
+
+        The span ends at the first fed token after which stopping is at
+        least as likely as copying the next one, where a decoder stops.
+
+        Args:
+            force: Whether a span still copying ends after its last fed
+                token.
+        """
+        for j, (copy, stop) in enumerate(zip(self.copy, self.stop)):
+            if stop >= copy:
+                return j
+        return len(self.copy) - 1 if force and self.copy else None
+
+    def score(self, force: bool = False) -> float:
+        """Return the ended span's score: its start, its copies, and its stop."""
+        j = self.end(force)
+        if j is None:
+            return NEG
+        return self.start + sum(self.copy[:j]) + self.stop[j]
 
 
 @dataclass
@@ -322,8 +342,17 @@ def choose_candidates(tables: Tables, starts: dict, lp, follow, prefix) -> list:
     return scored
 
 
-def make_branches(tables: Tables, text: str, candidates, skip_to) -> list:
-    """Return one branch per candidate: its tokens to the document's end."""
+def make_branches(tables: Tables, text: str, candidates, skip_to, lp) -> list:
+    """Return one branch per candidate: its tokens to the document's end.
+
+    Args:
+        tables: The token tables.
+        text: The document's text.
+        candidates: The start positions, from choose_candidates.
+        skip_to: The document character the located lines' last line
+            starts at, or None: a span ends in that line or after it.
+        lp: The cue row's log probabilities.
+    """
     branches = []
     for c in candidates:
         ids, offsets = tables.encode(text[c.end:])
@@ -331,18 +360,49 @@ def make_branches(tables: Tables, text: str, candidates, skip_to) -> list:
         ends = [c.end] * (1 + len(c.filler)) + [c.end + b for _, b in offsets]
         skip = sum(end <= skip_to for end in ends) if skip_to else 0
         branches.append(Branch(c.char, c.first, stream, ends,
-                               min(skip, len(stream))))
+                               min(skip, len(stream)),
+                               start=lp.get(c.first, NEG), rank=c.score))
     return branches
 
 
-def best_span(branches) -> tuple | None:
-    """Return the branch and fed token index of the best span, or None."""
-    spans = [(score, index, j) for index, branch in enumerate(branches)
-             for j, score in enumerate(branch.scores())]
-    if not spans:
+def open_branches(branches) -> list:
+    """Return the indexes of the branches to feed next.
+
+    The starts are fed in the model's order, the likeliest first, as a
+    decoder writes its likeliest token. A start is fed while no
+    better one has ended with a span; one below every ended span is
+    never fed. Positions that tie, the same start and the same token
+    after it, are fed together and told apart by what follows.
+    """
+    done = max((b.order for b in branches
+                if b.end() is not None and b.score() > NEG), default=None)
+    live = [(b.order, i) for i, b in enumerate(branches)
+            if b.end() is None and b.fed < len(b.stream)
+            and (done is None or b.order >= done)]
+    if not live:
+        return []
+    top = max(order for order, _ in live)
+    return [i for order, i in live if order == top]
+
+
+def best_span(branches, force: bool = False) -> tuple | None:
+    """Return the branch and fed token index of the answer, or None.
+
+    The answer begins with the start the model ranks first among those
+    whose span ended; among that start's positions, the span the model
+    copies best wins.
+
+    Args:
+        branches: The candidates' branches.
+        force: Whether a span still copying ends at its last fed token.
+    """
+    ended = [(branch.order, branch.score(force), index)
+             for index, branch in enumerate(branches)
+             if branch.score(force) > NEG]
+    if not ended:
         return None
-    _, index, j = max(spans, key=lambda item: item[0])
-    return branches[index], j
+    _, _, index = max(ended)
+    return branches[index], branches[index].end(force)
 
 
 class ExtractStages:
@@ -551,8 +611,8 @@ class ExtractStages:
         doc.candidates = choose_candidates(
             self.tables, doc.starts, doc.cue_lp, follow, doc.prefix)
         doc.branches = make_branches(self.tables, doc.text, doc.candidates,
-                                     doc.skip_to)
-        doc.open = list(range(len(doc.branches)))
+                                     doc.skip_to, doc.cue_lp)
+        doc.open = open_branches(doc.branches)
         if not doc.open:
             doc.answer, doc.span = None, None
 
@@ -592,22 +652,23 @@ class ExtractStages:
                     copy = lps[ids.index(following)]
                 branch.copy.append(copy)
                 branch.stop.append(float(values[j, 0]) if j >= branch.skip else NEG)
-            if branch.start == NEG:
-                branch.start = doc.cue_lp.get(branch.first, NEG)
             branch.fed += take
         doc.passes = p
-        best = max((max(b.scores()) for b in doc.branches if b.fed), default=NEG)
-        doc.open = [i for i in doc.open
-                    if doc.branches[i].fed < len(doc.branches[i].stream)
-                    and doc.branches[i].start + sum(doc.branches[i].copy) >= best]
+        doc.open = open_branches(doc.branches)
         if not doc.open or p == MAX_PASSES:
-            self._answer(doc)
+            self._answer(doc, force=p == MAX_PASSES)
         return True
 
-    def _answer(self, doc):
-        """Set the document's answer: its best span, or none."""
+    def _answer(self, doc, force: bool = False):
+        """Set the document's answer: its span, or none.
+
+        Args:
+            doc: The extraction.
+            force: Whether a span still copying at the pass limit ends
+                at its last fed token.
+        """
         doc.open = []
-        found = best_span(doc.branches)
+        found = best_span(doc.branches, force)
         if found is None or doc.none_wins:
             doc.answer, doc.span = None, None
             return

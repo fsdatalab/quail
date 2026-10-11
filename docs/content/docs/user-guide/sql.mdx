@@ -373,10 +373,12 @@ not write it, it is read from the model's next-token probabilities.
 For a document of three lines or more, the model first names the lines
 that hold the answer, shown numbered as `cat -n` shows them; the
 answer's start is then read within those lines. A shorter document is
-read whole. From each likely start, Quail feeds the document's own
-tokens in chunks of 16 and scores every span by the probability of
-copying each token and of stopping after it; the best span is the
-answer. The document, the lines, and the question stay in KV across
+read whole. The answer starts with the token the model is most likely
+to write at the cue, at the position whose following tokens it copies
+best. From there Quail feeds the document's own tokens in chunks of 16
+and ends the span at the first token after which stopping is at least
+as likely as copying the next one, where a decoder would close the
+quote. The document, the lines, and the question stay in KV across
 these steps.
 
 These limits apply:

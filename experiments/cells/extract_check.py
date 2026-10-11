@@ -5,14 +5,16 @@ stock vLLM, over the same 300 SQuAD and 300 CUAD items the measurement
 cell (extract_spans.py) scored, one query per distinct question, and
 compares the answers with that cell's saved run by item id.
 
-Prediction: the Quail backend matches the cell's k8 answers on most
-items, with F1 near the cell's 81.8 on SQuAD and 33.6 on CUAD, lower
-by a few points where the executor differs from the cell: it reads at
-most 32 tokens per fed row, so a next token outside them ends a span;
-it answers null when "none" outranks every start, which the cell did
-not; and it tokenizes the head, document, and tail apart. Stock vLLM
-lands near the cell's free generation, 82.1 F1 on SQuAD. The cost
-model's estimate is within a factor of two of the measured query time.
+Run 20261011T050258Z, with the cell's span scoring, gave 80.1 F1 on
+SQuAD (cell 81.8, stock vLLM 80.3) and 32.8 on CUAD with trim and 41.0
+without (cell 33.6, stock vLLM 52.0): the scored spans started late or
+stopped early on CUAD's clauses, 32 words at the median.
+
+Prediction for the decoder rule, which starts at the model's likeliest
+start and ends a span where stopping beats copying: CUAD trim F1
+within 5 points of stock vLLM's 52.0, SQuAD within 2 points of 80.1,
+and fewer fresh tokens on CUAD than that run's 768,598, as one start
+is fed instead of up to eight. Stock vLLM is unchanged.
 
     uv run modal run --detach -m experiments.cells.extract_check \
         2>&1 | tee /tmp/extract_check.log

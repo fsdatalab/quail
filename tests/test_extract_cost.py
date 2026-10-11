@@ -8,9 +8,9 @@ from quail.cost.extract import (
     FED_PER_START,
     LINE_NUMBER_TOKENS,
     LOCATE_MIN_LINES,
-    MAX_STARTS,
     RANGE_TOKENS,
     START_STEP_TOKENS,
+    STARTS_FED,
     document_work,
     estimate,
     line_counts,
@@ -36,16 +36,16 @@ def test_a_plain_document_scans_once_then_feeds_the_step_and_the_starts():
     context = HEAD + 100 + TAIL
     expected = (scan(HEAD + 100, TAIL)
                 + stream(context, [1] * START_STEP_TOKENS)
-                + stream(context, [FED_PER_START] * MAX_STARTS))
+                + stream(context, [FED_PER_START] * STARTS_FED))
     assert work == expected
-    assert fed == TAIL + START_STEP_TOKENS + FED_PER_START * MAX_STARTS
-    assert rows == 1 + START_STEP_TOKENS + FED_PER_START * MAX_STARTS
+    assert fed == TAIL + START_STEP_TOKENS + FED_PER_START * STARTS_FED
+    assert rows == 1 + START_STEP_TOKENS + FED_PER_START * STARTS_FED
     # resident KV turns the scan into a question over it
     resident, _, _ = document_work(100, 1, HEAD, TAIL, NUMBERED_HEAD,
                                    NUMBERED_TAIL, resident=True)
     assert resident == (ask(HEAD + 100, TAIL)
                         + stream(context, [1] * START_STEP_TOKENS)
-                        + stream(context, [FED_PER_START] * MAX_STARTS))
+                        + stream(context, [FED_PER_START] * STARTS_FED))
     assert resident.tokens < work.tokens
 
 
@@ -62,12 +62,12 @@ def test_a_numbered_document_answers_its_lines_then_the_cue():
     expected += ask(context, CUE_TOKENS)
     context += CUE_TOKENS
     expected += stream(context, [1] * START_STEP_TOKENS)
-    expected += stream(context, [FED_PER_START] * MAX_STARTS)
+    expected += stream(context, [FED_PER_START] * STARTS_FED)
     assert work == expected
     assert fed == (NUMBERED_TAIL + RANGE_TOKENS + CUE_TOKENS + START_STEP_TOKENS
-                   + FED_PER_START * MAX_STARTS)
+                   + FED_PER_START * STARTS_FED)
     assert rows == (1 + RANGE_TOKENS + 1 + START_STEP_TOKENS
-                    + FED_PER_START * MAX_STARTS)
+                    + FED_PER_START * STARTS_FED)
     # a numbered document is never resident: its tokens are not the table's
     assert document_work(100, lines, HEAD, TAIL, NUMBERED_HEAD, NUMBERED_TAIL,
                          resident=True)[0] == work

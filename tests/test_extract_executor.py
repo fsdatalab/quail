@@ -23,6 +23,7 @@ from quail.backends.quail.executor.extract import (
     document_tokens,
     make_branches,
     numbered_text,
+    open_branches,
     parse_lines,
     rank_starts,
     same_word,
@@ -207,26 +208,67 @@ def test_start_ranking_tells_repeated_words_apart_and_keeps_the_first():
     forced = choose_candidates(tables, inside, likely, {}, prefix)
     assert forced[-1].char == 0 and forced[-1].score == NEG
     assert len(forced) == 9
-    branches = make_branches(tables, text, candidates[:2], skip_to=None)
+    branches = make_branches(tables, text, candidates[:2], None, lp)
     assert branches[0].stream[0] == the and branches[0].char == 26
     # the first token ends at the candidate's end; the rest follow
     assert branches[1].ends[:4] == [23, 24, 25, 26]
     assert text[branches[1].char:branches[1].ends[3]] == " March 3."
     assert branches[0].skip == 0
-    assert make_branches(tables, text, candidates[:1], skip_to=30)[0].skip == 1
+    assert branches[0].start == lp[the]
+    assert branches[0].rank == candidates[0].score
+    assert make_branches(tables, text, candidates[:1], 30, lp)[0].skip == 1
 
 
-def test_scores_and_best_span_follow_the_worked_example():
-    branch = extract_mod.Branch(char=0, first=1, stream=[1, 2, 3, 4, 5],
-                                ends=[1, 2, 3, 4, 5], skip=0, start=0.0,
-                                copy=[np.log(.85), np.log(.90), np.log(.95),
-                                      np.log(.05), np.log(.30)],
-                                stop=[np.log(.10), np.log(.05), np.log(.02),
-                                      np.log(.90), np.log(.60)], fed=5)
-    scores = branch.scores()
-    assert np.exp(scores[3]) == pytest.approx(.85 * .90 * .95 * .90)
+def _branch(copy, stop, **fields):
+    fields.setdefault("start", 0.0)
+    return extract_mod.Branch(char=0, first=1, stream=list(range(1, 7)),
+                              ends=list(range(1, 7)), skip=0,
+                              copy=[np.log(c) for c in copy],
+                              stop=[np.log(s) for s in stop], fed=len(copy),
+                              **fields)
+
+
+def test_span_ends_where_stopping_beats_copying():
+    # the worked example: the fourth token's stop beats copying the fifth
+    branch = _branch([.85, .90, .95, .05, .30], [.10, .05, .02, .90, .60])
+    assert branch.end() == 3
+    assert np.exp(branch.score()) == pytest.approx(.85 * .90 * .95 * .90)
     assert best_span([branch]) == (branch, 3)
     assert best_span([]) is None
+    # a span still copying has no end, unless forced at the pass limit
+    copying = _branch([.9, .9, .9], [.1, .1, .1])
+    assert copying.end() is None and copying.score() == NEG
+    assert copying.end(force=True) == 2
+    assert best_span([copying]) is None
+    assert best_span([copying], force=True) == (copying, 2)
+    # a span that stops before the located lines is dead
+    dead = _branch([.9], [.1])
+    dead.skip, dead.stop, dead.copy = 1, [NEG], [NEG]
+    assert dead.end() == 0 and dead.score() == NEG
+
+
+def test_starts_are_fed_in_the_models_order():
+    best = _branch([], [], start=-0.1, rank=-0.1)
+    tied = _branch([], [], start=-0.1, rank=-0.1)
+    second = _branch([], [], start=-0.5, rank=-0.5)
+    branches = [second, best, tied]
+    # the likeliest start and its tied position are fed first
+    assert open_branches(branches) == [1, 2]
+    # the tied position diverges and ends with a low stop; the best copies on
+    tied.copy, tied.stop, tied.fed = [np.log(.01)], [np.log(.02)], 1
+    best.copy, best.stop, best.fed = [np.log(.9)], [np.log(.1)], 1
+    assert open_branches(branches) == [1]
+    # once the best start ends, nothing below it is fed and it answers
+    best.copy.append(np.log(.1))
+    best.stop.append(np.log(.8))
+    best.fed = 2
+    assert open_branches(branches) == []
+    assert best_span(branches) == (best, 1)
+    # a dead best start hands over to the second
+    best.copy, best.stop, best.skip, best.fed = [NEG], [NEG], 1, 1
+    tied.copy, tied.stop, tied.skip = [NEG], [NEG], 1
+    assert open_branches(branches) == [0]
+    assert best_span(branches) is None
 
 
 class ScriptedModel:
@@ -478,7 +520,8 @@ def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatc
     assert lease.branches[0].first == march
     (first,) = [suffix for suffix in fed if suffix[0] == march]
     assert len(first) == lease.branches[0].fed <= lease.branches[0].skip + CHUNK
-    assert len(fed) == len(lease.candidates) <= 8
+    # the likeliest start ended with a span, so no other start is fed
+    assert len(fed) == 1 and 1 < len(lease.candidates) <= 8
     assert lease.key == ("extract", "ends", 0)
     assert term.key == ("c", 1) and nothing.key == ("c", 2)
     assert result.metrics.extension["located"] == 1
@@ -513,6 +556,9 @@ def test_extractor_stops_after_the_pass_limit(monkeypatch):
                            3, [-3.0]) for j in range(len(suffix))]
 
     model._feed_rows = feed_rows
+    # every position of "word" but the last is followed by " word": they
+    # tie as starts and are fed together
+    model._follow_row = lambda key, token: model._cue({word: -0.1}, -7.0, -7.0)
     readouts = _fake_readouts(tables, 4, 3)
     monkeypatch.setattr(ExtractStages, "_readouts", lambda self, state: readouts)
     state = _state(model, chunk_tokens=2000)
