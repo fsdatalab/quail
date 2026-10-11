@@ -65,8 +65,9 @@ after a document is about 154 MB, as much memory as 2,350 tokens of
 the model's KV. Quail saves it in a pool of slots beside the KV
 pages and starts later requests from the saved copy: a filter's next
 question, a join's partners, and a document that shares a prefix with
-an earlier one. The planner sizes the pool with the KV pages so both
-hold the same number of documents, and `explain()` shows it as
+an earlier one. The planner sizes the pool with the KV pages so the
+pages hold two prefixes of the mean document length for every
+document the pool holds, and `explain()` shows it as
 `state pool=... slots`.
 
 On the `stock_vllm` backend the model runs at most 128 sequences at
