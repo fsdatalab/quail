@@ -45,9 +45,7 @@ QWEN3_8_27B_FP8 = ModelSpec(
     prompt_format="qwen3_5-chat-nonthinking-v1",
     vocab=248_320,
     tied_head=False,
-    # vLLM's model type; Quail's executor has no forward pass for it,
-    # so the Quail backend refuses this model and the stock vLLM
-    # backend runs it
+    # vLLM's model type, which names the Quail executor's pipeline
     arch="qwen3_5",
     language_model_only=True,
     # Limits for the stock vLLM backend. vLLM keeps one state block per
