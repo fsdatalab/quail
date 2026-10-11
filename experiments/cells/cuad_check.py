@@ -82,9 +82,15 @@ def run_cuad(run: str, backend: str, sf: float = 0.1, only=None) -> dict:
     """Run the CUAD queries on one backend and save the QUAIL-B record."""
     import quail
     from quail.bench import quailb
+    from quail_b.data import GROUND_TRUTH_ROOT, PUBLISHED_CORPORA
 
     queries = list(only or QUERIES)
     root = f"/results/cuad_labels/sf{sf}"
+    # the mirror's corpus directory holds the tables; naming it lets the
+    # runner skip the queries a backend refuses, such as a GROUP BY on
+    # stock vLLM, instead of failing the run
+    data_dir = (f"{root}/{GROUND_TRUTH_ROOT}/corpora/"
+                f"{PUBLISHED_CORPORA[sf]}")
     output = f"/results/benchmarks/quailb/cuad-{run}-{backend}"
     started = time.perf_counter()
     try:
@@ -92,7 +98,7 @@ def run_cuad(run: str, backend: str, sf: float = 0.1, only=None) -> dict:
             queries, sf=sf,
             config=quail.EngineConfig(model=MODEL, device="h100-sxm",
                                       backend=backend),
-            root=root, output_dir=output)
+            data_dir=data_dir, root=root, output_dir=output)
     finally:
         VOLUMES["/results"].commit()
     summary = {"run": run, "backend": backend, "sf": sf, "output": output,
