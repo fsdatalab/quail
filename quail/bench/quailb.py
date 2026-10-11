@@ -348,6 +348,10 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     )
     if session.config.backend == "quail":
         output.measurements["frontend_s"] = frontend_s
+        output.measurements["memory_trace"] = result.report.get(
+            "memory_trace", [])
+        output.measurements["memory_trace_started"] = result.report.get(
+            "memory_trace_started")
         output.measurements["kernel_cache_files"] = {
             "before": cache_before, "after": kernel_cache_files()}
     if session.config.backend in TEXT_VLLM_BACKENDS:

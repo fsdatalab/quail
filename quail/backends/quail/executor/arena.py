@@ -540,6 +540,30 @@ class KVArena:
         self.evicted_keys = 0
         self.evicted_pages = 0
         self.evicted_prefix_tokens = 0
+        self.memory_trace = []
+
+    def sample_memory(self) -> None:
+        """Append the arena's occupancy and the device's memory use.
+
+        Called after each forward pass; the rows are
+        (seconds, pages in use, retained pages, resident keys,
+        checkpoint slots in use, device MiB in use, torch MiB allocated).
+        """
+        import time
+
+        torch = getattr(self, "torch", None)
+        if torch is None or not torch.cuda.is_available():
+            return
+        free, total = torch.cuda.mem_get_info()
+        accounting = self.accounting
+        self.memory_trace.append((
+            round(time.perf_counter(), 4),
+            accounting.n_pages - len(accounting.free),
+            accounting.retained_pages,
+            len(accounting.owned),
+            accounting.n_slots - len(accounting.free_slots),
+            round((total - free) / 2**20, 1),
+            round(torch.cuda.memory_allocated() / 2**20, 1)))
 
     # ---- the window --------------------------------------------------
 

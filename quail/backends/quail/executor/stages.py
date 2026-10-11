@@ -335,6 +335,10 @@ class _StageExecutor:
                     points.setdefault(parent, set()).add(shared)
             for parent, values in points.items():
                 self.share_points[parent] = tuple(sorted(values))
+            if points:
+                # a parent also holds a slot per shared point
+                self.sched.active_limit = max(
+                    1, self.arena.n_state_slots // (per_document + 1))
             self.borrowing.can_borrow = self._state_borrow_check(
                 self.borrowing.can_borrow)
         # The admission detaches residents from borrowing: they pack no prefix.

@@ -25,7 +25,11 @@ def _forward(pipeline, arena, chunk):
     temporaries whether the pass returns or raises.
     """
     try:
-        return pipeline.forward_chunk(chunk)
+        out = pipeline.forward_chunk(chunk)
+        sample = getattr(arena, "sample_memory", None)
+        if sample is not None:
+            sample()
+        return out
     finally:
         keys, chunk.temporary_keys = chunk.temporary_keys, ()
         for key in keys:
