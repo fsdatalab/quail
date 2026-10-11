@@ -78,12 +78,14 @@ def _summary(record) -> dict:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=7200,
               volumes=VOLUMES)
-def run_cuad(run: str, backend: str, sf: float = 0.1, only=None) -> dict:
+def run_cuad(run: str, backend: str, sf: float = 0.1, only=None,
+             locate: bool = True) -> dict:
     """Run the CUAD queries on one backend and save the QUAIL-B record."""
     import quail
     from quail.bench import quailb
     from quail_b.data import GROUND_TRUTH_ROOT, PUBLISHED_CORPORA
 
+    quailb.EXTRACT_OPTIONS.update(locate=locate)
     queries = list(only or QUERIES)
     root = f"/results/cuad_labels/sf{sf}"
     # the mirror's corpus directory holds the tables; naming it lets the
@@ -91,7 +93,8 @@ def run_cuad(run: str, backend: str, sf: float = 0.1, only=None) -> dict:
     # stock vLLM, instead of failing the run
     data_dir = (f"{root}/{GROUND_TRUTH_ROOT}/corpora/"
                 f"{PUBLISHED_CORPORA[sf]}")
-    output = f"/results/benchmarks/quailb/cuad-{run}-{backend}"
+    output = (f"/results/benchmarks/quailb/cuad-{run}-{backend}"
+              f"{'' if locate else '-plain'}")
     started = time.perf_counter()
     try:
         record = quailb.run_suite(
@@ -102,6 +105,7 @@ def run_cuad(run: str, backend: str, sf: float = 0.1, only=None) -> dict:
     finally:
         VOLUMES["/results"].commit()
     summary = {"run": run, "backend": backend, "sf": sf, "output": output,
+               "locate": locate,
                "total_s": time.perf_counter() - started,
                "skipped": record.get("skipped_queries", {}),
                "queries": _summary(record)}
@@ -110,11 +114,12 @@ def run_cuad(run: str, backend: str, sf: float = 0.1, only=None) -> dict:
 
 
 @app.local_entrypoint()
-def main(backends: str = "quail,stock_vllm", sf: float = 0.1, only: str = ""):
+def main(backends: str = "quail,stock_vllm", sf: float = 0.1, only: str = "",
+         locate: bool = True):
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     queries = [q for q in only.split(",") if q] or None
     for backend in backends.split(","):
-        call = run_cuad.spawn(run, backend, sf, queries)
+        call = run_cuad.spawn(run, backend, sf, queries, locate)
         print(f"{backend}: function call id {call.object_id}", flush=True)
     print(f"run {run}; fetch with modal.FunctionCall.from_id(id).get()",
           flush=True)

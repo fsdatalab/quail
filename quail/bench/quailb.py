@@ -65,8 +65,14 @@ def register_tables(session, data_dir):
             str(path), id_col="id"))
 
 
+# options every AI.EXTRACT call of a benchmark query takes, such as
+# {"locate": False}; a cell sets them before run_suite to measure one
+EXTRACT_OPTIONS: dict = {}
+
+
 def _build(session, info: PlanInfo):
-    return substrait.build_query(session, info, SELECTIVITY, order="by_cost")
+    return substrait.build_query(session, info, SELECTIVITY, order="by_cost",
+                                 extract_options=EXTRACT_OPTIONS)
 
 
 def build_query(session, spec: QuerySpec):
