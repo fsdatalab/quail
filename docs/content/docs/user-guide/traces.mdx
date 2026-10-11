@@ -1,0 +1,148 @@
+---
+title: Agent traces
+---
+
+An agent trace is one conversation between a user, an agent, and the
+agent's tools. Most agent frameworks log it as a list of messages in
+the OpenAI chat format: each message has a `role` (`system`, `user`,
+`assistant`, or `tool`) and a `content` string, an assistant message
+may carry `tool_calls`, and a tool message carries a `tool_call_id`.
+
+One row per trace, with the messages in a JSON column, is a poor shape
+for queries: a question about the first user message would send every
+message through the model. `quail.trace_tables` splits trace records
+into two tables that queries can filter, join, and group:
+
+| Table | One row per | Columns |
+| --- | --- | --- |
+| `traces` | trace | `id`, `request` (the first user message), `transcript`, `message_count`, then any columns you keep |
+| `messages` | message | `id`, `trace_id`, `turn_index`, `role`, `content`, `tool_call_id`, `prev_id`, `prev_user_id`, `prev_assistant_id` |
+
+A message's `id` is `<trace id>/<turn index>`. `prev_id` is the id of the
+message before it, and `prev_user_id` and `prev_assistant_id` are the ids
+of the latest user and assistant messages before it, or null when there
+is none. The transcript renders every message under a `[ROLE]` heading,
+leaving out the system prompt by default. `content` renders a tool call
+as `[tool call] name(arguments)`, so an assistant message that only calls
+tools is not empty.
+
+## Registering traces
+
+`register_traces` builds both tables and registers them on a session.
+For example, imagine support traces saved with the task each run was
+given, its run number, and whether it succeeded:
+
+```python
+import pyarrow as pa
+import quail
+
+runs = pa.table({
+    "id": ["t1", "t2"],
+    "task_id": ["task-7", "task-7"],
+    "trial": [0, 1],
+    "reward": [1.0, 0.0],
+    "messages": [
+        [{"role": "user", "content": "I want to return my order."},
+         {"role": "assistant", "content": "Which order is it?"},
+         {"role": "user", "content": "The one that arrived yesterday."}],
+        [{"role": "user", "content": "I want to return my order."},
+         {"role": "assistant", "content": "Returns are closed."},
+         {"role": "user", "content": "That is not your policy."}],
+    ],
+})
+
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+with quail.Session(config=config) as session:
+    quail.register_traces(session, runs, prefix="support_",
+                          keep=("task_id", "trial", "reward"))
+```
+
+This registers `support_traces` and `support_messages`. `trace_tables`
+returns the same two Arrow tables without registering them, for saving
+to Parquet or registering under other names. Both take:
+
+| Argument | Meaning |
+| --- | --- |
+| `id_col` | The column that identifies each trace. Defaults to `id`. |
+| `messages_col` | The column holding the messages, as a list or its JSON text. Defaults to `messages`. |
+| `keep` | Columns copied onto each `traces` row. |
+| `transcript_roles` | The roles the transcript keeps. Defaults to user, assistant, and tool. |
+| `max_message_chars` | Cut each message in the transcript to this length. Long tool outputs are the usual reason. |
+
+## Queries over traces
+
+What users ask the agent for, as counts per category:
+
+```sql
+SELECT AI.CLASSIFY(PROMPT('What is the customer asking the agent to do?\n\n{0}',
+                          t.request),
+                   ARRAY['return', 'exchange', 'cancel', 'other']) AS intent,
+       COUNT(*) AS n
+FROM support_traces t
+GROUP BY intent
+ORDER BY n DESC
+```
+
+Where users push back on the agent. The equality condition pairs each
+user message with the assistant message it answers, so the model reads
+one pair per user message rather than every pair of messages:
+
+```sql
+SELECT u.id, a.id
+FROM support_messages u
+JOIN support_messages a
+  ON u.prev_assistant_id = a.id
+ AND u.role = 'user'
+ AND AI.IF(PROMPT('The agent said:\n{0}\n\nThe customer replied:\n{1}\n\nDoes the customer disagree with or correct the agent?',
+                  a.content, u.content))
+```
+
+What the disagreements are about, with `AI.CLASSIFY` over the pairs the
+join keeps:
+
+```sql
+SELECT u.id,
+       AI.CLASSIFY(PROMPT('The agent said:\n{0}\n\nThe customer replied:\n{1}\n\nWhat is the disagreement about?',
+                          a.content, u.content),
+                   ARRAY['policy', 'wrong item', 'tone', 'other']) AS kind
+FROM support_messages u
+JOIN support_messages a
+  ON u.prev_assistant_id = a.id
+ AND u.role = 'user'
+ AND AI.IF(PROMPT('The agent said:\n{0}\n\nThe customer replied:\n{1}\n\nDoes the customer disagree with or correct the agent?',
+                  a.content, u.content))
+```
+
+Which runs of the same task took different approaches. The join on
+`task_id` limits the pairs to runs of one task, and the shared request
+at the start of each transcript is one KV prefix:
+
+```sql
+SELECT r1.id, r2.id
+FROM support_traces r1
+JOIN support_traces r2
+  ON r1.task_id = r2.task_id
+ AND AI.IF(PROMPT('Run A:\n{0}\n\nRun B:\n{1}\n\nDo the two runs take different approaches to the same request?',
+                  r1.transcript, r2.transcript))
+```
+
+Which approach succeeds most often, from a kept outcome column:
+
+```sql
+SELECT AI.CLASSIFY(PROMPT('Which approach does the agent take in this run?\n\n{0}',
+                          t.transcript),
+                   ARRAY['refund', 'replace', 'escalate']) AS approach,
+       AVG(t.reward) AS success,
+       COUNT(*) AS n
+FROM support_traces t
+GROUP BY approach
+HAVING n >= 2
+```
+
+Two limits to know about. The run-pairs query returns each pair in both
+orders and each run paired with itself, because a comparison between
+two tables' columns other than `=` is not supported in `ON`; drop those
+rows after collecting. And a category list must be given: finding the
+categories themselves is open-ended generation, which Quail does not
+run. Classify a sample by hand or with another model first, then run
+the categories over every trace.
