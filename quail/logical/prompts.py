@@ -755,6 +755,7 @@ def bind_extract_prompt(args: tuple, question: str, tokenizer=None,
         question: The question the answer is copied for.
         tokenizer: Optional callable mapping text to token IDs.
         turn: Chat text before the prompt and after the answer template.
+            Without it, a line break separates the template and the cue.
         numbered: Whether the document is shown as numbered lines, with
             the answer template's lines field and the lines cue.
 
@@ -772,7 +773,9 @@ def bind_extract_prompt(args: tuple, question: str, tokenizer=None,
     label = NUMBERED_DOCUMENT_LABEL if numbered else SHARED_PRE
     cue = EXTRACT_LINES_CUE if numbered else EXTRACT_PHRASE_CUE
     preamble = turn[0] + label
-    after = render_extract_question(question, numbered) + turn[1] + cue
+    # the cue opens the model's turn; without turn text it opens a line
+    after = (render_extract_question(question, numbered) + (turn[1] or "\n")
+             + cue)
     pre_tok = tail_tok = frame_tok = None
     pre_ids = tail_ids = ()
     if tokenizer is not None:

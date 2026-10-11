@@ -420,6 +420,8 @@ class RequestExtractSpec:
     question: str
     tail_token_ids: tuple[Any, ...]
     trim: bool = True
+    # the tail's text, for an engine that tokenizes prompts itself
+    tail_text: str = ""
 
     @property
     def span_output(self) -> str:
@@ -434,6 +436,7 @@ class RequestExtractSpec:
             question=str(value["question"]),
             tail_token_ids=tuple(value["tail_token_ids"]),
             trim=bool(value.get("trim", True)),
+            tail_text=str(value.get("tail_text", "")),
         )
 
     def to_dict(self) -> dict:
@@ -443,6 +446,7 @@ class RequestExtractSpec:
             "question": self.question,
             "tail_token_ids": list(self.tail_token_ids),
             "trim": self.trim,
+            "tail_text": self.tail_text,
         }
 
 

@@ -1,5 +1,6 @@
 """AI.EXTRACT: the operator surface, its prompt, and its plan."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -95,6 +96,8 @@ def test_extract_prompt_puts_every_question_dependent_text_after_the_document():
     assert prompt.preamble == "<user>" + SHARED_PRE
     assert prompt.tail == (
         "{0}" + AFTER_DOCUMENT_TEXT + "<assistant>" + EXTRACT_PHRASE_CUE)
+    raw = bind_extract_prompt((ref,), QUESTION, letter_tokens)
+    assert raw.tail == "{0}" + AFTER_DOCUMENT_TEXT + "\n" + EXTRACT_PHRASE_CUE
     assert prompt.frame == "" and prompt.frame_tokens == 0
     assert prompt.preamble_tokens == len(prompt.preamble_token_ids) == len(
         prompt.preamble.encode())
@@ -174,12 +177,13 @@ def test_extract_plans_one_physical_node_with_both_prompts(session):
     turn = session.model.turn
     head, tail = spec.prompt_token_parts
     assert list(head) == letter_tokens(turn[0] + SHARED_PRE)
+    # a model without turn text gets a line break before the cue
     assert list(tail) == letter_tokens(
-        AFTER_DOCUMENT_TEXT + turn[1] + EXTRACT_PHRASE_CUE)
+        AFTER_DOCUMENT_TEXT + (turn[1] or "\n") + EXTRACT_PHRASE_CUE)
     head, tail = spec.numbered_token_parts
     assert list(head) == letter_tokens(turn[0] + NUMBERED_DOCUMENT_LABEL)
     assert list(tail) == letter_tokens(
-        AFTER_NUMBERED_DOCUMENT_TEXT + turn[1] + EXTRACT_LINES_CUE)
+        AFTER_NUMBERED_DOCUMENT_TEXT + (turn[1] or "\n") + EXTRACT_LINES_CUE)
     assert [port.name for port in node.outputs] == ["scores", "ids:c"]
     assert node.outputs[0].schema == ("c", "ends", "ends_span")
     assert node.runtime_key == "quail.ai_extract"
@@ -416,6 +420,18 @@ class _PhraseClient(request_tests._Client):
         return outputs
 
 
+class _TextPhraseClient(_PhraseClient):
+    """Takes text prompts, as vLLM does, and answers from their words."""
+
+    accepts_text = True
+
+    def generate(self, prompts, sampling_params, use_tqdm=False):
+        self.prompts = list(prompts)
+        return super().generate(
+            [{"prompt_token_ids": request_tests._tokens(prompt)}
+             for prompt in prompts], sampling_params, use_tqdm)
+
+
 TEXTS = [LEASE, "No dates here.", "Term: five years\nmore text",
          "the absent one"]
 
@@ -463,6 +479,17 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     # the executor needs the document text to locate an answer
     with pytest.raises(ValueError, match="needs the text"):
         request_tests._execution(documents, client=client).execute(node, {})
+    # an engine that takes text gets the preamble, the document, and
+    # the tail's text, tokenized by the engine itself
+    texted = _TextPhraseClient()
+    node = replace(node, preamble_text="DOCUMENT:\n",
+                   extracts=(replace(specs[0], tail_text="\nQ?\nPhrase: \""),))
+    result = request_tests._execution(
+        documents, client=texted, document_texts={"c": TEXTS}).execute(node, {})
+    assert texted.prompts == ["DOCUMENT:\n" + text + "\nQ?\nPhrase: \""
+                              for text in TEXTS]
+    assert result.outputs["extract_answers:ends"].to_pydict()["ends"] == [
+        "March 3, 2027", None, "five years", "a phrase the document lacks"]
 
 
 def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
@@ -477,8 +504,10 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     (spec,) = request_node.extracts
     assert (spec.alias, spec.output, spec.question, spec.trim) == (
         "c", "ends", QUESTION, True)
-    assert list(spec.tail_token_ids) == request_tests._tokens(
-        AFTER_DOCUMENT_TEXT + session.model.turn[1] + EXTRACT_PHRASE_CUE)
+    tail_text = (AFTER_DOCUMENT_TEXT + (session.model.turn[1] or "\n")
+                 + EXTRACT_PHRASE_CUE)
+    assert list(spec.tail_token_ids) == request_tests._tokens(tail_text)
+    assert spec.tail_text == tail_text
     assert not request_node.filters and not request_node.classifies
     project = next(node for node in plan.nodes if isinstance(node, Project))
     assert [port.source.port for port in project.inputs] == [

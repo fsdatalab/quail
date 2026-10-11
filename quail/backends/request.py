@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -390,7 +391,8 @@ def plan_request_backend(
             alias=node.alias, output=node.name,
             question=node.call.question,
             tail_token_ids=tuple(node.call.prompt.tail_token_ids),
-            trim=node.call.trim))
+            trim=node.call.trim,
+            tail_text=re.sub(r"\{\d+\}", "", node.call.prompt.tail)))
 
     preambles = {
         tuple(prompt.preamble_token_ids)
@@ -741,7 +743,7 @@ EXTRACT_MAX_TOKENS = 64
 EXTRACT_SPAN_TYPE = pa.struct([("start", pa.int32()), ("end", pa.int32())])
 
 
-def _extract_documents(client, spec, bodies, texts) -> dict:
+def _extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
     """Decode one answer per prompt body and locate it in the document's text.
 
     Generation stops at the quote that closes the phrase. An answer
@@ -755,6 +757,8 @@ def _extract_documents(client, spec, bodies, texts) -> dict:
         spec: The RequestExtractSpec with the prompt tail.
         bodies: Token ids for each prompt before the tail, preamble included.
         texts: The document text of each body.
+        body_texts: The text of each prompt before the tail, for an
+            engine that tokenizes the prompt itself; None sends token ids.
 
     Returns:
         A dict with one answer and one span per body, the counts of
@@ -763,7 +767,10 @@ def _extract_documents(client, spec, bodies, texts) -> dict:
     """
     tail = _token_list(spec.tail_token_ids)
     params = client.decode_params(EXTRACT_MAX_TOKENS, stop=['"'])
-    prompts = [{"prompt_token_ids": body + tail} for body in bodies]
+    if body_texts is not None:
+        prompts = [body_text + spec.tail_text for body_text in body_texts]
+    else:
+        prompts = [{"prompt_token_ids": body + tail} for body in bodies]
     started = time.perf_counter()
     outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
     wall_s = time.perf_counter() - started
@@ -1256,12 +1263,16 @@ class RequestModelExecution:
                 raise ValueError(
                     f"AI.EXTRACT needs the text of {spec.alias!r}, which "
                     f"the scan did not load")
+            document_texts = [_text_value(texts, document)
+                              for document in document_ids]
             result = _extract_documents(
                 self.client, spec, [
                     _token_list(node.preamble_token_ids)
                     + _token_list(self.documents[spec.alias][document])
                     for document in document_ids],
-                [_text_value(texts, document) for document in document_ids])
+                document_texts,
+                body_texts=([node.preamble_text + text for text in document_texts]
+                            if self.submit_text else None))
             outputs[f"extract_answers:{spec.output}"] = _extract_answer_table(
                 spec, document_ids, result["answers"], result["spans"])
             steps.append({
