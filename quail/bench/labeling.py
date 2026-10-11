@@ -191,12 +191,19 @@ def join_specs(specs) -> tuple:
     return tuple(p for p in specs if p.kind == "join")
 
 
-def _load_corpus(corpus_id: str) -> tuple[Path, dict, dict]:
-    """Read a corpus already materialized on the volume."""
+def _load_corpus(corpus_id: str, tables: tuple[str, ...] | None = None
+                 ) -> tuple[Path, dict, dict]:
+    """Read a corpus already materialized on the volume.
+
+    Args:
+        corpus_id: The corpus to read.
+        tables: The tables to read. None reads every table in
+            CORPUS_COLUMNS.
+    """
     target = ROOT / "corpora" / corpus_id
     with open(target / "manifest.json") as f:
         manifest = json.load(f)
-    return target, manifest, _read_rows(target)
+    return target, manifest, _read_rows(target, tables)
 
 
 # Every table here feeds corpus_id, so adding or removing one mints a
@@ -317,11 +324,14 @@ def _atomic_parquet(path: Path, rows: list[dict]) -> None:
     os.replace(temp, path)
 
 
-def _read_rows(data_dir: Path) -> dict[str, list[dict]]:
+def _read_rows(data_dir: Path, tables: tuple[str, ...] | None = None
+               ) -> dict[str, list[dict]]:
     import pyarrow.parquet as pq
 
     rows = {}
     for table, columns in CORPUS_COLUMNS.items():
+        if tables is not None and table not in tables:
+            continue
         rows[table] = pq.read_table(
             data_dir / f"{table}.parquet", columns=list(columns)).to_pylist()
     return rows
@@ -1323,7 +1333,9 @@ def _source_labels_by_content(
     _, manifest = _label_manifest(source_label_set_id)
     if manifest.get("status") != "complete":
         raise ValueError(f"label set {source_label_set_id} is not complete")
-    _, _source_manifest, source_rows = _load_corpus(manifest["corpus_id"])
+    # An older source corpus can lack tables added since it was built.
+    _, _source_manifest, source_rows = _load_corpus(
+        manifest["corpus_id"], _required_tables(spec))
     source_identity = {"label_set_id": source_label_set_id,
                        **part_size_fields(manifest)}
     label_dir = _label_dir_by_id(spec, source_label_set_id)

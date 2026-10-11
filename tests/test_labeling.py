@@ -278,8 +278,10 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
         evidence=[("page0", "yes page"), ("page1", "no")],
         contexts=[("context one", ["p1", "p2"]), ("context two", ["p3"])],
         passages=[("passage a", ["p2"]), ("passage b", ["p1"])])
-    _, source_corpus, _ = _write_corpus(tmp_path, 1.0, source_rows)
+    source_dir, source_corpus, _ = _write_corpus(tmp_path, 1.0, source_rows)
     source_id = source_corpus["corpus_id"]
+    # the source corpus predates a table that none of these labels use
+    (source_dir / "sales_calls.parquet").unlink()
     identities = {
         spec.key: labeling.label_set_identity(
             spec, source_id, source_corpus["corpus_full_hash"])
