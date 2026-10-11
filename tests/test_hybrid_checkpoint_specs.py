@@ -105,6 +105,11 @@ def test_qwen3_8_27b_has_the_geometry_of_qwen3_5_27b():
     # 24,328,929,280 fp8 and convolution elements in the headers, plus
     # 48 layers x 2 x 48 x 5,120 bf16 in_proj_a and in_proj_b elements
     assert new.params == 24_328_929_280 + 48 * 2 * 48 * 5120
+    # vLLM's reported memory after loading, 0.6 percent above the
+    # 29,468,003,328 bytes of text tensors
+    assert new.w_mem_bytes == 29_638_887_936
+    assert new.w_mem_bytes / 29_468_003_328 < 1.01
+    assert new.max_num_seqs == 768
 
 
 def test_lfm2_matches_the_config():
