@@ -492,6 +492,17 @@ def test_pair_columns_restrict_the_pairs_a_join_labels(monkeypatch, tmp_path):
         {"left_id": "a1", "right_id": "u1", "answer": True},
         {"left_id": "a2", "right_id": "u2", "answer": False}]
 
+    # a smaller corpus copies only its matching pair, by content
+    def content(row):
+        return labeling._content_hash(row, "content")
+    monkeypatch.setattr(
+        labeling, "_source_labels_by_content", lambda *_: {
+            (content(agents[0]), content(replies[0])): (True, MODEL_NAME)})
+    small = {"support_messages": [agents[0], replies[0], replies[2]]}
+    small_identity = labeling.label_set_identity(spec, "c_small", "1" * 64)
+    assert labeling._copy_label_set(
+        spec, "ls_source", small_identity, "c_small", small) == 1
+
 
 def test_where_conditions_restrict_a_join_to_matching_sides(monkeypatch):
     monkeypatch.setattr(quail, "Session", _FakeSession)

@@ -1382,24 +1382,33 @@ def _copy_label_set(spec: PredicateSpec, source_label_set_id: str,
     right_hashes = [
         None if right is None else _content_hash(right, spec.right_column)
         for right in right_rows]
+    restricted = spec.kind == "join" and _pair_columns(spec)
     written = 0
     for part, (start, end) in zip(parts,
                                   _part_bounds(spec, identity, rows)):
         if part.exists():
             continue
+        batch = left_rows[start:end]
+        if restricted:
+            pairs = _matching_pairs(spec, batch, right_rows)
+        else:
+            pairs = [(i, j) for i in range(len(batch))
+                     for j in range(len(right_rows))]
         output = []
         missing = 0
-        for left in left_rows[start:end]:
-            left_hash = _content_hash(left, spec.left_column)
-            for right, right_hash in zip(right_rows, right_hashes):
-                found = labels.get((left_hash, right_hash))
-                if found is None:
-                    missing += 1
-                    continue
-                answer, source = found
-                output.append(_answer_row(
-                    spec, identity, corpus_id, left, right, answer, source,
-                    None))
+        left_hashes = {}
+        for i, j in pairs:
+            left, right = batch[i], right_rows[j]
+            if i not in left_hashes:
+                left_hashes[i] = _content_hash(left, spec.left_column)
+            found = labels.get((left_hashes[i], right_hashes[j]))
+            if found is None:
+                missing += 1
+                continue
+            answer, source = found
+            output.append(_answer_row(
+                spec, identity, corpus_id, left, right, answer, source,
+                None))
         if missing:
             raise ValueError(
                 f"{spec.key}: {missing} target labels are not in "
