@@ -58,7 +58,7 @@ STOCK_ROWS = "stock_rows.pt"
 SUFFIX_TOKENS = 8
 
 
-def _prompt_ids():
+def _prompt_ids(*reviews):
     from gigatoken import Tokenizer
 
     from quail.logical import bind_prompt, render_filter_prompt_ids
@@ -72,7 +72,7 @@ def _prompt_ids():
 
     prompt = bind_prompt(QUESTION, ("body",), ids, turn=spec.turn)
     return [render_filter_prompt_ids(prompt, ids(review), ids)
-            for review in REVIEWS]
+            for review in reviews or REVIEWS]
 
 
 def stock_rows_main(out_path):
@@ -124,6 +124,12 @@ def stock_rows_main(out_path):
 @pytest.fixture(scope="module")
 def prompts():
     return _prompt_ids()
+
+
+@pytest.fixture(scope="module")
+def long_prompt():
+    """One prompt over four reviews, longer than a 64-token kernel chunk."""
+    return _prompt_ids(" ".join(REVIEWS[:4]))[0]
 
 
 @pytest.fixture(scope="module")
@@ -279,45 +285,89 @@ def _relative(ours, reference):
             / reference.norm(dim=-1).clamp_min(1e-6))
 
 
-def test_state_saved_at_the_document_end_restores_the_sequence(prompts, state_run):
+def _per_layer_outputs(pipeline, chunk):
+    """The rows after every layer, by cutting the stack after each one."""
+    layers = list(pipeline.layers)
+    outputs = []
+    for depth in range(1, len(layers) + 1):
+        pipeline.layers = layers[:depth]
+        outputs.append(_layer_output(pipeline, chunk))
+    pipeline.layers = layers
+    return outputs
+
+
+def _split_and_restore(pipeline, arena, ids, split):
+    """Run ids whole, then as a saved prefix and a restored suffix.
+
+    Returns the per-layer rows of the whole run, of the prefix run,
+    and of the suffix run.
+    """
     from quail.backends.quail.executor.chunk import pack_chunk
 
-    arena, pipeline = state_run
-    ids = prompts[0]
-    split = len(ids) - SUFFIX_TOKENS
-    whole_key = ("whole", 0)
+    whole_key = ("whole", split)
     arena.activate(whole_key, len(ids), capacity_tokens=len(ids) + 16,
                    base_tokens=split)
-    whole = _layer_output(pipeline, pack_chunk(
+    whole = _per_layer_outputs(pipeline, pack_chunk(
         torch, arena, [dict(key=whole_key, prefix=ids[:split], f=split,
                             suffixes=[ids[split:]])],
         attention_mode="unified"))
     arena.free_key(whole_key)
 
-    key = ("split", 0)
+    key = ("split", split)
     arena.activate(key, split, capacity_tokens=len(ids) + 16, base_tokens=split,
                    slots=1)
     first = pack_chunk(torch, arena, [dict(key=key, prefix=ids[:split], f=split,
                                            suffixes=[], save_at=(split,))],
                        attention_mode="unified")
     assert [seg.save for seg in first.meta["state"]["segments"]] != [0]
-    prefix_rows = _layer_output(pipeline, first)
+    # the stack cuts rerun the prefix and save the same state each time
+    prefix = _per_layer_outputs(pipeline, first)
     second = pack_chunk(torch, arena, [dict(key=key, prefix=None, f=split,
                                             suffixes=[ids[split:]])],
                         attention_mode="unified")
-    suffix_rows = _layer_output(pipeline, second)
+    suffix = _per_layer_outputs(pipeline, second)
     arena.free_key(key)
-    prefix_error = _relative(prefix_rows, whole[:split])
-    suffix_error = _relative(suffix_rows, whole[split:])
-    print(json.dumps(dict(prefix_median=prefix_error.median().item(),
-                          suffix_median=suffix_error.median().item(),
-                          suffix_max=suffix_error.max().item())))
-    # the prefix rows are the same computation; the suffix rows start
-    # from the saved state instead of running behind the prefix, and
-    # differ by the kernels' chunk boundaries alone
-    assert prefix_error.max().item() < 1e-3
-    assert suffix_error.median().item() < 0.02
-    assert suffix_error.max().item() < 0.1
+    return whole, prefix, suffix
+
+
+def test_state_saved_at_the_document_end_restores_the_sequence(
+        prompts, long_prompt, stock_layers, state_run):
+    arena, pipeline = state_run
+    assert len(long_prompt) > 64 + SUFFIX_TOKENS
+    report = {}
+    # the unaligned split is the document end; the aligned one is a
+    # multiple of the delta-rule kernel's 64-token chunk, so the
+    # suffix's chunk boundaries match the whole run's
+    cases = (("document_end", prompts[0], len(prompts[0]) - SUFFIX_TOKENS,
+              stock_layers[0]),
+             ("aligned", long_prompt, 64, None))
+    for name, ids, split, stock in cases:
+        whole, prefix, suffix = _split_and_restore(pipeline, arena, ids, split)
+        prefix_error = _relative(prefix[-1], whole[-1][:split])
+        per_layer = [round(_relative(s_, w[split:]).median().item(), 4)
+                     for s_, w in zip(suffix, whole)]
+        per_row = [round(e, 4) for e in
+                   _relative(suffix[-1], whole[-1][split:]).tolist()]
+        vs_stock = None if stock is None else dict(
+            whole=round(_relative(whole[-1][split:],
+                                  stock[-1][split:]).median().item(), 4),
+            restored=round(_relative(suffix[-1],
+                                     stock[-1][split:]).median().item(), 4))
+        report[name] = dict(prefix_max=prefix_error.max().item(),
+                            per_layer=per_layer, per_row=per_row,
+                            vs_stock=vs_stock)
+    print(json.dumps(report))
+    for name, entry in report.items():
+        # the prefix rows are the same computation
+        assert entry["prefix_max"] < 1e-3, name
+    # the restored suffix stays as close to stock vLLM as the whole run
+    # does; a wrong saved state would move it well away
+    vs_stock = report["document_end"]["vs_stock"]
+    assert vs_stock["restored"] < 1.5 * vs_stock["whole"] + 0.01
+    # cut at a kernel chunk boundary, the two runs do the same
+    # arithmetic in the linear layers and differ by the attention
+    # kernel's split alone
+    assert report["aligned"]["per_layer"][-1] < 0.02
 
 
 def test_partners_read_the_kept_state_and_leave_it_unchanged(prompts, state_run):
