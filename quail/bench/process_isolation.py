@@ -221,6 +221,7 @@ def run_backend_group_in_fresh_process(**arguments) -> dict:
         ) from receive_error
     status, result = message
     if status != "ok":
-        raise RuntimeError(f"backend process failed:\n{result}")
+        # Modal cuts long messages; the end of a traceback names the error
+        raise RuntimeError(f"backend process failed:\n{result[-3000:]}")
     result["process_cleanup"] = cleanup
     return result
