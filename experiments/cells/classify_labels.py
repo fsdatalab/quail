@@ -641,7 +641,7 @@ def check_collection(sf: float, collection_id: str) -> dict:
 
     counts = {}
     for query_id in (query_id for query_id, spec
-                     in queries(include_pending=True).items()
+                     in queries().items()
                      if spec._info.classifies):
         suite = benchmark.load_benchmark(
             [query_id], scale_factor=sf, collection_id=collection_id,
