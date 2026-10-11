@@ -332,13 +332,55 @@ def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale):
     return out[0]
 
 
-def causal_conv_kernel(x, weight, phase, history, bias=None):
-    """The same convolution as one depthwise conv1d over a padded buffer.
+_CONV_KERNEL = None
 
-    Each sequence is laid out as its width - 1 history columns then its
-    tokens, so one convolution over the whole buffer holds every
-    sequence's windows; windows that straddle two sequences are never
-    read back.
+
+def _conv_triton_kernel():
+    """Build the convolution kernel once; triton is imported on first use."""
+    global _CONV_KERNEL
+    if _CONV_KERNEL is not None:
+        return _CONV_KERNEL
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def conv_silu(x_ptr, w_ptr, bias_ptr, hist_ptr, seq_ptr, within_ptr,
+                  out_ptr, channels, stride_x, stride_hs, stride_ht,
+                  stride_o, W: tl.constexpr, BLOCK: tl.constexpr,
+                  HAS_HIST: tl.constexpr, HAS_BIAS: tl.constexpr):
+        row = tl.program_id(0)
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < channels
+        sequence = tl.load(seq_ptr + row)
+        within = tl.load(within_ptr + row)
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for back in tl.static_range(W):
+            tap = tl.load(w_ptr + cols * W + (W - 1 - back), mask=mask,
+                          other=0.0).to(tl.float32)
+            inside = (within - back) >= 0
+            value = tl.load(x_ptr + (row - back) * stride_x + cols,
+                            mask=mask & inside, other=0.0).to(tl.float32)
+            if HAS_HIST:
+                past = tl.load(
+                    hist_ptr + sequence * stride_hs
+                    + (W - 1 - back + within) * stride_ht + cols,
+                    mask=mask & (within - back < 0), other=0.0
+                ).to(tl.float32)
+                value = value + past
+            acc += value * tap
+        if HAS_BIAS:
+            acc += tl.load(bias_ptr + cols, mask=mask,
+                           other=0.0).to(tl.float32)
+        out = acc * tl.sigmoid(acc)
+        tl.store(out_ptr + row * stride_o + cols,
+                 out.to(out_ptr.dtype.element_ty), mask=mask)
+
+    _CONV_KERNEL = conv_silu
+    return _CONV_KERNEL
+
+
+def causal_conv_kernel(x, weight, phase, history, bias=None):
+    """The same convolution as one Triton kernel over the packed rows.
 
     Args:
         x: (rows, channels) inputs of the phase's sequences back to back.
@@ -353,31 +395,35 @@ def causal_conv_kernel(x, weight, phase, history, bias=None):
         (output with x's shape, tails), as causal_conv_reference does.
     """
     import torch
-    import torch.nn.functional as F
 
     rows, channels = x.shape
-    count = len(phase.lengths)
-    keep = weight.shape[1] - 1
+    width = weight.shape[1]
     device = x.device
     lengths = torch.as_tensor(phase.lengths, device=device)
-    sequence = torch.repeat_interleave(
-        torch.arange(count, device=device), lengths)
     starts = torch.cumsum(lengths, 0) - lengths
-    # a sequence's segment of the padded buffer starts here
-    segment = starts + torch.arange(count, device=device) * keep
-    token_row = torch.arange(rows, device=device) + sequence * keep
-    padded = x.new_zeros((rows + count * keep, channels))
-    padded[token_row + keep] = x
-    if history is not None and keep:
-        columns = torch.arange(keep, device=device)
-        padded[(segment[:, None] + columns).reshape(-1)] = history.reshape(
-            -1, channels)
-    mixed = F.conv1d(padded.t().unsqueeze(0), weight.unsqueeze(1), bias,
-                     groups=channels)[0].t()
-    out = F.silu(mixed[token_row].float()).to(x.dtype)
-    ends = segment + lengths
-    tails = padded[ends[:, None] + torch.arange(keep, device=device)]
+    sequence = torch.repeat_interleave(
+        torch.arange(len(phase.lengths), device=device), lengths)
+    within = (torch.arange(rows, device=device) - starts[sequence]).int()
+    out = torch.empty_like(x)
+    x = x.contiguous()
+    weight = weight.contiguous()
+    block = 1024
+    has_history = history is not None
+    hist = history if has_history else x
+    _conv_triton_kernel()[(rows, triton_cdiv(channels, block))](
+        x, weight, bias if bias is not None else x, hist,
+        sequence.int(), within, out, channels, x.stride(0),
+        hist.stride(0) if has_history else 0,
+        hist.stride(1) if has_history else 0, out.stride(0),
+        W=width, BLOCK=block, HAS_HIST=has_history,
+        HAS_BIAS=bias is not None, num_warps=4)
+    tails = _conv_tails(x, lengths, starts, history, width)
     return out, tails
+
+
+def triton_cdiv(value, block):
+    """Blocks of `block` covering `value` elements."""
+    return -(-value // block)
 
 
 # a CUDA launch has at most this many blocks along its second grid axis,
