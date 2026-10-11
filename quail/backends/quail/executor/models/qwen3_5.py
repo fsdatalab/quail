@@ -10,6 +10,8 @@ modules, so the arithmetic matches vLLM's. Quail's arena serves the
 full layers' attention and the linear layers' state.
 """
 
+from types import SimpleNamespace
+
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.model import text_model
 from quail.backends.quail.executor.models.base import ModelPipeline
@@ -57,53 +59,51 @@ class Qwen35Pipeline(ModelPipeline):
                 f"{(spec.n_q, spec.n_kv, spec.d_head)}")
         if not attn.attn_output_gate:
             raise ValueError("the forward pass expects gated attention")
+        # the block-fp8 projections run DeepGEMM through the engine
+        # behind its fused norm, SiLU, and quantization kernels; the
+        # Gated DeltaNet's a and b projections stay bf16 in the
+        # checkpoint and run as vLLM's module
+        fp8 = "float8" in str(attn.qkv_proj.weight.dtype)
         self.engine = engine_class(
             arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
-            head_dim=attn.head_dim, rotary=attn.rotary_emb, fp8=False)
+            head_dim=attn.head_dim, rotary=attn.rotary_emb, fp8=fp8)
         self.arena = arena
         self.max_chunk_tokens = budgets.kernel_index_cap(spec)
-        self._norm_weights = {}
+        self._norms = {}
 
     def linears(self):
         # the full-attention and linear-attention layers each repeat
-        # their shapes; the MLP is the same in every layer
+        # their fp8 shapes; the MLP is the same in every layer
         full = next(layer for layer in self.layers
                     if layer.layer_type == "full_attention")
         linear = next(layer for layer in self.layers
                       if layer.layer_type != "full_attention")
         return (full.self_attn.qkv_proj, full.self_attn.o_proj,
-                linear.linear_attn.in_proj_qkvz, linear.linear_attn.in_proj_ba,
-                linear.linear_attn.out_proj, full.mlp.gate_up_proj,
-                full.mlp.down_proj)
-
-    def warm_gemm(self, linear, x):
-        # the forward pass runs vLLM's modules, which quantize and
-        # dispatch the GEMM themselves
-        linear(x)
+                linear.linear_attn.in_proj_qkvz, linear.linear_attn.out_proj,
+                full.mlp.gate_up_proj, full.mlp.down_proj)
 
     def forward_chunk(self, chunk):
         hidden, residual = self.backbone_rows(chunk)
         final = chunk.final_indices
-        normed, _ = self._norm(self.final_norm, hidden.index_select(0, final),
-                               residual.index_select(0, final))
+        normed, _ = self.engine.fused_add_norm_rows(
+            hidden.index_select(0, final), residual.index_select(0, final),
+            self._norm(self.final_norm).weight, self.final_norm.variance_epsilon)
         return normed
 
-    def _norm(self, module, x, residual=None):
-        """One of the model's RMS norms, through the engine's kernel.
+    def _norm(self, module):
+        """The norm as the engine's kernels read it: weight and epsilon.
 
-        The model's norms scale by one plus their weight; the loaded
-        module dispatches them to unfused PyTorch outside vLLM's
-        engine. With a residual, the kernel adds it into x in place
-        and returns (normalized rows, sum).
+        The model's norms scale by one plus their weight, and the
+        loaded modules dispatch to unfused PyTorch outside vLLM's
+        engine, so the engine gets the folded weight instead.
         """
-        weight = self._norm_weights.get(id(module))
-        if weight is None:
-            weight = (module.weight + 1).to(x.dtype)
-            self._norm_weights[id(module)] = weight
-        if residual is None:
-            return self.engine.norm_rows(x, weight, module.variance_epsilon)
-        return self.engine.fused_add_norm_rows(x, residual, weight,
-                                               module.variance_epsilon)
+        norm = self._norms.get(id(module))
+        if norm is None:
+            norm = SimpleNamespace(
+                weight=(module.weight + 1).to(self.engine.torch.bfloat16),
+                variance_epsilon=module.variance_epsilon)
+            self._norms[id(module)] = norm
+        return norm
 
     def backbone_rows(self, chunk):
         """Return (hidden, residual) after the last layer; their sum is its output.
@@ -112,50 +112,74 @@ class Qwen35Pipeline(ModelPipeline):
         output and the residual it was added to, and the next layer's
         input norm sums them.
         """
+        engine = self.engine
         meta = chunk.meta
         positions = chunk.positions
         hidden = self.embed(chunk.input_ids)
         residual = None
         for index, layer in enumerate(self.layers):
-            if residual is None:
-                residual = hidden
-                x = self._norm(layer.input_layernorm, hidden)
-            else:
-                x, residual = self._norm(layer.input_layernorm, hidden, residual)
+            norm = self._norm(layer.input_layernorm)
             if layer.layer_type == "full_attention":
+                # the fused kernel adds the residual into its sum in
+                # place and quantizes the normalized rows
+                if residual is None:
+                    residual = hidden
+                    q_in, q_scale = engine.norm_quant(hidden, norm)
+                else:
+                    q_in, q_scale = engine.norm_quant(hidden, norm, residual)
                 # the engine indexes the arena's pools by model layer
                 meta["layer"] = index
-                x = self._full_attention(layer.self_attn, x, positions, meta)
+                hidden = self._full_attention(layer.self_attn, q_in, q_scale,
+                                              positions, meta)
             else:
-                x = self._linear_attention(layer.linear_attn, x, meta, index)
-            x, residual = self._norm(layer.post_attention_layernorm, x, residual)
-            hidden = layer.mlp(x)
+                # the a and b projections read the normalized rows in
+                # bf16, so the norm runs unfused here
+                if residual is None:
+                    residual = hidden
+                    x = engine.norm_rows(hidden, norm.weight,
+                                         norm.variance_epsilon)
+                else:
+                    x, residual = engine.fused_add_norm_rows(
+                        hidden, residual, norm.weight, norm.variance_epsilon)
+                hidden = self._linear_attention(layer.linear_attn, x, meta, index)
+            g_in, g_scale = engine.norm_quant(
+                hidden, self._norm(layer.post_attention_layernorm), residual)
+            gate_up = engine.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
+            d_in, d_scale = engine.activation_quant(gate_up)
+            hidden = engine.gemm(d_in, d_scale, layer.mlp.down_proj)
         return hidden, residual
 
-    def _full_attention(self, attn, x, positions, meta):
-        """Gated attention: per-head [q | gate], partial rotary, sigmoid gate."""
-        torch = self.engine.torch
-        n = x.shape[0]
+    def _full_attention(self, attn, q_in, q_scale, positions, meta):
+        """Gated attention: per-head [q | gate], partial rotary, sigmoid gate.
+
+        Takes the quantized, normalized rows and returns o_proj's output.
+        """
+        engine = self.engine
+        torch = engine.torch
+        n = q_in.shape[0]
         heads, kv_heads, dim = attn.num_heads, attn.num_kv_heads, attn.head_dim
-        qkv, _ = attn.qkv_proj(x)
+        qkv = engine.gemm(q_in, q_scale, attn.qkv_proj)
         q_gate, k, v = qkv.split([attn.q_size * 2, attn.kv_size, attn.kv_size],
                                  dim=-1)
         q, gate = torch.chunk(q_gate.view(n, heads, 2 * dim), 2, dim=-1)
-        q = self._norm(attn.q_norm, q.contiguous()).view(n, heads * dim)
-        k = self._norm(attn.k_norm, k.view(n, kv_heads, dim)).view(n, kv_heads * dim)
+        q_norm, k_norm = self._norm(attn.q_norm), self._norm(attn.k_norm)
+        q = engine.norm_rows(q.contiguous(), q_norm.weight,
+                             q_norm.variance_epsilon).view(n, heads * dim)
+        k = engine.norm_rows(k.view(n, kv_heads, dim), k_norm.weight,
+                             k_norm.variance_epsilon).view(n, kv_heads * dim)
         q, k = attn.rotary_emb(positions, q, k)
-        out = self.engine.attention_unified(
+        out = engine.attention_unified(
             q.view(n, heads, dim), k.view(n, kv_heads, dim).contiguous(),
             v.view(n, kv_heads, dim).contiguous(), meta)
         out = out * torch.sigmoid(gate.reshape(n, heads * dim))
-        out, _ = attn.o_proj(out)
-        return out
+        return engine.gemm(*engine.quant(out), attn.o_proj)
 
     def _linear_attention(self, linear, x, meta, layer):
         """Gated DeltaNet over the chunk's state segments, wave by wave."""
-        torch = self.engine.torch
+        engine = self.engine
+        torch = engine.torch
         n = x.shape[0]
-        mixed_qkvz, _ = linear.in_proj_qkvz(x)
+        mixed_qkvz = engine.gemm(*engine.quant(x), linear.in_proj_qkvz)
         ba, _ = linear.in_proj_ba(x)
         qkv_size = 2 * linear.key_dim + linear.value_dim
         mixed_qkv, z = mixed_qkvz.split([qkv_size, linear.value_dim], dim=-1)
@@ -176,8 +200,7 @@ class Qwen35Pipeline(ModelPipeline):
                 core.index_copy_(0, wave["rows"], out)
         head = linear.head_v_dim
         gated = linear.norm(core.reshape(-1, head), z.reshape(-1, head))
-        out, _ = linear.out_proj(gated.reshape(n, -1))
-        return out
+        return engine.gemm(*engine.quant(gated.reshape(n, -1)), linear.out_proj)
 
     def _wave(self, linear, wave, mixed_qkv, a, b, pools):
         """One conv call and one delta-rule call over a wave's rows.

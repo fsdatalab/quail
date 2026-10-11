@@ -69,6 +69,13 @@ def _linear_attention(torch):
         out_proj=_Linear(torch.eye(HIDDEN, VALUE_DIM)))
 
 
+def _mlp(torch):
+    """An MLP the fakes' activation turns into the identity."""
+    eye = torch.eye(HIDDEN)
+    return SimpleNamespace(gate_up_proj=_Linear(torch.cat([eye, eye])),
+                           down_proj=_Linear(eye))
+
+
 def _layer(torch, index, gate_rows=(0.0, 0.0)):
     full = (index + 1) % 4 == 0
     return SimpleNamespace(
@@ -77,7 +84,7 @@ def _layer(torch, index, gate_rows=(0.0, 0.0)):
         self_attn=_attention(torch, gate_rows) if full else None,
         linear_attn=None if full else _linear_attention(torch),
         input_layernorm=_Norm(torch), post_attention_layernorm=_Norm(torch),
-        mlp=lambda x: x)
+        mlp=_mlp(torch))
 
 
 def _model(torch, layers=None):
@@ -105,13 +112,31 @@ class _Engine:
         return self.q
 
     # the fakes' norms scale rows by their weight and skip the
-    # normalization, so constant rows stay easy to follow
+    # normalization, their quantization is the identity with no scale,
+    # and their activation keeps the gate half and skips the SiLU and
+    # the up product, so constant rows stay easy to follow
     def norm_rows(self, x, weight, eps):
         return x * weight
 
     def fused_add_norm_rows(self, hidden, residual, weight, eps):
-        residual = residual + hidden
+        residual.add_(hidden)
         return residual * weight, residual
+
+    def norm_quant(self, hidden, norm, residual=None):
+        if residual is None:
+            return hidden * norm.weight, None
+        residual.add_(hidden)
+        return residual * norm.weight, None
+
+    def quant(self, x):
+        return x, None
+
+    def gemm(self, q_input, input_scale, linear):
+        linear.inputs.append(q_input)
+        return q_input @ linear.weight.T
+
+    def activation_quant(self, gate_up):
+        return gate_up[:, :gate_up.shape[1] // 2], None
 
 
 def _kernel_stubs(monkeypatch, torch):
@@ -167,7 +192,7 @@ def _kernel_stubs(monkeypatch, torch):
 
 def _spec():
     return replace(QWEN3_8_27B_FP8, layers=LAYERS, hidden=HIDDEN, n_q=HEADS,
-                   n_kv=KV_HEADS, d_head=DIM, ffn_width=8)
+                   n_kv=KV_HEADS, d_head=DIM, ffn_width=HIDDEN)
 
 
 def _chunk(torch, rows=5):
