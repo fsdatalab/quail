@@ -412,7 +412,9 @@ class RequestExtractSpec:
     the instruction, the answer template, and the phrase cue. The
     answer is the text the model writes up to the closing quote,
     located in the document's text; with trim off, the whole lines
-    that hold it.
+    that hold it. The preamble precedes the document: the model's
+    extract turn and the document label, which differ from the
+    request's shared preamble on a model that answers AI.IF raw.
     """
 
     alias: str
@@ -422,6 +424,8 @@ class RequestExtractSpec:
     trim: bool = True
     # the tail's text, for an engine that tokenizes prompts itself
     tail_text: str = ""
+    preamble_token_ids: tuple[Any, ...] = ()
+    preamble_text: str = ""
 
     @property
     def span_output(self) -> str:
@@ -437,6 +441,8 @@ class RequestExtractSpec:
             tail_token_ids=tuple(value["tail_token_ids"]),
             trim=bool(value.get("trim", True)),
             tail_text=str(value.get("tail_text", "")),
+            preamble_token_ids=tuple(value.get("preamble_token_ids", ())),
+            preamble_text=str(value.get("preamble_text", "")),
         )
 
     def to_dict(self) -> dict:
@@ -447,6 +453,8 @@ class RequestExtractSpec:
             "tail_token_ids": list(self.tail_token_ids),
             "trim": self.trim,
             "tail_text": self.tail_text,
+            "preamble_token_ids": list(self.preamble_token_ids),
+            "preamble_text": self.preamble_text,
         }
 
 

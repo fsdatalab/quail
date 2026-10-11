@@ -383,16 +383,18 @@ def plan_request_backend(
         ))
 
     # each extraction decodes one answer per surviving document of its
-    # alias, after the joins
+    # alias, after the joins; its prompt carries its own preamble, the
+    # model's extract turn, so it stays out of the shared one
     extract_specs = []
     for node in operators.extracts:
-        prompts.append(node.call.prompt)
         extract_specs.append(RequestExtractSpec(
             alias=node.alias, output=node.name,
             question=node.call.question,
             tail_token_ids=tuple(node.call.prompt.tail_token_ids),
             trim=node.call.trim,
-            tail_text=re.sub(r"\{\d+\}", "", node.call.prompt.tail)))
+            tail_text=re.sub(r"\{\d+\}", "", node.call.prompt.tail),
+            preamble_token_ids=tuple(node.call.prompt.preamble_token_ids),
+            preamble_text=node.call.prompt.preamble))
 
     preambles = {
         tuple(prompt.preamble_token_ids)
@@ -1265,13 +1267,15 @@ class RequestModelExecution:
                     f"the scan did not load")
             document_texts = [_text_value(texts, document)
                               for document in document_ids]
+            preamble = _token_list(spec.preamble_token_ids
+                                   or node.preamble_token_ids)
+            preamble_text = spec.preamble_text or node.preamble_text
             result = _extract_documents(
                 self.client, spec, [
-                    _token_list(node.preamble_token_ids)
-                    + _token_list(self.documents[spec.alias][document])
+                    preamble + _token_list(self.documents[spec.alias][document])
                     for document in document_ids],
                 document_texts,
-                body_texts=([node.preamble_text + text for text in document_texts]
+                body_texts=([preamble_text + text for text in document_texts]
                             if self.submit_text else None))
             outputs[f"extract_answers:{spec.output}"] = _extract_answer_table(
                 spec, document_ids, result["answers"], result["spans"])

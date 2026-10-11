@@ -410,6 +410,42 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
     assert pieces["extracts"][0]["tail"][-1] == 'Phrase: "'.split()[-1]
 
 
+def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
+    spec = get_query("CUAD-1")
+    span_type = pa.struct([("start", pa.int64()), ("end", pa.int64())])
+
+    def nodes(graph, request):
+        model = next(
+            node for node in graph.nodes if isinstance(node, RequestExecution))
+        return {model.node_id: NodeResult({
+            "ids:c": [0, 1, 2],
+            "extract_answers:governing_law": pa.table({
+                "c": pa.array([0, 1, 2], pa.int32()),
+                "governing_law": pa.array(["audit yearly", None, "will"],
+                                          pa.string()),
+                "governing_law_span": pa.array(
+                    [{"start": 0, "end": 12}, None, {"start": 9, "end": 13}],
+                    span_type),
+            }),
+        })}
+
+    with _session(tmp_path, backend="stock_vllm") as sess:
+        sess.register("contracts", DocumentProvider.from_table(
+            CONTRACTS, id_col="id"))
+        query = build_query(sess, spec)
+        result = _execute(query, nodes, cached_tokens=0)
+        output = run_output(result, spec.info, {"contracts": CONTRACTS})
+        pieces = prompt_pieces(query, spec.info, {})
+        turn = sess.model.extract_turn
+    assert output.extract_answers["extract-1"].to_pydict() == {
+        "c": ["ct0", "ct1", "ct2"], "answer": ["audit yearly", None, "will"]}
+    assert output.rows.column_names == ["c", "governing_law"]
+    # the request node carries the extraction's own head and tail
+    assert pieces["preamble"] == _token_ids(turn[0] + quail.SHARED_PRE)
+    assert [item["id"] for item in pieces["extracts"]] == ["extract-1"]
+    assert pieces["extracts"][0]["tail"][-1] == _token_ids('"')[-1]
+
+
 def test_benchmark_results_and_scoring(tmp_path):
     with _session(tmp_path) as sess:
         quail_result = _run(_query(sess), [1, 0])

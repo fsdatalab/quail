@@ -517,6 +517,22 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     (spec,) = request_node.extracts
     assert (spec.alias, spec.output, spec.question, spec.trim) == (
         "c", "ends", QUESTION, True)
+    # the extraction's own preamble: the model's extract turn and the
+    # document label, kept apart from the request's shared preamble
+    assert spec.preamble_text == session.model.extract_turn[0] + SHARED_PRE
+    assert list(spec.preamble_token_ids) == request_tests._tokens(
+        spec.preamble_text)
+    assert spec == RequestExtractSpec.from_mapping(spec.to_dict())
+    # a filter and an extraction plan together although their preambles
+    # differ
+    mixed = session.sql(
+        f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
+        f"FROM contracts c WHERE AI_FILTER(PROMPT('{{0}}\n\nIs it a lease?', "
+        f"c.text))").plan()
+    assert not isinstance(mixed, Refusal)
+    (mixed_node,) = [n for n in mixed.nodes if isinstance(n, RequestExecution)]
+    assert mixed_node.preamble_text == session.model.turn_prefix + SHARED_PRE
+    assert mixed_node.extracts[0].preamble_text != mixed_node.preamble_text
     tail_text = (AFTER_DOCUMENT_TEXT + (session.model.extract_turn[1] or "\n")
                  + EXTRACT_PHRASE_CUE)
     assert list(spec.tail_token_ids) == request_tests._tokens(tail_text)

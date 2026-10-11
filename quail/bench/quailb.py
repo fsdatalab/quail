@@ -29,7 +29,7 @@ from quail.bench import substrait
 from quail.bench.results import write_json
 from quail.logical.expressions import SPAN_SUFFIX
 from quail.logical.prompts import bind_classify_prompt
-from quail.physical import AiClassify, AiExtract, AiScore
+from quail.physical import AiClassify, AiExtract, AiScore, RequestExecution
 from quail.planner.plan import Refusal
 from quail.progress import say
 from quail.specs import H100_USD_PER_HOUR, MODELS
@@ -287,10 +287,7 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
     # inside the model's extract turn, which differs from the AI.IF
     # preamble on a model that answers AI.IF raw
     for operator in info.extracts:
-        node = next(node for node in query.plan().nodes
-                    if isinstance(node, AiExtract)
-                    and node.spec.name == operator.output)
-        head, tail = node.spec.prompt_token_parts
+        head, tail = _extract_parts(query.plan(), operator.output)
         if not pieces["preamble"]:
             pieces["preamble"] = list(head)
         elif list(head) != pieces["preamble"]:
@@ -299,6 +296,22 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
             return None
         pieces["extracts"].append({"id": operator.id, "tail": list(tail)})
     return pieces
+
+
+def _extract_parts(plan, output: str) -> tuple:
+    """Return an extraction's plain head and tail token ids from a plan.
+
+    The Quail backend plans an AiExtract node; a request backend
+    carries the extraction in its RequestExecution node's specs.
+    """
+    for node in plan.nodes:
+        if isinstance(node, AiExtract) and node.spec.name == output:
+            return node.spec.prompt_token_parts
+        if isinstance(node, RequestExecution):
+            for spec in node.extracts:
+                if spec.output == output:
+                    return spec.preamble_token_ids, spec.tail_token_ids
+    raise ValueError(f"the plan has no extraction named {output!r}")
 
 
 def _pair_pieces(prompt, anchor) -> dict:
