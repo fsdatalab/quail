@@ -39,18 +39,40 @@ def test_params_follow_the_checkpoint_dimensions():
     assert SPEC.head_mem_bytes == 248_320 * 5120 * 2
     assert SPEC.W_mem == 29.4e9
     assert budgets.minimum_weight_gpus(SPEC, H100_SXM) == 1
-    # a quarter of Qwen3 32B's KV per token, so more than three times
-    # the resident document tokens on one H100
-    assert budgets.arena_tokens(SPEC, H100_SXM) > \
-        3 * budgets.arena_tokens(QWEN3_32B_FP8, H100_SXM)
     assert not tree_attention_allowed(SPEC)
 
 
-def test_quail_refuses_and_stock_vllm_accepts():
+def test_state_per_sequence_and_the_pool_split():
+    assert SPEC.linear_layer_set == frozenset(
+        i for i in range(64) if (i + 1) % 4)
+    assert SPEC.state_shape == (48, 128, 128)
+    assert SPEC.conv_shape == (10_240, 3)
+    # 48 layers of a 3,145,728-byte state and a 61,440-byte window
+    assert SPEC.state_bytes == 48 * (48 * 128 * 128 * 4 + 10_240 * 3 * 2)
+    assert QWEN3_32B_FP8.state_bytes == 0 and QWEN3_32B_FP8.state_shape is None
+    chunk = budgets.chunk_budget(SPEC, H100_SXM)
+    slots = budgets.state_slots(SPEC, H100_SXM, chunk)
+    assert budgets.state_slots(QWEN3_32B_FP8, H100_SXM, chunk) == 0
+    # the pool and the pages hold the same documents of the mean
+    # length, and together they take the free memory to within a slot
+    documents = (slots - 1) // budgets.STATE_SLOTS_PER_DOCUMENT
+    assert documents >= 64
+    tokens = budgets.arena_tokens(SPEC, H100_SXM, chunk)
+    assert abs(tokens - documents * budgets.STATE_MEAN_DOC_TOKENS) \
+        < SPEC.state_bytes / SPEC.kappa + budgets.PAGE_TOKENS
+    free = budgets.arena_bytes(SPEC, H100_SXM, chunk)
+    assert free - (tokens * SPEC.kappa + slots * SPEC.state_bytes) \
+        < SPEC.state_bytes + SPEC.kappa * budgets.PAGE_TOKENS
+    # a longer mean document shifts memory from slots to pages
+    longer = budgets.state_slots(SPEC, H100_SXM, chunk, mean_doc_tokens=4096)
+    assert longer < slots
+    assert budgets.arena_tokens(SPEC, H100_SXM, chunk, mean_doc_tokens=4096) \
+        > tokens
+
+
+def test_both_backends_accept_the_model():
     assert MODELS["qwen3.8-27b-fp8"] is SPEC
-    support = QuailBackend().supports(SPEC, H100_SXM, 1)
-    assert not support.supported
-    assert "qwen3_5" in support.reason
+    assert QuailBackend().supports(SPEC, H100_SXM, 1).supported
     engine = SimpleNamespace(label="stock vLLM", kind="vllm")
     backend = RequestBackend(name="stock", engine=engine,
                              filter_submission="operator")

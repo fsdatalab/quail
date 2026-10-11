@@ -62,6 +62,31 @@ def arena_bytes(model: ModelSpec, device: DeviceSpec,
             - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
 
 
+# Slots a document in flight holds on a linear-attention model: the
+# state at its document end and the state after its frame.
+STATE_SLOTS_PER_DOCUMENT = 2
+# The document length the state pool is sized for when the planner
+# gives no mean.
+STATE_MEAN_DOC_TOKENS = 512
+
+
+def state_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
+                mean_doc_tokens: float | None = None) -> int:
+    """Slots of the state pool; 0 for a model without linear layers.
+
+    A document of the mean length takes its KV pages and
+    STATE_SLOTS_PER_DOCUMENT slots, so the pool holds as many documents
+    as the pages do and both run out together. Slot 0 is the kernels'
+    zero state and is added on top.
+    """
+    if not model.state_bytes:
+        return 0
+    mean = max(1.0, mean_doc_tokens or STATE_MEAN_DOC_TOKENS)
+    per_document = mean * model.kappa + STATE_SLOTS_PER_DOCUMENT * model.state_bytes
+    documents = arena_bytes(model, device, chunk_tokens) // per_document
+    return 1 + STATE_SLOTS_PER_DOCUMENT * max(1, int(documents))
+
+
 # Rows past a document that its pages also cover: the shared question
 # preamble and a stage tail, taken as a round number for the split.
 SPLIT_EXTRA_TOKENS = 64
@@ -93,6 +118,9 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
     free = arena_bytes(model, device, chunk_tokens)
+    # the state pool takes its share first
+    free -= state_slots(model, device, chunk_tokens, mean_doc_tokens) \
+        * model.state_bytes
     page_bytes_full = model.kappa_full * PAGE_TOKENS
     page_bytes_sliding = model.kappa_sliding * PAGE_TOKENS
     if not page_bytes_sliding:

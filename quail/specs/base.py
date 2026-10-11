@@ -82,6 +82,14 @@ class ModelSpec:
     # fixed-size state per sequence instead of KV rows, so those layers
     # keep no KV. 0 means no layer runs linear attention.
     linear_attention_params: int = 0
+    # A linear-attention layer's heads: its state per sequence is one
+    # linear_head_dim x linear_head_dim matrix per value head, in fp32,
+    # and a convolution window of linear_conv_kernel - 1 rows over its
+    # query, key, and value columns, in the KV dtype.
+    linear_key_heads: int = 0
+    linear_value_heads: int = 0
+    linear_head_dim: int = 0
+    linear_conv_kernel: int = 0
     # Experts beside the dense MLP, for a mixture-of-experts model;
     # 0 means the dense MLP alone.
     experts: int = 0
@@ -130,6 +138,37 @@ class ModelSpec:
     def is_linear_layer(self, layer: int) -> bool:
         """Whether the layer runs linear attention and keeps no KV."""
         return bool(self.linear_attention_params) and not self.is_full_layer(layer)
+
+    @property
+    def linear_layer_set(self) -> frozenset:
+        """The layers that run linear attention and keep a state per sequence."""
+        return frozenset(i for i in range(self.layers) if self.is_linear_layer(i))
+
+    @property
+    def state_shape(self) -> tuple | None:
+        """One linear layer's recurrent state per sequence, (heads, dim, dim)."""
+        if not self.linear_attention_params:
+            return None
+        return (self.linear_value_heads, self.linear_head_dim, self.linear_head_dim)
+
+    @property
+    def conv_shape(self) -> tuple | None:
+        """One linear layer's convolution window per sequence, (columns, rows)."""
+        if not self.linear_attention_params:
+            return None
+        columns = (2 * self.linear_key_heads + self.linear_value_heads) \
+            * self.linear_head_dim
+        return (columns, self.linear_conv_kernel - 1)
+
+    @property
+    def state_bytes(self) -> int:
+        """Bytes one sequence's saved state takes over the linear layers."""
+        if not self.linear_attention_params:
+            return 0
+        heads, dim, _ = self.state_shape
+        columns, rows = self.conv_shape
+        return len(self.linear_layer_set) * (
+            heads * dim * dim * 4 + int(columns * rows * self.kv_bytes))
 
     @property
     def kv_shapes(self) -> tuple:

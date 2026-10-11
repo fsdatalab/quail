@@ -244,3 +244,134 @@ def test_answers_agree_with_stock_vllm(stock_layers, quail):
 
 if __name__ == "__main__":
     stock_rows_main(sys.argv[1])
+
+
+# ---- saved state: a sequence split at a save point equals the whole one
+
+
+@pytest.fixture(scope="module")
+def state_run(prompts, quail):
+    """A pipeline over an arena with state slots, sharing the loaded model."""
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.models.qwen3_5 import Qwen35Pipeline
+    from quail.cost.budgets import PAGE_TOKENS
+    from quail.specs import MODELS
+
+    _, model = quail
+    spec = MODELS[MODEL]
+    arena = KVArena(n_layers=spec.layers, n_pages=1024,
+                    page_tokens=PAGE_TOKENS, n_kv=spec.n_kv,
+                    d_head=spec.d_head, dtype=torch.bfloat16,
+                    layer_kv=spec.kv_shapes, state_layers=spec.linear_layer_set,
+                    n_state_slots=8, state_shape=spec.state_shape,
+                    conv_shape=spec.conv_shape)
+    return arena, Qwen35Pipeline(model, arena, spec=spec)
+
+
+def _layer_output(pipeline, chunk):
+    with torch.inference_mode():
+        hidden, residual = pipeline.backbone_rows(chunk)
+    return (hidden + residual).float().cpu()
+
+
+def _relative(ours, reference):
+    return ((ours - reference).norm(dim=-1)
+            / reference.norm(dim=-1).clamp_min(1e-6))
+
+
+def test_state_saved_at_the_document_end_restores_the_sequence(prompts, state_run):
+    from quail.backends.quail.executor.chunk import pack_chunk
+
+    arena, pipeline = state_run
+    ids = prompts[0]
+    split = len(ids) - SUFFIX_TOKENS
+    whole_key = ("whole", 0)
+    arena.activate(whole_key, len(ids), capacity_tokens=len(ids) + 16,
+                   base_tokens=split)
+    whole = _layer_output(pipeline, pack_chunk(
+        torch, arena, [dict(key=whole_key, prefix=ids[:split], f=split,
+                            suffixes=[ids[split:]])],
+        attention_mode="unified"))
+    arena.free_key(whole_key)
+
+    key = ("split", 0)
+    arena.activate(key, split, capacity_tokens=len(ids) + 16, base_tokens=split,
+                   slots=1)
+    first = pack_chunk(torch, arena, [dict(key=key, prefix=ids[:split], f=split,
+                                           suffixes=[], save_at=(split,))],
+                       attention_mode="unified")
+    assert [seg.save for seg in first.meta["state"]["segments"]] != [0]
+    prefix_rows = _layer_output(pipeline, first)
+    second = pack_chunk(torch, arena, [dict(key=key, prefix=None, f=split,
+                                            suffixes=[ids[split:]])],
+                        attention_mode="unified")
+    suffix_rows = _layer_output(pipeline, second)
+    arena.free_key(key)
+    prefix_error = _relative(prefix_rows, whole[:split])
+    suffix_error = _relative(suffix_rows, whole[split:])
+    print(json.dumps(dict(prefix_median=prefix_error.median().item(),
+                          suffix_median=suffix_error.median().item(),
+                          suffix_max=suffix_error.max().item())))
+    # the prefix rows are the same computation; the suffix rows start
+    # from the saved state instead of running behind the prefix, and
+    # differ by the kernels' chunk boundaries alone
+    assert prefix_error.max().item() < 1e-3
+    assert suffix_error.median().item() < 0.02
+    assert suffix_error.max().item() < 0.1
+
+
+def test_partners_read_the_kept_state_and_leave_it_unchanged(prompts, state_run):
+    from quail.backends.quail.executor.chunk import pack_chunk
+
+    arena, pipeline = state_run
+    ids = prompts[1]
+    anchor, frame = ids[:len(ids) - SUFFIX_TOKENS], ids[len(ids) - SUFFIX_TOKENS:
+                                                         len(ids) - 4]
+    partners = [ids[len(ids) - 4:], prompts[2][-4:], prompts[3][-4:]]
+    f = len(anchor)
+    separate = []
+    for index, partner in enumerate(partners):
+        key = ("one", index)
+        arena.activate(key, f + len(frame) + len(partner),
+                       capacity_tokens=f + 32, base_tokens=f)
+        rows = _layer_output(pipeline, pack_chunk(
+            torch, arena, [dict(key=key, prefix=anchor + frame, f=f + len(frame),
+                                suffixes=[partner])],
+            attention_mode="unified"))
+        separate.append(rows[f + len(frame):])
+        arena.free_key(key)
+
+    key = ("anchor", 0)
+    arena.activate(key, f, capacity_tokens=f + 32, base_tokens=f, slots=1)
+    chunk = pack_chunk(torch, arena, [
+        dict(key=key, prefix=anchor, f=f, suffixes=[frame],
+             write_suffix_tokens=len(frame), save_at=(f + len(frame),)),
+        dict(key=key, prefix=None, f=f + len(frame), suffixes=partners),
+    ], attention_mode="unified")
+    plan = chunk.meta["state"]
+    assert [w["n"] for w in plan["waves"]] == [1, 3]
+    together = _layer_output(pipeline, chunk)
+    kept = arena.state_slot_at(key, f + len(frame))
+    pools = [pipeline.arena.state_pools(layer) for layer in sorted(arena.state_layers)]
+    before = [(s[kept].clone(), c[kept].clone()) for s, c in pools]
+    # a second round of partners starts from the kept state again
+    again = pack_chunk(torch, arena, [
+        dict(key=key, prefix=None, f=f + len(frame), suffixes=partners)],
+        attention_mode="unified")
+    repeated = _layer_output(pipeline, again)
+    for key_ in chunk.temporary_keys + again.temporary_keys:
+        arena.free_key(key_)
+    after = [(s[kept], c[kept]) for s, c in pools]
+    assert all(torch.equal(b[0], a[0]) and torch.equal(b[1], a[1])
+               for b, a in zip(before, after))
+    arena.free_key(key)
+    offset = f + len(frame)
+    errors = []
+    for index, partner in enumerate(partners):
+        rows = together[offset:offset + len(partner)]
+        errors.append(_relative(rows, separate[index]).median().item())
+        assert torch.equal(rows, repeated[sum(map(len, partners[:index])):
+                                          sum(map(len, partners[:index + 1]))])
+        offset += len(partner)
+    print(json.dumps(dict(partner_medians=errors)))
+    assert max(errors) < 0.02

@@ -97,7 +97,11 @@ class LoadedGpu:
                              layer_kv=spec.kv_shapes,
                              sliding_layers=spec.sliding_layer_set,
                              sliding_window=spec.sliding_window,
-                             n_sliding_pages=sliding_pages)
+                             n_sliding_pages=sliding_pages,
+                             state_layers=spec.linear_layer_set,
+                             n_state_slots=budgets.state_slots(spec, device, budget),
+                             state_shape=spec.state_shape,
+                             conv_shape=spec.conv_shape)
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()
