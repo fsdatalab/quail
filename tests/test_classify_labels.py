@@ -96,3 +96,9 @@ def test_labels_copy_by_content_and_join_a_reused_collection(
                       .read_text())["collection_id"] == summary["collection_id"]
 
 
+
+    carried = labeling.activate_reused_collection(
+        0.1, "c_small", summary["collection_id"], "")
+    assert carried["reused_predicates"] == 2
+    assert carried["new_predicates"] == 0
+    assert carried["collection_id"] == summary["collection_id"]

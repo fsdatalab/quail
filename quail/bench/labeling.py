@@ -43,6 +43,7 @@ from quail.bench.images import cpu_image, gpu_image
 from quail_b import data
 from quail_b.data import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 from quail_b.predicates import (
+    CLASSIFY_PREDICATES,
     MODEL_NAME,
     MODEL_REVISION,
     PREDICATE_BY_KEY,
@@ -1175,7 +1176,9 @@ def activate_reused_collection(
         relabeled_predicates: Keys of other predicates with new labels.
         new_specs: Predicates outside PREDICATES, such as classifications,
             whose finished label sets the collection adds. Their label-set
-            ids use quail_b's own judge for their kind.
+            ids use quail_b's own judge for their kind. A classification
+            the source collection labels and new_specs leaves out is
+            reused like an unchanged predicate.
     """
     with open(ROOT / "corpora" / target_corpus_id / "manifest.json") as f:
         target_corpus = json.load(f)
@@ -1210,15 +1213,20 @@ def activate_reused_collection(
     if unknown_predicates:
         raise ValueError(f"unknown relabeled predicates: {sorted(unknown_predicates)}")
 
+    new_keys = {spec.key for spec in new_specs}
+    carried = tuple(spec for spec in CLASSIFY_PREDICATES
+                    if spec.key in source_collection["label_sets"]
+                    and spec.key not in new_keys)
     identities = {}
     manifests = {}
     reused = {}
-    for spec in PREDICATES + tuple(new_specs):
+    for spec in PREDICATES + tuple(new_specs) + carried:
         if spec in new_specs:
             identity = _label_set_identity(
                 spec, target_corpus["corpus_id"],
                 target_corpus["corpus_full_hash"])
-        elif spec.workload in names or spec.key in relabeled_predicates:
+        elif spec not in carried and (spec.workload in names
+                                      or spec.key in relabeled_predicates):
             identity = label_set_identity(
                 spec, target_corpus["corpus_id"],
                 target_corpus["corpus_full_hash"])
