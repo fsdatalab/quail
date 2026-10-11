@@ -102,9 +102,8 @@ INSTRUCTION_TEXT = (
     "exactly. Use the fewest words that answer it. If the document does not "
     "answer the question, write none.")
 FORMAT_TEXT = "Answer in this format:"
-LINES_FORMAT_TEXT = ("Lines: START-END, the numbers of the fewest lines holding "
-                     "the phrase, for example 3-3 or 5-6")
-PHRASE_FORMAT_TEXT = 'Phrase: "the words, copied exactly"'
+LINES_FORMAT_TEXT = "Lines: <first line>-<last line>"
+PHRASE_FORMAT_TEXT = 'Phrase: "<copied words>"'
 BODY_TEMPLATE = ("DOCUMENT:\n{0}\n\nQuestion: {1}\n\n" + INSTRUCTION_TEXT + "\n"
                  + FORMAT_TEXT + "\n" + PHRASE_FORMAT_TEXT)
 LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\nQuestion: {1}\n\n"
