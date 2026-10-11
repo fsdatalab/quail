@@ -64,9 +64,10 @@ def plan_phases(arena, groups, stage):
        from the state before them, so the slot advances after it.
 
     Allocates a checkpoint slot for each fresh document and records the
-    tokens its checkpoint covers, retained tokens included. A document
-    kept at one length must be asked at exactly that length, since its
-    state cannot rewind.
+    tokens it covers. Retained suffix tokens advance a second slot, so
+    the document-end checkpoint survives for an operator that asks at
+    the document's length after the KV rewinds. A group must be asked
+    at one of the two lengths exactly, since a state cannot rewind.
 
     Args:
         arena: KVArena with checkpoint slots.
@@ -113,48 +114,80 @@ def plan_phases(arena, groups, stage):
                 f"group {key!r}: keeps {kept} suffix tokens, more than "
                 f"its first suffix holds")
         if group["fresh"]:
-            slot = arena.checkpoint_slot(key)
-            if slot is None:
+            source = arena.checkpoint_slot(key)
+            if source is None:
                 raise ArenaFullError(
                     f"no free checkpoint slot for {key!r}: all "
                     f"{arena.n_state_slots} belong to documents in use")
             first, last = group["row0"], group["prefix_end"]
             if last > first:
-                add("prefix", np.arange(first, last, dtype=np.int64), slot)
+                add("prefix", np.arange(first, last, dtype=np.int64), source)
+            arena.record_checkpoint(key, group["f"])
         else:
-            slot = arena.accounting.slots.get(key)
-            if slot is None or arena.checkpoint_tokens(key) != group["f"]:
+            source = None
+            if arena.checkpoint_tokens(key) == group["f"]:
+                source = arena.accounting.slots.get(key)
+            else:
+                extension = arena.extension(key)
+                if extension is not None and extension[1] == group["f"]:
+                    source = extension[0]
+            if source is None:
+                extension = arena.extension(key)
+                covered = [arena.checkpoint_tokens(key)]
+                if extension is not None:
+                    covered.append(extension[1])
                 raise ValueError(
                     f"group {key!r}: asked at {group['f']} tokens, but its "
-                    f"checkpoint covers {arena.checkpoint_tokens(key)}")
+                    f"checkpoints cover {covered}")
             if key in extended_after:
                 raise ValueError(
                     f"group {key!r}: follows a group of its key whose "
                     f"suffix runs before its checkpoint extends")
         pure = bool(kept) and len(begins) == 1 and kept == ends[0] - begins[0]
+        target = source
         if kept:
+            # the document-end checkpoint stays for a later operator
+            # that asks at the document's length; the retained suffix
+            # advances a second slot
+            held = arena.extension(key)
+            if held is not None and held[0] == source:
+                target = source
+            else:
+                target = arena.extension_slot(key)
+                if target is None:
+                    raise ArenaFullError(
+                        f"no free checkpoint slot to extend {key!r}")
+            arena.record_extension(key, group["f"] + kept)
             head = np.arange(begins[0], begins[0] + kept, dtype=np.int64)
-            add("continuation" if pure else "extension", head, slot)
+            name = "continuation" if pure else "extension"
+            lists[name][0].append(head)
+            lists[name][1].append(len(head))
+            lists[name][2].append((source, target))
             if not pure:
                 extended_after.add(key)
-        arena.record_checkpoint(key, group["f"] + kept)
         if pure:
             continue
         for begin, end in zip(begins, ends):
-            add("suffix", np.arange(begin, end, dtype=np.int64), slot)
+            add("suffix", np.arange(begin, end, dtype=np.int64), source)
 
     def phase(name, *, read, write, output=True):
         rows, lengths, slots = lists[name]
         if not lengths:
             return None
         cu = np.concatenate([[0], np.cumsum(lengths)])
-        slot_tensor = stage(f"gdn_{name}_slots", slots, torch.int64)
+        if name in ("continuation", "extension"):
+            reads = [pair[0] for pair in slots]
+            writes = [pair[1] for pair in slots]
+        else:
+            reads = writes = slots
         return GdnPhase(
             rows=stage(f"gdn_{name}_rows", np.concatenate(rows), torch.int64),
             cu_seqlens=stage(f"gdn_{name}_cu", cu, torch.int32),
             lengths=tuple(lengths),
-            read_slots=slot_tensor if read else None,
-            write_slots=slot_tensor if write else None,
+            read_slots=(stage(f"gdn_{name}_read", reads, torch.int64)
+                        if read else None),
+            write_slots=(stage(f"gdn_{name}_write", writes, torch.int64)
+                         if write else None),
             output=output)
 
     return (phase("prefix", read=False, write=True),
@@ -299,6 +332,37 @@ def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale):
     return out[0]
 
 
+# a CUDA launch has at most this many blocks along its second grid axis,
+# and the kernel spends one per sequence and value head
+GRID_LIMIT = 65_535
+
+
+def _kernel_in_batches(spec, q, k, v, g, beta, state, phase, scale):
+    """Run the chunked kernel over as many sequences as one launch holds.
+
+    Each batch updates its slice of `state` in place.
+    """
+    import torch
+
+    count = len(phase.lengths)
+    per_launch = max(1, GRID_LIMIT // spec.gdn_value_heads)
+    if count <= per_launch:
+        return gated_delta_kernel(q, k, v, g, beta, state,
+                                  phase.cu_seqlens, scale)
+    starts = [0]
+    for length in phase.lengths:
+        starts.append(starts[-1] + length)
+    pieces = []
+    for first in range(0, count, per_launch):
+        last = min(count, first + per_launch)
+        low, high = starts[first], starts[last]
+        pieces.append(gated_delta_kernel(
+            q[low:high], k[low:high], v[low:high], g[low:high],
+            beta[low:high], state[first:last],
+            phase.cu_seqlens[first:last + 1] - low, scale))
+    return torch.cat(pieces)
+
+
 # ---- the layer --------------------------------------------------------
 
 def gated_rms_norm(x, gate, weight, eps):
@@ -366,8 +430,7 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, use_kernels):
         else:
             state = arena.gdn_state[phase.read_slots, layer_slot]
         if use_kernels:
-            core = gated_delta_kernel(q, k, v, g, b, state,
-                                      phase.cu_seqlens, scale)
+            core = _kernel_in_batches(spec, q, k, v, g, b, state, phase, scale)
         else:
             core = gated_delta_reference(q, k, v, g, b, state,
                                          phase.lengths, scale)

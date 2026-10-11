@@ -46,6 +46,8 @@ class PageArena:
         self.free_slots = list(range(n_slots - 1, -1, -1))    # stack
         self.slots = {}    # key -> the checkpoint slot it holds
         self.slot_tokens = {}    # key -> tokens its checkpoint covers
+        self.ext_slots = {}    # key -> slot of the state past retained suffix
+        self.ext_tokens = {}    # key -> tokens that second checkpoint covers
         self.free = list(range(n_pages - 1, -1, -1))    # stack
         self.owned = {}       # key -> list of page ids it alone writes
         self.borrowed = {}    # key -> leading page ids read from a parent
@@ -147,10 +149,34 @@ class PageArena:
         self.slots[key] = self.free_slots.pop()
         return self.slots[key]
 
+    def alloc_extension(self, key):
+        """A second checkpoint slot for a resident key, or None when none is free.
+
+        Holds the state past tokens the key's KV retains beyond its
+        document, so the document-end checkpoint stays for a later
+        operator that asks at the document's length.
+        """
+        if key not in self.owned:
+            raise KeyError(key)
+        if key in self.ext_slots:
+            return self.ext_slots[key]
+        if not self.free_slots:
+            return None
+        self.ext_slots[key] = self.free_slots.pop()
+        return self.ext_slots[key]
+
+    def drop_extension(self, key) -> None:
+        """Free the key's second checkpoint slot, if it has one."""
+        slot = self.ext_slots.pop(key, None)
+        self.ext_tokens.pop(key, None)
+        if slot is not None:
+            self.free_slots.append(slot)
+
     def free_key(self, key) -> int:
-        """Drop a document's pages and slot; returns the pages that went free."""
+        """Drop a document's pages and slots; returns the pages that went free."""
         slot = self.slots.pop(key, None)
         self.slot_tokens.pop(key, None)
+        self.drop_extension(key)
         if slot is not None:
             self.free_slots.append(slot)
         pages = self.owned.pop(key)
@@ -443,6 +469,25 @@ class KVArena:
     def has_checkpoint(self, key) -> bool:
         return key in self.accounting.slots
 
+    def extension_slot(self, key):
+        """The key's second checkpoint slot, evicting retained keys to free one."""
+        slot = self.accounting.alloc_extension(key)
+        if slot is None:
+            self._evict_until(lambda: bool(self.accounting.free_slots))
+            slot = self.accounting.alloc_extension(key)
+        return slot
+
+    def record_extension(self, key, tokens: int) -> None:
+        """Note that the key's second checkpoint covers `tokens` tokens."""
+        self.accounting.ext_tokens[key] = tokens
+
+    def extension(self, key):
+        """The key's second checkpoint as (slot, tokens), or None."""
+        slot = self.accounting.ext_slots.get(key)
+        if slot is None:
+            return None
+        return slot, self.accounting.ext_tokens[key]
+
     def record_checkpoint(self, key, tokens: int) -> None:
         """Note that the key's checkpoint covers its first `tokens` tokens."""
         self.accounting.slot_tokens[key] = tokens
@@ -625,6 +670,8 @@ class KVArena:
         if self.sliding is not None:
             self.sliding.rewind(key, tokens - self._sliding_start[key])
         self._refresh_rows(key, tokens)
+        # a rewound key's state past its document is not needed again
+        self.accounting.drop_extension(key)
         self.accounting.retain(key, priority)
         cap = self.accounting.retention_cap_pages
         before = self.free_pages
