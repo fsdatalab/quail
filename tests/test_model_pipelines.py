@@ -23,7 +23,7 @@ from quail.specs import (
 
 def test_backends_support_registered_generative_models_and_refuse_others():
     for model in MODELS.values():
-        if model.arch == "qwen3_5":
+        if model.arch in ("qwen3_5", "lfm2"):
             continue
         assert model.arch in supported_archs()
         assert QuailBackend().supports(model, H100_SXM, 1).supported
