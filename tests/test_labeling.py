@@ -508,26 +508,3 @@ def test_pair_columns_restrict_the_pairs_a_join_labels(monkeypatch, tmp_path):
     assert pq.read_table(copied).to_pylist() == [labeling._answer_row(
         spec, small_identity, "c_small", agents[0], replies[0], True,
         MODEL_NAME, None)]
-
-
-def test_where_conditions_restrict_a_join_to_matching_sides(monkeypatch):
-    monkeypatch.setattr(quail, "Session", _FakeSession)
-    spec = SimpleNamespace(
-        key="quailb.runs.run.different_approach", workload="runs",
-        slug="different_approach", kind="join",
-        template="Does {1} differ from {0}?", left_role="successful_run",
-        left_table="issue_runs", left_column="transcript",
-        right_role="failed_run", right_table="issue_runs",
-        right_column="transcript", source_policy="qwen3_32b", labels=(),
-        descriptions=(), pair_columns=("instance_id", "instance_id"),
-        left_where=("resolved", 1), right_where=("resolved", 0))
-    runs = [{"id": "ir0", "transcript": "yes", "instance_id": "a", "resolved": 1},
-            {"id": "ir1", "transcript": "no", "instance_id": "a", "resolved": 0},
-            {"id": "ir2", "transcript": "yes", "instance_id": "a", "resolved": 0},
-            {"id": "ir3", "transcript": "yes", "instance_id": "b", "resolved": 1}]
-
-    # only the successful run of issue a pairs, with its two failed runs
-    assert labeling._matching_pairs(spec, runs, runs) == [(0, 1), (0, 2)]
-    assert labeling._expected_rows(spec, {"issue_runs": runs}) == 2
-    judge = labeling.QuailJudge()
-    assert judge.join(spec, runs, runs) == {(0, 1): False, (0, 2): True}

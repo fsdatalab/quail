@@ -19,7 +19,6 @@ from quail.planner.estimate import SpeedOfLightEstimate, speed_of_light_estimate
 from quail.planner.plan import EngineConfig
 from quail.server.client import QueryRun
 from quail.server.records import QueryFailedError, QueryStatus
-from quail.traces import register_traces, trace_tables
 
 __all__ = [
     "SHARED_PRE",
@@ -45,9 +44,7 @@ __all__ = [
     "bind_prompt",
     "col",
     "prompt",
-    "register_traces",
     "render_join_prompt_text",
     "speed_of_light_estimate",
-    "trace_tables",
     "true_false_ids",
 ]
