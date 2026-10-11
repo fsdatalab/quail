@@ -611,8 +611,10 @@ def measure(model: str, dataset: str, n: int, run: str) -> dict:
             scorer, ids, lp, ids, doc, region)
         rec["none_wins"] = none_lp > best_lp
         rec["start_rounds"] = rounds
-        rec["gold_rank"] = next((i for i, c in enumerate(candidates)
-                                 if c["char"] == gold_lo), -1)
+        # a candidate's offset may include the token's leading space
+        rec["gold_rank"] = next(
+            (i for i, c in enumerate(candidates)
+             if c["char"] <= gold_lo and not context[c["char"]:gold_lo].strip()), -1)
         rec["candidates"] = [(c["char"], scorer.vocab[c["first"]],
                               round(c["score"], 2), len(c["filler"]))
                              for c in candidates]
