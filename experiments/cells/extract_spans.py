@@ -98,10 +98,9 @@ TOP_K = (1, 4, 8)
 # what an answer is, the same on both paths; the question carries the
 # length, a date or a whole clause
 INSTRUCTION_TEXT = (
-    "Copy the exact words from the document that answer the question: as "
-    "short as a name, a number, or a date when that answers it, or the whole "
-    "clause when the question asks for one. Do not rewrite them. If the "
-    "document does not answer the question, write none.")
+    "Copy the words that answer the question from the document. Copy them "
+    "exactly. Use the fewest words that answer it: a name, a number, a date, "
+    "or a clause. If the document does not answer the question, write none.")
 FORMAT_TEXT = "Answer in this format:"
 LINES_FORMAT_TEXT = ("Lines: START-END, the numbers of the fewest lines holding "
                      "the phrase, for example 3-3 or 5-6")
