@@ -26,7 +26,7 @@ import modal
 
 from quail.bench import labeling as labels
 from quail_b import prompts
-from quail_b.data import GROUND_TRUTH_ROOT, PUBLISHED_CORPORA
+from quail_b.data import GROUND_TRUTH_ROOT
 from quail_b.predicates import (
     CLASSIFY_PREDICATES,
     MAX_MODEL_LEN,
@@ -47,8 +47,14 @@ app = labels.app
 SPECS = CLASSIFY_PREDICATES
 # a classification of joined rows labels the rows its join keeps: the
 # predicate key -> the join's prompt template
-JOIN_OF_CLASSIFY = {"quailb.imdb.review.aspect_sentiment": prompts.DISCUSS_ASPECT}
+JOIN_OF_CLASSIFY = {
+    "quailb.imdb.review.aspect_sentiment": prompts.DISCUSS_ASPECT,
+    "quailb.support.message.disagreement": prompts.SUPPORT_PUSHBACK,
+}
 ROWS_PER_PART = 256
+# the key of a joined row's partner document, apart from the anchor's
+# column because both sides can read the same column
+RIGHT_TEXT = "right_text"
 # vLLM refuses more requested token ids than this per request
 MAX_LOGPROB_TOKEN_IDS = 128
 # share of the KV capacity one batch of prompts may occupy, so a
@@ -67,25 +73,44 @@ SHARDS = {
     "quailb.imdb.review.aspect_sentiment": 4,
     "quailb.agent.trace.domain": 8,
     "quailb.agent.trace.root_cause": 8,
+    "quailb.support.message.disagreement": 1,
+    "quailb.support.trace.intent": 1,
+    "quailb.support.trace.outcome": 1,
+    "quailb.runs.run.strategy": 4,
+    "quailb.wrench.run.exploit_kind": 2,
+    "quailb.sales.call.customer_concern": 1,
 }
-# the published collections the new collections extend
+# the corpora with the trace and sales tables, and the collections of
+# their filter and join labels that the new collections extend
+CORPORA = {
+    0.1: "c_9f3b0042684bc7cba804450c3aa0172b",
+    0.5: "c_1f2572a884442d2660ed959960718e28",
+    1.0: "c_eb98e74f27c5d4b8d3343e82e37b5b9c",
+}
 SOURCES = {
-    0.1: "gt_9b8e7f5a649d715d64a5fa4646855a4d",
-    0.5: "gt_a0faa81557f0f7c98b6eb4c170ce3716",
-    1.0: "gt_cc042e13f1a6512ee51882e65d5d3456",
+    0.1: "gt_2427ef4b134d1ed128bd31f6a56ffd77",
+    0.5: "gt_073f07a68c2a8faff56a50d883ce7de4",
+    1.0: "gt_da2fa640ef88f556aba639699a638e58",
 }
-SUMMARY_PATH = Path("/results/ablations/classify-reference-labels.json")
+# rows each table holds at sf=1.0
+TABLE_ROWS = {"reviews": 50_000, "terms": 4_144, "claims": 5_000,
+              "citation_contexts": 4_972, "agent_traces": 17_711,
+              "support_traces": 1_320, "issue_runs": 3_200,
+              "wrench_runs": 5_920, "sales_calls": 10_088}
+SUMMARY_PATH = Path(
+    "/results/ablations/classify-reference-labels-traces-sales.json")
 CHECK_PATH = Path("/results/ablations/classify-reference-labels-check.json")
 PREDICTION_TEXT = (
-    "The AGENT queries replace outcome and failure mode with progress and "
-    "test result, two predicates over the 17,711 agent traces at sf=1.0: "
-    "174 million prompt tokens each at 9,815 tokens per trace. AGENT-5's "
-    "two predicates took about 5.7 H100 hours over 16 containers, so this "
-    "should take about the same: about 20 to 30 minutes per container "
-    "after a 6-minute boot. On the 100-trace screen Qwen3 32B put 65 "
-    "percent of traces on 'located the relevant code' and 75 percent on "
-    "'bug still occurs'; expect those shares within 15 points at sf=1.0, "
-    "and 15 to 30 percent of traces in a 'changed the code' stage.")
+    "Seven classifications over the support, issue run, Terminal Wrench, "
+    "and sales call tables take about 106 million prompt tokens at "
+    "sf=1.0: 57 million for the run strategy, 30 million for the exploit "
+    "kind, 13 million for the sales concern, 5.6 million for the support "
+    "intent and outcome, and a few hundred thousand for the 2,039 "
+    "pushback pairs and 40 patch pairs. AGENT-5's two predicates ran at "
+    "about 17,000 prompt tokens per second per H100, so this should take "
+    "about 1.7 H100 hours of model time over 11 containers, plus a "
+    "6-minute boot each: about 2.8 H100 hours in all, and about 30 "
+    "minutes of wall time for the largest shard of 14 million tokens.")
 
 
 def label_trie(label_ids: list[tuple[int, ...]]) -> dict:
@@ -157,11 +182,12 @@ def corpus_rows(sf: float, spec: PredicateSpec) -> tuple[dict, list[dict]]:
     Returns:
         A tuple of the manifest and input rows. Individual classifications
         have one row per document. Pair classifications include both documents
-        for each reference join match, ordered by left and right document ID.
+        for each reference join match, ordered by left and right document ID,
+        with the partner document under RIGHT_TEXT.
     """
     import pyarrow.parquet as pq
 
-    directory = labels.ROOT / "corpora" / PUBLISHED_CORPORA[sf]
+    directory = labels.ROOT / "corpora" / CORPORA[sf]
     manifest = json.loads((directory / "manifest.json").read_text())
     table = pq.read_table(directory / f"{spec.left_table}.parquet",
                           columns=["id", spec.left_column])
@@ -171,22 +197,26 @@ def corpus_rows(sf: float, spec: PredicateSpec) -> tuple[dict, list[dict]]:
 
     root = str(labels.ROOT)[:-len(GROUND_TRUTH_ROOT) - 1]
     truth = load_ground_truth(
-        root, scale_factor=sf, corpus_id=PUBLISHED_CORPORA[sf],
+        root, scale_factor=sf, corpus_id=CORPORA[sf],
         collection_id=SOURCES[sf], templates=[JOIN_OF_CLASSIFY[spec.key]])
-    pairs = truth.predicates[
-        truth.key_for_template(JOIN_OF_CLASSIFY[spec.key])].true_pairs
+    join_key = truth.key_for_template(JOIN_OF_CLASSIFY[spec.key])
+    pairs = truth.predicates[join_key].true_pairs
     right = pq.read_table(directory / f"{spec.right_table}.parquet",
                           columns=["id", spec.right_column])
     left_text = dict(zip(table["id"].to_pylist(),
                          table[spec.left_column].to_pylist()))
     right_text = dict(zip(right["id"].to_pylist(),
                           right[spec.right_column].to_pylist()))
-    rows = sorted(zip(pairs["left_id"].to_pylist(),
-                      pairs["right_id"].to_pylist()))
+    left_ids = pairs["left_id"].to_pylist()
+    right_ids = pairs["right_id"].to_pylist()
+    if PREDICATE_BY_KEY[join_key].left_role != spec.left_role:
+        # the classification puts the join's right document on its left
+        left_ids, right_ids = right_ids, left_ids
+    rows = sorted(zip(left_ids, right_ids))
     return manifest, [
         {"id": left, "right_id": right_id,
          spec.left_column: left_text[left],
-         spec.right_column: right_text[right_id]}
+         RIGHT_TEXT: right_text[right_id]}
         for left, right_id in rows]
 
 
@@ -198,7 +228,7 @@ def _label_row(spec, identity, corpus_id, row, label, scores) -> dict:
     if spec.right_table is not None:
         partner = labels._operand(spec.right_role, spec.right_table,
                                   {"id": row["right_id"],
-                                   spec.right_column: row[spec.right_column]},
+                                   spec.right_column: row[RIGHT_TEXT]},
                                   spec.right_column)
         operands.append(partner)
     example_id, example_full = example_identity(corpus_id, operands)
@@ -475,7 +505,7 @@ def quail_check_run(run_dir: str, query_ids: str, sf: float = 0.1) -> dict:
     by_template = {spec.template: spec for spec in SPECS}
     checks = {}
     for query_id in query_ids.split(","):
-        classifies = quail_b.get_query(query_id)._info.classifies
+        classifies = quail_b.get_query(query_id).info.classifies
         for index, operator in enumerate(classifies):
             (path,) = Path(run_dir, "quail").glob(
                 f"*/{query_id}/classifications-{index}.parquet")
@@ -533,7 +563,7 @@ def judge_shard(key: str, start: int, end: int) -> dict:
         labeled = judge.label(
             spec, [row[spec.left_column] for row in part],
             None if spec.right_table is None
-            else [row[spec.right_column] for row in part])
+            else [row[RIGHT_TEXT] for row in part])
         write_part(path, [
             _label_row(spec, identity, manifest["corpus_id"], row, label,
                        scores)
@@ -614,7 +644,7 @@ def copy_labels(sf: float, spec: PredicateSpec, source: dict) -> dict:
     def key_of(row):
         return (labels._content_hash(row, spec.left_column),
                 None if spec.right_table is None
-                else labels._content_hash(row, spec.right_column))
+                else labels._content_hash(row, RIGHT_TEXT))
 
     manifest_path = labels._label_dir(spec, identity) / "manifest.json"
     if manifest_path.exists() and json.loads(
@@ -634,38 +664,64 @@ def copy_labels(sf: float, spec: PredicateSpec, source: dict) -> dict:
 
 
 def check_collection(sf: float, collection_id: str) -> dict:
-    """Load each classification query's labels and count its reference rows."""
-    import quail_b as benchmark
+    """Load each classification query's labels and count its reference rows.
+
+    Reads the corpus from the volume, so it works before the corpus is
+    published.
+    """
+    import pyarrow.parquet as pq
+
+    from quail_b.data import CORPUS_COLUMNS
+    from quail_b.labels import load_ground_truth
     from quail_b.queries import queries
+    from quail_b.relational import expected_result
     from quail_b.scoring import expected_rows
 
+    root = str(labels.ROOT)[:-len(GROUND_TRUTH_ROOT) - 1]
+    directory = labels.ROOT / "corpora" / CORPORA[sf]
     counts = {}
-    for query_id in (query_id for query_id, spec
-                     in queries(include_pending=True).items()
-                     if spec._info.classifies):
-        suite = benchmark.load_benchmark(
-            [query_id], scale_factor=sf, collection_id=collection_id,
-            root="/results")
-        spec = suite.queries[0]
+    for query_id, spec in queries(include_pending=True).items():
+        if not spec.info.classifies:
+            continue
+        tables = {relation.table: pq.read_table(
+            directory / f"{relation.table}.parquet",
+            columns=list(CORPUS_COLUMNS[relation.table]))
+            for relation in spec.info.relations}
+        truth = load_ground_truth(
+            root, scale_factor=sf, corpus_id=CORPORA[sf],
+            collection_id=collection_id,
+            templates={operator.prompt
+                       for operator in spec.info.ai_operators})
+        # a relational query's reference result runs its aggregates
+        reference = (expected_result if spec.info.relational
+                     else expected_rows)(spec, truth, tables)
         counts[query_id] = {
-            "reference_output_rows": expected_rows(
-                spec, suite.ground_truth, suite.tables).num_rows,
+            "reference_output_rows": reference.num_rows,
             "input_documents": {
-                relation.alias: suite.tables[relation.table].num_rows
-                for relation in spec._info.relations},
+                relation.alias: tables[relation.table].num_rows
+                for relation in spec.info.relations},
         }
     return counts
 
 
 @app.function(image=labels.publish_image, memory=65536, timeout=4 * 3600,
               volumes={"/results": labels.results_vol})
-def finish_run(calls: str) -> dict:
-    """Compact, copy to smaller corpora, and build extended collections."""
+def finish_run(calls: str, keys: str = "") -> dict:
+    """Compact, copy to smaller corpora, and build extended collections.
+
+    Args:
+        calls: Comma-separated function call ids of the finished shards.
+        keys: Comma-separated predicate keys the shards labeled; empty
+            means every classification predicate. Every other
+            classification the source collection holds is reused.
+    """
     shard_results = [modal.FunctionCall.from_id(call.strip()).get()
                      for call in calls.split(",") if call.strip()]
     labels._mount()
+    wanted = tuple(spec for spec in SPECS
+                   if not keys or spec.key in keys.split(","))
     source = {}
-    for spec in SPECS:
+    for spec in wanted:
         manifest, rows = corpus_rows(1.0, spec)
         source[spec.key] = complete_manifest(
             spec, classify_identity(spec, manifest), len(rows))
@@ -673,11 +729,11 @@ def finish_run(calls: str) -> dict:
     collections = {}
     for sf in (1.0, 0.5, 0.1):
         if sf != 1.0:
-            for spec in SPECS:
+            for spec in wanted:
                 copy_labels(sf, spec, source[spec.key])
             labels.results_vol.commit()
         summary = labels.activate_reused_collection(
-            sf, PUBLISHED_CORPORA[sf], SOURCES[sf], "", new_specs=SPECS)
+            sf, CORPORA[sf], SOURCES[sf], "", new_specs=wanted)
         labels.results_vol.commit()
         summary["classify_queries"] = check_collection(
             sf, summary["collection_id"])
@@ -739,13 +795,11 @@ def label(keys: str = ""):
             volume is skipped either way.
     """
     print(PREDICTION_TEXT, flush=True)
-    rows = {"reviews": 50_000, "terms": 4_144, "claims": 5_000,
-            "citation_contexts": 4_972, "agent_traces": 17_711}
     wanted = [spec for spec in SPECS
               if not keys or spec.key in keys.split(",")]
     calls = []
     for spec in wanted:
-        count = (rows[spec.left_table] if spec.right_table is None
+        count = (TABLE_ROWS[spec.left_table] if spec.right_table is None
                  else count_rows.remote(spec.key))
         print(f"[classify] {spec.key}: {count} rows", flush=True)
         for start, end in shard_bounds(count, SHARDS[spec.key]):
@@ -757,14 +811,20 @@ def label(keys: str = ""):
     for call_id in calls:
         result = modal.FunctionCall.from_id(call_id).get()
         print(f"[classify] done {call_id}: {json.dumps(result)}", flush=True)
-    call = finish_run.spawn(",".join(calls))
+    call = finish_run.spawn(",".join(calls), keys)
     print(f"[classify] finish function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=2), flush=True)
 
 
 @app.local_entrypoint()
-def finish(calls: str):
-    """Build the collections once every shard has finished."""
-    call = finish_run.spawn(calls)
+def finish(calls: str, keys: str = ""):
+    """Build the collections once every shard has finished.
+
+    Args:
+        calls: Comma-separated function call ids of the finished shards.
+        keys: Comma-separated predicate keys the shards labeled; empty
+            means every classification predicate.
+    """
+    call = finish_run.spawn(calls, keys)
     print(f"[classify] finish function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=2), flush=True)

@@ -1,8 +1,9 @@
 """Execute classification with the shared stage scheduler.
 
-Letter scoring reads label letters in one pass. Tree scoring evaluates all
-label token sequences. Greedy decoding chooses one allowed token per
-round, keeping the chosen path in the document's KV after the frame.
+Letter scoring reads label letters in one pass. Tree scoring reads the
+packed trie's rows where the labels split. Greedy decoding chooses one
+allowed token per round at those rows, keeping the chosen path in the
+document's KV after the frame.
 A decision model's head scores every label's option block in one pass.
 """
 
@@ -24,13 +25,14 @@ from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.labels import (
     GreedyDecoder,
     best_label,
+    chain_reads,
     letter_scores,
     tree_scores,
     trie_chains,
 )
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens, prefix_tree
-from quail.labels import DECISION_SCORING
+from quail.labels import DECISION_SCORING, decode_runs, read_nodes
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 
 logger = logging.getLogger("quail")
@@ -44,15 +46,17 @@ class LabelRequests:
         frame: Prompt tail tokens before the final answer cue token, written
             once after each document.
         suffixes: Request token sequences. Scoring rules begin each with the
-            answer cue; greedy decoding has the cue, then one single-token
-            request per target.
+            answer cue; greedy decoding has the cue and the forced tokens
+            to the first choice, then one run per choice node child.
         targets: Sorted token IDs returned by the readout.
         read_all_rows: Whether every suffix row is read, rather than its last.
         score: Callback converting one document's readout values to label
             scores. Values have shape (suffixes, rows, targets) when all rows
             are read, otherwise (suffixes, targets). None uses greedy decoding.
         chains: Optional trie chains packed into the sole suffix for tree scoring.
-        rounds: Maximum decoder rounds. Each round feeds one token, kept in
+        read_mask: Which rows of the sole chains suffix are read, in chain
+            order; None reads every row.
+        rounds: Maximum decoder rounds. Each round feeds one run, kept in
             the document's KV after the frame. Zero scores all labels in one
             stage.
     """
@@ -63,6 +67,7 @@ class LabelRequests:
     read_all_rows: bool
     score: Callable[[np.ndarray], np.ndarray] | None
     chains: list | None = None
+    read_mask: list | None = None
     rounds: int = 0
 
 
@@ -88,21 +93,23 @@ def label_requests(spec, targets=None) -> LabelRequests:
     if targets is None:
         targets = sorted({token for label in ids for token in label})
     if spec.scoring == "trie_tree":
-        chains = trie_chains(ids)
+        read = read_nodes(ids, spec.label_word_starts)
+        chains = trie_chains(ids, read)
         tokens = [cue if node == () else node[-1]
                   for nodes, _, _ in chains for node in nodes]
         return LabelRequests(
             frame, [tokens], targets, True,
-            lambda logprobs: tree_scores(ids, chains, targets, logprobs[0]),
-            chains=chains)
+            lambda logprobs: tree_scores(ids, chains, targets, logprobs[0], read),
+            chains=chains, read_mask=chain_reads(chains, read))
     if spec.scoring == "letters":
         return LabelRequests(
             frame, [[cue]], targets, True,
             lambda logprobs: letter_scores(ids, targets, logprobs[0, 0]))
     if spec.scoring == "trie_decode":
+        runs = decode_runs(ids)
         return LabelRequests(
-            frame, [[cue], *([token] for token in targets)], targets, False,
-            None, rounds=max(len(label) for label in ids))
+            frame, [[cue, *runs.runs[0]], *runs.runs[1:]], targets, False,
+            None, rounds=runs.rounds)
     raise ValueError(f"unknown label scoring rule {spec.scoring!r}")
 
 
@@ -169,7 +176,7 @@ class ClassifyStages:
     """Classification stages and the labels they produce.
 
     Tree and letter scoring use one stage. Greedy decoding uses one stage
-    per token depth and skips remaining stages after selecting a label.
+    per choice and skips remaining stages after selecting a label.
     Diffusion models can add a stage for repeated draws. Pair classification
     uses one stage over the partner documents retained by the join.
 
@@ -207,7 +214,8 @@ class ClassifyStages:
         read_all = request.read_all_rows
         self.read_all = read_all
         self.readout_rows = readout_rows = (
-            max(map(len, request.suffixes)) if read_all else 1)
+            sum(request.read_mask) if request.read_mask is not None
+            else max(map(len, request.suffixes)) if read_all else 1)
         # a letters stage on a canvas model reads its canvas's rows
         answer_canvas = getattr(state.loaded_model.model_spec, "answer_canvas", None)
         if spec.scoring == "letters" and answer_canvas is not None:
@@ -237,14 +245,15 @@ class ClassifyStages:
                 suffixes=request.suffixes, readout=readout,
                 frame=request.frame, decide=whole,
                 read_all_rows=read_all, label=spec.name,
-                chains=request.chains,
+                chains=request.chains, read_mask=request.read_mask,
                 **({} if canvas is None else dict(
                     single=True, canvas=lambda anchor: canvas(anchor, 0),
                     canvas_rows=self.canvas_rows))))
             if self.draws > 1:
                 self.stages.append(self._more_draws(canvas, on_label))
             return
-        self.decoder = decoder = GreedyDecoder(spec.label_token_ids, targets, count)
+        self.decoder = decoder = GreedyDecoder(
+            spec.label_token_ids, targets, count, cue=request.suffixes[0][0])
 
         def ask(key):
             nodes = decoder.requests(self.index_of(key))

@@ -377,12 +377,14 @@ def _model_inputs(node, inputs, context: ExecutionContext, chain=None) -> dict:
         matched = any(row)
         alive = not matched if group[-1]["semantics"] == "anti" \
             else matched
-        if alive and node.keep_anchor_kv:
-            retain_after_join(
-                state["arena"], key, len(prefixes[local_index]), config,
-                config.get("after", {}).get(node.node_id, {}))
-        else:
-            state["arena"].free_key(key)
+        # an anchor with no pairs settles without loading its KV
+        if state["arena"].is_resident(key):
+            if alive and node.keep_anchor_kv:
+                retain_after_join(
+                    state["arena"], key, len(prefixes[local_index]), config,
+                    config.get("after", {}).get(node.node_id, {}))
+            else:
+                state["arena"].free_key(key)
         sink = answer_sink()
         # scores are floats, not yes/no answers; they arrive with the result
         if sink is not None and getattr(row, "dtype", None) is None:

@@ -6,7 +6,7 @@ from quail.cost import budgets
 from quail.cost import classify as classify_cost
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, scan
-from quail.labels import DECISION_SCORING, LETTERS_SCORING
+from quail.labels import DECISION_SCORING, LETTERS_SCORING, word_starts
 from quail.logical import (
     PROBABILITIES_SUFFIX,
     Alias,
@@ -925,6 +925,8 @@ class ClassifyBuilder(ClassifyStatistics):
             prompt_token_parts=(head, tail),
             labels=tuple(call.labels),
             label_token_ids=labels,
+            label_word_starts=word_starts(
+                labels, getattr(self.tokenizer, "decode", None)),
             scoring="", probabilities=call.probabilities,
         ), Work()
 

@@ -71,12 +71,17 @@ def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
             assert text == "hello"
             return np.array([1, 2], dtype=np.uint32)
 
+        def decode(self, ids):
+            return b"hello"[:len(ids)]
+
     monkeypatch.setitem(sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer))
     with quail.Session(CONFIG) as session:
         token_ids = session.tokenizer("hello")
+        piece = session.tokenizer.decode([1])
     assert sources == ["Qwen/Qwen3-4B-FP8"]
     assert token_ids == [1, 2]
     assert all(type(token_id) is int for token_id in token_ids)
+    assert piece == b"h"
 
 
 def make_executor(filter_truth, join_truth=None):

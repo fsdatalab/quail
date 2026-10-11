@@ -143,6 +143,36 @@ def test_sql_and_builder_bind_regular_predicates(session):
     assert scans["r"].predicates == ()
 
 
+def test_where_on_the_joined_query_reaches_its_scan(session):
+    session.register("products", quail.DocumentProvider.from_table(pa.table({
+        "asin": ["p0", "p1"], "description": ["d0", "d1"],
+        "price": [10, 20]}), id_col="asin"))
+    sql = session.sql("""
+        SELECT r.id, p.asin FROM reviews r
+        JOIN products p ON r.stars = p.price AND p.price > 15
+         AND AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
+        WHERE r.lang = 'en'
+    """).logical
+    products = session.docs("products").alias("p").where(col("p.price") > 15)
+    built = (session.docs("reviews").alias("r").where(col("r.lang") == "en")
+             .join(products, on=col("r.stars") == col("p.price"))
+             .ai_filter(prompt("x {0} {1}", col("r.review"),
+                               col("p.description")))
+             .select("r.id", "p.asin")).logical
+    assert built == sql
+
+    def predicates(plan):
+        return {node.alias: [str(p) for p in node.predicates]
+                for node in plan.walk() if isinstance(node, Scan)}
+
+    products = session.docs("products").alias("p").where(col("p.price") > 15)
+    built = (session.docs("reviews").alias("r").where(col("r.lang") == "en")
+             .ai_join(products, prompt("x {0} {1}", col("r.review"),
+                                       col("p.description")))
+             .select("r.id", "p.asin")).logical
+    assert predicates(built) == {"r": ["r.lang = 'en'"], "p": ["p.price > 15"]}
+
+
 def test_two_joins_on_one_table_sample_each_key_column(session):
     from quail.physical import HashJoin
     from quail.planner.plan import Refusal

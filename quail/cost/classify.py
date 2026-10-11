@@ -1,13 +1,14 @@
 """Classification costs: expected work priced like a filter's work.
 
 The estimate sums each document's work (quail/cost/work.py) over every
-document, weights each greedy decode round by the share of labels that
-reach it, and prices the total with the component roofline at ideal
+document, weights each label's greedy decode rounds by its share of
+the labels, and prices the total with the component roofline at ideal
 packing: forward passes are tokens divided by the chunk, as in
 quail/cost/sol.py. KV capacity, the two-pass round delay, and admission
 order do not enter, just as they do not enter filter and join costs.
 """
 
+from collections import Counter
 from dataclasses import dataclass
 
 import numpy as np
@@ -19,12 +20,14 @@ from quail.labels import (
     DECODE_SCORING,
     LETTERS_SCORING,
     TREE_SCORING,
-    label_trie,
+    decode_round_tokens,
+    fed_nodes,
+    read_nodes,
 )
 
 
 def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
-                   draws: int = 1) -> list[int]:
+                   draws: int = 1, starts=()) -> list[int]:
     """Estimate the request lengths for a classification scoring rule.
 
     Args:
@@ -32,10 +35,13 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
         labels: Token sequence for each label.
         canvas_rows: Number of diffusion answer canvas rows.
         draws: Maximum number of diffusion draws per document.
+        starts: Per label, which tokens begin a new word.
 
     Returns:
-        Request lengths in tokens, including the answer cue. Greedy decoding
-        feeds one token per round, for as many rounds as the longest label.
+        Request lengths in tokens, including the answer cue. The packed
+        trie feeds the read nodes and their ancestors. Greedy decoding
+        feeds one run per round, the longest run of any label in that
+        round, for as many rounds as the label with the most choices.
 
     Raises:
         ValueError: The scoring rule is unknown.
@@ -43,9 +49,11 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
     if scoring == LETTERS_SCORING:
         return [1 + canvas_rows] * (draws if canvas_rows else 1)
     if scoring == TREE_SCORING:
-        return [len(label_trie(labels))]
+        return [len(fed_nodes(read_nodes(labels, starts)))]
     if scoring == DECODE_SCORING:
-        return [1] * max(len(ids) for ids in labels)
+        fed = decode_round_tokens(labels)
+        return [max(counts[round_] for counts in fed if len(counts) > round_)
+                for round_ in range(max(map(len, fed)))]
     raise ValueError(f"unknown label scoring rule {scoring!r}")
 
 
@@ -151,11 +159,26 @@ def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:
     return work
 
 
+def _rounds_work(prefix, shared, frame_tokens: int, runs, resident: bool,
+                 window: int, canvas_rows: int) -> Work:
+    """Sum every document's work over one label's decode rounds.
+
+    The first run is packed with the frame into the prefix's request;
+    each later run streams after everything fed before it.
+    """
+    first_tail = frame_tokens + runs[0]
+    work = _first_work(prefix, shared, first_tail, resident, window)
+    context = prefix + first_tail
+    for fed in runs[1:]:
+        work += _stream_work(context, [fed], window, canvas_rows)
+        context = context + fed
+    return work
+
+
 def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
                     live: float, lengths, shared, chunk: int,
                     model, device, resident: bool = False,
-                    canvas_rows: int = 0,
-                    one_per_round: bool = False, depths=None,
+                    canvas_rows: int = 0, runs=None,
                     answer_rows: float | None = None,
                     head_rows: int = 0) -> ClassifyCost:
     """Estimate expected classification work and its roofline time.
@@ -163,7 +186,8 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
     Args:
         head_tokens: Number of prompt tokens before each document.
         frame_tokens: Number of prompt tokens written after each document.
-        chains: Request lengths in tokens, shared by all documents.
+        chains: Request lengths in tokens, shared by all documents, in
+            one round.
         live: Expected number of documents to classify.
         lengths: Document lengths in tokens.
         shared: Shared document prefix lengths, or an empty sequence.
@@ -172,10 +196,9 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
         device: Device specification.
         resident: Whether document KV is already available.
         canvas_rows: Number of answer canvas rows.
-        one_per_round: Whether each request runs in a separate decoder round,
-            packed with the frame into the prefix's request in the first.
-        depths: Label lengths in rounds, with each label equally likely.
-            None runs every round for every document.
+        runs: For a greedy decode, the tokens each label feeds in each
+            of its rounds, with each label equally likely; it replaces
+            chains. A round reads one row.
         answer_rows: Rows the readout processes per document. None reads
             the canvas rows or every request token in one round, and one
             row per decode round.
@@ -187,38 +210,32 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
         ideal packing.
     """
     n = len(lengths)
-    if live <= 0 or n == 0 or not chains:
+    if live <= 0 or n == 0 or not (chains or runs):
         return ClassifyCost(0.0, 0.0, Work(), 0.0, 0)
     window = model.sliding_window
     prefix = np.asarray(lengths, dtype=float) + head_tokens
     shared = np.asarray(shared if len(shared) else np.zeros(n), dtype=float)
     # a borrowed prefix includes the prompt head the documents share
     shared = np.where(shared > 0, shared + head_tokens, 0.0)
-    rounds = len(chains) if one_per_round else 1
-    reach = np.ones(rounds)
-    if one_per_round and depths is not None:
-        reach = np.array([sum(depth > round_ for depth in depths) / len(depths)
-                          for round_ in range(rounds)])
-    first_tail = frame_tokens + (chains[0] if one_per_round else 0)
-    work = _first_work(prefix, shared, first_tail, resident, window)
-    context = prefix + first_tail
-    if one_per_round:
-        for round_ in range(1, rounds):
-            work += _stream_work(context, [chains[round_]], window,
-                                 canvas_rows) * float(reach[round_])
-            context = context + chains[round_]
+    if runs is not None:
+        work = Work()
+        suffix_tokens = rows = 0.0
+        for fed, count in Counter(tuple(fed) for fed in runs).items():
+            share = count / len(runs)
+            work += _rounds_work(prefix, shared, frame_tokens, fed, resident,
+                                 window, canvas_rows) * share
+            suffix_tokens += sum(fed) * share
+            rows += len(fed) * share
+        rounds = max(map(len, runs))
     else:
-        work += _stream_work(context, chains, window, canvas_rows)
-    scale = live / n
-    total = work * scale
-    if one_per_round:
-        suffix_tokens = float(np.dot(reach, chains))
-        rows = float(reach.sum())
-    else:
+        work = (_first_work(prefix, shared, frame_tokens, resident, window)
+                + _stream_work(prefix + frame_tokens, chains, window, canvas_rows))
         suffix_tokens = float(sum(chains))
         rows = float(canvas_rows or sum(chains))
+        rounds = 1
     if answer_rows is not None:
         rows = answer_rows
+    total = work * (live / n)
     passes = total.tokens / chunk
     seconds = _seconds(total, rows * live, passes, model, device, head_rows)
     return ClassifyCost(seconds, passes, total, suffix_tokens * live, rounds)
@@ -226,7 +243,8 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
 
 def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
              labels, *, lengths, shared, chunk: int,
-             model, device, resident: bool = False, draws: int = 1) -> ClassifyCost:
+             model, device, resident: bool = False, draws: int = 1,
+             starts=()) -> ClassifyCost:
     """Estimate the cost of one classification scoring rule.
 
     Args:
@@ -242,6 +260,7 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         device: Device specification.
         resident: Whether document KV is already available.
         draws: Maximum number of diffusion draws per document.
+        starts: Per label, which tokens begin a new word.
 
     Returns:
         Estimated execution time, work, and token counts.
@@ -251,7 +270,13 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
     """
     canvas = model.answer_canvas
     canvas_rows = canvas.rows if canvas is not None else 0
-    chains = suffix_lengths(scoring, labels, canvas_rows, draws)
+    chains = suffix_lengths(scoring, labels, canvas_rows, draws, starts)
+    runs = answer_rows = None
+    if scoring == DECODE_SCORING:
+        # a document stops decoding at the choice that decides its label
+        runs = decode_round_tokens(labels)
+    elif scoring == TREE_SCORING:
+        answer_rows = float(len(read_nodes(labels, starts)))
     # one-token labels are all read at the cue row from their target
     # rows of the head; longer labels normalize over the vocabulary
     targets = {token for ids in labels for token in ids}
@@ -262,7 +287,4 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         head_rows=len(targets) if all(len(ids) == 1 for ids in labels) else 0,
         canvas_rows=(canvas_rows if scoring == LETTERS_SCORING
                      else model.canvas_tokens),
-        one_per_round=scoring == DECODE_SCORING,
-        # a document stops decoding at its label's last token
-        depths=([len(ids) for ids in labels] if scoring == DECODE_SCORING
-                else None))
+        runs=runs, answer_rows=answer_rows)

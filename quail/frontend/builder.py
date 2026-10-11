@@ -585,6 +585,8 @@ class Query:
                 self._filters.setdefault(a, []).extend(preds)
             for a, tests in other._label_filters.items():
                 self._label_filters.setdefault(a, []).extend(tests)
+            for a, preds in other._regular_predicates.items():
+                self._regular_predicates.setdefault(a, []).extend(preds)
             for a, applies in other._applies.items():
                 self._applies.setdefault(a, []).extend(applies)
             for name, fn in other._functions.items():

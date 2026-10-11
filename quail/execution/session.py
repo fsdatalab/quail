@@ -262,7 +262,12 @@ class Session:
 
     @property
     def tokenizer(self):
-        """Return Gigatoken's encoder, loading it when first used."""
+        """Return Gigatoken's encoder, loading it when first used.
+
+        The encoder's ``decode`` attribute returns a token id list's text
+        as bytes; the planner uses it to find the word each label token
+        starts.
+        """
         if self._tok is None:
             from gigatoken import Tokenizer
 
@@ -274,6 +279,7 @@ class Session:
                     return tokens.tolist()
                 return [int(token) for token in tokens]
 
+            encode.decode = fast.decode
             self._tok = encode
         return self._tok
 
