@@ -541,13 +541,21 @@ class KVArena:
         self.evicted_pages = 0
         self.evicted_prefix_tokens = 0
         self.memory_trace = []
+        self.events = []
 
-    def sample_memory(self) -> None:
+    def log_event(self, kind: str, **detail) -> None:
+        """Record what the engine did, with the time it did it."""
+        import time
+
+        self.events.append((round(time.perf_counter(), 4), kind, detail))
+
+    def sample_memory(self, tokens: int = 0, groups: int = 0) -> None:
         """Append the arena's occupancy and the device's memory use.
 
         Called after each forward pass; the rows are
         (seconds, pages in use, retained pages, resident keys,
-        checkpoint slots in use, device MiB in use, torch MiB allocated).
+        checkpoint slots in use, device MiB in use, torch MiB allocated,
+        tokens in the chunk, groups in the chunk, keys evicted so far).
         """
         import time
 
@@ -563,7 +571,8 @@ class KVArena:
             len(accounting.owned),
             accounting.n_slots - len(accounting.free_slots),
             round((total - free) / 2**20, 1),
-            round(torch.cuda.memory_allocated() / 2**20, 1)))
+            round(torch.cuda.memory_allocated() / 2**20, 1),
+            tokens, groups, self.evicted_keys))
 
     # ---- the window --------------------------------------------------
 
@@ -784,6 +793,7 @@ class KVArena:
         """
         prefix_tokens = self.accounting.tokens[key]
         pages = self.free_key(key)
+        self.log_event("evict", pages=pages, tokens=prefix_tokens)
         self.evicted_keys += 1
         self.evicted_pages += pages
         self.evicted_prefix_tokens += prefix_tokens

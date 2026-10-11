@@ -744,6 +744,16 @@ class _StageExecutor:
             if self.arena.is_resident(self.keys[a]):
                 self.arena.free_key(self.keys[a])
 
+    def _log_memory_event(self, kind, **detail):
+        log = getattr(self.arena, "log_event", None)
+        if log is not None:
+            reason = detail.get("reason", "")
+            if reason:
+                detail["reason"] = ("slots" if "checkpoint slot" in reason
+                                    else "pages" if "pages" in reason
+                                    else "rows")
+            log(kind, **detail)
+
     def _run_part(self, part):
         """Run one chunk of groups, halving it when its pages do not fit."""
         from quail.backends.quail.executor.chunk import ArenaFullError
@@ -754,6 +764,7 @@ class _StageExecutor:
             # retained KV nothing here reads makes room first
             need = self.arena.page_cost(sum(self._entry_rows(*e) for e in part))
             if self.arena.evict_retained(need):
+                self._log_memory_event("evict_retry", groups=len(part))
                 logger.info("chunk of %d groups retried after evicting "
                             "retained KV", len(part))
                 self._run_part(part)
@@ -764,6 +775,7 @@ class _StageExecutor:
                     raise
                 # one group of partners asks more than a chunk holds
                 # once each carries its own copy of the document
+                self._log_memory_event("split_partners", groups=1, reason=str(error))
                 logger.info("group of %d partners split: %s",
                             end - start, error)
                 mid = (start + end) // 2
@@ -771,6 +783,7 @@ class _StageExecutor:
                 self._run_part([(a, j, start, mid, carried)])
                 self._run_part([(a, j, mid, end, False)])
                 return
+            self._log_memory_event("split", groups=len(part), reason=str(error))
             logger.info("chunk of %d groups split: %s", len(part), error)
             half = len(part) // 2
             self._run_part(part[:half])

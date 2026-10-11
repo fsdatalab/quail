@@ -28,7 +28,8 @@ def _forward(pipeline, arena, chunk):
         out = pipeline.forward_chunk(chunk)
         sample = getattr(arena, "sample_memory", None)
         if sample is not None:
-            sample()
+            sample(getattr(chunk, "tokens", 0),
+                   len(getattr(chunk, "layout", ())))
         return out
     finally:
         keys, chunk.temporary_keys = chunk.temporary_keys, ()
