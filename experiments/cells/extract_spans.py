@@ -1,60 +1,52 @@
-"""Span extraction by scoring document tokens, measured on SQuAD through vLLM.
+"""Span extraction by locating lines and scoring document tokens, through vLLM.
 
-Three ways to answer an extractive question with a decoder model, on
-the same prompt, with no training:
+One method, with two paths chosen by the document's own line count:
 
-- free: greedy generation, then the text is aligned to the document
-  (exact match first, then the longest common block); this is what a
-  stock vLLM baseline would do.
-- greedy copy: the LogitMatch rule, one decode step at a time; the
-  first token must come from the document, each later token is the
-  next document token or a closing quote, and the answer stops at the
-  first step where the quote beats the copy.
-- lines: the document is shown with its own non-empty lines numbered,
-  as `cat -n` would, and the model answers with a START-END line
-  range; the answer is the text of those lines. Recorded as text F1,
-  as whether the range contains the reference span, and as whether it
-  is exactly the reference's line range.
-- combined: the lines answer when the document has more than one
-  line, the scored answer when it is one line. No extra passes; it is
-  scored from the two above.
-- scored: the top-k start tokens are read in one step; after each
+- A document of at most 2 lines is answered by scoring. The top-k
+  start tokens are read at the open quote in one step; after each
   candidate start the next CHUNK document tokens are fed in one pass,
   and every (start, end) span is scored as the product of its copy
   probabilities and its stop probability (exact-extract). A start
   whose copy product is still above the best span found gets another
   CHUNK tokens, up to MAX_PASSES passes; the best span wins.
+- A document of 3 or more lines is answered by locating, then
+  scoring. The document is shown with its non-empty lines numbered,
+  as `cat -n` would; the cue "The answer is in lines " has the model
+  write a range a-b; the prompt continues with ', and begins "', and
+  the start step above runs with the tokens of lines a to b as the
+  only allowed starts, the first token of line a always among them.
+  From each start the tokens up to the start of line b are fed in one
+  pass, since they are inside the answer, and from there the chunked
+  scoring above finds the end. A range the model does not write as
+  numbers falls back to the scoring path on the plain document.
 
-Every method sees one model and one prompt per question, through
-vLLM's public API on the checkpoint Quail runs. The copy probabilities
-are vLLM's prompt logprobs of the document tokens fed after the start;
-the stop probability at each position is the prompt logprob of one
-closing-quote token appended there, so a merged token such as `".` is
-not counted as a stop. The scored method is recorded under the
-model's full-vocabulary probabilities and under probabilities
-renormalized over copy and stop.
+Every question goes through vLLM's public API on the checkpoint Quail
+runs. The copy probabilities are vLLM's prompt logprobs of the fed
+tokens; the stop probability at each scored position is the prompt
+logprob of one closing-quote token appended there, so a merged token
+such as `".` is not counted as a stop. The first token may be written
+without its leading space, in another case, or as a prefix of the
+document's token; the rest of the word is then fed as the document
+writes it.
 
-Prediction (Qwen3 4B fp8, 300 questions): scored with k=8 lands
-within 2 F1 points of free generation; the gold start token is among
-the 8 candidates for at least 70% of questions; the bound closes at
-the gold end for half the questions; with 16-token chunks, at least
-85% of questions finish in one end pass. The lines baseline contains
-the reference span for at least 75% of questions and matches its line
-range exactly for at least 60%, with text F1 near 20 to 25.
+The record keeps, per question, the path taken, the line range and
+whether it contains the reference, the rank of the reference's start
+among the candidates, the end passes, and the SQuAD exact match and
+F1 of the answer; for the locating path also the F1 of lines a to b
+as they are, for comparison.
+
+Prediction (Qwen3 4B fp8, 300 questions each): on SQuAD every
+paragraph is one line, so the scoring path runs alone and repeats its
+82.2 F1 (/results/extract_spans/20261011T001712Z_qwen3-4b-fp8_squad.json).
+On CUAD, in 2,500-character contract windows, the locating path runs
+for at least 270 questions; its F1 is at least 50, above the 44.6 of
+answering with the whole lines; the reference's start is among the
+candidates for at least 70% of the questions whose range contains it;
+the end takes at most 2 chunk passes on average.
 
     uv run modal run --detach -m experiments.cells.extract_spans \
-        --model qwen3-4b-fp8 --dataset squad \
-        2>&1 | tee /tmp/extract_spans_qwen3_4b_fp8_squad.log
-
-The datasets are SQuAD (short answers in paragraphs) and CUAD (contract
-clauses, 31 words at the median, in a 2,500-character window of the
-contract around the first reference). Every setting and the prompt are
-the same on both. Prediction for CUAD on Qwen3 4B fp8: free generation
-and scored both land under 50 F1, within 5 points of each other; the
-gold start is among the 8 candidates for at least 60% of questions;
-about a third of the references are longer than the 48 fed tokens; the
-lines baseline contains the reference for at least 60% of questions
-but matches its line range exactly for under 40%.
+        --model qwen3-4b-fp8 --dataset cuad \
+        2>&1 | tee /tmp/extract_spans_qwen3_4b_fp8_cuad.log
 
 The per-question records and the summary are written to
 /results/extract_spans/<run>_<model>_<dataset>.json on the
@@ -98,7 +90,8 @@ MAX_STARTS = 8      # candidate start positions kept after expansion
 CUE_LOGPROBS = 1024    # vocabulary entries read at the cue
 CHUNK = 16          # document tokens fed per end pass
 MAX_PASSES = 8      # end passes a question may take: a runaway guard
-FREE_MAX_TOKENS = 48
+LOCATE_MIN_LINES = 3    # documents with fewer lines are scored directly
+LINE_MAX_TOKENS = 8
 TOP_K = (1, 4, 8)
 
 BODY_TEMPLATE = ("DOCUMENT:\n{0}\n\nAnswer the question with the shortest exact "
@@ -109,20 +102,16 @@ RAW_PROMPT_TEMPLATE = "{0}\nANSWER: \""
 CHAT_TURN_TEMPLATE = ("<|im_start|>user\n{0}<|im_end|>\n<|im_start|>assistant\n"
                       "<think>\n\n</think>\n\n")
 CHAT_PROMPT_TEMPLATE = CHAT_TURN_TEMPLATE + '"'
-# the lines baseline: the document is shown as numbered lines of at
-# the document's own non-empty lines, and the model answers with line
-# numbers; a document that is one line is answered by the scored
-# method instead (the "combined" method)
-LINE_MAX_TOKENS = 8
 LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\nAnswer the question with "
                       "the line numbers of the fewest lines that contain the "
                       "answer, as START-END, for example 3-3 or 5-6. If the "
                       "document does not answer it, answer none.\nQuestion: {1}")
 # the answer is begun for the model, as the open quote begins the
-# other methods' answers, so it writes the range and nothing else
+# scoring path's answer, so it writes the range and nothing else
 LINE_CUE = "The answer is in lines "
 RAW_LINE_TEMPLATE = "{0}\nANSWER: " + LINE_CUE
 CHAT_LINE_TEMPLATE = CHAT_TURN_TEMPLATE + LINE_CUE
+BEGINS_CUE = ', and begins "'
 
 
 def _squad_questions(n: int) -> list[dict]:
@@ -215,25 +204,6 @@ def _f1(prediction: str, answers: list[str]) -> tuple[float, float]:
     return best_em, best_f1
 
 
-def _align(text: str, context: str) -> tuple[str, str]:
-    """Map generated text onto the context: the method and the span text."""
-    import difflib
-
-    text = text.strip()
-    if not text:
-        return "empty", ""
-    if text in context:
-        return "exact", text
-    lowered = context.lower().find(text.lower())
-    if lowered >= 0:
-        return "case", context[lowered:lowered + len(text)]
-    match = difflib.SequenceMatcher(None, context, text).find_longest_match(
-        0, len(context), 0, len(text))
-    if match.size >= len(text) / 2:
-        return "fuzzy", context[match.a:match.a + match.size]
-    return "none", text
-
-
 def _lines(context: str) -> list[tuple[int, int]]:
     """Character ranges of the context's non-empty lines, as `cat -n` numbers them.
 
@@ -321,17 +291,51 @@ class Scorer:
             if key:
                 self.variants.setdefault(key, []).append(i)
 
+    def _doc_tokens(self, text: str, pieces: list[tuple[int, int, int]]) -> tuple:
+        """Token ids of a prompt, and its document tokens with context offsets.
+
+        Args:
+            text: The prompt text.
+            pieces: (offset in text, offset in context, length) of each
+                stretch of document text the prompt shows verbatim.
+
+        Returns:
+            The token ids, and (token index, (context start, context end))
+            for each token lying inside one of the pieces.
+        """
+        enc = self.tok(text, return_offsets_mapping=True, add_special_tokens=False)
+        doc = []
+        for i, (a, b) in enumerate(enc["offset_mapping"]):
+            for off, ctx, length in pieces:
+                if off <= a and b <= off + length and b > a:
+                    doc.append((i, (ctx + a - off, ctx + b - off)))
+                    break
+        return enc["input_ids"], doc
+
     def prompt(self, context: str, question: str) -> tuple[list[int], list]:
-        """Token ids and the document's (token index, char offsets)."""
+        """The scoring path's prompt: token ids and the document tokens."""
         body = BODY_TEMPLATE.format(context, question)
         text = (CHAT_PROMPT_TEMPLATE if self.chat else RAW_PROMPT_TEMPLATE).format(body)
-        enc = self.tok(text, return_offsets_mapping=True, add_special_tokens=False)
-        start = text.index(context)
-        end = start + len(context)
-        doc = [(i, (a - start, b - start))
-               for i, (a, b) in enumerate(enc["offset_mapping"])
-               if a < end and b > start]
-        return enc["input_ids"], doc
+        return self._doc_tokens(text, [(text.index(context), 0, len(context))])
+
+    def line_prompt(self, context: str, question: str) -> tuple[str, list]:
+        """The locating path's prompt text and its lines' pieces.
+
+        Returns:
+            The text, and (offset in text, offset in context, length) of
+            each line's text in it.
+        """
+        lines = _lines(context)
+        numbered, pieces, at = [], [], 0
+        for i, (a, b) in enumerate(lines):
+            head = f"{i + 1}: "
+            pieces.append((at + len(head), a, b - a))
+            numbered.append(head + context[a:b])
+            at += len(head) + (b - a) + 1
+        body = LINE_BODY_TEMPLATE.format("\n".join(numbered), question)
+        text = (CHAT_LINE_TEMPLATE if self.chat else RAW_LINE_TEMPLATE).format(body)
+        shift = text.index(numbered[0])
+        return text, [(off + shift, ctx, length) for off, ctx, length in pieces]
 
     def _run(self, sequences: list[list[int]], **params) -> list:
         from vllm import SamplingParams
@@ -341,20 +345,11 @@ class Scorer:
             [TokensPrompt(prompt_token_ids=s) for s in sequences],
             SamplingParams(temperature=0.0, **params), use_tqdm=False)
 
-    def free(self, prompts: list[list[int]], max_tokens: int = FREE_MAX_TOKENS,
-             stop=('"', "\n")) -> list[str]:
+    def generate(self, prompts: list[list[int]], max_tokens: int,
+                 stop=("\n",)) -> list[str]:
         """Greedy text after each prompt, cut at a stop string."""
         outputs = self._run(prompts, max_tokens=max_tokens, stop=list(stop))
         return [o.outputs[0].text for o in outputs]
-
-    def line_prompt(self, context: str, question: str) -> list[int]:
-        """Token ids of the lines-baseline prompt for one question."""
-        lines = _lines(context)
-        numbered = "\n".join(f"{i + 1}: {context[a:b]}"
-                             for i, (a, b) in enumerate(lines))
-        body = LINE_BODY_TEMPLATE.format(numbered, question)
-        text = (CHAT_LINE_TEMPLATE if self.chat else RAW_LINE_TEMPLATE).format(body)
-        return self.tok.encode(text, add_special_tokens=False)
 
     def cues(self, sequences: list[list[int]]) -> list[dict]:
         """Logprobs of the CUE_LOGPROBS likeliest next tokens, per sequence."""
@@ -399,74 +394,109 @@ def _best_start(scorer, lp, key, token) -> tuple[int, list[int]]:
     return first, rest
 
 
-def _candidates(scorer, prompt_ids, lp, doc_ids
+def _candidates(scorer, prompt_ids, lp, ids, doc, region=None
                 ) -> tuple[list[dict], float, float, int]:
     """Start candidates, the none and best logprobs, and the rounds taken.
 
-    Every document token is scored as the best of the tokens that can
-    begin it (`_best_start`). A start token that occurs at several
-    positions gets one more step: the logprob of each position's next
-    token after it, so the positions are told apart as a trie walk
-    would. Positions rank by start logprob plus that step. The rounds
+    Every document token in the region is scored as the best of the
+    tokens that can begin it (`_best_start`). A start token that occurs
+    at several positions gets one more step: the logprob of each
+    position's next token after it, so the positions are told apart as
+    a trie walk would. Positions rank by start logprob plus that step.
+    With a region, its first token is always a candidate. The rounds
     are 1, or 2 when any start token was ambiguous.
+
+    Args:
+        scorer: The model.
+        prompt_ids: The prompt the cue row ends.
+        lp: The cue row's logprobs.
+        ids: The prompt's token ids.
+        doc: The prompt's document tokens, (index, (context start, end)).
+        region: Context character range the start must lie in, or None.
     """
+    inside = [(i, span) for i, span in doc
+              if region is None or region[0] <= span[0] < region[1]]
     groups = {}
-    for pos, token in enumerate(doc_ids):
-        key = _same_word(scorer.vocab[token]) or token
-        groups.setdefault(key, []).append(pos)
+    for i, span in inside:
+        key = _same_word(scorer.vocab[ids[i]]) or ids[i]
+        groups.setdefault(key, []).append((i, span))
     best, filler = {}, {}
-    for key, positions in groups.items():
-        best[key], filler[key] = _best_start(scorer, lp, key, doc_ids[positions[0]])
+    for key, occurrences in groups.items():
+        best[key], filler[key] = _best_start(scorer, lp, key, ids[occurrences[0][0]])
     ranked = sorted(groups, key=lambda k: -float(lp[best[k]]))[:TOP_TOKENS]
     ambiguous = [key for key in ranked if len(groups[key]) > 1]
     follow = dict(zip(ambiguous, scorer.cues(
         [prompt_ids + [best[key]] for key in ambiguous]))) if ambiguous else {}
-    scored = []
-    for key in ranked:
-        for pos in groups[key]:
-            score = float(lp[best[key]])
-            if key in follow:
-                after = (filler[key] + doc_ids[pos + 1:pos + 2] + [scorer.quote_id])[0]
-                score += float(follow[key][after])
-            scored.append({"pos": pos, "first": best[key], "score": score,
-                           "filler": filler[key]})
-    scored.sort(key=lambda c: -c["score"])
-    return (scored[:MAX_STARTS], float(lp[scorer.none_id]),
-            float(lp[best[ranked[0]]]), 2 if ambiguous else 1)
+
+    def candidate(key, i, span):
+        score = float(lp[best[key]])
+        if key in follow:
+            after = (filler[key] + ids[i + 1:i + 2] + [scorer.quote_id])[0]
+            score += float(follow[key][after])
+        return {"char": span[0], "end": span[1], "first": best[key],
+                "score": score, "filler": filler[key]}
+
+    scored = sorted((candidate(key, i, span) for key in ranked
+                     for i, span in groups[key]), key=lambda c: -c["score"])
+    scored = scored[:MAX_STARTS]
+    if inside and all(c["char"] != inside[0][1][0] for c in scored):
+        i, span = inside[0]
+        key = _same_word(scorer.vocab[ids[i]]) or ids[i]
+        if key not in best:
+            best[key], filler[key] = _best_start(scorer, lp, key, ids[i])
+        scored.append(candidate(key, i, span))
+    return (scored, float(lp[scorer.none_id]),
+            float(lp[best[ranked[0]]]) if ranked else float("-inf"),
+            2 if ambiguous else 1)
 
 
-def _spans(scorer, prompt_ids, doc_ids, candidates) -> tuple[list[dict], int]:
+def _spans(scorer, prompt_ids, context, candidates, skip_to=None
+           ) -> tuple[list[dict], int]:
     """Per candidate: start, copy and stop logprobs along the fed tokens.
 
-    Each pass feeds the next CHUNK tokens of every open candidate. One
-    teacher-forced sequence per candidate gives the start and copy
-    logprobs; one more per fed position, ending in the closing quote,
-    gives the stop logprob there. A candidate stays open while its
-    copy product is at least the best span score so far, it has
-    document left, and fewer than MAX_PASSES passes have run.
+    The first pass feeds, for every candidate, the document up to the
+    character `skip_to` (the start of the range's last line, when the
+    range has more than one line) and then CHUNK tokens more; later
+    passes feed CHUNK tokens to each open candidate. Ends are scored
+    only from `skip_to` on. One teacher-forced sequence per candidate
+    gives the start and copy logprobs; one more per scored position,
+    ending in the closing quote, gives the stop logprob there. A
+    candidate stays open while its copy product is at least the best
+    span score so far, it has document left, and fewer than MAX_PASSES
+    passes have run.
 
     Returns:
         The candidates' branches and the number of passes.
     """
     n = len(prompt_ids)
-    branches = [{"pos": c["pos"], "first": c["first"], "start": None,
-                 "copy": [], "stop": [], "fed": 0, "extra": len(c["filler"]),
-                 "stream": [c["first"], *c["filler"], *doc_ids[c["pos"] + 1:]]}
-                for c in candidates]
+    branches = []
+    for c in candidates:
+        rest = scorer.tok(context[c["end"]:], return_offsets_mapping=True,
+                          add_special_tokens=False)
+        stream = [c["first"], *c["filler"], *rest["input_ids"]]
+        ends = ([c["end"]] * (1 + len(c["filler"]))
+                + [c["end"] + b for _, b in rest["offset_mapping"]])
+        skip = sum(e <= skip_to for e in ends) if skip_to else 0
+        branches.append({"char": c["char"], "first": c["first"], "start": None,
+                         "copy": [], "stop": [], "fed": 0, "ends": ends,
+                         "stream": stream, "skip": min(skip, len(stream))})
     open_branches = list(range(len(branches)))
     passes = 0
     while open_branches and passes < MAX_PASSES:
         passes += 1
-        news = {i: branches[i]["stream"][branches[i]["fed"]:branches[i]["fed"] + CHUNK]
-                for i in open_branches}
+        news = {}
+        for i in open_branches:
+            b = branches[i]
+            take = (b["skip"] if passes == 1 else 0) + CHUNK
+            news[i] = b["stream"][b["fed"]:b["fed"] + take]
         copies = scorer.teacher_forced([
             prompt_ids + branches[i]["stream"][:branches[i]["fed"] + len(news[i]) + 1]
             for i in open_branches])
-        stops = scorer.teacher_forced([
+        scored_rows = [(i, j) for i in open_branches for j in range(len(news[i]))
+                       if branches[i]["fed"] + j >= branches[i]["skip"]]
+        stops = dict(zip(scored_rows, scorer.teacher_forced([
             prompt_ids + branches[i]["stream"][:branches[i]["fed"] + j + 1]
-            + [scorer.quote_id]
-            for i in open_branches for j in range(len(news[i]))])
-        at = 0
+            + [scorer.quote_id] for i, j in scored_rows]))) if scored_rows else {}
         for i, lp in zip(open_branches, copies):
             b = branches[i]
             if b["start"] is None:
@@ -474,10 +504,10 @@ def _spans(scorer, prompt_ids, doc_ids, candidates) -> tuple[list[dict], int]:
             for j in range(len(news[i])):
                 row = n + b["fed"] + j + 1
                 b["copy"].append(lp[row] if row < len(lp) else float("-inf"))
-                b["stop"].append(stops[at + j][-1])
-            at += len(news[i])
+                b["stop"].append(stops[(i, j)][-1] if (i, j) in stops
+                                 else float("-inf"))
             b["fed"] += len(news[i])
-        best = max(max(_scores(b, False)) for b in branches if b["fed"])
+        best = max(max(_scores(b)) for b in branches if b["fed"])
         open_branches = [
             i for i in open_branches
             if branches[i]["fed"] < len(branches[i]["stream"])
@@ -487,18 +517,10 @@ def _spans(scorer, prompt_ids, doc_ids, candidates) -> tuple[list[dict], int]:
     return branches, passes
 
 
-def _scores(branch, renormalized: bool) -> list[float]:
+def _scores(branch) -> list[float]:
     """Score of the span ending after each fed token."""
-    import math
-
-    copy, stop = branch["copy"], branch["stop"]
-    if renormalized:
-        both = [math.log(math.exp(c) + math.exp(s)) if c > -math.inf else s
-                for c, s in zip(copy, stop)]
-        copy = [c - b for c, b in zip(copy, both)]
-        stop = [s - b for s, b in zip(stop, both)]
     total, out = branch["start"], []
-    for c, s in zip(copy, stop):
+    for c, s in zip(branch["copy"], branch["stop"]):
         out.append(total + s)
         total += c
     return out
@@ -506,7 +528,7 @@ def _scores(branch, renormalized: bool) -> list[float]:
 
 def _close_at(branch, best_other: float) -> int:
     """Tokens fed after the start before no longer span can win."""
-    scores = _scores(branch, False)
+    scores = _scores(branch)
     total, best = branch["start"], best_other
     for i, c in enumerate(branch["copy"]):
         best = max(best, scores[i])
@@ -516,149 +538,135 @@ def _close_at(branch, best_other: float) -> int:
     return branch["fed"]
 
 
+def _answer(context, branches, k) -> str:
+    """The best span over the first k branches."""
+    best = max(((s, b, j) for b in branches[:k] for j, s in enumerate(_scores(b))),
+               key=lambda t: t[0])
+    _, b, j = best
+    return context[b["char"]:b["ends"][j]].strip()
+
+
 @app.function(image=image, gpu="H100!", memory=65536, timeout=7200,
               volumes=VOLUMES)
 def measure(model: str, dataset: str, n: int, run: str) -> dict:
-    """Score every question four ways and summarize."""
+    """Answer every question and summarize."""
     import os
     import statistics
 
     scorer = Scorer(model)
     questions = _questions(dataset, n)
-    prompts = [scorer.prompt(q["context"], q["question"]) for q in questions]
     t0 = time.perf_counter()
-    free_texts = scorer.free([ids for ids, _ in prompts])
-    line_prompts = [scorer.line_prompt(q["context"], q["question"])
-                    for q in questions]
-    line_texts = scorer.free(line_prompts, LINE_MAX_TOKENS, ("\n",))
+    located = [i for i, q in enumerate(questions)
+               if len(_lines(q["context"])) >= LOCATE_MIN_LINES]
+    line_texts = {}
+    if located:
+        prompts = {i: scorer.line_prompt(questions[i]["context"],
+                                         questions[i]["question"]) for i in located}
+        answers = scorer.generate(
+            [scorer.tok.encode(prompts[i][0], add_special_tokens=False)
+             for i in located], LINE_MAX_TOKENS)
+        line_texts = dict(zip(located, answers))
     items = []
-    for q, (prompt_ids, doc), text, line_ids, line_text in zip(
-            questions, prompts, free_texts, line_prompts, line_texts):
-        doc_ids = [prompt_ids[i] for i, _ in doc]
-        offsets = [span for _, span in doc]
+    for qi, q in enumerate(questions):
+        context = q["context"]
+        lines = _lines(context)
         gold_lo = q["answer_start"]
         gold_hi = gold_lo + len(q["answers"][0])
-        gold = [p for p, (a, b) in enumerate(offsets) if a < gold_hi and b > gold_lo]
-        gold_start, gold_end = (gold[0], gold[-1]) if gold else (-1, -1)
-
-        how, aligned = _align(text, q["context"])
-        rec = {"id": q["id"], "answers": q["answers"], "prompt_tokens": len(prompt_ids),
-               "doc_tokens": len(doc_ids), "gold_start": gold_start,
-               "gold_len": gold_end - gold_start + 1,
-               "gold_token": scorer.vocab[doc_ids[gold_start]] if gold else "",
-               "free": {"text": text, "aligned": aligned, "how": how,
-                        "em_f1": _f1(aligned, q["answers"])}}
-        lines = _lines(q["context"])
-        gold_lines = [i + 1 for i, (a, b) in enumerate(lines)
-                      if a < gold_hi and b > gold_lo]
-        gold_range = (gold_lines[0], gold_lines[-1]) if gold_lines else None
-        chosen = _parse_lines(line_text, len(lines))
-        line_answer = (q["context"][lines[chosen[0] - 1][0]:lines[chosen[1] - 1][1]]
-                       if chosen else "")
-        rec["lines"] = {
-            "text": line_text, "range": chosen, "gold_range": gold_range,
-            "prompt_tokens": len(line_ids), "parsed": chosen is not None,
-            "contains": bool(chosen and gold_range
-                             and chosen[0] <= gold_range[0]
-                             and gold_range[1] <= chosen[1]),
-            "exact": chosen is not None and chosen == gold_range,
-            "em_f1": _f1(line_answer, q["answers"])}
-        rec["structured"] = len(lines) > 1
-
-        (lp,) = scorer.cues([prompt_ids])
+        rec = {"id": q["id"], "answers": q["answers"], "lines": len(lines),
+               "gold_chars": [gold_lo, gold_hi], "path": "scored"}
+        region = skip_to = None
+        if qi in line_texts:
+            text, pieces = prompts[qi]
+            chosen = _parse_lines(line_texts[qi], len(lines))
+            gold_lines = [i + 1 for i, (a, b) in enumerate(lines)
+                          if a < gold_hi and b > gold_lo]
+            rec["range"] = chosen
+            rec["range_text"] = line_texts[qi]
+            rec["gold_range"] = (gold_lines[0], gold_lines[-1]) if gold_lines else None
+            if chosen:
+                a, b = chosen
+                region = (lines[a - 1][0], lines[b - 1][1])
+                skip_to = lines[b - 1][0] if b > a else None
+                rec["path"] = "located"
+                rec["contains"] = bool(gold_lines and a <= gold_lines[0]
+                                       and gold_lines[-1] <= b)
+                rec["whole_lines_em_f1"] = _f1(context[region[0]:region[1]],
+                                               q["answers"])
+                ids, doc = scorer._doc_tokens(text + f"{a}-{b}" + BEGINS_CUE, pieces)
+            else:
+                rec["path"] = "fallback"
+        if region is None:
+            ids, doc = scorer.prompt(context, q["question"])
+        rec["prompt_tokens"] = len(ids)
+        (lp,) = scorer.cues([ids])
         candidates, none_lp, best_lp, rounds = _candidates(
-            scorer, prompt_ids, lp, doc_ids)
+            scorer, ids, lp, ids, doc, region)
         rec["none_wins"] = none_lp > best_lp
         rec["start_rounds"] = rounds
         rec["gold_rank"] = next((i for i, c in enumerate(candidates)
-                                 if c["pos"] == gold_start), -1)
-        rec["cue_top"] = [(scorer.vocab[t], round(v, 2)) for t, v in
-                          sorted(lp.items(), key=lambda kv: -kv[1])[:TOP_TOKENS]]
-        rec["candidates"] = [(c["pos"], scorer.vocab[c["first"]],
+                                 if c["char"] == gold_lo), -1)
+        rec["candidates"] = [(c["char"], scorer.vocab[c["first"]],
                               round(c["score"], 2), len(c["filler"]))
                              for c in candidates]
-        branches, passes = _spans(scorer, prompt_ids, doc_ids, candidates)
-
-        def span_text(branch, j):
-            """The document text of the span ending after fed token j."""
-            end = branch["pos"] + max(0, j - branch["extra"])
-            return q["context"][offsets[branch["pos"]][0]:offsets[end][1]].strip()
-
-        greedy = branches[0]
-        j = next((i for i, (c, s) in enumerate(zip(greedy["copy"], greedy["stop"]))
-                  if s > c), greedy["fed"] - 1)
-        rec["greedy"] = {"text": span_text(greedy, j),
-                         "rounds": j + 2}
-        rec["greedy"]["em_f1"] = _f1(rec["greedy"]["text"], q["answers"])
-        rec["scored"] = {}
-        for renormalized in (False, True):
-            for k in TOP_K:
-                best = max(((s, b, j) for b in branches[:k]
-                            for j, s in enumerate(_scores(b, renormalized))),
-                           key=lambda t: t[0])
-                answer = span_text(best[1], best[2])
-                rec["scored"][f"{'renorm' if renormalized else 'full'}_k{k}"] = {
-                    "text": answer, "em_f1": _f1(answer, q["answers"])}
+        branches, passes = _spans(scorer, ids, context, candidates, skip_to)
         rec["passes"] = passes
-        # the combined method: the lines answer when the document has
-        # its own lines, the scored answer when it is one line
-        rec["combined"] = (rec["lines"]["em_f1"] if rec["structured"]
-                           else rec["scored"]["full_k8"]["em_f1"])
+        rec["fed_tokens"] = sum(b["fed"] for b in branches)
+        rec["scored"] = {}
+        for k in TOP_K:
+            answer = _answer(context, branches, k)
+            rec["scored"][f"k{k}"] = {"text": answer,
+                                      "em_f1": _f1(answer, q["answers"])}
         if rec["gold_rank"] >= 0:
             branch = branches[rec["gold_rank"]]
-            others = [max(_scores(b, False)) for i, b in enumerate(branches)
+            others = [max(_scores(b)) for i, b in enumerate(branches)
                       if i != rec["gold_rank"]]
             close = _close_at(branch, max(others) if others else float("-inf"))
-            rec["past_gold_end"] = close - rec["gold_len"] - branch["extra"]
+            gold_tokens = sum(e <= gold_hi for e in branch["ends"])
+            rec["past_gold_end"] = close - gold_tokens
         items.append(rec)
     seconds = time.perf_counter() - t0
 
     def mean(values):
+        values = list(values)
         return statistics.fmean(values) if values else None
 
-    def em_f1(select):
-        pairs = [select(r) for r in items]
-        return {"em": 100 * mean([p[0] for p in pairs]),
-                "f1": 100 * mean([p[1] for p in pairs])}
+    def em_f1(rows, select):
+        pairs = [select(r) for r in rows]
+        return ({"em": 100 * mean(p[0] for p in pairs),
+                 "f1": 100 * mean(p[1] for p in pairs)} if pairs else None)
 
+    by_path = {path: [r for r in items if r["path"] == path]
+               for path in ("scored", "located", "fallback")}
     past = [r["past_gold_end"] for r in items if "past_gold_end" in r]
     summary = {
         "run": run, "model": model, "spec": MODELS[model]["spec"],
         "dataset": dataset, "n": len(items), "seconds": seconds, "chunk": CHUNK,
         "max_passes": MAX_PASSES, "top_tokens": TOP_TOKENS,
-        "max_starts": MAX_STARTS,
-        "answer_words_mean": mean([len(q["answers"][0].split()) for q in questions]),
-        "answer_tokens_mean": mean([r["gold_len"] for r in items]),
-        "answers_longer_than_cap": sum(r["gold_len"] > CHUNK * MAX_PASSES
-                                       for r in items),
-        "prompt_tokens_mean": mean([r["prompt_tokens"] for r in items]),
-        "doc_tokens_mean": mean([r["doc_tokens"] for r in items]),
-        "free": em_f1(lambda r: r["free"]["em_f1"]),
-        "free_alignment": {how: sum(r["free"]["how"] == how for r in items)
-                           for how in ("exact", "case", "fuzzy", "none", "empty")},
-        "lines": em_f1(lambda r: r["lines"]["em_f1"]),
-        "combined": em_f1(lambda r: r["combined"]),
-        "combined_used_lines": sum(r["structured"] for r in items),
-        "lines_contains_gold": mean([r["lines"]["contains"] for r in items]),
-        "lines_exact_range": mean([r["lines"]["exact"] for r in items]),
-        "lines_unparsed": sum(not r["lines"]["parsed"] for r in items),
-        "lines_prompt_tokens_mean": mean([r["lines"]["prompt_tokens"] for r in items]),
-        "lines_per_document_mean": mean([len(_lines(q["context"]))
-                                         for q in questions]),
-        "greedy": em_f1(lambda r: r["greedy"]["em_f1"]),
-        "greedy_rounds_mean": mean([r["greedy"]["rounds"] for r in items]),
-        "scored": {key: em_f1(lambda r, key=key: r["scored"][key]["em_f1"])
-                   for key in items[0]["scored"]},
-        "start_recall": {str(k): mean([0 <= r["gold_rank"] < k for r in items])
+        "max_starts": MAX_STARTS, "locate_min_lines": LOCATE_MIN_LINES,
+        "answer_words_mean": mean(len(q["answers"][0].split()) for q in questions),
+        "lines_per_document_mean": mean(r["lines"] for r in items),
+        "prompt_tokens_mean": mean(r["prompt_tokens"] for r in items),
+        "paths": {path: len(rows) for path, rows in by_path.items()},
+        "answer": {f"k{k}": em_f1(items, lambda r, k=k: r["scored"][f"k{k}"]["em_f1"])
+                   for k in TOP_K},
+        "answer_by_path": {path: em_f1(rows, lambda r: r["scored"]["k8"]["em_f1"])
+                           for path, rows in by_path.items()},
+        "whole_lines": em_f1(by_path["located"], lambda r: r["whole_lines_em_f1"]),
+        "range_contains_gold": mean(r["contains"] for r in by_path["located"]),
+        "start_recall": {str(k): mean(0 <= r["gold_rank"] < k for r in items)
                          for k in TOP_K},
+        "start_recall_when_contained": mean(
+            r["gold_rank"] >= 0 for r in by_path["located"] if r["contains"]),
+        "start_rounds_mean": mean(r["start_rounds"] for r in items),
         "none_wins": sum(r["none_wins"] for r in items),
         "past_gold_end": {"n": len(past), "mean": mean(past),
                           "median": statistics.median(past) if past else None,
                           "p95": (sorted(past)[int(0.95 * len(past)) - 1]
                                   if past else None)},
-        "one_pass_share": mean([r["passes"] == 1 for r in items]),
-        "passes_mean": mean([r["passes"] for r in items]),
+        "passes_mean": mean(r["passes"] for r in items),
+        "one_pass_share": mean(r["passes"] == 1 for r in items),
         "passes_hit_cap": sum(r["passes"] == MAX_PASSES for r in items),
+        "fed_tokens_mean": mean(r["fed_tokens"] for r in items),
     }
     path = f"/results/extract_spans/{run}_{model}_{dataset}.json"
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -669,7 +677,7 @@ def measure(model: str, dataset: str, n: int, run: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(model: str = "qwen3-4b-fp8", dataset: str = "squad", n: int = N_ITEMS):
+def main(model: str = "qwen3-4b-fp8", dataset: str = "cuad", n: int = N_ITEMS):
     """Measure one model on one dataset.
 
     Args:
