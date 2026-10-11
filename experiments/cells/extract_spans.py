@@ -301,14 +301,17 @@ class Scorer:
 
         Returns:
             The token ids, and (token index, (context start, context end))
-            for each token lying inside one of the pieces.
+            for each token overlapping one of the pieces, clipped to it:
+            a line's first token carries the space after its number,
+            and its last may carry the line break.
         """
         enc = self.tok(text, return_offsets_mapping=True, add_special_tokens=False)
         doc = []
         for i, (a, b) in enumerate(enc["offset_mapping"]):
             for off, ctx, length in pieces:
-                if off <= a and b <= off + length and b > a:
-                    doc.append((i, (ctx + a - off, ctx + b - off)))
+                lo, hi = max(a, off), min(b, off + length)
+                if hi > lo:
+                    doc.append((i, (ctx + lo - off, ctx + hi - off)))
                     break
         return enc["input_ids"], doc
 
@@ -539,10 +542,11 @@ def _close_at(branch, best_other: float) -> int:
 
 
 def _answer(context, branches, k) -> str:
-    """The best span over the first k branches."""
-    best = max(((s, b, j) for b in branches[:k] for j, s in enumerate(_scores(b))),
-               key=lambda t: t[0])
-    _, b, j = best
+    """The best span over the first k branches, or "" when none was fed."""
+    spans = [(s, b, j) for b in branches[:k] for j, s in enumerate(_scores(b))]
+    if not spans:
+        return ""
+    _, b, j = max(spans, key=lambda t: t[0])
     return context[b["char"]:b["ends"][j]].strip()
 
 
@@ -595,6 +599,10 @@ def measure(model: str, dataset: str, n: int, run: str) -> dict:
                 ids, doc = scorer._doc_tokens(text + f"{a}-{b}" + BEGINS_CUE, pieces)
             else:
                 rec["path"] = "fallback"
+        if region is not None and not any(region[0] <= span[0] < region[1]
+                                          for _, span in doc):
+            region = skip_to = None    # the range maps to no tokens
+            rec["path"] = "fallback"
         if region is None:
             ids, doc = scorer.prompt(context, q["question"])
         rec["prompt_tokens"] = len(ids)
