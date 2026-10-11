@@ -172,4 +172,4 @@ def test_lfm2_prices_its_short_convolution_projections():
 def test_a_model_without_short_convolutions_prices_none():
     from quail.cost.dense_decoder_cost import short_conv_projection_params
 
-    assert short_conv_projection_params(QWEN3_5_4B_BF16) == 0
+    assert short_conv_projection_params(QWEN3_5_27B_FP8) == 0
