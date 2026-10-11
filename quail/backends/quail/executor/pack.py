@@ -424,11 +424,20 @@ class JoinAdmission:
             return "finished" if j + 1 == k else "dropped"
 
     def _partner_list(self, a, j, lst):
-        """Return partner indices and cumulative request token counts for a stage."""
+        """Return partner indices and cumulative request token counts for a stage.
+
+        A list carrying its own lengths (OwnRequests) prices those in
+        place of the stage's shared list.
+        """
         if lst is None:
             return None, None
+        lengths = getattr(lst, "lengths", None)
         lst = list(lst)
         cum = [0]
+        if lengths is not None:
+            for n in lengths:
+                cum.append(cum[-1] + int(n))
+            return lst, cum
         for i in lst:
             if not 0 <= i < len(self.stages[j]):
                 raise ValueError(
@@ -534,8 +543,8 @@ class JoinAdmission:
         return a
 
     def _suffix(self, a, j, i):
-        lst = self._lists[a][j]
-        return self.stages[j][i if lst is None else lst[i]]
+        cum = self._cum_of(a, j)
+        return cum[i + 1] - cum[i]
 
     def admit(self, prefix_tokens, resident_pages=None, partners=None):
         """Queue one more anchor behind the pending ones; returns its index.

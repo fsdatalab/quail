@@ -21,7 +21,14 @@ class Stage:
     """Token requests, answer readout, and advancement condition for one step.
 
     Attributes:
-        suffixes: Token sequences processed after each document and frame.
+        suffixes: Token sequences processed after each document and frame,
+            or a callback from document key to that document's own
+            sequences, asked when the document enters the stage, so a
+            stage can feed what an earlier stage's answer chose for it.
+            The callback may return DROP or SKIP as requests does; it
+            takes the place of requests, and suffix_tokens bounds it.
+        suffix_tokens: The most tokens one sequence of a callback
+            suffixes may have; admission and page capacity count it.
         readout: Converts selected hidden states to Boolean answers, scores,
             or category token values. Its dtype determines the answer array.
         frame: Tokens retained after the document. Consecutive identical
@@ -54,7 +61,7 @@ class Stage:
     DROP = DROP
     SKIP = SKIP
 
-    suffixes: list
+    suffixes: Any
     readout: Any
     frame: list = field(default_factory=list)
     requests: Callable | None = None
@@ -68,12 +75,40 @@ class Stage:
     read_mask: Any = None
     canvas: Callable | None = None
     canvas_rows: int = 0
+    suffix_tokens: int = 0
 
     def __post_init__(self):
+        if self.own_suffixes:
+            if self.suffix_tokens < 1:
+                raise ValueError("a stage whose suffixes come from a callback "
+                                 "names its most tokens in suffix_tokens")
+            if (self.requests is not None or self.chains is not None
+                    or self.read_rows is not None or self.canvas is not None):
+                raise ValueError("a stage whose suffixes come from a callback "
+                                 "takes no requests, chains, read_rows, or canvas")
+            return
         trailing = getattr(self.readout, "trailing_rows", 1)
         if self.read_rows is None and trailing > 1:
             self.read_rows = [trailing] * len(self.suffixes)
             self.read_all_rows = True
+
+    @property
+    def own_suffixes(self) -> bool:
+        """Whether each document's suffixes come from the callback."""
+        return callable(self.suffixes)
+
+
+class OwnRequests(list):
+    """A document's requests at a stage whose suffixes are its own.
+
+    The indices run over the document's own sequences, and lengths
+    holds their token counts, which the admission prices in place of
+    the stage's shared list.
+    """
+
+    def __init__(self, lengths):
+        super().__init__(range(len(lengths)))
+        self.lengths = [int(n) for n in lengths]
 
 
 def shared_preamble_tokens(question_ids) -> int:
@@ -228,7 +263,8 @@ class _StageExecutor:
         k = len(self.stages)
         if not self.paged and (
                 k > 1 or prefix_tree is not None
-                or any(len(stage.suffixes) != 1 for stage in self.stages)):
+                or any(stage.own_suffixes or len(stage.suffixes) != 1
+                       for stage in self.stages)):
             raise ValueError("the unpaged path runs one stage of one suffix")
         if any(stage.append and not stage.single for stage in self.stages):
             raise ValueError("an append stage sends one request per document")
@@ -242,7 +278,12 @@ class _StageExecutor:
         self.frames = [list(stage.frame) for stage in self.stages]
         self.frame_ids = [np.asarray(frame, dtype=np.int64) for frame in self.frames]
         self.writes = frame_writes(self.stages)
-        self.suffixes = [Suffixes.of(stage.suffixes) for stage in self.stages]
+        # a stage whose suffixes are each document's own is priced by
+        # one sequence of its most tokens until a document enters it
+        self.suffixes = [Suffixes.of([[0] * stage.suffix_tokens])
+                         if stage.own_suffixes else Suffixes.of(stage.suffixes)
+                         for stage in self.stages]
+        self.own = {}      # (stage, document) -> its own Suffixes
         self.read_rows = [None if stage.read_rows is None
                           else np.asarray(stage.read_rows, dtype=np.int64)
                           for stage in self.stages]
@@ -265,9 +306,10 @@ class _StageExecutor:
         # A single suffix also occupies document pages on the unified path.
         if self.paged and self.mode == "unified":
             self.capacity_extra = max(
-                [frame_max] + [len(frame) + len(stage.suffixes[0]) + rows
-                               for frame, stage, rows in zip(
-                                   self.frames, self.stages, self.canvas_rows)
+                [frame_max] + [len(frame) + int(other.lengths.max()) + rows
+                               for frame, stage, other, rows in zip(
+                                   self.frames, self.stages, self.suffixes,
+                                   self.canvas_rows)
                                if stage.single])
         # an append stage's tokens stay in document pages after the
         # frame, so admission reserves the frame and every append round
@@ -290,7 +332,8 @@ class _StageExecutor:
         for a in resident:
             self.arena.pin(self.keys[a])
 
-        self.asking = any(stage.requests is not None for stage in self.stages)
+        self.asking = any(stage.requests is not None or stage.own_suffixes
+                          for stage in self.stages)
         if prefix_tree is not None and not prefix_tree.shared_tokens:
             prefix_tree = None
         self.sched = JoinAdmission(
@@ -301,7 +344,7 @@ class _StageExecutor:
             self.arena.n_pages if self.paged else 1 << 62,
             self.arena.page_tokens,
             frame_tokens=[len(f) for f in self.frames], resident=resident,
-            anchor_partners={a: self._requests_of(key)
+            anchor_partners={a: self._requests_of(a, key)
                              for a, key in enumerate(self.keys)},
             # a windowed model may pack any chunk unified, so it reserves
             # the unified path's temporary pages throughout
@@ -367,10 +410,14 @@ class _StageExecutor:
         per_chunk = max(1, int(budget // max(1.0, mean)))
         return max(1, -(-per_chunk // groups))
 
+    def _suffixes_of(self, j, a):
+        """Return the suffixes document a requests at stage j."""
+        return self.own[(j, a)] if self.stages[j].own_suffixes else self.suffixes[j]
+
     def _entry_rows(self, a, j, start, end, carried):
         f = self.prefix_lengths[a]
         indices = self.sched.partner_indices(a, j, start, end)
-        lengths = self.suffixes[j].lengths_at(indices)
+        lengths = self._suffixes_of(j, a).lengths_at(indices)
         rows = ((f if carried else 0) + int(lengths.sum())
                 + self.canvas_rows[j] * len(lengths))
         if self.writes[j] and start == 0:
@@ -385,13 +432,36 @@ class _StageExecutor:
         return (self.arena.page_cost(capacity)
                 - self.arena.growth_cost(key, capacity))
 
-    def _requests_of(self, key):
-        """Return a stage request selector, or None if every request is selected."""
+    def _requests_of(self, a, key):
+        """Return a stage request selector, or None if every request is selected.
+
+        At a stage whose suffixes are each document's own, the selector
+        asks the stage for the document's sequences, keeps them for the
+        chunk builder, and hands the admission their token counts.
+        """
         if not self.asking:
             return None
+        from quail.backends.quail.executor.chunk import Suffixes
+
         stages = self.stages
-        return lambda j: (None if stages[j].requests is None
-                          else stages[j].requests(key))
+
+        def ask(j):
+            stage = stages[j]
+            if not stage.own_suffixes:
+                return None if stage.requests is None else stage.requests(key)
+            got = stage.suffixes(key)
+            if got is DROP or got is SKIP:
+                return got
+            own = Suffixes.of(got)
+            if len(own) and int(own.lengths.max()) > stage.suffix_tokens:
+                raise ValueError(
+                    f"{stage.label or f'stage {j}'}: a document's suffix has "
+                    f"{int(own.lengths.max())} tokens, over the stage's "
+                    f"{stage.suffix_tokens}")
+            self.own[(j, a)] = own
+            return OwnRequests(own.lengths)
+
+        return ask
 
     def _merged(self, j, start, end):
         """Return whether the group packs its frame and suffix as one entry."""
@@ -428,7 +498,7 @@ class _StageExecutor:
             if carried:
                 prefix = self.prefixes[a][shared:] if shared else self.prefixes[a]
             indices = self.sched.partner_indices(a, j, start, end)
-            sufs = self.suffixes[j].take(indices)
+            sufs = self._suffixes_of(j, a).take(indices)
             read_all = self.stages[j].read_all_rows
             rows = int(sufs.lengths.sum()) if read_all else len(sufs)
             own = {}
