@@ -45,6 +45,7 @@ class PageArena:
         self.n_slots = n_slots
         self.free_slots = list(range(n_slots - 1, -1, -1))    # stack
         self.slots = {}    # key -> the checkpoint slot it holds
+        self.slot_tokens = {}    # key -> tokens its checkpoint covers
         self.free = list(range(n_pages - 1, -1, -1))    # stack
         self.owned = {}       # key -> list of page ids it alone writes
         self.borrowed = {}    # key -> leading page ids read from a parent
@@ -149,6 +150,7 @@ class PageArena:
     def free_key(self, key) -> int:
         """Drop a document's pages and slot; returns the pages that went free."""
         slot = self.slots.pop(key, None)
+        self.slot_tokens.pop(key, None)
         if slot is not None:
             self.free_slots.append(slot)
         pages = self.owned.pop(key)
@@ -440,6 +442,14 @@ class KVArena:
 
     def has_checkpoint(self, key) -> bool:
         return key in self.accounting.slots
+
+    def record_checkpoint(self, key, tokens: int) -> None:
+        """Note that the key's checkpoint covers its first `tokens` tokens."""
+        self.accounting.slot_tokens[key] = tokens
+
+    def checkpoint_tokens(self, key) -> int:
+        """Tokens the key's checkpoint covers; 0 when it has none."""
+        return self.accounting.slot_tokens.get(key, 0)
 
     def reset_stats(self):
         self.evicted_keys = 0

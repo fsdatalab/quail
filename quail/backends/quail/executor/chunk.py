@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from quail.backends.quail.executor.attention import ATTENTION_PATHS
+from quail.backends.quail.executor.gdn import plan_phases
 
 
 @dataclass
@@ -764,9 +765,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     table=unified["sliding"]["table"].index_select(0, seq),
                     used=unified["sliding"]["used"].index_select(0, seq),
                     max_used=max(pools[1].lengths[i] for i in canvas_seq))
+    gdn = None
+    if getattr(arena, "n_state_slots", 0):
+        if attention_mode != "unified":
+            raise ValueError("a model with Gated DeltaNet layers runs "
+                             "the unified attention path")
+        gdn = plan_phases(arena, unified_groups, stage)
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads,
-        unified=unified, canvas=canvas_meta,
+        unified=unified, canvas=canvas_meta, gdn=gdn,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)
     out = Chunk(

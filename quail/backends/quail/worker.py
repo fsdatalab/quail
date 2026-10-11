@@ -75,7 +75,8 @@ class LoadedGpu:
                                 revision=None if model_path else spec.revision,
                                 answer_token_ids=answer_token_ids,
                                 max_batched_tokens=budget,
-                                moe_backend=spec.moe_backend)
+                                moe_backend=spec.moe_backend,
+                                text_only=spec.vision_tower)
         self.load_model_s = time.perf_counter() - t0
 
         # cuBLAS allocates its handle outside PyTorch's caching allocator.
