@@ -381,7 +381,7 @@ def _model_inputs(node, inputs, context: ExecutionContext, chain=None) -> dict:
             retain_after_join(
                 state["arena"], key, len(prefixes[local_index]), config,
                 config.get("after", {}).get(node.node_id, {}))
-        else:
+        elif state["arena"].is_resident(key):
             state["arena"].free_key(key)
         sink = answer_sink()
         # scores are floats, not yes/no answers; they arrive with the result
