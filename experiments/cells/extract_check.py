@@ -20,12 +20,18 @@ the stop was one quote token where a decoder closes with any token
 opening with the quote; and a span had to end in the last located
 line, so a start the model stopped early died.
 
-Prediction with those three fixed: Quail matches stock vLLM's answer
-on at least 260 of 300 SQuAD items, CUAD trim F1 within 5 points of
-stock vLLM's 52.0, SQuAD within 2 points of 80.1, nulls near the 9
-the none token gives, and fewer fresh tokens on CUAD than the
-768,598 of run 20261011T050258Z, as one start is fed instead of up to
-eight. Stock vLLM is unchanged.
+Runs 20261011T055736Z and 20261011T055904Z, with those three fixed,
+gave 77.4 on SQuAD and 44.3 on CUAD trim with 9 nulls and 249,995
+fresh tokens, and matched stock vLLM's answer on 234 SQuAD items. The
+spans that ran past stock vLLM's ended at a token the vocabulary
+merges with the closing quote, such as `)"` or `%"`, which the
+decoder wrote in one step and the stop did not count.
+
+Prediction with merged tokens counted and 128 tokens read per fed
+row: Quail matches stock vLLM's answer on at least 250 of 300 SQuAD
+items and lands within 2 points of its 80.3 F1 there and within 5
+points of its 52.0 on CUAD trim; nulls stay near 9 and CUAD's fresh
+tokens near 250,000. Stock vLLM is unchanged.
 
     uv run modal run --detach -m experiments.cells.extract_check \
         2>&1 | tee /tmp/extract_check.log
@@ -174,7 +180,8 @@ def check(dataset: str, backend: str, trim: bool, n: int, run: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(n: int = N_ITEMS, backends: str = "quail,stock_vllm"):
+def main(n: int = N_ITEMS, backends: str = "quail,stock_vllm",
+         datasets: str = "squad,cuad"):
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     calls = {}
     for dataset, backend, trim in (("squad", "quail", True),
@@ -182,7 +189,8 @@ def main(n: int = N_ITEMS, backends: str = "quail,stock_vllm"):
                                    ("cuad", "quail", False),
                                    ("squad", "stock_vllm", True),
                                    ("cuad", "stock_vllm", True)):
-        if backend not in backends.split(","):
+        if (backend not in backends.split(",")
+                or dataset not in datasets.split(",")):
             continue
         call = check.spawn(dataset, backend, trim, n, run)
         calls[(dataset, backend, trim)] = call

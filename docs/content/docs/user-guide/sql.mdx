@@ -376,10 +376,11 @@ answer's start is then read within those lines. A shorter document is
 read whole. The answer starts with the token the model is most likely
 to write at the cue, at the position whose following tokens it copies
 best. From there Quail feeds the document's own tokens in chunks of 16
-and ends the span at the first token after which stopping is at least
-as likely as copying the next one, where a decoder would close the
-quote. The document, the lines, and the question stay in KV across
-these steps.
+and ends the span where a decoder would close the quote: at the first
+token after which closing it is at least as likely as copying the next
+one, or after the next token when the model would copy it and close
+the quote in one token, such as `."`. The document, the lines, and the
+question stay in KV across these steps.
 
 These limits apply:
 

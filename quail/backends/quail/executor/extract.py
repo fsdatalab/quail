@@ -29,7 +29,7 @@ from quail.progress import say
 TOP_TOKENS = 8      # start tokens read at the cue
 MAX_STARTS = 8      # candidate start positions kept after expansion
 CUE_TOP = 1024      # vocabulary entries read at the cue
-FEED_TOP = 32       # vocabulary entries read at each fed row
+FEED_TOP = 128      # vocabulary entries read at each fed row
 CHUNK = 16          # document tokens fed per pass from each start
 MAX_PASSES = 8      # passes a document may take: a runaway guard
 LOCATE_MIN_LINES = 3    # documents with fewer lines are shown plain
@@ -111,6 +111,12 @@ class Tables:
         # quote, such as `".` or `",`: together they are the stop
         self.stop_ids = tuple(index for index, token in enumerate(self.vocab)
                               if token.startswith('"'))
+        # a decoder may copy a token and close the quote in one token,
+        # such as `."` or `)"`: the merged token of each token that has one
+        index = {token: i for i, token in enumerate(self.vocab)}
+        self.merged = {index[token[:-1]]: i for token, i in index.items()
+                       if len(token) > 1 and token.endswith('"')
+                       and token[:-1] in index}
         self.none_id = self.encode_ids("none")[0]
         digits = [self.encode_ids(digit)[0] for digit in "0123456789"]
         dash, newline = self.encode_ids("-")[0], self.encode_ids("\n")[0]
@@ -196,8 +202,10 @@ class Branch:
     ends: list          # the document character each stream token ends at
     start: float = NEG  # the first token's log probability at the cue
     rank: float = NEG   # the candidate's score, which orders the starts
-    copy: list = field(default_factory=list)
-    stop: list = field(default_factory=list)
+    copy: list = field(default_factory=list)    # per fed row, the next token
+    stop: list = field(default_factory=list)    # per fed row, closing the quote
+    merged: list = field(default_factory=list)  # per fed row, the next token
+    #                                             and the quote in one token
     fed: int = 0
 
     @property
@@ -205,27 +213,44 @@ class Branch:
         """The branch's place in the model's order of starts."""
         return self.start, self.rank
 
-    def end(self, force: bool = False) -> int | None:
-        """Return the fed token the span ends after, or None while it copies on.
+    def ending(self, force: bool = False) -> tuple | None:
+        """Return where the span ends, or None while it copies on.
 
-        The span ends at the first fed token after which stopping is at
-        least as likely as copying the next one, where a decoder stops.
+        The span ends where a decoder stops: at the first fed row
+        after which closing the quote is at least as likely as copying
+        the next token, or after the next token when copying it and
+        closing the quote in one token is likelier than either.
 
         Args:
             force: Whether a span still copying ends after its last fed
                 token.
+
+        Returns:
+            The stream token the span ends after, the fed row that
+            decided it, and the log probability of stopping there.
         """
         for j, (copy, stop) in enumerate(zip(self.copy, self.stop)):
+            merged = self.merged[j] if j < len(self.merged) else NEG
+            if merged > max(copy, stop):
+                return j + 1, j, merged
             if stop >= copy:
-                return j
-        return len(self.copy) - 1 if force and self.copy else None
+                return j, j, stop
+        if force and self.copy:
+            return len(self.copy) - 1, len(self.copy) - 1, self.stop[-1]
+        return None
+
+    def end(self, force: bool = False) -> int | None:
+        """Return the stream token the span ends after, or None."""
+        ending = self.ending(force)
+        return None if ending is None else ending[0]
 
     def score(self, force: bool = False) -> float:
         """Return the ended span's score: its start, its copies, and its stop."""
-        j = self.end(force)
-        if j is None:
+        ending = self.ending(force)
+        if ending is None:
             return NEG
-        return self.start + sum(self.copy[:j]) + self.stop[j]
+        _, row, stop = ending
+        return self.start + sum(self.copy[:row]) + stop
 
 
 @dataclass
@@ -646,10 +671,14 @@ class ExtractStages:
                 ids = values[j, 1:1 + k].astype(np.int64).tolist()
                 lps = values[j, 1 + k:].tolist()
                 following = branch.stream[j + 1] if j + 1 < len(branch.stream) else None
-                copy = NEG
+                copy = merged = NEG
                 if following is not None and following in ids:
                     copy = lps[ids.index(following)]
+                joined = self.tables.merged.get(following)
+                if joined is not None and joined in ids:
+                    merged = lps[ids.index(joined)]
                 branch.copy.append(copy)
+                branch.merged.append(merged)
                 branch.stop.append(float(values[j, 0]))
             branch.fed += take
         doc.passes = p

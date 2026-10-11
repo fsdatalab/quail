@@ -250,6 +250,12 @@ def test_span_ends_where_stopping_beats_copying():
     assert np.exp(branch.score()) == pytest.approx(.85 * .90 * .95 * .90)
     assert best_span([branch]) == (branch, 3)
     assert best_span([]) is None
+    # copying the next token and closing the quote in one token, as a
+    # decoder writes `."`, ends the span after that token
+    joined = _branch([.85, .90, .95, .05, .30], [.10, .05, .02, .90, .60])
+    joined.merged = [NEG, NEG, np.log(.97), NEG, NEG]
+    assert joined.ending() == (3, 2, pytest.approx(np.log(.97)))
+    assert np.exp(joined.score()) == pytest.approx(.85 * .90 * .97)
     # a span still copying has no end, unless forced at the pass limit
     copying = _branch([.9, .9, .9], [.1, .1, .1])
     assert copying.end() is None and copying.score() == NEG
@@ -662,3 +668,14 @@ def test_top_logprob_readout_sums_a_group_of_extras():
     assert row[1] == pytest.approx(logprobs[2])
     assert row[2:4] == [0.0, 1.0] and row[4:] == pytest.approx(logprobs[:2])
     assert readout.width == 2 + 2 * 2
+
+
+def test_tables_pair_each_token_with_its_quote_closing_merge():
+    tokenizer = FakeTokenizer([LEASE, TAIL])
+    tokenizer.tokens.extend(['."', '""', 'Ġ"'])
+    tokenizer.ids = {token: index for index, token in enumerate(tokenizer.tokens)}
+    tables = Tables(tokenizer)
+    ids = tokenizer.ids
+    assert tables.merged == {ids["."]: ids['."'], ids['"']: ids['""'],
+                             ids[" "]: ids['Ġ"']}
+    assert set(tables.stop_ids) == {ids['"'], ids['""']}
