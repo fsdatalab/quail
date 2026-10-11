@@ -426,7 +426,7 @@ class ExpressionBinder:
         self.note_doc_column(ref)
         call = ModelCall(prompt, "extract", question=question,
                          trim=options.get("trim", True),
-                         locate=options.get("locate", False))
+                         locate=options.get("locate", True))
         call.validate()
         return call
 

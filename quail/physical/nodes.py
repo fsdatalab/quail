@@ -1027,9 +1027,9 @@ class ExtractSpec(ScoreSpec):
     The prompt token parts are the head before the document and the
     tail after it, ending in the phrase cue; the numbered parts are the
     same for the document shown as numbered lines, ending in the lines
-    cue. With locate on, the executor names the answer's lines with
-    the numbered prompt when the document has enough lines, then
-    reads the answer's start among them.
+    cue. The executor locates the answer's lines with the numbered
+    prompt when the document has enough lines, then reads the answer's
+    span with the plain one.
 
     Attributes:
         question: The question the answer is copied for.
@@ -1043,7 +1043,7 @@ class ExtractSpec(ScoreSpec):
 
     question: str = ""
     trim: bool = True
-    locate: bool = False
+    locate: bool = True
     numbered_token_parts: tuple[tuple[int, ...], ...] = ()
 
     @property
@@ -1066,7 +1066,7 @@ class ExtractSpec(ScoreSpec):
                 "prompt_token_parts", "draws", "share_prefixes")},
             question=str(value["question"]),
             trim=bool(value.get("trim", True)),
-            locate=bool(value.get("locate", False)),
+            locate=bool(value.get("locate", True)),
             numbered_token_parts=tuple(
                 tuple(int(token) for token in part)
                 for part in value.get("numbered_token_parts", ())),
@@ -1115,7 +1115,7 @@ class AiExtract(AiScore):
             **super().explain_fields(),
             "question": None if self.spec is None else self.spec.question,
             "trim": True if self.spec is None else self.spec.trim,
-            "locate": False if self.spec is None else self.spec.locate,
+            "locate": True if self.spec is None else self.spec.locate,
         }
 
     @classmethod

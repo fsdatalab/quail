@@ -365,24 +365,23 @@ Pass an object as the third argument, such as `{'trim': false}`.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `trim` | `true` | Return the fewest words that answer the question. With `false`, return the whole lines of the document that hold them, as the document's own line breaks divide it. Use `false` for an answer that is a clause rather than a name, a date, or a number. |
-| `locate` | `false` | Show a document of three or more lines as numbered lines and have the model name the lines that hold the answer before its start is read among them. Off, every document is shown plain and the start is read anywhere in it. On 300 CUAD contract windows of 2,500 characters, locating scored 47.5 token F1 against 50.1 plain and saved no tokens. |
+| `locate` | `true` | Show a document of three or more lines as numbered lines and have the model name the lines that hold the answer before its start is read among them. With `false`, every document is shown plain and the start is read anywhere in it. On 300 CUAD contract windows of 2,500 characters, locating scored 47.5 token F1 against 50.1 plain; it is on for long documents, where it has not been measured. |
 
 ### How the answer is found
 
 The answer is always a span of the document's own text: the model does
 not write it, it is read from the model's next-token probabilities.
-The prompt shows the document, the question, and the answer template,
-and opens the answer with `Phrase: "`. The answer starts with the
-token the model is most likely to write there, at the position whose
-following tokens it copies best. From there Quail feeds the document's
-own tokens in chunks of 16 and ends the span where a decoder would
-close the quote: at the first token after which closing it is at least
-as likely as copying the next one, or after the next token when the
-model would copy it and close the quote in one token, such as `."`.
-The document and the question stay in KV across these steps. With
-`locate` on, a document of three lines or more is shown numbered as
-`cat -n` shows it, the model first names the lines that hold the
-answer, and the start is read within those lines.
+For a document of three lines or more, the model first names the lines
+that hold the answer, shown numbered as `cat -n` shows them; the
+answer's start is then read within those lines. A shorter document is
+read whole. The answer starts with the token the model is most likely
+to write at the cue, at the position whose following tokens it copies
+best. From there Quail feeds the document's own tokens in chunks of 16
+and ends the span where a decoder would close the quote: at the first
+token after which closing it is at least as likely as copying the next
+one, or after the next token when the model would copy it and close
+the quote in one token, such as `."`. The document, the lines, and the
+question stay in KV across these steps.
 
 These limits apply:
 

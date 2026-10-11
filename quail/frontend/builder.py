@@ -409,7 +409,7 @@ class Query:
         return self
 
     def ai_extract(self, c, question: str, *, name: str,
-                   trim: bool = True, locate: bool = False) -> "Query":
+                   trim: bool = True, locate: bool = True) -> "Query":
         """Copy the words that answer a question from each document.
 
         The result column ``name`` holds the copied words, or null when
@@ -431,8 +431,7 @@ class Query:
             locate: Whether a document of three or more lines is shown
                 as numbered lines, so the model names the lines that
                 hold the answer before its start is read among them.
-                Off, every document is shown plain and the start is
-                read anywhere in it.
+                With locate off, every document is shown plain.
 
         Returns:
             This query builder, with the extraction added.
