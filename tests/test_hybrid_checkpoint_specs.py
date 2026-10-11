@@ -1,4 +1,4 @@
-"""The Qwen3.5-27B-FP8 and LFM2-2.6B specs against their config.json files."""
+"""Hybrid model specs against their config.json files."""
 
 import json
 from pathlib import Path
@@ -9,7 +9,12 @@ from quail.cost.dense_decoder_cost import (
     gdn_projection_params,
     mlp_params,
 )
-from quail.specs import LFM2_2_6B_BF16, MODELS, QWEN3_5_27B_FP8
+from quail.specs import (
+    LFM2_2_6B_BF16,
+    MODELS,
+    QWEN3_5_27B_FP8,
+    QWEN3_8_27B_FP8,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -67,6 +72,39 @@ def test_qwen3_5_27b_is_text_only_for_stock_vllm():
         assert engine.llm_kwargs(spec)["limit_mm_per_prompt"] == {
             "image": 0, "video": 0}
     assert VLLMEngine().llm_kwargs(spec)["max_num_seqs"] == 768
+
+
+def test_qwen3_8_27b_matches_the_config():
+    spec = QWEN3_8_27B_FP8
+    config = _config("qwen3_5_configs/qwen3.8-27b-fp8.json")["text_config"]
+    assert spec.layers == config["num_hidden_layers"]
+    assert spec.hidden == config["hidden_size"]
+    assert spec.n_q == config["num_attention_heads"]
+    assert spec.n_kv == config["num_key_value_heads"]
+    assert spec.d_head == config["head_dim"]
+    assert spec.ffn_width == 2 * config["intermediate_size"]
+    assert spec.vocab == config["vocab_size"]
+    assert spec.gdn_key_heads == config["linear_num_key_heads"]
+    assert spec.gdn_value_heads == config["linear_num_value_heads"]
+    assert spec.gdn_key_dim == config["linear_key_head_dim"]
+    assert spec.gdn_value_dim == config["linear_value_head_dim"]
+    assert spec.conv_width == config["linear_conv_kernel_dim"]
+    assert [spec.layer_kind(i) for i in range(spec.layers)] == [
+        {"linear_attention": "gated_delta_net"}.get(kind, kind)
+        for kind in config["layer_types"]]
+    assert MODELS[spec.name] is spec
+
+
+def test_qwen3_8_27b_has_the_geometry_of_qwen3_5_27b():
+    # the two checkpoints share every size the cost model reads
+    new, old = QWEN3_8_27B_FP8, QWEN3_5_27B_FP8
+    for field in ("params", "layers", "hidden", "n_q", "n_kv", "d_head",
+                  "ffn_width", "vocab", "layer_kinds", "kappa",
+                  "turn_prefix", "turn_suffix"):
+        assert getattr(new, field) == getattr(old, field)
+    # 24,328,929,280 fp8 and convolution elements in the headers, plus
+    # 48 layers x 2 x 48 x 5,120 bf16 in_proj_a and in_proj_b elements
+    assert new.params == 24_328_929_280 + 48 * 2 * 48 * 5120
 
 
 def test_lfm2_matches_the_config():
