@@ -516,7 +516,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),
         "kv_manager": kv_manager,
-        "memory_trace": list(arena.memory_trace),
+        "memory_trace": list(getattr(arena, "memory_trace", ())),
         "memory_trace_started": started,
         "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
     }
