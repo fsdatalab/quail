@@ -11,8 +11,9 @@ One method, with two paths chosen by the document's own line count:
   CHUNK tokens, up to MAX_PASSES passes; the best span wins.
 - A document of 3 or more lines is answered by locating, then
   scoring. The document is shown with its non-empty lines numbered,
-  as `cat -n` would; the cue "The answer is in lines " has the model
-  write a range a-b; the prompt continues with ', and reads "', and
+  as `cat -n` would, and an answer template of a Lines field and a
+  Phrase field; the cue "Lines: " has the model write a range a-b; the
+  prompt continues with the Phrase field's open quote, and
   the start step above runs with the tokens of lines a to b as the
   only allowed starts, the first token of line a always among them.
   From each start the tokens up to the start of line b are fed in one
@@ -94,26 +95,34 @@ LOCATE_MIN_LINES = 3    # documents with fewer lines are scored directly
 LINE_MAX_TOKENS = 8
 TOP_K = (1, 4, 8)
 
-# what an answer is, the same on both paths
-ANSWER_INSTRUCTION_TEXT = (
-    "Answer the question with the shortest exact phrase copied from the "
-    "document: a name, a number, a date, or a few words, never a whole "
-    "sentence. If the document does not answer it, answer none.")
-BODY_TEMPLATE = "DOCUMENT:\n{0}\n\n" + ANSWER_INSTRUCTION_TEXT + "\nQuestion: {1}"
-RAW_PROMPT_TEMPLATE = "{0}\nANSWER: \""
+# what an answer is, the same on both paths; the question carries the
+# length, a date or a whole clause
+INSTRUCTION_TEXT = (
+    "Copy the exact words from the document that answer the question: as "
+    "short as a name, a number, or a date when that answers it, or the whole "
+    "clause when the question asks for one. Do not rewrite them. If the "
+    "document does not answer the question, write none.")
+FORMAT_TEXT = "Answer in this format:"
+LINES_FORMAT_TEXT = ("Lines: START-END, the numbers of the fewest lines holding "
+                     "the phrase, for example 3-3 or 5-6")
+PHRASE_FORMAT_TEXT = 'Phrase: "the words, copied exactly"'
+BODY_TEMPLATE = ("DOCUMENT:\n{0}\n\nQuestion: {1}\n\n" + INSTRUCTION_TEXT + "\n"
+                 + FORMAT_TEXT + "\n" + PHRASE_FORMAT_TEXT)
+LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\nQuestion: {1}\n\n"
+                      + INSTRUCTION_TEXT + "\n" + FORMAT_TEXT + "\n"
+                      + LINES_FORMAT_TEXT + "\n" + PHRASE_FORMAT_TEXT)
+# the answer is begun for the model: the scoring path's answer opens
+# with the phrase's quote, the locating path's with the lines field,
+# so the model writes the range and nothing else
+PHRASE_CUE = 'Phrase: "'
+LINE_CUE = "Lines: "
+BEGINS_CUE = "\n" + PHRASE_CUE
 CHAT_TURN_TEMPLATE = ("<|im_start|>user\n{0}<|im_end|>\n<|im_start|>assistant\n"
                       "<think>\n\n</think>\n\n")
-CHAT_PROMPT_TEMPLATE = CHAT_TURN_TEMPLATE + '"'
-LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\n" + ANSWER_INSTRUCTION_TEXT
-                      + " First give the line numbers of the fewest lines that "
-                      "contain the phrase, as START-END, for example 3-3 or 5-6, "
-                      "then quote the phrase.\nQuestion: {1}")
-# the answer is begun for the model, as the open quote begins the
-# scoring path's answer, so it writes the range and nothing else
-LINE_CUE = "The answer is in lines "
-RAW_LINE_TEMPLATE = "{0}\nANSWER: " + LINE_CUE
+RAW_PROMPT_TEMPLATE = "{0}\n" + PHRASE_CUE
+CHAT_PROMPT_TEMPLATE = CHAT_TURN_TEMPLATE + PHRASE_CUE
+RAW_LINE_TEMPLATE = "{0}\n" + LINE_CUE
 CHAT_LINE_TEMPLATE = CHAT_TURN_TEMPLATE + LINE_CUE
-BEGINS_CUE = ', and reads "'
 
 
 def _squad_questions(n: int) -> list[dict]:
