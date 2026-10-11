@@ -31,7 +31,13 @@ Prediction with merged tokens counted and 128 tokens read per fed
 row: Quail matches stock vLLM's answer on at least 250 of 300 SQuAD
 items and lands within 2 points of its 80.3 F1 there and within 5
 points of its 52.0 on CUAD trim; nulls stay near 9 and CUAD's fresh
-tokens near 250,000. Stock vLLM is unchanged.
+tokens near 250,000. Stock vLLM is unchanged. Run 20261011T060458Z
+met it: 256 SQuAD answers the same as stock vLLM's, 78.7 F1 on SQuAD,
+47.5 on CUAD trim, 9 nulls, 237,699 fresh tokens. The remaining CUAD
+gap is on the located path, 45.5 F1 on its 237 documents against
+50.2 for stock vLLM on the same ones: the numbered lines change the
+prompt the model answers, and its likeliest start is at times a line
+number.
 
     uv run modal run --detach -m experiments.cells.extract_check \
         2>&1 | tee /tmp/extract_check.log

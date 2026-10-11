@@ -21,9 +21,11 @@ from quail.cost.work import Work, ask, scan, stream
 # the executor's settings
 MAX_STARTS = 8          # candidate start positions kept
 CHUNK = 16              # document tokens fed per pass from each start
-# starts fed as a mean: the likeliest, with a tied position, and a
-# later one when it ends before the located lines; a placeholder until
-# the next GPU check measures it
+# starts fed as a mean: the likeliest and its tied positions; run
+# 20261011T060458Z fed 50 tokens per SQuAD document and 60 per CUAD
+# document after the start step, 1.6 to 1.9 starts of FED_PER_START
+# (/results/extract_check/20261011T060458Z_quail_squad_trim.json and
+# _cuad_trim.json)
 STARTS_FED = 2
 LOCATE_MIN_LINES = 3    # documents with fewer lines are shown plain
 # the lines answer "a-b" and its line break, one token each
