@@ -415,8 +415,11 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(
         dict(key=key, prefix=None, f=f + len(frame), suffixes=partners),
     ], attention_mode="unified")
     plan = chunk.meta["state"]
-    assert [w["n"] for w in plan["waves"]] == [1, 3]
-    covered = torch.cat([w["rows"] for w in plan["waves"]]).sort().values
+    # the anchor and frame are one 64-row segment, short enough for
+    # the partners to rerun it ahead of themselves in its wave
+    assert [w["n"] for w in plan["waves"]] == [4]
+    assert plan["waves"][0]["lead_host"] == [0, 64, 64, 64]
+    covered = torch.cat([w["out_rows"] for w in plan["waves"]]).sort().values
     assert covered.tolist() == list(range(chunk.tokens))
     together_layers = _per_layer_outputs(pipeline, chunk)
     together = together_layers[-1]
