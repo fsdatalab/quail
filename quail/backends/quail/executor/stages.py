@@ -196,6 +196,34 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     ).run()
 
 
+def state_share_points(parents, shared):
+    """The token counts at which each document's borrowers start.
+
+    Args:
+        parents: Per document, the document it borrows from or None.
+        shared: Per document, the tokens it borrows from its parent.
+
+    Returns:
+        Per document, the sorted distinct counts its borrowers start
+        from; an empty tuple for a document nobody borrows from.
+    """
+    points = [set() for _ in parents]
+    for parent, count in zip(parents, shared):
+        if parent is not None and count:
+            points[parent].add(count)
+    return [tuple(sorted(values)) for values in points]
+
+
+def checkpoint_slot_limit(n_slots, n_stages, shares):
+    """Most documents in flight that the checkpoint slots can serve.
+
+    A document holds one slot, a second once a later stage extends it,
+    and one more when borrowers start from a state inside it.
+    """
+    per_document = (2 if n_stages > 1 else 1) + (1 if shares else 0)
+    return max(1, n_slots // per_document)
+
+
 class _StageExecutor:
     """Admission state, packed inputs, pending answers, and metrics for one run."""
 
@@ -311,30 +339,17 @@ class _StageExecutor:
             stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,
         )
-        if self.paged and getattr(self.arena, "n_state_slots", 0):
-            # a document holds a checkpoint slot, and a second one once
-            # a later stage extends it; the scheduler's count of active
-            # anchors already includes the resident ones
-            per_document = 2 if len(self.stages) > 1 else 1
-            self.sched.active_limit = max(
-                1, self.arena.n_state_slots // per_document)
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         # a Gated DeltaNet layer starts a borrower from the parent's state
         # at the shared point, so a parent writes one slot per point
         self.share_points = [()] * len(self.keys)
         if self.paged and getattr(self.arena, "n_state_slots", 0):
-            points = {}
-            for doc, parent in enumerate(self.borrowing.tree_parent):
-                shared = self.borrowing.tree_shared[doc]
-                if parent is not None and shared:
-                    points.setdefault(parent, set()).add(shared)
-            for parent, values in points.items():
-                self.share_points[parent] = tuple(sorted(values))
-            if points:
-                # a parent also holds a slot per shared point
-                self.sched.active_limit = max(
-                    1, self.arena.n_state_slots // (per_document + 1))
+            self.share_points = state_share_points(
+                self.borrowing.tree_parent, self.borrowing.tree_shared)
+            self.sched.active_limit = checkpoint_slot_limit(
+                self.arena.n_state_slots, len(self.stages),
+                any(self.share_points))
             self.borrowing.can_borrow = self._state_borrow_check(
                 self.borrowing.can_borrow)
         # The admission detaches residents from borrowing: they pack no prefix.

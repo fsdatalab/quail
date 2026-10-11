@@ -150,8 +150,8 @@ def plan_phases(arena, groups, stage):
                 if last <= first:
                     raise ValueError(
                         f"group {key!r}: borrows its whole prefix")
-            points = [t for t in group.get("share_points", ())
-                      if start < t < group["f"]]
+            points = sorted({t for t in group.get("share_points", ())
+                             if start < t < group["f"]})
             bounds = [start] + points + [group["f"]]
             for low, high in zip(bounds, bounds[1:]):
                 if high == group["f"]:
