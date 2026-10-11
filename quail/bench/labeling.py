@@ -52,6 +52,7 @@ from quail_b.predicates import (
     SCHEMA_VERSION,
     WORKLOADS,
     PredicateSpec,
+    _canonical,
     _full_hash,
     _named_id,
     _text_hash,
@@ -293,13 +294,10 @@ def _atomic_json(path: Path, payload: dict) -> None:
     os.replace(temp, path)
 
 
-def _atomic_parquet(path: Path, rows: list[dict]) -> None:
+def _part_schema():
     import pyarrow as pa
-    import pyarrow.parquet as pq
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    schema = pa.schema([
+    return pa.schema([
         ("judgment_id", pa.string()),
         ("example_id", pa.string()),
         ("example_full_hash", pa.string()),
@@ -318,8 +316,21 @@ def _atomic_parquet(path: Path, rows: list[dict]) -> None:
         ("right_content_sha256", pa.string()),
         ("selected_token_id", pa.int64()),
     ])
-    table = pa.Table.from_pylist(rows, schema=schema)
-    pq.write_table(table, temp, compression="zstd",
+
+
+def _atomic_parquet(path: Path, rows: list[dict]) -> None:
+    import pyarrow as pa
+
+    _atomic_parquet_table(path, pa.Table.from_pylist(rows,
+                                                     schema=_part_schema()))
+
+
+def _atomic_parquet_table(path: Path, table) -> None:
+    import pyarrow.parquet as pq
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    pq.write_table(table.cast(_part_schema()), temp, compression="zstd",
                    use_dictionary=True)
     os.replace(temp, path)
 
@@ -1319,12 +1330,19 @@ def activate_reused_collection(
 
 def _source_labels_by_content(
         spec: PredicateSpec, source_label_set_id: str,
-        target_rows: dict[str, list[dict]]) -> dict:
-    """Read one finished label set, keyed by document content hashes.
+        target_rows: dict[str, list[dict]]):
+    """Read one finished label set's answers, keyed by document content.
 
-    Only rows whose documents also appear in the target corpus are
-    kept, so a join over a large corpus does not have to fit in memory
-    as Python objects.
+    Args:
+        spec: The predicate.
+        source_label_set_id: The finished label set to read.
+        target_rows: The target corpus rows. Only labels whose documents
+            appear here are kept.
+
+    Returns:
+        A table of left_content_sha256, right_content_sha256, answer and
+        label_source, with one row per content pair. When the source
+        corpus repeats a document, the pair's last label is kept.
     """
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -1344,25 +1362,66 @@ def _source_labels_by_content(
     table = pq.read_table(compact_path, columns=[
         "left_content_sha256", "right_content_sha256", "answer",
         "label_source"])
-    left_hashes = pa.array(
-        sorted({_content_hash(row, spec.left_column)
-                for row in target_rows[spec.left_table]}))
+    left_hashes = pa.array(sorted(
+        {_content_hash(row, spec.left_column)
+         for row in target_rows[spec.left_table]}), pa.string())
     table = table.filter(
         pc.is_in(table["left_content_sha256"], value_set=left_hashes))
+    keys = ["left_content_sha256"]
     if spec.kind == "join":
-        right_hashes = pa.array(
-            sorted({_content_hash(row, spec.right_column)
-                    for row in target_rows[spec.right_table]}))
+        right_hashes = pa.array(sorted(
+            {_content_hash(row, spec.right_column)
+             for row in target_rows[spec.right_table]}), pa.string())
         table = table.filter(
             pc.is_in(table["right_content_sha256"], value_set=right_hashes))
-    return {
-        (left, right): (bool(answer), source)
-        for left, right, answer, source in zip(
-            table["left_content_sha256"].to_pylist(),
-            table["right_content_sha256"].to_pylist(),
-            table["answer"].to_pylist(),
-            table["label_source"].to_pylist())
-    }
+        keys.append("right_content_sha256")
+    table = table.group_by(keys, use_threads=False).aggregate(
+        [("answer", "last"), ("label_source", "last")])
+    return table.rename_columns(keys + ["answer", "label_source"])
+
+
+def _pair_ids(corpus_id: str, label_set_id: str, left_json: list[bytes],
+              right_json: list[bytes], left_index, right_index
+              ) -> tuple[list[str], list[str], list[str]]:
+    """The example ids, example hashes, and judgment ids of many pairs.
+
+    Gives the same ids as example_identity and judgment_identity from
+    operands encoded once, instead of once per pair.
+
+    Args:
+        corpus_id: The corpus the examples belong to.
+        label_set_id: The label set the judgments belong to.
+        left_json: The canonical JSON of every left operand.
+        right_json: The canonical JSON of every right operand, each
+            after a comma; empty for a filter.
+        left_index: The left row of each pair.
+        right_index: The right row of each pair, or None for a filter.
+
+    Returns:
+        The example ids, example full hashes, and judgment ids, in pair
+        order.
+    """
+    import hashlib
+
+    # canonical JSON sorts keys: corpus_id before operands, and
+    # example_full_hash before label_set_id
+    head = b'{"corpus_id":' + _canonical(corpus_id) + b',"operands":['
+    judgment_head = b'{"example_full_hash":"'
+    judgment_tail = b'","label_set_id":' + _canonical(label_set_id) + b"}"
+    example_ids, example_fulls, judgment_ids = [], [], []
+    sha256 = hashlib.sha256
+    if right_index is None:
+        pairs = ((left_json[i], b"") for i in left_index.tolist())
+    else:
+        pairs = zip((left_json[i] for i in left_index.tolist()),
+                    (right_json[j] for j in right_index.tolist()))
+    for left, right in pairs:
+        full = sha256(head + left + right + b"]}").hexdigest()
+        example_ids.append(_named_id("ex", full))
+        example_fulls.append(full)
+        judgment = sha256(judgment_head + full.encode() + judgment_tail)
+        judgment_ids.append(_named_id("jd", judgment.hexdigest()))
+    return example_ids, example_fulls, judgment_ids
 
 
 def _copy_label_set(spec: PredicateSpec, source_label_set_id: str,
@@ -1370,54 +1429,115 @@ def _copy_label_set(spec: PredicateSpec, source_label_set_id: str,
                     rows: dict[str, list[dict]]) -> int:
     """Write one predicate's target parts from a larger corpus's labels.
 
-    Returns the number of labels written. Raises when a target document
-    or pair has no label in the source set.
+    Args:
+        spec: The predicate.
+        source_label_set_id: The finished label set to copy from.
+        identity: The target label set's identity.
+        corpus_id: The target corpus.
+        rows: The target corpus rows.
+
+    Returns:
+        The number of labels written.
+
+    Raises:
+        ValueError: A target document or pair has no label in the source
+            set.
     """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
     parts = _expected_parts(spec, identity, rows)
     if all(part.exists() for part in parts):
         return 0
     labels = _source_labels_by_content(spec, source_label_set_id, rows)
+    join = spec.kind == "join"
     left_rows = rows[spec.left_table]
-    right_rows = rows[spec.right_table] if spec.kind == "join" else [None]
-    right_hashes = [
-        None if right is None else _content_hash(right, spec.right_column)
-        for right in right_rows]
-    restricted = spec.kind == "join" and _pair_columns(spec)
+    right_rows = rows[spec.right_table] if join else []
+    left_ops = [_operand(spec.left_role, spec.left_table, row,
+                         spec.left_column) for row in left_rows]
+    right_ops = [_operand(spec.right_role, spec.right_table, row,
+                          spec.right_column) for row in right_rows]
+    left_ids = pa.array([op["row_id"] for op in left_ops], pa.string())
+    left_hashes = pa.array([op["content_sha256"] for op in left_ops],
+                           pa.string())
+    right_ids = pa.array([op["row_id"] for op in right_ops], pa.string())
+    right_hashes = pa.array([op["content_sha256"] for op in right_ops],
+                            pa.string())
+    left_json = [_canonical(op) for op in left_ops]
+    right_json = [b"," + _canonical(op) for op in right_ops]
+    keys = ["left_content_sha256"]
+    if join:
+        keys.append("right_content_sha256")
+    restricted = join and _pair_columns(spec)
     written = 0
     for part, (start, end) in zip(parts,
                                   _part_bounds(spec, identity, rows)):
         if part.exists():
             continue
-        batch = left_rows[start:end]
         if restricted:
-            pairs = _matching_pairs(spec, batch, right_rows)
+            pairs = _matching_pairs(spec, left_rows[start:end], right_rows)
+            left_index = np.array([start + i for i, _ in pairs], np.int64)
+            right_index = np.array([j for _, j in pairs], np.int64)
+        elif join:
+            left_index = np.repeat(np.arange(start, end), len(right_rows))
+            right_index = np.tile(np.arange(len(right_rows)), end - start)
         else:
-            pairs = [(i, j) for i in range(len(batch))
-                     for j in range(len(right_rows))]
-        output = []
-        missing = 0
-        left_hashes = {}
-        for i, j in pairs:
-            left, right = batch[i], right_rows[j]
-            if i not in left_hashes:
-                left_hashes[i] = _content_hash(left, spec.left_column)
-            found = labels.get((left_hashes[i], right_hashes[j]))
-            if found is None:
-                missing += 1
-                continue
-            answer, source = found
-            output.append(_answer_row(
-                spec, identity, corpus_id, left, right, answer, source,
-                None))
+            left_index = np.arange(start, end)
+            right_index = None
+        # the join does not keep row order; the sort below restores it
+        target = {"left_index": left_index,
+                  "left_content_sha256": left_hashes.take(left_index)}
+        if join:
+            target["right_index"] = right_index
+            target["right_content_sha256"] = right_hashes.take(right_index)
+        found = pa.table(target).join(labels, keys=keys,
+                                      join_type="left outer")
+        missing = found["answer"].null_count
         if missing:
             raise ValueError(
                 f"{spec.key}: {missing} target labels are not in "
                 f"{source_label_set_id}")
-        if spec.kind == "join":
-            output.sort(key=lambda row: (row["left_id"], row["right_id"]))
-        _atomic_parquet(part, output)
+        left_index = found["left_index"].to_numpy()
+        right_index = found["right_index"].to_numpy() if join else None
+        example_ids, example_fulls, judgment_ids = _pair_ids(
+            corpus_id, identity["label_set_id"], left_json, right_json,
+            left_index, right_index)
+        size = found.num_rows
+        nulls = pa.nulls(size, pa.string())
+
+        def constant(value):
+            return pa.repeat(pa.scalar(value, pa.string()), size)
+
+        output = pa.table({
+            "judgment_id": pa.array(judgment_ids, pa.string()),
+            "example_id": pa.array(example_ids, pa.string()),
+            "example_full_hash": pa.array(example_fulls, pa.string()),
+            "label_set_id": constant(identity["label_set_id"]),
+            "predicate_key": constant(spec.key),
+            "predicate_version": constant(identity["predicate_version"]),
+            "answer": found["answer"],
+            "label_source": found["label_source"],
+            "left_role": constant(spec.left_role),
+            "left_table": constant(spec.left_table),
+            "left_id": left_ids.take(left_index),
+            "left_content_sha256": found["left_content_sha256"],
+            "right_role": constant(spec.right_role),
+            "right_table": constant(spec.right_table),
+            "right_id": right_ids.take(right_index) if join else nulls,
+            "right_content_sha256": (found["right_content_sha256"] if join
+                                     else nulls),
+            "selected_token_id": pa.nulls(size, pa.int64()),
+        })
+        if join:
+            output = output.sort_by([("left_id", "ascending"),
+                                     ("right_id", "ascending")])
+        else:
+            # a filter part keeps the corpus order
+            output = output.take(pc.sort_indices(pa.array(left_index)))
+        _atomic_parquet_table(part, output)
         after_write()
-        written += len(output)
+        written += size
         print(f"[derive] {spec.key} rows {start}:{end}", flush=True)
     return written
 

@@ -496,12 +496,18 @@ def test_pair_columns_restrict_the_pairs_a_join_labels(monkeypatch, tmp_path):
     def content(row):
         return labeling._content_hash(row, "content")
     monkeypatch.setattr(
-        labeling, "_source_labels_by_content", lambda *_: {
-            (content(agents[0]), content(replies[0])): (True, MODEL_NAME)})
+        labeling, "_source_labels_by_content", lambda *_: pa.table({
+            "left_content_sha256": [content(agents[0])],
+            "right_content_sha256": [content(replies[0])],
+            "answer": [True], "label_source": [MODEL_NAME]}))
     small = {"support_messages": [agents[0], replies[0], replies[2]]}
     small_identity = labeling.label_set_identity(spec, "c_small", "1" * 64)
     assert labeling._copy_label_set(
         spec, "ls_source", small_identity, "c_small", small) == 1
+    (copied,) = labeling._expected_parts(spec, small_identity, small)
+    assert pq.read_table(copied).to_pylist() == [labeling._answer_row(
+        spec, small_identity, "c_small", agents[0], replies[0], True,
+        MODEL_NAME, None)]
 
 
 def test_where_conditions_restrict_a_join_to_matching_sides(monkeypatch):
