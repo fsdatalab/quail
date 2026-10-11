@@ -9,6 +9,7 @@ from quail.logical import DEFAULT_SELECTIVITY, LogicalPlan, effective_selectivit
 from quail.physical import (
     Aggregate,
     AiClassify,
+    AiExtract,
     AiFilter,
     AiJoin,
     Barrier,
@@ -110,6 +111,10 @@ def logical_tree(logical):
                 title += f", {node.name}{logical_nodes.PROBABILITIES_SUFFIX}"
             details = [f"{_prompt(node.call.prompt)} "
                        f"labels={list(node.call.labels)}"]
+        elif isinstance(node, logical_nodes.SemanticExtract):
+            title = f"SemanticExtract: {node.name}, {node.span_name}"
+            details = [f"question={node.call.question!r} "
+                       f"trim={'on' if node.call.trim else 'off'}"]
         elif isinstance(node, logical_nodes.Join):
             title = "Join"
             details = ([f"on {condition}" for condition in node.on]
@@ -420,6 +425,12 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                            f"{sum(len(ids) for ids in spec.label_token_ids)}"
                            + (f", up to {spec.draws} noise draws"
                               if spec.draws > 1 else ""))
+        elif isinstance(node, AiExtract):
+            spec = node.spec
+            title += f": {spec.name} over {spec.alias}"
+            details.append(f"question={spec.question!r}, "
+                           f"trim={'on' if spec.trim else 'off'}, "
+                           f"not priced")
         elif isinstance(node, Filter):
             title += f": {node.predicate.describe()}"
         elif isinstance(node, AiJoin):

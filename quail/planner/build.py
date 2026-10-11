@@ -9,17 +9,20 @@ from quail.cost.work import Work, scan
 from quail.labels import DECISION_SCORING, LETTERS_SCORING, word_starts
 from quail.logical import (
     PROBABILITIES_SUFFIX,
+    SPAN_SUFFIX,
     Alias,
     CompileError,
     LabelWork,
     LogicalPlan,
     classified_above_joins,
     effective_selectivity,
+    extracted_above_joins,
     has_score,
     is_score,
     oriented_join_conditions,
 )
 from quail.logical.prompts import (
+    bind_extract_prompt,
     choice_token_parts,
     classify_prompt_tokens,
     prompt_aliases,
@@ -27,6 +30,7 @@ from quail.logical.prompts import (
 )
 from quail.physical import (
     AiClassify,
+    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -34,6 +38,7 @@ from quail.physical import (
     ClassifySpec,
     Comparison,
     Exchange,
+    ExtractSpec,
     Filter,
     FilterStage,
     Foreign,
@@ -70,6 +75,7 @@ from quail.planner.validation import (
     ClassifyRefusedError,
     ScoreRefusedError,
     classification_refusal,
+    extraction_refusal,
     join_input_tokens,
     score_input_tokens,
     score_projections,
@@ -278,6 +284,22 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 constraint="unsupported_classify_query",
                 needed=1, available=0, unit="queries")
         refusal = classification_refusal(context)
+        if refusal is not None:
+            return refusal
+    extracts = operators.extracts
+    extract_after = extracted_above_joins(plan.root)
+    if extracts:
+        if context is None:
+            return Refusal(
+                reasons=("AI.EXTRACT planning needs a planning context",),
+                constraint="unsupported_extract_query",
+                needed=1, available=0, unit="queries")
+        if scored:
+            return Refusal(
+                reasons=("AI.EXTRACT cannot be mixed with AI.SCORE",),
+                constraint="unsupported_extract_query",
+                needed=1, available=0, unit="queries")
+        refusal = extraction_refusal(context)
         if refusal is not None:
             return refusal
     alias_applies = {}
@@ -541,6 +563,28 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         if scores is not None:
             rows_src[alias] = scores
 
+    def emit_extract(alias, live=None):
+        """Copy the answers of the alias's documents, after its labels."""
+        calls = [node for node in extracts if node.alias == alias]
+        if not calls or (alias in extract_after and live is None):
+            return
+        if live is None:
+            live = live_asked.get(alias, float(stats[alias].n_docs))
+            for test in operators.label_filters.get(alias, ()):
+                live *= effective_selectivity(test.selectivity)
+        for logical_node in calls:
+            node = AiExtract(
+                node_id=f"ai-extract:{sum(isinstance(n, AiExtract) for n in nodes)}",
+                inputs=input_ports((rows_src.get(alias, ids_src[alias]),)),
+                backend_name="quail", model=model.name,
+                spec=extract_spec(context, logical_node.call,
+                                  logical_node.name, live))
+            nodes.append(node)
+            scores = PortRef(node.node_id, "scores")
+            ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
+            rows_src[alias] = scores
+            label_ports.append(scores)
+
     try:
         for s in scans:
             if scoring is not None:
@@ -550,6 +594,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             else:
                 emit_applies(s.alias)
             emit_classify(s.alias)
+            emit_extract(s.alias)
     except ClassifyRefusedError as refused:
         return refused.refusal()
     except ScoreRefusedError as refused:
@@ -705,14 +750,17 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     # matched: a document with at least one true pair, expected as the
     # join selectivity times the partners it met, at most every document
     try:
-        for alias in sorted(after_joins):
+        for alias in sorted(after_joins | extract_after):
             met = sum(
                 effective_selectivity(join.selectivity)
                 * sum(live0[argument.alias] for argument in join.prompt.args
                       if argument.alias != alias)
                 for join in joins
                 if alias in {argument.alias for argument in join.prompt.args})
-            emit_classify(alias, live=live0[alias] * min(1.0, met))
+            if alias in after_joins:
+                emit_classify(alias, live=live0[alias] * min(1.0, met))
+            if alias in extract_after:
+                emit_extract(alias, live=live0[alias] * min(1.0, met))
     except ClassifyRefusedError as refused:
         return refused.refusal()
 
@@ -748,6 +796,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                        else f"{c.alias}.{c.column}")
         if isinstance(c, Alias) and getattr(c.expression, "probabilities", False):
             columns.append(c.name + PROBABILITIES_SUFFIX)
+        if isinstance(c, Alias) and c.expression.kind == "extract":
+            columns.append(c.name + SPAN_SUFFIX)
     nodes.extend(result_nodes(
         plan.result, tuple(sink_inputs) + tuple(label_ports), tuple(columns)))
 
@@ -879,6 +929,36 @@ class ScoreLowering:
             written_pos=position)
         self.nodes.append(node)
         return PortRef(node.node_id, "scores")
+
+
+def extract_spec(context, call, name, live) -> ExtractSpec:
+    """Build an extraction's specification.
+
+    The specification carries the token ids of the plain prompt and of
+    the numbered-lines prompt around the document. The estimate stays
+    zero: the extraction's cost is not priced yet.
+
+    Args:
+        context: The planning context, with the model and tokenizer.
+        call: Logical AI.EXTRACT call.
+        name: Result column name.
+        live: Expected number of documents to extract from.
+    """
+    turn = context.model.turn
+    plain = bind_extract_prompt(call.prompt.args, call.question,
+                                context.tokenizer, turn)
+    numbered = bind_extract_prompt(call.prompt.args, call.question,
+                                   context.tokenizer, turn, numbered=True)
+    return ExtractSpec(
+        name=name, aliases=call.aliases(),
+        query_template=call.prompt.template,
+        arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
+        expected_inputs=live, estimated_seconds=0.0,
+        prompt_token_parts=(tuple(plain.preamble_token_ids),
+                            tuple(plain.tail_token_ids)),
+        question=call.question, trim=call.trim,
+        numbered_token_parts=(tuple(numbered.preamble_token_ids),
+                              tuple(numbered.tail_token_ids)))
 
 
 def classify_builder(context, alias, backend_name):

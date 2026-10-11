@@ -9,6 +9,7 @@ from .base import InputPort, PhysicalGraph, PhysicalNode, PortRef, ValueType
 from .nodes import (
     Aggregate,
     AiClassify,
+    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -143,6 +144,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         AiScore,
         Filter,
         AiClassify,
+        AiExtract,
         Barrier,
         Exchange,
         Foreign,

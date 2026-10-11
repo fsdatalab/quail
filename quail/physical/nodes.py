@@ -960,6 +960,110 @@ class AiFilter(PhysicalNode):
 
 
 @dataclass(frozen=True)
+class ExtractSpec(ScoreSpec):
+    """Specification for copying each document's answer to a question.
+
+    The prompt token parts are the head before the document and the
+    tail after it, ending in the phrase cue; the numbered parts are the
+    same for the document shown as numbered lines, ending in the lines
+    cue. The executor locates the answer's lines with the numbered
+    prompt when the document has enough lines, then reads the answer's
+    span with the plain one.
+
+    Attributes:
+        question: The question the answer is copied for.
+        trim: Whether the answer is the fewest words that answer the
+            question, or the whole lines that hold them.
+        numbered_token_parts: The head and tail token ids of the
+            numbered-lines prompt.
+    """
+
+    question: str = ""
+    trim: bool = True
+    numbered_token_parts: tuple[tuple[int, ...], ...] = ()
+
+    @property
+    def alias(self) -> str:
+        """Return the table alias the answer columns belong to."""
+        return self.aliases[0]
+
+    @property
+    def span_name(self) -> str:
+        """Return the name of the span column."""
+        return self.name + "_span"
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ExtractSpec":
+        base = ScoreSpec.from_mapping(value)
+        return cls(
+            **{name: getattr(base, name) for name in (
+                "name", "aliases", "query_template", "arguments",
+                "expected_inputs", "estimated_seconds", "pair_fraction",
+                "prompt_token_parts", "draws", "share_prefixes")},
+            question=str(value["question"]),
+            trim=bool(value.get("trim", True)),
+            numbered_token_parts=tuple(
+                tuple(int(token) for token in part)
+                for part in value.get("numbered_token_parts", ())),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            **super().to_dict(),
+            "question": self.question,
+            "trim": self.trim,
+            "numbered_token_parts": [
+                list(part) for part in self.numbered_token_parts],
+        }
+
+
+@dataclass(frozen=True)
+class AiExtract(AiScore):
+    """Physical operator that appends each row's answer and its span.
+
+    The scores port carries one row per input document: its id, the
+    answer text, and the answer's (start, end) character span in the
+    document; both are null when the document does not answer the
+    question. The ids port carries the same documents.
+    """
+
+    spec: ExtractSpec | None = None
+
+    type_name: ClassVar[str] = "quail.ai_extract"
+    runtime_key: ClassVar[str] = type_name
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        if self.spec is None:
+            return ()
+        spec = self.spec
+        return (
+            OutputPort("scores", ValueType.SCORES,
+                       schema=(spec.alias, spec.name, spec.span_name)),
+            OutputPort(f"ids:{spec.alias}", ValueType.DOCUMENT_IDS,
+                       schema=(spec.alias,)),
+        )
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {
+            **super().explain_fields(),
+            "question": None if self.spec is None else self.spec.question,
+            "trim": True if self.spec is None else self.spec.trim,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        value = attributes["spec"]
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            backend_name=str(attributes["backend_name"]),
+            model=str(attributes["model"]),
+            spec=None if value is None else ExtractSpec.from_mapping(value),
+        )
+
+
+@dataclass(frozen=True)
 class Barrier(PhysicalNode):
     """Move or repartition survivor ids between join steps."""
 

@@ -24,6 +24,7 @@ from quail.logical.nodes import (
     Result,
     Scan,
     SemanticClassify,
+    SemanticExtract,
     SemanticFilter,
     SemanticJoin,
 )
@@ -69,8 +70,9 @@ class LogicalPlanBuilder:
         labels: tuple = (),
         label_filters: tuple = (),
         regular_predicates: tuple = (),
+        extracts: tuple = (),
     ) -> None:
-        """Add one table with its filters, applies, and classifications.
+        """Add one table with its filters, applies, classifications, and extractions.
 
         Args:
             alias: The table's alias in the query.
@@ -86,6 +88,8 @@ class LogicalPlanBuilder:
                 order given.
             label_filters: (name, values, selectivity) per Filter on a
                 classification's label column, in written order.
+            extracts: (call, name) per extraction, in order. They sit
+                above the classifications and label filters.
 
         Raises:
             CompileError: The alias is taken, or a label filter names a
@@ -130,6 +134,8 @@ class LogicalPlanBuilder:
             if call not in classified:
                 node = SemanticClassify(node, call, name)
                 classified.append(call)
+        for call, name in extracts:
+            node = SemanticExtract(node, call, name)
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:

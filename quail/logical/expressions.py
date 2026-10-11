@@ -76,7 +76,7 @@ DEFAULT_SELECTIVITY = 0.2
 SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 
 
-MODEL_CALL_KINDS = ("boolean", "score", "label")
+MODEL_CALL_KINDS = ("boolean", "score", "label", "extract")
 
 
 def effective_selectivity(selectivity: Optional[float]) -> float:
@@ -85,6 +85,9 @@ def effective_selectivity(selectivity: Optional[float]) -> float:
 
 
 PROBABILITIES_SUFFIX = "_probabilities"
+# an "extract" call's second result column: the answer's character
+# span in the document
+SPAN_SUFFIX = "_span"
 
 
 @dataclass(frozen=True)
@@ -105,6 +108,11 @@ class ModelCall:
     # probability, as the column named after the label column plus
     # PROBABILITIES_SUFFIX
     probabilities: bool = False
+    # an "extract" call only: the question the answer is copied for,
+    # and whether the answer is the copied words (trim) or the whole
+    # lines of the document that hold them
+    question: str = ""
+    trim: bool = True
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -117,11 +125,26 @@ class ModelCall:
             raise CompileError(
                 f"model call kind must be one of {MODEL_CALL_KINDS}, got {self.kind!r}"
             )
-        if self.kind != "label":
-            if self.labels or self.descriptions or self.probabilities:
-                raise CompileError("only an AI.CLASSIFY call has labels")
-            return
-        validate_labels(self.labels, self.descriptions)
+        if self.kind != "label" and (
+            self.labels or self.descriptions or self.probabilities
+        ):
+            raise CompileError("only an AI.CLASSIFY call has labels")
+        if self.kind != "extract" and (self.question or not self.trim):
+            raise CompileError("only an AI.EXTRACT call has a question")
+        if self.kind == "label":
+            validate_labels(self.labels, self.descriptions)
+        elif self.kind == "extract":
+            validate_question(self.question)
+
+
+def validate_question(question: str) -> None:
+    """Check an AI.EXTRACT question: text with at least one word.
+
+    Raises:
+        CompileError: The question is empty or not a string.
+    """
+    if not isinstance(question, str) or not question.strip():
+        raise CompileError("AI.EXTRACT needs a question with at least one word")
 
 
 def validate_labels(labels: tuple, descriptions: tuple = ()) -> None:
@@ -242,6 +265,11 @@ def is_label(expression) -> bool:
     return model_call(expression).kind == "label"
 
 
+def is_extract(expression) -> bool:
+    """Return whether the expression computes an AI.EXTRACT answer."""
+    return model_call(expression).kind == "extract"
+
+
 def has_score(plan) -> bool:
     """Return whether a logical plan computes an AI.SCORE value anywhere."""
     operators = plan.operators()
@@ -274,6 +302,10 @@ def validate_predicate(expression) -> None:
             raise CompileError(
                 "an AI.CLASSIFY label is tested by a Filter on its "
                 "column, not by a SemanticFilter"
+            )
+        if expression.kind == "extract":
+            raise CompileError(
+                "an AI.EXTRACT answer is a result column, not a predicate"
             )
         return
     raise CompileError(
@@ -374,12 +406,15 @@ def _explain(expression) -> str:
             f"IN {list(expression.values)}"
         )
     if isinstance(expression, Alias):
-        if expression.expression.kind == "label":
-            # the SemanticClassify below computes the column
+        if expression.expression.kind in ("label", "extract"):
+            # the SemanticClassify or SemanticExtract below computes
+            # the column
             return expression.name
         return f"{_explain(expression.expression)} AS {expression.name}"
     if expression.kind == "label":
         return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"
+    if expression.kind == "extract":
+        return f"AI.EXTRACT({expression.prompt.template!r}, {expression.question!r})"
     function = "AI.SCORE" if expression.kind == "score" else "AI.IF"
     return f"{function}({expression.prompt.template!r})"
 

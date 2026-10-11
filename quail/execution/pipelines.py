@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from quail.physical import (
     AiClassify,
+    AiExtract,
     AiFilter,
     AiJoin,
     Filter,
@@ -57,6 +58,8 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
         if node.spec is None:
             return ()
         return (node.spec.anchor,)
+    if isinstance(node, AiExtract):
+        return () if node.spec is None else (node.spec.alias,)
     if isinstance(node, Filter):
         # a filter over one table's rows; it joins a chain only after
         # the classification whose labels its predicate reads
@@ -72,7 +75,7 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
 
 def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
     """Return output ports carrying documents for the given alias."""
-    if isinstance(node, (AiClassify, Filter)):
+    if isinstance(node, (AiClassify, AiExtract, Filter)):
         return ("scores", f"ids:{alias}")
     if isinstance(node, Foreign) and node.ids == "pairs":
         return (f"pairs:{node.written_pos}",)
@@ -146,8 +149,9 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         aliases = operator_aliases(node)
         if not aliases or node.node_id in followed:
             continue
-        # only an AI filter, classification, or join starts a pipeline
-        if not isinstance(node, (AiFilter, AiClassify, AiJoin)):
+        # only an AI filter, classification, extraction, or join
+        # starts a pipeline
+        if not isinstance(node, (AiFilter, AiClassify, AiExtract, AiJoin)):
             continue
         (alias,) = aliases
         members = [node]

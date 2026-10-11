@@ -76,7 +76,7 @@ from quail.planner.join_order import search_joins
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planner.statistics import prepare_filter_costs, summarize_alias
-from quail.planner.validation import has_label
+from quail.planner.validation import has_extract, has_label
 
 
 def _answer_ids(tokenizer) -> tuple[list[int], list[int]]:
@@ -131,6 +131,16 @@ def plan_request_backend(
                 reasons=("ORDER BY, DISTINCT, OFFSET, and GROUP BY run on "
                          "the Quail backend only",),
                 constraint="sort_needs_quail_backend",
+                needed=1, available=0, unit="backends"),
+            estimated_seconds=float("inf"),
+        ),)
+    if has_extract(region.logical_plan):
+        return (PhysicalCandidate(
+            graph=None,
+            plan=Refusal(
+                reasons=(f"AI.EXTRACT runs on the Quail backend; "
+                         f"{backend_name} does not run it",),
+                constraint="extract_needs_quail_backend",
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),
         ),)

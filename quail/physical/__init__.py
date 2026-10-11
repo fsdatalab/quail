@@ -21,6 +21,7 @@ from .codec import (
 from .nodes import (
     Aggregate,
     AiClassify,
+    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -28,6 +29,7 @@ from .nodes import (
     ClassifySpec,
     Comparison,
     Exchange,
+    ExtractSpec,
     Filter,
     FilterStage,
     Foreign,
@@ -49,9 +51,11 @@ from .nodes import (
 __all__ = [
     "Aggregate",
     "AiClassify",
+    "AiExtract",
     "AiJoin",
     "AiScore",
     "ClassifySpec",
+    "ExtractSpec",
     "Scan",
     "Barrier",
     "Exchange",

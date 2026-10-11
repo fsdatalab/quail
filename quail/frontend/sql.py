@@ -66,6 +66,8 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
             replacement = "AI_SCORE("
         elif function == "CLASSIFY":
             replacement = "AI_CLASSIFY("
+        elif function == "EXTRACT":
+            replacement = "AI_EXTRACT("
         elif function == "IF" and dialect is SQLDialect.BQ:
             replacement = "AI_FILTER("
         if (
@@ -99,10 +101,11 @@ def _reject_forbidden(tree) -> None:
         if name.startswith("AI_") and name not in {
             "AI_FILTER",
             "AI_SCORE",
+            "AI_EXTRACT",
         }:
             raise CompileError(
                 f"{name} is not supported; supported AI functions are "
-                "AI_FILTER and AI_SCORE"
+                "AI_FILTER, AI_SCORE, AI_CLASSIFY, and AI_EXTRACT"
             )
     # subqueries are legal only as the EXISTS form, checked
     # structurally; any other subquery is refused here
@@ -250,6 +253,12 @@ def compile_sql(
     order = bind_order(tree, b, columns, aggregation)
     _validate_query(b, joins, columns)
     named, labels = _bind_label_names(b, columns)
+    extracts = {}
+    for column in columns:
+        if isinstance(column, Alias) and column.expression.kind == "extract":
+            extracts.setdefault(column.expression.aliases()[0], []).append(
+                (column.expression, column.name)
+            )
 
     logical = LogicalPlanBuilder()
     for alias, provider in b.tables:
@@ -264,6 +273,7 @@ def compile_sql(
                 (labels[alias][call], accepted, selectivity)
                 for call, accepted, selectivity in b.label_tests.get(alias, ())
             ),
+            extracts=tuple(extracts.get(alias, ())),
         )
     for join in b.joins:
         logical.add_join(join)

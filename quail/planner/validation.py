@@ -5,6 +5,7 @@ from quail.logical import (
     Alias,
     Apply,
     SemanticClassify,
+    SemanticExtract,
     classified_above_joins,
     is_score,
 )
@@ -129,6 +130,36 @@ def joined_classification_refusal(graph, workers: int) -> Refusal | None:
 def has_label(logical) -> bool:
     """Return whether a logical plan classifies documents or joined rows."""
     return any(isinstance(node, SemanticClassify) for node in logical.walk())
+
+
+def has_extract(logical) -> bool:
+    """Return whether a logical plan copies answers from documents."""
+    return any(isinstance(node, SemanticExtract) for node in logical.walk())
+
+
+def extraction_refusal(context) -> Refusal | None:
+    """Check whether the model supports extraction planning.
+
+    An extraction reads the model's next-token probabilities over the
+    document's own tokens, which a reranker, a decision model, and a
+    diffusion model with an answer canvas do not give.
+
+    Args:
+        context: Planning context with the tokenizer and model specification.
+
+    Returns:
+        A Refusal describing missing support, or None if planning can proceed.
+    """
+    model = context.model
+    if context.tokenizer is None:
+        reason = "AI.EXTRACT planning needs the model's tokenizer"
+    elif model.role in ("reranker", "decision") or model.canvas_tokens:
+        reason = (f"AI.EXTRACT reads next-token probabilities over the "
+                  f"document's tokens, which {model.name!r} does not give")
+    else:
+        return None
+    return Refusal(reasons=(reason,), constraint="unsupported_extract_query",
+                   needed=1, available=0, unit="queries")
 
 
 class ClassifyRefusedError(Exception):
