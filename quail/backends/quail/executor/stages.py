@@ -437,7 +437,9 @@ class _StageExecutor:
             pairs += len(indices) * (1 if stage.single or not len(frame_ids)
                                      else 2)
         free_slots = len(self.arena.accounting.free_slots)
-        if (planned > room or pairs > free_slots) and len(chunk_groups) > 1:
+        splittable = (len(chunk_groups) > 1
+                      or chunk_groups[0][3] - chunk_groups[0][2] > 1)
+        if (planned > room or pairs > free_slots) and splittable:
             raise ArenaFullError(
                 f"recomputed prefixes ask {planned} rows of {room} and "
                 f"{pairs} slots of {free_slots}; split the chunk "
@@ -715,7 +717,18 @@ class _StageExecutor:
                 self._run_part(part)
                 return
             if len(part) < 2:
-                raise
+                a, j, start, end, carried = part[0]
+                if not self.recompute_state or end - start < 2:
+                    raise
+                # one group of partners asks more than a chunk holds
+                # once each carries its own copy of the document
+                logger.info("group of %d partners split: %s",
+                            end - start, error)
+                mid = (start + end) // 2
+                self.sched.in_flight += 1
+                self._run_part([(a, j, start, mid, carried)])
+                self._run_part([(a, j, mid, end, False)])
+                return
             logger.info("chunk of %d groups split: %s", len(part), error)
             half = len(part) // 2
             self._run_part(part[:half])
