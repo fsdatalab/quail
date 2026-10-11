@@ -144,6 +144,15 @@ def _install_single_rank_groups(torch):
     ps._NODE_COUNT = 1
 
 
+def text_model(model):
+    """Return the module holding `lm_head` and `model` for a loaded checkpoint.
+
+    A vision-language checkpoint nests its text model under
+    `language_model`; a text checkpoint is that module itself.
+    """
+    return getattr(model, "language_model", model)
+
+
 def retain_answer_head(torch, model, token_ids):
     """Keep the TRUE/FALSE answer rows and the full output head in bf16."""
     allowed = tuple(sorted(set(token_ids)))
@@ -152,7 +161,8 @@ def retain_answer_head(torch, model, token_ids):
     if hasattr(model, "quail_answer_token_ids"):
         answer_weights(model, allowed)
         return
-    weight = model.lm_head.weight
+    text = text_model(model)
+    weight = text.lm_head.weight
     indices = torch.tensor(allowed, device=weight.device, dtype=torch.long)
     weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
     model.register_buffer("quail_answer_weights", weights, persistent=False)
@@ -162,7 +172,7 @@ def retain_answer_head(torch, model, token_ids):
     # memory; the model spec prices an untied head into the KV arena.
     model.quail_full_head = weight.detach().to(dtype=torch.bfloat16)
     # lm_head can be the same module as embed_tokens; drop only this reference.
-    model.lm_head = None
+    text.lm_head = None
 
 
 def full_output_head(model):
@@ -187,13 +197,15 @@ def answer_weights(model, token_ids):
 
 def load_model(model_name: str, revision: str | None = None, *,
                answer_token_ids=None, max_batched_tokens=None,
-               moe_backend=None):
+               moe_backend=None, language_model_only=False):
     """Load model weights and retain the answer rows and the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
     fused MoE kernels size their scratch buffers from it; a dense model
     ignores it. moe_backend is passed through as vLLM's moe_backend
     setting (see ModelSpec.moe_backend); None lets vLLM pick.
+    language_model_only loads a vision-language checkpoint's text model
+    alone (see ModelSpec.language_model_only).
     """
     import os
     import tempfile
@@ -221,6 +233,8 @@ def load_model(model_name: str, revision: str | None = None, *,
         args["max_num_batched_tokens"] = int(max_batched_tokens)
     if moe_backend is not None:
         args["moe_backend"] = moe_backend
+    if language_model_only:
+        args["language_model_only"] = True
     config = EngineArgs(**args).create_engine_config()
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):

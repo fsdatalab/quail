@@ -10,7 +10,11 @@ from fakes import cpu_arena, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor import loop, model
-from quail.backends.quail.executor.model import answer_weights, retain_answer_head
+from quail.backends.quail.executor.model import (
+    answer_weights,
+    full_output_head,
+    retain_answer_head,
+)
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
 from quail.builtins import built_in_registry
 
@@ -27,6 +31,20 @@ def _model(torch, tied=False):
     model.lm_head = (model.model.embed_tokens if tied else
                      torch.nn.Linear(4, 8, bias=False, dtype=torch.bfloat16))
     return model
+
+
+def test_retained_head_of_a_nested_text_model(torch):
+    # a vision-language checkpoint keeps its text model, and so its
+    # head, one level down
+    outer = torch.nn.Module()
+    outer.language_model = _model(torch)
+    expected = outer.language_model.lm_head.weight.detach()[[1, 3]].clone()
+    retain_answer_head(torch, outer, [3, 1])
+    assert outer.language_model.lm_head is None
+    assert not hasattr(outer, "lm_head")
+    assert outer.quail_answer_token_ids == (1, 3)
+    assert torch.equal(outer.quail_answer_weights, expected)
+    assert full_output_head(outer).shape == (8, 4)
 
 
 def test_retained_answer_weights_ownership_and_answer_rows(torch):
