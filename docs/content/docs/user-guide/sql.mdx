@@ -329,6 +329,69 @@ For labels computed before later filters, see
 For the scoring methods, see
 [Label scoring](/docs/architecture/execution#label-scoring).
 
+## AI.EXTRACT
+
+`AI.EXTRACT` copies the words that answer a question from each document.
+It returns the copied words as a `STRING`, and their character span in
+the document as a `STRUCT<start INT32, end INT32>` in a second column
+named after the first plus `_span`. For example, imagine a `contracts`
+table with contract text in `body`. Return when each lease ends:
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.body, 'When does the lease end?') AS ends
+FROM contracts c;
+```
+
+The result has the columns `c.id`, `ends`, and `ends_span`. Both answer
+columns are null when the document does not answer the question. An
+extraction in `SELECT` requires a column alias with `AS`, and it cannot
+be used in `WHERE`.
+
+### Arguments
+
+`AI.EXTRACT(input, question[, options])`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `input` | `STRING` column | The document to copy from. |
+| `question` | `STRING` literal | The question the answer is copied for. |
+| `options` | Object | Optional parameters listed below. |
+
+### Optional parameters
+
+Pass an object as the third argument, such as `{'trim': false}`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `trim` | `true` | Return the fewest words that answer the question. With `false`, return the whole lines of the document that hold them, as the document's own line breaks divide it. Use `false` for an answer that is a clause rather than a name, a date, or a number. |
+
+### How the answer is found
+
+The answer is always a span of the document's own text: the model does
+not write it, it is read from the model's next-token probabilities.
+For a document of three lines or more, the model first names the lines
+that hold the answer, shown numbered as `cat -n` shows them; the
+answer's start is then read within those lines. A shorter document is
+read whole. From each likely start, Quail feeds the document's own
+tokens in chunks of 16 and scores every span by the probability of
+copying each token and of stopping after it; the best span is the
+answer. The document, the lines, and the question stay in KV across
+these steps.
+
+These limits apply:
+
+- `AI.EXTRACT` runs on the Quail backend and on the stock vLLM backend,
+  where the model writes the answer and Quail locates it in the text.
+- It runs on Qwen3 4B and Qwen3 32B. A reranker, a decision model, and
+  a diffusion model give no next-token probabilities over the document.
+- It runs on one GPU, and it cannot be mixed with `AI.SCORE`.
+- An extraction of a joined table runs over the documents the join
+  matched, or before the join; the planner picks the cheaper placement.
+
+For the answers of every document, see
+[Extraction answers](/docs/user-guide/results#extraction-answers).
+
 ## WHERE and ON
 
 `WHERE` keeps rows that satisfy the given conditions. `ON` specifies
@@ -366,9 +429,9 @@ in `ON`. See [Joining](#joining).
 
 Quail supports these SQL clauses with the following limits:
 
-- **`SELECT`** lists columns and `AI.SCORE` or `AI.CLASSIFY`
-  outputs with column aliases. `*` expands to all table columns. Other
-  computed expressions are unsupported.
+- **`SELECT`** lists columns and `AI.SCORE`, `AI.CLASSIFY`, or
+  `AI.EXTRACT` outputs with column aliases. `*` expands to all table
+  columns. Other computed expressions are unsupported.
 - **`FROM`** names a registered table, with an optional alias.
 - **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
   `RIGHT`, `FULL`) are not.
@@ -471,6 +534,6 @@ rows that pass `WHERE`.
 - Queries with no AI operator
 - `JOIN` with only relational predicates (no AI operator)
 - Outer joins (`LEFT`, `RIGHT`, `FULL`)
-- `AI.EXTRACT` and `AI.MAP`
+- `AI.MAP`
 
 Using any of these raises `quail.logical.CompileError`.

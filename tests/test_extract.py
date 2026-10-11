@@ -11,7 +11,6 @@ from fakes import letter_tokens
 import quail
 from quail.backends.request import EXTRACT_MAX_TOKENS
 from quail.catalog import DocumentProvider
-from quail.execution.execute import execute_query
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.logical import (
     SHARED_PRE,
@@ -36,7 +35,6 @@ from quail.physical import (
     AiJoin,
     ExtractSpec,
     Filter,
-    GraphValidationError,
     Project,
     RequestExecution,
     RequestExtractSpec,
@@ -188,10 +186,7 @@ def test_extract_plans_one_physical_node_with_both_prompts(session):
     assert plan.nodes[-1].columns == ("c.id", "ends", "ends_span")
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
-    # the executor for the node is not registered yet, so running the
-    # plan is refused by name rather than failing inside the engine
-    with pytest.raises(GraphValidationError, match="quail.ai_extract"):
-        execute_query(query, physical_executor=lambda request: None)
+    assert node.runtime_key in session.registry.runtimes
 
 
 def test_extract_follows_the_filters_and_labels_of_its_table(session):

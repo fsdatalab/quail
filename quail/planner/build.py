@@ -299,6 +299,11 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 reasons=("AI.EXTRACT cannot be mixed with AI.SCORE",),
                 constraint="unsupported_extract_query",
                 needed=1, available=0, unit="queries")
+        if gpus > 1:
+            return Refusal(
+                reasons=("AI.EXTRACT runs on one GPU; set gpus=1",),
+                constraint="extract_needs_one_gpu",
+                needed=1, available=gpus, unit="gpus")
         refusal = extraction_refusal(context)
         if refusal is not None:
             return refusal

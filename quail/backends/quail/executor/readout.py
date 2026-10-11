@@ -206,6 +206,90 @@ class AsyncLabelLogprobs:
         return values
 
 
+class AsyncTopLogprobs:
+    """Asynchronous readout of each row's likeliest tokens' log probabilities.
+
+    A row's values are the log probabilities of the extra tokens, then
+    the ids of its k likeliest tokens, then their log probabilities,
+    all normalized over the full vocabulary at temperature 1. A token
+    outside the k likeliest has no value: the reader treats it as
+    impossible.
+
+    Args:
+        torch: Torch module.
+        F: Torch functional module.
+        head: Full output head with shape (vocabulary, hidden size).
+        k: How many likeliest tokens each row returns.
+        extras: Token ids whose log probability every row returns.
+        ragged: Whether answers have several rows each: submit then
+            takes rows_per_answer and result returns one (rows, width)
+            array per answer, in an object array.
+    """
+
+    BLOCK_ROWS = AsyncLabelLogprobs.BLOCK_ROWS
+
+    def __init__(self, torch, F, head, k, extras, ragged=False):
+        self.torch = torch
+        self.F = F
+        self.head = head
+        self.k = k
+        self.extras = torch.tensor(list(extras), device=head.device,
+                                   dtype=torch.long)
+        self.width = len(extras) + 2 * k
+        self.ragged = ragged
+        self.dtype = (np.dtype(object) if ragged
+                      else np.dtype((np.float32, (self.width,))))
+        self.available = []
+
+    def values(self, normed):
+        """Compute each row's values from normalized hidden states."""
+        torch = self.torch
+        out = torch.empty((normed.shape[0], self.width), dtype=torch.float32,
+                          device=normed.device)
+        n = len(self.extras)
+        for start in range(0, normed.shape[0], self.BLOCK_ROWS):
+            block = normed[start:start + self.BLOCK_ROWS]
+            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
+            logits -= torch.logsumexp(logits, dim=1, keepdim=True)
+            rows = slice(start, start + block.shape[0])
+            out[rows, :n] = logits.index_select(1, self.extras)
+            top, ids = torch.topk(logits, self.k, dim=1)
+            out[rows, n:n + self.k] = ids.float()
+            out[rows, n + self.k:] = top
+        return out
+
+    def submit(self, normed, rows_per_answer=None):
+        torch = self.torch
+        values = self.values(normed)
+        host = self.available.pop() if self.available else None
+        if host is None or host.shape[0] < values.shape[0]:
+            host = torch.empty(values.shape, dtype=torch.float32,
+                               pin_memory=True)
+        host[:values.shape[0]].copy_(values, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        return event, host, values.shape[0], rows_per_answer
+
+    def result(self, handle):
+        event, host, count, rows_per_answer = handle
+        event.synchronize()
+        values = host[:count].numpy().copy()
+        self.available.append(host)
+        return split_rows(values, rows_per_answer) if self.ragged else values
+
+
+def split_rows(values, rows_per_answer):
+    """Split stacked answer rows into one array per answer, in an object array."""
+    if rows_per_answer is None:
+        rows_per_answer = [1] * len(values)
+    out = np.empty(len(rows_per_answer), dtype=object)
+    row = 0
+    for index, count in enumerate(rows_per_answer):
+        out[index] = values[row:row + count]
+        row += count
+    return out
+
+
 class AsyncScores:
     """Non-blocking yes-against-no sigmoid readout for AI.SCORE."""
 

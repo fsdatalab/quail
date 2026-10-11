@@ -101,6 +101,36 @@ Using both raises a compilation error. The
 [SQL reference](/docs/user-guide/sql#aiclassify) lists label requirements,
 probability output, and limits on classifications of joined rows.
 
+### ai_extract
+
+`ai_extract(column, question, *, name, trim=True)`
+
+Copy the words that answer a question from each document. `name` sets
+the answer column's name; the answer's character span in the document
+comes in the column `name` plus `_span`. Include `name` in `select()`
+to return both.
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `column` | `str` or `col()` | The document column, such as `"c.body"`. |
+| `question` | `str` | The question the answer is copied for. |
+| `name` | `str` | Name of the answer column. |
+| `trim` | `bool` | Return the fewest words that answer the question, or with `False` the whole lines that hold them. Defaults to `True`. |
+
+```python
+query = (
+    session.docs("contracts").alias("c")
+    .ai_extract("c.body", "When does the lease end?", name="ends")
+    .select("c.id", "ends")
+)
+result = query.collect()
+```
+
+The result has the columns `c.id`, `ends`, and `ends_span`; both answer
+columns are null for a document that does not answer the question. The
+[SQL reference](/docs/user-guide/sql#aiextract) explains how the answer
+is found and the limits.
+
 ### ai_score
 
 `ai_score(prompt, name=...)`

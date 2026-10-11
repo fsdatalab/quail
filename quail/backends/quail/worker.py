@@ -208,15 +208,19 @@ def quail_runtime_payload(request, graph) -> dict:
     """Build private Quail scheduler state from a standard request."""
     envelope = request.plan
     docs = {}
+    texts = {}
     for node in graph.nodes:
         if not isinstance(node, Scan):
             continue
         docs[node.alias] = request.inputs[node.input_id].documents
+        if request.inputs[node.input_id].texts is not None:
+            texts[node.alias] = request.inputs[node.input_id].texts
     return {
         "physical_plan": envelope,
         "model": envelope["model"],
         "workers": envelope["workers"],
         "docs": docs,
+        "texts": texts,
         "columns": request.column_tables(),
         **dict(envelope["settings"]),
     }
@@ -369,6 +373,7 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
     runtime_state = {
         **state,
         "docs": decode_payload_documents(payload["docs"]),
+        "texts": payload.get("texts", {}),
         "columns": payload.get("columns", {}),
         "functions": registry.functions,
         "runtimes": registry.runtimes,

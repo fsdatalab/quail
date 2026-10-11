@@ -8,8 +8,8 @@ Set `model` to the model you want to run and `device` to your GPU type.
 
 | Model | `model` value | Weight precision | AI functions |
 | --- | --- | --- | --- |
-| Qwen3 4B | `"qwen3-4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
-| Qwen3 32B | `"qwen3-32b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
+| Qwen3 4B | `"qwen3-4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
+| Qwen3 32B | `"qwen3-32b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 | DiffusionGemma 26B-A4B | `"diffusion-gemma-26b-a4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
 | Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | BF16 | `AI.SCORE` |
 | Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | BF16 | `AI.SCORE` |
@@ -18,9 +18,10 @@ Set `model` to the model you want to run and `device` to your GPU type.
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
 format. All listed models store KV in BF16.
 
-`AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
-`AI.CLASSIFY` assigns a label. See the
-[SQL reference](/docs/user-guide/sql) for examples.
+`AI.IF` supports filters and joins. `AI.SCORE` returns a score,
+`AI.CLASSIFY` assigns a label, and `AI.EXTRACT` copies the words that
+answer a question. See the [SQL reference](/docs/user-guide/sql) for
+examples.
 
 ## GPUs
 

@@ -74,6 +74,26 @@ The table contains `r` and `sentiment`. The `r` values are input row
 indices starting at zero, rather than review IDs. For joined rows,
 there is an index column for each table alias.
 
+### Extraction answers
+
+For an `AI.EXTRACT` query, `result.answer_tables["extracts"]` holds one
+table per extraction, named after its column, with a row for every
+document it read: the input row index, the answer, and its span.
+For example, with the `contracts` table of the
+[SQL reference](/docs/user-guide/sql#aiextract):
+
+```python
+result = session.sql("""
+    SELECT c.id, AI.EXTRACT(c.body, 'When does the lease end?') AS ends
+    FROM contracts c
+""").run()
+answers = result.answer_tables["extracts"]["ends"]
+print(answers.to_pydict())
+```
+
+The table contains `c`, `ends`, and `ends_span`. A document that does
+not answer the question has nulls in the last two.
+
 ## Preview the plan
 
 Call `explain()` to inspect the plan without running the model:

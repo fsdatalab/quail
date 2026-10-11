@@ -27,6 +27,7 @@ from quail.execution.runner import (
 from quail.execution.tokens import DocumentKeys, DocumentPrefixes, chain_tokens
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
+    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -44,6 +45,7 @@ def quail_runtimes() -> dict:
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
         AiScore.runtime_key: model_runtime,
+        AiExtract.runtime_key: model_runtime,
         Filter.runtime_key: FilterRuntime(),
     }
 
@@ -266,6 +268,17 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext,
         A scheduler input mapping for filters, joins, and scores. Other
         operators receive the original input mapping.
     """
+    if isinstance(node, AiExtract):
+        # the one input carries the documents' ids, or the rows of an
+        # earlier operator over them
+        (value,) = inputs.values()
+        ids = (value.column(node.spec.alias).to_pylist()
+               if hasattr(value, "column") else list(value))
+        return {"document_ids": [int(document) for document in ids],
+                "documents": context.state["docs"],
+                "texts": context.state.get("texts", {}),
+                "pre": context.state.get("pre", []),
+                "gpu_timing": context.state.get("gpu_timing", False)}
     if isinstance(node, AiScore):
         return {"score_inputs": inputs, "documents": context.state["docs"],
                 "pre": context.state.get("pre", []),

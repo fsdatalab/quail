@@ -69,6 +69,7 @@ Nodes are frozen dataclasses. Rewrites use `with_children()`,
 | `Join(left, right, on)` | Form pairs from two inputs. Optional column equalities restrict the pairs. Without `on`, it forms every pair. |
 | `SemanticJoin(input, predicate, semantics, selectivity, anchor)` | Evaluate a model predicate over the pairs from a `Join`. The semantics are `full`, `exists`, or `anti`. |
 | `SemanticClassify(input, call, name)` | Evaluate an `AI.CLASSIFY` call and add the label column `name`. |
+| `SemanticExtract(input, call, name)` | Evaluate an `AI.EXTRACT` call and add the answer column `name` and its span column `name_span`. |
 | `Filter(input, condition, selectivity)` | Keep rows that satisfy a condition on a computed label. |
 | `Apply(input, function, kind, ids, columns, aliases)` | Run a registered Python function on input rows or pairs. |
 | `Project(input, columns, limit)` | Select result columns and optionally limit the result. This is the root node. |
