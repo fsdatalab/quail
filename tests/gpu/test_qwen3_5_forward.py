@@ -357,6 +357,7 @@ def test_state_saved_at_the_document_end_restores_the_sequence(
                             per_layer=per_layer, per_row=per_row,
                             vs_stock=vs_stock)
     print(json.dumps(report))
+    _null_slot_is_zero(arena)
     for name, entry in report.items():
         # the prefix rows are the same computation
         assert entry["prefix_max"] < 1e-3, name
@@ -370,10 +371,18 @@ def test_state_saved_at_the_document_end_restores_the_sequence(
     assert report["aligned"]["per_layer"][-1] < 0.02
 
 
+def _null_slot_is_zero(arena):
+    """Slot 0 is the zero state every fresh sequence starts from."""
+    for layer in sorted(arena.state_layers):
+        state, conv = arena.state_pools(layer)
+        assert not state[0].any() and not conv[0].any(), layer
+
+
 def test_partners_read_the_kept_state_and_leave_it_unchanged(prompts, state_run):
     from quail.backends.quail.executor.chunk import pack_chunk
 
     arena, pipeline = state_run
+    _null_slot_is_zero(arena)
     ids = prompts[1]
     anchor, frame = ids[:len(ids) - SUFFIX_TOKENS], ids[len(ids) - SUFFIX_TOKENS:
                                                          len(ids) - 4]
@@ -390,6 +399,10 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(prompts, state_run)
             attention_mode="unified"))
         separate.append(rows[f + len(frame):])
         arena.free_key(key)
+    # the three partners are the same question tail, so their separate
+    # runs are the same computation over the same pages
+    assert all(torch.equal(separate[0], other) for other in separate[1:])
+    _null_slot_is_zero(arena)
 
     key = ("anchor", 0)
     arena.activate(key, f, capacity_tokens=f + 32, base_tokens=f, slots=1)
@@ -400,7 +413,10 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(prompts, state_run)
     ], attention_mode="unified")
     plan = chunk.meta["state"]
     assert [w["n"] for w in plan["waves"]] == [1, 3]
+    covered = torch.cat([w["rows"] for w in plan["waves"]]).sort().values
+    assert covered.tolist() == list(range(len(chunk.ids)))
     together = _layer_output(pipeline, chunk)
+    _null_slot_is_zero(arena)
     kept = arena.state_slot_at(key, f + len(frame))
     pools = [pipeline.arena.state_pools(layer) for layer in sorted(arena.state_layers)]
     before = [(s[kept].clone(), c[kept].clone()) for s, c in pools]
@@ -416,15 +432,18 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(prompts, state_run)
                for b, a in zip(before, after))
     arena.free_key(key)
     offset = f + len(frame)
-    errors, again_errors = [], []
+    errors, again_errors, again_vs_separate = [], [], []
     for index, partner in enumerate(partners):
         rows = together[offset:offset + len(partner)]
         errors.append(_relative(rows, separate[index]).median().item())
         start = sum(map(len, partners[:index]))
-        again_errors.append(_relative(
-            rows, repeated[start:start + len(partner)]).median().item())
+        again_rows = repeated[start:start + len(partner)]
+        again_errors.append(_relative(rows, again_rows).median().item())
+        again_vs_separate.append(
+            _relative(again_rows, separate[index]).median().item())
         offset += len(partner)
-    print(json.dumps(dict(partner_medians=errors, again_medians=again_errors)))
+    print(json.dumps(dict(partner_medians=errors, again_medians=again_errors,
+                          again_vs_separate=again_vs_separate)))
     assert max(errors) < 0.02
     # the same rows from the same slot in a smaller chunk: the GEMM and
     # attention kernels may tile the two batch shapes differently, so

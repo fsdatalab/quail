@@ -169,10 +169,9 @@ class Qwen35Pipeline(ModelPipeline):
         # its index names and writes the final window back there; slot
         # 0 is its null slot, so the sequences take slots 1 and up of
         # a scratch copy, and the pool sees only the windows that save
-        windows = torch.empty((m + 1, conv_dim, kernel - 1),
+        windows = torch.zeros((m + 1, conv_dim, kernel - 1),
                               dtype=mixed_qkv.dtype, device=mixed_qkv.device)
         if pools is None:
-            windows.zero_()
             initial = None
         else:
             s_pool, conv_pool = pools
