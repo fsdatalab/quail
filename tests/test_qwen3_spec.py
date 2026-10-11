@@ -25,6 +25,7 @@ def test_qwen3_spec_matches_built_in(name):
     for field in ARCHITECTURE:
         assert getattr(spec, field) == getattr(built_in, field), field
     assert spec.role == built_in.role
+    assert spec.extract_turn == built_in.extract_turn
     if built_in.role != "reranker":
         # the reranker specs count the embedding table in params
         assert spec.params == pytest.approx(built_in.params, rel=0.01)
@@ -54,3 +55,13 @@ def test_qwen3_spec_fields_override_derived_values():
 def test_qwen3_spec_rejects_layouts_the_executor_cannot_run(changes, message):
     with pytest.raises(ValueError, match=message):
         qwen3_spec("m", "Org/M", config=_config(**changes))
+
+
+def test_qwen3_copies_spans_in_its_chat_turn():
+    """AI.IF prompts stay raw; the extract prompt gets the chat turn."""
+    spec = MODELS["qwen3-4b-fp8"]
+    assert spec.turn == ("", "")
+    assert spec.extract_turn == (
+        "<|im_start|>user\n",
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    assert MODELS["qwen3-32b-fp8"].extract_turn == spec.extract_turn

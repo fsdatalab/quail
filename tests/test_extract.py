@@ -174,7 +174,7 @@ def test_extract_plans_one_physical_node_with_both_prompts(session):
     assert spec.arguments == (("c", "text"),)
     assert spec.expected_inputs == 2
     assert spec.estimated_seconds > 0
-    turn = session.model.turn
+    turn = session.model.extract_turn
     head, tail = spec.prompt_token_parts
     assert list(head) == letter_tokens(turn[0] + SHARED_PRE)
     # a model without turn text gets a line break before the cue
@@ -504,7 +504,7 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     (spec,) = request_node.extracts
     assert (spec.alias, spec.output, spec.question, spec.trim) == (
         "c", "ends", QUESTION, True)
-    tail_text = (AFTER_DOCUMENT_TEXT + (session.model.turn[1] or "\n")
+    tail_text = (AFTER_DOCUMENT_TEXT + (session.model.extract_turn[1] or "\n")
                  + EXTRACT_PHRASE_CUE)
     assert list(spec.tail_token_ids) == request_tests._tokens(tail_text)
     assert spec.tail_text == tail_text

@@ -956,7 +956,7 @@ def extract_spec(context, call, name, live) -> ExtractSpec:
         name: Result column name.
         live: Expected number of documents to extract from.
     """
-    turn = context.model.turn
+    turn = context.model.extract_turn
     plain = bind_extract_prompt(call.prompt.args, call.question,
                                 context.tokenizer, turn)
     numbered = bind_extract_prompt(call.prompt.args, call.question,

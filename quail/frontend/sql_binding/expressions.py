@@ -162,10 +162,12 @@ def _is_ai_score_comparison(node) -> bool:
 
 
 class ExpressionBinder:
-    def __init__(self, catalog: Catalog, tokenizer, turn=("", ""), layout="ai-if"):
+    def __init__(self, catalog: Catalog, tokenizer, turn=("", ""), layout="ai-if",
+                 extract_turn=None):
         self.catalog = catalog
         self.tokenizer = tokenizer
         self.turn = turn
+        self.extract_turn = turn if extract_turn is None else extract_turn
         self.layout = layout
         self.tables: list[tuple[str, str]] = []
         self.regular_predicates: dict[str, list[RegularPredicate]] = {}
@@ -419,7 +421,7 @@ class ExpressionBinder:
         question = str(args[1].this)
         options = self.parse_extract_options(args[2] if len(args) == 3 else None)
         prompt = bind_extract_prompt(
-            (ref,), question, self.tokenizer, turn=self.turn)
+            (ref,), question, self.tokenizer, turn=self.extract_turn)
         self.note_doc_column(ref)
         call = ModelCall(prompt, "extract", question=question,
                          trim=options.get("trim", True))

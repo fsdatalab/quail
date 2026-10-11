@@ -205,6 +205,7 @@ def compile_sql(
     dialect: SQLDialect | str = SQLDialect.SNOWFLAKE,
     turn: tuple[str, str] = ("", ""),
     layout: str = "ai-if",
+    extract_turn: tuple[str, str] | None = None,
 ) -> LogicalPlan:
     """Compile AI SQL text into a LogicalPlan.
 
@@ -215,6 +216,8 @@ def compile_sql(
         dialect: SQL dialect used to parse the statement.
         turn: Model chat text placed before and after each prompt.
         layout: Prompt layout used by the model.
+        extract_turn: Model chat text around AI.EXTRACT prompts, when it
+            differs from `turn`.
 
     Returns:
         The bound logical query plan.
@@ -242,7 +245,8 @@ def compile_sql(
     offset = _parse_offset(tree)
     distinct = _parse_distinct(tree)
 
-    b = ExpressionBinder(catalog, tokenizer, turn, layout)
+    b = ExpressionBinder(catalog, tokenizer, turn, layout,
+                         extract_turn=extract_turn)
 
     joins = JoinBinder(b)
     joins.bind_tables(tree)

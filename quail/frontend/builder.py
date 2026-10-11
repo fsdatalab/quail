@@ -211,11 +211,13 @@ def prompt(template: str, *cols: ColSpec) -> PromptSpec:
 
 class Query:
     def __init__(self, catalog: Catalog, provider: str, tokenizer=None,
-                 turn: tuple[str, str] = ("", ""), layout: str = "ai-if"):
+                 turn: tuple[str, str] = ("", ""), layout: str = "ai-if",
+                 extract_turn: tuple[str, str] | None = None):
         catalog.get(provider)     # unknown provider -> CompileError
         self._catalog = catalog
         self._tokenizer = tokenizer
         self._turn = turn
+        self._extract_turn = turn if extract_turn is None else extract_turn
         self._layout = layout
         self._tables = [(provider, provider)]   # (alias, provider)
         self._doc_columns = {}
@@ -446,7 +448,7 @@ class Query:
         self._claim_name(name + SPAN_SUFFIX)
         ref = self._resolve(col(c) if isinstance(c, str) else c)
         bound = bind_extract_prompt((ref,), question, self._tokenizer,
-                                    turn=self._turn)
+                                    turn=self._extract_turn)
         self._note_doc_column(ref)
         call = ModelCall(bound, "extract", question=question, trim=trim)
         call.validate()

@@ -234,6 +234,7 @@ class Session:
         logical = compile_sql(
             text, self.catalog, self.tokenizer, dialect=dialect,
             turn=self.model.turn, layout=self.model.prompt_layout,
+            extract_turn=self.model.extract_turn,
         )
         return Query(self, logical, order=order)
 
@@ -258,7 +259,8 @@ class Session:
                             BuilderQuery(self.catalog, name,
                                          self.tokenizer,
                                          turn=self.model.turn,
-                                         layout=self.model.prompt_layout))
+                                         layout=self.model.prompt_layout,
+                                         extract_turn=self.model.extract_turn))
 
     @property
     def tokenizer(self):
