@@ -208,21 +208,36 @@ def test_start_ranking_tells_repeated_words_apart_and_keeps_the_first():
     forced = choose_candidates(tables, inside, likely, {}, prefix)
     assert forced[-1].char == 0 and forced[-1].score == NEG
     assert len(forced) == 9
-    branches = make_branches(tables, text, candidates[:2], None, lp)
+    branches = make_branches(tables, text, candidates[:2], lp)
     assert branches[0].stream[0] == the and branches[0].char == 26
     # the first token ends at the candidate's end; the rest follow
     assert branches[1].ends[:4] == [23, 24, 25, 26]
     assert text[branches[1].char:branches[1].ends[3]] == " March 3."
-    assert branches[0].skip == 0
     assert branches[0].start == lp[the]
     assert branches[0].rank == candidates[0].score
-    assert make_branches(tables, text, candidates[:1], 30, lp)[0].skip == 1
+
+
+def test_a_start_that_begins_another_word_gets_the_next_token_step():
+    text = "The lease is their lease."
+    tables = _tables(text, "their", "ir")
+    ids, offsets = tables.encode(text)
+    prefix = [99] + ids
+    tokens = document_tokens(ids, offsets, [(0, 0, len(text))], 1)
+    the = tables.encode_ids("The")[0]
+    starts = rank_starts(tables, {the: -0.5}, prefix, tokens, None)
+    # "the" begins "their" too, so both start with it and tie at the cue
+    assert starts["best"]["their"] == the and starts["filler"]["their"]
+    assert {"the", "their"} <= set(starts["ambiguous"])
+    lease, ir = tables.encode_ids(" lease")[0], tables.encode_ids("ir")[0]
+    follow = {"the": {lease: -0.1}, "their": {ir: -9.0}}
+    candidates = choose_candidates(tables, starts, {the: -0.5}, follow, prefix)
+    assert [(c.char, c.score) for c in candidates[:2]] == [(0, -0.6), (13, -9.5)]
 
 
 def _branch(copy, stop, **fields):
     fields.setdefault("start", 0.0)
     return extract_mod.Branch(char=0, first=1, stream=list(range(1, 7)),
-                              ends=list(range(1, 7)), skip=0,
+                              ends=list(range(1, 7)),
                               copy=[np.log(c) for c in copy],
                               stop=[np.log(s) for s in stop], fed=len(copy),
                               **fields)
@@ -241,9 +256,9 @@ def test_span_ends_where_stopping_beats_copying():
     assert copying.end(force=True) == 2
     assert best_span([copying]) is None
     assert best_span([copying], force=True) == (copying, 2)
-    # a span that stops before the located lines is dead
-    dead = _branch([.9], [.1])
-    dead.skip, dead.stop, dead.copy = 1, [NEG], [NEG]
+    # a start the cue gave no probability, the region's forced first
+    # token, ends but never answers
+    dead = _branch([.1], [.9], start=NEG)
     assert dead.end() == 0 and dead.score() == NEG
 
 
@@ -264,9 +279,8 @@ def test_starts_are_fed_in_the_models_order():
     best.fed = 2
     assert open_branches(branches) == []
     assert best_span(branches) == (best, 1)
-    # a dead best start hands over to the second
-    best.copy, best.stop, best.skip, best.fed = [NEG], [NEG], 1, 1
-    tied.copy, tied.stop, tied.skip = [NEG], [NEG], 1
+    # starts without a span hand over to the second
+    best.start = tied.start = NEG
     assert open_branches(branches) == [0]
     assert best_span(branches) is None
 
@@ -486,7 +500,6 @@ def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatc
     assert lease.numbered and lease.path == "located"
     assert lease.range == (2, 3)
     assert lease.region == (LEASE.index("The lease"), LEASE.index("\nRent"))
-    assert lease.skip_to == LEASE.index("March")
     assert [c.char for c in lease.candidates][0] == LEASE.index("March")
     assert lease.passes == 1 and not lease.open
     # the two short documents are shown plain; the model writes none
@@ -519,7 +532,7 @@ def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatc
     march = tables.encode_ids("March")[0]
     assert lease.branches[0].first == march
     (first,) = [suffix for suffix in fed if suffix[0] == march]
-    assert len(first) == lease.branches[0].fed <= lease.branches[0].skip + CHUNK
+    assert len(first) == lease.branches[0].fed <= CHUNK
     # the likeliest start ended with a span, so no other start is fed
     assert len(fed) == 1 and 1 < len(lease.candidates) <= 8
     assert lease.key == ("extract", "ends", 0)
@@ -632,3 +645,20 @@ def test_answer_table_and_session_project_the_answer_columns():
     answers = result.answer_tables["extracts"]["ends"]
     assert answers.column_names == ["c", "ends", "ends_span"]
     session.close()
+
+
+def test_top_logprob_readout_sums_a_group_of_extras():
+    import torch
+
+    from quail.backends.quail.executor.readout import AsyncTopLogprobs
+
+    head = torch.eye(6, dtype=torch.float32)
+    readout = AsyncTopLogprobs(torch, torch.nn.functional, head, 2,
+                               [(0, 1), 2])
+    normed = torch.tensor([[3.0, 2.0, 1.0, 0.0, 0.0, 0.0]])
+    (row,) = readout.values(normed).tolist()
+    logprobs = torch.log_softmax(normed[0], dim=0).tolist()
+    assert row[0] == pytest.approx(np.logaddexp(logprobs[0], logprobs[1]))
+    assert row[1] == pytest.approx(logprobs[2])
+    assert row[2:4] == [0.0, 1.0] and row[4:] == pytest.approx(logprobs[:2])
+    assert readout.width == 2 + 2 * 2

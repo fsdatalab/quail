@@ -107,6 +107,10 @@ class Tables:
             if key:
                 self.variants.setdefault(key, []).append(index)
         self.quote_id = tokenizer.convert_tokens_to_ids('"')
+        # a decoder closes the answer with any token that opens with the
+        # quote, such as `".` or `",`: together they are the stop
+        self.stop_ids = tuple(index for index, token in enumerate(self.vocab)
+                              if token.startswith('"'))
         self.none_id = self.encode_ids("none")[0]
         digits = [self.encode_ids(digit)[0] for digit in "0123456789"]
         dash, newline = self.encode_ids("-")[0], self.encode_ids("\n")[0]
@@ -190,7 +194,6 @@ class Branch:
     first: int
     stream: list        # the tokens from the start to the document's end
     ends: list          # the document character each stream token ends at
-    skip: int           # tokens before the last line, whose ends are not scored
     start: float = NEG  # the first token's log probability at the cue
     rank: float = NEG   # the candidate's score, which orders the starts
     copy: list = field(default_factory=list)
@@ -241,7 +244,6 @@ class Extraction:
     range_done: bool = False
     range: tuple | None = None
     region: tuple | None = None
-    skip_to: int | None = None
     path: str = "scored"
     none_lp: float = NEG
     best_lp: float = NEG
@@ -283,7 +285,8 @@ def rank_starts(tables: Tables, lp, prefix, tokens, region) -> dict:
 
     Every document token in the region is scored as the best of the
     tokens that can begin it. The TOP_TOKENS likeliest start tokens
-    are kept; one that occurs at several positions is ambiguous and
+    are kept; one that occurs at several positions, or that begins
+    another kept word too, as "the" begins "their", is ambiguous and
     gets one more step, the log probability of each position's next
     token after it, so the positions are told apart.
 
@@ -303,9 +306,11 @@ def rank_starts(tables: Tables, lp, prefix, tokens, region) -> dict:
         best[key], filler[key] = best_start(
             tables, lp, key, prefix[occurrences[0][0]])
     ranked = sorted(groups, key=lambda k: -lp.get(best[k], NEG))[:TOP_TOKENS]
+    firsts = [best[key] for key in ranked]
     return {"ranked": ranked, "best": best, "filler": filler,
             "groups": groups, "inside": inside,
-            "ambiguous": [key for key in ranked if len(groups[key]) > 1],
+            "ambiguous": [key for key in ranked if len(groups[key]) > 1
+                          or firsts.count(best[key]) > 1],
             "none_lp": lp.get(tables.none_id, NEG),
             "best_lp": lp.get(best[ranked[0]], NEG) if ranked else NEG}
 
@@ -342,15 +347,13 @@ def choose_candidates(tables: Tables, starts: dict, lp, follow, prefix) -> list:
     return scored
 
 
-def make_branches(tables: Tables, text: str, candidates, skip_to, lp) -> list:
+def make_branches(tables: Tables, text: str, candidates, lp) -> list:
     """Return one branch per candidate: its tokens to the document's end.
 
     Args:
         tables: The token tables.
         text: The document's text.
         candidates: The start positions, from choose_candidates.
-        skip_to: The document character the located lines' last line
-            starts at, or None: a span ends in that line or after it.
         lp: The cue row's log probabilities.
     """
     branches = []
@@ -358,9 +361,7 @@ def make_branches(tables: Tables, text: str, candidates, skip_to, lp) -> list:
         ids, offsets = tables.encode(text[c.end:])
         stream = [c.first, *c.filler, *ids]
         ends = [c.end] * (1 + len(c.filler)) + [c.end + b for _, b in offsets]
-        skip = sum(end <= skip_to for end in ends) if skip_to else 0
         branches.append(Branch(c.char, c.first, stream, ends,
-                               min(skip, len(stream)),
                                start=lp.get(c.first, NEG), rank=c.score))
     return branches
 
@@ -370,9 +371,9 @@ def open_branches(branches) -> list:
 
     The starts are fed in the model's order, the likeliest first, as a
     decoder writes its likeliest token. A start is fed while no
-    better one has ended with a span; one below every ended span is
-    never fed. Positions that tie, the same start and the same token
-    after it, are fed together and told apart by what follows.
+    better one has ended with a span; one below an ended span is never
+    fed. Positions that tie, the same start and the same token after
+    it, are fed together and told apart by what follows.
     """
     done = max((b.order for b in branches
                 if b.end() is not None and b.score() > NEG), default=None)
@@ -476,7 +477,7 @@ class ExtractStages:
         return (AsyncTopLogprobs(torch, F, head, CUE_TOP,
                                  [tables.none_id, tables.quote_id,
                                   *tables.range_targets]),
-                AsyncTopLogprobs(torch, F, head, FEED_TOP, [tables.quote_id],
+                AsyncTopLogprobs(torch, F, head, FEED_TOP, [tables.stop_ids],
                                  ragged=True))
 
     def _prepare(self, index, document, text, stored) -> Extraction:
@@ -550,7 +551,6 @@ class ExtractStages:
             else:
                 a, b = doc.range
                 doc.region = (doc.lines[a - 1][0], doc.lines[b - 1][1])
-                doc.skip_to = doc.lines[b - 1][0] if b > a else None
         return True
 
     # ---- the start -------------------------------------------------------
@@ -576,7 +576,7 @@ class ExtractStages:
             doc.fed_tokens += len(self.tables.begins_cue)
         if doc.region is not None and not any(
                 doc.region[0] <= span[0] < doc.region[1] for _, span in doc.tokens):
-            doc.region = doc.skip_to = None      # the range maps to no tokens
+            doc.region = None      # the range maps to no tokens
             doc.path = "fallback"
         lp = self._lp(row)
         doc.starts = rank_starts(self.tables, lp, doc.prefix, doc.tokens,
@@ -611,7 +611,7 @@ class ExtractStages:
         doc.candidates = choose_candidates(
             self.tables, doc.starts, doc.cue_lp, follow, doc.prefix)
         doc.branches = make_branches(self.tables, doc.text, doc.candidates,
-                                     doc.skip_to, doc.cue_lp)
+                                     doc.cue_lp)
         doc.open = open_branches(doc.branches)
         if not doc.open:
             doc.answer, doc.span = None, None
@@ -630,8 +630,7 @@ class ExtractStages:
     def _take(self, doc, i, p) -> int:
         """Return how many more tokens the branch feeds at pass p."""
         branch = doc.branches[i]
-        take = (branch.skip if p == 1 else 0) + CHUNK
-        take = min(take, len(branch.stream) - branch.fed,
+        take = min(CHUNK, len(branch.stream) - branch.fed,
                    self.pass_bound[p] - branch.fed)
         return max(take, 0)
 
@@ -651,7 +650,7 @@ class ExtractStages:
                 if following is not None and following in ids:
                     copy = lps[ids.index(following)]
                 branch.copy.append(copy)
-                branch.stop.append(float(values[j, 0]) if j >= branch.skip else NEG)
+                branch.stop.append(float(values[j, 0]))
             branch.fed += take
         doc.passes = p
         doc.open = open_branches(doc.branches)

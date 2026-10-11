@@ -10,11 +10,22 @@ SQuAD (cell 81.8, stock vLLM 80.3) and 32.8 on CUAD with trim and 41.0
 without (cell 33.6, stock vLLM 52.0): the scored spans started late or
 stopped early on CUAD's clauses, 32 words at the median.
 
-Prediction for the decoder rule, which starts at the model's likeliest
-start and ends a span where stopping beats copying: CUAD trim F1
-within 5 points of stock vLLM's 52.0, SQuAD within 2 points of 80.1,
-and fewer fresh tokens on CUAD than that run's 768,598, as one start
-is fed instead of up to eight. Stock vLLM is unchanged.
+Run 20261011T054943Z, the first decoder rule, which started at the
+model's likeliest start and ended a span where stopping beat copying,
+gave 74.7 on SQuAD and 31.1 on CUAD trim with 60 nulls, and matched
+stock vLLM's answer on 226 of 300 SQuAD items. Three differences from
+a decoder explained the misses: a start token that begins another
+word too ("the" and "their") tied at the cue and the shorter span won;
+the stop was one quote token where a decoder closes with any token
+opening with the quote; and a span had to end in the last located
+line, so a start the model stopped early died.
+
+Prediction with those three fixed: Quail matches stock vLLM's answer
+on at least 260 of 300 SQuAD items, CUAD trim F1 within 5 points of
+stock vLLM's 52.0, SQuAD within 2 points of 80.1, nulls near the 9
+the none token gives, and fewer fresh tokens on CUAD than the
+768,598 of run 20261011T050258Z, as one start is fed instead of up to
+eight. Stock vLLM is unchanged.
 
     uv run modal run --detach -m experiments.cells.extract_check \
         2>&1 | tee /tmp/extract_check.log

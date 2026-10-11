@@ -220,7 +220,9 @@ class AsyncTopLogprobs:
         F: Torch functional module.
         head: Full output head with shape (vocabulary, hidden size).
         k: How many likeliest tokens each row returns.
-        extras: Token ids whose log probability every row returns.
+        extras: Token ids whose log probability every row returns. An
+            entry that is a tuple of ids returns one value, the log
+            probability of any of them.
         ragged: Whether answers have several rows each: submit then
             takes rows_per_answer and result returns one (rows, width)
             array per answer, in an object array.
@@ -233,8 +235,12 @@ class AsyncTopLogprobs:
         self.F = F
         self.head = head
         self.k = k
-        self.extras = torch.tensor(list(extras), device=head.device,
-                                   dtype=torch.long)
+        ids, self.groups = [], []
+        for extra in extras:
+            members = list(extra) if isinstance(extra, tuple) else [extra]
+            self.groups.append(slice(len(ids), len(ids) + len(members)))
+            ids.extend(members)
+        self.extras = torch.tensor(ids, device=head.device, dtype=torch.long)
         self.width = len(extras) + 2 * k
         self.ragged = ragged
         self.dtype = (np.dtype(object) if ragged
@@ -246,13 +252,15 @@ class AsyncTopLogprobs:
         torch = self.torch
         out = torch.empty((normed.shape[0], self.width), dtype=torch.float32,
                           device=normed.device)
-        n = len(self.extras)
+        n = len(self.groups)
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
             block = normed[start:start + self.BLOCK_ROWS]
             logits = self.F.linear(block.to(self.head.dtype), self.head).float()
             logits -= torch.logsumexp(logits, dim=1, keepdim=True)
             rows = slice(start, start + block.shape[0])
-            out[rows, :n] = logits.index_select(1, self.extras)
+            picked = logits.index_select(1, self.extras)
+            for column, group in enumerate(self.groups):
+                out[rows, column] = torch.logsumexp(picked[:, group], dim=1)
             top, ids = torch.topk(logits, self.k, dim=1)
             out[rows, n:n + self.k] = ids.float()
             out[rows, n + self.k:] = top
