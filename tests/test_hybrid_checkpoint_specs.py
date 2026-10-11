@@ -173,3 +173,21 @@ def test_a_model_without_short_convolutions_prices_none():
     from quail.cost.dense_decoder_cost import short_conv_projection_params
 
     assert short_conv_projection_params(QWEN3_5_27B_FP8) == 0
+
+
+def test_lfm2_work_includes_its_convolution_projections():
+    from quail.cost.dense_decoder_cost import (
+        attention_projection_params,
+        dense_decoder_components,
+        short_conv_projection_params,
+    )
+    from quail.cost.work import Work
+
+    spec = LFM2_2_6B_BF16
+    work = Work(tokens=1_000)
+    projection = next(
+        c for c in dense_decoder_components(work, spec, passes=1.0)
+        if c.name == "attn_proj")
+    expected = (attention_projection_params(spec)
+                + short_conv_projection_params(spec))
+    assert projection.flops == 2.0 * expected * 1_000

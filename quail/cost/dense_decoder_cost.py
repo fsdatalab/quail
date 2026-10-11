@@ -92,7 +92,8 @@ def dense_decoder_components(work: Work, model: ModelSpec,
     if passes < 0:
         raise ValueError("passes must be nonnegative")
     attn_proj = (attention_projection_params(model)
-                 + gdn_projection_params(model))
+                 + gdn_projection_params(model)
+                 + short_conv_projection_params(model))
     mlp = mlp_params(model)
     full_flops, sliding_flops = attention_pair_flops(model)
     return (
