@@ -311,6 +311,12 @@ class _StageExecutor:
             stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,
         )
+        if self.paged and getattr(self.arena, "n_state_slots", 0):
+            # a document holds a checkpoint slot, and a second one once
+            # a later stage extends it
+            per_document = 2 if len(self.stages) > 1 else 1
+            self.sched.active_limit = max(
+                1, (self.arena.n_state_slots - len(resident)) // per_document)
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         # The admission detaches residents from borrowing: they pack no prefix.

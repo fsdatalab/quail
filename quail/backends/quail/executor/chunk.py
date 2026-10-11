@@ -771,7 +771,12 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         if attention_mode != "unified":
             raise ValueError("a model with Gated DeltaNet layers runs "
                              "the unified attention path")
-        gdn = plan_phases(arena, unified_groups, stage)
+        try:
+            gdn = plan_phases(arena, unified_groups, stage)
+        except Exception:
+            for key in temporary_keys:
+                arena.free_key(key)
+            raise
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads,
         unified=unified, canvas=canvas_meta, gdn=gdn,
