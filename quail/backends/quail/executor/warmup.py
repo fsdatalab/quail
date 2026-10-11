@@ -116,15 +116,19 @@ def _warm_row_classes(torch, arena, pipeline, mode):
     readers = max(m for _, m in ROW_CLASSES)
     keys = [("warm-rows", index) for index in range(readers)]
     prefix = list(range(10, 10 + cached))
+    # a model with state slots saves each document's state at its end,
+    # where the reader rows start from
+    stateful = bool(getattr(arena, "has_state", False))
     for key in keys:
         arena.activate(key, cached, capacity_tokens=cached + 1,
-                       base_tokens=cached)
+                       base_tokens=cached, slots=int(stateful))
     try:
         # a forward pass ends in a norm over its answer rows, which
         # fails with a CUDA error when there are none: each document
         # takes a one-token question whose answer is not read
         _forward(pipeline, arena, pack_chunk(
-            torch, arena, [dict(key=key, prefix=prefix, f=cached, suffixes=[[11]])
+            torch, arena, [dict(key=key, prefix=prefix, f=cached, suffixes=[[11]],
+                                save_at=(cached,) if stateful else ())
                            for key in keys], attention_mode=mode))
         for n, m in ROW_CLASSES:
             groups = [dict(key=key, prefix=None, f=cached, suffixes=[[11]],

@@ -2,11 +2,12 @@
 
 Three Gated DeltaNet linear-attention layers, then one gated
 full-attention layer, repeated. A linear layer keeps one recurrent
-state per sequence instead of KV rows; this pass runs every segment
-from the zero state (saved state arrives with the state pool). The
-norms, projections, rotary, and gated norm are vLLM's own modules, so
-the arithmetic matches vLLM's. Quail's arena serves the full layers'
-attention.
+state per sequence instead of KV rows: the chunk's state plan
+(meta["state"], from pack_chunk) says which slot of the arena's state
+pool each segment starts from and which it saves to, wave by wave.
+The norms, projections, rotary, and gated norm are vLLM's own
+modules, so the arithmetic matches vLLM's. Quail's arena serves the
+full layers' attention and the linear layers' state.
 """
 
 from quail.backends.quail.executor.attention import Engine
@@ -60,6 +61,7 @@ class Qwen35Pipeline(ModelPipeline):
         self.engine = engine_class(
             arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb, fp8=False)
+        self.arena = arena
         self.max_chunk_tokens = budgets.kernel_index_cap(spec)
 
     def forward_chunk(self, chunk):
@@ -91,7 +93,7 @@ class Qwen35Pipeline(ModelPipeline):
                 meta["layer"] = index
                 x = self._full_attention(layer.self_attn, x, positions, meta)
             else:
-                x = self._linear_attention(layer.linear_attn, x, meta)
+                x = self._linear_attention(layer.linear_attn, x, meta, index)
             x, residual = layer.post_attention_layernorm(x, residual)
             hidden = layer.mlp(x)
         return hidden, residual
@@ -115,8 +117,39 @@ class Qwen35Pipeline(ModelPipeline):
         out, _ = attn.o_proj(out)
         return out
 
-    def _linear_attention(self, linear, x, meta):
-        """Gated DeltaNet over the chunk's segments, each from the zero state."""
+    def _linear_attention(self, linear, x, meta, layer):
+        """Gated DeltaNet over the chunk's state segments, wave by wave."""
+        torch = self.engine.torch
+        n = x.shape[0]
+        mixed_qkvz, _ = linear.in_proj_qkvz(x)
+        ba, _ = linear.in_proj_ba(x)
+        qkv_size = 2 * linear.key_dim + linear.value_dim
+        mixed_qkv, z = mixed_qkvz.split([qkv_size, linear.value_dim], dim=-1)
+        b, a = ba.chunk(2, dim=-1)
+        plan = meta.get("state")
+        if plan is None:
+            # an arena without state slots: every sequence starts from
+            # the zero state and saves nothing
+            waves, pools = [self._zero_wave(meta)], None
+        else:
+            waves, pools = plan["waves"], self.arena.state_pools(layer)
+        core = torch.empty((n, linear.value_dim), dtype=x.dtype, device=x.device)
+        for wave in waves:
+            out = self._wave(linear, wave, mixed_qkv, a, b, pools)
+            if wave["rows"] is None:
+                core = out
+            else:
+                core.index_copy_(0, wave["rows"], out)
+        head = linear.head_v_dim
+        gated = linear.norm(core.reshape(-1, head), z.reshape(-1, head))
+        out, _ = linear.out_proj(gated.reshape(n, -1))
+        return out
+
+    def _wave(self, linear, wave, mixed_qkv, a, b, pools):
+        """One conv call and one delta-rule call over a wave's rows.
+
+        Returns the wave's rows of the core output, (rows, value_dim).
+        """
         from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
             causal_conv1d_fn,
         )
@@ -126,53 +159,59 @@ class Qwen35Pipeline(ModelPipeline):
         )
 
         torch = self.engine.torch
-        n = x.shape[0]
-        cu = self._segment_bounds(meta)
-        segments = cu.numel() - 1
-        mixed_qkvz, _ = linear.in_proj_qkvz(x)
-        ba, _ = linear.in_proj_ba(x)
-        qkv_size = 2 * linear.key_dim + linear.value_dim
-        mixed_qkv, z = mixed_qkvz.split([qkv_size, linear.value_dim], dim=-1)
-        b, a = ba.chunk(2, dim=-1)
+        rows, m = wave["rows"], wave["n"]
+        if rows is not None:
+            mixed_qkv = mixed_qkv.index_select(0, rows)
+            a, b = a.index_select(0, rows), b.index_select(0, rows)
         weight = linear.conv1d.weight
         conv_dim, kernel = weight.shape[0], weight.shape[-1]
-        # the conv kernel reads each segment's window from the slot its
-        # index names and writes the final window back there; slot 0
-        # is its null slot, so the segments take slots 1 and up
-        windows = torch.zeros((segments + 1, conv_dim, kernel - 1),
-                              dtype=mixed_qkv.dtype, device=x.device)
+        # the conv kernel reads each sequence's window from the slot
+        # its index names and writes the final window back there; slot
+        # 0 is its null slot, so the sequences take slots 1 and up of
+        # a scratch copy, and the pool sees only the windows that save
+        windows = torch.empty((m + 1, conv_dim, kernel - 1),
+                              dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+        if pools is None:
+            windows.zero_()
+            initial = None
+        else:
+            s_pool, conv_pool = pools
+            windows[1:].copy_(conv_pool.index_select(0, wave["init"]))
+            initial = s_pool.index_select(0, wave["init"])
         conv_out = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1), weight.view(conv_dim, kernel),
             linear.conv1d.bias, activation=linear.activation,
-            conv_states=windows,
-            has_initial_state=torch.zeros(segments, dtype=torch.bool,
-                                          device=x.device),
-            cache_indices=torch.arange(1, segments + 1, dtype=torch.int32,
-                                       device=x.device),
-            query_start_loc=cu).transpose(0, 1).contiguous()
+            conv_states=windows, has_initial_state=wave["has_init"],
+            cache_indices=torch.arange(1, m + 1, dtype=torch.int32,
+                                       device=mixed_qkv.device),
+            query_start_loc=wave["cu"]).transpose(0, 1).contiguous()
         q, k, v, g, beta = fused_post_conv_prep(
             conv_output=conv_out, a=a.contiguous(), b=b.contiguous(),
             A_log=linear.A_log, dt_bias=linear.dt_bias,
             num_k_heads=linear.num_k_heads, head_k_dim=linear.head_k_dim,
             head_v_dim=linear.head_v_dim, apply_l2norm=True,
             output_g_exp=False)
-        core, _ = chunk_gated_delta_rule(
+        saving = wave["save_index"] is not None
+        out, final = chunk_gated_delta_rule(
             q=q.unsqueeze(0), k=k.unsqueeze(0), v=v.unsqueeze(0),
-            g=g.unsqueeze(0), beta=beta.unsqueeze(0), initial_state=None,
-            output_final_state=False, cu_seqlens=cu,
+            g=g.unsqueeze(0), beta=beta.unsqueeze(0), initial_state=initial,
+            output_final_state=saving, cu_seqlens=wave["cu"],
             use_qk_l2norm_in_kernel=False)
-        head = linear.head_v_dim
-        gated = linear.norm(core.reshape(-1, head), z.reshape(-1, head))
-        out, _ = linear.out_proj(gated.reshape(n, -1))
-        return out
+        if saving:
+            index, slots = wave["save_index"], wave["save_slots"]
+            s_pool.index_copy_(0, slots, final.index_select(0, index)
+                               .to(s_pool.dtype))
+            conv_pool.index_copy_(0, slots,
+                                  windows[1:].index_select(0, index))
+        return out.squeeze(0).reshape(out.shape[1], -1)
 
-    def _segment_bounds(self, meta):
-        """Cumulative row bounds of the chunk's sequences, int32 on the device.
-
-        One segment per unified sequence; a chunk without arena pages
-        falls back to its causal segments.
-        """
+    def _zero_wave(self, meta):
+        """The one wave of a chunk without a state plan: every sequence from zero."""
         torch = self.engine.torch
         unified = meta["unified"]
-        cu = unified["cu_q"] if unified is not None else meta["cu_a"]
-        return cu.to(dtype=torch.int32)
+        cu = (unified["cu_q"] if unified is not None else meta["cu_a"]).to(
+            dtype=torch.int32)
+        m = cu.numel() - 1
+        return dict(rows=None, cu=cu, n=m, init=None,
+                    has_init=torch.zeros(m, dtype=torch.bool, device=cu.device),
+                    save_index=None, save_slots=None)

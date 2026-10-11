@@ -135,7 +135,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                attention_mode=None, prefix_tree=None, stats=None,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
-               on_answers=None, stop_groups=None):
+               on_answers=None, stop_groups=None, save_base=()):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -180,6 +180,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             rows) run as each chunk's answers are read, with the
             document's answer rows for its requests start to end at
             the stage.
+        save_base: On an arena with state slots, the documents whose
+            state at their document end a later operator reads: True
+            for all of them, or their indices. The stages save it
+            themselves when a later stage starts from it.
 
     Returns:
         A tuple of answers, timing spans, and fresh token count. Answers is
@@ -195,7 +199,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         attention_mode=attention_mode, prefix_tree=prefix_tree, stats=stats,
         limit=limit, paged=paged, unit=unit, count_answers=count_answers,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
-        on_answers=on_answers, stop_groups=stop_groups,
+        on_answers=on_answers, stop_groups=stop_groups, save_base=save_base,
     ).run()
 
 
@@ -205,12 +209,14 @@ class _StageExecutor:
     def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
-                 default_attention, on_chunk, on_answers, stop_groups=None):
+                 default_attention, on_chunk, on_answers, stop_groups=None,
+                 save_base=()):
         from quail.backends.quail.executor.chunk import Suffixes
         from quail.backends.quail.executor.loop import (
             attention_path,
             borrow_check,
             lowest_borrows,
+            share_points,
         )
 
         self.torch = torch
@@ -293,13 +299,35 @@ class _StageExecutor:
         self.asking = any(stage.requests is not None for stage in self.stages)
         if prefix_tree is not None and not prefix_tree.shared_tokens:
             prefix_tree = None
+        # On an arena with state slots a document reserves one slot per
+        # saved state: its borrowers' share points, its document end
+        # when a later frame or operator starts from it, and the kept
+        # rows (frame and appended path) later requests start from.
+        self.stateful = self.paged and bool(getattr(self.arena, "has_state", False))
+        n = len(self.prefixes)
+        self.share_points = (share_points(prefix_tree, resident)
+                             if self.stateful and prefix_tree is not None else {})
+        self.state_kept, self.state_base = self._state_needs()
+        self.keep_base = (set(range(n)) if save_base is True
+                          else set(save_base or ()))
+        self.anchor_slots = [
+            (len(self.share_points.get(a, ())) + int(self.state_kept)
+             + int(self.state_base or a in self.keep_base))
+            if self.stateful else 0
+            for a in range(n)]
+        if self.stateful:
+            resident = {a: self._held_pages(self.keys[a], self.prefix_lengths[a],
+                                            self.anchor_slots[a])
+                        for a in resident}
         self.sched = JoinAdmission(
             self.prefix_lengths,
             [(s.lengths + rows).tolist()
              for s, rows in zip(self.suffixes, self.canvas_rows)],
             budget,
-            self.arena.n_pages if self.paged else 1 << 62,
+            self.arena.admission_pages if self.paged else 1 << 62,
             self.arena.page_tokens,
+            anchor_pages=([slots * self.arena.slot_pages for slots in self.anchor_slots]
+                          if self.stateful else None),
             frame_tokens=[len(f) for f in self.frames], resident=resident,
             anchor_partners={a: self._requests_of(key)
                              for a, key in enumerate(self.keys)},
@@ -377,13 +405,48 @@ class _StageExecutor:
             rows += len(self.frames[j]) + len(self.canvas)
         return rows
 
-    def _held_pages(self, key, prefix_tokens):
+    def _held_pages(self, key, prefix_tokens, slots=0):
         # the admission prices a document at page_cost(prefix + extra)
-        # less what it holds; a trimmed window holds fewer sliding
-        # pages than that price assumes, so count what growing takes
+        # plus its state slots, less what it holds; a trimmed window
+        # holds fewer sliding pages than that price assumes, so count
+        # what growing takes
         capacity = prefix_tokens + self.capacity_extra
-        return (self.arena.page_cost(capacity)
-                - self.arena.growth_cost(key, capacity))
+        return (self.arena.page_cost(capacity) + slots * self.arena.slot_pages
+                - self.arena.growth_cost(key, capacity, slots=slots))
+
+    def _state_needs(self):
+        """Whether the stages read a document's kept state, and its base state.
+
+        A later stage, a stage with several requests per document, or
+        an append stage reads the state after the document's prefix
+        pass: the kept state when a frame or appended rows precede the
+        request, the base state otherwise, and the base state again
+        when a later stage writes a new frame.
+        """
+        if not self.stateful:
+            return False, False
+        k = len(self.stages)
+        multi = any(len(stage.suffixes) > 1 for stage in self.stages)
+        appends = any(stage.append for stage in self.stages)
+        reading = k > 1 or multi or appends
+        frames = [len(frame) for frame in self.frames]
+        kept = reading and (any(frames) or appends)
+        base = any(self.writes[1:]) or (reading and any(
+            frames[j] == 0 for j in range(k) if j or multi))
+        return kept, base
+
+    def _save_at(self, a, f, wst, shared=0, fresh=False):
+        """The positions one spec saves the document's state at."""
+        if not self.stateful:
+            return ()
+        points = []
+        if fresh:
+            points += [p for p in self.share_points.get(a, ()) if p > shared]
+            if self.state_base or a in self.keep_base:
+                points.append(self.prefix_lengths[a])
+        if wst and self.state_kept:
+            points.append(f + wst)
+        return tuple(points)
 
     def _requests_of(self, key):
         """Return a stage request selector, or None if every request is selected."""
@@ -418,7 +481,8 @@ class _StageExecutor:
                 got = self.arena.activate(
                     key, f, capacity_tokens=f + self.capacity_extra,
                     base_tokens=f,
-                    borrow=(self.keys[parent], shared) if shared else None)
+                    borrow=(self.keys[parent], shared) if shared else None,
+                    slots=self.anchor_slots[a])
                 assert got is not None, \
                     "the admission placed a document the arena cannot hold"
                 if fresh and a < len(self.borrowers) and self.borrowers[a]:
@@ -451,6 +515,7 @@ class _StageExecutor:
             kept = int(sufs.lengths.sum()) if append else 0
             if append or (self.writes[j] and start == 0):
                 appended[a] = path + kept
+            borrow_parent = self.keys[parent] if shared else None
             if self.writes[j] and start == 0 and self._merged(j, start, end):
                 # the frame and the one suffix are one entry; the
                 # frame's rows are scattered into KV after the document
@@ -460,19 +525,24 @@ class _StageExecutor:
                         np.concatenate([self.frame_ids[j], sufs.ids]),
                         [len(frame) + int(sufs.lengths[0])]),
                     write_suffix_tokens=len(frame) + kept, single=True,
-                    read_all_rows=read_all, **own))
+                    read_all_rows=read_all, borrow_parent=borrow_parent,
+                    save_at=self._save_at(a, f, len(frame) + kept, shared,
+                                          fresh=carried), **own))
             elif self.writes[j] and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows; its own answer row means nothing
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f, suffixes=Suffixes(self.frame_ids[j], [len(frame)]),
-                    write_suffix_tokens=len(frame)))
+                    write_suffix_tokens=len(frame), borrow_parent=borrow_parent,
+                    save_at=self._save_at(a, f, len(frame), shared,
+                                          fresh=carried)))
                 entries.append((j, 1))
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
                     write_suffix_tokens=kept,
+                    save_at=self._save_at(a, f + len(frame), kept),
                     chains=self.stages[j].chains, **own))
             else:
                 specs.append(dict(
@@ -481,6 +551,9 @@ class _StageExecutor:
                     suffixes=sufs, read_all_rows=read_all,
                     write_suffix_tokens=kept,
                     single=self.stages[j].single and end - start == 1,
+                    borrow_parent=borrow_parent,
+                    save_at=self._save_at(a, f + len(frame) + path, kept,
+                                          shared, fresh=carried),
                     chains=self.stages[j].chains, **own))
             entries.append((j, rows))
         chunk = pack_chunk(

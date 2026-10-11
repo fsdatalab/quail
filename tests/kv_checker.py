@@ -36,6 +36,9 @@ class Setup:
         sliding_pages: Sliding pool pages.
         budget: Chunk token budget.
         page_tokens: Tokens per KV page.
+        state_slots: Slots of a state pool beside the KV pool, for a
+            model whose first layer keeps a recurrent state instead of
+            KV; 0 for an arena without one.
     """
 
     path: str
@@ -45,6 +48,7 @@ class Setup:
     sliding_pages: int = 400
     budget: int = 600
     page_tokens: int = 16
+    state_slots: int = 0
 
 
 def mix(previous, token):
@@ -72,6 +76,7 @@ class HashModel:
     """A forward pass whose answers are right only if every KV read is."""
 
     def __init__(self, arena, answers, canvas):
+        self.arena = arena
         self.page = arena.page_tokens
         self.window = arena.window
         self.full = Pool(arena.accounting.n_pages, self.page)
@@ -79,16 +84,21 @@ class HashModel:
                         if arena.has_sliding else None)
         self.answers = answers      # request hash -> answer bit
         self.canvas = canvas
+        self.state_hash = {}        # state slot -> hash of the prefix it holds
+        self._prev = {}             # row -> the hash its attention reads before it
 
     def forward_chunk(self, chunk):
         ids = chunk.input_ids.tolist()
         positions = chunk.positions.tolist()
         meta = chunk.meta
         hashes = [None] * len(ids)
+        self._prev = {}
         if chunk.attention_mode == "unified":
             self._unified(meta["unified"], ids, positions, hashes)
         else:
             self._tree(meta, ids, positions, hashes)
+        if meta.get("state") is not None:
+            self._state(meta["state"], ids, positions, hashes)
         out = []
         for row in chunk.final_indices.tolist():
             h = hashes[row]
@@ -149,6 +159,7 @@ class HashModel:
                     self.full, full, phys(table, i, view - 1))
                 assert pos == position - 1, \
                     f"row at {position} reads position {pos} before it"
+            self._prev[row] = previous
             hashes[row] = mix(previous, ids[row])
             return hashes[row]
 
@@ -181,6 +192,61 @@ class HashModel:
         self._commit(self.full, full, ids, positions, hashes)
         if sliding is not None:
             self._commit(self.sliding, sliding, ids, positions, hashes)
+
+    # ---- state: the linear layers' segments and waves ----------------
+
+    def _state(self, plan, ids, positions, hashes):
+        """Replay the state plan: every segment starts from the right prefix.
+
+        A slot holds the hash of the prefix its state summarizes. A
+        segment's chain starts from its slot's hash, which must be the
+        hash the KV chain reads before its first row, and must end at
+        its last row's hash. Saves commit after their wave.
+        """
+        covered = set()
+        for wave in plan["waves"]:
+            rows = wave["rows"].tolist()
+            cu = wave["cu_host"]
+            assert wave["n"] == len(cu) - 1
+            pending = []
+            for i in range(len(cu) - 1):
+                segment = rows[cu[i]:cu[i + 1]]
+                first = segment[0]
+                assert segment == list(range(first, first + len(segment))), \
+                    "a segment's rows are contiguous"
+                assert not covered.intersection(segment), "a row in two segments"
+                covered.update(segment)
+                init, save = wave["init_host"][i], wave["save_host"][i]
+                assert wave["has_init"][i].item() == bool(init)
+                if init:
+                    assert init in self.state_hash, (
+                        f"the segment at row {first} starts from slot {init}, "
+                        f"which nothing saved")
+                h = self.state_hash[init] if init else 0
+                assert h == self._prev[first], (
+                    f"the segment at row {first} (position {positions[first]}) "
+                    f"starts from the state of another prefix")
+                for row in segment:
+                    assert self._prev[row] == h, "the KV and state chains differ"
+                    h = mix(h, ids[row])
+                    assert h == hashes[row]
+                if save:
+                    pending.append((save, h))
+            if pending:
+                assert wave["save_index"].tolist() == [
+                    i for i in range(len(cu) - 1) if wave["save_host"][i]]
+                assert wave["save_slots"].tolist() == [s for s, _ in pending]
+            else:
+                assert wave["save_index"] is None
+            for save, h in pending:
+                self.state_hash[save] = h
+        assert len(covered) == len(ids), "the state plan skips rows"
+        for seg in plan["segments"]:
+            if seg.save:
+                saved_at = positions[seg.r1 - 1] + 1
+                assert self.arena.state_slot_at(seg.key, saved_at) == seg.save, (
+                    f"{seg.key!r} saved at {saved_at} into slot {seg.save}, "
+                    f"which the arena maps elsewhere")
 
     @staticmethod
     def _pool_maps(pool):
@@ -286,6 +352,14 @@ def make_arena(setup):
                        layer_kv=[(1, 1), (1, 1)], sliding_layers=(1,),
                        sliding_window=setup.window,
                        n_sliding_pages=setup.sliding_pages)
+    if setup.state_slots:
+        # layer 0 keeps a recurrent state, layer 1 keeps every token
+        return KVArena(n_layers=2, n_pages=setup.pages,
+                       page_tokens=setup.page_tokens, n_kv=1, d_head=1,
+                       dtype=torch.float32, device="cpu",
+                       layer_kv=[(0, 0), (1, 1)], state_layers=(0,),
+                       n_state_slots=setup.state_slots,
+                       state_shape=(1, 1, 1), conv_shape=(1, 3))
     return KVArena(n_layers=1, n_pages=setup.pages,
                    page_tokens=setup.page_tokens, n_kv=1, d_head=1,
                    dtype=torch.float32, device="cpu")
@@ -388,7 +462,7 @@ def check_join(anchors, frame, partners, setup, retain=False):
         run.torch, run.arena, run.pipeline, passthrough(), anchors,
         [partners], setup.budget, stage_frames=[frame], anchor_keys=keys,
         anchor_done=anchor_done, attention_mode=setup.path,
-        prefix_tree=run.tree(anchors))
+        prefix_tree=run.tree(anchors), save_base=retain)
     for a, anchor in enumerate(anchors):
         assert rows[a] == [answers[chain(anchor + frame + p + tail)]
                            for p in partners], f"anchor {a}"
@@ -442,7 +516,7 @@ def check_join_after_join(anchors, frame, partners, setup):
         run.torch, run.arena, run.pipeline, passthrough(), first,
         [partners], setup.budget, stage_frames=[frame], anchor_keys=keys[:1],
         anchor_done=retain, attention_mode=setup.path,
-        prefix_tree=run.tree(first))
+        prefix_tree=run.tree(first), save_base=True)
     assert run.arena.is_resident(keys[0])
     rows = {}
 

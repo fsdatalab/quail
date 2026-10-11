@@ -21,11 +21,14 @@ from kv_checker import (
 pytest.importorskip("torch")
 
 
-@pytest.fixture(params=[("unified", False, False), ("tree", False, False),
-                        ("unified", True, False), ("unified", True, True)],
-                ids=["unified", "tree", "sliding", "sliding-canvas"])
+@pytest.fixture(params=[("unified", False, False, False),
+                        ("tree", False, False, False),
+                        ("unified", True, False, False),
+                        ("unified", True, True, False),
+                        ("unified", False, False, True)],
+                ids=["unified", "tree", "sliding", "sliding-canvas", "state"])
 def arena_kind(request, monkeypatch):
-    """(attention path, sliding layers, canvas row), with CPU staging."""
+    """(attention path, sliding layers, canvas row, state slots), with CPU staging."""
     cpu_staging(monkeypatch)
     return request.param
 
@@ -57,28 +60,32 @@ def corpus(rng, n, header_tokens, piece_tokens):
 
 def small(rng, kind, n, pages, sliding_pages):
     """A corpus of short documents and an arena a few of them fill."""
-    path, sliding, canvas = kind
+    path, sliding, canvas, state = kind
     docs = corpus(rng, n, (0, 5, 16, 20), (1, 7, 16, 30, 45))
+    pages = rng.choice(pages)
     return docs, Setup(
         path=path, window=32 if sliding else None,
-        canvas=(99,) if canvas else (), pages=rng.choice(pages),
+        canvas=(99,) if canvas else (), pages=pages,
         sliding_pages=rng.choice(sliding_pages),
-        budget=max(map(len, docs)) + rng.choice((8, 60, 600)))
+        budget=max(map(len, docs)) + rng.choice((8, 60, 600)),
+        state_slots=pages if state else 0)
 
 
 def large(rng, kind):
     """Documents of thousands of tokens, a 1,024-token window."""
-    path, sliding, canvas = kind
+    path, sliding, canvas, state = kind
     docs = corpus(rng, 120, (0, 48, 300), (40, 200, 700, 1500))
     longest = max(map(len, docs))
     # the longest document and its extra rows fit either pool untrimmed
     pages = -(-(longest + 16) // 16) + 1
+    pages = pages * rng.choice((1, 3, 10))
     return docs, Setup(
         path=path, window=1024 if sliding else None,
         canvas=(99,) if canvas else (),
-        pages=pages * rng.choice((1, 3, 10)),
+        pages=pages,
         sliding_pages=pages * rng.choice((1, 2)),
-        budget=longest + rng.choice((16, 4096, 16384)))
+        budget=longest + rng.choice((16, 4096, 16384)),
+        state_slots=pages if state else 0)
 
 
 def questions(rng):
@@ -121,12 +128,13 @@ def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
         named(f"feed seed {seed}", check_feed, docs, [90, 91, 92],
               *join_parts(), setup)
 
-    path, sliding, canvas = arena_kind
+    path, sliding, canvas, state = arena_kind
     parent = [1] * 64                  # four pages, two of them the window
     child = [1] * 16 + [3] * 5
     setup = Setup(path=path, window=32 if sliding else None,
                   canvas=(99,) if canvas else (), pages=12,
-                  sliding_pages=12, budget=200, page_tokens=16)
+                  sliding_pages=12, budget=200, page_tokens=16,
+                  state_slots=12 if state else 0)
     check_join_after_join([parent, child], *join_parts(), setup)
 
 

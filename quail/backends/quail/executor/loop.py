@@ -39,7 +39,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              anchor_keys=None, anchor_done=None,
              anchor_partners=None, staging=None,
              attention_mode=None, prefix_tree=None, stats=None,
-             read_all_rows=False, advance=None, on_answers=None):
+             read_all_rows=False, advance=None, on_answers=None,
+             save_base=()):
     """Stream each stage's selected partner requests against anchor documents.
 
     Survivors are gated between stages.
@@ -81,6 +82,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             next stage; None advances on any true answer.
         on_answers: Optional callable(anchor, stage, start, end, rows)
             run as each chunk's answers are read; see run_stages().
+        save_base: The anchors whose state at their document end a
+            later operator reads, or True for all; see run_stages().
 
     Returns:
         A tuple of per-stage partner answers, chunk timing spans, and fresh
@@ -113,7 +116,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         prefix_tree=prefix_tree, stats=stats,
         unit="scores" if scoring else "documents", count_answers=scoring,
         label="AI.SCORE" if scoring else f"join ({k} stages)",
-        on_answers=on_answers)
+        on_answers=on_answers, save_base=save_base)
 
 
 # ---------------------------------------------------------- the filter
@@ -133,6 +136,18 @@ def borrow_check(arena, keys, borrowing):
             return arena.can_borrow(keys[parent], shared)
         return arena.origin(borrowing.shared(parent)) <= arena.origin(shared)
     return can_borrow
+
+
+def share_points(tree, resident=()):
+    """Per parent, the sorted distinct prefix lengths its borrowers start from.
+
+    Resident children borrow nothing, as the admission detaches them.
+    """
+    points = {}
+    for doc, parent in enumerate(tree.parent):
+        if parent is not None and doc not in resident:
+            points.setdefault(parent, set()).add(tree.shared[doc])
+    return {parent: tuple(sorted(shared)) for parent, shared in points.items()}
 
 
 def lowest_borrows(borrowing):
@@ -234,7 +249,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         stats=stats, limit=limit, stop_groups=stop_groups,
         paged=arena_writes, staging=staging,
         label=f"filter ({k} stages)", default_attention="unified",
-        on_chunk=on_chunk if document_done is not None else None)
+        on_chunk=on_chunk if document_done is not None else None,
+        save_base=True if retain_all else retain)
     by_document = {}
     for stage in answers:
         for doc, row in stage.items():

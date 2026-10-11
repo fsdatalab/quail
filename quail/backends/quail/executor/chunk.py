@@ -6,6 +6,7 @@ by the caller so importing the executor does not load it.
 """
 
 import time
+from collections import namedtuple
 from dataclasses import dataclass
 from typing import Any
 
@@ -219,6 +220,129 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
 
 # ------------------------------------------------------- chunk packing
 
+# One sequence's contiguous chunk rows on the linear-attention layers:
+# `position` is the logical row r0 holds; `init` the slot its state
+# starts from (0 is the zero state); `save` the slot its final state
+# goes to (0 discards it); `wave` the kernel call it runs in.
+StateSegment = namedtuple("StateSegment",
+                          "key r0 r1 position init save wave")
+
+
+def _state_plan(arena, groups, token_count, torch, pinned):
+    """Segments and waves of the linear-attention layers' state.
+
+    A segment is one sequence's contiguous rows with the slot its
+    state starts from and the slot its final state saves to. The slots
+    are claimed here, as the KV rows are mapped here. A segment whose
+    initial slot another segment of this chunk saves runs one wave
+    after it; a wave is one conv call and one delta-rule call per
+    layer over the wave's rows, gathered in segment order.
+
+    Returns:
+        meta["state"]: `segments`, the StateSegments in chunk order;
+        `waves`, per wave the gather `rows`, the varlen bounds `cu`,
+        the `init` slots and `has_init` flags, the `save_index` of
+        the segments that save and their `save_slots` (None when none
+        does), `n`, `max_len`, and host copies for checkers; and
+        `max_sequences`, the widest wave.
+
+    Raises:
+        ValueError: A group reads state no segment saved, or a fresh
+            prefix does not end at its f.
+    """
+    segments = []
+    produced = {}    # slot -> the wave of this chunk that saves it
+
+    def add(key, r0, r1, position, init, save):
+        if r1 <= r0:
+            return
+        wave = produced[init] + 1 if init in produced else 0
+        segments.append(StateSegment(key, r0, r1, position, init, save, wave))
+        if save:
+            produced[save] = wave
+
+    for u in groups:
+        key, f, wst = u["key"], u["f"], u["wst"]
+        begins, ends = u["suffix_spans"]
+        n = len(begins)
+        if u["fresh"]:
+            start, row0, prefix_end = u["start"], u["row0"], u["prefix_end"]
+            if start + prefix_end - row0 != f:
+                raise ValueError(
+                    f"group {key!r}: its prefix ends at "
+                    f"{start + prefix_end - row0}, not at f={f}")
+            if start:
+                parent = u["borrow_parent"]
+                init = (arena.state_slot_at(parent, start)
+                        if parent is not None else None)
+                if init is None:
+                    raise ValueError(
+                        f"group {key!r}: no state saved at {start} on its "
+                        f"parent {parent!r}")
+            else:
+                init = 0
+            position, row = start, row0
+            for cut in sorted(p for p in set(u["save_at"]) if start < p < f):
+                slot = arena.claim_state(key, cut, "share")
+                add(key, row, row0 + cut - start, position, init, slot)
+                init, position, row = slot, cut, row0 + cut - start
+            if n == 1 and f not in u["save_at"]:
+                # nothing saved at f: the prefix and the one suffix are
+                # one sequence, cut only where the kept rows end
+                s0, s1 = int(begins[0]), int(ends[0])
+                if wst and f + wst in u["save_at"]:
+                    kept = arena.claim_state(key, f + wst, "kept")
+                    add(key, row, s0 + wst, position, init, kept)
+                    add(key, s0 + wst, s1, f + wst, kept, 0)
+                else:
+                    add(key, row, s1, position, init, 0)
+                continue
+            base = arena.claim_state(key, f, "base") if n or f in u["save_at"] else 0
+            add(key, row, prefix_end, position, init, base)
+            init = base
+        else:
+            init = arena.state_slot_at(key, f) if n else 0
+            if n and init is None:
+                raise ValueError(f"group {key!r}: no state saved at {f}")
+        for s0, s1 in zip(begins.tolist(), ends.tolist()):
+            if wst and f + wst in u["save_at"]:
+                kept = arena.claim_state(key, f + wst, "kept")
+                add(key, s0, s0 + wst, f, init, kept)
+                add(key, s0 + wst, s1, f + wst, kept, 0)
+            else:
+                add(key, s0, s1, f, init, 0)
+    covered = sum(seg.r1 - seg.r0 for seg in segments)
+    if covered != token_count:
+        raise AssertionError(
+            f"the state plan covers {covered} of {token_count} rows")
+    by_wave = {}
+    for seg in segments:
+        by_wave.setdefault(seg.wave, []).append(seg)
+    waves = []
+    for index in sorted(by_wave):
+        segs = by_wave[index]
+        lengths = [seg.r1 - seg.r0 for seg in segs]
+        cu = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
+        init = [seg.init for seg in segs]
+        saving = [i for i, seg in enumerate(segs) if seg.save]
+        waves.append(dict(
+            rows=_staged(torch, np.concatenate([
+                np.arange(seg.r0, seg.r1, dtype=np.int64) for seg in segs]),
+                torch.int64, pinned),
+            cu=_staged(torch, cu, torch.int32, pinned),
+            init=_staged(torch, init, torch.int64, pinned),
+            has_init=_staged(torch, [bool(slot) for slot in init], torch.bool,
+                             pinned),
+            save_index=(_staged(torch, saving, torch.int64, pinned)
+                        if saving else None),
+            save_slots=(_staged(torch, [segs[i].save for i in saving],
+                                torch.int64, pinned) if saving else None),
+            n=len(segs), max_len=max(lengths), cu_host=cu.tolist(),
+            init_host=init, save_host=[seg.save for seg in segs]))
+    return dict(segments=segments, waves=waves,
+                max_sequences=max((len(v) for v in by_wave.values()), default=0))
+
+
 class _PoolView:
     """Rows and pages owned by one KV key in one arena pool.
 
@@ -316,10 +440,20 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     * chains: Trie chains and ancestor rows from trie_chains(). The document
       KV must already be resident.
     * canvas: Per-group answer canvas tokens, overriding the default canvas.
+    * save_at: On an arena with state slots, the logical positions
+      where the key's state is saved: its borrowers' start points
+      inside a fresh prefix, its document end f, and f plus
+      write_suffix_tokens for the frame or appended rows a later
+      request starts from.
+    * borrow_parent: The parent key a borrowing group starts from, on an
+      arena with state slots.
 
     Fresh groups without arena pages must have at most one suffix. Unified
     attention cannot mix paged and unpaged groups. Canvas rows use unified
-    attention and their KV is not retained.
+    attention and their KV is not retained. An arena with state slots
+    packs paged unified chunks without canvas rows or chains, and the
+    chunk carries meta["state"]: the linear-attention layers' segments
+    and the waves they run in (see _state_plan).
 
     Args:
         torch: Torch module.
@@ -358,6 +492,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     if canvas and not 0 <= answer_row < len(canvas):
         raise ValueError(
             f"answer_row {answer_row} is outside the {len(canvas)}-row canvas")
+    stateful = bool(getattr(arena, "has_state", False))
+    if stateful and attention_mode != "unified":
+        raise ValueError("an arena with state slots runs unified attention")
+    if stateful and (canvas or any(g.get("canvas") is not None for g in groups)):
+        raise ValueError("canvas rows carry no recurrent state")
     t = time.perf_counter() if timing is not None else 0.0
     # unified scatters every fresh row through its own src/dst map, so
     # the reads and kv_writes bookkeeping below is tree only
@@ -576,7 +715,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     prefix_end=prefix_end, row1=token_count,
                     suffix_spans=(s_row0 + begins, s_row0 + ends),
                     canvas=bool(n and width),
-                    keeps=bool(g.get("write_suffix_tokens"))))
+                    keeps=bool(g.get("write_suffix_tokens")),
+                    wst=int(g.get("write_suffix_tokens") or 0),
+                    save_at=tuple(g.get("save_at") or ()),
+                    borrow_parent=g.get("borrow_parent")))
             elif not fresh:
                 raise ValueError(
                     "unified attention requires pages for a kept "
@@ -726,6 +868,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             for key in temporary_keys:
                 arena.free_key(key)
             raise
+    state_meta = None
+    if stateful:
+        if unified is None:
+            raise ValueError("an arena with state slots packs paged chunks")
+        state_meta = _state_plan(arena, unified_groups, token_count, torch,
+                                 pinned)
+    t = _tick(timing, "pack_state", t)
 
     # the tree path's KV writes as one list of (source, destination)
     # row pairs: the attention pass scatters them with a single kernel
@@ -776,7 +925,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     max_used=max(pools[1].lengths[i] for i in canvas_seq))
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads,
-        unified=unified, canvas=canvas_meta,
+        unified=unified, canvas=canvas_meta, state=state_meta,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)
     out = Chunk(

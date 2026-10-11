@@ -277,7 +277,7 @@ class JoinAdmission:
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, extra_tokens=None,
-                 stop_groups=None, stop_width=1):
+                 stop_groups=None, stop_width=1, anchor_pages=None):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -287,6 +287,11 @@ class JoinAdmission:
         self.limit = limit
         self.survivors = 0
         n = len(prefix_tokens)
+        # per anchor, pages charged beyond its KV: its state slots
+        self._extra_pages = []
+        anchor_pages = list(anchor_pages) if anchor_pages is not None else [0] * n
+        if len(anchor_pages) != n:
+            raise ValueError("anchor_pages must match prefix_tokens")
         self.groups = None if stop_groups is None else list(stop_groups)
         if self.groups is not None and len(self.groups) != n:
             raise ValueError("stop_groups must match prefix_tokens")
@@ -360,7 +365,8 @@ class JoinAdmission:
         resident = dict(resident or {})
         anchor_partners = dict(anchor_partners or {})
         for a, prefix in enumerate(prefix_tokens):
-            self._register(prefix, resident.get(a), anchor_partners.get(a))
+            self._register(prefix, resident.get(a), anchor_partners.get(a),
+                           anchor_pages[a])
         # resident anchors first: they cost no prefix tokens and few
         # or no pages, so they never wait behind a page-blocked anchor
         n = len(self.prefix)
@@ -444,10 +450,15 @@ class JoinAdmission:
         lst = self._lists[a][j]
         return range(start, end) if lst is None else lst[start:end]
 
-    def _register(self, prefix, resident_pages, partners):
-        """Record one anchor's costs; returns its index."""
+    def _register(self, prefix, resident_pages, partners, extra_pages=0):
+        """Record one anchor's costs; returns its index.
+
+        extra_pages are charged to a fresh anchor beyond its KV pages:
+        the state slots it reserves, in every-token pages.
+        """
         a = len(self.prefix)
         k = len(self.stages)
+        self._extra_pages.append(extra_pages)
         lazy = None
         if partners is None:
             lists = [None] * k
@@ -475,7 +486,7 @@ class JoinAdmission:
                 lists.append(lst)
                 cums.append(cum)
         self._lazy.append(lazy)
-        need = self.page_cost(prefix + self._extra)
+        need = self.page_cost(prefix + self._extra) + extra_pages
         if resident_pages is not None:
             need = max(0, need - resident_pages)
         elif need > self.arena_pages:
@@ -519,7 +530,7 @@ class JoinAdmission:
                     partner_pages(self.page_cost, self.page_tokens, prefix,
                                   self.frames[j], max(self.stages[j]))
                     for j in range(1, k) if self.stages[j]])
-            needed = self.page_cost(prefix + self._extra) + largest
+            needed = self.page_cost(prefix + self._extra) + extra_pages + largest
             if needed > self.arena_pages:
                 raise ValueError("anchor and one suffix exceed the KV arena")
             self._page_reserve = max(self._page_reserve, largest)
@@ -537,15 +548,16 @@ class JoinAdmission:
         lst = self._lists[a][j]
         return self.stages[j][i if lst is None else lst[i]]
 
-    def admit(self, prefix_tokens, resident_pages=None, partners=None):
+    def admit(self, prefix_tokens, resident_pages=None, partners=None,
+              extra_pages=0):
         """Queue one more anchor behind the pending ones; returns its index.
 
         resident_pages says the anchor's prefix KV is already in the
         arena on that many pages, so it packs no prefix tokens.
         partners is the anchor's per-stage partner index lists, as in
-        anchor_partners.
+        anchor_partners. extra_pages are charged beyond its KV pages.
         """
-        a = self._register(prefix_tokens, resident_pages, partners)
+        a = self._register(prefix_tokens, resident_pages, partners, extra_pages)
         self.borrowing.add()
         if self._stage[a] == -1:
             self.pending.append(a)
@@ -671,7 +683,8 @@ class JoinAdmission:
                 held.append(a)      # its parent is still queued
                 continue
             need = (self._page_cost[a] if borrow is None
-                    else self.page_cost(self.prefix[a] - borrow[1] + self._extra))
+                    else self.page_cost(self.prefix[a] - borrow[1] + self._extra)
+                    + self._extra_pages[a])
             if blocked and need:
                 held.append(a)
                 if not self._zero_cost:

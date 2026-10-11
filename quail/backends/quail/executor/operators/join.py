@@ -97,7 +97,9 @@ def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
         anchor_keys=anchor_keys, on_settled=on_settled,
         attention_mode=attention, prefix_tree=tree, stats=join_stats,
         on_chunk=on_chunk, label=f"join ({len(join_stages)} stages)",
-        staging=input_staging(state))
+        staging=input_staging(state),
+        # a retained anchor's next operator starts from its document end
+        save_base=bool(node.keep_anchor_kv))
     answers = every[leading:leading + len(join_stages)]
     after_tokens = 0
     if after:
