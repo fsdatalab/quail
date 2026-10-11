@@ -161,12 +161,6 @@ class QuailBackend:
             return SupportResult.reject(
                 f"Quail does not support model {model.name!r}: "
                 f"no forward pass for architecture {model.arch!r}")
-        if model.gdn_layers:
-            return SupportResult.reject(
-                f"Quail does not support model {model.name!r} yet: the "
-                f"executor runs single filters and filter chains on "
-                f"architecture {model.arch!r}, but the planner can still "
-                f"choose prefix sharing and joins, which it cannot run")
         if gpu_count not in {1, 2, 4, 8}:
             return SupportResult.reject(
                 "Quail requires 1, 2, 4, or 8 GPUs")

@@ -13,6 +13,7 @@ from quail.cost.budgets import tree_attention_allowed
 from quail.specs import (
     DECISION_2_KAI_0_6B_BF16,
     H100_SXM,
+    LFM2_2_6B_BF16,
     MODELS,
     QWEN3_4B_FP8,
     QWEN3_5_4B_BF16,
@@ -23,17 +24,17 @@ from quail.specs import (
 
 def test_backends_support_registered_generative_models_and_refuse_others():
     for model in MODELS.values():
-        if model.arch in ("qwen3_5", "lfm2"):
+        if model.arch == "lfm2":
             continue
         assert model.arch in supported_archs()
         assert QuailBackend().supports(model, H100_SXM, 1).supported
 
-    # the forward pass exists, but the planner cannot yet avoid rewind and
-    # prefix sharing; stock vLLM runs the model
-    hybrid = QuailBackend().supports(QWEN3_5_4B_BF16, H100_SXM, 1)
-    assert not hybrid.supported
-    assert "qwen3_5" in hybrid.reason
-    assert "qwen3_5" in supported_archs()
+    # the hybrid forward pass runs filters and filter chains; the executor
+    # refuses joins and prefix sharing when a plan asks for them
+    assert QuailBackend().supports(QWEN3_5_4B_BF16, H100_SXM, 1).supported
+    lfm2 = QuailBackend().supports(LFM2_2_6B_BF16, H100_SXM, 1)
+    assert not lfm2.supported
+    assert "lfm2" in lfm2.reason
 
     spec = replace(QWEN3_4B_FP8, name="other", arch="other")
     with pytest.raises(ValueError, match="other"):
