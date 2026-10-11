@@ -414,7 +414,7 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(prompts, state_run)
     plan = chunk.meta["state"]
     assert [w["n"] for w in plan["waves"]] == [1, 3]
     covered = torch.cat([w["rows"] for w in plan["waves"]]).sort().values
-    assert covered.tolist() == list(range(len(chunk.ids)))
+    assert covered.tolist() == list(range(chunk.tokens))
     together = _layer_output(pipeline, chunk)
     _null_slot_is_zero(arena)
     kept = arena.state_slot_at(key, f + len(frame))
