@@ -1268,6 +1268,9 @@ class Query:
                 # the label column follows the alias columns: one, or
                 # the anchor and partner of a classification of joined rows
                 answer_tables["classifies"][table.column_names[-1]] = table
+            elif value_type is ValueType.EXTRACT_ANSWERS:
+                # the alias column, the answer, and its span
+                answer_tables["extracts"][table.column_names[1]] = table
             elif value_type is ValueType.JOIN_ANSWERS:
                 written_pos = metadata.get(b"quail.written_pos")
                 if written_pos is None:

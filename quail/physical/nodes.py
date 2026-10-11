@@ -405,6 +405,48 @@ class Scan(PhysicalNode):
 
 
 @dataclass(frozen=True)
+class RequestExtractSpec:
+    """Specification for one decoded answer per document, located in its text.
+
+    The tail_token_ids follow the document and contain the question,
+    the instruction, the answer template, and the phrase cue. The
+    answer is the text the model writes up to the closing quote,
+    located in the document's text; with trim off, the whole lines
+    that hold it.
+    """
+
+    alias: str
+    output: str
+    question: str
+    tail_token_ids: tuple[Any, ...]
+    trim: bool = True
+
+    @property
+    def span_output(self) -> str:
+        """Return the name of the span column."""
+        return self.output + "_span"
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "RequestExtractSpec":
+        return cls(
+            alias=str(value["alias"]),
+            output=str(value["output"]),
+            question=str(value["question"]),
+            tail_token_ids=tuple(value["tail_token_ids"]),
+            trim=bool(value.get("trim", True)),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "alias": self.alias,
+            "output": self.output,
+            "question": self.question,
+            "tail_token_ids": list(self.tail_token_ids),
+            "trim": self.trim,
+        }
+
+
+@dataclass(frozen=True)
 class RequestExecution(PhysicalNode):
     """Run filters and joins through an independent request engine."""
 
@@ -415,6 +457,7 @@ class RequestExecution(PhysicalNode):
     filters: tuple[RequestFilterSpec, ...] = ()
     joins: tuple[RequestJoinSpec, ...] = ()
     classifies: tuple[RequestClassifySpec, ...] = ()
+    extracts: tuple[RequestExtractSpec, ...] = ()
 
     type_name: ClassVar[str] = "quail.request_execution"
     runtime_key: ClassVar[str] = type_name
@@ -468,6 +511,14 @@ class RequestExecution(PhysicalNode):
             )
             for spec in self.classifies if spec.tests
         )
+        outputs.extend(
+            OutputPort(
+                f"extract_answers:{spec.output}",
+                ValueType.EXTRACT_ANSWERS,
+                schema=(spec.alias, spec.output, spec.span_output),
+            )
+            for spec in self.extracts
+        )
         return tuple(outputs)
 
     def attributes(self) -> dict:
@@ -479,6 +530,7 @@ class RequestExecution(PhysicalNode):
             "filters": [spec.to_dict() for spec in self.filters],
             "joins": [spec.to_dict() for spec in self.joins],
             "classifies": [spec.to_dict() for spec in self.classifies],
+            "extracts": [spec.to_dict() for spec in self.extracts],
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -488,6 +540,7 @@ class RequestExecution(PhysicalNode):
             "filter_chains": len(self.filters),
             "joins": len(self.joins),
             "classifications": len(self.classifies),
+            "extractions": len(self.extracts),
         }
 
     @classmethod
@@ -510,6 +563,10 @@ class RequestExecution(PhysicalNode):
             classifies=tuple(
                 RequestClassifySpec.from_mapping(spec)
                 for spec in attributes.get("classifies", ())
+            ),
+            extracts=tuple(
+                RequestExtractSpec.from_mapping(spec)
+                for spec in attributes.get("extracts", ())
             ),
         )
 

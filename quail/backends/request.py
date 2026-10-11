@@ -35,9 +35,10 @@ from quail.execution.runner import (
     compute_subgraph,
     scalar_node_metrics,
 )
+from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.logical import Aggregate as LogicalAggregate
 from quail.logical import (
+    SPAN_SUFFIX,
     Alias,
     Apply,
     answer_row_offsets,
@@ -49,6 +50,7 @@ from quail.logical import (
     render_join_frame,
     shared_preamble,
 )
+from quail.logical import Aggregate as LogicalAggregate
 from quail.physical import (
     Limit,
     PhysicalNode,
@@ -57,6 +59,7 @@ from quail.physical import (
     Recombine,
     RequestClassifySpec,
     RequestExecution,
+    RequestExtractSpec,
     RequestFilterSpec,
     RequestJoinSpec,
     Scan,
@@ -76,7 +79,7 @@ from quail.planner.join_order import search_joins
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planner.statistics import prepare_filter_costs, summarize_alias
-from quail.planner.validation import has_extract, has_label
+from quail.planner.validation import extraction_refusal, has_extract, has_label
 
 
 def _answer_ids(tokenizer) -> tuple[list[int], list[int]]:
@@ -111,7 +114,7 @@ def plan_request_backend(
         filter_submission: How filter stages become requests.
         join_submission: How join tuples become requests.
         scores_labels: Whether the engine decodes an answer as text,
-            which AI.CLASSIFY needs.
+            which AI.CLASSIFY and AI.EXTRACT need.
     """
     if any(isinstance(node, Apply) for node in region.logical_plan.walk()):
         return (PhysicalCandidate(
@@ -134,16 +137,20 @@ def plan_request_backend(
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),
         ),)
-    if has_extract(region.logical_plan):
-        return (PhysicalCandidate(
-            graph=None,
-            plan=Refusal(
-                reasons=(f"AI.EXTRACT runs on the Quail backend; "
-                         f"{backend_name} does not run it",),
+    extracts = has_extract(region.logical_plan)
+    if extracts:
+        refusal = extraction_refusal(context)
+        if refusal is None and not (scores_labels
+                                    and not context.model.canvas_tokens):
+            refusal = Refusal(
+                reasons=(f"AI.EXTRACT on {backend_name} decodes each answer "
+                         f"as text, which its engine does not return for "
+                         f"{context.model.name!r}",),
                 constraint="extract_needs_quail_backend",
-                needed=1, available=0, unit="backends"),
-            estimated_seconds=float("inf"),
-        ),)
+                needed=1, available=0, unit="backends")
+        if refusal is not None:
+            return (PhysicalCandidate(
+                graph=None, plan=refusal, estimated_seconds=float("inf")),)
     classifies = has_label(region.logical_plan)
     if any(isinstance(column, Alias)
            and getattr(column.expression, "probabilities", False)
@@ -374,6 +381,17 @@ def plan_request_backend(
             tail_text=prompt.tail,
         ))
 
+    # each extraction decodes one answer per surviving document of its
+    # alias, after the joins
+    extract_specs = []
+    for node in operators.extracts:
+        prompts.append(node.call.prompt)
+        extract_specs.append(RequestExtractSpec(
+            alias=node.alias, output=node.name,
+            question=node.call.question,
+            tail_token_ids=tuple(node.call.prompt.tail_token_ids),
+            trim=node.call.trim))
+
     preambles = {
         tuple(prompt.preamble_token_ids)
         for prompt in prompts
@@ -402,6 +420,7 @@ def plan_request_backend(
         filters=tuple(filter_specs),
         joins=tuple(join_specs),
         classifies=tuple(classify_specs),
+        extracts=tuple(extract_specs),
     )
     nodes.append(request_node)
 
@@ -432,15 +451,22 @@ def plan_request_backend(
 
     label_ports = tuple(
         PortRef(request_node.node_id, f"label_answers:{name}")
-        for name in label_plan.projected.values())
+        for name in label_plan.projected.values()
+    ) + tuple(
+        PortRef(request_node.node_id, f"extract_answers:{spec.output}")
+        for spec in extract_specs)
+    columns = []
+    for column in region.logical_plan.projection.columns:
+        if isinstance(column, Alias):
+            columns.append(column.name)
+            if column.expression.kind == "extract":
+                columns.append(column.name + SPAN_SUFFIX)
+        else:
+            columns.append(f"{column.alias}.{column.column}")
     nodes.append(Project(
         node_id="project",
         inputs=input_ports((sink_input, *label_ports)),
-        columns=tuple(
-            column.name if isinstance(column, Alias)
-            else f"{column.alias}.{column.column}"
-            for column in region.logical_plan.projection.columns
-        ),
+        columns=tuple(columns),
     ))
     if region.logical_plan.result.limit is not None:
         nodes.append(Limit(
@@ -707,6 +733,82 @@ def _classify_documents(client, spec, bodies) -> dict:
         "generated_tokens": generated_tokens,
         "unmatched": unmatched,
     }
+
+
+# the most tokens an answer may run to; the measured answers of a
+# 16-token chunk fit, and a clause of a contract runs longer
+EXTRACT_MAX_TOKENS = 64
+EXTRACT_SPAN_TYPE = pa.struct([("start", pa.int32()), ("end", pa.int32())])
+
+
+def _extract_documents(client, spec, bodies, texts) -> dict:
+    """Decode one answer per prompt body and locate it in the document's text.
+
+    Generation stops at the quote that closes the phrase. An answer
+    the document holds is returned as the document's own text at its
+    span, widened to whole lines when trim is off; "none" gives nulls;
+    an answer the document does not hold is returned as written, with
+    a null span.
+
+    Args:
+        client: The engine client.
+        spec: The RequestExtractSpec with the prompt tail.
+        bodies: Token ids for each prompt before the tail, preamble included.
+        texts: The document text of each body.
+
+    Returns:
+        A dict with one answer and one span per body, the counts of
+        unanswered and unaligned documents, the request and token
+        counts, and the generation seconds.
+    """
+    tail = _token_list(spec.tail_token_ids)
+    params = client.decode_params(EXTRACT_MAX_TOKENS, stop=['"'])
+    prompts = [{"prompt_token_ids": body + tail} for body in bodies]
+    started = time.perf_counter()
+    outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
+    wall_s = time.perf_counter() - started
+    answers, spans = [], []
+    unanswered = unaligned = 0
+    prompt_tokens = cached_tokens = generated_tokens = fed_back = 0
+    for output, document in zip(outputs, texts):
+        prompt_tokens += len(output.prompt_token_ids)
+        cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
+        generated = len(output.outputs[0].token_ids)
+        generated_tokens += generated
+        fed_back += max(generated - 1, 0)
+        phrase = read_phrase(output.outputs[0].text or "")
+        span = None if phrase is None else locate_span(document, phrase)
+        if phrase is None:
+            unanswered += 1
+        elif span is None:
+            unaligned += 1
+        elif not spec.trim:
+            span = line_span(document, span)
+        answers.append(phrase if span is None else document[span[0]:span[1]])
+        spans.append(span)
+    return {
+        "answers": answers,
+        "spans": spans,
+        "wall_s": wall_s,
+        "requests": len(prompts),
+        "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
+        "fresh_tokens": prompt_tokens - cached_tokens + fed_back,
+        "generated_tokens": generated_tokens,
+        "unanswered": unanswered,
+        "unaligned": unaligned,
+    }
+
+
+def _extract_answer_table(spec, document_ids, answers, spans) -> pa.Table:
+    """Return one row per document: its id, its answer, and the answer's span."""
+    return pa.table({
+        spec.alias: pa.array(document_ids, pa.int32()),
+        spec.output: pa.array(answers, pa.string()),
+        spec.span_output: pa.array(
+            [None if span is None else {"start": span[0], "end": span[1]}
+             for span in spans], EXTRACT_SPAN_TYPE),
+    })
 
 
 def _choose_documents(client, spec, bodies) -> dict:
@@ -1146,6 +1248,40 @@ class RequestModelExecution:
             fresh_tokens += result["fresh_tokens"]
             cached_tokens += result["cached_tokens"]
             evaluated_pairs += result["requests"]
+
+        for spec in node.extracts:
+            document_ids = list(survivors[spec.alias])
+            texts = self.document_texts.get(spec.alias)
+            if texts is None:
+                raise ValueError(
+                    f"AI.EXTRACT needs the text of {spec.alias!r}, which "
+                    f"the scan did not load")
+            result = _extract_documents(
+                self.client, spec, [
+                    _token_list(node.preamble_token_ids)
+                    + _token_list(self.documents[spec.alias][document])
+                    for document in document_ids],
+                [_text_value(texts, document) for document in document_ids])
+            outputs[f"extract_answers:{spec.output}"] = _extract_answer_table(
+                spec, document_ids, result["answers"], result["spans"])
+            steps.append({
+                "kind": "extract",
+                "alias": spec.alias,
+                "output": spec.output,
+                "n_in": len(document_ids),
+                "n_out": len(document_ids) - result["unanswered"],
+                "wall_s": result["wall_s"],
+                "requests": result["requests"],
+                "fresh_tokens": result["fresh_tokens"],
+                "cached_tokens": result["cached_tokens"],
+                "generated_tokens": result["generated_tokens"],
+                "unanswered": result["unanswered"],
+                "unaligned": result["unaligned"],
+            })
+            requests += result["requests"]
+            fresh_tokens += result["fresh_tokens"]
+            cached_tokens += result["cached_tokens"]
+            evaluated_documents += len(document_ids)
 
         for alias in node.aliases:
             outputs[f"ids:{alias}"] = survivors[alias]

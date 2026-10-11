@@ -487,6 +487,11 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                              if spec.written_pos < len(joins)
                              else f"predicate {spec.written_pos + 1}")
                 details.append(f"Join {spec.semantics}: {predicate}")
+            for spec in node.extracts:
+                details.append(
+                    f"Extract {spec.alias}: {spec.output} "
+                    f"question={spec.question!r}, "
+                    f"trim={'on' if spec.trim else 'off'}")
         else:
             title = node.type_name
             if not verbose:

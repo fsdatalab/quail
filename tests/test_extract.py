@@ -5,11 +5,14 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import test_request_backends as request_tests
 from fakes import letter_tokens
 
 import quail
+from quail.backends.request import EXTRACT_MAX_TOKENS
 from quail.catalog import DocumentProvider
 from quail.execution.execute import execute_query
+from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.logical import (
     SHARED_PRE,
     Alias,
@@ -34,6 +37,9 @@ from quail.physical import (
     ExtractSpec,
     Filter,
     GraphValidationError,
+    Project,
+    RequestExecution,
+    RequestExtractSpec,
     decode_graph,
     encode_graph,
 )
@@ -308,15 +314,15 @@ def test_extract_errors_and_refusals(session):
     # the speed of light estimate does not price an extraction yet
     with pytest.raises(NotImplementedError, match="semantic_extract"):
         quail.speed_of_light_estimate(_ends(session), lambda *_: True)
-    # neither request backend runs it
-    vllm = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
-                                      backend="stock_vllm"),
-                         tokenizer=letter_tokens)
-    vllm.register("contracts", session.catalog.get("contracts"))
-    refused = _ends(vllm).plan()
+    # SGLang returns no decoded text, so it does not run it
+    sglang = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
+                                        backend="pipelined_sglang"),
+                           tokenizer=letter_tokens)
+    sglang.register("contracts", session.catalog.get("contracts"))
+    refused = _ends(sglang).plan()
     assert isinstance(refused, Refusal)
     assert refused.constraint == "extract_needs_quail_backend"
-    vllm.close()
+    sglang.close()
     # a reranker gives no next-token probabilities over the document,
     # nor does a decision model or a diffusion model with a canvas
     reranker = quail.Session(
@@ -354,3 +360,146 @@ def test_extract_errors_and_refusals(session):
                 .select("c.id", "ends"))
     nodes = filtered.plan().nodes
     assert isinstance(nodes[1], AiFilter) and isinstance(nodes[2], AiExtract)
+
+
+def test_span_helpers_read_locate_and_widen_an_answer():
+    assert read_phrase('March 3, 2027" and more') == "March 3, 2027"
+    assert read_phrase("March 3, 2027") == "March 3, 2027"
+    assert read_phrase(" five years\"") == "five years"
+    for empty in ("", '"', "none", "None.", ' none"'):
+        assert read_phrase(empty) is None
+    assert locate_span(LEASE, "March 3, 2027") == (14, 27)
+    assert LEASE[14:27] == "March 3, 2027"
+    # case and runs of whitespace are forgiven; the first occurrence wins
+    assert locate_span(LEASE, "RENT   is") == (29, 36)
+    assert locate_span("a b a b", "a b") == (0, 3)
+    assert locate_span(LEASE, "April") is None
+    assert locate_span(LEASE, "   ") is None
+    assert line_span(LEASE, (14, 27)) == (0, 28)
+    assert line_span(LEASE, (29, 36)) == (29, len(LEASE))
+    assert LEASE[29:len(LEASE)] == "Rent is $2,000."
+    assert line_span("one\n\nthree", (4, 4)) == (4, 4)
+
+
+class _PhraseClient(request_tests._Client):
+    """Writes each document's answer from the text its prompt tokens spell."""
+
+    def __init__(self):
+        self.params = []
+
+    def decode_params(self, max_tokens, stop=None):
+        self.params.append((max_tokens, stop))
+        return ("decode", max_tokens)
+
+    def generate(self, prompts, sampling_params, use_tqdm=False):
+        assert sampling_params == ("decode", EXTRACT_MAX_TOKENS)
+        outputs = []
+        for prompt in prompts:
+            ids = prompt["prompt_token_ids"]
+            spelled = bytes(token - 1 for token in ids if 1 <= token <= 256)
+            text = spelled.decode("utf-8", errors="ignore")
+            if "March" in text:
+                answer, tokens = "March 3, 2027", [1, 2, 3, 4]
+            elif "five" in text:
+                answer, tokens = "FIVE   years", [1, 2]
+            elif "absent" in text:
+                answer, tokens = "a phrase the document lacks", [1, 2, 3]
+            else:
+                answer, tokens = "none", [1]
+            outputs.append(SimpleNamespace(
+                prompt_token_ids=ids, num_cached_tokens=0,
+                outputs=[SimpleNamespace(text=answer, token_ids=tokens)]))
+        return outputs
+
+
+TEXTS = [LEASE, "No dates here.", "Term: five years\nmore text",
+         "the absent one"]
+
+
+def test_request_backend_decodes_and_locates_one_answer_per_document():
+    documents = {"c": [request_tests._tokens(text) for text in TEXTS]}
+    specs = (
+        RequestExtractSpec(alias="c", output="ends", question=QUESTION,
+                           tail_token_ids=(90,)),
+        RequestExtractSpec(alias="c", output="lines", question=QUESTION,
+                           tail_token_ids=(90,), trim=False),
+    )
+    node = RequestExecution(
+        node_id="request-model", backend_name="stock_vllm", aliases=("c",),
+        preamble_token_ids=(3,), extracts=specs)
+    client = _PhraseClient()
+    execution = request_tests._execution(
+        documents, client=client, document_texts={"c": TEXTS})
+    result = execution.execute(node, {"input:0": [0, 1, 2, 3]})
+    assert client.params == [(EXTRACT_MAX_TOKENS, ['"'])] * 2
+    trimmed = result.outputs["extract_answers:ends"].to_pydict()
+    assert trimmed == {
+        "c": [0, 1, 2, 3],
+        "ends": ["March 3, 2027", None, "five years",
+                 "a phrase the document lacks"],
+        "ends_span": [{"start": 14, "end": 27}, None, {"start": 6, "end": 16},
+                      None]}
+    whole = result.outputs["extract_answers:lines"].to_pydict()
+    assert whole["lines"] == ["Lease ends on March 3, 2027.", None,
+                              "Term: five years", "a phrase the document lacks"]
+    assert whole["lines_span"] == [{"start": 0, "end": 28}, None,
+                                   {"start": 0, "end": 16}, None]
+    # an extraction keeps every document
+    assert result.outputs["ids:c"] == [0, 1, 2, 3]
+    step, _ = result.metrics.extension["steps"]
+    assert (step["kind"], step["output"], step["n_in"], step["n_out"]) == (
+        "extract", "ends", 4, 3)
+    assert (step["requests"], step["unanswered"], step["unaligned"]) == (4, 1, 1)
+    assert step["generated_tokens"] == 4 + 1 + 2 + 3
+    # the preamble, document, and tail of each prompt, and each
+    # answer's tokens but the last, fed back
+    assert step["fresh_tokens"] == sum(
+        2 + len(ids) for ids in documents["c"]) + (3 + 0 + 1 + 2)
+    assert result.metrics.evaluated_documents == 8
+    # the executor needs the document text to locate an answer
+    with pytest.raises(ValueError, match="needs the text"):
+        request_tests._execution(documents, client=client).execute(node, {})
+
+
+def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
+    session = request_tests._session(
+        "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
+    query = session.sql(
+        f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
+        f"FROM contracts c")
+    plan = query.plan()
+    assert not isinstance(plan, Refusal)
+    (request_node,) = [n for n in plan.nodes if isinstance(n, RequestExecution)]
+    (spec,) = request_node.extracts
+    assert (spec.alias, spec.output, spec.question, spec.trim) == (
+        "c", "ends", QUESTION, True)
+    assert list(spec.tail_token_ids) == request_tests._tokens(
+        AFTER_DOCUMENT_TEXT + session.model.turn[1] + EXTRACT_PHRASE_CUE)
+    assert not request_node.filters and not request_node.classifies
+    project = next(node for node in plan.nodes if isinstance(node, Project))
+    assert [port.source.port for port in project.inputs] == [
+        "ids:c", "extract_answers:ends"]
+    assert project.columns == ("c.id", "ends", "ends_span")
+    assert "Extract c: ends question=" in query.explain()
+    codecs = session.registry.codecs
+    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
+
+    boot = {"client": _PhraseClient(), "sampling_params": object(),
+            "capacity": request_tests.CAPACITY}
+    monkeypatch.setattr(
+        "quail.backends.vllm.VLLMEngine.boot",
+        lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
+    result = request_tests._run_stock_vllm(session, query)
+    rows = result.collect()
+    assert rows.column_names == ["c.id", "ends", "ends_span"]
+    assert rows.column("c.id").to_pylist() == ["a", "b", "c", "d"]
+    assert rows.column("ends").to_pylist() == [
+        "March 3, 2027", None, "five years", "a phrase the document lacks"]
+    assert rows.column("ends_span").to_pylist() == [
+        {"start": 14, "end": 27}, None, {"start": 6, "end": 16}, None]
+    answers = result.answer_tables["extracts"]["ends"]
+    assert answers.column_names == ["c", "ends", "ends_span"]
+    assert answers.num_rows == 4
+    (step,) = result.report["backend_metrics"]["steps"]
+    assert step["kind"] == "extract" and step["requests"] == 4
+    session.close()
