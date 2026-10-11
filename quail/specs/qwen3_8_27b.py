@@ -33,13 +33,11 @@ QWEN3_8_27B_FP8 = ModelSpec(
     hf_name="Qwen/Qwen3.8-27B-FP8",
     revision="017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
     kv_bytes=2.0,
-    # Estimated from the checkpoint's 30.9e9 bytes of safetensors
-    # without the 0.7e9-byte multi-token-prediction layer, which vLLM
-    # loads only for speculative decoding, and the 0.8e9-byte vision
-    # tower, which it skips in language_model_only mode: fp8
-    # projections and the bf16 embedding table and untied head.
-    # Replace with the measured footprint.
-    w_mem_bytes=29.4e9,
+    # Measured: 27.60 GiB allocated after load_model on an H100 in
+    # language_model_only mode (quail-b run 20261011T035627Z-c1b6c9e4),
+    # against 30.9e9 bytes of safetensors that include the
+    # multi-token-prediction layer and the vision tower vLLM skips.
+    w_mem_bytes=29.63e9,
     vocab=248_320,
     tied_head=False,
     # vLLM's model type; Quail's executor has no forward pass for it,
