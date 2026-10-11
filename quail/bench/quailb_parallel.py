@@ -14,7 +14,6 @@ function and every family call running if the local process disconnects.
 """
 
 import json
-import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,7 +160,6 @@ def run_query_family(
     gpu_timing: bool = False,
     label_root: str = "",
     canvas_draws: str = "",
-    recompute_state: bool = False,
 ) -> str:
     """Run one query family through the selected benchmark methods.
 
@@ -181,13 +179,10 @@ def run_query_family(
         label_root: Optional local mirror of reference labels.
         canvas_draws: Comma-separated maximum diffusion draw counts. Empty
             keeps the default; multiple counts create separate Quail runs.
-        recompute_state: Whether Quail recomputes each document for every
-            question instead of reusing its state.
 
     Returns:
         Path to the saved family result on the results volume.
     """
-    os.environ["QUAIL_RECOMPUTE_STATE"] = "1" if recompute_state else "0"
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
         process_groups.append(tuple(_methods(baselines)))
@@ -302,7 +297,6 @@ def run_all(
     gpu_timing: bool = False,
     label_root: str = "",
     canvas_draws: str = "",
-    recompute_state: bool = False,
 ):
     from quail_b import select_queries
 
@@ -358,7 +352,6 @@ def run_all(
                     gpu_timing=gpu_timing,
                     label_root=label_root,
                     canvas_draws=canvas_draws,
-                    recompute_state=recompute_state,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -521,7 +514,6 @@ def main(
     label_root: str = "",
     finish: str = "",
     canvas_draws: str = "",
-    recompute_state: bool = False,
 ):
     if finish:
         # finish an earlier run whose orchestrator died
@@ -550,7 +542,6 @@ def main(
         gpu_timing=gpu_timing,
         label_root=label_root,
         canvas_draws=canvas_draws,
-        recompute_state=recompute_state,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)
