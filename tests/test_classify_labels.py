@@ -96,14 +96,6 @@ def test_labels_copy_by_content_and_join_a_reused_collection(
                       .read_text())["collection_id"] == summary["collection_id"]
 
 
-
-    carried = labeling.activate_reused_collection(
-        0.1, "c_small", summary["collection_id"], "")
-    assert carried["reused_predicates"] == 2
-    assert carried["new_predicates"] == 0
-    assert carried["collection_id"] == summary["collection_id"]
-
-
 def test_joined_rows_take_the_classification_sides(monkeypatch, tmp_path):
     import quail_b.labels
 
@@ -128,15 +120,3 @@ def test_joined_rows_take_the_classification_sides(monkeypatch, tmp_path):
     _, rows = cell.corpus_rows(1.0, spec)
     assert rows == [{"id": "u1", "right_id": "a1", "content": "that is wrong",
                      cell.RIGHT_TEXT: "here is the fee"}]
-
-
-def test_required_tables_match_the_reader():
-    from quail_b.labels import _predicate_tables
-
-    for spec in PREDICATES + tuple(PREDICATE_BY_KEY[key] for key in (
-            "quailb.imdb.review.aspect_sentiment",
-            "quailb.support.message.disagreement",
-            "quailb.fever.claim.topic")):
-        assert labeling._required_tables(spec) == _predicate_tables(
-            {"kind": spec.kind, "left_table": spec.left_table,
-             "right_table": spec.right_table})

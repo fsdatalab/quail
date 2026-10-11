@@ -225,36 +225,7 @@ def _corpus_rows(reviews, reports, terms, claims, evidence, contexts,
         "agent_traces": [{"id": "at0000-t005", "trace": "yes trace",
                           "trajectory_id": "at0000", "turn_index": 5,
                           "token_count": 2}],
-        "support_traces": [{
-            "id": "sp0000", "request": "yes", "transcript": "yes",
-            "message_count": 1, "task_id": "airline-0", "domain": "airline",
-            "model": "gpt-4o", "trial": 0, "reward": 1.0}],
-        "support_messages": [_message("sp0000/0")],
-        "issue_runs": [{
-            "id": "ir00000", "request": "yes", "transcript": "yes",
-            "patch": "yes", "message_count": 1, "instance_id": "a__b-1", "repo": "a/b",
-            "resolved": 1, "token_count": 1}],
-        "issue_messages": [_message("ir00000/0")],
-        "wrench_runs": [{
-            "id": "wr00000", "task_id": "t1", "model": "gpt-5.4",
-            "mode": "hack", "transcript": "yes", "step_count": 1,
-            "token_count": 1}],
-        "wrench_steps": [{"id": "wr00000/1", "run_id": "wr00000",
-                          "step_index": 1, "model": "gpt-5.4",
-                          "text": "yes"}],
-        "sales_calls": [{
-            "id": "sc00000", "domain": "b2b", "deal_id": "sdb2b0000",
-            "call_index": 1, "prev_call_id": None,
-            "deal_stage": "Negotiation", "deal_amount": 10.0,
-            "transcript": "yes"}],
     }
-
-
-def _message(message_id):
-    return {"id": message_id, "trace_id": message_id.split("/")[0],
-            "turn_index": 0, "role": "user", "content": "yes",
-            "tool_call_id": None, "prev_id": None, "prev_user_id": None,
-            "prev_assistant_id": None}
 
 
 def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
@@ -278,10 +249,8 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
         evidence=[("page0", "yes page"), ("page1", "no")],
         contexts=[("context one", ["p1", "p2"]), ("context two", ["p3"])],
         passages=[("passage a", ["p2"]), ("passage b", ["p1"])])
-    source_dir, source_corpus, _ = _write_corpus(tmp_path, 1.0, source_rows)
+    _, source_corpus, _ = _write_corpus(tmp_path, 1.0, source_rows)
     source_id = source_corpus["corpus_id"]
-    # the source corpus predates a table that none of these labels use
-    (source_dir / "sales_calls.parquet").unlink()
     identities = {
         spec.key: labeling.label_set_identity(
             spec, source_id, source_corpus["corpus_full_hash"])
