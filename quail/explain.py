@@ -610,6 +610,9 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
             budgets.append(f"chunk budget={chunk:,} tokens")
         if admission is not None:
             budgets.append(f"admission budget={admission:,} tokens")
+        split = physical.settings.get("arena_pages") or ()
+        if len(split) > 2:
+            budgets.append(f"state pool={split[2]:,} slots")
         lines.append("  " + ", ".join(budgets))
     lines.append("")
     lines.extend("  " + line for line in physical_tree(

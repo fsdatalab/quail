@@ -77,3 +77,30 @@ def test_both_backends_accept_the_model():
     backend = RequestBackend(name="stock", engine=engine,
                              filter_submission="operator")
     assert backend.supports(SPEC, H100_SXM, 1).supported
+
+
+def test_plans_ship_the_state_pool_and_explain_shows_it(tmp_path):
+    from test_planner import _five_filter_plan, _parquet, _plan
+
+    from quail.catalog import Catalog, DocumentProvider
+    from quail.explain import explain
+
+    catalog = Catalog()
+    catalog.register("reviews", DocumentProvider.from_parquet(
+        _parquet(tmp_path / "r.parquet", ["id", "review"]), id_col="id"))
+    logical = _five_filter_plan(catalog, (0.5, 0.5))
+    plan = _plan(logical, {"r": [400] * 64}, model=SPEC)
+    split = plan.settings["arena_pages"]
+    assert len(split) == 3
+    pages, sliding, slots = split
+    assert sliding == 0 and slots > 1 and pages > 0
+    # the split is the budget's own for the corpus's mean length
+    chunk = plan.settings["chunk_tokens"]
+    assert slots == budgets.state_slots(SPEC, H100_SXM, chunk, 400)
+    assert plan.settings["admission_tokens"] == pages * budgets.PAGE_TOKENS
+    text = explain(logical, plan)
+    assert f"state pool={slots:,} slots" in text
+    # a model without state keeps the two-way split
+    other = _plan(logical, {"r": [400] * 64}, model=QWEN3_32B_FP8)
+    assert len(other.settings["arena_pages"]) == 2
+    assert "state pool" not in explain(logical, other)

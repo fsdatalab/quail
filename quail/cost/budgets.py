@@ -194,14 +194,20 @@ def _projection_time(model: ModelSpec, device: DeviceSpec,
     return t * model.layers
 
 
+def _kv_layers(model: ModelSpec) -> int:
+    """The layers that run attention over KV: all but the linear-attention ones."""
+    return model.layers - len(model.linear_layer_set)
+
+
 def _attention_time(model: ModelSpec, device: DeviceSpec,
                     chunk: int, context: int) -> float:
-    """Ideal seconds for the attention kernels in one chunk, all layers."""
+    """Ideal seconds for the attention kernels in one chunk, over the KV layers."""
+    layers = _kv_layers(model)
     flops = 4.0 * chunk * context * model.n_q * model.d_head
-    moved = (context * model.kappa / model.layers
+    moved = (context * model.kappa / layers
              + 2.0 * chunk * model.n_q * model.d_head * ACT_BYTES)
     return max(flops / device.peak_flops,
-               moved / device.hbm_bw) * model.layers
+               moved / device.hbm_bw) * layers
 
 
 # Below this many dense parameters a model runs unified attention only.
@@ -253,7 +259,7 @@ def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
     # the merge kernel reads two partial outputs and writes one, in
     # bf16, once per layer
     merge = 3 * rows * model.n_q * model.d_head * ACT_BYTES / device.hbm_bw
-    tree += merge * model.layers
+    tree += merge * _kv_layers(model)
     return "tree" if tree < unified else "unified"
 
 

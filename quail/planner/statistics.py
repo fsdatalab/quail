@@ -244,7 +244,9 @@ class PlanStatistics:
         lengths: alias -> AliasStats, the length sums the join search
             and the stage pricing read.
         chunk: The forward pass token budget.
-        arena_pages: The KV arena's page split.
+        arena_pages: The KV arena's page split: every-token pages,
+            sliding pages, and the state pool's slots on a model that
+            has one.
         admission: The admission budget in tokens.
         cap_pages: Pages the retention pool may hold.
         pre: The engine preamble's token count.
@@ -315,6 +317,10 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
     longest_mean = max(
         (st.mean_doc_tokens for st in stats.values()), default=None)
     arena_split = budgets.arena_pages(model, device, chunk, longest_mean)
+    if model.state_bytes:
+        # the state pool's slots ride with the page split
+        arena_split = (*arena_split,
+                       budgets.state_slots(model, device, chunk, longest_mean))
     admission = arena_split[0] * budgets.PAGE_TOKENS
     return PlanStatistics(
         stats=stats, lengths=lengths, chunk=chunk,
