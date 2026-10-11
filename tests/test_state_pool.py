@@ -9,8 +9,8 @@ torch = pytest.importorskip("torch")
 
 def state_arena(pages=64, slots=5):
     # layer 0 runs linear attention and keeps no KV; layer 1 keeps
-    # every token. A page is 16 x 4 x 4 = 256 bytes; a slot is a
-    # 256-byte state plus a 48-byte window, so it counts as 2 pages.
+    # every token. A slot prices at the pages over the usable slots:
+    # 64 / 4 = 16 pages with five slots.
     return KVArena(n_layers=2, n_pages=pages, page_tokens=16, n_kv=1, d_head=2,
                    dtype=torch.float32, device="cpu", layer_kv=[(0, 0), (1, 2)],
                    state_layers=(0,), n_state_slots=slots,
@@ -20,11 +20,11 @@ def state_arena(pages=64, slots=5):
 def test_slot_pages_and_the_free_page_currency():
     arena = state_arena()
     assert arena.has_state
-    assert arena.slot_pages == 2
+    assert arena.slot_pages == 16
     assert arena.n_state_slots == 5
     # slot 0 is the zero state, so four slots are usable
-    assert arena.admission_pages == 8
-    assert arena.free_pages == 8
+    assert arena.admission_pages == 64
+    assert arena.free_pages == 64
     state, conv = arena.state_pools(0)
     assert state.shape == (5, 8, 8) and state.dtype == torch.float32
     assert conv.shape == (5, 4, 3) and conv.dtype == torch.float32
@@ -50,24 +50,25 @@ def test_activate_reserves_slots_and_prices_them_as_pages():
     key = ("d", 0)
     assert arena.activate(key, 20, capacity_tokens=40, base_tokens=20, slots=2)
     assert arena.state.owned_count(key) == 2
-    assert arena.held_cost(key) == 3 + 2 * 2
-    assert arena.free_pages == min(64 - 3, 2 * 2)
-    assert arena.growth_cost(key, 40, slots=3) == 2
+    # the key costs the larger of its 3 pages and its slots' 32
+    assert arena.held_cost(key) == 32
+    assert arena.free_pages == min(64 - 3, 2 * 16)
+    assert arena.growth_cost(key, 40, slots=3) == 16
     assert arena.growth_cost(key, 40) == 0
     # a resident key grows its reservation
     assert arena.activate(key, 20, capacity_tokens=40, slots=3) is not None
     assert arena.state.owned_count(key) == 3
-    assert arena.free_pages == 2
+    assert arena.free_pages == 16
     # one slot left: a key asking for two is refused and takes no pages
     other = ("d", 1)
     assert arena.activate(other, 16, slots=2) is None
     assert not arena.is_resident(other)
-    assert arena.free_pages == 2
+    assert arena.free_pages == 16
     assert arena.activate(other, 16, slots=1)
     assert arena.free_pages == 0
-    assert arena.free_key(other) == 1 + 2
-    assert arena.free_key(key) == 3 + 3 * 2
-    assert arena.free_pages == 8
+    assert arena.free_key(other) == 16
+    assert arena.free_key(key) == 48
+    assert arena.free_pages == 64
 
 
 def test_claims_rewind_shares_and_borrowing():
@@ -90,14 +91,15 @@ def test_claims_rewind_shares_and_borrowing():
     assert arena.state_slot_at(key, 105) is None
     assert arena.state_slot_at(key, 64) == share
     assert arena.state.owned_count(key) == 2
-    # the retained size counts the slots: 7 pages of KV plus 2 slots
-    assert arena.retained_pages == 7 + 2 * 2
+    # the retained size is the larger of 7 pages of KV and 2 slots
+    # at 64 / 5 = 13 pages each
+    assert arena.retained_pages == 26
     # the last borrower is admitted: the share slot goes
     arena.release(key)
     assert arena.state_slot_at(key, 64) is None
     assert not arena.can_borrow(key, 64)
     assert arena.state.owned_count(key) == 1
-    assert arena.free_key(key) == 7 + 2
+    assert arena.free_key(key) == 13
 
 
 def test_eviction_frees_slots_when_the_pool_is_slot_bound():
@@ -111,8 +113,8 @@ def test_eviction_frees_slots_when_the_pool_is_slot_bound():
     assert arena.activate(third, 16, slots=1)
     assert arena.evicted_keys == 1
     assert not arena.is_resident(first)
-    # the evicted key's slot counts in the pages it freed
-    assert arena.evicted_pages == 1 + 2
+    # the evicted key's slot, 64 / 2 = 32 pages, is what it freed
+    assert arena.evicted_pages == 32
     assert arena.state.owned_count(third) == 1
 
 
@@ -125,7 +127,7 @@ def test_resize_rebuilds_the_state_pool():
     assert arena.n_pages == 32 and arena.n_state_slots == 7
     assert arena.state_pools(0)[0].shape == (7, 8, 8)
     assert not arena.state_pools(0)[0].any()
-    assert arena.free_pages == min(32, 6 * 2)
+    assert arena.free_pages == min(32, 6 * 6)
     # a resize that names no slot count keeps the pool
     arena.resize(16)
     assert arena.n_state_slots == 7

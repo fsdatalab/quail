@@ -156,9 +156,10 @@ class PageArena:
     def retain(self, key, priority=None, extra_pages=None) -> None:
         """Make a resident key evictable after its current use.
 
-        extra_pages are pages the key holds outside this pool, counted
-        in its retained size and priority; None keeps the key's last
-        value.
+        extra_pages is the key's price in another pool, in this pool's
+        pages; the key's retained size and priority count the larger
+        of that and the pages it alone holds here. None keeps the
+        key's last value.
         """
         if key not in self.owned:
             raise KeyError(key)
@@ -171,8 +172,8 @@ class PageArena:
         # the pages evicting the key would free: those it alone holds
         # now; a child freed later leaves more, so the count is a
         # lower bound, and admission short of pages evicts anyway
-        pages = extra_pages + sum(
-            1 for page in self.table_pages(key) if self.holds[page] == 1)
+        pages = max(extra_pages, sum(
+            1 for page in self.table_pages(key) if self.holds[page] == 1))
         self.retained[key] = prefix_tokens
         self._retained_sizes[key] = pages
         self._retained_pages += pages
@@ -533,7 +534,10 @@ class KVArena:
                 self.conv_pool[layer] = torch.zeros(
                     (n_state_slots, *self.conv_shape), dtype=self.conv_dtype,
                     device=self.device)
-            self._slot_pages = -(-self._slot_bytes() // self._page_bytes())
+            # a slot's price in every-token pages: the arena's pages over
+            # its usable slots, so a full slot pool and a full page pool
+            # price alike, as the sliding pool's rows do in free_pages
+            self._slot_pages = -(-n_pages // (n_state_slots - 1))
         # row indices stay on the host: pageable H2D copies block the
         # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU
@@ -576,16 +580,6 @@ class KVArena:
         return self.page_tokens * itemsize * sum(
             2 * heads * dim for layer, (heads, dim) in enumerate(self.shapes)
             if layer not in self.sliding_layers)
-
-    def _slot_bytes(self) -> int:
-        """Bytes one state slot takes across the state layers."""
-        import math
-        torch = self.torch
-        state = math.prod(self.state_shape) * torch.empty(
-            (), dtype=self.state_dtype).element_size()
-        conv = math.prod(self.conv_shape) * torch.empty(
-            (), dtype=self.conv_dtype).element_size()
-        return len(self.state_layers) * (state + conv)
 
     def reset_stats(self):
         self.evicted_keys = 0
@@ -956,7 +950,7 @@ class KVArena:
         slots = 0
         if self.state is not None and key in self.state.owned:
             slots = self.state.free_key(key)
-        return self.accounting.free_key(key) + slots * self._slot_pages
+        return max(self.accounting.free_key(key), slots * self._slot_pages)
 
     # ---- residency and retention, read by the loop and operators ------
 
@@ -984,7 +978,12 @@ class KVArena:
 
     @property
     def slot_pages(self) -> int:
-        """Every-token pages one state slot counts for; 0 without state."""
+        """Every-token pages one state slot prices at; 0 without state.
+
+        A key costs the larger of its KV pages and its slots' pages,
+        so a chunk of short documents fills the slot pool and a chunk
+        of long ones fills the page pool.
+        """
         return self._slot_pages
 
     @property
@@ -1038,7 +1037,7 @@ class KVArena:
             pages = max(pages, self._as_every_token_pages(
                 len(self.sliding.owned[key])))
         if self.state is not None:
-            pages += self.state.owned_count(key) * self._slot_pages
+            pages = max(pages, self.state.owned_count(key) * self._slot_pages)
         return pages
 
     def growth_cost(self, key, capacity_tokens: int, slots: int = 0) -> int:
@@ -1057,7 +1056,8 @@ class KVArena:
                 - len(self.sliding.table_pages(key)))
             need = max(need, self._as_every_token_pages(need_s))
         if self.state is not None:
-            need += max(0, slots - self.state.owned_count(key)) * self._slot_pages
+            need = max(need, (slots - self.state.owned_count(key))
+                       * self._slot_pages)
         return need
 
     def _as_every_token_pages(self, sliding_pages: int) -> int:

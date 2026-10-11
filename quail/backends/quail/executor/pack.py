@@ -453,8 +453,8 @@ class JoinAdmission:
     def _register(self, prefix, resident_pages, partners, extra_pages=0):
         """Record one anchor's costs; returns its index.
 
-        extra_pages are charged to a fresh anchor beyond its KV pages:
-        the state slots it reserves, in every-token pages.
+        extra_pages price a fresh anchor's state slots in every-token
+        pages; the anchor costs the larger of them and its KV pages.
         """
         a = len(self.prefix)
         k = len(self.stages)
@@ -486,7 +486,7 @@ class JoinAdmission:
                 lists.append(lst)
                 cums.append(cum)
         self._lazy.append(lazy)
-        need = self.page_cost(prefix + self._extra) + extra_pages
+        need = max(self.page_cost(prefix + self._extra), extra_pages)
         if resident_pages is not None:
             need = max(0, need - resident_pages)
         elif need > self.arena_pages:
@@ -530,7 +530,8 @@ class JoinAdmission:
                     partner_pages(self.page_cost, self.page_tokens, prefix,
                                   self.frames[j], max(self.stages[j]))
                     for j in range(1, k) if self.stages[j]])
-            needed = self.page_cost(prefix + self._extra) + extra_pages + largest
+            needed = max(self.page_cost(prefix + self._extra),
+                         extra_pages) + largest
             if needed > self.arena_pages:
                 raise ValueError("anchor and one suffix exceed the KV arena")
             self._page_reserve = max(self._page_reserve, largest)
@@ -555,7 +556,7 @@ class JoinAdmission:
         resident_pages says the anchor's prefix KV is already in the
         arena on that many pages, so it packs no prefix tokens.
         partners is the anchor's per-stage partner index lists, as in
-        anchor_partners. extra_pages are charged beyond its KV pages.
+        anchor_partners. extra_pages price its state slots.
         """
         a = self._register(prefix_tokens, resident_pages, partners, extra_pages)
         self.borrowing.add()
@@ -683,8 +684,9 @@ class JoinAdmission:
                 held.append(a)      # its parent is still queued
                 continue
             need = (self._page_cost[a] if borrow is None
-                    else self.page_cost(self.prefix[a] - borrow[1] + self._extra)
-                    + self._extra_pages[a])
+                    else max(self.page_cost(self.prefix[a] - borrow[1]
+                                            + self._extra),
+                             self._extra_pages[a]))
             if blocked and need:
                 held.append(a)
                 if not self._zero_cost:

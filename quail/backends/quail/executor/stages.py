@@ -406,12 +406,13 @@ class _StageExecutor:
         return rows
 
     def _held_pages(self, key, prefix_tokens, slots=0):
-        # the admission prices a document at page_cost(prefix + extra)
-        # plus its state slots, less what it holds; a trimmed window
-        # holds fewer sliding pages than that price assumes, so count
-        # what growing takes
+        # the admission prices a document at the larger of
+        # page_cost(prefix + extra) and its state slots' pages, less
+        # what it holds; a trimmed window holds fewer sliding pages
+        # than that price assumes, so count what growing takes
         capacity = prefix_tokens + self.capacity_extra
-        return (self.arena.page_cost(capacity) + slots * self.arena.slot_pages
+        return (max(self.arena.page_cost(capacity),
+                    slots * self.arena.slot_pages)
                 - self.arena.growth_cost(key, capacity, slots=slots))
 
     def _state_needs(self):
