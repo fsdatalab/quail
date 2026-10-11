@@ -1,0 +1,144 @@
+"""Time Quail's Qwen3.5 forward pass by layer part on a realistic chunk.
+
+Wraps the pipeline's mixers and the GDN kernels with synchronized
+timers and runs one filter over documents the size of IMDB reviews.
+The timers add launch gaps, so shares matter more than the totals.
+
+Prediction: the Gated DeltaNet layers (projection GEMMs, convolution,
+recurrence, gated norm) take at least 60 percent of the forward time,
+and the recurrence kernel plus the convolution take more than the
+attention layers do.
+
+    uv run modal run experiments/cells/hybrid_quail_profile.py \
+        --model qwen3.5-4b-bf16 2>&1 | tee /tmp/hybrid_quail_profile.log
+
+The record is written to /results/ablations/<model>-quail-profile.json.
+"""
+
+import json
+import time
+from collections import defaultdict
+
+import modal
+
+try:
+    from quail.bench.images import gpu_image
+    image = gpu_image()
+except ImportError:    # a container without the local quail package
+    image = None
+
+app = modal.App("quail-milestone1")
+hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
+kernel_cache = modal.Volume.from_name("quail-kernel-cache",
+                                      create_if_missing=True)
+results = modal.Volume.from_name("quail-results", create_if_missing=True)
+VOLUMES = {"/root/.cache/huggingface": hf_cache,
+           "/root/.cache/kernels": kernel_cache,
+           "/results": results}
+DOCUMENTS = 600
+DOCUMENT_TOKENS = 370
+QUESTION = "Is the text above about a person?"
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=VOLUMES)
+def profile(model: str) -> dict:
+    """Return seconds by forward-pass part for one filter run."""
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoTokenizer
+
+    from quail.backends.quail.executor import gdn
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.loop import run_filter
+    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.models import build_pipeline
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+    from quail.backends.quail.worker import checkpoint_arena_args
+    from quail.cost import budgets
+    from quail.logical import true_false_ids
+    from quail.specs import H100_SXM, MODELS
+
+    spec = MODELS[model]
+    tokenizer = AutoTokenizer.from_pretrained(
+        spec.hf_name, revision=spec.revision or None)
+    true_ids, false_ids = true_false_ids(tokenizer)
+    budget = budgets.chunk_budget(spec, H100_SXM)
+    loaded = load_model(spec.hf_name, spec.revision or None,
+                        answer_token_ids=true_ids | false_ids,
+                        max_batched_tokens=budget,
+                        text_only=spec.vision_tower)
+    full_pages, sliding = budgets.arena_pages(
+        spec, H100_SXM, budget, DOCUMENT_TOKENS)
+    arena = KVArena(
+        n_layers=spec.layers, n_pages=full_pages,
+        page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv, d_head=spec.d_head,
+        dtype=torch.bfloat16, layer_kv=spec.kv_shapes,
+        sliding_layers=spec.sliding_layer_set,
+        sliding_window=spec.sliding_window, n_sliding_pages=sliding,
+        **checkpoint_arena_args(spec, H100_SXM, budget, full_pages))
+    pipeline = build_pipeline(spec, loaded, arena)
+    rows = AnswerRows(torch, F, loaded, true_ids, false_ids)
+    answers = AsyncAnswers(torch, rows)
+
+    seconds = defaultdict(float)
+    calls = defaultdict(int)
+
+    def timed(name, function):
+        def wrapper(*args, **kwargs):
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            result = function(*args, **kwargs)
+            torch.cuda.synchronize()
+            seconds[name] += time.perf_counter() - started
+            calls[name] += 1
+            return result
+        return wrapper
+
+    pipeline._gated_delta_net = timed("gdn_layer", pipeline._gated_delta_net)
+    pipeline._attention = timed("attention_layer", pipeline._attention)
+    pipeline._mlp = timed("mlp", pipeline._mlp)
+    gdn.causal_conv_reference = timed("gdn_convolution",
+                                      gdn.causal_conv_reference)
+    gdn.gated_delta_kernel = timed("gdn_recurrence_kernel",
+                                   gdn.gated_delta_kernel)
+    pipeline.embed = timed("embedding", pipeline.embed)
+
+    word = tokenizer("the review describes a film and its cast in detail "
+                     "including the plot", add_special_tokens=False)["input_ids"]
+    documents = []
+    for index in range(DOCUMENTS):
+        body = (word * (DOCUMENT_TOKENS // len(word) + 2))[:DOCUMENT_TOKENS]
+        documents.append([10 + (index % 40)] + body)
+    question = tokenizer("\n" + QUESTION + spec.turn_suffix,
+                         add_special_tokens=False)["input_ids"]
+    with torch.inference_mode():
+        run_filter(torch, arena, pipeline, answers, documents[:60],
+                   [question], budget, arena_writes=True,
+                   attention_mode="unified")
+        for key in arena.resident_keys():
+            arena.free_key(key)
+        seconds.clear()
+        calls.clear()
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        run_filter(torch, arena, pipeline, answers, documents, [question],
+                   budget, arena_writes=True, attention_mode="unified")
+        torch.cuda.synchronize()
+        wall = time.perf_counter() - started
+    tokens = sum(len(d) + len(question) for d in documents)
+    record = {"model": model, "documents": DOCUMENTS, "tokens": tokens,
+              "wall_s": wall, "tokens_per_second": tokens / wall,
+              "chunk_budget": budget, "seconds": dict(seconds),
+              "calls": dict(calls)}
+    with open(f"/results/ablations/{model}-quail-profile.json", "w") as out:
+        json.dump(record, out, indent=1)
+    results.commit()
+    return record
+
+
+@app.local_entrypoint()
+def main(model: str = "qwen3.5-4b-bf16"):
+    call = profile.spawn(model)
+    print(f"function call id: {call.object_id}", flush=True)
+    print(json.dumps(call.get(), indent=1), flush=True)

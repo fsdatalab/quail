@@ -13,8 +13,8 @@ in the order plan_phases documents: a phase reads the slots the ones
 before it wrote.
 
 The reference functions are plain torch and define the maths. The
-recurrence can also run vLLM's chunked kernel on the same tensors; the
-convolution always runs the reference.
+convolution and the recurrence can also run vLLM's fused kernels on the
+same tensors.
 """
 
 from dataclasses import dataclass
@@ -332,6 +332,54 @@ def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale):
     return out[0]
 
 
+def causal_conv_kernel(x, weight, phase, history, bias=None):
+    """The same convolution as one depthwise conv1d over a padded buffer.
+
+    Each sequence is laid out as its width - 1 history columns then its
+    tokens, so one convolution over the whole buffer holds every
+    sequence's windows; windows that straddle two sequences are never
+    read back.
+
+    Args:
+        x: (rows, channels) inputs of the phase's sequences back to back.
+        weight: (channels, width) filter taps; the last tap is the
+            current row.
+        phase: The GdnPhase whose lengths bound the sequences.
+        history: (sequences, width - 1, channels) input columns before
+            each sequence, or None for zeros.
+        bias: Optional (channels,) bias.
+
+    Returns:
+        (output with x's shape, tails), as causal_conv_reference does.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    rows, channels = x.shape
+    count = len(phase.lengths)
+    keep = weight.shape[1] - 1
+    device = x.device
+    lengths = torch.as_tensor(phase.lengths, device=device)
+    sequence = torch.repeat_interleave(
+        torch.arange(count, device=device), lengths)
+    starts = torch.cumsum(lengths, 0) - lengths
+    # a sequence's segment of the padded buffer starts here
+    segment = starts + torch.arange(count, device=device) * keep
+    token_row = torch.arange(rows, device=device) + sequence * keep
+    padded = x.new_zeros((rows + count * keep, channels))
+    padded[token_row + keep] = x
+    if history is not None and keep:
+        columns = torch.arange(keep, device=device)
+        padded[(segment[:, None] + columns).reshape(-1)] = history.reshape(
+            -1, channels)
+    mixed = F.conv1d(padded.t().unsqueeze(0), weight.unsqueeze(1), bias,
+                     groups=channels)[0].t()
+    out = F.silu(mixed[token_row].float()).to(x.dtype)
+    ends = segment + lengths
+    tails = padded[ends[:, None] + torch.arange(keep, device=device)]
+    return out, tails
+
+
 # a CUDA launch has at most this many blocks along its second grid axis,
 # and the kernel spends one per sequence and value head
 GRID_LIMIT = 65_535
@@ -410,9 +458,14 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, use_kernels):
         mixed = qkv.index_select(0, phase.rows)
         history = (None if phase.read_slots is None
                    else arena.conv_state[phase.read_slots, layer_slot])
-        mixed, tails = causal_conv_reference(
-            mixed, tensors["conv_weight"], phase.lengths, history,
-            tensors["conv_bias"])
+        if use_kernels:
+            mixed, tails = causal_conv_kernel(
+                mixed, tensors["conv_weight"], phase, history,
+                tensors["conv_bias"])
+        else:
+            mixed, tails = causal_conv_reference(
+                mixed, tensors["conv_weight"], phase.lengths, history,
+                tensors["conv_bias"])
         if phase.write_slots is not None:
             arena.conv_state[phase.write_slots, layer_slot] = tails
         q, k, v = mixed.split([key_width, key_width, mixed.shape[1]
