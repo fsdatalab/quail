@@ -78,6 +78,9 @@ class LoadedGpu:
                                 moe_backend=spec.moe_backend,
                                 language_model_only=spec.language_model_only)
         self.load_model_s = time.perf_counter() - t0
+        say(f"model loaded in {self.load_model_s:.1f} s: "
+            f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated, "
+            f"the spec prices {spec.W_mem / 2**30:.2f} GiB")
 
         # cuBLAS allocates its handle outside PyTorch's caching allocator.
         # At the warm-up peak the allocator holds every free byte, so

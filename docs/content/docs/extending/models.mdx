@@ -92,7 +92,8 @@ code. The Quail backend currently accepts `h100-sxm` and
 
 ## Implementing a model architecture
 
-The Quail executor implements the Qwen3 and DiffusionGemma architectures.
+The Quail executor implements the Qwen3, DiffusionGemma, and Qwen3.5
+family (Qwen3.8 27B) architectures.
 
 Quail loads the checkpoint through vLLM, then selects its forward pass
 using `ModelSpec.arch`. Supporting another architecture requires both a

@@ -25,6 +25,7 @@ def install_fake_torch(monkeypatch):
     torch.ones = lambda *args, **kwargs: SimpleNamespace()
     torch.inference_mode = contextlib.nullcontext
     torch.cuda = SimpleNamespace(mem_get_info=lambda: (40 * 2**30, 80 * 2**30),
+                                 memory_allocated=lambda: 29 * 2**30,
                                  current_blas_handle=lambda: 1,
                                  synchronize=lambda: None)
     monkeypatch.setitem(sys.modules, "torch", torch)
