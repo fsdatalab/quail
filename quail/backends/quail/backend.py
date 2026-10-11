@@ -164,8 +164,9 @@ class QuailBackend:
         if model.gdn_layers:
             return SupportResult.reject(
                 f"Quail does not support model {model.name!r} yet: the "
-                f"planner has not been told that architecture "
-                f"{model.arch!r} cannot rewind or share a prefix")
+                f"executor runs single filters and filter chains on "
+                f"architecture {model.arch!r}, but the planner can still "
+                f"choose prefix sharing and joins, which it cannot run")
         if gpu_count not in {1, 2, 4, 8}:
             return SupportResult.reject(
                 "Quail requires 1, 2, 4, or 8 GPUs")

@@ -567,7 +567,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     prefix_end=prefix_end, row1=token_count,
                     suffix_spans=(s_row0 + begins, s_row0 + ends),
                     canvas=bool(n and width),
-                    keeps=bool(g.get("write_suffix_tokens"))))
+                    keeps=bool(g.get("write_suffix_tokens")),
+                    kept=int(g.get("write_suffix_tokens") or 0)))
             elif not fresh:
                 raise ValueError(
                     "unified attention requires pages for a kept "

@@ -5,11 +5,12 @@ question that follows a document. A prefix starts from zero state and
 leaves a checkpoint (the recurrent matrix and the convolution columns)
 in its document's slot. A question starts from that checkpoint and
 leaves nothing, so any number of questions read one document without
-rewinding.
+rewinding. A chain's retained tokens, such as a stage frame, advance
+the checkpoint in place, so the next stage asks at the longer length.
 
-Each phase below runs every sequence of one kind in one pass over its
-rows. Prefixes run first: a question's start state is read after they
-have written their slots.
+Each phase runs every sequence of one kind in one pass over its rows,
+in the order plan_phases documents: a phase reads the slots the ones
+before it wrote.
 
 The reference functions are plain torch and define the maths. The
 recurrence can also run vLLM's chunked kernel on the same tensors; the
@@ -35,6 +36,8 @@ class GdnPhase:
             when every sequence starts from zero state.
         write_slots: Checkpoint slot each sequence leaves its final
             state in, or None when none is kept.
+        output: Whether the sequences' outputs feed the next layer;
+            False for rows another phase already produced.
     """
 
     rows: object
@@ -42,72 +45,106 @@ class GdnPhase:
     lengths: tuple
     read_slots: object = None
     write_slots: object = None
+    output: bool = True
 
 
 def plan_phases(arena, groups, stage):
-    """Lay a chunk's groups out as the two phases of every Gated DeltaNet layer.
+    """Lay a chunk's groups out as the phases of every Gated DeltaNet layer.
+
+    Each layer runs the phases in this order, and a phase reads the
+    slots the ones before it wrote:
+
+    1. prefix: a fresh document's rows from zero state, writing its slot.
+    2. continuation: the retained tokens of a group whose whole first
+       suffix is kept (a stage frame), from its slot back into it. A
+       later group of the same key in the chunk reads the extended slot.
+    3. suffix: every question from its document's slot, writing nothing.
+    4. extension: the leading retained tokens of a suffix that also
+       holds a question, from the slot back into it. The suffix ran
+       from the state before them, so the slot advances after it.
 
     Allocates a checkpoint slot for each fresh document and records the
-    length its checkpoint covers. A kept document must be asked at
-    exactly that length, since its state cannot rewind.
+    tokens its checkpoint covers, retained tokens included. A document
+    kept at one length must be asked at exactly that length, since its
+    state cannot rewind.
 
     Args:
         arena: KVArena with checkpoint slots.
         groups: One mapping per group in chunk order, with key, fresh,
-            f, start, row0, prefix_end, keeps, and suffix_spans (the
-            begin and end rows of each suffix).
+            f, start, row0, prefix_end, keeps, kept, and suffix_spans
+            (the begin and end rows of each suffix).
         stage: Callable (name, values, dtype) that copies host values to
             the GPU.
 
     Returns:
-        (prefix phase, suffix phase); either is None when it has no
-        sequences.
+        (prefix, continuation, suffix, extension) phases; each is None
+        when it has no sequences.
 
     Raises:
-        ValueError: A group cannot run on a state that does not rewind.
+        ValueError: A group borrows a prefix, keeps more tokens than its
+            first suffix holds, or follows a group of its key that
+            extends the checkpoint after its suffix.
         ArenaFullError: Every checkpoint slot belongs to a pinned key.
     """
     import torch
 
     from quail.backends.quail.executor.chunk import ArenaFullError
 
-    prefix_rows, prefix_lengths, prefix_slots = [], [], []
-    suffix_rows, suffix_lengths, suffix_slots = [], [], []
+    lists = {name: ([], [], []) for name in
+             ("prefix", "continuation", "suffix", "extension")}
+
+    def add(name, rows, slot):
+        rows_list, lengths, slots = lists[name]
+        rows_list.append(rows)
+        lengths.append(len(rows))
+        slots.append(slot)
+
+    extended_after = set()
     for group in groups:
         key = group["key"]
-        if group["keeps"]:
+        kept = group.get("kept", 0)
+        if group["start"]:
             raise ValueError(
-                f"group {key!r}: a hybrid model keeps no suffix KV, since "
-                f"its state cannot rewind past the document")
+                f"group {key!r}: a hybrid model cannot borrow a prefix, "
+                f"which needs the state at the shared point")
+        begins, ends = (spans.tolist() for spans in group["suffix_spans"])
+        if kept and (not begins or kept > ends[0] - begins[0]):
+            raise ValueError(
+                f"group {key!r}: keeps {kept} suffix tokens, more than "
+                f"its first suffix holds")
         if group["fresh"]:
-            if group["start"]:
-                raise ValueError(
-                    f"group {key!r}: a hybrid model cannot borrow a prefix, "
-                    f"which needs the state at the shared point")
             slot = arena.checkpoint_slot(key)
             if slot is None:
                 raise ArenaFullError(
                     f"no free checkpoint slot for {key!r}: all "
                     f"{arena.n_state_slots} belong to documents in use")
-            arena.record_checkpoint(key, group["f"])
             first, last = group["row0"], group["prefix_end"]
             if last > first:
-                prefix_rows.append(np.arange(first, last, dtype=np.int64))
-                prefix_lengths.append(last - first)
-                prefix_slots.append(slot)
+                add("prefix", np.arange(first, last, dtype=np.int64), slot)
         else:
             slot = arena.accounting.slots.get(key)
             if slot is None or arena.checkpoint_tokens(key) != group["f"]:
                 raise ValueError(
                     f"group {key!r}: asked at {group['f']} tokens, but its "
                     f"checkpoint covers {arena.checkpoint_tokens(key)}")
-        begins, ends = group["suffix_spans"]
-        for begin, end in zip(begins.tolist(), ends.tolist()):
-            suffix_rows.append(np.arange(begin, end, dtype=np.int64))
-            suffix_lengths.append(end - begin)
-            suffix_slots.append(arena.accounting.slots[key])
+            if key in extended_after:
+                raise ValueError(
+                    f"group {key!r}: follows a group of its key whose "
+                    f"suffix runs before its checkpoint extends")
+        pure = bool(kept) and len(begins) == 1 and kept == ends[0] - begins[0]
+        if kept:
+            head = np.arange(begins[0], begins[0] + kept, dtype=np.int64)
+            add("continuation" if pure else "extension", head, slot)
+            if not pure:
+                extended_after.add(key)
+        arena.record_checkpoint(key, group["f"] + kept)
+        if pure:
+            continue
+        for begin, end in zip(begins, ends):
+            add("suffix", np.arange(begin, end, dtype=np.int64), slot)
 
-    def phase(name, rows, lengths, slots, *, read):
+    def phase(name, *, read, write, output=True):
+        rows, lengths, slots = lists[name]
         if not lengths:
             return None
         cu = np.concatenate([[0], np.cumsum(lengths)])
@@ -117,12 +154,13 @@ def plan_phases(arena, groups, stage):
             cu_seqlens=stage(f"gdn_{name}_cu", cu, torch.int32),
             lengths=tuple(lengths),
             read_slots=slot_tensor if read else None,
-            write_slots=None if read else slot_tensor)
+            write_slots=slot_tensor if write else None,
+            output=output)
 
-    return (phase("prefix", prefix_rows, prefix_lengths, prefix_slots,
-                  read=False),
-            phase("suffix", suffix_rows, suffix_lengths, suffix_slots,
-                  read=True))
+    return (phase("prefix", read=False, write=True),
+            phase("continuation", read=True, write=True),
+            phase("suffix", read=True, write=False),
+            phase("extension", read=True, write=True, output=False))
 
 
 # ---- reference maths --------------------------------------------------
@@ -248,7 +286,9 @@ def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale):
     The kernel normalizes q and k itself and takes key heads fewer than
     value heads without repeating them.
     """
-    from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule
+    from vllm.third_party.flash_linear_attention.ops import (
+        chunk_gated_delta_rule,
+    )
 
     out, final = chunk_gated_delta_rule(
         q=q[None], k=k[None], v=v[None], g=g[None], beta=beta[None],
@@ -333,5 +373,6 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, use_kernels):
                                          phase.lengths, scale)
         if phase.write_slots is not None:
             arena.gdn_state[phase.write_slots, layer_slot] = state
-        out.index_copy_(0, phase.rows, core)
+        if phase.output:
+            out.index_copy_(0, phase.rows, core)
     return out

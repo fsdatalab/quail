@@ -36,6 +36,8 @@ class Qwen35Pipeline(ModelPipeline):
         self.spec = spec
         self.arena = arena
         self.use_gdn_kernels = use_gdn_kernels
+        # vLLM's norms and rotary dispatch read the current config
+        self.vllm_config = getattr(model, "quail_vllm_config", None)
         self.layers = text.model.layers
         self.embed = text.model.embed_tokens
         self.final_norm = text.model.norm
@@ -120,6 +122,16 @@ class Qwen35Pipeline(ModelPipeline):
         return self.engine.gemm(d_in, d_scale, mlp.down_proj)
 
     def forward_chunk(self, chunk):
+        from contextlib import nullcontext
+
+        from vllm.config import set_current_vllm_config
+
+        context = (nullcontext() if self.vllm_config is None
+                   else set_current_vllm_config(self.vllm_config))
+        with context:
+            return self._forward(chunk)
+
+    def _forward(self, chunk):
         meta = chunk.meta
         meta["layer"] = 0
         phases = meta["gdn"]
