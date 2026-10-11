@@ -153,7 +153,7 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
     assert "SemanticExtract: ends, ends_span" in text
     assert f"question={QUESTION!r} trim=on" in text
     assert "AiExtract: ends over c" in text
-    assert "not priced" in text
+    assert "starts=8, 16-token passes" in text
     assert "Project: c.id, ends" in text
 
 
@@ -170,7 +170,7 @@ def test_extract_plans_one_physical_node_with_both_prompts(session):
     assert spec.question == QUESTION and spec.trim
     assert spec.arguments == (("c", "text"),)
     assert spec.expected_inputs == 2
-    assert spec.estimated_seconds == 0.0
+    assert spec.estimated_seconds > 0
     turn = session.model.turn
     head, tail = spec.prompt_token_parts
     assert list(head) == letter_tokens(turn[0] + SHARED_PRE)
@@ -241,24 +241,26 @@ def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
     assert not isinstance(plan, Refusal)
     written, lifted = _candidates(session, query)
     # the backend also offers the extraction after the join, over the
-    # documents the join matched; the two cost the same until the
-    # extraction is priced, so the plan as written wins
+    # documents the join matched: a fifth of them by default, so the
+    # lifted plan is cheaper and wins
     assert written.logical_plan.root == query.logical.root
     assert extracted_above_joins(lifted.logical_plan.root) == {"c"}
     assert [type(node).__name__
             for node in LogicalPlan(lifted.logical_plan.root).walk()] == [
         "Scan", "Scan", "Join", "SemanticJoin", "SemanticExtract", "Project"]
-    assert written.estimated_seconds == lifted.estimated_seconds
-    assert [node.node_id for node in plan.nodes] == [
+    assert lifted.estimated_seconds < written.estimated_seconds
+    assert [node.node_id for node in written.plan.nodes] == [
         "scan:c", "scan:q", "ai-extract:0", "ai_join:q", "project"]
-    (join,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
+    (join,) = [n for n in written.plan.nodes if isinstance(n, AiJoin)]
     assert ("ai-extract:0", "ids:c") in [
         (port.source.node_id, port.source.port) for port in join.inputs]
-    assert [node.node_id for node in lifted.plan.nodes] == [
+    assert [node.node_id for node in plan.nodes] == [
         "scan:c", "scan:q", "ai_join:q", "ai-extract:0", "project"]
-    (node,) = [n for n in lifted.plan.nodes if isinstance(n, AiExtract)]
-    # a fifth of the pairs match by default, one partner each
+    (node,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
     assert node.spec.expected_inputs == pytest.approx(2 * 0.2)
+    (before,) = [n for n in written.plan.nodes if isinstance(n, AiExtract)]
+    assert before.spec.expected_inputs == 2
+    assert node.spec.estimated_seconds < before.spec.estimated_seconds
     assert plan.nodes[-1].columns == ("c.id", "q.id", "ends", "ends_span")
 
 
@@ -306,9 +308,16 @@ def test_extract_errors_and_refusals(session):
         ModelCall(call.prompt, "extract", question=QUESTION,
                   labels=("a",)).validate()
 
-    # the speed of light estimate does not price an extraction yet
-    with pytest.raises(NotImplementedError, match="semantic_extract"):
-        quail.speed_of_light_estimate(_ends(session), lambda *_: True)
+    # the speed of light estimate prices an extraction as one question
+    # per document, read once at the cue
+    estimate = quail.speed_of_light_estimate(_ends(session), lambda *_: True)
+    (stage,) = estimate.filter_stages
+    assert (stage["operator"], stage["alias"], stage["name"]) == (
+        "AI.EXTRACT", "c", "ends")
+    assert (stage["evaluated"], stage["passed"]) == (2, 2)
+    assert estimate.extraction_evaluations == 2
+    assert estimate.seconds > 0 and "extraction" in estimate.assumptions()
+    assert estimate.as_dict()["extraction_evaluations"] == 2
     # SGLang returns no decoded text, so it does not run it
     sglang = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
                                         backend="pipelined_sglang"),

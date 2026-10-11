@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from quail.cost import budgets
 from quail.cost import classify as classify_cost
+from quail.cost import extract as extract_cost
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, scan
 from quail.labels import DECISION_SCORING, LETTERS_SCORING, word_starts
@@ -150,6 +151,8 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
             for stage in node.stages:
                 work = work + stage_works.get(stage.written_pos, Work())
             entry["seconds"] = speed_of_light(work, model, device, chunk).seconds
+        elif isinstance(node, AiExtract) and node.spec is not None:
+            entry["seconds"] = node.spec.estimated_seconds
         # other nodes do no model work and get no seconds
         out[node.node_id] = entry
     return out
@@ -937,11 +940,15 @@ class ScoreLowering:
 
 
 def extract_spec(context, call, name, live) -> ExtractSpec:
-    """Build an extraction's specification.
+    """Build an extraction's specification and price it.
 
     The specification carries the token ids of the plain prompt and of
-    the numbered-lines prompt around the document. The estimate stays
-    zero: the extraction's cost is not priced yet.
+    the numbered-lines prompt around the document. The estimate
+    (quail.cost.extract) prices each document as shown plain or
+    numbered by its line count, read from the table's text when the
+    scan loads it, else as numbered. The documents' KV is priced as
+    computed afresh: the extraction runs after its table's filters
+    finish, which free the KV they held.
 
     Args:
         context: The planning context, with the model and tokenizer.
@@ -954,16 +961,37 @@ def extract_spec(context, call, name, live) -> ExtractSpec:
                                 context.tokenizer, turn)
     numbered = bind_extract_prompt(call.prompt.args, call.question,
                                    context.tokenizer, turn, numbered=True)
+    (ref,) = call.prompt.args
+    lengths = context.document_tokens[ref.alias]
+    cost = extract_cost.estimate(
+        live, [int(length) for length in lengths],
+        document_line_counts(lengths, ref.column),
+        len(plain.preamble_token_ids), len(plain.tail_token_ids),
+        len(numbered.preamble_token_ids), len(numbered.tail_token_ids),
+        chunk=budgets.chunk_budget(context.model, context.device),
+        model=context.model, device=context.device)
     return ExtractSpec(
         name=name, aliases=call.aliases(),
         query_template=call.prompt.template,
         arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
-        expected_inputs=live, estimated_seconds=0.0,
+        expected_inputs=live, estimated_seconds=cost.seconds,
         prompt_token_parts=(tuple(plain.preamble_token_ids),
                             tuple(plain.tail_token_ids)),
         question=call.question, trim=call.trim,
         numbered_token_parts=(tuple(numbered.preamble_token_ids),
                               tuple(numbered.tail_token_ids)))
+
+
+def document_line_counts(lengths, column: str):
+    """Return each document's line count from the table's text, or None.
+
+    The text is at hand when the scan loads the column as a value,
+    which it does for a projected extraction.
+    """
+    store = getattr(lengths, "_store", None)
+    if store is None or column not in getattr(store, "projected_columns", ()):
+        return None
+    return extract_cost.line_counts(store.column(column))
 
 
 def classify_builder(context, alias, backend_name):

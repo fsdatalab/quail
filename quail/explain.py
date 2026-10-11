@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Mapping
 
 from quail import logical as logical_nodes
+from quail.cost import extract as extract_cost
 from quail.execution.pipelines import build_pipelines
 from quail.logical import DEFAULT_SELECTIVITY, LogicalPlan, effective_selectivity
 from quail.physical import (
@@ -430,7 +431,8 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             title += f": {spec.name} over {spec.alias}"
             details.append(f"question={spec.question!r}, "
                            f"trim={'on' if spec.trim else 'off'}, "
-                           f"not priced")
+                           f"starts={extract_cost.MAX_STARTS}, "
+                           f"{extract_cost.CHUNK}-token passes")
         elif isinstance(node, Filter):
             title += f": {node.predicate.describe()}"
         elif isinstance(node, AiJoin):
