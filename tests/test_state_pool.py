@@ -131,3 +131,26 @@ def test_resize_rebuilds_the_state_pool():
     # a resize that names no slot count keeps the pool
     arena.resize(16)
     assert arena.n_state_slots == 7
+
+
+def test_the_base_slot_goes_back_once_the_frame_is_kept():
+    arena = state_arena(slots=6)
+    key = ("d", 0)
+    assert arena.activate(key, 100, capacity_tokens=120, base_tokens=100, slots=3)
+    share = arena.claim_state(key, 64, "share")
+    base = arena.claim_state(key, 100, "base")
+    kept = arena.claim_state(key, 105, "kept")
+    before = arena.state.free_slots
+    assert arena.drop_base_state(key) == 1
+    assert arena.state.free_slots == before + 1
+    assert arena.state_slot_at(key, 100) is None
+    assert arena.state_slot_at(key, 105) == kept
+    assert arena.state_slot_at(key, 64) == share
+    assert base not in arena.state.owned[key]
+    # dropping the base again frees nothing, and the share slot still
+    # goes with the shares
+    assert arena.drop_base_state(key) == 0
+    assert arena.state.drop_shares(key) == 1
+    assert arena.state_slot_at(key, 64) is None
+    assert arena.state_slot_at(key, 105) == kept
+    assert arena.free_key(key) == 13

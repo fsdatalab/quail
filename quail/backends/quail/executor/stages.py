@@ -436,6 +436,20 @@ class _StageExecutor:
             frames[j] == 0 for j in range(k) if j or multi))
         return kept, base
 
+    def _base_done(self, a, j, start):
+        """Whether the chunk that wrote stage j's frame ends the base slot's use.
+
+        The base state is read again by a later stage that writes a
+        new frame or sends its requests without one, and by a later
+        operator the anchor is kept for.
+        """
+        if not (self.stateful and self.state_kept and self.writes[j]
+                and start == 0 and self.frames[j]):
+            return False
+        later = range(j + 1, len(self.stages))
+        return (a not in self.keep_base
+                and not any(self.writes[i] or not self.frames[i] for i in later))
+
     def _save_at(self, a, f, wst, shared=0, fresh=False):
         """The positions one spec saves the document's state at."""
         if not self.stateful:
@@ -708,6 +722,13 @@ class _StageExecutor:
         e1.record()
         for key in chunk.fresh_keys:
             self.arena.trim_window(key)
+        for a, j, start, _, _ in part:
+            if self._base_done(a, j, start):
+                # the frame's kept state is saved and nothing later
+                # starts from the document end: the slot goes back to
+                # the pool while the partners stream (one stream, so
+                # the reads of this chunk precede any reuse)
+                self.arena.drop_base_state(self.keys[a])
         by_stage = {}
         for entry in part:
             by_stage[entry[1]] = by_stage.get(entry[1], 0) + self._entry_rows(*entry)

@@ -403,15 +403,24 @@ class StateAccounting:
         return self._release(key, [s for s in self.owned[key] if s not in keep])
 
     def drop_shares(self, key) -> int:
-        """Free the share slots, the positions below the base; returns the count."""
-        base = self.base.get(key)
-        if base is None:
-            return 0
+        """Free the share slots, every saved position but the base and the kept."""
         positions = self.positions[key]
-        gone = [slot for position, slot in positions.items() if position < base]
-        for position in [p for p in positions if p < base]:
-            del positions[position]
+        keep = {self.base.get(key)}
+        if key in self.kept:
+            keep.add(self.kept[key][0])
+        shares = [position for position in positions if position not in keep]
+        gone = [positions.pop(position) for position in shares]
         return self._release(key, gone)
+
+    def drop_base(self, key) -> int:
+        """Free the base slot once nothing will start from the document end.
+
+        Returns the slots freed, 0 when the key saved no base.
+        """
+        position = self.base.pop(key, None)
+        if position is None:
+            return 0
+        return self._release(key, [self.positions[key].pop(position)])
 
     def free_key(self, key) -> int:
         """Return every slot of the key to the pool; returns the count."""
@@ -996,6 +1005,10 @@ class KVArena:
     def state_slot_at(self, key, position: int) -> int | None:
         """The slot holding the key's state at `position`, or None."""
         return self.state.slot_at(key, position)
+
+    def drop_base_state(self, key) -> int:
+        """Free the key's base slot (see StateAccounting.drop_base)."""
+        return self.state.drop_base(key)
 
     def claim_state(self, key, position: int, role: str) -> int:
         """The slot the key's state at `position` saves to (see StateAccounting)."""
