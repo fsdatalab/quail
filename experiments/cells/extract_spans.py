@@ -99,8 +99,8 @@ TOP_K = (1, 4, 8)
 # length, a date or a whole clause
 INSTRUCTION_TEXT = (
     "Copy the words that answer the question from the document. Copy them "
-    "exactly. Use the fewest words that answer it: a name, a number, a date, "
-    "or a clause. If the document does not answer the question, write none.")
+    "exactly. Use the fewest words that answer it. If the document does not "
+    "answer the question, write none.")
 FORMAT_TEXT = "Answer in this format:"
 LINES_FORMAT_TEXT = ("Lines: START-END, the numbers of the fewest lines holding "
                      "the phrase, for example 3-3 or 5-6")
