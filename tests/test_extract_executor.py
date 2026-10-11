@@ -139,7 +139,7 @@ def _spec(trim=True, *extra):
         arguments=(("c", "text"),), expected_inputs=3, estimated_seconds=0.0,
         prompt_token_parts=(tuple(tables.encode_ids(HEAD)),
                             tuple(tables.encode_ids(TAIL))),
-        question=QUESTION, trim=trim,
+        question=QUESTION, trim=trim, locate=True,
         numbered_token_parts=(tuple(tables.encode_ids(NUMBERED_HEAD)),
                               tuple(tables.encode_ids(NUMBERED_TAIL)))), tables
 
@@ -568,6 +568,8 @@ def test_locate_off_shows_every_document_plain():
     plain = ExtractStages.__new__(ExtractStages)
     plain.spec, plain.tables = replace(spec, locate=False), tables
     assert not plain._prepare(0, 0, LEASE, None).numbered
+    assert not ExtractSpec.from_mapping(
+        {k: v for k, v in spec.to_dict().items() if k != "locate"}).locate
 
 
 def test_extractor_stops_after_the_pass_limit(monkeypatch):

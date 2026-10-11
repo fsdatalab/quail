@@ -82,7 +82,7 @@ def session(tmp_path):
     value.close()
 
 
-def _ends(session, trim=True, locate=True):
+def _ends(session, trim=True, locate=False):
     return (session.docs("contracts").alias("c")
             .ai_extract("c.text", QUESTION, name="ends", trim=trim,
                         locate=locate)
@@ -148,18 +148,18 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
         f"AS ends FROM contracts c")
     assert loose.logical == _ends(session, trim=False).logical
     (node,) = loose.logical.operators().extracts
-    assert not node.call.trim and node.call.locate
-    # so is locate: with it off, every document is shown plain
-    plain = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}', {{'locate': false}}) "
+    assert not node.call.trim and not node.call.locate
+    # so is locate: on, a document of enough lines is shown numbered
+    located = session.sql(
+        f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}', {{'locate': true}}) "
         f"AS ends FROM contracts c")
-    assert plain.logical == _ends(session, locate=False).logical
-    (node,) = plain.logical.operators().extracts
-    assert node.call.trim and not node.call.locate
-    assert "trim=on locate=off" in plain.explain()
-    plan = plain.plan()
+    assert located.logical == _ends(session, locate=True).logical
+    (node,) = located.logical.operators().extracts
+    assert node.call.trim and node.call.locate
+    assert "trim=on locate=on" in located.explain()
+    plan = located.plan()
     (spec,) = [n.spec for n in plan.nodes if isinstance(n, AiExtract)]
-    assert not spec.locate
+    assert spec.locate
     assert spec == ExtractSpec.from_mapping(spec.to_dict())
     # the BigQuery dialect names the call the same way
     assert session.sql(
@@ -167,7 +167,7 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
         f"FROM contracts c", dialect="bq").logical == logical
     text = built.explain()
     assert "SemanticExtract: ends, ends_span" in text
-    assert f"question={QUESTION!r} trim=on locate=on" in text
+    assert f"question={QUESTION!r} trim=on locate=off" in text
     assert "AiExtract: ends over c" in text
     assert "starts=8, 16-token passes" in text
     assert "Project: c.id, ends" in text

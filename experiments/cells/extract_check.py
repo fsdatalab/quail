@@ -87,7 +87,7 @@ def _mean(values):
 @app.function(image=image, gpu="H100!", memory=65536, timeout=7200,
               volumes=VOLUMES)
 def check(dataset: str, backend: str, trim: bool, n: int, run: str,
-          locate: bool = True) -> dict:
+          locate: bool = False) -> dict:
     """Answer every item through the session and score the answers."""
     import os
 
@@ -180,7 +180,8 @@ def check(dataset: str, backend: str, trim: bool, n: int, run: str,
     print(json.dumps(summary, indent=2), flush=True)
     os.makedirs("/results/extract_check", exist_ok=True)
     path = (f"/results/extract_check/{run}_{backend}_{dataset}_"
-            f"{'trim' if trim else 'lines'}{'' if locate else '_plain'}.json")
+            f"{'trim' if trim else 'lines'}"
+            f"{'_located' if locate else '_plain'}.json")
     with open(path, "w") as f:
         json.dump({"summary": summary, "queries": queries, "items": items},
                   f, indent=1)
@@ -190,7 +191,7 @@ def check(dataset: str, backend: str, trim: bool, n: int, run: str,
 
 @app.local_entrypoint()
 def main(n: int = N_ITEMS, backends: str = "quail,stock_vllm",
-         datasets: str = "squad,cuad", locate: bool = True):
+         datasets: str = "squad,cuad", locate: bool = False):
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     calls = {}
     for dataset, backend, trim in (("squad", "quail", True),

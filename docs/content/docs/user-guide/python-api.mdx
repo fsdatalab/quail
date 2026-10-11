@@ -116,7 +116,7 @@ to return both.
 | `question` | `str` | The question the answer is copied for. |
 | `name` | `str` | Name of the answer column. |
 | `trim` | `bool` | Return the fewest words that answer the question, or with `False` the whole lines that hold them. Defaults to `True`. |
-| `locate` | `bool` | Show a document of three or more lines numbered and have the model name the answer's lines before its start is read, or with `False` show every document plain. Defaults to `True`. |
+| `locate` | `bool` | Show a document of three or more lines numbered and have the model name the answer's lines before its start is read. Defaults to `False`: every document is shown plain. |
 
 ```python
 query = (

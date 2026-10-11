@@ -112,10 +112,11 @@ class ModelCall:
     # whether the answer is the copied words (trim) or the whole lines
     # of the document that hold them, and whether a document of several
     # lines is shown numbered so the model names the answer's lines
-    # before its start is read (locate)
+    # before its start is read (locate); off, as every document is
+    # shown plain
     question: str = ""
     trim: bool = True
-    locate: bool = True
+    locate: bool = False
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -133,7 +134,7 @@ class ModelCall:
         ):
             raise CompileError("only an AI.CLASSIFY call has labels")
         if self.kind != "extract" and (self.question or not self.trim
-                                       or not self.locate):
+                                       or self.locate):
             raise CompileError("only an AI.EXTRACT call has a question")
         if self.kind == "label":
             validate_labels(self.labels, self.descriptions)
