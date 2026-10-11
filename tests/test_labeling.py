@@ -139,6 +139,12 @@ class _FakeQuery:
         self.names.append(other.names[0])
         return self
 
+    def join(self, other, on):
+        self.session.join_anchors.append("on")
+        self.names.append(other.names[0])
+        self.on = on
+        return self
+
     def select(self, *_columns):
         return self
 
@@ -150,8 +156,17 @@ class _FakeQuery:
                               "answer": ["yes" in value for value in text]})
             return _FakeResult({"filters": {("l", 0): table}, "joins": {}})
         left, right = (table.column(1).to_pylist() for table in tables)
+        on = getattr(self, "on", None)
+        if on is None:
+            allowed = None
+        else:
+            keys = (tables[0].column(on.left.column).to_pylist(),
+                    tables[1].column(on.right.column).to_pylist())
+            allowed = {(i, j) for i, a in enumerate(keys[0])
+                       for j, b in enumerate(keys[1]) if a == b}
         rows = [(i, j, "yes" in a and "yes" in b)
-                for i, a in enumerate(left) for j, b in enumerate(right)]
+                for i, a in enumerate(left) for j, b in enumerate(right)
+                if allowed is None or (i, j) in allowed]
         table = pa.table({"l": [r[0] for r in rows], "r": [r[1] for r in rows],
                           "answer": [r[2] for r in rows]})
         return _FakeResult({"filters": {}, "joins": {0: table}})
@@ -210,7 +225,36 @@ def _corpus_rows(reviews, reports, terms, claims, evidence, contexts,
         "agent_traces": [{"id": "at0000-t005", "trace": "yes trace",
                           "trajectory_id": "at0000", "turn_index": 5,
                           "token_count": 2}],
+        "support_traces": [{
+            "id": "sp0000", "request": "yes", "transcript": "yes",
+            "message_count": 1, "task_id": "airline-0", "domain": "airline",
+            "model": "gpt-4o", "trial": 0, "reward": 1.0}],
+        "support_messages": [_message("sp0000/0")],
+        "issue_runs": [{
+            "id": "ir00000", "request": "yes", "transcript": "yes",
+            "patch": "yes", "message_count": 1, "instance_id": "a__b-1", "repo": "a/b",
+            "resolved": 1, "token_count": 1}],
+        "issue_messages": [_message("ir00000/0")],
+        "wrench_runs": [{
+            "id": "wr00000", "task_id": "t1", "model": "gpt-5.4",
+            "mode": "hack", "transcript": "yes", "step_count": 1,
+            "token_count": 1}],
+        "wrench_steps": [{"id": "wr00000/1", "run_id": "wr00000",
+                          "step_index": 1, "model": "gpt-5.4",
+                          "text": "yes"}],
+        "sales_calls": [{
+            "id": "sc00000", "domain": "b2b", "deal_id": "sdb2b0000",
+            "call_index": 1, "prev_call_id": None,
+            "deal_stage": "Negotiation", "deal_amount": 10.0,
+            "transcript": "yes"}],
     }
+
+
+def _message(message_id):
+    return {"id": message_id, "trace_id": message_id.split("/")[0],
+            "turn_index": 0, "role": "user", "content": "yes",
+            "tool_call_id": None, "prev_id": None, "prev_user_id": None,
+            "prev_assistant_id": None}
 
 
 def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
@@ -234,8 +278,10 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
         evidence=[("page0", "yes page"), ("page1", "no")],
         contexts=[("context one", ["p1", "p2"]), ("context two", ["p3"])],
         passages=[("passage a", ["p2"]), ("passage b", ["p1"])])
-    _, source_corpus, _ = _write_corpus(tmp_path, 1.0, source_rows)
+    source_dir, source_corpus, _ = _write_corpus(tmp_path, 1.0, source_rows)
     source_id = source_corpus["corpus_id"]
+    # the source corpus predates a table that none of these labels use
+    (source_dir / "sales_calls.parquet").unlink()
     identities = {
         spec.key: labeling.label_set_identity(
             spec, source_id, source_corpus["corpus_full_hash"])
@@ -406,3 +452,82 @@ def test_activate_reuses_workload_labels_and_publish_uploads_reader_files(
     assert f"{GROUND_TRUTH_ROOT}/corpora/c_x/reviews.parquet" in client.uploads
     assert (f"{GROUND_TRUTH_ROOT}/corpora/c_x/active_collection.json"
             in client.uploads)
+
+
+def test_pair_columns_restrict_the_pairs_a_join_labels(monkeypatch, tmp_path):
+    monkeypatch.setattr(quail, "Session", _FakeSession)
+    monkeypatch.setattr(labeling, "ROOT", tmp_path)
+    spec = SimpleNamespace(
+        key="quailb.support.message.customer_pushes_back",
+        workload="support", slug="customer_pushes_back", kind="join",
+        template="Does {1} push back on {0}?", left_role="agent_message",
+        left_table="support_messages", left_column="content",
+        right_role="customer_message", right_table="support_messages",
+        right_column="content", source_policy="qwen3_32b", labels=(),
+        descriptions=(), pair_columns=("id", "prev_assistant_id"),
+        left_where=None, right_where=None)
+    agents = [{"id": "a1", "content": "yes", "prev_assistant_id": None},
+              {"id": "a2", "content": "no", "prev_assistant_id": None}]
+    replies = [{"id": "u1", "content": "yes", "prev_assistant_id": "a1"},
+               {"id": "u2", "content": "yes", "prev_assistant_id": "a2"},
+               {"id": "u3", "content": "yes", "prev_assistant_id": None}]
+    rows = {"support_messages": agents + replies}
+
+    assert labeling._matching_pairs(spec, agents, replies) == [(0, 0), (1, 1)]
+    assert labeling._expected_rows(spec, {"support_messages": agents + replies}
+                                   ) == 2
+    identity = labeling.label_set_identity(spec, "c_test", "0" * 64)
+    assert labeling._part_bounds(spec, identity, rows) == [(0, 5)]
+
+    judge = labeling.QuailJudge()
+    assert judge.join(spec, agents, replies) == {(0, 0): True, (1, 1): False}
+    assert judge.session.join_anchors == ["on"]
+    assert judge.rows_answered == 2
+
+    sample = labeling.VerificationSample()
+    labeling._write_qwen_join_parts(
+        judge, sample, spec, agents, replies, identity, "c_test")
+    part = pq.read_table(labeling._part_path(spec, identity, 0, 2))
+    assert part.select(["left_id", "right_id", "answer"]).to_pylist() == [
+        {"left_id": "a1", "right_id": "u1", "answer": True},
+        {"left_id": "a2", "right_id": "u2", "answer": False}]
+
+    # a smaller corpus copies only its matching pair, by content
+    def content(row):
+        return labeling._content_hash(row, "content")
+    monkeypatch.setattr(
+        labeling, "_source_labels_by_content", lambda *_: pa.table({
+            "left_content_sha256": [content(agents[0])],
+            "right_content_sha256": [content(replies[0])],
+            "answer": [True], "label_source": [MODEL_NAME]}))
+    small = {"support_messages": [agents[0], replies[0], replies[2]]}
+    small_identity = labeling.label_set_identity(spec, "c_small", "1" * 64)
+    assert labeling._copy_label_set(
+        spec, "ls_source", small_identity, "c_small", small) == 1
+    (copied,) = labeling._expected_parts(spec, small_identity, small)
+    assert pq.read_table(copied).to_pylist() == [labeling._answer_row(
+        spec, small_identity, "c_small", agents[0], replies[0], True,
+        MODEL_NAME, None)]
+
+
+def test_where_conditions_restrict_a_join_to_matching_sides(monkeypatch):
+    monkeypatch.setattr(quail, "Session", _FakeSession)
+    spec = SimpleNamespace(
+        key="quailb.runs.run.different_approach", workload="runs",
+        slug="different_approach", kind="join",
+        template="Does {1} differ from {0}?", left_role="successful_run",
+        left_table="issue_runs", left_column="transcript",
+        right_role="failed_run", right_table="issue_runs",
+        right_column="transcript", source_policy="qwen3_32b", labels=(),
+        descriptions=(), pair_columns=("instance_id", "instance_id"),
+        left_where=("resolved", 1), right_where=("resolved", 0))
+    runs = [{"id": "ir0", "transcript": "yes", "instance_id": "a", "resolved": 1},
+            {"id": "ir1", "transcript": "no", "instance_id": "a", "resolved": 0},
+            {"id": "ir2", "transcript": "yes", "instance_id": "a", "resolved": 0},
+            {"id": "ir3", "transcript": "yes", "instance_id": "b", "resolved": 1}]
+
+    # only the successful run of issue a pairs, with its two failed runs
+    assert labeling._matching_pairs(spec, runs, runs) == [(0, 1), (0, 2)]
+    assert labeling._expected_rows(spec, {"issue_runs": runs}) == 2
+    judge = labeling.QuailJudge()
+    assert judge.join(spec, runs, runs) == {(0, 1): False, (0, 2): True}
