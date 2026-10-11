@@ -19,16 +19,12 @@ LAYERS = 8
 
 
 class _Norm:
+    """A norm module as the pipeline reads it: a weight the model adds one to."""
+
     variance_epsilon = 1e-6
 
-    def __init__(self, torch, weight=1.0):
+    def __init__(self, torch, weight=0.0):
         self.weight = torch.tensor(weight)
-
-    def __call__(self, x, residual=None):
-        if residual is None:
-            return x * self.weight
-        residual = residual + x
-        return residual * self.weight, residual
 
 
 class _Linear:
@@ -89,7 +85,7 @@ def _model(torch, layers=None):
     backbone = SimpleNamespace(
         layers=layers,
         embed_tokens=lambda ids: torch.ones(ids.shape[0], HIDDEN),
-        norm=_Norm(torch, 0.5))
+        norm=_Norm(torch, -0.5))
     return SimpleNamespace(language_model=SimpleNamespace(model=backbone))
 
 
@@ -107,6 +103,15 @@ class _Engine:
         self.q = q3.reshape(q3.shape[0], -1)
         meta["layer"] += 1
         return self.q
+
+    # the fakes' norms scale rows by their weight and skip the
+    # normalization, so constant rows stay easy to follow
+    def norm_rows(self, x, weight, eps):
+        return x * weight
+
+    def fused_add_norm_rows(self, hidden, residual, weight, eps):
+        residual = residual + hidden
+        return residual * weight, residual
 
 
 def _kernel_stubs(monkeypatch, torch):
@@ -233,7 +238,7 @@ def test_layer_output_is_feedforward_plus_residual(monkeypatch):
     # layer's q is its input and the gate halves it: 64 + 32 = 96.
     assert torch.equal(residual, torch.full((4, HIDDEN), 96.0))
     assert torch.equal(hidden, torch.full((4, HIDDEN), 96.0))
-    # the final norm, weight 0.5, over the two final rows' sums
+    # the final norm, weight -0.5 plus one, over the two final rows' sums
     normed = pipeline.forward_chunk(chunk)
     assert torch.equal(normed, torch.full((2, HIDDEN), 96.0))
 

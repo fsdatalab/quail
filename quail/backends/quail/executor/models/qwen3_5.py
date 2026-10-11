@@ -63,13 +63,31 @@ class Qwen35Pipeline(ModelPipeline):
             head_dim=attn.head_dim, rotary=attn.rotary_emb, fp8=False)
         self.arena = arena
         self.max_chunk_tokens = budgets.kernel_index_cap(spec)
+        self._norm_weights = {}
 
     def forward_chunk(self, chunk):
         hidden, residual = self.backbone_rows(chunk)
         final = chunk.final_indices
-        normed, _ = self.final_norm(hidden.index_select(0, final),
-                                    residual.index_select(0, final))
+        normed, _ = self._norm(self.final_norm, hidden.index_select(0, final),
+                               residual.index_select(0, final))
         return normed
+
+    def _norm(self, module, x, residual=None):
+        """One of the model's RMS norms, through the engine's kernel.
+
+        The model's norms scale by one plus their weight; the loaded
+        module dispatches them to unfused PyTorch outside vLLM's
+        engine. With a residual, the kernel adds it into x in place
+        and returns (normalized rows, sum).
+        """
+        weight = self._norm_weights.get(id(module))
+        if weight is None:
+            weight = (module.weight + 1).to(x.dtype)
+            self._norm_weights[id(module)] = weight
+        if residual is None:
+            return self.engine.norm_rows(x, weight, module.variance_epsilon)
+        return self.engine.fused_add_norm_rows(x, residual, weight,
+                                               module.variance_epsilon)
 
     def backbone_rows(self, chunk):
         """Return (hidden, residual) after the last layer; their sum is its output.
@@ -85,16 +103,16 @@ class Qwen35Pipeline(ModelPipeline):
         for index, layer in enumerate(self.layers):
             if residual is None:
                 residual = hidden
-                x = layer.input_layernorm(hidden)
+                x = self._norm(layer.input_layernorm, hidden)
             else:
-                x, residual = layer.input_layernorm(hidden, residual)
+                x, residual = self._norm(layer.input_layernorm, hidden, residual)
             if layer.layer_type == "full_attention":
                 # the engine indexes the arena's pools by model layer
                 meta["layer"] = index
                 x = self._full_attention(layer.self_attn, x, positions, meta)
             else:
                 x = self._linear_attention(layer.linear_attn, x, meta, index)
-            x, residual = layer.post_attention_layernorm(x, residual)
+            x, residual = self._norm(layer.post_attention_layernorm, x, residual)
             hidden = layer.mlp(x)
         return hidden, residual
 
@@ -107,8 +125,8 @@ class Qwen35Pipeline(ModelPipeline):
         q_gate, k, v = qkv.split([attn.q_size * 2, attn.kv_size, attn.kv_size],
                                  dim=-1)
         q, gate = torch.chunk(q_gate.view(n, heads, 2 * dim), 2, dim=-1)
-        q = attn.q_norm(q.contiguous()).view(n, heads * dim)
-        k = attn.k_norm(k.view(n, kv_heads, dim)).view(n, kv_heads * dim)
+        q = self._norm(attn.q_norm, q.contiguous()).view(n, heads * dim)
+        k = self._norm(attn.k_norm, k.view(n, kv_heads, dim)).view(n, kv_heads * dim)
         q, k = attn.rotary_emb(positions, q, k)
         out = self.engine.attention_unified(
             q.view(n, heads, dim), k.view(n, kv_heads, dim).contiguous(),

@@ -166,9 +166,17 @@ class Engine:
         return out.view(x.shape)
 
     def fused_add_rms_norm(self, hidden, residual, norm):
+        return self.fused_add_norm_rows(hidden, residual, norm.weight,
+                                        norm.variance_epsilon)
+
+    def fused_add_norm_rows(self, hidden, residual, weight, eps):
+        """Add residual into hidden and RMS-normalize the sum, in place.
+
+        vLLM's one kernel: afterwards residual holds the sum and hidden
+        the normalized rows. Returns (hidden, residual).
+        """
         from vllm import _custom_ops as ops
-        ops.fused_add_rms_norm(hidden, residual, norm.weight,
-                               norm.variance_epsilon)
+        ops.fused_add_rms_norm(hidden, residual, weight, eps)
         return hidden, residual
 
     def norm_quant_rows(self, x, weight, eps):
