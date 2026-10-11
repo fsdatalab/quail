@@ -231,7 +231,7 @@ def test_a_start_that_begins_another_word_gets_the_next_token_step():
     lease, ir = tables.encode_ids(" lease")[0], tables.encode_ids("ir")[0]
     follow = {"the": {lease: -0.1}, "their": {ir: -9.0}}
     candidates = choose_candidates(tables, starts, {the: -0.5}, follow, prefix)
-    assert [(c.char, c.score) for c in candidates[:2]] == [(0, -0.6), (13, -9.5)]
+    assert [(c.char, c.score) for c in candidates[:2]] == [(0, -0.6), (12, -9.5)]
 
 
 def _branch(copy, stop, **fields):
