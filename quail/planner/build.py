@@ -965,7 +965,8 @@ def extract_spec(context, call, name, live) -> ExtractSpec:
     lengths = context.document_tokens[ref.alias]
     cost = extract_cost.estimate(
         live, [int(length) for length in lengths],
-        document_line_counts(lengths, ref.column),
+        (document_line_counts(lengths, ref.column) if call.locate
+         else [0] * len(lengths)),
         len(plain.preamble_token_ids), len(plain.tail_token_ids),
         len(numbered.preamble_token_ids), len(numbered.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),
@@ -977,7 +978,7 @@ def extract_spec(context, call, name, live) -> ExtractSpec:
         expected_inputs=live, estimated_seconds=cost.seconds,
         prompt_token_parts=(tuple(plain.preamble_token_ids),
                             tuple(plain.tail_token_ids)),
-        question=call.question, trim=call.trim,
+        question=call.question, trim=call.trim, locate=call.locate,
         numbered_token_parts=(tuple(numbered.preamble_token_ids),
                               tuple(numbered.tail_token_ids)))
 

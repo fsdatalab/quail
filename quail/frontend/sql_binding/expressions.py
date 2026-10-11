@@ -393,7 +393,8 @@ class ExpressionBinder:
     def bind_ai_extract(self, node) -> ModelCall:
         """Parse an AI.EXTRACT call and bind its document reference.
 
-        The call is ``AI.EXTRACT(column, 'question'[, {'trim': false}])``.
+        The call is ``AI.EXTRACT(column, 'question'[, {'trim': false}])``;
+        the options are trim and locate.
 
         Args:
             node: The AI_EXTRACT call.
@@ -424,7 +425,8 @@ class ExpressionBinder:
             (ref,), question, self.tokenizer, turn=self.extract_turn)
         self.note_doc_column(ref)
         call = ModelCall(prompt, "extract", question=question,
-                         trim=options.get("trim", True))
+                         trim=options.get("trim", True),
+                         locate=options.get("locate", True))
         call.validate()
         return call
 
@@ -435,7 +437,7 @@ class ExpressionBinder:
             node: SQLGlot Struct expression, or None for no options.
 
         Returns:
-            A dictionary with the supplied trim value.
+            A dictionary with the supplied trim and locate values.
 
         Raises:
             CompileError: The object is malformed, a key is unknown, or a
@@ -453,13 +455,14 @@ class ExpressionBinder:
                 raise CompileError(f"malformed option {prop.sql()}")
             key = str(prop.this.name).lower()
             value = prop.expression
-            if key == "trim":
+            if key in ("trim", "locate"):
                 if not isinstance(value, exp.Boolean):
-                    raise CompileError("trim is true or false")
+                    raise CompileError(f"{key} is true or false")
                 out[key] = bool(value.this)
             else:
                 raise CompileError(
-                    f"unknown AI.EXTRACT option {key!r}; the option is trim")
+                    f"unknown AI.EXTRACT option {key!r}; the options are "
+                    f"trim and locate")
         return out
 
     def bind_ai_value(self, node: exp.Expression) -> ModelCall:

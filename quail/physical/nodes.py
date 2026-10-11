@@ -1035,12 +1035,15 @@ class ExtractSpec(ScoreSpec):
         question: The question the answer is copied for.
         trim: Whether the answer is the fewest words that answer the
             question, or the whole lines that hold them.
+        locate: Whether a document of enough lines is shown numbered
+            and its answer's lines named before the start is read.
         numbered_token_parts: The head and tail token ids of the
             numbered-lines prompt.
     """
 
     question: str = ""
     trim: bool = True
+    locate: bool = True
     numbered_token_parts: tuple[tuple[int, ...], ...] = ()
 
     @property
@@ -1063,6 +1066,7 @@ class ExtractSpec(ScoreSpec):
                 "prompt_token_parts", "draws", "share_prefixes")},
             question=str(value["question"]),
             trim=bool(value.get("trim", True)),
+            locate=bool(value.get("locate", True)),
             numbered_token_parts=tuple(
                 tuple(int(token) for token in part)
                 for part in value.get("numbered_token_parts", ())),
@@ -1073,6 +1077,7 @@ class ExtractSpec(ScoreSpec):
             **super().to_dict(),
             "question": self.question,
             "trim": self.trim,
+            "locate": self.locate,
             "numbered_token_parts": [
                 list(part) for part in self.numbered_token_parts],
         }
@@ -1110,6 +1115,7 @@ class AiExtract(AiScore):
             **super().explain_fields(),
             "question": None if self.spec is None else self.spec.question,
             "trim": True if self.spec is None else self.spec.trim,
+            "locate": True if self.spec is None else self.spec.locate,
         }
 
     @classmethod

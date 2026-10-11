@@ -409,7 +409,7 @@ class Query:
         return self
 
     def ai_extract(self, c, question: str, *, name: str,
-                   trim: bool = True) -> "Query":
+                   trim: bool = True, locate: bool = True) -> "Query":
         """Copy the words that answer a question from each document.
 
         The result column ``name`` holds the copied words, or null when
@@ -428,6 +428,10 @@ class Query:
                 question. With trim off, the answer is the whole lines
                 of the document that hold them, as the document's own
                 line breaks divide it.
+            locate: Whether a document of three or more lines is shown
+                as numbered lines, so the model names the lines that
+                hold the answer before its start is read among them.
+                With locate off, every document is shown plain.
 
         Returns:
             This query builder, with the extraction added.
@@ -450,7 +454,8 @@ class Query:
         bound = bind_extract_prompt((ref,), question, self._tokenizer,
                                     turn=self._extract_turn)
         self._note_doc_column(ref)
-        call = ModelCall(bound, "extract", question=question, trim=trim)
+        call = ModelCall(bound, "extract", question=question, trim=trim,
+                         locate=locate)
         call.validate()
         self._extracts[name] = Alias(call, name)
         return self

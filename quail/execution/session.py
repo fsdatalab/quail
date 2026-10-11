@@ -584,8 +584,9 @@ class BoundBuilder:
                                 probabilities=probabilities)
         return self
 
-    def ai_extract(self, c, question, *, name, trim=True):
-        self._inner.ai_extract(c, question, name=name, trim=trim)
+    def ai_extract(self, c, question, *, name, trim=True, locate=True):
+        self._inner.ai_extract(c, question, name=name, trim=trim,
+                               locate=locate)
         return self
 
     def label_in(self, name, labels, selectivity=None):

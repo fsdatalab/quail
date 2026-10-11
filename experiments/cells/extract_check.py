@@ -86,7 +86,8 @@ def _mean(values):
 
 @app.function(image=image, gpu="H100!", memory=65536, timeout=7200,
               volumes=VOLUMES)
-def check(dataset: str, backend: str, trim: bool, n: int, run: str) -> dict:
+def check(dataset: str, backend: str, trim: bool, n: int, run: str,
+          locate: bool = True) -> dict:
     """Answer every item through the session and score the answers."""
     import os
 
@@ -111,7 +112,8 @@ def check(dataset: str, backend: str, trim: bool, n: int, run: str) -> dict:
             "id": [m["id"] for m in members],
             "text": [m["context"] for m in members]}), id_col="id"))
         query = (session.docs(name).alias("d")
-                 .ai_extract("d.text", question, name="answer", trim=trim)
+                 .ai_extract("d.text", question, name="answer", trim=trim,
+                             locate=locate)
                  .select("d.id", "answer"))
         plan = query.plan()
         if isinstance(plan, Refusal):
@@ -160,6 +162,7 @@ def check(dataset: str, backend: str, trim: bool, n: int, run: str) -> dict:
                 "same_as_cell": _mean(i["same_as_cell"] for i in subset)}
     summary = {
         "run": run, "dataset": dataset, "backend": backend, "trim": trim,
+        "locate": locate,
         "model": MODEL, "n": len(items), "queries": len(queries),
         "seconds": seconds,
         "query_wall_s": sum(q["wall_s"] for q in queries),
@@ -177,7 +180,7 @@ def check(dataset: str, backend: str, trim: bool, n: int, run: str) -> dict:
     print(json.dumps(summary, indent=2), flush=True)
     os.makedirs("/results/extract_check", exist_ok=True)
     path = (f"/results/extract_check/{run}_{backend}_{dataset}_"
-            f"{'trim' if trim else 'lines'}.json")
+            f"{'trim' if trim else 'lines'}{'' if locate else '_plain'}.json")
     with open(path, "w") as f:
         json.dump({"summary": summary, "queries": queries, "items": items},
                   f, indent=1)
@@ -187,7 +190,7 @@ def check(dataset: str, backend: str, trim: bool, n: int, run: str) -> dict:
 
 @app.local_entrypoint()
 def main(n: int = N_ITEMS, backends: str = "quail,stock_vllm",
-         datasets: str = "squad,cuad"):
+         datasets: str = "squad,cuad", locate: bool = True):
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     calls = {}
     for dataset, backend, trim in (("squad", "quail", True),
@@ -198,7 +201,7 @@ def main(n: int = N_ITEMS, backends: str = "quail,stock_vllm",
         if (backend not in backends.split(",")
                 or dataset not in datasets.split(",")):
             continue
-        call = check.spawn(dataset, backend, trim, n, run)
+        call = check.spawn(dataset, backend, trim, n, run, locate)
         calls[(dataset, backend, trim)] = call
         print(f"{dataset} {backend} trim={trim}: function call id "
               f"{call.object_id}", flush=True)

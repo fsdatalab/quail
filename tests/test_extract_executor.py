@@ -1,6 +1,7 @@
 """The Quail executor's AI.EXTRACT: its steps on a scripted model."""
 
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -557,6 +558,16 @@ def test_extractor_returns_whole_lines_with_trim_off(monkeypatch):
     assert table["ends"] == ["March 3, 2027 at noon.", "Term: five years", None]
     assert table["ends_span"][0] == {"start": line, "end": line + 22}
     assert table["ends_span"][1] == {"start": 0, "end": len(TERM)}
+
+
+def test_locate_off_shows_every_document_plain():
+    spec, tables = _spec(True, LEASE)
+    located = ExtractStages.__new__(ExtractStages)
+    located.spec, located.tables = spec, tables
+    assert located._prepare(0, 0, LEASE, None).numbered
+    plain = ExtractStages.__new__(ExtractStages)
+    plain.spec, plain.tables = replace(spec, locate=False), tables
+    assert not plain._prepare(0, 0, LEASE, None).numbered
 
 
 def test_extractor_stops_after_the_pass_limit(monkeypatch):

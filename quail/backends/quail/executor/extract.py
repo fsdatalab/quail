@@ -515,7 +515,7 @@ class ExtractStages:
         spec, tables = self.spec, self.tables
         text = text.as_py() if hasattr(text, "as_py") else str(text)
         lines = document_lines(text)
-        numbered = len(lines) >= LOCATE_MIN_LINES
+        numbered = spec.locate and len(lines) >= LOCATE_MIN_LINES
         if numbered:
             head, tail = spec.numbered_token_parts
             body, pieces = numbered_text(text, lines)

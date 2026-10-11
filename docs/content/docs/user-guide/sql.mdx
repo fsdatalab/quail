@@ -365,6 +365,7 @@ Pass an object as the third argument, such as `{'trim': false}`.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `trim` | `true` | Return the fewest words that answer the question. With `false`, return the whole lines of the document that hold them, as the document's own line breaks divide it. Use `false` for an answer that is a clause rather than a name, a date, or a number. |
+| `locate` | `true` | Show a document of three or more lines as numbered lines and have the model name the lines that hold the answer before its start is read among them. With `false`, every document is shown plain and the start is read anywhere in it. |
 
 ### How the answer is found
 
