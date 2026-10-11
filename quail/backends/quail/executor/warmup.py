@@ -213,8 +213,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
                                   device="cuda",
                                   dtype=torch.bfloat16)
                 cur = lin
-            q, s = pipeline.engine.quant(buf[:m])
-            pipeline.engine.gemm(q, s, lin)
+            pipeline.warm_gemm(lin, buf[:m])
             progress.update(done)
         buf = None
         torch.cuda.synchronize()

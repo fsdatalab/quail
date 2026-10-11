@@ -33,7 +33,6 @@ class Qwen35Pipeline(ModelPipeline):
     # merge takes 128-wide heads only, and canvas rows do not apply
     needs_pages = True
     tree_attention = False
-    gemm_warmup = False
 
     def __init__(self, model, arena, *, spec, engine_class=Engine):
         backbone = text_model(model).model
@@ -64,6 +63,23 @@ class Qwen35Pipeline(ModelPipeline):
         self.arena = arena
         self.max_chunk_tokens = budgets.kernel_index_cap(spec)
         self._norm_weights = {}
+
+    def linears(self):
+        # the full-attention and linear-attention layers each repeat
+        # their shapes; the MLP is the same in every layer
+        full = next(layer for layer in self.layers
+                    if layer.layer_type == "full_attention")
+        linear = next(layer for layer in self.layers
+                      if layer.layer_type != "full_attention")
+        return (full.self_attn.qkv_proj, full.self_attn.o_proj,
+                linear.linear_attn.in_proj_qkvz, linear.linear_attn.in_proj_ba,
+                linear.linear_attn.out_proj, full.mlp.gate_up_proj,
+                full.mlp.down_proj)
+
+    def warm_gemm(self, linear, x):
+        # the forward pass runs vLLM's modules, which quantize and
+        # dispatch the GEMM themselves
+        linear(x)
 
     def forward_chunk(self, chunk):
         hidden, residual = self.backbone_rows(chunk)

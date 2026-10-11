@@ -68,21 +68,27 @@ STATE_SLOTS_PER_DOCUMENT = 2
 # The document length the state pool is sized for when the planner
 # gives no mean.
 STATE_MEAN_DOC_TOKENS = 512
+# KV pages per document beside the state pool, in prefixes of the mean
+# length. The page pool also holds the frames and partner suffixes that
+# read a prefix and the documents retained between operators, so two
+# prefixes' worth keeps it from binding admission before the slot pool.
+STATE_KV_PREFIXES_PER_DOCUMENT = 2
 
 
 def state_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
                 mean_doc_tokens: float | None = None) -> int:
     """Slots of the state pool; 0 for a model without linear layers.
 
-    A document of the mean length takes its KV pages and
-    STATE_SLOTS_PER_DOCUMENT slots, so the pool holds as many documents
-    as the pages do and both run out together. Slot 0 is the kernels'
-    zero state and is added on top.
+    A document of the mean length takes STATE_KV_PREFIXES_PER_DOCUMENT
+    prefixes of KV pages and STATE_SLOTS_PER_DOCUMENT slots, so the pool
+    holds as many documents as the pages do with room for the rows that
+    read them. Slot 0 is the kernels' zero state and is added on top.
     """
     if not model.state_bytes:
         return 0
     mean = max(1.0, mean_doc_tokens or STATE_MEAN_DOC_TOKENS)
-    per_document = mean * model.kappa + STATE_SLOTS_PER_DOCUMENT * model.state_bytes
+    per_document = (STATE_KV_PREFIXES_PER_DOCUMENT * mean * model.kappa
+                    + STATE_SLOTS_PER_DOCUMENT * model.state_bytes)
     documents = arena_bytes(model, device, chunk_tokens) // per_document
     return 1 + STATE_SLOTS_PER_DOCUMENT * max(1, int(documents))
 

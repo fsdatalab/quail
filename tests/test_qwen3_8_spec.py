@@ -58,12 +58,14 @@ def test_state_per_sequence_and_the_pool_split():
     chunk = budgets.chunk_budget(SPEC, H100_SXM)
     slots = budgets.state_slots(SPEC, H100_SXM, chunk)
     assert budgets.state_slots(QWEN3_32B_FP8, H100_SXM, chunk) == 0
-    # the pool and the pages hold the same documents of the mean
-    # length, and together they take the free memory to within a slot
+    # the pages hold two prefixes of the mean length for every document
+    # the pool holds, and together they take the free memory to within
+    # a slot
     documents = (slots - 1) // budgets.STATE_SLOTS_PER_DOCUMENT
     assert documents >= 64
     tokens = budgets.arena_tokens(SPEC, H100_SXM, chunk)
-    assert abs(tokens - documents * budgets.STATE_MEAN_DOC_TOKENS) \
+    assert abs(tokens - documents * budgets.STATE_KV_PREFIXES_PER_DOCUMENT
+               * budgets.STATE_MEAN_DOC_TOKENS) \
         < SPEC.state_bytes / SPEC.kappa + budgets.PAGE_TOKENS
     free = budgets.arena_bytes(SPEC, H100_SXM, chunk)
     assert free - (tokens * SPEC.kappa + slots * SPEC.state_bytes) \

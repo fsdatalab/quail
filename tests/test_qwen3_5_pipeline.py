@@ -184,7 +184,7 @@ def test_layers_dispatch_by_type_and_segments_start_from_zero(monkeypatch):
                                engine_class=_Engine)
     assert pipeline.engine.geometry == (HEADS, KV_HEADS, DIM, False)
     assert (pipeline.needs_pages, pipeline.tree_attention,
-            pipeline.gemm_warmup) == (True, False, False)
+            pipeline.gemm_warmup) == (True, False, True)
     chunk = _chunk(torch)
     out = pipeline.forward_chunk(chunk)
     # the full layers address the arena by their own index

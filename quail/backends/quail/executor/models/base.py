@@ -45,3 +45,8 @@ class ModelPipeline:
     def linears(self):
         """One linear module per distinct GEMM shape, for kernel warm-up."""
         raise NotImplementedError
+
+    def warm_gemm(self, linear, x):
+        """Run one GEMM of `linear` over the bf16 rows x, as the forward pass does."""
+        q, s = self.engine.quant(x)
+        self.engine.gemm(q, s, linear)
