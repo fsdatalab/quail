@@ -378,15 +378,18 @@ def _null_slot_is_zero(arena):
         assert not state[0].any() and not conv[0].any(), layer
 
 
-def test_partners_read_the_kept_state_and_leave_it_unchanged(prompts, state_run):
+def test_partners_read_the_kept_state_and_leave_it_unchanged(
+        prompts, long_prompt, state_run):
     from quail.backends.quail.executor.chunk import pack_chunk
 
     arena, pipeline = state_run
     _null_slot_is_zero(arena)
-    ids = prompts[1]
-    anchor, frame = ids[:len(ids) - SUFFIX_TOKENS], ids[len(ids) - SUFFIX_TOKENS:
-                                                         len(ids) - 4]
-    partners = [ids[len(ids) - 4:], prompts[2][-4:], prompts[3][-4:]]
+    # the anchor and frame end at a kernel chunk boundary, so partners
+    # started from the kept state do the same linear-layer arithmetic
+    # as partners run behind the frame, and the rows must agree exactly
+    ids = long_prompt
+    anchor, frame = ids[:60], ids[60:64]
+    partners = [ids[64:68], prompts[2][-4:], prompts[3][-4:]]
     f = len(anchor)
     separate = []
     for index, partner in enumerate(partners):
@@ -399,9 +402,9 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(prompts, state_run)
             attention_mode="unified"))
         separate.append(rows[f + len(frame):])
         arena.free_key(key)
-    # the three partners are the same question tail, so their separate
-    # runs are the same computation over the same pages
-    assert all(torch.equal(separate[0], other) for other in separate[1:])
+    # the last two partners are the same question tail, so their
+    # separate runs are the same computation over the same pages
+    assert torch.equal(separate[1], separate[2])
     _null_slot_is_zero(arena)
 
     key = ("anchor", 0)
@@ -444,8 +447,6 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(prompts, state_run)
         offset += len(partner)
     print(json.dumps(dict(partner_medians=errors, again_medians=again_errors,
                           again_vs_separate=again_vs_separate)))
-    assert max(errors) < 0.02
-    # the same rows from the same slot in a smaller chunk: the GEMM and
-    # attention kernels may tile the two batch shapes differently, so
-    # the rows agree to rounding rather than bit for bit
-    assert max(again_errors) < 0.02
+    assert max(again_vs_separate) < 1e-3
+    assert max(errors) < 1e-3
+    assert max(again_errors) < 1e-3
