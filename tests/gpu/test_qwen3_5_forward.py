@@ -391,19 +391,15 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(
     anchor, frame = ids[:60], ids[60:64]
     partners = [ids[64:68], prompts[2][-4:], prompts[3][-4:]]
     f = len(anchor)
-    separate, separate_layers = [], None
+    separate = []
     for index, partner in enumerate(partners):
         key = ("one", index)
         arena.activate(key, f + len(frame) + len(partner),
                        capacity_tokens=f + 32, base_tokens=f)
-        one = pack_chunk(
+        rows = _layer_output(pipeline, pack_chunk(
             torch, arena, [dict(key=key, prefix=anchor + frame, f=f + len(frame),
                                 suffixes=[partner])],
-            attention_mode="unified")
-        if index == 0:
-            separate_layers = [rows[f + len(frame):]
-                               for rows in _per_layer_outputs(pipeline, one)]
-        rows = _layer_output(pipeline, one)
+            attention_mode="unified"))
         separate.append(rows[f + len(frame):])
         arena.free_key(key)
     # the last two partners are the same question tail, so their
@@ -428,40 +424,48 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(
     kept = arena.state_slot_at(key, f + len(frame))
     pools = [pipeline.arena.state_pools(layer) for layer in sorted(arena.state_layers)]
     before = [(s[kept].clone(), c[kept].clone()) for s, c in pools]
-    # a second round of partners starts from the kept state again
-    again = pack_chunk(torch, arena, [
+    # a later round of partners starts from the kept state again. The
+    # chunk of 12 rows alone sends its projections down vLLM's small-M
+    # GEMM path, which rounds differently from the first chunk's, so
+    # the exact comparison pads it to the first chunk's row count with
+    # a fresh document ahead of the partners
+    small = pack_chunk(torch, arena, [
         dict(key=key, prefix=None, f=f + len(frame), suffixes=partners)],
         attention_mode="unified")
-    again_layers = _per_layer_outputs(pipeline, again)
-    repeated = again_layers[-1]
-    first = f + len(frame), f + len(frame) + len(partners[0])
-    print(json.dumps(dict(
-        together_vs_again_by_layer=[
-            round(_relative(t[first[0]:first[1]],
-                            a[:len(partners[0])]).median().item(), 4)
-            for t, a in zip(together_layers, again_layers)],
-        again_vs_separate_by_layer=[
-            round(_relative(a[:len(partners[0])], s_).median().item(), 4)
-            for a, s_ in zip(again_layers, separate_layers)])))
-    for key_ in chunk.temporary_keys + again.temporary_keys:
+    small_layers = _per_layer_outputs(pipeline, small)
+    pad = ("pad", 0)
+    arena.activate(pad, f + len(frame), capacity_tokens=f + 32,
+                   base_tokens=f + len(frame))
+    padded = pack_chunk(torch, arena, [
+        dict(key=pad, prefix=anchor + frame, f=f + len(frame), suffixes=[]),
+        dict(key=key, prefix=None, f=f + len(frame), suffixes=partners)],
+        attention_mode="unified")
+    repeated = _layer_output(pipeline, padded)
+    for key_ in chunk.temporary_keys + small.temporary_keys + padded.temporary_keys:
         arena.free_key(key_)
+    arena.free_key(pad)
     after = [(s[kept], c[kept]) for s, c in pools]
     assert all(torch.equal(b[0], a[0]) and torch.equal(b[1], a[1])
                for b, a in zip(before, after))
     arena.free_key(key)
     offset = f + len(frame)
-    errors, again_errors, again_vs_separate = [], [], []
+    first = len(partners[0])
+    small_by_layer = [
+        round(_relative(t[offset:offset + first], a[:first]).median().item(), 4)
+        for t, a in zip(together_layers, small_layers)]
+    errors, again_errors = [], []
     for index, partner in enumerate(partners):
         rows = together[offset:offset + len(partner)]
         errors.append(_relative(rows, separate[index]).median().item())
-        start = sum(map(len, partners[:index]))
-        again_rows = repeated[start:start + len(partner)]
-        again_errors.append(_relative(rows, again_rows).median().item())
-        again_vs_separate.append(
-            _relative(again_rows, separate[index]).median().item())
+        again_errors.append(_relative(
+            rows, repeated[offset:offset + len(partner)]).median().item())
         offset += len(partner)
-    print(json.dumps(dict(partner_medians=errors, again_medians=again_errors,
-                          again_vs_separate=again_vs_separate)))
-    assert max(again_vs_separate) < 1e-3
+    print(json.dumps(dict(partner_medians=errors, padded_medians=again_errors,
+                          small_chunk_by_layer=small_by_layer)))
+    # partners behind the frame and partners from the kept state are
+    # the same rows, in the same chunk and in a later one
     assert max(errors) < 1e-3
     assert max(again_errors) < 1e-3
+    # the small chunk differs by its GEMM path's rounding from the
+    # first layer on; a wrong window or state would show there at once
+    assert small_by_layer[0] < 0.02
