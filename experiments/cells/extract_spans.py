@@ -16,12 +16,11 @@ the same prompt, with no training:
   the range contains the reference span, and as whether it is exactly
   the reference's line range.
 - scored: the top-k start tokens are read in one step; after each
-  candidate start the next FEED document tokens are fed in one pass,
+  candidate start the next CHUNK document tokens are fed in one pass,
   and every (start, end) span is scored as the product of its copy
-  probabilities and its stop probability (exact-extract). The best
-  span wins. The bound "no longer span can beat the best so far once
-  the copy product falls below it" is replayed offline for each chunk
-  size in CHUNKS to count the passes the engine would make.
+  probabilities and its stop probability (exact-extract). A start
+  whose copy product is still above the best span found gets another
+  CHUNK tokens, up to MAX_PASSES passes; the best span wins.
 
 Every method sees one model and one prompt per question, through
 vLLM's public API on the checkpoint Quail runs. The copy probabilities
@@ -94,9 +93,9 @@ SEED = 20261010
 TOP_TOKENS = 8      # start tokens read at the cue
 MAX_STARTS = 8      # candidate start positions kept after expansion
 CUE_LOGPROBS = 1024    # vocabulary entries read at the cue
-FEED = 48           # document tokens fed after each candidate start
+CHUNK = 16          # document tokens fed per end pass
+MAX_PASSES = 8      # end passes a question may take: a runaway guard
 FREE_MAX_TOKENS = 48
-CHUNKS = (8, 16, 32)
 TOP_K = (1, 4, 8)
 
 BODY_TEMPLATE = ("DOCUMENT:\n{0}\n\nAnswer the question with the shortest exact "
@@ -437,33 +436,56 @@ def _candidates(scorer, prompt_ids, lp, doc_ids
             float(lp[best[ranked[0]]]), 2 if ambiguous else 1)
 
 
-def _spans(scorer, prompt_ids, doc_ids, candidates):
+def _spans(scorer, prompt_ids, doc_ids, candidates) -> tuple[list[dict], int]:
     """Per candidate: start, copy and stop logprobs along the fed tokens.
 
-    One teacher-forced sequence per candidate gives the start and copy
+    Each pass feeds the next CHUNK tokens of every open candidate. One
+    teacher-forced sequence per candidate gives the start and copy
     logprobs; one more per fed position, ending in the closing quote,
-    gives the stop logprob there.
+    gives the stop logprob there. A candidate stays open while its
+    copy product is at least the best span score so far, it has
+    document left, and fewer than MAX_PASSES passes have run.
+
+    Returns:
+        The candidates' branches and the number of passes.
     """
     n = len(prompt_ids)
-    feeds = [[c["first"], *c["filler"],
-              *doc_ids[c["pos"] + 1:c["pos"] + 1 + FEED - len(c["filler"])]]
-             for c in candidates]
-    copies = scorer.teacher_forced([
-        prompt_ids + fed + doc_ids[c["pos"] + len(fed) - len(c["filler"]):][:1]
-        for c, fed in zip(candidates, feeds)])
-    stops = scorer.teacher_forced([
-        prompt_ids + fed[:i + 1] + [scorer.quote_id]
-        for fed in feeds for i in range(len(fed))])
-    out, at = [], 0
-    for c, fed, lp in zip(candidates, feeds, copies):
-        copy = [lp[n + i + 1] if n + i + 1 < len(lp) else float("-inf")
-                for i in range(len(fed))]
-        stop = [stops[at + i][-1] for i in range(len(fed))]
-        at += len(fed)
-        out.append({"pos": c["pos"], "first": c["first"], "start": lp[n],
-                    "copy": copy, "stop": stop, "fed": len(fed),
-                    "extra": len(c["filler"])})
-    return out
+    branches = [{"pos": c["pos"], "first": c["first"], "start": None,
+                 "copy": [], "stop": [], "fed": 0, "extra": len(c["filler"]),
+                 "stream": [c["first"], *c["filler"], *doc_ids[c["pos"] + 1:]]}
+                for c in candidates]
+    open_branches = list(range(len(branches)))
+    passes = 0
+    while open_branches and passes < MAX_PASSES:
+        passes += 1
+        news = {i: branches[i]["stream"][branches[i]["fed"]:branches[i]["fed"] + CHUNK]
+                for i in open_branches}
+        copies = scorer.teacher_forced([
+            prompt_ids + branches[i]["stream"][:branches[i]["fed"] + len(news[i]) + 1]
+            for i in open_branches])
+        stops = scorer.teacher_forced([
+            prompt_ids + branches[i]["stream"][:branches[i]["fed"] + j + 1]
+            + [scorer.quote_id]
+            for i in open_branches for j in range(len(news[i]))])
+        at = 0
+        for i, lp in zip(open_branches, copies):
+            b = branches[i]
+            if b["start"] is None:
+                b["start"] = lp[n]
+            for j in range(len(news[i])):
+                row = n + b["fed"] + j + 1
+                b["copy"].append(lp[row] if row < len(lp) else float("-inf"))
+                b["stop"].append(stops[at + j][-1])
+            at += len(news[i])
+            b["fed"] += len(news[i])
+        best = max(max(_scores(b, False)) for b in branches if b["fed"])
+        open_branches = [
+            i for i in open_branches
+            if branches[i]["fed"] < len(branches[i]["stream"])
+            and branches[i]["start"] + sum(branches[i]["copy"]) >= best]
+    for b in branches:
+        del b["stream"]
+    return branches, passes
 
 
 def _scores(branch, renormalized: bool) -> list[float]:
@@ -481,27 +503,6 @@ def _scores(branch, renormalized: bool) -> list[float]:
         out.append(total + s)
         total += c
     return out
-
-
-def _passes(branches, chunk: int) -> int:
-    """End passes the bound needs when the engine feeds `chunk` tokens a pass."""
-    scores = [_scores(b, False) for b in branches]
-    running = []
-    for b in branches:
-        total, run = b["start"], []
-        for c in b["copy"]:
-            total += c
-            run.append(total)
-        running.append(run)
-    fed, passes = 0, 0
-    open_branches = list(range(len(branches)))
-    while open_branches and fed < FEED:
-        fed += chunk
-        passes += 1
-        best = max(max(s[:fed]) for s in scores)
-        open_branches = [i for i in open_branches
-                         if fed < branches[i]["fed"] and running[i][fed - 1] >= best]
-    return passes
 
 
 def _close_at(branch, best_other: float) -> int:
@@ -576,7 +577,7 @@ def measure(model: str, dataset: str, n: int, run: str) -> dict:
         rec["candidates"] = [(c["pos"], scorer.vocab[c["first"]],
                               round(c["score"], 2), len(c["filler"]))
                              for c in candidates]
-        branches = _spans(scorer, prompt_ids, doc_ids, candidates)
+        branches, passes = _spans(scorer, prompt_ids, doc_ids, candidates)
 
         def span_text(branch, j):
             """The document text of the span ending after fed token j."""
@@ -598,7 +599,7 @@ def measure(model: str, dataset: str, n: int, run: str) -> dict:
                 answer = span_text(best[1], best[2])
                 rec["scored"][f"{'renorm' if renormalized else 'full'}_k{k}"] = {
                     "text": answer, "em_f1": _f1(answer, q["answers"])}
-        rec["passes"] = {str(m): _passes(branches, m) for m in CHUNKS}
+        rec["passes"] = passes
         if rec["gold_rank"] >= 0:
             branch = branches[rec["gold_rank"]]
             others = [max(_scores(b, False)) for i, b in enumerate(branches)
@@ -619,11 +620,13 @@ def measure(model: str, dataset: str, n: int, run: str) -> dict:
     past = [r["past_gold_end"] for r in items if "past_gold_end" in r]
     summary = {
         "run": run, "model": model, "spec": MODELS[model]["spec"],
-        "dataset": dataset, "n": len(items), "seconds": seconds, "feed": FEED,
-        "top_tokens": TOP_TOKENS, "max_starts": MAX_STARTS,
+        "dataset": dataset, "n": len(items), "seconds": seconds, "chunk": CHUNK,
+        "max_passes": MAX_PASSES, "top_tokens": TOP_TOKENS,
+        "max_starts": MAX_STARTS,
         "answer_words_mean": mean([len(q["answers"][0].split()) for q in questions]),
         "answer_tokens_mean": mean([r["gold_len"] for r in items]),
-        "answers_longer_than_feed": sum(r["gold_len"] > FEED for r in items),
+        "answers_longer_than_cap": sum(r["gold_len"] > CHUNK * MAX_PASSES
+                                       for r in items),
         "prompt_tokens_mean": mean([r["prompt_tokens"] for r in items]),
         "doc_tokens_mean": mean([r["doc_tokens"] for r in items]),
         "free": em_f1(lambda r: r["free"]["em_f1"]),
@@ -647,10 +650,9 @@ def measure(model: str, dataset: str, n: int, run: str) -> dict:
                           "median": statistics.median(past) if past else None,
                           "p95": (sorted(past)[int(0.95 * len(past)) - 1]
                                   if past else None)},
-        "one_pass_share": {str(m): mean([r["passes"][str(m)] == 1 for r in items])
-                           for m in CHUNKS},
-        "passes_mean": {str(m): mean([r["passes"][str(m)] for r in items])
-                        for m in CHUNKS},
+        "one_pass_share": mean([r["passes"] == 1 for r in items]),
+        "passes_mean": mean([r["passes"] for r in items]),
+        "passes_hit_cap": sum(r["passes"] == MAX_PASSES for r in items),
     }
     path = f"/results/extract_spans/{run}_{model}_{dataset}.json"
     os.makedirs(os.path.dirname(path), exist_ok=True)
