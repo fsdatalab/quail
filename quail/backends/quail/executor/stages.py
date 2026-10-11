@@ -324,6 +324,19 @@ class _StageExecutor:
                 1, self.arena.n_state_slots // per_document)
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
+        # a Gated DeltaNet layer starts a borrower from the parent's state
+        # at the shared point, so a parent writes one slot per point
+        self.share_points = [()] * len(self.keys)
+        if self.paged and getattr(self.arena, "n_state_slots", 0):
+            points = {}
+            for doc, parent in enumerate(self.borrowing.tree_parent):
+                shared = self.borrowing.tree_shared[doc]
+                if parent is not None and shared:
+                    points.setdefault(parent, set()).add(shared)
+            for parent, values in points.items():
+                self.share_points[parent] = tuple(sorted(values))
+            self.borrowing.can_borrow = self._state_borrow_check(
+                self.borrowing.can_borrow)
         # The admission detaches residents from borrowing: they pack no prefix.
         self.borrowers = self.borrowing.borrowers()
         self.lowest_borrow = lowest_borrows(self.borrowing)
@@ -397,6 +410,25 @@ class _StageExecutor:
         stages = self.stages
         return lambda j: (None if stages[j].requests is None
                           else stages[j].requests(key))
+
+    def _state_borrow_check(self, can_borrow):
+        """Narrow can_borrow to borrows a parent's saved state can serve.
+
+        The borrower must start after the parent's own start and before
+        its own end, at a point the parent saves a state for or has
+        saved already.
+        """
+        def check(doc, parent, same_chunk):
+            shared = self.borrowing.tree_shared[doc]
+            if not shared < self.prefix_lengths[doc]:
+                return False
+            if not shared > self.borrowing.shared(parent):
+                return False
+            if not same_chunk and self.arena.shared_state(
+                    self.keys[parent], shared) is None:
+                return False
+            return can_borrow(doc, parent, same_chunk)
+        return check
 
     def _merged(self, j, start, end):
         """Return whether the group packs its frame and suffix as one entry."""
@@ -552,6 +584,11 @@ class _StageExecutor:
             # under tree attention a borrowing document with one
             # suffix reads its parent's pages stacked with its siblings
             read_key = self.keys[parent] if shared and self.stages[j].single else None
+            carry = {}
+            if prefix is not None:
+                carry = dict(
+                    borrow_key=self.keys[parent] if shared else None,
+                    share_points=self.share_points[a])
             kept = int(sufs.lengths.sum()) if append else 0
             if append or (self.writes[j] and start == 0):
                 appended[a] = path + kept
@@ -564,14 +601,14 @@ class _StageExecutor:
                         np.concatenate([self.frame_ids[j], sufs.ids]),
                         [len(frame) + int(sufs.lengths[0])]),
                     write_suffix_tokens=len(frame) + kept, single=True,
-                    read_all_rows=read_all, **own))
+                    read_all_rows=read_all, **carry, **own))
             elif self.writes[j] and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows; its own answer row means nothing
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f, suffixes=Suffixes(self.frame_ids[j], [len(frame)]),
-                    write_suffix_tokens=len(frame)))
+                    write_suffix_tokens=len(frame), **carry))
                 entries.append((j, 1))
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
@@ -585,7 +622,7 @@ class _StageExecutor:
                     suffixes=sufs, read_all_rows=read_all,
                     write_suffix_tokens=kept,
                     single=self.stages[j].single and end - start == 1,
-                    chains=self.stages[j].chains, **own))
+                    chains=self.stages[j].chains, **carry, **own))
             entries.append((j, rows))
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,

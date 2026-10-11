@@ -299,10 +299,6 @@ class PrefixSharing:
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
             return None
-        if context.model.gdn_layers:
-            # a Gated DeltaNet layer's state exists only at a document's
-            # end, so a document cannot start from a shared page prefix
-            return None
         nodes = []
         changed = False
         pipelines = build_pipelines(graph) if context.gpu_count == 1 else {}

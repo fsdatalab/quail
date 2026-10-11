@@ -48,6 +48,7 @@ class PageArena:
         self.slot_tokens = {}    # key -> tokens its checkpoint covers
         self.ext_slots = {}    # key -> slot of the state past retained suffix
         self.ext_tokens = {}    # key -> tokens that second checkpoint covers
+        self.share_slots = {}    # (key, tokens) -> slot of the state there
         self.free = list(range(n_pages - 1, -1, -1))    # stack
         self.owned = {}       # key -> list of page ids it alone writes
         self.borrowed = {}    # key -> leading page ids read from a parent
@@ -165,6 +166,22 @@ class PageArena:
         self.ext_slots[key] = self.free_slots.pop()
         return self.ext_slots[key]
 
+    def alloc_share(self, key, tokens: int):
+        """A slot for the key's state after `tokens` tokens, or None.
+
+        A borrower of the key's first `tokens` tokens starts from it.
+        The slot lives until the key is freed.
+        """
+        if key not in self.owned:
+            raise KeyError(key)
+        point = (key, tokens)
+        if point in self.share_slots:
+            return self.share_slots[point]
+        if not self.free_slots:
+            return None
+        self.share_slots[point] = self.free_slots.pop()
+        return self.share_slots[point]
+
     def drop_extension(self, key) -> None:
         """Free the key's second checkpoint slot, if it has one."""
         slot = self.ext_slots.pop(key, None)
@@ -177,6 +194,8 @@ class PageArena:
         slot = self.slots.pop(key, None)
         self.slot_tokens.pop(key, None)
         self.drop_extension(key)
+        for point in [p for p in self.share_slots if p[0] == key]:
+            self.free_slots.append(self.share_slots.pop(point))
         if slot is not None:
             self.free_slots.append(slot)
         pages = self.owned.pop(key)
@@ -475,6 +494,27 @@ class KVArena:
         if slot is None:
             self._evict_until(lambda: bool(self.accounting.free_slots))
             slot = self.accounting.alloc_extension(key)
+        return slot
+
+    def share_slot(self, key, tokens: int):
+        """The slot for the key's state after `tokens` tokens, evicting if short.
+
+        Returns None when every slot belongs to a pinned or held key.
+        """
+        slot = self.accounting.alloc_share(key, tokens)
+        if slot is None:
+            self._evict_until(lambda: bool(self.accounting.free_slots))
+            slot = self.accounting.alloc_share(key, tokens)
+        return slot
+
+    def shared_state(self, key, tokens: int):
+        """The slot holding the key's state after `tokens` tokens, or None.
+
+        The document-end checkpoint serves the key's own length.
+        """
+        slot = self.accounting.share_slots.get((key, tokens))
+        if slot is None and self.accounting.slot_tokens.get(key) == tokens:
+            slot = self.accounting.slots.get(key)
         return slot
 
     def record_extension(self, key, tokens: int) -> None:

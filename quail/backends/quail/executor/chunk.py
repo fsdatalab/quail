@@ -568,7 +568,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     suffix_spans=(s_row0 + begins, s_row0 + ends),
                     canvas=bool(n and width),
                     keeps=bool(g.get("write_suffix_tokens")),
-                    kept=int(g.get("write_suffix_tokens") or 0)))
+                    kept=int(g.get("write_suffix_tokens") or 0),
+                    borrow_key=g.get("borrow_key"),
+                    share_points=g.get("share_points", ())))
             elif not fresh:
                 raise ValueError(
                     "unified attention requires pages for a kept "

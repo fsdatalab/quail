@@ -54,45 +54,62 @@ def plan_phases(arena, groups, stage):
     Each layer runs the phases in this order, and a phase reads the
     slots the ones before it wrote:
 
-    1. prefix: a fresh document's rows from zero state, writing its slot.
-    2. continuation: the retained tokens of a group whose whole first
-       suffix is kept (a stage frame), from its slot back into it. A
-       later group of the same key in the chunk reads the extended slot.
+    1. level 0: a fresh document's rows from zero state, writing its
+       slot, and its state after each point a borrower starts from.
+    2. levels 1 and up: rows that start from a slot a lower level wrote,
+       in this chunk or an earlier one. A document that borrows a
+       prefix starts from its parent's state at the shared point; the
+       retained tokens of a group whose whole first suffix is kept (a
+       stage frame) run from its slot back into it.
     3. suffix: every question from its document's slot, writing nothing.
     4. extension: the leading retained tokens of a suffix that also
        holds a question, from the slot back into it. The suffix ran
        from the state before them, so the slot advances after it.
 
     Allocates a checkpoint slot for each fresh document and records the
-    tokens it covers. Retained suffix tokens advance a second slot, so
-    the document-end checkpoint survives for an operator that asks at
-    the document's length after the KV rewinds. A group must be asked
-    at one of the two lengths exactly, since a state cannot rewind.
+    tokens it covers, and a slot for each shared point. Retained suffix
+    tokens advance a second slot, so the document-end checkpoint
+    survives for an operator that asks at the document's length after
+    the KV rewinds. A group must be asked at one of the two lengths
+    exactly, since a state cannot rewind.
 
     Args:
         arena: KVArena with checkpoint slots.
         groups: One mapping per group in chunk order, with key, fresh,
-            f, start, row0, prefix_end, keeps, kept, and suffix_spans
-            (the begin and end rows of each suffix).
+            f, start, row0, prefix_end, keeps, kept, suffix_spans (the
+            begin and end rows of each suffix), borrow_key (the parent
+            of a borrowed prefix), and share_points (the token counts
+            a borrower starts from).
         stage: Callable (name, values, dtype) that copies host values to
             the GPU.
 
     Returns:
-        (prefix, continuation, suffix, extension) phases; each is None
-        when it has no sequences.
+        The phases in run order, each a GdnPhase.
 
     Raises:
-        ValueError: A group borrows a prefix, keeps more tokens than its
-            first suffix holds, or follows a group of its key that
-            extends the checkpoint after its suffix.
+        ValueError: A group borrows a prefix no state covers, keeps more
+            tokens than its first suffix holds, or follows a group of
+            its key that extends the checkpoint after its suffix.
         ArenaFullError: Every checkpoint slot belongs to a pinned key.
     """
     import torch
 
     from quail.backends.quail.executor.chunk import ArenaFullError
 
-    lists = {name: ([], [], []) for name in
-             ("prefix", "continuation", "suffix", "extension")}
+    # level 0 runs from zero state; level n >= 1 reads slots that a lower
+    # level wrote in this chunk or an earlier one
+    levels = {}
+    ready = {}
+    lists = {name: ([], [], []) for name in ("suffix", "extension")}
+
+    def segment(rows, read, write):
+        """Queue rows that start from slot `read` and leave state in `write`."""
+        level = 0 if read is None else max(1, ready.get(read, -1) + 1)
+        rows_list, lengths, slots = levels.setdefault(level, ([], [], []))
+        rows_list.append(rows)
+        lengths.append(len(rows))
+        slots.append((read, write))
+        ready[write] = level
 
     def add(name, rows, slot):
         rows_list, lengths, slots = lists[name]
@@ -104,10 +121,11 @@ def plan_phases(arena, groups, stage):
     for group in groups:
         key = group["key"]
         kept = group.get("kept", 0)
-        if group["start"]:
+        start = group["start"]
+        if start and not group["fresh"]:
             raise ValueError(
-                f"group {key!r}: a hybrid model cannot borrow a prefix, "
-                f"which needs the state at the shared point")
+                f"group {key!r}: a resident document cannot start at "
+                f"token {start}")
         begins, ends = (spans.tolist() for spans in group["suffix_spans"])
         if kept and (not begins or kept > ends[0] - begins[0]):
             raise ValueError(
@@ -120,8 +138,35 @@ def plan_phases(arena, groups, stage):
                     f"no free checkpoint slot for {key!r}: all "
                     f"{arena.n_state_slots} belong to documents in use")
             first, last = group["row0"], group["prefix_end"]
-            if last > first:
-                add("prefix", np.arange(first, last, dtype=np.int64), source)
+            read = None
+            if start:
+                parent = group.get("borrow_key")
+                read = (None if parent is None
+                        else arena.shared_state(parent, start))
+                if read is None:
+                    raise ValueError(
+                        f"group {key!r}: borrows {start} tokens, but "
+                        f"no state of the parent covers them")
+                if last <= first:
+                    raise ValueError(
+                        f"group {key!r}: borrows its whole prefix")
+            points = [t for t in group.get("share_points", ())
+                      if start < t < group["f"]]
+            bounds = [start] + points + [group["f"]]
+            for low, high in zip(bounds, bounds[1:]):
+                if high == group["f"]:
+                    write = source
+                else:
+                    write = arena.share_slot(key, high)
+                    if write is None:
+                        raise ArenaFullError(
+                            f"no free checkpoint slot to share {key!r} "
+                            f"at {high} tokens")
+                if last > first:
+                    segment(np.arange(first + low - start,
+                                      first + high - start, dtype=np.int64),
+                            read, write)
+                read = write
             arena.record_checkpoint(key, group["f"])
         else:
             source = None
@@ -159,41 +204,46 @@ def plan_phases(arena, groups, stage):
                         f"no free checkpoint slot to extend {key!r}")
             arena.record_extension(key, group["f"] + kept)
             head = np.arange(begins[0], begins[0] + kept, dtype=np.int64)
-            name = "continuation" if pure else "extension"
-            lists[name][0].append(head)
-            lists[name][1].append(len(head))
-            lists[name][2].append((source, target))
-            if not pure:
+            if pure:
+                segment(head, source, target)
+            else:
+                rows_list, lengths, slots = lists["extension"]
+                rows_list.append(head)
+                lengths.append(len(head))
+                slots.append((source, target))
                 extended_after.add(key)
         if pure:
             continue
         for begin, end in zip(begins, ends):
             add("suffix", np.arange(begin, end, dtype=np.int64), source)
 
-    def phase(name, *, read, write, output=True):
-        rows, lengths, slots = lists[name]
-        if not lengths:
-            return None
+    def build(name, rows, lengths, reads, writes, output=True):
         cu = np.concatenate([[0], np.cumsum(lengths)])
-        if name in ("continuation", "extension"):
-            reads = [pair[0] for pair in slots]
-            writes = [pair[1] for pair in slots]
-        else:
-            reads = writes = slots
         return GdnPhase(
             rows=stage(f"gdn_{name}_rows", np.concatenate(rows), torch.int64),
             cu_seqlens=stage(f"gdn_{name}_cu", cu, torch.int32),
             lengths=tuple(lengths),
-            read_slots=(stage(f"gdn_{name}_read", reads, torch.int64)
-                        if read else None),
-            write_slots=(stage(f"gdn_{name}_write", writes, torch.int64)
-                         if write else None),
+            read_slots=(None if reads is None else
+                        stage(f"gdn_{name}_read", reads, torch.int64)),
+            write_slots=(None if writes is None else
+                         stage(f"gdn_{name}_write", writes, torch.int64)),
             output=output)
 
-    return (phase("prefix", read=False, write=True),
-            phase("continuation", read=True, write=True),
-            phase("suffix", read=True, write=False),
-            phase("extension", read=True, write=True, output=False))
+    phases = []
+    for level in sorted(levels):
+        rows, lengths, slots = levels[level]
+        reads = None if level == 0 else [pair[0] for pair in slots]
+        phases.append(build(f"level{level}", rows, lengths, reads,
+                            [pair[1] for pair in slots]))
+    rows, lengths, slots = lists["suffix"]
+    if lengths:
+        phases.append(build("suffix", rows, lengths, slots, None))
+    rows, lengths, slots = lists["extension"]
+    if lengths:
+        phases.append(build("extension", rows, lengths,
+                            [pair[0] for pair in slots],
+                            [pair[1] for pair in slots], output=False))
+    return tuple(phases)
 
 
 # ---- reference maths --------------------------------------------------
