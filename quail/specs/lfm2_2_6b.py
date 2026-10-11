@@ -26,6 +26,7 @@ LFM2_2_6B_BF16 = ModelSpec(
     tied_head=True,
     weight_precision="bf16",
     arch="lfm2",
+    conv_width=3,          # L_cache: a short convolution reads 2 columns back
     layer_kinds=tuple(
         "full_attention" if layer in _ATTENTION_LAYERS else "short_conv"
         for layer in range(30)),

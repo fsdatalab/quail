@@ -168,6 +168,23 @@ class ModelSpec:
                      if self.layer_kind(i) == "gated_delta_net")
 
     @property
+    def short_conv_layers(self) -> tuple[int, ...]:
+        """The layers that keep a short convolution's input columns."""
+        return tuple(i for i in range(self.layers)
+                     if self.layer_kind(i) == "short_conv")
+
+    @property
+    def state_layers(self) -> tuple[int, ...]:
+        """The layers that keep state between a document's tokens."""
+        return tuple(i for i in range(self.layers)
+                     if self.layer_kind(i) in ("gated_delta_net", "short_conv"))
+
+    @property
+    def conv_state_channels(self) -> int:
+        """Channels of the convolution input a state layer keeps."""
+        return self.conv_channels if self.gdn_layers else self.hidden
+
+    @property
     def conv_channels(self) -> int:
         """Channels of a Gated DeltaNet layer's convolution: q, k, and v joined."""
         return (2 * self.gdn_key_heads * self.gdn_key_dim
@@ -187,12 +204,16 @@ class ModelSpec:
 
     @property
     def checkpoint_bytes(self) -> int:
-        """Bytes of the state a sequence leaves in every Gated DeltaNet layer.
+        """Bytes of the state a sequence leaves in every state layer.
 
-        Zero for a model without Gated DeltaNet layers.
+        A Gated DeltaNet layer keeps its state matrix and convolution
+        columns; a short convolution layer keeps its input columns.
+        Zero for a model without either.
         """
-        return len(self.gdn_layers) * (self.gdn_state_bytes
-                                       + self.conv_state_bytes)
+        return (len(self.gdn_layers) * (self.gdn_state_bytes
+                                        + self.conv_state_bytes)
+                + len(self.short_conv_layers) * self.hidden
+                * (self.conv_width - 1) * CONV_STATE_ELEMENT_BYTES)
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""

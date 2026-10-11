@@ -166,7 +166,7 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
     """
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
-    if model.gdn_layers:
+    if model.state_layers:
         return hybrid_arena_pages(model, device, chunk_tokens,
                                   mean_doc_tokens), 0
     free = arena_bytes(model, device, chunk_tokens)
@@ -227,6 +227,10 @@ def _projection_shapes(model: ModelSpec):
                     2 * key_width + 2 * value_width + 2 * model.gdn_value_heads,
                     gdn),
                    (value_width, model.hidden, gdn)]
+    if model.short_conv_layers:
+        short = len(model.short_conv_layers)
+        shapes += [(model.hidden, 3 * model.hidden, short),
+                   (model.hidden, model.hidden, short)]
     return tuple(shapes)
 
 
@@ -283,9 +287,9 @@ def tree_attention_allowed(model: ModelSpec) -> bool:
     """Whether the planner and the executor may run the model's tree path.
 
     A diffusion model packs canvas rows, which the tree path does not.
-    A hybrid model's Gated DeltaNet layers have no tree path.
+    A hybrid model's state layers have no tree path.
     """
-    return (not model.canvas_tokens and not model.gdn_layers
+    return (not model.canvas_tokens and not model.state_layers
             and model.params >= TREE_ATTENTION_MIN_PARAMS)
 
 

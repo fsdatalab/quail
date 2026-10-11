@@ -24,17 +24,11 @@ from quail.specs import (
 
 def test_backends_support_registered_generative_models_and_refuse_others():
     for model in MODELS.values():
-        if model.arch == "lfm2":
-            continue
         assert model.arch in supported_archs()
         assert QuailBackend().supports(model, H100_SXM, 1).supported
 
-    # the hybrid forward pass runs filters and filter chains; the executor
-    # refuses joins and prefix sharing when a plan asks for them
     assert QuailBackend().supports(QWEN3_5_4B_BF16, H100_SXM, 1).supported
-    lfm2 = QuailBackend().supports(LFM2_2_6B_BF16, H100_SXM, 1)
-    assert not lfm2.supported
-    assert "lfm2" in lfm2.reason
+    assert QuailBackend().supports(LFM2_2_6B_BF16, H100_SXM, 1).supported
 
     spec = replace(QWEN3_4B_FP8, name="other", arch="other")
     with pytest.raises(ValueError, match="other"):

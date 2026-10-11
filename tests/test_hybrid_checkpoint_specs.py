@@ -142,3 +142,34 @@ def test_lfm2_parameters_follow_the_config():
     assert len(spec.attention_layers) == 8
     # 8 layers x 2 x 8 KV heads x 64 x 2 bytes
     assert spec.kappa == 16_384
+
+
+def test_lfm2_keeps_only_convolution_columns():
+    spec = LFM2_2_6B_BF16
+    assert len(spec.short_conv_layers) == 22
+    assert len(spec.state_layers) == 30 - 8
+    assert spec.gdn_layers == ()
+    assert spec.conv_state_channels == spec.hidden == 2048
+    # two bf16 columns of 2,048 channels in each of 22 layers
+    assert spec.checkpoint_bytes == 22 * 2048 * 2 * 2
+
+
+def test_lfm2_prices_its_short_convolution_projections():
+    from quail.cost import budgets
+    from quail.cost.dense_decoder_cost import (
+        dense_params,
+        short_conv_projection_params,
+    )
+
+    spec = LFM2_2_6B_BF16
+    assert short_conv_projection_params(spec) == 22 * 4 * 2048 * 2048
+    assert dense_params(spec) > short_conv_projection_params(spec)
+    shapes = budgets._projection_shapes(spec)
+    assert (2048, 3 * 2048, 22) in shapes and (2048, 2048, 22) in shapes
+    assert not budgets.tree_attention_allowed(spec)
+
+
+def test_a_model_without_short_convolutions_prices_none():
+    from quail.cost.dense_decoder_cost import short_conv_projection_params
+
+    assert short_conv_projection_params(QWEN3_5_4B_BF16) == 0

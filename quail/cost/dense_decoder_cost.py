@@ -5,7 +5,8 @@ is priced from its ModelSpec shape; nothing here is Qwen3-specific.
 A mixture-of-experts model names its experts on the spec: FLOPs
 follow the params one token multiplies, weight bytes follow the
 params a full chunk reads. A hybrid model adds its Gated DeltaNet
-projections to the attention projections; the state update, the
+projections to the attention projections, and a short convolution
+model its gate and output projections; the state update, the
 convolution, and the state's movement are not priced here yet.
 """
 
@@ -40,6 +41,16 @@ def gdn_projection_params(model: ModelSpec) -> int:
     return per_layer * len(model.gdn_layers)
 
 
+def short_conv_projection_params(model: ModelSpec) -> int:
+    """Return short convolution input and output projection parameters.
+
+    Per layer: the projection to the three gates (B, C, and x, each
+    the model's width) and the output projection. The convolution
+    itself is not priced here.
+    """
+    return 4 * model.hidden * model.hidden * len(model.short_conv_layers)
+
+
 def mlp_params(model: ModelSpec) -> int:
     """Return the MLP parameters one token multiplies."""
     return _mlp_params(model, model.experts_active)
@@ -60,7 +71,7 @@ def _mlp_params(model: ModelSpec, experts: int) -> int:
 def dense_params(model: ModelSpec) -> int:
     """Return parameters used by the modeled dense components."""
     return (attention_projection_params(model) + gdn_projection_params(model)
-            + mlp_params(model))
+            + short_conv_projection_params(model) + mlp_params(model))
 
 
 def attention_pair_flops(model: ModelSpec) -> tuple[int, int]:

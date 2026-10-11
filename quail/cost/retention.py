@@ -46,6 +46,6 @@ def coefficients(model, device) -> dict:
         "sliding_pair_seconds": sliding / bandwidth,
         "sliding_window": model.sliding_window,
     }
-    if model.gdn_layers:
+    if model.state_layers:
         config["checkpoint_pages"] = checkpoint_pages(model)
     return config

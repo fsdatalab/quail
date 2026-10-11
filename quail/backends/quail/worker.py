@@ -178,16 +178,17 @@ class LoadedGpu:
 
 
 def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages) -> dict:
-    """KVArena arguments for the checkpoint slots; empty without GDN layers."""
-    if not spec.gdn_layers:
+    """KVArena arguments for the checkpoint slots; empty without state layers."""
+    if not spec.state_layers:
         return {}
-    layers = len(spec.gdn_layers)
+    layers = len(spec.state_layers)
     return {
         "n_state_slots": budgets.checkpoint_slots(
             spec, device, chunk_tokens, kv_pages),
         "gdn_state_shape": (layers, spec.gdn_value_heads,
                             spec.gdn_value_dim, spec.gdn_key_dim),
-        "conv_state_shape": (layers, spec.conv_width - 1, spec.conv_channels),
+        "conv_state_shape": (layers, spec.conv_width - 1,
+                             spec.conv_state_channels),
     }
 
 

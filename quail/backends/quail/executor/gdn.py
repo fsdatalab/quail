@@ -256,8 +256,9 @@ def l2_normalize(x):
     return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + L2_EPS)
 
 
-def causal_conv_reference(x, weight, lengths, history=None, bias=None):
-    """Depthwise causal convolution then SiLU, per sequence of packed rows.
+def causal_conv_reference(x, weight, lengths, history=None, bias=None,
+                          activate=True):
+    """Depthwise causal convolution, then SiLU, per sequence of packed rows.
 
     Args:
         x: (rows, channels) inputs of the sequences back to back.
@@ -267,6 +268,8 @@ def causal_conv_reference(x, weight, lengths, history=None, bias=None):
         history: (sequences, width - 1, channels) input columns before
             each sequence, oldest first; None means zeros.
         bias: Optional (channels,) bias.
+        activate: Whether SiLU follows the convolution; a short
+            convolution layer has none.
 
     Returns:
         (output with x's shape, tails), where tails is
@@ -298,7 +301,7 @@ def causal_conv_reference(x, weight, lengths, history=None, bias=None):
     if bias is not None:
         out += bias.float()
     tails = _conv_tails(x, lengths_t, starts, history, width)
-    return F.silu(out).to(x.dtype), tails
+    return (F.silu(out) if activate else out).to(x.dtype), tails
 
 
 def _conv_tails(x, lengths, starts, history, width):
@@ -397,7 +400,8 @@ def _conv_triton_kernel():
     def conv_silu(x_ptr, w_ptr, bias_ptr, hist_ptr, seq_ptr, within_ptr,
                   out_ptr, channels, stride_x, stride_hs, stride_ht,
                   stride_o, W: tl.constexpr, BLOCK: tl.constexpr,
-                  HAS_HIST: tl.constexpr, HAS_BIAS: tl.constexpr):
+                  HAS_HIST: tl.constexpr, HAS_BIAS: tl.constexpr,
+                  ACTIVATE: tl.constexpr):
         row = tl.program_id(0)
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = cols < channels
@@ -421,7 +425,10 @@ def _conv_triton_kernel():
         if HAS_BIAS:
             acc += tl.load(bias_ptr + cols, mask=mask,
                            other=0.0).to(tl.float32)
-        out = acc * tl.sigmoid(acc)
+        if ACTIVATE:
+            out = acc * tl.sigmoid(acc)
+        else:
+            out = acc
         tl.store(out_ptr + row * stride_o + cols,
                  out.to(out_ptr.dtype.element_ty), mask=mask)
 
@@ -429,7 +436,7 @@ def _conv_triton_kernel():
     return _CONV_KERNEL
 
 
-def causal_conv_kernel(x, weight, phase, history, bias=None):
+def causal_conv_kernel(x, weight, phase, history, bias=None, activate=True):
     """The same convolution as one Triton kernel over the packed rows.
 
     Args:
@@ -440,6 +447,7 @@ def causal_conv_kernel(x, weight, phase, history, bias=None):
         history: (sequences, width - 1, channels) input columns before
             each sequence, or None for zeros.
         bias: Optional (channels,) bias.
+        activate: Whether SiLU follows the convolution.
 
     Returns:
         (output with x's shape, tails), as causal_conv_reference does.
@@ -466,7 +474,7 @@ def causal_conv_kernel(x, weight, phase, history, bias=None):
         hist.stride(0) if has_history else 0,
         hist.stride(1) if has_history else 0, out.stride(0),
         W=width, BLOCK=block, HAS_HIST=has_history,
-        HAS_BIAS=bias is not None, num_warps=4)
+        HAS_BIAS=bias is not None, ACTIVATE=activate, num_warps=4)
     tails = _conv_tails(x, lengths, starts, history, width)
     return out, tails
 
@@ -518,6 +526,42 @@ def gated_rms_norm(x, gate, weight, eps):
                                      + eps)
     scaled = weight * normed.to(x.dtype)
     return (scaled.float() * F.silu(gate.float())).to(x.dtype)
+
+
+def short_conv_core(inputs, weight, phases, arena, layer_slot, *, use_kernels):
+    """Run one short convolution layer's causal convolution.
+
+    Args:
+        inputs: (rows, channels) gated input, B times x.
+        weight: (channels, width) filter taps; the last is the current row.
+        phases: The chunk's phases from plan_phases.
+        arena: KVArena holding the checkpoint pools.
+        layer_slot: Index of this layer among the state layers.
+        use_kernels: Whether the convolution runs the Triton kernel.
+
+    Returns:
+        (rows, channels) convolution outputs, with no activation.
+    """
+    import torch
+
+    out = torch.zeros_like(inputs)
+    for phase in phases:
+        if phase is None:
+            continue
+        mixed = inputs.index_select(0, phase.rows)
+        history = (None if phase.read_slots is None
+                   else arena.conv_state[phase.read_slots, layer_slot])
+        if use_kernels:
+            mixed, tails = causal_conv_kernel(
+                mixed, weight, phase, history, None, activate=False)
+        else:
+            mixed, tails = causal_conv_reference(
+                mixed, weight, phase.lengths, history, None, activate=False)
+        if phase.write_slots is not None:
+            arena.conv_state[phase.write_slots, layer_slot] = tails
+        if phase.output:
+            out.index_copy_(0, phase.rows, mixed)
+    return out
 
 
 def gdn_core(geometry, tensors, phases, arena, layer_slot, *, use_kernels):
