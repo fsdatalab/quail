@@ -209,13 +209,18 @@ class HashModel:
             cu = wave["cu_host"]
             assert wave["n"] == len(cu) - 1
             pending = []
+            landed = []
             for i in range(len(cu) - 1):
-                segment = rows[cu[i]:cu[i + 1]]
-                first = segment[0]
-                assert segment == list(range(first, first + len(segment))), \
-                    "a segment's rows are contiguous"
+                sequence = rows[cu[i]:cu[i + 1]]
+                lead, segment = sequence[:wave["lead_host"][i]], \
+                    sequence[wave["lead_host"][i]:]
+                for piece in (lead, segment):
+                    assert piece == list(range(piece[0], piece[0] + len(piece))) \
+                        if piece else True, "a segment's rows are contiguous"
+                first = sequence[0]
                 assert not covered.intersection(segment), "a row in two segments"
                 covered.update(segment)
+                landed += [cu[i] + len(lead) + k for k in range(len(segment))]
                 init, save = wave["init_host"][i], wave["save_host"][i]
                 assert wave["has_init"][i].item() == bool(init)
                 if init:
@@ -226,12 +231,19 @@ class HashModel:
                 assert h == self._prev[first], (
                     f"the segment at row {first} (position {positions[first]}) "
                     f"starts from the state of another prefix")
-                for row in segment:
+                # the lead rows rerun another segment's rows: their chain
+                # must match too, and their outputs are dropped
+                for row in sequence:
                     assert self._prev[row] == h, "the KV and state chains differ"
                     h = mix(h, ids[row])
                     assert h == hashes[row]
                 if save:
                     pending.append((save, h))
+            if any(wave["lead_host"]):
+                assert wave["scatter"].tolist() == landed
+                assert wave["out_rows"].tolist() == [rows[k] for k in landed]
+            else:
+                assert wave["scatter"] is None and wave["out_rows"] is None
             if pending:
                 assert wave["save_index"].tolist() == [
                     i for i in range(len(cu) - 1) if wave["save_host"][i]]
