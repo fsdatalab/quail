@@ -12,7 +12,7 @@ One method, with two paths chosen by the document's own line count:
 - A document of 3 or more lines is answered by locating, then
   scoring. The document is shown with its non-empty lines numbered,
   as `cat -n` would; the cue "The answer is in lines " has the model
-  write a range a-b; the prompt continues with ', and begins "', and
+  write a range a-b; the prompt continues with ', and reads "', and
   the start step above runs with the tokens of lines a to b as the
   only allowed starts, the first token of line a always among them.
   From each start the tokens up to the start of line b are fed in one
@@ -94,24 +94,26 @@ LOCATE_MIN_LINES = 3    # documents with fewer lines are scored directly
 LINE_MAX_TOKENS = 8
 TOP_K = (1, 4, 8)
 
-BODY_TEMPLATE = ("DOCUMENT:\n{0}\n\nAnswer the question with the shortest exact "
-                 "phrase copied from the document: a name, a number, a date, or a "
-                 "few words, never a whole sentence. If the document does not "
-                 "answer it, answer none.\nQuestion: {1}")
+# what an answer is, the same on both paths
+ANSWER_INSTRUCTION_TEXT = (
+    "Answer the question with the shortest exact phrase copied from the "
+    "document: a name, a number, a date, or a few words, never a whole "
+    "sentence. If the document does not answer it, answer none.")
+BODY_TEMPLATE = "DOCUMENT:\n{0}\n\n" + ANSWER_INSTRUCTION_TEXT + "\nQuestion: {1}"
 RAW_PROMPT_TEMPLATE = "{0}\nANSWER: \""
 CHAT_TURN_TEMPLATE = ("<|im_start|>user\n{0}<|im_end|>\n<|im_start|>assistant\n"
                       "<think>\n\n</think>\n\n")
 CHAT_PROMPT_TEMPLATE = CHAT_TURN_TEMPLATE + '"'
-LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\nAnswer the question with "
-                      "the line numbers of the fewest lines that contain the "
-                      "answer, as START-END, for example 3-3 or 5-6. If the "
-                      "document does not answer it, answer none.\nQuestion: {1}")
+LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\n" + ANSWER_INSTRUCTION_TEXT
+                      + " First give the line numbers of the fewest lines that "
+                      "contain the phrase, as START-END, for example 3-3 or 5-6, "
+                      "then quote the phrase.\nQuestion: {1}")
 # the answer is begun for the model, as the open quote begins the
 # scoring path's answer, so it writes the range and nothing else
 LINE_CUE = "The answer is in lines "
 RAW_LINE_TEMPLATE = "{0}\nANSWER: " + LINE_CUE
 CHAT_LINE_TEMPLATE = CHAT_TURN_TEMPLATE + LINE_CUE
-BEGINS_CUE = ', and begins "'
+BEGINS_CUE = ', and reads "'
 
 
 def _squad_questions(n: int) -> list[dict]:
