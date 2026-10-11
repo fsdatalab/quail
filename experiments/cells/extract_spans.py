@@ -10,11 +10,14 @@ the same prompt, with no training:
   first token must come from the document, each later token is the
   next document token or a closing quote, and the answer stops at the
   first step where the quote beats the copy.
-- lines: the document is shown as numbered lines of at most 100
-  characters, and the model answers with a START-END line range; the
-  answer is the text of those lines. Recorded as text F1, as whether
-  the range contains the reference span, and as whether it is exactly
-  the reference's line range.
+- lines: the document is shown with its own non-empty lines numbered,
+  as `cat -n` would, and the model answers with a START-END line
+  range; the answer is the text of those lines. Recorded as text F1,
+  as whether the range contains the reference span, and as whether it
+  is exactly the reference's line range.
+- combined: the lines answer when the document has more than one
+  line, the scored answer when it is one line. No extra passes; it is
+  scored from the two above.
 - scored: the top-k start tokens are read in one step; after each
   candidate start the next CHUNK document tokens are fed in one pass,
   and every (start, end) span is scored as the product of its copy
@@ -107,8 +110,9 @@ CHAT_TURN_TEMPLATE = ("<|im_start|>user\n{0}<|im_end|>\n<|im_start|>assistant\n"
                       "<think>\n\n</think>\n\n")
 CHAT_PROMPT_TEMPLATE = CHAT_TURN_TEMPLATE + '"'
 # the lines baseline: the document is shown as numbered lines of at
-# most LINE_WIDTH characters, and the model answers with line numbers
-LINE_WIDTH = 100
+# the document's own non-empty lines, and the model answers with line
+# numbers; a document that is one line is answered by the scored
+# method instead (the "combined" method)
 LINE_MAX_TOKENS = 8
 LINE_BODY_TEMPLATE = ("DOCUMENT, as numbered lines:\n{0}\n\nAnswer the question with "
                       "the line numbers of the fewest lines that contain the "
@@ -231,22 +235,17 @@ def _align(text: str, context: str) -> tuple[str, str]:
 
 
 def _lines(context: str) -> list[tuple[int, int]]:
-    """Character ranges of the context cut into lines of at most LINE_WIDTH.
+    """Character ranges of the context's non-empty lines, as `cat -n` numbers them.
 
-    A cut falls at the last space before the limit when there is one,
-    so words stay whole; the text itself is unchanged.
+    Blank lines get no number, so the model does not have to count
+    them; the text of each line is unchanged.
     """
     out, start = [], 0
-    while start < len(context):
-        end = min(start + LINE_WIDTH, len(context))
-        if end < len(context):
-            space = context.rfind(" ", start + 1, end + 1)
-            if space > start:
-                end = space
-        out.append((start, end))
-        start = end
-        while start < len(context) and context[start] == " ":
-            start += 1
+    for line in context.split("\n"):
+        end = start + len(line)
+        if line.strip():
+            out.append((start, end))
+        start = end + 1
     return out
 
 
@@ -564,6 +563,7 @@ def measure(model: str, dataset: str, n: int, run: str) -> dict:
                              and gold_range[1] <= chosen[1]),
             "exact": chosen is not None and chosen == gold_range,
             "em_f1": _f1(line_answer, q["answers"])}
+        rec["structured"] = len(lines) > 1
 
         (lp,) = scorer.cues([prompt_ids])
         candidates, none_lp, best_lp, rounds = _candidates(
@@ -600,6 +600,10 @@ def measure(model: str, dataset: str, n: int, run: str) -> dict:
                 rec["scored"][f"{'renorm' if renormalized else 'full'}_k{k}"] = {
                     "text": answer, "em_f1": _f1(answer, q["answers"])}
         rec["passes"] = passes
+        # the combined method: the lines answer when the document has
+        # its own lines, the scored answer when it is one line
+        rec["combined"] = (rec["lines"]["em_f1"] if rec["structured"]
+                           else rec["scored"]["full_k8"]["em_f1"])
         if rec["gold_rank"] >= 0:
             branch = branches[rec["gold_rank"]]
             others = [max(_scores(b, False)) for i, b in enumerate(branches)
@@ -633,6 +637,8 @@ def measure(model: str, dataset: str, n: int, run: str) -> dict:
         "free_alignment": {how: sum(r["free"]["how"] == how for r in items)
                            for how in ("exact", "case", "fuzzy", "none", "empty")},
         "lines": em_f1(lambda r: r["lines"]["em_f1"]),
+        "combined": em_f1(lambda r: r["combined"]),
+        "combined_used_lines": sum(r["structured"] for r in items),
         "lines_contains_gold": mean([r["lines"]["contains"] for r in items]),
         "lines_exact_range": mean([r["lines"]["exact"] for r in items]),
         "lines_unparsed": sum(not r["lines"]["parsed"] for r in items),
