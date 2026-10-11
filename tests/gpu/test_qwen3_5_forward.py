@@ -391,15 +391,19 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(
     anchor, frame = ids[:60], ids[60:64]
     partners = [ids[64:68], prompts[2][-4:], prompts[3][-4:]]
     f = len(anchor)
-    separate = []
+    separate, separate_layers = [], None
     for index, partner in enumerate(partners):
         key = ("one", index)
         arena.activate(key, f + len(frame) + len(partner),
                        capacity_tokens=f + 32, base_tokens=f)
-        rows = _layer_output(pipeline, pack_chunk(
+        one = pack_chunk(
             torch, arena, [dict(key=key, prefix=anchor + frame, f=f + len(frame),
                                 suffixes=[partner])],
-            attention_mode="unified"))
+            attention_mode="unified")
+        if index == 0:
+            separate_layers = [rows[f + len(frame):]
+                               for rows in _per_layer_outputs(pipeline, one)]
+        rows = _layer_output(pipeline, one)
         separate.append(rows[f + len(frame):])
         arena.free_key(key)
     # the last two partners are the same question tail, so their
@@ -418,7 +422,8 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(
     assert [w["n"] for w in plan["waves"]] == [1, 3]
     covered = torch.cat([w["rows"] for w in plan["waves"]]).sort().values
     assert covered.tolist() == list(range(chunk.tokens))
-    together = _layer_output(pipeline, chunk)
+    together_layers = _per_layer_outputs(pipeline, chunk)
+    together = together_layers[-1]
     _null_slot_is_zero(arena)
     kept = arena.state_slot_at(key, f + len(frame))
     pools = [pipeline.arena.state_pools(layer) for layer in sorted(arena.state_layers)]
@@ -427,7 +432,17 @@ def test_partners_read_the_kept_state_and_leave_it_unchanged(
     again = pack_chunk(torch, arena, [
         dict(key=key, prefix=None, f=f + len(frame), suffixes=partners)],
         attention_mode="unified")
-    repeated = _layer_output(pipeline, again)
+    again_layers = _per_layer_outputs(pipeline, again)
+    repeated = again_layers[-1]
+    first = f + len(frame), f + len(frame) + len(partners[0])
+    print(json.dumps(dict(
+        together_vs_again_by_layer=[
+            round(_relative(t[first[0]:first[1]],
+                            a[:len(partners[0])]).median().item(), 4)
+            for t, a in zip(together_layers, again_layers)],
+        again_vs_separate_by_layer=[
+            round(_relative(a[:len(partners[0])], s_).median().item(), 4)
+            for a, s_ in zip(again_layers, separate_layers)])))
     for key_ in chunk.temporary_keys + again.temporary_keys:
         arena.free_key(key_)
     after = [(s[kept], c[kept]) for s, c in pools]
