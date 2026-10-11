@@ -38,6 +38,11 @@ def test_params_follow_the_checkpoint_dimensions():
     assert abs(dense_params(SPEC) - expected) / expected < 0.03
     assert SPEC.head_mem_bytes == 248_320 * 5120 * 2
     assert SPEC.W_mem == 29.63e9
+    # the chat turn with thinking off, as the template renders it with
+    # enable_thinking false
+    assert SPEC.turn == ("<|im_start|>user\n",
+                         "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    assert SPEC.prompt_format == "qwen3_5-chat-nonthinking-v1"
     assert budgets.minimum_weight_gpus(SPEC, H100_SXM) == 1
     assert not tree_attention_allowed(SPEC)
 

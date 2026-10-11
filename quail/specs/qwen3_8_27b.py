@@ -38,6 +38,11 @@ QWEN3_8_27B_FP8 = ModelSpec(
     # against 30.9e9 bytes of safetensors that include the
     # multi-token-prediction layer and the vision tower vLLM skips.
     w_mem_bytes=29.63e9,
+    # the chat template's turn with thinking off; a raw prompt makes the
+    # model open a <think> block, and no answer names a label
+    turn_prefix="<|im_start|>user\n",
+    turn_suffix="<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    prompt_format="qwen3_5-chat-nonthinking-v1",
     vocab=248_320,
     tied_head=False,
     # vLLM's model type; Quail's executor has no forward pass for it,
