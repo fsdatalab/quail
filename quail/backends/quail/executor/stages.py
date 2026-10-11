@@ -421,6 +421,7 @@ class _StageExecutor:
         entries = []
         pair_keys = []
         planned = 0
+        pairs = 0
         for a, j, start, end, _ in chunk_groups:
             stage = self.stages[j]
             if (stage.append or self.appended[a] or stage.canvas is not None
@@ -433,10 +434,14 @@ class _StageExecutor:
             sufs = self.suffixes[j].take(indices)
             planned += len(indices) * f + int(sufs.lengths.sum()) \
                 + len(indices) * len(frame_ids)
-        if planned > room and len(chunk_groups) > 1:
+            pairs += len(indices) * (1 if stage.single or not len(frame_ids)
+                                     else 2)
+        free_slots = len(self.arena.accounting.free_slots)
+        if (planned > room or pairs > free_slots) and len(chunk_groups) > 1:
             raise ArenaFullError(
-                f"recomputed prefixes ask {planned} rows of {room}; "
-                f"split the chunk (groups {len(chunk_groups)})")
+                f"recomputed prefixes ask {planned} rows of {room} and "
+                f"{pairs} slots of {free_slots}; split the chunk "
+                f"(groups {len(chunk_groups)})")
         try:
             for a, j, start, end, _ in chunk_groups:
                 stage = self.stages[j]

@@ -96,10 +96,20 @@ def profile(model: str) -> dict:
         return wrapper
 
     pipeline._gated_delta_net = timed("gdn_layer", pipeline._gated_delta_net)
+    import quail.backends.quail.executor.models.qwen3_5 as pipeline_module
+    pipeline_module.gdn_core = timed("gdn_core", pipeline_module.gdn_core)
     pipeline._attention = timed("attention_layer", pipeline._attention)
     pipeline._mlp = timed("mlp", pipeline._mlp)
-    gdn.causal_conv_reference = timed("gdn_convolution",
+    gdn.causal_conv_kernel = timed("gdn_convolution", gdn.causal_conv_kernel)
+    gdn.causal_conv_reference = timed("gdn_convolution_reference",
                                       gdn.causal_conv_reference)
+    mixer = pipeline.gdn_layer.linear_attn
+    for name in ("in_proj_qkvz", "in_proj_ba", "norm", "out_proj"):
+        for layer in pipeline.layers:
+            if hasattr(layer, "linear_attn"):
+                module = getattr(layer.linear_attn, name)
+                module.forward = timed(f"gdn_{name}", module.forward)
+    del mixer
     gdn.gated_delta_kernel = timed("gdn_recurrence_kernel",
                                    gdn.gated_delta_kernel)
     pipeline.embed = timed("embedding", pipeline.embed)
