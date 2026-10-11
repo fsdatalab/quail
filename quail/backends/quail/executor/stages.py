@@ -5,6 +5,7 @@ The shared admission scheduler combines documents at different stages in
 each forward pass and releases KV when a document finishes or is removed.
 """
 
+import os
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -311,6 +312,9 @@ class _StageExecutor:
             stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,
         )
+        self.recompute_state = (os.environ.get("QUAIL_RECOMPUTE_STATE") == "1"
+                                and self.paged
+                                and bool(getattr(self.arena, "n_state_slots", 0)))
         if self.paged and getattr(self.arena, "n_state_slots", 0):
             # a document holds a checkpoint slot, and a second one once
             # a later stage extends it
@@ -397,10 +401,105 @@ class _StageExecutor:
         """Return whether the group packs its frame and suffix as one entry."""
         return self.stages[j].single and end - start == 1
 
+    def _build_recomputing(self, chunk_groups):
+        """Pack a chunk whose every suffix carries its own copy of the document.
+
+        Each partner suffix runs as a sequence of the document, the
+        stage's frame, and the suffix, from a zero state, under a
+        temporary key that the forward pass frees. No document key is
+        activated, so nothing a later stage or operator could read is
+        written.
+        """
+        from quail.backends.quail.executor.chunk import (
+            ArenaFullError,
+            Suffixes,
+            pack_chunk,
+        )
+
+        room = self.sched.chunk_budget
+        specs = []
+        entries = []
+        pair_keys = []
+        planned = 0
+        for a, j, start, end, _ in chunk_groups:
+            stage = self.stages[j]
+            if (stage.append or self.appended[a] or stage.canvas is not None
+                    or self.read_rows[j] is not None):
+                raise ValueError(
+                    "recomputing state supports plain filter and join stages")
+            f = self.prefix_lengths[a]
+            frame_ids = np.asarray(self.frame_ids[j])
+            indices = list(self.sched.partner_indices(a, j, start, end))
+            sufs = self.suffixes[j].take(indices)
+            planned += len(indices) * f + int(sufs.lengths.sum()) \
+                + len(indices) * len(frame_ids)
+        if planned > room and len(chunk_groups) > 1:
+            raise ArenaFullError(
+                f"recomputed prefixes ask {planned} rows of {room}; "
+                f"split the chunk (groups {len(chunk_groups)})")
+        try:
+            for a, j, start, end, _ in chunk_groups:
+                stage = self.stages[j]
+                f = self.prefix_lengths[a]
+                frame = self.frame_ids[j]
+                read_all = stage.read_all_rows
+                for n, index in enumerate(
+                        self.sched.partner_indices(a, j, start, end)):
+                    one = self.suffixes[j].take([index])
+                    pair = (self.keys[a], "recompute", j, start + n)
+                    got = self.arena.activate(
+                        pair, f, capacity_tokens=f + self.capacity_extra,
+                        base_tokens=f)
+                    if got is None:
+                        raise ArenaFullError(
+                            f"no pages for the recomputed copy of "
+                            f"{self.keys[a]!r}; split the chunk")
+                    pair_keys.append(pair)
+                    rows = int(one.lengths.sum()) if read_all else 1
+                    if len(frame) and stage.single:
+                        specs.append(dict(
+                            key=pair, prefix=self.prefixes[a], start=0,
+                            read_key=None, f=f, suffixes=Suffixes(
+                                np.concatenate([frame, one.ids]),
+                                [len(frame) + int(one.lengths[0])]),
+                            write_suffix_tokens=0, single=True,
+                            read_all_rows=read_all))
+                    elif len(frame):
+                        specs.append(dict(
+                            key=pair, prefix=self.prefixes[a], start=0,
+                            read_key=None, f=f,
+                            suffixes=Suffixes(frame, [len(frame)]),
+                            write_suffix_tokens=len(frame)))
+                        entries.append((j, 1))
+                        specs.append(dict(
+                            key=pair, prefix=None, f=f + len(frame),
+                            suffixes=one, read_all_rows=read_all,
+                            write_suffix_tokens=0, chains=stage.chains))
+                    else:
+                        specs.append(dict(
+                            key=pair, prefix=self.prefixes[a], start=0,
+                            read_key=None, f=f, suffixes=one,
+                            read_all_rows=read_all, write_suffix_tokens=0,
+                            single=stage.single, chains=stage.chains))
+                    entries.append((j, rows))
+            chunk = pack_chunk(
+                self.torch, self.arena, specs, attention_mode=self.mode,
+                staging=self.staging, canvas=self.canvas,
+                answer_row=self.answer_row)
+        except Exception:
+            for pair in pair_keys:
+                if self.arena.is_resident(pair):
+                    self.arena.free_key(pair)
+            raise
+        chunk.temporary_keys = tuple(chunk.temporary_keys) + tuple(pair_keys)
+        return chunk, entries
+
     def _build(self, chunk_groups):
         """Pack a chunk and identify each entry's stage and answer row count."""
         from quail.backends.quail.executor.chunk import Suffixes, pack_chunk
 
+        if self.recompute_state:
+            return self._build_recomputing(chunk_groups)
         specs = []
         entries = []
         appended = {}

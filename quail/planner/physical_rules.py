@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
@@ -101,6 +102,8 @@ class KvRetention:
         if context is None or context.logical_plan is None \
                 or "retention" in context.settings:
             return None
+        if os.environ.get("QUAIL_RECOMPUTE_STATE") == "1":
+            return None    # no document state is kept for a later operator
         logical = context.logical_plan
         statistics = cached_statistics(
             logical, context.memo, model=context.model, device=context.device,
