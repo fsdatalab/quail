@@ -28,10 +28,12 @@ def test_backends_support_registered_generative_models_and_refuse_others():
         assert model.arch in supported_archs()
         assert QuailBackend().supports(model, H100_SXM, 1).supported
 
-    # Quail has no hybrid forward pass yet; stock vLLM runs the model
+    # the forward pass exists, but the planner cannot yet avoid rewind and
+    # prefix sharing; stock vLLM runs the model
     hybrid = QuailBackend().supports(QWEN3_5_4B_BF16, H100_SXM, 1)
     assert not hybrid.supported
     assert "qwen3_5" in hybrid.reason
+    assert "qwen3_5" in supported_archs()
 
     spec = replace(QWEN3_4B_FP8, name="other", arch="other")
     with pytest.raises(ValueError, match="other"):

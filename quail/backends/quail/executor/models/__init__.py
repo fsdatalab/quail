@@ -9,8 +9,10 @@ from quail.backends.quail.executor.models.diffusion_gemma import (
     DiffusionGemmaPipeline,
 )
 from quail.backends.quail.executor.models.qwen3 import Qwen3Pipeline
+from quail.backends.quail.executor.models.qwen3_5 import Qwen35Pipeline
 
 PIPELINES = {"qwen3": Qwen3Pipeline,
+             "qwen3_5": Qwen35Pipeline,
              "diffusion_gemma": DiffusionGemmaPipeline}
 
 
