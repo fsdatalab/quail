@@ -137,3 +137,51 @@ def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
     # the parent still holds the borrowed page; one own page goes free
     assert a.drop_leading("s", 2) == 1
     assert a.borrowed["s"] == [] and len(a.owned["s"]) == 1
+
+
+def test_state_slots_by_role_rewind_and_shares():
+    from quail.backends.quail.executor.arena import StateAccounting
+
+    with pytest.raises(ValueError, match="slot 0"):
+        StateAccounting(0)
+    s = StateAccounting(6)
+    # slot 0 is the kernels' zero state and is never issued
+    assert s.free_slots == 5 and 0 not in s.free
+    assert s.alloc("A", 3) == [1, 2, 3]
+    assert s.alloc("B", 3) is None
+    assert s.alloc("B", 1) == [4]
+    with pytest.raises(KeyError):
+        s.alloc("A", 1)
+    assert s.owned_count("A") == 3 and s.owned_count("missing") == 0
+
+    # a share point inside the prefix, then the base, then the kept slot
+    assert s.claim("A", 64, "share") == 1
+    assert s.claim("A", 64, "share") == 1
+    assert s.claim("A", 100, "base") == 2
+    assert s.claim("A", 105, "kept") == 3
+    assert s.slot_at("A", 105) == 3 and s.slot_at("A", 99) is None
+    with pytest.raises(ValueError, match="base state moves"):
+        s.claim("A", 101, "base")
+    with pytest.raises(ValueError, match="unknown"):
+        s.claim("A", 101, "other")
+    # the kept slot is repointed as the frame or appended path moves
+    assert s.claim("A", 110, "kept") == 3
+    assert s.slot_at("A", 105) is None and s.slot_at("A", 110) == 3
+    with pytest.raises(ValueError, match="exceeds its 3 reserved"):
+        s.claim("A", 32, "share")
+
+    # rewinding to the base frees the kept slot; the share slot stays
+    # until the borrowers are gone; spare slots go too
+    assert s.grow("A", 4) == 1 and s.owned_count("A") == 4
+    assert s.grow("A", 4) == 0 and s.grow("A", 9) is None
+    assert s.rewind("A", 100) == 2
+    assert s.owned["A"] == [1, 2] and s.slot_at("A", 110) is None
+    assert "A" not in s.kept
+    assert s.drop_shares("A") == 1
+    assert s.owned["A"] == [2] and s.slot_at("A", 64) is None
+    assert s.drop_shares("B") == 0
+    assert s.free_key("A") == 1
+    assert s.free_slots == 4 and "A" not in s.owned
+    assert s.claim("B", 50, "base") == 4
+    assert s.free_key("B") == 1
+    assert sorted(s.free) == [1, 2, 3, 4, 5]

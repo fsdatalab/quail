@@ -58,6 +58,10 @@ def bare_arena(arena, pages):
     arena._deferred = set()
     arena._window_floor = {}
     arena._trimmed = set()
+    arena.state = None
+    arena.state_layers = frozenset()
+    arena.s_pool = arena.conv_pool = {}
+    arena._slot_pages = 0
     arena._refresh_rows = lambda *args: None
     arena.reset_stats()
     return arena
@@ -103,7 +107,7 @@ def cpu_arena(pages):
     arena = bare_arena(KVArena.__new__(KVArena), pages)
 
     def allocate(key, tokens, capacity_tokens=None, base_tokens=None,
-                 sliding_tokens=None, borrow=None):
+                 sliding_tokens=None, borrow=None, slots=0):
         borrowed = (arena.accounting.shared_pages(*borrow) if borrow else ())
         got = arena.accounting.alloc(key, tokens, capacity_tokens,
                                      borrowed=borrowed)
