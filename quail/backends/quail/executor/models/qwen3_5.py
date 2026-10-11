@@ -196,13 +196,8 @@ class Qwen35Pipeline(ModelPipeline):
             out = self._wave(linear, wave, mixed_qkv, a, b, pools)
             if wave["rows"] is None:
                 core = out
-            elif wave["scatter"] is None:
-                core.index_copy_(0, wave["rows"], out)
             else:
-                # a segment that reran another's rows ahead of its own
-                # drops their outputs
-                core.index_copy_(0, wave["out_rows"],
-                                 out.index_select(0, wave["scatter"]))
+                core.index_copy_(0, wave["rows"], out)
         head = linear.head_v_dim
         gated = linear.norm(core.reshape(-1, head), z.reshape(-1, head))
         return engine.gemm(*engine.quant(gated.reshape(n, -1)), linear.out_proj)
@@ -275,5 +270,4 @@ class Qwen35Pipeline(ModelPipeline):
         m = cu.numel() - 1
         return dict(rows=None, cu=cu, n=m, init=None,
                     has_init=torch.zeros(m, dtype=torch.bool, device=cu.device),
-                    save_index=None, save_slots=None, scatter=None,
-                    out_rows=None)
+                    save_index=None, save_slots=None)

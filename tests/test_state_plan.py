@@ -36,65 +36,49 @@ def test_two_stage_filter_with_same_chunk_borrowing(monkeypatch):
     ], attention_mode="unified")
     a_share, a_base, a_kept = 1, 2, 3
     b_base, b_kept = 4, 5
-    # the shared 64 rows and the frames are short, so the segments
-    # that start from their slots rerun them as leads in the same
-    # wave instead of waiting for the slots
     assert _segments(chunk) == [
-        (a, 0, 64, 0, 0, a_share, 0, None),
-        (a, 64, 100, 64, 0, a_base, 0, (0, 64)),
-        (a, 100, 105, 100, a_base, a_kept, 1, None),
-        (a, 105, 108, 105, a_base, 0, 1, (100, 105)),
-        (b, 108, 134, 64, 0, b_base, 0, (0, 64)),
-        (b, 134, 139, 90, b_base, b_kept, 1, None),
-        (b, 139, 142, 95, b_base, 0, 1, (134, 139)),
+        (a, 0, 64, 0, 0, a_share, 0),
+        (a, 64, 100, 64, a_share, a_base, 1),
+        (a, 100, 105, 100, a_base, a_kept, 2),
+        (a, 105, 108, 105, a_kept, 0, 3),
+        (b, 108, 134, 64, a_share, b_base, 1),
+        (b, 134, 139, 90, b_base, b_kept, 2),
+        (b, 139, 142, 95, b_kept, 0, 3),
     ]
     assert arena.state_slot_at(a, 64) == a_share
     assert arena.state_slot_at(a, 100) == a_base
     assert arena.state_slot_at(a, 105) == a_kept
     assert arena.state_slot_at(b, 95) == b_kept
     plan = chunk.meta["state"]
-    assert plan["max_sequences"] == 4
+    assert plan["max_sequences"] == 2
     waves = plan["waves"]
-    assert len(waves) == 2
-    shared = list(range(64))
-    assert waves[0]["rows"].tolist() == (
-        shared + shared + list(range(64, 100)) + shared + list(range(108, 134)))
-    assert waves[0]["cu_host"] == [0, 64, 164, 254]
-    assert waves[0]["lead_host"] == [0, 64, 64]
-    assert waves[0]["init_host"] == [0, 0, 0]
-    assert waves[0]["save_host"] == [a_share, a_base, b_base]
-    assert waves[0]["has_init"].tolist() == [False, False, False]
-    assert waves[0]["save_index"].tolist() == [0, 1, 2]
-    assert waves[0]["save_slots"].tolist() == [a_share, a_base, b_base]
-    # the outputs of the reruns are dropped: the wave lands rows 0-63
-    # once, then 64-99 and 108-133
-    assert waves[0]["scatter"].tolist() == (
-        shared + list(range(128, 164)) + list(range(228, 254)))
-    assert waves[0]["out_rows"].tolist() == (
-        shared + list(range(64, 100)) + list(range(108, 134)))
-    frame_a, frame_b = list(range(100, 105)), list(range(134, 139))
-    assert waves[1]["rows"].tolist() == (
-        frame_a + frame_a + [105, 106, 107] + frame_b + frame_b + [139, 140, 141])
-    assert waves[1]["cu_host"] == [0, 5, 13, 18, 26]
-    assert waves[1]["lead_host"] == [0, 5, 0, 5]
-    assert waves[1]["init_host"] == [a_base, a_base, b_base, b_base]
-    assert waves[1]["save_host"] == [a_kept, 0, b_kept, 0]
-    assert waves[1]["has_init"].tolist() == [True] * 4
-    assert waves[1]["save_index"].tolist() == [0, 2]
-    assert waves[1]["save_slots"].tolist() == [a_kept, b_kept]
-    assert waves[1]["out_rows"].tolist() == (
-        frame_a + [105, 106, 107] + frame_b + [139, 140, 141])
-    assert waves[1]["n"] == 4 and waves[1]["max_len"] == 8
+    assert len(waves) == 4
+    assert waves[0]["rows"].tolist() == list(range(64))
+    assert waves[0]["cu_host"] == [0, 64]
+    assert waves[0]["init_host"] == [0] and waves[0]["save_host"] == [a_share]
+    assert waves[0]["has_init"].tolist() == [False]
+    assert waves[0]["save_index"].tolist() == [0]
+    assert waves[0]["save_slots"].tolist() == [a_share]
+    assert waves[1]["rows"].tolist() == list(range(64, 100)) + list(range(108, 134))
+    assert waves[1]["cu_host"] == [0, 36, 62]
+    assert waves[1]["init_host"] == [a_share, a_share]
+    assert waves[1]["save_host"] == [a_base, b_base]
+    assert waves[1]["has_init"].tolist() == [True, True]
+    assert waves[2]["init_host"] == [a_base, b_base]
+    assert waves[2]["save_host"] == [a_kept, b_kept]
+    assert waves[3]["rows"].tolist() == [105, 106, 107, 139, 140, 141]
+    assert waves[3]["init_host"] == [a_kept, b_kept]
+    assert waves[3]["save_index"] is None and waves[3]["save_slots"] is None
+    assert waves[3]["n"] == 2 and waves[3]["max_len"] == 3
 
     # the second stage reads the kept state in one wave
     chunk = chunk_mod.pack_chunk(torch, arena, [
         dict(key=a, prefix=None, f=105, suffixes=[_tokens(4, 6000)]),
         dict(key=b, prefix=None, f=95, suffixes=[_tokens(4, 6000)]),
     ], attention_mode="unified")
-    assert _segments(chunk) == [(a, 0, 4, 105, a_kept, 0, 0, None),
-                                (b, 4, 8, 95, b_kept, 0, 0, None)]
+    assert _segments(chunk) == [(a, 0, 4, 105, a_kept, 0, 0),
+                                (b, 4, 8, 95, b_kept, 0, 0)]
     assert len(chunk.meta["state"]["waves"]) == 1
-    assert chunk.meta["state"]["waves"][0]["scatter"] is None
     # a survivor rewound to its document keeps the base state only
     arena.retain(a, 100)
     assert arena.state_slot_at(a, 100) == a_base
@@ -118,12 +102,11 @@ def test_join_frame_and_partners_in_one_chunk(monkeypatch):
              suffixes=[_tokens(7, 6000), _tokens(8, 7000), _tokens(9, 8000)]),
     ], attention_mode="unified")
     kept = 1
-    # the 105-row sequence is too long to rerun ahead of the partners
     assert _segments(chunk) == [
-        (x, 0, 105, 0, 0, kept, 0, None),
-        (x, 105, 112, 105, kept, 0, 1, None),
-        (x, 112, 120, 105, kept, 0, 1, None),
-        (x, 120, 129, 105, kept, 0, 1, None),
+        (x, 0, 105, 0, 0, kept, 0),
+        (x, 105, 112, 105, kept, 0, 1),
+        (x, 112, 120, 105, kept, 0, 1),
+        (x, 120, 129, 105, kept, 0, 1),
     ]
     assert arena.state_slot_at(x, 100) is None
     waves = chunk.meta["state"]["waves"]
@@ -140,41 +123,6 @@ def test_join_frame_and_partners_in_one_chunk(monkeypatch):
     assert all(seg.wave == 0 for seg in chunk.meta["state"]["segments"])
 
 
-def test_partners_rerun_a_resident_anchors_frame_in_its_wave(monkeypatch):
-    cpu_staging(monkeypatch)
-    arena = state_arena(pages=64, slots=6)
-    y = ("d", 0)
-    assert arena.activate(y, 100, capacity_tokens=120, base_tokens=100, slots=2)
-    chunk_mod.pack_chunk(torch, arena, [
-        dict(key=y, prefix=_tokens(100), f=100, suffixes=[], save_at=(100,))],
-        attention_mode="unified")
-    base = arena.state_slot_at(y, 100)
-    # as a join packs a resident anchor: the frame entry from the base
-    # state, then the partners from the kept state
-    chunk = chunk_mod.pack_chunk(torch, arena, [
-        dict(key=y, prefix=None, f=100, suffixes=[_tokens(5, 5000)],
-             write_suffix_tokens=5, save_at=(105,)),
-        dict(key=y, prefix=None, f=105,
-             suffixes=[_tokens(7, 6000), _tokens(8, 7000)]),
-    ], attention_mode="unified")
-    kept = arena.state_slot_at(y, 105)
-    assert _segments(chunk) == [
-        (y, 0, 5, 100, base, kept, 0, None),
-        (y, 5, 12, 105, base, 0, 0, (0, 5)),
-        (y, 12, 20, 105, base, 0, 0, (0, 5)),
-    ]
-    waves = chunk.meta["state"]["waves"]
-    assert len(waves) == 1
-    frame = [0, 1, 2, 3, 4]
-    assert waves[0]["rows"].tolist() == (
-        frame + frame + list(range(5, 12)) + frame + list(range(12, 20)))
-    assert waves[0]["cu_host"] == [0, 5, 17, 30]
-    assert waves[0]["scatter"].tolist() == (
-        frame + list(range(10, 17)) + list(range(22, 30)))
-    assert waves[0]["out_rows"].tolist() == list(range(20))
-    assert waves[0]["max_len"] == 13
-
-
 def test_single_pass_groups_save_nothing_and_errors(monkeypatch):
     cpu_staging(monkeypatch)
     arena = state_arena(pages=64, slots=4)
@@ -185,7 +133,7 @@ def test_single_pass_groups_save_nothing_and_errors(monkeypatch):
         attention_mode="unified")
     # one suffix and nothing to save: the prefix and suffix are one
     # sequence from the zero state
-    assert _segments(chunk) == [(key, 0, 26, 0, 0, 0, 0, None)]
+    assert _segments(chunk) == [(key, 0, 26, 0, 0, 0, 0)]
     assert arena.state.owned_count(key) == 0
     with pytest.raises(ValueError, match="unified attention"):
         chunk_mod.pack_chunk(torch, arena, [
@@ -199,8 +147,7 @@ def test_single_pass_groups_save_nothing_and_errors(monkeypatch):
         chunk_mod.pack_chunk(torch, arena, [
             dict(key=key, prefix=None, f=20, suffixes=[_tokens(6)])],
             attention_mode="unified")
-    # a kept state alone cuts the one sequence where the kept rows
-    # end; the tail reruns the short head in the same wave
+    # a kept state alone cuts the one sequence where the kept rows end
     kept_key = ("d", 2)
     assert arena.activate(kept_key, 20, capacity_tokens=40, base_tokens=20,
                           slots=1)
@@ -209,8 +156,8 @@ def test_single_pass_groups_save_nothing_and_errors(monkeypatch):
              write_suffix_tokens=2, save_at=(22,))],
         attention_mode="unified")
     slot = arena.state_slot_at(kept_key, 22)
-    assert _segments(chunk) == [(kept_key, 0, 22, 0, 0, slot, 0, None),
-                                (kept_key, 22, 26, 22, 0, 0, 0, (0, 22))]
+    assert _segments(chunk) == [(kept_key, 0, 22, 0, 0, slot, 0),
+                                (kept_key, 22, 26, 22, slot, 0, 1)]
     # a saved base needs a reserved slot
     with pytest.raises(ValueError, match="exceeds its 0 reserved"):
         chunk_mod.pack_chunk(torch, arena, [

@@ -225,13 +225,7 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
 # starts from (0 is the zero state); `save` the slot its final state
 # goes to (0 discards it); `wave` the kernel call it runs in.
 StateSegment = namedtuple("StateSegment",
-                          "key r0 r1 position init save wave lead",
-                          defaults=(None,))
-# The most rows a segment may rerun ahead of another's: a segment
-# that starts from a slot a short segment saves in the same chunk
-# runs that segment's rows first instead of waiting a wave for the
-# slot, and the rerun fits the delta-rule kernel's one tile.
-LEAD_ROWS = 64
+                          "key r0 r1 position init save wave")
 
 
 def _state_plan(arena, groups, token_count, torch, pinned):
@@ -241,20 +235,15 @@ def _state_plan(arena, groups, token_count, torch, pinned):
     state starts from and the slot its final state saves to. The slots
     are claimed here, as the KV rows are mapped here. A segment whose
     initial slot another segment of this chunk saves runs one wave
-    after it, unless that segment is at most LEAD_ROWS rows: then it
-    reruns those rows ahead of its own (its `lead`) from that
-    segment's slot, in that segment's wave, and drops their outputs.
-    A wave is one conv call and one delta-rule call per layer over
-    the wave's rows, gathered in segment order.
+    after it; a wave is one conv call and one delta-rule call per
+    layer over the wave's rows, gathered in segment order.
 
     Returns:
         meta["state"]: `segments`, the StateSegments in chunk order;
         `waves`, per wave the gather `rows`, the varlen bounds `cu`,
         the `init` slots and `has_init` flags, the `save_index` of
         the segments that save and their `save_slots` (None when none
-        does), `out_rows` and `scatter` (the rows the wave's outputs
-        land on and the outputs that land, None when no segment has a
-        lead), `n`, `max_len`, and host copies for checkers; and
+        does), `n`, `max_len`, and host copies for checkers; and
         `max_sequences`, the widest wave.
 
     Raises:
@@ -262,24 +251,15 @@ def _state_plan(arena, groups, token_count, torch, pinned):
             prefix does not end at its f.
     """
     segments = []
-    produced = {}    # slot -> the segment of this chunk that saves it
+    produced = {}    # slot -> the wave of this chunk that saves it
 
     def add(key, r0, r1, position, init, save):
         if r1 <= r0:
             return
-        maker = produced.get(init)
-        if maker is None:
-            wave, lead = 0, None
-        elif maker.lead is None and maker.r1 - maker.r0 <= LEAD_ROWS:
-            # rerun the short maker's rows from its own start instead
-            # of waiting a wave for the slot it saves
-            wave, lead, init = maker.wave, (maker.r0, maker.r1), maker.init
-        else:
-            wave, lead = maker.wave + 1, None
-        segments.append(StateSegment(key, r0, r1, position, init, save, wave,
-                                     lead))
+        wave = produced[init] + 1 if init in produced else 0
+        segments.append(StateSegment(key, r0, r1, position, init, save, wave))
         if save:
-            produced[save] = segments[-1]
+            produced[save] = wave
 
     for u in groups:
         key, f, wst = u["key"], u["f"], u["wst"]
@@ -341,27 +321,14 @@ def _state_plan(arena, groups, token_count, torch, pinned):
     waves = []
     for index in sorted(by_wave):
         segs = by_wave[index]
-        leads = [seg.lead[1] - seg.lead[0] if seg.lead else 0 for seg in segs]
-        lengths = [lead + seg.r1 - seg.r0 for lead, seg in zip(leads, segs)]
+        lengths = [seg.r1 - seg.r0 for seg in segs]
         cu = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
         init = [seg.init for seg in segs]
         saving = [i for i, seg in enumerate(segs) if seg.save]
-        pieces = []
-        for seg in segs:
-            if seg.lead:
-                pieces.append(np.arange(*seg.lead, dtype=np.int64))
-            pieces.append(np.arange(seg.r0, seg.r1, dtype=np.int64))
-        rows = np.concatenate(pieces)
-        out_rows = scatter = None
-        if any(leads):
-            # the lead rows' outputs belong to their own segment
-            scatter = np.concatenate([
-                np.arange(start + lead, start + length, dtype=np.int64)
-                for start, lead, length in zip(cu[:-1], leads, lengths)])
-            out_rows = np.concatenate([
-                np.arange(seg.r0, seg.r1, dtype=np.int64) for seg in segs])
         waves.append(dict(
-            rows=_staged(torch, rows, torch.int64, pinned),
+            rows=_staged(torch, np.concatenate([
+                np.arange(seg.r0, seg.r1, dtype=np.int64) for seg in segs]),
+                torch.int64, pinned),
             cu=_staged(torch, cu, torch.int32, pinned),
             init=_staged(torch, init, torch.int64, pinned),
             has_init=_staged(torch, [bool(slot) for slot in init], torch.bool,
@@ -370,13 +337,8 @@ def _state_plan(arena, groups, token_count, torch, pinned):
                         if saving else None),
             save_slots=(_staged(torch, [segs[i].save for i in saving],
                                 torch.int64, pinned) if saving else None),
-            out_rows=(_staged(torch, out_rows, torch.int64, pinned)
-                      if out_rows is not None else None),
-            scatter=(_staged(torch, scatter, torch.int64, pinned)
-                     if scatter is not None else None),
             n=len(segs), max_len=max(lengths), cu_host=cu.tolist(),
-            init_host=init, save_host=[seg.save for seg in segs],
-            lead_host=leads))
+            init_host=init, save_host=[seg.save for seg in segs]))
     return dict(segments=segments, waves=waves,
                 max_sequences=max((len(v) for v in by_wave.values()), default=0))
 
