@@ -268,9 +268,20 @@ class GreedyGenerator:
         if any(generation.image is not None for generation, _ in admit):
             chunk.inputs_embeds = self._embeds(chunk, active, admit)
         self.stats["mixed_pack_s"] += time.perf_counter() - started
+        timed = str(arena.device).startswith("cuda")
+        if timed:
+            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+                enable_timing=True)
+            begin.record()
         with torch.inference_mode():
             hidden = _forward(self.pipeline, arena, chunk)
-            tokens = (hidden @ self.head.t()).argmax(dim=-1).tolist()
+            tokens = (hidden @ self.head.t()).argmax(dim=-1)
+        if timed:
+            end.record()
+        tokens = tokens.tolist()
+        if timed:
+            self.stats["mixed_gpu_s"] = (self.stats.get("mixed_gpu_s", 0.0)
+                                         + begin.elapsed_time(end) / 1e3)
         for generation, capacity in admit:
             key = generation.key
             document = _Document(

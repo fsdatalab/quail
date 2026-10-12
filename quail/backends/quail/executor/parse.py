@@ -308,8 +308,18 @@ class PageParser:
         if "image_embeds" not in page:
             with torch.inference_mode():
                 return rows, self._images([page])[0]
+        import time
+
         stream = torch.cuda.current_stream()
-        stream.wait_event(page.pop("image_done"))
+        done = page.pop("image_done")
+        started = time.perf_counter()
+        # waiting on the host shows how long the vision thread kept the
+        # step waiting
+        done.synchronize()
+        stats = self.generator.stats
+        stats["image_wait_s"] = (stats.get("image_wait_s", 0.0)
+                                 + time.perf_counter() - started)
+        stream.wait_event(done)
         embeds = page.pop("image_embeds")
         # the rows were allocated on the encoding stream
         embeds.record_stream(stream)
