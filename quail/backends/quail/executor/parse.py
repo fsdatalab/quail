@@ -326,7 +326,7 @@ class PageParser:
         while True:
             admit = []
             budget = self.prefill_tokens
-            while free and not exhausted:
+            while len(admit) < len(free) and not exhausted:
                 if waiting is None:
                     started = time.perf_counter()
                     waiting = next(pending, None)
