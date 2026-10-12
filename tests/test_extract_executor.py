@@ -11,22 +11,16 @@ from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
 
 import quail
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.executor import extract as extract_mod
 from quail.backends.quail.executor.extract import (
-    CHUNK,
     LINE_MAX_TOKENS,
-    MAX_PASSES,
     ExtractStages,
     Tables,
-    best_span,
-    choose_candidates,
     document_lines,
     document_tokens,
-    make_branches,
+    first_tokens,
+    make_streams,
     numbered_text,
-    open_branches,
     parse_lines,
-    rank_starts,
     same_word,
 )
 from quail.backends.quail.executor.operators.extract import (
@@ -34,9 +28,9 @@ from quail.backends.quail.executor.operators.extract import (
     execute_extractions,
     extract_answer_table,
 )
-from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.catalog import DocumentProvider
+from quail.cost.extract import ANSWER_MAX_TOKENS
 from quail.execution.execute import execute_query
 from quail.execution.runner import (
     ExecutionContext,
@@ -173,7 +167,7 @@ def test_lines_numbering_parsing_and_token_offsets():
                if tables.vocab[ids[index - 3]] != "Ċ")
 
 
-def test_start_ranking_tells_repeated_words_apart_and_keeps_the_first():
+def test_first_tokens_follow_the_models_spelling_and_the_region():
     tables = _tables()
     text = RANKED
     ids, offsets = tables.encode(text)
@@ -181,133 +175,64 @@ def test_start_ranking_tells_repeated_words_apart_and_keeps_the_first():
     tokens = document_tokens(ids, offsets, [(0, 0, len(text))], 1)
     the, march = tables.encode_ids("The")[0], tables.encode_ids("March")[0]
     space_march = tables.encode_ids(" March")[0]
-    lp = {the: -0.5, march: -1.0, space_march: -3.0, tables.none_id: -4.0}
-    starts = rank_starts(tables, lp, prefix, tokens, None)
+    lp = {the: -0.5, march: -1.0, space_march: -3.0}
+    starts = first_tokens(tables, lp, prefix, tokens, None)
+    by_char = {tokens[i - 1][1][0]: value for i, value in starts.items()}
     # the model writes "March" without its space; the document's token
-    # has one, and both count as the same start
-    assert starts["ranked"][:2] == ["the", "march"]
-    assert starts["best"]["march"] == march and starts["filler"]["march"] == []
-    # "The" and "." each occur twice, so both get the next-token step
-    assert starts["ambiguous"] == ["the", "."]
-    assert (starts["none_lp"], starts["best_lp"]) == (-4.0, -0.5)
-    # the second "The" is followed by " rent", which the model prefers
-    rent = tables.encode_ids(" rent")[0]
-    follow = {"the": {rent: -0.1, tables.encode_ids(" lease")[0]: -2.0}}
-    candidates = choose_candidates(tables, starts, lp, follow, prefix)
-    # a candidate's offset includes its token's leading space
-    assert [(c.char, c.score) for c in candidates[:3]] == [
-        (26, -0.6), (17, -1.0), (0, -2.5)]
-    assert candidates[0].first == the and candidates[1].first == march
-    # within a region, its first token is always a candidate, even
-    # when the TOP_TOKENS likeliest start tokens leave it out
+    # has one, and the likelier spelling starts it; "The" twice
+    assert by_char[text.index(" March")] == (march, [])
+    assert by_char[0] == (the, []) and by_char[26] == (the, [])
+    assert set(by_char) == {0, 26, text.index(" March")}
+    # a region keeps the positions inside it
     region = (text.index(" on"), len(text))
-    inside = rank_starts(tables, lp, prefix, tokens, region)
-    assert inside["ranked"][:2] == ["the", "march"] and "on" in inside["ranked"]
-    likely = {starts["best"][key]: -1.0 for key in starts["groups"]
-              if key != "the"}
-    assert len(likely) > 8
-    inside = rank_starts(tables, likely, prefix, tokens, None)
-    assert len(inside["ranked"]) == 8 and "the" not in inside["ranked"]
-    forced = choose_candidates(tables, inside, likely, {}, prefix)
-    assert forced[-1].char == 0 and forced[-1].score == NEG
-    assert len(forced) == 9
-    branches = make_branches(tables, text, candidates[:2], lp)
-    assert branches[0].stream[0] == the and branches[0].char == 26
-    # the first token ends at the candidate's end; the rest follow
-    assert branches[1].ends[:4] == [23, 24, 25, 26]
-    assert text[branches[1].char:branches[1].ends[3]] == " March 3."
-    assert branches[0].start == lp[the]
-    assert branches[0].rank == candidates[0].score
+    inside = first_tokens(tables, lp, prefix, tokens, region)
+    assert {tokens[i - 1][1][0] for i in inside} == {26, text.index(" March")}
+    # the chosen first token names the streams, each the text from
+    # its start as the model would write it, with its character ends
+    streams = make_streams(tables, text, tokens, starts, the)
+    assert [stream.char for stream in streams] == [0, 26]
+    assert streams[1].stream[:3] == tables.encode_ids("The rent is")
+    # a start's offset includes its token's leading space
+    assert text[streams[1].char:streams[1].ends[2]] == " The rent is"
+    (march_stream,) = make_streams(tables, text, tokens, starts, march)
+    assert march_stream.ends[:4] == [23, 24, 25, 26]
+    assert text[march_stream.char:march_stream.ends[3]] == " March 3."
 
 
-def test_a_start_that_begins_another_word_gets_the_next_token_step():
+def test_a_first_token_that_begins_a_longer_word_carries_its_rest():
     text = "The lease is their lease."
     tables = _tables(text, "their", "ir")
     ids, offsets = tables.encode(text)
     prefix = [99] + ids
     tokens = document_tokens(ids, offsets, [(0, 0, len(text))], 1)
     the = tables.encode_ids("The")[0]
-    starts = rank_starts(tables, {the: -0.5}, prefix, tokens, None)
-    # "the" begins "their" too, so both start with it and tie at the cue
-    assert starts["best"]["their"] == the and starts["filler"]["their"]
-    assert {"the", "their"} <= set(starts["ambiguous"])
-    lease, ir = tables.encode_ids(" lease")[0], tables.encode_ids("ir")[0]
-    follow = {"the": {lease: -0.1}, "their": {ir: -9.0}}
-    candidates = choose_candidates(tables, starts, {the: -0.5}, follow, prefix)
-    assert [(c.char, c.score) for c in candidates[:2]] == [(0, -0.6), (12, -9.5)]
-
-
-def _branch(copy, stop, **fields):
-    fields.setdefault("start", 0.0)
-    return extract_mod.Branch(char=0, first=1, stream=list(range(1, 7)),
-                              ends=list(range(1, 7)),
-                              copy=[np.log(c) for c in copy],
-                              stop=[np.log(s) for s in stop], fed=len(copy),
-                              **fields)
-
-
-def test_span_ends_where_stopping_beats_copying():
-    # the worked example: the fourth token's stop beats copying the fifth
-    branch = _branch([.85, .90, .95, .05, .30], [.10, .05, .02, .90, .60])
-    assert branch.end() == 3
-    assert np.exp(branch.score()) == pytest.approx(.85 * .90 * .95 * .90)
-    assert best_span([branch]) == (branch, 3)
-    assert best_span([]) is None
-    # copying the next token and closing the quote in one token, as a
-    # decoder writes `."`, ends the span after that token
-    joined = _branch([.85, .90, .95, .05, .30], [.10, .05, .02, .90, .60])
-    joined.merged = [NEG, NEG, np.log(.97), NEG, NEG]
-    assert joined.ending() == (3, 2, pytest.approx(np.log(.97)))
-    assert np.exp(joined.score()) == pytest.approx(.85 * .90 * .97)
-    # a span still copying has no end, unless forced at the pass limit
-    copying = _branch([.9, .9, .9], [.1, .1, .1])
-    assert copying.end() is None and copying.score() == NEG
-    assert copying.end(force=True) == 2
-    assert best_span([copying]) is None
-    assert best_span([copying], force=True) == (copying, 2)
-    # a start the cue gave no probability, the region's forced first
-    # token, ends but never answers
-    dead = _branch([.1], [.9], start=NEG)
-    assert dead.end() == 0 and dead.score() == NEG
-
-
-def test_starts_are_fed_in_the_models_order():
-    best = _branch([], [], start=-0.1, rank=-0.1)
-    tied = _branch([], [], start=-0.1, rank=-0.1)
-    second = _branch([], [], start=-0.5, rank=-0.5)
-    branches = [second, best, tied]
-    # the likeliest start and its tied position are fed first
-    assert open_branches(branches) == [1, 2]
-    # the tied position diverges and ends with a low stop; the best copies on
-    tied.copy, tied.stop, tied.fed = [np.log(.01)], [np.log(.02)], 1
-    best.copy, best.stop, best.fed = [np.log(.9)], [np.log(.1)], 1
-    assert open_branches(branches) == [1]
-    # once the best start ends, nothing below it is fed and it answers
-    best.copy.append(np.log(.1))
-    best.stop.append(np.log(.8))
-    best.fed = 2
-    assert open_branches(branches) == []
-    assert best_span(branches) == (best, 1)
-    # starts without a span hand over to the second
-    best.start = tied.start = NEG
-    assert open_branches(branches) == [0]
-    assert best_span(branches) is None
+    starts = first_tokens(tables, {the: -0.5}, prefix, tokens, None)
+    by_char = {tokens[i - 1][1][0]: value for i, value in starts.items()}
+    # "the" begins "their" too: that start continues with "ir"
+    assert by_char[0] == (the, [])
+    assert by_char[12] == (the, tables.encode_ids("ir"))
+    streams = make_streams(tables, text, tokens, starts, the)
+    assert [stream.char for stream in streams] == [0, 12]
+    assert streams[1].stream[:2] == [the, tables.encode_ids("ir")[0]]
+    assert text[streams[1].char:streams[1].ends[1]] == " their"
 
 
 class ScriptedModel:
-    """Writes the gold answer: the lines that hold it, its words, then stops.
+    """Writes the gold answer: the lines that hold it, its tokens, then stops.
 
-    The model prefers the gold span's next token while the fed tokens
-    are a prefix of it, and the closing quote right after it.
+    At the cue the model prefers the gold answer's first word, written
+    without its space; at each later step it prefers the gold answer's
+    next token while the tokens written so far are a prefix of it,
+    and closes the quote once the whole answer is written.
     """
 
-    def __init__(self, tables, docs, gold, cue_k, feed_k):
+    def __init__(self, tables, docs, gold, k):
         self.tables = tables
         self.docs = docs            # key -> (text, numbered, range text)
         self.gold = gold            # key -> gold answer text, or None
-        self.cue_k, self.feed_k = cue_k, feed_k
+        self.k = k
         self.targets = len(tables.range_targets)
-        self.width = max(2 + self.targets + 2 * cue_k, 1 + 2 * feed_k)
+        self.width = 2 + self.targets + 2 * k
         # the phrase cue ends in the quote that follows a space, which
         # is not the quote that closes an answer
         self.cue_token = tables.encode_ids(TAIL)[-1]
@@ -320,27 +245,26 @@ class ScriptedModel:
         row[:len(values)] = values
         return row
 
-    def _top(self, lps, k, extras):
-        """A cue or feed row: the extras, then the k likeliest ids and values."""
-        best = sorted(lps.items(), key=lambda item: -item[1])[:k]
-        while len(best) < k:
+    def _top(self, lps, extras):
+        """A row: the extras, then the k likeliest ids and values."""
+        best = sorted(lps.items(), key=lambda item: -item[1])[:self.k]
+        while len(best) < self.k:
             best.append((0, -30.0))
         return self._row(list(extras) + [float(i) for i, _ in best]
                          + [v for _, v in best])
 
-    def _cue(self, lps, none_lp, quote_lp, digits=None):
-        """A cue row: none, quote, the lines targets, then the top tokens."""
+    def _cue(self, lps, none_lp, stop_lp, digits=None):
+        """A row: none, the stop, the lines targets, then the top tokens."""
         digits = digits or [-9.0] * self.targets
-        return self._top(lps, self.cue_k, [none_lp, quote_lp, *digits])
+        return self._top(lps, [none_lp, stop_lp, *digits])
 
     def _range_row(self, wanted):
         return self._cue({}, -9.0, -9.0, [0.0 if token == wanted else -9.0
                                          for token in self.tables.range_targets])
 
-    def _gold_keys(self, key):
+    def _gold_ids(self, key):
         gold = self.gold[key]
-        ids = self.tables.encode_ids(gold) if gold else []
-        return [same_word(self.tables.vocab[i]) or i for i in ids]
+        return self.tables.encode_ids(gold) if gold else []
 
     def forward_chunk(self, chunk):
         rows = []
@@ -359,12 +283,11 @@ class ScriptedModel:
                 if spec.get("f") is not None and key in self.prefix_len:
                     held = held[:spec["f"] - self.prefix_len[key]]
                 path = held + suffix
-                if spec.get("read_all_rows"):
-                    rows.extend(self._feed_rows(key, suffix))
-                elif path[-1] == self.cue_token:
+                if path[-1] == self.cue_token:
                     rows.append(self._cue_row(key))
-                elif held and held[-1] == self.cue_token:
-                    rows.append(self._follow_row(key, suffix[-1]))
+                elif self.cue_token in path:
+                    cue = len(path) - 1 - path[::-1].index(self.cue_token)
+                    rows.append(self._answer_row(key, path[cue + 1:]))
                 elif numbered:
                     rows.append(self._next_digit(path, range_text))
                 else:
@@ -376,8 +299,6 @@ class ScriptedModel:
     def _next_digit(self, path, range_text):
         """The lines answer, one digit or dash at a time, then a line break."""
         tables = self.tables
-        written = "".join(tables.range_text.get(t, "") for t in path
-                          if t in tables.range_text)
         # digits before the cue belong to the numbered lines, not the answer
         cue = tables.encode_ids(NUMBERED_TAIL)[-1]
         after = path[len(path) - 1 - path[::-1].index(cue):]
@@ -388,69 +309,42 @@ class ScriptedModel:
 
     def _cue_row(self, key):
         tables = self.tables
-        gold = self._gold_keys(key)
+        gold = self._gold_ids(key)
         lps = {}
         if gold:
             # the model writes the first word without its space, and
             # every other document word is far behind
-            for index in tables.variants.get(gold[0], []):
+            first = same_word(tables.vocab[gold[0]]) or gold[0]
+            for index in tables.variants.get(first, [gold[0]]):
                 lps[index] = -0.5 if not tables.vocab[index].startswith("Ġ") else -0.9
-            the = tables.variants.get("the", [])
-            for index in the:
+            for index in tables.variants.get("the", []):
                 lps[index] = -2.0
         none_lp = -0.2 if not gold else -5.0
         return self._cue(lps, none_lp, -6.0)
 
-    def _follow_row(self, key, token):
-        return self._cue({}, -7.0, -7.0)
-
-    def _feed_rows(self, key, suffix):
-        """Feed rows: the gold span's next token is likely, then the quote.
-
-        The last fed token's row names no next token, as the fake does
-        not look past the suffix; a gold span that runs past a pass
-        would lose its branch there.
-        """
+    def _answer_row(self, key, written):
+        """The answer's next token while the writing fits the gold, then the stop."""
         tables = self.tables
-        gold = self._gold_keys(key)
-        rows = []
-        for j in range(len(suffix)):
-            fed = [same_word(tables.vocab[t]) or t for t in suffix[:j + 1]]
-            on_gold = fed == gold[:len(fed)] and len(fed) <= len(gold)
-            following = suffix[j + 1] if j + 1 < len(suffix) else None
-            if following is None:
-                following_key = None
-            else:
-                following_key = same_word(tables.vocab[following]) or following
-            lps = {}
-            if following is not None:
-                still = (on_gold and len(fed) < len(gold)
-                         and following_key == gold[len(fed)])
-                lps[following] = -0.2 if still else -2.5
-            stop = -0.1 if on_gold and len(fed) == len(gold) else -4.0
-            rows.append(self._top(lps, self.feed_k, [stop]))
-        return rows
+        gold = self._gold_ids(key)
+        keys = [same_word(tables.vocab[t]) or t for t in gold]
+        fed = [same_word(tables.vocab[t]) or t for t in written]
+        if fed == keys:
+            return self._cue({}, -9.0, -0.1)
+        if fed == keys[:len(fed)]:
+            return self._cue({gold[len(fed)]: -0.2}, -9.0, -4.0)
+        return self._cue({}, -9.0, -0.5)
 
 
-def _fake_readouts(tables, cue_k, feed_k):
-    def readout(k, width_of, ragged=False):
-        value = SimpleNamespace(k=k, width=width_of, ragged=ragged)
-        value.dtype = (np.dtype(object) if ragged
-                       else np.dtype((np.float32, (width_of,))))
+def _fake_readout(tables, k):
+    width = 2 + len(tables.range_targets) + 2 * k
+    value = SimpleNamespace(k=k, width=width, ragged=False)
+    value.dtype = np.dtype((np.float32, (width,)))
 
-        def submit(rows, rows_per_answer=None):
-            rows = np.asarray(rows, dtype=np.float32)[:, :width_of]
-            return rows, rows_per_answer
+    def submit(rows, rows_per_answer=None):
+        return np.asarray(rows, dtype=np.float32)[:, :width]
 
-        def result(handle):
-            rows, rows_per_answer = handle
-            return split_rows(rows, rows_per_answer) if ragged else rows
-
-        value.submit, value.result = submit, result
-        return value
-
-    return (readout(cue_k, 2 + len(tables.range_targets) + 2 * cue_k),
-            readout(feed_k, 1 + 2 * feed_k, ragged=True))
+    value.submit, value.result = submit, lambda handle: handle
+    return value
 
 
 def _state(model, chunk_tokens=400):
@@ -474,10 +368,9 @@ def _setup(monkeypatch, trim=True, documents=None):
     spec, tables = _spec(trim)
     documents = DOCS if documents is None else documents
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    cue_k, feed_k = 4, 3
-    model = ScriptedModel(tables, {}, {}, cue_k, feed_k)
-    readouts = _fake_readouts(tables, cue_k, feed_k)
-    monkeypatch.setattr(ExtractStages, "_readouts", lambda self, state: readouts)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(ExtractStages, "_readout", lambda self, state: readout)
     state = _state(model)
     state.loaded_model.extract_tables = tables
     tokens = {"c": [tables.encode_ids(text) for text in documents]}
@@ -519,7 +412,12 @@ def _run(monkeypatch, trim=True, documents=None):
     return result, stages, model
 
 
-def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatch):
+def tables_of(stages):
+    return stages.tables
+
+
+def test_extractor_locates_lines_then_writes_the_answer_along_the_document(
+        monkeypatch):
     result, stages, model = _run(monkeypatch)
     table = result.outputs["scores"].to_pydict()
     assert table == {
@@ -537,16 +435,19 @@ def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatc
     assert lease.numbered and asked.path == "located"
     assert asked.range == (2, 3)
     assert asked.region == (LEASE.index("The lease"), LEASE.index("\nRent"))
-    assert [c.char for c in asked.candidates][0] == LEASE.index("March")
-    assert asked.passes == 1 and not asked.open
+    # the model writes "March" without its space, then the document's
+    # tokens after it, and closes the quote after "2027"
+    march = tables_of(stages).encode_ids("March")[0]
+    assert asked.written == [march, *tables_of(stages).encode_ids(" 3, 2027")]
+    assert asked.done and asked.steps == 1 + len(asked.written)
     # the model names the one line of the short documents; it writes
-    # none for the one without dates, and no start is read for it
+    # none for the one without dates, and no token is written for it
     assert term.numbered and term.questions[0].path == "located"
     assert nothing.numbered and nothing.questions[0].none_wins
-    assert nothing.questions[0].candidates == []
-    assert nothing.questions[0].passes == 0
+    assert nothing.questions[0].written == []
+    assert nothing.questions[0].steps == 1
     # the steps: the tail and each digit are appended to the lease's
-    # KV, then the phrase cue; the candidates are fed after it
+    # KV, then the phrase cue, then each token of the answer
     tables = stages.tables
     (tail,) = stages.tails
     lease_key = lease.key
@@ -555,21 +456,10 @@ def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatc
     assert appended[0] == tail
     assert [tables.vocab[s[0]] for s in appended[1:4]] == ["2", "-", "3"]
     assert appended[4] == list(tables.begins_cue)
-    # the candidate spans are read whole; a start token the lines
-    # repeat (the space before a number) got its one-token step first
-    steps = [suffix for key, suffix, kept, whole in model.packed
-             if key == lease_key and not kept and not whole]
-    assert steps == [[tables.encode_ids(" ")[0]]]
-    fed = [suffix for key, suffix, kept, whole in model.packed
-           if key == lease_key and whole]
-    # the likeliest start, "March" as the model writes it, is fed with
-    # the document's tokens after it, CHUNK past the start of line 3
-    march = tables.encode_ids("March")[0]
-    assert asked.branches[0].first == march
-    (first,) = [suffix for suffix in fed if suffix[0] == march]
-    assert len(first) == asked.branches[0].fed <= CHUNK
-    # the likeliest start ended with a span, so no other start is fed
-    assert len(fed) == 1 and 1 < len(asked.candidates) <= 8
+    assert [s[0] for s in appended[5:]] == asked.written
+    assert all(len(s) == 1 for s in appended[5:])
+    # nothing is fed whole: every request is one appended token
+    assert not any(whole for key, _, _, whole in model.packed if key == lease_key)
     # the keys name the document and its rendering, not the output,
     # so another extraction of the table reads the KV left resident
     assert [doc.key for doc in stages.docs] == [
@@ -577,6 +467,8 @@ def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatc
     assert result.metrics.extension["located"] == 3
     assert result.metrics.extension["scored"] == 0
     assert result.metrics.extension["none"] == 1
+    assert result.metrics.extension["answer_tokens"] == (
+        len(asked.written) + len(term.questions[0].written))
     assert result.metrics.fresh_tokens > 0
     assert result.metrics.output_rows == 3
 
@@ -592,20 +484,21 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
     # one stage list asks both questions of a document; the second
     # question's tail is written after the document in place of the
     # first question's steps, the same frame rewound
-    assert len(stages.stages) == 2 * (LINE_MAX_TOKENS + 2 + MAX_PASSES)
+    assert len(stages.stages) == 2 * (LINE_MAX_TOKENS + 1 + ANSWER_MAX_TOKENS)
     assert stages.tails[0] == stages.tails[1]
     lease = stages.docs[0]
     (tail,) = set(map(tuple, stages.tails))
-    tails = [(index, suffix)
-             for index, (key, suffix, kept, _) in enumerate(model.packed)
-             if key == lease.key and kept
-             and suffix in (list(tail), [tail[-1]])]
-    # the frame is written once; the second question feeds the cue
-    # token after it, past the first question's steps
-    assert [suffix for _, suffix in tails] == [list(tail), [tail[-1]]]
-    between = [suffix for key, suffix, _, _
-               in model.packed[tails[0][0] + 1:tails[1][0]] if key == lease.key]
-    assert between, "the first question's steps come before the second tail"
+    tables = stages.tables
+    appended = [suffix for key, suffix, kept, _ in model.packed
+                if key == lease.key and kept]
+    digits = [[t] for t in tables.encode_ids("2-3")]
+    written = [[t] for t in lease.questions[0].written]
+    # the frame is written once, with the first question's cue token;
+    # the second question feeds its cue token alone after the frame,
+    # past the first question's steps, and asks its lines again
+    assert appended == (
+        [list(tail), *digits, list(tables.begins_cue), *written,
+         [tail[-1]], *digits, list(tables.begins_cue), *written])
     # the documents are read once: the second extraction is charged
     # only the tokens fed after them
     prefixes = sum(len(doc.prefix) for doc in stages.docs)
@@ -649,49 +542,37 @@ def test_locate_off_shows_every_document_plain():
     spec, tables = _spec(True, LEASE)
     state = SimpleNamespace(chunk_tokens=400)
     documents = [tables.encode_ids(LEASE)]
+    readout = SimpleNamespace(k=4)
     located = ExtractStages(state, [spec], tables, [0], documents, [LEASE],
-                            readouts=(None, None))
+                            readout=readout)
     assert located.docs[0].numbered
     assert located.docs[0].key == (("extract", "c", "numbered"), 0)
     plain = ExtractStages(state, [replace(spec, locate=False)], tables, [0],
-                          documents, [LEASE], readouts=(None, None))
+                          documents, [LEASE], readout=readout)
     assert not plain.docs[0].numbered
     # the plain prompt has a head, so the table's KV is not the document's
     assert plain.docs[0].key == (("extract", "c", "plain"), 0)
     # a pipeline's extractions show the document the same way
     with pytest.raises(ValueError, match="locating"):
         ExtractStages(state, [spec, replace(spec, locate=False)], tables, [0],
-                      documents, [LEASE], readouts=(None, None))
+                      documents, [LEASE], readout=readout)
 
 
-def test_extractor_stops_after_the_pass_limit(monkeypatch):
-    # a model that never closes the quote keeps every start open; the
-    # passes stop at MAX_PASSES and the best span so far answers
+def test_extractor_stops_at_the_answer_token_cap(monkeypatch):
+    # a model that never closes the quote keeps writing the document;
+    # the answer ends at ANSWER_MAX_TOKENS
     long = " ".join(["word"] * 200)
     spec, tables = _spec(True, long)
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    model = ScriptedModel(tables, {}, {}, 4, 3)
-
-    word = tables.encode_ids(" word")[0]
-
-    def feed_rows(key, suffix):
-        # every next token is " word", the last fed one's included
-        return [model._top({suffix[j + 1] if j + 1 < len(suffix) else word: -0.01},
-                           3, [-3.0]) for j in range(len(suffix))]
-
-    model._feed_rows = feed_rows
-    # every position of "word" but the last is followed by " word": they
-    # tie as starts and are fed together
-    model._follow_row = lambda key, token: model._cue({word: -0.1}, -7.0, -7.0)
-    readouts = _fake_readouts(tables, 4, 3)
-    monkeypatch.setattr(ExtractStages, "_readouts", lambda self, state: readouts)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(ExtractStages, "_readout", lambda self, state: readout)
     state = _state(model, chunk_tokens=2000)
     state.loaded_model.extract_tables = tables
-    texts = [long]
     stages = ExtractStages(state, [replace(spec, locate=False)], tables, [0],
-                           [tables.encode_ids(long)], texts)
+                           [tables.encode_ids(long)], [long])
     model.docs[stages.docs[0].key] = (long, False, "")
-    model.gold[stages.docs[0].key] = "word"
+    model.gold[stages.docs[0].key] = long
     from quail.backends.quail.executor.stages import run_stages
 
     run_stages(state.torch, state.loaded_model.arena,
@@ -699,11 +580,12 @@ def test_extractor_stops_after_the_pass_limit(monkeypatch):
                state.chunk_tokens, anchor_keys=stages.keys)
     stages.finish()
     asked = stages.docs[0].questions[0]
-    assert asked.passes == MAX_PASSES and not asked.open
-    assert asked.answer is not None
-    assert len(stages.stages) == LINE_MAX_TOKENS + 2 + MAX_PASSES
+    assert asked.done and len(asked.written) == ANSWER_MAX_TOKENS
+    assert asked.answer == " ".join(["word"] * ANSWER_MAX_TOKENS)
+    assert len(stages.stages) == LINE_MAX_TOKENS + 1 + ANSWER_MAX_TOKENS
     assert [stage.label for stage in stages.stages][:2] == [
         "ends tail", "ends lines 1"]
+    assert stages.stages[-1].label == f"ends token {ANSWER_MAX_TOKENS}"
 
 
 def test_answer_table_and_session_project_the_answer_columns():

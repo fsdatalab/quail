@@ -170,7 +170,7 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
     assert "SemanticExtract: ends, ends_span" in text
     assert f"question={QUESTION!r} trim=on locate=on" in text
     assert "AiExtract: ends over c" in text
-    assert "starts=8, 16-token passes" in text
+    assert "up to 64 answer tokens" in text
     assert "Project: c.id, ends" in text
 
 

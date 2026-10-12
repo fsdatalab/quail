@@ -433,8 +433,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             details.append(f"question={spec.question!r}, "
                            f"trim={'on' if spec.trim else 'off'}, "
                            f"locate={'on' if spec.locate else 'off'}, "
-                           f"starts={extract_cost.MAX_STARTS}, "
-                           f"{extract_cost.CHUNK}-token passes")
+                           f"up to {extract_cost.ANSWER_MAX_TOKENS} answer tokens")
         elif isinstance(node, Filter):
             title += f": {node.predicate.describe()}"
         elif isinstance(node, AiJoin):

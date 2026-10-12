@@ -5,11 +5,11 @@ to the live count, and prices the total with the component roofline
 at ideal packing, as quail/cost/classify.py does. The steps follow the
 executor (quail/backends/quail/executor/extract.py): the prompt with
 the document, plain or as numbered lines; the lines answer, one token
-per round; the phrase cue; the start step; and the candidate spans fed
-after the cue. How many tokens the spans take is a measured constant,
-not a function of the document: the planner does not see the answer.
-The second and later extractions of a pipeline find the document
-resident and are priced without reading it.
+per round; the phrase cue; and the answer, one token per round. How
+many tokens the answer takes is a measured constant, not a function
+of the document: the planner does not see the answer. The second and
+later extractions of a pipeline find the document resident and are
+priced without reading it.
 """
 
 from dataclasses import dataclass
@@ -21,31 +21,22 @@ from quail.cost.roofline import CostComponent, component_latencies
 from quail.cost.work import Work, ask, scan, stream
 
 # the executor's settings
-MAX_STARTS = 8          # candidate start positions kept
-CHUNK = 16              # document tokens fed per pass from each start
-# starts fed as a mean: the likeliest and its tied positions; run
-# 20261011T060458Z fed 50 tokens per SQuAD document and 60 per CUAD
-# document after the start step, 1.6 to 1.9 starts of FED_PER_START
-# (/results/extract_check/20261011T060458Z_quail_squad_trim.json and
-# _cuad_trim.json)
-STARTS_FED = 2
 ASSUMED_LINES = 3       # a document's lines when the text is not at hand
 # the lines answer "a-b" and its line break, one token each
 RANGE_TOKENS = 4
 # the phrase cue after the lines answer: a line break, "Phrase", ":",
 # and the opening quote
 CUE_TOKENS = 5
-# the start step, one token per ambiguous start token, at most the
-# TOP_TOKENS read at the cue; measured 1.9 to 2.0 rounds per document
-START_STEP_TOKENS = 8
+# the answer's tokens, as a mean: the answers measured were 2.8 words
+# on SQuAD and 48 words on CUAD's clause fields
+# (/results/extract_spans/20261011T010106Z_qwen3-4b-fp8_squad.json and
+# 20261011T005925Z_qwen3-4b-fp8_cuad.json); one token per round, and
+# one more round reads the closing quote
+ANSWER_TOKENS = 16
 # a numbered line's number, colon, and space
 LINE_NUMBER_TOKENS = 3
-# passes each start takes, as a mean: measured 1.05 on SQuAD, whose
-# answers are 2.8 words, and 2.9 on CUAD, whose answers are clauses of
-# 48 words (/results/extract_spans/20261011T010106Z_qwen3-4b-fp8_squad.json
-# and 20261011T005925Z_qwen3-4b-fp8_cuad.json)
-PASSES = 2.0
-FED_PER_START = CHUNK * PASSES
+# tokens an answer may take, as the stock path's EXTRACT_MAX_TOKENS
+ANSWER_MAX_TOKENS = 64
 
 
 @dataclass(frozen=True)
@@ -114,12 +105,10 @@ def document_work(length: int, lines: int, head_tokens: int, tail_tokens: int,
         context = prefix + tail_tokens
         fed += tail_tokens
     rows += 1
-    work += stream(context, [1] * START_STEP_TOKENS, window=window)
-    fed += START_STEP_TOKENS
-    rows += START_STEP_TOKENS
-    work += stream(context, [FED_PER_START] * STARTS_FED, window=window)
-    fed += FED_PER_START * STARTS_FED
-    rows += FED_PER_START * STARTS_FED
+    # the answer's tokens, each appended and read, then the quote's row
+    work += stream(context, [1] * ANSWER_TOKENS, window=window)
+    fed += ANSWER_TOKENS
+    rows += ANSWER_TOKENS
     return work, fed, rows
 
 

@@ -38,7 +38,25 @@ question asked while it is resident): CUAD-10 reads each contract
 once, under 400 thousand fresh tokens, and takes about 35 s, the
 single read of 5 s plus three questions' steps of about 10 s each,
 with every answer unchanged. CUAD-1 and CUAD-7 keep their times and
-answers within a second.
+answers within a second. Measured on run 20261012T003911Z: CUAD-10
+took 23.7 s and 368 thousand fresh tokens; CUAD-1 and CUAD-7 kept
+their answers; CUAD-10's second and third questions changed on 7 and
+8 contracts. Runs 20261012T005434Z, 010321Z, and 010614Z
+(experiments/cells/extract_pipeline_check.py) showed the KV those
+questions read is bit-identical to what the first question wrote, and
+that the same question alone moves on 0 to 3 contracts when only the
+chunk budget changes: the span rule's decisions sat on near ties.
+
+Prediction for the answer written token by token within the located
+lines, each token chosen among the document's continuations: span
+token F1 lands within 3 points of stock vLLM's on every extraction
+query of run 20261011T235454Z (CUAD-1 0.35, CUAD-2 0.85, CUAD-3 0.55,
+CUAD-4 0.63, CUAD-7 0.75, CUAD-8 0.48, CUAD-9 0.26, CUAD-10 0.48),
+since both write the answer greedily and the stock path keeps only
+answers it finds in the text. Time follows the answer's tokens: the
+short fields (CUAD-1, 2, 10) stay within 2 s of their last runs, and
+the clause fields (CUAD-3, 7, 8, 9), about 60 tokens, take up to 60 s
+at today's cost per round.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the

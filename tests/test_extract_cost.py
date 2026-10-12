@@ -4,13 +4,11 @@ import numpy as np
 import pyarrow as pa
 
 from quail.cost.extract import (
+    ANSWER_TOKENS,
     ASSUMED_LINES,
     CUE_TOKENS,
-    FED_PER_START,
     LINE_NUMBER_TOKENS,
     RANGE_TOKENS,
-    START_STEP_TOKENS,
-    STARTS_FED,
     document_work,
     estimate,
     line_counts,
@@ -30,22 +28,18 @@ def _cost(lengths, lines, **kwargs):
                     NUMBERED_TAIL, **options)
 
 
-def test_a_plain_document_scans_once_then_feeds_the_step_and_the_starts():
+def test_a_plain_document_scans_once_then_writes_its_answer():
     work, fed, rows = document_work(100, 1, HEAD, TAIL, NUMBERED_HEAD,
                                     NUMBERED_TAIL, numbered=False)
     context = HEAD + 100 + TAIL
-    expected = (scan(HEAD + 100, TAIL)
-                + stream(context, [1] * START_STEP_TOKENS)
-                + stream(context, [FED_PER_START] * STARTS_FED))
+    expected = scan(HEAD + 100, TAIL) + stream(context, [1] * ANSWER_TOKENS)
     assert work == expected
-    assert fed == TAIL + START_STEP_TOKENS + FED_PER_START * STARTS_FED
-    assert rows == 1 + START_STEP_TOKENS + FED_PER_START * STARTS_FED
+    assert fed == TAIL + ANSWER_TOKENS
+    assert rows == 1 + ANSWER_TOKENS
     # resident KV turns the scan into a question over it
     resident, _, _ = document_work(100, 1, HEAD, TAIL, NUMBERED_HEAD,
                                    NUMBERED_TAIL, numbered=False, resident=True)
-    assert resident == (ask(HEAD + 100, TAIL)
-                        + stream(context, [1] * START_STEP_TOKENS)
-                        + stream(context, [FED_PER_START] * STARTS_FED))
+    assert resident == ask(HEAD + 100, TAIL) + stream(context, [1] * ANSWER_TOKENS)
     assert resident.tokens < work.tokens
 
 
@@ -61,13 +55,10 @@ def test_a_numbered_document_answers_its_lines_then_the_cue():
         context += 1
     expected += ask(context, CUE_TOKENS)
     context += CUE_TOKENS
-    expected += stream(context, [1] * START_STEP_TOKENS)
-    expected += stream(context, [FED_PER_START] * STARTS_FED)
+    expected += stream(context, [1] * ANSWER_TOKENS)
     assert work == expected
-    assert fed == (NUMBERED_TAIL + RANGE_TOKENS + CUE_TOKENS + START_STEP_TOKENS
-                   + FED_PER_START * STARTS_FED)
-    assert rows == (1 + RANGE_TOKENS + 1 + START_STEP_TOKENS
-                    + FED_PER_START * STARTS_FED)
+    assert fed == NUMBERED_TAIL + RANGE_TOKENS + CUE_TOKENS + ANSWER_TOKENS
+    assert rows == 1 + RANGE_TOKENS + 1 + ANSWER_TOKENS
     # a later extraction of the pipeline finds the numbered document
     # resident and asks its tail over it instead of reading it
     resident = document_work(100, lines, HEAD, TAIL, NUMBERED_HEAD,
@@ -79,8 +70,7 @@ def test_a_numbered_document_answers_its_lines_then_the_cue():
         context += 1
     asked += ask(context, CUE_TOKENS)
     context += CUE_TOKENS
-    asked += stream(context, [1] * START_STEP_TOKENS)
-    asked += stream(context, [FED_PER_START] * STARTS_FED)
+    asked += stream(context, [1] * ANSWER_TOKENS)
     assert resident == asked
     assert resident.tokens < work.tokens
     # the locating choice decides the layout, whatever the line count

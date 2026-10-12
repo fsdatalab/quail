@@ -1,3 +1,17 @@
+The answer is always a span of the document's own text. With `locate`
+on, the model first names the lines that hold the answer, shown
+numbered as `cat -n` shows them. The model then writes the answer one
+token at a time, as a decoder would, but each token is chosen among
+the tokens that continue some position of the document inside those
+lines, so the writing can only trace the document's own text. With
+`locate` off, the positions are the whole document. The answer ends
+where the model would close the quote: when closing it is at least as
+likely as every continuation, or after a token the model would write
+with the closing quote in one token, such as `."`. The document, the
+lines, and the question stay in KV across these steps. Several
+extractions of one table with the same `locate` setting read each
+document once and ask their questions of it in turn.
+
 ---
 title: SQL reference
 ---
