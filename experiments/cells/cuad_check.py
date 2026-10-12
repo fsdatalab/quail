@@ -27,7 +27,18 @@ rendering, retained after each extraction): CUAD-10 falls from 46 s to
 under 22 s and from 1.07 million fresh tokens to under 400 thousand,
 with every answer unchanged; CUAD-7, a filter then an extraction,
 keeps its 18.7 s and its answers, since a filter's KV holds the plain
-document and the extraction shows it numbered.
+document and the extraction shows it numbered. Measured on run
+20261012T001413Z: CUAD-10 took 42.4 s and 800 thousand fresh tokens,
+answers unchanged. The arena holds 362 thousand tokens and the
+retention cap leaves 141 thousand retained, so 38% of the contracts
+stayed resident between the extractions.
+
+Prediction for the extraction pipeline (one read per document, every
+question asked while it is resident): CUAD-10 reads each contract
+once, under 400 thousand fresh tokens, and takes about 35 s, the
+single read of 5 s plus three questions' steps of about 10 s each,
+with every answer unchanged. CUAD-1 and CUAD-7 keep their times and
+answers within a second.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the

@@ -31,6 +31,7 @@ from quail.backends.quail.executor.extract import (
 )
 from quail.backends.quail.executor.operators.extract import (
     execute_extract,
+    execute_extractions,
     extract_answer_table,
 )
 from quail.backends.quail.executor.readout import split_rows
@@ -127,7 +128,8 @@ RANKED = "The lease ends on March 3. The rent is due."
 def _tables(*extra):
     tokenizer = FakeTokenizer([LEASE, TERM, NOTHING, HEAD, NUMBERED_HEAD, TAIL,
                                NUMBERED_TAIL, "March", "five", RANKED,
-                               numbered_text(LEASE, document_lines(LEASE))[0],
+                               *(numbered_text(text, document_lines(text))[0]
+                                 for text in (LEASE, TERM, NOTHING)),
                                *extra])
     return Tables(tokenizer)
 
@@ -310,6 +312,7 @@ class ScriptedModel:
         # is not the quote that closes an answer
         self.cue_token = tables.encode_ids(TAIL)[-1]
         self.kv = {}                # key -> tokens appended after the prefix
+        self.prefix_len = {}        # key -> the prefix's tokens
         self.packed = []
 
     def _row(self, values):
@@ -348,7 +351,13 @@ class ScriptedModel:
                 suffix = [int(t) for t in suffix]
                 self.packed.append((key, suffix, spec.get("write_suffix_tokens", 0),
                                     bool(spec.get("read_all_rows"))))
+                # the request's rows follow position f: a frame or a
+                # rewinding stage drops what an earlier stage appended
+                if spec.get("prefix") is not None:
+                    self.prefix_len[key] = len(spec["prefix"])
                 held = self.kv.get(key, [])
+                if spec.get("f") is not None and key in self.prefix_len:
+                    held = held[:spec["f"] - self.prefix_len[key]]
                 path = held + suffix
                 if spec.get("read_all_rows"):
                     rows.extend(self._feed_rows(key, suffix))
@@ -457,7 +466,7 @@ def _state(model, chunk_tokens=400):
 
 DOCS = [LEASE, TERM, NOTHING]
 GOLD = ["March 3, 2027", "five years", None]
-RANGES = ["2-3", "", ""]
+RANGES = ["2-3", "1", "1"]
 
 
 def _setup(monkeypatch, trim=True, documents=None):
@@ -485,19 +494,27 @@ def _setup(monkeypatch, trim=True, documents=None):
 
     monkeypatch.setattr(ExtractStages, "__init__", init)
 
-    def run(name="ends"):
-        node = AiExtract(node_id=f"ai-extract:{name}", backend_name="quail",
+    def node(name):
+        return AiExtract(node_id=f"ai-extract:{name}", backend_name="quail",
                          model="qwen3-4b-fp8", spec=replace(spec, name=name))
-        result = execute_extract(state, node, {
-            "document_ids": list(range(len(documents))), "documents": tokens,
-            "texts": {"c": documents}, "pre": [], "gpu_timing": False})
+
+    inputs = {"document_ids": list(range(len(documents))), "documents": tokens,
+              "texts": {"c": documents}, "pre": [], "gpu_timing": False}
+
+    def run(name="ends"):
+        result = execute_extract(state, node(name), inputs)
         return result, stages_seen["stages"]
 
-    return state, model, run
+    def run_pipeline(*names):
+        results = execute_extractions(state, [node(name) for name in names],
+                                      inputs)
+        return results, stages_seen["stages"]
+
+    return state, model, run, run_pipeline
 
 
 def _run(monkeypatch, trim=True, documents=None):
-    _, model, run = _setup(monkeypatch, trim, documents)
+    _, model, run, _ = _setup(monkeypatch, trim, documents)
     result, stages = run()
     return result, stages, model
 
@@ -513,31 +530,31 @@ def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatc
                       {"start": 6, "end": 16}, None]}
     assert result.outputs["ids:c"] == [0, 1, 2]
     lease, term, nothing = stages.docs
-    # the four-line lease is shown numbered; the model names lines 2-3,
-    # so the starts are read in them and the ends from line 3 on
-    assert lease.numbered and lease.path == "located"
-    assert lease.range == (2, 3)
-    assert lease.region == (LEASE.index("The lease"), LEASE.index("\nRent"))
-    assert [c.char for c in lease.candidates][0] == LEASE.index("March")
-    assert lease.passes == 1 and not lease.open
-    # the two short documents are shown plain; the model writes none
-    # for the one without dates, and no start is read for it
-    assert not term.numbered and term.path == "scored"
-    assert not nothing.numbered and nothing.none_wins
-    assert nothing.candidates == [] and nothing.passes == 0
-    # the steps: the numbered tail and each digit are appended to the
-    # lease's KV, then the phrase cue; the candidates are fed after it
+    asked = lease.questions[0]
+    # with locating on, every document is shown numbered; the model
+    # names lines 2-3 of the lease, so the starts are read in them and
+    # the ends from line 3 on
+    assert lease.numbered and asked.path == "located"
+    assert asked.range == (2, 3)
+    assert asked.region == (LEASE.index("The lease"), LEASE.index("\nRent"))
+    assert [c.char for c in asked.candidates][0] == LEASE.index("March")
+    assert asked.passes == 1 and not asked.open
+    # the model names the one line of the short documents; it writes
+    # none for the one without dates, and no start is read for it
+    assert term.numbered and term.questions[0].path == "located"
+    assert nothing.numbered and nothing.questions[0].none_wins
+    assert nothing.questions[0].candidates == []
+    assert nothing.questions[0].passes == 0
+    # the steps: the tail and each digit are appended to the lease's
+    # KV, then the phrase cue; the candidates are fed after it
     tables = stages.tables
+    (tail,) = stages.tails
     lease_key = lease.key
     appended = [suffix for key, suffix, kept, _ in model.packed
                 if key == lease_key and kept]
-    assert appended[0] == list(lease.tail)
+    assert appended[0] == tail
     assert [tables.vocab[s[0]] for s in appended[1:4]] == ["2", "-", "3"]
     assert appended[4] == list(tables.begins_cue)
-    # a plain document appends its tail, whose last row is its cue
-    term_appended = [suffix for key, suffix, kept, _ in model.packed
-                     if key == term.key and kept]
-    assert term_appended == [list(term.tail)]
     # the candidate spans are read whole; a start token the lines
     # repeat (the space before a number) got its one-token step first
     steps = [suffix for key, suffix, kept, whole in model.packed
@@ -548,25 +565,59 @@ def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatc
     # the likeliest start, "March" as the model writes it, is fed with
     # the document's tokens after it, CHUNK past the start of line 3
     march = tables.encode_ids("March")[0]
-    assert lease.branches[0].first == march
+    assert asked.branches[0].first == march
     (first,) = [suffix for suffix in fed if suffix[0] == march]
-    assert len(first) == lease.branches[0].fed <= CHUNK
+    assert len(first) == asked.branches[0].fed <= CHUNK
     # the likeliest start ended with a span, so no other start is fed
-    assert len(fed) == 1 and 1 < len(lease.candidates) <= 8
+    assert len(fed) == 1 and 1 < len(asked.candidates) <= 8
     # the keys name the document and its rendering, not the output,
     # so another extraction of the table reads the KV left resident
-    assert lease.key == (("extract", "c", "numbered"), 0)
-    assert term.key == (("extract", "c", "plain"), 1)
-    assert nothing.key == (("extract", "c", "plain"), 2)
-    assert result.metrics.extension["located"] == 1
-    assert result.metrics.extension["scored"] == 2
+    assert [doc.key for doc in stages.docs] == [
+        (("extract", "c", "numbered"), index) for index in range(3)]
+    assert result.metrics.extension["located"] == 3
+    assert result.metrics.extension["scored"] == 0
     assert result.metrics.extension["none"] == 1
     assert result.metrics.fresh_tokens > 0
     assert result.metrics.output_rows == 3
 
 
+def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
+    state, model, _, run_pipeline = _setup(monkeypatch)
+    results, stages = run_pipeline("ends", "starts")
+    first, second = results["ai-extract:ends"], results["ai-extract:starts"]
+    assert second.outputs["scores"].column("starts").to_pylist() == \
+        first.outputs["scores"].column("ends").to_pylist()
+    assert second.outputs["scores"].column("starts_span").to_pylist() == \
+        first.outputs["scores"].column("ends_span").to_pylist()
+    # one stage list asks both questions of a document; the second
+    # question's tail is written after the document in place of the
+    # first question's steps, the same frame rewound
+    assert len(stages.stages) == 2 * (LINE_MAX_TOKENS + 2 + MAX_PASSES)
+    assert stages.tails[0] == stages.tails[1]
+    lease = stages.docs[0]
+    (tail,) = set(map(tuple, stages.tails))
+    tails = [(index, suffix)
+             for index, (key, suffix, kept, _) in enumerate(model.packed)
+             if key == lease.key and kept
+             and suffix in (list(tail), [tail[-1]])]
+    # the frame is written once; the second question feeds the cue
+    # token after it, past the first question's steps
+    assert [suffix for _, suffix in tails] == [list(tail), [tail[-1]]]
+    between = [suffix for key, suffix, _, _
+               in model.packed[tails[0][0] + 1:tails[1][0]] if key == lease.key]
+    assert between, "the first question's steps come before the second tail"
+    # the documents are read once: the second extraction is charged
+    # only the tokens fed after them
+    prefixes = sum(len(doc.prefix) for doc in stages.docs)
+    fed = [stages.counts(q)["suffix_tokens"] for q in range(2)]
+    assert first.metrics.fresh_tokens == prefixes + fed[0]
+    assert second.metrics.fresh_tokens == fed[1] > 0
+    assert second.metrics.wall_s == 0.0 and first.metrics.wall_s > 0.0
+    assert [doc.questions[1].path for doc in stages.docs] == ["located"] * 3
+
+
 def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
-    state, model, run = _setup(monkeypatch)
+    state, model, run, _ = _setup(monkeypatch)
     first, stages = run("ends")
     arena = state.loaded_model.arena
     # every document's KV stays resident after the extraction
@@ -596,12 +647,21 @@ def test_extractor_returns_whole_lines_with_trim_off(monkeypatch):
 
 def test_locate_off_shows_every_document_plain():
     spec, tables = _spec(True, LEASE)
-    located = ExtractStages.__new__(ExtractStages)
-    located.spec, located.tables = spec, tables
-    assert located._prepare(0, 0, LEASE, None).numbered
-    plain = ExtractStages.__new__(ExtractStages)
-    plain.spec, plain.tables = replace(spec, locate=False), tables
-    assert not plain._prepare(0, 0, LEASE, None).numbered
+    state = SimpleNamespace(chunk_tokens=400)
+    documents = [tables.encode_ids(LEASE)]
+    located = ExtractStages(state, [spec], tables, [0], documents, [LEASE],
+                            readouts=(None, None))
+    assert located.docs[0].numbered
+    assert located.docs[0].key == (("extract", "c", "numbered"), 0)
+    plain = ExtractStages(state, [replace(spec, locate=False)], tables, [0],
+                          documents, [LEASE], readouts=(None, None))
+    assert not plain.docs[0].numbered
+    # the plain prompt has a head, so the table's KV is not the document's
+    assert plain.docs[0].key == (("extract", "c", "plain"), 0)
+    # a pipeline's extractions show the document the same way
+    with pytest.raises(ValueError, match="locating"):
+        ExtractStages(state, [spec, replace(spec, locate=False)], tables, [0],
+                      documents, [LEASE], readouts=(None, None))
 
 
 def test_extractor_stops_after_the_pass_limit(monkeypatch):
@@ -628,7 +688,7 @@ def test_extractor_stops_after_the_pass_limit(monkeypatch):
     state = _state(model, chunk_tokens=2000)
     state.loaded_model.extract_tables = tables
     texts = [long]
-    stages = ExtractStages(state, spec, tables, [0],
+    stages = ExtractStages(state, [replace(spec, locate=False)], tables, [0],
                            [tables.encode_ids(long)], texts)
     model.docs[stages.docs[0].key] = (long, False, "")
     model.gold[stages.docs[0].key] = "word"
@@ -638,9 +698,9 @@ def test_extractor_stops_after_the_pass_limit(monkeypatch):
                state.loaded_model.pipeline, stages.stages, stages.prefixes,
                state.chunk_tokens, anchor_keys=stages.keys)
     stages.finish()
-    doc = stages.docs[0]
-    assert doc.passes == MAX_PASSES and not doc.open
-    assert doc.answer is not None
+    asked = stages.docs[0].questions[0]
+    assert asked.passes == MAX_PASSES and not asked.open
+    assert asked.answer is not None
     assert len(stages.stages) == LINE_MAX_TOKENS + 2 + MAX_PASSES
     assert [stage.label for stage in stages.stages][:2] == [
         "ends tail", "ends lines 1"]

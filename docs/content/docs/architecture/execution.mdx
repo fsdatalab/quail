@@ -150,6 +150,23 @@ Classification can also read both documents of a joined pair. It runs
 in the join's pipeline, on one GPU, and classifies only pairs that the
 join kept. It reuses the anchor's KV when processing each pair.
 
+### Extraction
+
+An extraction copies each document's answer to a question from the
+document's own text. It shows the document inside its own prompt head,
+plain or as numbered lines, so it cannot reuse the KV a filter or a
+classification left: those show the document raw. The extractions of
+one table with the same `locate` setting run in a pipeline of their
+own. Quail reads a document once, then asks every question of it while
+its KV is resident: each question's text is written right after the
+document, in place of the tokens the question before it added, which
+is KV rewind again.
+
+For example, imagine a query that extracts the agreement date, the
+expiration date, and the governing law of each contract. Quail reads
+each contract once and asks the three questions of it in turn, instead
+of reading it three times.
+
 ## GPU execution
 
 ### Attention paths

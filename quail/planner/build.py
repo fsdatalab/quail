@@ -580,13 +580,18 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             live = live_asked.get(alias, float(stats[alias].n_docs))
             for test in operators.label_filters.get(alias, ()):
                 live *= effective_selectivity(test.selectivity)
-        for logical_node in calls:
+        for index, logical_node in enumerate(calls):
+            # the extractions of a table with one locating choice run
+            # in one pipeline (quail.execution.pipelines): a document
+            # is read once for all of them
+            shared = (index > 0
+                      and calls[index - 1].call.locate == logical_node.call.locate)
             node = AiExtract(
                 node_id=f"ai-extract:{sum(isinstance(n, AiExtract) for n in nodes)}",
                 inputs=input_ports((rows_src.get(alias, ids_src[alias]),)),
                 backend_name="quail", model=model.name,
                 spec=extract_spec(context, logical_node.call,
-                                  logical_node.name, live))
+                                  logical_node.name, live, shared=shared))
             nodes.append(node)
             scores = PortRef(node.node_id, "scores")
             ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
@@ -939,22 +944,24 @@ class ScoreLowering:
         return PortRef(node.node_id, "scores")
 
 
-def extract_spec(context, call, name, live) -> ExtractSpec:
+def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
     """Build an extraction's specification and price it.
 
     The specification carries the token ids of the plain prompt and of
     the numbered-lines prompt around the document. The estimate
-    (quail.cost.extract) prices each document as shown plain or
-    numbered by its line count, read from the table's text when the
-    scan loads it, else as numbered. The documents' KV is priced as
-    computed afresh: the extraction runs after its table's filters
-    finish, which free the KV they held.
+    (quail.cost.extract) prices each document as shown numbered when
+    the call locates, with its line count read from the table's text
+    when the scan loads it, else plain. The documents' KV is priced as
+    computed afresh unless the extraction shares a pipeline with the
+    one before it, which read the documents in the same rendering.
 
     Args:
         context: The planning context, with the model and tokenizer.
         call: Logical AI.EXTRACT call.
         name: Result column name.
         live: Expected number of documents to extract from.
+        shared: Whether an extraction of the same table and locating
+            choice runs right before this one.
     """
     turn = context.model.extract_turn
     plain = bind_extract_prompt(call.prompt.args, call.question,
@@ -970,7 +977,8 @@ def extract_spec(context, call, name, live) -> ExtractSpec:
         len(plain.preamble_token_ids), len(plain.tail_token_ids),
         len(numbered.preamble_token_ids), len(numbered.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),
-        model=context.model, device=context.device)
+        model=context.model, device=context.device,
+        numbered=call.locate, resident=shared)
     return ExtractSpec(
         name=name, aliases=call.aliases(),
         query_template=call.prompt.template,

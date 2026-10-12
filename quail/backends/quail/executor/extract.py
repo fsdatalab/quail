@@ -1,16 +1,20 @@
-"""Copy each document's answer to a question with the stage scheduler.
+"""Copy each document's answers to its questions with the stage scheduler.
 
-A document with LOCATE_MIN_LINES lines or more is shown as numbered
-lines: the model writes the lines that hold the answer, then the
-executor reads the likeliest start positions in those lines after
-the phrase cue. A shorter document is shown plain and the start
-positions are read over the whole of it. From each start, the
-document's own tokens are fed CHUNK at a time; each row gives the
-probability of copying the next token and of stopping, so every span
-from the start is scored in one pass, and a start whose copy
-probability falls below the best span's score is dropped. The
-document, the lines, and the cue stay in KV across the steps; the
-candidate spans are fed after them and read whole.
+With locating on, a document is shown as numbered lines: the model
+writes the lines that hold the answer, then the executor reads the
+likeliest start positions in those lines after the phrase cue. With
+locating off, the document is shown plain and the start positions are
+read over the whole of it. From each start, the document's own tokens
+are fed CHUNK at a time; each row gives the probability of copying the
+next token and of stopping, so every span from the start is scored in
+one pass, and a start whose copy probability falls below the best
+span's score is dropped. The document stays in KV across the steps;
+the candidate spans are fed after the cue and read whole.
+
+The extractions of one pipeline run as one stage list over the
+documents: a question's tail is the frame of its stages, written right
+after the document in place of the tokens the question before it
+appended, so a document is read once however many questions it takes.
 """
 
 import re
@@ -32,7 +36,6 @@ CUE_TOP = 1024      # vocabulary entries read at the cue
 FEED_TOP = 128      # vocabulary entries read at each fed row
 CHUNK = 16          # document tokens fed per pass from each start
 MAX_PASSES = 8      # passes a document may take: a runaway guard
-LOCATE_MIN_LINES = 3    # documents with fewer lines are shown plain
 LINE_MAX_TOKENS = 8     # tokens the lines answer may take
 NEG = float("-inf")
 
@@ -254,17 +257,9 @@ class Branch:
 
 
 @dataclass
-class Extraction:
-    """One document's prompt, its steps' answers, and its result."""
+class Question:
+    """One document's steps and result for one question."""
 
-    index: int
-    text: str
-    lines: list
-    numbered: bool
-    prefix: list
-    tokens: list        # (prefix index, (start, end)) per document token
-    tail: list
-    key: tuple
     range_tokens: list = field(default_factory=list)
     range_done: bool = False
     range: tuple | None = None
@@ -282,6 +277,20 @@ class Extraction:
     answer: str | None = None
     span: tuple | None = None
     none_wins: bool = False
+
+
+@dataclass
+class Extraction:
+    """One document's prompt and its answer to each question."""
+
+    index: int
+    text: str
+    lines: list
+    numbered: bool
+    prefix: list
+    tokens: list        # (prefix index, (start, end)) per document token
+    key: tuple
+    questions: list     # one Question per spec
 
 
 def best_start(tables: Tables, lp, key, token) -> tuple:
@@ -432,11 +441,12 @@ def best_span(branches, force: bool = False) -> tuple | None:
 
 
 class ExtractStages:
-    """The stages of one extraction and the answers they produce.
+    """The stages of one pipeline's extractions and the answers they produce.
 
     Args:
         state: The loaded model and current query state.
-        spec: The ExtractSpec.
+        specs: The ExtractSpecs, in order; they share a table, a
+            locating choice, and a prompt head.
         tables: The model's token tables.
         document_ids: The documents' ids in their table.
         documents: The table's tokenized documents.
@@ -444,11 +454,27 @@ class ExtractStages:
         readouts: Optional (cue, feed) readouts in place of the model's.
             The cue readout's extras are the none and quote tokens, then
             the lines answer's targets.
+
+    Raises:
+        ValueError: The specs differ in their table, locating, or head.
     """
 
-    def __init__(self, state, spec, tables: Tables, document_ids, documents,
+    def __init__(self, state, specs, tables: Tables, document_ids, documents,
                  texts, readouts=None):
-        self.spec = spec
+        self.specs = list(specs)
+        first = self.specs[0]
+        if any(spec.alias != first.alias or spec.locate != first.locate
+               for spec in self.specs):
+            raise ValueError("a pipeline's extractions share a table and locating")
+        self.numbered = first.locate
+        parts = [spec.numbered_token_parts if self.numbered
+                 else spec.prompt_token_parts for spec in self.specs]
+        self.head = list(parts[0][0])
+        if any(list(head) != self.head for head, _ in parts):
+            raise ValueError("a pipeline's extractions share a prompt head")
+        self.tails = [list(tail) for _, tail in parts]
+        if any(len(tail) < 2 for tail in self.tails):
+            raise ValueError("an extraction's tail ends in its cue after the question")
         self.tables = tables
         self.docs = [self._prepare(index, document, texts[document],
                                    None if documents is None
@@ -461,38 +487,53 @@ class ExtractStages:
             readouts = self._readouts(state)
         self.cue_readout, self.feed_readout = readouts
         longest = max((len(doc.tokens) for doc in self.docs), default=0)
-        tails = max((len(doc.tail) for doc in self.docs), default=1)
-        name = spec.name
-        # every document appends its tail first: a numbered one reads
-        # the lines answer's first token there, a plain one its start
-        self.stages = [Stage(
-            suffixes=self._tail_suffix, suffix_tokens=tails,
-            readout=self.cue_readout, decide=self._tail_decide,
-            single=True, append=True, label=f"{name} tail")]
-        self.stages.extend(
-            Stage(suffixes=self._range_suffix, suffix_tokens=1,
-                  readout=self.cue_readout, decide=self._range_decide,
-                  single=True, append=True, label=f"{name} lines {r}")
-            for r in range(1, LINE_MAX_TOKENS))
-        self.stages.append(Stage(
-            suffixes=self._cue_suffix, suffix_tokens=len(tables.begins_cue),
-            readout=self.cue_readout, decide=self._cue_decide,
-            single=True, append=True, label=f"{name} start"))
-        self.stages.append(Stage(
-            suffixes=self._step_suffix, suffix_tokens=1,
-            readout=self.cue_readout, decide=self._step_decide,
-            label=f"{name} start step"))
         # a branch's tokens are the document's text from its start,
         # tokenized afresh, so they may outnumber the document's tokens;
         # a suffix is fed whole, so a pass never exceeds the chunk budget
         self.pass_bound = {p: min(2 * longest + CHUNK * (p + 1), state.chunk_tokens)
                            for p in range(1, MAX_PASSES + 1)}
-        self.stages.extend(
-            Stage(suffixes=partial(self._pass_suffix, p),
-                  suffix_tokens=self.pass_bound[p],
-                  readout=self.feed_readout, decide=partial(self._pass_decide, p),
+        self.stages = []
+        for q, (spec, tail) in enumerate(zip(self.specs, self.tails)):
+            self.stages.extend(self._question_stages(q, spec.name, tail))
+
+    def _question_stages(self, q: int, name: str, tail: list) -> list:
+        """Build one question's stages: its tail, lines, start, and passes.
+
+        The tail but its last token is the frame of every stage, so
+        the scheduler writes it once after the document; the first
+        stage rewinds past what the question before appended. The
+        last token of the tail is the stage's suffix, whose row is
+        read: the lines answer's first token for a numbered document,
+        the start for a plain one.
+        """
+        frame, last = tail[:-1], tail[-1]
+        stages = [Stage(
+            suffixes=[[last]], frame=frame, rewind=True,
+            readout=self.cue_readout, decide=partial(self._tail_decide, q),
+            single=True, append=True, label=f"{name} tail")]
+        stages.extend(
+            Stage(suffixes=partial(self._range_suffix, q), suffix_tokens=1,
+                  frame=frame, readout=self.cue_readout,
+                  decide=partial(self._range_decide, q),
+                  single=True, append=True, label=f"{name} lines {r}")
+            for r in range(1, LINE_MAX_TOKENS))
+        stages.append(Stage(
+            suffixes=partial(self._cue_suffix, q),
+            suffix_tokens=len(self.tables.begins_cue), frame=frame,
+            readout=self.cue_readout, decide=partial(self._cue_decide, q),
+            single=True, append=True, label=f"{name} start"))
+        stages.append(Stage(
+            suffixes=partial(self._step_suffix, q), suffix_tokens=1,
+            frame=frame, readout=self.cue_readout,
+            decide=partial(self._step_decide, q), label=f"{name} start step"))
+        stages.extend(
+            Stage(suffixes=partial(self._pass_suffix, q, p),
+                  suffix_tokens=self.pass_bound[p], frame=frame,
+                  readout=self.feed_readout,
+                  decide=partial(self._pass_decide, q, p),
                   read_all_rows=True, label=f"{name} pass {p}")
             for p in range(1, MAX_PASSES + 1))
+        return stages
 
     def _readouts(self, state) -> tuple:
         torch = state.torch
@@ -514,77 +555,81 @@ class ExtractStages:
         head, whose tokens are the table's, keeps the table's key, so
         KV a filter left resident is read.
         """
-        spec, tables = self.spec, self.tables
+        tables = self.tables
         text = text.as_py() if hasattr(text, "as_py") else str(text)
         lines = document_lines(text)
-        numbered = spec.locate and len(lines) >= LOCATE_MIN_LINES
-        if numbered:
-            head, tail = spec.numbered_token_parts
+        if self.numbered:
             body, pieces = numbered_text(text, lines)
         else:
-            head, tail = spec.prompt_token_parts
             body, pieces = text, [(0, 0, len(text))]
         ids, offsets = tables.encode(body)
-        rendering = "numbered" if numbered else "plain"
-        key = (("extract", spec.alias, rendering), int(document))
-        if (not numbered and not head and stored is not None
+        alias = self.specs[0].alias
+        rendering = "numbered" if self.numbered else "plain"
+        key = (("extract", alias, rendering), int(document))
+        if (not self.numbered and not self.head and stored is not None
                 and [int(t) for t in stored] == ids):
-            key = (spec.alias, int(document))
-        prefix = list(head) + ids
-        tokens = document_tokens(ids, offsets, pieces, len(head))
+            key = (alias, int(document))
+        prefix = self.head + ids
+        tokens = document_tokens(ids, offsets, pieces, len(self.head))
+        path = "located" if self.numbered else "scored"
         return Extraction(index=index, text=text, lines=lines,
-                          numbered=numbered, prefix=prefix, tokens=tokens,
-                          tail=list(tail), key=key,
-                          path="located" if numbered else "scored")
+                          numbered=self.numbered, prefix=prefix, tokens=tokens,
+                          key=key,
+                          questions=[Question(path=path) for _ in self.specs])
+
+    def _question(self, q: int, anchor: int) -> tuple:
+        doc = self.docs[anchor]
+        return doc, doc.questions[q]
 
     # ---- the tail, then the lines range -----------------------------------
 
-    def _tail_suffix(self, key):
-        return [self.by_key[key].tail]
-
-    def _tail_decide(self, anchor, row):
-        doc = self.docs[anchor]
-        doc.fed_tokens += len(doc.tail)
+    def _tail_decide(self, q, anchor, row):
+        doc, qs = self._question(q, anchor)
+        # a tail equal to the question's before it is in KV already:
+        # only its cue token is fed
+        same = q > 0 and self.tails[q] == self.tails[q - 1]
+        qs.fed_tokens += 1 if same else len(self.tails[q])
         if doc.numbered:
-            return self._range_decide(anchor, row, first=True)
-        return self._cue_decide(anchor, row)
+            return self._range_decide(q, anchor, row, first=True)
+        return self._cue_decide(q, anchor, row)
 
-    def _range_suffix(self, key):
+    def _range_suffix(self, q, key):
         doc = self.by_key[key]
-        if not doc.numbered or doc.range_done:
+        qs = doc.questions[q]
+        if not doc.numbered or qs.range_done:
             return Stage.SKIP
-        return [[doc.range_tokens[-1]]]
+        return [[qs.range_tokens[-1]]]
 
     def _extras(self, values) -> np.ndarray:
         """Return a cue row's extra values: none, quote, then the lines targets."""
         values = np.asarray(values, dtype=np.float32).reshape(-1)
         return values[:len(values) - 2 * self.cue_readout.k]
 
-    def _range_decide(self, anchor, row, first=False):
-        doc = self.docs[anchor]
+    def _range_decide(self, q, anchor, row, first=False):
+        doc, qs = self._question(q, anchor)
         tables = self.tables
         if not first:
-            doc.fed_tokens += 1
+            qs.fed_tokens += 1
         token = tables.range_targets[int(np.argmax(self._extras(row)[2:]))]
         if token in tables.range_text:
-            doc.range_tokens.append(token)
+            qs.range_tokens.append(token)
         else:
-            doc.range_done = True
-        if len(doc.range_tokens) == LINE_MAX_TOKENS:
-            doc.range_done = True
-        if doc.range_done:
-            answer = "".join(tables.range_text[t] for t in doc.range_tokens)
-            doc.range = parse_lines(answer, len(doc.lines))
-            if doc.range is None:
-                doc.path = "fallback"
+            qs.range_done = True
+        if len(qs.range_tokens) == LINE_MAX_TOKENS:
+            qs.range_done = True
+        if qs.range_done:
+            answer = "".join(tables.range_text[t] for t in qs.range_tokens)
+            qs.range = parse_lines(answer, len(doc.lines))
+            if qs.range is None:
+                qs.path = "fallback"
             else:
-                a, b = doc.range
-                doc.region = (doc.lines[a - 1][0], doc.lines[b - 1][1])
+                a, b = qs.range
+                qs.region = (doc.lines[a - 1][0], doc.lines[b - 1][1])
         return True
 
     # ---- the start -------------------------------------------------------
 
-    def _cue_suffix(self, key):
+    def _cue_suffix(self, q, key):
         doc = self.by_key[key]
         return [self.tables.begins_cue] if doc.numbered else Stage.SKIP
 
@@ -599,78 +644,79 @@ class ExtractStages:
         lp.setdefault(self.tables.quote_id, float(extras[1]))
         return lp
 
-    def _cue_decide(self, anchor, row):
-        doc = self.docs[anchor]
+    def _cue_decide(self, q, anchor, row):
+        doc, qs = self._question(q, anchor)
         if doc.numbered:
-            doc.fed_tokens += len(self.tables.begins_cue)
-        if doc.region is not None and not any(
-                doc.region[0] <= span[0] < doc.region[1] for _, span in doc.tokens):
-            doc.region = None      # the range maps to no tokens
-            doc.path = "fallback"
+            qs.fed_tokens += len(self.tables.begins_cue)
+        if qs.region is not None and not any(
+                qs.region[0] <= span[0] < qs.region[1] for _, span in doc.tokens):
+            qs.region = None      # the range maps to no tokens
+            qs.path = "fallback"
         lp = self._lp(row)
-        doc.starts = rank_starts(self.tables, lp, doc.prefix, doc.tokens,
-                                 doc.region)
-        doc.none_lp, doc.best_lp = doc.starts["none_lp"], doc.starts["best_lp"]
-        doc.none_wins = doc.none_lp > doc.best_lp
-        doc.cue_lp = lp
-        if doc.none_wins:
+        qs.starts = rank_starts(self.tables, lp, doc.prefix, doc.tokens,
+                                qs.region)
+        qs.none_lp, qs.best_lp = qs.starts["none_lp"], qs.starts["best_lp"]
+        qs.none_wins = qs.none_lp > qs.best_lp
+        qs.cue_lp = lp
+        if qs.none_wins:
             # the model would write none: no start is read
-            doc.starts["ambiguous"] = []
-            doc.answer, doc.span = None, None
-        elif not doc.starts["ambiguous"]:
-            self._finish_candidates(doc, {})
+            qs.starts["ambiguous"] = []
+            qs.answer, qs.span = None, None
+        elif not qs.starts["ambiguous"]:
+            self._finish_candidates(doc, qs, {})
         return True
 
-    def _step_suffix(self, key):
-        doc = self.by_key[key]
-        if not doc.starts.get("ambiguous"):
+    def _step_suffix(self, q, key):
+        qs = self.by_key[key].questions[q]
+        if not qs.starts.get("ambiguous"):
             return Stage.SKIP
-        return [[doc.starts["best"][k]] for k in doc.starts["ambiguous"]]
+        return [[qs.starts["best"][k]] for k in qs.starts["ambiguous"]]
 
-    def _step_decide(self, anchor, row):
-        doc = self.docs[anchor]
+    def _step_decide(self, q, anchor, row):
+        doc, qs = self._question(q, anchor)
         rows = np.asarray(row, dtype=np.float32).reshape(-1, self.cue_readout.width)
-        doc.fed_tokens += len(rows)
+        qs.fed_tokens += len(rows)
         follow = {key: self._lp(values)
-                  for key, values in zip(doc.starts["ambiguous"], rows)}
-        self._finish_candidates(doc, follow)
+                  for key, values in zip(qs.starts["ambiguous"], rows)}
+        self._finish_candidates(doc, qs, follow)
         return True
 
-    def _finish_candidates(self, doc, follow):
-        doc.candidates = choose_candidates(
-            self.tables, doc.starts, doc.cue_lp, follow, doc.prefix)
-        doc.branches = make_branches(self.tables, doc.text, doc.candidates,
-                                     doc.cue_lp)
-        doc.open = open_branches(doc.branches)
-        if not doc.open:
-            doc.answer, doc.span = None, None
+    def _finish_candidates(self, doc, qs, follow):
+        qs.candidates = choose_candidates(
+            self.tables, qs.starts, qs.cue_lp, follow, doc.prefix)
+        qs.branches = make_branches(self.tables, doc.text, qs.candidates,
+                                    qs.cue_lp)
+        qs.open = open_branches(qs.branches)
+        if not qs.open:
+            qs.answer, qs.span = None, None
 
     # ---- the spans -------------------------------------------------------
 
-    def _pass_suffix(self, p, key):
+    def _pass_suffix(self, q, p, key):
         doc = self.by_key[key]
-        doc.open = [i for i in doc.open if self._take(doc, i, p) > 0]
-        if not doc.open:
-            self._answer(doc)
+        qs = doc.questions[q]
+        qs.open = [i for i in qs.open if self._take(qs, i, p) > 0]
+        if not qs.open:
+            self._answer(doc, q)
             return Stage.SKIP
-        return [doc.branches[i].stream[:doc.branches[i].fed + self._take(doc, i, p)]
-                for i in doc.open]
+        return [qs.branches[i].stream[:qs.branches[i].fed + self._take(qs, i, p)]
+                for i in qs.open]
 
-    def _take(self, doc, i, p) -> int:
+    def _take(self, qs, i, p) -> int:
         """Return how many more tokens the branch feeds at pass p."""
-        branch = doc.branches[i]
+        branch = qs.branches[i]
         take = min(CHUNK, len(branch.stream) - branch.fed,
                    self.pass_bound[p] - branch.fed)
         return max(take, 0)
 
-    def _pass_decide(self, p, anchor, row):
-        doc = self.docs[anchor]
+    def _pass_decide(self, q, p, anchor, row):
+        doc, qs = self._question(q, anchor)
         k = self.feed_readout.k
-        for i, values in zip(doc.open, row):
-            branch = doc.branches[i]
+        for i, values in zip(qs.open, row):
+            branch = qs.branches[i]
             values = np.asarray(values, dtype=np.float32).reshape(-1, 1 + 2 * k)
-            take = self._take(doc, i, p)
-            doc.fed_tokens += len(values)
+            take = self._take(qs, i, p)
+            qs.fed_tokens += len(values)
             for j in range(branch.fed, branch.fed + take):
                 ids = values[j, 1:1 + k].astype(np.int64).tolist()
                 lps = values[j, 1 + k:].tolist()
@@ -685,24 +731,26 @@ class ExtractStages:
                 branch.merged.append(merged)
                 branch.stop.append(float(values[j, 0]))
             branch.fed += take
-        doc.passes = p
-        doc.open = open_branches(doc.branches)
-        if not doc.open or p == MAX_PASSES:
-            self._answer(doc, force=p == MAX_PASSES)
+        qs.passes = p
+        qs.open = open_branches(qs.branches)
+        if not qs.open or p == MAX_PASSES:
+            self._answer(doc, q, force=p == MAX_PASSES)
         return True
 
-    def _answer(self, doc, force: bool = False):
-        """Set the document's answer: its span, or none.
+    def _answer(self, doc, q, force: bool = False):
+        """Set the question's answer for the document: its span, or none.
 
         Args:
             doc: The extraction.
+            q: The question.
             force: Whether a span still copying at the pass limit ends
                 at its last fed token.
         """
-        doc.open = []
-        found = best_span(doc.branches, force)
-        if found is None or doc.none_wins:
-            doc.answer, doc.span = None, None
+        qs = doc.questions[q]
+        qs.open = []
+        found = best_span(qs.branches, force)
+        if found is None or qs.none_wins:
+            qs.answer, qs.span = None, None
             return
         branch, j = found
         start, end = branch.char, branch.ends[j]
@@ -711,23 +759,30 @@ class ExtractStages:
             start += 1
         while end > start and text[end - 1].isspace():
             end -= 1
-        if not self.spec.trim:
+        if not self.specs[q].trim:
             start, end = line_span(text, (start, end))
-        doc.answer, doc.span = text[start:end], (start, end)
+        qs.answer, qs.span = text[start:end], (start, end)
 
     def finish(self) -> None:
-        """Answer every document the passes left open."""
+        """Answer every question the passes left open."""
         for doc in self.docs:
-            if doc.open:
-                self._answer(doc)
+            for q, qs in enumerate(doc.questions):
+                if qs.open:
+                    self._answer(doc, q)
 
-    def counts(self) -> dict:
+    def answers(self, q: int) -> tuple:
+        """Return every document's answer and span for question q."""
+        return ([doc.questions[q].answer for doc in self.docs],
+                [doc.questions[q].span for doc in self.docs])
+
+    def counts(self, q: int) -> dict:
         """Return how many documents took each path and how much was fed."""
+        states = [doc.questions[q] for doc in self.docs]
         return {
-            "located": sum(doc.path == "located" for doc in self.docs),
-            "fallback": sum(doc.path == "fallback" for doc in self.docs),
-            "scored": sum(doc.path == "scored" for doc in self.docs),
-            "none": sum(doc.answer is None for doc in self.docs),
-            "passes": sum(doc.passes for doc in self.docs),
-            "suffix_tokens": sum(doc.fed_tokens for doc in self.docs),
+            "located": sum(qs.path == "located" for qs in states),
+            "fallback": sum(qs.path == "fallback" for qs in states),
+            "scored": sum(qs.path == "scored" for qs in states),
+            "none": sum(qs.answer is None for qs in states),
+            "passes": sum(qs.passes for qs in states),
+            "suffix_tokens": sum(qs.fed_tokens for qs in states),
         }

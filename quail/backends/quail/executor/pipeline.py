@@ -8,6 +8,7 @@ from quail.backends.quail.executor.operators.classify import (
     classification_part,
     joined_classification,
 )
+from quail.backends.quail.executor.operators.extract import execute_extractions
 from quail.backends.quail.executor.operators.filter import FilterPart, LabelGate
 from quail.backends.quail.executor.operators.join import execute_join
 from quail.backends.quail.executor.parts import (
@@ -20,7 +21,7 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.stages import run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.tokens import DocumentKeys, DocumentPrefixes
-from quail.physical import AiClassify, AiFilter, AiJoin, Filter, Foreign
+from quail.physical import AiClassify, AiExtract, AiFilter, AiJoin, Filter, Foreign
 
 
 def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> dict:
@@ -31,7 +32,8 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
     document goes through every operator with its KV resident. A
     filter on a label or per-batch apply between two stages gates the
     next stage; one after the last stage runs over the documents
-    that came out of it.
+    that came out of it. A pipeline of extractions runs as one stage
+    list of their questions (quail.backends.quail.executor.operators.extract).
 
     Args:
         state: The loaded model and current query state.
@@ -54,6 +56,12 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
               else next(iter(inputs[first.node_id].values())))
     ids = (source.column(alias).to_pylist() if isinstance(source, pa.Table)
            else list(source))
+    if isinstance(first, AiExtract):
+        # the extractions of one table: every document is read once
+        # and asked each question while resident
+        return execute_extractions(
+            state, members,
+            context.model_inputs(first, inputs[first.node_id], context))
     gpu_inputs = {"gpu_timing": context.state.get("gpu_timing", False)}
     # the members with stages, then the gates after the last of them
     last_staged = max(index for index, member in enumerate(members)

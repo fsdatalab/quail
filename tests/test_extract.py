@@ -12,6 +12,7 @@ from fakes import letter_tokens
 import quail
 from quail.backends.request import EXTRACT_MAX_TOKENS
 from quail.catalog import DocumentProvider
+from quail.execution.pipelines import build_pipelines
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.logical import (
     SHARED_PRE,
@@ -226,6 +227,38 @@ def test_extract_follows_the_filters_and_labels_of_its_table(session):
     # half the documents pass the label filter
     assert node.spec.expected_inputs == pytest.approx(2 * 0.2 * 0.5)
     assert plan.nodes[-1].columns == ("c.id", "kind", "ends", "ends_span")
+
+
+def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
+        session):
+    query = (session.docs("contracts").alias("c")
+             .ai_extract("c.text", QUESTION, name="ends")
+             .ai_extract("c.text", "Who signs?", name="signer")
+             .ai_extract("c.text", "Where?", name="place", locate=False)
+             .select("c.id", "ends", "signer", "place"))
+    plan = query.plan()
+    extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    pipelines = build_pipelines(plan.graph)
+    # the first two show the document numbered and run as one
+    # pipeline: the second reads the KV the first leaves and is
+    # priced without reading the document; the third shows it plain
+    # and starts a pipeline of its own
+    assert pipelines[extracts[0].node_id].node_ids == (
+        extracts[0].node_id, extracts[1].node_id)
+    assert pipelines[extracts[2].node_id].node_ids == (extracts[2].node_id,)
+    assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
+    # a filter's pipeline ends before an extraction: they show the
+    # document under different prompt heads
+    filtered = (session.docs("contracts").alias("c")
+                .ai_filter(quail.prompt("Is {0} a lease?", quail.col("c.text")))
+                .ai_extract("c.text", QUESTION, name="ends")
+                .select("c.id", "ends"))
+    plan = filtered.plan()
+    (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    (ai_filter,) = [n for n in plan.nodes if isinstance(n, AiFilter)]
+    pipelines = build_pipelines(plan.graph)
+    assert pipelines[ai_filter.node_id].node_ids == (ai_filter.node_id,)
+    assert pipelines[extract.node_id].node_ids == (extract.node_id,)
 
 
 def _candidates(session, query):

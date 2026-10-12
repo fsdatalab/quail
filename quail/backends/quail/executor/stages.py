@@ -48,6 +48,9 @@ class Stage:
         append: Whether the request's tokens join the document's KV after
             the frame and any tokens earlier append stages added, so the
             next append stage reads them instead of feeding them again.
+        rewind: Whether the request's tokens follow the frame directly,
+            in place of the tokens earlier append stages added, as the
+            first stage of a new question over the same document does.
         label: Name displayed in progress messages.
         chains: Optional trie chains and ancestor references from trie_chains().
         read_mask: Optional mask of the rows read in the sole chains
@@ -69,6 +72,7 @@ class Stage:
     read_all_rows: bool = False
     read_rows: Any = None
     single: bool = False
+    rewind: bool = False
     append: bool = False
     label: str = ""
     chains: list | None = None
@@ -486,8 +490,10 @@ class _StageExecutor:
             f = self.prefix_lengths[a]
             frame = self.frames[j]
             append = self.stages[j].append
-            # a written frame replaces any path an earlier stage kept
-            path = 0 if self.writes[j] and start == 0 else self.appended[a]
+            # a written frame, or a rewinding stage, replaces any path
+            # an earlier stage kept
+            rewinds = self.writes[j] or self.stages[j].rewind
+            path = 0 if rewinds and start == 0 else self.appended[a]
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
             if self.paged:

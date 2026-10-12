@@ -4,10 +4,10 @@ import numpy as np
 import pyarrow as pa
 
 from quail.cost.extract import (
+    ASSUMED_LINES,
     CUE_TOKENS,
     FED_PER_START,
     LINE_NUMBER_TOKENS,
-    LOCATE_MIN_LINES,
     RANGE_TOKENS,
     START_STEP_TOKENS,
     STARTS_FED,
@@ -32,7 +32,7 @@ def _cost(lengths, lines, **kwargs):
 
 def test_a_plain_document_scans_once_then_feeds_the_step_and_the_starts():
     work, fed, rows = document_work(100, 1, HEAD, TAIL, NUMBERED_HEAD,
-                                    NUMBERED_TAIL)
+                                    NUMBERED_TAIL, numbered=False)
     context = HEAD + 100 + TAIL
     expected = (scan(HEAD + 100, TAIL)
                 + stream(context, [1] * START_STEP_TOKENS)
@@ -42,7 +42,7 @@ def test_a_plain_document_scans_once_then_feeds_the_step_and_the_starts():
     assert rows == 1 + START_STEP_TOKENS + FED_PER_START * STARTS_FED
     # resident KV turns the scan into a question over it
     resident, _, _ = document_work(100, 1, HEAD, TAIL, NUMBERED_HEAD,
-                                   NUMBERED_TAIL, resident=True)
+                                   NUMBERED_TAIL, numbered=False, resident=True)
     assert resident == (ask(HEAD + 100, TAIL)
                         + stream(context, [1] * START_STEP_TOKENS)
                         + stream(context, [FED_PER_START] * STARTS_FED))
@@ -68,12 +68,24 @@ def test_a_numbered_document_answers_its_lines_then_the_cue():
                    + FED_PER_START * STARTS_FED)
     assert rows == (1 + RANGE_TOKENS + 1 + START_STEP_TOKENS
                     + FED_PER_START * STARTS_FED)
-    # a numbered document is never resident: its tokens are not the table's
-    assert document_work(100, lines, HEAD, TAIL, NUMBERED_HEAD, NUMBERED_TAIL,
-                         resident=True)[0] == work
-    # the line count decides the layout
-    plain = document_work(100, LOCATE_MIN_LINES - 1, HEAD, TAIL,
-                          NUMBERED_HEAD, NUMBERED_TAIL)[0]
+    # a later extraction of the pipeline finds the numbered document
+    # resident and asks its tail over it instead of reading it
+    resident = document_work(100, lines, HEAD, TAIL, NUMBERED_HEAD,
+                             NUMBERED_TAIL, resident=True)[0]
+    asked = ask(prefix, NUMBERED_TAIL)
+    context = prefix + NUMBERED_TAIL
+    for _ in range(RANGE_TOKENS):
+        asked += ask(context, 1)
+        context += 1
+    asked += ask(context, CUE_TOKENS)
+    context += CUE_TOKENS
+    asked += stream(context, [1] * START_STEP_TOKENS)
+    asked += stream(context, [FED_PER_START] * STARTS_FED)
+    assert resident == asked
+    assert resident.tokens < work.tokens
+    # the locating choice decides the layout, whatever the line count
+    plain = document_work(100, lines, HEAD, TAIL, NUMBERED_HEAD,
+                          NUMBERED_TAIL, numbered=False)[0]
     assert plain.tokens < work.tokens
 
 
@@ -99,8 +111,12 @@ def test_estimate_sums_documents_scales_to_live_and_prices_passes():
     assert half.seconds < cost.seconds
     assert _cost(lengths, lines, live=0).seconds == 0
     assert _cost([], []).work == Work()
-    # unknown line counts price every document as numbered
-    assert _cost(lengths, None).work == _cost(lengths, [LOCATE_MIN_LINES] * 3).work
+    # unknown line counts price every document at the assumed count
+    assert _cost(lengths, None).work == _cost(lengths, [ASSUMED_LINES] * 3).work
+    # plain documents cost less than numbered ones; a resident pipeline
+    # of extractions reads neither
+    assert _cost(lengths, lines, numbered=False).work.tokens < cost.work.tokens
+    assert _cost(lengths, lines, resident=True).work.tokens < cost.work.tokens
     # a smaller chunk reads the weights more often: more time, same work
     small = _cost(lengths, lines, chunk=100)
     assert small.work == cost.work and small.seconds > cost.seconds

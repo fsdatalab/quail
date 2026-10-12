@@ -8,6 +8,8 @@ the document, plain or as numbered lines; the lines answer, one token
 per round; the phrase cue; the start step; and the candidate spans fed
 after the cue. How many tokens the spans take is a measured constant,
 not a function of the document: the planner does not see the answer.
+The second and later extractions of a pipeline find the document
+resident and are priced without reading it.
 """
 
 from dataclasses import dataclass
@@ -27,7 +29,7 @@ CHUNK = 16              # document tokens fed per pass from each start
 # (/results/extract_check/20261011T060458Z_quail_squad_trim.json and
 # _cuad_trim.json)
 STARTS_FED = 2
-LOCATE_MIN_LINES = 3    # documents with fewer lines are shown plain
+ASSUMED_LINES = 3       # a document's lines when the text is not at hand
 # the lines answer "a-b" and its line break, one token each
 RANGE_TOKENS = 4
 # the phrase cue after the lines answer: a line break, "Phrase", ":",
@@ -74,7 +76,8 @@ def _readout(model, rows: float, passes: float) -> CostComponent:
 
 def document_work(length: int, lines: int, head_tokens: int, tail_tokens: int,
                   numbered_head_tokens: int, numbered_tail_tokens: int, *,
-                  window: int = 0, resident: bool = False) -> tuple[Work, float, float]:
+                  numbered: bool = True, window: int = 0,
+                  resident: bool = False) -> tuple[Work, float, float]:
     """Return one document's work, its fed tokens, and its readout rows.
 
     Args:
@@ -84,14 +87,17 @@ def document_work(length: int, lines: int, head_tokens: int, tail_tokens: int,
         tail_tokens: Prompt tokens after a plain document, through the cue.
         numbered_head_tokens: Prompt tokens before a numbered document.
         numbered_tail_tokens: Prompt tokens after it, through the lines cue.
+        numbered: Whether the document is shown as numbered lines.
         window: The model's sliding window, 0 for none.
-        resident: Whether a plain document's KV is already available.
+        resident: Whether the document's KV, in that rendering, is
+            already available, as it is for the second and later
+            extractions of a pipeline.
     """
-    numbered = lines >= LOCATE_MIN_LINES
     fed = rows = 0.0
     if numbered:
         prefix = numbered_head_tokens + length + LINE_NUMBER_TOKENS * lines
-        work = scan(prefix, numbered_tail_tokens, window=window)
+        work = (ask(prefix, numbered_tail_tokens, window=window) if resident
+                else scan(prefix, numbered_tail_tokens, window=window))
         context = prefix + numbered_tail_tokens
         rows += 1
         for _ in range(RANGE_TOKENS):
@@ -119,14 +125,15 @@ def document_work(length: int, lines: int, head_tokens: int, tail_tokens: int,
 
 def estimate(live: float, lengths, lines, head_tokens: int, tail_tokens: int,
              numbered_head_tokens: int, numbered_tail_tokens: int, *,
-             chunk: int, model, device, resident: bool = False) -> ExtractCost:
+             chunk: int, model, device, numbered: bool = True,
+             resident: bool = False) -> ExtractCost:
     """Estimate the cost of one extraction over a table.
 
     Args:
         live: Expected number of documents to extract from.
         lengths: Document lengths in tokens.
         lines: Document line counts, or None when unknown: every
-            document is then priced as numbered.
+            document is then priced at ASSUMED_LINES.
         head_tokens: Prompt tokens before a plain document.
         tail_tokens: Prompt tokens after a plain document, through the cue.
         numbered_head_tokens: Prompt tokens before a numbered document.
@@ -134,7 +141,8 @@ def estimate(live: float, lengths, lines, head_tokens: int, tail_tokens: int,
         chunk: Maximum tokens per forward pass.
         model: Model specification.
         device: Device specification.
-        resident: Whether plain documents' KV is already available.
+        numbered: Whether the documents are shown as numbered lines.
+        resident: Whether the documents' KV is already available.
 
     Returns:
         Estimated execution time, work, and token counts.
@@ -143,13 +151,13 @@ def estimate(live: float, lengths, lines, head_tokens: int, tail_tokens: int,
     if live <= 0 or n == 0:
         return ExtractCost(0.0, 0.0, Work(), 0.0, 0.0)
     if lines is None:
-        lines = [LOCATE_MIN_LINES] * n
+        lines = [ASSUMED_LINES] * n
     work = Work()
     fed = rows = 0.0
     for length, count in zip(lengths, lines):
         own, own_fed, own_rows = document_work(
             int(length), int(count), head_tokens, tail_tokens,
-            numbered_head_tokens, numbered_tail_tokens,
+            numbered_head_tokens, numbered_tail_tokens, numbered=numbered,
             window=model.sliding_window, resident=resident)
         work += own
         fed += own_fed

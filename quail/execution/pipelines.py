@@ -4,6 +4,8 @@ A pipeline processes each document through its filters, classifications,
 and per-batch functions while its KV remains available. Materializing
 operators, incompatible prompt heads, and independent consumers end a
 pipeline. A join can continue into classification of the pairs it keeps.
+Extractions show the document inside their own prompt head, so they form
+pipelines of their own: one per table and locating choice.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from dataclasses import dataclass
 
 from quail.physical import (
     AiClassify,
+    AiExtract,
     AiFilter,
     AiJoin,
     Filter,
@@ -51,6 +54,8 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
     """
     if isinstance(node, AiFilter):
         return (node.alias,)
+    if isinstance(node, AiExtract):
+        return () if node.spec is None else (node.spec.alias,)
     if isinstance(node, AiClassify):
         # a classification of joined rows takes the join's anchors,
         # with the partners the join kept for each
@@ -72,7 +77,7 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
 
 def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
     """Return output ports carrying documents for the given alias."""
-    if isinstance(node, (AiClassify, Filter)):
+    if isinstance(node, (AiClassify, AiExtract, Filter)):
         return ("scores", f"ids:{alias}")
     if isinstance(node, Foreign) and node.ids == "pairs":
         return (f"pairs:{node.written_pos}",)
@@ -81,6 +86,19 @@ def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
         return tuple(f"join_answers:{stage.written_pos}"
                      for stage in node.stages) + (f"ids:{alias}",)
     return (f"ids:{alias}",)
+
+
+def _same_prompt_head(node: PhysicalNode, consumer: PhysicalNode) -> bool:
+    """Return whether the consumer shows the document as the node does.
+
+    An extraction shows the document inside its own head, plain or
+    numbered, so it continues only an extraction with the same
+    locating choice, and nothing else continues it.
+    """
+    if isinstance(node, AiExtract) or isinstance(consumer, AiExtract):
+        return (isinstance(node, AiExtract) and isinstance(consumer, AiExtract)
+                and node.spec.locate == consumer.spec.locate)
+    return True
 
 
 def _classifies_rows_of(node: PhysicalNode, join: AiJoin) -> bool:
@@ -132,6 +150,8 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
             for consumer in consumers.get((node.node_id, port), ()):
                 if isinstance(node, AiJoin) and not _classifies_rows_of(consumer, node):
                     continue
+                if not _same_prompt_head(node, consumer):
+                    continue
                 if takes(consumer, alias) and consumer not in following:
                     following.append(consumer)
         following.sort(key=lambda consumer: order[consumer.node_id])
@@ -146,8 +166,9 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         aliases = operator_aliases(node)
         if not aliases or node.node_id in followed:
             continue
-        # only an AI filter, classification, or join starts a pipeline
-        if not isinstance(node, (AiFilter, AiClassify, AiJoin)):
+        # only an AI filter, classification, extraction, or join
+        # starts a pipeline
+        if not isinstance(node, (AiFilter, AiClassify, AiExtract, AiJoin)):
             continue
         (alias,) = aliases
         members = [node]
