@@ -26,6 +26,7 @@ from quail.logical.prompts import (
     choice_token_parts,
     classify_prompt_tokens,
     score_query_template,
+    shared_preamble,
 )
 from quail.physical import (
     AiClassify,
@@ -957,6 +958,11 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
             before this one.
     """
     prompt = call.prompt
+    # under the query's shared preamble, the prompt's document KV is
+    # the one a filter writes
+    shares_head = context.tokenizer is not None and tuple(
+        prompt.preamble_token_ids) == tuple(context.tokenizer(shared_preamble(
+            context.model.turn_prefix, context.model.prompt_layout)))
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
     spec = bind_inference(
@@ -964,7 +970,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         expected_inputs=live, estimated_seconds=0.0,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
-        question=call.question, trim=call.trim)
+        question=call.question, trim=call.trim, shares_head=shares_head)
     cost = extract_cost.estimate(
         live, lengths, len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),
