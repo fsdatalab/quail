@@ -285,6 +285,16 @@ class PageParser:
         stream = torch.cuda.Stream()
         groups = queue.Queue(maxsize=max(1, self.encode_ahead // self.encode_batch))
         failure = []
+        stopped = threading.Event()
+
+        def put(item):
+            # a consumer that stopped early takes nothing more
+            while not stopped.is_set():
+                try:
+                    groups.put(item, timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
 
         def encode(group):
             embeds = self._images([page for _, page in group])
@@ -292,13 +302,15 @@ class PageParser:
             done.record(stream)
             for (_, page), rows in zip(group, embeds):
                 page["image_embeds"], page["image_done"] = rows, done
-            groups.put(group)
+            put(group)
 
         def run():
             try:
                 with torch.cuda.stream(stream), torch.inference_mode():
                     group = []
                     for item in pages:
+                        if stopped.is_set():
+                            return
                         group.append(item)
                         if len(group) == self.encode_batch:
                             encode(group)
@@ -308,11 +320,16 @@ class PageParser:
             except BaseException as error:
                 failure.append(error)
             finally:
-                groups.put(None)
+                put(None)
 
-        threading.Thread(target=run, daemon=True).start()
-        while (group := groups.get()) is not None:
-            yield from group
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        try:
+            while (group := groups.get()) is not None:
+                yield from group
+        finally:
+            stopped.set()
+            thread.join()
         if failure:
             raise failure[0]
 

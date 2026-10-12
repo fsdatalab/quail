@@ -112,6 +112,9 @@ class ParseRuntime:
 
     def execute(self, node, inputs, context) -> NodeResult:
         ids = list(next(iter(inputs.values())))
+        limit = context.state.get("parse_limit")
+        if limit is not None:
+            ids = ids[:limit]
         parsing = _Parsing(node, ids, context)
         for _ in parsing:
             pass
@@ -177,12 +180,25 @@ def execute_parsed_pipeline(run_rest, pipeline, inputs, context,
             rounds[node_id].append(result)
         reader_s += time.perf_counter() - started
 
-    for row, count in parsing:
+    limit = context.state.get("filter_limit")
+    sink = members[-1]
+
+    def enough() -> bool:
+        kept = sum(len(result.outputs.get(f"ids:{pipeline.alias}", ()))
+                   for result in rounds[sink.node_id])
+        return limit is not None and kept >= limit
+
+    rows = iter(parsing)
+    for row, count in rows:
         waiting.append(row)
         tokens += count
         if tokens >= round_tokens:
             run(waiting)
             waiting, tokens = [], 0
+            if enough():
+                # the rows already kept fill the LIMIT
+                rows.close()
+                break
     if waiting or not any(rounds.values()):
         run(waiting)
     result = parsing.result()

@@ -73,7 +73,7 @@ def _graph(with_filter):
     return PhysicalGraph(tuple(nodes), root)
 
 
-def _run(monkeypatch, graph, chunk_tokens=120):
+def _run(monkeypatch, graph, chunk_tokens=120, settings=SETTINGS):
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     rng = random.Random(3)
     lengths = [rng.randrange(10, 40) for _ in range(ROWS)]
@@ -99,7 +99,7 @@ def _run(monkeypatch, graph, chunk_tokens=120):
         "chunk_tokens": chunk_tokens, "docs": {"r": pages},
         "parser": lambda node: parser, "tokenize": tokenize,
     }
-    result = execute_single_graph(state, SETTINGS, graph)
+    result = execute_single_graph(state, settings, graph)
     assert not arena.accounting.owned
     return result, model, parser, lengths, truth
 
@@ -134,3 +134,13 @@ def test_a_filter_reads_parsed_rows_in_rounds(monkeypatch):
     assert sorted(packed) == list(range(ROWS))
     for row, prefix in packed.items():
         assert list(prefix)[-lengths[row]:] == [DOC + row] * lengths[row]
+
+
+def test_parsing_stops_once_the_filter_kept_the_limit(monkeypatch):
+    settings = {**SETTINGS, "filter_limit": 1}
+    result, _, parser, _, truth = _run(monkeypatch, _graph(True), chunk_tokens=40,
+                                       settings=settings)
+    assert len(parser.parsed) < ROWS
+    survivors = result["_outputs"][PortRef("filter:r", "ids:r")]
+    assert 1 <= survivors.num_rows
+    assert all(truth[row][0] for row in survivors.column("r").to_pylist())

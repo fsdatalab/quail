@@ -33,6 +33,7 @@ from quail.physical import (
     Filter,
     Foreign,
     Limit,
+    Parse,
     PhysicalGraph,
     Sort,
 )
@@ -46,13 +47,16 @@ class LimitPushdown:
 
     The rule puts the limit in the ``filter_limit`` setting, which the
     executor reads to stop admitting documents once that many survived
-    the chain's last stage. The pushdown keeps the first survivors to
-    finish, so it is sound only when those are the rows the query
-    returns: the graph ends in a Limit and has no Sort or Aggregate (an
-    ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
-    AiJoin (survivors are settled per join round), and no AiScore (a
-    score comparison after the chain can drop survivors). Otherwise the
-    rule removes the setting.
+    the chain's last stage, and to stop parsing once the chain after a
+    parse kept that many. A parse with nothing after it that drops rows
+    gets the ``parse_limit`` setting and parses only that many rows.
+    The pushdown keeps the first survivors to finish, so it is sound
+    only when those are the rows the query returns: the graph ends in
+    a Limit and has no Sort or Aggregate (an ORDER BY, DISTINCT,
+    OFFSET, or GROUP BY needs every survivor), no AiJoin (survivors are
+    settled per join round), and no AiScore (a score comparison after
+    the chain can drop survivors). Otherwise the rule removes the
+    settings.
     """
 
     name = "limit_pushdown"
@@ -69,6 +73,15 @@ class LimitPushdown:
             context.settings.pop("filter_limit", None)
         else:
             context.settings["filter_limit"] = limit.count
+        # a parse that nothing after it thins parses only the rows
+        # the limit returns
+        thinned = any(isinstance(node, (AiFilter, Filter, Foreign, AiJoin))
+                      for node in graph.nodes)
+        if (limit is not None and not blocked and not thinned
+                and any(isinstance(node, Parse) for node in graph.nodes)):
+            context.settings["parse_limit"] = limit.count
+        else:
+            context.settings.pop("parse_limit", None)
         return None
 
 

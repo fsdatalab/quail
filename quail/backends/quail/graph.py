@@ -462,6 +462,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
                         for node in graph.nodes)
             else payload.get("filter_limit")
         ),
+        "parse_limit": payload.get("parse_limit"),
         "joins_started": False,
         "kv_stats": {
             "retained_after_filters": 0,

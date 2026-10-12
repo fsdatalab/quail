@@ -67,6 +67,18 @@ def test_lanes_bound_the_documents_in_flight(monkeypatch):
     assert max(len(c.final_indices) for c in model.chunks) <= 2
 
 
+def test_a_run_stopped_early_frees_its_documents(monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = state_arena(pages=64, slots=4)
+    model = _CountingModel(limit=9)
+    run = _generator(arena, model, lanes=2).run(
+        Generation(key, np.array([1, 2])) for key in ("a", "b", "c"))
+    next(run)
+    assert arena.resident_keys() != []
+    run.close()
+    assert arena.resident_keys() == []
+
+
 def test_the_output_limit_ends_a_document(monkeypatch):
     cpu_staging(monkeypatch)
     arena = state_arena(pages=64, slots=4)

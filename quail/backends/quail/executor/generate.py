@@ -197,10 +197,24 @@ class GreedyGenerator:
                           decode_steps=0, decode_rows=0, decode_host_s=0.0,
                           decode_wait_s=0.0, discarded_rows=0)
         admission = _Admission(iter(generations), self)
-        if self.graphs:
-            yield from self._run_graphs(admission)
-        else:
-            yield from self._run_eager(admission)
+        try:
+            if self.graphs:
+                yield from self._run_graphs(admission)
+            else:
+                yield from self._run_eager(admission)
+        finally:
+            # a run its consumer stopped early still holds lanes
+            self._free_documents()
+
+    def _free_documents(self) -> None:
+        """Free every document's pages and slot; the graphs' scratch lane stays."""
+        scratch = getattr(self, "_scratch", None)
+        held = [key for key in self.arena.resident_keys() if key != scratch]
+        if held and self.graphs:
+            # a launched step may still write the lanes
+            self.torch.cuda.synchronize()
+        for key in held:
+            self.arena.free_key(key)
 
     def _run_eager(self, admission):
         """One pass per step, packing the decode rows with the admitted prompts."""

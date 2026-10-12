@@ -55,7 +55,8 @@ def _execute(request, query):
     }
     try:
         report = execute_single_graph(
-            state, {"pre_ids": [], "retention": {}}, query.plan().graph)
+            state, {**query.plan().settings, "pre_ids": [], "retention": {}},
+            query.plan().graph)
     finally:
         parser.close()
     return PhysicalResponse(report.pop("_outputs"), report)
@@ -120,3 +121,12 @@ def test_an_ocr_parser_takes_memory_from_the_reader(folder):
     # half the memory left after both models' weights, at 103 MB a lane
     assert 200 < parse.lanes <= 256
     assert 25 < plan.settings["parser_gib"] < 40
+
+
+def test_a_limit_parses_only_the_rows_it_returns(folder):
+    query = _session(folder).sql(
+        "SELECT p.path, AI.PARSE(p.document) AS text FROM pages p LIMIT 2")
+    assert query.plan().settings["parse_limit"] == 2
+    result = execute_query(query, physical_executor=lambda r: _execute(r, query))
+    assert result.count() == 2
+    assert result.report["node_metrics"]["parse:p"]["pages_parsed"] == 2
