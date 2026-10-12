@@ -88,9 +88,11 @@ def _run(arena, keys, stages, budget, monkeypatch, prefix_tree=None,
                              tree_attention=False)
     pipeline.forward_chunk = lambda chunk: [True] * chunk.n
 
+    lengths = [len(p) for p in (prefixes or [[1] * 64 for _ in keys])]
+
     def settled(anchor, survivors, row):
         if arena.is_resident(keys[anchor]):
-            arena.retain(keys[anchor], 64)
+            arena.retain(keys[anchor], lengths[anchor])
 
     return run_stages(
         fake_torch(), arena, pipeline, stages,
@@ -275,3 +277,56 @@ def test_a_failed_plan_leaves_the_extension_records_as_they_were(monkeypatch):
     assert arena.extension("a")[1] == 36
     _plan(arena, [advance], monkeypatch)
     assert arena.extension("a")[1] == 40
+
+
+def _tree_run(slots, parents, children, monkeypatch, stages=1, frame=(),
+              budget=1_000, spread=16):
+    """Parents whose children share prefixes of increasing length."""
+    docs, parent, shared = [], [], []
+    for p in range(parents):
+        base = [p + 1] * (spread * (children + 1))
+        docs.append(base)
+        parent.append(None)
+        shared.append(0)
+        index = len(docs) - 1
+        for c in range(children):
+            cut = spread * (c + 1)
+            docs.append(base[:cut] + [100 + p * 10 + c] * 40)
+            parent.append(index)
+            shared.append(cut)
+    firsts = [p * (children + 1) for p in range(parents)]
+    rest = [i for i in range(len(docs)) if i not in firsts]
+    tree = SimpleNamespace(parent=parent, shared=shared, order=firsts + rest,
+                           shared_tokens=sum(shared))
+    keys = [("t", i) for i in range(len(docs))]
+    arena = _arena(slots, pages=100_000)
+    if frame:
+        run_stages_ = _stages(stages, frame=frame)
+    else:
+        run_stages_ = [Stage(suffixes=[[9, 9]], readout=_Readout(), single=True)
+                       for _ in range(stages)]
+    _run(arena, keys, run_stages_, budget, monkeypatch, prefix_tree=tree,
+         prefixes=docs)
+
+
+@pytest.mark.parametrize("slots", [3, 6, 10, 15, 30])
+@pytest.mark.parametrize("children", [2, 6])
+@pytest.mark.parametrize("stages,frame", [(1, ()), (1, (7, 7)), (2, (7, 7))])
+def test_parents_with_many_share_lengths_run_in_a_small_pool(
+        slots, children, stages, frame, monkeypatch):
+    # a pool too small for every share point keeps the ones that save
+    # the most, and the other borrowers compute their whole prefix
+    _tree_run(slots, 6, children, monkeypatch, stages=stages, frame=frame)
+
+
+def test_the_share_points_a_parent_keeps_are_the_ones_that_save_most():
+    from quail.backends.quail.executor.stages import state_share_points
+
+    parents = [None, 0, 0, 0, 0, 0]
+    shared = [0, 16, 16, 32, 48, 48]
+    assert state_share_points(parents, shared) == [(16, 32, 48), (), (), (),
+                                                    (), ()]
+    # 16 has 2 borrowers (32 tokens saved), 48 has 2 (96), 32 has 1 (32)
+    assert state_share_points(parents, shared, limit=1)[0] == (48,)
+    assert state_share_points(parents, shared, limit=2)[0] == (16, 48)
+    assert state_share_points(parents, shared, limit=0)[0] == ()

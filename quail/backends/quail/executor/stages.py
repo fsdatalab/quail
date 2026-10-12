@@ -199,22 +199,29 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     ).run()
 
 
-def state_share_points(parents, shared):
+def state_share_points(parents, shared, limit=None):
     """The token counts at which each document's borrowers start.
 
     Args:
         parents: Per document, the document it borrows from or None.
         shared: Per document, the tokens it borrows from its parent.
+        limit: Most counts to keep per document, or None for all. The
+            counts that save the most tokens (borrowers times length)
+            are kept; a borrower at another count computes its prefix.
 
     Returns:
         Per document, the sorted distinct counts its borrowers start
         from; an empty tuple for a document nobody borrows from.
     """
-    points = [set() for _ in parents]
+    counts = [{} for _ in parents]
     for parent, count in zip(parents, shared):
         if parent is not None and count:
-            points[parent].add(count)
-    return [tuple(sorted(values)) for values in points]
+            counts[parent][count] = counts[parent].get(count, 0) + 1
+    points = []
+    for found in counts:
+        keep = sorted(found, key=lambda n: (-found[n] * n, n))
+        points.append(tuple(sorted(keep if limit is None else keep[:limit])))
+    return points
 
 
 def slots_per_document(n_stages, shares, frames=False):
@@ -373,11 +380,17 @@ class _StageExecutor:
                 "one document's state beside a chunk's KV, so a document "
                 "this long needs a smaller chunk or a larger pool")
         if self.paged and getattr(self.arena, "n_state_slots", 0):
-            self.share_points = state_share_points(
-                self.borrowing.tree_parent, self.borrowing.tree_shared)
-            self._share_width = max(map(len, self.share_points), default=0)
             self._extends = (any(self.writes)
                              or any(s.append for s in self.stages))
+            # a parent holds one slot per share length beside its own and
+            # its extension, and its borrowers need slots of their own, so
+            # a small pool keeps only the lengths that save the most
+            base = 1 + (1 if self._extends or len(self.stages) > 1 else 0)
+            room = max(0, (self.arena.n_state_slots - base) // 3)
+            self.share_points = state_share_points(
+                self.borrowing.tree_parent, self.borrowing.tree_shared,
+                limit=room)
+            self._share_width = max(map(len, self.share_points), default=0)
             need = slots_per_document(len(self.stages), self._share_width,
                                       self._extends)
             if self.arena.n_state_slots < need:
@@ -398,6 +411,7 @@ class _StageExecutor:
         self.held = [self.keys[a] for a, n in enumerate(self.borrowers) if n]
 
         self._held_parents = set()
+        self._unborrowed = set()    # borrowers rebuilt with their whole prefix
         self.spans = []
         self.tokens = 0
         self.pack_s = 0.0
@@ -480,6 +494,10 @@ class _StageExecutor:
                 return False
             if not shared > self.borrowing.shared(parent):
                 return False
+            # the parent saves a state only at the lengths it kept
+            if (shared != self.prefix_lengths[parent]
+                    and shared not in self.share_points[parent]):
+                return False
             if not same_chunk and self.arena.shared_state(
                     self.keys[parent], shared) is None:
                 return False
@@ -505,7 +523,8 @@ class _StageExecutor:
             # a written frame replaces any path an earlier stage kept
             path = 0 if self.writes[j] and start == 0 else self.appended[a]
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
-                              if carried else (None, 0))
+                              if carried and a not in self._unborrowed
+                              else (None, 0))
             if self.paged:
                 got = self.arena.activate(
                     key, f, capacity_tokens=f + self.capacity_extra,
@@ -713,10 +732,20 @@ class _StageExecutor:
 
     def _run_part(self, part):
         """Run one chunk of groups, halving it when its pages do not fit."""
-        from quail.backends.quail.executor.chunk import ArenaFullError
+        from quail.backends.quail.executor.chunk import (
+            ArenaFullError,
+            BorrowStateMissingError,
+        )
 
         try:
             self._run_one(part)
+        except BorrowStateMissingError as error:
+            # the parent's state is gone: the borrower computes its whole
+            # prefix, which the chunk packs in full
+            borrower = next(a for a, *_ in part if self.keys[a] == error.key)
+            self._unborrowed.add(borrower)
+            self._log_memory_event("unborrow", groups=len(part))
+            self._run_part(part)
         except ArenaFullError as error:
             # retained KV nothing here reads makes room first
             need = self.arena.page_cost(sum(self._entry_rows(*e) for e in part))
@@ -732,6 +761,12 @@ class _StageExecutor:
                 self._log_memory_event("drain_retry", groups=len(part))
                 while self.outstanding:
                     self._report(self.outstanding.pop(0))
+                self._run_part(part)
+                return
+            if len(part) < 2 and self.arena.drop_holds(self.held):
+                # parents held for queued children hold the slots: release
+                # them, and the children compute their whole prefixes
+                self._log_memory_event("drop_holds_retry", groups=len(part))
                 self._run_part(part)
                 return
             if len(part) < 2:

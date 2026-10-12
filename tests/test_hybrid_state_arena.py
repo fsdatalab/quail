@@ -226,7 +226,7 @@ def test_slot_limit_counts_each_slot_a_document_can_hold(
 
 
 def borrow_checker(parent_start, prefix_length, shared, saved=None,
-                   allowed=True):
+                   allowed=True, kept=True):
     arena = SimpleNamespace(
         shared_state=lambda key, tokens: (
             None if saved is None else saved.get((key, tokens))))
@@ -235,6 +235,8 @@ def borrow_checker(parent_start, prefix_length, shared, saved=None,
             tree_shared=[0, shared],
             shared=lambda parent: parent_start),
         prefix_lengths=[100, prefix_length],
+        # the parent saves a state at the length its child borrows
+        share_points=[(shared,) if kept else (), ()],
         arena=arena, keys=["p", "c"])
     return _StageExecutor._state_borrow_check(
         executor, lambda doc, parent, same_chunk: allowed)
@@ -296,3 +298,17 @@ def test_a_split_is_logged_with_what_ran_out(message, reason):
 
 def test_an_arena_without_a_log_ignores_events():
     event_of(SimpleNamespace(), reason="no free checkpoint slot")
+
+
+def test_a_borrow_at_a_length_the_parent_did_not_keep_is_refused():
+    # a small pool keeps only some share lengths; the other borrowers
+    # compute their whole prefix
+    assert borrow_checker(0, 100, 32)(1, 0, True)
+    assert not borrow_checker(0, 100, 32, kept=False)(1, 0, True)
+    assert not borrow_checker(0, 100, 32, kept=False,
+                              saved={("p", 32): 3})(1, 0, False)
+
+
+def test_a_borrow_of_the_parents_whole_prefix_needs_no_kept_point():
+    # the parent's document-end checkpoint serves its own length
+    assert borrow_checker(0, 200, 100, kept=False)(1, 0, True)

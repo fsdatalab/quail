@@ -53,6 +53,17 @@ class ArenaFullError(RuntimeError):
     """The KV arena has too few free pages to pack the chunk."""
 
 
+class BorrowStateMissingError(ArenaFullError):
+    """A borrower's parent holds no state at the length it borrows.
+
+    The borrower can compute its whole prefix instead.
+    """
+
+    def __init__(self, key, message):
+        super().__init__(message)
+        self.key = key
+
+
 def _tick(timing, key, t0):
     if timing is not None:
         timing[key] = timing.get(key, 0.0) + time.perf_counter() - t0

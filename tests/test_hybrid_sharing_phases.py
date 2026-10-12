@@ -8,6 +8,7 @@ import pytest
 from fakes import bare_arena
 
 from quail.backends.quail.executor.arena import KVArena, PageArena
+from quail.backends.quail.executor.chunk import BorrowStateMissingError
 from quail.backends.quail.executor.gdn import plan_phases
 
 
@@ -100,7 +101,7 @@ def test_borrower_after_the_parent_chunk_reads_the_saved_state(torch_stub):
 def test_a_borrow_without_a_saved_state_is_refused(torch_stub):
     arena = arena_with_slots()
     resident(arena, "p", "c")
-    with pytest.raises(ValueError, match="no state of the parent"):
+    with pytest.raises(BorrowStateMissingError, match="no state of the parent"):
         plan_phases(
             arena, [group("c", 64, 0, 32, start=32, borrow_key="p")], stage)
 
@@ -192,7 +193,7 @@ def test_a_borrower_of_the_parents_whole_prefix_reads_its_slot(torch_stub):
 def test_borrowing_without_a_parent_key_is_refused(torch_stub):
     arena = arena_with_slots()
     resident(arena, "c")
-    with pytest.raises(ValueError, match="no state of the parent"):
+    with pytest.raises(BorrowStateMissingError, match="no state of the parent"):
         plan_phases(
             arena, [group("c", 64, 0, 32, start=32, borrow_key=None)], stage)
 
@@ -201,7 +202,7 @@ def test_a_state_at_a_different_length_does_not_serve_a_borrow(torch_stub):
     arena = arena_with_slots()
     resident(arena, "p", "c")
     plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
-    with pytest.raises(ValueError, match="no state of the parent"):
+    with pytest.raises(BorrowStateMissingError, match="no state of the parent"):
         plan_phases(
             arena, [group("c", 80, 0, 32, start=16, borrow_key="p")], stage)
 

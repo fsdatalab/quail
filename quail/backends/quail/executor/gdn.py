@@ -89,7 +89,8 @@ def plan_phases(arena, groups, stage):
         The phases in run order, each a GdnPhase.
 
     Raises:
-        ValueError: A group borrows a prefix no state covers, keeps more
+        BorrowStateMissingError: A group borrows a prefix no state covers.
+        ValueError: A group keeps more
             tokens than its first suffix holds, follows a group of
             its key that extends the checkpoint after its suffix,
             advances a checkpoint in place that a question of the chunk
@@ -114,7 +115,10 @@ def _plan_phases(arena, groups, stage, undo):
     """Plan a chunk's phases, logging each extension record in `undo`."""
     import torch
 
-    from quail.backends.quail.executor.chunk import ArenaFullError
+    from quail.backends.quail.executor.chunk import (
+        ArenaFullError,
+        BorrowStateMissingError,
+    )
 
     # level 0 runs from zero state; level n >= 1 reads slots that a lower
     # level wrote in this chunk or an earlier one
@@ -170,8 +174,8 @@ def _plan_phases(arena, groups, stage, undo):
                 read = (None if parent is None
                         else arena.shared_state(parent, start))
                 if read is None:
-                    raise ValueError(
-                        f"group {key!r}: borrows {start} tokens, but "
+                    raise BorrowStateMissingError(
+                        key, f"group {key!r}: borrows {start} tokens, but "
                         f"no state of the parent covers them")
                 if last <= first:
                     raise ValueError(
