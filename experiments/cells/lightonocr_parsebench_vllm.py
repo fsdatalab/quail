@@ -291,7 +291,7 @@ def parse(mode: str, max_num_seqs: int, run_id: str) -> dict:
     stream = _page_stream(limit, window)
     keys, added, records, steps = {}, {}, [], []
     kernels, profile = None, None
-    in_flight, exhausted, next_id = 0, False, 0
+    in_flight, exhausted, next_id, add_s = 0, False, 0, 0.0
     with _GpuSampler() as sampler:
         started = time.perf_counter()
         while True:
@@ -308,6 +308,7 @@ def parse(mode: str, max_num_seqs: int, run_id: str) -> dict:
                 engine.add_request(request_id, {
                     "prompt": prompt,
                     "multi_modal_data": {"image": picture}}, params)
+                add_s += time.perf_counter() - started - added[request_id]
                 in_flight += 1
             if not engine.has_unfinished_requests():
                 break
@@ -355,7 +356,8 @@ def parse(mode: str, max_num_seqs: int, run_id: str) -> dict:
         image_tokens=sum(r["prompt_tokens"] for r in records),
         pages_at_max_tokens=sum(1 for r in records
                                 if r["output_tokens"] >= MAX_OUTPUT_TOKENS),
-        engine_steps=len(steps),
+        engine_steps=len(steps), add_request_s=add_s,
+        step_s=sum(step.get("step_s", 0.0) for step in steps),
         gpu_utilization_mean=(sum(sampler.utilization)
                               / max(len(sampler.utilization), 1)),
         gpu_memory_mib_max=max(sampler.memory_mib, default=0),
