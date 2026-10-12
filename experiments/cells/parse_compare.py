@@ -240,6 +240,21 @@ def _quail_pass(files, stem) -> dict:
                    if name.startswith("generator_") or name == "prepare_workers"})
 
 
+def _snapshot() -> dict:
+    """GPU memory and processes, the busiest host processes, and the load."""
+    def run(command):
+        return subprocess.run(command, capture_output=True, text=True).stdout.strip()
+
+    return dict(
+        gpu=run(["nvidia-smi", "--query-gpu=memory.used,utilization.gpu",
+                 "--format=csv,noheader"]),
+        gpu_processes=run(["nvidia-smi", "--query-compute-apps=pid,name,used_memory",
+                           "--format=csv,noheader"]),
+        top_processes=run(["ps", "-eo", "pid,pcpu,rss,comm", "--sort=-pcpu"])
+        .splitlines()[:8],
+        load=open("/proc/loadavg").read().strip())
+
+
 def _agreement(a, b) -> int:
     """Pages whose text is identical in two record files, given by stem."""
     import pyarrow.parquet as pq
@@ -282,12 +297,14 @@ def compare(mode: str, run_id: str, order: str, reference: str = "") -> dict:
         env = dict(os.environ)
         if workers:
             env["QUAIL_OCR_WORKERS"] = workers
+        snapshot = _snapshot()
         print(f"pass {index}: {name}", flush=True)
+        print(json.dumps(snapshot), flush=True)
         subprocess.run([sys.executable, __file__, engine, "/tmp/files.json", stem, out],
                        check=True, env=env)
         result = json.loads(Path(out).read_text())
         seconds = result["query_s"]
-        result.update(pass_index=index, pass_name=name,
+        result.update(pass_index=index, pass_name=name, snapshot=snapshot,
                       usd_per_query=seconds / 3600 * H100_USD_PER_HOUR,
                       input_tokens_per_second=result["input_tokens"] / seconds,
                       pages_per_second=result["pages"] / seconds)
