@@ -241,7 +241,7 @@ def _quail_pass(files, stem) -> dict:
 
 
 def _agreement(a, b) -> int:
-    """Pages whose text is identical in two passes' records."""
+    """Pages whose text is identical in two record files, given by stem."""
     import pyarrow.parquet as pq
 
     texts = {(r["path"], r["page"]): r["text"]
@@ -252,13 +252,15 @@ def _agreement(a, b) -> int:
 
 @app.function(image=image, gpu="H100!", cpu=32, memory=131072,
               timeout=3 * 3600, volumes=volumes)
-def compare(mode: str, run_id: str, order: str) -> dict:
+def compare(mode: str, run_id: str, order: str, reference: str = "") -> dict:
     """Run the passes in order, each in its own process, and compare them.
 
     Args:
         mode: smoke or run.
         run_id: The run id.
         order: Comma-separated passes: vllm, quail, or quail:<workers>.
+        reference: The stem of an earlier pass's records; each pass
+            reports how many pages it shares with them word for word.
     """
     import os
     from pathlib import Path
@@ -297,7 +299,11 @@ def compare(mode: str, run_id: str, order: str) -> dict:
         run_id=run_id, mode=mode, files=len(files), order=order, host=host,
         passes=passes,
         # pages each pass shares, word for word, with the first pass
-        identical_to_first_pass=[_agreement(stems[0], stem) for stem in stems])
+        identical_to_first_pass=[_agreement(stems[0], stem) for stem in stems],
+        **({"reference": reference,
+            "identical_to_reference": [_agreement(reference, stem)
+                                       for stem in stems]}
+           if reference else {}))
     path = f"{OUT_DIR}/summary_{mode}_{run_id}.json"
     Path(path).write_text(json.dumps(summary, indent=1))
     results_vol.commit()
@@ -306,11 +312,12 @@ def compare(mode: str, run_id: str, order: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(mode: str = "smoke", order: str = ORDER, prediction: str = ""):
+def main(mode: str = "smoke", order: str = ORDER, reference: str = "",
+         prediction: str = ""):
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
     print(f"prediction: {prediction}", flush=True)
     print(f"run id: {run_id}", flush=True)
-    call = compare.spawn(mode, run_id, order)
+    call = compare.spawn(mode, run_id, order, reference)
     print(f"function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=1, default=str), flush=True)
 

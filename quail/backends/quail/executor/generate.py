@@ -51,6 +51,14 @@ class Generation:
     image: Callable | None = None
 
 
+def _to_device(torch, array, device):
+    """Copy a host array to the device without waiting for the stream."""
+    tensor = torch.as_tensor(array)
+    if not str(device).startswith("cuda"):
+        return tensor.to(device)
+    return tensor.pin_memory().to(device, non_blocking=True)
+
+
 @dataclass
 class _Document:
     """A document in flight: its lane, KV rows, and the tokens chosen so far."""
@@ -263,25 +271,36 @@ class GreedyGenerator:
         stats = self.stats
         active, free = [], list(range(self.lanes - 1, -1, -1))
         flight = None    # the launched step not read yet
+        pending = None   # the prefilled documents whose first token is not read
         while True:
             admit = admission.take(len(free), len(active))
+            prefilled = None
             if admit:
                 started = time.perf_counter()
                 admitted = []
-                first = self._mixed(admitted, admit, free)
+                first = self._mixed(admitted, admit, free, defer=True)
+                prefilled = (admitted, first)
+                active.extend(admitted)
                 stats["mixed_s"] += time.perf_counter() - started
                 stats["mixed_steps"] += 1
-                for document, token in zip(admitted, first):
-                    document.tokens.append(token)
-                    if self._done(document):
-                        self._release(document, free)
-                        yield document.generation.key, document.tokens
-                    else:
-                        active.append(document)
             launch = [document for document in active if self._launchable(document)]
             started = time.perf_counter()
             launched = self._launch(launch) if launch else None
             stats["decode_host_s"] += time.perf_counter() - started
+            # an earlier pass's first tokens come before the decode
+            # tokens of the step read after them
+            if pending is not None:
+                started = time.perf_counter()
+                documents, first = pending
+                tokens = self._read_first(first)
+                stats["decode_wait_s"] += time.perf_counter() - started
+                for document, token in zip(documents, tokens):
+                    document.tokens.append(token)
+                    if self._done(document):
+                        document.finished = True
+                        self._release(document, free)
+                        yield document.generation.key, document.tokens
+            pending = prefilled
             if flight is not None:
                 started = time.perf_counter()
                 tokens = self._read(flight)
@@ -336,7 +355,7 @@ class GreedyGenerator:
 
     # ---- a step that packs prompts --------------------------------------
 
-    def _mixed(self, active, admit, free) -> list:
+    def _mixed(self, active, admit, free, defer=False):
         """Decode every document in flight and prefill the admitted ones.
 
         Args:
@@ -344,9 +363,14 @@ class GreedyGenerator:
                 after them, in admission order.
             admit: (Generation, capacity) pairs whose pages are reserved.
             free: The free lanes.
+            defer: Return without waiting for the tokens: the admitted
+                prompts' first tokens land in a pinned host tensor, for
+                _read_first.
 
         Returns:
-            One token per document of the new `active`, in its order.
+            One token per document of the new `active`, in its order;
+            with defer, the host tensor, its copy's event, and the
+            pass's timing events (or None).
         """
         import time
 
@@ -390,6 +414,8 @@ class GreedyGenerator:
                 enable_timing=True)
             begin.record()
         lanes = [free.pop() for _ in admit]
+        lane_index = _to_device(torch, np.asarray(lanes, dtype=np.int64),
+                                arena.device)
         profiling = self.stats["mixed_steps"] + 1 == self.profile_mixed
         if profiling:
             profiler = torch.profiler.profile(activities=[
@@ -402,29 +428,38 @@ class GreedyGenerator:
             tokens = (hidden @ self.head.t()).argmax(dim=-1)
             if self.graphs and admit:
                 # the decode graphs read each lane's last token here
-                self._last.index_copy_(
-                    0, torch.as_tensor(lanes, device=arena.device),
-                    tokens[len(tokens) - len(admit):])
+                self._last.index_copy_(0, lane_index,
+                                       tokens[len(tokens) - len(admit):])
         if timed:
             end.record()
-        tokens = tokens.tolist()
+        if defer:
+            # the host reads the admitted prompts' first tokens a step
+            # later, as it reads decode steps
+            first = torch.empty(len(admit), dtype=tokens.dtype, pin_memory=True)
+            first.copy_(tokens[len(tokens) - len(admit):], non_blocking=True)
+            copied = torch.cuda.Event()
+            copied.record()
+            tokens = (first, copied, (begin, end) if timed else None)
+        else:
+            tokens = tokens.tolist()
         if profiling:
             wall_ms = (time.perf_counter() - profile_started) * 1e3
             profiler.__exit__(None, None, None)
             self.stats["mixed_profile"] = dict(
                 _kernels(profiler, len(groups), chunk.tokens), wall_ms=wall_ms)
-        if timed:
+        if timed and not defer:
             self.stats["mixed_gpu_s"] = (self.stats.get("mixed_gpu_s", 0.0)
                                          + begin.elapsed_time(end) / 1e3)
+        admitted = []
         for (generation, capacity), lane in zip(admit, lanes):
             key = generation.key
-            document = _Document(
+            admitted.append(_Document(
                 generation, lane, capacity,
                 arena.capacity_rows(key).numpy(),
-                slot=arena.state_slot_at(key, len(generation.prompt)) or 0)
-            active.append(document)
-            if self.graphs:
-                self._write_lane(document)
+                slot=arena.state_slot_at(key, len(generation.prompt)) or 0))
+        active.extend(admitted)
+        if self.graphs:
+            self._write_lanes(admitted, lane_index)
         return tokens
 
     def _embeds(self, chunk, active, admitted):
@@ -433,12 +468,17 @@ class GreedyGenerator:
         with torch.inference_mode():
             embeds = self.pipeline.embed(chunk.input_ids)
             row = len(active)
+            indices, values = [], []
             for generation, _ in admitted:
                 if generation.image is not None:
-                    rows, values = generation.image()
-                    index = torch.as_tensor(rows + row, device=self.arena.device)
-                    embeds.index_copy_(0, index, values.to(embeds.dtype))
+                    rows, rows_values = generation.image()
+                    indices.append(rows + row)
+                    values.append(rows_values)
                 row += len(generation.prompt)
+            if indices:
+                index = _to_device(torch, np.concatenate(indices).astype(np.int64),
+                                   self.arena.device)
+                embeds.index_copy_(0, index, torch.cat(values).to(embeds.dtype))
         return embeds
 
     # ---- a step that only decodes: CUDA graphs --------------------------
@@ -521,12 +561,19 @@ class GreedyGenerator:
         self._out[:size].copy_(chosen)
         self._last.index_copy_(0, lanes, chosen)
 
-    def _write_lane(self, document):
-        """Write the document's pages into its lane's block table row."""
-        pages = self.arena.owned_pages(document.generation.key)
-        row = self.torch.zeros(self.width, dtype=self.torch.int32)
-        row[:len(pages)] = self.torch.as_tensor(pages, dtype=self.torch.int32)
-        self._table[document.lane].copy_(row)
+    def _write_lanes(self, documents, lane_index):
+        """Write each document's pages into its lane's block table row.
+
+        Args:
+            documents: The admitted documents.
+            lane_index: Their lanes, on the device.
+        """
+        rows = np.zeros((len(documents), self.width), dtype=np.int32)
+        for row, document in zip(rows, documents):
+            pages = self.arena.owned_pages(document.generation.key)
+            row[:len(pages)] = pages
+        self._table.index_copy_(
+            0, lane_index, _to_device(self.torch, rows, self._table.device))
 
     def _launch(self, documents):
         """Lay out and replay one decode step without waiting for its tokens.
@@ -569,6 +616,16 @@ class GreedyGenerator:
         flight = (documents, n, done, chosen)
         self._parity ^= 1
         return flight
+
+    def _read_first(self, pending) -> list:
+        """The first tokens of a prefill pass that _mixed deferred."""
+        first, copied, timing = pending
+        copied.synchronize()
+        if timing is not None:
+            begin, end = timing
+            self.stats["mixed_gpu_s"] = (self.stats.get("mixed_gpu_s", 0.0)
+                                         + begin.elapsed_time(end) / 1e3)
+        return first.tolist()
 
     def _read(self, flight) -> list:
         """The tokens a launched decode step chose, in its row order."""
