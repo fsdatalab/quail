@@ -5,7 +5,8 @@ experiments/cells/lightonocr_parsebench_vllm.py prepared, with the same
 prompt, greedy decoding, output limit, and context as the vLLM runs,
 and compares every page's output tokens with the saved vLLM run. Page
 preparation (the image processor) runs in worker processes ahead of
-the GPU.
+the GPU; the workers start while the model loads, and the startup time
+reported (load_s) covers both.
 
 Run from the repository root and tee every line:
 
@@ -97,32 +98,42 @@ def parse(mode: str, rows: int, run_id: str) -> dict:
 
     import pyarrow as pa
     import pyarrow.parquet as pq
+    from transformers import AutoProcessor
 
     from quail.backends.quail.executor.model import resolve_model_path
-    from quail.backends.quail.executor.parse import PageParser, prepared_pages
+    from quail.backends.quail.executor.parse import PageParser, PagePreparer
     from quail.specs import MODELS
 
     spec = MODELS[MODEL]
     started = time.perf_counter()
+    path = resolve_model_path(spec.hf_name, spec.revision)
+    prompt = AutoProcessor.from_pretrained(path).apply_chat_template(
+        [{"role": "user", "content": [{"type": "image"}]}], tokenize=False,
+        add_generation_prompt=True, enable_thinking=False)
+    # the workers start while the model loads
+    preparer = PagePreparer(path, prompt, workers=WORKERS)
     parser = PageParser(spec, rows=rows, max_output_tokens=MAX_OUTPUT_TOKENS,
                         context_tokens=CONTEXT_TOKENS,
                         prefill_tokens=PREFILL_TOKENS)
+    if prompt != parser.prompt():
+        raise ValueError("the workers' prompt differs from the parser's")
+    for future in preparer.started:
+        future.result()
     load_s = time.perf_counter() - started
     limit = SMOKE_PAGES if mode == "smoke" else None
-    path = resolve_model_path(spec.hf_name, spec.revision)
     sampler = subprocess.Popen(
         ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits",
          "-lms", "100"], stdout=subprocess.PIPE, text=True)
     records = []
     started = time.perf_counter()
-    pages = prepared_pages(_pages(limit), path, parser.prompt(),
-                           workers=WORKERS, window=WINDOW)
+    pages = preparer.pages(_pages(limit), window=WINDOW)
     for (pdf, page), tokens, prompt_tokens in parser.parse(pages):
         records.append(dict(
             pdf=pdf, page=page, prompt_tokens=prompt_tokens,
             output_tokens=len(tokens), token_ids=tokens,
             finished_s=time.perf_counter() - started))
     wall_s = time.perf_counter() - started
+    preparer.close()
     sampler.terminate()
     utilization = [float(x) for x in sampler.communicate()[0].split()]
     tokenizer = parser.processor.tokenizer

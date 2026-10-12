@@ -75,34 +75,53 @@ def prepare_png(png: bytes) -> dict:
     return prepare_page(_WORKER["processor"], _WORKER["prompt"], image)
 
 
-def prepared_pages(items, model_path: str, prompt: str, *, workers: int,
-                   window: int):
-    """Yield (key, prepared page) in order, preparing ahead in worker processes.
+def _ready() -> bool:
+    return "processor" in _WORKER
+
+
+class PagePreparer:
+    """Prepare pages in worker processes, ahead of the parser.
+
+    The workers start, and load the image processor, when the preparer
+    is made, so their startup can overlap loading the model.
 
     Args:
-        items: Iterable of (key, PNG bytes).
         model_path: The checkpoint directory the processor loads from.
         prompt: The chat turn with one image placeholder.
         workers: Worker processes.
-        window: Pages prepared ahead of the consumer at most.
     """
-    import multiprocessing
-    from collections import deque
-    from concurrent.futures import ProcessPoolExecutor
 
-    # spawn: the parent has CUDA initialized
-    with ProcessPoolExecutor(
+    def __init__(self, model_path: str, prompt: str, *, workers: int):
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+
+        # spawn: the parent has, or will have, CUDA initialized
+        self.pool = ProcessPoolExecutor(
             workers, mp_context=multiprocessing.get_context("spawn"),
-            initializer=init_worker, initargs=(model_path, prompt)) as pool:
+            initializer=init_worker, initargs=(model_path, prompt))
+        self.started = [self.pool.submit(_ready) for _ in range(workers)]
+
+    def pages(self, items, *, window: int):
+        """Yield (key, prepared page) in order, at most `window` pages ahead.
+
+        Args:
+            items: Iterable of (key, PNG bytes).
+            window: Pages prepared ahead of the consumer at most.
+        """
+        from collections import deque
+
         ahead = deque()
         for key, png in items:
-            ahead.append((key, pool.submit(prepare_png, png)))
+            ahead.append((key, self.pool.submit(prepare_png, png)))
             if len(ahead) >= window:
                 key, future = ahead.popleft()
                 yield key, future.result()
         while ahead:
             key, future = ahead.popleft()
             yield key, future.result()
+
+    def close(self) -> None:
+        self.pool.shutdown(cancel_futures=True)
 
 
 def _normalization(processor) -> tuple[float, float]:
