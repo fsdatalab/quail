@@ -14,7 +14,9 @@ Run from the repository root and tee every line:
       --mode smoke --prediction "State the expected result before starting." \
       2>&1 | tee results/lightonocr-parsebench-quail-smoke.log
 
-Modes: smoke parses the first 20 pages; run parses every page.
+Modes: smoke parses the first 20 pages; run parses every page;
+profile times prefill calls of one and of five pages, with and without
+the vision tower, and lists the kernels of one five-page prefill.
 
 Writes /results/ablations/lightonocr_parsebench/quail_<mode>_<rows>_<run
 id>.parquet (one record per page) and .json (the summary).
@@ -48,6 +50,8 @@ MAX_OUTPUT_TOKENS = 4096
 CONTEXT_TOKENS = 8448
 PREFILL_TOKENS = 16384
 SMOKE_PAGES = 20
+PROFILE_PAGES = 40
+PROFILE_CALLS = 5
 WORKERS = 24
 WINDOW = 96
 
@@ -120,6 +124,8 @@ def parse(mode: str, rows: int, run_id: str) -> dict:
     for future in preparer.started:
         future.result()
     load_s = time.perf_counter() - started
+    if mode == "profile":
+        return _profile_prefill(parser, preparer, run_id)
     limit = SMOKE_PAGES if mode == "smoke" else None
     sampler = subprocess.Popen(
         ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits",
@@ -164,6 +170,53 @@ def parse(mode: str, rows: int, run_id: str) -> dict:
              vllm_tokens=r["vllm_output_tokens"],
              common=r["common_prefix_tokens"]) for r in records[:SMOKE_PAGES]]
     return summary
+
+
+def _profile_prefill(parser, preparer, run_id) -> dict:
+    """Time prefill calls of one and of five pages and list their kernels."""
+    import torch
+
+    pages = list(preparer.pages(_pages(PROFILE_PAGES), window=WINDOW))
+    preparer.close()
+    result = dict(run_id=run_id, mode="profile")
+    with torch.inference_mode():
+        parser._prefill(pages[:5], list(range(5)))
+        for size in (1, 5):
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            for i in range(PROFILE_CALLS):
+                batch = pages[5 + i * size:5 + (i + 1) * size]
+                parser._prefill(batch, list(range(size)))
+            torch.cuda.synchronize()
+            result[f"prefill_ms_{size}_pages"] = (
+                (time.perf_counter() - started) * 1e3 / PROFILE_CALLS)
+            started = time.perf_counter()
+            for i in range(PROFILE_CALLS):
+                batch = pages[5 + i * size:5 + (i + 1) * size]
+                parser._images([page for _, page in batch])
+            torch.cuda.synchronize()
+            result[f"vision_ms_{size}_pages"] = (
+                (time.perf_counter() - started) * 1e3 / PROFILE_CALLS)
+        batch = pages[5:10]
+        with torch.profiler.profile(activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA]) as profiler:
+            parser._prefill(batch, list(range(5)))
+            torch.cuda.synchronize()
+    kernels = []
+    for event in profiler.key_averages():
+        gpu_us = getattr(event, "self_device_time_total", 0)
+        if gpu_us > 0:
+            kernels.append((gpu_us, event.count, event.key[:100]))
+    kernels.sort(reverse=True)
+    result["profiled_gpu_ms"] = sum(k[0] for k in kernels) / 1e3
+    result["kernels"] = [f"{us / 1e3:8.2f} ms {n:5}x {name}"
+                         for us, n, name in kernels[:30]]
+    result["cpu_ops"] = [
+        f"{e.self_cpu_time_total / 1e3:8.2f} ms {e.count:5}x {e.key[:80]}"
+        for e in sorted(profiler.key_averages(),
+                        key=lambda e: -e.self_cpu_time_total)[:20]]
+    return result
 
 
 @app.local_entrypoint()
