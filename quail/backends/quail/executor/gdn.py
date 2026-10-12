@@ -21,6 +21,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from quail.cost.budgets import CHECKPOINT_PASS_QUESTIONS
+
 L2_EPS = 1e-6
 
 
@@ -88,8 +90,10 @@ def plan_phases(arena, groups, stage):
 
     Raises:
         ValueError: A group borrows a prefix no state covers, keeps more
-            tokens than its first suffix holds, or follows a group of
-            its key that extends the checkpoint after its suffix.
+            tokens than its first suffix holds, follows a group of
+            its key that extends the checkpoint after its suffix,
+            advances a checkpoint in place that a question of the chunk
+            reads at its current length, or is an empty document.
         ArenaFullError: Every checkpoint slot belongs to a pinned key.
     """
     import torch
@@ -118,6 +122,8 @@ def plan_phases(arena, groups, stage):
         slots.append(slot)
 
     extended_after = set()
+    # slots a question of this chunk reads at their current length
+    suffix_slots = set()
     for group in groups:
         key = group["key"]
         kept = group.get("kept", 0)
@@ -132,6 +138,10 @@ def plan_phases(arena, groups, stage):
                 f"group {key!r}: keeps {kept} suffix tokens, more than "
                 f"its first suffix holds")
         if group["fresh"]:
+            if group["f"] == 0:
+                raise ValueError(
+                    f"group {key!r}: an empty document has no state to "
+                    f"checkpoint")
             source = arena.checkpoint_slot(key)
             if source is None:
                 raise ArenaFullError(
@@ -202,6 +212,10 @@ def plan_phases(arena, groups, stage):
                 if target is None:
                     raise ArenaFullError(
                         f"no free checkpoint slot to extend {key!r}")
+            if pure and target == source and source in suffix_slots:
+                raise ValueError(
+                    f"group {key!r}: advances a checkpoint in place that "
+                    f"a question of this chunk reads at {group['f']} tokens")
             arena.record_extension(key, group["f"] + kept)
             head = np.arange(begins[0], begins[0] + kept, dtype=np.int64)
             if pure:
@@ -216,6 +230,7 @@ def plan_phases(arena, groups, stage):
             continue
         for begin, end in zip(begins, ends):
             add("suffix", np.arange(begin, end, dtype=np.int64), source)
+            suffix_slots.add(source)
 
     def build(name, rows, lengths, reads, writes, output=True):
         cu = np.concatenate([[0], np.cumsum(lengths)])
@@ -487,20 +502,26 @@ def triton_cdiv(value, block):
 # a CUDA launch has at most this many blocks along its second grid axis,
 # and the kernel spends one per sequence and value head
 GRID_LIMIT = 65_535
+# A launch holds the state it gathered and the final state the kernel
+# writes: two copies per sequence of one layer. The pass budget reserves
+# one copy for each of CHECKPOINT_PASS_QUESTIONS questions, so a launch
+# takes half that many sequences.
+SEQUENCES_PER_LAUNCH = CHECKPOINT_PASS_QUESTIONS // 2
 
 
-def _kernel_in_batches(spec, q, k, v, g, beta, state, phase, scale):
+def _kernel_in_batches(spec, q, k, v, g, beta, load, store, phase, scale):
     """Run the chunked kernel over as many sequences as one launch holds.
 
-    Each batch updates its slice of `state` in place.
+    A launch gathers its sequences' state with load(first, last), the
+    kernel updates it in place, and store(first, last, state) writes it
+    back, so the copies of one layer are bounded by the launch size and
+    not by the number of questions in the chunk.
     """
     import torch
 
     count = len(phase.lengths)
-    per_launch = max(1, GRID_LIMIT // spec.gdn_value_heads)
-    if count <= per_launch:
-        return gated_delta_kernel(q, k, v, g, beta, state,
-                                  phase.cu_seqlens, scale)
+    per_launch = max(1, min(GRID_LIMIT // spec.gdn_value_heads,
+                            SEQUENCES_PER_LAUNCH))
     starts = [0]
     for length in phase.lengths:
         starts.append(starts[-1] + length)
@@ -508,11 +529,13 @@ def _kernel_in_batches(spec, q, k, v, g, beta, state, phase, scale):
     for first in range(0, count, per_launch):
         last = min(count, first + per_launch)
         low, high = starts[first], starts[last]
+        state = load(first, last)
         pieces.append(gated_delta_kernel(
             q[low:high], k[low:high], v[low:high], g[low:high],
-            beta[low:high], state[first:last],
+            beta[low:high], state,
             phase.cu_seqlens[first:last + 1] - low, scale))
-    return torch.cat(pieces)
+        store(first, last, state)
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
 
 # ---- the layer --------------------------------------------------------
@@ -615,20 +638,27 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, use_kernels):
         v = v.reshape(-1, spec.gdn_value_heads, spec.gdn_value_dim)
         g = gate.index_select(0, phase.rows)
         b = beta.index_select(0, phase.rows)
-        if phase.read_slots is None:
-            state = torch.zeros(
-                (len(phase.lengths), spec.gdn_value_heads,
-                 spec.gdn_value_dim, spec.gdn_key_dim),
-                dtype=torch.float32, device=qkv.device)
-        else:
-            state = arena.gdn_state[phase.read_slots, layer_slot]
+        def load(first, last, phase=phase):
+            if phase.read_slots is None:
+                return torch.zeros(
+                    (last - first, spec.gdn_value_heads,
+                     spec.gdn_value_dim, spec.gdn_key_dim),
+                    dtype=torch.float32, device=qkv.device)
+            return arena.gdn_state[phase.read_slots[first:last], layer_slot]
+
+        def store(first, last, state, phase=phase):
+            if phase.write_slots is not None:
+                arena.gdn_state[phase.write_slots[first:last],
+                                layer_slot] = state
+
         if use_kernels:
-            core = _kernel_in_batches(spec, q, k, v, g, b, state, phase, scale)
+            core = _kernel_in_batches(spec, q, k, v, g, b, load, store,
+                                      phase, scale)
         else:
+            state = load(0, len(phase.lengths))
             core = gated_delta_reference(q, k, v, g, b, state,
                                          phase.lengths, scale)
-        if phase.write_slots is not None:
-            arena.gdn_state[phase.write_slots, layer_slot] = state
+            store(0, len(phase.lengths), state)
         if phase.output:
             out.index_copy_(0, phase.rows, core)
     return out

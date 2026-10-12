@@ -217,14 +217,22 @@ def state_share_points(parents, shared):
     return [tuple(sorted(values)) for values in points]
 
 
-def checkpoint_slot_limit(n_slots, n_stages, shares):
+def slots_per_document(n_stages, shares):
+    """Checkpoint slots one document in flight holds.
+
+    One slot, a second once a later stage extends it, and one more when
+    borrowers start from a state inside it.
+    """
+    return (2 if n_stages > 1 else 1) + (1 if shares else 0)
+
+
+def checkpoint_slot_limit(n_slots, n_stages, shares, held=0):
     """Most documents in flight that the checkpoint slots can serve.
 
-    A document holds one slot, a second once a later stage extends it,
-    and one more when borrowers start from a state inside it.
+    `held` slots belong to resident documents pinned for the run, so
+    they serve no fresh document.
     """
-    per_document = (2 if n_stages > 1 else 1) + (1 if shares else 0)
-    return max(1, n_slots // per_document)
+    return max(1, (n_slots - held) // slots_per_document(n_stages, shares))
 
 
 class _StageExecutor:
@@ -350,12 +358,28 @@ class _StageExecutor:
         # a Gated DeltaNet layer starts a borrower from the parent's state
         # at the shared point, so a parent writes one slot per point
         self.share_points = [()] * len(self.keys)
+        spec = getattr(self.pipeline, "spec", None)
+        if (self.paged and getattr(spec, "state_layers", ())
+                and not getattr(self.arena, "n_state_slots", 0)):
+            raise ValueError(
+                "the arena has no checkpoint slots: the pool cannot hold "
+                "one document's state beside a chunk's KV, so a document "
+                "this long needs a smaller chunk or a larger pool")
         if self.paged and getattr(self.arena, "n_state_slots", 0):
             self.share_points = state_share_points(
                 self.borrowing.tree_parent, self.borrowing.tree_shared)
+            need = slots_per_document(len(self.stages),
+                                      any(self.share_points))
+            if self.arena.n_state_slots < need:
+                raise ValueError(
+                    f"the arena has {self.arena.n_state_slots} checkpoint "
+                    f"slots and this query holds {need} per document in "
+                    f"flight; a document this long needs a smaller chunk "
+                    f"or a larger pool")
             self.sched.active_limit = checkpoint_slot_limit(
                 self.arena.n_state_slots, len(self.stages),
-                any(self.share_points))
+                any(self.share_points),
+                held=self.arena.slots_held(self.keys[a] for a in resident))
             self.borrowing.can_borrow = self._state_borrow_check(
                 self.borrowing.can_borrow)
         # The admission detaches residents from borrowing: they pack no prefix.
@@ -685,6 +709,14 @@ class _StageExecutor:
                 self._log_memory_event("evict_retry", groups=len(part))
                 logger.info("chunk of %d groups retried after evicting "
                             "retained KV", len(part))
+                self._run_part(part)
+                return
+            if len(part) < 2 and self.outstanding:
+                # reporting an earlier chunk settles documents, which
+                # frees their slots
+                self._log_memory_event("drain_retry", groups=len(part))
+                while self.outstanding:
+                    self._report(self.outstanding.pop(0))
                 self._run_part(part)
                 return
             if len(part) < 2:

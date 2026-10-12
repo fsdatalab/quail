@@ -144,6 +144,10 @@ def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
     kv_pages = int(pool - slots * ckpt)
     if kv_pages <= 0:
         raise ValueError("the pool cannot hold one chunk's KV beside a checkpoint")
+    if slots < 1:
+        raise ValueError(
+            f"the pool holds no checkpoint of {ckpt:.1f} pages beside a "
+            f"document of {mean:.0f} tokens")
     return kv_pages
 
 

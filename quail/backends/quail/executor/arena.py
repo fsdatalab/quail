@@ -722,6 +722,14 @@ class KVArena:
             capacity_s = len(self.sliding.table_pages(key)) * self.page_tokens
             self._sliding_rows[key] = self._page_rows(self.sliding, key, capacity_s)
 
+    def slots_held(self, keys) -> int:
+        """Checkpoint slots the given keys hold: main, extension, and share."""
+        keys = set(keys)
+        held = self.accounting
+        return (sum(1 for key in held.slots if key in keys)
+                + sum(1 for key in held.ext_slots if key in keys)
+                + sum(1 for point in held.share_slots if point[0] in keys))
+
     def pin(self, key):
         self.accounting.pin(key)
 
