@@ -97,7 +97,18 @@ leave the document, and none only when that is at the cue: CUAD-4
 holds at or above 0.62, with exact match above 0.24 since a contract
 is scored against its best-matching party; CUAD-7 and CUAD-8 land
 between the two runs, at or above 0.63 and 0.45; CUAD-1, 2, 3, 9,
-and 10 hold within 3 points of run 015932Z.
+and 10 hold within 3 points of run 015932Z. Measured on run
+20261012T020405Z: CUAD-4 0.79 (exact match 0.49), above stock vLLM's
+0.63; CUAD-1 0.36, CUAD-2 0.83, CUAD-3 0.55, CUAD-9 0.33, CUAD-10
+0.49, as predicted; CUAD-7 0.60 and CUAD-8 0.40, unchanged from run
+015932Z, so that part of the prediction failed. The filters in front
+of CUAD-7 and CUAD-8 returned the same rows on all three runs. On
+CUAD-7 the null rule had answered none on 7 more of the 39 extracted
+contracts than ending the answer does; ending it changed 3 answers
+and moved the score by 0.3 points. CUAD-8 extracts 10 contracts, so
+its 10 points are one contract that the null rule answered none,
+matching the reference. Stock vLLM reaches 0.75 on CUAD-7 by
+writing none on more contracts than Quail's cue does.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the
