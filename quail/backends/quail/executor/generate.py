@@ -282,6 +282,7 @@ class GreedyGenerator:
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA])
             profiler.__enter__()
+            profile_started = time.perf_counter()
         with torch.inference_mode():
             hidden = _forward(self.pipeline, arena, chunk)
             tokens = (hidden @ self.head.t()).argmax(dim=-1)
@@ -289,9 +290,10 @@ class GreedyGenerator:
             end.record()
         tokens = tokens.tolist()
         if profiling:
+            wall_ms = (time.perf_counter() - profile_started) * 1e3
             profiler.__exit__(None, None, None)
-            self.stats["mixed_profile"] = _kernels(profiler, len(groups),
-                                                   chunk.tokens)
+            self.stats["mixed_profile"] = dict(
+                _kernels(profiler, len(groups), chunk.tokens), wall_ms=wall_ms)
         if timed:
             self.stats["mixed_gpu_s"] = (self.stats.get("mixed_gpu_s", 0.0)
                                          + begin.elapsed_time(end) / 1e3)
@@ -429,11 +431,15 @@ class GreedyGenerator:
 
 
 def _kernels(profiler, groups: int, rows: int) -> dict:
-    """A profiled step's GPU time by kernel, largest first."""
+    """A profiled step's GPU time by kernel and CPU time by op, largest first."""
     events = [(getattr(e, "self_device_time_total", 0), e.count, e.key)
               for e in profiler.key_averages()]
     events = sorted((e for e in events if e[0] > 0), reverse=True)
+    cpu = sorted(((e.self_cpu_time_total, e.count, e.key)
+                  for e in profiler.key_averages()), reverse=True)
     return dict(groups=groups, rows=rows,
                 gpu_ms=sum(e[0] for e in events) / 1e3,
                 kernels=[f"{us / 1e3:8.2f} ms {count:5}x {name[:90]}"
-                         for us, count, name in events[:25]])
+                         for us, count, name in events[:25]],
+                cpu=[f"{us / 1e3:8.2f} ms {count:5}x {name[:90]}"
+                     for us, count, name in cpu[:25]])
