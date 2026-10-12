@@ -75,7 +75,7 @@ TOP_KERNELS = 60
 
 
 def _render(path: str) -> list[dict] | str:
-    """Render every page of one PDF and read its stored text.
+    """Render every page of one PDF, or load one page image, with its stored text.
 
     Returns:
         One dict per page, or PDFium's error message when the file does
@@ -84,7 +84,20 @@ def _render(path: str) -> list[dict] | str:
     import io
 
     import pypdfium2 as pdfium
+    from PIL import Image
 
+    if path.lower().endswith((".png", ".jpg", ".jpeg")):
+        # ParseBench's layout split also holds page images; they have no
+        # stored text and keep their size unless longer than the edge
+        started = time.perf_counter()
+        picture = Image.open(path).convert("RGB")
+        picture.thumbnail((LONGEST_EDGE, LONGEST_EDGE))
+        buffer = io.BytesIO()
+        picture.save(buffer, format="PNG")
+        return [dict(page=1, width=picture.width, height=picture.height,
+                     png=buffer.getvalue(),
+                     render_ms=(time.perf_counter() - started) * 1e3,
+                     stored_text="", extract_ms=0.0)]
     try:
         pdf = pdfium.PdfDocument(path)
     except pdfium.PdfiumError as error:
