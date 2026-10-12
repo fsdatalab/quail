@@ -127,8 +127,42 @@ class PagePreparer:
             key, future = ahead.popleft()
             yield key, future.result()
 
+    def futures(self, items, *, window: int, prepare=prepare_png):
+        """Yield (key, future of the prepared page) in order, without waiting.
+
+        At most `window` pages are submitted ahead of the consumer.
+
+        Args:
+            items: Iterable of (key, the argument of prepare).
+            window: Pages submitted ahead of the consumer at most.
+            prepare: The worker function, as for pages.
+        """
+        from collections import deque
+
+        items = iter(items)
+        ahead = deque()
+
+        def submit() -> bool:
+            item = next(items, None)
+            if item is None:
+                return False
+            key, argument = item
+            ahead.append((key, self.pool.submit(prepare, argument)))
+            return True
+
+        while len(ahead) < window and submit():
+            pass
+        while ahead:
+            yield ahead.popleft()
+            submit()
+
     def close(self) -> None:
         self.pool.shutdown(cancel_futures=True)
+
+
+def _prepared(page):
+    """A prepared page, waiting for it when it is a worker's future."""
+    return page.result() if hasattr(page, "result") else page
 
 
 def _normalization(processor) -> tuple[float, float]:
@@ -184,25 +218,38 @@ class _Encoder:
 
         self.parser = parser
         self.upstream = iter(pages)
+        self.pending = deque()
         self.ready = deque()
         self.stream = parser.torch.cuda.Stream()
         self.exhausted = False
 
-    def step(self) -> None:
-        """Encode one group if fewer than encode_ahead pages are ready."""
+    def step(self, wait: bool = False) -> None:
+        """Encode one group if fewer than encode_ahead pages are ready.
+
+        Args:
+            wait: Wait for pages still being prepared; without it, a
+                group whose pages are not all prepared waits for a
+                later step.
+        """
         import time
 
         parser = self.parser
-        if self.exhausted or len(self.ready) >= parser.encode_ahead:
+        if len(self.ready) >= parser.encode_ahead and not wait:
             return
         started = time.perf_counter()
-        group = []
-        while len(group) < parser.encode_batch:
+        while not self.exhausted and len(self.pending) < parser.encode_batch:
             item = next(self.upstream, None)
             if item is None:
                 self.exhausted = True
-                break
-            group.append(item)
+            else:
+                self.pending.append(item)
+        group = list(self.pending)[:parser.encode_batch]
+        if not wait and any(hasattr(page, "done") and not page.done()
+                            for _, page in group):
+            group = []
+        for _ in group:
+            self.pending.popleft()
+        group = [(key, _prepared(page)) for key, page in group]
         if group:
             torch = parser.torch
             with torch.cuda.stream(self.stream), torch.inference_mode():
@@ -219,7 +266,7 @@ class _Encoder:
     def __iter__(self):
         while True:
             if not self.ready:
-                self.step()
+                self.step(wait=True)
             if not self.ready:
                 return
             yield self.ready.popleft()
@@ -306,7 +353,7 @@ class PageParser:
         """Transcribe pages; yields (key, token ids, prompt tokens) as each ends.
 
         Args:
-            pages: Iterable of (key, prepare_page output) pairs.
+            pages: Iterable of (key, prepare_page output or a future of it).
         """
         from quail.backends.quail.executor.generate import Generation
 
@@ -316,6 +363,7 @@ class PageParser:
 
         def generations():
             for key, page in pages:
+                page = _prepared(page)
                 rope, offset = mrope_positions(
                     page["input_ids"], page["grid"], self.image_token_id,
                     self.merge)
@@ -444,8 +492,8 @@ class RowParser:
                 for index, page in enumerate(pages):
                     yield (key, index), (path_file.path, page, OCR_LONGEST_EDGE)
 
-        prepared = self.preparer.pages(items(), window=self.window,
-                                       prepare=prepare_pdf_page)
+        prepared = self.preparer.futures(items(), window=self.window,
+                                         prepare=prepare_pdf_page)
         for (key, index), tokens, prompt_tokens in self.pages.parse(prepared):
             stats["parse_input_tokens"] += prompt_tokens
             stats["pages_parsed"] += 1
