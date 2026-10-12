@@ -50,7 +50,6 @@ from quail_b.predicates import (
     PREDICATES,
     QUAIL_JUDGE_SPEC,
     SCHEMA_VERSION,
-    WORKLOADS,
     PredicateSpec,
     _canonical,
     _full_hash,
@@ -63,6 +62,22 @@ from quail_b.predicates import (
 )
 from quail_b.predicates import label_set_identity as _label_set_identity
 from quail_b.rendering import PROMPT_FORMAT
+
+
+def judged_predicates() -> tuple:
+    """The predicates this pass labels.
+
+    A predicate whose labels come from its dataset's own annotations,
+    such as CUAD's, never runs the model: quail-bench's
+    tools/make_cuad_labels.py writes those.
+    """
+    return tuple(spec for spec in PREDICATES
+                 if spec.source_policy != "cuad_annotation")
+
+
+def judged_workloads() -> tuple:
+    """The workloads with a predicate this pass labels."""
+    return tuple(dict.fromkeys(spec.workload for spec in judged_predicates()))
 
 SCALE_FACTOR = 0.1
 SUPPORTED_SCALE_FACTORS = (0.1, 0.5, 1.0)
@@ -704,11 +719,11 @@ def _saved_verification_sample(
         corpus_rows: dict[str, list[dict]],
         identities: dict[str, dict],
         specs: tuple | None = None) -> VerificationSample:
-    # read PREDICATES at call time, not as a default: the module
+    # read judged_predicates() at call time, not as a default: the module
     # attribute is patchable and a default would freeze it
     import pyarrow.parquet as pq
 
-    specs = PREDICATES if specs is None else specs
+    specs = judged_predicates() if specs is None else specs
 
     rows_by_table = {
         table: {str(row["id"]): row for row in rows}
@@ -1020,7 +1035,7 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> dict:
         spec.key: label_set_identity(
             spec, corpus_manifest["corpus_id"],
             corpus_manifest["corpus_full_hash"])
-        for spec in PREDICATES
+        for spec in judged_predicates()
     }
     collection = _collection_identity(corpus_manifest, identities)
     path = (ROOT / "collections" / collection["collection_id"]
@@ -1119,7 +1134,7 @@ def finalize_collection(sf: float, corpus_id: str,
         spec.key: label_set_identity(
             spec, corpus_manifest["corpus_id"],
             corpus_manifest["corpus_full_hash"])
-        for spec in PREDICATES
+        for spec in judged_predicates()
     }
     collection = _collection_identity(corpus_manifest, identities)
     collection_dir = (ROOT / "collections"
@@ -1129,7 +1144,7 @@ def finalize_collection(sf: float, corpus_id: str,
     manifests = {}
     for partial in by_workload.values():
         manifests.update(partial["manifests"])
-    missing = [spec.key for spec in PREDICATES if spec.key not in manifests]
+    missing = [spec.key for spec in judged_predicates() if spec.key not in manifests]
     if missing:
         raise ValueError(f"no label set reported for: {missing}")
 
@@ -1148,7 +1163,7 @@ def finalize_collection(sf: float, corpus_id: str,
         "qwen_judgments": qwen_rows,
         "source_labels": total_rows - qwen_rows,
         "total_labels": total_rows,
-        "predicate_count": len(PREDICATES),
+        "predicate_count": len(judged_predicates()),
         "workloads": {
             name: {k: partial[k] for k in (
                 "boot_s", "model_wall_s", "total_wall_s",
@@ -1199,7 +1214,7 @@ def activate_reused_collection(
         source_collection_id: The collection whose label sets are reused.
         relabeled_workloads: Comma-separated workloads with new labels.
         relabeled_predicates: Keys of other predicates with new labels.
-        new_specs: Predicates outside PREDICATES, such as classifications,
+        new_specs: Predicates outside judged_predicates(), such as classifications,
             whose finished label sets the collection adds. Their label-set
             ids use quail_b's own judge for their kind. A classification
             the source collection labels and new_specs leaves out is
@@ -1231,7 +1246,7 @@ def activate_reused_collection(
         raise ValueError(f"target corpus {target_corpus_id} is invalid")
     names = {name.strip() for name in relabeled_workloads.split(",")
              if name.strip()}
-    unknown = names - set(WORKLOADS)
+    unknown = names - set(judged_workloads())
     if unknown:
         raise ValueError(f"unknown relabeled workloads: {sorted(unknown)}")
     unknown_predicates = set(relabeled_predicates) - set(PREDICATE_BY_KEY)
@@ -1245,7 +1260,7 @@ def activate_reused_collection(
     identities = {}
     manifests = {}
     reused = {}
-    for spec in PREDICATES + tuple(new_specs) + carried:
+    for spec in judged_predicates() + tuple(new_specs) + carried:
         if spec in new_specs:
             identity = _label_set_identity(
                 spec, target_corpus["corpus_id"],
@@ -1569,7 +1584,7 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
         raise ValueError(
             f"source collection has scale factor {source['scale_factor']}, "
             f"which is not larger than {sf}")
-    missing = [spec.key for spec in PREDICATES
+    missing = [spec.key for spec in judged_predicates()
                if spec.key not in source["label_sets"]]
     if missing:
         raise ValueError(f"source collection has no label set for: {missing}")
@@ -1580,10 +1595,10 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
     identities = {
         spec.key: label_set_identity(
             spec, corpus_id, corpus_manifest["corpus_full_hash"])
-        for spec in PREDICATES
+        for spec in judged_predicates()
     }
     origin = {}
-    for spec in PREDICATES:
+    for spec in judged_predicates():
         identity = identities[spec.key]
         label_dir = _label_dir(spec, identity)
         label_dir.mkdir(parents=True, exist_ok=True)
@@ -1604,7 +1619,7 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
         origin[spec.key] = {"copied_from": source_label_set_id}
 
     manifests = {spec.key: _complete_manifest(spec, identities[spec.key], rows)
-                 for spec in PREDICATES}
+                 for spec in judged_predicates()}
     collection = _collection_identity(corpus_manifest, identities)
     collection_dir = ROOT / "collections" / collection["collection_id"]
     qwen_rows = sum(m["source_rows"].get(MODEL_NAME, 0)
@@ -1625,7 +1640,7 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
         "qwen_judgments": qwen_rows,
         "source_labels": total_rows - qwen_rows,
         "total_labels": total_rows,
-        "predicate_count": len(PREDICATES),
+        "predicate_count": len(judged_predicates()),
         "total_wall_s": round(time.perf_counter() - t_total, 2),
         "label_sets": {
             key: {"label_set_id": m["label_set_id"], "rows": m["rows"],
@@ -1796,8 +1811,8 @@ def parse_function_calls(value: str) -> dict[str, str]:
         if workload in calls:
             raise ValueError(f"duplicate workload {workload!r}")
         calls[workload] = function_call_id
-    missing = set(WORKLOADS) - set(calls)
-    unknown = set(calls) - set(WORKLOADS)
+    missing = set(judged_workloads()) - set(calls)
+    unknown = set(calls) - set(judged_workloads())
     if missing or unknown:
         raise ValueError(
             f"function calls have missing={sorted(missing)}, "
@@ -1972,8 +1987,8 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
         return
 
     names = ([w.strip() for w in only.split(",")] if only
-             else list(WORKLOADS))
-    unknown = [w for w in names if w not in WORKLOADS]
+             else list(judged_workloads()))
+    unknown = [w for w in names if w not in judged_workloads()]
     if unknown:
         raise ValueError(f"unknown workloads: {unknown}")
 

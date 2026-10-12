@@ -27,8 +27,9 @@ import quail
 import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.results import write_json
+from quail.logical.expressions import SPAN_SUFFIX
 from quail.logical.prompts import bind_classify_prompt
-from quail.physical import AiClassify, AiScore
+from quail.physical import AiClassify, AiExtract, AiScore, RequestExecution
 from quail.planner.plan import Refusal
 from quail.progress import say
 from quail.specs import H100_USD_PER_HOUR, MODELS
@@ -178,16 +179,30 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
                 operator.relation, table.column(operator.relation)),
             "score": table.column(operator.output).cast(pa.float64()),
         })
-    # quail-b checks that a plan selects ids, labels, scores, and measures
+    extract_answers = {}
+    for operator in info.extracts:
+        table = result.answer_tables["extracts"][operator.output]
+        extract_answers[operator.id] = pa.table({
+            operator.relation: id_column(
+                operator.relation, table.column(operator.relation)),
+            "answer": table.column(operator.output).cast(pa.string()),
+        })
+    # quail-b checks that a plan selects ids, labels, scores, answers,
+    # and measures; a selected answer brings its span column, which the
+    # benchmark does not take
     names = [output_name(name) for name in info.select]
     started = time.perf_counter()
     rows = result.collect()
     collection_s = time.perf_counter() - started
+    spans = [f"{operator.output}{SPAN_SUFFIX}" for operator in info.extracts]
+    rows = rows.drop_columns([name for name in rows.column_names
+                              if name in spans])
     return RunOutput(
         filter_answers, join_answers, rows.rename_columns(names),
         result.report["wall_s"], dict(result.report, collection_s=collection_s),
         classify_answers=classify_answers or None,
-        score_answers=score_answers or None)
+        score_answers=score_answers or None,
+        extract_answers=extract_answers or None)
 
 
 def _alias_filters(info: PlanInfo, alias: str) -> list:
@@ -226,7 +241,8 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                      for prompt in operators.prompts
                      if prompt.preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
-              "filters": [], "joins": [], "classifies": [], "scores": []}
+              "filters": [], "joins": [], "classifies": [], "scores": [],
+              "extracts": []}
     for alias, predicates in filters.items():
         written = _alias_filters(info, alias)
         for position, predicate in enumerate(predicates):
@@ -267,7 +283,35 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                 f"reports no prompt pieces")
             return None
         pieces["scores"].append({"id": operator.id, "tail": list(tail)})
+    # an extraction's plain prompt: its head is the document label
+    # inside the model's extract turn, which differs from the AI.IF
+    # preamble on a model that answers AI.IF raw
+    for operator in info.extracts:
+        head, tail = _extract_parts(query.plan(), operator.output)
+        if not pieces["preamble"]:
+            pieces["preamble"] = list(head)
+        elif list(head) != pieces["preamble"]:
+            say(f"extraction {operator.id} has its own prompt head; the "
+                f"query reports no prompt pieces")
+            return None
+        pieces["extracts"].append({"id": operator.id, "tail": list(tail)})
     return pieces
+
+
+def _extract_parts(plan, output: str) -> tuple:
+    """Return an extraction's plain head and tail token ids from a plan.
+
+    The Quail backend plans an AiExtract node; a request backend
+    carries the extraction in its RequestExecution node's specs.
+    """
+    for node in plan.nodes:
+        if isinstance(node, AiExtract) and node.spec.name == output:
+            return node.spec.prompt_token_parts
+        if isinstance(node, RequestExecution):
+            for spec in node.extracts:
+                if spec.output == output:
+                    return spec.preamble_token_ids, spec.tail_token_ids
+    raise ValueError(f"the plan has no extraction named {output!r}")
 
 
 def _pair_pieces(prompt, anchor) -> dict:
