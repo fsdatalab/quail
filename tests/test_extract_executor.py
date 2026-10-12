@@ -460,7 +460,8 @@ GOLD = ["March 3, 2027", "five years", None]
 RANGES = ["2-3", "", ""]
 
 
-def _run(monkeypatch, trim=True, documents=None):
+def _setup(monkeypatch, trim=True, documents=None):
+    """A state, its scripted model, and a node builder for one spec name."""
     spec, tables = _spec(trim)
     documents = DOCS if documents is None else documents
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
@@ -470,8 +471,6 @@ def _run(monkeypatch, trim=True, documents=None):
     monkeypatch.setattr(ExtractStages, "_readouts", lambda self, state: readouts)
     state = _state(model)
     state.loaded_model.extract_tables = tables
-    node = AiExtract(node_id="ai-extract:0", backend_name="quail",
-                     model="qwen3-4b-fp8", spec=spec)
     tokens = {"c": [tables.encode_ids(text) for text in documents]}
     stages_seen = {}
     original = ExtractStages.__init__
@@ -485,10 +484,22 @@ def _run(monkeypatch, trim=True, documents=None):
         stages_seen["stages"] = self
 
     monkeypatch.setattr(ExtractStages, "__init__", init)
-    result = execute_extract(state, node, {
-        "document_ids": list(range(len(documents))), "documents": tokens,
-        "texts": {"c": documents}, "pre": [], "gpu_timing": False})
-    return result, stages_seen["stages"], model
+
+    def run(name="ends"):
+        node = AiExtract(node_id=f"ai-extract:{name}", backend_name="quail",
+                         model="qwen3-4b-fp8", spec=replace(spec, name=name))
+        result = execute_extract(state, node, {
+            "document_ids": list(range(len(documents))), "documents": tokens,
+            "texts": {"c": documents}, "pre": [], "gpu_timing": False})
+        return result, stages_seen["stages"]
+
+    return state, model, run
+
+
+def _run(monkeypatch, trim=True, documents=None):
+    _, model, run = _setup(monkeypatch, trim, documents)
+    result, stages = run()
+    return result, stages, model
 
 
 def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatch):
@@ -542,13 +553,36 @@ def test_extractor_locates_lines_reads_the_start_and_scores_the_spans(monkeypatc
     assert len(first) == lease.branches[0].fed <= CHUNK
     # the likeliest start ended with a span, so no other start is fed
     assert len(fed) == 1 and 1 < len(lease.candidates) <= 8
-    assert lease.key == ("extract", "ends", 0)
-    assert term.key == ("c", 1) and nothing.key == ("c", 2)
+    # the keys name the document and its rendering, not the output,
+    # so another extraction of the table reads the KV left resident
+    assert lease.key == (("extract", "c", "numbered"), 0)
+    assert term.key == (("extract", "c", "plain"), 1)
+    assert nothing.key == (("extract", "c", "plain"), 2)
     assert result.metrics.extension["located"] == 1
     assert result.metrics.extension["scored"] == 2
     assert result.metrics.extension["none"] == 1
     assert result.metrics.fresh_tokens > 0
     assert result.metrics.output_rows == 3
+
+
+def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
+    state, model, run = _setup(monkeypatch)
+    first, stages = run("ends")
+    arena = state.loaded_model.arena
+    # every document's KV stays resident after the extraction
+    assert all(arena.is_resident(doc.key) for doc in stages.docs)
+    assert all(arena.prefix_tokens(doc.key) == len(doc.prefix)
+               for doc in stages.docs)
+    model.kv = {}
+    second, again = run("starts")
+    assert [doc.key for doc in again.docs] == [doc.key for doc in stages.docs]
+    assert second.outputs["scores"].column("starts").to_pylist() == \
+        first.outputs["scores"].column("ends").to_pylist()
+    # the second extraction feeds no document: only its tail, lines,
+    # cue, and spans are fresh
+    prefixes = sum(len(doc.prefix) for doc in stages.docs)
+    assert first.metrics.fresh_tokens > prefixes
+    assert second.metrics.fresh_tokens == first.metrics.fresh_tokens - prefixes
 
 
 def test_extractor_returns_whole_lines_with_trim_off(monkeypatch):

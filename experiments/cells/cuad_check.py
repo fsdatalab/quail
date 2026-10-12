@@ -20,7 +20,14 @@ up to 32 points on the clause fields (CUAD-3: 0.23 against 0.55) and
 matched it within 3 points on the filters. Run 20261011T235454Z, on
 the published labels, repeated every number; Quail took 15 to 19 s on
 the single extractions against 7 to 15 s for stock vLLM, and 46 s
-against 13 s on CUAD-10, where it reads each contract three times.
+against 13 s on CUAD-10, where it read each contract three times.
+
+Prediction for the shared document KV (one key per document and
+rendering, retained after each extraction): CUAD-10 falls from 46 s to
+under 22 s and from 1.07 million fresh tokens to under 400 thousand,
+with every answer unchanged; CUAD-7, a filter then an extraction,
+keeps its 18.7 s and its answers, since a filter's KV holds the plain
+document and the extraction shows it numbered.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the

@@ -508,9 +508,11 @@ class ExtractStages:
     def _prepare(self, index, document, text, stored) -> Extraction:
         """Build a document's prefix: the head and its plain or numbered text.
 
-        A plain document whose tokens are the table's keeps the table's
-        arena key, so KV an earlier operator left resident is read;
-        any other prefix gets a key of its own.
+        The key names the document and its rendering, so a later
+        extraction of the same table in the same rendering reads the
+        KV this one leaves resident. A plain document shown without a
+        head, whose tokens are the table's, keeps the table's key, so
+        KV a filter left resident is read.
         """
         spec, tables = self.spec, self.tables
         text = text.as_py() if hasattr(text, "as_py") else str(text)
@@ -523,8 +525,10 @@ class ExtractStages:
             head, tail = spec.prompt_token_parts
             body, pieces = text, [(0, 0, len(text))]
         ids, offsets = tables.encode(body)
-        key = ("extract", spec.name, index)
-        if not numbered and stored is not None and [int(t) for t in stored] == ids:
+        rendering = "numbered" if numbered else "plain"
+        key = (("extract", spec.alias, rendering), int(document))
+        if (not numbered and not head and stored is not None
+                and [int(t) for t in stored] == ids):
             key = (spec.alias, int(document))
         prefix = list(head) + ids
         tokens = document_tokens(ids, offsets, pieces, len(head))

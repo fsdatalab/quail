@@ -324,10 +324,17 @@ class _StageExecutor:
         # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
 
-        resident = ({a: self._held_pages(self.keys[a], self.prefix_lengths[a])
-                     for a, key in enumerate(self.keys)
-                     if self.arena.is_resident(key)}
-                    if self.paged else {})
+        resident = {}
+        if self.paged:
+            for a, key in enumerate(self.keys):
+                if not self.arena.is_resident(key):
+                    continue
+                if self.arena.prefix_tokens(key) != self.prefix_lengths[a]:
+                    # KV an earlier operator left under this key was
+                    # built for another prefix; it is fed afresh
+                    self.arena.free_key(key)
+                    continue
+                resident[a] = self._held_pages(key, self.prefix_lengths[a])
         # Pin resident documents while fresh admissions evict retained KV.
         for a in resident:
             self.arena.pin(self.keys[a])

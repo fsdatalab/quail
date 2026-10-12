@@ -51,11 +51,23 @@ def execute_extract(state: QueryExecutionState, node, inputs) -> NodeResult:
     stats = {}
     fresh = 0
     spans = []
+    arena = state.loaded_model.arena
+    if arena.retention_cap_pages is None:
+        arena.retention_cap_pages = max(
+            0, arena.n_pages - arena.pages_needed(2 * state.chunk_tokens))
+
+    def on_settled(anchor, survived, row):
+        # the document's KV stays for a later extraction of the table
+        key = stages.keys[anchor]
+        if arena.is_resident(key):
+            arena.retain(key, len(stages.prefixes[anchor]))
+
     if document_ids:
         _, spans, fresh = run_stages(
-            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+            state.torch, arena, state.loaded_model.pipeline,
             stages.stages, stages.prefixes, state.chunk_tokens,
-            anchor_keys=stages.keys, staging=input_staging(state), stats=stats,
+            anchor_keys=stages.keys, on_settled=on_settled,
+            staging=input_staging(state), stats=stats,
             label=f"extract {spec.name}")
     stages.finish()
     counts = stages.counts()
