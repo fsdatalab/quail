@@ -22,6 +22,7 @@ from quail.backends.quail.executor.extract import (
     numbered_text,
     parse_lines,
     same_word,
+    squeezed,
 )
 from quail.backends.quail.executor.operators.extract import (
     execute_extract,
@@ -197,6 +198,24 @@ def test_first_tokens_follow_the_models_spelling_and_the_region():
     (march_stream,) = make_streams(tables, text, tokens, starts, march)
     assert march_stream.ends[:4] == [23, 24, 25, 26]
     assert text[march_stream.char:march_stream.ends[3]] == " March 3."
+
+
+def test_a_stream_writes_a_run_of_whitespace_as_one_space():
+    text = "laws of the State of          Arkansas\nshall apply."
+    tables = _tables(text, "laws of the State of Arkansas shall apply.")
+    ids, offsets = tables.encode(text)
+    prefix = [99] + ids
+    tokens = document_tokens(ids, offsets, [(0, 0, len(text))], 1)
+    laws = tables.encode_ids("laws")[0]
+    starts = first_tokens(tables, {laws: -0.5}, prefix, tokens, None)
+    (stream,) = make_streams(tables, text, tokens, starts, laws)
+    # the model writes " Arkansas" right after "of"; the stream does too,
+    # and its end is the document's, past the spaces
+    assert stream.stream == tables.encode_ids(
+        "laws of the State of Arkansas shall apply.")
+    assert text[stream.char:stream.ends[5]] == "laws of the State of          Arkansas"
+    assert text[stream.char:stream.ends[6]].endswith("Arkansas\nshall")
+    assert squeezed("a  b\n\n c") == ("a b c", [1, 3, 4, 7, 8])
 
 
 def test_a_first_token_that_begins_a_longer_word_carries_its_rest():

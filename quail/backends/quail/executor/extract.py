@@ -263,18 +263,48 @@ def first_tokens(tables: Tables, lp, prefix, tokens, region) -> dict:
     return starts
 
 
+def squeezed(text: str) -> tuple:
+    """Return the text with each run of whitespace as one space, and a map back.
+
+    The model writes a run of spaces or line breaks as one space, so
+    the stream follows the squeezed text; the map gives, for each
+    squeezed character, the document character it ends at.
+    """
+    out, ends = [], []
+    run = False
+    for at, char in enumerate(text):
+        if char.isspace():
+            if not run:
+                out.append(" ")
+                ends.append(at + 1)
+            else:
+                ends[-1] = at + 1
+            run = True
+        else:
+            out.append(char)
+            ends.append(at + 1)
+            run = False
+    return "".join(out), ends
+
+
 def make_streams(tables: Tables, text: str, tokens, starts, first) -> list:
-    """Return a stream for each start the chosen first token begins."""
+    """Return a stream for each start the chosen first token begins.
+
+    A stream's tokens are the text from the start as the model writes
+    it, with every run of whitespace as one space; its ends map each
+    token back to the document.
+    """
     spans = dict(tokens)
     streams = []
     for i, (token, filler) in starts.items():
         if token != first:
             continue
         char, end = spans[i]
-        ids, offsets = tables.encode(text[end:])
+        rest, ends = squeezed(text[end:])
+        ids, offsets = tables.encode(rest)
         streams.append(Stream(
             char, [token, *filler, *ids],
-            [end] * (1 + len(filler)) + [end + b for _, b in offsets]))
+            [end] * (1 + len(filler)) + [end + ends[b - 1] for _, b in offsets]))
     return streams
 
 
