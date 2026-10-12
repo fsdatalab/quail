@@ -282,10 +282,82 @@ def run_snapshot(run: str, document: int = 1) -> dict:
     return {"path": path, **report}
 
 
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=VOLUMES)
+def run_budgets(run: str) -> dict:
+    """Ask the governing law alone under three chunk budgets.
+
+    The budget changes only how the rows are batched. Answers that
+    move with it show the extraction's decisions depend on the batch
+    the rows share, which the pipeline also changes.
+    """
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.backends.quail.executor import extract as executor
+    from quail.cost import budgets
+    from quail.planner.plan import EngineConfig
+    from quail_b.data import build_sets
+    from quail_b.prompts import CUAD_QUESTIONS
+
+    data_dir = build_sets(TABLES, 0.1)
+    contracts = pq.read_table(data_dir / "contracts.parquet")
+    captured = []
+    original = executor.ExtractStages.__init__
+
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        captured.append(self)
+
+    executor.ExtractStages.__init__ = init
+    default_budget = budgets.chunk_budget
+    law = CUAD_QUESTIONS["Governing Law"]
+    results = {}
+    for budget in (None, 60_000, 30_000):
+        budgets.chunk_budget = (default_budget if budget is None
+                                else lambda model, device, b=budget: b)
+        session = quail.Session(EngineConfig(model=MODEL, device="h100-sxm",
+                                             backend="quail"))
+        session.register("contracts", quail.DocumentProvider.from_table(
+            contracts, id_col="id"))
+        query = (session.docs("contracts").alias("c")
+                 .ai_extract("c.text", law, name="q0").select("c.id", "q0"))
+        started = time.perf_counter()
+        query.run().collect()
+        label = "default" if budget is None else str(budget)
+        results[label] = {"wall_s": time.perf_counter() - started,
+                          "state": _state(captured[-1])}
+        print(f"budget {label}: {results[label]['wall_s']:.1f} s", flush=True)
+        session.close()
+    base = {s["document"]: s for s in results["default"]["state"]}
+    comparison = {}
+    for label in ("60000", "30000"):
+        mine = {s["document"]: s for s in results[label]["state"]}
+        comparison[f"{label} vs default"] = {
+            "answers_differ": sum(mine[d]["answer"] != base[d]["answer"]
+                                  for d in mine),
+            "ranges_differ": sum(mine[d]["range"] != base[d]["range"]
+                                 for d in mine),
+            "max_none_lp_gap": round(max(abs(mine[d]["none_lp"] - base[d]["none_lp"])
+                                         for d in mine), 4),
+            "max_best_lp_gap": round(max(abs(mine[d]["best_lp"] - base[d]["best_lp"])
+                                         for d in mine), 4)}
+    summary = {"run": run, "comparison": comparison,
+               "walls": {k: v["wall_s"] for k, v in results.items()}}
+    print(json.dumps(summary, indent=2), flush=True)
+    os.makedirs("/results/extract_pipeline_check", exist_ok=True)
+    path = f"/results/extract_pipeline_check/{run}_budgets.json"
+    with open(path, "w") as f:
+        json.dump({"summary": summary, "results": results}, f, indent=1)
+    VOLUMES["/results"].commit()
+    return {"path": path, **summary}
+
+
 @app.local_entrypoint()
-def main(snapshot: bool = False):
+def main(snapshot: bool = False, budgets: bool = False):
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    call = (run_snapshot if snapshot else run_check).spawn(run)
+    function = run_snapshot if snapshot else run_budgets if budgets else run_check
+    call = function.spawn(run)
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     print(f"function call id {call.object_id}", flush=True)
     print(f"run {run}; fetch with modal.FunctionCall.from_id(id).get()",
