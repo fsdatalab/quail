@@ -115,7 +115,10 @@ class Qwen35Pipeline(ModelPipeline):
         engine = self.engine
         meta = chunk.meta
         positions = chunk.positions
-        hidden = self.embed(chunk.input_ids)
+        # a chunk with image rows carries its embeddings, the vision
+        # tower's rows already written over the image tokens'
+        embeds = getattr(chunk, "inputs_embeds", None)
+        hidden = self.embed(chunk.input_ids) if embeds is None else embeds
         residual = None
         for index, layer in enumerate(self.layers):
             norm = self._norm(layer.input_layernorm)
@@ -184,6 +187,14 @@ class Qwen35Pipeline(ModelPipeline):
         qkv_size = 2 * linear.key_dim + linear.value_dim
         mixed_qkv, z = mixed_qkvz.split([qkv_size, linear.value_dim], dim=-1)
         b, a = ba.chunk(2, dim=-1)
+        slots = meta.get("decode_slots")
+        if slots is not None:
+            core = self._decode(linear, mixed_qkv, a.contiguous(), b.contiguous(),
+                                slots, self.arena.state_pools(layer))
+            head = linear.head_v_dim
+            gated = linear.norm(core.reshape(-1, head), z.reshape(-1, head))
+            return engine.gemm(*engine.quant(gated.reshape(n, -1)),
+                               linear.out_proj)
         plan = meta.get("state")
         if plan is None:
             # an arena without state slots: every sequence starts from
@@ -260,6 +271,36 @@ class Qwen35Pipeline(ModelPipeline):
             conv_pool.index_copy_(0, slots,
                                   windows[1:].index_select(0, index))
         return out.squeeze(0).reshape(out.shape[1], -1)
+
+    def _decode(self, linear, mixed_qkv, a, b, slots, pools):
+        """One token per sequence, each sequence's state updated in its slot.
+
+        The conv window and the recurrent state are read from and
+        written back to the pools in place, as vLLM's decode step does.
+        Returns the core output, (sequences, value_dim).
+        """
+        from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+            causal_conv1d_update,
+        )
+        from vllm.third_party.flash_linear_attention.ops.fused_recurrent import (
+            fused_recurrent_gated_delta_rule_packed_decode,
+        )
+
+        torch = self.engine.torch
+        s_pool, conv_pool = pools
+        weight = linear.conv1d.weight
+        conv_out = causal_conv1d_update(
+            mixed_qkv, conv_pool, weight.view(weight.shape[0], weight.shape[-1]),
+            linear.conv1d.bias, linear.activation, conv_state_indices=slots)
+        n = mixed_qkv.shape[0]
+        out = torch.empty((n, 1, linear.num_v_heads, linear.head_v_dim),
+                          dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+        fused_recurrent_gated_delta_rule_packed_decode(
+            mixed_qkv=conv_out, a=a, b=b, A_log=linear.A_log,
+            dt_bias=linear.dt_bias, scale=linear.head_k_dim ** -0.5,
+            initial_state=s_pool, out=out, ssm_state_indices=slots,
+            use_qk_l2norm_in_kernel=True)
+        return out.view(n, -1)
 
     def _zero_wave(self, meta):
         """The one wave of a chunk without a state plan: every sequence from zero."""

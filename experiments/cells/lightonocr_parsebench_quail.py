@@ -1,0 +1,165 @@
+"""Parse ParseBench pages with LightOnOCR-3-0.8B on Quail's executor.
+
+Runs quail.backends.quail.executor.parse.PageParser over the pages
+experiments/cells/lightonocr_parsebench_vllm.py prepared, with the same
+prompt, greedy decoding, output limit, and context as the vLLM runs,
+and compares every page's output tokens with the saved vLLM run. Page
+preparation (the image processor) runs in worker processes ahead of
+the GPU.
+
+Run from the repository root and tee every line:
+
+    uv run modal run --detach experiments/cells/lightonocr_parsebench_quail.py \
+      --mode smoke --prediction "State the expected result before starting." \
+      2>&1 | tee results/lightonocr-parsebench-quail-smoke.log
+
+Modes: smoke parses the first 20 pages; run parses every page.
+
+Writes /results/ablations/lightonocr_parsebench/quail_<mode>_<rows>_<run
+id>.parquet (one record per page) and .json (the summary).
+"""
+
+import json
+import time
+import uuid
+
+import modal
+
+from quail.bench.images import gpu_image
+
+app = modal.App("quail-milestone1")
+image = gpu_image()
+hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
+results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
+kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
+volumes = {
+    "/root/.cache/huggingface": hf_cache,
+    "/root/.cache/kernels": kernel_cache,
+    "/results": results_vol,
+}
+
+MODEL = "lightonocr-3-0.8b"
+OUT_DIR = "/results/ablations/lightonocr_parsebench"
+PAGES_PATH = f"{OUT_DIR}/pages.parquet"
+# the vLLM run the outputs are compared with: max_num_seqs 256
+VLLM_RUN = f"{OUT_DIR}/vllm_run_256_20261012T003224Z-64e10e.parquet"
+MAX_OUTPUT_TOKENS = 4096
+CONTEXT_TOKENS = 8448
+PREFILL_TOKENS = 16384
+SMOKE_PAGES = 20
+WORKERS = 24
+WINDOW = 96
+
+
+def _pages(limit):
+    """Yield ((pdf, page), PNG bytes) in the prepared order."""
+    import pyarrow.parquet as pq
+
+    count = 0
+    for batch in pq.ParquetFile(PAGES_PATH).iter_batches(
+            batch_size=64, columns=["pdf", "page", "png"]):
+        for row in batch.to_pylist():
+            if limit is not None and count >= limit:
+                return
+            yield (row["pdf"], row["page"]), row["png"]
+            count += 1
+
+
+def _agreement(records) -> dict:
+    """Compare each page's tokens with the saved vLLM run's."""
+    import pyarrow.parquet as pq
+
+    vllm = {(r["pdf"], r["page"]): r["token_ids"] for r in pq.read_table(
+        VLLM_RUN, columns=["pdf", "page", "token_ids"]).to_pylist()}
+    exact, shares = 0, []
+    for record in records:
+        theirs = vllm[(record["pdf"], record["page"])]
+        ours = record["token_ids"]
+        common = 0
+        for a, b in zip(ours, theirs):
+            if a != b:
+                break
+            common += 1
+        exact += ours == theirs
+        shares.append(common / max(len(theirs), 1))
+        record["common_prefix_tokens"] = common
+        record["vllm_output_tokens"] = len(theirs)
+    return dict(pages_identical=exact,
+                common_prefix_share_mean=sum(shares) / len(shares))
+
+
+@app.function(image=image, gpu="H100!", cpu=32, memory=131072,
+              timeout=2 * 3600, volumes=volumes)
+def parse(mode: str, rows: int, run_id: str) -> dict:
+    """Parse pages on Quail's executor and save every output."""
+    import subprocess
+    from pathlib import Path
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from quail.backends.quail.executor.model import resolve_model_path
+    from quail.backends.quail.executor.parse import PageParser, prepared_pages
+    from quail.specs import MODELS
+
+    spec = MODELS[MODEL]
+    started = time.perf_counter()
+    parser = PageParser(spec, rows=rows, max_output_tokens=MAX_OUTPUT_TOKENS,
+                        context_tokens=CONTEXT_TOKENS,
+                        prefill_tokens=PREFILL_TOKENS)
+    load_s = time.perf_counter() - started
+    limit = SMOKE_PAGES if mode == "smoke" else None
+    path = resolve_model_path(spec.hf_name, spec.revision)
+    sampler = subprocess.Popen(
+        ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits",
+         "-lms", "100"], stdout=subprocess.PIPE, text=True)
+    records = []
+    started = time.perf_counter()
+    pages = prepared_pages(_pages(limit), path, parser.prompt(),
+                           workers=WORKERS, window=WINDOW)
+    for (pdf, page), tokens, prompt_tokens in parser.parse(pages):
+        records.append(dict(
+            pdf=pdf, page=page, prompt_tokens=prompt_tokens,
+            output_tokens=len(tokens), token_ids=tokens,
+            finished_s=time.perf_counter() - started))
+    wall_s = time.perf_counter() - started
+    sampler.terminate()
+    utilization = [float(x) for x in sampler.communicate()[0].split()]
+    tokenizer = parser.processor.tokenizer
+    for record in records:
+        record["text"] = tokenizer.decode(record["token_ids"],
+                                          skip_special_tokens=True)
+    output_tokens = sum(r["output_tokens"] for r in records)
+    summary = dict(
+        run_id=run_id, mode=mode, model=MODEL, backend="quail", rows=rows,
+        max_output_tokens=MAX_OUTPUT_TOKENS, context_tokens=CONTEXT_TOKENS,
+        prefill_tokens=PREFILL_TOKENS, workers=WORKERS, sampling="greedy",
+        load_s=load_s, pages=len(records), wall_s=wall_s,
+        pages_per_s=len(records) / wall_s, output_tokens=output_tokens,
+        output_tokens_per_s=output_tokens / wall_s,
+        image_tokens=sum(r["prompt_tokens"] for r in records),
+        pages_at_max_tokens=sum(1 for r in records
+                                if r["output_tokens"] >= MAX_OUTPUT_TOKENS),
+        gpu_utilization_mean=sum(utilization) / max(len(utilization), 1),
+        compared_with=VLLM_RUN, **_agreement(records))
+    stem = f"{OUT_DIR}/quail_{mode}_{rows}_{run_id}"
+    Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pylist(records), f"{stem}.parquet")
+    Path(f"{stem}.json").write_text(json.dumps(summary, indent=1))
+    results_vol.commit()
+    summary["paths"] = [f"{stem}.parquet", f"{stem}.json"]
+    summary["first_pages"] = [
+        dict(pdf=r["pdf"], tokens=r["output_tokens"],
+             vllm_tokens=r["vllm_output_tokens"],
+             common=r["common_prefix_tokens"]) for r in records[:SMOKE_PAGES]]
+    return summary
+
+
+@app.local_entrypoint()
+def main(mode: str = "smoke", rows: int = 256, prediction: str = ""):
+    run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
+    print(f"prediction: {prediction}", flush=True)
+    print(f"run id: {run_id}", flush=True)
+    call = parse.spawn(mode, rows, run_id)
+    print(f"function call id: {call.object_id}", flush=True)
+    print(json.dumps(call.get(), indent=1, default=str), flush=True)
