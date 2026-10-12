@@ -94,25 +94,42 @@ def plan_phases(arena, groups, stage):
             tokens than its first suffix holds, follows a group of
             its key that extends the checkpoint after its suffix,
             advances a checkpoint in place that a question of the chunk
-            reads at its current length, or is an empty document.
+            reads at its current length, is an empty document, or has
+            a suffix that holds no tokens.
         ArenaFullError: Every checkpoint slot belongs to a pinned key.
     """
     undo = []
     try:
         return _plan_phases(arena, groups, stage, undo)
     except Exception:
-        # a failed plan leaves no extension record for a state it never
-        # computed, so a retry after the chunk splits asks at the old length
-        for key, had_slot, previous in reversed(undo):
-            if had_slot:
-                arena.accounting.ext_tokens[key] = previous
+        # a failed plan leaves no record or slot for a state it never
+        # computed, so a retry after the chunk splits asks at the old
+        # length and no borrower reads a share slot nothing wrote
+        accounting = arena.accounting
+        for kind, key, *rest in reversed(undo):
+            if kind == "extension":
+                had_slot, previous = rest
+                if had_slot:
+                    accounting.ext_tokens[key] = previous
+                else:
+                    accounting.drop_extension(key)
+            elif kind == "checkpoint":
+                had_slot, previous = rest
+                if previous is None:
+                    accounting.slot_tokens.pop(key, None)
+                else:
+                    accounting.slot_tokens[key] = previous
+                if not had_slot and key in accounting.slots:
+                    accounting.free_slots.append(accounting.slots.pop(key))
             else:
-                arena.accounting.drop_extension(key)
+                slot = accounting.share_slots.pop((key, rest[0]), None)
+                if slot is not None:
+                    accounting.free_slots.append(slot)
         raise
 
 
 def _plan_phases(arena, groups, stage, undo):
-    """Plan a chunk's phases, logging each extension record in `undo`."""
+    """Plan a chunk's phases, logging each record and slot it takes in `undo`."""
     import torch
 
     from quail.backends.quail.executor.chunk import (
@@ -162,11 +179,14 @@ def _plan_phases(arena, groups, stage, undo):
                 raise ValueError(
                     f"group {key!r}: an empty document has no state to "
                     f"checkpoint")
+            had_slot = arena.has_checkpoint(key)
+            previous = arena.accounting.slot_tokens.get(key)
             source = arena.checkpoint_slot(key)
             if source is None:
                 raise ArenaFullError(
                     f"no free checkpoint slot for {key!r}: all "
                     f"{arena.n_state_slots} belong to documents in use")
+            undo.append(("checkpoint", key, had_slot, previous))
             first, last = group["row0"], group["prefix_end"]
             read = None
             if start:
@@ -187,11 +207,14 @@ def _plan_phases(arena, groups, stage, undo):
                 if high == group["f"]:
                     write = source
                 else:
+                    existed = (key, high) in arena.accounting.share_slots
                     write = arena.share_slot(key, high)
                     if write is None:
                         raise ArenaFullError(
                             f"no free checkpoint slot to share {key!r} "
                             f"at {high} tokens")
+                    if not existed:
+                        undo.append(("share", key, high))
                 if last > first:
                     segment(np.arange(first + low - start,
                                       first + high - start, dtype=np.int64),
@@ -236,7 +259,7 @@ def _plan_phases(arena, groups, stage, undo):
                 raise ValueError(
                     f"group {key!r}: advances a checkpoint in place that "
                     f"a question of this chunk reads at {group['f']} tokens")
-            undo.append((key, held is not None,
+            undo.append(("extension", key, held is not None,
                          None if held is None else held[1]))
             arena.record_extension(key, group["f"] + kept)
             head = np.arange(begins[0], begins[0] + kept, dtype=np.int64)
@@ -251,6 +274,9 @@ def _plan_phases(arena, groups, stage, undo):
         if pure:
             continue
         for begin, end in zip(begins, ends):
+            # an empty sequence would repeat a cu_seqlens entry
+            if end <= begin:
+                raise ValueError(f"group {key!r}: a suffix holds no tokens")
             add("suffix", np.arange(begin, end, dtype=np.int64), source)
             suffix_slots.add(source)
 
@@ -439,7 +465,8 @@ def _conv_triton_kernel():
                   stride_o, W: tl.constexpr, BLOCK: tl.constexpr,
                   HAS_HIST: tl.constexpr, HAS_BIAS: tl.constexpr,
                   ACTIVATE: tl.constexpr):
-        row = tl.program_id(0)
+        # int64 so row * stride cannot overflow on a long chunk
+        row = tl.program_id(0).to(tl.int64)
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = cols < channels
         sequence = tl.load(seq_ptr + row)

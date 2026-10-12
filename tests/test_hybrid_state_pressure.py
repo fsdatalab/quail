@@ -279,6 +279,36 @@ def test_a_failed_plan_leaves_the_extension_records_as_they_were(monkeypatch):
     assert arena.extension("a")[1] == 40
 
 
+def test_a_failed_plan_returns_the_checkpoint_and_share_slots_it_took(
+        monkeypatch):
+    arena = _arena(2)
+    for key in ("a", "b"):
+        arena.alloc(key, 64)
+    free = list(arena.accounting.free_slots)
+    first = _group("a", 48, 0, 48, fresh=True)
+    first["share_points"] = (16,)
+    second = _group("b", 32, 50, 82, fresh=True)
+    # a takes a share slot and its checkpoint slot, and b finds none left
+    with pytest.raises(Exception, match="no free checkpoint slot"):
+        _plan(arena, [first, second], monkeypatch)
+    accounting = arena.accounting
+    assert sorted(accounting.free_slots) == sorted(free)
+    assert not accounting.slots and not accounting.share_slots
+    assert arena.checkpoint_tokens("a") == 0
+    assert arena.shared_state("a", 16) is None
+    # the retry plans a again and records it once
+    _plan(arena, [first], monkeypatch)
+    assert arena.checkpoint_tokens("a") == 48
+    assert arena.shared_state("a", 16) is not None
+
+
+def test_a_suffix_that_holds_no_tokens_is_refused(monkeypatch):
+    arena = _arena(2)
+    arena.alloc("a", 64)
+    with pytest.raises(ValueError, match="holds no tokens"):
+        _plan(arena, [_group("a", 32, 0, 32, fresh=True, slen=0)], monkeypatch)
+
+
 def _tree_run(slots, parents, children, monkeypatch, stages=1, frame=(),
               budget=1_000, spread=16):
     """Parents whose children share prefixes of increasing length."""
