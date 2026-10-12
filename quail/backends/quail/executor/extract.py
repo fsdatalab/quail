@@ -129,6 +129,38 @@ class Tables:
         self.range_text = {**{token: digit for token, digit
                               in zip(digits, "0123456789")}, dash: "-"}
         self.begins_cue = self.encode_ids("\n" + EXTRACT_PHRASE_CUE)
+        self._options = {}      # word key -> its (first token, prefix length)s
+
+    def first_token(self, key, lp, token) -> tuple | None:
+        """Return the likeliest token that begins a word, and the word's rest.
+
+        Args:
+            key: The word's key from same_word, or its token when it
+                has none.
+            lp: The row's log probabilities by token id.
+            token: The document's token for the word.
+        """
+        options = self._options.get(key)
+        if options is None:
+            if isinstance(key, str) and key.isascii():
+                options = [(t, j) for j in range(len(key), 0, -1)
+                           for t in self.variants.get(key[:j], [])]
+            elif isinstance(key, str):
+                options = [(t, len(key)) for t in self.variants.get(key, [token])]
+            else:
+                options = [(token, 1)]
+            self._options[key] = options
+        rated = [(t, j) for t, j in options if t in lp]
+        if not rated:
+            return None
+        # the whole word first, so it wins a tie with a prefix of itself
+        first, j = max(rated, key=lambda o: (lp[o[0]], o[1]))
+        filler = []
+        if isinstance(key, str) and j < len(key):
+            text = self.vocab[token]
+            text = text[1:] if text.startswith("Ġ") else text
+            filler = self.encode_ids(text[j:])
+        return first, filler
 
     def encode(self, text: str) -> tuple:
         """Return the token ids of a text and each token's character range."""
@@ -179,13 +211,47 @@ def document_tokens(ids, offsets, pieces, shift: int) -> list:
     return doc
 
 
+# characters a stream tokenizes ahead of its start at a time: room
+# for ANSWER_MAX_TOKENS tokens of several characters each
+STREAM_WINDOW = 512
+
+
 @dataclass
 class Stream:
     """One start position's text, as the model would write it from there."""
 
     char: int
-    stream: list        # the tokens from the start to the document's end
+    stream: list        # the tokens from the start, as far as tokenized
     ends: list          # the document character each stream token ends at
+    text: str           # the document
+    exhausted: bool = False
+
+    def extend(self, tables: Tables) -> None:
+        """Tokenize the next window of the document past the stream's end.
+
+        A window ends before a whitespace character, so no word is cut
+        and the tokens are the whole text's.
+        """
+        start = self.ends[-1]
+        cut = start + STREAM_WINDOW
+        if cut < len(self.text):
+            boundary = re.compile(r"\s").search(self.text, cut)
+            cut = len(self.text) if boundary is None else boundary.start()
+        window = self.text[start:cut]
+        rest, ends = squeezed(window)
+        if not rest:
+            self.exhausted = True
+            return
+        ids, offsets = tables.encode(rest)
+        self.stream.extend(ids)
+        self.ends.extend(start + ends[b - 1] for _, b in offsets)
+        self.exhausted = start + len(window) >= len(self.text)
+
+    def next(self, at: int, tables: Tables):
+        """Return the stream's token at index at, or None past its end."""
+        while at >= len(self.stream) and not self.exhausted:
+            self.extend(tables)
+        return self.stream[at] if at < len(self.stream) else None
 
 
 @dataclass
@@ -230,36 +296,26 @@ def first_tokens(tables: Tables, lp, prefix, tokens, region) -> dict:
     case, or split differently from the document: any vocabulary token
     whose text is a prefix of the word, up to case, can start it; the
     likeliest wins, and a shorter one is followed by the rest of the
-    word as the document writes it.
+    word as the document writes it. Positions of one word share the
+    choice.
 
     Returns:
         Position index -> (first token, filler tokens) for every
         document token in the region whose first token the row rates.
     """
-    starts = {}
+    by_key = {}
     for i, span in tokens:
         if region is not None and not region[0] <= span[0] < region[1]:
             continue
         token = prefix[i]
         key = same_word(tables.vocab[token]) or token
-        if isinstance(key, str) and key.isascii():
-            options = [(t, j) for j in range(len(key), 0, -1)
-                       for t in tables.variants.get(key[:j], [])]
-        else:
-            options = [(t, len(key) if isinstance(key, str) else 1)
-                       for t in (tables.variants.get(key, [token])
-                                 if isinstance(key, str) else [token])]
-        rated = [(t, j) for t, j in options if t in lp]
-        if not rated:
-            continue
-        # the whole word first, so it wins a tie with a prefix of itself
-        first, j = max(rated, key=lambda o: (lp[o[0]], o[1]))
-        filler = []
-        if isinstance(key, str) and j < len(key):
-            text = tables.vocab[token]
-            text = text[1:] if text.startswith("Ġ") else text
-            filler = tables.encode_ids(text[j:])
-        starts[i] = (first, filler)
+        by_key.setdefault(key, []).append(i)
+    starts = {}
+    for key, positions in by_key.items():
+        choice = tables.first_token(key, lp, prefix[positions[0]])
+        if choice is not None:
+            for i in positions:
+                starts[i] = choice
     return starts
 
 
@@ -291,8 +347,8 @@ def make_streams(tables: Tables, text: str, tokens, starts, first) -> list:
     """Return a stream for each start the chosen first token begins.
 
     A stream's tokens are the text from the start as the model writes
-    it, with every run of whitespace as one space; its ends map each
-    token back to the document.
+    it, with every run of whitespace as one space, tokenized a window
+    at a time; its ends map each token back to the document.
     """
     spans = dict(tokens)
     streams = []
@@ -300,11 +356,9 @@ def make_streams(tables: Tables, text: str, tokens, starts, first) -> list:
         if token != first:
             continue
         char, end = spans[i]
-        rest, ends = squeezed(text[end:])
-        ids, offsets = tables.encode(rest)
-        streams.append(Stream(
-            char, [token, *filler, *ids],
-            [end] * (1 + len(filler)) + [end + ends[b - 1] for _, b in offsets]))
+        stream = Stream(char, [token, *filler], [end] * (1 + len(filler)), text)
+        stream.extend(tables)
+        streams.append(stream)
     return streams
 
 
@@ -540,7 +594,8 @@ class ExtractStages:
             qs.written.append(first)
         else:
             at = len(qs.written)
-            following = {s.stream[at] for s in qs.live if at < len(s.stream)}
+            following = {token for token in (s.next(at, tables) for s in qs.live)
+                         if token is not None}
             best = max(following, key=lambda t: lp.get(t, NEG), default=None)
             best_lp = NEG if best is None else lp.get(best, NEG)
             merged = {t: tables.merged[t] for t in following
@@ -548,16 +603,14 @@ class ExtractStages:
             joined = max(merged, key=lambda t: lp[merged[t]], default=None)
             if joined is not None and lp[merged[joined]] > max(best_lp, stop_lp):
                 qs.written.append(joined)
-                qs.live = [s for s in qs.live
-                           if at < len(s.stream) and s.stream[at] == joined]
+                qs.live = [s for s in qs.live if s.next(at, tables) == joined]
                 self._answer(doc, q)
                 return True
             if best is None or stop_lp >= best_lp:
                 self._answer(doc, q)
                 return True
             qs.written.append(best)
-            qs.live = [s for s in qs.live
-                       if at < len(s.stream) and s.stream[at] == best]
+            qs.live = [s for s in qs.live if s.next(at, tables) == best]
         if len(qs.written) >= ANSWER_MAX_TOKENS:
             self._answer(doc, q)
         return True

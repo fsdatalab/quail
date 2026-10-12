@@ -218,6 +218,29 @@ def test_a_stream_writes_a_run_of_whitespace_as_one_space():
     assert squeezed("a  b\n\n c") == ("a b c", [1, 3, 4, 7, 8])
 
 
+def test_a_stream_tokenizes_a_window_at_a_time():
+    from quail.backends.quail.executor import extract as extract_mod
+
+    text = " ".join(["word"] * 300)
+    tables = _tables(text)
+    ids, offsets = tables.encode(text)
+    prefix = [99] + ids
+    tokens = document_tokens(ids, offsets, [(0, 0, len(text))], 1)
+    word = tables.encode_ids("word")[0]
+    starts = first_tokens(tables, {word: -0.5}, prefix, tokens, None)
+    streams = make_streams(tables, text, tokens, starts, word)
+    assert len(streams) == 300
+    first = streams[0]
+    # one window of the text is tokenized ahead; the rest on demand
+    window_tokens = len(first.stream)
+    assert window_tokens < 300 and not first.exhausted
+    assert first.next(window_tokens + 5, tables) == tables.encode_ids(" word")[0]
+    assert len(first.stream) > window_tokens
+    assert first.next(10_000, tables) is None and first.exhausted
+    assert text[first.char:first.ends[-1]] == text
+    assert extract_mod.STREAM_WINDOW == 512
+
+
 def test_a_first_token_that_begins_a_longer_word_carries_its_rest():
     text = "The lease is their lease."
     tables = _tables(text, "their", "ir")
