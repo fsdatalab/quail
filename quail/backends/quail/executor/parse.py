@@ -75,9 +75,9 @@ def prepare_pdf_page(item) -> dict:
     Args:
         item: (path, page number from 1, longest edge in pixels).
     """
-    from quail.pdf import render_png
+    from quail.pdf import render_page
 
-    return prepare_png(render_png(*item))
+    return prepare_page(_WORKER["processor"], _WORKER["prompt"], render_page(*item))
 
 
 def _ready() -> bool:
@@ -431,7 +431,8 @@ class RowParser:
         started = time.perf_counter()
         tokenizer = self.pages.processor.tokenizer
         texts = {}
-        stats = self.stats = dict(pages_parsed=0, parse_output_tokens=0,
+        stats = self.stats = dict(pages_parsed=0, parse_input_tokens=0,
+                                  parse_output_tokens=0,
                                   parse_truncated_pages=0)
 
         def items():
@@ -443,7 +444,8 @@ class RowParser:
 
         prepared = self.preparer.pages(items(), window=self.window,
                                        prepare=prepare_pdf_page)
-        for (key, index), tokens, _ in self.pages.parse(prepared):
+        for (key, index), tokens, prompt_tokens in self.pages.parse(prepared):
+            stats["parse_input_tokens"] += prompt_tokens
             stats["pages_parsed"] += 1
             stats["parse_output_tokens"] += len(tokens)
             stats["parse_truncated_pages"] += len(tokens) >= self.max_output_tokens

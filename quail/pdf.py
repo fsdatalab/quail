@@ -221,16 +221,17 @@ def stored_text(path: str, pages) -> list[str]:
         pdf.close()
 
 
-def render_png(path: str, page: int, longest_edge: int) -> bytes:
-    """Render one page at RENDER_DPI, shrunk to fit longest_edge, as PNG bytes.
+def render_page(path: str, page: int, longest_edge: int):
+    """Render one page at RENDER_DPI, shrunk to fit longest_edge, as an RGB image.
 
     Args:
         path: The file.
         page: The page number, from 1.
         longest_edge: The largest width or height, in pixels.
-    """
-    import io
 
+    Returns:
+        A PIL image.
+    """
     pdf = _open(path)
     try:
         handle = pdf[page - 1]
@@ -239,6 +240,5 @@ def render_png(path: str, page: int, longest_edge: int) -> bytes:
     finally:
         pdf.close()
     picture.thumbnail((longest_edge, longest_edge))
-    buffer = io.BytesIO()
-    picture.save(buffer, format="PNG")
-    return buffer.getvalue()
+    return picture
+
