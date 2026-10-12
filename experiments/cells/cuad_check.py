@@ -168,6 +168,13 @@ three questions' prompts whole. The 45-contract scores were noisier
 than predicted: at 450 contracts stock vLLM leads on the clause
 fields by 6 to 12 points (CUAD-3, 7, 8, 9) and Quail on CUAD-4 by 18.
 
+Prediction for a draft of 32 tokens instead of 16, at scale factor
+0.1: the clause fields take about half the rounds (the cap on
+liability took 13 on run 055945Z), so CUAD-3 falls from 5.6 s to
+about 5.0 s and CUAD-7 from 9.5 s to about 8.8 s; the short fields
+move by less than 0.3 s; every answer unchanged but for 0 to 3
+contracts per query.
+
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the
 two filter queries lands within 10 points of Qwen3 4B's (CUAD-5 0.71,
