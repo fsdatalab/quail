@@ -137,6 +137,22 @@ tokenized on demand (preparation 2.5 s to 0.9 s and the scan 3.3 s to
 0.6 s, measured locally over the 45 contracts): every query 1.5 to
 2.5 s faster than run 055523Z, CUAD-1 about 6 s and CUAD-3 about 6.5
 s, with every answer unchanged but for 0 to 3 contracts per query.
+Measured on run 20261012T061618Z: CUAD-1 6.4 s, CUAD-2 5.2 s, CUAD-3
+5.6 s, CUAD-4 5.3 s, CUAD-7 9.5 s, CUAD-8 6.6 s, CUAD-9 6.6 s, and
+CUAD-10 6.1 s, every one faster than stock vLLM's run 235454Z (6.9,
+8.7, 10.3, 10.0, 14.8, 11.4, 10.2, 12.7 s); CUAD-10, three questions
+over each contract, fell 5.8 s since each question's scan and the
+preparation were paid three times. Scores within a point of run
+055523Z (CUAD-3 0.53, CUAD-10 0.49, the rest equal).
+
+Prediction for scale factor 1.0, 450 contracts and about 3.4 million
+document tokens, on both backends: Quail reads at the 75 thousand
+tokens per second its read chunks run, so the short fields (CUAD-1,
+2, 4) take 55 to 65 s and the clause fields and CUAD-10 up to 80 s,
+the rounds riding inside the 31 read chunks; stock vLLM, which read
+at 49 thousand tokens per second at scale factor 0.1, takes 70 to 100
+s per query. Span F1 lands within 5 points of the scale factor 0.1
+values for both backends, since the contracts differ.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the
