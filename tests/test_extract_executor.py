@@ -241,10 +241,31 @@ def test_a_stream_tokenizes_a_window_at_a_time():
     assert extract_mod.STREAM_WINDOW == 512
 
 
-def test_writing_that_leaves_the_document_answers_none(monkeypatch):
-    # the model writes "March" then a word the document does not
-    # continue with: the stock path would not find its answer in the
-    # text, and neither extraction answers
+def test_writing_that_begins_outside_the_document_answers_none(monkeypatch):
+    # at the cue the model prefers a word that begins no position: its
+    # answer is not in the document, and neither extraction answers
+    state, model, run, _ = _setup(monkeypatch)
+    tables = model.tables
+    stray = tables.encode_ids(" five")[0]
+    cue_row = model._cue_row
+
+    def straying(key):
+        if key[1] != 0:
+            return cue_row(key)
+        march = tables.encode_ids("March")[0]
+        return model._cue({stray: -0.05, march: -0.5}, -5.0, -6.0)
+
+    model._cue_row = straying
+    result, stages = run()
+    assert result.outputs["scores"].column("ends").to_pylist() == [
+        None, "five years", None]
+    assert stages.docs[0].questions[0].none_wins
+
+
+def test_writing_that_leaves_the_document_later_goes_on_along_it(monkeypatch):
+    # after "March" the model would rather write a word the document
+    # does not continue with; the answer follows the document instead,
+    # as the parties of a contract are listed without an "and" between
     state, model, run, _ = _setup(monkeypatch)
     tables = model.tables
     stray = tables.encode_ids(" lease")[0]
@@ -253,14 +274,15 @@ def test_writing_that_leaves_the_document_answers_none(monkeypatch):
     def straying(key, written):
         row = answer_row(key, written)
         if key[1] == 0 and len(written) == 1:
-            return model._cue({stray: -0.05}, -9.0, -4.0)
+            gold = model._gold_ids(key)
+            return model._cue({stray: -0.05, gold[1]: -1.0}, -9.0, -4.0)
         return row
 
     model._answer_row = straying
     result, stages = run()
     assert result.outputs["scores"].column("ends").to_pylist() == [
-        None, "five years", None]
-    assert stages.docs[0].questions[0].none_wins
+        "March 3, 2027", "five years", None]
+    assert not stages.docs[0].questions[0].none_wins
 
 
 def test_a_first_token_that_begins_a_longer_word_carries_its_rest():

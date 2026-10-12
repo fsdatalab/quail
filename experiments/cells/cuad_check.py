@@ -74,6 +74,19 @@ its written answer is not in the text): CUAD-3 and CUAD-7 close to
 within 5 points of stock vLLM (0.55, 0.75), since stock vLLM returned
 null on 16 of 45 contracts for CUAD-3 where the reference is often
 null; CUAD-1 and CUAD-2 stay within 2 points of 0.37 and 0.83.
+Measured on run 20261012T014442Z: CUAD-3 0.57, CUAD-7 0.67, CUAD-8
+0.50, CUAD-1 0.37, CUAD-2 0.81, and every query within 2 s of stock
+vLLM; Quail now returns null on all 16 contracts stock vLLM does for
+CUAD-3. CUAD-4, the parties, fell from 0.62 to 0.26: the rule fired
+in the middle of 27 answers, where the model would write "and"
+between two names the contract lists apart, and stock vLLM keeps
+such an answer as written (locate_span finds no span; the text is
+scored).
+
+Prediction for the rule at the first token only, the answer later
+following the document's continuation as before: CUAD-4 returns to
+at least 0.58, and CUAD-3, CUAD-7, and CUAD-8 hold within 3 points of
+run 014442Z, if their added nulls came at the first token.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the

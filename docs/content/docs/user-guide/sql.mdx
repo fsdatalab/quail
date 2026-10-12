@@ -1,20 +1,3 @@
-The answer is always a span of the document's own text. The model
-writes the answer one token at a time, as a decoder would, but each
-token is chosen among the tokens that continue some position of the
-document, so the writing can only trace the document's own text. A
-token the model likes better than every continuation, and that
-continues no position, means its writing leaves the document: the
-answer is null, as it is on the stock vLLM path when the written
-answer is not found in the text. The answer ends where the model would
-close the quote: when closing it is at least as likely as every
-continuation, or after a token the model would write with the closing
-quote in one token, such as `."`. With `locate` on, the model first
-names the lines that hold the answer, shown numbered as `cat -n` shows
-them, and the positions are those lines. The document, the lines, and
-the question stay in KV across these steps. Several
-extractions of one table with the same `locate` setting read each
-document once and ask their questions of it in turn.
-
 ---
 title: SQL reference
 ---
@@ -334,6 +317,76 @@ FROM reviews r
 JOIN aspects a ON AI.IF(
     PROMPT('Does the review discuss this aspect? {0} {1}', r.body, a.aspect));
 ```
+
+These limits apply:
+
+- The classification and its `AI.IF` join run on one GPU.
+- A `WHERE` condition cannot test the label of a joined row.
+- A query cannot classify joined rows and also use `AI.SCORE`.
+
+For labels computed before later filters, see
+[Classification answers](/docs/user-guide/results#classification-answers).
+For the scoring methods, see
+[Label scoring](/docs/architecture/execution#label-scoring).
+
+## AI.EXTRACT
+
+`AI.EXTRACT` copies the words that answer a question from each document.
+It returns the copied words as a `STRING`, and their character span in
+the document as a `STRUCT<start INT32, end INT32>` in a second column
+named after the first plus `_span`. For example, imagine a `contracts`
+table with contract text in `body`. Return when each lease ends:
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.body, 'When does the lease end?') AS ends
+FROM contracts c;
+```
+
+The result has the columns `c.id`, `ends`, and `ends_span`. Both answer
+columns are null when the document does not answer the question. An
+extraction in `SELECT` requires a column alias with `AS`, and it cannot
+be used in `WHERE`.
+
+### Arguments
+
+`AI.EXTRACT(input, question[, options])`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `input` | `STRING` column | The document to copy from. |
+| `question` | `STRING` literal | The question the answer is copied for. |
+| `options` | Object | Optional parameters listed below. |
+
+### Optional parameters
+
+Pass an object as the third argument, such as `{'trim': false}`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `trim` | `true` | Return the fewest words that answer the question. With `false`, return the whole lines of the document that hold them, as the document's own line breaks divide it. Use `false` for an answer that is a clause rather than a name, a date, or a number. |
+| `locate` | `false` | Show every document as numbered lines and have the model name the lines that hold the answer before it is written within them. With `false`, the answer is written over the whole document. Off by default: on 45 CUAD contracts with Qwen3 4B, locating lost 5 to 22 points of span F1 on every extraction query (run 20261012T011602Z against 011923Z), because the answer is forced into the lines the model named. |
+
+### How the answer is found
+
+The answer is always a span of the document's own text. The model
+writes the answer one token at a time, as a decoder would, but each
+token is chosen among the tokens that continue some position of the
+document, so the writing can only trace the document's own text. When
+the model's first token begins no position, or it writes `none`, the
+answer is null: its answer is not in the document. Later in the
+answer, a token that continues no position is passed over for the
+document's own continuation; for example, the model would write
+"and" between two parties a contract lists apart, and the answer
+follows the contract instead. The answer ends where the model would
+close the quote: when closing it is at least as likely as every
+continuation, or after a token the model would write with the closing
+quote in one token, such as `."`. With `locate` on, the model first
+names the lines that hold the answer, shown numbered as `cat -n` shows
+them, and the positions are those lines. The document, the lines, and
+the question stay in KV across these steps. Several extractions of one
+table with the same `locate` setting read each document once and ask
+their questions of it in turn.
 
 These limits apply:
 
