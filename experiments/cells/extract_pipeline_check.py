@@ -406,6 +406,8 @@ def run_profile(run: str) -> dict:
         current["build"] = time.perf_counter() - started
         current["kind"] = ("read" if any(carried for *_, carried in part)
                            else "round")
+        # the kernel warm-up runs stages of its own, over positional keys
+        current["warm"] = not isinstance(self.keys[0], tuple)
         current["tokens"] = int(chunk.tokens)
         current["rows"] = int(sum(rows for _, rows in entries))
         current["stages"] = sorted({int(j) for _, j, *_ in part})
@@ -453,8 +455,7 @@ def run_profile(run: str) -> dict:
         started = time.perf_counter()
         query.run().collect()
         wall = time.perf_counter() - started
-        # the kernel warm-up runs chunks of its own before the query
-        own = [c for c in chunks if c.get("tokens", 0) > 0]
+        own = [c for c in chunks if c.get("tokens", 0) > 0 and not c["warm"]]
         summary = {}
         for kind in ("read", "round"):
             mine = [c for c in own if c["kind"] == kind]
@@ -478,11 +479,101 @@ def run_profile(run: str) -> dict:
                              for k, v in results.items()}}
 
 
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=VOLUMES)
+def run_kernels(run: str) -> dict:
+    """Profile the kernels of one read chunk and one answer round.
+
+    Asks the cap on liability of the 45 contracts and runs the second
+    read chunk and the third round under the torch profiler. Saves
+    each one's kernels by GPU time and its operators by host time.
+    Prediction: a round's kernels sum to under 30 ms of its 126 ms, and
+    its host-side operator time fills the rest, so the rounds are
+    launch-bound and CUDA graphs would cut them; a single kernel over
+    half the round means that kernel is.
+    """
+    import pyarrow.parquet as pq
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    import quail
+    from quail.backends.quail.executor import loop
+    from quail.backends.quail.executor import stages as scheduler
+    from quail.planner.plan import EngineConfig
+    from quail_b.data import build_sets
+    from quail_b.prompts import CUAD_QUESTIONS
+
+    data_dir = build_sets(TABLES, 0.1)
+    contracts = pq.read_table(data_dir / "contracts.parquet")
+    executor = scheduler._StageExecutor
+    original = {"build": executor._build, "forward": loop._forward}
+    seen = {"read": 0, "round": 0}
+    current = {}
+    traces = {}
+
+    def build(self, part):
+        chunk, entries = original["build"](self, part)
+        if isinstance(self.keys[0], tuple):
+            kind = "read" if any(carried for *_, carried in part) else "round"
+            seen[kind] += 1
+            current["label"] = f"{kind} {seen[kind]}"
+            current["tokens"] = int(chunk.tokens)
+            current["rows"] = int(sum(rows for _, rows in entries))
+        else:
+            current.clear()
+        return chunk, entries
+
+    def forward(pipeline, arena, chunk):
+        label = current.get("label")
+        if label not in ("read 2", "round 3"):
+            return original["forward"](pipeline, arena, chunk)
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                     record_shapes=False) as prof:
+            out = original["forward"](pipeline, arena, chunk)
+            torch.cuda.synchronize()
+        wall = time.perf_counter() - started
+        averages = prof.key_averages()
+        by_gpu = averages.table(sort_by="cuda_time_total", row_limit=30)
+        by_cpu = averages.table(sort_by="cpu_time_total", row_limit=30)
+        kernel_s = sum(item.self_device_time_total for item in averages) / 1e6
+        traces[label] = {"wall_s": round(wall, 4), "kernel_s": round(kernel_s, 4),
+                         "tokens": current["tokens"], "rows": current["rows"],
+                         "by_gpu": by_gpu, "by_cpu": by_cpu}
+        print(label, f"{wall:.3f} s wall, {kernel_s:.3f} s of kernels",
+              flush=True)
+        print(by_gpu, flush=True)
+        return out
+
+    executor._build = build
+    loop._forward = forward
+    session = quail.Session(EngineConfig(model=MODEL, device="h100-sxm",
+                                         backend="quail"))
+    session.register("contracts", quail.DocumentProvider.from_table(
+        contracts, id_col="id"))
+    query = (session.docs("contracts").alias("c")
+             .ai_extract("c.text", CUAD_QUESTIONS["Cap On Liability"], name="q0")
+             .select("c.id", "q0"))
+    query.run().collect()
+    session.close()
+    os.makedirs("/results/extract_pipeline_check", exist_ok=True)
+    path = f"/results/extract_pipeline_check/{run}_kernels.json"
+    with open(path, "w") as f:
+        json.dump({"run": run, "model": MODEL, "traces": traces}, f, indent=1)
+    VOLUMES["/results"].commit()
+    return {"path": path, **{label: {k: v for k, v in trace.items()
+                                     if k not in ("by_gpu", "by_cpu")}
+                             for label, trace in traces.items()}}
+
+
 @app.local_entrypoint()
-def main(snapshot: bool = False, budgets: bool = False, profile: bool = False):
+def main(snapshot: bool = False, budgets: bool = False, profile: bool = False,
+         kernels: bool = False):
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    function = (run_profile if profile else run_snapshot if snapshot
-                else run_budgets if budgets else run_check)
+    function = (run_kernels if kernels else run_profile if profile
+                else run_snapshot if snapshot else run_budgets if budgets
+                else run_check)
     call = function.spawn(run)
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     print(f"function call id {call.object_id}", flush=True)

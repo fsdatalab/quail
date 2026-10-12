@@ -94,6 +94,10 @@ class FakeTokenizer:
             raise ValueError(f"cannot tokenize {text[at:]!r}")
 
     def __call__(self, text, return_offsets_mapping=True, add_special_tokens=False):
+        if isinstance(text, list):
+            each = [self(one) for one in text]
+            return {"input_ids": [e["input_ids"] for e in each],
+                    "offset_mapping": [e["offset_mapping"] for e in each]}
         ids, offsets = [], []
         for piece, span in self._pieces(text):
             ids.append(self.ids[piece])
@@ -179,7 +183,7 @@ def test_first_tokens_follow_the_models_spelling_and_the_region():
     space_march = tables.encode_ids(" March")[0]
     lp = {the: -0.5, march: -1.0, space_march: -3.0}
     starts = first_tokens(tables, lp, prefix, tokens, None)
-    by_char = {tokens[i - 1][1][0]: value for i, value in starts.items()}
+    by_char = {tokens[i - 1][1][0]: value for i, value in starts.items(tables)}
     # the model writes "March" without its space; the document's token
     # has one, and the likelier spelling starts it; "The" twice
     assert by_char[text.index(" March")] == (march, [])
@@ -191,12 +195,16 @@ def test_first_tokens_follow_the_models_spelling_and_the_region():
     assert {tokens[i - 1][1][0] for i in inside} == {26, text.index(" March")}
     # the chosen first token names the streams, each the text from
     # its start as the model would write it, with its character ends
-    streams = make_streams(tables, text, tokens, starts, the)
+    streams = make_streams(tables, text, starts, the)
     assert [stream.char for stream in streams] == [0, 26]
+    # a stream holds its first token until the writing reaches it
+    assert streams[1].stream == [the]
+    streams[1].extend(tables)
     assert streams[1].stream[:3] == tables.encode_ids("The rent is")
     # a start's offset includes its token's leading space
     assert text[streams[1].char:streams[1].ends[2]] == " The rent is"
-    (march_stream,) = make_streams(tables, text, tokens, starts, march)
+    (march_stream,) = make_streams(tables, text, starts, march)
+    march_stream.extend(tables)
     assert march_stream.ends[:4] == [23, 24, 25, 26]
     assert text[march_stream.char:march_stream.ends[3]] == " March 3."
 
@@ -209,7 +217,8 @@ def test_a_stream_writes_a_run_of_whitespace_as_one_space():
     tokens = document_tokens(ids, offsets, [(0, 0, len(text))], 1)
     laws = tables.encode_ids("laws")[0]
     starts = first_tokens(tables, {laws: -0.5}, prefix, tokens, None)
-    (stream,) = make_streams(tables, text, tokens, starts, laws)
+    (stream,) = make_streams(tables, text, starts, laws)
+    stream.extend(tables)
     # the model writes " Arkansas" right after "of"; the stream does too,
     # and its end is the document's, past the spaces
     assert stream.stream == tables.encode_ids(
@@ -229,7 +238,7 @@ def test_a_stream_tokenizes_a_window_at_a_time():
     tokens = document_tokens(ids, offsets, [(0, 0, len(text))], 1)
     word = tables.encode_ids("word")[0]
     starts = first_tokens(tables, {word: -0.5}, prefix, tokens, None)
-    streams = make_streams(tables, text, tokens, starts, word)
+    streams = make_streams(tables, text, starts, word)
     assert len(streams) == 300
     first = streams[0]
     # one window of the text is tokenized ahead; the rest on demand
@@ -333,11 +342,11 @@ def test_a_first_token_that_begins_a_longer_word_carries_its_rest():
     tokens = document_tokens(ids, offsets, [(0, 0, len(text))], 1)
     the = tables.encode_ids("The")[0]
     starts = first_tokens(tables, {the: -0.5}, prefix, tokens, None)
-    by_char = {tokens[i - 1][1][0]: value for i, value in starts.items()}
+    by_char = {tokens[i - 1][1][0]: value for i, value in starts.items(tables)}
     # "the" begins "their" too: that start continues with "ir"
     assert by_char[0] == (the, [])
     assert by_char[12] == (the, tables.encode_ids("ir"))
-    streams = make_streams(tables, text, tokens, starts, the)
+    streams = make_streams(tables, text, starts, the)
     assert [stream.char for stream in streams] == [0, 12]
     assert streams[1].stream[:2] == [the, tables.encode_ids("ir")[0]]
     assert text[streams[1].char:streams[1].ends[1]] == " their"

@@ -124,7 +124,19 @@ CUAD-8 7.4 s, less than predicted; CUAD-1 7.8 s, CUAD-2 7.3 s, CUAD-4
 2.5 s too, so the rounds were not the whole gap: a query with answers
 of a few tokens takes 7 to 8 s, and run 20261012T055945Z
 (experiments/cells/extract_pipeline_check.py --profile) times the
-read chunks and the rounds apart.
+read chunks and the rounds apart. It measured, for the cap on
+liability: 4.5 s of forward passes over 4 read chunks, with the
+attention and the fp8 matrix multiplies near their peak (run
+20261012T060259Z --kernels); 4.2 s on the host reading those chunks'
+answers, nearly all the first-token scan; 1.6 s of forward passes over
+13 rounds; and, before the run, 2.2 s on the host preparing the
+documents, measured locally.
+
+Prediction for batch tokenization, the scan vectorized, and streams
+tokenized on demand (preparation 2.5 s to 0.9 s and the scan 3.3 s to
+0.6 s, measured locally over the 45 contracts): every query 1.5 to
+2.5 s faster than run 055523Z, CUAD-1 about 6 s and CUAD-3 about 6.5
+s, with every answer unchanged but for 0 to 3 contracts per query.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the

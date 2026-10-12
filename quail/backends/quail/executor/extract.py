@@ -35,19 +35,16 @@ LINE_MAX_TOKENS = 8     # tokens the lines answer may take
 NEG = float("-inf")
 
 
+NONBLANK_LINE = re.compile(r"[^\n]*[^\s][^\n]*")
+
+
 def document_lines(text: str) -> list:
     """Return the character ranges of the text's non-empty lines.
 
     Blank lines get no number, so the model does not have to count
     them; the text of each line is unchanged.
     """
-    out, start = [], 0
-    for line in text.split("\n"):
-        end = start + len(line)
-        if line.strip():
-            out.append((start, end))
-        start = end + 1
-    return out
+    return [match.span() for match in NONBLANK_LINE.finditer(text)]
 
 
 def numbered_text(text: str, lines) -> tuple:
@@ -100,10 +97,25 @@ class Tables:
         # or in another case after the opening quote: every
         # vocabulary token with the same text up to those can start it
         self.variants = {}
+        # every token's key: its word, or the token itself without one
+        self.keys = []
+        key_ids = {}
+        key_of = np.empty(len(self.vocab), dtype=np.int64)
         for index, token in enumerate(self.vocab):
             key = same_word(token)
             if key:
                 self.variants.setdefault(key, []).append(index)
+            else:
+                key = index
+            kid = key_ids.get(key)
+            if kid is None:
+                kid = len(self.keys)
+                self.keys.append(key)
+                key_ids[key] = kid
+            key_of[index] = kid
+        self.key_of = key_of
+        self._options = {}      # key id -> (its first tokens, their lengths)
+        self._fillers = {}      # (token, length) -> the rest of its word
         self.quote_id = tokenizer.convert_tokens_to_ids('"')
         # a decoder closes the answer with any token that opens with the
         # quote, such as `".` or `",`: together they are the stop
@@ -130,44 +142,57 @@ class Tables:
         self.range_text = {**{token: digit for token, digit
                               in zip(digits, "0123456789")}, dash: "-"}
         self.begins_cue = self.encode_ids("\n" + EXTRACT_PHRASE_CUE)
-        self._options = {}      # word key -> its (first token, prefix length)s
 
-    def first_token(self, key, lp, token) -> tuple | None:
-        """Return the likeliest token that begins a word, and the word's rest.
+    def options(self, kid: int) -> tuple:
+        """Return the tokens that can begin a key's word, and their lengths.
 
-        Args:
-            key: The word's key from same_word, or its token when it
-                has none.
-            lp: The row's log probabilities by token id.
-            token: The document's token for the word.
+        A word's token, in any spelling, begins it whole; so does any
+        token spelling a prefix of an ASCII word, followed by the rest
+        of the word. A token without a word begins itself alone.
         """
-        options = self._options.get(key)
-        if options is None:
+        found = self._options.get(kid)
+        if found is None:
+            key = self.keys[kid]
             if isinstance(key, str) and key.isascii():
-                options = [(t, j) for j in range(len(key), 0, -1)
-                           for t in self.variants.get(key[:j], [])]
+                pairs = [(t, j) for j in range(len(key), 0, -1)
+                         for t in self.variants.get(key[:j], [])]
             elif isinstance(key, str):
-                options = [(t, len(key)) for t in self.variants.get(key, [token])]
+                pairs = [(t, len(key)) for t in self.variants[key]]
             else:
-                options = [(token, 1)]
-            self._options[key] = options
-        rated = [(t, j) for t, j in options if t in lp]
-        if not rated:
-            return None
-        # the whole word first, so it wins a tie with a prefix of itself
-        first, j = max(rated, key=lambda o: (lp[o[0]], o[1]))
-        filler = []
-        if isinstance(key, str) and j < len(key):
+                pairs = [(key, len(self.vocab[key]))]
+            found = (np.array([t for t, _ in pairs], dtype=np.int64),
+                     np.array([j for _, j in pairs], dtype=np.int64))
+            self._options[kid] = found
+        return found
+
+    def filler(self, token: int, length: int) -> list:
+        """Return the rest of a token's word after its first length characters."""
+        found = self._fillers.get((token, length))
+        if found is None:
             text = self.vocab[token]
             text = text[1:] if text.startswith("Ġ") else text
-            filler = self.encode_ids(text[j:])
-        return first, filler
+            found = self.encode_ids(text[length:]) if length < len(text) else []
+            self._fillers[(token, length)] = found
+        return found
 
     def encode(self, text: str) -> tuple:
         """Return the token ids of a text and each token's character range."""
         enc = self.tokenizer(text, return_offsets_mapping=True,
                              add_special_tokens=False)
         return list(enc["input_ids"]), list(enc["offset_mapping"])
+
+    def encode_batch(self, texts: list) -> list:
+        """Return (token ids, character ranges) of each text, encoded together."""
+        if not texts:
+            return []
+        backend = getattr(self.tokenizer, "backend_tokenizer", None)
+        if backend is not None:
+            return [(enc.ids, enc.offsets) for enc in backend.encode_batch(
+                list(texts), add_special_tokens=False)]
+        enc = self.tokenizer(list(texts), return_offsets_mapping=True,
+                             add_special_tokens=False)
+        return [(list(ids), list(offsets))
+                for ids, offsets in zip(enc["input_ids"], enc["offset_mapping"])]
 
     def encode_ids(self, text: str) -> list:
         return list(self.tokenizer.encode(text, add_special_tokens=False))
@@ -188,12 +213,49 @@ def load_tables(state) -> Tables:
     return loaded.extract_tables
 
 
-def document_tokens(ids, offsets, pieces, shift: int) -> list:
-    """Return (token index, (start, end) in the document) of each document token.
+def document_spans(offsets, pieces) -> tuple:
+    """Return which tokens show document text, and each one's character range.
 
     A token overlapping one of the pieces is clipped to it: a numbered
     line's first token carries the space after its number, and its
     last may carry the line break.
+
+    Args:
+        offsets: Each token's character range in the text shown.
+        pieces: (offset in the text, offset in the document, length)
+            of each stretch of document text the text shows verbatim,
+            in order.
+
+    Returns:
+        The indices of the tokens that overlap a piece, and the
+        document character each one's text starts and ends at.
+    """
+    bounds = np.asarray(offsets, dtype=np.int64).reshape(-1, 2)
+    a, b = bounds[:, 0], bounds[:, 1]
+    at = np.array([off for off, _, _ in pieces], dtype=np.int64)
+    ctx = np.array([ctx for _, ctx, _ in pieces], dtype=np.int64)
+    length = np.array([length for _, _, length in pieces], dtype=np.int64)
+    # the first piece a token overlaps is the last one starting at or
+    # before it, or one of the next two
+    last = np.searchsorted(at, a, side="right") - 1
+    chosen = np.full(len(a), -1, dtype=np.int64)
+    lo = np.zeros(len(a), dtype=np.int64)
+    hi = np.zeros(len(a), dtype=np.int64)
+    for step in range(3):
+        k = last + step
+        valid = (k >= 0) & (k < len(at)) & (chosen < 0)
+        kk = np.clip(k, 0, max(len(at) - 1, 0))
+        low = np.maximum(a, at[kk])
+        high = np.minimum(b, at[kk] + length[kk])
+        hit = valid & (high > low)
+        chosen[hit], lo[hit], hi[hit] = kk[hit], low[hit], high[hit]
+    index = np.flatnonzero(chosen >= 0)
+    k = chosen[index]
+    return index, ctx[k] + lo[index] - at[k], ctx[k] + hi[index] - at[k]
+
+
+def document_tokens(ids, offsets, pieces, shift: int) -> list:
+    """Return (token index, (start, end) in the document) of each document token.
 
     Args:
         ids: The tokens of a text showing the document.
@@ -202,19 +264,43 @@ def document_tokens(ids, offsets, pieces, shift: int) -> list:
             of each stretch of document text the text shows verbatim.
         shift: The token index of the text's first token.
     """
-    doc = []
-    for index, (a, b) in enumerate(offsets):
-        for off, ctx, length in pieces:
-            lo, hi = max(a, off), min(b, off + length)
-            if hi > lo:
-                doc.append((shift + index, (ctx + lo - off, ctx + hi - off)))
-                break
-    return doc
+    index, starts, ends = document_spans(offsets, pieces)
+    return list(zip((index + shift).tolist(),
+                    zip(starts.tolist(), ends.tolist())))
+
+
+@dataclass
+class Scan:
+    """A document's tokens as the first-token scan reads them.
+
+    Attributes:
+        positions: Each document token's index in the prefix.
+        starts: The document character each one's text starts at.
+        ends: The document character each one's text ends at.
+        tokens: Each one's token.
+        kids: Each one's key id in the tables.
+    """
+
+    positions: np.ndarray
+    starts: np.ndarray
+    ends: np.ndarray
+    tokens: np.ndarray
+    kids: np.ndarray
+
+    @classmethod
+    def of(cls, tables, prefix, tokens) -> "Scan":
+        """Build the scan of a document from its prefix and document tokens."""
+        positions = np.array([i for i, _ in tokens], dtype=np.int64)
+        spans = np.array([span for _, span in tokens], dtype=np.int64).reshape(-1, 2)
+        ids = np.asarray(prefix, dtype=np.int64)[positions]
+        return cls(positions, spans[:, 0], spans[:, 1], ids, tables.key_of[ids])
 
 
 # characters a stream tokenizes ahead of its start at a time: room
-# for ANSWER_MAX_TOKENS tokens of several characters each
+# for ANSWER_MAX_TOKENS tokens of several characters each; the first
+# window is short, since most streams end at their second token
 STREAM_WINDOW = 512
+STREAM_FIRST_WINDOW = 64
 
 
 @dataclass
@@ -226,6 +312,7 @@ class Stream:
     ends: list          # the document character each stream token ends at
     text: str           # the document
     exhausted: bool = False
+    windows: int = 0    # windows tokenized so far
 
     def extend(self, tables: Tables) -> None:
         """Tokenize the next window of the document past the stream's end.
@@ -234,7 +321,8 @@ class Stream:
         and the tokens are the whole text's.
         """
         start = self.ends[-1]
-        cut = start + STREAM_WINDOW
+        cut = start + (STREAM_FIRST_WINDOW if not self.windows else STREAM_WINDOW)
+        self.windows += 1
         if cut < len(self.text):
             boundary = re.compile(r"\s").search(self.text, cut)
             cut = len(self.text) if boundary is None else boundary.start()
@@ -287,12 +375,77 @@ class Extraction:
     lines: list
     numbered: bool
     prefix: list
-    tokens: list        # (prefix index, (start, end)) per document token
+    scan: Scan          # its document tokens
     key: tuple
     questions: list     # one Question per spec
 
 
-def first_tokens(tables: Tables, lp, prefix, tokens, region) -> dict:
+@dataclass
+class Starts:
+    """Each word's first token as the model writes it, over a region's positions.
+
+    Attributes:
+        scan: The document's scan.
+        chosen: The scan indices of the positions in the region.
+        kids: The distinct key ids among them, sorted.
+        inverse: Each chosen position's index into kids.
+        token: Each key's likeliest first token.
+        lp: Its log probability, NEG for a key the row does not rate.
+        length: The word's characters that token spells.
+        anchor: The scan index of each key's first position, whose
+            token spells the word for the filler.
+    """
+
+    scan: Scan
+    chosen: np.ndarray
+    kids: np.ndarray
+    inverse: np.ndarray
+    token: np.ndarray
+    lp: np.ndarray
+    length: np.ndarray
+    anchor: np.ndarray
+
+    @property
+    def rated(self) -> np.ndarray:
+        return self.lp > NEG
+
+    @property
+    def best_lp(self) -> float:
+        rated = self.rated
+        return float(self.lp[rated].max()) if rated.any() else NEG
+
+    @property
+    def best_token(self) -> int:
+        return int(self.token[int(np.argmax(self.lp))])
+
+    @property
+    def allowed(self) -> set:
+        return set(self.token[self.rated].tolist())
+
+    def keys_of(self, token: int) -> np.ndarray:
+        """Return the indices into kids of the keys the token begins."""
+        return np.flatnonzero(self.rated & (self.token == token))
+
+    def positions_of(self, keys) -> np.ndarray:
+        """Return the scan indices of the chosen positions of those keys."""
+        return self.chosen[np.isin(self.inverse, keys)]
+
+    def __iter__(self):
+        """Yield the prefix index of every rated position."""
+        yield from self.scan.positions[self.positions_of(
+            np.flatnonzero(self.rated))].tolist()
+
+    def items(self, tables: Tables):
+        """Yield (prefix index, (first token, filler)) of every rated position."""
+        for k in np.flatnonzero(self.rated):
+            filler = tables.filler(int(self.scan.tokens[self.anchor[k]]),
+                                   int(self.length[k]))
+            for at in self.positions_of([k]):
+                yield int(self.scan.positions[at]), (int(self.token[k]), filler)
+
+
+def first_tokens(tables: Tables, lp, prefix, tokens, region,
+                 scan: Scan | None = None) -> Starts:
     """Return each start position's first token, as the model writes it.
 
     The model may write a word without its leading space, in another
@@ -302,24 +455,45 @@ def first_tokens(tables: Tables, lp, prefix, tokens, region) -> dict:
     word as the document writes it. Positions of one word share the
     choice.
 
-    Returns:
-        Position index -> (first token, filler tokens) for every
-        document token in the region whose first token the row rates.
+    Args:
+        tables: The model's token tables.
+        lp: The row's log probabilities by token id.
+        prefix: The document's prefix tokens.
+        tokens: The document tokens, as document_tokens returns them,
+            or None with a scan.
+        region: The document characters the positions start in, or None
+            for the whole document.
+        scan: The document's scan, built from prefix and tokens when
+            not given.
     """
-    by_key = {}
-    for i, span in tokens:
-        if region is not None and not region[0] <= span[0] < region[1]:
-            continue
-        token = prefix[i]
-        key = same_word(tables.vocab[token]) or token
-        by_key.setdefault(key, []).append(i)
-    starts = {}
-    for key, positions in by_key.items():
-        choice = tables.first_token(key, lp, prefix[positions[0]])
-        if choice is not None:
-            for i in positions:
-                starts[i] = choice
-    return starts
+    if scan is None:
+        scan = Scan.of(tables, prefix, tokens)
+    if region is None:
+        chosen = np.arange(len(scan.positions), dtype=np.int64)
+    else:
+        chosen = np.flatnonzero((scan.starts >= region[0])
+                                & (scan.starts < region[1]))
+    kids, first, inverse = np.unique(scan.kids[chosen], return_index=True,
+                                     return_inverse=True)
+    options = [tables.options(int(kid)) for kid in kids]
+    counts = np.array([len(t) for t, _ in options], dtype=np.int64)
+    option_token = np.concatenate([t for t, _ in options]) if options else \
+        np.zeros(0, dtype=np.int64)
+    option_length = np.concatenate([j for _, j in options]) if options else \
+        np.zeros(0, dtype=np.int64)
+    segment = np.repeat(np.arange(len(kids), dtype=np.int64), counts)
+    rated = np.full(len(tables.vocab), NEG, dtype=np.float32)
+    rated[np.fromiter(lp.keys(), dtype=np.int64, count=len(lp))] = \
+        np.fromiter(lp.values(), dtype=np.float32, count=len(lp))
+    values = rated[option_token]
+    # per key, the likeliest option; the whole word wins a tie with a
+    # prefix of itself
+    order = np.lexsort((-option_length, -values, segment))
+    _, top = np.unique(segment[order], return_index=True)
+    best = order[top]
+    return Starts(scan=scan, chosen=chosen, kids=kids, inverse=inverse,
+                  token=option_token[best], lp=values[best],
+                  length=option_length[best], anchor=chosen[first])
 
 
 def squeezed(text: str) -> tuple:
@@ -346,22 +520,23 @@ def squeezed(text: str) -> tuple:
     return "".join(out), ends
 
 
-def make_streams(tables: Tables, text: str, tokens, starts, first) -> list:
+def make_streams(tables: Tables, text: str, starts: Starts, first) -> list:
     """Return a stream for each start the chosen first token begins.
 
     A stream's tokens are the text from the start as the model writes
     it, with every run of whitespace as one space, tokenized a window
-    at a time; its ends map each token back to the document.
+    at a time as the writing reaches it; its ends map each token back
+    to the document.
     """
-    spans = dict(tokens)
+    scan = starts.scan
     streams = []
-    for i, (token, filler) in starts.items():
-        if token != first:
-            continue
-        char, end = spans[i]
-        stream = Stream(char, [token, *filler], [end] * (1 + len(filler)), text)
-        stream.extend(tables)
-        streams.append(stream)
+    for k in starts.keys_of(first):
+        filler = tables.filler(int(scan.tokens[starts.anchor[k]]),
+                               int(starts.length[k]))
+        for at in starts.positions_of([k]):
+            end = int(scan.ends[at])
+            streams.append(Stream(int(scan.starts[at]), [first, *filler],
+                                  [end] * (1 + len(filler)), text))
     return streams
 
 
@@ -401,10 +576,13 @@ class ExtractStages:
         if any(len(tail) < 2 for tail in self.tails):
             raise ValueError("an extraction's tail ends in its cue after the question")
         self.tables = tables
-        self.docs = [self._prepare(index, document, texts[document],
+        shown = [self._shown(texts[document]) for document in document_ids]
+        encoded = tables.encode_batch([body for _, _, body, _ in shown])
+        self.docs = [self._prepare(index, document, *own, *ids,
                                    None if documents is None
                                    else documents[document])
-                     for index, document in enumerate(document_ids)]
+                     for index, (document, own, ids)
+                     in enumerate(zip(document_ids, shown, encoded))]
         self.by_key = {doc.key: doc for doc in self.docs}
         self.prefixes = [doc.prefix for doc in self.docs]
         self.keys = [doc.key for doc in self.docs]
@@ -467,7 +645,18 @@ class ExtractStages:
                                 [tables.none_id, tables.stop_ids,
                                  *tables.range_targets], ragged=True)
 
-    def _prepare(self, index, document, text, stored) -> Extraction:
+    def _shown(self, text) -> tuple:
+        """Return a document's text, lines, and the text shown with its pieces."""
+        text = text.as_py() if hasattr(text, "as_py") else str(text)
+        lines = document_lines(text)
+        if self.numbered:
+            body, pieces = numbered_text(text, lines)
+        else:
+            body, pieces = text, [(0, 0, len(text))]
+        return text, lines, body, pieces
+
+    def _prepare(self, index, document, text, lines, body, pieces, ids, offsets,
+                 stored) -> Extraction:
         """Build a document's prefix: the head and its plain or numbered text.
 
         The key names the document and its rendering, so a later
@@ -477,13 +666,6 @@ class ExtractStages:
         KV a filter left resident is read.
         """
         tables = self.tables
-        text = text.as_py() if hasattr(text, "as_py") else str(text)
-        lines = document_lines(text)
-        if self.numbered:
-            body, pieces = numbered_text(text, lines)
-        else:
-            body, pieces = text, [(0, 0, len(text))]
-        ids, offsets = tables.encode(body)
         alias = self.specs[0].alias
         rendering = "numbered" if self.numbered else "plain"
         key = (("extract", alias, rendering), int(document))
@@ -491,10 +673,13 @@ class ExtractStages:
                 and [int(t) for t in stored] == ids):
             key = (alias, int(document))
         prefix = self.head + ids
-        tokens = document_tokens(ids, offsets, pieces, len(self.head))
+        shown, starts, ends = document_spans(offsets, pieces)
+        tokens = np.asarray(ids, dtype=np.int64)[shown]
+        scan = Scan(shown + len(self.head), starts, ends, tokens,
+                    tables.key_of[tokens])
         path = "located" if self.numbered else "scored"
         return Extraction(index=index, text=text, lines=lines,
-                          numbered=self.numbered, prefix=prefix, tokens=tokens,
+                          numbered=self.numbered, prefix=prefix, scan=scan,
                           key=key,
                           questions=[Question(path=path) for _ in self.specs])
 
@@ -651,22 +836,23 @@ class ExtractStages:
         tables = self.tables
         lp, none_lp, stop_lp = self._lp(values)
         if not qs.written:
-            if qs.region is not None and not any(
-                    qs.region[0] <= span[0] < qs.region[1] for _, span in doc.tokens):
+            scan = doc.scan
+            if qs.region is not None and not ((scan.starts >= qs.region[0])
+                                              & (scan.starts < qs.region[1])).any():
                 qs.region = None      # the range maps to no tokens
                 qs.path = "fallback"
-            starts = first_tokens(tables, lp, doc.prefix, doc.tokens, qs.region)
+            starts = first_tokens(tables, lp, doc.prefix, None, qs.region,
+                                  scan=scan)
             qs.none_lp = none_lp
-            qs.best_lp = max((lp[token] for token, _ in starts.values()),
-                             default=NEG)
-            allowed = {token for token, _ in starts.values()}
+            qs.best_lp = starts.best_lp
             qs.none_wins = (max(none_lp, stop_lp) > qs.best_lp
-                            or self._leaves(tables, lp, allowed, qs.best_lp, stop_lp))
+                            or self._leaves(tables, lp, starts.allowed, qs.best_lp,
+                                            stop_lp))
             if qs.none_wins:
                 self._answer(doc, q)
                 return None
-            token = max(starts.values(), key=lambda s: lp[s[0]])[0]
-            qs.live = make_streams(tables, doc.text, doc.tokens, starts, token)
+            token = starts.best_token
+            qs.live = make_streams(tables, doc.text, starts, token)
         else:
             at = len(qs.written)
             following = {token for token in (s.next(at, tables) for s in qs.live)
