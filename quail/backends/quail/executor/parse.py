@@ -171,6 +171,60 @@ def mrope_positions(input_ids, grid, image_token_id: int, merge: int):
     return positions.astype(np.int64), resume + tail - ids.size
 
 
+class _Encoder:
+    """Run the vision tower ahead of the pages admission takes.
+
+    Args:
+        parser: The PageParser.
+        pages: Iterator of (key, prepare_page output).
+    """
+
+    def __init__(self, parser, pages):
+        from collections import deque
+
+        self.parser = parser
+        self.upstream = iter(pages)
+        self.ready = deque()
+        self.stream = parser.torch.cuda.Stream()
+        self.exhausted = False
+
+    def step(self) -> None:
+        """Encode one group if fewer than encode_ahead pages are ready."""
+        import time
+
+        parser = self.parser
+        if self.exhausted or len(self.ready) >= parser.encode_ahead:
+            return
+        started = time.perf_counter()
+        group = []
+        while len(group) < parser.encode_batch:
+            item = next(self.upstream, None)
+            if item is None:
+                self.exhausted = True
+                break
+            group.append(item)
+        if group:
+            torch = parser.torch
+            with torch.cuda.stream(self.stream), torch.inference_mode():
+                embeds = parser._images([page for _, page in group])
+                done = torch.cuda.Event()
+                done.record(self.stream)
+            for (_, page), rows in zip(group, embeds):
+                page["image_embeds"], page["image_done"] = rows, done
+            self.ready.extend(group)
+        stats = parser.generator.stats
+        stats["encode_host_s"] = (stats.get("encode_host_s", 0.0)
+                                  + time.perf_counter() - started)
+
+    def __iter__(self):
+        while True:
+            if not self.ready:
+                self.step()
+            if not self.ready:
+                return
+            yield self.ready.popleft()
+
+
 class PageParser:
     """Transcribe page images greedily on Quail's executor.
 
@@ -180,10 +234,11 @@ class PageParser:
         max_output_tokens: The output limit per page.
         context_tokens: The longest prompt plus output a page holds.
         budget: Rows one step packs at most, decode rows included.
-        encode_ahead: Pages whose image rows a thread computes ahead,
-            on its own CUDA stream, so the vision tower runs beside the
-            decode steps; 0 runs the tower in the step that prefills.
-        encode_batch: Pages per vision tower call in that thread.
+        encode_ahead: Pages whose image rows are computed ahead, on
+            their own CUDA stream between decode steps, so the vision
+            tower runs beside the decode steps; 0 runs the tower in the
+            step that prefills.
+        encode_batch: Pages per vision tower call ahead.
         profile_mixed: Passed to GreedyGenerator.
     """
 
@@ -272,66 +327,21 @@ class PageParser:
             yield key, tokens, prompts.pop(key)
 
     def _encoded(self, pages):
-        """Yield pages with their image rows, computed ahead in a thread.
+        """Yield pages, their image rows computed ahead on a side CUDA stream.
 
-        The thread runs the vision tower on its own CUDA stream and
-        records an event after each group; the step that prefills a
-        page waits on the event before it reads the rows.
+        The decode loop calls the encoder between decode steps
+        (GreedyGenerator.between_steps), and each call launches the
+        vision tower for at most one group of pages on its own stream.
+        The launches run on the loop's thread, so no other Python
+        thread competes with it for the interpreter. The step that
+        prefills a page waits on its group's event on the GPU.
         """
-        import queue
-        import threading
-
-        torch = self.torch
-        stream = torch.cuda.Stream()
-        groups = queue.Queue(maxsize=max(1, self.encode_ahead // self.encode_batch))
-        failure = []
-        stopped = threading.Event()
-
-        def put(item):
-            # a consumer that stopped early takes nothing more
-            while not stopped.is_set():
-                try:
-                    groups.put(item, timeout=0.1)
-                    return
-                except queue.Full:
-                    continue
-
-        def encode(group):
-            embeds = self._images([page for _, page in group])
-            done = torch.cuda.Event()
-            done.record(stream)
-            for (_, page), rows in zip(group, embeds):
-                page["image_embeds"], page["image_done"] = rows, done
-            put(group)
-
-        def run():
-            try:
-                with torch.cuda.stream(stream), torch.inference_mode():
-                    group = []
-                    for item in pages:
-                        if stopped.is_set():
-                            return
-                        group.append(item)
-                        if len(group) == self.encode_batch:
-                            encode(group)
-                            group = []
-                    if group:
-                        encode(group)
-            except BaseException as error:
-                failure.append(error)
-            finally:
-                put(None)
-
-        thread = threading.Thread(target=run, daemon=True)
-        thread.start()
+        encoder = _Encoder(self, pages)
+        self.generator.between_steps = encoder.step
         try:
-            while (group := groups.get()) is not None:
-                yield from group
+            yield from encoder
         finally:
-            stopped.set()
-            thread.join()
-        if failure:
-            raise failure[0]
+            self.generator.between_steps = None
 
     def _image_rows(self, page):
         """The page's image rows in its prompt and their embeddings, on this stream."""

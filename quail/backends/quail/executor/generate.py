@@ -193,6 +193,8 @@ class GreedyGenerator:
 
             self.staging = InputStaging(torch)
         self.stats = {}
+        # called after each decode launch, while the step runs
+        self.between_steps = None
         if graphs:
             self._capture()
 
@@ -287,6 +289,9 @@ class GreedyGenerator:
             started = time.perf_counter()
             launched = self._launch(launch) if launch else None
             stats["decode_host_s"] += time.perf_counter() - started
+            if self.between_steps is not None:
+                # host work that overlaps the launched decode step
+                self.between_steps()
             # an earlier pass's first tokens come before the decode
             # tokens of the step read after them
             if pending is not None:
