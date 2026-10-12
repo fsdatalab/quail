@@ -96,6 +96,22 @@ def plan_phases(arena, groups, stage):
             reads at its current length, or is an empty document.
         ArenaFullError: Every checkpoint slot belongs to a pinned key.
     """
+    undo = []
+    try:
+        return _plan_phases(arena, groups, stage, undo)
+    except Exception:
+        # a failed plan leaves no extension record for a state it never
+        # computed, so a retry after the chunk splits asks at the old length
+        for key, had_slot, previous in reversed(undo):
+            if had_slot:
+                arena.accounting.ext_tokens[key] = previous
+            else:
+                arena.accounting.drop_extension(key)
+        raise
+
+
+def _plan_phases(arena, groups, stage, undo):
+    """Plan a chunk's phases, logging each extension record in `undo`."""
     import torch
 
     from quail.backends.quail.executor.chunk import ArenaFullError
@@ -216,6 +232,8 @@ def plan_phases(arena, groups, stage):
                 raise ValueError(
                     f"group {key!r}: advances a checkpoint in place that "
                     f"a question of this chunk reads at {group['f']} tokens")
+            undo.append((key, held is not None,
+                         None if held is None else held[1]))
             arena.record_extension(key, group["f"] + kept)
             head = np.arange(begins[0], begins[0] + kept, dtype=np.int64)
             if pure:

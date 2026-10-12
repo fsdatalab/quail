@@ -217,22 +217,29 @@ def state_share_points(parents, shared):
     return [tuple(sorted(values)) for values in points]
 
 
-def slots_per_document(n_stages, shares):
+def slots_per_document(n_stages, shares, frames=False):
     """Checkpoint slots one document in flight holds.
 
-    One slot, a second once a later stage extends it, and one more when
-    borrowers start from a state inside it.
+    One slot, a second once a later stage or a written frame extends
+    it, and one more for each distinct length at which borrowers start
+    from a state inside it.
+
+    Args:
+        n_stages: Stages the query runs.
+        shares: Most distinct lengths any document's borrowers start at.
+        frames: Whether a stage writes a frame or appends tokens.
     """
-    return (2 if n_stages > 1 else 1) + (1 if shares else 0)
+    return 1 + (1 if n_stages > 1 or frames else 0) + int(shares)
 
 
-def checkpoint_slot_limit(n_slots, n_stages, shares, held=0):
+def checkpoint_slot_limit(n_slots, n_stages, shares, held=0, frames=False):
     """Most documents in flight that the checkpoint slots can serve.
 
     `held` slots belong to resident documents pinned for the run, so
     they serve no fresh document.
     """
-    return max(1, (n_slots - held) // slots_per_document(n_stages, shares))
+    return max(1, (n_slots - held)
+               // slots_per_document(n_stages, shares, frames))
 
 
 class _StageExecutor:
@@ -368,8 +375,11 @@ class _StageExecutor:
         if self.paged and getattr(self.arena, "n_state_slots", 0):
             self.share_points = state_share_points(
                 self.borrowing.tree_parent, self.borrowing.tree_shared)
-            need = slots_per_document(len(self.stages),
-                                      any(self.share_points))
+            self._share_width = max(map(len, self.share_points), default=0)
+            self._extends = (any(self.writes)
+                             or any(s.append for s in self.stages))
+            need = slots_per_document(len(self.stages), self._share_width,
+                                      self._extends)
             if self.arena.n_state_slots < need:
                 raise ValueError(
                     f"the arena has {self.arena.n_state_slots} checkpoint "
@@ -378,7 +388,7 @@ class _StageExecutor:
                     f"or a larger pool")
             self.sched.active_limit = checkpoint_slot_limit(
                 self.arena.n_state_slots, len(self.stages),
-                any(self.share_points),
+                self._share_width, frames=self._extends,
                 held=self.arena.slots_held(self.keys[a] for a in resident))
             self.borrowing.can_borrow = self._state_borrow_check(
                 self.borrowing.can_borrow)
@@ -387,6 +397,7 @@ class _StageExecutor:
         self.lowest_borrow = lowest_borrows(self.borrowing)
         self.held = [self.keys[a] for a, n in enumerate(self.borrowers) if n]
 
+        self._held_parents = set()
         self.spans = []
         self.tokens = 0
         self.pack_s = 0.0
@@ -496,14 +507,18 @@ class _StageExecutor:
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
             if self.paged:
-                fresh = not self.arena.is_resident(key)
                 got = self.arena.activate(
                     key, f, capacity_tokens=f + self.capacity_extra,
                     base_tokens=f,
                     borrow=(self.keys[parent], shared) if shared else None)
                 assert got is not None, \
                     "the admission placed a document the arena cannot hold"
-                if fresh and a < len(self.borrowers) and self.borrowers[a]:
+                # a retained parent is held too: a child planned in this
+                # chunk reads its state, and another group's slot request
+                # would otherwise evict it first
+                if (a not in self._held_parents and a < len(self.borrowers)
+                        and self.borrowers[a]):
+                    self._held_parents.add(a)
                     self.arena.hold(key, self.borrowers[a])
                     self.arena.keep_window(key, self.lowest_borrow[a])
             prefix = None

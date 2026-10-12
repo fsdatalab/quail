@@ -77,7 +77,8 @@ class _Readout:
         return handle
 
 
-def _run(arena, keys, stages, budget, monkeypatch):
+def _run(arena, keys, stages, budget, monkeypatch, prefix_tree=None,
+         prefixes=None):
     # plan_phases names torch dtypes and never runs a torch operation
     stub = ModuleType("torch")
     stub.int64 = stub.int32 = None
@@ -92,9 +93,10 @@ def _run(arena, keys, stages, budget, monkeypatch):
             arena.retain(keys[anchor], 64)
 
     return run_stages(
-        fake_torch(), arena, pipeline, stages, [[1] * 64 for _ in keys],
+        fake_torch(), arena, pipeline, stages,
+        prefixes or [[1] * 64 for _ in keys],
         budget, anchor_keys=keys, on_settled=settled,
-        attention_mode="unified", prefix_tree=None)
+        attention_mode="unified", prefix_tree=prefix_tree)
 
 
 def _stages(count=2, frame=(7, 7), question=3):
@@ -207,3 +209,69 @@ def test_a_pool_that_holds_no_checkpoint_beside_a_document_is_refused():
         budgets.hybrid_arena_pages(QWEN3_5_27B_FP8, H100_SXM, 61_680, 1e7)
     assert budgets.hybrid_arena_pages(
         QWEN3_5_27B_FP8, H100_SXM, 61_680, 1_000) > 0
+
+
+def test_slots_per_document_count_the_frame_and_every_share_length():
+    from quail.backends.quail.executor.stages import slots_per_document
+
+    assert slots_per_document(1, 0) == 1
+    assert slots_per_document(2, 0) == 2
+    # a written frame extends the document's checkpoint, even in one stage
+    assert slots_per_document(1, 0, frames=True) == 2
+    # borrowers at 16, 32, and 48 tokens each start from their own slot
+    assert slots_per_document(1, 3) == 4
+    assert slots_per_document(2, 3, frames=True) == 5
+
+
+@pytest.mark.parametrize("slots", [20, 24, 30, 40])
+def test_a_single_stage_with_a_frame_gets_its_second_slot(slots, monkeypatch):
+    arena = _arena(slots, pages=4_000)
+    keys = [("d", i) for i in range(200)]
+    prefixes = [[i + 1] * 64 for i in range(200)]
+    _run(arena, keys, _stages(1), 72 * 12, monkeypatch, prefixes=prefixes)
+
+
+def test_a_retained_parent_is_not_evicted_by_its_childs_chunk(monkeypatch):
+    # 6 slots hold the retained parent and 5 fresh documents; the child
+    # starts from the parent's state at 64 tokens and is planned last
+    slots, fresh = 6, 5
+    keys = [("d", i) for i in range(2 + fresh)]
+    arena = _arena(slots, pages=4_000)
+    parent = keys[0]
+    arena.alloc(parent, 64)
+    arena.accounting.alloc_slot(parent)
+    arena.record_checkpoint(parent, 64)
+    arena.retain(parent, 64)
+    prefixes = [[1] * 64, [1] * 64 + [2] * 16] + [
+        [5 + i] * 64 for i in range(fresh)]
+    tree = SimpleNamespace(
+        parent=[None, 0] + [None] * fresh, shared=[0, 64] + [0] * fresh,
+        order=[0, *range(2, 2 + fresh), 1], shared_tokens=64)
+    stage = [Stage(suffixes=[[9, 9]], readout=_Readout(), single=True)]
+    for budget in (100, 140, 200, 300, 600):
+        run_arena = _arena(slots, pages=4_000)
+        run_arena.alloc(parent, 64)
+        run_arena.accounting.alloc_slot(parent)
+        run_arena.record_checkpoint(parent, 64)
+        run_arena.retain(parent, 64)
+        _run(run_arena, keys, stage, budget, monkeypatch,
+             prefix_tree=tree, prefixes=prefixes)
+
+
+def test_a_failed_plan_leaves_the_extension_records_as_they_were(monkeypatch):
+    arena = _arena(2)
+    arena.alloc("a", 64)
+    arena.alloc("b", 64)
+    _plan(arena, [_group("a", 32, 0, 32, fresh=True, kept=4, slen=4)],
+          monkeypatch)
+    assert arena.extension("a")[1] == 36
+    # the pool is full: a's frame advances, then a fresh document finds no slot
+    arena.accounting.free_slots.clear()
+    advance = _group("a", 36, 0, 0, fresh=False, kept=4, slen=4)
+    fresh = _group("b", 32, 10, 42, fresh=True)
+    with pytest.raises(Exception, match="no free checkpoint slot"):
+        _plan(arena, [advance, fresh], monkeypatch)
+    # the record is back at 36, so the retry asks at the length it holds
+    assert arena.extension("a")[1] == 36
+    _plan(arena, [advance], monkeypatch)
+    assert arena.extension("a")[1] == 40
