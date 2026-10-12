@@ -115,8 +115,7 @@ def logical_tree(logical):
         elif isinstance(node, logical_nodes.SemanticExtract):
             title = f"SemanticExtract: {node.name}, {node.span_name}"
             details = [f"question={node.call.question!r} "
-                       f"trim={'on' if node.call.trim else 'off'} "
-                       f"locate={'on' if node.call.locate else 'off'}"]
+                       f"trim={'on' if node.call.trim else 'off'}"]
         elif isinstance(node, logical_nodes.Join):
             title = "Join"
             details = ([f"on {condition}" for condition in node.on]
@@ -432,7 +431,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             title += f": {spec.name} over {spec.alias}"
             details.append(f"question={spec.question!r}, "
                            f"trim={'on' if spec.trim else 'off'}, "
-                           f"locate={'on' if spec.locate else 'off'}, "
                            f"up to {extract_cost.ANSWER_MAX_TOKENS} answer tokens")
         elif isinstance(node, Filter):
             title += f": {node.predicate.describe()}"

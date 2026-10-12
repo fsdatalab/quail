@@ -713,36 +713,27 @@ def bind_score_prompt(template: str, args: tuple,
 
 
 # AI.EXTRACT: the document, the question, the instruction, and the
-# answer template. The answer opens with the phrase field's quote,
-# or with the lines field when the document is shown as numbered
-# lines and the executor locates the answer's lines first; the model
-# writes the rest.
+# answer template. The answer opens with the phrase field's quote;
+# the model writes the rest.
 EXTRACT_QUESTION_LABEL = "\n\nQuestion: "
 EXTRACT_INSTRUCTION = (
     "Copy the words that answer the question from the document. Copy them "
     "exactly. Use the fewest words that answer it. If the document does not "
     "answer the question, write none.")
 EXTRACT_FORMAT = "Answer in this format:"
-EXTRACT_LINES_FORMAT = "Lines: <first line>-<last line>"
 EXTRACT_PHRASE_FORMAT = 'Phrase: "<copied words>"'
 EXTRACT_PHRASE_CUE = 'Phrase: "'
-EXTRACT_LINES_CUE = "Lines: "
 EXTRACT_NONE = "none"
-NUMBERED_DOCUMENT_LABEL = "DOCUMENT, as numbered lines:\n"
 
 
-def render_extract_question(question: str, numbered: bool = False) -> str:
+def render_extract_question(question: str) -> str:
     """Return the text after the document: question, instruction, and template."""
-    lines = [EXTRACT_INSTRUCTION, EXTRACT_FORMAT]
-    if numbered:
-        lines.append(EXTRACT_LINES_FORMAT)
-    lines.append(EXTRACT_PHRASE_FORMAT)
+    lines = [EXTRACT_INSTRUCTION, EXTRACT_FORMAT, EXTRACT_PHRASE_FORMAT]
     return EXTRACT_QUESTION_LABEL + question + "\n\n" + "\n".join(lines)
 
 
 def bind_extract_prompt(args: tuple, question: str, tokenizer=None,
-                        turn: tuple[str, str] = ("", ""),
-                        numbered: bool = False) -> Prompt:
+                        turn: tuple[str, str] = ("", "")) -> Prompt:
     """Bind an AI.EXTRACT prompt over one document column.
 
     The prompt is the document label, the document, the question, the
@@ -756,8 +747,6 @@ def bind_extract_prompt(args: tuple, question: str, tokenizer=None,
         tokenizer: Optional callable mapping text to token IDs.
         turn: Chat text before the prompt and after the answer template.
             Without it, a line break separates the template and the cue.
-        numbered: Whether the document is shown as numbered lines, with
-            the answer template's lines field and the lines cue.
 
     Returns:
         A Prompt whose template is ``{0}`` and whose tail is the text
@@ -770,12 +759,10 @@ def bind_extract_prompt(args: tuple, question: str, tokenizer=None,
     if len(args) != 1:
         raise CompileError("AI.EXTRACT reads one document column")
     validate_question(question)
-    label = NUMBERED_DOCUMENT_LABEL if numbered else SHARED_PRE
-    cue = EXTRACT_LINES_CUE if numbered else EXTRACT_PHRASE_CUE
-    preamble = turn[0] + label
+    preamble = turn[0] + SHARED_PRE
     # the cue opens the model's turn; without turn text it opens a line
-    after = (render_extract_question(question, numbered) + (turn[1] or "\n")
-             + cue)
+    after = (render_extract_question(question) + (turn[1] or "\n")
+             + EXTRACT_PHRASE_CUE)
     pre_tok = tail_tok = frame_tok = None
     pre_ids = tail_ids = ()
     if tokenizer is not None:

@@ -535,7 +535,6 @@ class SemanticExtract:
             "expression": _explain(self.call),
             "question": self.call.question,
             "trim": self.call.trim,
-            "locate": self.call.locate,
         }
 
 

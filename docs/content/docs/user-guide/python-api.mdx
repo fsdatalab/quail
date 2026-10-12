@@ -103,7 +103,7 @@ probability output, and limits on classifications of joined rows.
 
 ### ai_extract
 
-`ai_extract(column, question, *, name, trim=True, locate=False)`
+`ai_extract(column, question, *, name, trim=True)`
 
 Copy the words that answer a question from each document. `name` sets
 the answer column's name; the answer's character span in the document
@@ -116,7 +116,6 @@ to return both.
 | `question` | `str` | The question the answer is copied for. |
 | `name` | `str` | Name of the answer column. |
 | `trim` | `bool` | Return the fewest words that answer the question, or with `False` the whole lines that hold them. Defaults to `True`. |
-| `locate` | `bool` | Show every document as numbered lines and have the model name the answer's lines before it is written within them, or with `False` write it over the whole document. Defaults to `False`: on 45 CUAD contracts, locating lost 5 to 22 points of span F1 on every extraction query. |
 
 ```python
 query = (

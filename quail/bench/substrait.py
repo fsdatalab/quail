@@ -27,7 +27,7 @@ from quail_b.substrait import (
 
 
 def build_query(session, info: PlanInfo, selectivity=None,
-                order: str | None = None, extract_options=None):
+                order: str | None = None):
     """Build a Quail query from the benchmark's reading of a plan.
 
     Args:
@@ -38,11 +38,8 @@ def build_query(session, info: PlanInfo, selectivity=None,
             filter's key is (classification prompt, frozenset of
             accepted labels).
         order: The filter order rule `select` takes.
-        extract_options: Keyword options every `ai_extract` call takes,
-            such as `locate`; the benchmark's plans carry none.
     """
     selectivity = selectivity or {}
-    extract_options = extract_options or {}
     per_alias = {}
     for item in info.operators:
         if isinstance(item, Classify) and item.partner is not None:
@@ -76,7 +73,7 @@ def build_query(session, info: PlanInfo, selectivity=None,
             elif isinstance(item, Extract):
                 query = query.ai_extract(
                     f"{alias}.{info.relation(alias).text_column}",
-                    item.prompt, name=item.output, **extract_options)
+                    item.prompt, name=item.output)
             elif isinstance(item, Filter):
                 query = query.ai_filter(
                     quail.prompt(item.prompt, document(alias)),

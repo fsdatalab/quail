@@ -582,11 +582,10 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             for test in operators.label_filters.get(alias, ()):
                 live *= effective_selectivity(test.selectivity)
         for index, logical_node in enumerate(calls):
-            # the extractions of a table with one locating choice run
-            # in one pipeline (quail.execution.pipelines): a document
-            # is read once for all of them
-            shared = (index > 0
-                      and calls[index - 1].call.locate == logical_node.call.locate)
+            # the extractions of a table run in one pipeline
+            # (quail.execution.pipelines): a document is read once
+            # for all of them
+            shared = index > 0
             node = AiExtract(
                 node_id=f"ai-extract:{sum(isinstance(n, AiExtract) for n in nodes)}",
                 inputs=input_ports((rows_src.get(alias, ids_src[alias]),)),
@@ -948,66 +947,42 @@ class ScoreLowering:
 def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
     """Build an extraction's specification and price it.
 
-    The specification carries the token ids of the plain prompt and of
-    the numbered-lines prompt around the document. The estimate
-    (quail.cost.extract) prices each document as shown numbered when
-    the call locates, with its line count read from the table's text
-    when the scan loads it, else plain. The documents' KV is priced as
-    computed afresh unless the extraction shares a pipeline with the
-    one before it, which read the documents in the same rendering.
+    The specification carries the token ids of the prompt around the
+    document. The documents' KV is priced as computed afresh unless
+    the extraction shares a pipeline with the one before it, which
+    read the documents.
 
     Args:
         context: The planning context, with the model and tokenizer.
         call: Logical AI.EXTRACT call.
         name: Result column name.
         live: Expected number of documents to extract from.
-        shared: Whether an extraction of the same table and locating
-            choice runs right before this one.
+        shared: Whether an extraction of the same table runs right
+            before this one.
     """
     turn = context.model.extract_turn
-    plain = bind_extract_prompt(call.prompt.args, call.question,
-                                context.tokenizer, turn)
-    # under the query's shared preamble, the plain prompt's document
-    # KV is the one a filter writes
+    prompt = bind_extract_prompt(call.prompt.args, call.question,
+                                 context.tokenizer, turn)
+    # under the query's shared preamble, the prompt's document KV is
+    # the one a filter writes
     shares_head = context.tokenizer is not None and tuple(
-        plain.preamble_token_ids) == tuple(context.tokenizer(shared_preamble(
+        prompt.preamble_token_ids) == tuple(context.tokenizer(shared_preamble(
             context.model.turn_prefix, context.model.prompt_layout)))
-    numbered = bind_extract_prompt(call.prompt.args, call.question,
-                                   context.tokenizer, turn, numbered=True)
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
     cost = extract_cost.estimate(
         live, [int(length) for length in lengths],
-        (document_line_counts(lengths, ref.column) if call.locate
-         else [0] * len(lengths)),
-        len(plain.preamble_token_ids), len(plain.tail_token_ids),
-        len(numbered.preamble_token_ids), len(numbered.tail_token_ids),
+        len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),
-        model=context.model, device=context.device,
-        numbered=call.locate, resident=shared)
+        model=context.model, device=context.device, resident=shared)
     return ExtractSpec(
         name=name, aliases=call.aliases(),
         query_template=call.prompt.template,
         arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
         expected_inputs=live, estimated_seconds=cost.seconds,
-        prompt_token_parts=(tuple(plain.preamble_token_ids),
-                            tuple(plain.tail_token_ids)),
-        question=call.question, trim=call.trim, locate=call.locate,
-        numbered_token_parts=(tuple(numbered.preamble_token_ids),
-                              tuple(numbered.tail_token_ids)),
-        shares_head=shares_head)
-
-
-def document_line_counts(lengths, column: str):
-    """Return each document's line count from the table's text, or None.
-
-    The text is at hand when the scan loads the column as a value,
-    which it does for a projected extraction.
-    """
-    store = getattr(lengths, "_store", None)
-    if store is None or column not in getattr(store, "projected_columns", ()):
-        return None
-    return extract_cost.line_counts(store.column(column))
+        prompt_token_parts=(tuple(prompt.preamble_token_ids),
+                            tuple(prompt.tail_token_ids)),
+        question=call.question, trim=call.trim, shares_head=shares_head)
 
 
 def classify_builder(context, alias, backend_name):

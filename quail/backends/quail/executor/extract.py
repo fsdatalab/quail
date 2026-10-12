@@ -1,14 +1,13 @@
 """Copy each document's answers to its questions with the stage scheduler.
 
-With locating on, a document is shown as numbered lines and the model
-writes the lines that hold the answer. The answer is then decoded one
-token at a time after the phrase cue, as a decoder writes it, but
+The answer is decoded after the phrase cue as a decoder writes it, but
 each token is chosen among the tokens that continue some position of
-the document inside those lines: the span is the document's own text
-wherever the model's writing leads. With locating off, the document is
-shown plain and the positions are the whole of it. The answer ends
-where the model would close the quote. The document stays in KV
-across the steps; each chosen token is appended after it.
+the document: the span is the document's own text wherever the
+model's writing leads. Each round feeds the chosen token and the
+document's next tokens as a draft, and verifies them by the rows after
+them. The answer ends where the model would close the quote, or where
+its writing would leave the document. The document stays in KV across
+the rounds; the verified tokens are appended after it.
 
 The extractions of one pipeline run as one stage list over the
 documents: a question's tail is the frame of its stages, written right
@@ -27,51 +26,10 @@ from quail.backends.quail.executor.readout import AsyncTopLogprobs
 from quail.backends.quail.executor.stages import Stage
 from quail.cost.extract import ANSWER_MAX_TOKENS, DRAFT_TOKENS
 from quail.execution.spans import line_span
-from quail.logical.prompts import EXTRACT_PHRASE_CUE
 from quail.progress import say
 
 CUE_TOP = 1024      # vocabulary entries read at the cue and each step
-LINE_MAX_TOKENS = 8     # tokens the lines answer may take
 NEG = float("-inf")
-
-
-NONBLANK_LINE = re.compile(r"[^\n]*[^\s][^\n]*")
-
-
-def document_lines(text: str) -> list:
-    """Return the character ranges of the text's non-empty lines.
-
-    Blank lines get no number, so the model does not have to count
-    them; the text of each line is unchanged.
-    """
-    return [match.span() for match in NONBLANK_LINE.finditer(text)]
-
-
-def numbered_text(text: str, lines) -> tuple:
-    """Return the lines numbered as ``cat -n`` would, and where each line's text is.
-
-    Returns:
-        The numbered text, and (offset in it, offset in text, length)
-        of each line.
-    """
-    numbered, pieces, at = [], [], 0
-    for index, (a, b) in enumerate(lines):
-        head = f"{index + 1}: "
-        pieces.append((at + len(head), a, b - a))
-        numbered.append(head + text[a:b])
-        at += len(head) + (b - a) + 1
-    return "\n".join(numbered), pieces
-
-
-def parse_lines(answer: str, count: int):
-    """Return the 1-based line range an answer names, within the document."""
-    match = re.fullmatch(r"(\d+)(?:-(\d+))?", answer)
-    if not match:
-        return None
-    a, b = int(match.group(1)), int(match.group(2) or match.group(1))
-    if not 1 <= a <= b <= count:
-        return None
-    return a, b
 
 
 def same_word(token) -> str:
@@ -129,19 +87,6 @@ class Tables:
                        if len(token) > 1 and token.endswith('"')
                        and token[:-1] in index}
         self.none_id = self.encode_ids("none")[0]
-        digits = [self.encode_ids(digit)[0] for digit in "0123456789"]
-        dash, newline = self.encode_ids("-")[0], self.encode_ids("\n")[0]
-        ends = {tokenizer.eos_token_id,
-                tokenizer.convert_tokens_to_ids("<|im_end|>")}
-        ends = sorted(token for token in ends
-                      if token is not None and token >= 0
-                      and token != tokenizer.unk_token_id)
-        # the lines answer is decoded over these alone: the digits,
-        # the dash, and the tokens that end it
-        self.range_targets = digits + [dash, newline] + ends
-        self.range_text = {**{token: digit for token, digit
-                              in zip(digits, "0123456789")}, dash: "-"}
-        self.begins_cue = self.encode_ids("\n" + EXTRACT_PHRASE_CUE)
 
     def options(self, kid: int) -> tuple:
         """Return the tokens that can begin a key's word, and their lengths.
@@ -213,60 +158,14 @@ def load_tables(state) -> Tables:
     return loaded.extract_tables
 
 
-def document_spans(offsets, pieces) -> tuple:
-    """Return which tokens show document text, and each one's character range.
-
-    A token overlapping one of the pieces is clipped to it: a numbered
-    line's first token carries the space after its number, and its
-    last may carry the line break.
-
-    Args:
-        offsets: Each token's character range in the text shown.
-        pieces: (offset in the text, offset in the document, length)
-            of each stretch of document text the text shows verbatim,
-            in order.
-
-    Returns:
-        The indices of the tokens that overlap a piece, and the
-        document character each one's text starts and ends at.
-    """
-    bounds = np.asarray(offsets, dtype=np.int64).reshape(-1, 2)
-    a, b = bounds[:, 0], bounds[:, 1]
-    at = np.array([off for off, _, _ in pieces], dtype=np.int64)
-    ctx = np.array([ctx for _, ctx, _ in pieces], dtype=np.int64)
-    length = np.array([length for _, _, length in pieces], dtype=np.int64)
-    # the first piece a token overlaps is the last one starting at or
-    # before it, or one of the next two
-    last = np.searchsorted(at, a, side="right") - 1
-    chosen = np.full(len(a), -1, dtype=np.int64)
-    lo = np.zeros(len(a), dtype=np.int64)
-    hi = np.zeros(len(a), dtype=np.int64)
-    for step in range(3):
-        k = last + step
-        valid = (k >= 0) & (k < len(at)) & (chosen < 0)
-        kk = np.clip(k, 0, max(len(at) - 1, 0))
-        low = np.maximum(a, at[kk])
-        high = np.minimum(b, at[kk] + length[kk])
-        hit = valid & (high > low)
-        chosen[hit], lo[hit], hi[hit] = kk[hit], low[hit], high[hit]
-    index = np.flatnonzero(chosen >= 0)
-    k = chosen[index]
-    return index, ctx[k] + lo[index] - at[k], ctx[k] + hi[index] - at[k]
-
-
-def document_tokens(ids, offsets, pieces, shift: int) -> list:
+def document_tokens(offsets, shift: int) -> list:
     """Return (token index, (start, end) in the document) of each document token.
 
     Args:
-        ids: The tokens of a text showing the document.
-        offsets: Each token's character range in that text.
-        pieces: (offset in the text, offset in the document, length)
-            of each stretch of document text the text shows verbatim.
-        shift: The token index of the text's first token.
+        offsets: Each token's character range in the document.
+        shift: The token index of the document's first token.
     """
-    index, starts, ends = document_spans(offsets, pieces)
-    return list(zip((index + shift).tolist(),
-                    zip(starts.tolist(), ends.tolist())))
+    return [(shift + index, (int(a), int(b))) for index, (a, b) in enumerate(offsets)]
 
 
 @dataclass
@@ -348,11 +247,6 @@ class Question:
     """One document's steps and result for one question."""
 
     asked: bool = False     # the document reached the question's stages
-    range_tokens: list = field(default_factory=list)
-    range_done: bool = False
-    range: tuple | None = None
-    region: tuple | None = None
-    path: str = "scored"
     none_lp: float = NEG
     best_lp: float = NEG
     written: list = field(default_factory=list)   # the answer's tokens so far
@@ -373,8 +267,6 @@ class Extraction:
 
     index: int
     text: str
-    lines: list
-    numbered: bool
     prefix: list
     scan: Scan          # its document tokens
     key: tuple
@@ -383,13 +275,12 @@ class Extraction:
 
 @dataclass
 class Starts:
-    """Each word's first token as the model writes it, over a region's positions.
+    """Each word's first token as the model writes it, over the document.
 
     Attributes:
         scan: The document's scan.
-        chosen: The scan indices of the positions in the region.
-        kids: The distinct key ids among them, sorted.
-        inverse: Each chosen position's index into kids.
+        kids: The distinct key ids among its positions, sorted.
+        inverse: Each position's index into kids.
         token: Each key's likeliest first token.
         lp: Its log probability, NEG for a key the row does not rate.
         length: The word's characters that token spells.
@@ -398,7 +289,6 @@ class Starts:
     """
 
     scan: Scan
-    chosen: np.ndarray
     kids: np.ndarray
     inverse: np.ndarray
     token: np.ndarray
@@ -428,8 +318,8 @@ class Starts:
         return np.flatnonzero(self.rated & (self.token == token))
 
     def positions_of(self, keys) -> np.ndarray:
-        """Return the scan indices of the chosen positions of those keys."""
-        return self.chosen[np.isin(self.inverse, keys)]
+        """Return the scan indices of the positions of those keys."""
+        return np.flatnonzero(np.isin(self.inverse, keys))
 
     def __iter__(self):
         """Yield the prefix index of every rated position."""
@@ -445,7 +335,7 @@ class Starts:
                 yield int(self.scan.positions[at]), (int(self.token[k]), filler)
 
 
-def first_tokens(tables: Tables, lp, prefix, tokens, region,
+def first_tokens(tables: Tables, lp, prefix, tokens,
                  scan: Scan | None = None) -> Starts:
     """Return each start position's first token, as the model writes it.
 
@@ -462,19 +352,12 @@ def first_tokens(tables: Tables, lp, prefix, tokens, region,
         prefix: The document's prefix tokens.
         tokens: The document tokens, as document_tokens returns them,
             or None with a scan.
-        region: The document characters the positions start in, or None
-            for the whole document.
         scan: The document's scan, built from prefix and tokens when
             not given.
     """
     if scan is None:
         scan = Scan.of(tables, prefix, tokens)
-    if region is None:
-        chosen = np.arange(len(scan.positions), dtype=np.int64)
-    else:
-        chosen = np.flatnonzero((scan.starts >= region[0])
-                                & (scan.starts < region[1]))
-    kids, first, inverse = np.unique(scan.kids[chosen], return_index=True,
+    kids, first, inverse = np.unique(scan.kids, return_index=True,
                                      return_inverse=True)
     options = [tables.options(int(kid)) for kid in kids]
     counts = np.array([len(t) for t, _ in options], dtype=np.int64)
@@ -492,9 +375,9 @@ def first_tokens(tables: Tables, lp, prefix, tokens, region,
     order = np.lexsort((-option_length, -values, segment))
     _, top = np.unique(segment[order], return_index=True)
     best = order[top]
-    return Starts(scan=scan, chosen=chosen, kids=kids, inverse=inverse,
+    return Starts(scan=scan, kids=kids, inverse=inverse,
                   token=option_token[best], lp=values[best],
-                  length=option_length[best], anchor=chosen[first])
+                  length=option_length[best], anchor=first)
 
 
 def squeezed(text: str) -> tuple:
@@ -546,32 +429,28 @@ class ExtractStages:
 
     Args:
         state: The loaded model and current query state.
-        specs: The ExtractSpecs, in order; they share a table, a
-            locating choice, and a prompt head.
+        specs: The ExtractSpecs, in order; they share a table and a
+            prompt head.
         tables: The model's token tables.
         document_ids: The documents' ids in their table.
         documents: The table's tokenized documents.
         texts: The table's document texts.
         readout: Optional readout in place of the model's. Its extras
-            are the none token, the stop tokens as one group, then the
-            lines answer's targets.
+            are the none token, then the stop tokens as one group.
         shared_head: The query's shared preamble, under which a filter
             writes the documents' KV; None when the query has none.
 
     Raises:
-        ValueError: The specs differ in their table, locating, or head.
+        ValueError: The specs differ in their table or head.
     """
 
     def __init__(self, state, specs, tables: Tables, document_ids, documents,
                  texts, readout=None, shared_head=None):
         self.specs = list(specs)
         first = self.specs[0]
-        if any(spec.alias != first.alias or spec.locate != first.locate
-               for spec in self.specs):
-            raise ValueError("a pipeline's extractions share a table and locating")
-        self.numbered = first.locate
-        parts = [spec.numbered_token_parts if self.numbered
-                 else spec.prompt_token_parts for spec in self.specs]
+        if any(spec.alias != first.alias for spec in self.specs):
+            raise ValueError("a pipeline's extractions share a table")
+        parts = [spec.prompt_token_parts for spec in self.specs]
         self.head = list(parts[0][0])
         if any(list(head) != self.head for head, _ in parts):
             raise ValueError("a pipeline's extractions share a prompt head")
@@ -581,12 +460,13 @@ class ExtractStages:
         if any(len(tail) < 2 for tail in self.tails):
             raise ValueError("an extraction's tail ends in its cue after the question")
         self.tables = tables
-        shown = [self._shown(texts[document]) for document in document_ids]
-        encoded = tables.encode_batch([body for _, _, body, _ in shown])
-        self.docs = [self._prepare(index, document, *own, *ids,
+        shown = [text.as_py() if hasattr(text, "as_py") else str(text)
+                 for text in (texts[document] for document in document_ids)]
+        encoded = tables.encode_batch(shown)
+        self.docs = [self._prepare(index, document, text, *ids,
                                    None if documents is None
                                    else documents[document])
-                     for index, (document, own, ids)
+                     for index, (document, text, ids)
                      in enumerate(zip(document_ids, shown, encoded))]
         self.by_key = {doc.key: doc for doc in self.docs}
         self.prefixes = [doc.prefix for doc in self.docs]
@@ -597,31 +477,19 @@ class ExtractStages:
             self.stages.extend(self._question_stages(q, spec.name, tail))
 
     def _question_stages(self, q: int, name: str, tail: list) -> list:
-        """Build one question's stages: its tail, lines, cue, and answer tokens.
+        """Build one question's stages: its tail, then the answer's rounds.
 
         The tail but its last token is the frame of every stage, so
         the scheduler writes it once after the document; the first
         stage rewinds past what the question before appended. The
-        last token of the tail is the stage's suffix, whose row is
-        read: the lines answer's first token for a numbered document,
-        the answer's first token for a plain one.
+        last token of the tail, the cue, is the stage's suffix, whose
+        row chooses the answer's first token.
         """
         frame, last = tail[:-1], tail[-1]
         stages = [Stage(
             suffixes=[[last]], frame=frame, rewind=True,
             readout=self.readout, decide=partial(self._tail_decide, q),
             single=True, append=True, label=f"{name} tail")]
-        stages.extend(
-            Stage(suffixes=partial(self._range_suffix, q), suffix_tokens=1,
-                  frame=frame, readout=self.readout,
-                  decide=partial(self._range_decide, q),
-                  single=True, append=True, label=f"{name} lines {r}")
-            for r in range(1, LINE_MAX_TOKENS))
-        stages.append(Stage(
-            suffixes=partial(self._cue_suffix, q),
-            suffix_tokens=len(self.tables.begins_cue), frame=frame,
-            readout=self.readout, decide=partial(self._cue_decide, q),
-            single=True, append=True, label=f"{name} start"))
         stages.extend(
             Stage(suffixes=partial(self._step_suffix, q),
                   suffix_tokens=1 + DRAFT_TOKENS, frame=frame,
@@ -635,84 +503,58 @@ class ExtractStages:
     def appended_tokens(self) -> int:
         """The most tokens a question leaves in KV after its frame.
 
-        The tail's last token, the lines answer, the cue, and the
-        answer's tokens with the last round's draft past them.
+        The cue, and the answer's tokens with the last round's draft
+        past them.
         """
-        return (1 + LINE_MAX_TOKENS + len(self.tables.begins_cue)
-                + ANSWER_MAX_TOKENS + DRAFT_TOKENS)
+        return 1 + ANSWER_MAX_TOKENS + DRAFT_TOKENS
 
     def _readout(self, state):
-        """The readout of every row: none, the stop, the lines targets, top tokens."""
+        """The readout of every row: none, the stop, then the top tokens."""
         torch = state.torch
         head = full_output_head(state.loaded_model.model)
         tables = self.tables
         return AsyncTopLogprobs(torch, torch.nn.functional, head, CUE_TOP,
-                                [tables.none_id, tables.stop_ids,
-                                 *tables.range_targets], ragged=True)
+                                [tables.none_id, tables.stop_ids], ragged=True)
 
-    def _shown(self, text) -> tuple:
-        """Return a document's text, lines, and the text shown with its pieces."""
-        text = text.as_py() if hasattr(text, "as_py") else str(text)
-        lines = document_lines(text)
-        if self.numbered:
-            body, pieces = numbered_text(text, lines)
-        else:
-            body, pieces = text, [(0, 0, len(text))]
-        return text, lines, body, pieces
+    def _prepare(self, index, document, text, ids, offsets, stored) -> Extraction:
+        """Build a document's prefix: the head and its text.
 
-    def _prepare(self, index, document, text, lines, body, pieces, ids, offsets,
-                 stored) -> Extraction:
-        """Build a document's prefix: the head and its plain or numbered text.
-
-        The key names the document and its rendering, so a later
-        extraction of the same table in the same rendering reads the
-        KV this one leaves resident. A plain document shown under the
-        query's shared head, whose tokens are the table's, keeps the
-        table's key, so the KV a filter wrote is read.
+        The key names the document under the extraction's head, so a
+        later extraction of the same table reads the KV this one
+        leaves resident. A document shown under the query's shared
+        head, whose tokens are the table's, keeps the table's key, so
+        the KV a filter wrote is read.
         """
         tables = self.tables
         alias = self.specs[0].alias
-        rendering = "numbered" if self.numbered else "plain"
-        key = (("extract", alias, rendering), int(document))
+        key = (("extract", alias), int(document))
         shared = (self.head == self.shared_head if self.shared_head is not None
                   else not self.head)
-        if (not self.numbered and shared and stored is not None
-                and [int(t) for t in stored] == ids):
+        if shared and stored is not None and [int(t) for t in stored] == ids:
             key = (alias, int(document))
         prefix = self.head + ids
-        shown, starts, ends = document_spans(offsets, pieces)
-        tokens = np.asarray(ids, dtype=np.int64)[shown]
-        scan = Scan(shown + len(self.head), starts, ends, tokens,
-                    tables.key_of[tokens])
-        path = "located" if self.numbered else "scored"
-        return Extraction(index=index, text=text, lines=lines,
-                          numbered=self.numbered, prefix=prefix, scan=scan,
-                          key=key,
-                          questions=[Question(path=path) for _ in self.specs])
+        bounds = np.asarray(offsets, dtype=np.int64).reshape(-1, 2)
+        tokens = np.asarray(ids, dtype=np.int64)
+        scan = Scan(np.arange(len(ids), dtype=np.int64) + len(self.head),
+                    bounds[:, 0], bounds[:, 1], tokens, tables.key_of[tokens])
+        return Extraction(index=index, text=text, prefix=prefix, scan=scan,
+                          key=key, questions=[Question() for _ in self.specs])
 
     def _question(self, q: int, anchor: int) -> tuple:
         doc = self.docs[anchor]
         return doc, doc.questions[q]
 
-    # ---- the tail, then the lines range -----------------------------------
+    # ---- the tail, then the answer, a round of tokens at a time ------------
 
     def _tail_decide(self, q, anchor, row):
+        """Choose the answer's first token from the row after the cue."""
         doc, qs = self._question(q, anchor)
         qs.asked = True
         # a tail equal to the question's before it is in KV already:
         # only its cue token is fed
         same = q > 0 and self.tails[q] == self.tails[q - 1]
         qs.fed_tokens += 1 if same else len(self.tails[q])
-        if doc.numbered:
-            return self._range_decide(q, anchor, row, first=True)
-        return self._cue_decide(q, anchor, row)
-
-    def _range_suffix(self, q, key):
-        doc = self.by_key[key]
-        qs = doc.questions[q]
-        if not doc.numbered or qs.range_done:
-            return Stage.SKIP
-        return [[qs.range_tokens[-1]]]
+        return self._verify(doc, q, self._rows(row), [])
 
     def _rows(self, row) -> np.ndarray:
         """Return a stage's answer as its rows of readout values."""
@@ -720,47 +562,6 @@ class ExtractStages:
         if values.dtype == object:
             values = np.asarray(values.reshape(-1)[0], dtype=np.float32)
         return values.reshape(-1, self.readout.width)
-
-    def _extras(self, values) -> np.ndarray:
-        """Return a row's extra values: none, the stop, then the lines targets."""
-        values = np.asarray(values, dtype=np.float32).reshape(-1)
-        return values[:len(values) - 2 * self.readout.k]
-
-    def _range_decide(self, q, anchor, row, first=False):
-        doc, qs = self._question(q, anchor)
-        tables = self.tables
-        if not first:
-            qs.fed_tokens += 1
-        values = self._rows(row)[-1]
-        token = tables.range_targets[int(np.argmax(self._extras(values)[2:]))]
-        if token in tables.range_text:
-            qs.range_tokens.append(token)
-        else:
-            qs.range_done = True
-        if len(qs.range_tokens) == LINE_MAX_TOKENS:
-            qs.range_done = True
-        if qs.range_done:
-            answer = "".join(tables.range_text[t] for t in qs.range_tokens)
-            qs.range = parse_lines(answer, len(doc.lines))
-            if qs.range is None:
-                qs.path = "fallback"
-            else:
-                a, b = qs.range
-                qs.region = (doc.lines[a - 1][0], doc.lines[b - 1][1])
-        return True
-
-    # ---- the answer, a round of tokens at a time ---------------------------
-
-    def _cue_suffix(self, q, key):
-        doc = self.by_key[key]
-        return [self.tables.begins_cue] if doc.numbered else Stage.SKIP
-
-    def _cue_decide(self, q, anchor, row):
-        """Choose the answer's first token from the row after the cue."""
-        doc, qs = self._question(q, anchor)
-        if doc.numbered:
-            qs.fed_tokens += len(self.tables.begins_cue)
-        return self._verify(doc, q, self._rows(row), [])
 
     def _step_suffix(self, q, key):
         """Feed the chosen token, then the document's next tokens as a draft.
@@ -796,10 +597,9 @@ class ExtractStages:
         """Return a row's log probabilities by token id, and none's and the stop's."""
         values = np.asarray(values, dtype=np.float32).reshape(-1)
         k = self.readout.k
-        extras = self._extras(values)
         lp = dict(zip(values[-2 * k:-k].astype(np.int64).tolist(),
                       values[-k:].tolist()))
-        return lp, float(extras[0]), float(extras[1])
+        return lp, float(values[0]), float(values[1])
 
     def _verify(self, doc, q, rows, fed) -> bool:
         """Choose the answer's tokens from a round's rows, in order.
@@ -830,7 +630,7 @@ class ExtractStages:
         position, ends the answer, and at the cue it answers none, as
         does the model writing none or closing the quote at once. At
         the cue, the token is the likeliest first token of any
-        position in the region; afterwards, the likeliest continuation
+        position in the document; afterwards, the likeliest continuation
         of the streams the writing so far fits. A token the model
         would write with the closing quote, such as `."`, ends the
         answer after that token. The answer also ends when closing the
@@ -844,13 +644,7 @@ class ExtractStages:
         tables = self.tables
         lp, none_lp, stop_lp = self._lp(values)
         if not qs.written:
-            scan = doc.scan
-            if qs.region is not None and not ((scan.starts >= qs.region[0])
-                                              & (scan.starts < qs.region[1])).any():
-                qs.region = None      # the range maps to no tokens
-                qs.path = "fallback"
-            starts = first_tokens(tables, lp, doc.prefix, None, qs.region,
-                                  scan=scan)
+            starts = first_tokens(tables, lp, doc.prefix, None, scan=doc.scan)
             qs.none_lp = none_lp
             qs.best_lp = starts.best_lp
             qs.none_wins = (max(none_lp, stop_lp) > qs.best_lp
@@ -941,12 +735,9 @@ class ExtractStages:
                 if doc.questions[0].asked]
 
     def counts(self, q: int) -> dict:
-        """Return how many documents took each path and how much was fed."""
+        """Return how many documents answered none and how much was fed."""
         states = [doc.questions[q] for doc in self.docs]
         return {
-            "located": sum(qs.path == "located" for qs in states),
-            "fallback": sum(qs.path == "fallback" for qs in states),
-            "scored": sum(qs.path == "scored" for qs in states),
             "none": sum(qs.answer is None for qs in states),
             "steps": sum(qs.steps for qs in states),
             "answer_tokens": sum(len(qs.written) for qs in states),

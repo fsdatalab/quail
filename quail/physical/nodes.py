@@ -1033,29 +1033,19 @@ class ExtractSpec(ScoreSpec):
     """Specification for copying each document's answer to a question.
 
     The prompt token parts are the head before the document and the
-    tail after it, ending in the phrase cue; the numbered parts are the
-    same for the document shown as numbered lines, ending in the lines
-    cue. The executor locates the answer's lines with the numbered
-    prompt when the document has enough lines, then reads the answer's
-    span with the plain one.
+    tail after it, ending in the phrase cue.
 
     Attributes:
         question: The question the answer is copied for.
         trim: Whether the answer is the fewest words that answer the
             question, or the whole lines that hold them.
-        locate: Whether a document of enough lines is shown numbered
-            and its answer's lines named before the start is read.
-        numbered_token_parts: The head and tail token ids of the
-            numbered-lines prompt.
-        shares_head: Whether the plain prompt's head is the query's
-            shared preamble, so a plain extraction reads the document
-            KV a filter wrote and continues its pipeline.
+        shares_head: Whether the prompt's head is the query's shared
+            preamble, so the extraction reads the document KV a filter
+            wrote and continues its pipeline.
     """
 
     question: str = ""
     trim: bool = True
-    locate: bool = False
-    numbered_token_parts: tuple[tuple[int, ...], ...] = ()
     shares_head: bool = False
 
     @property
@@ -1078,9 +1068,6 @@ class ExtractSpec(ScoreSpec):
                 "prompt_token_parts", "draws", "share_prefixes")},
             question=str(value["question"]),
             trim=bool(value.get("trim", True)),
-            locate=bool(value.get("locate", False)),
-            numbered_token_parts=tuple(
-                tuple(part) for part in value.get("numbered_token_parts", ())),
             shares_head=bool(value.get("shares_head", False)),
         )
 
@@ -1089,9 +1076,6 @@ class ExtractSpec(ScoreSpec):
             **super().to_dict(),
             "question": self.question,
             "trim": self.trim,
-            "locate": self.locate,
-            "numbered_token_parts": [
-                list(part) for part in self.numbered_token_parts],
             "shares_head": self.shares_head,
         }
 
@@ -1128,7 +1112,6 @@ class AiExtract(AiScore):
             **super().explain_fields(),
             "question": None if self.spec is None else self.spec.question,
             "trim": True if self.spec is None else self.spec.trim,
-            "locate": False if self.spec is None else self.spec.locate,
         }
 
     @classmethod

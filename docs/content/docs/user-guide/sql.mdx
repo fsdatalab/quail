@@ -365,7 +365,6 @@ Pass an object as the third argument, such as `{'trim': false}`.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `trim` | `true` | Return the fewest words that answer the question. With `false`, return the whole lines of the document that hold them, as the document's own line breaks divide it. Use `false` for an answer that is a clause rather than a name, a date, or a number. |
-| `locate` | `false` | Show every document as numbered lines and have the model name the lines that hold the answer before it is written within them. With `false`, the answer is written over the whole document. Off by default: on 45 CUAD contracts with Qwen3 4B, locating lost 5 to 22 points of span F1 on every extraction query (run 20261012T011602Z against 011923Z), because the answer is forced into the lines the model named. |
 
 ### How the answer is found
 
@@ -378,91 +377,25 @@ after it as a draft, and reads the model's choice after every one of
 them, so a round writes as many tokens as the model would have chosen
 one at a time, and a 60-token clause takes a few rounds instead of
 60. Where the model's choice differs from the draft, the next round
-starts from that token. The
-answer is what the model wrote before its writing would leave the
-document: a token the model likes better than every continuation,
-and that continues no position, ends the answer there. For example,
-the model would write "and" between two parties a contract lists
-apart, and the answer is the first party. When the model's first
-token begins no position, or it writes `none`, the answer is null:
-its answer is not in the document. The answer also ends where the
-model would close the quote: when closing it is at least as likely
-as every continuation, or after a token the model would write with
-the closing quote in one token, such as `."`. With `locate` on, the model first
-names the lines that hold the answer, shown numbered as `cat -n` shows
-them, and the positions are those lines. The document, the lines, and
-the question stay in KV across these steps. Several extractions of one
-table with the same `locate` setting read each document once and ask
-their questions of it in turn, and a plain extraction after an
-`AI.IF` filter on the same table asks its question of the documents
-the filter read, without reading them again.
-
-These limits apply:
-
-- The classification and its `AI.IF` join run on one GPU.
-- A `WHERE` condition cannot test the label of a joined row.
-- A query cannot classify joined rows and also use `AI.SCORE`.
-
-For labels computed before later filters, see
-[Classification answers](/docs/user-guide/results#classification-answers).
-For the scoring methods, see
-[Label scoring](/docs/architecture/execution#label-scoring).
-
-## AI.EXTRACT
-
-`AI.EXTRACT` copies the words that answer a question from each document.
-It returns the copied words as a `STRING`, and their character span in
-the document as a `STRUCT<start INT32, end INT32>` in a second column
-named after the first plus `_span`. For example, imagine a `contracts`
-table with contract text in `body`. Return when each lease ends:
-
-```sql
-SELECT c.id,
-       AI.EXTRACT(c.body, 'When does the lease end?') AS ends
-FROM contracts c;
-```
-
-The result has the columns `c.id`, `ends`, and `ends_span`. Both answer
-columns are null when the document does not answer the question. An
-extraction in `SELECT` requires a column alias with `AS`, and it cannot
-be used in `WHERE`.
-
-### Arguments
-
-`AI.EXTRACT(input, question[, options])`
-
-| Argument | Type | Description |
-| --- | --- | --- |
-| `input` | `STRING` column | The document to copy from. |
-| `question` | `STRING` literal | The question the answer is copied for. |
-| `options` | Object | Optional parameters listed below. |
-
-### Optional parameters
-
-Pass an object as the third argument, such as `{'trim': false}`.
-
-| Parameter | Default | Meaning |
-| --- | --- | --- |
-| `trim` | `true` | Return the fewest words that answer the question. With `false`, return the whole lines of the document that hold them, as the document's own line breaks divide it. Use `false` for an answer that is a clause rather than a name, a date, or a number. |
-| `locate` | `false` | Show every document as numbered lines and have the model name the lines that hold the answer before it is written within them. With `false`, the answer is written over the whole document. Off by default: on 45 CUAD contracts with Qwen3 4B, locating lost 5 to 22 points of span F1 on every extraction query (run 20261012T011602Z against 011923Z), because the answer is forced into the lines the model named. |
-
-### How the answer is found
-
-The answer is always a span of the document's own text: the model does
-not write it, it is read from the model's next-token probabilities.
-With `locate` on, the model first names the lines that hold the
-answer, shown numbered as `cat -n` shows them; the answer's start is
-then read within those lines. With it off, the document is read whole.
-The answer starts with the token the model is most likely
-to write at the cue, at the position whose following tokens it copies
-best. From there Quail feeds the document's own tokens in chunks of 16
-and ends the span where a decoder would close the quote: at the first
-token after which closing it is at least as likely as copying the next
-one, or after the next token when the model would copy it and close
-the quote in one token, such as `."`. The document, the lines, and the
-question stay in KV across these steps. Several extractions of one
-table with the same `locate` setting read each document once and ask
-their questions of it in turn.
+starts from that token. The answer is what the model wrote before its
+writing would leave the document: a token the model likes better than
+every continuation, and that continues no position, ends the answer
+there. For example, the model would write "and" between two parties
+a contract lists apart, and the answer is the first party. When the
+model's first token begins no position, or it writes `none`, the
+answer is null: its answer is not in the document. The answer also
+ends where the model would close the quote: when closing it is at
+least as likely as every continuation, or after a token the model
+would write with the closing quote in one token, such as `."`. The
+document and the question stay in KV across the rounds. Several
+extractions of one table read each document once and ask their
+questions of it in turn, and an extraction after an `AI.IF` filter
+or an `AI.CLASSIFY` on the same table asks its question of the
+documents they read, without reading them again. A variant that had
+the model name the answer's lines first, shown numbered, was measured
+and dropped: it lost 5 to 22 points of span F1 on every CUAD
+extraction query at 45 contracts (runs 20261012T011602Z and
+011923Z).
 
 These limits apply:
 

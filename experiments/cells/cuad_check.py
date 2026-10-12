@@ -42,7 +42,7 @@ answers within a second. Measured on run 20261012T003911Z: CUAD-10
 took 23.7 s and 368 thousand fresh tokens; CUAD-1 and CUAD-7 kept
 their answers; CUAD-10's second and third questions changed on 7 and
 8 contracts. Runs 20261012T005434Z, 010321Z, and 010614Z
-(experiments/cells/extract_pipeline_check.py) showed the KV those
+(experiments/cells/extract_profile.py) showed the KV those
 questions read is bit-identical to what the first question wrote, and
 that the same question alone moves on 0 to 3 contracts when only the
 chunk budget changes: the span rule's decisions sat on near ties.
@@ -123,7 +123,7 @@ CUAD-8 7.4 s, less than predicted; CUAD-1 7.8 s, CUAD-2 7.3 s, CUAD-4
 6.7 s, CUAD-9 7.6 s, CUAD-10 11.9 s. The short fields fell by 0.2 to
 2.5 s too, so the rounds were not the whole gap: a query with answers
 of a few tokens takes 7 to 8 s, and run 20261012T055945Z
-(experiments/cells/extract_pipeline_check.py --profile) times the
+(experiments/cells/extract_profile.py --profile) times the
 read chunks and the rounds apart. It measured, for the cap on
 liability: 4.5 s of forward passes over 4 read chunks, with the
 attention and the fp8 matrix multiplies near their peak (run
@@ -221,7 +221,7 @@ and precision below 0.3. Every query finishes in under 10 s on Quail.
 
     uv run modal run --detach -m experiments.cells.cuad_check
         [--model decision-2.0-kai-0.6b-bf16] [--backends quail]
-        [--sf 0.1] [--only CUAD-5,CUAD-13] [--locate]
+        [--sf 0.1] [--only CUAD-5,CUAD-13]
         2>&1 | tee /tmp/cuad_check.log
 """
 
@@ -282,18 +282,16 @@ def _summary(record) -> dict:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=7200,
               volumes=VOLUMES)
 def run_cuad(run: str, model: str, backend: str, sf: float = 0.1,
-             only=None, locate: bool = False) -> dict:
+             only=None) -> dict:
     """Run the CUAD queries on one backend and save the QUAIL-B record."""
     import quail
     from quail.bench import quailb
     from quail_b.data import build_sets
 
-    quailb.EXTRACT_OPTIONS.update(locate=locate)
     queries = list(only or QUERIES)
     data_dir = build_sets(TABLES, sf)
     VOLUMES["/root/.cache/huggingface"].commit()
-    output = (f"/results/benchmarks/quailb/cuad-{run}-{model}-{backend}"
-              f"{'-located' if locate else ''}")
+    output = f"/results/benchmarks/quailb/cuad-{run}-{model}-{backend}"
     started = time.perf_counter()
     try:
         record = quailb.run_suite(
@@ -304,7 +302,7 @@ def run_cuad(run: str, model: str, backend: str, sf: float = 0.1,
     finally:
         VOLUMES["/results"].commit()
     summary = {"run": run, "model": model, "backend": backend, "sf": sf,
-               "output": output, "locate": locate,
+               "output": output,
                "total_s": time.perf_counter() - started,
                "skipped": record.get("skipped_queries", {}),
                "queries": _summary(record)}
@@ -314,11 +312,11 @@ def run_cuad(run: str, model: str, backend: str, sf: float = 0.1,
 
 @app.local_entrypoint()
 def main(model: str = "qwen3-4b-fp8", backends: str = "quail,stock_vllm",
-         sf: float = 0.1, only: str = "", locate: bool = False):
+         sf: float = 0.1, only: str = ""):
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     queries = [q for q in only.split(",") if q] or None
     for backend in backends.split(","):
-        call = run_cuad.spawn(run, model, backend, sf, queries, locate)
+        call = run_cuad.spawn(run, model, backend, sf, queries)
         print(f"{backend}: function call id {call.object_id}", flush=True)
     print(f"run {run}; fetch with modal.FunctionCall.from_id(id).get()",
           flush=True)

@@ -26,11 +26,7 @@ from quail.logical import (
     bind_extract_prompt,
     extracted_above_joins,
 )
-from quail.logical.prompts import (
-    EXTRACT_LINES_CUE,
-    EXTRACT_PHRASE_CUE,
-    NUMBERED_DOCUMENT_LABEL,
-)
+from quail.logical.prompts import EXTRACT_PHRASE_CUE
 from quail.physical import (
     AiClassify,
     AiExtract,
@@ -64,9 +60,6 @@ AFTER_DOCUMENT_TEXT = (
     "answer the question, write none.\n"
     "Answer in this format:\n"
     'Phrase: "<copied words>"')
-AFTER_NUMBERED_DOCUMENT_TEXT = AFTER_DOCUMENT_TEXT.replace(
-    "Answer in this format:\n", "Answer in this format:\n"
-    "Lines: <first line>-<last line>\n")
 
 
 @pytest.fixture()
@@ -84,10 +77,9 @@ def session(tmp_path):
     value.close()
 
 
-def _ends(session, trim=True, locate=False):
+def _ends(session, trim=True):
     return (session.docs("contracts").alias("c")
-            .ai_extract("c.text", QUESTION, name="ends", trim=trim,
-                        locate=locate)
+            .ai_extract("c.text", QUESTION, name="ends", trim=trim)
             .select("c.id", "ends"))
 
 
@@ -106,11 +98,6 @@ def test_extract_prompt_puts_every_question_dependent_text_after_the_document():
         prompt.preamble.encode())
     assert prompt.tail_tokens == len(prompt.tail_token_ids) == len(
         prompt.tail[3:].encode())
-    numbered = bind_extract_prompt((ref,), QUESTION, letter_tokens, turn,
-                                   numbered=True)
-    assert numbered.preamble == "<user>" + NUMBERED_DOCUMENT_LABEL
-    assert numbered.tail == (
-        "{0}" + AFTER_NUMBERED_DOCUMENT_TEXT + "<assistant>" + EXTRACT_LINES_CUE)
     # without a tokenizer the counts stay for the planner to fill
     untokenized = bind_extract_prompt((ref,), QUESTION)
     assert untokenized.preamble_tokens is None
@@ -150,18 +137,11 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
         f"AS ends FROM contracts c")
     assert loose.logical == _ends(session, trim=False).logical
     (node,) = loose.logical.operators().extracts
-    assert not node.call.trim and not node.call.locate
-    # so is locate: with it on, every document is shown as numbered lines
-    located = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}', {{'locate': true}}) "
-        f"AS ends FROM contracts c")
-    assert located.logical == _ends(session, locate=True).logical
-    (node,) = located.logical.operators().extracts
-    assert node.call.trim and node.call.locate
-    assert "trim=on locate=on" in located.explain()
-    plan = located.plan()
+    assert not node.call.trim
+    assert "trim=off" in loose.explain()
+    plan = loose.plan()
     (spec,) = [n.spec for n in plan.nodes if isinstance(n, AiExtract)]
-    assert spec.locate
+    assert not spec.trim
     assert spec == ExtractSpec.from_mapping(spec.to_dict())
     # the BigQuery dialect names the call the same way
     assert session.sql(
@@ -169,7 +149,7 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
         f"FROM contracts c", dialect="bq").logical == logical
     text = built.explain()
     assert "SemanticExtract: ends, ends_span" in text
-    assert f"question={QUESTION!r} trim=on locate=off" in text
+    assert f"question={QUESTION!r} trim=on" in text
     assert "AiExtract: ends over c" in text
     assert "up to 64 answer tokens" in text
     assert "Project: c.id, ends" in text
@@ -195,10 +175,6 @@ def test_extract_plans_one_physical_node_with_both_prompts(session):
     # a model without turn text gets a line break before the cue
     assert list(tail) == letter_tokens(
         AFTER_DOCUMENT_TEXT + (turn[1] or "\n") + EXTRACT_PHRASE_CUE)
-    head, tail = spec.numbered_token_parts
-    assert list(head) == letter_tokens(turn[0] + NUMBERED_DOCUMENT_LABEL)
-    assert list(tail) == letter_tokens(
-        AFTER_NUMBERED_DOCUMENT_TEXT + (turn[1] or "\n") + EXTRACT_LINES_CUE)
     assert [port.name for port in node.outputs] == ["scores", "ids:c"]
     assert node.outputs[0].schema == ("c", "ends", "ends_span")
     assert node.runtime_key == "quail.ai_extract"
@@ -233,21 +209,19 @@ def test_extract_follows_the_filters_and_labels_of_its_table(session):
 def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
         session):
     query = (session.docs("contracts").alias("c")
-             .ai_extract("c.text", QUESTION, name="ends", locate=True)
-             .ai_extract("c.text", "Who signs?", name="signer", locate=True)
+             .ai_extract("c.text", QUESTION, name="ends")
+             .ai_extract("c.text", "Who signs?", name="signer")
              .ai_extract("c.text", "Where?", name="place")
              .select("c.id", "ends", "signer", "place"))
     plan = query.plan()
     extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
     pipelines = build_pipelines(plan.graph)
-    # the first two show the document numbered and run as one
-    # pipeline: the second reads the KV the first leaves and is
-    # priced without reading the document; the third shows it plain
-    # and starts a pipeline of its own
-    assert pipelines[extracts[0].node_id].node_ids == (
-        extracts[0].node_id, extracts[1].node_id)
-    assert pipelines[extracts[2].node_id].node_ids == (extracts[2].node_id,)
+    # the three run as one pipeline: the later ones read the KV the
+    # first leaves and are priced without reading the document
+    assert pipelines[extracts[0].node_id].node_ids == tuple(
+        extract.node_id for extract in extracts)
     assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
+    assert extracts[2].spec.estimated_seconds < extracts[0].spec.estimated_seconds
     # a plain extraction shows the document under the query's shared
     # head, as the filter does, so it continues the filter's pipeline
     # and asks its question of the KV the filter wrote
@@ -278,17 +252,6 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
     pipelines = build_pipelines(plan.graph)
     assert pipelines[classify.node_id].node_ids == (
         classify.node_id, extract.node_id)
-    # a located extraction shows the document numbered: its own pipeline
-    located = (session.docs("contracts").alias("c")
-               .ai_filter(quail.prompt("Is {0} a lease?", quail.col("c.text")))
-               .ai_extract("c.text", QUESTION, name="ends", locate=True)
-               .select("c.id", "ends"))
-    plan = located.plan()
-    (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
-    (ai_filter,) = [n for n in plan.nodes if isinstance(n, AiFilter)]
-    pipelines = build_pipelines(plan.graph)
-    assert pipelines[ai_filter.node_id].node_ids == (ai_filter.node_id,)
-    assert pipelines[extract.node_id].node_ids == (extract.node_id,)
 
 
 def _candidates(session, query):

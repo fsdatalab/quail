@@ -109,13 +109,10 @@ class ModelCall:
     # PROBABILITIES_SUFFIX
     probabilities: bool = False
     # an "extract" call only: the question the answer is copied for,
-    # whether the answer is the copied words (trim) or the whole lines
-    # of the document that hold them, and whether a document of several
-    # lines is shown numbered so the model names the answer's lines
-    # before its start is read (locate)
+    # and whether the answer is the copied words (trim) or the whole
+    # lines of the document that hold them
     question: str = ""
     trim: bool = True
-    locate: bool = False
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -132,8 +129,7 @@ class ModelCall:
             self.labels or self.descriptions or self.probabilities
         ):
             raise CompileError("only an AI.CLASSIFY call has labels")
-        if self.kind != "extract" and (self.question or not self.trim
-                                       or self.locate):
+        if self.kind != "extract" and (self.question or not self.trim):
             raise CompileError("only an AI.EXTRACT call has a question")
         if self.kind == "label":
             validate_labels(self.labels, self.descriptions)

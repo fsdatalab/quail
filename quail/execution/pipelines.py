@@ -92,12 +92,11 @@ def _same_prompt_head(node: PhysicalNode, consumer: PhysicalNode,
                       first: PhysicalNode) -> bool:
     """Return whether the consumer shows the document as the pipeline does.
 
-    An extraction continues an extraction with the same locating
-    choice. A plain extraction whose head is the query's shared
-    preamble also continues a pipeline a filter started, which wrote
-    the documents under that preamble, or one a classification of
-    the table started under the same head. Nothing else continues an
-    extraction.
+    An extraction continues an extraction. One whose head is the
+    query's shared preamble also continues a pipeline a filter
+    started, which wrote the documents under that preamble, or one a
+    classification of the table started under the same head. Nothing
+    else continues an extraction.
 
     Args:
         node: The pipeline's last member.
@@ -106,8 +105,8 @@ def _same_prompt_head(node: PhysicalNode, consumer: PhysicalNode,
     """
     if isinstance(consumer, AiExtract):
         if isinstance(node, AiExtract):
-            return node.spec.locate == consumer.spec.locate
-        if consumer.spec.locate or not consumer.spec.shares_head:
+            return True
+        if not consumer.spec.shares_head:
             return False
         if isinstance(first, AiClassify):
             return (first.spec is not None and first.spec.partner is None
