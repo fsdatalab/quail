@@ -7,14 +7,17 @@ rounds. GreedyGenerator schedules that work with the same pieces the
 stage scheduler uses: the arena's pages and state slots, pack_chunk,
 and the pipeline's forward pass.
 
-Each step packs one decode row for every document in flight and, when
-lanes are free, the prompts of newly admitted documents. A prompt's
-last token is its one suffix, so the step that prefills it also gives
-its first output token. A decode row appends the last chosen token to
-the document's KV and, on a model with linear-attention layers, steps
-the state kept in its slot in place. A step that admits nobody has the
-same shape as the last, so it replays a CUDA graph captured for its
-batch size.
+Each step decodes one token for every document in flight and, when
+lanes are free, prefills the prompts of newly admitted documents. A
+prompt's last token is its one suffix, so the pass that prefills it
+also gives its first output token. A decode row appends the last
+chosen token to the document's KV and, on a model with linear-attention
+layers, steps the state kept in its slot in place. The decode rows
+replay a CUDA graph captured for their batch size, and a step's prompts
+prefill in a pass of their own: a pass mixing the two runs every
+decode row eagerly, which on LightOnOCR-3-0.8B cost more than it saved
+(ParseBench run 20261012T015625Z-1df818). Without graphs, one pass
+packs both.
 
 A document leaves at a stop token, its output limit, or its context,
 and its lane takes the next document.
@@ -175,7 +178,25 @@ class GreedyGenerator:
                     room -= size
                     waiting = None
             started = time.perf_counter()
-            if admit:
+            if admit and self.graphs:
+                # the admitted prompts prefill in their own pass, and the
+                # documents already in flight decode by graph: a pass
+                # mixing the two would run every decode row eagerly
+                admitted = []
+                first = self._mixed(admitted, admit, free)
+                stats["mixed_s"] += time.perf_counter() - started
+                stats["mixed_steps"] += 1
+                stats["prefilled_tokens"] += sum(len(g.prompt) for g, _ in admit)
+                if active:
+                    started = time.perf_counter()
+                    tokens = self._replay(active) + first
+                    stats["decode_s"] += time.perf_counter() - started
+                    stats["decode_steps"] += 1
+                    stats["decode_rows"] += len(active)
+                else:
+                    tokens = first
+                active = active + admitted
+            elif admit:
                 tokens = self._mixed(active, admit, free)
                 stats["mixed_s"] += time.perf_counter() - started
                 stats["mixed_steps"] += 1
