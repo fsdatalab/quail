@@ -105,6 +105,28 @@ def _render(path: str) -> list[dict]:
     return pages
 
 
+def _download():
+    """Download the dataset, retrying when the Hub rate-limits the requests."""
+    import os
+    from pathlib import Path
+
+    # anonymous downloads through the Hub's xet service hit 429 at the
+    # default 8 workers on 2,084 files (run of 2026-10-12)
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    from huggingface_hub import snapshot_download
+
+    for attempt in range(6):
+        try:
+            return Path(snapshot_download(
+                DATASET, repo_type="dataset", revision=DATASET_REVISION,
+                allow_patterns=["docs/**", "*.jsonl"], max_workers=4))
+        except Exception as error:
+            print(f"download attempt {attempt + 1} failed: {error}", flush=True)
+            hf_cache.commit()
+            time.sleep(30 * (attempt + 1))
+    raise RuntimeError("the dataset download kept failing")
+
+
 @app.function(image=render_image, cpu=32, memory=65536, timeout=3600,
               volumes=volumes)
 def prepare() -> dict:
@@ -114,11 +136,8 @@ def prepare() -> dict:
 
     import pyarrow as pa
     import pyarrow.parquet as pq
-    from huggingface_hub import snapshot_download
 
-    root = Path(snapshot_download(
-        DATASET, repo_type="dataset", revision=DATASET_REVISION,
-        allow_patterns=["docs/**", "*.jsonl"]))
+    root = _download()
     categories = {}
     for split in SPLITS:
         for line in (root / f"{split}.jsonl").open():
