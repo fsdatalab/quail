@@ -202,9 +202,13 @@ def run_snapshot(run: str, document: int = 1) -> dict:
         return key, self.arena.capacity_rows(key)[:f]
 
     def snapshot(self, a, j, label):
-        key, rows = rows_of(self, a, j)
-        if not self.arena.is_resident(key):
+        # the kernel warm-up runs stages of its own, over positional keys
+        if len(self.stages) != 2 * per_question:
             return
+        key = self.keys[a]
+        if not isinstance(key, tuple) or not self.arena.is_resident(key):
+            return
+        key, rows = rows_of(self, a, j)
         layers = sorted({0, len(self.arena.k) - 1})
         self.torch.cuda.synchronize()
         taken = {}
