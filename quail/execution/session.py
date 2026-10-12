@@ -807,7 +807,8 @@ class Query:
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions,
                 memo=context.memo,
-                parser=config.parser)
+                parser=config.parser,
+                parse_saved=self._parse_saved())
             extra = {}
             if config.gpu_timing:
                 extra["gpu_timing"] = True
@@ -816,6 +817,22 @@ class Query:
                     **self._plan.settings, **extra})
             self._planning_finished_at = time.perf_counter()
         return self._plan
+
+    def _parse_saved(self) -> dict | None:
+        """Alias -> the rows of its table whose parse is saved; None when off."""
+        config = self.session.config
+        if not config.save_parses or config.parser is None:
+            return None
+        from quail.saved_parses import SavedParses
+
+        saved = SavedParses()
+        counts = {}
+        for node in self.logical.operators().parses:
+            pages = self.session.catalog.get(node.call.document.provider).pages()
+            counts[node.alias] = sum(
+                saved.has(saved.key(*pages[row], config.parser, node.call.mode))
+                for row in range(len(pages)))
+        return counts
 
     def _pages(self, scan) -> bool:
         """Whether a scan reads a read_pdfs table, whose rows AI.PARSE reads."""
@@ -947,7 +964,8 @@ class Query:
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
                 logical_plan=self.logical,
-                parser=self.session.config.parser)
+                parser=self.session.config.parser,
+                parse_saved=self._parse_saved())
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.

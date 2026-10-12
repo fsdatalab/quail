@@ -13,10 +13,16 @@ from quail.execution.execute import execute_query
 from quail.execution.types import PhysicalResponse
 from quail.parsers import PdfiumParser
 from quail.physical import Parse, Scan
+from quail.saved_parses import SavedParses
 from quail.specs import DEVICES, MODELS
 
 SQL = ("SELECT p.path, p.page, AI.PARSE(p.document) AS text "
        "FROM pages p WHERE p.page = 2")
+
+
+@pytest.fixture(autouse=True)
+def saved_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("QUAIL_PARSE_DIR", str(tmp_path / "parses"))
 
 
 @pytest.fixture
@@ -52,6 +58,7 @@ def _execute(request, query):
                  for node in query.plan().nodes if isinstance(node, Scan)},
         "columns": request.column_tables(),
         "parser": lambda node: parser, "tokenize": letter_tokens,
+        "saved_parses": SavedParses(),
     }
     try:
         report = execute_single_graph(
@@ -130,3 +137,29 @@ def test_a_limit_parses_only_the_rows_it_returns(folder):
     result = execute_query(query, physical_executor=lambda r: _execute(r, query))
     assert result.count() == 2
     assert result.report["node_metrics"]["parse:p"]["pages_parsed"] == 2
+
+
+def test_a_second_query_reads_the_saved_rows(folder):
+    session = _session(folder)
+    first = session.sql(SQL)
+    (parse,) = [node for node in first.plan().nodes if isinstance(node, Parse)]
+    assert parse.saved and parse.saved_rows == 0
+    execute_query(first, physical_executor=lambda r: _execute(r, first))
+    second = session.sql(SQL)
+    (parse,) = [node for node in second.plan().nodes if isinstance(node, Parse)]
+    assert parse.saved_rows == 2
+    assert "saved results: 2 of the table's rows" in second.explain()
+    result = execute_query(second, physical_executor=lambda r: _execute(r, second))
+    metrics = result.report["node_metrics"]["parse:p"]
+    assert metrics["rows_from_saved"] == 2 and "pages_parsed" not in metrics
+    assert [row["text"] for row in result.collect().to_pylist()] == [
+        "second page of a", ""]
+
+
+def test_saved_results_can_be_turned_off(folder):
+    session = _session(folder, save_parses=False)
+    query = session.sql(SQL)
+    (parse,) = [node for node in query.plan().nodes if isinstance(node, Parse)]
+    assert not parse.saved
+    execute_query(query, physical_executor=lambda r: _execute(r, query))
+    assert not list(SavedParses().directory.glob("*/*.txt"))

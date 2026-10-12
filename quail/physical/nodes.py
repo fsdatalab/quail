@@ -423,6 +423,9 @@ class Parse(PhysicalNode):
         expected_tokens: The parsed text's expected tokens over them,
             in the reading model's tokens.
         lanes: Pages an OCR parser decodes at once; 0 for pdfium.
+        saved: Whether rows read and write saved parse results.
+        saved_rows: The table's rows whose parse was saved when the
+            query was planned.
     """
 
     alias: str = ""
@@ -432,6 +435,8 @@ class Parse(PhysicalNode):
     expected_rows: float = 0.0
     expected_tokens: float = 0.0
     lanes: int = 0
+    saved: bool = False
+    saved_rows: int = 0
 
     type_name: ClassVar[str] = "quail.parse"
     runtime_key: ClassVar[str] = type_name
@@ -455,6 +460,8 @@ class Parse(PhysicalNode):
             "expected_rows": self.expected_rows,
             "expected_tokens": self.expected_tokens,
             "lanes": self.lanes,
+            "saved": self.saved,
+            "saved_rows": self.saved_rows,
         }
 
     @classmethod
@@ -469,6 +476,8 @@ class Parse(PhysicalNode):
             expected_rows=float(attributes["expected_rows"]),
             expected_tokens=float(attributes["expected_tokens"]),
             lanes=int(attributes["lanes"]),
+            saved=bool(attributes["saved"]),
+            saved_rows=int(attributes["saved_rows"]),
         )
 
 

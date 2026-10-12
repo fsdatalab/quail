@@ -21,7 +21,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                scan_fractions=None,
                canvas_draws: int = 4,
                attention: str | None = None, memo=None,
-               parser: str | None = None):
+               parser: str | None = None, parse_saved: dict | None = None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -47,6 +47,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         memo: Results the logical rules computed for this plan, such
             as its statistics, for the physical planner to reuse.
         parser: EngineConfig.parser, which runs the plan's AI.PARSE.
+        parse_saved: Alias -> the table's rows whose parse is saved;
+            None when saved parse results are off.
 
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
@@ -62,7 +64,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         registry = built_in_registry()
     placement = place_parser(plan, model=model, device=device, gpus=gpus,
                              backend=backend, parser=parser,
-                             models=registry.models)
+                             models=registry.models, saved_rows=parse_saved)
     if isinstance(placement, Refusal):
         return placement
     if placement is not None:
@@ -140,7 +142,7 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
                 tokenizer=None, pair_fractions=None,
                 canvas_draws: int = 4,
                 attention: str | None = None, logical_plan=None,
-                parser: str | None = None):
+                parser: str | None = None, parse_saved: dict | None = None):
     """Run the physical rules again over a plan once its inputs are exact.
 
     A plan made on estimated document lengths never saw the token
@@ -157,7 +159,7 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
     if logical_plan is not None:
         placement = place_parser(logical_plan, model=model, device=device,
                                  gpus=gpus, backend=backend, parser=parser,
-                                 models=registry.models)
+                                 models=registry.models, saved_rows=parse_saved)
         if isinstance(placement, Refusal):
             return placement
     if placement is not None:

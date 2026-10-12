@@ -35,20 +35,26 @@ class ParserSpec:
         modes: The AI.PARSE modes it supports.
         tokens_per_page: Expected output tokens per page, for planning
             when no sample is parsed.
+        version: What else decides its output; a saved parse with
+            another version is not read.
     """
 
     name: str
     gpu: bool
     modes: tuple
     tokens_per_page: float
+    version: str = ""
 
 
 # LightOnOCR's mean output on ParseBench: 2,385,005 tokens over 2,080
 # pages (run 20261012T022224Z-74d939); pdfium's is sampled per table
 PARSER_SPECS = {
-    PDFIUM: ParserSpec(PDFIUM, gpu=False, modes=("text",), tokens_per_page=0.0),
-    LIGHTONOCR: ParserSpec(LIGHTONOCR, gpu=True, modes=("text",),
-                           tokens_per_page=1147.0),
+    PDFIUM: ParserSpec(PDFIUM, gpu=False, modes=("text",), tokens_per_page=0.0,
+                       version="pypdfium2 5.13.0"),
+    # the checkpoint revision, render size, output limit, and greedy decoding
+    LIGHTONOCR: ParserSpec(
+        LIGHTONOCR, gpu=True, modes=("text",), tokens_per_page=1147.0,
+        version="36d8636925327c671bd8e479c517a004f7566bd9 2048px 4096 greedy"),
 }
 
 

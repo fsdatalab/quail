@@ -422,6 +422,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 f"mode={node.mode}, about {_number(node.expected_rows)} rows "
                 f"and {_number(node.expected_tokens)} parsed tokens"
                 + (f", {node.lanes} pages decoded at once" if node.lanes else ""))
+            if node.saved:
+                details.append(f"saved results: {node.saved_rows:,} of the "
+                               f"table's rows")
         elif isinstance(node, AiClassify):
             spec = node.spec
             title += f": {spec.name} over {spec.aliases[0]}"

@@ -439,7 +439,9 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 parser=context.parse.parser,
                 expected_rows=float(stats[s.alias].n_docs),
                 expected_tokens=float(stats[s.alias].total_tokens),
-                lanes=context.parse.lanes))
+                lanes=context.parse.lanes,
+                saved=context.parse.saved_rows is not None,
+                saved_rows=(context.parse.saved_rows or {}).get(s.alias, 0)))
             ids_src[s.alias] = PortRef(pid, f"ids:{s.alias}")
             if any(is_parse(column) and column.expression == semantic.call
                    for column in plan.projection.columns):

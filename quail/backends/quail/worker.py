@@ -43,6 +43,7 @@ from quail.physical import (
     decode_graph,
 )
 from quail.progress import say, set_gpu_index
+from quail.saved_parses import SavedParses
 
 # Children outlive sessions so later queries can reuse their loaded models.
 _CHILDREN: list = []
@@ -414,6 +415,7 @@ def _gpu_state(gpu):
         "model": gpu.model, "arena": gpu.arena,
         "pipeline": gpu.pipeline, "spec": gpu.spec,
         "parser": gpu.parser, "tokenize": gpu.tokenize,
+        "saved_parses": SavedParses(),
     }
 
 

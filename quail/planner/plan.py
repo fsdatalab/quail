@@ -290,3 +290,6 @@ class EngineConfig:
     # the CPU, "lightonocr-3-0.8b" reads page images on the GPU beside
     # the model; None refuses AI.PARSE
     parser: str | None = None
+    # whether AI.PARSE reads and writes saved results
+    # (quail.saved_parses), so a row parsed once is not parsed again
+    save_parses: bool = True

@@ -85,25 +85,58 @@ class _Parsing:
         self.node = node
         self.parser = state["parser"](node)
         self.tokenize = state["tokenize"]
+        self.saved = state.get("saved_parses") if node.saved else None
         pages = state["docs"][node.alias]
         self.documents = ParsedDocuments(len(pages))
         state["docs"][node.alias] = self.documents
-        self.rows = _rows(pages, ids)
+        self.rows = list(_rows(pages, ids))
         self.texts = {}
         self.tokens = 0
+        self.from_saved = 0
+        self.parsed = False
         self.started = time.perf_counter()
 
+    def _key(self, path_file, pages):
+        return self.saved.key(path_file, pages, self.node.parser, self.node.mode)
+
+    def _row(self, row, text):
+        tokens = list(self.tokenize(text))
+        self.documents.set(row, tokens)
+        self.texts[row] = text
+        self.tokens += len(tokens)
+        return row, len(tokens)
+
     def __iter__(self):
-        """Yield (row, token count) as each row is parsed and tokenized."""
-        for row, text in self.parser.parse(self.rows):
-            tokens = list(self.tokenize(text))
-            self.documents.set(row, tokens)
-            self.texts[row] = text
-            self.tokens += len(tokens)
-            yield row, len(tokens)
+        """Yield (row, token count) as each row is read or parsed, and tokenized.
+
+        Saved rows come first; the parser parses the rest, and each
+        row it parses is saved.
+        """
+        rows = self.rows
+        if self.saved is not None:
+            missing = []
+            for row, path_file, pages in rows:
+                text = self.saved.get(self._key(path_file, pages))
+                if text is None:
+                    missing.append((row, path_file, pages))
+                    continue
+                self.from_saved += 1
+                yield self._row(row, text)
+            rows = missing
+        if not rows:
+            return
+        files = {row: (path_file, pages) for row, path_file, pages in rows}
+        self.parsed = True
+        for row, text in self.parser.parse(iter(rows)):
+            if self.saved is not None:
+                self.saved.put(self._key(*files[row]), text)
+            yield self._row(row, text)
 
     def result(self) -> NodeResult:
-        return parse_result(self.node, self.texts, dict(self.parser.stats),
+        # a parser that did not run holds an earlier query's stats
+        stats = {**(self.parser.stats if self.parsed else {}),
+                 "rows_from_saved": self.from_saved}
+        return parse_result(self.node, self.texts, stats,
                             time.perf_counter() - self.started, self.tokens)
 
 

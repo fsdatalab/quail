@@ -23,12 +23,15 @@ class ParsePlacement:
         parser_bytes: GPU memory the parser takes beside the reader.
         reader_device: The device the reader is planned on, with the
             parser's memory taken out.
+        saved_rows: Alias -> the table's rows whose parse is saved;
+            None when saved results are off.
     """
 
     parser: str
     lanes: int
     parser_bytes: float
     reader_device: DeviceSpec
+    saved_rows: dict | None = None
 
 
 def _refusal(reason: str, constraint: str) -> Refusal:
@@ -37,8 +40,8 @@ def _refusal(reason: str, constraint: str) -> Refusal:
 
 
 def place_parser(plan, *, model: ModelSpec, device: DeviceSpec, gpus: int,
-                 backend: str, parser: str | None,
-                 models) -> ParsePlacement | Refusal | None:
+                 backend: str, parser: str | None, models,
+                 saved_rows: dict | None = None) -> ParsePlacement | Refusal | None:
     """Check a plan's parses against the session's parser and place it.
 
     Args:
@@ -49,6 +52,8 @@ def place_parser(plan, *, model: ModelSpec, device: DeviceSpec, gpus: int,
         backend: The model backend.
         parser: EngineConfig.parser.
         models: The registered ModelSpecs by name.
+        saved_rows: Alias -> the table's rows whose parse is saved, or
+            None when saved results are off.
 
     Returns:
         None when the plan parses nothing, a Refusal, or the placement.
@@ -76,11 +81,11 @@ def place_parser(plan, *, model: ModelSpec, device: DeviceSpec, gpus: int,
         return _refusal(f"AI.PARSE runs on the quail backend, not {backend!r}",
                         "parse_needs_quail_backend")
     if not spec.gpu:
-        return ParsePlacement(parser, 0, 0.0, device)
+        return ParsePlacement(parser, 0, 0.0, device, saved_rows)
     free = device.mem_bytes * POOL_FRACTION - model.W_mem
     try:
         lanes, taken = ocr_memory(models[parser], free)
     except ValueError as error:
         return _refusal(str(error), "parser_memory")
     reader = replace(device, mem_bytes=device.mem_bytes - taken / POOL_FRACTION)
-    return ParsePlacement(parser, lanes, taken, reader)
+    return ParsePlacement(parser, lanes, taken, reader, saved_rows)
