@@ -35,6 +35,12 @@ class Chunk:
         rows_per_answer: Rows of final_indices each answer takes, one
             entry per suffix in chunk order, when some suffix reads
             more than its last row; empty when every answer is one row.
+        inputs_embeds: Each row's input embedding, when some rows are
+            not token embeddings (an image's rows); None embeds
+            input_ids.
+        rope_positions: Rotary positions with one row per axis, for a
+            model whose rotary reads several (an image's time, row,
+            and column); None reads positions.
     """
 
     input_ids: Any
@@ -47,6 +53,8 @@ class Chunk:
     temporary_keys: tuple = ()
     fresh_keys: tuple = ()
     rows_per_answer: tuple = ()
+    inputs_embeds: Any = None
+    rope_positions: Any = None
 
 
 class ArenaFullError(RuntimeError):
@@ -238,13 +246,20 @@ def _state_plan(arena, groups, token_count, torch, pinned):
     after it; a wave is one conv call and one delta-rule call per
     layer over the wave's rows, gathered in segment order.
 
+    A decode group's one appended row, which starts from the slot it
+    saves to, is not a segment: it goes to `decode`, which the
+    linear-attention layers run as one recurrent step per row, updating
+    each slot in place.
+
     Returns:
         meta["state"]: `segments`, the StateSegments in chunk order;
         `waves`, per wave the gather `rows`, the varlen bounds `cu`,
         the `init` slots and `has_init` flags, the `save_index` of
         the segments that save and their `save_slots` (None when none
-        does), `n`, `max_len`, and host copies for checkers; and
-        `max_sequences`, the widest wave.
+        does), `n`, `max_len`, and host copies for checkers;
+        `max_sequences`, the widest wave; and `decode`, the decode
+        rows and their slots (`rows`, `slots`, and host copies), or
+        None.
 
     Raises:
         ValueError: A group reads state no segment saved, or a fresh
@@ -252,6 +267,7 @@ def _state_plan(arena, groups, token_count, torch, pinned):
     """
     segments = []
     produced = {}    # slot -> the wave of this chunk that saves it
+    decoded = []     # (row, slot) of each decode row
 
     def add(key, r0, r1, position, init, save):
         if r1 <= r0:
@@ -307,11 +323,14 @@ def _state_plan(arena, groups, token_count, torch, pinned):
         for s0, s1 in zip(begins.tolist(), ends.tolist()):
             if wst and f + wst in u["save_at"]:
                 kept = arena.claim_state(key, f + wst, "kept")
+                if u["decode"] and s1 - s0 == wst == 1 and kept == init:
+                    decoded.append((s0, kept))
+                    continue
                 add(key, s0, s0 + wst, f, init, kept)
                 add(key, s0 + wst, s1, f + wst, kept, 0)
             else:
                 add(key, s0, s1, f, init, 0)
-    covered = sum(seg.r1 - seg.r0 for seg in segments)
+    covered = sum(seg.r1 - seg.r0 for seg in segments) + len(decoded)
     if covered != token_count:
         raise AssertionError(
             f"the state plan covers {covered} of {token_count} rows")
@@ -339,7 +358,13 @@ def _state_plan(arena, groups, token_count, torch, pinned):
                                 torch.int64, pinned) if saving else None),
             n=len(segs), max_len=max(lengths), cu_host=cu.tolist(),
             init_host=init, save_host=[seg.save for seg in segs]))
-    return dict(segments=segments, waves=waves,
+    decode = None
+    if decoded:
+        rows, slots = (list(column) for column in zip(*decoded))
+        decode = dict(rows=_staged(torch, rows, torch.int64, pinned),
+                      slots=_staged(torch, slots, torch.int32, pinned),
+                      rows_host=rows, slots_host=slots)
+    return dict(segments=segments, waves=waves, decode=decode,
                 max_sequences=max((len(v) for v in by_wave.values()), default=0))
 
 
@@ -447,6 +472,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
       request starts from.
     * borrow_parent: The parent key a borrowing group starts from, on an
       arena with state slots.
+    * decode: On an arena with state slots, a resident group appending
+      one token that starts from the kept state it saves: its row runs
+      as one recurrent step updating that slot in place (see
+      _state_plan).
 
     Fresh groups without arena pages must have at most one suffix. Unified
     attention cannot mix paged and unpaged groups. Canvas rows use unified
@@ -718,7 +747,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     keeps=bool(g.get("write_suffix_tokens")),
                     wst=int(g.get("write_suffix_tokens") or 0),
                     save_at=tuple(g.get("save_at") or ()),
-                    borrow_parent=g.get("borrow_parent")))
+                    borrow_parent=g.get("borrow_parent"),
+                    decode=bool(g.get("decode"))))
             elif not fresh:
                 raise ValueError(
                     "unified attention requires pages for a kept "

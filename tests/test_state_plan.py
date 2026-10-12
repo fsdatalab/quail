@@ -172,3 +172,56 @@ def test_single_pass_groups_save_nothing_and_errors(monkeypatch):
             dict(key=child, prefix=_tokens(16), start=16, f=32,
                  suffixes=[_tokens(6)], borrow_parent=key)],
             attention_mode="unified")
+
+
+def _prompt_then_decode(arena, key, prompt):
+    """Prefill a prompt whose last token is its one suffix, keeping its state."""
+    f = prompt - 1
+    assert arena.activate(key, f, capacity_tokens=prompt + 8, base_tokens=f,
+                          slots=1)
+    return dict(key=key, prefix=_tokens(f), start=0, f=f, suffixes=[[7]],
+                write_suffix_tokens=1, single=True, save_at=(prompt,))
+
+
+def test_a_decode_group_steps_its_kept_slot_in_place(monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = state_arena(pages=64, slots=4)
+    a, b = ("p", 0), ("p", 1)
+    first = chunk_mod.pack_chunk(torch, arena, [
+        _prompt_then_decode(arena, a, 20)], attention_mode="unified")
+    kept = arena.state_slot_at(a, 20)
+    # the prompt and its last token are one segment saving the kept slot
+    assert _segments(first) == [(a, 0, 20, 0, 0, kept, 0)]
+    assert first.meta["state"]["decode"] is None
+    # next chunk: a decodes one token while b's prompt prefills
+    assert arena.activate(a, 20, capacity_tokens=28, slots=1)
+    second = chunk_mod.pack_chunk(torch, arena, [
+        dict(key=a, prefix=None, f=20, suffixes=[[9]], write_suffix_tokens=1,
+             save_at=(21,), decode=True),
+        _prompt_then_decode(arena, b, 12),
+    ], attention_mode="unified")
+    plan = second.meta["state"]
+    # a's row is a decode step from its kept slot, which moves to 21
+    assert plan["decode"]["rows_host"] == [0]
+    assert plan["decode"]["slots_host"] == [kept]
+    assert arena.state_slot_at(a, 21) == kept
+    assert arena.state_slot_at(a, 20) is None
+    # b's prompt is the only segment and the only wave
+    b_kept = arena.state_slot_at(b, 12)
+    assert _segments(second) == [(b, 1, 13, 0, 0, b_kept, 0)]
+    assert [wave["rows"].tolist() for wave in plan["waves"]] == [list(range(1, 13))]
+
+
+def test_without_the_decode_flag_an_appended_row_stays_a_segment(monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = state_arena(pages=64, slots=4)
+    a = ("p", 0)
+    chunk_mod.pack_chunk(torch, arena, [_prompt_then_decode(arena, a, 20)],
+                         attention_mode="unified")
+    kept = arena.state_slot_at(a, 20)
+    assert arena.activate(a, 20, capacity_tokens=28, slots=1)
+    chunk = chunk_mod.pack_chunk(torch, arena, [
+        dict(key=a, prefix=None, f=20, suffixes=[[9]], write_suffix_tokens=1,
+             save_at=(21,))], attention_mode="unified")
+    assert chunk.meta["state"]["decode"] is None
+    assert _segments(chunk) == [(a, 0, 1, 20, kept, kept, 0)]

@@ -2,23 +2,19 @@
 
 PageParser loads an OCR checkpoint such as LightOnOCR-3-0.8B through
 vLLM's loader, runs its vision tower over page images, and transcribes
-each page with greedy decoding on Quail's executor: the Qwen3.5
-pipeline's forward pass, the engine's paged attention for the
-full-attention layers, and the arena's state pool for the Gated
-DeltaNet layers.
-
-Every row of the batch owns a fixed block of pages, sized for the
-longest prompt plus the output limit, and one state slot. A step
-prefills newly admitted pages up to a token budget, then decodes one
-token for every page in flight; a page leaves the batch at its end of
-text or its output limit, and the next page takes its row.
+each page with greedy decoding on Quail's executor: GreedyGenerator
+(executor/generate.py) schedules the steps over the arena, each page's
+prompt carries its image rows and Qwen3-VL's three-axis rotary
+positions, and the Qwen3.5 pipeline runs the forward pass.
 
 prepare_page runs on the CPU, in worker processes: the checkpoint's
 image processor gives the prompt's token ids and the patches, which
 travel as uint8 and are normalized on the GPU.
 """
 
-from dataclasses import dataclass, field
+from functools import partial
+
+import numpy as np
 
 
 def prepare_page(processor, prompt: str, image) -> dict:
@@ -37,8 +33,6 @@ def prepare_page(processor, prompt: str, image) -> dict:
         ValueError: The processor's normalized pixels are not an exact
             image of uint8 values, so uint8 would lose precision.
     """
-    import numpy as np
-
     out = processor(text=[prompt], images=[image], return_tensors="np")
     mean, std = _normalization(processor)
     raw = (out["pixel_values"] * std + mean) * 255.0
@@ -145,8 +139,6 @@ def mrope_positions(input_ids, grid, image_token_id: int, merge: int):
         A (3, tokens) int64 array and the decode offset: a token at
         sequence index i takes position i + offset on all three axes.
     """
-    import numpy as np
-
     ids = np.asarray(input_ids)
     where = np.flatnonzero(ids == image_token_id)
     _, height, width = grid
@@ -166,55 +158,29 @@ def mrope_positions(input_ids, grid, image_token_id: int, merge: int):
     return positions.astype(np.int64), resume + tail - ids.size
 
 
-@dataclass
-class _Chunk:
-    """The rows one forward pass reads, in the shape the pipeline takes."""
-
-    input_ids: object
-    positions: object
-    meta: dict
-    final_indices: object
-    inputs_embeds: object = None
-
-
-@dataclass
-class _Row:
-    """One page in flight: its key, row, and the tokens so far."""
-
-    key: object
-    row: int
-    prompt_tokens: int
-    offset: int
-    tokens: list = field(default_factory=list)
-
-
 class PageParser:
     """Transcribe page images greedily on Quail's executor.
 
     Args:
         spec: The OCR model's ModelSpec (arch "qwen3_5").
-        rows: Pages in flight at once.
+        lanes: Pages in flight at once.
         max_output_tokens: The output limit per page.
-        context_tokens: The longest prompt plus output a row holds.
-        prefill_tokens: The prompt tokens one step prefills at most.
-        admit_pages: Free rows a step waits for before it prefills,
-            while other pages are decoding; a prefill's cost is mostly
-            per call, so one page at a time costs about twice as much
-            per page as five.
+        context_tokens: The longest prompt plus output a page holds.
+        budget: Rows one step packs at most, decode rows included.
         encode_ahead: Pages whose image rows a thread computes ahead,
             on its own CUDA stream, so the vision tower runs beside the
-            decode steps; 0 runs the tower inside each prefill.
+            decode steps; 0 runs the tower in the step that prefills.
         encode_batch: Pages per vision tower call in that thread.
     """
 
-    def __init__(self, spec, *, rows: int, max_output_tokens: int,
-                 context_tokens: int, prefill_tokens: int,
-                 admit_pages: int = 1, encode_ahead: int = 0,
+    def __init__(self, spec, *, lanes: int, max_output_tokens: int,
+                 context_tokens: int, budget: int, encode_ahead: int = 0,
                  encode_batch: int = 4):
         import torch
         from transformers import AutoProcessor, GenerationConfig
 
         from quail.backends.quail.executor.arena import KVArena
+        from quail.backends.quail.executor.generate import GreedyGenerator
         from quail.backends.quail.executor.model import (
             full_output_head,
             load_model,
@@ -230,89 +196,35 @@ class PageParser:
         stops = {tokenizer.eos_token_id}
         generation = GenerationConfig.from_pretrained(path).eos_token_id
         stops.update(generation if isinstance(generation, list) else [generation])
-        self.stops = frozenset(s for s in stops if s is not None)
+        stops = frozenset(s for s in stops if s is not None)
         self.model = load_model(spec.hf_name, spec.revision,
-                                answer_token_ids=tuple(sorted(self.stops)),
-                                max_batched_tokens=prefill_tokens)
-        self.head = full_output_head(self.model)
+                                answer_token_ids=tuple(sorted(stops)),
+                                max_batched_tokens=budget)
         self.visual = self.model.visual
         self.merge = self.visual.spatial_merge_size
         self.image_token_id = self.model.config.image_token_id
         self.mean, self.std = _normalization(self.processor)
-        self.rows = rows
-        self.max_output_tokens = max_output_tokens
-        self.context_tokens = context_tokens
-        self.prefill_tokens = prefill_tokens
-        self.admit_pages = admit_pages
         self.encode_ahead = encode_ahead
         self.encode_batch = encode_batch
-        self.row_pages = -(-context_tokens // PAGE_TOKENS)
-        self.row_capacity = self.row_pages * PAGE_TOKENS
-        # one row past the last is scratch: a decode graph's padded rows
-        # write their KV there and read state slot 0, which the decode
-        # kernels skip
+        # every lane can hold a whole context, and one page is the
+        # decode graphs' scratch lane
+        lane_pages = -(-context_tokens // PAGE_TOKENS)
         self.arena = KVArena(
-            n_layers=spec.layers, n_pages=(rows + 1) * self.row_pages,
+            n_layers=spec.layers, n_pages=lanes * lane_pages + 1,
             page_tokens=PAGE_TOKENS, n_kv=spec.n_kv, d_head=spec.d_head,
             dtype=torch.bfloat16, layer_kv=spec.kv_shapes,
-            state_layers=spec.linear_layer_set, n_state_slots=rows + 1,
+            state_layers=spec.linear_layer_set, n_state_slots=lanes + 1,
             state_shape=spec.state_shape, conv_shape=spec.conv_shape)
         self.pipeline = build_pipeline(spec, self.model, self.arena)
-        self.table = torch.arange((rows + 1) * self.row_pages, dtype=torch.int32,
-                                  device="cuda").view(rows + 1, self.row_pages)
-        self._capture_decode()
+        self.generator = GreedyGenerator(
+            torch, self.arena, self.pipeline, full_output_head(self.model),
+            lanes=lanes, budget=budget, max_new_tokens=max_output_tokens,
+            context_tokens=context_tokens, stops=stops)
 
-    def _capture_decode(self):
-        """Capture the decode step as a CUDA graph per batch size.
-
-        The graphs read static input buffers; a step fills the first
-        rows of the smallest graph that holds its pages and pads the
-        rest onto the scratch row.
-        """
-        torch = self.torch
-        n = self.rows
-        self._pad = dict(ids=0, positions=0, dst=n * self.row_capacity, used=1,
-                         rows=n, slots=0)
-        dtypes = dict(ids=torch.int64, positions=torch.int64, dst=torch.int64,
-                      used=torch.int32, rows=torch.int64, slots=torch.int32)
-        sizes = dict(positions=3 * n)
-        self._host, self._device = {}, {}
-        for name, dtype in dtypes.items():
-            width = sizes.get(name, n)
-            self._host[name] = torch.full((width,), self._pad[name], dtype=dtype,
-                                          pin_memory=True)
-            self._device[name] = self._host[name].to("cuda")
-        self._out = torch.zeros(n, dtype=torch.int64, device="cuda")
-        self._cu = torch.arange(n + 1, dtype=torch.int32, device="cuda")
-        self._index = torch.arange(n, device="cuda")
-        self._sizes = sorted({min(1 << k, n) for k in range(n.bit_length() + 1)})
-        pool = torch.cuda.graph_pool_handle()
-        self._graphs = {}
-        with torch.inference_mode():
-            for size in reversed(self._sizes):
-                # the eager run compiles and tunes every kernel first
-                self._decode_rows(size)
-                torch.cuda.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=pool):
-                    self._decode_rows(size)
-                self._graphs[size] = graph
-        torch.cuda.synchronize()
-
-    def _decode_rows(self, size: int):
-        """One decode step over the first `size` rows of the static buffers."""
-        d = self._device
-        meta = dict(
-            unified=dict(
-                cu_q=self._cu[:size + 1], max_q=1, src=self._index[:size],
-                dst=d["dst"][:size], tail_src=None, used=d["used"][:size],
-                max_used=self.row_capacity,
-                table=self.table.index_select(0, d["rows"][:size])),
-            decode_slots=d["slots"][:size])
-        chunk = _Chunk(d["ids"][:size], d["positions"][:3 * size].view(3, size),
-                       meta, self._index[:size])
-        hidden = self.pipeline.forward_chunk(chunk)
-        self._out[:size].copy_((hidden @ self.head.t()).argmax(dim=-1))
+    @property
+    def stats(self) -> dict:
+        """The last run's step counts and times (see GreedyGenerator.run)."""
+        return self.generator.stats
 
     def prompt(self) -> str:
         """The transcription prompt: one image, no text, thinking off."""
@@ -326,102 +238,30 @@ class PageParser:
         Args:
             pages: Iterable of (key, prepare_page output) pairs.
         """
-        import time
+        from quail.backends.quail.executor.generate import Generation
 
-        self.stats = dict(wait_s=0.0, prefill_s=0.0, prefills=0,
-                          prefilled_tokens=0, decode_s=0.0, decode_steps=0,
-                          decode_rows=0)
-        stats = self.stats
         if self.encode_ahead:
             pages = self._encoded(pages)
-        pending = iter(pages)
-        waiting, active = None, {}
-        free = list(range(self.rows - 1, -1, -1))
-        exhausted = False
-        while True:
-            admit = []
-            budget = self.prefill_tokens
-            ready = not active or len(free) >= self.admit_pages
-            while ready and len(admit) < len(free) and not exhausted:
-                if waiting is None:
-                    started = time.perf_counter()
-                    waiting = next(pending, None)
-                    stats["wait_s"] += time.perf_counter() - started
-                    if waiting is None:
-                        exhausted = True
-                        break
-                size = waiting[1]["input_ids"].size
-                if admit and size > budget:
-                    break
-                admit.append(waiting)
-                budget -= size
-                waiting = None
-            if admit:
-                rows = [free.pop() for _ in admit]
-                started = time.perf_counter()
-                with self.torch.inference_mode():
-                    first = self._prefill(admit, rows)
-                stats["prefill_s"] += time.perf_counter() - started
-                stats["prefills"] += 1
-                stats["prefilled_tokens"] += sum(p["input_ids"].size
-                                               for _, p in admit)
-                for (key, page), row, token in zip(admit, rows, first):
-                    state = _Row(key, row, page["input_ids"].size, page["offset"],
-                                 [token])
-                    if self._done(state):
-                        free.append(row)
-                        yield key, state.tokens, state.prompt_tokens
-                    else:
-                        active[row] = state
-            if not active:
-                if exhausted and waiting is None:
-                    return
-                continue
-            states = list(active.values())
-            started = time.perf_counter()
-            with self.torch.inference_mode():
-                tokens = self._decode(states)
-            stats["decode_s"] += time.perf_counter() - started
-            stats["decode_steps"] += 1
-            stats["decode_rows"] += len(states)
-            for state, token in zip(states, tokens):
-                state.tokens.append(token)
-                if self._done(state):
-                    del active[state.row]
-                    free.append(state.row)
-                    yield state.key, state.tokens, state.prompt_tokens
+        prompts = {}
 
-    def _done(self, state) -> bool:
-        return (state.tokens[-1] in self.stops
-                or len(state.tokens) >= self.max_output_tokens
-                or state.prompt_tokens + len(state.tokens) >= self.context_tokens)
+        def generations():
+            for key, page in pages:
+                rope, offset = mrope_positions(
+                    page["input_ids"], page["grid"], self.image_token_id,
+                    self.merge)
+                prompts[key] = page["input_ids"].size
+                yield Generation(key, page["input_ids"].astype(np.int64), rope,
+                                 offset, image=partial(self._image_rows, page))
 
-    def _tensor(self, values, dtype):
-        torch = self.torch
-        return torch.as_tensor(values, dtype=dtype).pin_memory().to(
-            "cuda", non_blocking=True)
-
-    def _images(self, pages):
-        """Run the vision tower over the pages' patches; one tensor per page."""
-        import numpy as np
-        from vllm.config import set_current_vllm_config
-
-        torch = self.torch
-        patches = self._tensor(np.concatenate([p["patches"] for p in pages]),
-                               torch.uint8)
-        pixels = ((patches.to(torch.float32) / 255.0 - self.mean) / self.std)
-        grid = torch.tensor([p["grid"] for p in pages], dtype=torch.int64)
-        with set_current_vllm_config(self.model.quail_vllm_config):
-            embeds = self.visual(pixels.to(self.visual.dtype), grid_thw=grid)
-        sizes = (grid.prod(-1) // self.merge // self.merge).tolist()
-        return embeds.split(sizes)
+        for key, tokens in self.generator.run(generations()):
+            yield key, tokens, prompts.pop(key)
 
     def _encoded(self, pages):
         """Yield pages with their image rows, computed ahead in a thread.
 
         The thread runs the vision tower on its own CUDA stream and
-        records an event after each group; a prefill waits on the event
-        before it reads the rows.
+        records an event after each group; the step that prefills a
+        page waits on the event before it reads the rows.
         """
         import queue
         import threading
@@ -436,7 +276,7 @@ class PageParser:
             done = torch.cuda.Event()
             done.record(stream)
             for (_, page), rows in zip(group, embeds):
-                page["image_rows"], page["image_done"] = rows, done
+                page["image_embeds"], page["image_done"] = rows, done
             groups.put(group)
 
         def run():
@@ -461,84 +301,31 @@ class PageParser:
         if failure:
             raise failure[0]
 
-    def _image_rows(self, pages):
-        """The pages' image rows on this stream, computed ahead or now."""
+    def _image_rows(self, page):
+        """The page's image rows in its prompt and their embeddings, on this stream."""
         torch = self.torch
-        if not all("image_rows" in page for page in pages):
-            return torch.cat(self._images(pages))
+        rows = np.flatnonzero(page["input_ids"] == self.image_token_id)
+        if "image_embeds" not in page:
+            with torch.inference_mode():
+                return rows, self._images([page])[0]
         stream = torch.cuda.current_stream()
-        for page in pages:
-            stream.wait_event(page["image_done"])
-            # the rows were allocated on the encoding stream
-            page["image_rows"].record_stream(stream)
-        return torch.cat([page.pop("image_rows") for page in pages])
+        stream.wait_event(page.pop("image_done"))
+        embeds = page.pop("image_embeds")
+        # the rows were allocated on the encoding stream
+        embeds.record_stream(stream)
+        return rows, embeds
 
-    def _prefill(self, admitted, rows) -> list:
-        """Prefill new pages into their rows; returns each page's first token."""
-        import numpy as np
+    def _images(self, pages):
+        """Run the vision tower over the pages' patches; one tensor per page."""
+        from vllm.config import set_current_vllm_config
 
         torch = self.torch
-        pages = [page for _, page in admitted]
-        ids = np.concatenate([p["input_ids"] for p in pages])
-        lengths = [p["input_ids"].size for p in pages]
-        positions = []
-        for page in pages:
-            pos, page["offset"] = mrope_positions(
-                page["input_ids"], page["grid"], self.image_token_id, self.merge)
-            positions.append(pos)
-        input_ids = self._tensor(ids, torch.int64)
-        embeds = self.pipeline.embed(input_ids)
-        images = self._image_rows(pages)
-        embeds[input_ids == self.image_token_id] = images.to(embeds.dtype)
-        cu = np.concatenate([[0], np.cumsum(lengths)])
-        dst = np.concatenate([row * self.row_capacity + np.arange(n)
-                              for row, n in zip(rows, lengths)])
-        cu_q = self._tensor(cu, torch.int32)
-        slots = self._tensor([row + 1 for row in rows], torch.int64)
-        k = len(pages)
-        meta = dict(unified=dict(
-            cu_q=cu_q, max_q=max(lengths),
-            src=torch.arange(ids.size, device="cuda"),
-            dst=self._tensor(dst, torch.int64), tail_src=None,
-            used=self._tensor(lengths, torch.int32), max_used=max(lengths),
-            table=self.table.index_select(0, self._tensor(rows, torch.int64))),
-            state=dict(waves=[dict(
-                rows=None, cu=cu_q, n=k,
-                init=torch.zeros(k, dtype=torch.int64, device="cuda"),
-                has_init=torch.zeros(k, dtype=torch.bool, device="cuda"),
-                save_index=torch.arange(k, device="cuda"), save_slots=slots)]))
-        chunk = _Chunk(input_ids, self._tensor(np.concatenate(positions, axis=1),
-                                               torch.int64),
-                       meta, self._tensor(cu[1:] - 1, torch.int64), embeds)
-        return self._next_tokens(chunk)
-
-    def _decode(self, states) -> list:
-        """One token for every page in flight, by replaying a captured graph."""
-        n = len(states)
-        size = next(s for s in self._sizes if s >= n)
-        lengths = [s.prompt_tokens + len(s.tokens) - 1 for s in states]
-        values = dict(
-            ids=[s.tokens[-1] for s in states],
-            dst=[s.row * self.row_capacity + length
-                 for s, length in zip(states, lengths)],
-            used=[length + 1 for length in lengths],
-            rows=[s.row for s in states],
-            slots=[s.row + 1 for s in states])
-        for name, value in values.items():
-            host = self._host[name].numpy()
-            host[:n] = value
-            host[n:size] = self._pad[name]
-            self._device[name][:size].copy_(self._host[name][:size],
-                                            non_blocking=True)
-        positions = self._host["positions"].numpy()[:3 * size].reshape(3, size)
-        positions[:, :n] = [length + s.offset for length, s in zip(lengths, states)]
-        positions[:, n:] = 0
-        self._device["positions"][:3 * size].copy_(
-            self._host["positions"][:3 * size], non_blocking=True)
-        self._graphs[size].replay()
-        return self._out[:n].tolist()
-
-    def _next_tokens(self, chunk) -> list:
-        """The greedy next token after each final row of the chunk."""
-        hidden = self.pipeline.forward_chunk(chunk)
-        return (hidden @ self.head.t()).argmax(dim=-1).tolist()
+        patches = torch.as_tensor(
+            np.concatenate([p["patches"] for p in pages])).pin_memory().to(
+                "cuda", non_blocking=True)
+        pixels = ((patches.to(torch.float32) / 255.0 - self.mean) / self.std)
+        grid = torch.tensor([p["grid"] for p in pages], dtype=torch.int64)
+        with set_current_vllm_config(self.model.quail_vllm_config):
+            embeds = self.visual(pixels.to(self.visual.dtype), grid_thw=grid)
+        sizes = (grid.prod(-1) // self.merge // self.merge).tolist()
+        return embeds.split(sizes)

@@ -17,11 +17,9 @@ Run from the repository root and tee every line:
 --encode-ahead 0 runs the vision tower inside each prefill instead of
 in a thread on its own stream.
 
-Modes: smoke parses the first 20 pages; run parses every page;
-profile times prefill calls of one and of five pages, with and without
-the vision tower, and lists the kernels of one five-page prefill.
+Modes: smoke parses the first 20 pages; run parses every page.
 
-Writes /results/ablations/lightonocr_parsebench/quail_<mode>_<rows>_<run
+Writes /results/ablations/lightonocr_parsebench/quail_<mode>_<lanes>_<run
 id>.parquet (one record per page) and .json (the summary).
 """
 
@@ -51,12 +49,11 @@ PAGES_PATH = f"{OUT_DIR}/pages.parquet"
 VLLM_RUN = f"{OUT_DIR}/vllm_run_256_20261012T003224Z-64e10e.parquet"
 MAX_OUTPUT_TOKENS = 4096
 CONTEXT_TOKENS = 8448
-PREFILL_TOKENS = 16384
-ADMIT_PAGES = 5
+# rows per step, decode rows included: vLLM's max_num_batched_tokens
+# in the baseline runs
+BUDGET = 16384
 ENCODE_AHEAD = 16
 SMOKE_PAGES = 20
-PROFILE_PAGES = 40
-PROFILE_CALLS = 5
 WORKERS = 24
 WINDOW = 96
 
@@ -100,7 +97,7 @@ def _agreement(records) -> dict:
 
 @app.function(image=image, gpu="H100!", cpu=32, memory=131072,
               timeout=2 * 3600, volumes=volumes)
-def parse(mode: str, rows: int, run_id: str, encode_ahead: int) -> dict:
+def parse(mode: str, lanes: int, run_id: str, encode_ahead: int) -> dict:
     """Parse pages on Quail's executor and save every output."""
     import subprocess
     from pathlib import Path
@@ -121,17 +118,14 @@ def parse(mode: str, rows: int, run_id: str, encode_ahead: int) -> dict:
         add_generation_prompt=True, enable_thinking=False)
     # the workers start while the model loads
     preparer = PagePreparer(path, prompt, workers=WORKERS)
-    parser = PageParser(spec, rows=rows, max_output_tokens=MAX_OUTPUT_TOKENS,
-                        context_tokens=CONTEXT_TOKENS,
-                        prefill_tokens=PREFILL_TOKENS,
-                        admit_pages=ADMIT_PAGES, encode_ahead=encode_ahead)
+    parser = PageParser(spec, lanes=lanes, max_output_tokens=MAX_OUTPUT_TOKENS,
+                        context_tokens=CONTEXT_TOKENS, budget=BUDGET,
+                        encode_ahead=encode_ahead)
     if prompt != parser.prompt():
         raise ValueError("the workers' prompt differs from the parser's")
     for future in preparer.started:
         future.result()
     load_s = time.perf_counter() - started
-    if mode == "profile":
-        return _profile_prefill(parser, preparer, run_id)
     limit = SMOKE_PAGES if mode == "smoke" else None
     sampler = subprocess.Popen(
         ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits",
@@ -154,9 +148,9 @@ def parse(mode: str, rows: int, run_id: str, encode_ahead: int) -> dict:
                                           skip_special_tokens=True)
     output_tokens = sum(r["output_tokens"] for r in records)
     summary = dict(
-        run_id=run_id, mode=mode, model=MODEL, backend="quail", rows=rows,
+        run_id=run_id, mode=mode, model=MODEL, backend="quail", lanes=lanes,
         max_output_tokens=MAX_OUTPUT_TOKENS, context_tokens=CONTEXT_TOKENS,
-        prefill_tokens=PREFILL_TOKENS, admit_pages=ADMIT_PAGES,
+        budget=BUDGET,
         encode_ahead=encode_ahead, workers=WORKERS, sampling="greedy",
         load_s=load_s, pages=len(records), wall_s=wall_s,
         pages_per_s=len(records) / wall_s, output_tokens=output_tokens,
@@ -166,7 +160,7 @@ def parse(mode: str, rows: int, run_id: str, encode_ahead: int) -> dict:
                                 if r["output_tokens"] >= MAX_OUTPUT_TOKENS),
         gpu_utilization_mean=sum(utilization) / max(len(utilization), 1),
         compared_with=VLLM_RUN, **parser.stats, **_agreement(records))
-    stem = f"{OUT_DIR}/quail_{mode}_{rows}_{run_id}"
+    stem = f"{OUT_DIR}/quail_{mode}_{lanes}_{run_id}"
     Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(records), f"{stem}.parquet")
     Path(f"{stem}.json").write_text(json.dumps(summary, indent=1))
@@ -179,59 +173,12 @@ def parse(mode: str, rows: int, run_id: str, encode_ahead: int) -> dict:
     return summary
 
 
-def _profile_prefill(parser, preparer, run_id) -> dict:
-    """Time prefill calls of one and of five pages and list their kernels."""
-    import torch
-
-    pages = list(preparer.pages(_pages(PROFILE_PAGES), window=WINDOW))
-    preparer.close()
-    result = dict(run_id=run_id, mode="profile")
-    with torch.inference_mode():
-        parser._prefill(pages[:5], list(range(5)))
-        for size in (1, 5):
-            torch.cuda.synchronize()
-            started = time.perf_counter()
-            for i in range(PROFILE_CALLS):
-                batch = pages[5 + i * size:5 + (i + 1) * size]
-                parser._prefill(batch, list(range(size)))
-            torch.cuda.synchronize()
-            result[f"prefill_ms_{size}_pages"] = (
-                (time.perf_counter() - started) * 1e3 / PROFILE_CALLS)
-            started = time.perf_counter()
-            for i in range(PROFILE_CALLS):
-                batch = pages[5 + i * size:5 + (i + 1) * size]
-                parser._images([page for _, page in batch])
-            torch.cuda.synchronize()
-            result[f"vision_ms_{size}_pages"] = (
-                (time.perf_counter() - started) * 1e3 / PROFILE_CALLS)
-        batch = pages[5:10]
-        with torch.profiler.profile(activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA]) as profiler:
-            parser._prefill(batch, list(range(5)))
-            torch.cuda.synchronize()
-    kernels = []
-    for event in profiler.key_averages():
-        gpu_us = getattr(event, "self_device_time_total", 0)
-        if gpu_us > 0:
-            kernels.append((gpu_us, event.count, event.key[:100]))
-    kernels.sort(reverse=True)
-    result["profiled_gpu_ms"] = sum(k[0] for k in kernels) / 1e3
-    result["kernels"] = [f"{us / 1e3:8.2f} ms {n:5}x {name}"
-                         for us, n, name in kernels[:30]]
-    result["cpu_ops"] = [
-        f"{e.self_cpu_time_total / 1e3:8.2f} ms {e.count:5}x {e.key[:80]}"
-        for e in sorted(profiler.key_averages(),
-                        key=lambda e: -e.self_cpu_time_total)[:20]]
-    return result
-
-
 @app.local_entrypoint()
-def main(mode: str = "smoke", rows: int = 256, encode_ahead: int = ENCODE_AHEAD,
+def main(mode: str = "smoke", lanes: int = 256, encode_ahead: int = ENCODE_AHEAD,
          prediction: str = ""):
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
     print(f"prediction: {prediction}", flush=True)
     print(f"run id: {run_id}", flush=True)
-    call = parse.spawn(mode, rows, run_id, encode_ahead)
+    call = parse.spawn(mode, lanes, run_id, encode_ahead)
     print(f"function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=1, default=str), flush=True)

@@ -114,7 +114,8 @@ class Qwen35Pipeline(ModelPipeline):
         """
         engine = self.engine
         meta = chunk.meta
-        positions = chunk.positions
+        rope = getattr(chunk, "rope_positions", None)
+        positions = chunk.positions if rope is None else rope
         # a chunk with image rows carries its embeddings, the vision
         # tower's rows already written over the image tokens'
         embeds = getattr(chunk, "inputs_embeds", None)
@@ -187,22 +188,26 @@ class Qwen35Pipeline(ModelPipeline):
         qkv_size = 2 * linear.key_dim + linear.value_dim
         mixed_qkv, z = mixed_qkvz.split([qkv_size, linear.value_dim], dim=-1)
         b, a = ba.chunk(2, dim=-1)
-        slots = meta.get("decode_slots")
-        if slots is not None:
-            core = self._decode(linear, mixed_qkv, a.contiguous(), b.contiguous(),
-                                slots, self.arena.state_pools(layer))
-            head = linear.head_v_dim
-            gated = linear.norm(core.reshape(-1, head), z.reshape(-1, head))
-            return engine.gemm(*engine.quant(gated.reshape(n, -1)),
-                               linear.out_proj)
         plan = meta.get("state")
         if plan is None:
             # an arena without state slots: every sequence starts from
             # the zero state and saves nothing
-            waves, pools = [self._zero_wave(meta)], None
+            waves, pools, decode = [self._zero_wave(meta)], None, None
         else:
             waves, pools = plan["waves"], self.arena.state_pools(layer)
+            decode = plan.get("decode")
         core = torch.empty((n, linear.value_dim), dtype=x.dtype, device=x.device)
+        if decode is not None:
+            rows = decode["rows"]
+            if rows is None:
+                # every row of the chunk is a decode row, in order
+                core = self._decode(linear, mixed_qkv, a.contiguous(),
+                                    b.contiguous(), decode["slots"], pools)
+            else:
+                core.index_copy_(0, rows, self._decode(
+                    linear, mixed_qkv.index_select(0, rows),
+                    a.index_select(0, rows), b.index_select(0, rows),
+                    decode["slots"], pools))
         for wave in waves:
             out = self._wave(linear, wave, mixed_qkv, a, b, pools)
             if wave["rows"] is None:
@@ -273,7 +278,7 @@ class Qwen35Pipeline(ModelPipeline):
         return out.squeeze(0).reshape(out.shape[1], -1)
 
     def _decode(self, linear, mixed_qkv, a, b, slots, pools):
-        """One token per sequence, each sequence's state updated in its slot.
+        """One row per sequence, each sequence's state updated in its slot.
 
         The conv window and the recurrent state are read from and
         written back to the pools in place, as vLLM's decode step does.
