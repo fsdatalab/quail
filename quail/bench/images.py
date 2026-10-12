@@ -36,16 +36,20 @@ def _cuda_base() -> modal.Image:
             .env(CACHE_ENV))
 
 
-def gpu_image(*local_dirs: tuple[str, str]) -> modal.Image:
+def gpu_image(*local_dirs: tuple[str, str],
+              packages: tuple[str, ...] = ()) -> modal.Image:
     """The GPU image: quail's locked dependencies and the dev group.
 
     Args:
         local_dirs: (local path, remote path) pairs mounted after the
             quail source; Modal refuses a build step after a mount.
+        packages: Pinned requirements installed before the quail
+            source, for a cell that needs a package Quail does not.
     """
-    image = (_cuda_base()
-             .uv_sync(groups=["dev"], uv_version=UV_VERSION)
-             .add_local_python_source("quail"))
+    image = _cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
+    if packages:
+        image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
+    image = image.add_local_python_source("quail")
     for local, remote in local_dirs:
         image = image.add_local_dir(local, remote_path=remote)
     return image
@@ -74,10 +78,17 @@ def sglang_image() -> modal.Image:
             .add_local_python_source("quail"))
 
 
-def cpu_image() -> modal.Image:
-    """The CPU image: the locked dependencies without the GPU stack."""
-    return (modal.Image.debian_slim(python_version="3.12")
-            .apt_install("git")
-            .uv_sync(groups=["dev"], uv_version=UV_VERSION,
-                     extra_options="--no-install-package vllm")
-            .add_local_python_source("quail"))
+def cpu_image(packages: tuple[str, ...] = ()) -> modal.Image:
+    """The CPU image: the locked dependencies without the GPU stack.
+
+    Args:
+        packages: Pinned requirements installed before the quail
+            source, for a cell that needs a package Quail does not.
+    """
+    image = (modal.Image.debian_slim(python_version="3.12")
+             .apt_install("git")
+             .uv_sync(groups=["dev"], uv_version=UV_VERSION,
+                      extra_options="--no-install-package vllm"))
+    if packages:
+        image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
+    return image.add_local_python_source("quail")
