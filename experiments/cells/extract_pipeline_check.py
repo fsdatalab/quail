@@ -4,9 +4,10 @@ Runs queries over the 45 CUAD contracts of scale factor 0.1 on Qwen3
 4B, through the Quail backend, each a pipeline of extractions: A asks
 the governing law, the agreement date, and the governing law again; B
 the governing law alone; C the agreement date alone; D the governing
-law twice; E the governing law then the agreement date. A and D run
-again on the unified attention path. For every contract and question
-it saves the lines the model named, the none and best start log
+law twice; E the governing law then the agreement date. Every query
+runs on the tree attention path and again on the unified path, and
+each question is compared with the same question alone on its path.
+For every contract and question it saves the lines the model named, the none and best start log
 probabilities at the cue, and the answer, under
 /results/extract_pipeline_check/.
 
@@ -105,7 +106,7 @@ def run_check(run: str) -> dict:
     session.register("contracts", quail.DocumentProvider.from_table(
         contracts, id_col="id"))
     results = {}
-    for attention, names in (("tree", "ABCDE"), ("unified", "AD")):
+    for attention, names in (("tree", "ABCDE"), ("unified", "ABCDE")):
         forced["attention"] = attention
         for name in names:
             questions = queries[name]
@@ -130,17 +131,19 @@ def run_check(run: str) -> dict:
         return {s["document"]: s for s in results[label]["state"]
                 if s["question"] == q}
 
-    pairs = {
-        "A.q0 vs B": (("A", 0), ("B", 0)),
-        "A.q1 vs C": (("A", 1), ("C", 0)),
-        "A.q2 vs B": (("A", 2), ("B", 0)),
-        "D.q1 vs B": (("D", 1), ("B", 0)),
-        "E.q1 vs C": (("E", 1), ("C", 0)),
-        "A.unified.q0 vs B": (("A.unified", 0), ("B", 0)),
-        "A.unified.q1 vs C": (("A.unified", 1), ("C", 0)),
-        "A.unified.q2 vs B": (("A.unified", 2), ("B", 0)),
-        "D.unified.q1 vs B": (("D.unified", 1), ("B", 0)),
-    }
+    pairs = {}
+    for path, suffix in (("tree", ""), ("unified", ".unified")):
+        standalone = {"law": (f"B{suffix}", 0), "date": (f"C{suffix}", 0)}
+        for name, questions in queries.items():
+            for q, question in enumerate(questions):
+                if q == 0 and name in "BC":
+                    continue
+                alone = standalone["law" if question == law else "date"]
+                pairs[f"{name}{suffix}.q{q} vs {alone[0]}"] = (
+                    (f"{name}{suffix}", q), alone)
+            if len(questions) > 1 and questions[0] == questions[-1]:
+                pairs[f"{name}{suffix}.q{len(questions) - 1} vs q0"] = (
+                    (f"{name}{suffix}", len(questions) - 1), (f"{name}{suffix}", 0))
     comparison = {}
     for label, (mine_ref, other_ref) in pairs.items():
         mine, other = rows(*mine_ref), rows(*other_ref)
