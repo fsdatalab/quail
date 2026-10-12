@@ -216,15 +216,71 @@ class PageParser:
         self.prefill_tokens = prefill_tokens
         self.row_pages = -(-context_tokens // PAGE_TOKENS)
         self.row_capacity = self.row_pages * PAGE_TOKENS
+        # one row past the last is scratch: a decode graph's padded rows
+        # write their KV there and read state slot 0, which the decode
+        # kernels skip
         self.arena = KVArena(
-            n_layers=spec.layers, n_pages=rows * self.row_pages,
+            n_layers=spec.layers, n_pages=(rows + 1) * self.row_pages,
             page_tokens=PAGE_TOKENS, n_kv=spec.n_kv, d_head=spec.d_head,
             dtype=torch.bfloat16, layer_kv=spec.kv_shapes,
             state_layers=spec.linear_layer_set, n_state_slots=rows + 1,
             state_shape=spec.state_shape, conv_shape=spec.conv_shape)
         self.pipeline = build_pipeline(spec, self.model, self.arena)
-        self.table = torch.arange(rows * self.row_pages, dtype=torch.int32,
-                                  device="cuda").view(rows, self.row_pages)
+        self.table = torch.arange((rows + 1) * self.row_pages, dtype=torch.int32,
+                                  device="cuda").view(rows + 1, self.row_pages)
+        self._capture_decode()
+
+    def _capture_decode(self):
+        """Capture the decode step as a CUDA graph per batch size.
+
+        The graphs read static input buffers; a step fills the first
+        rows of the smallest graph that holds its pages and pads the
+        rest onto the scratch row.
+        """
+        torch = self.torch
+        n = self.rows
+        self._pad = dict(ids=0, positions=0, dst=n * self.row_capacity, used=1,
+                         rows=n, slots=0)
+        dtypes = dict(ids=torch.int64, positions=torch.int64, dst=torch.int64,
+                      used=torch.int32, rows=torch.int64, slots=torch.int32)
+        sizes = dict(positions=3 * n)
+        self._host, self._device = {}, {}
+        for name, dtype in dtypes.items():
+            width = sizes.get(name, n)
+            self._host[name] = torch.full((width,), self._pad[name], dtype=dtype,
+                                          pin_memory=True)
+            self._device[name] = self._host[name].to("cuda")
+        self._out = torch.zeros(n, dtype=torch.int64, device="cuda")
+        self._cu = torch.arange(n + 1, dtype=torch.int32, device="cuda")
+        self._index = torch.arange(n, device="cuda")
+        self._sizes = sorted({min(1 << k, n) for k in range(n.bit_length() + 1)})
+        pool = torch.cuda.graph_pool_handle()
+        self._graphs = {}
+        with torch.inference_mode():
+            for size in reversed(self._sizes):
+                # the eager run compiles and tunes every kernel first
+                self._decode_rows(size)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=pool):
+                    self._decode_rows(size)
+                self._graphs[size] = graph
+        torch.cuda.synchronize()
+
+    def _decode_rows(self, size: int):
+        """One decode step over the first `size` rows of the static buffers."""
+        d = self._device
+        meta = dict(
+            unified=dict(
+                cu_q=self._cu[:size + 1], max_q=1, src=self._index[:size],
+                dst=d["dst"][:size], tail_src=None, used=d["used"][:size],
+                max_used=self.row_capacity,
+                table=self.table.index_select(0, d["rows"][:size])),
+            decode_slots=d["slots"][:size])
+        chunk = _Chunk(d["ids"][:size], d["positions"][:3 * size].view(3, size),
+                       meta, self._index[:size])
+        hidden = self.pipeline.forward_chunk(chunk)
+        self._out[:size].copy_((hidden @ self.head.t()).argmax(dim=-1))
 
     def prompt(self) -> str:
         """The transcription prompt: one image, no text, thinking off."""
@@ -348,29 +404,30 @@ class PageParser:
         return self._next_tokens(chunk)
 
     def _decode(self, states) -> list:
-        """One token for every page in flight."""
-        torch = self.torch
+        """One token for every page in flight, by replaying a captured graph."""
         n = len(states)
-        rows = [s.row for s in states]
+        size = next(s for s in self._sizes if s >= n)
         lengths = [s.prompt_tokens + len(s.tokens) - 1 for s in states]
-        position = [length + s.offset for length, s in zip(lengths, states)]
-        meta = dict(
-            unified=dict(
-                cu_q=torch.arange(n + 1, dtype=torch.int32, device="cuda"),
-                max_q=1, src=torch.arange(n, device="cuda"),
-                dst=self._tensor([row * self.row_capacity + length
-                                  for row, length in zip(rows, lengths)],
-                                 torch.int64),
-                tail_src=None,
-                used=self._tensor([length + 1 for length in lengths],
-                                  torch.int32),
-                max_used=max(lengths) + 1,
-                table=self.table.index_select(0, self._tensor(rows, torch.int64))),
-            decode_slots=self._tensor([row + 1 for row in rows], torch.int32))
-        chunk = _Chunk(self._tensor([s.tokens[-1] for s in states], torch.int64),
-                       self._tensor([position] * 3, torch.int64), meta,
-                       torch.arange(n, device="cuda"))
-        return self._next_tokens(chunk)
+        values = dict(
+            ids=[s.tokens[-1] for s in states],
+            dst=[s.row * self.row_capacity + length
+                 for s, length in zip(states, lengths)],
+            used=[length + 1 for length in lengths],
+            rows=[s.row for s in states],
+            slots=[s.row + 1 for s in states])
+        for name, value in values.items():
+            host = self._host[name].numpy()
+            host[:n] = value
+            host[n:size] = self._pad[name]
+            self._device[name][:size].copy_(self._host[name][:size],
+                                            non_blocking=True)
+        positions = self._host["positions"].numpy()[:3 * size].reshape(3, size)
+        positions[:, :n] = [length + s.offset for length, s in zip(lengths, states)]
+        positions[:, n:] = 0
+        self._device["positions"][:3 * size].copy_(
+            self._host["positions"][:3 * size], non_blocking=True)
+        self._graphs[size].replay()
+        return self._out[:n].tolist()
 
     def _next_tokens(self, chunk) -> list:
         """The greedy next token after each final row of the chunk."""
