@@ -16,9 +16,12 @@ with greedy decoding and at most 4,096 output tokens.
   image processor in add_request, as it does by default.
 
 Each pass runs in its own process, so the GPU starts empty, and warms
-up on 8 pages before the timed query. The passes run vLLM, Quail,
-vLLM, Quail on one H100, so both engines see the same GPU and host
-twice. Query time excludes model startup and the warm-up.
+up on 8 pages before the timed query. By default the passes run vLLM,
+Quail, vLLM, Quail on one H100, so both engines see the same GPU and
+host twice. ``--order`` lists other passes, such as
+quail:24,quail:12,quail:24,quail:12 to compare Quail's page-preparing
+worker counts; each Quail pass reports the generator's time split.
+Query time excludes model startup and the warm-up.
 
 Run from the repository root and tee every line:
 
@@ -63,7 +66,8 @@ SQL = "SELECT p.path, p.page, AI.PARSE(p.document) AS text FROM pages p"
 WARM_SQL = SQL + " LIMIT 8"
 WARM_PAGES = 8
 SMOKE_FILES = 20
-ORDER = ("vllm", "quail", "vllm", "quail")
+# the default passes; "quail:<n>" runs Quail with n page-preparing workers
+ORDER = "vllm,quail,vllm,quail"
 # vLLM's settings in the ParseBench runs, and Quail's OCR settings
 MAX_NUM_SEQS = 256
 MAX_BATCHED_TOKENS = 16384
@@ -231,7 +235,9 @@ def _quail_pass(files, stem) -> dict:
                 pages=len(rows), input_tokens=parse.get("parse_input_tokens"),
                 output_tokens=parse.get("parse_output_tokens"),
                 truncated_pages=parse.get("parse_truncated_pages"),
-                gpu_utilization_mean=sampler.mean)
+                gpu_utilization_mean=sampler.mean,
+                **{name: value for name, value in parse.items()
+                   if name.startswith("generator_") or name == "prepare_workers"})
 
 
 def _agreement(a, b) -> int:
@@ -246,23 +252,40 @@ def _agreement(a, b) -> int:
 
 @app.function(image=image, gpu="H100!", cpu=32, memory=131072,
               timeout=3 * 3600, volumes=volumes)
-def compare(mode: str, run_id: str) -> dict:
-    """Run the passes in ORDER, each in its own process, and compare them."""
+def compare(mode: str, run_id: str, order: str) -> dict:
+    """Run the passes in order, each in its own process, and compare them.
+
+    Args:
+        mode: smoke or run.
+        run_id: The run id.
+        order: Comma-separated passes: vllm, quail, or quail:<workers>.
+    """
+    import os
     from pathlib import Path
 
+    order = order.split(",")
+    lscpu = subprocess.run(["lscpu"], capture_output=True, text=True).stdout
+    host = dict(cpus=os.cpu_count(), cpu_model=next(
+        (line.split(":", 1)[1].strip() for line in lscpu.splitlines()
+         if line.startswith("Model name")), None))
+    print(json.dumps(host), flush=True)
     files = _files(SMOKE_FILES if mode == "smoke" else None)
     Path("/tmp/files.json").write_text(json.dumps(files))
     Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
     passes, stems = [], []
-    for index, engine in enumerate(ORDER):
+    for index, name in enumerate(order):
+        engine, _, workers = name.partition(":")
         stem = f"{OUT_DIR}/{engine}_{index}_{mode}_{run_id}"
         out = f"/tmp/pass_{index}.json"
-        print(f"pass {index}: {engine}", flush=True)
+        env = dict(os.environ)
+        if workers:
+            env["QUAIL_OCR_WORKERS"] = workers
+        print(f"pass {index}: {name}", flush=True)
         subprocess.run([sys.executable, __file__, engine, "/tmp/files.json", stem, out],
-                       check=True)
+                       check=True, env=env)
         result = json.loads(Path(out).read_text())
         seconds = result["query_s"]
-        result.update(pass_index=index,
+        result.update(pass_index=index, pass_name=name,
                       usd_per_query=seconds / 3600 * H100_USD_PER_HOUR,
                       input_tokens_per_second=result["input_tokens"] / seconds,
                       pages_per_second=result["pages"] / seconds)
@@ -270,14 +293,11 @@ def compare(mode: str, run_id: str) -> dict:
         passes.append(result)
         stems.append(stem)
         results_vol.commit()
-    vllm = [i for i, engine in enumerate(ORDER) if engine == "vllm"]
-    ours = [i for i, engine in enumerate(ORDER) if engine == "quail"]
     summary = dict(
-        run_id=run_id, mode=mode, files=len(files), order=list(ORDER),
+        run_id=run_id, mode=mode, files=len(files), order=order, host=host,
         passes=passes,
-        identical_quail_vs_vllm=_agreement(stems[vllm[0]], stems[ours[0]]),
-        identical_vllm_vs_vllm=_agreement(stems[vllm[0]], stems[vllm[1]]),
-        identical_quail_vs_quail=_agreement(stems[ours[0]], stems[ours[1]]))
+        # pages each pass shares, word for word, with the first pass
+        identical_to_first_pass=[_agreement(stems[0], stem) for stem in stems])
     path = f"{OUT_DIR}/summary_{mode}_{run_id}.json"
     Path(path).write_text(json.dumps(summary, indent=1))
     results_vol.commit()
@@ -286,11 +306,11 @@ def compare(mode: str, run_id: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(mode: str = "smoke", prediction: str = ""):
+def main(mode: str = "smoke", order: str = ORDER, prediction: str = ""):
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
     print(f"prediction: {prediction}", flush=True)
     print(f"run id: {run_id}", flush=True)
-    call = compare.spawn(mode, run_id)
+    call = compare.spawn(mode, run_id, order)
     print(f"function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=1, default=str), flush=True)
 

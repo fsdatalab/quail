@@ -142,7 +142,7 @@ class LoadedGpu:
         An OCR parser loads into the memory the plan left beside the
         reader's arena, after bind_query resized it.
         """
-        from quail.parsers import LIGHTONOCR, PDFIUM, PdfiumParser
+        from quail.parsers import LIGHTONOCR, PDFIUM, PdfiumParser, ocr_workers
 
         key = (node.parser, node.lanes)
         if key not in self._parsers:
@@ -159,7 +159,8 @@ class LoadedGpu:
 
                 self.torch.cuda.empty_cache()
                 t0 = time.perf_counter()
-                parser = RowParser(MODELS[LIGHTONOCR], lanes=node.lanes)
+                parser = RowParser(MODELS[LIGHTONOCR], lanes=node.lanes,
+                                   workers=ocr_workers())
                 say(f"parser {LIGHTONOCR} loaded in "
                     f"{time.perf_counter() - t0:.1f} s, {node.lanes} lanes")
             else:

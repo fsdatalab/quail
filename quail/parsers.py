@@ -142,12 +142,21 @@ OCR_CONTEXT_TOKENS = 8448
 OCR_STEP_TOKENS = 16384
 OCR_MAX_LANES = 256
 OCR_LONGEST_EDGE = 2048
+# processes that render pages and run the image processor
+OCR_WORKERS = 24
 # memory for the vision tower's activations on one batch of pages,
 # outside the parser's arena and step activations
 OCR_VISION_BYTES = 2 * 2**30
 # the share of memory left after both models' weights that the parser
 # may take; the reader keeps the rest
 OCR_MEMORY_SHARE = 0.5
+
+
+def ocr_workers() -> int:
+    """The OCR parser's page-preparing processes: QUAIL_OCR_WORKERS, or OCR_WORKERS."""
+    import os
+
+    return int(os.environ.get("QUAIL_OCR_WORKERS", OCR_WORKERS))
 
 
 def ocr_lane_bytes(model) -> float:

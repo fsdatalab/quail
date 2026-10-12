@@ -406,6 +406,7 @@ class RowParser:
             [{"role": "user", "content": [{"type": "image"}]}], tokenize=False,
             add_generation_prompt=True, enable_thinking=False)
         # the workers start while the model loads
+        self.workers = workers
         self.preparer = PagePreparer(path, prompt, workers=workers)
         self.window = window
         self.max_output_tokens = OCR_MAX_OUTPUT_TOKENS
@@ -455,6 +456,12 @@ class RowParser:
                 del texts[key]
                 yield key, PAGE_SEPARATOR.join(row)
         stats["parse_decode_steps"] = self.pages.stats.get("decode_steps", 0)
+        # the generator's split of the time: waiting for prepared pages
+        # and image rows, prefill passes, and decode steps
+        stats.update({f"generator_{name}": value
+                      for name, value in self.pages.stats.items()
+                      if isinstance(value, (int, float))})
+        stats["prepare_workers"] = self.workers
         stats["parse_s"] = time.perf_counter() - started
 
     def close(self) -> None:
