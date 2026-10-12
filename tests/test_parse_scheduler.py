@@ -23,6 +23,7 @@ class _Parser(PageParser):
         self.context_tokens = 1000
         self.stops = frozenset({STOP})
         self.admit_pages = 1
+        self.encode_ahead = 0
         self.holding = {}
         self.most_in_flight = 0
 

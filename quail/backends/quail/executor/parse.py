@@ -201,11 +201,16 @@ class PageParser:
             while other pages are decoding; a prefill's cost is mostly
             per call, so one page at a time costs about twice as much
             per page as five.
+        encode_ahead: Pages whose image rows a thread computes ahead,
+            on its own CUDA stream, so the vision tower runs beside the
+            decode steps; 0 runs the tower inside each prefill.
+        encode_batch: Pages per vision tower call in that thread.
     """
 
     def __init__(self, spec, *, rows: int, max_output_tokens: int,
                  context_tokens: int, prefill_tokens: int,
-                 admit_pages: int = 1):
+                 admit_pages: int = 1, encode_ahead: int = 0,
+                 encode_batch: int = 4):
         import torch
         from transformers import AutoProcessor, GenerationConfig
 
@@ -239,6 +244,8 @@ class PageParser:
         self.context_tokens = context_tokens
         self.prefill_tokens = prefill_tokens
         self.admit_pages = admit_pages
+        self.encode_ahead = encode_ahead
+        self.encode_batch = encode_batch
         self.row_pages = -(-context_tokens // PAGE_TOKENS)
         self.row_capacity = self.row_pages * PAGE_TOKENS
         # one row past the last is scratch: a decode graph's padded rows
@@ -325,6 +332,8 @@ class PageParser:
                           prefilled_tokens=0, decode_s=0.0, decode_steps=0,
                           decode_rows=0)
         stats = self.stats
+        if self.encode_ahead:
+            pages = self._encoded(pages)
         pending = iter(pages)
         waiting, active = None, {}
         free = list(range(self.rows - 1, -1, -1))
@@ -407,6 +416,63 @@ class PageParser:
         sizes = (grid.prod(-1) // self.merge // self.merge).tolist()
         return embeds.split(sizes)
 
+    def _encoded(self, pages):
+        """Yield pages with their image rows, computed ahead in a thread.
+
+        The thread runs the vision tower on its own CUDA stream and
+        records an event after each group; a prefill waits on the event
+        before it reads the rows.
+        """
+        import queue
+        import threading
+
+        torch = self.torch
+        stream = torch.cuda.Stream()
+        groups = queue.Queue(maxsize=max(1, self.encode_ahead // self.encode_batch))
+        failure = []
+
+        def encode(group):
+            embeds = self._images([page for _, page in group])
+            done = torch.cuda.Event()
+            done.record(stream)
+            for (_, page), rows in zip(group, embeds):
+                page["image_rows"], page["image_done"] = rows, done
+            groups.put(group)
+
+        def run():
+            try:
+                with torch.cuda.stream(stream), torch.inference_mode():
+                    group = []
+                    for item in pages:
+                        group.append(item)
+                        if len(group) == self.encode_batch:
+                            encode(group)
+                            group = []
+                    if group:
+                        encode(group)
+            except BaseException as error:
+                failure.append(error)
+            finally:
+                groups.put(None)
+
+        threading.Thread(target=run, daemon=True).start()
+        while (group := groups.get()) is not None:
+            yield from group
+        if failure:
+            raise failure[0]
+
+    def _image_rows(self, pages):
+        """The pages' image rows on this stream, computed ahead or now."""
+        torch = self.torch
+        if not all("image_rows" in page for page in pages):
+            return torch.cat(self._images(pages))
+        stream = torch.cuda.current_stream()
+        for page in pages:
+            stream.wait_event(page["image_done"])
+            # the rows were allocated on the encoding stream
+            page["image_rows"].record_stream(stream)
+        return torch.cat([page.pop("image_rows") for page in pages])
+
     def _prefill(self, admitted, rows) -> list:
         """Prefill new pages into their rows; returns each page's first token."""
         import numpy as np
@@ -422,7 +488,7 @@ class PageParser:
             positions.append(pos)
         input_ids = self._tensor(ids, torch.int64)
         embeds = self.pipeline.embed(input_ids)
-        images = torch.cat(self._images(pages))
+        images = self._image_rows(pages)
         embeds[input_ids == self.image_token_id] = images.to(embeds.dtype)
         cu = np.concatenate([[0], np.cumsum(lengths)])
         dst = np.concatenate([row * self.row_capacity + np.arange(n)

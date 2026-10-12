@@ -14,6 +14,9 @@ Run from the repository root and tee every line:
       --mode smoke --prediction "State the expected result before starting." \
       2>&1 | tee results/lightonocr-parsebench-quail-smoke.log
 
+--encode-ahead 0 runs the vision tower inside each prefill instead of
+in a thread on its own stream.
+
 Modes: smoke parses the first 20 pages; run parses every page;
 profile times prefill calls of one and of five pages, with and without
 the vision tower, and lists the kernels of one five-page prefill.
@@ -50,6 +53,7 @@ MAX_OUTPUT_TOKENS = 4096
 CONTEXT_TOKENS = 8448
 PREFILL_TOKENS = 16384
 ADMIT_PAGES = 5
+ENCODE_AHEAD = 16
 SMOKE_PAGES = 20
 PROFILE_PAGES = 40
 PROFILE_CALLS = 5
@@ -96,7 +100,7 @@ def _agreement(records) -> dict:
 
 @app.function(image=image, gpu="H100!", cpu=32, memory=131072,
               timeout=2 * 3600, volumes=volumes)
-def parse(mode: str, rows: int, run_id: str) -> dict:
+def parse(mode: str, rows: int, run_id: str, encode_ahead: int) -> dict:
     """Parse pages on Quail's executor and save every output."""
     import subprocess
     from pathlib import Path
@@ -120,7 +124,7 @@ def parse(mode: str, rows: int, run_id: str) -> dict:
     parser = PageParser(spec, rows=rows, max_output_tokens=MAX_OUTPUT_TOKENS,
                         context_tokens=CONTEXT_TOKENS,
                         prefill_tokens=PREFILL_TOKENS,
-                        admit_pages=ADMIT_PAGES)
+                        admit_pages=ADMIT_PAGES, encode_ahead=encode_ahead)
     if prompt != parser.prompt():
         raise ValueError("the workers' prompt differs from the parser's")
     for future in preparer.started:
@@ -153,7 +157,7 @@ def parse(mode: str, rows: int, run_id: str) -> dict:
         run_id=run_id, mode=mode, model=MODEL, backend="quail", rows=rows,
         max_output_tokens=MAX_OUTPUT_TOKENS, context_tokens=CONTEXT_TOKENS,
         prefill_tokens=PREFILL_TOKENS, admit_pages=ADMIT_PAGES,
-        workers=WORKERS, sampling="greedy",
+        encode_ahead=encode_ahead, workers=WORKERS, sampling="greedy",
         load_s=load_s, pages=len(records), wall_s=wall_s,
         pages_per_s=len(records) / wall_s, output_tokens=output_tokens,
         output_tokens_per_s=output_tokens / wall_s,
@@ -223,10 +227,11 @@ def _profile_prefill(parser, preparer, run_id) -> dict:
 
 
 @app.local_entrypoint()
-def main(mode: str = "smoke", rows: int = 256, prediction: str = ""):
+def main(mode: str = "smoke", rows: int = 256, encode_ahead: int = ENCODE_AHEAD,
+         prediction: str = ""):
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
     print(f"prediction: {prediction}", flush=True)
     print(f"run id: {run_id}", flush=True)
-    call = parse.spawn(mode, rows, run_id)
+    call = parse.spawn(mode, rows, run_id, encode_ahead)
     print(f"function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=1, default=str), flush=True)
