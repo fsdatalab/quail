@@ -250,13 +250,15 @@ class Qwen35Pipeline(ModelPipeline):
             s_pool, conv_pool = pools
             windows[1:].copy_(conv_pool.index_select(0, wave["init"]))
             initial = s_pool.index_select(0, wave["init"])
+        indices, offsets, conv_metadata = self._wave_metadata(wave)
         conv_out = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1), weight.view(conv_dim, kernel),
             linear.conv1d.bias, activation=linear.activation,
             conv_states=windows, has_initial_state=wave["has_init"],
             cache_indices=torch.arange(1, m + 1, dtype=torch.int32,
                                        device=mixed_qkv.device),
-            query_start_loc=wave["cu"]).transpose(0, 1).contiguous()
+            query_start_loc=wave["cu"],
+            metadata=conv_metadata).transpose(0, 1).contiguous()
         q, k, v, g, beta = fused_post_conv_prep(
             conv_output=conv_out, a=a.contiguous(), b=b.contiguous(),
             A_log=linear.A_log, dt_bias=linear.dt_bias,
@@ -268,6 +270,7 @@ class Qwen35Pipeline(ModelPipeline):
             q=q.unsqueeze(0), k=k.unsqueeze(0), v=v.unsqueeze(0),
             g=g.unsqueeze(0), beta=beta.unsqueeze(0), initial_state=initial,
             output_final_state=saving, cu_seqlens=wave["cu"],
+            chunk_indices=indices, chunk_offsets=offsets,
             use_qk_l2norm_in_kernel=False)
         if saving:
             index, slots = wave["save_index"], wave["save_slots"]
@@ -276,6 +279,41 @@ class Qwen35Pipeline(ModelPipeline):
             conv_pool.index_copy_(0, slots,
                                   windows[1:].index_select(0, index))
         return out.squeeze(0).reshape(out.shape[1], -1)
+
+    def _wave_metadata(self, wave):
+        """The wave's delta-rule chunk indices and offsets and its conv metadata.
+
+        Computed from the wave's host bounds on the first linear layer
+        and kept in the wave for the rest; without them each kernel
+        reads the bounds back from the GPU, a sync per layer.
+        """
+        cached = wave.get("kernel_metadata")
+        if cached is not None:
+            return cached
+        if "cu_host" not in wave:
+            # a wave built without host bounds: the kernels read them
+            return None, None, None
+        from types import SimpleNamespace
+
+        from vllm.third_party.flash_linear_attention.ops.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
+        from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+        from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+
+        torch = self.engine.torch
+        device = wave["cu"].device
+        cu = torch.tensor(wave["cu_host"], dtype=torch.int32)
+        nums, batch_ptr, offset_ptr = compute_causal_conv1d_metadata(
+            cu, device=device)
+        cached = (
+            prepare_chunk_indices(cu, FLA_CHUNK_SIZE).to(device, non_blocking=True),
+            prepare_chunk_offsets(cu, FLA_CHUNK_SIZE).to(device, non_blocking=True),
+            SimpleNamespace(nums_dict=nums, batch_ptr=batch_ptr,
+                            token_chunk_offset_ptr=offset_ptr))
+        wave["kernel_metadata"] = cached
+        return cached
 
     def _decode(self, linear, mixed_qkv, a, b, slots, pools):
         """One row per sequence, each sequence's state updated in its slot.
