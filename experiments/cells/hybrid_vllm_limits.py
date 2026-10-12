@@ -108,6 +108,7 @@ def probe(model: str, max_num_seqs: int) -> dict:
         record["boot"] = f"{type(error).__name__}: {error}"
     record["vllm_log"] = capture.lines
     path = f"/results/ablations/{model}-vllm-limits-{max_num_seqs}.json"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as out:
         json.dump(record, out, indent=2)
     results.commit()

@@ -14,6 +14,7 @@ the quail-results volume.
 
 import inspect
 import json
+import os
 
 import modal
 
@@ -117,6 +118,7 @@ def inspect_model(model: str) -> dict:
              if name.endswith(".norm") and name.count(".") <= 2}
     record["final_norms"] = final
     path = f"/results/ablations/{model}-module-tree.json"
+    os.makedirs("/results/ablations", exist_ok=True)
     with open(path, "w") as out:
         json.dump(record, out, indent=1)
     results.commit()

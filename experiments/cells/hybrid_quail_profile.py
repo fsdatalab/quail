@@ -16,6 +16,7 @@ The record is written to /results/ablations/<model>-quail-profile.json.
 """
 
 import json
+import os
 import time
 from collections import defaultdict
 
@@ -141,6 +142,7 @@ def profile(model: str) -> dict:
               "wall_s": wall, "tokens_per_second": tokens / wall,
               "chunk_budget": budget, "seconds": dict(seconds),
               "calls": dict(calls)}
+    os.makedirs("/results/ablations", exist_ok=True)
     with open(f"/results/ablations/{model}-quail-profile.json", "w") as out:
         json.dump(record, out, indent=1)
     results.commit()

@@ -25,6 +25,7 @@ Records: /results/ablations/<model>-quail-compare-{reference,quail}.json.
 """
 
 import json
+import os
 import statistics
 
 import modal
@@ -122,6 +123,7 @@ def reference(model: str) -> dict:
               "difference_second": differences[SEQUENCES:],
               "true_ids": sorted(true_ids),
               "false_ids": sorted(false_ids)}
+    os.makedirs("/results/ablations", exist_ok=True)
     with open(f"/results/ablations/{model}-quail-compare-reference.json",
               "w") as out:
         json.dump(record, out)
@@ -276,6 +278,7 @@ def quail(model: str) -> dict:
         **report("alone", record["alone"], record["alone_bits"]),
         **report("batched", record["batched_differences"][:len(pairs)],
                  record["batched_bits"], ordered=False)}
+    os.makedirs("/results/ablations", exist_ok=True)
     with open(f"/results/ablations/{model}-quail-compare-quail.json",
               "w") as out:
         json.dump(record, out)
