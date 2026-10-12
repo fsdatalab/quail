@@ -152,7 +152,21 @@ tokens per second its read chunks run, so the short fields (CUAD-1,
 the rounds riding inside the 31 read chunks; stock vLLM, which read
 at 49 thousand tokens per second at scale factor 0.1, takes 70 to 100
 s per query. Span F1 lands within 5 points of the scale factor 0.1
-values for both backends, since the contracts differ.
+values for both backends, since the contracts differ. Measured on run
+20261012T061833Z, Quail then stock vLLM: CUAD-1 51.0 s (0.35) and
+57.4 s (0.36); CUAD-2 48.7 s (0.75) and 56.2 s (0.78); CUAD-3 49.6 s
+(0.57) and 69.4 s (0.65); CUAD-4 48.9 s (0.82) and 61.7 s (0.64);
+CUAD-7 89.6 s (0.59) and 113.1 s (0.71); CUAD-8 62.3 s (0.45) and
+104.1 s (0.54); CUAD-9 63.1 s (0.35) and 95.6 s (0.44); CUAD-10 53.7
+s (0.45) and 170.4 s (0.47). Quail read at 67 to 70 thousand input
+tokens per second and stock vLLM at 49 to 60 thousand. The short
+fields came in under the predicted 55 s; CUAD-7 took 89.6 s, over the
+predicted 80, since its filter passes most contracts and the
+extraction reads them again under its own prompt head. Stock vLLM's
+CUAD-10 took 170 s, over the predicted 100, as it feeds each of the
+three questions' prompts whole. The 45-contract scores were noisier
+than predicted: at 450 contracts stock vLLM leads on the clause
+fields by 6 to 12 points (CUAD-3, 7, 8, 9) and Quail on CUAD-4 by 18.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the
