@@ -405,6 +405,60 @@ class Scan(PhysicalNode):
 
 
 @dataclass(frozen=True)
+class RequestExtractSpec:
+    """Specification for one decoded answer per document, located in its text.
+
+    The tail_token_ids follow the document and contain the question,
+    the instruction, the answer template, and the phrase cue. The
+    answer is the text the model writes up to the closing quote,
+    located in the document's text; with trim off, the whole lines
+    that hold it. The preamble precedes the document: the model's
+    extract turn and the document label, which differ from the
+    request's shared preamble on a model that answers AI.IF raw.
+    """
+
+    alias: str
+    output: str
+    question: str
+    tail_token_ids: tuple[Any, ...]
+    trim: bool = True
+    # the tail's text, for an engine that tokenizes prompts itself
+    tail_text: str = ""
+    preamble_token_ids: tuple[Any, ...] = ()
+    preamble_text: str = ""
+
+    @property
+    def span_output(self) -> str:
+        """Return the name of the span column."""
+        return self.output + "_span"
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "RequestExtractSpec":
+        return cls(
+            alias=str(value["alias"]),
+            output=str(value["output"]),
+            question=str(value["question"]),
+            tail_token_ids=tuple(value["tail_token_ids"]),
+            trim=bool(value.get("trim", True)),
+            tail_text=str(value.get("tail_text", "")),
+            preamble_token_ids=tuple(value.get("preamble_token_ids", ())),
+            preamble_text=str(value.get("preamble_text", "")),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "alias": self.alias,
+            "output": self.output,
+            "question": self.question,
+            "tail_token_ids": list(self.tail_token_ids),
+            "trim": self.trim,
+            "tail_text": self.tail_text,
+            "preamble_token_ids": list(self.preamble_token_ids),
+            "preamble_text": self.preamble_text,
+        }
+
+
+@dataclass(frozen=True)
 class RequestExecution(PhysicalNode):
     """Run filters and joins through an independent request engine."""
 
@@ -415,6 +469,7 @@ class RequestExecution(PhysicalNode):
     filters: tuple[RequestFilterSpec, ...] = ()
     joins: tuple[RequestJoinSpec, ...] = ()
     classifies: tuple[RequestClassifySpec, ...] = ()
+    extracts: tuple[RequestExtractSpec, ...] = ()
 
     type_name: ClassVar[str] = "quail.request_execution"
     runtime_key: ClassVar[str] = type_name
@@ -468,6 +523,14 @@ class RequestExecution(PhysicalNode):
             )
             for spec in self.classifies if spec.tests
         )
+        outputs.extend(
+            OutputPort(
+                f"extract_answers:{spec.output}",
+                ValueType.EXTRACT_ANSWERS,
+                schema=(spec.alias, spec.output, spec.span_output),
+            )
+            for spec in self.extracts
+        )
         return tuple(outputs)
 
     def attributes(self) -> dict:
@@ -479,6 +542,7 @@ class RequestExecution(PhysicalNode):
             "filters": [spec.to_dict() for spec in self.filters],
             "joins": [spec.to_dict() for spec in self.joins],
             "classifies": [spec.to_dict() for spec in self.classifies],
+            "extracts": [spec.to_dict() for spec in self.extracts],
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -488,6 +552,7 @@ class RequestExecution(PhysicalNode):
             "filter_chains": len(self.filters),
             "joins": len(self.joins),
             "classifications": len(self.classifies),
+            "extractions": len(self.extracts),
         }
 
     @classmethod
@@ -510,6 +575,10 @@ class RequestExecution(PhysicalNode):
             classifies=tuple(
                 RequestClassifySpec.from_mapping(spec)
                 for spec in attributes.get("classifies", ())
+            ),
+            extracts=tuple(
+                RequestExtractSpec.from_mapping(spec)
+                for spec in attributes.get("extracts", ())
             ),
         )
 
@@ -956,6 +1025,98 @@ class AiFilter(PhysicalNode):
             attention=str(attributes.get("attention", "")),
             stop_key=tuple(str(column)
                            for column in attributes.get("stop_key", ())),
+        )
+
+
+@dataclass(frozen=True)
+class ExtractSpec(ScoreSpec):
+    """Specification for copying each document's answer to a question.
+
+    The prompt token parts are the head before the document and the
+    tail after it, ending in the phrase cue.
+
+    Attributes:
+        question: The question the answer is copied for.
+        trim: Whether the answer is the fewest words that answer the
+            question, or the whole lines that hold them.
+    """
+
+    question: str = ""
+    trim: bool = True
+
+    @property
+    def alias(self) -> str:
+        """Return the table alias the answer columns belong to."""
+        return self.aliases[0]
+
+    @property
+    def span_name(self) -> str:
+        """Return the name of the span column."""
+        return self.name + "_span"
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ExtractSpec":
+        base = ScoreSpec.from_mapping(value)
+        return cls(
+            **{name: getattr(base, name) for name in (
+                "name", "aliases", "query_template", "arguments",
+                "expected_inputs", "estimated_seconds", "pair_fraction",
+                "prompt_token_parts", "draws", "share_prefixes")},
+            question=str(value["question"]),
+            trim=bool(value.get("trim", True)),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            **super().to_dict(),
+            "question": self.question,
+            "trim": self.trim,
+        }
+
+
+@dataclass(frozen=True)
+class AiExtract(AiScore):
+    """Physical operator that appends each row's answer and its span.
+
+    The scores port carries one row per input document: its id, the
+    answer text, and the answer's (start, end) character span in the
+    document; both are null when the document does not answer the
+    question. The ids port carries the same documents.
+    """
+
+    spec: ExtractSpec | None = None
+
+    type_name: ClassVar[str] = "quail.ai_extract"
+    runtime_key: ClassVar[str] = type_name
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        if self.spec is None:
+            return ()
+        spec = self.spec
+        return (
+            OutputPort("scores", ValueType.SCORES,
+                       schema=(spec.alias, spec.name, spec.span_name)),
+            OutputPort(f"ids:{spec.alias}", ValueType.DOCUMENT_IDS,
+                       schema=(spec.alias,)),
+        )
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {
+            **super().explain_fields(),
+            "question": None if self.spec is None else self.spec.question,
+            "trim": True if self.spec is None else self.spec.trim,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        value = attributes["spec"]
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            backend_name=str(attributes["backend_name"]),
+            model=str(attributes["model"]),
+            spec=None if value is None else ExtractSpec.from_mapping(value),
         )
 
 

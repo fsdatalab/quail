@@ -27,6 +27,7 @@ from quail.execution.runner import (
 from quail.execution.tokens import DocumentKeys, DocumentPrefixes, chain_tokens
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
+    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -44,6 +45,7 @@ def quail_runtimes() -> dict:
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
         AiScore.runtime_key: model_runtime,
+        AiExtract.runtime_key: model_runtime,
         Filter.runtime_key: FilterRuntime(),
     }
 

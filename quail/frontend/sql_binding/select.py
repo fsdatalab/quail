@@ -313,13 +313,19 @@ def _compile_projection(b: ExpressionBinder, expressions) -> list:
             call = b.bind_ai_value(e)
             columns.append(Alias(call, alias))
             continue
+        if _is_call(e, "AI_EXTRACT"):
+            if not alias:
+                raise CompileError("AI.EXTRACT needs an AS name in SELECT")
+            columns.append(Alias(b.bind_ai_extract(e), alias))
+            continue
         if any(
-            _is_call(call, "AI_SCORE") or isinstance(call, exp.AIClassify)
+            _is_call(call, "AI_SCORE") or _is_call(call, "AI_EXTRACT")
+            or isinstance(call, exp.AIClassify)
             for call in e.walk()
         ):
             raise CompileError(
-                "AI.SCORE and AI.CLASSIFY in SELECT must be direct "
-                "expressions with an AS name"
+                "AI.SCORE, AI.CLASSIFY, and AI.EXTRACT in SELECT must be "
+                "direct expressions with an AS name"
             )
         if not isinstance(e, exp.Column):
             raise CompileError(

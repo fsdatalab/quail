@@ -47,6 +47,7 @@ from quail.logical import (
     Result,
     Scan,
     SemanticClassify,
+    SemanticExtract,
     SemanticFilter,
     SemanticJoin,
     oriented_join_conditions,
@@ -68,10 +69,11 @@ LabelOracle = Callable[[object, Mapping[str, int]], str]
 # the operators of one alias, as the stage records name them
 FILTER = "AI.IF"
 CLASSIFY = "AI.CLASSIFY"
+EXTRACT = "AI.EXTRACT"
 LABEL_IN = "IN"
 
-_PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, Filter, Join,
-                 SemanticJoin, Project, Aggregate, Result)
+_PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, SemanticExtract,
+                 Filter, Join, SemanticJoin, Project, Aggregate, Result)
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,12 @@ class SpeedOfLightEstimate:
             for classification in stage["classifications"])
 
     @property
+    def extraction_evaluations(self) -> int:
+        """Return the number of documents an answer was copied from."""
+        return sum(stage["evaluated"] for stage in self.filter_stages
+                   if stage["operator"] == EXTRACT)
+
+    @property
     def join_pair_evaluations(self) -> int:
         return sum(stage["evaluated_pairs"] for stage in self.join_stages)
 
@@ -141,6 +149,10 @@ class SpeedOfLightEstimate:
                 "the reference prompt's tail per document or joined row, "
                 "read at the answer cue; a scoring rule's extra rows are "
                 "not counted"),
+            "extraction": (
+                "the plain prompt's tail per document, read once at the "
+                "cue; the lines answer, the start step, and the span "
+                "passes are not counted"),
             "plan_space": "all feasible eager binary full left deep plans",
             "cached_values": (
                 "document prefixes used by filters, classifications, "
@@ -200,6 +212,7 @@ class SpeedOfLightEstimate:
             "post_filter_counts": dict(self.post_filter_counts),
             "filter_evaluations": self.filter_evaluations,
             "classification_evaluations": self.classification_evaluations,
+            "extraction_evaluations": self.extraction_evaluations,
             "join_pair_evaluations": self.join_pair_evaluations,
             "filter_stages": [dict(stage) for stage in self.filter_stages],
             "join_stages": [dict(stage) for stage in self.join_stages],
@@ -275,11 +288,11 @@ def _refuse_unpriced(logical) -> None:
             raise NotImplementedError(
                 "the speed of light estimate prices binary join predicates")
     for column in operators.projections:
-        if column.expression.kind != "label":
+        if column.expression.kind not in ("label", "extract"):
             raise NotImplementedError(
                 f"the speed of light estimate does not price the "
                 f"{column.expression.kind!r} column {column.name!r}; it "
-                f"prices AI.CLASSIFY columns")
+                f"prices AI.CLASSIFY and AI.EXTRACT columns")
     joined = [frozenset(arg.alias for arg in join.prompt.args)
               for join in operators.joins]
     for call, _ in operators.labels.calls:
@@ -326,6 +339,7 @@ class _Search:
         )
         self.labels = operators.labels
         self.label_filters = operators.label_filters
+        self.extracts = operators.extracts
         if self.labels.calls and label is None:
             raise ValueError(
                 "the query classifies documents; pass label=(prompt, "
@@ -507,7 +521,8 @@ class _Search:
             asks = list(range(len(predicates)))
             calls = [call for call, owner in self.labels.calls
                      if owner == alias and len(call.aliases()) == 1]
-            if not asks and not calls:
+            extracts = [node for node in self.extracts if node.alias == alias]
+            if not asks and not calls and not extracts:
                 continue
             tokens = self.aliases[alias].tokens
             mean_tokens = sum(tokens) / len(tokens) if tokens else 0
@@ -562,6 +577,16 @@ class _Search:
                         name=self.labels.names[call],
                         accepted=list(test.values)))
                     live = passed
+            # an extraction follows the labels; it keeps every document
+            for node in extracts:
+                stage_work = self.question_work(
+                    alias, live, node.call.prompt.tail_tokens, first)
+                first = False
+                work = work + stage_work
+                stages.append(_stage(
+                    EXTRACT, alias, node.call.prompt.template, None,
+                    node.call.prompt.tail_tokens, None, live, live,
+                    stage_work, name=node.name))
             survivors[alias] = live
         return survivors, work, stages
 

@@ -234,6 +234,7 @@ class Session:
         logical = compile_sql(
             text, self.catalog, self.tokenizer, dialect=dialect,
             turn=self.model.turn, layout=self.model.prompt_layout,
+            extract_turn=self.model.extract_turn,
         )
         return Query(self, logical, order=order)
 
@@ -258,7 +259,8 @@ class Session:
                             BuilderQuery(self.catalog, name,
                                          self.tokenizer,
                                          turn=self.model.turn,
-                                         layout=self.model.prompt_layout))
+                                         layout=self.model.prompt_layout,
+                                         extract_turn=self.model.extract_turn))
 
     @property
     def tokenizer(self):
@@ -580,6 +582,10 @@ class BoundBuilder:
                                 descriptions=descriptions,
                                 task_description=task_description,
                                 probabilities=probabilities)
+        return self
+
+    def ai_extract(self, c, question, *, name, trim=True):
+        self._inner.ai_extract(c, question, name=name, trim=trim)
         return self
 
     def label_in(self, name, labels, selectivity=None):
@@ -1088,7 +1094,7 @@ class Query:
                             f"label column {name!r} belongs to {alias!r}, "
                             f"which is not in the result")
                     labeled = table.column(name).combine_chunks()
-                    if not pa.types.is_map(labeled.type):
+                    if not pa.types.is_nested(labeled.type):
                         labeled = labeled.cast(pa.string())
                     # a document whose answer names no label has no row
                     # in the table, and leaves the result
@@ -1109,7 +1115,7 @@ class Query:
                                  for column in self.logical.projection.columns
                                  if isinstance(column, Alias)
                                  and column.name == name), None)
-                    if call is not None:
+                    if call is not None and call.kind == "label":
                         order = pa.array(call.labels, pa.string())
                         values = pa.DictionaryArray.from_arrays(
                             pc.index_in(widened, order).cast(pa.int32()),
@@ -1207,7 +1213,7 @@ class Query:
         result.report = report
 
         from quail.execution.reranker import classify_label_tables
-        from quail.physical import AiClassify, AiScore
+        from quail.physical import AiClassify, AiExtract, AiScore
 
         # every classified document's label, before any filter on it;
         # a chain's later stages label the documents their gate passed
@@ -1225,7 +1231,14 @@ class Query:
                 PortRef(node.node_id, "scores")
             ].select([*node.spec.aliases, node.spec.name])
             for node in plan.nodes
-            if isinstance(node, AiScore) and not isinstance(node, AiClassify)
+            if isinstance(node, AiScore)
+            and not isinstance(node, (AiClassify, AiExtract))
+            and PortRef(node.node_id, "scores") in response.outputs
+        }, "extracts": {
+            # every document's answer and span, null for no answer
+            node.spec.name: response.outputs[PortRef(node.node_id, "scores")]
+            for node in plan.nodes
+            if isinstance(node, AiExtract)
             and PortRef(node.node_id, "scores") in response.outputs
         }}
         survivors = {
@@ -1257,6 +1270,9 @@ class Query:
                 # the label column follows the alias columns: one, or
                 # the anchor and partner of a classification of joined rows
                 answer_tables["classifies"][table.column_names[-1]] = table
+            elif value_type is ValueType.EXTRACT_ANSWERS:
+                # the alias column, the answer, and its span
+                answer_tables["extracts"][table.column_names[1]] = table
             elif value_type is ValueType.JOIN_ANSWERS:
                 written_pos = metadata.get(b"quail.written_pos")
                 if written_pos is None:

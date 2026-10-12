@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Optional, Protocol
 
 from quail.logical.expressions import (
     PROBABILITIES_SUFFIX,
+    SPAN_SUFFIX,
     AggregateCall,
     Aggregation,
     Alias,
@@ -445,6 +446,98 @@ class SemanticClassify:
         }
 
 
+@dataclass(frozen=True)
+class SemanticExtract:
+    """One AI.EXTRACT call over its input rows, adding the answer columns.
+
+    Every input row passes through with the answer in the column named
+    ``name`` and its character span in the document, as a (start, end)
+    pair, in the column ``name`` plus SPAN_SUFFIX. A row whose document
+    does not answer the question gets nulls. The node starts on its
+    table above the table's AI.IF SemanticFilter, classifications, and
+    label filters, and below any join; the lift_classifications rule
+    moves it above the joins of a joined table, so the extraction runs
+    over the documents the joins matched. The root Project returns the
+    columns through an Alias of the same call.
+    """
+
+    input: LogicalNode
+    call: ModelCall
+    name: str
+
+    type_name: ClassVar[str] = "quail.semantic_extract"
+
+    @property
+    def alias(self) -> str:
+        """The table alias the answer columns belong to."""
+        return self.call.aliases()[0]
+
+    @property
+    def span_name(self) -> str:
+        """The name of the span column."""
+        return self.name + SPAN_SUFFIX
+
+    def children(self) -> tuple[LogicalNode, ...]:
+        return (self.input,)
+
+    def expressions(self) -> tuple:
+        return (self.call,)
+
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        fields = self.input.output_schema()
+        provider = next(
+            (field.provider for field in fields if field.alias == self.alias), ""
+        )
+        return fields + (
+            ColumnRef(self.alias, provider, self.name),
+            ColumnRef(self.alias, provider, self.span_name),
+        )
+
+    def validate(self) -> None:
+        self.call.validate()
+        if self.call.kind != "extract":
+            raise CompileError("SemanticExtract needs an AI.EXTRACT call")
+        if not self.name or "." in self.name:
+            raise CompileError(
+                f"an extraction needs a column name without a dot, got {self.name!r}"
+            )
+        aliases = self.call.aliases()
+        if len(aliases) != 1:
+            raise CompileError("AI.EXTRACT reads one document column")
+        present = {field.alias for field in self.input.output_schema()}
+        if self.alias not in present:
+            raise CompileError(
+                f"the extraction reads {self.alias!r}, which its input "
+                f"does not produce ({sorted(present)})"
+            )
+        taken = {
+            field.column
+            for field in self.input.output_schema()
+            if field.alias == self.alias
+        }
+        for name in (self.name, self.span_name):
+            if name in taken:
+                raise CompileError(f"the name {name!r} is already used")
+
+    def with_children(self, children: tuple[LogicalNode, ...]):
+        if len(children) != 1:
+            raise CompileError("SemanticExtract needs one input")
+        return replace(self, input=children[0])
+
+    def with_expressions(self, expressions: tuple):
+        if len(expressions) != 1:
+            raise CompileError("SemanticExtract needs one call")
+        return replace(self, call=expressions[0])
+
+    def explain_fields(self) -> dict:
+        return {
+            "name": self.name,
+            "expression": _explain(self.call),
+            "question": self.call.question,
+            "trim": self.call.trim,
+        }
+
+
 def _subtree(node) -> tuple:
     """Return the node and every node below it, children first."""
     nodes = []
@@ -472,6 +565,26 @@ def classified_above_joins(root) -> frozenset:
         for node in classifications(root)
         if len(node.call.aliases()) == 1
         and any(isinstance(below, SemanticJoin) for below in _subtree(node.input))
+    )
+
+
+def extractions(node) -> tuple:
+    """Return the SemanticExtract nodes at or below a node, children first."""
+    return tuple(
+        found for found in _subtree(node) if isinstance(found, SemanticExtract)
+    )
+
+
+def extracted_above_joins(root) -> frozenset:
+    """Return the aliases whose extraction sits above a join.
+
+    The planner runs such an extraction after the joins, over the
+    documents the joins matched.
+    """
+    return frozenset(
+        node.alias
+        for node in extractions(root)
+        if any(isinstance(below, SemanticJoin) for below in _subtree(node.input))
     )
 
 
@@ -579,6 +692,7 @@ class Project:
 
     def validate(self) -> None:
         computed = {(node.call, node.name) for node in classifications(self.input)}
+        extracted = {(node.call, node.name) for node in extractions(self.input)}
         for column in self.columns:
             if isinstance(column, Alias):
                 column.validate()
@@ -589,6 +703,14 @@ class Project:
                     raise CompileError(
                         f"the label column {column.name!r} needs a "
                         f"SemanticClassify below the Project"
+                    )
+                if (
+                    column.expression.kind == "extract"
+                    and (column.expression, column.name) not in extracted
+                ):
+                    raise CompileError(
+                        f"the answer column {column.name!r} needs a "
+                        f"SemanticExtract below the Project"
                     )
             elif not isinstance(column, ColumnRef):
                 raise CompileError(
