@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from quail.cost.dense_decoder_cost import (
     attention_projection_params,
     dense_decoder_components,
@@ -66,7 +68,8 @@ def test_weights_match_the_plan():
 
 def test_dense_components_price_gdn_projections_with_the_attention_ones():
     work = Work(tokens=1_000, pairs=0, kv_written=0, kv_read=0)
-    attn_proj, mlp, attention = dense_decoder_components(work, SPEC, passes=1.0)
+    attn_proj, mlp, attention, *_ = dense_decoder_components(
+        work, SPEC, passes=1.0)
     assert attn_proj.flops == 2.0 * 1_000 * (
         8 * 36_700_160 + 24 * 42_106_880)
     assert attn_proj.bytes_moved == 2.0 * (8 * 36_700_160 + 24 * 42_106_880)
@@ -116,3 +119,83 @@ def test_chunk_size_follows_the_plan():
     # the memory bound before it, 412,529 tokens
     assert budgets.chunk_memory_bound(SPEC, H100_SXM) == 412_529
     assert budgets.chunk_budget(SPEC, H100_SXM) == 116_508
+
+
+def test_gdn_core_and_convolution_are_priced_per_token():
+    from quail.cost.dense_decoder_cost import (
+        conv_flops_per_token,
+        gdn_core_flops_per_token,
+    )
+
+    work = Work(tokens=1_000, pairs=0, kv_written=0, kv_read=0)
+    names = [c.name for c in dense_decoder_components(work, SPEC, passes=1.0)]
+    assert names == ["attn_proj", "mlp", "attention", "gdn_core", "state",
+                     "conv"]
+    # per token and value head: 6 C K + 4 C V + 6 K V + 2 C^2 / 3 with
+    # C = 64 and K = V = 128, over 32 value heads and 24 layers
+    per_head = 6 * 64 * 128 + 4 * 64 * 128 + 6 * 128 * 128 + 2 * 64 * 64 / 3
+    assert gdn_core_flops_per_token(SPEC) == per_head * 32 * 24
+    # 2 FLOPs per tap per channel: 8,192 channels, width 4, 24 layers
+    assert conv_flops_per_token(SPEC) == 2 * 4 * 8_192 * 24
+
+
+def test_a_pure_attention_model_has_no_state_components():
+    from quail.specs import QWEN3_4B_FP8
+
+    work = Work(tokens=1_000, pairs=0, kv_written=0, kv_read=0)
+    names = [c.name for c in dense_decoder_components(
+        work, QWEN3_4B_FP8, passes=1.0)]
+    assert names == ["attn_proj", "mlp", "attention"]
+
+
+def test_state_component_prices_checkpoint_writes_and_reads_like_kv():
+    from quail.cost.work import ask, scan, stream
+
+    # a scan saves one checkpoint, an ask reads one, a stream reads one
+    # per suffix
+    assert scan(100, 10).state_written == 1 and scan(100, 10).state_read == 0
+    assert ask(100, 10).state_read == 1 and ask(100, 10).state_written == 0
+    assert stream(100, [10, 20, 30]).state_read == 3
+    work = scan(100, 10) + stream(100, [10, 20, 30]) * 2
+    assert (work.state_written, work.state_read) == (1, 6)
+    state = next(c for c in dense_decoder_components(work, SPEC, passes=1.0)
+                 if c.name == "state")
+    assert state.flops == 0
+    assert state.bytes_moved == SPEC.checkpoint_bytes * 7
+    assert SPEC.checkpoint_bytes == 51_511_296
+
+
+def test_a_pure_attention_model_prices_no_state_bytes():
+    from quail.cost.work import ask
+    from quail.specs import QWEN3_4B_FP8
+
+    names = [c.name for c in dense_decoder_components(
+        ask(100, 10), QWEN3_4B_FP8, passes=1.0)]
+    assert "state" not in names
+
+
+def test_one_review_through_a_filter_and_a_join_matches_the_hand_calculation():
+    from quail.cost.sol import speed_of_light
+    from quail.cost.work import ask, scan, stream
+    from quail.specs import H100_SXM
+
+    # 100-token review, 6-token preamble, 56-token filter question, then a
+    # join: a 43-token frame and two aspects of 2 and 3 tokens, each with a
+    # 13-token tail
+    work = (scan(106, 56)
+            + ask(106, 43) + Work(state_written=1.0)
+            + stream(149, [15, 16]))
+    assert work.tokens == 236
+    assert work.pairs == 13_203 + 5_504 + 4_875
+    assert work.kv_written == 236
+    assert work.kv_read == 106 + 149
+    assert (work.state_written, work.state_read) == (2, 3)
+    sol = speed_of_light(work, SPEC, H100_SXM, chunk_tokens=116_508)
+    assert sol.passes == 1
+    assert [c.name for c in sol.components] == [
+        "attn_proj", "mlp", "attention", "gdn_core", "state", "conv"]
+    # one pass reads every weight once, so the three weight components
+    # are limited by memory at this size
+    assert sol.component("attn_proj").bound_by == "memory"
+    assert sol.component("state").bytes_moved == 5 * 51_511_296
+    assert sol.seconds == pytest.approx(2.2516e-3, rel=1e-3)

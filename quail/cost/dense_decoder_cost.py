@@ -6,8 +6,11 @@ A mixture-of-experts model names its experts on the spec: FLOPs
 follow the params one token multiplies, weight bytes follow the
 params a full chunk reads. A hybrid model adds its Gated DeltaNet
 projections to the attention projections, and a short convolution
-model its gate and output projections; the state update, the
-convolution, and the state's movement are not priced here yet.
+model its gate and output projections. The Gated DeltaNet chunked
+recurrence is priced as its own component at the bf16 tensor-core
+rate, and each convolution at the fp32 CUDA-core rate. The state's
+movement is priced like KV movement: one checkpoint of
+ModelSpec.checkpoint_bytes for every write and every read in Work.
 """
 
 from __future__ import annotations
@@ -15,6 +18,9 @@ from __future__ import annotations
 from quail.cost.roofline import CostComponent
 from quail.cost.work import Work
 from quail.specs import ModelSpec
+
+# vLLM's FLA_CHUNK_SIZE: tokens per chunk of the chunked gated delta rule
+GDN_CHUNK_TOKENS = 64
 
 
 def attention_projection_params(model: ModelSpec) -> int:
@@ -49,6 +55,36 @@ def short_conv_projection_params(model: ModelSpec) -> int:
     itself is not priced here.
     """
     return 4 * model.hidden * model.hidden * len(model.short_conv_layers)
+
+
+def gdn_core_flops_per_token(model: ModelSpec) -> float:
+    """Return FLOPs per token of the chunked gated delta rule, over all layers.
+
+    The kernel (vLLM's chunk_gated_delta_rule) works on chunks of C
+    tokens. Per chunk and value head, with key dim K and value dim V:
+    three C x C x K products (K K^T, the w update, Q K^T), two
+    C x C x V products (the u update and the A times new-value
+    product), three C x K x V products (w times state, K^T times new
+    value, Q times state), and a C x C triangular inverse of
+    about 2 C^3 / 3. Each product costs 2 FLOPs per multiply-add. Divided
+    by C this is 6 C K + 4 C V + 6 K V + 2 C^2 / 3 per token and head.
+    """
+    c = GDN_CHUNK_TOKENS
+    k, v = model.gdn_key_dim, model.gdn_value_dim
+    per_head = 6 * c * k + 4 * c * v + 6 * k * v + 2 * c * c / 3
+    return per_head * model.gdn_value_heads * len(model.gdn_layers)
+
+
+def conv_flops_per_token(model: ModelSpec) -> float:
+    """Return FLOPs per token of the depthwise convolutions, over all layers.
+
+    Each channel takes one multiply and one add per tap. A Gated
+    DeltaNet layer convolves its q, k, and v channels; a short
+    convolution layer convolves the model's width.
+    """
+    gdn = len(model.gdn_layers) * model.conv_channels
+    short = len(model.short_conv_layers) * model.hidden
+    return 2.0 * model.conv_width * (gdn + short)
 
 
 def mlp_params(model: ModelSpec) -> int:
@@ -96,7 +132,7 @@ def dense_decoder_components(work: Work, model: ModelSpec,
                  + short_conv_projection_params(model))
     mlp = mlp_params(model)
     full_flops, sliding_flops = attention_pair_flops(model)
-    return (
+    components = (
         CostComponent(
             name="attn_proj",
             flops=2.0 * attn_proj * work.tokens,
@@ -118,3 +154,26 @@ def dense_decoder_components(work: Work, model: ModelSpec,
             precision=model.attention_precision,
         ),
     )
+    if model.gdn_layers:
+        components += (CostComponent(
+            name="gdn_core",
+            flops=gdn_core_flops_per_token(model) * work.tokens,
+            bytes_moved=0.0,
+            precision="bf16",
+        ),)
+    if model.checkpoint_bytes:
+        components += (CostComponent(
+            name="state",
+            flops=0.0,
+            bytes_moved=model.checkpoint_bytes * (
+                work.state_written + work.state_read),
+            precision="bf16",
+        ),)
+    if model.gdn_layers or model.short_conv_layers:
+        components += (CostComponent(
+            name="conv",
+            flops=conv_flops_per_token(model) * work.tokens,
+            bytes_moved=0.0,
+            precision="fp32",
+        ),)
+    return components

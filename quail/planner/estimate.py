@@ -392,7 +392,9 @@ class _Search:
         if shared_tokens == 0:
             return scan(prefix, suffix, window=self.window)
         resident = self.pre + shared_tokens
-        return ask(resident, prefix - resident + suffix, window=self.window)
+        # the document saves its own state after reading the parent's
+        return ask(resident, prefix - resident + suffix,
+                   window=self.window) + Work(state_written=1.0)
 
     def question_work(self, alias: str, live, tail: int, first: bool) -> Work:
         """Return the work of one question asked of every live document.
@@ -459,9 +461,12 @@ class _Search:
                 suffix_tokens = sum(streamed)
                 suffix_triangles = sum(triangle(suffix) for suffix in streamed)
             prefix = self.pre + self.aliases[anchor].tokens[row]
-            work = work + (ask(prefix, frame, window=self.window)
-                           if row in resident_rows
-                           else self.first_use(anchor, row, frame))
+            if row in resident_rows:
+                # the frame's state is saved for every partner to start from
+                work = work + ask(prefix, frame, window=self.window) + Work(
+                    state_written=1.0)
+            else:
+                work = work + self.first_use(anchor, row, frame)
             anchor_prefix = prefix + frame
             sliding_pairs = 0.0
             if self.window:
@@ -478,6 +483,7 @@ class _Search:
                 sliding_pairs=sliding_pairs,
                 sliding_kv_read=(min(anchor_prefix, self.window - 1)
                                  if self.window else 0.0),
+                state_read=float(len(streamed)),
             )
         return work
 

@@ -58,6 +58,10 @@ def _decode_outcome_work(lengths, runs, window=0, shared=None, resident=False):
         total["pairs"] += sum(fresh)
         contexts = [prompt + sum(fed[:round_]) for round_ in range(1, len(fed))]
         total["kv_read"] += kept + sum(contexts)
+        # one checkpoint read when the prefix is kept, one written when the
+        # document is computed, and one read for each later run
+        total["state_read"] += (1 if kept else 0) + len(contexts)
+        total["state_written"] += 0 if resident else 1
         if window:
             total["sliding_pairs"] += sum(min(i, window) for i in fresh)
             total["sliding_kv_read"] += sum(

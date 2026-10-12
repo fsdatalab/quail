@@ -115,11 +115,13 @@ def _triangle(n, window: int = 0):
     return np.where(n > window, window * n - window * (window - 1) / 2, full)
 
 
-def _total(tokens, pairs, written, read, sliding_pairs, sliding_read) -> Work:
+def _total(tokens, pairs, written, read, sliding_pairs, sliding_read,
+           state_written=0.0, state_read=0.0) -> Work:
     """Sum per-document work arrays into one Work record."""
     return Work(float(np.sum(tokens)), float(np.sum(pairs)), float(np.sum(written)),
                 float(np.sum(read)), float(np.sum(sliding_pairs)),
-                float(np.sum(sliding_read)))
+                float(np.sum(sliding_read)), float(np.sum(state_written)),
+                float(np.sum(state_read)))
 
 
 def _first_work(prefix, shared, tail: int, resident: bool, window: int) -> Work:
@@ -131,14 +133,17 @@ def _first_work(prefix, shared, tail: int, resident: bool, window: int) -> Work:
             suffix, tail * prefix + _triangle(tail), suffix, prefix,
             _triangle(prefix + tail, window) - _triangle(prefix, window)
             if window else 0.0,
-            np.minimum(prefix, window - 1) if window else 0.0)
+            np.minimum(prefix, window - 1) if window else 0.0,
+            state_read=np.ones_like(prefix))
     # scan(prefix, tail) without a shared prefix, ask(shared, rest) with one
     fresh = prefix - shared + tail
     return _total(
         fresh, fresh * shared + _triangle(fresh), fresh, shared,
         _triangle(prefix + tail, window) - _triangle(shared, window)
         if window else 0.0,
-        np.minimum(shared, window - 1) if window else 0.0)
+        np.minimum(shared, window - 1) if window else 0.0,
+        state_written=np.ones_like(prefix),
+        state_read=(shared > 0).astype(float))
 
 
 def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:
@@ -150,7 +155,8 @@ def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:
     work = _total(
         np.full_like(context, total), pairs, np.full_like(context, total),
         context, sliding_pairs,
-        np.minimum(context, window - 1) if window else 0.0)
+        np.minimum(context, window - 1) if window else 0.0,
+        state_read=np.full_like(context, len(suffixes)))
     if canvas_rows > 1:
         # a canvas longer than one row reads the document a second time
         work += Work(pairs=work.pairs, kv_read=work.kv_read,
