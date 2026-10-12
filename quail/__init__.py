@@ -14,6 +14,7 @@ from quail.logical import (
     render_join_prompt_text,
     true_false_ids,
 )
+from quail.pdf import read_pdfs
 from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
 from quail.planner.estimate import SpeedOfLightEstimate, speed_of_light_estimate
 from quail.planner.plan import EngineConfig
@@ -44,6 +45,7 @@ __all__ = [
     "bind_prompt",
     "col",
     "prompt",
+    "read_pdfs",
     "render_join_prompt_text",
     "speed_of_light_estimate",
     "true_false_ids",

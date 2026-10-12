@@ -69,6 +69,17 @@ def prepare_png(png: bytes) -> dict:
     return prepare_page(_WORKER["processor"], _WORKER["prompt"], image)
 
 
+def prepare_pdf_page(item) -> dict:
+    """prepare_page on a rendered PDF page, in a worker set up by init_worker.
+
+    Args:
+        item: (path, page number from 1, longest edge in pixels).
+    """
+    from quail.pdf import render_png
+
+    return prepare_png(render_png(*item))
+
+
 def _ready() -> bool:
     return "processor" in _WORKER
 
@@ -95,18 +106,20 @@ class PagePreparer:
             initializer=init_worker, initargs=(model_path, prompt))
         self.started = [self.pool.submit(_ready) for _ in range(workers)]
 
-    def pages(self, items, *, window: int):
+    def pages(self, items, *, window: int, prepare=prepare_png):
         """Yield (key, prepared page) in order, at most `window` pages ahead.
 
         Args:
-            items: Iterable of (key, PNG bytes).
+            items: Iterable of (key, the argument of prepare).
             window: Pages prepared ahead of the consumer at most.
+            prepare: The worker function: prepare_png on PNG bytes, or
+                prepare_pdf_page.
         """
         from collections import deque
 
         ahead = deque()
-        for key, png in items:
-            ahead.append((key, self.pool.submit(prepare_png, png)))
+        for key, item in items:
+            ahead.append((key, self.pool.submit(prepare, item)))
             if len(ahead) >= window:
                 key, future = ahead.popleft()
                 yield key, future.result()
@@ -341,3 +354,89 @@ class PageParser:
             embeds = self.visual(pixels.to(self.visual.dtype), grid_thw=grid)
         sizes = (grid.prod(-1) // self.merge // self.merge).tolist()
         return embeds.split(sizes)
+
+
+class RowParser:
+    """Transcribe rows of a read_pdfs table with an OCR model.
+
+    Renders each row's pages and prepares them in worker processes,
+    transcribes them with PageParser, and yields a row's text once its
+    last page ends.
+
+    Args:
+        spec: The OCR model's ModelSpec.
+        lanes: Pages in flight at once.
+        workers: Page-preparing worker processes.
+        window: Pages prepared ahead at most.
+        encode_ahead: Pages whose image rows are computed ahead.
+    """
+
+    def __init__(self, spec, *, lanes: int, workers: int = 24, window: int = 96,
+                 encode_ahead: int = 16):
+        from transformers import AutoProcessor
+
+        from quail.backends.quail.executor.model import resolve_model_path
+        from quail.parsers import (
+            LIGHTONOCR,
+            OCR_CONTEXT_TOKENS,
+            OCR_MAX_OUTPUT_TOKENS,
+            OCR_STEP_TOKENS,
+        )
+
+        self.name = LIGHTONOCR
+        path = resolve_model_path(spec.hf_name, spec.revision)
+        prompt = AutoProcessor.from_pretrained(path).apply_chat_template(
+            [{"role": "user", "content": [{"type": "image"}]}], tokenize=False,
+            add_generation_prompt=True, enable_thinking=False)
+        # the workers start while the model loads
+        self.preparer = PagePreparer(path, prompt, workers=workers)
+        self.window = window
+        self.max_output_tokens = OCR_MAX_OUTPUT_TOKENS
+        self.pages = PageParser(spec, lanes=lanes,
+                                max_output_tokens=OCR_MAX_OUTPUT_TOKENS,
+                                context_tokens=OCR_CONTEXT_TOKENS,
+                                budget=OCR_STEP_TOKENS, encode_ahead=encode_ahead)
+        for future in self.preparer.started:
+            future.result()
+        self.stats = {}
+
+    def parse(self, rows):
+        """Yield (key, text) per row as its last page ends.
+
+        Args:
+            rows: Iterable of (key, PdfFile, page numbers from 1).
+        """
+        import time
+
+        from quail.parsers import OCR_LONGEST_EDGE
+        from quail.pdf import PAGE_SEPARATOR, check_unchanged
+
+        started = time.perf_counter()
+        tokenizer = self.pages.processor.tokenizer
+        texts = {}
+        stats = self.stats = dict(pages_parsed=0, parse_output_tokens=0,
+                                  parse_truncated_pages=0)
+
+        def items():
+            for key, path_file, pages in rows:
+                check_unchanged(path_file)
+                texts[key] = [None] * len(pages)
+                for index, page in enumerate(pages):
+                    yield (key, index), (path_file.path, page, OCR_LONGEST_EDGE)
+
+        prepared = self.preparer.pages(items(), window=self.window,
+                                       prepare=prepare_pdf_page)
+        for (key, index), tokens, _ in self.pages.parse(prepared):
+            stats["pages_parsed"] += 1
+            stats["parse_output_tokens"] += len(tokens)
+            stats["parse_truncated_pages"] += len(tokens) >= self.max_output_tokens
+            row = texts[key]
+            row[index] = tokenizer.decode(tokens, skip_special_tokens=True)
+            if all(text is not None for text in row):
+                del texts[key]
+                yield key, PAGE_SEPARATOR.join(row)
+        stats["parse_decode_steps"] = self.pages.stats.get("decode_steps", 0)
+        stats["parse_s"] = time.perf_counter() - started
+
+    def close(self) -> None:
+        self.preparer.close()
