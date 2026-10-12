@@ -49,6 +49,7 @@ VLLM_RUN = f"{OUT_DIR}/vllm_run_256_20261012T003224Z-64e10e.parquet"
 MAX_OUTPUT_TOKENS = 4096
 CONTEXT_TOKENS = 8448
 PREFILL_TOKENS = 16384
+ADMIT_PAGES = 5
 SMOKE_PAGES = 20
 PROFILE_PAGES = 40
 PROFILE_CALLS = 5
@@ -118,7 +119,8 @@ def parse(mode: str, rows: int, run_id: str) -> dict:
     preparer = PagePreparer(path, prompt, workers=WORKERS)
     parser = PageParser(spec, rows=rows, max_output_tokens=MAX_OUTPUT_TOKENS,
                         context_tokens=CONTEXT_TOKENS,
-                        prefill_tokens=PREFILL_TOKENS)
+                        prefill_tokens=PREFILL_TOKENS,
+                        admit_pages=ADMIT_PAGES)
     if prompt != parser.prompt():
         raise ValueError("the workers' prompt differs from the parser's")
     for future in preparer.started:
@@ -150,7 +152,8 @@ def parse(mode: str, rows: int, run_id: str) -> dict:
     summary = dict(
         run_id=run_id, mode=mode, model=MODEL, backend="quail", rows=rows,
         max_output_tokens=MAX_OUTPUT_TOKENS, context_tokens=CONTEXT_TOKENS,
-        prefill_tokens=PREFILL_TOKENS, workers=WORKERS, sampling="greedy",
+        prefill_tokens=PREFILL_TOKENS, admit_pages=ADMIT_PAGES,
+        workers=WORKERS, sampling="greedy",
         load_s=load_s, pages=len(records), wall_s=wall_s,
         pages_per_s=len(records) / wall_s, output_tokens=output_tokens,
         output_tokens_per_s=output_tokens / wall_s,

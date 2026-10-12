@@ -197,10 +197,15 @@ class PageParser:
         max_output_tokens: The output limit per page.
         context_tokens: The longest prompt plus output a row holds.
         prefill_tokens: The prompt tokens one step prefills at most.
+        admit_pages: Free rows a step waits for before it prefills,
+            while other pages are decoding; a prefill's cost is mostly
+            per call, so one page at a time costs about twice as much
+            per page as five.
     """
 
     def __init__(self, spec, *, rows: int, max_output_tokens: int,
-                 context_tokens: int, prefill_tokens: int):
+                 context_tokens: int, prefill_tokens: int,
+                 admit_pages: int = 1):
         import torch
         from transformers import AutoProcessor, GenerationConfig
 
@@ -233,6 +238,7 @@ class PageParser:
         self.max_output_tokens = max_output_tokens
         self.context_tokens = context_tokens
         self.prefill_tokens = prefill_tokens
+        self.admit_pages = admit_pages
         self.row_pages = -(-context_tokens // PAGE_TOKENS)
         self.row_capacity = self.row_pages * PAGE_TOKENS
         # one row past the last is scratch: a decode graph's padded rows
@@ -326,7 +332,8 @@ class PageParser:
         while True:
             admit = []
             budget = self.prefill_tokens
-            while len(admit) < len(free) and not exhausted:
+            ready = not active or len(free) >= self.admit_pages
+            while ready and len(admit) < len(free) and not exhausted:
                 if waiting is None:
                     started = time.perf_counter()
                     waiting = next(pending, None)

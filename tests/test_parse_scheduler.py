@@ -22,6 +22,7 @@ class _Parser(PageParser):
         self.max_output_tokens = 100
         self.context_tokens = 1000
         self.stops = frozenset({STOP})
+        self.admit_pages = 1
         self.holding = {}
         self.most_in_flight = 0
 
@@ -75,3 +76,22 @@ def test_a_step_prefills_no_more_than_its_budget_past_the_first_page():
     parser._prefill = recording
     list(parser.parse(_pages(6)))
     assert max(admitted) == 2
+
+
+def test_a_step_waits_for_enough_free_rows_while_pages_decode():
+    parser = _Parser(rows=6, prefill_tokens=1000)
+    parser.admit_pages = 3
+    admitted = []
+    original = parser._prefill
+
+    def recording(pages, rows):
+        admitted.append(len(pages))
+        return original(pages, rows)
+
+    parser._prefill = recording
+    done = list(parser.parse(_pages(30)))
+    assert len(done) == 30
+    # the first prefill fills every row; later ones wait for three
+    # free rows unless the input runs out or nothing is decoding
+    assert admitted[0] == 6
+    assert min(admitted[1:-1]) >= 3
