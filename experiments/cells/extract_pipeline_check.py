@@ -7,8 +7,9 @@ the governing law alone; C the agreement date alone; D the governing
 law twice; E the governing law then the agreement date. Every query
 runs on the tree attention path and again on the unified path, and
 each question is compared with the same question alone on its path.
-For every contract and question it saves the lines the model named, the none and best start log
-probabilities at the cue, and the answer, under
+For every contract and question it saves the lines the model
+named, the none and best start log probabilities at the cue, and
+the answer, under
 /results/extract_pipeline_check/.
 
 Prediction: the pipeline reuses the document's KV exactly. A's first
