@@ -409,7 +409,7 @@ class Query:
         return self
 
     def ai_extract(self, c, question: str, *, name: str,
-                   trim: bool = True, locate: bool = True) -> "Query":
+                   trim: bool = True, locate: bool = False) -> "Query":
         """Copy the words that answer a question from each document.
 
         The result column ``name`` holds the copied words, or null when

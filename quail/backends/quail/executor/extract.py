@@ -109,6 +109,7 @@ class Tables:
         # quote, such as `".` or `",`: together they are the stop
         self.stop_ids = tuple(index for index, token in enumerate(self.vocab)
                               if token.startswith('"'))
+        self._stops = set(self.stop_ids)
         # a decoder may copy a token and close the quote in one token,
         # such as `."` or `)"`: the merged token of each token that has one
         index = {token: i for i, token in enumerate(self.vocab)}
@@ -565,7 +566,11 @@ class ExtractStages:
         A token the model would write with the closing quote, such as
         `."`, ends the answer after that token. The answer ends when
         closing the quote is at least as likely as every continuation,
-        when no stream continues, or at ANSWER_MAX_TOKENS.
+        when no stream continues, or at ANSWER_MAX_TOKENS. A token the
+        model likes better than every continuation and the stop, and
+        that continues no position, means the model's writing leaves
+        the document: the answer is none, as it is on the stock path
+        when the written answer is not found in the text.
         """
         doc, qs = self._question(q, anchor)
         tables = self.tables
@@ -585,7 +590,9 @@ class ExtractStages:
             qs.none_lp = none_lp
             qs.best_lp = max((lp[token] for token, _ in starts.values()),
                              default=NEG)
-            qs.none_wins = max(none_lp, stop_lp) > qs.best_lp
+            allowed = {token for token, _ in starts.values()}
+            qs.none_wins = (max(none_lp, stop_lp) > qs.best_lp
+                            or self._leaves(tables, lp, allowed, qs.best_lp, stop_lp))
             if qs.none_wins:
                 self._answer(doc, q)
                 return True
@@ -606,6 +613,11 @@ class ExtractStages:
                 qs.live = [s for s in qs.live if s.next(at, tables) == joined]
                 self._answer(doc, q)
                 return True
+            if self._leaves(tables, lp, following | set(merged.values()),
+                            best_lp, stop_lp):
+                qs.none_wins = True
+                self._answer(doc, q)
+                return True
             if best is None or stop_lp >= best_lp:
                 self._answer(doc, q)
                 return True
@@ -614,6 +626,13 @@ class ExtractStages:
         if len(qs.written) >= ANSWER_MAX_TOKENS:
             self._answer(doc, q)
         return True
+
+    @staticmethod
+    def _leaves(tables, lp, allowed, best_lp, stop_lp) -> bool:
+        """Return whether the model's likeliest token leaves the document."""
+        top = max(lp, key=lp.get)
+        return (lp[top] > max(best_lp, stop_lp) and top not in allowed
+                and top not in tables._stops and top != tables.none_id)
 
     def _answer(self, doc, q):
         """Set the question's answer for the document: its span, or none.

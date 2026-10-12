@@ -115,7 +115,7 @@ class ModelCall:
     # before its start is read (locate)
     question: str = ""
     trim: bool = True
-    locate: bool = True
+    locate: bool = False
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -133,7 +133,7 @@ class ModelCall:
         ):
             raise CompileError("only an AI.CLASSIFY call has labels")
         if self.kind != "extract" and (self.question or not self.trim
-                                       or not self.locate):
+                                       or self.locate):
             raise CompileError("only an AI.EXTRACT call has a question")
         if self.kind == "label":
             validate_labels(self.labels, self.descriptions)

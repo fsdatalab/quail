@@ -56,7 +56,24 @@ since both write the answer greedily and the stock path keeps only
 answers it finds in the text. Time follows the answer's tokens: the
 short fields (CUAD-1, 2, 10) stay within 2 s of their last runs, and
 the clause fields (CUAD-3, 7, 8, 9), about 60 tokens, take up to 60 s
-at today's cost per round.
+at today's cost per round. Measured on run 20261012T011602Z, with
+locating on: F1 unchanged from the span rule on every query (CUAD-1
+0.28, CUAD-2 0.61, CUAD-3 0.21), 13 to 19 s. Run 011923Z, locating
+off: within 3 points of stock vLLM on CUAD-1, 2, 4, 9, and 10 (0.37,
+0.83, 0.62, 0.29, 0.49) and below on the clause fields (CUAD-3 0.41,
+CUAD-7 0.58, CUAD-8 0.36); the lines the model names are wrong often
+enough to cost 5 to 22 points on every query, so locating is off by
+default. That run took 30 to 126 s per query from a first-token scan
+per position and streams tokenized to the contract's end; run
+013438Z, with the scan by word and streams tokenized a window at a
+time, took 7.9 to 14.0 s, within a second of stock vLLM on each query.
+
+Prediction for the null rule (the answer is none when the model's
+likeliest token continues no position, as the stock path's is when
+its written answer is not in the text): CUAD-3 and CUAD-7 close to
+within 5 points of stock vLLM (0.55, 0.75), since stock vLLM returned
+null on 16 of 45 contracts for CUAD-3 where the reference is often
+null; CUAD-1 and CUAD-2 stay within 2 points of 0.37 and 0.83.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the
@@ -68,7 +85,7 @@ and precision below 0.3. Every query finishes in under 10 s on Quail.
 
     uv run modal run --detach -m experiments.cells.cuad_check
         [--model decision-2.0-kai-0.6b-bf16] [--backends quail]
-        [--sf 0.1] [--only CUAD-5,CUAD-13]
+        [--sf 0.1] [--only CUAD-5,CUAD-13] [--locate]
         2>&1 | tee /tmp/cuad_check.log
 """
 
@@ -129,7 +146,7 @@ def _summary(record) -> dict:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=7200,
               volumes=VOLUMES)
 def run_cuad(run: str, model: str, backend: str, sf: float = 0.1,
-             only=None, locate: bool = True) -> dict:
+             only=None, locate: bool = False) -> dict:
     """Run the CUAD queries on one backend and save the QUAIL-B record."""
     import quail
     from quail.bench import quailb
@@ -140,7 +157,7 @@ def run_cuad(run: str, model: str, backend: str, sf: float = 0.1,
     data_dir = build_sets(TABLES, sf)
     VOLUMES["/root/.cache/huggingface"].commit()
     output = (f"/results/benchmarks/quailb/cuad-{run}-{model}-{backend}"
-              f"{'' if locate else '-plain'}")
+              f"{'-located' if locate else ''}")
     started = time.perf_counter()
     try:
         record = quailb.run_suite(
@@ -161,7 +178,7 @@ def run_cuad(run: str, model: str, backend: str, sf: float = 0.1,
 
 @app.local_entrypoint()
 def main(model: str = "qwen3-4b-fp8", backends: str = "quail,stock_vllm",
-         sf: float = 0.1, only: str = "", locate: bool = True):
+         sf: float = 0.1, only: str = "", locate: bool = False):
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     queries = [q for q in only.split(",") if q] or None
     for backend in backends.split(","):

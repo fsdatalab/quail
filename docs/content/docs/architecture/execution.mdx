@@ -153,9 +153,9 @@ join kept. It reuses the anchor's KV when processing each pair.
 ### Extraction
 
 An extraction copies each document's answer to a question from the
-document's own text: the model names the lines that hold it, then
-writes it one token at a time, each token chosen among the tokens
-that continue some position of the document in those lines. It shows
+document's own text: the model writes it one token at a time, each
+token chosen among the tokens that continue some position of the
+document, or of the lines it named first with `locate` on. It shows
 the document inside its own prompt head, plain or as numbered lines,
 so it cannot reuse the KV a filter or a classification left: those
 show the document raw. The extractions of

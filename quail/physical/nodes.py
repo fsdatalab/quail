@@ -1051,7 +1051,7 @@ class ExtractSpec(ScoreSpec):
 
     question: str = ""
     trim: bool = True
-    locate: bool = True
+    locate: bool = False
     numbered_token_parts: tuple[tuple[int, ...], ...] = ()
 
     @property
@@ -1074,7 +1074,7 @@ class ExtractSpec(ScoreSpec):
                 "prompt_token_parts", "draws", "share_prefixes")},
             question=str(value["question"]),
             trim=bool(value.get("trim", True)),
-            locate=bool(value.get("locate", True)),
+            locate=bool(value.get("locate", False)),
             numbered_token_parts=tuple(
                 tuple(part) for part in value.get("numbered_token_parts", ())),
         )
@@ -1122,7 +1122,7 @@ class AiExtract(AiScore):
             **super().explain_fields(),
             "question": None if self.spec is None else self.spec.question,
             "trim": True if self.spec is None else self.spec.trim,
-            "locate": True if self.spec is None else self.spec.locate,
+            "locate": False if self.spec is None else self.spec.locate,
         }
 
     @classmethod

@@ -136,7 +136,7 @@ def _spec(trim=True, *extra):
         arguments=(("c", "text"),), expected_inputs=3, estimated_seconds=0.0,
         prompt_token_parts=(tuple(tables.encode_ids(HEAD)),
                             tuple(tables.encode_ids(TAIL))),
-        question=QUESTION, trim=trim,
+        question=QUESTION, trim=trim, locate=True,
         numbered_token_parts=(tuple(tables.encode_ids(NUMBERED_HEAD)),
                               tuple(tables.encode_ids(NUMBERED_TAIL)))), tables
 
@@ -239,6 +239,28 @@ def test_a_stream_tokenizes_a_window_at_a_time():
     assert first.next(10_000, tables) is None and first.exhausted
     assert text[first.char:first.ends[-1]] == text
     assert extract_mod.STREAM_WINDOW == 512
+
+
+def test_writing_that_leaves_the_document_answers_none(monkeypatch):
+    # the model writes "March" then a word the document does not
+    # continue with: the stock path would not find its answer in the
+    # text, and neither extraction answers
+    state, model, run, _ = _setup(monkeypatch)
+    tables = model.tables
+    stray = tables.encode_ids(" lease")[0]
+    answer_row = model._answer_row
+
+    def straying(key, written):
+        row = answer_row(key, written)
+        if key[1] == 0 and len(written) == 1:
+            return model._cue({stray: -0.05}, -9.0, -4.0)
+        return row
+
+    model._answer_row = straying
+    result, stages = run()
+    assert result.outputs["scores"].column("ends").to_pylist() == [
+        None, "five years", None]
+    assert stages.docs[0].questions[0].none_wins
 
 
 def test_a_first_token_that_begins_a_longer_word_carries_its_rest():
