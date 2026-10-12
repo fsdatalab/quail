@@ -116,7 +116,15 @@ as on run 020405Z but for the 0 to 3 contracts per query that move
 between runs; the clause fields drop from 10.2 s to about 6 s
 (CUAD-3), 13.0 to about 8 s (CUAD-7), and 8.9 to about 6 s (CUAD-8),
 since a 60-token answer takes 4 to 8 rounds instead of 60; the short
-fields (CUAD-1, 2, 4, 10) move by less than 1 s.
+fields (CUAD-1, 2, 4, 10) move by less than 1 s. Measured on run
+20261012T055523Z: every score within a point of run 020405Z (CUAD-3
+0.54, CUAD-4 0.80, the rest equal); CUAD-3 8.5 s, CUAD-7 11.6 s,
+CUAD-8 7.4 s, less than predicted; CUAD-1 7.8 s, CUAD-2 7.3 s, CUAD-4
+6.7 s, CUAD-9 7.6 s, CUAD-10 11.9 s. The short fields fell by 0.2 to
+2.5 s too, so the rounds were not the whole gap: a query with answers
+of a few tokens takes 7 to 8 s, and run 20261012T055945Z
+(experiments/cells/extract_pipeline_check.py --profile) times the
+read chunks and the rounds apart.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the

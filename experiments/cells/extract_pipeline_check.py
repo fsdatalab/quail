@@ -12,6 +12,20 @@ named, the none and best start log probabilities at the cue, and
 the answer, under
 /results/extract_pipeline_check/.
 
+With --profile, run_profile asks the governing law and the cap on
+liability of the 45 contracts, one query each, and times every chunk
+of the stage executor in four parts, with the GPU synchronized after
+each: packing the chunk on the host, the forward pass, the readout,
+and reading the answers and deciding the next tokens. Chunks are
+grouped into those that read documents and the answer rounds. The
+synchronizing loses the overlap of one chunk's reading with the next
+chunk's forward pass, so the parts sum to more than the query time.
+Prediction: the read chunks take at least 6 s of CUAD-1's 7.8 s on
+run 20261012T055523Z, with at least 4.5 s in the forward pass; the
+rounds of the cap on liability take at most 8 chunks and 1.5 s. Rounds
+over 2 s mean the per-round cost is the problem; read chunks with over
+1 s outside the forward pass mean the host is.
+
 Prediction: the pipeline reuses the document's KV exactly. A's first
 question answers as B does on every contract but the few whose start
 or lines decision is a near tie moved by chunk composition, with cue
@@ -56,12 +70,11 @@ def _state(stages) -> list:
     out = []
     for doc in stages.docs:
         for q, qs in enumerate(doc.questions):
-            top = sorted(qs.cue_lp.items(), key=lambda item: -item[1])[:5]
             out.append({
                 "document": doc.index, "question": q, "path": qs.path,
                 "range": qs.range, "none_lp": qs.none_lp, "best_lp": qs.best_lp,
-                "top_cue": [[int(t), round(v, 4)] for t, v in top],
-                "answer": qs.answer, "span": qs.span, "passes": qs.passes})
+                "answer": qs.answer, "span": qs.span, "steps": qs.steps,
+                "written": len(qs.written)})
     return out
 
 
@@ -353,10 +366,123 @@ def run_budgets(run: str) -> dict:
     return {"path": path, **summary}
 
 
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=VOLUMES)
+def run_profile(run: str) -> dict:
+    """Time each chunk's packing, forward pass, readout, and deciding."""
+    import pyarrow.parquet as pq
+
+    import quail
+    from quail.backends.quail.executor import loop
+    from quail.backends.quail.executor import stages as scheduler
+    from quail.planner.plan import EngineConfig
+    from quail_b.data import build_sets
+    from quail_b.prompts import CUAD_QUESTIONS
+
+    data_dir = build_sets(TABLES, 0.1)
+    contracts = pq.read_table(data_dir / "contracts.parquet")
+    chunks = []          # one record per chunk, in order
+    current = {}
+    executor = scheduler._StageExecutor
+    original = {"build": executor._build, "submit": executor._submit,
+                "report": executor._report, "run_one": executor._run_one,
+                "forward": loop._forward}
+
+    def timed(name):
+        def wrap(self, *args, **kwargs):
+            self.torch.cuda.synchronize()
+            started = time.perf_counter()
+            out = original[name](self, *args, **kwargs)
+            self.torch.cuda.synchronize()
+            current[name] = time.perf_counter() - started
+            return out
+        return wrap
+
+    def build(self, part):
+        self.torch.cuda.synchronize()
+        started = time.perf_counter()
+        chunk, entries = original["build"](self, part)
+        current.clear()
+        current["build"] = time.perf_counter() - started
+        current["kind"] = ("read" if any(carried for *_, carried in part)
+                           else "round")
+        current["tokens"] = int(chunk.tokens)
+        current["rows"] = int(sum(rows for _, rows in entries))
+        current["stages"] = sorted({int(j) for _, j, *_ in part})
+        return chunk, entries
+
+    def forward(pipeline, arena, chunk):
+        import torch
+
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        out = original["forward"](pipeline, arena, chunk)
+        torch.cuda.synchronize()
+        current["forward"] = time.perf_counter() - started
+        return out
+
+    def run_one(self, part):
+        original["run_one"](self, part)
+        chunks.append(dict(current))
+
+    def report(self, entry):
+        started = time.perf_counter()
+        original["report"](self, entry)
+        # the entry's chunk is the last recorded one that lacks a report
+        for record in reversed(chunks):
+            if "report" not in record:
+                record["report"] = time.perf_counter() - started
+                break
+
+    executor._build = build
+    executor._submit = timed("submit")
+    executor._report = report
+    executor._run_one = run_one
+    loop._forward = forward
+    session = quail.Session(EngineConfig(model=MODEL, device="h100-sxm",
+                                         backend="quail"))
+    session.register("contracts", quail.DocumentProvider.from_table(
+        contracts, id_col="id"))
+    results = {}
+    for label, category in (("governing law", "Governing Law"),
+                            ("cap on liability", "Cap On Liability")):
+        chunks.clear()
+        query = (session.docs("contracts").alias("c")
+                 .ai_extract("c.text", CUAD_QUESTIONS[category], name="q0")
+                 .select("c.id", "q0"))
+        started = time.perf_counter()
+        query.run().collect()
+        wall = time.perf_counter() - started
+        # the kernel warm-up runs chunks of its own before the query
+        own = [c for c in chunks if c.get("tokens", 0) > 0]
+        summary = {}
+        for kind in ("read", "round"):
+            mine = [c for c in own if c["kind"] == kind]
+            summary[kind] = {
+                "chunks": len(mine),
+                "tokens": sum(c["tokens"] for c in mine),
+                "rows": sum(c["rows"] for c in mine),
+                **{part: round(sum(c.get(part, 0.0) for c in mine), 3)
+                   for part in ("build", "forward", "submit", "report")}}
+        results[label] = {"wall_s": round(wall, 3), "summary": summary,
+                          "chunks": own}
+        print(label, json.dumps({"wall_s": round(wall, 3), **summary}),
+              flush=True)
+    session.close()
+    os.makedirs("/results/extract_pipeline_check", exist_ok=True)
+    path = f"/results/extract_pipeline_check/{run}_profile.json"
+    with open(path, "w") as f:
+        json.dump({"run": run, "model": MODEL, "results": results}, f, indent=1)
+    VOLUMES["/results"].commit()
+    return {"path": path, **{k: {"wall_s": v["wall_s"], **v["summary"]}
+                             for k, v in results.items()}}
+
+
 @app.local_entrypoint()
-def main(snapshot: bool = False, budgets: bool = False):
+def main(snapshot: bool = False, budgets: bool = False, profile: bool = False):
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    function = run_snapshot if snapshot else run_budgets if budgets else run_check
+    function = (run_profile if profile else run_snapshot if snapshot
+                else run_budgets if budgets else run_check)
     call = function.spawn(run)
     run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     print(f"function call id {call.object_id}", flush=True)
