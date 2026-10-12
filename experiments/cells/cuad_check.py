@@ -198,7 +198,18 @@ turn opener gone: Quail's CUAD-7 falls from 89.6 s to about 55 s and
 CUAD-8 and CUAD-9 from 62 and 63 s to about 50 s, the rest within 3 s
 of run 061833Z; stock vLLM's times hold within 5 s; span F1 on both
 backends holds within 3 points of run 061833Z, CUAD-3 and CUAD-9
-included, if the drops above were the 45-contract noise.
+included, if the drops above were the 45-contract noise. Measured on
+run 20261012T065554Z, Quail then stock vLLM: CUAD-1 52.6 s (0.36) and
+58.0 s (0.37); CUAD-2 49.8 s (0.74) and 56.2 s (0.77); CUAD-3 50.7 s
+(0.57) and 68.6 s (0.70); CUAD-4 50.0 s (0.82) and 61.5 s (0.63);
+CUAD-7 53.0 s (0.59) and 113.4 s (0.71); CUAD-8 51.3 s (0.50) and
+104.6 s (0.57); CUAD-9 51.7 s (0.37) and 95.3 s (0.43); CUAD-10 54.9
+s (0.45) and 170.7 s (0.47). Every Quail query fed about 3.4 million
+fresh tokens, the documents once; CUAD-7, 8, and 9 report 107 to 122
+thousand input tokens per second. Quail's scores held within 1 point
+of run 061833Z but CUAD-8, up 5, and CUAD-9, up 2, so the 45-contract
+drops were noise; stock vLLM's held within 1 point but CUAD-3, up 4,
+and CUAD-8, up 3.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the
