@@ -11,6 +11,7 @@ from quail.logical import (
     FilterPredicate,
     JoinSpec,
     ModelCall,
+    ParseCall,
     RegularPredicate,
     bind_join_prompt,
     bind_prompt,
@@ -23,6 +24,25 @@ JOIN_OPTION_KEYS = {"selectivity", "anchor"}
 
 
 SCORE_OPTION_KEYS = {"selectivity"}
+
+PARSE_FUNCTIONS = ("AI_PARSE", "AI_PARSE_DOCUMENT")
+# Snowflake's AI_PARSE_DOCUMENT modes, by the AI.PARSE mode they name
+SNOWFLAKE_PARSE_MODES = {"OCR": "text", "LAYOUT": "layout"}
+# set on a document column that stands for AI.PARSE of it
+PARSED = "quail_parsed"
+
+
+def is_parse_call(node) -> bool:
+    """Return whether a SQL node is AI.PARSE or AI_PARSE_DOCUMENT."""
+    return any(_is_call(node, name) for name in PARSE_FUNCTIONS)
+
+
+def is_document_column(catalog, ref) -> bool:
+    """Return whether a column refers to PDF pages rather than holding text."""
+    from quail.pdf import DOCUMENT_COLUMN, PdfPagesProvider
+
+    return (ref.column == DOCUMENT_COLUMN
+            and isinstance(catalog.get(ref.provider), PdfPagesProvider))
 
 
 def _is_call(node, name: str) -> bool:
@@ -174,6 +194,7 @@ class ExpressionBinder:
             str, list[tuple[ModelCall, tuple[str, ...], float | None]]
         ] = {}
         self.joins: list[JoinSpec] = []
+        self.parses: dict[str, ParseCall] = {}
 
     # ---- scope ------------------------------------------------------
 
@@ -200,7 +221,8 @@ class ExpressionBinder:
                     f"column {column!r} not in provider {provider!r} "
                     f"(schema: {self.catalog.get(provider).columns})"
                 )
-            return ColumnRef(alias=col.table, provider=provider, column=column)
+            return self._readable(
+                col, ColumnRef(alias=col.table, provider=provider, column=column))
         owners = [
             (a, p) for a, p in scope.items() if column in self.catalog.get(p).columns
         ]
@@ -209,7 +231,111 @@ class ExpressionBinder:
                 f"column {column!r} is {'ambiguous' if owners else 'unknown'};"
                 f" qualify it with a table alias"
             )
-        return ColumnRef(alias=owners[0][0], provider=owners[0][1], column=column)
+        return self._readable(
+            col, ColumnRef(alias=owners[0][0], provider=owners[0][1], column=column))
+
+    def _readable(self, col: exp.Column, ref: ColumnRef) -> ColumnRef:
+        """Refuse a PDF document column outside AI.PARSE."""
+        if is_document_column(self.catalog, ref) and not col.meta.get(PARSED):
+            raise CompileError(
+                f"{ref.alias}.{ref.column} refers to PDF pages, not text; "
+                f"read it with AI.PARSE({ref.alias}.{ref.column})")
+        return ref
+
+    def bind_parse(self, node) -> ParseCall:
+        """Bind one AI.PARSE or AI_PARSE_DOCUMENT call.
+
+        Args:
+            node: The call: AI_PARSE(document [, mode => 'text' |
+                'layout']) or AI_PARSE_DOCUMENT(document [, {'mode':
+                'OCR' | 'LAYOUT'}]).
+
+        Returns:
+            The ParseCall, also recorded as the table's parse.
+
+        Raises:
+            CompileError: The argument is not a read_pdfs document
+                column, the mode is unknown, or the table is parsed in
+                two modes.
+        """
+        name = str(node.this).upper()
+        args = node.expressions
+        if not args or len(args) > 2 or not isinstance(args[0], exp.Column):
+            raise CompileError(
+                f"{name} takes a document column and an optional mode, "
+                f"got {node.sql()}")
+        column = args[0].copy()
+        column.meta[PARSED] = True
+        ref = self.resolve_column(column)
+        if not is_document_column(self.catalog, ref):
+            raise CompileError(
+                f"{name} reads the document column of a read_pdfs table, "
+                f"got {args[0].sql()}")
+        mode = "text"
+        if len(args) == 2:
+            mode = self._parse_mode(name, args[1])
+        call = ParseCall(ref, mode)
+        call.validate()
+        known = self.parses.setdefault(ref.alias, call)
+        if known != call:
+            raise CompileError(
+                f"{ref.alias!r} is parsed in two modes, {known.mode!r} and "
+                f"{call.mode!r}; parse each table in one mode")
+        self.note_doc_column(ref)
+        return call
+
+    @staticmethod
+    def _parse_mode(name: str, node) -> str:
+        if name == "AI_PARSE":
+            if not (isinstance(node, exp.Kwarg)
+                    and str(node.this.name).lower() == "mode"
+                    and isinstance(node.expression, exp.Literal)
+                    and node.expression.is_string):
+                raise CompileError(
+                    f"AI.PARSE's second argument is mode => 'text' or "
+                    f"'layout', got {node.sql()}")
+            return str(node.expression.this).lower()
+        if isinstance(node, exp.Struct) and len(node.expressions) == 1:
+            prop = node.expressions[0]
+            if (isinstance(prop, exp.PropertyEQ)
+                    and str(prop.this.name).lower() == "mode"
+                    and isinstance(prop.expression, exp.Literal)):
+                mode = str(prop.expression.this).upper()
+                if mode in SNOWFLAKE_PARSE_MODES:
+                    return SNOWFLAKE_PARSE_MODES[mode]
+        raise CompileError(
+            f"AI_PARSE_DOCUMENT's options are {{'mode': 'OCR'}} or "
+            f"{{'mode': 'LAYOUT'}}, got {node.sql()}")
+
+    def bind_parses(self, tree) -> None:
+        """Bind every AI.PARSE call, and replace each one a prompt reads.
+
+        A call inside PROMPT or as AI.CLASSIFY's input becomes its
+        document column, marked as parsed: the table's operators read
+        the parsed text as their document. A call returned in SELECT
+        stays for the projection to name.
+
+        Raises:
+            CompileError: A call appears anywhere else.
+        """
+        for node in list(tree.find_all(exp.Anonymous)):
+            if not is_parse_call(node):
+                continue
+            self.bind_parse(node)
+            parent = node.parent
+            if (isinstance(parent, exp.Alias)
+                    and isinstance(parent.parent, exp.Select)
+                    and parent.arg_key == "expressions"):
+                continue
+            if not (_is_call(parent, "PROMPT")
+                    or (isinstance(parent, exp.AIClassify)
+                        and node.arg_key == "this")):
+                raise CompileError(
+                    f"{node.sql()}: AI.PARSE may be a PROMPT argument, "
+                    f"AI.CLASSIFY's input, or a SELECT column with an AS name")
+            column = node.expressions[0].copy()
+            column.meta[PARSED] = True
+            node.replace(column)
 
     def note_doc_column(self, ref: ColumnRef) -> None:
         seen = self.doc_columns.get(ref.alias)

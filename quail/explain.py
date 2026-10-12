@@ -110,6 +110,10 @@ def logical_tree(logical):
                 title += f", {node.name}{logical_nodes.PROBABILITIES_SUFFIX}"
             details = [f"{_prompt(node.call.prompt)} "
                        f"labels={list(node.call.labels)}"]
+        elif isinstance(node, logical_nodes.SemanticParse):
+            document = node.call.document
+            title = (f"SemanticParse: {node.name} = AI.PARSE("
+                     f"{document.alias}.{document.column}, mode={node.call.mode})")
         elif isinstance(node, logical_nodes.Join):
             title = "Join"
             details = ([f"on {condition}" for condition in node.on]

@@ -24,6 +24,7 @@ from quail.logical.nodes import (
     SemanticClassify,
     SemanticFilter,
     SemanticJoin,
+    SemanticParse,
 )
 
 
@@ -128,6 +129,7 @@ class LogicalPlan:
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
         scans, filters, joins, applies, classifies = [], {}, [], [], []
+        parsed = []
         tested, aliases = {}, []
         nodes = self.walk()
         for node in nodes:
@@ -150,6 +152,8 @@ class LogicalPlan:
                 applies.append(node)
             elif isinstance(node, SemanticClassify):
                 classifies.append(node)
+            elif isinstance(node, SemanticParse):
+                parsed.append(node)
         calls = {
             (node.alias, node.name): node.call
             for node in classifies
@@ -185,10 +189,12 @@ class LogicalPlan:
             joins=tuple(joins),
             applies=tuple(applies),
             projections=tuple(
-                column for column in columns if isinstance(column, Alias)
+                column for column in columns
+                if isinstance(column, Alias) and column.expression.kind != "parse"
             ),
             labels=_label_work(classifies, columns, label_filters),
             classifies=tuple(classifies),
+            parses=tuple(parsed),
         )
 
 
@@ -207,8 +213,10 @@ class Operators:
     joins: tuple  # tuple[SemanticJoin, ...]
     applies: tuple  # tuple[Apply, ...]
     labels: LabelWork
-    projections: tuple = ()  # named model calls in SELECT order
+    projections: tuple = ()  # named model calls in SELECT order; a
+    #                          projected AI.PARSE is in parses
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
+    parses: tuple = ()  # tuple[SemanticParse, ...]
     label_filters: dict = field(default_factory=dict)
     #                     alias -> tuple[LabelFilter, ...]
 

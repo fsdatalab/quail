@@ -15,6 +15,7 @@ from quail.logical.expressions import (
     HavingTest,
     InList,
     ModelCall,
+    ParseCall,
     Prompt,
     RegularPredicate,
     SortKey,
@@ -445,6 +446,73 @@ class SemanticClassify:
         }
 
 
+@dataclass(frozen=True)
+class SemanticParse:
+    """AI.PARSE over its input rows, adding the parsed text column.
+
+    Every input row passes through with the text of its document's
+    pages in the column named ``name``. It sits above its table's Scan
+    and below every operator that reads the text: the table's AI
+    operators read the parsed text as their document, and the root
+    Project returns the column through an Alias of the same call.
+    """
+
+    input: LogicalNode
+    call: ParseCall
+    name: str
+
+    type_name: ClassVar[str] = "quail.semantic_parse"
+
+    @property
+    def alias(self) -> str:
+        """The table alias whose rows are parsed."""
+        return self.call.document.alias
+
+    def children(self) -> tuple[LogicalNode, ...]:
+        return (self.input,)
+
+    def expressions(self) -> tuple:
+        return (self.call,)
+
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        return self.input.output_schema() + (
+            ColumnRef(self.alias, self.call.document.provider, self.name),)
+
+    def validate(self) -> None:
+        self.call.validate()
+        if not self.name or "." in self.name:
+            raise CompileError(
+                f"a parse needs a column name without a dot, got {self.name!r}")
+        fields = self.input.output_schema()
+        if self.call.document not in fields:
+            raise CompileError(
+                f"the parse reads {self.alias}.{self.call.document.column}, "
+                f"which its input does not produce")
+        if any(field.alias == self.alias and field.column == self.name
+               for field in fields):
+            raise CompileError(f"the name {self.name!r} is already used")
+
+    def with_children(self, children: tuple[LogicalNode, ...]):
+        if len(children) != 1:
+            raise CompileError("SemanticParse needs one input")
+        return replace(self, input=children[0])
+
+    def with_expressions(self, expressions: tuple):
+        if len(expressions) != 1:
+            raise CompileError("SemanticParse needs one call")
+        return replace(self, call=expressions[0])
+
+    def explain_fields(self) -> dict:
+        return {"name": self.name, "expression": _explain(self.call),
+                "mode": self.call.mode}
+
+
+def parses(node) -> tuple:
+    """Return the SemanticParse nodes at or below a node, children first."""
+    return tuple(found for found in _subtree(node)
+                 if isinstance(found, SemanticParse))
+
+
 def _subtree(node) -> tuple:
     """Return the node and every node below it, children first."""
     nodes = []
@@ -579,9 +647,15 @@ class Project:
 
     def validate(self) -> None:
         computed = {(node.call, node.name) for node in classifications(self.input)}
+        parsed = {(node.call, node.name) for node in parses(self.input)}
         for column in self.columns:
             if isinstance(column, Alias):
                 column.validate()
+                if (column.expression.kind == "parse"
+                        and (column.expression, column.name) not in parsed):
+                    raise CompileError(
+                        f"the parsed column {column.name!r} needs a "
+                        f"SemanticParse below the Project")
                 if (
                     column.expression.kind == "label"
                     and (column.expression, column.name) not in computed

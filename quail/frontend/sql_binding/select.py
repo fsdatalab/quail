@@ -10,6 +10,8 @@ from quail.frontend.sql_binding.expressions import (
     ExpressionBinder,
     _conjuncts,
     _is_call,
+    is_document_column,
+    is_parse_call,
 )
 from quail.logical import (
     AggregateCall,
@@ -291,7 +293,10 @@ def _compile_projection(b: ExpressionBinder, expressions) -> list:
         if isinstance(e, exp.Star):
             for alias, provider in b.tables:
                 for c in b.catalog.get(provider).columns:
-                    columns.append(ColumnRef(alias=alias, provider=provider, column=c))
+                    ref = ColumnRef(alias=alias, provider=provider, column=c)
+                    # the pages a document refers to are read with AI.PARSE
+                    if not is_document_column(b.catalog, ref):
+                        columns.append(ref)
             continue
         alias = None
         if isinstance(e, exp.Alias):
@@ -306,6 +311,11 @@ def _compile_projection(b: ExpressionBinder, expressions) -> list:
                     "projected AI.SCORE must reference one or two relations"
                 )
             columns.append(Alias(call, alias))
+            continue
+        if is_parse_call(e):
+            if not alias:
+                raise CompileError("AI.PARSE needs an AS name in SELECT")
+            columns.append(Alias(b.bind_parse(e), alias))
             continue
         if isinstance(e, exp.AIClassify):
             if not alias:

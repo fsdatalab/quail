@@ -206,11 +206,45 @@ class InList:
             )
 
 
+PARSE_MODES = ("text", "layout")
+
+
+@dataclass(frozen=True)
+class ParseCall:
+    """AI.PARSE: the text of the pages a row's document refers to.
+
+    ``document`` is the document column of a read_pdfs table. Mode
+    "text" gives the pages' text; "layout" also gives each block's
+    label and box.
+    """
+
+    document: ColumnRef
+    mode: str = "text"
+
+    kind: ClassVar[str] = "parse"
+    type_name: ClassVar[str] = "quail.parse_call"
+
+    def aliases(self) -> tuple[str, ...]:
+        """Return the table alias whose rows are parsed."""
+        return (self.document.alias,)
+
+    def validate(self) -> None:
+        if self.mode not in PARSE_MODES:
+            raise CompileError(
+                f"AI.PARSE mode must be one of {PARSE_MODES}, got {self.mode!r}")
+
+
+def is_parse(expression) -> bool:
+    """Return whether a projected column is an AI.PARSE output."""
+    return isinstance(expression, Alias) and isinstance(expression.expression,
+                                                        ParseCall)
+
+
 @dataclass(frozen=True)
 class Alias:
-    """A model call returned as a named result column."""
+    """A model call or AI.PARSE returned as a named result column."""
 
-    expression: ModelCall
+    expression: Any  # ModelCall | ParseCall
     name: str
 
     type_name: ClassVar[str] = "quail.alias"
@@ -374,10 +408,13 @@ def _explain(expression) -> str:
             f"IN {list(expression.values)}"
         )
     if isinstance(expression, Alias):
-        if expression.expression.kind == "label":
-            # the SemanticClassify below computes the column
+        if expression.expression.kind in ("label", "parse"):
+            # the SemanticClassify or SemanticParse below computes the column
             return expression.name
         return f"{_explain(expression.expression)} AS {expression.name}"
+    if isinstance(expression, ParseCall):
+        document = expression.document
+        return f"AI.PARSE({document.alias}.{document.column}, {expression.mode!r})"
     if expression.kind == "label":
         return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"
     function = "AI.SCORE" if expression.kind == "score" else "AI.IF"

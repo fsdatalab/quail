@@ -7,6 +7,7 @@ from sqlglot import exp
 
 from quail.catalog import Catalog
 from quail.frontend.sql_binding.expressions import (
+    PARSE_FUNCTIONS,
     ExpressionBinder,
 )
 from quail.frontend.sql_binding.relations import (
@@ -27,6 +28,7 @@ from quail.logical import (
     CompileError,
     LogicalPlan,
     LogicalPlanBuilder,
+    is_parse,
     is_score,
 )
 
@@ -66,6 +68,8 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
             replacement = "AI_SCORE("
         elif function == "CLASSIFY":
             replacement = "AI_CLASSIFY("
+        elif function == "PARSE":
+            replacement = "AI_PARSE("
         elif function == "IF" and dialect is SQLDialect.BQ:
             replacement = "AI_FILTER("
         if (
@@ -99,10 +103,11 @@ def _reject_forbidden(tree) -> None:
         if name.startswith("AI_") and name not in {
             "AI_FILTER",
             "AI_SCORE",
+            *PARSE_FUNCTIONS,
         }:
             raise CompileError(
                 f"{name} is not supported; supported AI functions are "
-                "AI_FILTER and AI_SCORE"
+                "AI_FILTER, AI_SCORE, AI_PARSE, and AI_PARSE_DOCUMENT"
             )
     # subqueries are legal only as the EXISTS form, checked
     # structurally; any other subquery is refused here
@@ -116,7 +121,16 @@ def _validate_query(
     b: ExpressionBinder, joins: JoinBinder, columns: tuple[ColumnRef | Alias, ...]
 ) -> None:
     """Validate output names and supported combinations of AI operators."""
-    projected = tuple(column for column in columns if isinstance(column, Alias))
+    parsed = tuple(column for column in columns if is_parse(column))
+    projected = tuple(column for column in columns
+                      if isinstance(column, Alias) and not is_parse(column))
+    for column in parsed:
+        if column.name in dict(b.tables):
+            raise CompileError(
+                f"output name {column.name!r} is also a table alias; pick "
+                f"another AS name")
+    if len({column.expression for column in parsed}) != len(parsed):
+        raise CompileError("the same AI.PARSE is projected twice; project it once")
     projected_scores = tuple(
         column for column in projected if column.expression.kind == "score"
     )
@@ -162,7 +176,8 @@ def _validate_query(
             "AI.SCORE cannot be mixed with generative AI predicates in one query"
         )
 
-    if not b.joins and not b.filters and not b.label_tests and not projected:
+    if (not b.joins and not b.filters and not b.label_tests and not projected
+            and not b.parses):
         raise CompileError(
             "the query has no AI predicate; a plain "
             "scan belongs in the database the ids came "
@@ -243,6 +258,7 @@ def compile_sql(
 
     joins = JoinBinder(b)
     joins.bind_tables(tree)
+    b.bind_parses(tree)
     bind_where(b, tree, joins)
 
     selection = SelectBinder(b).bind(tree)
@@ -251,6 +267,8 @@ def compile_sql(
     _validate_query(b, joins, columns)
     named, labels = _bind_label_names(b, columns)
 
+    parse_names = {column.expression.document.alias: column.name
+                   for column in columns if is_parse(column)}
     logical = LogicalPlanBuilder()
     for alias, provider in b.tables:
         logical.add_scan(
@@ -264,6 +282,8 @@ def compile_sql(
                 (labels[alias][call], accepted, selectivity)
                 for call, accepted, selectivity in b.label_tests.get(alias, ())
             ),
+            parse=(None if alias not in b.parses else
+                   (b.parses[alias], parse_names.get(alias, f"__parse_{alias}"))),
         )
     for join in b.joins:
         logical.add_join(join)

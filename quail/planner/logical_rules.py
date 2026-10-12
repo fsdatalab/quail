@@ -19,6 +19,7 @@ from quail.logical import (
     LogicalPlan,
     ModelCall,
     Operators,
+    ParseCall,
     Project,
     RegularPredicate,
     Result,
@@ -26,7 +27,9 @@ from quail.logical import (
     SemanticClassify,
     SemanticFilter,
     SemanticJoin,
+    SemanticParse,
     SortKey,
+    is_parse,
     is_score,
     model_call,
 )
@@ -38,6 +41,10 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return (expression,)
     if isinstance(expression, FilterPredicate):
         return _column_refs(expression.expression)
+    if isinstance(expression, Alias) and isinstance(expression.expression, ParseCall):
+        return _column_refs(expression.expression)
+    if isinstance(expression, ParseCall):
+        return (expression.document,)
     if isinstance(expression, (ModelCall, Compare, Alias)):
         return tuple(model_call(expression).prompt.args)
     if isinstance(expression, (InList, RegularPredicate)):
@@ -59,7 +66,8 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     Scan, so the path holds the complete set.
 
     The document column is always tokenized. It is kept as a value too
-    only when the root projection returns it.
+    only when the root projection returns it. A read_pdfs document
+    column is never a value: AI.PARSE reads its pages.
     """
     plan = LogicalPlan(root)
     projection = next((node for node in reversed(plan.walk())
@@ -76,7 +84,7 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     score_inputs = {
         (ref.alias, ref.column)
         for expression in (projection.columns if projection is not None else ())
-        if isinstance(expression, Alias)
+        if isinstance(expression, Alias) and not is_parse(expression)
         for ref in _column_refs(expression)
     }
 
@@ -86,8 +94,8 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         for expression in expressions:
             for ref in _column_refs(expression):
                 needed.setdefault(ref.alias, {})[ref.column] = None
-        if isinstance(node, SemanticClassify):
-            # the label columns a classification adds are not read below it
+        if isinstance(node, (SemanticClassify, SemanticParse)):
+            # the columns a classification or parse adds are not read below it
             for field in node.output_schema()[len(node.input.output_schema()):]:
                 needed.get(field.alias, {}).pop(field.column, None)
         if isinstance(node, Scan):
@@ -148,6 +156,8 @@ def _lets_through(node, alias: str) -> bool:
         return node.semantics == "full"
     if isinstance(node, SemanticClassify):
         return len(node.call.aliases()) == 2 or node.alias != alias
+    if isinstance(node, SemanticParse):
+        return node.alias != alias
     if isinstance(node, Apply):
         return node.ids != "pairs" and node.aliases[0] != alias
     if isinstance(node, Filter):

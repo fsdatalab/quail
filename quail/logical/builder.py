@@ -26,6 +26,7 @@ from quail.logical.nodes import (
     SemanticClassify,
     SemanticFilter,
     SemanticJoin,
+    SemanticParse,
 )
 from quail.logical.plan import (
     LogicalPlan,
@@ -69,8 +70,9 @@ class LogicalPlanBuilder:
         labels: tuple = (),
         label_filters: tuple = (),
         regular_predicates: tuple = (),
+        parse: tuple | None = None,
     ) -> None:
-        """Add one table with its filters, applies, and classifications.
+        """Add one table with its parse, filters, applies, and classifications.
 
         Args:
             alias: The table's alias in the query.
@@ -86,6 +88,8 @@ class LogicalPlanBuilder:
                 order given.
             label_filters: (name, values, selectivity) per Filter on a
                 classification's label column, in written order.
+            parse: (ParseCall, name) when the table's rows are parsed;
+                every operator above reads the parsed text.
 
         Raises:
             CompileError: The alias is taken, or a label filter names a
@@ -99,6 +103,8 @@ class LogicalPlanBuilder:
             column=column,
             predicates=tuple(regular_predicates),
         )
+        if parse is not None:
+            node = SemanticParse(node, *parse)
         if predicates:
             node = SemanticFilter(node, tuple(predicates))
         for function, kind, ids, columns in applies:
