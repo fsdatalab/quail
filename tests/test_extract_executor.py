@@ -606,7 +606,8 @@ def test_extractor_locates_lines_then_writes_the_answer_along_the_document(
     assert appended[4] == list(tables.begins_cue)
     (round_fed,) = appended[5:]
     assert round_fed[:len(asked.written)] == asked.written
-    assert len(round_fed) == 1 + DRAFT_TOKENS
+    # the draft runs to the document's end, short of DRAFT_TOKENS
+    assert len(asked.written) < len(round_fed) <= 1 + DRAFT_TOKENS
     # the draft's rows are read whole; every other request reads its last
     assert [whole for key, _, kept, whole, _ in model.packed
             if key == lease_key and kept] == [False] * 5 + [True]

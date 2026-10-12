@@ -173,7 +173,9 @@ Prediction for a draft of 32 tokens instead of 16, at scale factor
 liability took 13 on run 055945Z), so CUAD-3 falls from 5.6 s to
 about 5.0 s and CUAD-7 from 9.5 s to about 8.8 s; the short fields
 move by less than 0.3 s; every answer unchanged but for 0 to 3
-contracts per query.
+contracts per query. Measured on run 20261012T063539Z: every time
+within 0.3 s of run 061618Z and every score equal, so the draft's
+length does not set the round count, and the draft stays 16 tokens.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the

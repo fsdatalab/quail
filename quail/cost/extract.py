@@ -39,7 +39,7 @@ LINE_NUMBER_TOKENS = 3
 ANSWER_MAX_TOKENS = 64
 # document tokens a round feeds after the chosen token, as a draft of
 # the answer's next tokens, each verified by the row before it
-DRAFT_TOKENS = 32
+DRAFT_TOKENS = 16
 # rounds an answer of ANSWER_TOKENS takes when every draft is accepted
 ANSWER_ROUNDS = -(-ANSWER_TOKENS // (DRAFT_TOKENS + 1))
 
