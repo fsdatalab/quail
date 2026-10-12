@@ -48,6 +48,7 @@ from quail.logical import (
     label_text,
     render_join_frame,
     shared_preamble,
+    without_bos,
 )
 from quail.physical import (
     Limit,
@@ -385,9 +386,11 @@ def plan_request_backend(
         backend_name=backend_name,
         aliases=aliases,
         preamble_token_ids=tuple(preamble),
-        preamble_text=(
+        # vLLM adds the model's beginning-of-text token to a text prompt
+        preamble_text=without_bos(
             next(iter(preamble_texts), "")
-            or shared_preamble(context.model.turn_prefix)
+            or shared_preamble(context.model.turn_prefix),
+            context.model.bos_text,
         ),
         filters=tuple(filter_specs),
         joins=tuple(join_specs),

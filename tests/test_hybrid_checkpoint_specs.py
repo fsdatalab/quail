@@ -191,3 +191,41 @@ def test_lfm2_work_includes_its_convolution_projections():
     expected = (attention_projection_params(spec)
                 + short_conv_projection_params(spec))
     assert projection.flops == 2.0 * expected * 1_000
+
+
+def test_lfm2_prices_its_short_convolutions_on_the_cuda_cores():
+    from quail.cost.dense_decoder_cost import (
+        conv_flops_per_token,
+        dense_decoder_components,
+    )
+    from quail.cost.work import Work
+
+    spec = LFM2_2_6B_BF16
+    conv = next(c for c in dense_decoder_components(
+        Work(tokens=1_000), spec, passes=1.0) if c.name == "conv")
+    # 2 FLOPs per tap per channel: width 3, 2,048 channels, 22 layers
+    assert conv_flops_per_token(spec) == 2 * 3 * 2_048 * 22
+    assert conv.flops == conv_flops_per_token(spec) * 1_000
+    assert conv.precision == "fp32"
+
+
+def test_lfm2_prompt_opens_with_the_beginning_of_text_token():
+    from quail.logical.prompts import shared_preamble, without_bos
+
+    spec = LFM2_2_6B_BF16
+    assert spec.bos_text == "<|startoftext|>"
+    # Quail tokenizes without special tokens, so its prefix carries the token
+    assert shared_preamble(spec.turn_prefix).startswith(spec.bos_text)
+    # vLLM adds the token itself, so the text it receives must not repeat it
+    text = without_bos(shared_preamble(spec.turn_prefix), spec.bos_text)
+    assert text == "<|im_start|>user\n" + shared_preamble("")
+    assert not text.startswith(spec.bos_text)
+
+
+def test_models_without_a_beginning_of_text_token_keep_their_prefix():
+    from quail.logical.prompts import without_bos
+    from quail.specs import QWEN3_4B_FP8, QWEN3_5_4B_BF16
+
+    for spec in (QWEN3_4B_FP8, QWEN3_5_4B_BF16):
+        assert spec.bos_text == ""
+        assert without_bos(spec.turn_prefix, spec.bos_text) == spec.turn_prefix

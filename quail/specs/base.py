@@ -104,6 +104,11 @@ class ModelSpec:
     #                                        letters rule reads
     turn_prefix: str = ""     # chat-turn text before every prompt
     turn_suffix: str = ""     # chat-turn text after the answer cue
+    bos_text: str = ""    # the beginning-of-text token at the start of
+    #                       turn_prefix, for a model whose tokenizer adds it
+    #                       to every prompt: Quail tokenizes without special
+    #                       tokens, so the prefix carries it, and the text
+    #                       sent to vLLM drops it because vLLM adds its own
     prompt_format: str = "raw-v1"    # names the turn layout in run records
     prompt_layout: str = "ai-if"     # the PROMPT_LAYOUTS entry AI.IF
     #                                  prompts are written in

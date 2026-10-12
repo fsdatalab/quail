@@ -30,7 +30,9 @@ LFM2_2_6B_BF16 = ModelSpec(
     layer_kinds=tuple(
         "full_attention" if layer in _ATTENTION_LAYERS else "short_conv"
         for layer in range(30)),
-    turn_prefix="<|im_start|>user\n",
+    # the chat template opens with the beginning-of-text token
+    turn_prefix="<|startoftext|><|im_start|>user\n",
+    bos_text="<|startoftext|>",
     turn_suffix="<|im_end|>\n<|im_start|>assistant\n",
     prompt_format="lfm2-chat-v1",
 )
