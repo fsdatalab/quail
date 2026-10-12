@@ -1,14 +1,16 @@
 """Where an extraction's decode idles: GPU bubbles and the host between them.
 
 Runs one CUAD extraction query over the 45 contracts of scale factor
-0.1 on Qwen3 4B through the Quail backend, twice: once unprofiled for
-the wall the summary cites, and once under the torch profiler (CPU
-and CUDA activities) with py-spy sampling the process. The stage
-executor's chunks and answer reads are marked in the trace, so the
-summary gives, for the read chunks and the answer rounds apart: the
-wall, the GPU-active time, the idle share, and the longest gaps with
-the host operations that ran during them. py-spy's samples give the
-host functions by self time over the whole query.
+0.1 on Qwen3 4B through the Quail backend, three times: once
+unprofiled for the wall the summary cites (the first pass also warms
+the kernels), once under the torch profiler (CPU and CUDA
+activities), and once under cProfile. The stage executor's chunks and
+answer reads are marked in the trace, so the summary gives, for the
+read chunks and the answer rounds apart: the wall, the GPU-active
+time, the idle share, and the longest gaps with the host operations
+that ran during them. cProfile gives the host functions by own time
+over the whole query; py-spy cannot attach in the container (ptrace
+is denied), so run 20261012T074221Z has no samples.
 
 Prediction: the answer rounds are about 35% idle, as run
 20261012T060259Z measured one round at 44 ms wall with 28 ms of
@@ -16,8 +18,18 @@ kernels; the idle time is the per-layer kernel launches of the
 decoder, which the forward pass issues from Python one layer at a
 time, and the answers' reading and deciding between rounds; the read
 chunks are under 10% idle, with a gap between chunks while the next
-one is packed. py-spy's top self-time functions outside the forward
-pass are the first-token scan and the stream tokenization.
+one is packed. Measured on run 20261012T074221Z: the read chunks are
+0.2% idle on CUAD-3 and CUAD-7; the rounds are 79% and 69% idle, far
+over the prediction, and every gap over 10 ms is the host reading the
+previous chunk's answers, up to 115 ms for the first rounds, which
+wait for the first-token scan of the last read chunk's documents, and
+10 to 25 ms for the later ones. The launches are not the cost: a
+round's kernels take 13 to 19 ms and the GPU waits for the host.
+
+Prediction for the cProfile pass: the host time outside the forward
+pass is the first-token scan (first_tokens and Tables.options) and,
+per round, the row dictionaries _lp builds, about 1024 entries per
+row for 45 documents and 17 rows each.
 
     uv run modal run --detach -m experiments.profile_extract --query CUAD-3 \
         2>&1 | tee /tmp/profile_extract.log
@@ -26,13 +38,15 @@ Outputs on the quail-results volume:
 
     /results/ablations/extract-profile-<run>/<query>.json
     /results/ablations/extract-profile-<run>/<query>.chrome.json.gz
-    /results/ablations/extract-profile-<run>/<query>.pyspy.txt
+    /results/ablations/extract-profile-<run>/<query>.cprofile.txt
 """
 
+import cProfile
 import gzip
+import io
 import json
 import os
-import subprocess
+import pstats
 import time
 from collections import Counter
 
@@ -40,7 +54,7 @@ import modal
 
 from quail.bench.images import gpu_image
 
-image = gpu_image(packages=("py-spy",))
+image = gpu_image()
 app = modal.App("quail-milestone1")
 VOLUMES = {
     "/root/.cache/huggingface": modal.Volume.from_name(
@@ -158,24 +172,15 @@ def _summarize(events):
     return summary
 
 
-def _pyspy_top(path, limit=25):
-    """Return the functions by self samples from a py-spy raw dump."""
-    self_time, total = Counter(), Counter()
-    with open(path) as stream:
-        for line in stream:
-            line = line.strip()
-            if not line or " " not in line:
-                continue
-            stack, count = line.rsplit(" ", 1)
-            frames = stack.split(";")
-            count = int(count)
-            self_time[frames[-1]] += count
-            for frame in set(frames):
-                total[frame] += count
-    samples = sum(self_time.values())
-    return {"samples": samples,
-            "self": [(name, count) for name, count in self_time.most_common(limit)],
-            "total": [(name, count) for name, count in total.most_common(limit)]}
+def _top_functions(profiler, limit) -> list:
+    """Return (file:line function, own seconds, calls) by own time."""
+    stats = pstats.Stats(profiler)
+    rows = []
+    for (file, line, name), (_, calls, own, _, _) in stats.stats.items():
+        rows.append((f"{os.path.basename(file)}:{line} {name}", round(own, 3),
+                     calls))
+    rows.sort(key=lambda row: -row[1])
+    return rows[:limit]
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
@@ -205,13 +210,12 @@ def profile(run: str, query_id: str) -> dict:
     _query(session, query_id).run().collect()
     wall = time.perf_counter() - started
     print(f"{query_id}: {wall:.2f} s unprofiled", flush=True)
-    # the profiled pass: the torch profiler and py-spy sampling this process
-    raw = f"{out}/{query_id}.pyspy.txt"
-    spy = subprocess.Popen(
-        ["py-spy", "record", "--pid", str(os.getpid()), "--rate", "250",
-         "--format", "raw", "--nonblocking", "--output", raw],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    time.sleep(1.0)
+    # a second unprofiled pass: the warm wall
+    started = time.perf_counter()
+    _query(session, query_id).run().collect()
+    warm_wall = time.perf_counter() - started
+    print(f"{query_id}: {warm_wall:.2f} s unprofiled and warm", flush=True)
+    # the traced pass
     started = time.perf_counter()
     with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU,
@@ -219,22 +223,29 @@ def profile(run: str, query_id: str) -> dict:
         _query(session, query_id).run().collect()
         torch.cuda.synchronize()
     profiled_wall = time.perf_counter() - started
-    spy.send_signal(2)      # SIGINT ends the recording and writes the file
-    try:
-        _, spy_err = spy.communicate(timeout=60)
-    except subprocess.TimeoutExpired:
-        spy.kill()
-        spy_err = b"py-spy did not stop"
     trace = f"{out}/{query_id}.chrome.json.gz"
     prof.export_chrome_trace(trace)
+    # the cProfile pass: the host functions by own time
+    profiler = cProfile.Profile()
+    started = time.perf_counter()
+    profiler.enable()
+    _query(session, query_id).run().collect()
+    torch.cuda.synchronize()
+    profiler.disable()
+    cprofile_wall = time.perf_counter() - started
+    text = io.StringIO()
+    stats = pstats.Stats(profiler, stream=text)
+    stats.sort_stats("tottime").print_stats(40)
+    stats.sort_stats("cumulative").print_stats(40)
+    with open(f"{out}/{query_id}.cprofile.txt", "w") as stream:
+        stream.write(text.getvalue())
     session.close()
-    summary = {"run": run, "query": query_id, "wall_s": round(wall, 3),
+    summary = {"run": run, "query": query_id, "first_wall_s": round(wall, 3),
+               "wall_s": round(warm_wall, 3),
                "profiled_wall_s": round(profiled_wall, 3),
-               "chunks": _summarize(_events(trace))}
-    if os.path.exists(raw) and os.path.getsize(raw):
-        summary["pyspy"] = _pyspy_top(raw)
-    else:
-        summary["pyspy_error"] = spy_err.decode(errors="replace")[-2000:]
+               "cprofile_wall_s": round(cprofile_wall, 3),
+               "chunks": _summarize(_events(trace)),
+               "host_by_own_time": _top_functions(profiler, 30)}
     with open(f"{out}/{query_id}.json", "w") as stream:
         json.dump(summary, stream, indent=1)
     VOLUMES["/results"].commit()
