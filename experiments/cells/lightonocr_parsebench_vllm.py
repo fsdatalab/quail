@@ -74,13 +74,21 @@ PROFILE_STEPS = 40
 TOP_KERNELS = 60
 
 
-def _render(path: str) -> list[dict]:
-    """Render every page of one PDF and read its stored text."""
+def _render(path: str) -> list[dict] | str:
+    """Render every page of one PDF and read its stored text.
+
+    Returns:
+        One dict per page, or PDFium's error message when the file does
+        not open.
+    """
     import io
 
     import pypdfium2 as pdfium
 
-    pdf = pdfium.PdfDocument(path)
+    try:
+        pdf = pdfium.PdfDocument(path)
+    except pdfium.PdfiumError as error:
+        return str(error)
     pages = []
     for index in range(len(pdf)):
         page = pdf[index]
@@ -149,8 +157,11 @@ def prepare() -> dict:
         rendered = list(pool.map(_render, [str(root / pdf) for pdf in pdfs],
                                  chunksize=4))
     seconds = time.perf_counter() - started
-    rows = []
+    rows, unreadable = [], {}
     for pdf, pages in zip(pdfs, rendered):
+        if isinstance(pages, str):
+            unreadable[pdf] = pages
+            continue
         for page in pages:
             rows.append(dict(pdf=pdf, folder=pdf.split("/")[1],
                              categories=sorted(categories[pdf]), **page))
@@ -161,7 +172,8 @@ def prepare() -> dict:
     return dict(pdfs=len(pdfs), pages=len(rows), wall_s=seconds,
                 render_ms_mean=sum(r["render_ms"] for r in rows) / len(rows),
                 extract_ms_mean=sum(r["extract_ms"] for r in rows) / len(rows),
-                pages_without_stored_text=empty, path=PAGES_PATH)
+                pages_without_stored_text=empty, unreadable=unreadable,
+                path=PAGES_PATH)
 
 
 def _page_stream(limit: int | None, window: int):
