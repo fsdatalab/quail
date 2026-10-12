@@ -297,7 +297,7 @@ class PageParser:
         import time
 
         self.stats = dict(wait_s=0.0, prefill_s=0.0, prefills=0,
-                          prefill_tokens=0, decode_s=0.0, decode_steps=0,
+                          prefilled_tokens=0, decode_s=0.0, decode_steps=0,
                           decode_rows=0)
         stats = self.stats
         pending = iter(pages)
@@ -328,7 +328,7 @@ class PageParser:
                     first = self._prefill(admit, rows)
                 stats["prefill_s"] += time.perf_counter() - started
                 stats["prefills"] += 1
-                stats["prefill_tokens"] += sum(p["input_ids"].size
+                stats["prefilled_tokens"] += sum(p["input_ids"].size
                                                for _, p in admit)
                 for (key, page), row, token in zip(admit, rows, first):
                     state = _Row(key, row, page["input_ids"].size, page["offset"],
