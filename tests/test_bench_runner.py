@@ -367,9 +367,14 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
         "c": ["ct0", "ct2"], "answer": ["audit yearly", None]}
     assert output.rows.to_pydict() == {
         "c": ["ct0", "ct2"], "audit_rights": ["audit yearly", None]}
-    # the extraction's head is the document label inside the chat turn,
-    # not the raw AI.IF preamble, so the query reports no pieces
-    assert turn[0] and output.prompt_pieces is None
+    # the extraction's turn has no opener: its head is the AI.IF
+    # preamble, so the query reports its pieces under one preamble
+    assert not turn[0]
+    pieces = output.prompt_pieces
+    assert pieces is not None
+    assert [piece["id"] for piece in pieces["filters"]] == ["filter-1"]
+    assert [piece["id"] for piece in pieces["extracts"]] == ["extract-1"]
+    assert pieces["preamble"] == list(sess.tokenizer("DOCUMENT:\n"))
 
     alone = get_query("CUAD-1")
     with _session(tmp_path) as sess:

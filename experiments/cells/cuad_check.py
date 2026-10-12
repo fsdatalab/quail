@@ -177,6 +177,16 @@ contracts per query. Measured on run 20261012T063539Z: every time
 within 0.3 s of run 061618Z and every score equal, so the draft's
 length does not set the round count, and the draft stays 16 tokens.
 
+Prediction for the extraction continuing the filter's pipeline,
+its prompt without the chat turn's opener so its head is the filter's
+"DOCUMENT:" preamble: CUAD-7 feeds about 345 thousand fresh tokens
+instead of 638 thousand and falls from 9.4 s to about 6.5 s, CUAD-8
+and CUAD-9 fall by about 1 s each, the other five queries move by
+less than 0.3 s; quail-b reports input tokens per second for CUAD-7,
+8, and 9, since the query has one preamble; and every span F1 stays
+within 3 points of run 061618Z, if the opener did not matter to the
+model's copying.
+
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the
 two filter queries lands within 10 points of Qwen3 4B's (CUAD-5 0.71,

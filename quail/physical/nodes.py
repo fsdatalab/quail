@@ -1047,12 +1047,16 @@ class ExtractSpec(ScoreSpec):
             and its answer's lines named before the start is read.
         numbered_token_parts: The head and tail token ids of the
             numbered-lines prompt.
+        shares_head: Whether the plain prompt's head is the query's
+            shared preamble, so a plain extraction reads the document
+            KV a filter wrote and continues its pipeline.
     """
 
     question: str = ""
     trim: bool = True
     locate: bool = False
     numbered_token_parts: tuple[tuple[int, ...], ...] = ()
+    shares_head: bool = False
 
     @property
     def alias(self) -> str:
@@ -1077,6 +1081,7 @@ class ExtractSpec(ScoreSpec):
             locate=bool(value.get("locate", False)),
             numbered_token_parts=tuple(
                 tuple(part) for part in value.get("numbered_token_parts", ())),
+            shares_head=bool(value.get("shares_head", False)),
         )
 
     def to_dict(self) -> dict:
@@ -1087,6 +1092,7 @@ class ExtractSpec(ScoreSpec):
             "locate": self.locate,
             "numbered_token_parts": [
                 list(part) for part in self.numbered_token_parts],
+            "shares_head": self.shares_head,
         }
 
 

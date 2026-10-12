@@ -347,6 +347,7 @@ class Stream:
 class Question:
     """One document's steps and result for one question."""
 
+    asked: bool = False     # the document reached the question's stages
     range_tokens: list = field(default_factory=list)
     range_done: bool = False
     range: tuple | None = None
@@ -554,13 +555,15 @@ class ExtractStages:
         readout: Optional readout in place of the model's. Its extras
             are the none token, the stop tokens as one group, then the
             lines answer's targets.
+        shared_head: The query's shared preamble, under which a filter
+            writes the documents' KV; None when the query has none.
 
     Raises:
         ValueError: The specs differ in their table, locating, or head.
     """
 
     def __init__(self, state, specs, tables: Tables, document_ids, documents,
-                 texts, readout=None):
+                 texts, readout=None, shared_head=None):
         self.specs = list(specs)
         first = self.specs[0]
         if any(spec.alias != first.alias or spec.locate != first.locate
@@ -573,6 +576,8 @@ class ExtractStages:
         if any(list(head) != self.head for head, _ in parts):
             raise ValueError("a pipeline's extractions share a prompt head")
         self.tails = [list(tail) for _, tail in parts]
+        self.shared_head = (None if shared_head is None
+                            else [int(t) for t in shared_head])
         if any(len(tail) < 2 for tail in self.tails):
             raise ValueError("an extraction's tail ends in its cue after the question")
         self.tables = tables
@@ -661,15 +666,17 @@ class ExtractStages:
 
         The key names the document and its rendering, so a later
         extraction of the same table in the same rendering reads the
-        KV this one leaves resident. A plain document shown without a
-        head, whose tokens are the table's, keeps the table's key, so
-        KV a filter left resident is read.
+        KV this one leaves resident. A plain document shown under the
+        query's shared head, whose tokens are the table's, keeps the
+        table's key, so the KV a filter wrote is read.
         """
         tables = self.tables
         alias = self.specs[0].alias
         rendering = "numbered" if self.numbered else "plain"
         key = (("extract", alias, rendering), int(document))
-        if (not self.numbered and not self.head and stored is not None
+        shared = (self.head == self.shared_head if self.shared_head is not None
+                  else not self.head)
+        if (not self.numbered and shared and stored is not None
                 and [int(t) for t in stored] == ids):
             key = (alias, int(document))
         prefix = self.head + ids
@@ -691,6 +698,7 @@ class ExtractStages:
 
     def _tail_decide(self, q, anchor, row):
         doc, qs = self._question(q, anchor)
+        qs.asked = True
         # a tail equal to the question's before it is in KV already:
         # only its cue token is fed
         same = q > 0 and self.tails[q] == self.tails[q - 1]
@@ -915,10 +923,22 @@ class ExtractStages:
                 if not qs.done:
                     self._answer(doc, q)
 
-    def answers(self, q: int) -> tuple:
-        """Return every document's answer and span for question q."""
-        return ([doc.questions[q].answer for doc in self.docs],
-                [doc.questions[q].span for doc in self.docs])
+    def answers(self, q: int, kept=None) -> tuple:
+        """Return each document's answer and span for question q.
+
+        Args:
+            q: The question's index.
+            kept: The indices of the documents to return, in order;
+                None returns every document.
+        """
+        docs = self.docs if kept is None else [self.docs[i] for i in kept]
+        return ([doc.questions[q].answer for doc in docs],
+                [doc.questions[q].span for doc in docs])
+
+    def asked(self) -> list:
+        """Return the indices of the documents the questions were asked of."""
+        return [index for index, doc in enumerate(self.docs)
+                if doc.questions[0].asked]
 
     def counts(self, q: int) -> dict:
         """Return how many documents took each path and how much was fed."""

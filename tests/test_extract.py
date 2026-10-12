@@ -247,13 +247,27 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
         extracts[0].node_id, extracts[1].node_id)
     assert pipelines[extracts[2].node_id].node_ids == (extracts[2].node_id,)
     assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
-    # a filter's pipeline ends before an extraction: they show the
-    # document under different prompt heads
+    # a plain extraction shows the document under the query's shared
+    # head, as the filter does, so it continues the filter's pipeline
+    # and asks its question of the KV the filter wrote
     filtered = (session.docs("contracts").alias("c")
                 .ai_filter(quail.prompt("Is {0} a lease?", quail.col("c.text")))
                 .ai_extract("c.text", QUESTION, name="ends")
                 .select("c.id", "ends"))
     plan = filtered.plan()
+    (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    (ai_filter,) = [n for n in plan.nodes if isinstance(n, AiFilter)]
+    assert extract.spec.shares_head
+    assert list(extract.spec.prompt_token_parts[0]) == plan.settings["pre_ids"]
+    pipelines = build_pipelines(plan.graph)
+    assert pipelines[ai_filter.node_id].node_ids == (
+        ai_filter.node_id, extract.node_id)
+    # a located extraction shows the document numbered: its own pipeline
+    located = (session.docs("contracts").alias("c")
+               .ai_filter(quail.prompt("Is {0} a lease?", quail.col("c.text")))
+               .ai_extract("c.text", QUESTION, name="ends", locate=True)
+               .select("c.id", "ends"))
+    plan = located.plan()
     (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
     (ai_filter,) = [n for n in plan.nodes if isinstance(n, AiFilter)]
     pipelines = build_pipelines(plan.graph)
@@ -556,8 +570,8 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     assert list(spec.preamble_token_ids) == request_tests._tokens(
         spec.preamble_text)
     assert spec == RequestExtractSpec.from_mapping(spec.to_dict())
-    # a filter and an extraction plan together although their preambles
-    # differ
+    # a filter and an extraction plan together under one preamble: the
+    # extraction's turn has no opener on Qwen3
     mixed = session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
         f"FROM contracts c WHERE AI_FILTER(PROMPT('{{0}}\n\nIs it a lease?', "
@@ -565,7 +579,7 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     assert not isinstance(mixed, Refusal)
     (mixed_node,) = [n for n in mixed.nodes if isinstance(n, RequestExecution)]
     assert mixed_node.preamble_text == session.model.turn_prefix + SHARED_PRE
-    assert mixed_node.extracts[0].preamble_text != mixed_node.preamble_text
+    assert mixed_node.extracts[0].preamble_text == mixed_node.preamble_text
     tail_text = (AFTER_DOCUMENT_TEXT + (session.model.extract_turn[1] or "\n")
                  + EXTRACT_PHRASE_CUE)
     assert list(spec.tail_token_ids) == request_tests._tokens(tail_text)

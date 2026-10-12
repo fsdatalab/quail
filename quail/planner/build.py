@@ -28,6 +28,7 @@ from quail.logical.prompts import (
     classify_prompt_tokens,
     prompt_aliases,
     score_query_template,
+    shared_preamble,
 )
 from quail.physical import (
     AiClassify,
@@ -966,6 +967,11 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
     turn = context.model.extract_turn
     plain = bind_extract_prompt(call.prompt.args, call.question,
                                 context.tokenizer, turn)
+    # under the query's shared preamble, the plain prompt's document
+    # KV is the one a filter writes
+    shares_head = context.tokenizer is not None and tuple(
+        plain.preamble_token_ids) == tuple(context.tokenizer(shared_preamble(
+            context.model.turn_prefix, context.model.prompt_layout)))
     numbered = bind_extract_prompt(call.prompt.args, call.question,
                                    context.tokenizer, turn, numbered=True)
     (ref,) = call.prompt.args
@@ -988,7 +994,8 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
                             tuple(plain.tail_token_ids)),
         question=call.question, trim=call.trim, locate=call.locate,
         numbered_token_parts=(tuple(numbered.preamble_token_ids),
-                              tuple(numbered.tail_token_ids)))
+                              tuple(numbered.tail_token_ids)),
+        shares_head=shares_head)
 
 
 def document_line_counts(lengths, column: str):

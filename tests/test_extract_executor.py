@@ -1,6 +1,7 @@
 """The Quail executor's AI.EXTRACT: its steps on a scripted model."""
 
 import re
+from collections import Counter
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ import pytest
 from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
 
 import quail
+from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.extract import (
     LINE_MAX_TOKENS,
@@ -31,6 +33,8 @@ from quail.backends.quail.executor.operators.extract import (
 )
 from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
+from quail.backends.quail.graph import execute_single_graph
+from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
 from quail.cost.extract import ANSWER_MAX_TOKENS, DRAFT_TOKENS
 from quail.execution.execute import execute_query
@@ -43,8 +47,18 @@ from quail.execution.runner import (
     scalar_node_metrics,
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.physical import AiExtract, ExtractSpec
+from quail.physical import (
+    AiExtract,
+    AiFilter,
+    ExtractSpec,
+    FilterStage,
+    PhysicalGraph,
+    PortRef,
+    Scan,
+)
+from quail.physical.base import input_ports
 from quail.planner.plan import EngineConfig
+from quail.specs import DEVICES, MODELS
 
 NEG = float("-inf")
 QUESTION = "When does the lease end?"
@@ -366,6 +380,8 @@ class ScriptedModel:
         self.docs = docs            # key -> (text, numbered, range text)
         self.gold = gold            # key -> gold answer text, or None
         self.k = k
+        self.filter_truth = {}      # key -> a filter question's answer
+        self.reads = Counter()      # key -> times its prefix was packed
         self.targets = len(tables.range_targets)
         self.width = 2 + self.targets + 2 * k
         # the phrase cue ends in the quote that follows a space, which
@@ -416,6 +432,7 @@ class ScriptedModel:
                 # earlier stage appended
                 if spec.get("prefix") is not None:
                     self.prefix_len[key] = len(spec["prefix"])
+                    self.reads[key] += 1
                 held = self.kv.get(key, [])
                 if spec.get("f") is not None and key in self.prefix_len:
                     held = held[:spec["f"] - self.prefix_len[key]]
@@ -437,6 +454,11 @@ class ScriptedModel:
             return self._answer_row(key, path[cue + 1:])
         if numbered:
             return self._next_digit(path, range_text)
+        if key in self.filter_truth:
+            # a filter's question: the row's first value is the answer
+            row = self._cue({}, -9.0, -9.0)
+            row[:] = float(self.filter_truth[key])
+            return row
         raise AssertionError(f"unexpected request {path}")
 
     def _next_digit(self, path, range_text):
@@ -660,6 +682,68 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
     assert second.metrics.fresh_tokens == fed[1] > 0
     assert second.metrics.wall_s == 0.0 and first.metrics.wall_s > 0.0
     assert [doc.questions[1].path for doc in stages.docs] == ["located"] * 3
+
+
+def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
+        monkeypatch):
+    # the filter writes each document under the query's shared head;
+    # the plain extraction continues its pipeline, so a document is
+    # packed once and the extraction feeds only its question
+    spec, tables = _spec()
+    plain = replace(spec, locate=False, shares_head=True)
+    head = list(plain.prompt_token_parts[0])
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(ExtractStages, "_readout", lambda self, state: readout)
+    for index, text in enumerate(DOCS):
+        model.docs[("c", index)] = (text, False, "")
+        model.gold[("c", index)] = GOLD[index]
+        model.filter_truth[("c", index)] = index != 2
+    question = tables.encode_ids(" question")
+    graph = PhysicalGraph((
+        Scan(node_id="input:c", alias="c", input_id="c"),
+        AiFilter(node_id="ai_filter:c",
+                 inputs=input_ports((PortRef("input:c", "ids:c"),)),
+                 alias="c", arena_writes=True,
+                 stages=(FilterStage(0, len(question), len(head), 0.7, 2.0),),
+                 question_token_ids=(tuple(question),)),
+        AiExtract(node_id="ai-extract:ends",
+                  inputs=input_ports((PortRef("ai_filter:c", "ids:c"),)),
+                  backend_name="quail", model="qwen3-4b-fp8", spec=plain),
+    ), PortRef("ai-extract:ends", "scores"))
+    torch, arena = fake_torch(), cpu_arena(256)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    execution = QuailModelExecution(SimpleNamespace())
+    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.loaded_model.extract_tables = tables
+    execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+    execution.bind_query(
+        torch=torch, answer_rows=object(), chunk_tokens=400,
+        async_answers=SimpleNamespace(
+            submit=lambda rows: [float(np.asarray(r).ravel()[0]) for r in rows],
+            result=lambda v: v, dtype=None))
+    state = {"torch": torch, "arena": arena, "pipeline": pipeline,
+             "model_execution": execution,
+             "runtimes": built_in_registry().runtimes,
+             "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
+             "chunk_tokens": 400,
+             "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
+             "texts": {"c": list(DOCS)}}
+    report = execute_single_graph(
+        state, {"filter_limit": None, "pre_ids": head, "retention": {}}, graph)
+    table = report["_outputs"][PortRef("ai-extract:ends", "scores")].to_pydict()
+    assert table["c"] == [0, 1]
+    assert table["ends"] == ["March 3, 2027", "five years"]
+    # every document was packed once: the extraction's tail followed
+    # the filter's question over the resident KV
+    assert dict(model.reads) == {("c", 0): 1, ("c", 1): 1, ("c", 2): 1}
+    metrics = report["node_metrics"]
+    documents = sum(len(head) + len(tokens) for tokens in state["docs"]["c"])
+    assert metrics["ai-extract:ends"]["fresh_tokens"] < documents
+    assert metrics["ai_filter:c"]["fresh_tokens"] >= documents
+    assert metrics["ai-extract:ends"]["evaluated_documents"] == 2
+    assert not arena.accounting.owned
 
 
 def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):

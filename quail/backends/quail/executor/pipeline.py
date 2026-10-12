@@ -8,7 +8,10 @@ from quail.backends.quail.executor.operators.classify import (
     classification_part,
     joined_classification,
 )
-from quail.backends.quail.executor.operators.extract import execute_extractions
+from quail.backends.quail.executor.operators.extract import (
+    ExtractPart,
+    execute_extractions,
+)
 from quail.backends.quail.executor.operators.filter import FilterPart, LabelGate
 from quail.backends.quail.executor.operators.join import execute_join
 from quail.backends.quail.executor.parts import (
@@ -33,7 +36,9 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
     filter on a label or per-batch apply between two stages gates the
     next stage; one after the last stage runs over the documents
     that came out of it. A pipeline of extractions runs as one stage
-    list of their questions (quail.backends.quail.executor.operators.extract).
+    list of their questions (quail.backends.quail.executor.operators.extract);
+    extractions after a filter ask their questions of the documents
+    the filter's stages leave resident.
 
     Args:
         state: The loaded model and current query state.
@@ -65,20 +70,21 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
     gpu_inputs = {"gpu_timing": context.state.get("gpu_timing", False)}
     # the members with stages, then the gates after the last of them
     last_staged = max(index for index, member in enumerate(members)
-                      if isinstance(member, (AiFilter, AiClassify, AiJoin)))
+                      if isinstance(member, (AiFilter, AiClassify, AiJoin,
+                                             AiExtract)))
     staged, trailing = members[:last_staged + 1], members[last_staged + 1:]
     joins = [index for index, member in enumerate(staged)
              if isinstance(member, AiJoin)]
     parts = []
-    for member in staged[:joins[0] if joins else -1]:
-        parts.append(_part(state, member, ids, parts, inputs, context))
+    if joins:
+        for member in staged[:joins[0]]:
+            parts.append(_part(state, member, ids, parts, inputs, context))
     # a pipeline that starts with a classification writes the
     # documents' KV under that classification's own prompt head;
     # a classification plan's settings carry no shared preamble
     head = (list(first.spec.prompt_token_parts[0])
             if isinstance(first, AiClassify) else context.state["pre"])
     prefixes = DocumentPrefixes(head, context.state["docs"][alias], ids)
-    sink = staged[-1]
     results = {}
     if joins:
         # the join settles each anchor's KV; a classification of
@@ -100,9 +106,11 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
         for part in chain["after"]:
             results[part.node.node_id] = part.result_value
     else:
-        own = _part(state, sink, ids, parts, inputs, context)
-        stages = gated_stages(parts + [own])
+        parts = _extract_parts(state, staged, ids, inputs, context)
+        stages = gated_stages(parts)
         stats = {}
+        appended = [part.appended_tokens for part in parts
+                    if isinstance(part, ExtractPart)]
         every, spans, tokens = run_stages(
             state.torch, state.loaded_model.arena, state.loaded_model.pipeline, stages,
             prefixes, state.chunk_tokens,
@@ -112,14 +120,16 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
                 first, prefixes, state.loaded_model.arena),
             stats=stats, staging=input_staging(state),
             on_chunk=lambda transitions: report_chain_transitions(
-                parts + [own], transitions),
-            label=f"pipeline {alias} ({len(stages)} stages)")
-        complete_chain(parts + [own], every, spans, tokens, stats,
+                parts, transitions),
+            label=f"pipeline {alias} ({len(stages)} stages)",
+            appended_tokens=max(appended) if appended else None)
+        complete_chain(parts, every, spans, tokens, stats,
                        state.torch, gpu_inputs)
     for part in parts:
-        results[part.node.node_id] = part.result_value
-    if not joins:
-        results[sink.node_id] = own.result_value
+        if isinstance(part, ExtractPart):
+            results.update(part.results)
+        else:
+            results[part.node.node_id] = part.result_value
     # gates after the last stage read the documents that came out
     for member in trailing:
         member_inputs = dict(inputs[member.node_id])
@@ -130,6 +140,28 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
         results[member.node_id] = context.runtimes[
             member.runtime_key].execute(member, member_inputs, context)
     return results
+
+
+def _extract_parts(state: QueryExecutionState, members, ids, inputs, context):
+    """Build the remaining members' parts, consecutive extractions as one."""
+    parts = []
+    index = 0
+    while index < len(members):
+        member = members[index]
+        if isinstance(member, AiExtract):
+            end = index
+            while end < len(members) and isinstance(members[end], AiExtract):
+                end += 1
+            # the documents are the pipeline's, not an input port's
+            parts.append(ExtractPart(state, members[index:end], ids, {
+                "documents": context.state["docs"],
+                "texts": context.state.get("texts", {}),
+                "pre": context.state.get("pre", [])}))
+            index = end
+        else:
+            parts.append(_part(state, member, ids, parts, inputs, context))
+            index += 1
+    return parts
 
 
 def _part(state: QueryExecutionState, node, ids, parts, inputs, context):

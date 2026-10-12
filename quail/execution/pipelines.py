@@ -88,17 +88,27 @@ def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
     return (f"ids:{alias}",)
 
 
-def _same_prompt_head(node: PhysicalNode, consumer: PhysicalNode) -> bool:
-    """Return whether the consumer shows the document as the node does.
+def _same_prompt_head(node: PhysicalNode, consumer: PhysicalNode,
+                      first: PhysicalNode) -> bool:
+    """Return whether the consumer shows the document as the pipeline does.
 
-    An extraction shows the document inside its own head, plain or
-    numbered, so it continues only an extraction with the same
-    locating choice, and nothing else continues it.
+    An extraction continues an extraction with the same locating
+    choice. A plain extraction whose head is the query's shared
+    preamble also continues a pipeline a filter started, which wrote
+    the documents under that preamble. Nothing else continues an
+    extraction.
+
+    Args:
+        node: The pipeline's last member.
+        consumer: The operator that would follow it.
+        first: The pipeline's first member.
     """
-    if isinstance(node, AiExtract) or isinstance(consumer, AiExtract):
-        return (isinstance(node, AiExtract) and isinstance(consumer, AiExtract)
-                and node.spec.locate == consumer.spec.locate)
-    return True
+    if isinstance(consumer, AiExtract):
+        if isinstance(node, AiExtract):
+            return node.spec.locate == consumer.spec.locate
+        return (isinstance(first, AiFilter) and consumer.spec.shares_head
+                and not consumer.spec.locate)
+    return not isinstance(node, AiExtract)
 
 
 def _classifies_rows_of(node: PhysicalNode, join: AiJoin) -> bool:
@@ -135,7 +145,8 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         return any(port.source.node_id == producer.node_id
                    for port in consumer.inputs)
 
-    def continuation(node: PhysicalNode, alias: str) -> list[PhysicalNode]:
+    def continuation(node: PhysicalNode, alias: str,
+                     first: PhysicalNode) -> list[PhysicalNode]:
         """Find consumers that can continue this operator's pipeline.
 
         One consumer continues the chain. Several continue it only
@@ -150,7 +161,7 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
             for consumer in consumers.get((node.node_id, port), ()):
                 if isinstance(node, AiJoin) and not _classifies_rows_of(consumer, node):
                     continue
-                if not _same_prompt_head(node, consumer):
+                if not _same_prompt_head(node, consumer, first):
                     continue
                 if takes(consumer, alias) and consumer not in following:
                     following.append(consumer)
@@ -174,7 +185,8 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         members = [node]
         followed.add(node.node_id)
         while True:
-            after = [consumer for consumer in continuation(members[-1], alias)
+            after = [consumer
+                     for consumer in continuation(members[-1], alias, members[0])
                      if consumer.node_id not in followed]
             if not after:
                 break

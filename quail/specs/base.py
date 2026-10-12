@@ -97,8 +97,9 @@ class ModelSpec:
     turn_suffix: str = ""     # chat-turn text after the answer cue
     extract_turn_prefix: str = ""    # chat-turn text before an AI.EXTRACT
     #                                  prompt, when it differs from
-    #                                  turn_prefix; Qwen3 answers AI.IF
-    #                                  raw but copies spans in its chat turn
+    #                                  turn_prefix; a prefix unlike the
+    #                                  AI.IF turn's keeps an extraction
+    #                                  from reading a filter's document KV
     extract_turn_suffix: str = ""    # chat-turn text between an AI.EXTRACT
     #                                  prompt's answer template and its cue
     prompt_format: str = "raw-v1"    # names the turn layout in run records

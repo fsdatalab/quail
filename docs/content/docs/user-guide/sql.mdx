@@ -393,7 +393,9 @@ names the lines that hold the answer, shown numbered as `cat -n` shows
 them, and the positions are those lines. The document, the lines, and
 the question stay in KV across these steps. Several extractions of one
 table with the same `locate` setting read each document once and ask
-their questions of it in turn.
+their questions of it in turn, and a plain extraction after an
+`AI.IF` filter on the same table asks its question of the documents
+the filter read, without reading them again.
 
 These limits apply:
 
@@ -468,10 +470,10 @@ These limits apply:
   where the model writes the answer and Quail locates it in the text.
 - It runs on Qwen3 4B and Qwen3 32B. A reranker, a decision model, and
   a diffusion model give no next-token probabilities over the document.
-  Qwen3 reads the extraction prompt inside its chat turn, with thinking
-  off; its `AI.IF` prompts stay raw. On 300 SQuAD questions the chat
-  turn copied the reference answer for 82% of questions by token F1,
-  compared with 48% for the raw prompt.
+  Qwen3 closes the extraction prompt with its chat turn, thinking
+  off, after the question; the document itself is shown under the
+  same head as in an `AI.IF` prompt, so a filter's KV serves the
+  extraction.
 - It runs on one GPU, and it cannot be mixed with `AI.SCORE`.
 - An extraction of a joined table runs over the documents the join
   matched, or before the join; the planner picks the cheaper placement.
