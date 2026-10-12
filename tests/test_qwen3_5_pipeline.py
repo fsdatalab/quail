@@ -145,7 +145,8 @@ def _kernel_stubs(monkeypatch, torch):
     conv = types.ModuleType("vllm.model_executor.layers.mamba.ops.causal_conv1d")
 
     def causal_conv1d_fn(x, weight, bias, conv_states, query_start_loc,
-                         cache_indices, has_initial_state, activation):
+                         cache_indices, has_initial_state, activation,
+                         metadata=None):
         seen["conv"].append(dict(
             x=tuple(x.shape), weight=tuple(weight.shape), bias=bias,
             states=tuple(conv_states.shape), cu=query_start_loc.tolist(),
@@ -169,7 +170,8 @@ def _kernel_stubs(monkeypatch, torch):
 
     def chunk_gated_delta_rule(q, k, v, g, beta, initial_state,
                                output_final_state, cu_seqlens,
-                               use_qk_l2norm_in_kernel):
+                               use_qk_l2norm_in_kernel, chunk_indices=None,
+                               chunk_offsets=None):
         seen["delta"].append(dict(
             q=tuple(q.shape), v=tuple(v.shape), initial=initial_state,
             final=output_final_state, cu=cu_seqlens.tolist(),
