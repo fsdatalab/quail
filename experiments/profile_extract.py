@@ -29,7 +29,12 @@ round's kernels take 13 to 19 ms and the GPU waits for the host.
 Prediction for the cProfile pass: the host time outside the forward
 pass is the first-token scan (first_tokens and Tables.options) and,
 per round, the row dictionaries _lp builds, about 1024 entries per
-row for 45 documents and 17 rows each.
+row for 45 documents and 17 rows each. Measured on run
+20261012T074509Z (CUAD-3, 5.1 s warm): the host's own time outside
+waiting on the GPU is the streams' tokenization, 0.37 s over 3,909
+window extensions and their whitespace squeezing, then the first-token
+scan at 0.10 s, and _lp at 0.04 s; the GEMM launches and the readout
+waits, 2.0 s, are the host blocked on the read chunks' GPU work.
 
     uv run modal run --detach -m experiments.profile_extract --query CUAD-3 \
         2>&1 | tee /tmp/profile_extract.log
