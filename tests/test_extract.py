@@ -32,6 +32,7 @@ from quail.logical.prompts import (
     NUMBERED_DOCUMENT_LABEL,
 )
 from quail.physical import (
+    AiClassify,
     AiExtract,
     AiFilter,
     AiJoin,
@@ -262,6 +263,21 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
     pipelines = build_pipelines(plan.graph)
     assert pipelines[ai_filter.node_id].node_ids == (
         ai_filter.node_id, extract.node_id)
+    # a classification of the table writes the documents under the
+    # same head, so the extraction continues its pipeline too
+    classified = (session.docs("contracts").alias("c")
+                  .ai_classify(quail.prompt("Which kind is {0}?", quail.col("c.text")),
+                               ["lease", "license"], name="kind")
+                  .ai_extract("c.text", QUESTION, name="ends")
+                  .select("c.id", "kind", "ends"))
+    plan = classified.plan()
+    (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert (tuple(classify.spec.prompt_token_parts[0])
+            == tuple(extract.spec.prompt_token_parts[0]))
+    pipelines = build_pipelines(plan.graph)
+    assert pipelines[classify.node_id].node_ids == (
+        classify.node_id, extract.node_id)
     # a located extraction shows the document numbered: its own pipeline
     located = (session.docs("contracts").alias("c")
                .ai_filter(quail.prompt("Is {0} a lease?", quail.col("c.text")))

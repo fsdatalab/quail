@@ -95,7 +95,8 @@ def _same_prompt_head(node: PhysicalNode, consumer: PhysicalNode,
     An extraction continues an extraction with the same locating
     choice. A plain extraction whose head is the query's shared
     preamble also continues a pipeline a filter started, which wrote
-    the documents under that preamble. Nothing else continues an
+    the documents under that preamble, or one a classification of
+    the table started under the same head. Nothing else continues an
     extraction.
 
     Args:
@@ -106,8 +107,13 @@ def _same_prompt_head(node: PhysicalNode, consumer: PhysicalNode,
     if isinstance(consumer, AiExtract):
         if isinstance(node, AiExtract):
             return node.spec.locate == consumer.spec.locate
-        return (isinstance(first, AiFilter) and consumer.spec.shares_head
-                and not consumer.spec.locate)
+        if consumer.spec.locate or not consumer.spec.shares_head:
+            return False
+        if isinstance(first, AiClassify):
+            return (first.spec is not None and first.spec.partner is None
+                    and tuple(first.spec.prompt_token_parts[0])
+                    == tuple(consumer.spec.prompt_token_parts[0]))
+        return isinstance(first, AiFilter)
     return not isinstance(node, AiExtract)
 
 

@@ -106,7 +106,7 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
         for part in chain["after"]:
             results[part.node.node_id] = part.result_value
     else:
-        parts = _extract_parts(state, staged, ids, inputs, context)
+        parts = _extract_parts(state, staged, ids, head, inputs, context)
         stages = gated_stages(parts)
         stats = {}
         appended = [part.appended_tokens for part in parts
@@ -142,8 +142,18 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
     return results
 
 
-def _extract_parts(state: QueryExecutionState, members, ids, inputs, context):
-    """Build the remaining members' parts, consecutive extractions as one."""
+def _extract_parts(state: QueryExecutionState, members, ids, head, inputs,
+                   context):
+    """Build the members' parts, consecutive extractions as one.
+
+    Args:
+        state: The loaded model and current query state.
+        members: The pipeline's staged members, in order.
+        ids: The pipeline's document ids.
+        head: The prompt head the pipeline writes the documents under.
+        inputs: Member node id -> its inputs from outside the pipeline.
+        context: The graph's execution context.
+    """
     parts = []
     index = 0
     while index < len(members):
@@ -156,7 +166,7 @@ def _extract_parts(state: QueryExecutionState, members, ids, inputs, context):
             parts.append(ExtractPart(state, members[index:end], ids, {
                 "documents": context.state["docs"],
                 "texts": context.state.get("texts", {}),
-                "pre": context.state.get("pre", [])}))
+                "pre": list(head)}))
             index = end
         else:
             parts.append(_part(state, member, ids, parts, inputs, context))
