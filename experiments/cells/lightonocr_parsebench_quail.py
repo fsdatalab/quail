@@ -17,7 +17,9 @@ Run from the repository root and tee every line:
 --encode-ahead 0 runs the vision tower inside each prefill instead of
 in a thread on its own stream.
 
-Modes: smoke parses the first 20 pages; run parses every page.
+Modes: smoke parses the first 20 pages; run parses every page;
+profile parses PROFILE_PAGES pages and lists the kernels of mixed step
+PROFILE_MIXED.
 
 Writes /results/ablations/lightonocr_parsebench/quail_<mode>_<lanes>_<run
 id>.parquet (one record per page) and .json (the summary).
@@ -54,6 +56,10 @@ CONTEXT_TOKENS = 8448
 BUDGET = 16384
 ENCODE_AHEAD = 16
 SMOKE_PAGES = 20
+# the profile mode runs this many pages and profiles one mixed step
+# once about 256 pages are decoding
+PROFILE_PAGES = 400
+PROFILE_MIXED = 60
 WORKERS = 24
 WINDOW = 96
 
@@ -120,13 +126,14 @@ def parse(mode: str, lanes: int, run_id: str, encode_ahead: int) -> dict:
     preparer = PagePreparer(path, prompt, workers=WORKERS)
     parser = PageParser(spec, lanes=lanes, max_output_tokens=MAX_OUTPUT_TOKENS,
                         context_tokens=CONTEXT_TOKENS, budget=BUDGET,
-                        encode_ahead=encode_ahead)
+                        encode_ahead=encode_ahead,
+                        profile_mixed=PROFILE_MIXED if mode == "profile" else 0)
     if prompt != parser.prompt():
         raise ValueError("the workers' prompt differs from the parser's")
     for future in preparer.started:
         future.result()
     load_s = time.perf_counter() - started
-    limit = SMOKE_PAGES if mode == "smoke" else None
+    limit = dict(smoke=SMOKE_PAGES, profile=PROFILE_PAGES).get(mode)
     sampler = subprocess.Popen(
         ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits",
          "-lms", "100"], stdout=subprocess.PIPE, text=True)

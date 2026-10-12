@@ -171,11 +171,12 @@ class PageParser:
             on its own CUDA stream, so the vision tower runs beside the
             decode steps; 0 runs the tower in the step that prefills.
         encode_batch: Pages per vision tower call in that thread.
+        profile_mixed: Passed to GreedyGenerator.
     """
 
     def __init__(self, spec, *, lanes: int, max_output_tokens: int,
                  context_tokens: int, budget: int, encode_ahead: int = 0,
-                 encode_batch: int = 4):
+                 encode_batch: int = 4, profile_mixed: int = 0):
         import torch
         from transformers import AutoProcessor, GenerationConfig
 
@@ -219,7 +220,8 @@ class PageParser:
         self.generator = GreedyGenerator(
             torch, self.arena, self.pipeline, full_output_head(self.model),
             lanes=lanes, budget=budget, max_new_tokens=max_output_tokens,
-            context_tokens=context_tokens, stops=stops)
+            context_tokens=context_tokens, stops=stops,
+            profile_mixed=profile_mixed)
 
     @property
     def stats(self) -> dict:

@@ -103,11 +103,13 @@ class GreedyGenerator:
         context_tokens: Prompt and generated tokens a document holds at most.
         stops: Token ids that end a document's generation.
         graphs: Whether decode-only steps replay captured CUDA graphs.
+        profile_mixed: Which mixed step, counted from 1, to run under
+            torch.profiler, listing its kernels in stats; 0 for none.
     """
 
     def __init__(self, torch, arena, pipeline, head, *, lanes: int, budget: int,
                  max_new_tokens: int, context_tokens: int, stops,
-                 graphs: bool = True):
+                 graphs: bool = True, profile_mixed: int = 0):
         self.torch = torch
         self.arena = arena
         self.pipeline = pipeline
@@ -118,6 +120,7 @@ class GreedyGenerator:
         self.context_tokens = context_tokens
         self.stops = frozenset(stops)
         self.graphs = graphs
+        self.profile_mixed = profile_mixed
         self.width = arena.pages_needed(context_tokens)
         self.staging = None
         if str(arena.device).startswith("cuda"):
@@ -273,12 +276,22 @@ class GreedyGenerator:
             begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
                 enable_timing=True)
             begin.record()
+        profiling = self.stats["mixed_steps"] + 1 == self.profile_mixed
+        if profiling:
+            profiler = torch.profiler.profile(activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA])
+            profiler.__enter__()
         with torch.inference_mode():
             hidden = _forward(self.pipeline, arena, chunk)
             tokens = (hidden @ self.head.t()).argmax(dim=-1)
         if timed:
             end.record()
         tokens = tokens.tolist()
+        if profiling:
+            profiler.__exit__(None, None, None)
+            self.stats["mixed_profile"] = _kernels(profiler, len(groups),
+                                                   chunk.tokens)
         if timed:
             self.stats["mixed_gpu_s"] = (self.stats.get("mixed_gpu_s", 0.0)
                                          + begin.elapsed_time(end) / 1e3)
@@ -413,3 +426,14 @@ class GreedyGenerator:
         with torch.inference_mode():
             self._graphs[size].replay()
             return self._out[:n].tolist()
+
+
+def _kernels(profiler, groups: int, rows: int) -> dict:
+    """A profiled step's GPU time by kernel, largest first."""
+    events = [(getattr(e, "self_device_time_total", 0), e.count, e.key)
+              for e in profiler.key_averages()]
+    events = sorted((e for e in events if e[0] > 0), reverse=True)
+    return dict(groups=groups, rows=rows,
+                gpu_ms=sum(e[0] for e in events) / 1e3,
+                kernels=[f"{us / 1e3:8.2f} ms {count:5}x {name[:90]}"
+                         for us, count, name in events[:25]])
