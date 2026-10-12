@@ -185,7 +185,20 @@ and CUAD-9 fall by about 1 s each, the other five queries move by
 less than 0.3 s; quail-b reports input tokens per second for CUAD-7,
 8, and 9, since the query has one preamble; and every span F1 stays
 within 3 points of run 061618Z, if the opener did not matter to the
-model's copying.
+model's copying. Measured on run 20261012T065334Z: CUAD-7 fed 339
+thousand fresh tokens and took 5.8 s, CUAD-8 5.6 s, CUAD-9 5.4 s, and
+the three report 102 to 111 thousand input tokens per second; CUAD-2,
+3, 4, and 10 moved by at most 0.2 s, CUAD-1 took 7.3 s as the run's
+first query. Span F1 held within 2 points on six queries; CUAD-3 fell
+from 0.53 to 0.49 and CUAD-9 from 0.33 to 0.28, two contracts' worth
+each at 45 contracts, which the 450-contract run below settles.
+
+Prediction for scale factor 1.0 on both backends with the extraction's
+turn opener gone: Quail's CUAD-7 falls from 89.6 s to about 55 s and
+CUAD-8 and CUAD-9 from 62 and 63 s to about 50 s, the rest within 3 s
+of run 061833Z; stock vLLM's times hold within 5 s; span F1 on both
+backends holds within 3 points of run 061833Z, CUAD-3 and CUAD-9
+included, if the drops above were the 45-contract noise.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the
