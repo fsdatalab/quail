@@ -294,6 +294,12 @@ class PageParser:
         Args:
             pages: Iterable of (key, prepare_page output) pairs.
         """
+        import time
+
+        self.stats = dict(wait_s=0.0, prefill_s=0.0, prefills=0,
+                          prefill_tokens=0, decode_s=0.0, decode_steps=0,
+                          decode_rows=0)
+        stats = self.stats
         pending = iter(pages)
         waiting, active = None, {}
         free = list(range(self.rows - 1, -1, -1))
@@ -303,7 +309,9 @@ class PageParser:
             budget = self.prefill_tokens
             while free and not exhausted:
                 if waiting is None:
+                    started = time.perf_counter()
                     waiting = next(pending, None)
+                    stats["wait_s"] += time.perf_counter() - started
                     if waiting is None:
                         exhausted = True
                         break
@@ -315,8 +323,13 @@ class PageParser:
                 waiting = None
             if admit:
                 rows = [free.pop() for _ in admit]
+                started = time.perf_counter()
                 with self.torch.inference_mode():
                     first = self._prefill(admit, rows)
+                stats["prefill_s"] += time.perf_counter() - started
+                stats["prefills"] += 1
+                stats["prefill_tokens"] += sum(p["input_ids"].size
+                                               for _, p in admit)
                 for (key, page), row, token in zip(admit, rows, first):
                     state = _Row(key, row, page["input_ids"].size, page["offset"],
                                  [token])
@@ -330,8 +343,12 @@ class PageParser:
                     return
                 continue
             states = list(active.values())
+            started = time.perf_counter()
             with self.torch.inference_mode():
                 tokens = self._decode(states)
+            stats["decode_s"] += time.perf_counter() - started
+            stats["decode_steps"] += 1
+            stats["decode_rows"] += len(states)
             for state, token in zip(states, tokens):
                 state.tokens.append(token)
                 if self._done(state):

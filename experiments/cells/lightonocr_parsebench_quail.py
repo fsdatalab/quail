@@ -141,7 +141,7 @@ def parse(mode: str, rows: int, run_id: str) -> dict:
         pages_at_max_tokens=sum(1 for r in records
                                 if r["output_tokens"] >= MAX_OUTPUT_TOKENS),
         gpu_utilization_mean=sum(utilization) / max(len(utilization), 1),
-        compared_with=VLLM_RUN, **_agreement(records))
+        compared_with=VLLM_RUN, **parser.stats, **_agreement(records))
     stem = f"{OUT_DIR}/quail_{mode}_{rows}_{run_id}"
     Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(records), f"{stem}.parquet")
