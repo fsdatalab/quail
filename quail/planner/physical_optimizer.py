@@ -49,6 +49,9 @@ class PlanningContext:
     # the planner choose per node
     attention: str | None = None
     tokenizer: Callable[[str], Any] | None = None
+    # where AI.PARSE runs (quail.planner.parsing.ParsePlacement); None
+    # when the plan parses nothing
+    parse: Any = None
     # join written position -> its equality pairs as a fraction of
     # the cross product; joins without conditions are absent
     pair_fractions: Mapping[int, float] = field(default_factory=dict)

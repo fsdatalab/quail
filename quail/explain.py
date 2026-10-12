@@ -17,6 +17,7 @@ from quail.physical import (
     Foreign,
     HashJoin,
     Limit,
+    Parse,
     PortRef,
     Project,
     Recombine,
@@ -415,6 +416,12 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                     stage.selectivity, stage.expected_docs,
                     stages.get(("filter", node.alias, stage.written_pos)),
                     "evaluated")))
+        elif isinstance(node, Parse):
+            title += f": {node.name} over {node.alias} with {node.parser}"
+            details.append(
+                f"mode={node.mode}, about {_number(node.expected_rows)} rows "
+                f"and {_number(node.expected_tokens)} parsed tokens"
+                + (f", {node.lanes} pages decoded at once" if node.lanes else ""))
         elif isinstance(node, AiClassify):
             spec = node.spec
             title += f": {spec.name} over {spec.aliases[0]}"

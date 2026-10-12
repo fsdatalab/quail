@@ -286,3 +286,7 @@ class EngineConfig:
     # one attention path, "tree" or "unified", forced for every filter
     # and join; None lets the planner choose per node
     attention: str | None = None
+    # how AI.PARSE gets text: "pdfium" reads the PDF's stored text on
+    # the CPU, "lightonocr-3-0.8b" reads page images on the GPU beside
+    # the model; None refuses AI.PARSE
+    parser: str | None = None

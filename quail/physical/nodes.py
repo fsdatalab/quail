@@ -405,6 +405,74 @@ class Scan(PhysicalNode):
 
 
 @dataclass(frozen=True)
+class Parse(PhysicalNode):
+    """AI.PARSE: the text of each input row's pages, from the session's parser.
+
+    Reads the row ids of a read_pdfs table and passes them on; its
+    ``parsed`` port holds each row's text in the column ``name``. The
+    table's model operators after it read the parsed text as their
+    documents, and in one pipeline each parsed row reaches them as it
+    finishes.
+
+    Attributes:
+        alias: The table alias.
+        name: The parsed column.
+        mode: The AI.PARSE mode.
+        parser: The EngineConfig.parser that runs it.
+        expected_rows: Rows the planner expects to parse.
+        expected_tokens: The parsed text's expected tokens over them,
+            in the reading model's tokens.
+        lanes: Pages an OCR parser decodes at once; 0 for pdfium.
+    """
+
+    alias: str = ""
+    name: str = ""
+    mode: str = "text"
+    parser: str = ""
+    expected_rows: float = 0.0
+    expected_tokens: float = 0.0
+    lanes: int = 0
+
+    type_name: ClassVar[str] = "quail.parse"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (
+            OutputPort(f"ids:{self.alias}", ValueType.DOCUMENT_IDS,
+                       schema=(self.alias,)),
+            OutputPort("parsed", ValueType.PARSED_TEXT,
+                       schema=(self.alias, self.name)),
+        )
+
+    def attributes(self) -> dict:
+        return {
+            "alias": self.alias,
+            "name": self.name,
+            "mode": self.mode,
+            "parser": self.parser,
+            "expected_rows": self.expected_rows,
+            "expected_tokens": self.expected_tokens,
+            "lanes": self.lanes,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            alias=str(attributes["alias"]),
+            name=str(attributes["name"]),
+            mode=str(attributes["mode"]),
+            parser=str(attributes["parser"]),
+            expected_rows=float(attributes["expected_rows"]),
+            expected_tokens=float(attributes["expected_tokens"]),
+            lanes=int(attributes["lanes"]),
+        )
+
+
+@dataclass(frozen=True)
 class RequestExecution(PhysicalNode):
     """Run filters and joins through an independent request engine."""
 

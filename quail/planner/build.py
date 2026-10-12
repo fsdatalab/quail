@@ -16,6 +16,7 @@ from quail.logical import (
     classified_above_joins,
     effective_selectivity,
     has_score,
+    is_parse,
     is_score,
     oriented_join_conditions,
 )
@@ -40,6 +41,7 @@ from quail.physical import (
     HashJoin,
     InList,
     JoinStage,
+    Parse,
     PortRef,
     Recombine,
     ScoreSpec,
@@ -400,6 +402,14 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
 
     # ---- build the dataflow graph; ids_src tracks each table's
     # current producer node
+    parsed = {node.alias: node for node in operators.parses}
+    if parsed and (context is None or context.parse is None):
+        return Refusal(
+            reasons=("AI.PARSE planning needs the session's parser",),
+            constraint="parse_without_parser", needed=1, available=0,
+            unit="queries")
+    # the label and parsed columns the projection reads
+    label_ports = []
     nodes = []
     ids_src = {}
     rows_src = {}
@@ -420,6 +430,20 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             expected_docs=(float(stats[s.alias].n_docs)
                            if s.predicates else None)))
         ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
+        if s.alias in parsed:
+            semantic = parsed[s.alias]
+            pid = f"parse:{s.alias}"
+            nodes.append(Parse(
+                node_id=pid, inputs=input_ports((ids_src[s.alias],)),
+                alias=s.alias, name=semantic.name, mode=semantic.call.mode,
+                parser=context.parse.parser,
+                expected_rows=float(stats[s.alias].n_docs),
+                expected_tokens=float(stats[s.alias].total_tokens),
+                lanes=context.parse.lanes))
+            ids_src[s.alias] = PortRef(pid, f"ids:{s.alias}")
+            if any(is_parse(column) and column.expression == semantic.call
+                   for column in plan.projection.columns):
+                label_ports.append(PortRef(pid, "parsed"))
     # the hash join reads the scans; survivors thin its pairs at the AI join
     pairs_src = {}
     for node in hash_join_nodes(joins, pair_fractions, ids_src.values()):
@@ -499,7 +523,6 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         for predicate in predicates:
             survival *= effective_selectivity(predicate.selectivity)
         live_asked[alias] = float(stats[alias].n_docs) * survival
-    label_ports = []
 
     def emit_classify(alias, live=None):
         """Classify the alias's documents, then keep the accepted labels."""
@@ -793,6 +816,10 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                if labels.calls else {}),
             **({"canvas_draws": context.canvas_draws}
                if labels.calls and model.answer_canvas else {}),
+            **({"parser": context.parse.parser,
+                "parser_lanes": context.parse.lanes,
+                "parser_gib": round(context.parse.parser_bytes / 2**30, 2)}
+               if parsed else {}),
         },
         estimator=estimator)
 

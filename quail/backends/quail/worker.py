@@ -124,6 +124,47 @@ class LoadedGpu:
 
         self.async_ans = None
         self.chunk_tokens = None
+        self._parsers = {}
+        self._encoder = None
+
+    def tokenize(self, text):
+        """The reading model's token ids for a text, as the session tokenizes."""
+        if self._encoder is None:
+            from quail.execution.tokens import model_encoder
+
+            self._encoder = model_encoder(self.spec.hf_name)
+        return self._encoder(text)
+
+    def parser(self, node):
+        """The parser a Parse node names, loaded once beside the model.
+
+        An OCR parser loads into the memory the plan left beside the
+        reader's arena, after bind_query resized it.
+        """
+        from quail.parsers import LIGHTONOCR, PDFIUM, PdfiumParser
+
+        key = (node.parser, node.lanes)
+        if key not in self._parsers:
+            for loaded in self._parsers.values():
+                loaded.close()
+            self._parsers.clear()
+            if node.parser == PDFIUM:
+                import os
+
+                parser = PdfiumParser(workers=max(1, (os.cpu_count() or 2) // 2))
+            elif node.parser == LIGHTONOCR:
+                from quail.backends.quail.executor.parse import RowParser
+                from quail.specs import MODELS
+
+                self.torch.cuda.empty_cache()
+                t0 = time.perf_counter()
+                parser = RowParser(MODELS[LIGHTONOCR], lanes=node.lanes)
+                say(f"parser {LIGHTONOCR} loaded in "
+                    f"{time.perf_counter() - t0:.1f} s, {node.lanes} lanes")
+            else:
+                raise ValueError(f"unknown parser {node.parser!r}")
+            self._parsers[key] = parser
+        return self._parsers[key]
 
     def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None):
         """Attach the answer rows, readout, and chunk budget for one query.
@@ -172,6 +213,9 @@ class LoadedGpu:
 
     def close(self):
         """Release GPU resources held by the execution context."""
+        for parser in self._parsers.values():
+            parser.close()
+        self._parsers.clear()
         close_fn = getattr(self.execution, "close", None)
         if callable(close_fn):
             close_fn()
@@ -369,6 +413,7 @@ def _gpu_state(gpu):
         "model_execution": gpu.execution,
         "model": gpu.model, "arena": gpu.arena,
         "pipeline": gpu.pipeline, "spec": gpu.spec,
+        "parser": gpu.parser, "tokenize": gpu.tokenize,
     }
 
 

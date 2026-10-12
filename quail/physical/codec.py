@@ -18,6 +18,7 @@ from .nodes import (
     Foreign,
     HashJoin,
     Limit,
+    Parse,
     Project,
     Recombine,
     RequestExecution,
@@ -138,6 +139,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
     """Return codecs for every built in physical node."""
     return tuple(NodeCodec(node_type) for node_type in (
         Scan,
+        Parse,
         AiFilter,
         RequestExecution,
         AiScore,

@@ -29,8 +29,10 @@ from quail.execution.runner import (
 from quail.execution.selection import selected_rows
 from quail.execution.tokens import (
     ColumnStoreWriter,
+    PageScanInput,
     ScanInput,
     TokenStoreWriter,
+    model_encoder,
 )
 from quail.execution.types import PhysicalRequest, document_input
 from quail.extensions import ExtensionRegistry
@@ -40,6 +42,7 @@ from quail.logical import (
     Alias,
     CompileError,
     LogicalPlan,
+    is_parse,
     join_conditions,
     oriented_join_conditions,
 )
@@ -141,6 +144,15 @@ class Session:
                 available=0,
                 unit="configurations",
             ))
+        if config.parser is not None:
+            from quail.parsers import parser_spec
+
+            try:
+                parser_spec(config.parser)
+            except ValueError as error:
+                raise RefusalError(Refusal(
+                    reasons=(str(error),), constraint="unknown_parser",
+                    needed=1, available=0, unit="parsers")) from error
         self.catalog = Catalog()
         self._tok = tokenizer      # injectable for tests
         self._tokenizer_name = "configured tokenizer" if tokenizer else "Gigatoken"
@@ -269,18 +281,7 @@ class Session:
         starts.
         """
         if self._tok is None:
-            from gigatoken import Tokenizer
-
-            fast = Tokenizer(self.model.hf_name)
-
-            def encode(text):
-                tokens = fast.encode(text)
-                if hasattr(tokens, "tolist"):
-                    return tokens.tolist()
-                return [int(token) for token in tokens]
-
-            encode.decode = fast.decode
-            self._tok = encode
+            self._tok = model_encoder(self.model.hf_name)
         return self._tok
 
     def tokenize(self, provider_name: str, column: str,
@@ -317,6 +318,52 @@ class Session:
                 for name in projected_columns
             },
         )
+
+    def page_input(self, provider_name: str, projected_columns=()) -> PageScanInput:
+        """Return a read_pdfs table's page references and value columns.
+
+        The rows are parsed when the query runs; their lengths are
+        estimate_parse_lengths' estimates.
+        """
+        with self._lock:
+            provider = self.catalog.get(provider_name)
+            identity = provider.content_identity()
+            projected_columns = tuple(dict.fromkeys(projected_columns))
+            missing = tuple(name for name in projected_columns
+                            if (identity, name) not in self._column_stores)
+            if missing:
+                self._load(provider_name, None, missing)
+            return PageScanInput(
+                provider.pages(), self.estimate_parse_lengths(provider_name),
+                {name: self._column_stores[(identity, name)]
+                 for name in projected_columns})
+
+    def estimate_parse_lengths(self, provider_name: str) -> list[int]:
+        """Estimate each read_pdfs row's parsed tokens in the model's tokens.
+
+        With the pdfium parser, the stored text of the first
+        ESTIMATE_SAMPLE rows is read and tokenized, and its tokens per
+        page scale every row's page count. An OCR parser's tokens per
+        page are its ParserSpec's.
+        """
+        from quail.parsers import PDFIUM, parser_spec, stored_texts
+
+        provider = self.catalog.get(provider_name)
+        key = (provider.content_identity(), ("parsed", self.config.parser))
+        if key in self._length_estimates:
+            return self._length_estimates[key]
+        pages = provider.pages()
+        counts = [pages.page_count(row) for row in range(len(pages))]
+        per_page = (parser_spec(self.config.parser).tokens_per_page
+                    if self.config.parser is not None else 0.0)
+        if self.config.parser == PDFIUM and counts:
+            sample = [pages[row] for row in range(min(ESTIMATE_SAMPLE, len(pages)))]
+            tok = self.tokenizer
+            tokens = sum(len(tok(text)) for text in stored_texts(sample))
+            per_page = tokens / sum(len(row_pages) for _, row_pages in sample)
+        lengths = [max(1, round(per_page * count)) for count in counts]
+        self._length_estimates[key] = lengths
+        return lengths
 
     def tokenize_async(self, provider_name: str, column: str,
                        projected_columns=()) -> Future:
@@ -693,6 +740,10 @@ class Query:
             self._token_inputs = {}
             estimated = []
             for s in operators.scans:
+                if self._pages(s):
+                    self._doc_tokens[s.alias] = \
+                        self.session.estimate_parse_lengths(s.provider)
+                    continue
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
                     self._doc_tokens[s.alias] = exact
@@ -726,6 +777,10 @@ class Query:
                     "stock_vllm", "pipelined_vllm", "dumb_vllm"
                 }:
                     columns = tuple(dict.fromkeys((*columns, s.column)))
+                if self._pages(s):
+                    self._token_inputs[s.alias] = self.session.page_input(
+                        s.provider, columns)
+                    continue
                 if s.alias not in self._estimated:
                     self._token_inputs[s.alias] = self.session.tokenize(
                         s.provider, s.column, columns)
@@ -751,7 +806,8 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions,
-                memo=context.memo)
+                memo=context.memo,
+                parser=config.parser)
             extra = {}
             if config.gpu_timing:
                 extra["gpu_timing"] = True
@@ -760,6 +816,13 @@ class Query:
                     **self._plan.settings, **extra})
             self._planning_finished_at = time.perf_counter()
         return self._plan
+
+    def _pages(self, scan) -> bool:
+        """Whether a scan reads a read_pdfs table, whose rows AI.PARSE reads."""
+        from quail.pdf import PdfPagesProvider
+
+        return isinstance(self.session.catalog.get(scan.provider),
+                          PdfPagesProvider)
 
     @property
     def planning_s(self) -> float:
@@ -882,7 +945,9 @@ class Query:
                 attention=self.session.config.attention,
                 backend=self.session.config.backend,
                 registry=self.session.registry,
-                tokenizer=self.session.tokenizer)
+                tokenizer=self.session.tokenizer,
+                logical_plan=self.logical,
+                parser=self.session.config.parser)
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.
@@ -929,6 +994,9 @@ class Query:
                 continue
             store = self._token_inputs[node.alias]
             logical_scan = logical_scans[node.alias]
+            if isinstance(store, PageScanInput):
+                inputs[node.input_id] = document_input(store.tokens)
+                continue
             inputs[node.input_id] = document_input(
                 store.tokens,
                 (
@@ -1108,6 +1176,7 @@ class Query:
                     call = next((column.expression
                                  for column in self.logical.projection.columns
                                  if isinstance(column, Alias)
+                                 and not is_parse(column)
                                  and column.name == name), None)
                     if call is not None:
                         order = pa.array(call.labels, pa.string())

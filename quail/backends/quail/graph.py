@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import time
 
+from quail.backends.quail.executor.operators.parse import ParseRuntime
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution.pairs import (
     allowed_members,
@@ -31,6 +32,7 @@ from quail.physical import (
     AiJoin,
     AiScore,
     Filter,
+    Parse,
     PhysicalGraph,
     Scan,
 )
@@ -45,6 +47,7 @@ def quail_runtimes() -> dict:
         AiJoin.runtime_key: model_runtime,
         AiScore.runtime_key: model_runtime,
         Filter.runtime_key: FilterRuntime(),
+        Parse.runtime_key: ParseRuntime(),
     }
 
 

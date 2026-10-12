@@ -16,6 +16,7 @@ from quail.physical import (
     AiJoin,
     Filter,
     Foreign,
+    Parse,
     PhysicalGraph,
     PhysicalNode,
 )
@@ -67,6 +68,8 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
         return tuple(node.aliases) if node.ids == "pairs" else node.aliases[:1]
     if isinstance(node, AiJoin):
         return (node.anchor,)
+    if isinstance(node, Parse):
+        return (node.alias,)
     return ()
 
 
@@ -146,19 +149,26 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         aliases = operator_aliases(node)
         if not aliases or node.node_id in followed:
             continue
-        # only an AI filter, classification, or join starts a pipeline
-        if not isinstance(node, (AiFilter, AiClassify, AiJoin)):
+        # only a parse, AI filter, classification, or join starts a pipeline
+        if not isinstance(node, (Parse, AiFilter, AiClassify, AiJoin)):
             continue
         (alias,) = aliases
         members = [node]
-        followed.add(node.node_id)
         while True:
             after = [consumer for consumer in continuation(members[-1], alias)
                      if consumer.node_id not in followed]
             if not after:
                 break
             members.extend(after)
-            followed.update(consumer.node_id for consumer in after)
+        if isinstance(node, Parse) and (
+                len(members) == 1
+                or not isinstance(members[1], (AiFilter, AiClassify))
+                or any(isinstance(member, AiJoin) for member in members)):
+            # parsed rows reach a filter or classification chain in
+            # rounds; a join needs every row first, so the parse runs
+            # alone and the operators after it start their own pipeline
+            members = [node]
+        followed.update(member.node_id for member in members)
         pipeline = Pipeline(alias, tuple(members))
         for member in members:
             pipelines[member.node_id] = pipeline

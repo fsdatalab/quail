@@ -380,6 +380,43 @@ class ScanInput:
         return self._columns[name].values
 
 
+def model_encoder(hf_name: str):
+    """Return Gigatoken's encoder for a checkpoint: text -> token id list.
+
+    The encoder's ``decode`` attribute returns a token id list's text
+    as bytes.
+    """
+    from gigatoken import Tokenizer
+
+    fast = Tokenizer(hf_name)
+
+    def encode(text):
+        tokens = fast.encode(text)
+        if hasattr(tokens, "tolist"):
+            return tokens.tolist()
+        return [int(token) for token in tokens]
+
+    encode.decode = fast.decode
+    return encode
+
+
+class PageScanInput(ScanInput):
+    """The page references of one read_pdfs scan and its stored value columns.
+
+    The rows hold no tokens until AI.PARSE runs; ``lengths`` are the
+    planner's estimates of each row's parsed tokens.
+    """
+
+    def __init__(self, pages, lengths, columns: dict):
+        super().__init__(pages, columns)
+        self._lengths = list(lengths)
+
+    @property
+    def lengths(self):
+        """Return each row's estimated parsed tokens."""
+        return self._lengths
+
+
 class TokenSelection(Sequence):
     """Open selected token documents inside a child process."""
 

@@ -22,6 +22,7 @@ class ValueType(str, Enum):
     FILTER_ANSWERS = "filter_answers"
     JOIN_ANSWERS = "join_answers"
     LABEL_ANSWERS = "label_answers"
+    PARSED_TEXT = "parsed_text"
     PAIRS = "pairs"
     SCORES = "scores"
     ROWS = "rows"

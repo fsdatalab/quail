@@ -10,6 +10,7 @@ from quail.backends.quail.executor.operators.classify import (
 )
 from quail.backends.quail.executor.operators.filter import FilterPart, LabelGate
 from quail.backends.quail.executor.operators.join import execute_join
+from quail.backends.quail.executor.operators.parse import execute_parsed_pipeline
 from quail.backends.quail.executor.parts import (
     complete_chain,
     execution_prefix_tree,
@@ -20,7 +21,7 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.stages import run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.tokens import DocumentKeys, DocumentPrefixes
-from quail.physical import AiClassify, AiFilter, AiJoin, Filter, Foreign
+from quail.physical import AiClassify, AiFilter, AiJoin, Filter, Foreign, Parse
 
 
 def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> dict:
@@ -43,6 +44,12 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
     Returns:
         Node id -> NodeResult for every member.
     """
+    if isinstance(pipeline.members[0], Parse):
+        # the operators after a parse run in rounds of parsed rows
+        return execute_parsed_pipeline(
+            lambda rest, rest_inputs, rest_context: execute_pipeline(
+                state, rest, rest_inputs, rest_context),
+            pipeline, inputs, context, state.chunk_tokens)
     state.gpu_timing = bool(context.state.get("gpu_timing", False))
     members = list(pipeline.members)
     alias = pipeline.alias
