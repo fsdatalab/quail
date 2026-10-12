@@ -61,6 +61,8 @@ class _Document:
     rows: np.ndarray
     slot: int = 0
     tokens: list = field(default_factory=list)
+    launched: int = 0    # decode steps launched, read or not
+    finished: bool = False
 
     @property
     def fed(self) -> int:
@@ -90,6 +92,58 @@ def admission_ready(free: int, decoding: int, mean_prompt: float,
     if not decoding or exhausted:
         return True
     return free * mean_prompt >= budget - decoding
+
+
+class _Admission:
+    """The documents waiting to start, taken as the admission rule allows."""
+
+    def __init__(self, pending, generator):
+        self.pending = pending
+        self.generator = generator
+        self.waiting = None
+        self.exhausted = False
+        self.prompt_tokens = 0
+        self.prompt_count = 0
+
+    @property
+    def done(self) -> bool:
+        """Whether every document has been taken."""
+        return self.exhausted and self.waiting is None
+
+    def take(self, free: int, decoding: int) -> list:
+        """Reserve and return (Generation, capacity) pairs for this step."""
+        import time
+
+        generator = self.generator
+        mean = self.prompt_tokens / self.prompt_count if self.prompt_count else 0.0
+        if not admission_ready(free, decoding, mean, generator.budget,
+                               self.exhausted):
+            return []
+        admit = []
+        room = generator.budget - decoding
+        while len(admit) < free and not self.exhausted:
+            if self.waiting is None:
+                started = time.perf_counter()
+                self.waiting = next(self.pending, None)
+                generator.stats["wait_s"] += time.perf_counter() - started
+                if self.waiting is None:
+                    self.exhausted = True
+                    break
+            size = len(self.waiting.prompt)
+            if admit and size > room:
+                break
+            capacity = generator._reserve(self.waiting)
+            if capacity is None:
+                # the arena is full: the prompt waits for documents to
+                # finish and free their pages
+                break
+            admit.append((self.waiting, capacity))
+            generator.stats["prefilled_tokens"] += size
+            self.prompt_tokens += size
+            self.prompt_count += 1
+            room -= size
+            self.waiting = None
+        return admit
 
 
 class GreedyGenerator:
@@ -138,80 +192,37 @@ class GreedyGenerator:
 
     def run(self, generations):
         """Generate for every document; yields (key, tokens) as each ends."""
+        self.stats = dict(wait_s=0.0, mixed_s=0.0, mixed_steps=0,
+                          mixed_pack_s=0.0, prefilled_tokens=0, decode_s=0.0,
+                          decode_steps=0, decode_rows=0, decode_host_s=0.0,
+                          decode_wait_s=0.0, discarded_rows=0)
+        admission = _Admission(iter(generations), self)
+        if self.graphs:
+            yield from self._run_graphs(admission)
+        else:
+            yield from self._run_eager(admission)
+
+    def _run_eager(self, admission):
+        """One pass per step, packing the decode rows with the admitted prompts."""
         import time
 
-        stats = self.stats = dict(wait_s=0.0, mixed_s=0.0, mixed_steps=0,
-                                  mixed_pack_s=0.0, prefilled_tokens=0,
-                                  decode_s=0.0, decode_steps=0, decode_rows=0,
-                                  decode_host_s=0.0)
-        pending = iter(generations)
-        waiting = None
-        exhausted = False
-        active = []
-        free = list(range(self.lanes - 1, -1, -1))
-        prompt_tokens = prompt_count = 0
+        stats = self.stats
+        active, free = [], list(range(self.lanes - 1, -1, -1))
         while True:
-            admit = []
-            room = self.budget - len(active)
-            mean = prompt_tokens / prompt_count if prompt_count else 0.0
-            if admission_ready(len(free), len(active), mean, self.budget,
-                               exhausted):
-                while len(admit) < len(free) and not exhausted:
-                    if waiting is None:
-                        started = time.perf_counter()
-                        waiting = next(pending, None)
-                        stats["wait_s"] += time.perf_counter() - started
-                        if waiting is None:
-                            exhausted = True
-                            break
-                    size = len(waiting.prompt)
-                    if admit and size > room:
-                        break
-                    capacity = self._reserve(waiting)
-                    if capacity is None:
-                        # the arena is full: the prompt waits for lanes
-                        # to finish and free their pages
-                        break
-                    admit.append((waiting, capacity))
-                    prompt_tokens += size
-                    prompt_count += 1
-                    room -= size
-                    waiting = None
+            admit = admission.take(len(free), len(active))
             started = time.perf_counter()
-            if admit and self.graphs:
-                # the admitted prompts prefill in their own pass, and the
-                # documents already in flight decode by graph: a pass
-                # mixing the two would run every decode row eagerly
-                admitted = []
-                first = self._mixed(admitted, admit, free)
-                stats["mixed_s"] += time.perf_counter() - started
-                stats["mixed_steps"] += 1
-                stats["prefilled_tokens"] += sum(len(g.prompt) for g, _ in admit)
-                if active:
-                    started = time.perf_counter()
-                    tokens = self._replay(active) + first
-                    stats["decode_s"] += time.perf_counter() - started
-                    stats["decode_steps"] += 1
-                    stats["decode_rows"] += len(active)
-                else:
-                    tokens = first
-                active = active + admitted
-            elif admit:
+            if admit:
                 tokens = self._mixed(active, admit, free)
                 stats["mixed_s"] += time.perf_counter() - started
                 stats["mixed_steps"] += 1
-                stats["prefilled_tokens"] += sum(len(g.prompt) for g, _ in admit)
             elif active:
-                tokens = (self._replay(active) if self.graphs
-                          else self._mixed(active, [], free))
+                tokens = self._mixed(active, [], free)
                 stats["decode_s"] += time.perf_counter() - started
                 stats["decode_steps"] += 1
                 stats["decode_rows"] += len(active)
-            elif exhausted and waiting is None:
+            elif admission.done:
                 return
             else:
-                # the arena could not take the next prompt and nothing is
-                # in flight to free room
                 raise RuntimeError("the arena cannot hold one prompt")
             still = []
             for document, token in zip(active, tokens):
@@ -222,6 +233,61 @@ class GreedyGenerator:
                 else:
                     still.append(document)
             active = still
+
+    def _run_graphs(self, admission):
+        """Prefill admitted prompts in their own pass and decode by graph, ahead.
+
+        Each decode step launches before the host reads the step
+        before it: the graph reads each lane's last token from the
+        GPU, so the host only counts rows to lay out the next step,
+        and reads the chosen tokens one step late. A document that
+        stopped in the step being read has already run one more
+        step, whose token is discarded.
+        """
+        import time
+
+        stats = self.stats
+        active, free = [], list(range(self.lanes - 1, -1, -1))
+        flight = None    # the launched step not read yet
+        while True:
+            admit = admission.take(len(free), len(active))
+            if admit:
+                started = time.perf_counter()
+                admitted = []
+                first = self._mixed(admitted, admit, free)
+                stats["mixed_s"] += time.perf_counter() - started
+                stats["mixed_steps"] += 1
+                for document, token in zip(admitted, first):
+                    document.tokens.append(token)
+                    if self._done(document):
+                        self._release(document, free)
+                        yield document.generation.key, document.tokens
+                    else:
+                        active.append(document)
+            launch = [document for document in active if self._launchable(document)]
+            started = time.perf_counter()
+            launched = self._launch(launch) if launch else None
+            stats["decode_host_s"] += time.perf_counter() - started
+            if flight is not None:
+                started = time.perf_counter()
+                tokens = self._read(flight)
+                stats["decode_wait_s"] += time.perf_counter() - started
+                for document, token in zip(flight[0], tokens):
+                    if document.finished:
+                        stats["discarded_rows"] += 1
+                        continue
+                    document.tokens.append(token)
+                    if self._done(document):
+                        document.finished = True
+                        self._release(document, free)
+                        yield document.generation.key, document.tokens
+                active = [document for document in active if not document.finished]
+            flight = launched
+            if launched is None and not active:
+                if admission.done:
+                    return
+                if not admit:
+                    raise RuntimeError("the arena cannot hold one prompt")
 
     def _reserve(self, generation):
         """Reserve the prompt's pages and slot; returns its capacity, or None."""
@@ -237,6 +303,18 @@ class GreedyGenerator:
         return (document.tokens[-1] in self.stops
                 or len(document.tokens) >= self.max_new_tokens
                 or document.fed + 1 >= document.capacity)
+
+    def _launchable(self, document) -> bool:
+        """Whether one more decode step stays within the document's limits.
+
+        Every launched step writes one row and yields one token, so
+        the tokens after it count one per launched step and one from
+        the prompt's pass.
+        """
+        tokens = 1 + document.launched + 1
+        prompt = len(document.generation.prompt)
+        return (tokens <= self.max_new_tokens
+                and prompt + tokens <= document.capacity)
 
     def _release(self, document, free):
         self.arena.free_key(document.generation.key)
@@ -297,6 +375,7 @@ class GreedyGenerator:
             begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
                 enable_timing=True)
             begin.record()
+        lanes = [free.pop() for _ in admit]
         profiling = self.stats["mixed_steps"] + 1 == self.profile_mixed
         if profiling:
             profiler = torch.profiler.profile(activities=[
@@ -307,6 +386,11 @@ class GreedyGenerator:
         with torch.inference_mode():
             hidden = _forward(self.pipeline, arena, chunk)
             tokens = (hidden @ self.head.t()).argmax(dim=-1)
+            if self.graphs and admit:
+                # the decode graphs read each lane's last token here
+                self._last.index_copy_(
+                    0, torch.as_tensor(lanes, device=arena.device),
+                    tokens[len(tokens) - len(admit):])
         if timed:
             end.record()
         tokens = tokens.tolist()
@@ -318,10 +402,10 @@ class GreedyGenerator:
         if timed:
             self.stats["mixed_gpu_s"] = (self.stats.get("mixed_gpu_s", 0.0)
                                          + begin.elapsed_time(end) / 1e3)
-        for generation, capacity in admit:
+        for (generation, capacity), lane in zip(admit, lanes):
             key = generation.key
             document = _Document(
-                generation, free.pop(), capacity,
+                generation, lane, capacity,
                 arena.capacity_rows(key).numpy(),
                 slot=arena.state_slot_at(key, len(generation.prompt)) or 0)
             active.append(document)
@@ -364,16 +448,24 @@ class GreedyGenerator:
         self._table = torch.zeros((n + 1, self.width), dtype=torch.int32,
                                   device="cuda")
         self._table[n, 0] = arena.owned_pages(self._scratch)[0]
-        self._pad = dict(ids=0, positions=0, dst=scratch_row, used=1, lanes=n,
-                         slots=0)
-        dtypes = dict(ids=torch.int64, positions=torch.int64, dst=torch.int64,
-                      used=torch.int32, lanes=torch.int64, slots=torch.int32)
-        self._host, self._device = {}, {}
+        self._pad = dict(positions=0, dst=scratch_row, used=1, lanes=n, slots=0)
+        dtypes = dict(positions=torch.int64, dst=torch.int64, used=torch.int32,
+                      lanes=torch.int64, slots=torch.int32)
+        # two sets of host buffers: a launch fills one while the copies
+        # of the launch before it may still be pending from the other
+        self._host = [{}, {}]
+        self._device = {}
         for name, dtype in dtypes.items():
             width = 3 * n if name == "positions" else n
-            self._host[name] = torch.full((width,), self._pad[name], dtype=dtype,
-                                          pin_memory=True)
-            self._device[name] = self._host[name].to("cuda")
+            for host in self._host:
+                host[name] = torch.full((width,), self._pad[name], dtype=dtype,
+                                        pin_memory=True)
+            self._device[name] = self._host[0][name].to("cuda")
+        self._chosen = [torch.zeros(n, dtype=torch.int64, pin_memory=True)
+                        for _ in range(2)]
+        self._parity = 0
+        # each lane's last chosen token, which its next decode row feeds
+        self._last = torch.zeros(n + 1, dtype=torch.int64, device="cuda")
         self._out = torch.zeros(n, dtype=torch.int64, device="cuda")
         self._cu = torch.arange(n + 1, dtype=torch.int32, device="cuda")
         self._index = torch.arange(n, device="cuda")
@@ -404,12 +496,16 @@ class GreedyGenerator:
                 max_used=self.width * self.arena.page_tokens,
                 table=self._table.index_select(0, d["lanes"][:size])),
             state=dict(waves=[], decode=dict(rows=None, slots=d["slots"][:size])))
+        lanes = d["lanes"][:size]
+        ids = self._last.index_select(0, lanes)
         chunk = SimpleNamespace(
-            input_ids=d["ids"][:size], positions=d["ids"][:size],
+            input_ids=ids, positions=ids,
             rope_positions=d["positions"][:3 * size].view(3, size),
             meta=meta, final_indices=self._index[:size])
         hidden = self.pipeline.forward_chunk(chunk)
-        self._out[:size].copy_((hidden @ self.head.t()).argmax(dim=-1))
+        chosen = (hidden @ self.head.t()).argmax(dim=-1)
+        self._out[:size].copy_(chosen)
+        self._last.index_copy_(0, lanes, chosen)
 
     def _write_lane(self, document):
         """Write the document's pages into its lane's block table row."""
@@ -418,38 +514,53 @@ class GreedyGenerator:
         row[:len(pages)] = self.torch.as_tensor(pages, dtype=self.torch.int32)
         self._table[document.lane].copy_(row)
 
-    def _replay(self, active) -> list:
-        """One token for every document in flight, by replaying a graph."""
-        import time
+    def _launch(self, documents):
+        """Lay out and replay one decode step without waiting for its tokens.
 
+        Returns what _read needs: the documents in row order, their
+        count, the event after the tokens' copy to the host, and the
+        host buffer they land in.
+        """
         torch = self.torch
-        started = time.perf_counter()
-        n = len(active)
+        n = len(documents)
         size = next(s for s in self._sizes if s >= n)
-        fed = [document.fed for document in active]
+        host = self._host[self._parity]
+        rows = [len(d.generation.prompt) + d.launched for d in documents]
         values = dict(
-            ids=[document.tokens[-1] for document in active],
-            dst=[int(document.rows[f]) for document, f in zip(active, fed)],
-            used=[f + 1 for f in fed],
-            lanes=[document.lane for document in active],
-            slots=[document.slot for document in active])
+            dst=[int(d.rows[row]) for d, row in zip(documents, rows)],
+            used=[row + 1 for row in rows],
+            lanes=[d.lane for d in documents],
+            slots=[d.slot for d in documents])
         for name, value in values.items():
-            host = self._host[name].numpy()
-            host[:n] = value
-            host[n:size] = self._pad[name]
-            self._device[name][:size].copy_(self._host[name][:size],
-                                            non_blocking=True)
-        positions = self._host["positions"].numpy()[:3 * size].reshape(3, size)
-        positions[:, :n] = [f + document.generation.rope_offset
-                            for f, document in zip(fed, active)]
+            buffer = host[name].numpy()
+            buffer[:n] = value
+            buffer[n:size] = self._pad[name]
+            self._device[name][:size].copy_(host[name][:size], non_blocking=True)
+        positions = host["positions"].numpy()[:3 * size].reshape(3, size)
+        positions[:, :n] = [row + d.generation.rope_offset
+                            for row, d in zip(rows, documents)]
         positions[:, n:] = 0
         self._device["positions"][:3 * size].copy_(
-            self._host["positions"][:3 * size], non_blocking=True)
-        self.stats["decode_host_s"] += time.perf_counter() - started
+            host["positions"][:3 * size], non_blocking=True)
+        chosen = self._chosen[self._parity]
         with torch.inference_mode():
             self._graphs[size].replay()
-            return self._out[:n].tolist()
+            chosen[:n].copy_(self._out[:n], non_blocking=True)
+        done = torch.cuda.Event()
+        done.record()
+        for document in documents:
+            document.launched += 1
+        self.stats["decode_steps"] += 1
+        self.stats["decode_rows"] += n
+        flight = (documents, n, done, chosen)
+        self._parity ^= 1
+        return flight
 
+    def _read(self, flight) -> list:
+        """The tokens a launched decode step chose, in its row order."""
+        _, n, done, chosen = flight
+        done.synchronize()
+        return chosen[:n].tolist()
 
 def _kernels(profiler, groups: int, rows: int) -> dict:
     """A profiled step's GPU time by kernel and CPU time by op, largest first."""
