@@ -86,7 +86,18 @@ scored).
 Prediction for the rule at the first token only, the answer later
 following the document's continuation as before: CUAD-4 returns to
 at least 0.58, and CUAD-3, CUAD-7, and CUAD-8 hold within 3 points of
-run 014442Z, if their added nulls came at the first token.
+run 014442Z, if their added nulls came at the first token. Measured
+on run 20261012T015932Z: CUAD-4 0.65 (exact match 0.24), CUAD-3 0.56,
+CUAD-1 0.37, CUAD-2 0.83, CUAD-9 0.35, CUAD-10 0.49; CUAD-7 fell to
+0.60 and CUAD-8 to 0.40, so their added nulls came in the middle of
+the answer, where the model would rather paraphrase than copy on.
+
+Prediction for ending the answer where the model's writing would
+leave the document, and none only when that is at the cue: CUAD-4
+holds at or above 0.62, with exact match above 0.24 since a contract
+is scored against its best-matching party; CUAD-7 and CUAD-8 land
+between the two runs, at or above 0.63 and 0.45; CUAD-1, 2, 3, 9,
+and 10 hold within 3 points of run 015932Z.
 
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the

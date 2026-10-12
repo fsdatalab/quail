@@ -559,17 +559,17 @@ class ExtractStages:
     def _decode_decide(self, q, anchor, row):
         """Choose the answer's next token among the document's continuations.
 
-        At the cue, the token is the likeliest first token of any
-        position in the region; the model writing none, closing the
-        quote at once, or liking a token that begins no position
-        better than any that does, answers none: its answer is not in
-        the document. Afterwards, the token is the likeliest
-        continuation of the streams the writing so far fits, even when
-        the model would rather write a word that continues none, such
-        as "and" between two names the document lists apart. A token
-        the model would write with the closing quote, such as `."`,
-        ends the answer after that token. The answer ends when closing
-        the quote is at least as likely as every continuation, when no
+        The answer is the document text the model writes before its
+        writing would leave the document: a token it likes better than
+        every continuation and the stop, and that continues no
+        position, ends the answer, and at the cue it answers none, as
+        does the model writing none or closing the quote at once. At
+        the cue, the token is the likeliest first token of any
+        position in the region; afterwards, the likeliest continuation
+        of the streams the writing so far fits. A token the model
+        would write with the closing quote, such as `."`, ends the
+        answer after that token. The answer also ends when closing the
+        quote is at least as likely as every continuation, when no
         stream continues, or at ANSWER_MAX_TOKENS.
         """
         doc, qs = self._question(q, anchor)
@@ -613,7 +613,9 @@ class ExtractStages:
                 qs.live = [s for s in qs.live if s.next(at, tables) == joined]
                 self._answer(doc, q)
                 return True
-            if best is None or stop_lp >= best_lp:
+            if (best is None or stop_lp >= best_lp
+                    or self._leaves(tables, lp, following | set(merged.values()),
+                                    best_lp, stop_lp)):
                 self._answer(doc, q)
                 return True
             qs.written.append(best)

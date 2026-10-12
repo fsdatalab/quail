@@ -262,10 +262,11 @@ def test_writing_that_begins_outside_the_document_answers_none(monkeypatch):
     assert stages.docs[0].questions[0].none_wins
 
 
-def test_writing_that_leaves_the_document_later_goes_on_along_it(monkeypatch):
+def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
     # after "March" the model would rather write a word the document
-    # does not continue with; the answer follows the document instead,
-    # as the parties of a contract are listed without an "and" between
+    # does not continue with: the answer is what it wrote within the
+    # document, as a contract's first party before an "and" the
+    # contract does not have
     state, model, run, _ = _setup(monkeypatch)
     tables = model.tables
     stray = tables.encode_ids(" lease")[0]
@@ -281,7 +282,7 @@ def test_writing_that_leaves_the_document_later_goes_on_along_it(monkeypatch):
     model._answer_row = straying
     result, stages = run()
     assert result.outputs["scores"].column("ends").to_pylist() == [
-        "March 3, 2027", "five years", None]
+        "March", "five years", None]
     assert not stages.docs[0].questions[0].none_wins
 
 

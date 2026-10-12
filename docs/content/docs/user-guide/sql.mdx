@@ -372,16 +372,17 @@ Pass an object as the third argument, such as `{'trim': false}`.
 The answer is always a span of the document's own text. The model
 writes the answer one token at a time, as a decoder would, but each
 token is chosen among the tokens that continue some position of the
-document, so the writing can only trace the document's own text. When
-the model's first token begins no position, or it writes `none`, the
-answer is null: its answer is not in the document. Later in the
-answer, a token that continues no position is passed over for the
-document's own continuation; for example, the model would write
-"and" between two parties a contract lists apart, and the answer
-follows the contract instead. The answer ends where the model would
-close the quote: when closing it is at least as likely as every
-continuation, or after a token the model would write with the closing
-quote in one token, such as `."`. With `locate` on, the model first
+document, so the writing can only trace the document's own text. The
+answer is what the model wrote before its writing would leave the
+document: a token the model likes better than every continuation,
+and that continues no position, ends the answer there. For example,
+the model would write "and" between two parties a contract lists
+apart, and the answer is the first party. When the model's first
+token begins no position, or it writes `none`, the answer is null:
+its answer is not in the document. The answer also ends where the
+model would close the quote: when closing it is at least as likely
+as every continuation, or after a token the model would write with
+the closing quote in one token, such as `."`. With `locate` on, the model first
 names the lines that hold the answer, shown numbered as `cat -n` shows
 them, and the positions are those lines. The document, the lines, and
 the question stay in KV across these steps. Several extractions of one
