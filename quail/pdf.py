@@ -64,7 +64,8 @@ def read_pdfs(paths: str | Sequence[str], *,
     path, then page.
 
     Args:
-        paths: A glob, or a list of paths and globs.
+        paths: A glob, or a list of paths and globs; ** matches any
+            folders.
         split_pages: One row per page; False gives one row per file
             whose document covers every page in order.
 
@@ -77,7 +78,8 @@ def read_pdfs(paths: str | Sequence[str], *,
     patterns = [paths] if isinstance(paths, str) else list(paths)
     found = set()
     for pattern in patterns:
-        matched = globbing.glob(pattern) if globbing.has_magic(pattern) else [pattern]
+        matched = (globbing.glob(pattern, recursive=True)
+                   if globbing.has_magic(pattern) else [pattern])
         found.update(os.path.abspath(path) for path in matched)
     if not found:
         raise ValueError(f"no PDF file matches {paths!r}")
