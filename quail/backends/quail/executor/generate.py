@@ -119,6 +119,11 @@ class GreedyGenerator:
         self.stops = frozenset(stops)
         self.graphs = graphs
         self.width = arena.pages_needed(context_tokens)
+        self.staging = None
+        if str(arena.device).startswith("cuda"):
+            from quail.backends.quail.executor.chunk import InputStaging
+
+            self.staging = InputStaging(torch)
         self.stats = {}
         if graphs:
             self._capture()
@@ -130,18 +135,19 @@ class GreedyGenerator:
         import time
 
         stats = self.stats = dict(wait_s=0.0, mixed_s=0.0, mixed_steps=0,
-                                  prefilled_tokens=0, decode_s=0.0,
-                                  decode_steps=0, decode_rows=0)
+                                  mixed_pack_s=0.0, prefilled_tokens=0,
+                                  decode_s=0.0, decode_steps=0, decode_rows=0,
+                                  decode_host_s=0.0)
         pending = iter(generations)
         waiting = None
         exhausted = False
         active = []
         free = list(range(self.lanes - 1, -1, -1))
-        prompts = []
+        prompt_tokens = prompt_count = 0
         while True:
             admit = []
             room = self.budget - len(active)
-            mean = float(np.mean(prompts)) if prompts else 0.0
+            mean = prompt_tokens / prompt_count if prompt_count else 0.0
             if admission_ready(len(free), len(active), mean, self.budget,
                                exhausted):
                 while len(admit) < len(free) and not exhausted:
@@ -161,7 +167,8 @@ class GreedyGenerator:
                         # to finish and free their pages
                         break
                     admit.append((waiting, capacity))
-                    prompts.append(size)
+                    prompt_tokens += size
+                    prompt_count += 1
                     room -= size
                     waiting = None
             started = time.perf_counter()
@@ -225,16 +232,20 @@ class GreedyGenerator:
         Returns:
             One token per document of the new `active`, in its order.
         """
+        import time
+
         from quail.backends.quail.executor.chunk import pack_chunk
         from quail.backends.quail.executor.loop import _forward
 
         torch = self.torch
         arena = self.arena
+        started = time.perf_counter()
         groups, rope = [], []
         for document in active:
             f = document.fed
-            arena.activate(document.generation.key, f,
-                           capacity_tokens=document.capacity, slots=1)
+            # decode graphs step the kept state without telling the
+            # arena; its record moves to the state's position here
+            arena.claim_state(document.generation.key, f, "kept")
             groups.append(dict(
                 key=document.generation.key, prefix=None, f=f,
                 suffixes=[[document.tokens[-1]]], write_suffix_tokens=1,
@@ -250,11 +261,13 @@ class GreedyGenerator:
                 save_at=(f + 1,)))
             rope.append(generation.rope if generation.rope is not None
                         else np.broadcast_to(np.arange(f + 1), (3, f + 1)))
-        chunk = pack_chunk(torch, arena, groups, attention_mode="unified")
+        chunk = pack_chunk(torch, arena, groups, attention_mode="unified",
+                           staging=self.staging)
         chunk.rope_positions = torch.as_tensor(
             np.concatenate(rope, axis=1)).to(arena.device, non_blocking=True)
         if any(generation.image is not None for generation, _ in admit):
             chunk.inputs_embeds = self._embeds(chunk, active, admit)
+        self.stats["mixed_pack_s"] += time.perf_counter() - started
         with torch.inference_mode():
             hidden = _forward(self.pipeline, arena, chunk)
             tokens = (hidden @ self.head.t()).argmax(dim=-1).tolist()
@@ -360,7 +373,10 @@ class GreedyGenerator:
 
     def _replay(self, active) -> list:
         """One token for every document in flight, by replaying a graph."""
+        import time
+
         torch = self.torch
+        started = time.perf_counter()
         n = len(active)
         size = next(s for s in self._sizes if s >= n)
         fed = [document.fed for document in active]
@@ -382,10 +398,7 @@ class GreedyGenerator:
         positions[:, n:] = 0
         self._device["positions"][:3 * size].copy_(
             self._host["positions"][:3 * size], non_blocking=True)
+        self.stats["decode_host_s"] += time.perf_counter() - started
         with torch.inference_mode():
             self._graphs[size].replay()
-            tokens = self._out[:n].tolist()
-        # the arena's record of each kept state moves with the step
-        for document, f in zip(active, fed):
-            self.arena.claim_state(document.generation.key, f + 1, "kept")
-        return tokens
+            return self._out[:n].tolist()
