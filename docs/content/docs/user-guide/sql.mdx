@@ -370,9 +370,15 @@ Pass an object as the third argument, such as `{'trim': false}`.
 ### How the answer is found
 
 The answer is always a span of the document's own text. The model
-writes the answer one token at a time, as a decoder would, but each
-token is chosen among the tokens that continue some position of the
-document, so the writing can only trace the document's own text. The
+writes the answer token by token, as a decoder would, but each token
+is chosen among the tokens that continue some position of the
+document, so the writing can only trace the document's own text.
+Each round feeds the chosen token and the document's next 16 tokens
+after it as a draft, and reads the model's choice after every one of
+them, so a round writes as many tokens as the model would have chosen
+one at a time, and a 60-token clause takes a few rounds instead of
+60. Where the model's choice differs from the draft, the next round
+starts from that token. The
 answer is what the model wrote before its writing would leave the
 document: a token the model likes better than every continuation,
 and that continues no position, ends the answer there. For example,

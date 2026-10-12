@@ -91,7 +91,8 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
             stages.stages, stages.prefixes, state.chunk_tokens,
             anchor_keys=stages.keys, on_settled=on_settled,
             staging=input_staging(state), stats=stats,
-            label=f"extract {', '.join(spec.name for spec in specs)}")
+            label=f"extract {', '.join(spec.name for spec in specs)}",
+            appended_tokens=stages.appended_tokens)
     stages.finish()
     wall = time.perf_counter() - started
     timing = {"gpu_timing": state.gpu_timing}

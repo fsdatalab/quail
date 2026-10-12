@@ -51,6 +51,10 @@ class Stage:
         rewind: Whether the request's tokens follow the frame directly,
             in place of the tokens earlier append stages added, as the
             first stage of a new question over the same document does.
+        discard: Optional callback from document key to how many of the
+            tokens earlier append stages added, counted from the end,
+            this stage's request replaces: the tokens the stage before
+            fed past what it verified.
         label: Name displayed in progress messages.
         chains: Optional trie chains and ancestor references from trie_chains().
         read_mask: Optional mask of the rows read in the sole chains
@@ -73,6 +77,7 @@ class Stage:
     read_rows: Any = None
     single: bool = False
     rewind: bool = False
+    discard: Callable | None = None
     append: bool = False
     label: str = ""
     chains: list | None = None
@@ -174,7 +179,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                attention_mode=None, prefix_tree=None, stats=None,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
-               on_answers=None, stop_groups=None):
+               on_answers=None, stop_groups=None, appended_tokens=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -219,6 +224,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             rows) run as each chunk's answers are read, with the
             document's answer rows for its requests start to end at
             the stage.
+        appended_tokens: The most tokens the append stages leave after
+            a document's frame, when stages discard tokens earlier ones
+            added; None sums every append stage's longest suffix.
 
     Returns:
         A tuple of answers, timing spans, and fresh token count. Answers is
@@ -235,6 +243,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         limit=limit, paged=paged, unit=unit, count_answers=count_answers,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,
+        appended_tokens=appended_tokens,
     ).run()
 
 
@@ -244,7 +253,8 @@ class _StageExecutor:
     def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
-                 default_attention, on_chunk, on_answers, stop_groups=None):
+                 default_attention, on_chunk, on_answers, stop_groups=None,
+                 appended_tokens=None):
         from quail.backends.quail.executor.chunk import Suffixes
         from quail.backends.quail.executor.loop import (
             attention_path,
@@ -323,6 +333,8 @@ class _StageExecutor:
                            for f, other, s in zip(self.frames, self.suffixes,
                                                   self.stages)
                            if s.append and f == frame)
+                if appended_tokens is not None:
+                    kept = min(kept, int(appended_tokens))
                 self.capacity_extra = max(self.capacity_extra,
                                           len(frame) + kept)
         # append-stage tokens each document holds after its frame
@@ -494,6 +506,8 @@ class _StageExecutor:
             # an earlier stage kept
             rewinds = self.writes[j] or self.stages[j].rewind
             path = 0 if rewinds and start == 0 else self.appended[a]
+            if path and self.stages[j].discard is not None:
+                path = max(0, path - int(self.stages[j].discard(key)))
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
             if self.paged:

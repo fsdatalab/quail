@@ -29,9 +29,10 @@ from quail.backends.quail.executor.operators.extract import (
     execute_extractions,
     extract_answer_table,
 )
+from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.catalog import DocumentProvider
-from quail.cost.extract import ANSWER_MAX_TOKENS
+from quail.cost.extract import ANSWER_MAX_TOKENS, DRAFT_TOKENS
 from quail.execution.execute import execute_query
 from quail.execution.runner import (
     ExecutionContext,
@@ -286,6 +287,44 @@ def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
     assert not stages.docs[0].questions[0].none_wins
 
 
+def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
+    # "five" starts two positions; the draft follows the first, "five
+    # days", and the model chooses " years" instead: the round ends
+    # there, and the next round feeds " years" in the draft's place
+    text = "five days or five years"
+    spec, tables = _spec(True, text)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(ExtractStages, "_readout", lambda self, state: readout)
+    state = _state(model)
+    state.loaded_model.extract_tables = tables
+    stages = ExtractStages(state, [replace(spec, locate=False)], tables, [0],
+                           [tables.encode_ids(text)], [text])
+    key = stages.docs[0].key
+    model.docs[key] = (text, False, "")
+    model.gold[key] = "five years"
+    from quail.backends.quail.executor.stages import run_stages
+
+    run_stages(state.torch, state.loaded_model.arena,
+               state.loaded_model.pipeline, stages.stages, stages.prefixes,
+               state.chunk_tokens, anchor_keys=stages.keys,
+               appended_tokens=stages.appended_tokens)
+    stages.finish()
+    asked = stages.docs[0].questions[0]
+    assert asked.answer == "five years" and asked.span == (13, 23)
+    assert asked.written == tables.encode_ids("five years")
+    five, days, years = (tables.encode_ids(w)[0] for w in ("five", " days", " years"))
+    fed = [(suffix, f) for k, suffix, kept, _, f in model.packed if k == key and kept]
+    # the cue, then the two rounds: the second starts where the first
+    # verified, one token past the first round's position
+    assert fed[1][0][:2] == [five, days]
+    assert fed[2][0][:1] == [years] and fed[2][1] == fed[1][1] + 1
+    assert asked.steps == 3
+    assert asked.fed_tokens == (len(tables.encode_ids(TAIL)) + len(fed[1][0])
+                                + len(fed[2][0]))
+
+
 def test_a_first_token_that_begins_a_longer_word_carries_its_rest():
     text = "The lease is their lease."
     tables = _tables(text, "their", "ir")
@@ -360,28 +399,36 @@ class ScriptedModel:
             text, numbered, range_text = self.docs[key]
             for suffix in spec["suffixes"]:
                 suffix = [int(t) for t in suffix]
+                read_all = bool(spec.get("read_all_rows"))
                 self.packed.append((key, suffix, spec.get("write_suffix_tokens", 0),
-                                    bool(spec.get("read_all_rows"))))
-                # the request's rows follow position f: a frame or a
-                # rewinding stage drops what an earlier stage appended
+                                    read_all, spec.get("f")))
+                # the request's rows follow position f: a frame, a
+                # rewinding stage, or a discarding one drops what an
+                # earlier stage appended
                 if spec.get("prefix") is not None:
                     self.prefix_len[key] = len(spec["prefix"])
                 held = self.kv.get(key, [])
                 if spec.get("f") is not None and key in self.prefix_len:
                     held = held[:spec["f"] - self.prefix_len[key]]
                 path = held + suffix
-                if path[-1] == self.cue_token:
-                    rows.append(self._cue_row(key))
-                elif self.cue_token in path:
-                    cue = len(path) - 1 - path[::-1].index(self.cue_token)
-                    rows.append(self._answer_row(key, path[cue + 1:]))
-                elif numbered:
-                    rows.append(self._next_digit(path, range_text))
-                else:
-                    raise AssertionError(f"unexpected request {suffix}")
+                # every row of a draft is read; otherwise the last
+                for end in (range(len(held) + 1, len(path) + 1) if read_all
+                            else [len(path)]):
+                    rows.append(self._row_after(key, path[:end], numbered,
+                                                range_text))
                 if spec.get("write_suffix_tokens", 0):
                     self.kv[key] = path
         return np.stack(rows)
+
+    def _row_after(self, key, path, numbered, range_text):
+        if path[-1] == self.cue_token:
+            return self._cue_row(key)
+        if self.cue_token in path:
+            cue = len(path) - 1 - path[::-1].index(self.cue_token)
+            return self._answer_row(key, path[cue + 1:])
+        if numbered:
+            return self._next_digit(path, range_text)
+        raise AssertionError(f"unexpected request {path}")
 
     def _next_digit(self, path, range_text):
         """The lines answer, one digit or dash at a time, then a line break."""
@@ -427,8 +474,11 @@ def _fake_readout(tables, k):
     value = SimpleNamespace(k=k, width=width, ragged=False)
     value.dtype = np.dtype((np.float32, (width,)))
 
+    value.dtype = np.dtype(object)
+
     def submit(rows, rows_per_answer=None):
-        return np.asarray(rows, dtype=np.float32)[:, :width]
+        return split_rows(np.asarray(rows, dtype=np.float32)[:, :width],
+                          rows_per_answer)
 
     value.submit, value.result = submit, lambda handle: handle
     return value
@@ -526,7 +576,9 @@ def test_extractor_locates_lines_then_writes_the_answer_along_the_document(
     # tokens after it, and closes the quote after "2027"
     march = tables_of(stages).encode_ids("March")[0]
     assert asked.written == [march, *tables_of(stages).encode_ids(" 3, 2027")]
-    assert asked.done and asked.steps == 1 + len(asked.written)
+    # the cue's row chooses "March"; one round feeds it with the
+    # document's next tokens as a draft and verifies the rest
+    assert asked.done and asked.steps == 2
     # the model names the one line of the short documents; it writes
     # none for the one without dates, and no token is written for it
     assert term.numbered and term.questions[0].path == "located"
@@ -538,15 +590,17 @@ def test_extractor_locates_lines_then_writes_the_answer_along_the_document(
     tables = stages.tables
     (tail,) = stages.tails
     lease_key = lease.key
-    appended = [suffix for key, suffix, kept, _ in model.packed
+    appended = [suffix for key, suffix, kept, _, _ in model.packed
                 if key == lease_key and kept]
     assert appended[0] == tail
     assert [tables.vocab[s[0]] for s in appended[1:4]] == ["2", "-", "3"]
     assert appended[4] == list(tables.begins_cue)
-    assert [s[0] for s in appended[5:]] == asked.written
-    assert all(len(s) == 1 for s in appended[5:])
-    # nothing is fed whole: every request is one appended token
-    assert not any(whole for key, _, _, whole in model.packed if key == lease_key)
+    (round_fed,) = appended[5:]
+    assert round_fed[:len(asked.written)] == asked.written
+    assert len(round_fed) == 1 + DRAFT_TOKENS
+    # the draft's rows are read whole; every other request reads its last
+    assert [whole for key, _, kept, whole, _ in model.packed
+            if key == lease_key and kept] == [False] * 5 + [True]
     # the keys name the document and its rendering, not the output,
     # so another extraction of the table reads the KV left resident
     assert [doc.key for doc in stages.docs] == [
@@ -576,16 +630,18 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
     lease = stages.docs[0]
     (tail,) = set(map(tuple, stages.tails))
     tables = stages.tables
-    appended = [suffix for key, suffix, kept, _ in model.packed
+    appended = [suffix for key, suffix, kept, _, _ in model.packed
                 if key == lease.key and kept]
     digits = [[t] for t in tables.encode_ids("2-3")]
-    written = [[t] for t in lease.questions[0].written]
+    written = lease.questions[0].written
+    round_fed = appended[5]
+    assert round_fed[:len(written)] == written
     # the frame is written once, with the first question's cue token;
     # the second question feeds its cue token alone after the frame,
     # past the first question's steps, and asks its lines again
     assert appended == (
-        [list(tail), *digits, list(tables.begins_cue), *written,
-         [tail[-1]], *digits, list(tables.begins_cue), *written])
+        [list(tail), *digits, list(tables.begins_cue), round_fed,
+         [tail[-1]], *digits, list(tables.begins_cue), round_fed])
     # the documents are read once: the second extraction is charged
     # only the tokens fed after them
     prefixes = sum(len(doc.prefix) for doc in stages.docs)
@@ -672,7 +728,7 @@ def test_extractor_stops_at_the_answer_token_cap(monkeypatch):
     assert len(stages.stages) == LINE_MAX_TOKENS + 1 + ANSWER_MAX_TOKENS
     assert [stage.label for stage in stages.stages][:2] == [
         "ends tail", "ends lines 1"]
-    assert stages.stages[-1].label == f"ends token {ANSWER_MAX_TOKENS}"
+    assert stages.stages[-1].label == f"ends round {ANSWER_MAX_TOKENS}"
 
 
 def test_answer_table_and_session_project_the_answer_columns():

@@ -153,9 +153,13 @@ join kept. It reuses the anchor's KV when processing each pair.
 ### Extraction
 
 An extraction copies each document's answer to a question from the
-document's own text: the model writes it one token at a time, each
-token chosen among the tokens that continue some position of the
-document, or of the lines it named first with `locate` on. It shows
+document's own text: the model writes it token by token, each token
+chosen among the tokens that continue some position of the document,
+or of the lines it named first with `locate` on. A round feeds the
+chosen token and the document's next 16 tokens as a draft and reads
+the choice after each, so a round writes as many tokens as the model
+would have chosen one at a time; where the choice leaves the draft,
+the next round replaces the rest of it in KV. It shows
 the document inside its own prompt head, plain or as numbered lines,
 so it cannot reuse the KV a filter or a classification left: those
 show the document raw. The extractions of

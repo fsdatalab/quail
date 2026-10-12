@@ -110,6 +110,14 @@ its 10 points are one contract that the null rule answered none,
 matching the reference. Stock vLLM reaches 0.75 on CUAD-7 by
 writing none on more contracts than Quail's cue does.
 
+Prediction for feeding the document's next 16 tokens as a draft each
+round and verifying them by the rows after them: every answer stays
+as on run 020405Z but for the 0 to 3 contracts per query that move
+between runs; the clause fields drop from 10.2 s to about 6 s
+(CUAD-3), 13.0 to about 8 s (CUAD-7), and 8.9 to about 6 s (CUAD-8),
+since a 60-token answer takes 4 to 8 rounds instead of 60; the short
+fields (CUAD-1, 2, 4, 10) move by less than 1 s.
+
 Prediction for Decision-2.0-Kai 0.6B: the planner refuses the nine
 extraction queries, so six run. Its agreement with the lawyers on the
 two filter queries lands within 10 points of Qwen3 4B's (CUAD-5 0.71,

@@ -5,11 +5,12 @@ to the live count, and prices the total with the component roofline
 at ideal packing, as quail/cost/classify.py does. The steps follow the
 executor (quail/backends/quail/executor/extract.py): the prompt with
 the document, plain or as numbered lines; the lines answer, one token
-per round; the phrase cue; and the answer, one token per round. How
-many tokens the answer takes is a measured constant, not a function
-of the document: the planner does not see the answer. The second and
-later extractions of a pipeline find the document resident and are
-priced without reading it.
+per round; the phrase cue; and the answer, one chosen token and
+DRAFT_TOKENS of the document per round, every row read. How many
+tokens the answer takes is a measured constant, not a function of the
+document: the planner does not see the answer. The second and later
+extractions of a pipeline find the document resident and are priced
+without reading it.
 """
 
 from dataclasses import dataclass
@@ -30,13 +31,17 @@ CUE_TOKENS = 5
 # the answer's tokens, as a mean: the answers measured were 2.8 words
 # on SQuAD and 48 words on CUAD's clause fields
 # (/results/extract_spans/20261011T010106Z_qwen3-4b-fp8_squad.json and
-# 20261011T005925Z_qwen3-4b-fp8_cuad.json); one token per round, and
-# one more round reads the closing quote
+# 20261011T005925Z_qwen3-4b-fp8_cuad.json)
 ANSWER_TOKENS = 16
 # a numbered line's number, colon, and space
 LINE_NUMBER_TOKENS = 3
 # tokens an answer may take, as the stock path's EXTRACT_MAX_TOKENS
 ANSWER_MAX_TOKENS = 64
+# document tokens a round feeds after the chosen token, as a draft of
+# the answer's next tokens, each verified by the row before it
+DRAFT_TOKENS = 16
+# rounds an answer of ANSWER_TOKENS takes when every draft is accepted
+ANSWER_ROUNDS = -(-ANSWER_TOKENS // (DRAFT_TOKENS + 1))
 
 
 @dataclass(frozen=True)
@@ -105,10 +110,12 @@ def document_work(length: int, lines: int, head_tokens: int, tail_tokens: int,
         context = prefix + tail_tokens
         fed += tail_tokens
     rows += 1
-    # the answer's tokens, each appended and read, then the quote's row
-    work += stream(context, [1] * ANSWER_TOKENS, window=window)
-    fed += ANSWER_TOKENS
-    rows += ANSWER_TOKENS
+    # each round appends the chosen token and the draft, and reads
+    # every row; the last row read decides the closing quote
+    round_tokens = 1 + DRAFT_TOKENS
+    work += stream(context, [round_tokens] * ANSWER_ROUNDS, window=window)
+    fed += ANSWER_ROUNDS * round_tokens
+    rows += ANSWER_ROUNDS * round_tokens
     return work, fed, rows
 
 

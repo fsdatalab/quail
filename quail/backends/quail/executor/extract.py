@@ -25,7 +25,7 @@ import numpy as np
 from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
 from quail.backends.quail.executor.stages import Stage
-from quail.cost.extract import ANSWER_MAX_TOKENS
+from quail.cost.extract import ANSWER_MAX_TOKENS, DRAFT_TOKENS
 from quail.execution.spans import line_span
 from quail.logical.prompts import EXTRACT_PHRASE_CUE
 from quail.progress import say
@@ -268,6 +268,8 @@ class Question:
     best_lp: float = NEG
     written: list = field(default_factory=list)   # the answer's tokens so far
     live: list = field(default_factory=list)      # streams the writing fits
+    fed: list = field(default_factory=list)       # the last round's tokens
+    discard: int = 0    # tokens of the last round past what it verified
     done: bool = False
     steps: int = 0
     fed_tokens: int = 0
@@ -435,15 +437,26 @@ class ExtractStages:
         stages.append(Stage(
             suffixes=partial(self._cue_suffix, q),
             suffix_tokens=len(self.tables.begins_cue), frame=frame,
-            readout=self.readout, decide=partial(self._decode_decide, q),
+            readout=self.readout, decide=partial(self._cue_decide, q),
             single=True, append=True, label=f"{name} start"))
         stages.extend(
-            Stage(suffixes=partial(self._step_suffix, q), suffix_tokens=1,
-                  frame=frame, readout=self.readout,
-                  decide=partial(self._decode_decide, q),
-                  single=True, append=True, label=f"{name} token {t}")
+            Stage(suffixes=partial(self._step_suffix, q),
+                  suffix_tokens=1 + DRAFT_TOKENS, frame=frame,
+                  readout=self.readout, decide=partial(self._step_decide, q),
+                  discard=partial(self._step_discard, q), read_all_rows=True,
+                  single=True, append=True, label=f"{name} round {t}")
             for t in range(1, ANSWER_MAX_TOKENS + 1))
         return stages
+
+    @property
+    def appended_tokens(self) -> int:
+        """The most tokens a question leaves in KV after its frame.
+
+        The tail's last token, the lines answer, the cue, and the
+        answer's tokens with the last round's draft past them.
+        """
+        return (1 + LINE_MAX_TOKENS + len(self.tables.begins_cue)
+                + ANSWER_MAX_TOKENS + DRAFT_TOKENS)
 
     def _readout(self, state):
         """The readout of every row: none, the stop, the lines targets, top tokens."""
@@ -452,7 +465,7 @@ class ExtractStages:
         tables = self.tables
         return AsyncTopLogprobs(torch, torch.nn.functional, head, CUE_TOP,
                                 [tables.none_id, tables.stop_ids,
-                                 *tables.range_targets])
+                                 *tables.range_targets], ragged=True)
 
     def _prepare(self, index, document, text, stored) -> Extraction:
         """Build a document's prefix: the head and its plain or numbered text.
@@ -499,7 +512,7 @@ class ExtractStages:
         qs.fed_tokens += 1 if same else len(self.tails[q])
         if doc.numbered:
             return self._range_decide(q, anchor, row, first=True)
-        return self._decode_decide(q, anchor, row)
+        return self._cue_decide(q, anchor, row)
 
     def _range_suffix(self, q, key):
         doc = self.by_key[key]
@@ -507,6 +520,13 @@ class ExtractStages:
         if not doc.numbered or qs.range_done:
             return Stage.SKIP
         return [[qs.range_tokens[-1]]]
+
+    def _rows(self, row) -> np.ndarray:
+        """Return a stage's answer as its rows of readout values."""
+        values = np.asarray(row)
+        if values.dtype == object:
+            values = np.asarray(values.reshape(-1)[0], dtype=np.float32)
+        return values.reshape(-1, self.readout.width)
 
     def _extras(self, values) -> np.ndarray:
         """Return a row's extra values: none, the stop, then the lines targets."""
@@ -518,7 +538,8 @@ class ExtractStages:
         tables = self.tables
         if not first:
             qs.fed_tokens += 1
-        token = tables.range_targets[int(np.argmax(self._extras(row)[2:]))]
+        values = self._rows(row)[-1]
+        token = tables.range_targets[int(np.argmax(self._extras(values)[2:]))]
         if token in tables.range_text:
             qs.range_tokens.append(token)
         else:
@@ -535,17 +556,48 @@ class ExtractStages:
                 qs.region = (doc.lines[a - 1][0], doc.lines[b - 1][1])
         return True
 
-    # ---- the answer, one token at a time -----------------------------------
+    # ---- the answer, a round of tokens at a time ---------------------------
 
     def _cue_suffix(self, q, key):
         doc = self.by_key[key]
         return [self.tables.begins_cue] if doc.numbered else Stage.SKIP
 
+    def _cue_decide(self, q, anchor, row):
+        """Choose the answer's first token from the row after the cue."""
+        doc, qs = self._question(q, anchor)
+        if doc.numbered:
+            qs.fed_tokens += len(self.tables.begins_cue)
+        return self._verify(doc, q, self._rows(row), [])
+
     def _step_suffix(self, q, key):
+        """Feed the chosen token, then the document's next tokens as a draft.
+
+        The draft follows the first position the writing fits; the
+        rows after its tokens verify it, so a round writes as many
+        tokens as the model would have chosen one at a time.
+        """
         qs = self.by_key[key].questions[q]
         if qs.done:
             return Stage.SKIP
-        return [[qs.written[-1]]]
+        at = len(qs.written)
+        stream = min(qs.live, key=lambda s: s.char)
+        draft = []
+        for i in range(DRAFT_TOKENS):
+            token = stream.next(at + i, self.tables)
+            if token is None:
+                break
+            draft.append(token)
+        qs.fed = [qs.written[-1], *draft]
+        return [qs.fed]
+
+    def _step_discard(self, q, key):
+        return self.by_key[key].questions[q].discard
+
+    def _step_decide(self, q, anchor, row):
+        """Verify the round's draft by the row after each of its tokens."""
+        doc, qs = self._question(q, anchor)
+        qs.fed_tokens += len(qs.fed)
+        return self._verify(doc, q, self._rows(row), qs.fed)
 
     def _lp(self, values) -> tuple:
         """Return a row's log probabilities by token id, and none's and the stop's."""
@@ -556,7 +608,27 @@ class ExtractStages:
                       values[-k:].tolist()))
         return lp, float(extras[0]), float(extras[1])
 
-    def _decode_decide(self, q, anchor, row):
+    def _verify(self, doc, q, rows, fed) -> bool:
+        """Choose the answer's tokens from a round's rows, in order.
+
+        Row i follows token i of the round's fed tokens, so the token
+        chosen from it is written and, when it is not the token fed
+        next, the rest of the round is discarded: the next round feeds
+        the chosen token in its place.
+        """
+        qs = doc.questions[q]
+        qs.steps += 1
+        qs.discard = 0
+        for i, values in enumerate(rows):
+            token = self._choose(doc, q, values)
+            if qs.done:
+                return True
+            if i + 1 < len(fed) and token != fed[i + 1]:
+                qs.discard = len(fed) - (i + 1)
+                return True
+        return True
+
+    def _choose(self, doc, q, values):
         """Choose the answer's next token among the document's continuations.
 
         The answer is the document text the model writes before its
@@ -571,16 +643,13 @@ class ExtractStages:
         answer after that token. The answer also ends when closing the
         quote is at least as likely as every continuation, when no
         stream continues, or at ANSWER_MAX_TOKENS.
+
+        Returns:
+            The token written, or None when the answer ended.
         """
-        doc, qs = self._question(q, anchor)
+        qs = doc.questions[q]
         tables = self.tables
-        if not qs.written:
-            if doc.numbered:
-                qs.fed_tokens += len(tables.begins_cue)
-        else:
-            qs.fed_tokens += 1
-        lp, none_lp, stop_lp = self._lp(row)
-        qs.steps += 1
+        lp, none_lp, stop_lp = self._lp(values)
         if not qs.written:
             if qs.region is not None and not any(
                     qs.region[0] <= span[0] < qs.region[1] for _, span in doc.tokens):
@@ -595,10 +664,9 @@ class ExtractStages:
                             or self._leaves(tables, lp, allowed, qs.best_lp, stop_lp))
             if qs.none_wins:
                 self._answer(doc, q)
-                return True
-            first = max(starts.values(), key=lambda s: lp[s[0]])[0]
-            qs.live = make_streams(tables, doc.text, doc.tokens, starts, first)
-            qs.written.append(first)
+                return None
+            token = max(starts.values(), key=lambda s: lp[s[0]])[0]
+            qs.live = make_streams(tables, doc.text, doc.tokens, starts, token)
         else:
             at = len(qs.written)
             following = {token for token in (s.next(at, tables) for s in qs.live)
@@ -612,17 +680,18 @@ class ExtractStages:
                 qs.written.append(joined)
                 qs.live = [s for s in qs.live if s.next(at, tables) == joined]
                 self._answer(doc, q)
-                return True
+                return None
             if (best is None or stop_lp >= best_lp
                     or self._leaves(tables, lp, following | set(merged.values()),
                                     best_lp, stop_lp)):
                 self._answer(doc, q)
-                return True
-            qs.written.append(best)
-            qs.live = [s for s in qs.live if s.next(at, tables) == best]
+                return None
+            token = best
+            qs.live = [s for s in qs.live if s.next(at, tables) == token]
+        qs.written.append(token)
         if len(qs.written) >= ANSWER_MAX_TOKENS:
             self._answer(doc, q)
-        return True
+        return token
 
     @staticmethod
     def _leaves(tables, lp, allowed, best_lp, stop_lp) -> bool:
