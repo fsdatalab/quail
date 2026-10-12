@@ -113,8 +113,10 @@ def run_query(query: str, parser: str, sql: str, mode: str, run_id: str) -> dict
     import quail
 
     files, root = _files(SMOKE_FILES if mode == "smoke" else None)
+    # each run parses every page; saved results would let the second
+    # run read the first run's pages
     session = quail.Session(quail.EngineConfig(
-        model=READER, device="h100-sxm", parser=parser))
+        model=READER, device="h100-sxm", parser=parser, save_parses=False))
     started = time.perf_counter()
     session.register("pages", quail.read_pdfs(files))
     register_s = time.perf_counter() - started
