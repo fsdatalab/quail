@@ -6,7 +6,7 @@ import pytest
 import server_fakes
 
 import quail
-from quail.execution.session import Query, QueryLike
+from quail.api import Query, QueryLike
 from quail.planner.plan import EngineConfig
 from quail.server.records import QueryFailedError, ServerError
 

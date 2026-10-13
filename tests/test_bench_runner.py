@@ -5,6 +5,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import quail
+from quail.api.execute import execute_query
 from quail.backends.quail.prompts import join_request
 from quail.baselines import RequestExecution
 from quail.bench.quailb import (
@@ -17,7 +18,6 @@ from quail.bench.quailb import (
 )
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
-from quail.execution.execute import execute_query
 from quail.execution.result import answer_table
 from quail.execution.runner import NodeMetrics, NodeResult, RunResult
 from quail.execution.types import PhysicalResponse, export_physical_outputs

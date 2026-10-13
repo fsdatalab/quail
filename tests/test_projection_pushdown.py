@@ -98,8 +98,8 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
         "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
     assert sorted(second.to_rows()) == [(3, "fine one"), (5, "good one")]
     assert len(calls) == tokenized
-    assert len(session._token_stores) == 1
-    assert sorted(name for _, name in session._column_stores) == [
+    assert len(session.inputs._token_stores) == 1
+    assert sorted(name for _, name in session.inputs._column_stores) == [
         "id", "review", "stars"]
 
     truth = {"r": {"q:": [0, 1, 0]}}
@@ -168,15 +168,15 @@ class _UnstableProvider:
 def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
     session = _session(tmp_path)
     session.register("docs", _UnstableProvider())
-    session.tokenize("docs", "body", ("id",))
+    session.inputs.tokenize("docs", "body", ("id",))
 
     with pytest.raises(RuntimeError, match="stable order"):
-        session.tokenize("docs", "body", ("stars",))
+        session.inputs.tokenize("docs", "body", ("stars",))
     with pytest.raises(RuntimeError, match="stable order"):
-        session.tokenize("docs", "body", ("stars",))
+        session.inputs.tokenize("docs", "body", ("stars",))
 
-    assert ("unstable", "stars") not in session._column_stores
-    assert len(list(Path(session._token_directory.name).iterdir())) == 2
+    assert ("unstable", "stars") not in session.inputs._column_stores
+    assert len(list(Path(session.inputs._token_directory.name).iterdir())) == 2
     session.close()
 
     def broken(text):
@@ -186,12 +186,12 @@ def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
     session._tok = broken
 
     with pytest.raises(ValueError, match="tokenizer failed"):
-        session.tokenize("reviews", "review", ("id",))
+        session.inputs.tokenize("reviews", "review", ("id",))
 
-    assert session._token_stores == {}
-    assert session._column_stores == {}
-    assert session._token_directory is None or not list(
-        Path(session._token_directory.name).iterdir())
+    assert session.inputs._token_stores == {}
+    assert session.inputs._column_stores == {}
+    assert session.inputs._token_directory is None or not list(
+        Path(session.inputs._token_directory.name).iterdir())
     session.close()
 
 

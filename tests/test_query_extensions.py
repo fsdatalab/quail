@@ -7,9 +7,9 @@ import pyarrow.parquet as pq
 from modal._serialization import deserialize, serialize
 
 import quail
-from quail.execution import execute as runtime
+from quail.api import Session
+from quail.api import execute as runtime
 from quail.execution.runner import NodeMetrics, NodeResult, RunResult
-from quail.execution.session import Session
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.physical import AiFilter, Scan, decode_graph
 

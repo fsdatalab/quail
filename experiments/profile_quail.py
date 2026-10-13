@@ -103,7 +103,7 @@ def _write(result, name):
 def _boot_state(model, **pipeline_kwargs):
     """Load and warm a model for profiling.
 
-    Mirrors quail.execution.execute._execute_physical's boot with the
+    Mirrors quail.api.execute._execute_physical's boot with the
     shipping pipeline; warm_kernels runs the same tiered warmup.
     pipeline_kwargs go to the model's pipeline, for experiments that
     swap a kernel.
@@ -186,14 +186,14 @@ def _quailb_session(model, sf, gpus=1):
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
+    from quail.api.execute import (
+        _validate_physical_request,
+        execute_query,
+    )
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.worker import (
         execute_single,
         quail_runtime_payload,
-    )
-    from quail.execution.execute import (
-        _validate_physical_request,
-        execute_query,
     )
     from quail.execution.types import PhysicalResponse
 

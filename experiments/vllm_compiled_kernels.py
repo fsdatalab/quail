@@ -251,7 +251,7 @@ def _write(result, name):
 def _boot_state(model):
     """Load and warm a model with the kernel-source pipeline.
 
-    Mirrors quail.execution.execute._execute_physical's boot, with the
+    Mirrors quail.api.execute._execute_physical's boot, with the
     Engine subclass swapped in; warm_kernels runs the same tiered
     warmup the worker runs.
     """
@@ -329,14 +329,14 @@ def _quailb_session(model, sf, gpus=1):
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
+    from quail.api.execute import (
+        _validate_physical_request,
+        execute_query,
+    )
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.worker import (
         execute_single,
         quail_runtime_payload,
-    )
-    from quail.execution.execute import (
-        _validate_physical_request,
-        execute_query,
     )
     from quail.execution.types import PhysicalResponse
 

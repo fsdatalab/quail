@@ -10,10 +10,10 @@ import pytest
 from fakes import letter_tokens
 
 import quail
+from quail.api.execute import execute_query
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.catalog import Catalog, DocumentProvider
-from quail.execution.execute import execute_query
 from quail.execution.reranker import (
     FilterRuntime,
     RerankerBatch,

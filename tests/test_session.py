@@ -15,7 +15,7 @@ from fakes import register_claims_evidence
 
 import quail
 from demos import quickstart, quickstart_modal
-from quail.execution import execute as execution
+from quail.api import execute as execution
 from quail.execution.pairs import (
     allowed_members,
     estimate_pair_fraction,
@@ -46,11 +46,11 @@ def test_session_upgrades_and_reuses_offsets_without_invalidating_old_tokens():
     with quail.Session(CONFIG, tokenizer=encode) as session:
         session.register("docs", quail.DocumentProvider.from_table(
             pa.table({"id": [1, 2], "text": ["café", "東京"]}), id_col="id"))
-        previous = session.tokenize("docs", "text").tokens
+        previous = session.inputs.tokenize("docs", "text").tokens
         assert not previous.has_offsets
         calls.clear()
-        upgraded = session.tokenize("docs", "text", with_offsets=True).tokens
-        repeated = session.tokenize("docs", "text", with_offsets=True).tokens
+        upgraded = session.inputs.tokenize("docs", "text", with_offsets=True).tokens
+        repeated = session.inputs.tokenize("docs", "text", with_offsets=True).tokens
         assert upgraded is repeated and upgraded.has_offsets
         assert not calls
         assert list(previous[0]) == list(upgraded[0]) == encode("café")
@@ -74,7 +74,7 @@ def test_offset_tokenization_uses_gigatoken_without_transformers(monkeypatch):
     with quail.Session(CONFIG) as session:
         session.register("docs", quail.DocumentProvider.from_table(
             pa.table({"id": [1, 2], "text": texts}), id_col="id"))
-        scan = session.tokenize_async("docs", "text", with_offsets=True).result()
+        scan = session.inputs.tokenize_async("docs", "text", with_offsets=True).result()
         for index, encoding in enumerate(expected):
             assert list(scan.tokens[index]) == encoding.ids
             assert scan.tokens[index].character_offsets.tolist() == [
@@ -86,7 +86,7 @@ def fake_tok(text):
 
 
 def _run(query, execute):
-    from quail.execution.execute import execute_query
+    from quail.api.execute import execute_query
 
     return execute_query(query, physical_executor=execute)
 
@@ -241,8 +241,9 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
         return make_executor(TRUTH)(request)
 
     original = execution.execute_query
+    # Query.run binds execute_query at import, so patch it there
     monkeypatch.setattr(
-        execution, "execute_query",
+        "quail.api.query.execute_query",
         lambda q, physical_executor=executor, plan=None: original(
             q, physical_executor=physical_executor, plan=plan))
     planned = query.explain()
@@ -518,7 +519,7 @@ IMPORT_TEXT = """
 import sys
 import quail
 from quail.bench import quailb
-from quail.execution import execute
+from quail.api import execute
 from demos import quickstart
 
 assert "modal" not in sys.modules
@@ -562,7 +563,7 @@ def test_engine_import_gpu_requirement_and_quickstart_demos(
                else quickstart.run_query)
         rows, report = run()
         assert len(closed) == 1, on_modal
-        assert closed[0]._token_directory is None, on_modal
+        assert closed[0].inputs._token_directory is None, on_modal
         assert rows.to_pylist() == [{"r.id": "rv0"}], on_modal
         assert report["fresh_tokens"] == 1234, on_modal
         assert report["worker_total_s"] >= 0, on_modal

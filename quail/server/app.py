@@ -36,8 +36,8 @@ from starlette.responses import (
 )
 from starlette.routing import Route
 
+from quail.api import RefusalError, Session
 from quail.builtins import built_in_registry
-from quail.execution.session import RefusalError, Session
 from quail.logical import CompileError
 from quail.planner.plan import EngineConfig
 from quail.server.artifacts import (

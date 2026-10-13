@@ -6,7 +6,7 @@ import pyarrow as pa
 from test_session import make_executor
 
 import quail
-from quail.execution import execute as execution
+from quail.api import execute as execution
 
 DOCS = pa.table({
     "id": [f"d{i}" for i in range(6)],
@@ -28,16 +28,16 @@ def _session(tokenizer=str.split):
 def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
     lengths = [len(body.split()) for body in DOCS["body"].to_pylist()]
     session = _session()
-    estimates = session.estimate_lengths("docs", "body")
+    estimates = session.inputs.estimate_lengths("docs", "body")
     # tokens per byte is constant here, so the estimate is exact
     assert estimates == lengths
-    assert session.estimate_lengths("docs", "body") is estimates
+    assert session.inputs.estimate_lengths("docs", "body") is estimates
     session.close()
     # a larger table repeats the sample's lengths over the row count
     # instead of scanning the column
-    monkeypatch.setattr("quail.execution.session.ESTIMATE_SAMPLE", 2)
+    monkeypatch.setattr("quail.catalog.inputs.ESTIMATE_SAMPLE", 2)
     session = _session()
-    assert session.estimate_lengths("docs", "body") == [2, 4] * 3
+    assert session.inputs.estimate_lengths("docs", "body") == [2, 4] * 3
     session.close()
 
     monkeypatch.setattr(execution, "gpu_problem", lambda: None)
@@ -52,7 +52,7 @@ def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
     assert sorted(query.run().to_rows()) == [("d0",), ("d2",), ("d4",)]
     assert query.token_wait_s >= 0.0
     assert not query._token_futures
-    assert list(session.token_lengths("docs", "body")) == lengths
+    assert list(session.inputs.token_lengths("docs", "body")) == lengths
     again = session.sql(SQL)
     assert "estimated from a" not in again.explain()
     assert again._estimated == ()

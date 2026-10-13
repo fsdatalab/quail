@@ -199,7 +199,7 @@ def _labels_for(table, predicate, truth):
 
 
 def _run(session, sql):
-    from quail.execution.execute import execute_query
+    from quail.api.execute import execute_query
 
     result = execute_query(session.sql(sql))
     return result.collect(), result.report

@@ -81,8 +81,8 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
     starts, throttled ``progress`` counts, then ``finished`` with the
     result manifest or ``failed`` with the error. Never raises.
     """
-    from quail.execution.execute import execute_query
-    from quail.execution.session import RefusalError, Session
+    from quail.api import RefusalError, Session
+    from quail.api.execute import execute_query
     from quail.planner.plan import EngineConfig, Refusal
     from quail.progress import set_answer_sink, set_progress_sink
     from quail.server.artifacts import write_result

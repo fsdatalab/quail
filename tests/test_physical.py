@@ -11,9 +11,9 @@ import pyarrow as pa
 import pytest
 
 import quail
+from quail.api.execute import _execute_physical
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
-from quail.execution.execute import _execute_physical
 from quail.execution.runner import BarrierRuntime, NodeResult
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
 from quail.logical import LogicalPlan

@@ -1,8 +1,8 @@
 """Quail: a declarative query engine for AI_FILTER and AI_JOIN."""
 
+from quail.api import Query, RefusalError, Session
 from quail.catalog import DocumentProvider, ScanRequest, TableProvider
 from quail.execution.result import QueryResult
-from quail.execution.session import Query, RefusalError, Session
 from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import col, prompt
 from quail.frontend.sql import SQLDialect
