@@ -85,9 +85,14 @@ class SGLangClient:
         )
 
     def run_filter_sequence(self, sampling_params, body_ids, question_ids,
-                         read_answer, *, tag="q"):
-        """Submit each document's next filter as soon as it passes."""
-        del tag
+                            read_answer, *, tag="q", body_texts=None,
+                            question_texts=None):
+        """Submit each document's next filter as soon as it passes.
+
+        SGLang submits token ids, so the text prompts the request
+        planner builds for vLLM are ignored.
+        """
+        del tag, body_texts, question_texts
         return self.engine.loop.run_until_complete(run_filter_sequence_async(
             self._generate_one,
             sampling_params,

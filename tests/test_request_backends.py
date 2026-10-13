@@ -499,3 +499,15 @@ def test_match_label_takes_the_longest_label_the_answer_starts_with():
     assert match_label("thought\nnone", labels) is None
     assert match_label("thoughtful cardiac", labels) is None
     assert match_label("cardiac\nthought", labels) == "cardiac"
+
+
+def test_filter_clients_accept_the_pipelined_filter_call():
+    """The request planner passes text prompts to every client's filter run."""
+    import inspect
+
+    from quail.baselines.vllm import VLLMClient
+
+    for client in (SGLangClient, VLLMClient):
+        signature = inspect.signature(client.run_filter_sequence)
+        signature.bind(None, {}, [[1]], [[2]], None, tag="q",
+                       body_texts=None, question_texts=None)
