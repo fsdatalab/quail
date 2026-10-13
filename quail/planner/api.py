@@ -8,7 +8,7 @@ from quail.planner.physical_optimizer import (
     PlanningContext,
     apply_physical_rules,
 )
-from quail.planner.plan import Refusal, score_seconds
+from quail.planner.plan import Refusal, inference_seconds
 from quail.planner.validation import ClassifyRefusedError
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -183,7 +183,7 @@ def apply_plan_rules(plan, rules, context):
     # a rule that re-estimates a classification or score moves the
     # plan's total by the same amount
     seconds = plan.estimated_seconds + (
-        score_seconds(graph.nodes) - score_seconds(plan.nodes))
+        inference_seconds(graph.nodes) - inference_seconds(plan.nodes))
     return replace(
         plan, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
         settings=context.settings)

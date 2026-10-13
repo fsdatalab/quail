@@ -4,6 +4,7 @@ from sqlglot import exp
 
 from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
+from quail.frontend.prompts import PromptBinder
 from quail.logical import (
     ColumnRef,
     Compare,
@@ -12,12 +13,8 @@ from quail.logical import (
     JoinSpec,
     ModelCall,
     RegularPredicate,
-    bind_join_prompt,
-    bind_prompt,
-    bind_score_prompt,
 )
 from quail.logical.expressions import validate_task_description
-from quail.logical.prompts import bind_classify_prompt
 
 JOIN_OPTION_KEYS = {"selectivity", "anchor"}
 
@@ -87,6 +84,7 @@ def _has_ai_call(term) -> bool:
     return any(
         _is_call(node, "AI_FILTER")
         or _is_call(node, "AI_SCORE")
+        or _is_call(node, "AI_EXTRACT")
         or isinstance(node, (exp.AIClassify, exp.Exists))
         for node in term.walk()
     )
@@ -161,11 +159,9 @@ def _is_ai_score_comparison(node) -> bool:
 
 
 class ExpressionBinder:
-    def __init__(self, catalog: Catalog, tokenizer, turn=("", ""), layout="ai-if"):
+    def __init__(self, catalog: Catalog, prompts: PromptBinder):
         self.catalog = catalog
-        self.tokenizer = tokenizer
-        self.turn = turn
-        self.layout = layout
+        self.prompts = prompts
         self.tables: list[tuple[str, str]] = []
         self.regular_predicates: dict[str, list[RegularPredicate]] = {}
         self.doc_columns: dict[str, str] = {}
@@ -307,26 +303,13 @@ class ExpressionBinder:
                 "in words"
             )
         if classify is not None:
-            prompt = bind_classify_prompt(
-                template,
-                tuple(refs),
-                tokenizer=self.tokenizer,
-                turn=self.turn,
-                layout=self.layout,
-                **classify,
-            )
+            prompt = self.prompts.bind("label", template, tuple(refs), **classify)
         else:
             if function == "AI_SCORE":
-                binder = bind_score_prompt
+                kind = "score"
             else:
-                binder = bind_join_prompt if join else bind_prompt
-            prompt = binder(
-                template,
-                tuple(refs),
-                self.tokenizer,
-                turn=self.turn,
-                layout=self.layout,
-            )
+                kind = "join" if join else "filter"
+            prompt = self.prompts.bind(kind, template, tuple(refs))
         for r in refs:
             self.note_doc_column(r)
         return prompt, options, aliases
@@ -387,11 +370,86 @@ class ExpressionBinder:
         model_call.validate()
         return model_call, options, aliases
 
+    def bind_ai_extract(self, node) -> ModelCall:
+        """Parse an AI.EXTRACT call and bind its document reference.
+
+        The call is ``AI.EXTRACT(column, 'question'[, {'trim': false}])``;
+        the one option is trim.
+
+        Args:
+            node: The AI_EXTRACT call.
+
+        Returns:
+            The extract ModelCall.
+
+        Raises:
+            CompileError: The column, question, or options are invalid.
+        """
+        args = list(node.expressions)
+        if len(args) not in (2, 3):
+            raise CompileError(
+                "AI.EXTRACT takes a document column, a question string, "
+                "and at most one option object")
+        if not isinstance(args[0], exp.Column):
+            raise CompileError(
+                f"AI.EXTRACT's first argument is a document column, "
+                f"got {args[0].sql()}")
+        if not (isinstance(args[1], exp.Literal) and args[1].is_string):
+            raise CompileError(
+                f"AI.EXTRACT's second argument is the question as a "
+                f"string, got {args[1].sql()}")
+        ref = self.resolve_column(args[0])
+        question = str(args[1].this)
+        options = self.parse_extract_options(args[2] if len(args) == 3 else None)
+        prompt = self.prompts.bind("extract", question, (ref,))
+        self.note_doc_column(ref)
+        call = ModelCall(prompt, "extract", question=question,
+                         trim=options.get("trim", True))
+        call.validate()
+        return call
+
+    def parse_extract_options(self, node) -> dict:
+        """Validate and extract the options for AI.EXTRACT.
+
+        Args:
+            node: SQLGlot Struct expression, or None for no options.
+
+        Returns:
+            A dictionary with the supplied trim value.
+
+        Raises:
+            CompileError: The object is malformed, a key is unknown, or a
+                value has the wrong type.
+        """
+        if node is None:
+            return {}
+        if not isinstance(node, exp.Struct):
+            raise CompileError(
+                f"AI.EXTRACT's options are an object like "
+                f"{{'trim': false}}, got {node.sql()}")
+        out = {}
+        for prop in node.expressions:
+            if not isinstance(prop, exp.PropertyEQ):
+                raise CompileError(f"malformed option {prop.sql()}")
+            key = str(prop.this.name).lower()
+            value = prop.expression
+            if key == "trim":
+                if not isinstance(value, exp.Boolean):
+                    raise CompileError(f"{key} is true or false")
+                out[key] = bool(value.this)
+            else:
+                raise CompileError(
+                    f"unknown AI.EXTRACT option {key!r}; the one option is "
+                    f"trim")
+        return out
+
     def bind_ai_value(self, node: exp.Expression) -> ModelCall:
-        """Bind a score or classification expression to its model call."""
+        """Bind a score, classification, or extraction to its model call."""
         if isinstance(node, exp.AIClassify):
             call, _, _ = self.bind_ai_classify(node)
             return call
+        if _is_call(node, "AI_EXTRACT"):
+            return self.bind_ai_extract(node)
         prompt, _, _ = self.bind_ai_call(node, "AI_SCORE", set())
         return ModelCall(prompt, "score")
 

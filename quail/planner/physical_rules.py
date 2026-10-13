@@ -28,6 +28,7 @@ from quail.physical import (
     Aggregate,
     AiClassify,
     AiFilter,
+    AiInference,
     AiJoin,
     AiScore,
     Filter,
@@ -50,7 +51,7 @@ class LimitPushdown:
     finish, so it is sound only when those are the rows the query
     returns: the graph ends in a Limit and has no Sort or Aggregate (an
     ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
-    AiJoin (survivors are settled per join round), and no AiScore (a
+    AiJoin (survivors are settled per join round), and no AiInference (a
     score comparison after the chain can drop survivors). Otherwise the
     rule removes the setting.
     """
@@ -63,7 +64,7 @@ class LimitPushdown:
             return None
         limit = next((node for node in graph.nodes
                       if isinstance(node, Limit)), None)
-        blocked = any(isinstance(node, (Sort, Aggregate, AiJoin, AiScore))
+        blocked = any(isinstance(node, (Sort, Aggregate, AiJoin, AiInference))
                       for node in graph.nodes)
         if limit is None or blocked:
             context.settings.pop("filter_limit", None)
@@ -334,7 +335,7 @@ class PrefixSharing:
                     node = replace(node, spec=_shared_classify_spec(
                         node, context, store, resident=resident))
                     changed = True
-            elif (type(node) is AiScore and node.spec is not None
+            elif (isinstance(node, AiScore) and node.spec is not None
                   and len(node.spec.aliases) == 1
                   and not node.spec.share_prefixes):
                 lengths = context.document_tokens.get(node.spec.aliases[0])

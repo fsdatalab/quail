@@ -110,4 +110,4 @@ class LabelGate:
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         return filter_scores(self.node,
-                             self.source.result_value.outputs["scores"])
+                             self.source.result_value.outputs["rows"])

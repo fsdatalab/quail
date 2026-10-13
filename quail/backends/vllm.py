@@ -141,11 +141,18 @@ class VLLMClient:
     def generate(self, prompts, sampling_params, use_tqdm=False):
         return self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
-    def decode_params(self, max_tokens: int):
-        """Build sampling parameters for greedy text generation."""
+    def decode_params(self, max_tokens: int, stop=None):
+        """Build sampling parameters for greedy text generation.
+
+        Args:
+            max_tokens: The most tokens to generate.
+            stop: Optional strings that end the generation; the text
+                returned excludes the string that stopped it.
+        """
         from vllm import SamplingParams
 
-        return SamplingParams(max_tokens=max_tokens, temperature=0.0)
+        return SamplingParams(max_tokens=max_tokens, temperature=0.0,
+                              stop=stop)
 
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()

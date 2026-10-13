@@ -9,7 +9,7 @@ params a full chunk reads.
 
 from __future__ import annotations
 
-from quail.cost.roofline import CostComponent
+from quail.cost.roofline import CostComponent, component_latencies
 from quail.cost.work import Work
 from quail.specs import ModelSpec
 
@@ -86,3 +86,33 @@ def dense_decoder_components(work: Work, model: ModelSpec,
             precision=model.attention_precision,
         ),
     )
+
+
+def _readout(model, rows: float, passes: float, head_rows: int) -> CostComponent:
+    """Price the answer readout: the decision head, or output-head rows.
+
+    A decision model passes each option row and the prompt's last row
+    through its fp32 head: four projections of the hidden size to the
+    head width per row, and the head's weights once per pass. Any other
+    model multiplies each answer row by head_rows rows of the bf16
+    output head, the whole vocabulary when head_rows is 0, read once per
+    pass.
+    """
+    if model.role == "decision":
+        width, hidden = model.decision_head_dim, model.hidden
+        return CostComponent(
+            name="readout", flops=4.0 * width * hidden * rows,
+            bytes_moved=4.0 * (4 * width * hidden + 2 * width + 4 * hidden) * passes,
+            precision="fp32")
+    head = 2.0 * model.hidden * (head_rows or model.vocab)
+    return CostComponent(name="readout", flops=head * rows,
+                         bytes_moved=head * passes, precision="bf16")
+
+
+def decoder_seconds(work: Work, rows: float, passes: float, model, device,
+             head_rows: int = 0) -> float:
+    """Price work, answer rows, and forward passes with the component roofline."""
+    components = dense_decoder_components(work, model, passes=passes)
+    components += (_readout(model, rows, passes, head_rows),)
+    return sum(component.seconds
+               for component in component_latencies(components, device))

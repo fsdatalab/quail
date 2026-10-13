@@ -35,6 +35,7 @@ from quail.execution.tokens import (
 from quail.execution.types import PhysicalRequest, document_input
 from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
+from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
     Alias,
@@ -232,8 +233,8 @@ class Session:
             return RemoteQuery(self, text, order=order,
                                dialect=SQLDialect(dialect).value)
         logical = compile_sql(
-            text, self.catalog, self.tokenizer, dialect=dialect,
-            turn=self.model.turn, layout=self.model.prompt_layout,
+            text, self.catalog, dialect=dialect,
+            prompts=PromptBinder(self.tokenizer, model=self.model),
         )
         return Query(self, logical, order=order)
 
@@ -255,10 +256,8 @@ class Session:
                 "the builder API is not available on a remote Session; "
                 "write the query with sql()")
         return BoundBuilder(self,
-                            BuilderQuery(self.catalog, name,
-                                         self.tokenizer,
-                                         turn=self.model.turn,
-                                         layout=self.model.prompt_layout))
+                            BuilderQuery(self.catalog, name, prompts=PromptBinder(
+                                self.tokenizer, model=self.model)))
 
     @property
     def tokenizer(self):
@@ -580,6 +579,10 @@ class BoundBuilder:
                                 descriptions=descriptions,
                                 task_description=task_description,
                                 probabilities=probabilities)
+        return self
+
+    def ai_extract(self, c, question, *, name, trim=True):
+        self._inner.ai_extract(c, question, name=name, trim=trim)
         return self
 
     def label_in(self, name, labels, selectivity=None):
@@ -1088,7 +1091,7 @@ class Query:
                             f"label column {name!r} belongs to {alias!r}, "
                             f"which is not in the result")
                     labeled = table.column(name).combine_chunks()
-                    if not pa.types.is_map(labeled.type):
+                    if not pa.types.is_nested(labeled.type):
                         labeled = labeled.cast(pa.string())
                     # a document whose answer names no label has no row
                     # in the table, and leaves the result
@@ -1109,7 +1112,7 @@ class Query:
                                  for column in self.logical.projection.columns
                                  if isinstance(column, Alias)
                                  and column.name == name), None)
-                    if call is not None:
+                    if call is not None and call.kind == "label":
                         order = pa.array(call.labels, pa.string())
                         values = pa.DictionaryArray.from_arrays(
                             pc.index_in(widened, order).cast(pa.int32()),
@@ -1207,7 +1210,7 @@ class Query:
         result.report = report
 
         from quail.execution.reranker import classify_label_tables
-        from quail.physical import AiClassify, AiScore
+        from quail.physical import AiClassify, AiExtract, AiScore
 
         # every classified document's label, before any filter on it;
         # a chain's later stages label the documents their gate passed
@@ -1215,18 +1218,24 @@ class Query:
             name: table
             for node in plan.nodes
             if isinstance(node, AiClassify)
-            and PortRef(node.node_id, "scores") in response.outputs
+            and PortRef(node.node_id, "rows") in response.outputs
             for name, table in classify_label_tables(
-                node.spec, response.outputs[PortRef(node.node_id, "scores")]
+                node.spec, response.outputs[PortRef(node.node_id, "rows")]
             ).items()
         }, "scores": {
             # every scored document's score, before any sort or fetch
             node.spec.name: response.outputs[
-                PortRef(node.node_id, "scores")
+                PortRef(node.node_id, "rows")
             ].select([*node.spec.aliases, node.spec.name])
             for node in plan.nodes
-            if isinstance(node, AiScore) and not isinstance(node, AiClassify)
-            and PortRef(node.node_id, "scores") in response.outputs
+            if isinstance(node, AiScore)
+            and PortRef(node.node_id, "rows") in response.outputs
+        }, "extracts": {
+            # every document's answer and span, null for no answer
+            node.spec.name: response.outputs[PortRef(node.node_id, "rows")]
+            for node in plan.nodes
+            if isinstance(node, AiExtract)
+            and PortRef(node.node_id, "rows") in response.outputs
         }}
         survivors = {
             scan.alias: pa.array(
@@ -1257,6 +1266,9 @@ class Query:
                 # the label column follows the alias columns: one, or
                 # the anchor and partner of a classification of joined rows
                 answer_tables["classifies"][table.column_names[-1]] = table
+            elif value_type is ValueType.EXTRACT_ANSWERS:
+                # the alias column, the answer, and its span
+                answer_tables["extracts"][table.column_names[1]] = table
             elif value_type is ValueType.JOIN_ANSWERS:
                 written_pos = metadata.get(b"quail.written_pos")
                 if written_pos is None:

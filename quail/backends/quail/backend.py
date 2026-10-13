@@ -17,7 +17,15 @@ from quail.backends.quail.worker import execute_quail_request, prepare_quail_req
 from quail.execution.reranker import RerankerModelExecution
 from quail.logical import LogicalPlan, has_score, shared_preamble
 from quail.logical.prompts import answer_ids
-from quail.physical import AiFilter, AiJoin, AiScore, Barrier, PhysicalNode
+from quail.physical import (
+    AiClassify,
+    AiExtract,
+    AiFilter,
+    AiJoin,
+    AiScore,
+    Barrier,
+    PhysicalNode,
+)
 from quail.planner import pricing
 from quail.planner.logical_rules import lift_classifications
 from quail.planner.physical_optimizer import (
@@ -96,7 +104,13 @@ class QuailModelExecution:
         node: PhysicalNode,
         inputs: Mapping[str, Any],
     ) -> Any:
-        if isinstance(node, AiScore):
+        if isinstance(node, AiExtract):
+            # the Quail executor's AI.EXTRACT follows; the request
+            # backends run it
+            raise NotImplementedError(
+                "the Quail executor does not run AI.EXTRACT yet; use the "
+                "stock_vllm backend")
+        if isinstance(node, (AiScore, AiClassify)):
             execution = self._reranker_execution(inputs["documents"])
             self.query.gpu_timing = bool(inputs.get("gpu_timing", False))
             if "score_rows" in inputs:

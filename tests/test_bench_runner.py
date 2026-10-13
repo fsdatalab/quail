@@ -285,7 +285,7 @@ def test_a_score_query_reports_every_scored_document_and_its_pieces(tmp_path):
             **{node.node_id: NodeResult({f"ids:{node.alias}": range(
                 len(request.inputs[node.input_id].documents))})
                for node in graph.nodes if isinstance(node, PhysicalScan)},
-            scored.node_id: NodeResult({"scores": pa.table({
+            scored.node_id: NodeResult({"rows": pa.table({
                 "t": pa.array(range(6), pa.int32()),
                 "recovered_score": pa.array(scores, pa.float32())})}),
         }
