@@ -18,7 +18,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import pyarrow.ipc as ipc
@@ -278,8 +278,7 @@ class Server:
             raise InvalidRequestError("session_id must be a string")
         paths = self.snapshot_paths(inputs)
         self.compile(spec, engine, inputs, paths)
-        config = {"model": engine.model, "device": engine.device,
-                  "gpus": engine.gpus, "backend": engine.backend}
+        config = asdict(engine)
         existed = query_id is not None and self.store.find(query_id) is not None
         status = self.store.create(spec=spec, config=config, inputs=inputs,
                                    timeout_s=float(timeout_s),

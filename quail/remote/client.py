@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Iterator
+from dataclasses import asdict
 from pathlib import Path
 
 import pyarrow as pa
@@ -377,11 +378,8 @@ class RemoteQuery:
             timeout_s: Execution time limit; the server default when
                 omitted.
         """
-        config = self.session.config
         run = self.session._remote.submit(
-            self._spec(),
-            {"model": config.model, "device": config.device,
-             "gpus": config.gpus, "backend": config.backend},
+            self._spec(), asdict(self.session.config),
             query_id=query_id or uuid.uuid4().hex, timeout_s=timeout_s)
         say(f"submitted query {run.id} to {self.session._remote.client.endpoint}")
         return run

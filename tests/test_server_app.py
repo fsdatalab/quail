@@ -155,6 +155,14 @@ def test_capabilities_submission_validation_client_ids_and_hf_inputs(
     assert [item["id"] for item in mine["queries"]] == ["k"]
     all_queries = client.get("/v1/queries", params={"limit": "all"}).json()
     assert {item["id"] for item in all_queries["queries"]} == {"k", other["id"]}
+    # every EngineConfig field reaches the record, not only the four
+    # the server checks
+    timed = client.post("/v1/queries", json=submission(
+        content_id, query_id="timed",
+        config={**config, "gpu_timing": True, "attention": "tree"})).json()
+    stored = client.app.state.server.store.find(timed["id"]).config
+    assert stored["gpu_timing"] is True and stored["attention"] == "tree"
+    assert stored["canvas_draws"] == 4
 
     # a Hugging Face input is resolved without a download
     from quail.catalog import HuggingFaceProvider
