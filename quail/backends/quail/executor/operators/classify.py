@@ -8,6 +8,7 @@ from quail.backends.quail.executor.classify import (
     ClassifyStages,
     JoinPartners,
 )
+from quail.backends.quail.executor.parts import ExecutionPart
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.reranker import (
     _score_table,
@@ -18,7 +19,7 @@ from quail.execution.reranker import (
 )
 from quail.execution.runner import NodeMetrics, NodeResult
 from quail.logical import PROBABILITIES_SUFFIX
-from quail.physical import AiClassify, ValueType
+from quail.physical import ValueType
 from quail.progress import answer_sink
 
 
@@ -42,9 +43,6 @@ def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
 def joined_classification(state: QueryExecutionState, node, join, ids,
                           join_inputs, context):
     """Build classification stages for the pairs retained by a join."""
-    if not isinstance(node, AiClassify) or node.spec.partner is None:
-        raise TypeError(
-            f"{node.type_name!r} cannot follow a join in its pipeline")
     spec = node.spec
     stage = next(stage for stage in join
                  if set(spec.aliases) == {stage.anchor, *stage.partners})
@@ -65,12 +63,21 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
     return ClassifyPart(node, ids, plan, kept=kept)
 
 
-class ClassifyPart:
+class ClassifyPart(ExecutionPart):
     """Classification stages and result tables within a pipeline."""
 
-    gate = None
-    document_done = None
-    result_value = None
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        """Prepare labels for documents or for the pairs retained by a join."""
+        from quail.backends.quail.executor.operators.join import JoinPart
+
+        node = nodes[0]
+        if node.spec.partner is None:
+            return classification_part(state, node, ids, parts, inputs[node.node_id])
+        join = next(part for part in reversed(parts) if isinstance(part, JoinPart))
+        part = joined_classification(state, node, join.nodes, ids, join.inputs, context)
+        join.add_reader(part.kept)
+        return part
 
     def __init__(self, node, ids, plan: ClassifyStages, priors=(), kept=None,
                  prior_tables=()):

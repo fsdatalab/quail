@@ -2,6 +2,7 @@
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.parts import (
+    ExecutionPart,
     chunks,
     execution_prefix_tree,
     gpu_seconds,
@@ -85,11 +86,16 @@ def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
     return results
 
 
-class FilterPart:
+class FilterPart(ExecutionPart):
     """Filter stages and result tables within a pipeline."""
 
-    gate = None
-    result_value = None
+    execute_group = staticmethod(execute_filters)
+
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        """Prepare one filter's requests and answer notifications."""
+        return cls(nodes[0], ids, state.async_answers,
+                   len(state.loaded_model.pipeline.canvas_ids))
 
     def __init__(self, node, ids, async_answers, canvas_tokens=0):
         self.node = node
@@ -116,12 +122,23 @@ class FilterPart:
             pack_s=stats.get("pack_s", 0.0))
 
 
-class LabelGate:
+class LabelGate(ExecutionPart):
     """Pipeline condition that keeps documents with selected categories."""
 
     stages = ()
-    document_done = None
-    result_value = None
+
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        """Bind a label condition to its classification and input rows."""
+        from quail.backends.quail.executor.operators.classify import ClassifyPart
+
+        node = nodes[0]
+        labeled = next(part for part in reversed(parts)
+                       if isinstance(part, ClassifyPart)
+                       and part.node.spec.name == node.column)
+        source = next(part for part in parts
+                      if part.node.node_id == node.inputs[0].source.node_id)
+        return cls(node, labeled, source)
 
     def __init__(self, node, labeled, source):
         self.node = node

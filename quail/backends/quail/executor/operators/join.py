@@ -1,21 +1,20 @@
-"""Execute join stages and collect their partner answers."""
+"""Prepare join requests, retain matching pairs, and collect predicate results."""
+
+from functools import partial
 
 from quail.backends.quail.executor.parts import (
-    StagesPart,
+    ExecutionPart,
     chunks,
-    complete_chain,
+    execute_parts,
     execution_prefix_tree,
-    gated_stages,
     gpu_seconds,
-    input_staging,
-    report_chain_transitions,
     stage_spans,
 )
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.graph import stage_partner_lists
 from quail.execution.runner import NodeMetrics, NodeResult
-from quail.execution.tokens import DocumentKeys
+from quail.execution.tokens import DocumentPrefixes
 
 
 def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
@@ -24,173 +23,161 @@ def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
 
 
 def execute_joins(state: QueryExecutionState, nodes, inputs) -> dict:
-    """Run join predicates with any preceding and following pipeline parts."""
-    node = nodes[0]
-    torch = state.torch
-    arena = state.loaded_model.arena
-    pipeline = state.loaded_model.pipeline
-    async_answers = state.async_answers
-    chunk_tokens = state.chunk_tokens
+    """Run consecutive join predicates through the document scheduler."""
+    state.gpu_timing = bool(inputs.get("gpu_timing", False))
+    part = JoinPart(state, nodes, inputs, inputs["anchor_ids"])
+    return execute_parts(
+        state, [part], inputs["prefixes"], inputs["anchor_keys"],
+        keep_kv=nodes[-1].keep_kv,
+        tree=execution_prefix_tree(nodes[0], inputs["prefixes"],
+                                   state.loaded_model.arena),
+        label=f"join ({len(nodes)} predicates)")
 
-    stage_frames = inputs["stage_frames"]
-    chain = inputs.get("chain")
-    lists_for = inputs.get("anchor_partners")
-    join_stages = [
-        Stage(suffixes=suffixes, readout=async_answers, frame=frame,
-              requests=(None if lists_for is None
-                        else (lambda key, j=j: lists_for(key[1])[j])),
-              label=f"join stage {j}")
-        for j, (suffixes, frame) in enumerate(
-            zip(inputs["stage_suffixes"], stage_frames))
-    ]
-    join_stats = {}
-    leading = 0
-    parts = []
-    after = []
-    if chain is not None:
-        # the chain's stages lead the join's: a survivor goes on to
-        # the join with its KV resident, past the chain's gates;
-        # a classification of the rows kept follows the join's
-        filter_ids = chain["document_ids"]
-        parts = chain["parts"]
-        after = chain.get("after", [])
-        join_part = StagesPart(join_stages)
-        stages = gated_stages(parts + [join_part] + after)
-        leading = len(stages) - len(join_stages) - sum(
-            len(part.stages) for part in after)
-        root = parts[0].node if parts else node
-        prefixes = chain["documents"]
-        anchor_keys = DocumentKeys(node.anchor, filter_ids)
-        tree = execution_prefix_tree(root, prefixes, arena)
-        attention = (node.attention or getattr(root, "attention", None)
-                     or None)
-    else:
-        stages = join_stages
-        prefixes = inputs["prefixes"]
-        anchor_keys = inputs["anchor_keys"]
-        tree = execution_prefix_tree(node, inputs["prefixes"], arena)
-        attention = node.attention or None
-    anchor_done = inputs["anchor_done"]
-    settled = set()
-    join_rows = {}
-    if after:
-        last = len(join_stages) - 1
-        for j, stage in enumerate(join_stages):
-            recorders = [part.kept for part in after if part.kept.stage == j]
-            if not recorders and j != last:
-                continue
 
-            def kept(a, row, j=j, recorders=recorders):
-                indices = (None if lists_for is None
-                           else lists_for(anchor_keys[a][1])[j])
-                for recorder in recorders:
-                    recorder.record(a, row, indices)
-                if j == last:
-                    join_rows[a] = row
-                return bool(any(row))
+class JoinPart(ExecutionPart):
+    """Join predicates and their anchor KV within one scheduler run."""
 
-            stage.decide = kept
+    combine = True
 
-    def on_settled(anchor, survived, row):
-        settled.add(anchor)
-        anchor_done(anchor, join_rows.get(anchor, row) if after else row)
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        """Bind partner inputs and any pairs produced by preceding operators."""
+        from quail.backends.quail.executor.operators.apply import ApplyGate
 
-    def on_chunk(transitions):
-        report_chain_transitions(parts, transitions)
+        first = parts[0].node if parts else nodes[0]
+        head = first.document_head
+        prefixes = DocumentPrefixes(
+            context.state["pre"] if head is None else head,
+            context.state["docs"][nodes[0].anchor], ids)
+        chain = {"documents": prefixes, "document_ids": ids, "parts": tuple(parts),
+                 "pairs": {part.node.written_pos: part.rows for part in parts
+                           if isinstance(part, ApplyGate) and part.node.ids == "pairs"}}
+        prepared = context.model_inputs(nodes[0], inputs, context, chain, nodes=nodes)
+        return cls(state, nodes, prepared, ids, context=context)
 
-    every, spans, tokens = run_stages(
-        torch, arena, pipeline, stages, prefixes, chunk_tokens,
-        anchor_keys=anchor_keys, on_settled=on_settled,
-        attention_mode=attention, prefix_tree=tree, stats=join_stats,
-        on_chunk=on_chunk, label=f"join ({len(join_stages)} stages)",
-        staging=input_staging(state))
-    answers = every[leading:leading + len(join_stages)]
-    after_tokens = 0
-    if after:
-        low = leading + len(join_stages)
-        for part in after:
-            high = low + len(part.stages)
-            own = part.finish(every[low:high]) or 0
-            part_spans = stage_spans(spans, low, high)
-            part.result_value = part.result(
-                own, gpu_seconds(torch, part_spans, inputs),
-                chunks(part_spans, inputs), {})
-            after_tokens += own
-            low = high
-        spans = stage_spans(spans, 0, leading + len(join_stages))
-        tokens -= after_tokens
-    own_tokens = _predicate_tokens(
-        join_stages, answers, lists_for, anchor_keys, len(pipeline.canvas_ids))
-    if chain is not None:
-        # the join packs frames and partner suffixes; the rest is the chain's
-        join_tokens = sum(own_tokens)
-        # the join's anchors are the documents that reached it, in
-        # the chain's order: those with a first-stage row and those
-        # that settled there with no partner to ask; their rows are
-        # re-keyed to that order
-        reached = sorted(set(answers[0] if answers else ()) | settled)
-        local_of = {position: local for local, position in enumerate(reached)}
-        answers = [{local_of[position]: row for position, row in stage.items()}
-                   for stage in answers]
-        anchor_ids = [filter_ids[position] for position in reached]
-        if parts:
-            kv_round = {"hits": len(reached), "misses": 0}
-            complete_chain(parts, every[:leading], spans,
-                           tokens - join_tokens, join_stats, torch, inputs)
-            for part in parts:
-                if part.result_value is None:
-                    raise RuntimeError(
-                        "a pipeline part finished without a result")
-            join_stats = {}
-            spans = stage_spans(spans, leading, len(stages))
-            tokens = join_tokens
+    def __init__(self, state, nodes, inputs, ids, *, context=None):
+        self.nodes = nodes
+        self.node = nodes[0]
+        self.inputs = inputs
+        self.ids = ids
+        self.context = context
+        self.canvas_tokens = len(state.loaded_model.pipeline.canvas_ids)
+        self.attention = self.node.attention or None
+        self.settled = set()
+        self.final_rows = {}
+        self.readers = []
+        lists_for = inputs.get("anchor_partners")
+        self.stages = [
+            Stage(suffixes=suffixes, readout=state.async_answers, frame=frame,
+                  requests=(None if lists_for is None
+                            else lambda key, j=j: lists_for(key[1])[j]),
+                  label=f"join predicate {j}")
+            for j, (suffixes, frame) in enumerate(
+                zip(inputs["stage_suffixes"], inputs["stage_frames"]))]
+        self._results = {}
+
+    def add_reader(self, kept):
+        """Expose surviving pairs to a following classification."""
+        self.readers.append(kept)
+        for index in (kept.stage, len(self.stages) - 1):
+            self.stages[index].decide = partial(self._record, index)
+
+    def _record(self, index, anchor, row):
+        lists_for = self.inputs.get("anchor_partners")
+        key = self.inputs["anchor_keys"][anchor]
+        indices = None if lists_for is None else lists_for(key[1])[index]
+        for reader in self.readers:
+            if reader.stage == index:
+                reader.record(anchor, row, indices)
+        if index == len(self.stages) - 1:
+            self.final_rows[anchor] = row
+        return bool(any(row))
+
+    def on_settled(self, anchor, survived, row):
+        """Settle anchor KV using join answers after all readers finish."""
+        self.settled.add(anchor)
+        self.inputs["anchor_done"](anchor, self.final_rows.get(anchor, row))
+
+    def finish(self, every) -> int:
+        """Map predicate answers to reached anchors and count suffix work."""
+        self.own_tokens = _predicate_tokens(
+            self.stages, every, self.inputs.get("anchor_partners"),
+            self.inputs["anchor_keys"], self.canvas_tokens)
+        chain = self.inputs.get("chain")
+        if chain is not None:
+            reached = sorted(set(every[0] if every else ()) | self.settled)
+            local_of = {position: local for local, position in enumerate(reached)}
+            self.answers = [
+                {local_of[position]: row for position, row in answers.items()}
+                for answers in every]
+            self.anchor_ids = [self.ids[position] for position in reached]
+            self.kv_round = ({"hits": len(reached), "misses": 0} if chain["parts"]
+                             else {"hits": 0, "misses": len(reached)})
         else:
-            # the join led the pipeline and packed the anchors itself
-            kv_round = {"hits": 0, "misses": len(reached)}
-    else:
-        anchor_ids = list(inputs["anchor_ids"])
-        kv_round = inputs.get("kv_round") or {}
-    group = inputs["group"]
-    partner_lists = stage_partner_lists(group, lists_for, anchor_ids)
-    results = {}
-    own_tokens[0] = tokens - sum(own_tokens[1:])
-    for j, (member, rows, members) in enumerate(zip(nodes, answers, partner_lists)):
-        reached_ids = [anchor_ids[int(local)] for local in sorted(rows)]
-        matched = [anchor_ids[int(local)] for local in sorted(rows) if any(rows[local])]
-        survivors = matched
-        # Anchors with no candidates never launch a request.
-        if member.semantics == "anti":
-            candidates = anchor_ids if j == 0 else results[
-                nodes[j - 1].node_id].outputs[f"ids:{node.anchor}"]
-            survivors = [document for document in candidates if document not in matched]
-        answer = {
-            "rows": rows, "anchor_index": anchor_ids,
-            "partner_index": inputs["partner_indices"][member.written_pos],
-            "anchor_partners": members, "anchor": member.anchor,
-            "partners": list(member.partners), "semantics": member.semantics,
-            "selectivity": member.selectivity, "written_pos": member.written_pos,
-        }
-        own_spans = stage_spans(spans, leading + j, leading + j + 1)
-        results[member.node_id] = NodeResult(
-            outputs={f"ids:{member.anchor}": survivors,
-                     f"join_answers:{member.written_pos}": answer},
-            metrics=NodeMetrics(
-                input_rows=len(anchor_ids) if j == 0 else len(reached_ids),
-                output_rows=len(survivors),
-                evaluated_document_pairs=sum(len(row) for row in rows.values()),
-                kv_hits=kv_round.get("hits", 0) if j == 0 else len(rows),
-                kv_misses=kv_round.get("misses", 0) if j == 0 else 0,
-                fresh_tokens=own_tokens[j],
-                gpu_s=gpu_seconds(torch, own_spans, inputs),
-                chunks=chunks(own_spans, inputs),
-                extension={
-                    "answers": [rows],
-                    **({"borrowed_prefix_tokens": join_stats["borrowed_tokens"]}
-                       if j == 0 and join_stats.get("borrowed_tokens") else {}),
-                    **({"pack_s": round(join_stats["pack_s"], 3)}
-                       if j == 0 and join_stats.get("pack_s") else {}),
-                }))
-    return results
+            self.answers = every
+            self.anchor_ids = list(self.ids)
+            self.kv_round = self.inputs.get("kv_round") or {}
+        return sum(self.own_tokens)
+
+    def complete(self, tokens, spans, stats, torch, inputs, offset):
+        """Build each join predicate's answers and measured costs."""
+        nodes, inputs = self.nodes, self.inputs
+        node = self.node
+        anchor_ids, answers = self.anchor_ids, self.answers
+        lists_for = inputs.get("anchor_partners")
+        own_tokens = list(self.own_tokens)
+        kv_round = self.kv_round
+        group = inputs["group"]
+        partner_lists = stage_partner_lists(group, lists_for, anchor_ids)
+        results = {}
+        own_tokens[0] = tokens - sum(own_tokens[1:])
+        for j, (member, rows, members) in enumerate(zip(nodes, answers, partner_lists)):
+            reached_ids = [anchor_ids[int(local)] for local in sorted(rows)]
+            matched = [anchor_ids[int(local)] for local in sorted(rows)
+                       if any(rows[local])]
+            survivors = matched
+            # Anchors with no candidates never launch a request.
+            if member.semantics == "anti":
+                candidates = anchor_ids if j == 0 else results[
+                    nodes[j - 1].node_id].outputs[f"ids:{node.anchor}"]
+                survivors = [document for document in candidates
+                             if document not in matched]
+            answer = {
+                "rows": rows, "anchor_index": anchor_ids,
+                "partner_index": inputs["partner_indices"][member.written_pos],
+                "anchor_partners": members, "anchor": member.anchor,
+                "partners": list(member.partners), "semantics": member.semantics,
+                "selectivity": member.selectivity, "written_pos": member.written_pos,
+            }
+            own_spans = stage_spans(spans, offset + j, offset + j + 1)
+            results[member.node_id] = NodeResult(
+                outputs={f"ids:{member.anchor}": survivors,
+                         f"join_answers:{member.written_pos}": answer},
+                metrics=NodeMetrics(
+                    input_rows=len(anchor_ids) if j == 0 else len(reached_ids),
+                    output_rows=len(survivors),
+                    evaluated_document_pairs=sum(len(row) for row in rows.values()),
+                    kv_hits=kv_round.get("hits", 0) if j == 0 else len(rows),
+                    kv_misses=kv_round.get("misses", 0) if j == 0 else 0,
+                    fresh_tokens=own_tokens[j],
+                    gpu_s=gpu_seconds(torch, own_spans, inputs),
+                    chunks=chunks(own_spans, inputs),
+                    extension={
+                        "answers": [rows],
+                        **({"borrowed_prefix_tokens": stats["borrowed_tokens"]}
+                           if j == 0 and stats.get("borrowed_tokens") else {}),
+                        **({"pack_s": round(stats["pack_s"], 3)}
+                           if j == 0 and stats.get("pack_s") else {}),
+                    }))
+        self._results = results
+        self.result_value = results[node.node_id]
+        if self.context is not None:
+            last = nodes[-1]
+            self.context.model_result(last, results[last.node_id], self.context)
+
+    def results(self) -> dict:
+        """Return results for every join predicate in the group."""
+        return self._results
 
 
 def _predicate_tokens(join_stages, answers, lists_for, anchor_keys,

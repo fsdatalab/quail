@@ -1,30 +1,30 @@
 """Execute per-batch apply calls within a model pipeline."""
 
+from quail.backends.quail.executor.parts import ExecutionPart
 from quail.backends.quail.executor.stages import Stage
 from quail.execution.runner import NodeResult, foreign_call, foreign_outputs
 
 
-def apply_part(node, ids, parts, inputs, context):
-    """Bind an apply call to its document and partner inputs."""
-    values = {}
-    for port in node.inputs:
-        if not port.source.port.startswith("ids:"):
-            continue
-        port_alias = port.source.port.split(":", 1)[1]
-        values[port_alias] = (
-            ids if port.source.node_id in {
-                part.node.node_id for part in parts}
-            else inputs[node.node_id][port.name])
-    call, metrics = foreign_call(node, values, context)
-    return ApplyGate(node, call, metrics, values)
-
-
-class ApplyGate:
+class ApplyGate(ExecutionPart):
     """User function applied as each document reaches this pipeline position."""
 
     stages = ()
-    document_done = None
-    result_value = None
+
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        """Bind an apply call to its document and partner inputs."""
+        node = nodes[0]
+        values = {}
+        for port in node.inputs:
+            if not port.source.port.startswith("ids:"):
+                continue
+            port_alias = port.source.port.split(":", 1)[1]
+            values[port_alias] = (
+                ids if port.source.node_id in {
+                    part.node.node_id for part in parts}
+                else inputs[node.node_id][port.name])
+        call, metrics = foreign_call(node, values, context)
+        return cls(node, call, metrics, values)
 
     def __init__(self, node, call, metrics, values):
         self.node = node

@@ -10,6 +10,7 @@ from quail.backends.quail.executor.extract import (
     load_vocabulary,
 )
 from quail.backends.quail.executor.parts import (
+    ExecutionPart,
     chunks,
     gpu_seconds,
     input_staging,
@@ -174,7 +175,7 @@ def extraction_results(nodes, stages, document_ids, *, wall, fresh, own,
     return results
 
 
-class ExtractPart:
+class ExtractPart(ExecutionPart):
     """The extractions that continue a filter's pipeline.
 
     The documents are resident from the filter's stages, so the part
@@ -191,9 +192,18 @@ class ExtractPart:
             in its head or its tokens.
     """
 
-    gate = None
-    document_done = None
-    result_value = None
+    combine = True
+    execute_group = staticmethod(execute_extractions)
+
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        """Prepare consecutive questions over the preceding operator's documents."""
+        first = parts[0].node
+        head = first.document_head
+        return cls(state, nodes, ids, {
+            "documents": context.state["docs"],
+            "texts": context.state.get("texts", {}),
+            "pre": list(context.state["pre"] if head is None else head)})
 
     def __init__(self, state, nodes, ids, inputs):
         self.nodes = list(nodes)
@@ -208,7 +218,7 @@ class ExtractPart:
                     f"AI.EXTRACT {self.node.spec.name!r} shows document "
                     f"{document} of {alias!r} unlike the pipeline before it")
         self.stages = self.extraction.stages
-        self.results = {}
+        self._results = {}
 
     @property
     def appended_tokens(self) -> int:
@@ -222,8 +232,12 @@ class ExtractPart:
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         # the answer tables hold the documents the stages before let through
-        self.results = extraction_results(
+        self._results = extraction_results(
             self.nodes, self.extraction, self.ids, wall=0.0, fresh=tokens,
             own=lambda q: (gpu_s, chunks) if q == 0 else (0.0, 0), stats={},
             kept=self.extraction.asked())
-        return self.results[self.node.node_id]
+        return self._results[self.node.node_id]
+
+    def results(self) -> dict:
+        """Return the answer table and metrics for each extraction."""
+        return self._results

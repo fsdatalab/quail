@@ -3,10 +3,9 @@
 import time
 
 from quail.backends.quail.executor.chunk import InputStaging
-from quail.backends.quail.executor.stages import Stage
+from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.tokens import prefix_tree
-from quail.physical import AiClassify
 from quail.progress import logger
 
 
@@ -38,22 +37,56 @@ def input_staging(state: QueryExecutionState):
     return state.loaded_model.input_staging
 
 
-class StagesPart:
-    """Pipeline part that adds stages and produces no result."""
+class ExecutionPart:
+    """Operator work prepared for the shared document scheduler.
 
-    node = None
+    Implementations prepare stages, finish their answers, and return node
+    results. combine groups consecutive nodes into one part. execute_group
+    optionally handles a run containing only that operator type.
+    """
+
+    combine = False
+    execute_group = None
     gate = None
     document_done = None
     result_value = None
+    appended_tokens = 0
+    on_settled = None
+    attention = None
 
-    def __init__(self, stages):
-        self.stages = stages
+    def complete(self, tokens, spans, stats, torch, inputs, offset):
+        """Build the operator's result from its measured work."""
+        self.result_value = self.result(
+            tokens, gpu_seconds(torch, spans, inputs), chunks(spans, inputs), stats)
 
-    def finish(self, every):
-        return None
+    def results(self) -> dict:
+        """Return results keyed by physical node ID."""
+        return {self.node.node_id: self.result_value}
 
-    def result(self, tokens, gpu_s, chunks, stats):
-        return None
+
+def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
+                  attention=None, label="") -> dict:
+    """Run prepared operator work together and collect per-node results."""
+    stages = gated_stages(parts)
+    settled = next((part.on_settled for part in parts
+                    if part.on_settled is not None), None)
+    if settled is None:
+        settled = settle_documents(state.loaded_model.arena, keys, prefixes,
+                                   keep_kv, state.chunk_tokens)
+    stats = {}
+    every, spans, tokens = run_stages(
+        state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+        stages, prefixes, state.chunk_tokens, anchor_keys=keys,
+        on_settled=settled, prefix_tree=tree, stats=stats,
+        attention_mode=next((part.attention for part in parts if part.attention),
+                            attention),
+        staging=input_staging(state), label=label,
+        on_chunk=lambda transitions: report_chain_transitions(parts, transitions),
+        appended_tokens=max(part.appended_tokens for part in parts) or None)
+    complete_chain(parts, every, spans, tokens, stats, state.torch,
+                   {"gpu_timing": state.gpu_timing})
+    return {node_id: result for part in parts
+            for node_id, result in part.results().items()}
 
 
 def gated_stages(parts) -> list:
@@ -145,28 +178,18 @@ def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
     remainder = tokens - sum(own[index] or 0 for index in staged[1:])
     for index, (part, (low, high)) in enumerate(zip(parts, slices)):
         part_spans = stage_spans(spans, low, high)
-        part.result_value = part.result(
+        part.complete(
             remainder if staged and index == staged[0] else (own[index] or 0),
-            gpu_seconds(torch, part_spans, inputs),
-            chunks(part_spans, inputs), stats if staged and index == staged[0]
-            else {})
+            part_spans, stats if staged and index == staged[0] else {},
+            torch, inputs, low)
 
 
 def execution_prefix_tree(node, documents, arena):
     """Build the requested prefix tree, or return None if sharing is disabled."""
-    shares = (node.spec.share_prefixes if isinstance(node, AiClassify)
-              else node.share_prefixes)
-    if not shares:
+    settings = getattr(node, "spec", node)
+    if not settings.share_prefixes:
         return None
-    started = time.perf_counter()
-    tree = prefix_tree(documents, arena.page_tokens)
-    logger.info(
-        "prefix sharing on %s: %s documents borrow %s tokens "
-        "(tree built in %.2f s)",
-        node.spec.aliases[0] if isinstance(node, AiClassify)
-        else getattr(node, "alias", None) or node.anchor,
-        len(documents), tree.shared_tokens, time.perf_counter() - started)
-    return tree
+    return shared_prefix_tree(node.document_aliases[0], documents, arena)
 
 
 def stage_spans(spans, low, high) -> list:
