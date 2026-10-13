@@ -3,7 +3,7 @@
 import gzip
 import struct
 
-from experiments.sglang_profile_analysis import merge_intervals
+from experiments.trace_intervals import merge_intervals
 
 
 def read_gpu_intervals(path, window_unix_ns):

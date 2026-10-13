@@ -202,7 +202,6 @@ def _bind_label_names(b: ExpressionBinder, columns: tuple[ColumnRef | Alias, ...
 def compile_sql(
     sql: str,
     catalog: Catalog,
-    tokenizer=None,
     dialect: SQLDialect | str = SQLDialect.SNOWFLAKE,
     turn: tuple[str, str] = ("", ""),
     layout: str = "ai-if",
@@ -213,11 +212,10 @@ def compile_sql(
     Args:
         sql: A SELECT statement in the chosen dialect.
         catalog: Registered tables and their schemas.
-        tokenizer: Tokenizer used to bind AI prompts.
         dialect: SQL dialect used to parse the statement.
         turn: Model chat text placed before and after each prompt.
         layout: Prompt layout used by the model.
-        prompts: Model-aware prompt binder. Overrides tokenizer, turn, and layout.
+        prompts: Model-aware prompt binder. Overrides turn and layout.
 
     Returns:
         The bound logical query plan.
@@ -246,7 +244,7 @@ def compile_sql(
     distinct = _parse_distinct(tree)
 
     b = ExpressionBinder(catalog, prompts or PromptBinder(
-        tokenizer, turn=turn, layout=layout))
+        turn=turn, layout=layout))
 
     joins = JoinBinder(b)
     joins.bind_tables(tree)

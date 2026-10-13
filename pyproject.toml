@@ -43,7 +43,7 @@ dev = [
     "boto3==1.43.89",
     "matplotlib==3.11.1",
     "pytest==9.1.1",
-    # the quail-b benchmark; quail/bench/ is its runner for Quail
+    # the quail-b benchmark; bench/ is its runner for Quail
     "quail-b",
     "ruff==0.12.9",
     "vulture==2.16",
@@ -52,6 +52,7 @@ dev = [
     # downloads
     "pandas==3.0.5",
     "hf-transfer==0.1.9",
+    "import-linter==2.3",
 ]
 
 [tool.uv.sources]
@@ -83,6 +84,7 @@ required-version = "==0.12.13"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 
 [tool.ruff]
 line-length = 88
@@ -102,8 +104,37 @@ ignore = ["D1", "N803", "N806", "N812"]
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["quail", "quail_b", "experiments"]
+known-first-party = ["quail", "quail_b", "bench", "experiments"]
+
+# Each package imports only the packages below it. `uv run lint-imports`
+# checks the contract; the one exception is the lazy import that lets
+# ExtensionRegistry.with_built_ins() build the built in registry.
+[tool.importlinter]
+root_package = "quail"
+
+[[tool.importlinter.contracts]]
+name = "Packages import downward only"
+type = "layers"
+layers = [
+    "quail.server",
+    "quail.api",
+    "quail.builtins",
+    "quail.baselines",
+    "quail.extensions",
+    "quail.backends",
+    "quail.remote",
+    "quail.execution",
+    "quail.explain",
+    "quail.planner",
+    "quail.physical",
+    "quail.frontend",
+    "quail.catalog",
+    "quail.logical",
+    "quail.cost",
+    "quail.specs | quail.labels | quail.progress | quail.deploy",
+]
+ignore_imports = ["quail.extensions -> quail.builtins"]
 
 [tool.vulture]
-paths = ["quail"]
+paths = ["quail", "bench"]
 min_confidence = 70

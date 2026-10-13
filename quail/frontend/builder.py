@@ -1,11 +1,21 @@
 """Python builder that mirrors AI SQL construct for construct."""
 
-from dataclasses import dataclass
 from typing import Optional
 
 from quail.catalog import Catalog
+from quail.frontend.expressions import (
+    AggSpec,
+    ColSpec,
+    EqualsSpec,
+    HavingSpec,
+    PredicateSpec,
+    PromptSpec,
+    SortSpec,
+    col,
+)
 from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
+from quail.frontend.scope import Scope
 from quail.logical import (
     AggregateCall,
     Aggregation,
@@ -23,197 +33,23 @@ from quail.logical import (
     RegularPredicate,
     SortKey,
 )
-from quail.logical.expressions import SPAN_SUFFIX, validate_task_description
-
-
-@dataclass(frozen=True, eq=False)
-class ColSpec:
-    alias: Optional[str]
-    column: str
-
-    def __eq__(self, other):
-        """``col("c.url") == col("e.url")`` is a join condition.
-
-        Compared with a literal, it is a regular predicate for ``where()``.
-        """
-        if isinstance(other, ColSpec):
-            return EqualsSpec(self, other)
-        return PredicateSpec(self, "=", other)
-
-    def __ne__(self, other):
-        return PredicateSpec(self, "<>", other)
-
-    def __lt__(self, other):
-        return PredicateSpec(self, "<", other)
-
-    def __le__(self, other):
-        return PredicateSpec(self, "<=", other)
-
-    def __gt__(self, other):
-        return PredicateSpec(self, ">", other)
-
-    def __ge__(self, other):
-        return PredicateSpec(self, ">=", other)
-
-    def isin(self, values) -> "PredicateSpec":
-        return PredicateSpec(self, "in", tuple(values))
-
-    def is_null(self) -> "PredicateSpec":
-        return PredicateSpec(self, "is null")
-
-    def is_not_null(self) -> "PredicateSpec":
-        return PredicateSpec(self, "is not null")
-
-    def asc(self) -> "SortSpec":
-        return SortSpec(self)
-
-    def desc(self) -> "SortSpec":
-        return SortSpec(self, descending=True)
-
-    def nulls_first(self) -> "SortSpec":
-        return SortSpec(self, nulls="first")
-
-    def nulls_last(self) -> "SortSpec":
-        return SortSpec(self, nulls="last")
-
-    def __hash__(self):
-        return hash((self.alias, self.column))
-
-
-@dataclass(frozen=True)
-class SortSpec:
-    """A sort key for ``order_by()``: ``col("r.stars").desc().nulls_last()``.
-
-    Attributes:
-        col: The column or projected name to sort by.
-        descending: Whether to sort from the largest value down.
-        nulls: ``"first"`` or ``"last"``, or None for the default: nulls
-            last when ascending and first when descending.
-    """
-
-    col: ColSpec
-    descending: bool = False
-    nulls: Optional[str] = None
-
-    def asc(self) -> "SortSpec":
-        return SortSpec(self.col, False, self.nulls)
-
-    def desc(self) -> "SortSpec":
-        return SortSpec(self.col, True, self.nulls)
-
-    def nulls_first(self) -> "SortSpec":
-        return SortSpec(self.col, self.descending, "first")
-
-    def nulls_last(self) -> "SortSpec":
-        return SortSpec(self.col, self.descending, "last")
-
-
-@dataclass(frozen=True)
-class EqualsSpec:
-    """An unresolved ``col(...) == col(...)`` join condition."""
-    left: ColSpec
-    right: ColSpec
-
-
-@dataclass(frozen=True)
-class PredicateSpec:
-    """An unresolved regular predicate for ``where()``."""
-    col: ColSpec
-    comparison: str
-    value: object = None
-
-
-@dataclass(frozen=True)
-class PromptSpec:
-    template: str
-    cols: tuple
-
-
-@dataclass(frozen=True)
-class AggSpec:
-    """An unresolved aggregate for ``agg()``."""
-    function: str
-    col: object = None    # ColSpec, a label or score name, or None
-
-    def _test(self, comparison, value):
-        return HavingSpec(self, comparison, value)
-
-    def __eq__(self, other):
-        return self._test("=", other)
-
-    def __ne__(self, other):
-        return self._test("<>", other)
-
-    def __lt__(self, other):
-        return self._test("<", other)
-
-    def __le__(self, other):
-        return self._test("<=", other)
-
-    def __gt__(self, other):
-        return self._test(">", other)
-
-    def __ge__(self, other):
-        return self._test(">=", other)
-
-    def __hash__(self):
-        return hash((self.function, self.col))
-
-
-@dataclass(frozen=True)
-class HavingSpec:
-    """An unresolved ``having()`` test of an aggregate against a number."""
-    agg: AggSpec
-    comparison: str
-    value: object
-
-
-def count(c=None) -> AggSpec:
-    """``count()`` counts rows; ``count("r.id")`` counts non-null values."""
-    return AggSpec("count", c)
-
-
-def count_distinct(c) -> AggSpec:
-    return AggSpec("count_distinct", c)
-
-
-def sum_(c) -> AggSpec:
-    return AggSpec("sum", c)
-
-
-def avg(c) -> AggSpec:
-    return AggSpec("avg", c)
-
-
-def min_(c) -> AggSpec:
-    return AggSpec("min", c)
-
-
-def max_(c) -> AggSpec:
-    return AggSpec("max", c)
-
-
-def col(ref: str) -> ColSpec:
-    """"r.review" or "review" (unqualified resolves when unambiguous)."""
-    if "." in ref:
-        alias, column = ref.split(".", 1)
-        return ColSpec(alias=alias, column=column)
-    return ColSpec(alias=None, column=ref)
-
-
-def prompt(template: str, *cols: ColSpec) -> PromptSpec:
-    return PromptSpec(template=template, cols=tuple(cols))
+from quail.logical.expressions import (
+    SPAN_SUFFIX,
+    column_name,
+    validate_task_description,
+)
 
 
 class Query:
-    def __init__(self, catalog: Catalog, provider: str, tokenizer=None,
+    def __init__(self, catalog: Catalog, provider: str,
                  turn: tuple[str, str] = ("", ""), layout: str = "ai-if",
                  prompts: PromptBinder | None = None):
-        catalog.get(provider)     # unknown provider -> CompileError
         self._catalog = catalog
-        self._prompts = prompts or PromptBinder(tokenizer, turn=turn, layout=layout)
-        self._tables = [(provider, provider)]   # (alias, provider)
-        self._doc_columns = {}
+        self._prompts = prompts or PromptBinder(turn=turn, layout=layout)
+        self._scope_ = Scope(catalog)
+        self._scope_.add_table(provider, provider)
+        self._tables = self._scope_.tables      # (alias, provider)
+        self._doc_columns = self._scope_.doc_columns
         self._filters = {}
         self._label_filters = {}     # alias -> [(name, labels, selectivity)]
         self._joins = []
@@ -247,36 +83,10 @@ class Query:
         return dict(self._tables)
 
     def _resolve(self, c: ColSpec) -> ColumnRef:
-        scope = self._scope()
-        if c.alias is not None:
-            if c.alias not in scope:
-                raise CompileError(f"unknown table alias {c.alias!r}")
-            provider = scope[c.alias]
-            if c.column not in self._catalog.get(provider).columns:
-                raise CompileError(
-                    f"column {c.column!r} not in provider {provider!r} "
-                    f"(schema: {self._catalog.get(provider).columns})")
-            return ColumnRef(alias=c.alias, provider=provider,
-                             column=c.column)
-        owners = [(a, p) for a, p in scope.items()
-                  if c.column in self._catalog.get(p).columns]
-        if len(owners) != 1:
-            raise CompileError(
-                f"column {c.column!r} is "
-                f"{'ambiguous' if owners else 'unknown'}; qualify it "
-                f"with a table alias")
-        return ColumnRef(alias=owners[0][0], provider=owners[0][1],
-                         column=c.column)
+        return self._scope_.resolve(c.column, c.alias)
 
     def _note_doc_column(self, ref: ColumnRef) -> None:
-        seen = self._doc_columns.get(ref.alias)
-        if seen and seen != ref.column:
-            raise CompileError(
-                f"alias {ref.alias!r} is referenced through two "
-                f"columns ({seen!r}, {ref.column!r}); predicates over "
-                f"one table must share one document column so its KV "
-                f"is computed once")
-        self._doc_columns[ref.alias] = ref.column
+        self._scope_.note_doc_column(ref)
 
     def _bind(self, p: PromptSpec, join: bool = False):
         refs = tuple(self._resolve(c) for c in p.cols)
@@ -625,7 +435,7 @@ class Query:
                 if name in self._labels or name in self._scope():
                     raise CompileError(f"the name {name!r} is already used")
                 self._labels[name] = column
-            self._tables.append((alias, provider))
+            self._scope_.add_table(alias, provider)
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
             for a, tests in other._label_filters.items():
@@ -894,8 +704,7 @@ class Query:
                 column = self._resolve(col(c) if isinstance(c, str) else c)
             if column not in columns:
                 columns.append(column)
-            return (column.name if isinstance(column, Alias)
-                    else f"{column.alias}.{column.column}")
+            return column_name(column)
 
         keys = tuple(project(c) for c in self._group)
         aggregates = []
@@ -923,6 +732,6 @@ class Query:
                                     tuple(tests))
 
 
-def docs(catalog: Catalog, provider: str, tokenizer=None,
+def docs(catalog: Catalog, provider: str,
          turn: tuple[str, str] = ("", ""), layout: str = "ai-if") -> Query:
-    return Query(catalog, provider, tokenizer, turn, layout)
+    return Query(catalog, provider, turn, layout)

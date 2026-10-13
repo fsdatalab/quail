@@ -24,7 +24,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench import labeling as labels
+from bench import labeling as labels
 from quail_b import prompts
 from quail_b.data import GROUND_TRUTH_ROOT
 from quail_b.predicates import (
@@ -293,7 +293,7 @@ class VLLMJudge:
     def __init__(self, repo: str = MODEL_REPO, revision: str = MODEL_REVISION):
         from vllm import LLM
 
-        from quail.backends.vllm import _capacity
+        from quail.baselines.vllm import _capacity
 
         started = time.perf_counter()
         self.llm = LLM(

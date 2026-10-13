@@ -1,12 +1,17 @@
 """Compose operator stages and collect their execution metrics."""
 
 import time
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
+from itertools import groupby
+from typing import Any, ClassVar
+
+import numpy as np
 
 from quail.backends.quail.executor.chunk import InputStaging
-from quail.backends.quail.executor.stages import Stage
+from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.execution.tokens import prefix_tree
-from quail.physical import AiClassify
+from quail.catalog.tokens import prefix_tree
 from quail.progress import logger
 
 
@@ -38,22 +43,109 @@ def input_staging(state: QueryExecutionState):
     return state.loaded_model.input_staging
 
 
-class StagesPart:
-    """Pipeline part that adds stages and produces no result."""
+class ExecutionPart(ABC):
+    """Operator work prepared for the shared document scheduler.
 
-    node = None
+    Implementations prepare stages, finish their answers, and return node
+    results. combine groups consecutive nodes into one part. prepare_group
+    prepares stages across consecutive parts of the same type. execute_group
+    optionally handles a run containing only that operator type.
+    """
+
+    stages: Sequence[Stage]
+    combine: ClassVar[bool] = False
+    execute_group: ClassVar[Callable | None] = None
     gate = None
     document_done = None
     result_value = None
+    appended_tokens = 0
+    on_settled = None
+    attention = None
 
-    def __init__(self, stages):
-        self.stages = stages
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        """Prepare physical nodes for execution through an operator adapter."""
+        raise NotImplementedError(f"{cls.__name__} needs prepared requests")
 
-    def finish(self, every):
+    @staticmethod
+    def model_inputs(node, inputs, context, upstream=None, nodes=None):
+        """Turn the node's graph input ports into scheduler inputs.
+
+        Returns None for an operator that reads its port values as
+        they are.
+
+        Args:
+            node: The physical node.
+            inputs: Port values from the preceding operators.
+            context: The execution context with the documents.
+            upstream: The preceding pipeline state of a join, or None.
+            nodes: The nodes sharing one scheduler run, or None.
+        """
         return None
 
-    def result(self, tokens, gpu_s, chunks, stats):
-        return None
+    @staticmethod
+    def prepare_group(parts):
+        """Prepare stages shared by consecutive parts of the same type."""
+
+    @abstractmethod
+    def finish(self, every) -> int | None:
+        """Finalize answers and return this part's suffix token count."""
+
+    @abstractmethod
+    def complete(self, tokens, spans, stats, offset) -> None:
+        """Build results from the scheduler's token counts and timing spans."""
+
+    @abstractmethod
+    def results(self) -> dict:
+        """Return completed results keyed by node or output name."""
+
+
+class SingleResultPart(ExecutionPart):
+    """Prepared work whose execution produces one result."""
+
+    @abstractmethod
+    def result(self, tokens, gpu_s, chunks, stats) -> Any:
+        """Build the result with its measured execution work."""
+
+    def complete(self, tokens, spans, stats, offset):
+        """Build the operator's result from its measured work."""
+        self.result_value = self.result(
+            tokens, gpu_seconds(spans), len(spans), stats)
+
+    def results(self) -> dict:
+        """Return results keyed by physical node ID."""
+        return {self.node.node_id: self.result_value}
+
+
+def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
+                  attention=None, label="", limit=None, stop_groups=None,
+                  paged=True, on_answers=None) -> dict:
+    """Run prepared operator work together and collect per-node results."""
+    stages = gated_stages(parts)
+    paged = paged or state.loaded_model.pipeline.needs_pages
+    if keep_kv and not paged:
+        raise ValueError("retaining document KV requires arena writes")
+    if tree is not None and not tree.shared_tokens:
+        tree = None
+    settled = next((part.on_settled for part in parts
+                    if part.on_settled is not None), None)
+    if settled is None:
+        settled = settle_documents(state.loaded_model.arena, keys, prefixes,
+                                   keep_kv, state.chunk_tokens)
+    stats = {}
+    every, spans, tokens = run_stages(
+        state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+        stages, prefixes, state.chunk_tokens, anchor_keys=keys,
+        on_settled=settled, prefix_tree=tree, stats=stats, gpu_timing=state.gpu_timing,
+        attention_mode=next((part.attention for part in parts if part.attention),
+                            attention),
+        staging=input_staging(state), label=label, limit=limit,
+        stop_groups=stop_groups, paged=paged,
+        on_chunk=transition_reporter(parts), on_answers=on_answers,
+        appended_tokens=max(part.appended_tokens for part in parts) or None)
+    complete_parts(parts, every, spans, tokens, stats)
+    return {node_id: result for part in parts
+            for node_id, result in part.results().items()}
 
 
 def gated_stages(parts) -> list:
@@ -69,6 +161,8 @@ def gated_stages(parts) -> list:
     Raises:
         ValueError: A trailing condition has no following stage.
     """
+    for implementation, group in groupby(parts, type):
+        implementation.prepare_group(list(group))
     stages = []
     pending = []
     for part in parts:
@@ -103,26 +197,35 @@ def _part_slices(parts) -> list:
     return slices
 
 
-def report_chain_transitions(parts, transitions) -> None:
-    """Notify filter parts when documents pass or fail their final stage.
-
-    Args:
-        parts: Pipeline parts in execution order.
-        transitions: (document index, stage index, passed) completion records.
-            Intermediate successful stages do not complete a filter part.
-    """
+def transition_reporter(parts):
+    """Build a stage-indexed callback for operators that report completions."""
+    listeners = []
+    owners = []
     for part, (low, high) in zip(parts, _part_slices(parts)):
         if part.document_done is None:
+            owners.extend([None] * (high - low))
             continue
-        finished = [(anchor, stage - low, passed)
-                    for anchor, stage, passed in transitions
-                    if low <= stage < high
-                    and (not passed or stage == high - 1)]
-        if finished:
-            part.document_done(finished)
+        index = len(listeners)
+        listeners.append(part.document_done)
+        owners.extend([(index, low)] * (high - low))
+    if not listeners:
+        return None
+
+    def report(transitions):
+        finished = [[] for _ in listeners]
+        for anchor, stage, passed in transitions:
+            owner = owners[stage]
+            if owner is not None:
+                index, low = owner
+                finished[index].append((anchor, stage - low, passed))
+        for listener, records in zip(listeners, finished):
+            if records:
+                listener(records)
+
+    return report
 
 
-def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
+def complete_parts(parts, every, spans, tokens, stats):
     """Finalize pipeline parts and store each operator's result.
 
     The first part with stages receives document token costs, prefix-sharing
@@ -135,8 +238,6 @@ def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
         spans: Per-chunk row counts and timing events.
         tokens: Fresh token count excluding the final consumer's own work.
         stats: Packing time and prefix-sharing counts.
-        torch: Torch module used to synchronize timing events.
-        inputs: Execution settings, including whether GPU timing is enabled.
     """
     slices = _part_slices(parts)
     own = [part.finish(every[low:high])
@@ -145,28 +246,18 @@ def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
     remainder = tokens - sum(own[index] or 0 for index in staged[1:])
     for index, (part, (low, high)) in enumerate(zip(parts, slices)):
         part_spans = stage_spans(spans, low, high)
-        part.result_value = part.result(
+        part.complete(
             remainder if staged and index == staged[0] else (own[index] or 0),
-            gpu_seconds(torch, part_spans, inputs),
-            chunks(part_spans, inputs), stats if staged and index == staged[0]
-            else {})
+            part_spans, stats if staged and index == staged[0] else {},
+            low)
 
 
 def execution_prefix_tree(node, documents, arena):
     """Build the requested prefix tree, or return None if sharing is disabled."""
-    shares = (node.spec.share_prefixes if isinstance(node, AiClassify)
-              else node.share_prefixes)
-    if not shares:
+    settings = getattr(node, "spec", node)
+    if not settings.share_prefixes:
         return None
-    started = time.perf_counter()
-    tree = prefix_tree(documents, arena.page_tokens)
-    logger.info(
-        "prefix sharing on %s: %s documents borrow %s tokens "
-        "(tree built in %.2f s)",
-        node.spec.aliases[0] if isinstance(node, AiClassify)
-        else getattr(node, "alias", None) or node.anchor,
-        len(documents), tree.shared_tokens, time.perf_counter() - started)
-    return tree
+    return shared_prefix_tree(node.document_aliases[0], documents, arena)
 
 
 def stage_spans(spans, low, high) -> list:
@@ -189,27 +280,73 @@ def stage_spans(spans, low, high) -> list:
     return narrowed
 
 
-def gpu_seconds(torch, spans, inputs) -> float:
+def gpu_seconds(spans) -> float:
     """Calculate GPU seconds attributable to the selected stage rows.
 
     Args:
-        torch: Torch module used to synchronize CUDA events.
-        spans: Selected stage row counts and timing events per chunk.
-        inputs: Execution settings, including gpu_timing.
-
-    Returns:
-        GPU seconds weighted by each span's fraction of chunk rows, or 0.0
-        if GPU timing is disabled.
+        spans: Stage row counts and completed CUDA timing events per chunk.
+            Empty when GPU timing is disabled.
     """
-    if not inputs.get("gpu_timing"):
-        return 0.0
-    # elapsed_time needs every end event to have completed
-    torch.cuda.synchronize()
     return sum(
         start.elapsed_time(end) * min(1.0, sum(rows.values()) / tokens)
         for rows, tokens, start, end in spans if tokens) / 1000.0
 
 
-def chunks(spans, inputs) -> int:
-    """Return the number of timed forward chunks, or zero if timing is disabled."""
-    return len(spans) if inputs.get("gpu_timing") else 0
+def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
+    """Return a callback that applies the final operator's KV retention setting."""
+    if keep_kv and arena.retention_cap_pages is None:
+        arena.retention_cap_pages = max(
+            0, arena.n_pages - arena.pages_needed(2 * budget))
+
+    def settled(anchor, survived, row):
+        key = keys[anchor]
+        if not arena.is_resident(key):
+            return
+        if survived and keep_kv:
+            arena.retain(key, len(prefixes[anchor]))
+        else:
+            arena.free_key(key)
+
+    return settled
+
+
+class AnswerStream:
+    """Send documents' finished answers to a callback, each document once.
+
+    Args:
+        on_answers: Callable(document positions, values), or None to send
+            nothing.
+    """
+
+    def __init__(self, on_answers):
+        self.on_answers = on_answers
+        self.sent = set()
+
+    def chunk(self, value_of):
+        """Return an on_chunk callback for run_stages, or None.
+
+        Args:
+            value_of: Callable(document position) -> its answer, or None
+                while it has none.
+        """
+        if self.on_answers is None:
+            return None
+        return lambda transitions: self.send(
+            sorted({anchor for anchor, _, _ in transitions}), value_of)
+
+    def send(self, anchors, value_of):
+        """Send the answers of the anchors that have one and were not sent."""
+        ready = []
+        for anchor in anchors:
+            value = None if anchor in self.sent else value_of(anchor)
+            if value is not None:
+                ready.append((anchor, value))
+        if ready:
+            self.sent.update(anchor for anchor, _ in ready)
+            self.on_answers(np.asarray([anchor for anchor, _ in ready]),
+                            [value for _, value in ready])
+
+    def finish(self, anchors, value_of):
+        """Send every remaining answer after the run."""
+        if self.on_answers is not None:
+            self.send(anchors, value_of)

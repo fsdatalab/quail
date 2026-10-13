@@ -3,24 +3,102 @@
 import numpy as np
 import pyarrow as pa
 
-from quail.backends.quail.executor.classify import ClassifyStages, JoinPartners
+from quail.backends.quail.executor.label_stages import (
+    ClassifyStages,
+    JoinPartners,
+    document_prefixes,
+)
+from quail.backends.quail.executor.parts import (
+    AnswerStream,
+    SingleResultPart,
+    execute_parts,
+    shared_prefix_tree,
+)
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.execution.reranker import (
+from quail.backends.quail.reranker import (
+    RerankerBatch,
     _score_table,
     attach_prior_columns,
     classify_outputs,
     probability_column,
     scored_batch,
 )
-from quail.execution.runner import NodeMetrics, NodeResult
+from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.selection import document_positions
 from quail.logical import PROBABILITIES_SUFFIX
-from quail.physical import AiClassify, ValueType
+from quail.physical import ValueType
 from quail.progress import answer_sink
 
 
+class ClassifyBatch(SingleResultPart):
+    """Classification stages, answer streaming, and batch results."""
+
+    def __init__(self, plan, on_answers=None, prefix_tokens=0):
+        self.plan = plan
+        self.stages = plan.stages
+        self.prefix_tokens = prefix_tokens
+        self.stream = AnswerStream(on_answers)
+        self.document_done = self.stream.chunk(lambda anchor: plan.labels[anchor])
+
+    def finish(self, every) -> int:
+        """Finalize labels and count tokens processed after the documents."""
+        self.reached = len(every[0]) if every else 0
+        self.suffix_tokens, self.streamed_tokens = self.plan.finish(every)
+        self.stream.finish(range(len(self.plan.labels)),
+                           lambda anchor: self.plan.labels[anchor])
+        return self.streamed_tokens
+
+    def result(self, tokens, gpu_s, chunks, stats) -> RerankerBatch:
+        return RerankerBatch(
+            self.plan.labels, fresh_tokens=tokens,
+            cached_tokens=self.prefix_tokens + self.streamed_tokens - tokens,
+            suffix_tokens=self.suffix_tokens,
+            borrowed_tokens=stats.get("borrowed_tokens", 0),
+            pack_s=stats.get("pack_s", 0.0), gpu_s=gpu_s, chunks=chunks,
+            probabilities=self.plan.probabilities)
+
+    def results(self) -> dict:
+        return {self.plan.spec.name: self.result_value}
+
+
+class QuailClassifier:
+    """Classify document rows with Quail's token admission and KV arena."""
+
+    def __init__(self, state: QueryExecutionState):
+        self.state = state
+
+    def classify(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
+        """Classify document rows using the shared scheduler and KV arena.
+
+        Args:
+            spec: Classification specification.
+            rows: Document IDs to classify, in input order.
+            documents: Tokenized documents indexed by table alias and document ID.
+            on_answers: Optional callable(row positions, labels) run with each
+                chunk's newly labeled rows.
+
+        Returns:
+            A RerankerBatch containing labels, optional label probabilities,
+            token counts, and execution metrics.
+        """
+        state = self.state
+        rows = np.asarray(rows, dtype=np.int32).reshape(-1)
+        prefixes = document_prefixes(spec, documents, rows)
+        keys = [("classify", spec.name, index) for index in range(len(rows))]
+        tree = (shared_prefix_tree(spec.name, prefixes, state.loaded_model.arena)
+                if spec.share_prefixes else None)
+        plan = ClassifyStages(state, spec, len(rows), lambda key: key[2])
+        # a canvas is drawn from the document's row, so an answer is
+        # the same in any batch
+        plan.seeds = rows
+        part = ClassifyBatch(plan, on_answers, sum(map(len, prefixes)))
+        return execute_parts(
+            state, [part], prefixes, keys, keep_kv=False, tree=tree,
+            label=f"classify {spec.name}")[spec.name]
+
 def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
     """Prepare a classification with the labels its inputs provide."""
-    position = {document: index for index, document in enumerate(ids)}
+    position = document_positions(ids)
     plan = ClassifyStages(state, node.spec, len(ids),
                           lambda key: position[key[1]])
     plan.seeds = ids
@@ -38,11 +116,8 @@ def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
 def joined_classification(state: QueryExecutionState, node, join, ids,
                           join_inputs, context):
     """Build classification stages for the pairs retained by a join."""
-    if not isinstance(node, AiClassify) or node.spec.partner is None:
-        raise TypeError(
-            f"{node.type_name!r} cannot follow a join in its pipeline")
     spec = node.spec
-    stage = next(stage for stage in join.stages
+    stage = next(stage for stage in join
                  if set(spec.aliases) == {stage.anchor, *stage.partners})
     # the join's partner tuples, one partner alias each
     partner_ids = [int(entry[0]) if isinstance(entry, (tuple, list))
@@ -50,54 +125,55 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
                    for entry in join_inputs["partner_indices"][
                        stage.written_pos]]
     documents = context.state["docs"][spec.partner]
-    kept = KeptPairs(join.stages.index(stage))
+    kept = KeptPairs(join.index(stage))
     partners = JoinPartners(
         ids=partner_ids,
         documents=[documents[partner] for partner in partner_ids],
         kept=kept.of)
-    position = {document: index for index, document in enumerate(ids)}
+    position = document_positions(ids)
     plan = ClassifyStages(state, spec, len(ids),
                           lambda key: position[key[1]], partners=partners)
     return ClassifyPart(node, ids, plan, kept=kept)
 
 
-class ClassifyPart:
+class ClassifyPart(ClassifyBatch):
     """Classification stages and result tables within a pipeline."""
 
-    gate = None
-    document_done = None
-    result_value = None
+    @staticmethod
+    def model_inputs(node, inputs, context, sequence=None, nodes=None):
+        # scored through the reranker readout over the documents
+        return {"score_inputs": inputs, "documents": context.state["docs"],
+                "pre": context.state.get("pre", [])}
+
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        """Prepare labels for documents or for the pairs retained by a join."""
+        from quail.backends.quail.executor.operators.join import JoinPart
+
+        node = nodes[0]
+        if node.spec.partner is None:
+            return classification_part(state, node, ids, parts, inputs[node.node_id])
+        join = next(part for part in reversed(parts) if isinstance(part, JoinPart))
+        part = joined_classification(state, node, join.nodes, ids, join.inputs, context)
+        join.add_reader(part.kept)
+        return part
 
     def __init__(self, node, ids, plan: ClassifyStages, priors=(), kept=None,
                  prior_tables=()):
         self.node = node
         self.ids = ids
-        self.plan = plan
         self.priors = priors      # (part, port) of each label table read
         self.prior_tables = prior_tables
         self.kept = kept          # KeptPairs, for joined rows
-        self.stages = plan.stages
-        self.reached = 0
-        self.suffix_tokens = 0
+        sink = answer_sink()
+        rows = np.asarray(ids).reshape(-1, 1) if sink is not None else None
+        super().__init__(plan,
+            (lambda positions, values: sink(scored_batch(
+                node, rows[positions], values)))
+            if sink is not None and plan.partners is None else None)
 
-    def label(self, document) -> str | None:
-        """Return the category assigned to a document ID, or None if unresolved."""
-        return self.plan.labels[self.ids.index(document)] \
-            if not hasattr(self, "_position") else \
-            self.plan.labels[self._position[document]]
-
-    def finish(self, every) -> int:
-        """Finalize labels, set reached and suffix_tokens, and count tokens.
-
-        Args:
-            every: Per-stage answer mappings for this classification.
-
-        Returns:
-            Total streamed tokens, including the classification frame.
-        """
-        self.reached = len(every[0]) if every else 0
-        self.suffix_tokens, streamed = self.plan.finish(every)
-        return streamed
+    def results(self) -> dict:
+        return {self.node.node_id: self.result_value}
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         spec = self.node.spec
@@ -138,9 +214,6 @@ class ClassifyPart:
         priors.update({spec.aliases[0]: part.result_value.outputs[port]
                        for part, port in self.priors})
         table = attach_prior_columns(table, priors)
-        sink = answer_sink()
-        if sink is not None and len(rows):
-            sink(scored_batch(self.node, rows, table))
         return NodeResult(classify_outputs(self.node, table), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),
             evaluated_documents=self.reached, fresh_tokens=tokens,

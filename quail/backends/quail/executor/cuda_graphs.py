@@ -137,7 +137,6 @@ class DecodeGraphs:
         self.graphs = []
         self.storage = None
         self.replays = 0
-        self.fallbacks = 0
         self.capture_s = 0.0
 
     @property
@@ -227,5 +226,4 @@ class DecodeGraphs:
                     captured.graph.replay()
                     self.replays += 1
                     return captured.output.index_select(0, chunk.final_indices)
-        self.fallbacks += 1
         return self.pipeline.forward_chunk(chunk)

@@ -33,9 +33,7 @@ def read_label_table(catalog: Catalog, name: str) -> tuple[tuple, tuple]:
     wanted = [column for column in ("label", "description", "ordinal")
               if column in columns]
     table = pa.Table.from_batches(
-        provider.scan(ScanRequest(columns=tuple(wanted))),
-        schema=provider.schema.select(wanted) if hasattr(
-            provider.schema, "select") else None)
+        provider.scan(ScanRequest(columns=tuple(wanted))))
     if "ordinal" in wanted:
         ordinals = table.column("ordinal").to_pylist()
         if len(set(ordinals)) != len(ordinals) or None in ordinals:

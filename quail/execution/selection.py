@@ -1,5 +1,6 @@
 """Evaluate column predicates over a provider's values."""
 
+import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
@@ -54,3 +55,11 @@ def selected_rows(columns: dict, predicates) -> pa.Array:
     if isinstance(mask, pa.ChunkedArray):
         mask = mask.combine_chunks()
     return pc.indices_nonzero(mask)
+
+
+def document_positions(ids) -> np.ndarray:
+    """Map document IDs to positions in a selection; absent IDs map to -1."""
+    ids = np.asarray(ids, dtype=np.int64)
+    positions = np.full(int(ids.max()) + 1 if len(ids) else 0, -1, dtype=np.int32)
+    positions[ids] = np.arange(len(ids), dtype=np.int32)
+    return positions

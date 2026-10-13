@@ -16,7 +16,7 @@ from pathlib import Path
 import modal
 
 from demos.civil_comments.quail_backend import evaluate
-from quail.bench.images import pypi_gpu_image
+from quail.deploy.images import pypi_gpu_image
 
 RESULTS_MOUNT = Path("/results")
 RESULTS_DIR = Path("demos/civil-comments/quail")

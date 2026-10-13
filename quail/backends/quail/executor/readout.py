@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from quail.backends.quail.executor.model import answer_weights
-from quail.logical import true_false_ids
+from quail.planner.prompt_lowering import true_false_ids
 
 
 class AnswerRows:
@@ -105,7 +105,34 @@ def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
             np.arange(int(counts.sum())) - starts)
 
 
-class AsyncLabelLogprobs:
+class _HostReadout:
+    """Copy readout tensors asynchronously using reusable pinned buffers."""
+
+    def __init__(self, torch):
+        self.torch = torch
+        self.available = []
+
+    def _copy(self, values):
+        host = self.available.pop() if self.available else None
+        if host is None or host.shape[0] < values.shape[0]:
+            host = self.torch.empty(values.shape, dtype=values.dtype, pin_memory=True)
+        host[:values.shape[0]].copy_(values, non_blocking=True)
+        event = self.torch.cuda.Event()
+        event.record()
+        return event, host, values.shape[0]
+
+    def result(self, handle, *, copy=True):
+        """Read completed values; an uncopied view expires when its buffer is reused."""
+        event, host, count = handle
+        event.synchronize()
+        values = host[:count].numpy()
+        if copy:
+            values = values.copy()
+        self.available.append(host)
+        return values
+
+
+class AsyncLabelLogprobs(_HostReadout):
     """Asynchronous readout of selected tokens' log probabilities or logits.
 
     With normalize=True, each token's log probability is normalized over
@@ -127,7 +154,7 @@ class AsyncLabelLogprobs:
     BLOCK_ROWS = 512
 
     def __init__(self, torch, F, head, targets, rows=1, normalize=True):
-        self.torch = torch
+        super().__init__(torch)
         self.F = F
         self.head = head
         self.targets = torch.tensor(list(targets), device=head.device,
@@ -138,7 +165,6 @@ class AsyncLabelLogprobs:
             0, self.targets)
         self.dtype = np.dtype((np.float32, (rows, len(targets)) if rows > 1
                                else (len(targets),)))
-        self.available = []
 
     def logprobs(self, normed):
         """Compute selected token values from normalized hidden states.
@@ -189,24 +215,10 @@ class AsyncLabelLogprobs:
         elif rows_per_answer is not None and any(
                 n != 1 for n in rows_per_answer):
             raise ValueError("this readout holds one row per answer")
-        host = self.available.pop() if self.available else None
-        if host is None or host.shape[0] < values.shape[0]:
-            host = torch.empty(values.shape, dtype=torch.float32,
-                               pin_memory=True)
-        host[:values.shape[0]].copy_(values, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        return event, host, values.shape[0]
-
-    def result(self, handle):
-        event, host, count = handle
-        event.synchronize()
-        values = host[:count].numpy().copy()
-        self.available.append(host)
-        return values
+        return self._copy(values)
 
 
-class AsyncTopLogprobs:
+class AsyncTopLogprobs(_HostReadout):
     """Asynchronous readout of each row's likeliest tokens' log probabilities.
 
     A row's values are the log probabilities of the extra tokens, then
@@ -231,7 +243,7 @@ class AsyncTopLogprobs:
     BLOCK_ROWS = AsyncLabelLogprobs.BLOCK_ROWS
 
     def __init__(self, torch, F, head, k, extras, ragged=False):
-        self.torch = torch
+        super().__init__(torch)
         self.F = F
         self.head = head
         self.k = k
@@ -245,7 +257,6 @@ class AsyncTopLogprobs:
         self.ragged = ragged
         self.dtype = (np.dtype(object) if ragged
                       else np.dtype((np.float32, (self.width,))))
-        self.available = []
 
     def values(self, normed):
         """Compute each row's values from normalized hidden states."""
@@ -267,22 +278,11 @@ class AsyncTopLogprobs:
         return out
 
     def submit(self, normed, rows_per_answer=None):
-        torch = self.torch
-        values = self.values(normed)
-        host = self.available.pop() if self.available else None
-        if host is None or host.shape[0] < values.shape[0]:
-            host = torch.empty(values.shape, dtype=torch.float32,
-                               pin_memory=True)
-        host[:values.shape[0]].copy_(values, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        return event, host, values.shape[0], rows_per_answer
+        return (*self._copy(self.values(normed)), rows_per_answer)
 
     def result(self, handle):
-        event, host, count, rows_per_answer = handle
-        event.synchronize()
-        values = host[:count].numpy().copy()
-        self.available.append(host)
+        *transfer, rows_per_answer = handle
+        values = super().result(transfer)
         return split_rows(values, rows_per_answer) if self.ragged else values
 
 
@@ -298,16 +298,15 @@ def split_rows(values, rows_per_answer):
     return out
 
 
-class AsyncScores:
+class AsyncScores(_HostReadout):
     """Non-blocking yes-against-no sigmoid readout for AI.SCORE."""
 
     dtype = np.float32
 
     def __init__(self, torch, rows):
-        self.torch = torch
+        super().__init__(torch)
         self.rows = rows
         self.weights = rows.weights.float()
-        self.available = []
 
     def submit(self, normed):
         torch, rows = self.torch, self.rows
@@ -316,22 +315,8 @@ class AsyncScores:
         no = logits.index_select(1, rows.false_cols).amax(dim=1)
         return self._copy(torch.sigmoid(yes - no))
 
-    def _copy(self, scores):
-        """Copy scores to a pinned host buffer behind an event."""
-        torch = self.torch
-        host = self.available.pop() if self.available else None
-        if host is None or host.numel() < scores.shape[0]:
-            host = torch.empty(scores.shape[0], dtype=torch.float32, pin_memory=True)
-        host[:scores.shape[0]].copy_(scores, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        return event, host, scores.shape[0]
-
     def result(self, handle):
-        event, host, count = handle
-        event.synchronize()
-        self.available.append(host)
-        return host[:count].numpy()
+        return super().result(handle, copy=False)
 
 
 class DecisionHead:

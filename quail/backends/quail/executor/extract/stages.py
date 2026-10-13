@@ -23,7 +23,7 @@ from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
 from quail.backends.quail.executor.stages import Stage
-from quail.execution.tokens import chain_tokens
+from quail.catalog.tokens import concat_tokens
 
 
 class ExtractionStages:
@@ -78,9 +78,9 @@ class ExtractionStages:
         self.docs = [self._prepare(index, document, text, tokens, prior)
                      for index, (document, text, tokens, prior) in enumerate(
                          zip(document_ids, shown, encoded, stored))]
-        self.document_indices = np.full(max(document_ids, default=-1) + 1,
-                                        -1, dtype=np.int64)
-        self.document_indices[document_ids] = np.arange(len(document_ids))
+        document_ids = np.asarray(document_ids, dtype=np.int64)
+        self.document_order = np.argsort(document_ids, kind="stable")
+        self.document_ids = document_ids[self.document_order]
         self.prefixes = [doc.prefix for doc in self.docs]
         self.keys = [doc.key for doc in self.docs]
         self.readout = self._readout(state) if readout is None else readout
@@ -152,11 +152,9 @@ class ExtractionStages:
             same_tokens = np.array_equal(prior, tokens)
         if shared and stored is not None and same_tokens:
             key = (alias, int(document))
-        prefix = chain_tokens(self.head, ids)
-        bounds = ids.character_offsets
-        scan = DocumentTokens(
-            np.arange(len(ids), dtype=np.int64) + len(self.head),
-            bounds[:, 0], bounds[:, 1], tokens, self.vocabulary.key_of[tokens])
+        prefix = concat_tokens(self.head, ids)
+        scan = DocumentTokens.from_tokens(
+            self.vocabulary, tokens, ids.character_offsets, len(self.head))
         return Document(index=index, text=text, prefix=prefix, scan=scan, key=key,
                         answers=[AnswerState() for _ in self.specs])
 
@@ -176,13 +174,17 @@ class ExtractionStages:
 
     def _step_suffix(self, q, key):
         """Feed the chosen token, then the document's next tokens as a draft."""
-        answer = self.docs[self.document_indices[key[1]]].answers[q]
+        answer = self._answer(q, key)
         if answer.done:
             return Stage.SKIP
         return [self.decoder.draft(answer)]
 
     def _step_discard(self, q, key):
-        return self.docs[self.document_indices[key[1]]].answers[q].discard
+        return self._answer(q, key).discard
+
+    def _answer(self, q, key):
+        position = np.searchsorted(self.document_ids, key[1], side="right") - 1
+        return self.docs[self.document_order[position]].answers[q]
 
     def _step_decide(self, q, anchor, row):
         """Verify the round's draft by the row after each of its tokens."""

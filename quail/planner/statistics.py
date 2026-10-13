@@ -8,13 +8,17 @@ on the plan's nodes: each table's filter order and the join sequence.
 """
 
 import math
-from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
 from operator import mul
 
+import pyarrow as pa
+import pyarrow.compute as pc
+
 from quail.cost import budgets
-from quail.cost.filters import filter_chain_work, filter_cost
+from quail.cost.filters import filter_cost, filter_sequence_work
+from quail.cost.joins import PricedJoin
 from quail.cost.retention import retention_pages
 from quail.cost.score import ScoreCost
 from quail.cost.work import Work, triangle
@@ -27,9 +31,10 @@ from quail.logical import (
     join_conditions,
     model_call,
 )
-from quail.logical.prompts import prompt_aliases, score_token_parts
+from quail.logical.prompts import prompt_aliases
 from quail.planner.filter_order import PredicateCost
 from quail.planner.plan import CorpusStats
+from quail.planner.prompt_lowering import LoweredPrompt, score_token_parts
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -47,6 +52,12 @@ class AliasStats:
     @property
     def mean(self) -> float:
         return self.total / self.count if self.count else 0.0
+
+    @property
+    def variance(self) -> float:
+        if not self.count:
+            return 0.0
+        return (self.squared * self.count - self.total * self.total) / self.count**2
 
     def window_pairs(self, offset: float) -> float:
         """Sum sliding pairs for document lengths plus an offset."""
@@ -66,26 +77,33 @@ class AliasStats:
             for length, count in self.short_counts if length + offset < cap)
 
 
-def summarize_alias(lengths, window: int = 0) -> AliasStats:
-    """Summarize document lengths in one pass."""
-    count = total = squared = maximum = 0
-    short_counts = Counter()
-    for raw in lengths:
-        length = int(raw)
-        count += 1
-        total += length
-        squared += length * length
-        maximum = max(maximum, length)
-        if length < window:
-            short_counts[length] += 1
-    return AliasStats(
-        count=count,
-        total=total,
-        squared=squared,
-        maximum=maximum,
+def summarize_alias(lengths, window: int = 0, *, memo=None) -> AliasStats:
+    """Summarize a length column, optionally reusing a query's cached summary."""
+    key = ("alias_stats", id(lengths), window)
+    if memo is not None and key in memo:
+        return memo[key][1]
+    values = getattr(lengths, "arrow_array", lengths)
+    if not isinstance(values, (pa.Array, pa.ChunkedArray)):
+        values = pa.array(values, type=pa.int64())
+    else:
+        values = values.cast(pa.int64())
+    short_counts = ()
+    if window:
+        counts = pc.value_counts(pc.filter(values, pc.less(values, window)))
+        short_counts = tuple(sorted(zip(
+            counts.field("values").to_pylist(), counts.field("counts").to_pylist())))
+    summary = AliasStats(
+        count=len(values),
+        total=pc.sum(values).as_py() or 0,
+        squared=pc.sum(pc.multiply(values, values)).as_py() or 0,
+        maximum=pc.max(values).as_py() or 0,
         window=window,
-        short_counts=tuple(sorted(short_counts.items())),
+        short_counts=short_counts,
     )
+    if memo is not None:
+        # Keep the source alive so another column cannot reuse its identity.
+        memo[key] = (lengths, summary)
+    return summary
 
 
 def scale_alias(stats: AliasStats, fraction: float) -> AliasStats:
@@ -118,10 +136,10 @@ def surviving_docs(n_docs: float, n_partners: float,
                      ** max(1.0, n_partners))
 
 
-def thin(live: dict, spec: dict) -> None:
+def thin(live: dict, spec: PricedJoin) -> None:
     """Update live document counts after one join's selectivity."""
-    sel = spec["selectivity"]
-    aliases = spec["aliases"]
+    sel = spec.selectivity
+    aliases = spec.aliases
 
     def others(x):
         out = 1.0
@@ -130,51 +148,45 @@ def thin(live: dict, spec: dict) -> None:
                 out *= live[a]
         return out
 
-    if spec["semantics"] == "full":
+    if spec.semantics == "full":
         new = {a: surviving_docs(live[a], others(a), sel)
                for a in aliases}
         live.update(new)
     else:
-        anchor = spec["anchor"]
+        anchor = spec.anchor
         matched = surviving_docs(live[anchor], others(anchor), sel)
-        live[anchor] = (matched if spec["semantics"] == "exists"
+        live[anchor] = (matched if spec.semantics == "exists"
                         else live[anchor] - matched)
 
 
-def cross_tuples(spec: dict, live: dict) -> float:
+def cross_tuples(spec: PricedJoin, live: dict) -> float:
     """Expected tuples of one join.
 
     The live cross product, or the fraction of it the join's equality
     conditions keep.
     """
     tuples = 1.0
-    for a in spec["aliases"]:
+    for a in spec.aliases:
         tuples *= live[a]
-    return tuples * spec.get("pair_fraction", 1.0)
+    return tuples * spec.pair_fraction
 
 
-def question_tokens(prompt, canvas: int = 0) -> int:
+def question_tokens(lowered: LoweredPrompt, canvas: int = 0) -> int:
     """Token count of the prompt's per-evaluation tail.
 
     canvas is the rows a diffusion model appends to every evaluation
     to answer on; a decoder answers on the tail's last row.
     """
-    if prompt.tail_tokens is None or prompt.preamble_tokens is None:
-        raise ValueError(
-            "prompts were bound without a tokenizer; the planner "
-            "needs token counts (pass one to compile_sql / docs)")
-    return prompt.tail_tokens + canvas
+    if lowered.tail_tokens is None:
+        raise ValueError("a score prompt has no question tail")
+    return lowered.tail_tokens + canvas
 
 
-def preamble_tokens(filters, joins) -> int:
-    """Return the engine preamble's token count from any bound prompt."""
-    for fs in filters.values():
-        for p in fs:
-            if p.prompt.preamble_tokens is not None:
-                return p.prompt.preamble_tokens
-    for j in joins:
-        if j.prompt.preamble_tokens is not None:
-            return j.prompt.preamble_tokens
+def preamble_tokens(lowered_prompts) -> int:
+    """Return the engine preamble's token count from any lowered prompt."""
+    for lowered in lowered_prompts:
+        if lowered.preamble_tokens is not None:
+            return lowered.preamble_tokens
     return 0
 
 
@@ -183,19 +195,14 @@ def _join_aliases(join) -> list:
     return [r.alias for r in join.prompt.args]
 
 
-def _label_counts(join) -> dict:
+def _label_counts(lowered: LoweredPrompt) -> dict:
     """Return alias -> (block_label_tokens, anchor_frame_tokens)."""
-    out = {a: (lt, nt) for a, lt, nt in join.prompt.labels}
-    if any(lt is None for lt, _ in out.values()):
-        raise ValueError(
-            "join prompts were bound without a tokenizer; the planner "
-            "needs token counts (pass one to compile_sql / docs)")
-    return out
+    return {a: (lt, nt) for a, lt, nt in lowered.labels}
 
 
 def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
-               context=None, chunk: int = 0) -> list:
-    """The joins as the search's spec dicts, in written order.
+               context=None, chunk: int = 0) -> list[PricedJoin]:
+    """The joins as the cost model prices them, in written order.
 
     pair_fractions maps a written position to the fraction of the
     cross product its equality conditions keep; a join with
@@ -211,26 +218,28 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
             parts, cost = score_statistics(j.prompt, context, chunk)
             left, right = prompt_aliases(j.prompt)
             head, middle, tail = map(len, parts)
-            out.append(dict(
-                written_pos=i, aliases=[left, right], anchor=left,
+            out.append(PricedJoin(
+                written_pos=i, aliases=(left, right), anchor=left,
                 anchor_free=False, semantics=j.semantics,
                 selectivity=j.selectivity,
                 frame_tokens={left: head + middle, right: 0},
                 label_tokens={left: 0, right: 0}, tail_tokens=tail + canvas,
-                on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
-                    for c in conditions], pair_fraction=fraction,
+                on=tuple((c.left.alias, c.left.column, c.right.alias,
+                          c.right.column) for c in conditions),
+                pair_fraction=fraction,
                 cost=ScoreJoinCost((left, right), cost, fraction)))
             continue
-        labels = _label_counts(j)
-        out.append(dict(
-            written_pos=i, aliases=_join_aliases(j), anchor=j.anchor,
+        lowered = context.lowered(j.prompt)
+        labels = _label_counts(lowered)
+        out.append(PricedJoin(
+            written_pos=i, aliases=tuple(_join_aliases(j)), anchor=j.anchor,
             anchor_free=(j.anchor is None and j.semantics == "full"),
             semantics=j.semantics, selectivity=j.selectivity,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
-            tail_tokens=question_tokens(j.prompt, canvas),
-            on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
-                for c in conditions],
+            tail_tokens=question_tokens(lowered, canvas),
+            on=tuple((c.left.alias, c.left.column, c.right.alias,
+                      c.right.column) for c in conditions),
             pair_fraction=fraction))
     return out
 
@@ -248,8 +257,9 @@ class PlanStatistics:
         admission: The admission budget in tokens.
         cap_pages: Pages the retention pool may hold.
         pre: The engine preamble's token count.
-        specs: The joins as the search's spec dicts, in written order.
+        specs: The joins as PricedJoin records, in written order.
         asks: alias -> written positions of its AI.IF predicates.
+        lowered: Every prompt of the plan, lowered to token ids.
     """
 
     stats: dict
@@ -261,6 +271,7 @@ class PlanStatistics:
     pre: int
     specs: tuple
     asks: dict
+    lowered: dict
 
 
 def ask_positions(filters) -> dict:
@@ -297,7 +308,12 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
     ask_filters = {alias: [operators.filters[alias][position]
                            for position in positions]
                    for alias, positions in asks.items() if positions}
-    lengths = {a: summarize_alias(t, model.sliding_window)
+    if context is None:
+        raise ValueError("plan statistics need a planning context")
+    lowered = {prompt: context.lowered(prompt) for prompt in (
+        *operators.prompts, *(node.call.prompt for node in operators.extracts))}
+    lengths = {a: summarize_alias(t, model.sliding_window,
+                                  memo=context.memo if context is not None else None)
                for a, t in doc_tokens.items()}
     for alias, fraction in (scan_fractions or {}).items():
         if alias in lengths:
@@ -320,10 +336,14 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
         stats=stats, lengths=lengths, chunk=chunk,
         arena_pages=tuple(arena_split), admission=admission,
         cap_pages=retention_pages(admission, chunk, budgets.PAGE_TOKENS),
-        pre=preamble_tokens(ask_filters, operators.joins),
+        pre=preamble_tokens(
+            lowered[prompt] for prompt in (
+                *(p.prompt for fs in ask_filters.values() for p in fs),
+                *(j.prompt for j in operators.joins))),
         specs=tuple(join_specs(operators.joins, pair_fractions,
                                model.canvas_tokens, context=context,
                                chunk=chunk)),
+        lowered=lowered,
         asks=asks)
 
 
@@ -375,19 +395,20 @@ def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
     return live
 
 
-def filter_alias_work(preds, stats, order, pre: int,
+def filter_alias_work(preds, stats, order, pre: int, lowered,
                       canvas: int = 0, window: int = 0) -> Work:
-    """Prepare a filter chain's counts and price its recorded order."""
+    """Prepare a filter sequence's counts and price its recorded order."""
     predicates = [preds[index] for index in order]
-    return filter_chain_work(
-        [question_tokens(predicate.prompt, canvas) for predicate in predicates],
+    return filter_sequence_work(
+        [question_tokens(lowered[predicate.prompt], canvas)
+         for predicate in predicates],
         [effective_selectivity(predicate.selectivity) for predicate in predicates],
         pre + stats.mean_doc_tokens, float(stats.n_docs), window)
 
 
 def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
                  model: ModelSpec, orders: dict) -> dict:
-    """Return the expected Work of each table's filter chain in run order.
+    """Return the expected Work of each table's filter sequence in run order.
 
     Args:
         plan: The logical plan.
@@ -400,7 +421,8 @@ def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
         alias: filter_alias_work(
             predicates, statistics.stats[alias],
             [i for i in orders.get(alias, []) if i in statistics.asks[alias]],
-            statistics.pre, model.canvas_tokens, model.sliding_window)
+            statistics.pre, statistics.lowered, model.canvas_tokens,
+            model.sliding_window)
         for alias, predicates in plan.operators().filters.items()
     }
 
@@ -433,11 +455,13 @@ def score_statistics(prompt, context, chunk, *, mean_tokens=None):
         context.memo[key] = score_token_parts(prompt, context.model, context.tokenizer)
     parts = context.memo[key]
     aliases = prompt_aliases(prompt)
-    lengths = tuple(context.document_tokens[alias] for alias in aliases)
+    summaries = tuple(summarize_alias(
+        context.document_tokens[alias], context.model.sliding_window,
+        memo=context.memo) for alias in aliases)
     if mean_tokens is None:
-        mean_tokens = sum(sum(values) / max(1, len(values)) for values in lengths)
+        mean_tokens = sum(summary.mean for summary in summaries)
     cost = ScoreCost(
-        token_lengths=tuple(map(len, parts)), lengths=lengths,
+        token_lengths=tuple(map(len, parts)), summaries=summaries,
         mean_tokens=mean_tokens, model=context.model, device=context.device,
         chunk_tokens=chunk,
         capacity=budgets.arena_tokens(context.model, context.device, chunk),
@@ -448,8 +472,20 @@ def score_statistics(prompt, context, chunk, *, mean_tokens=None):
 
 
 def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
-                         chunk_tokens, context=None) -> tuple[PredicateCost, ...]:
-    """Prepare costs and reusable result identities for predicate ordering."""
+                         chunk_tokens, context=None,
+                         lower=None) -> tuple[PredicateCost, ...]:
+    """Prepare costs and reusable result identities for predicate ordering.
+
+    Args:
+        predicates: The model predicates of one table.
+        prefix_tokens: The preamble and mean document tokens.
+        model: Model spec.
+        device: Device spec.
+        chunk_tokens: The forward pass token budget.
+        context: The planning context; prices scores and lowers prompts.
+        lower: Lowers a prompt when there is no context.
+    """
+    lower = context.lowered if lower is None else lower
     prepared = []
     for predicate in predicates:
         if is_score(predicate.expression):
@@ -458,7 +494,7 @@ def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
             first = later = cost.seconds
             reuse_key = predicate.prompt
         else:
-            q = question_tokens(predicate.prompt, model.canvas_tokens)
+            q = question_tokens(lower(predicate.prompt), model.canvas_tokens)
             first = partial(mul, filter_cost(
                 q, prefix_tokens, model, device, chunk_tokens, first=True))
             later = partial(mul, filter_cost(
@@ -481,19 +517,20 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
     Returns:
         The table's document lengths, budgets, and model settings.
     """
-    lengths = [int(length) for length in context.document_tokens[alias]]
-    count = len(lengths)
-    total = sum(lengths)
+    lengths = context.document_tokens[alias]
+    summary = summarize_alias(lengths, context.model.sliding_window, memo=context.memo)
+    if hasattr(lengths, "arrow_array"):
+        lengths = lengths.arrow_array.to_numpy()
     chunk = budgets.chunk_budget(context.model, context.device)
     capacity = budgets.arena_tokens(context.model, context.device, chunk)
     return ClassifyStatistics(
-        alias=alias, mean=total / max(1, count),
-        longest=max(lengths, default=0), budget=min(chunk, capacity),
+        alias=alias, mean=summary.mean,
+        longest=summary.maximum, budget=min(chunk, capacity),
         chunk=chunk,
         draws=context.canvas_draws if context.model.answer_canvas else 1,
         model=context.model,
         device=context.device,
-        capacity=capacity, lengths=tuple(lengths), shared=tuple(shared),
+        capacity=capacity, lengths=lengths, shared=tuple(shared),
         tree=(budgets.tree_attention_allowed(context.model)
               and getattr(context, "attention", None) != "unified"))
 
@@ -528,6 +565,6 @@ class ClassifyStatistics:
     device: object
     capacity: int = 0
     draws: int = 1
-    lengths: tuple = ()
+    lengths: Sequence = ()
     shared: tuple = ()
     tree: bool = False
