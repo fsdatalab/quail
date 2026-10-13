@@ -8,7 +8,8 @@ from typing import ClassVar
 import pytest
 
 from quail.builtins import built_in_registry
-from quail.execution.runner import ExecutionContext, GenericRunner, ScanRuntime
+from quail.execution.runner import ExecutionContext, GenericRunner
+from quail.execution.runtimes import ScanRuntime
 from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
 from quail.planner.physical_optimizer import apply_physical_rules
 

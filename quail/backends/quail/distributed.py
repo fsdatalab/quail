@@ -15,11 +15,10 @@ from quail.backends.quail.prompts import join_request
 from quail.backends.quail.reranker import score_in_batches
 from quail.catalog.pairs import columns_key
 from quail.catalog.tokens import select_documents
+from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
-    NodeMetrics,
-    NodeResult,
     compute_subgraph,
 )
 from quail.physical import (

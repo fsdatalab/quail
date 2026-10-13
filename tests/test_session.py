@@ -153,7 +153,7 @@ def make_executor(filter_truth, join_truth=None):
 
         from quail.backends.quail.graph import execute_single_graph
         from quail.builtins import built_in_registry
-        from quail.execution.runner import NodeMetrics, NodeResult
+        from quail.execution.metrics import NodeMetrics, NodeResult
         from quail.execution.types import PhysicalResponse
         from quail.physical import AiFilter, Scan, decode_graph
 

@@ -42,7 +42,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
         outputs = []
         for sub in subs:
             indices = sub["doc_index"]["d"]
-            from quail.execution.runner import NodeMetrics, NodeResult
+            from quail.execution.metrics import NodeMetrics, NodeResult
 
             result = NodeResult({
                 "ids:d": [index for index in indices if index % 2 == 0],

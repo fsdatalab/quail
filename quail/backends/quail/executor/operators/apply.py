@@ -2,7 +2,8 @@
 
 from quail.backends.quail.executor.parts import SingleResultPart
 from quail.backends.quail.executor.stages import Stage
-from quail.execution.runner import NodeResult, foreign_call, foreign_outputs
+from quail.execution.metrics import NodeResult
+from quail.execution.runtimes.dataflow import foreign_call, foreign_outputs
 
 
 class ApplyGate(SingleResultPart):

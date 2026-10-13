@@ -11,7 +11,7 @@ from bench import quailb
 from quail.api.execute import execute_query
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.reranker import _score_table
-from quail.execution.runner import NodeMetrics, NodeResult
+from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.types import PhysicalResponse
 from quail.logical.nodes import CompileError
 from quail.physical import (

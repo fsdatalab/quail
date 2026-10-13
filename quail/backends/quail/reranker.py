@@ -9,11 +9,8 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.backends.base import GpuContext
+from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import DEFAULT_BATCH_ROWS, answer_table, filter_answer_table
-from quail.execution.runner import (
-    NodeMetrics,
-    NodeResult,
-)
 from quail.logical import PROBABILITIES_SUFFIX
 from quail.physical import AiClassify, AiScore, ClassifySpec, Filter, InList, ValueType
 from quail.progress import answer_sink

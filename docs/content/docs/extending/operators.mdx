@@ -61,7 +61,7 @@ In the example, `ScanRuntime` reads the prepared document IDs and returns
 them under the name declared by `Scan`:
 
 ```python
-from quail.execution.runner import NodeResult
+from quail.execution.metrics import NodeResult
 
 
 class ScanRuntime:
@@ -83,7 +83,7 @@ For your operator:
 See the complete implementations of
 [`Scan`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py)
 and
-[`ScanRuntime`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py).
+[`ScanRuntime`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runtimes/relational.py).
 
 ## Register the operator
 

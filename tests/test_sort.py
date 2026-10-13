@@ -6,8 +6,9 @@ from test_planner import _optimize, _plan, node_kinds, tok
 
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, DocumentProvider
+from quail.execution.metrics import NodeResult
 from quail.execution.result import QueryResult
-from quail.execution.runner import NodeResult, SortRuntime
+from quail.execution.runtimes import SortRuntime
 from quail.explain import explain
 from quail.frontend.builder import col, count, docs, prompt
 from quail.logical import Result, Scan, SemanticFilter

@@ -360,7 +360,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
     assert SETTINGS["pre_ids"] == []
     if shape == "score_first":
         from quail.backends.quail.reranker import _score_table
-        from quail.execution.runner import NodeResult
+        from quail.execution.metrics import NodeResult
 
         execute = execution.execute
 

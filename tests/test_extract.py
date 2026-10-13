@@ -14,8 +14,8 @@ import quail
 from quail.backends.quail.reranker import RerankerModelExecution
 from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
+from quail.execution.metrics import NodeResult
 from quail.execution.result import extract_answer_table
-from quail.execution.runner import NodeResult
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.logical import (
     CompileError,

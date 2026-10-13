@@ -18,8 +18,8 @@ from quail.backends.quail.prompts import join_request
 from quail.baselines.nodes import RequestExecution
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
+from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.result import answer_table
-from quail.execution.runner import NodeMetrics, NodeResult, RunResult
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical.prompts import render_join_prompt_text
 from quail.physical import AiFilter, AiJoin, decode_graph

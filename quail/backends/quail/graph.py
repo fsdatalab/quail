@@ -8,14 +8,13 @@ from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.reranker import FilterRuntime
 from quail.backends.quail.retention import apply_retention
 from quail.catalog.pairs import columns_key
+from quail.execution.metrics import NodeResult, scalar_node_metrics
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
-    ModelNodeRuntime,
-    NodeResult,
     compute_subgraph,
-    scalar_node_metrics,
 )
+from quail.execution.runtimes import ModelNodeRuntime
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiClassify,

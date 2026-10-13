@@ -17,8 +17,8 @@ from quail.backends.quail.executor.parts import (
     stage_spans,
 )
 from quail.backends.quail.executor.state import QueryExecutionState
+from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import extract_answer_table
-from quail.execution.runner import NodeMetrics, NodeResult
 from quail.physical import AiExtract
 
 

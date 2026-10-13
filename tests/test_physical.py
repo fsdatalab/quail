@@ -14,7 +14,8 @@ import quail
 from quail.api.execute import _execute_physical
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
-from quail.execution.runner import BarrierRuntime, NodeResult
+from quail.execution.metrics import NodeResult
+from quail.execution.runtimes import BarrierRuntime
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
 from quail.logical import LogicalPlan
 from quail.physical import (
@@ -272,7 +273,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
 
 
 def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
-    from quail.execution.runner import NodeMetrics, scalar_node_metrics
+    from quail.execution.metrics import NodeMetrics, scalar_node_metrics
     from quail.explain import physical_tree
     from quail.physical.base import input_ports
 

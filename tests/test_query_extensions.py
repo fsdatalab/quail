@@ -9,7 +9,7 @@ from modal._serialization import deserialize, serialize
 import quail
 from quail.api import Session
 from quail.api import execute as runtime
-from quail.execution.runner import NodeMetrics, NodeResult, RunResult
+from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.physical import AiFilter, Scan, decode_graph
 

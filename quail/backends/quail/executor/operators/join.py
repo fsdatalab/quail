@@ -26,11 +26,8 @@ from quail.catalog.tokens import (
     concat_tokens,
     select_documents,
 )
-from quail.execution.runner import (
-    ExecutionContext,
-    NodeMetrics,
-    NodeResult,
-)
+from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.runner import ExecutionContext
 from quail.progress import answer_sink
 
 

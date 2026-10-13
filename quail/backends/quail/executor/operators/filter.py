@@ -12,10 +12,7 @@ from quail.catalog.tokens import (
     DocumentKeys,
     DocumentPrefixes,
 )
-from quail.execution.runner import (
-    NodeMetrics,
-    NodeResult,
-)
+from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.progress import answer_sink
 
 

@@ -33,6 +33,7 @@ from quail.catalog.pairs import (
 )
 from quail.cost import budgets
 from quail.execution.labels import match_label
+from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
 from quail.execution.result import (
     answer_table,
     extract_answer_table,
@@ -41,12 +42,9 @@ from quail.execution.result import (
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
-    ModelNodeRuntime,
-    NodeMetrics,
-    NodeResult,
     compute_subgraph,
-    scalar_node_metrics,
 )
+from quail.execution.runtimes import ModelNodeRuntime
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical import (

@@ -22,11 +22,11 @@ from quail.backends.quail.reranker import (
     score_in_batches,
 )
 from quail.catalog import Catalog, DocumentProvider
+from quail.execution.metrics import scalar_node_metrics
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
     compute_subgraph,
-    scalar_node_metrics,
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.frontend.sql import compile_sql
@@ -262,7 +262,7 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     from quail.backends.quail.graph import throughput
     from quail.cost.score import ScoreCost, score_work
     from quail.cost.work import Work, ask, scan
-    from quail.execution.runner import NodeMetrics
+    from quail.execution.metrics import NodeMetrics
     from quail.explain import run_summary
     from quail.planner.statistics import summarize_alias
     from quail.specs import H100_SXM, QWEN3_4B_FP8

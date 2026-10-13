@@ -8,7 +8,7 @@ from test_session import CONFIG, _run, fake_tok, make_executor
 import quail
 from quail.catalog import Catalog, DocumentProvider
 from quail.execution.result import QueryResult
-from quail.execution.runner import AggregateRuntime, aggregate_table
+from quail.execution.runtimes.relational import AggregateRuntime, aggregate_table
 from quail.explain import explain
 from quail.frontend.builder import avg, col, count, docs, max_, prompt, sum_
 from quail.logical import AggregateCall, Aggregation, CompileError, HavingTest

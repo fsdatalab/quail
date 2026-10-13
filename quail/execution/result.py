@@ -396,7 +396,7 @@ class QueryResult:
 
     def attach_executed_plan(self, codecs) -> "QueryResult":
         """Decode the executed plan and node metrics from a saved report."""
-        from quail.execution.runner import NodeMetrics
+        from quail.execution.metrics import NodeMetrics
         from quail.physical import decode_graph
 
         encoded = self.report.get("executed_plan")
