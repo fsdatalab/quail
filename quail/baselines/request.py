@@ -53,7 +53,6 @@ from quail.logical import (
     SPAN_SUFFIX,
     Alias,
     Apply,
-    answer_row_offsets,
     effective_selectivity,
     filter_question_text,
     join_label,
@@ -61,7 +60,6 @@ from quail.logical import (
     label_text,
     render_join_frame,
     shared_preamble,
-    true_false_token_ids,
 )
 from quail.logical import Aggregate as LogicalAggregate
 from quail.physical import (
@@ -86,6 +84,7 @@ from quail.planner import (
 from quail.planner.join_order import search_joins
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
+from quail.planner.prompt_lowering import answer_row_offsets, true_false_token_ids
 from quail.planner.statistics import prepare_filter_costs, summarize_alias
 from quail.planner.validation import extraction_refusal, has_extract, has_label
 
@@ -224,7 +223,10 @@ def plan_request_backend(
 
     rule = context.order or default_order_rule(ask_filters, joins)[0]
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
-    preamble_count = preamble_tokens(ask_filters, joins)
+    preamble_count = preamble_tokens(
+        context.lowered(prompt) for prompt in (
+            *(p.prompt for fs in ask_filters.values() for p in fs),
+            *(j.prompt for j in joins)))
     filter_orders = {
         alias: order_filters_indexed(prepare_filter_costs(
             predicates,
@@ -234,6 +236,7 @@ def plan_request_backend(
             model=context.model,
             device=context.device,
             chunk_tokens=chunk_tokens,
+            context=context,
         ), rule)
         for alias, predicates in ask_filters.items()
     }
@@ -243,7 +246,7 @@ def plan_request_backend(
     for alias, predicates in operators.all_filters().items():
         for predicate in predicates:
             live[alias] *= effective_selectivity(predicate.selectivity)
-    search_specs = logical_join_specs(joins, context.pair_fractions)
+    search_specs = logical_join_specs(joins, context.pair_fractions, context=context)
     join_search = search_joins(
         search_specs,
         live,
@@ -272,7 +275,7 @@ def plan_request_backend(
         prompts.extend(predicate.prompt for predicate in ask_filters[alias])
         written_positions = tuple(filter_orders[alias])
         questions = tuple(
-            tuple(predicates[position].prompt.tail_token_ids)
+            tuple(context.lowered(predicates[position].prompt).tail_token_ids)
             for position in written_positions
         )
         question_texts = tuple(
@@ -300,7 +303,8 @@ def plan_request_backend(
             # that join, one request per row
             partner = call.aliases()[1]
             parts = {part_alias: (label, frame)
-                     for part_alias, label, frame in call.prompt.label_token_ids}
+                     for part_alias, label, frame
+                     in context.lowered(call.prompt).label_token_ids}
             written_pos = next(
                 (position for position, join in enumerate(joins)
                  if {argument.alias for argument in join.prompt.args}
@@ -316,7 +320,7 @@ def plan_request_backend(
         classify_specs.append(RequestClassifySpec(
             alias=alias,
             output=label_plan.names[call],
-            tail_token_ids=tuple(call.prompt.tail_token_ids),
+            tail_token_ids=tuple(context.lowered(call.prompt).tail_token_ids),
             labels=tuple(call.labels),
             label_token_ids=tuple(
                 tuple(context.tokenizer(label_text(label)))
@@ -333,8 +337,8 @@ def plan_request_backend(
     join_specs = []
     for written_pos, selected_anchor in join_sequence:
         join = joins[written_pos]
-        prompt = join.prompt
-        prompts.append(prompt)
+        prompt = context.lowered(join.prompt)
+        prompts.append(join.prompt)
         aliases_in_prompt = tuple(argument.alias for argument in prompt.args)
         labels = tuple(
             (str(alias), tuple(label))
@@ -384,16 +388,18 @@ def plan_request_backend(
         extract_specs.append(RequestExtractSpec(
             alias=node.alias, output=node.name,
             question=node.call.question,
-            tail_token_ids=tuple(node.call.prompt.tail_token_ids),
+            tail_token_ids=tuple(
+                context.lowered(node.call.prompt).tail_token_ids),
             trim=node.call.trim,
             tail_text=re.sub(r"\{\d+\}", "", node.call.prompt.tail),
-            preamble_token_ids=tuple(node.call.prompt.preamble_token_ids),
+            preamble_token_ids=tuple(
+                context.lowered(node.call.prompt).preamble_token_ids),
             preamble_text=node.call.prompt.preamble))
 
     preambles = {
-        tuple(prompt.preamble_token_ids)
+        tuple(context.lowered(prompt).preamble_token_ids)
         for prompt in prompts
-        if prompt.preamble_token_ids
+        if context.lowered(prompt).preamble_token_ids
     }
     if len(preambles) > 1:
         raise ValueError("request prompts have different preambles")

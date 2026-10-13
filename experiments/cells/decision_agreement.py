@@ -90,16 +90,15 @@ def quail_side(run: str) -> dict:
     import pyarrow as pa
 
     import quail
-    from quail.logical import (
-        ColumnRef,
+    from quail.logical import ColumnRef, bind_join_prompt, bind_prompt
+    from quail.physical import AiJoin
+    from quail.planner.plan import EngineConfig
+    from quail.planner.prompt_lowering import (
         answer_row_offsets,
-        bind_join_prompt,
-        bind_prompt,
+        lower_prompt,
         render_filter_prompt_ids,
         render_join_prompt_ids,
     )
-    from quail.physical import AiJoin
-    from quail.planner.plan import EngineConfig
 
     reviews, left, right = _reviews()
     session = quail.Session(EngineConfig(model=MODEL, device="h100-sxm"))
@@ -124,9 +123,9 @@ def quail_side(run: str) -> dict:
                      "report": result.report,
                      "ids": sorted(r[0] for r in result.to_rows())})
     out["filter_runs"] = runs
-    prompt = bind_prompt(FILTER_TEMPLATE, (ColumnRef("r", "reviews", "body"),),
-                         tok, layout=layout)
-    out["filter_ids"] = [render_filter_prompt_ids(prompt, tok(t), tok)
+    prompt = lower_prompt(bind_prompt(
+        FILTER_TEMPLATE, (ColumnRef("r", "reviews", "body"),), layout=layout), tok)
+    out["filter_ids"] = [render_filter_prompt_ids(prompt, tok(t))
                          for t, _ in reviews]
 
     join_sql = ("SELECT a.id, b.id FROM lefts a JOIN rights b ON AI_FILTER("
@@ -139,13 +138,13 @@ def quail_side(run: str) -> dict:
     out["join_run"] = {"seconds": time.perf_counter() - t0,
                        "report": result.report,
                        "pairs": sorted(result.to_rows())}
-    prompt = bind_join_prompt(
+    prompt = lower_prompt(bind_join_prompt(
         JOIN_TEMPLATE, (ColumnRef("a", "lefts", "body"),
-                        ColumnRef("b", "rights", "body")), tok, layout=layout)
+                        ColumnRef("b", "rights", "body")), layout=layout), tok)
     a = ["a", "b"].index(anchor)
     out["join_anchor"] = anchor
     out["join_ids"] = [
-        render_join_prompt_ids(prompt, [tok(x), tok(y)], a, tok)
+        render_join_prompt_ids(prompt, [tok(x), tok(y)], a)
         for x, _ in left for y, _ in right]
     session.close()
     return out

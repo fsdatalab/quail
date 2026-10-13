@@ -91,7 +91,11 @@ def test_expert_fusions_preserve_quantization(rows):
 def _prompt_ids():
     from gigatoken import Tokenizer
 
-    from quail.logical import bind_prompt, render_filter_prompt_ids
+    from quail.logical import bind_prompt
+    from quail.planner.prompt_lowering import (
+        lower_prompt,
+        render_filter_prompt_ids,
+    )
     from quail.specs import MODELS
 
     spec = MODELS[MODEL]
@@ -100,8 +104,8 @@ def _prompt_ids():
     def ids(text):
         return tokenizer(text, add_special_tokens=False)["input_ids"]
 
-    prompt = bind_prompt(QUESTION, ("body",), ids, turn=spec.turn)
-    return [render_filter_prompt_ids(prompt, ids(review), ids)
+    prompt = lower_prompt(bind_prompt(QUESTION, ("body",), turn=spec.turn), ids)
+    return [render_filter_prompt_ids(prompt, ids(review))
             for review in REVIEWS]
 
 
@@ -256,7 +260,7 @@ def test_no_layer_departs_from_stock_vllm(stock_layers, quail):
 def test_answers_agree_with_stock_vllm(stock_layers, quail):
     from gigatoken import Tokenizer
 
-    from quail.logical import true_false_ids
+    from quail.planner.prompt_lowering import true_false_ids
     from quail.specs import MODELS
 
     quail_layers, model = quail

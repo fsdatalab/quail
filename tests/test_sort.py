@@ -86,7 +86,7 @@ def test_sort_runtime_orders_bounds_and_deduplicates_rows():
 
 
 def _filtered(catalog):
-    return (docs(catalog, "reviews", tok).alias("r")
+    return (docs(catalog, "reviews").alias("r")
             .ai_filter(prompt("flag: {0}", col("r.review")), selectivity=0.5))
 
 
@@ -131,7 +131,7 @@ def test_distinct_is_dropped_when_every_tables_id_is_selected(catalog):
     assert not isinstance(optimized.root, Result) or not optimized.root.distinct
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
                       registry=built_in_registry(),
-                      doc_tokens=tokens)
+                      doc_tokens=tokens, tokenizer=tok)
     assert node_kinds(plan)[-2:] == ["Project", "Limit"]
     assert plan.settings["filter_limit"] == 3
     # a group's keys name it once, so DISTINCT over them is redundant too
@@ -160,7 +160,7 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
     assert node.stop_key == ("author",)
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
                       registry=built_in_registry(),
-                      doc_tokens=tokens)
+                      doc_tokens=tokens, tokenizer=tok)
     ai_filter = next(node for node in plan.nodes if isinstance(node, AiFilter))
     assert ai_filter.stop_key == ("author",)
     text = explain(optimized, plan)

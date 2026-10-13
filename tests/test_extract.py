@@ -90,16 +90,19 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
     assert loose.logical == _ends(session, trim=False).logical
 
 
-def test_planning_reuses_bound_extraction_tokens(session, monkeypatch):
+def test_planning_lowers_the_extraction_prompt_once(session, monkeypatch):
     query = _ends(session)
     tokenizer = session.tokenizer
+    seen = []
 
-    def reuse_prompt(text):
-        assert QUESTION not in text, "planning must reuse the bound extraction prompt"
+    def count_prompt(text):
+        if QUESTION in text:
+            seen.append(text)
         return tokenizer(text)
 
-    monkeypatch.setattr(session, "_tok", reuse_prompt)
+    monkeypatch.setattr(session, "_tok", count_prompt)
     assert not isinstance(query.plan(), Refusal)
+    assert len(seen) == 1, seen
 
 
 def test_extract_follows_the_filters_and_labels_of_its_table(session):

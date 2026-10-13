@@ -562,7 +562,8 @@ def stock_kernels(model: str = "qwen3-4b-fp8",
     from gigatoken import Tokenizer
     from vllm import LLM, SamplingParams
 
-    from quail.logical import bind_prompt, render_filter_prompt_ids
+    from quail.logical import bind_prompt
+    from quail.planner.prompt_lowering import lower_prompt, render_filter_prompt_ids
     from quail.specs import MODELS
     from quail_b.data import build_sets
     from quail_b.prompts import F1
@@ -575,9 +576,9 @@ def stock_kernels(model: str = "qwen3-4b-fp8",
 
     d = build_sets(DATA_DIR, 0.1)
     bodies = pq.read_table(f"{d}/reviews.parquet")["body"].to_pylist()
-    prompt = bind_prompt(F1, ("body",), tok, turn=spec.turn)
-    prompts = [dict(prompt_token_ids=render_filter_prompt_ids(
-        prompt, tok(b), tok)) for b in bodies[:n_docs]]
+    prompt = lower_prompt(bind_prompt(F1, ("body",), turn=spec.turn), tok)
+    prompts = [dict(prompt_token_ids=render_filter_prompt_ids(prompt, tok(b)))
+               for b in bodies[:n_docs]]
 
     llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.92,
               enable_prefix_caching=False, disable_log_stats=True)

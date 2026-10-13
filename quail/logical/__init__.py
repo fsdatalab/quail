@@ -56,7 +56,6 @@ from quail.logical.plan import (
 from quail.logical.prompts import (
     ANSWER_CUE,
     SHARED_PRE,
-    answer_row_offsets,
     bind_classify_prompt,
     bind_join_prompt,
     bind_prompt,
@@ -64,15 +63,11 @@ from quail.logical.prompts import (
     filter_question_text,
     join_label,
     label_text,
-    render_filter_prompt_ids,
     render_join_frame,
-    render_join_prompt_ids,
     render_join_prompt_text,
     render_join_question,
     shared_preamble,
     split_frame,
-    true_false_ids,
-    true_false_token_ids,
 )
 
 __all__ = [
@@ -112,7 +107,6 @@ __all__ = [
     "SemanticFilter",
     "SemanticJoin",
     "SortKey",
-    "answer_row_offsets",
     "bind_classify_prompt",
     "bind_join_prompt",
     "bind_prompt",
@@ -131,13 +125,9 @@ __all__ = [
     "label_text",
     "model_call",
     "oriented_join_conditions",
-    "render_filter_prompt_ids",
     "render_join_frame",
-    "render_join_prompt_ids",
     "render_join_prompt_text",
     "render_join_question",
     "shared_preamble",
     "split_frame",
-    "true_false_ids",
-    "true_false_token_ids",
 ]

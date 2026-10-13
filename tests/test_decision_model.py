@@ -20,15 +20,18 @@ from quail.baselines.request import RequestBackend
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (
     ColumnRef,
-    answer_row_offsets,
     bind_join_prompt,
     bind_prompt,
-    render_filter_prompt_ids,
-    render_join_prompt_ids,
     render_join_prompt_text,
 )
 from quail.physical import AiClassify, AiFilter, AiJoin, AiScore
 from quail.planner.plan import EngineConfig, Refusal
+from quail.planner.prompt_lowering import (
+    answer_row_offsets,
+    lower_prompt,
+    render_filter_prompt_ids,
+    render_join_prompt_ids,
+)
 from quail.specs import DECISION_2_KAI_0_6B_BF16, H100_SXM
 
 LAYOUT = "decision2-noul"
@@ -47,7 +50,8 @@ def _tokens(text):
 
 def test_filter_prompt_is_the_decision2_noul_format_tokenized_by_segment():
     prompt = bind_prompt("Does the customer have a receipt? {0}", (REF,),
-                         _tokens, layout=LAYOUT)
+                         layout=LAYOUT)
+    lowered = lower_prompt(prompt, _tokens)
     document = "The order arrived damaged."
     # decision2 segments(): prefix, one block per option, then the closing
     assert prompt.preamble + document + prompt.tail[len("{0}"):] == (
@@ -56,11 +60,11 @@ def test_filter_prompt_is_the_decision2_noul_format_tokenized_by_segment():
         + OPTIONS + CLOSING)
     segments = prompt.tail_segments
     assert len(segments) == 4
-    assert prompt.tail_token_ids == tuple(
+    assert lowered.tail_token_ids == tuple(
         t for segment in segments for t in _tokens(segment))
-    assert prompt.tail_token_ids != tuple(_tokens("".join(segments)))
+    assert lowered.tail_token_ids != tuple(_tokens("".join(segments)))
 
-    ids = render_filter_prompt_ids(prompt, _tokens(document), _tokens)
+    ids = render_filter_prompt_ids(lowered, _tokens(document))
     last = len(ids) - 1
     no, yes, query = (ids[last - o] for o in answer_row_offsets(LAYOUT, _tokens))
     assert (no, yes) == ("</option>", "</option>")
@@ -70,23 +74,23 @@ def test_filter_prompt_is_the_decision2_noul_format_tokenized_by_segment():
 
 
 def test_join_prompt_keeps_the_question_in_the_anchor_frame():
-    prompt = bind_join_prompt("Does {1} answer {0}?", PAIR, _tokens,
-                              layout=LAYOUT)
+    prompt = bind_join_prompt("Does {1} answer {0}?", PAIR, layout=LAYOUT)
+    lowered = lower_prompt(prompt, _tokens)
     assert render_join_prompt_text(prompt, ["Where is it?", "In the box."], 0) == (
         "Context:\nWhere is it?\n\n(The document above is DOCUMENT {0}.)"
         "\n\nTask type: noul\nQuestion:\nDoes {1} answer {0}?"
         "\n\nDOCUMENT {1}:\nIn the box.\nOptions:" + OPTIONS + CLOSING)
-    frames = {alias: frame for alias, _, frame in prompt.label_token_ids}
+    frames = {alias: frame for alias, _, frame in lowered.label_token_ids}
     assert "".join(frames["q"]) == (
         "\n\n(The document above is DOCUMENT {0}.)"
         "\n\nTask type: noul\nQuestion:\nDoes {1} answer {0}?")
-    ids = render_join_prompt_ids(prompt, [_tokens("Where is it?"),
-                                          _tokens("In the box.")], 0, _tokens)
-    assert tuple(ids[-len(prompt.tail_token_ids):]) == prompt.tail_token_ids
+    ids = render_join_prompt_ids(lowered, [_tokens("Where is it?"),
+                                           _tokens("In the box.")], 0)
+    assert tuple(ids[-len(lowered.tail_token_ids):]) == lowered.tail_token_ids
 
 
 def test_ai_if_layout_keeps_one_tail_segment():
-    prompt = bind_prompt("Is it positive? {0}", (REF,), _tokens)
+    prompt = bind_prompt("Is it positive? {0}", (REF,))
     assert prompt.preamble == "DOCUMENT:\n"
     assert prompt.tail_segments == (
         "\n\nEvaluate TRUE or FALSE for the following question: "
@@ -117,10 +121,10 @@ def test_worker_answer_offsets_match_session_tokens(tmp_path):
     with quail.Session(EngineConfig(model=spec.name, device="h100-sxm"),
                        registry=registry) as session:
         offsets = decision_offsets(spec, str(tmp_path))
-        prompt = bind_prompt("Refund? {0}", (REF,), session.tokenizer,
-                             layout=LAYOUT, turn=spec.turn)
+        prompt = lower_prompt(bind_prompt("Refund? {0}", (REF,), layout=LAYOUT,
+                                          turn=spec.turn), session.tokenizer)
         ids = render_filter_prompt_ids(
-            prompt, session.tokenizer("Please refund this."), session.tokenizer)
+            prompt, session.tokenizer("Please refund this."))
         assert offsets == answer_row_offsets(
             LAYOUT, session.tokenizer, spec.turn_suffix)
         tokenizer = Tokenizer(tmp_path).as_hf()

@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.logical import LogicalNode, LogicalPlan
-from quail.planner.physical_optimizer import PlanningContext
+from quail.planner.physical_optimizer import (
+    PlanningContext,
+    lowered_prompt,
+)
 
 # Rounds over the rule list before giving up on convergence. Two rules
 # that undo each other would otherwise loop forever.
@@ -56,6 +59,10 @@ class LogicalPlanningContext:
     pair_fractions: Mapping[int, float] = field(default_factory=dict)
     scan_fractions: Mapping[str, float] = field(default_factory=dict)
     memo: dict = field(default_factory=dict, compare=False, repr=False)
+
+    def lowered(self, prompt):
+        """Return the prompt lowered with the session tokenizer, once per query."""
+        return lowered_prompt(self, prompt)
 
     def physical_context(self, logical_plan=None) -> PlanningContext:
         """Return the physical planning context with the same inputs."""

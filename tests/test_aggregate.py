@@ -2,7 +2,7 @@
 
 import pyarrow as pa
 import pytest
-from test_planner import _plan, node_kinds, tok
+from test_planner import _plan, node_kinds
 from test_session import CONFIG, _run, fake_tok, make_executor
 
 import quail
@@ -63,7 +63,7 @@ def catalog():
 
 
 def test_group_by_ends_the_plan_in_an_aggregate(catalog):
-    logical = (docs(catalog, "reviews", tok).alias("r")
+    logical = (docs(catalog, "reviews").alias("r")
                .ai_filter(prompt("flag: {0}", col("r.review")), selectivity=0.5)
                .group_by("r.lang").agg(n=count(), s=avg("r.stars"))
                .having(count() > 1, max_("r.stars") < 5)
@@ -99,16 +99,16 @@ def test_group_by_ends_the_plan_in_an_aggregate(catalog):
     assert "Aggregate: r.lang, n, s" in text.split("physical:", 1)[1]
 
     with pytest.raises(CompileError, match="neither a GROUP BY key"):
-        (docs(catalog, "reviews", tok).alias("r")
+        (docs(catalog, "reviews").alias("r")
          .ai_filter(prompt("flag: {0}", col("r.review")))
          .agg(n=count()).select("r.lang", "n"))
     with pytest.raises(CompileError, match="names a key or an aggregate"):
-        (docs(catalog, "reviews", tok).alias("r")
+        (docs(catalog, "reviews").alias("r")
          .ai_filter(prompt("flag: {0}", col("r.review")))
          .group_by("r.lang").agg(n=count()).order_by("r.stars")
          .select("r.lang", "n"))
     with pytest.raises(CompileError, match="takes count"):
-        docs(catalog, "reviews", tok).alias("r").agg(n="count")
+        docs(catalog, "reviews").alias("r").agg(n="count")
     Aggregation(("r.lang",), (AggregateCall("count", None, "n"),),
                 ("r.lang", "n"), (HavingTest(AggregateCall("count", None, "n"),
                                              ">", 1),)).validate(("r.lang",))

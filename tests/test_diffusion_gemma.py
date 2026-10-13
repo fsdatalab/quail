@@ -22,6 +22,9 @@ from quail.logical.prompts import (
     bind_join_prompt,
     bind_prompt,
     filter_question_text,
+)
+from quail.planner.prompt_lowering import (
+    lower_prompt,
     render_filter_prompt_ids,
     render_join_prompt_ids,
 )
@@ -60,25 +63,27 @@ def test_spec_geometry_budgets_costs_and_turn_text():
     # the chat turn wraps filter and join prompts
     turn = ("<bos><|turn>user\n", "<turn|>\n<|turn>model\n")
     ref = SimpleNamespace(alias="d")
-    prompt = bind_prompt("Is {0} about food?", (ref,), _tok, turn=turn)
+    prompt = bind_prompt("Is {0} about food?", (ref,), turn=turn)
+    lowered = lower_prompt(prompt, _tok)
     assert prompt.preamble == turn[0] + SHARED_PRE
     assert prompt.tail.endswith(ANSWER_CUE + turn[1])
     doc = [7, 8, 9]
-    ids = render_filter_prompt_ids(prompt, doc, _tok)
+    ids = render_filter_prompt_ids(lowered, doc)
     assert ids[:len(_tok(prompt.preamble))] == _tok(prompt.preamble)
     assert ids[-len(_tok(turn[1])):] == _tok(turn[1])
     assert ids == (_tok(prompt.preamble) + doc
                    + _tok(filter_question_text(prompt)))
-    assert tuple(_tok(prompt.preamble)) == prompt.preamble_token_ids
+    assert tuple(_tok(prompt.preamble)) == lowered.preamble_token_ids
 
     left, right = SimpleNamespace(alias="a"), SimpleNamespace(alias="b")
-    join = bind_join_prompt("Same topic in {0} and {1}?", (left, right), _tok,
+    join = bind_join_prompt("Same topic in {0} and {1}?", (left, right),
                             turn=turn)
+    lowered = lower_prompt(join, _tok)
     assert join.preamble == turn[0] + SHARED_PRE
     assert join.tail == ANSWER_CUE + turn[1]
-    assert join.preamble_token_ids == tuple(_tok(join.preamble))
-    assert join.tail_token_ids == tuple(_tok(join.tail))
-    ids = render_join_prompt_ids(join, [[1, 2], [3]], 0, _tok)
+    assert lowered.preamble_token_ids == tuple(_tok(join.preamble))
+    assert lowered.tail_token_ids == tuple(_tok(join.tail))
+    ids = render_join_prompt_ids(lowered, [[1, 2], [3]], 0)
     assert ids[-len(_tok(join.tail)):] == _tok(join.tail)
 
 

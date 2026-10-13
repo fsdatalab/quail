@@ -32,6 +32,7 @@ from quail.logical.expressions import SPAN_SUFFIX
 from quail.logical.prompts import bind_classify_prompt
 from quail.physical import AiClassify, AiExtract, AiScore
 from quail.planner.plan import Refusal
+from quail.planner.prompt_lowering import lower_prompt
 from quail.progress import say
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
@@ -238,9 +239,13 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
     """
     operators = query.logical.operators()
     filters, joins = operators.filters, operators.joins
-    preamble = next((list(prompt.preamble_token_ids)
+
+    def lower(prompt):
+        return lower_prompt(prompt, query.session.tokenizer)
+
+    preamble = next((list(lower(prompt).preamble_token_ids)
                      for prompt in operators.prompts
-                     if prompt.preamble_token_ids), [])
+                     if lower(prompt).preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": [], "classifies": [], "scores": [],
               "extracts": []}
@@ -251,23 +256,24 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                 continue
             pieces["filters"].append({
                 "id": written[position].id,
-                "tail": list(predicate.prompt.tail_token_ids)})
+                "tail": list(lower(predicate.prompt).tail_token_ids)})
     for position, join in enumerate(joins):
         anchor = anchors[position]
         pieces["joins"].append({
             "id": info.joins[position].id, "anchor": anchor,
-            **_pair_pieces(join.prompt, anchor)})
+            **_pair_pieces(lower(join.prompt), anchor)})
     if info.classifies:
         labels = operators.labels
         calls = {labels.names[call]: call for call, _ in labels.calls}
         for operator in info.classifies:
             call = calls[operator.output]
             if operator.partner is None:
-                piece = {"tail": list(call.prompt.tail_token_ids)}
+                piece = {"tail": list(lower(call.prompt).tail_token_ids)}
             else:
                 # the anchor is the call's first document
                 anchor = call.aliases()[0]
-                piece = {"anchor": anchor, **_pair_pieces(call.prompt, anchor)}
+                piece = {"anchor": anchor,
+                         **_pair_pieces(lower(call.prompt), anchor)}
             pieces["classifies"].append({"id": operator.id, **piece})
     # the planner lays a score out as the AI.IF prompt of its document,
     # so its head is the preamble and its tail follows the document

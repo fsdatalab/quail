@@ -132,7 +132,7 @@ def choose_plan(plan, operators, model, device, doc_tokens, order,
         model, device)
     anchors = {spec.written_pos: anchor for spec, anchor in seq}
     for s in scans:
-        fq = max((question_tokens(p.prompt, model.canvas_tokens)
+        fq = max((question_tokens(context.lowered(p.prompt), model.canvas_tokens)
                   for p in ask_filters.get(s.alias, ())), default=None)
         if fq is None:
             continue

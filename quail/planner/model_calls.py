@@ -8,8 +8,6 @@ from quail.cost import extract as extract_cost
 from quail.cost.work import Work
 from quail.labels import DECISION_SCORING, LETTERS_SCORING, word_starts
 from quail.logical.prompts import (
-    choice_token_parts,
-    classify_prompt_tokens,
     prompt_aliases,
     score_query_template,
     shared_preamble,
@@ -26,6 +24,10 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.planner.plan import Refusal
+from quail.planner.prompt_lowering import (
+    choice_token_parts,
+    classify_prompt_tokens,
+)
 from quail.planner.statistics import (
     ClassifyStatistics,
     classify_statistics,
@@ -154,16 +156,16 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         shared: Whether an extraction of the same table runs right
             before this one.
     """
-    prompt = call.prompt
+    prompt = context.lowered(call.prompt)
     # under the query's shared preamble, the prompt's document KV is
     # the one a filter writes
-    shares_head = context.tokenizer is not None and tuple(
-        prompt.preamble_token_ids) == tuple(context.tokenizer(shared_preamble(
+    shares_head = tuple(prompt.preamble_token_ids) == tuple(
+        context.tokenizer(shared_preamble(
             context.model.turn_prefix, context.model.prompt_layout)))
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
     spec = bind_inference(
-        ExtractSpec, prompt, name=name,
+        ExtractSpec, call.prompt, name=name,
         expected_inputs=live, estimated_seconds=0.0,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
@@ -181,7 +183,7 @@ def classify_builder(context, alias, backend_name):
     """Prepare the inputs for constructing classification operators."""
     stats = classify_statistics(context, alias)
     return ClassifyBuilder(**vars(stats), tokenizer=context.tokenizer,
-                           backend_name=backend_name)
+                           lower=context.lowered, backend_name=backend_name)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -189,6 +191,7 @@ class ClassifyBuilder(ClassifyStatistics):
     """Construct classification specifications and operators."""
 
     tokenizer: object
+    lower: object
     backend_name: str
 
     def prepare(self, call, name, live) -> tuple[ClassifySpec, Work]:
@@ -208,11 +211,12 @@ class ClassifyBuilder(ClassifyStatistics):
             method. Otherwise, the physical label_scoring rule chooses the
             method and fills in its work later.
         """
+        lowered = self.lower(call.prompt)
         if self.model.role == "decision":
             return self._choice_spec(call, name, live, (self.alias,),
-                                     tuple(self.tokenizer(call.prompt.preamble)))
+                                     tuple(lowered.preamble_token_ids))
         head, tail, labels = classify_prompt_tokens(
-            call.prompt, call.labels, self.tokenizer)
+            lowered, call.labels, self.tokenizer)
         return bind_inference(
             ClassifySpec, call.prompt, name=name, aliases=(self.alias,),
             expected_inputs=live, estimated_seconds=0.0,
@@ -256,7 +260,7 @@ class ClassifyBuilder(ClassifyStatistics):
         if self.model.role == "decision":
             return self._joined_choice_spec(call, name, partner, pairs,
                                             partner_tokens)
-        prompt = call.prompt.lettered
+        prompt = self.lower(call.prompt).lettered
         if prompt is None:
             raise ClassifyRefusedError(
                 "the letters rule needs a one-token letter for every "
@@ -296,7 +300,8 @@ class ClassifyBuilder(ClassifyStatistics):
         Each document takes the question as its frame, then one request
         of every option block and the closing line.
         """
-        tail, frame, blocks = choice_token_parts(call.prompt, self.tokenizer)
+        tail, frame, blocks = choice_token_parts(
+            self.lower(call.prompt), self.tokenizer)
         request = len(tail) - frame
         need = len(head) + self.longest + len(tail)
         if need > self.budget:
@@ -320,9 +325,9 @@ class ClassifyBuilder(ClassifyStatistics):
         pair's request is the partner document, the question, every
         option block, and the closing line.
         """
-        prompt = call.prompt
+        prompt = self.lower(call.prompt)
         head = tuple(prompt.preamble_token_ids)
-        tail, frame, blocks = choice_token_parts(call.prompt, self.tokenizer)
+        tail, frame, blocks = choice_token_parts(prompt, self.tokenizer)
         parts = {alias: (label, note)
                  for alias, label, note in prompt.label_token_ids}
         note, partner_label = parts[self.alias][1], parts[partner][0]

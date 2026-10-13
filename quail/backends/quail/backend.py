@@ -15,7 +15,6 @@ from quail.backends.quail.executor.state import LoadedModelState, QueryExecution
 from quail.backends.quail.reranker import RerankerModelExecution
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.logical import LogicalPlan, has_score, shared_preamble
-from quail.logical.prompts import answer_ids
 from quail.physical import (
     AiClassify,
     AiFilter,
@@ -32,6 +31,7 @@ from quail.planner.physical_optimizer import (
     SupportResult,
 )
 from quail.planner.plan import Refusal
+from quail.planner.prompt_lowering import answer_ids
 from quail.planner.validation import has_label, joined_classification_refusal
 
 
@@ -225,12 +225,13 @@ class QuailBackend:
         for node in plan.nodes:
             if isinstance(node, AiFilter):
                 predicates = filters[node.alias]
-                question = tuple(predicates[node.written_pos].prompt.tail_token_ids)
+                question = tuple(context.lowered(
+                    predicates[node.written_pos].prompt).tail_token_ids)
                 if not question:
                     raise ValueError("filter prompts have no token ids")
                 node = replace(node, question_token_ids=question)
             elif isinstance(node, AiJoin):
-                prompt = joins[node.written_pos].prompt
+                prompt = context.lowered(joins[node.written_pos].prompt)
                 runtime_ids = {
                     alias: (tuple(label), tuple(frame))
                     for alias, label, frame in prompt.label_token_ids
@@ -250,7 +251,7 @@ class QuailBackend:
             list(tokenizer(shared_preamble(context.model.turn_prefix,
                                            context.model.prompt_layout)))
             if tokenizer is not None else
-            list(prompts[0].preamble_token_ids) if prompts else []
+            list(context.lowered(prompts[0]).preamble_token_ids) if prompts else []
         )
         return replace(
             plan,

@@ -19,8 +19,6 @@ from quail.logical import (
     Scan,
     SemanticClassify,
     SemanticJoin,
-    bind_join_prompt,
-    bind_prompt,
 )
 from quail.physical import Recombine
 from quail.planner.logical_optimizer import (
@@ -33,14 +31,6 @@ from quail.planner.logical_rules import (
     push_down_projection,
 )
 from quail.planner.plan import EngineConfig
-
-
-def test_prompts_bound_without_a_tokenizer_have_no_token_counts():
-    review = ColumnRef("r", "reviews", "review")
-    description = ColumnRef("p", "products", "description")
-    assert bind_prompt("q {0}", (review,)).tail_tokens is None
-    join = bind_join_prompt("same {0} {1}", (review, description))
-    assert join.tail_tokens is None
 
 
 def _scans(plan):
@@ -207,8 +197,8 @@ def _pair_catalog():
 
 
 def _joined(catalog, semantics="full"):
-    return (docs(catalog, "reviews", fake_tok).alias("r")
-            .ai_join(docs(catalog, "products", fake_tok).alias("p"),
+    return (docs(catalog, "reviews").alias("r")
+            .ai_join(docs(catalog, "products").alias("p"),
                      prompt("same {0} {1}", col("r.review"),
                             col("p.description")),
                      semantics=semantics)
@@ -248,11 +238,11 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
 
     # a filter on a label returns to its table, above the
     # classification that computes the label
-    labelled = (docs(catalog, "reviews", fake_tok).alias("r")
+    labelled = (docs(catalog, "reviews").alias("r")
                 .ai_classify(prompt("topic of {0}", col("r.review")),
                              ["a", "b"], name="topic")
                 .label_in("topic", ["a"])
-                .ai_join(docs(catalog, "products", fake_tok).alias("p"),
+                .ai_join(docs(catalog, "products").alias("p"),
                          prompt("same {0} {1}", col("r.review"),
                                 col("p.description")))
                 .select("r.id", "p.asin", "topic"))

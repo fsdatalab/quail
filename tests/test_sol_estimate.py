@@ -48,8 +48,8 @@ def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):
                     .ai_filter(quail.prompt(FILTER, quail.col("r.body"))))
         query = filtered.select("r.id")
         filters = query.logical.operators().filters
-        question = filters["r"][0].prompt.tail_tokens
-        preamble = filters["r"][0].prompt.preamble_tokens
+        lowered = quail.lower_prompt(filters["r"][0].prompt, sess.tokenizer)
+        question, preamble = lowered.tail_tokens, lowered.preamble_tokens
         distinct = quail.speed_of_light_estimate(query, _answer)
         per_document = quail.speed_of_light_estimate(
             query, _answer, credit_shared_prefixes=False)
@@ -120,7 +120,8 @@ def test_planner_and_estimate_price_hybrid_queries_and_prefix_reuse(tmp_path):
             query, lambda *_: True, credit_shared_prefixes=False)
         shared = quail.speed_of_light_estimate(query, lambda *_: True)
         planned = query.plan()
-        pre = query.logical.operators().filters["r"][0].prompt.preamble_tokens
+        pre = quail.lower_prompt(query.logical.operators().filters["r"][0].prompt,
+                                 session.tokenizer).preamble_tokens
     assert exact.join_stages[0]["anchor"] == "r"
     assert exact.seconds == pytest.approx(planned.estimated_seconds)
     assert exact.work.sliding_pairs < exact.work.pairs
@@ -151,7 +152,8 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
                                    ["good", "bad"], name="tone"))
         query = classified.select("r.id", "tone")
         call = _classification(query)
-        tail, preamble = call.prompt.tail_tokens, call.prompt.preamble_tokens
+        lowered = quail.lower_prompt(call.prompt, sess.tokenizer)
+        tail, preamble = lowered.tail_tokens, lowered.preamble_tokens
         distinct = quail.speed_of_light_estimate(query, _answer, label=_label)
         per_document = quail.speed_of_light_estimate(
             query, _answer, label=_label, credit_shared_prefixes=False)
@@ -171,7 +173,8 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
                                        quail.col("a.aspect")))
                  .select("r.id", "a.id", "tone"))
         filters = query.logical.operators().filters
-        question = filters["r"][0].prompt.tail_tokens
+        question = quail.lower_prompt(filters["r"][0].prompt,
+                                      sess.tokenizer).tail_tokens
         estimate = quail.speed_of_light_estimate(
             query, _answer, label=_label, credit_shared_prefixes=False)
 
@@ -220,7 +223,7 @@ def test_a_classification_of_joined_rows_is_priced_per_kept_pair(tmp_path):
                                            quail.col("a.aspect")),
                               ["praises", "pans"], name="stance")
                  .select("r.id", "a.id", "stance"))
-        call = _classification(query)
+        call = quail.lower_prompt(_classification(query).prompt, sess.tokenizer)
         estimate = quail.speed_of_light_estimate(query, _answer, label=_label)
 
     (stage,) = estimate.join_stages
@@ -228,12 +231,12 @@ def test_a_classification_of_joined_rows_is_priced_per_kept_pair(tmp_path):
     partner = "a" if anchor == "r" else "r"
     assert join_only.join_stages[0]["anchor"] == anchor
     parts = {alias: (len(label), len(note))
-             for alias, label, note in call.prompt.label_token_ids}
+             for alias, label, note in call.label_token_ids}
     # the one kept pair (r0, a0): the anchor note over the anchor's
     # resident prefix, then the partner label, the partner document,
     # and the classification tail
     partner_tokens = {"r": 2, "a": 1}[partner]
-    pair_tokens = parts[partner][0] + partner_tokens + call.prompt.tail_tokens
+    pair_tokens = parts[partner][0] + partner_tokens + call.tail_tokens
     (classification,) = stage["classifications"]
     assert classification["name"] == "stance"
     assert classification["pairs"] == 1

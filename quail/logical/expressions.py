@@ -36,36 +36,55 @@ def column_name(column: ColumnRef | Alias) -> str:
 
 @dataclass(frozen=True)
 class Prompt:
-    """Bound prompt text and token layout for one LLM call.
+    """The text of one model call, laid out for a model's prompt format.
 
-    Token counts are filled when a tokenizer is available; None means the
-    planner must calculate them. A classification prompt keeps the text
-    before each label in label_prefix. Its optional lettered prompt names
-    each label with a distinct one-token letter for the letters rule.
+    The planner lowers the text to token ids with the session's
+    tokenizer; see quail.planner.prompt_lowering. A classification
+    prompt keeps the text before each label in label_prefix and what
+    rendered its label list, so lowering can render it again with one
+    letter per label.
+
+    Attributes:
+        template: The template as the query names the predicate.
+        args: Column references in placeholder order.
+        preamble: The text before the document.
+        tail: The text after the document, or after a join's last
+            partner, with the document placeholder.
+        frame: The text after the anchor document that every pair shares.
+        frame_text: The text whose token count is the frame's; empty
+            when the prompt has no frame.
+        kind: filter, join, label, extract, or score.
+        layout: The PROMPT_LAYOUTS name the text was built with.
+        tail_segments: The tail after the placeholder, one entry per
+            separately tokenized segment; empty means one segment.
+        label_texts: Per placeholder of a join or a classification of
+            joined rows, (alias, its label text, its frame text).
+        label_prefix: The text before a scored letter or label.
+        categories: A classification's labels, in query order.
+        descriptions: Their descriptions, in label order.
+        task_description: A classification's extra instructions.
+        turn: The model's chat text around the prompt.
+        source: The classification template as written.
+        letters: The letters naming the labels of a lettered prompt.
     """
 
     template: str
     args: tuple  # tuple[ColumnRef, ...] in placeholder order
     preamble: str
     tail: str
-    preamble_tokens: Optional[int] = None
-    tail_tokens: Optional[int] = None
     frame: str = ""
-    frame_tokens: Optional[int] = None
-    # join prompts only: (alias, label_tokens, anchor_frame_tokens)
-    # per placeholder, in order. Empty for filter prompts.
-    labels: tuple = ()
-    preamble_token_ids: tuple = ()
-    tail_token_ids: tuple = ()
-    label_token_ids: tuple = ()
-    # the PROMPT_LAYOUTS name the prompt text was built with
+    frame_text: str = ""
+    kind: str = "filter"
     layout: str = "ai-if"
-    # the text after a filter document or a join's last partner, one
-    # entry per separately tokenized segment; empty means one segment
     tail_segments: tuple = ()
+    label_texts: tuple = ()
     label_prefix: str = LABEL_PREFIX
+    categories: tuple = ()
+    descriptions: tuple = ()
+    task_description: str = ""
+    turn: tuple = ("", "")
+    source: str = ""
     letters: tuple = ()
-    lettered: Optional["Prompt"] = None
 
     type_name: ClassVar[str] = "quail.prompt"
 

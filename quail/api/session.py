@@ -129,7 +129,7 @@ class Session:
                                dialect=SQLDialect(dialect).value)
         logical = compile_sql(
             text, self.catalog, dialect=dialect,
-            prompts=PromptBinder(self.tokenizer, model=self.model),
+            prompts=PromptBinder(model=self.model),
         )
         return Query(self, logical, order=order)
 
@@ -151,8 +151,8 @@ class Session:
                 "the builder API is not available on a remote Session; "
                 "write the query with sql()")
         return BoundBuilder(self,
-                            BuilderQuery(self.catalog, name, prompts=PromptBinder(
-                                self.tokenizer, model=self.model)))
+                            BuilderQuery(self.catalog, name,
+                                         prompts=PromptBinder(model=self.model)))
 
     @property
     def tokenizer(self):

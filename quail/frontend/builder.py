@@ -211,11 +211,11 @@ def prompt(template: str, *cols: ColSpec) -> PromptSpec:
 
 
 class Query:
-    def __init__(self, catalog: Catalog, provider: str, tokenizer=None,
+    def __init__(self, catalog: Catalog, provider: str,
                  turn: tuple[str, str] = ("", ""), layout: str = "ai-if",
                  prompts: PromptBinder | None = None):
         self._catalog = catalog
-        self._prompts = prompts or PromptBinder(tokenizer, turn=turn, layout=layout)
+        self._prompts = prompts or PromptBinder(turn=turn, layout=layout)
         self._scope_ = Scope(catalog)
         self._scope_.add_table(provider, provider)
         self._tables = self._scope_.tables      # (alias, provider)
@@ -902,6 +902,6 @@ class Query:
                                     tuple(tests))
 
 
-def docs(catalog: Catalog, provider: str, tokenizer=None,
+def docs(catalog: Catalog, provider: str,
          turn: tuple[str, str] = ("", ""), layout: str = "ai-if") -> Query:
-    return Query(catalog, provider, tokenizer, turn, layout)
+    return Query(catalog, provider, turn, layout)

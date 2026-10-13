@@ -57,6 +57,7 @@ from quail.planner.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.leftdeep import search_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
 from quail.planner.prefixes import document_shared_tokens
+from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.statistics import prepare_filter_costs
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -231,25 +232,14 @@ class _AliasData:
     shared: list[int]
 
 
-def _prompt_token_counts(prompt):
-    """Return each alias's partner label and anchor frame tokens, and the tail.
-
-    A join prompt carries the counts; a classification of joined rows
-    carries the token ids.
-    """
-    if prompt.labels:
-        labels_by_alias = {
-            alias: {"label": label_tokens, "frame": frame_tokens}
-            for alias, label_tokens, frame_tokens in prompt.labels}
-    else:
-        labels_by_alias = {
-            alias: {"label": len(label_ids), "frame": len(frame_ids)}
-            for alias, label_ids, frame_ids in prompt.label_token_ids}
-    if not labels_by_alias or prompt.tail_tokens is None:
-        raise ValueError(
-            "prompts were bound without a tokenizer; the estimate needs "
-            "token counts")
-    return labels_by_alias, prompt.tail_tokens
+def _prompt_token_counts(lowered):
+    """Return each alias's partner label and anchor frame tokens, and the tail."""
+    labels_by_alias = {
+        alias: {"label": label_tokens, "frame": frame_tokens}
+        for alias, label_tokens, frame_tokens in lowered.labels}
+    if not labels_by_alias or lowered.tail_tokens is None:
+        raise ValueError("a join prompt is needed to count its pieces")
+    return labels_by_alias, lowered.tail_tokens
 
 
 def _refuse_unpriced(logical) -> None:
@@ -352,8 +342,18 @@ class _Search:
                 self.joined_classifications.setdefault(
                     frozenset(call.aliases()), []).append(call)
         self.order = query.order
-        self.pre = next((prompt.preamble_tokens for prompt in operators.prompts
-                         if prompt.preamble_tokens is not None), 0)
+        tokenizer = query.session.tokenizer
+        self._lowered = {}
+
+        def lower(prompt):
+            if prompt not in self._lowered:
+                self._lowered[prompt] = lower_prompt(prompt, tokenizer)
+            return self._lowered[prompt]
+
+        self.lower = lower
+        self.pre = next((lowered.preamble_tokens
+                         for lowered in map(lower, operators.prompts)
+                         if lowered.preamble_tokens is not None), 0)
         self.aliases: dict[str, _AliasData] = {}
         for scan_node in self.scans:
             store = stores[scan_node.alias]
@@ -512,13 +512,14 @@ class _Search:
                     [predicates[position] for position in asks],
                     prefix_tokens=self.pre + mean_tokens,
                     model=self.model, device=self.device,
-                    chunk_tokens=self.chunk_tokens), rule)] if asks else []
+                    chunk_tokens=self.chunk_tokens, lower=self.lower),
+                rule)] if asks else []
             live = survivors[alias]
             first = True
             for written_pos in order:
                 predicate = predicates[written_pos]
                 stage_work = self.question_work(
-                    alias, live, predicate.prompt.tail_tokens, first)
+                    alias, live, self.lower(predicate.prompt).tail_tokens, first)
                 first = False
                 work = work + stage_work
                 passed = [
@@ -527,7 +528,7 @@ class _Search:
                 ]
                 stages.append(_stage(
                     FILTER, alias, predicate.prompt.template, written_pos,
-                    predicate.prompt.tail_tokens, predicate.selectivity,
+                    self.lower(predicate.prompt).tail_tokens, predicate.selectivity,
                     live, passed, stage_work))
                 live = passed
             steps = [(test.call, test)
@@ -538,12 +539,12 @@ class _Search:
             for call, test in steps:
                 if call not in classified:
                     stage_work = self.question_work(
-                        alias, live, call.prompt.tail_tokens, first)
+                        alias, live, self.lower(call.prompt).tail_tokens, first)
                     first = False
                     work = work + stage_work
                     stages.append(_stage(
                         CLASSIFY, alias, call.prompt.template, None,
-                        call.prompt.tail_tokens, None, live, live,
+                        self.lower(call.prompt).tail_tokens, None, live, live,
                         stage_work, name=self.labels.names[call]))
                     classified.add(call)
                 if test is not None:
@@ -561,12 +562,12 @@ class _Search:
             # an extraction follows the labels; it keeps every document
             for node in extracts:
                 stage_work = self.question_work(
-                    alias, live, node.call.prompt.tail_tokens, first)
+                    alias, live, self.lower(node.call.prompt).tail_tokens, first)
                 first = False
                 work = work + stage_work
                 stages.append(_stage(
                     EXTRACT, alias, node.call.prompt.template, None,
-                    node.call.prompt.tail_tokens, None, live, live,
+                    self.lower(node.call.prompt).tail_tokens, None, live, live,
                     stage_work, name=node.name))
             survivors[alias] = live
         return survivors, work, stages
@@ -624,7 +625,7 @@ class _Search:
                        if kept.get(row, set()) & live_partners]
         work = self.join_stage_work(
             anchor, [partner], {anchor: anchor_rows, partner: live[partner]},
-            call.prompt, anchor_rows, allowed=kept)
+            self.lower(call.prompt), anchor_rows, allowed=kept)
         pairs = sum(len(kept[row] & live_partners) for row in anchor_rows)
         return work, {
             "name": self.labels.names[call],
@@ -683,13 +684,13 @@ class _Search:
             for anchor in stage_aliases:
                 if not all(
                         self.anchor_fits(prompt, anchor, stage_aliases, live)
-                        for prompt in [join.prompt] + [
-                            call.prompt for call in classifications]):
+                        for prompt in map(self.lower, [join.prompt] + [
+                            call.prompt for call in classifications])):
                     continue
                 partners = [alias for alias in stage_aliases if alias != anchor]
                 allowed = self.allowed_pairs.get(edge_index, {}).get(anchor)
                 stage_work = self.join_stage_work(
-                    anchor, partners, live, join.prompt,
+                    anchor, partners, live, self.lower(join.prompt),
                     live[anchor] if anchor in cached else (),
                     self.cross_resident(anchor, live, cached),
                     allowed=allowed,

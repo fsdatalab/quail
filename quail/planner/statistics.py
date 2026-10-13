@@ -31,9 +31,10 @@ from quail.logical import (
     join_conditions,
     model_call,
 )
-from quail.logical.prompts import prompt_aliases, score_token_parts
+from quail.logical.prompts import prompt_aliases
 from quail.planner.filter_order import PredicateCost
 from quail.planner.plan import CorpusStats
+from quail.planner.prompt_lowering import LoweredPrompt, score_token_parts
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -170,28 +171,22 @@ def cross_tuples(spec: PricedJoin, live: dict) -> float:
     return tuples * spec.pair_fraction
 
 
-def question_tokens(prompt, canvas: int = 0) -> int:
+def question_tokens(lowered: LoweredPrompt, canvas: int = 0) -> int:
     """Token count of the prompt's per-evaluation tail.
 
     canvas is the rows a diffusion model appends to every evaluation
     to answer on; a decoder answers on the tail's last row.
     """
-    if prompt.tail_tokens is None or prompt.preamble_tokens is None:
-        raise ValueError(
-            "prompts were bound without a tokenizer; the planner "
-            "needs token counts (pass one to compile_sql / docs)")
-    return prompt.tail_tokens + canvas
+    if lowered.tail_tokens is None:
+        raise ValueError("a score prompt has no question tail")
+    return lowered.tail_tokens + canvas
 
 
-def preamble_tokens(filters, joins) -> int:
-    """Return the engine preamble's token count from any bound prompt."""
-    for fs in filters.values():
-        for p in fs:
-            if p.prompt.preamble_tokens is not None:
-                return p.prompt.preamble_tokens
-    for j in joins:
-        if j.prompt.preamble_tokens is not None:
-            return j.prompt.preamble_tokens
+def preamble_tokens(lowered_prompts) -> int:
+    """Return the engine preamble's token count from any lowered prompt."""
+    for lowered in lowered_prompts:
+        if lowered.preamble_tokens is not None:
+            return lowered.preamble_tokens
     return 0
 
 
@@ -200,14 +195,9 @@ def _join_aliases(join) -> list:
     return [r.alias for r in join.prompt.args]
 
 
-def _label_counts(join) -> dict:
+def _label_counts(lowered: LoweredPrompt) -> dict:
     """Return alias -> (block_label_tokens, anchor_frame_tokens)."""
-    out = {a: (lt, nt) for a, lt, nt in join.prompt.labels}
-    if any(lt is None for lt, _ in out.values()):
-        raise ValueError(
-            "join prompts were bound without a tokenizer; the planner "
-            "needs token counts (pass one to compile_sql / docs)")
-    return out
+    return {a: (lt, nt) for a, lt, nt in lowered.labels}
 
 
 def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
@@ -239,14 +229,15 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
                 pair_fraction=fraction,
                 cost=ScoreJoinCost((left, right), cost, fraction)))
             continue
-        labels = _label_counts(j)
+        lowered = context.lowered(j.prompt)
+        labels = _label_counts(lowered)
         out.append(PricedJoin(
             written_pos=i, aliases=tuple(_join_aliases(j)), anchor=j.anchor,
             anchor_free=(j.anchor is None and j.semantics == "full"),
             semantics=j.semantics, selectivity=j.selectivity,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
-            tail_tokens=question_tokens(j.prompt, canvas),
+            tail_tokens=question_tokens(lowered, canvas),
             on=tuple((c.left.alias, c.left.column, c.right.alias,
                       c.right.column) for c in conditions),
             pair_fraction=fraction))
@@ -268,6 +259,7 @@ class PlanStatistics:
         pre: The engine preamble's token count.
         specs: The joins as PricedJoin records, in written order.
         asks: alias -> written positions of its AI.IF predicates.
+        lowered: Every prompt of the plan, lowered to token ids.
     """
 
     stats: dict
@@ -279,6 +271,7 @@ class PlanStatistics:
     pre: int
     specs: tuple
     asks: dict
+    lowered: dict
 
 
 def ask_positions(filters) -> dict:
@@ -315,6 +308,10 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
     ask_filters = {alias: [operators.filters[alias][position]
                            for position in positions]
                    for alias, positions in asks.items() if positions}
+    if context is None:
+        raise ValueError("plan statistics need a planning context")
+    lowered = {prompt: context.lowered(prompt) for prompt in (
+        *operators.prompts, *(node.call.prompt for node in operators.extracts))}
     lengths = {a: summarize_alias(t, model.sliding_window,
                                   memo=context.memo if context is not None else None)
                for a, t in doc_tokens.items()}
@@ -339,10 +336,14 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
         stats=stats, lengths=lengths, chunk=chunk,
         arena_pages=tuple(arena_split), admission=admission,
         cap_pages=retention_pages(admission, chunk, budgets.PAGE_TOKENS),
-        pre=preamble_tokens(ask_filters, operators.joins),
+        pre=preamble_tokens(
+            lowered[prompt] for prompt in (
+                *(p.prompt for fs in ask_filters.values() for p in fs),
+                *(j.prompt for j in operators.joins))),
         specs=tuple(join_specs(operators.joins, pair_fractions,
                                model.canvas_tokens, context=context,
                                chunk=chunk)),
+        lowered=lowered,
         asks=asks)
 
 
@@ -394,12 +395,13 @@ def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
     return live
 
 
-def filter_alias_work(preds, stats, order, pre: int,
+def filter_alias_work(preds, stats, order, pre: int, lowered,
                       canvas: int = 0, window: int = 0) -> Work:
     """Prepare a filter sequence's counts and price its recorded order."""
     predicates = [preds[index] for index in order]
     return filter_sequence_work(
-        [question_tokens(predicate.prompt, canvas) for predicate in predicates],
+        [question_tokens(lowered[predicate.prompt], canvas)
+         for predicate in predicates],
         [effective_selectivity(predicate.selectivity) for predicate in predicates],
         pre + stats.mean_doc_tokens, float(stats.n_docs), window)
 
@@ -419,7 +421,8 @@ def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
         alias: filter_alias_work(
             predicates, statistics.stats[alias],
             [i for i in orders.get(alias, []) if i in statistics.asks[alias]],
-            statistics.pre, model.canvas_tokens, model.sliding_window)
+            statistics.pre, statistics.lowered, model.canvas_tokens,
+            model.sliding_window)
         for alias, predicates in plan.operators().filters.items()
     }
 
@@ -469,8 +472,20 @@ def score_statistics(prompt, context, chunk, *, mean_tokens=None):
 
 
 def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
-                         chunk_tokens, context=None) -> tuple[PredicateCost, ...]:
-    """Prepare costs and reusable result identities for predicate ordering."""
+                         chunk_tokens, context=None,
+                         lower=None) -> tuple[PredicateCost, ...]:
+    """Prepare costs and reusable result identities for predicate ordering.
+
+    Args:
+        predicates: The model predicates of one table.
+        prefix_tokens: The preamble and mean document tokens.
+        model: Model spec.
+        device: Device spec.
+        chunk_tokens: The forward pass token budget.
+        context: The planning context; prices scores and lowers prompts.
+        lower: Lowers a prompt when there is no context.
+    """
+    lower = context.lowered if lower is None else lower
     prepared = []
     for predicate in predicates:
         if is_score(predicate.expression):
@@ -479,7 +494,7 @@ def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
             first = later = cost.seconds
             reuse_key = predicate.prompt
         else:
-            q = question_tokens(predicate.prompt, model.canvas_tokens)
+            q = question_tokens(lower(predicate.prompt), model.canvas_tokens)
             first = partial(mul, filter_cost(
                 q, prefix_tokens, model, device, chunk_tokens, first=True))
             later = partial(mul, filter_cost(

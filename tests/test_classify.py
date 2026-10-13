@@ -47,6 +47,7 @@ from quail.physical import (
 from quail.physical.pipelines import build_pipelines
 from quail.planner.logical_rules import push_down_projection
 from quail.planner.plan import EngineConfig, Refusal
+from quail.planner.prompt_lowering import lower_prompt
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 from quail_b.prompts import AGENT_PROGRESS, AGENT_PROGRESS_DESCRIPTIONS
 from quail_b.prompts import AGENT_PROGRESS_LABELS as STAGES
@@ -1200,7 +1201,8 @@ def test_sql_category_forms_options_and_label_tables(session):
 
 
 def test_choice_letters_are_one_token_each_and_capped():
-    from quail.logical.prompts import MAX_LETTERS, choice_letters
+    from quail.logical.prompts import MAX_LETTERS
+    from quail.planner.prompt_lowering import choice_letters
 
     assert choice_letters(30) == tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZabcd")
     assert choice_letters(60)[52:56] == ("AA", "AB", "AC", "AD")
@@ -1222,7 +1224,7 @@ def test_classify_prompt_letters_its_categories():
     ref = ColumnRef("t", "agent_traces", "trace")
     bound = bind_classify_prompt(AGENT_PROGRESS, (ref,), STAGES,
                                  AGENT_PROGRESS_DESCRIPTIONS)
-    lettered = bound.lettered
+    lettered = lower_prompt(bound, letter_tokens).lettered
     assert lettered.letters == tuple("ABCDE") and bound.letters == ()
     assert lettered.preamble == bound.preamble
     assert LETTERS_INSTRUCTION in lettered.tail
@@ -1236,12 +1238,13 @@ def test_classify_prompt_letters_its_categories():
     assert bound.label_prefix == " " and answer_prefix(("", "")) == " "
     turned = bind_classify_prompt(AGENT_PROGRESS, (ref,), STAGES,
                                   turn=("<user>", "<model>"))
-    assert turned.label_prefix == "" and turned.lettered.tail.endswith("<model>")
+    assert turned.label_prefix == ""
+    assert lower_prompt(turned, letter_tokens).lettered.tail.endswith("<model>")
     # no lettered prompt when the tokenizer has no one-token letters
-    assert bind_classify_prompt(AGENT_PROGRESS, (ref,), STAGES,
-                                tokenizer=_bytes).lettered is None
-    tokenized = bind_classify_prompt(AGENT_PROGRESS, (ref,), STAGES,
-                                     tokenizer=letter_tokens)
+    assert lower_prompt(bind_classify_prompt(AGENT_PROGRESS, (ref,), STAGES),
+                        _bytes).lettered is None
+    tokenized = lower_prompt(bind_classify_prompt(AGENT_PROGRESS, (ref,), STAGES),
+                             letter_tokens)
     assert list(tokenized.lettered.tail_token_ids) == _bytes(
         tokenized.lettered.tail.replace("{0}", ""))
 

@@ -571,8 +571,9 @@ class GraphBuilder:
             self.nodes.append(AiFilter(
                 node_id=fid, inputs=input_ports((self.ids_src[alias],)), alias=alias,
                 written_pos=i,
-                question_tokens=question_tokens(p.prompt, self.model.canvas_tokens),
-                preamble_tokens=p.prompt.preamble_tokens,
+                question_tokens=question_tokens(
+                    self.context.lowered(p.prompt), self.model.canvas_tokens),
+                preamble_tokens=self.context.lowered(p.prompt).preamble_tokens,
                 selectivity=p.selectivity, expected_docs=round(n * surv, 1),
                 arena_writes=len(orders[alias]) > 1 or alias in self.pipelined,
                 stop_key=self.stop_keys.get(alias, ())))

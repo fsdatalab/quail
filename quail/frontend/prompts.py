@@ -1,6 +1,5 @@
 """Model-aware prompt binding for SQL and Python queries."""
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from quail.logical.expressions import Prompt
@@ -21,14 +20,13 @@ class PromptBinder:
     Without a model, turn and layout configure standalone frontend calls.
     """
 
-    tokenizer: Callable | None = None
     model: ModelSpec | None = None
     turn: tuple[str, str] = ("", "")
     layout: str = "ai-if"
 
     def bind(self, kind: str, template: str, args: tuple, *, labels=(),
              descriptions=(), task_description: str = "") -> Prompt:
-        """Bind and tokenize the prompt for an operator.
+        """Bind the prompt text for an operator.
 
         Args:
             kind: Filter, join, score, label, or extract operator kind.
@@ -39,7 +37,7 @@ class PromptBinder:
             task_description: Optional classification instruction.
 
         Returns:
-            The bound prompt with its text and token IDs.
+            The bound prompt text; the planner lowers it to token ids.
 
         Raises:
             ValueError: The operator kind is unknown.
@@ -49,10 +47,10 @@ class PromptBinder:
         if kind == "extract":
             if self.model is not None:
                 turn = self.model.extract_turn
-            return bind_extract_prompt(args, template, self.tokenizer, turn)
+            return bind_extract_prompt(args, template, turn)
         if kind == "label":
             return bind_classify_prompt(
-                template, args, labels, descriptions, self.tokenizer, turn,
+                template, args, labels, descriptions, turn,
                 task_description=task_description, layout=layout)
         if kind == "filter":
             binder = bind_prompt
@@ -62,4 +60,4 @@ class PromptBinder:
             binder = bind_score_prompt
         else:
             raise ValueError(f"unknown prompt kind {kind!r}")
-        return binder(template, args, self.tokenizer, turn=turn, layout=layout)
+        return binder(template, args, turn=turn, layout=layout)

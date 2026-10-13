@@ -44,7 +44,7 @@ from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
 def order_filters(predicates, rule, **kwargs):
-    costs = prepare_filter_costs(predicates, **kwargs)
+    costs = prepare_filter_costs(predicates, lower=lambda prompt: prompt, **kwargs)
     return [predicates[i] for i in order_filters_indexed(costs, rule)]
 
 def filter_sequence(plan, alias=None):
@@ -113,11 +113,11 @@ def _plan(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
     optimized, _ = _optimize(logical, doc_tokens, model, **kwargs)
     return plan_query(optimized, model=model, device=H100_SXM,
                       registry=built_in_registry(),
-                      doc_tokens=doc_tokens, **kwargs)
+                      doc_tokens=doc_tokens, tokenizer=tok, **kwargs)
 
 
 def _five_filter_plan(catalog, sels):
-    q = docs(catalog, "reviews", tok).alias("r")
+    q = docs(catalog, "reviews").alias("r")
     for j, s in enumerate(sels):
         q = q.ai_filter(prompt(f"flag {j} of: {{0}}", col("r.review")),
                         selectivity=s)
@@ -222,7 +222,7 @@ def test_filter_ordering_and_kv_writes(catalog):
     actual = order_filters(predicates, "by_cost", **kwargs)
     assert actual == [predicates[index] for index in expected_order]
 
-    logical = (docs(catalog, "reviews", tok).alias("r")
+    logical = (docs(catalog, "reviews").alias("r")
                .ai_filter(prompt("long " * 100 + "{0}", col("r.review")),
                           selectivity=0.1)
                .ai_filter(prompt("short " * 10 + "{0}", col("r.review")),
@@ -242,7 +242,7 @@ def test_filter_ordering_and_kv_writes(catalog):
     sequence = filter_sequence(plan)
     assert sequence.arena_writes is True
 
-    logical = (docs(catalog, "reviews", tok).alias("r")
+    logical = (docs(catalog, "reviews").alias("r")
                .ai_filter(prompt("a: {0}", col("r.review")))
                .ai_filter(prompt("b: {0}", col("r.review")),
                           selectivity=0.5)
@@ -361,12 +361,12 @@ def test_work_matches_attention_masks_and_component_costs():
 
 
 def _join_sequence(catalog, sels=(0.1, 0.1), anchors=(None, None)):
-    return (docs(catalog, "reviews", tok).alias("r")
-            .ai_join(docs(catalog, "threads", tok).alias("t"),
+    return (docs(catalog, "reviews").alias("r")
+            .ai_join(docs(catalog, "threads").alias("t"),
                      prompt("m1 {0} {1}", col("r.review"),
                             col("t.thread")),
                      selectivity=sels[0], anchor=anchors[0])
-            .ai_join(docs(catalog, "products", tok).alias("p"),
+            .ai_join(docs(catalog, "products").alias("p"),
                      prompt("m2 {0} {1}", col("t.thread"),
                             col("p.description")),
                      selectivity=sels[1], anchor=anchors[1])
@@ -374,9 +374,9 @@ def _join_sequence(catalog, sels=(0.1, 0.1), anchors=(None, None)):
 
 
 def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
-    logical = (docs(catalog, "reviews", tok).alias("r")
-               .ai_join([docs(catalog, "products", tok).alias("p"),
-                         docs(catalog, "threads", tok).alias("t")],
+    logical = (docs(catalog, "reviews").alias("r")
+               .ai_join([docs(catalog, "products").alias("p"),
+                         docs(catalog, "threads").alias("t")],
                         prompt("m {0} {1} {2}", col("r.review"),
                                col("p.description"), col("t.thread")),
                         selectivity=0.02)
@@ -430,12 +430,12 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     assert join_stages(same)[0]["anchor"] == "r"
 
     # by_cost runs the cheap .01 exists gate before the .9 full join
-    logical = (docs(catalog, "reviews", tok).alias("r")
-               .ai_join(docs(catalog, "products", tok).alias("p"),
+    logical = (docs(catalog, "reviews").alias("r")
+               .ai_join(docs(catalog, "products").alias("p"),
                         prompt("m {0} {1}", col("r.review"),
                                col("p.description")),
                         selectivity=0.9)
-               .ai_join(docs(catalog, "threads", tok).alias("t"),
+               .ai_join(docs(catalog, "threads").alias("t"),
                         prompt("m {0} {1}", col("r.review"),
                                col("t.thread")),
                         selectivity=0.01, semantics="exists")
@@ -472,12 +472,12 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
 
     # the gate runs first and the full join after it, both anchored on
     # r: the first group keeps r's KV for the second
-    logical = (docs(catalog, "reviews", tok).alias("r")
-               .ai_join(docs(catalog, "products", tok).alias("p"),
+    logical = (docs(catalog, "reviews").alias("r")
+               .ai_join(docs(catalog, "products").alias("p"),
                         prompt("m {0} {1}", col("r.review"),
                                col("p.description")),
                         selectivity=0.9)
-               .ai_join(docs(catalog, "threads", tok).alias("t"),
+               .ai_join(docs(catalog, "threads").alias("t"),
                         prompt("m {0} {1}", col("r.review"),
                                col("t.thread")),
                         selectivity=0.01, semantics="exists")
@@ -501,10 +501,10 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
     # on one GPU a filtered anchor streams into its join, so its sequence
     # keeps no KV; on two GPUs the sequence keeps its survivors for the
     # join, and writes KV pages to do so
-    filtered = (docs(catalog, "reviews", tok).alias("r")
+    filtered = (docs(catalog, "reviews").alias("r")
                 .ai_filter(prompt("negative: {0}", col("r.review")),
                            selectivity=0.5)
-                .ai_join(docs(catalog, "products", tok).alias("p"),
+                .ai_join(docs(catalog, "products").alias("p"),
                          prompt("about {0} {1}", col("r.review"),
                                 col("p.description")), selectivity=0.1)
                 .select("r.id", "p.asin"))
@@ -736,10 +736,10 @@ def test_foreign_node_placement_and_pipelines():
 
 
 def _big_plan(catalog):
-    logical = (docs(catalog, "reviews", tok).alias("r")
+    logical = (docs(catalog, "reviews").alias("r")
                .ai_filter(prompt("negative: {0}", col("r.review")),
                           selectivity=0.5)
-               .ai_join(docs(catalog, "products", tok).alias("p"),
+               .ai_join(docs(catalog, "products").alias("p"),
                         prompt("about {0} {1}", col("r.review"),
                                col("p.description")), selectivity=0.1)
                .select("r.id", "p.asin"))
@@ -831,7 +831,7 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     assert page_aligned_shared_tokens(store) == 32
     plain = _token_store(tmp_path / "plain.arrow", ["1 2 3", "4 5 6"])
 
-    logical = docs(catalog, "reviews", tok).alias("r").ai_filter(
+    logical = docs(catalog, "reviews").alias("r").ai_filter(
         prompt("flag: {0}", col("r.review")), selectivity=0.5).select("r.id")
 
     plan = _plan(logical, {"r": store.lengths})
@@ -880,8 +880,8 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     shared = " ".join(str(i) for i in range(400))
     reviews = _token_store(tmp_path / "anchors.arrow",
                            [shared + f" {9000 + r}" for r in range(20)])
-    logical = (docs(catalog, "reviews", tok).alias("r")
-               .ai_join(docs(catalog, "products", tok).alias("p"),
+    logical = (docs(catalog, "reviews").alias("r")
+               .ai_join(docs(catalog, "products").alias("p"),
                         prompt("m {0} {1}", col("r.review"),
                                col("p.description")),
                         selectivity=0.5, anchor="r")

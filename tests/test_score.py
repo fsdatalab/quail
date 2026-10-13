@@ -248,7 +248,6 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
         "0.8 > AI.SCORE(PROMPT('Is {1} relevant to {0}', q.text, d.body)) "
         "WHERE 0.5 <= AI.SCORE(PROMPT('Refund? {0}', d.body))",
         catalog,
-        _tokens,
     )
     join = plan.root.input
     assert isinstance(join, SemanticJoin)
@@ -798,7 +797,7 @@ def test_shared_score_borrows_prefixes_and_reads_the_cue(monkeypatch):
 def test_score_query_shape_errors_are_compile_errors(catalog):
     for sql, message in SHAPE_ERRORS:
         try:
-            compile_sql(sql, catalog, _tokens)
+            compile_sql(sql, catalog)
         except CompileError as error:
             assert message in str(error), sql
         else:
@@ -839,9 +838,12 @@ def test_reranker_prompts_render_stored_documents_and_the_ai_if_frame(catalog):
         QWEN3_RERANKER_SYSTEM_TEXT,
         bind_join_prompt,
         bind_prompt,
+        render_qwen3_reranker_input,
+    )
+    from quail.planner.prompt_lowering import (
+        lower_prompt,
         render_filter_prompt_ids,
         render_join_prompt_ids,
-        render_qwen3_reranker_input,
         true_false_token_ids,
     )
     from quail.specs import MODELS
@@ -898,14 +900,14 @@ def test_reranker_prompts_render_stored_documents_and_the_ai_if_frame(catalog):
             turn = MODELS[model].turn
             args = query.logical.root.columns[0].expression.prompt.args
             if pair:
-                prompt = bind_join_prompt(template, args, list, turn)
+                prompt = lower_prompt(bind_join_prompt(template, args, turn), list)
                 expected = [
-                    render_join_prompt_ids(prompt, [list(text), list(body)], 0, list)
+                    render_join_prompt_ids(prompt, [list(text), list(body)], 0)
                     for text in ("refund", "shipping") for body in documents
                 ]
             else:
-                prompt = bind_prompt(template, args, list, turn)
-                expected = [render_filter_prompt_ids(prompt, list(body), list)
+                prompt = lower_prompt(bind_prompt(template, args, turn), list)
+                expected = [render_filter_prompt_ids(prompt, list(body))
                             for body in documents]
             assert [list(tokens) for tokens in model_execution.reranker.prompts] \
                 == expected, case
