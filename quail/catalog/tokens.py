@@ -635,19 +635,6 @@ def longest_common_prefix(left, right) -> int:
     return limit
 
 
-def shared_prefix_lengths(sequences) -> list[int]:
-    """Return, per sequence, the prefix tokens another sequence also has.
-
-    The values sum to the tokens a prefix trie over the sequences
-    saves: an execution with unlimited KV that computes every distinct
-    prefix once pays for each sequence only beyond its shared length.
-    The sum does not depend on the order the sequences are computed
-    in; a sequence's shared length is the longest common prefix with
-    the lexicographic predecessor.
-    """
-    return prefix_tree(sequences, 1).shared
-
-
 def _token_array(document):
     """A document's token ids as an int32 array, without a Python list."""
     import numpy as np

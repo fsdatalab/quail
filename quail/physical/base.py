@@ -150,10 +150,6 @@ class PhysicalNode:
         """Return the same node with replacement inputs."""
         return replace(self, inputs=inputs)
 
-    def embedded_nodes(self) -> tuple["PhysicalNode", ...]:
-        """Return physical nodes stored inside this planning node."""
-        return ()
-
     def explain_fields(self) -> Mapping[str, Any]:
         """Return fields shown on one explain line."""
         return self.attributes()
@@ -288,15 +284,5 @@ class PhysicalGraph:
         return tuple(ordered)
 
     def nodes_by_type(self, type_name: str) -> tuple[PhysicalNode, ...]:
-        """Return graph and embedded nodes with one registered type name."""
-        found = []
-
-        def visit(node: PhysicalNode) -> None:
-            if node.type_name == type_name:
-                found.append(node)
-            for child in node.embedded_nodes():
-                visit(child)
-
-        for node in self.nodes:
-            visit(node)
-        return tuple(found)
+        """Return the graph's nodes with one registered type name."""
+        return tuple(node for node in self.nodes if node.type_name == type_name)

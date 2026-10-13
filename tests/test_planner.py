@@ -9,7 +9,6 @@ import pytest
 from fakes import keep_even, register_claims_evidence, two_alias_graph
 
 import quail
-from quail.backends.quail import expected_join_predicates
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, DocumentProvider
 from quail.cost.filters import filter_cost
@@ -53,7 +52,7 @@ def filter_chain(plan, alias=None):
 
 
 def join_stages(plan):
-    return [stage.attributes() for stage in expected_join_predicates(plan)]
+    return [node.attributes() for node in plan.nodes if isinstance(node, AiJoin)]
 
 
 def node_kinds(plan):

@@ -325,9 +325,6 @@ class ClassifySpec(InferenceSpec):
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ClassifySpec":
-        if value.get("stages"):
-            raise ValueError(
-                "nested classification stages are unsupported; replan query")
         return cls(
             **vars(InferenceSpec.from_mapping(value)),
             pair_fraction=float(value.get("pair_fraction", 1.0)),
@@ -693,8 +690,7 @@ class ExtractSpec(InferenceSpec):
             question=str(value["question"]),
             trim=bool(value.get("trim", True)),
             shares_head=bool(value.get("shares_head", False)),
-            **{name: value.get(name, value.get("config", {}).get(
-                name, getattr(cls, name)))
+            **{name: value.get(name, getattr(cls, name))
                for name in ("max_answer_tokens", "draft_tokens", "top_tokens",
                             "first_window_chars", "window_chars")},
         )

@@ -253,11 +253,6 @@ def filter_question_segments(tail: str, layout: str = "ai-if") -> list[str]:
     return PROMPT_LAYOUTS[layout].question_segments(content, sep)
 
 
-def render_filter_question(tail: str, layout: str = "ai-if") -> str:
-    """Wrap a filter tail with the task instruction and answer cue."""
-    return "".join(filter_question_segments(tail, layout))
-
-
 def filter_question_text(prompt) -> str:
     """Return the text appended after a filter document."""
     if len(prompt.args) != 1 or not prompt.tail.startswith("{0}"):
@@ -667,13 +662,6 @@ def _bind_choice_classify_prompt(template, args, labels, descriptions,
                   preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
                   label_token_ids=label_ids, layout=layout,
                   tail_segments=segments)
-
-
-def render_joined_classify_prompt_text(prompt, anchor: str,
-                                       partner: str) -> str:
-    """Render the complete classification prompt for one joined row."""
-    return (prompt.preamble + anchor + join_anchor_note(0) + join_label(1)
-            + partner + prompt.tail)
 
 
 def bind_score_prompt(template: str, args: tuple,

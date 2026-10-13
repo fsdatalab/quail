@@ -219,12 +219,6 @@ def intersect_tables(left: pa.Table, right: pa.Table) -> pa.Table:
     return table.select(keys).replace_schema_metadata(left.schema.metadata)
 
 
-def intersect_indices(left: pa.Array, right: pa.Array) -> pa.Array:
-    """Return document indices present in both arrays."""
-    mask = pc.is_in(left, value_set=right)
-    return pc.filter(left, mask)
-
-
 def count_rows(declaration: acero.Declaration) -> int:
     """Count rows inside Acero without returning the rows to Python."""
     options = acero.AggregateNodeOptions(

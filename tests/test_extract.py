@@ -478,13 +478,9 @@ def test_extraction_settings_survive_plan_serialization(session):
     for name in settings:
         legacy.pop(name)
     assert ExtractSpec.from_mapping(legacy) == node.spec
-    legacy["config"] = settings
-    assert ExtractSpec.from_mapping(legacy) == spec
     request = RequestExtractSpec(alias="c", output="ends", question=QUESTION,
                                  tail_token_ids=(1, 2), max_answer_tokens=7)
     assert RequestExtractSpec.from_mapping(request.to_dict()) == request
     legacy = request.to_dict()
     legacy.pop("max_answer_tokens")
     assert RequestExtractSpec.from_mapping(legacy).max_answer_tokens == 64
-    legacy["config"] = settings
-    assert RequestExtractSpec.from_mapping(legacy) == request

@@ -19,8 +19,3 @@ def document_shared_tokens(store) -> list[int]:
 def page_tree(store) -> PrefixTree:
     """Return the store's prefix tree in whole KV pages, cached on its token store."""
     return prefix_tree(_documents(store), PAGE_TOKENS)
-
-
-def shared_prefix_tokens(store) -> int:
-    """Return the prefix tokens a token store's documents share."""
-    return sum(document_shared_tokens(store))

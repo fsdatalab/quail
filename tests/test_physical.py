@@ -18,13 +18,8 @@ from quail.execution.runner import BarrierRuntime, NodeResult
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
 from quail.logical import LogicalPlan
 from quail.physical import (
-    AiClassify,
-    AiExtract,
-    AiScore,
     Barrier,
-    Comparison,
     ExecutionLocation,
-    Filter,
     InputPort,
     OutputPort,
     PhysicalGraph,
@@ -58,38 +53,6 @@ def test_barrier_preserves_survivor_order_and_duplicates():
             values = [outputs[f"ids:{alias}"].column(alias).to_pylist() if arrow
                       else outputs[f"ids:{alias}"] for alias in node.aliases]
             assert values == ([[3, 1, 3], [8, 7]] if keep else [[], []])
-
-
-@pytest.mark.parametrize("node_type, settings", [
-    (AiScore, {"draws": 2}),
-    (AiClassify, {"labels": ("yes", "no"), "draws": 2}),
-    (AiExtract, {"question": "When?", "draft_tokens": 8}),
-])
-def test_saved_score_ports_decode_as_rows(node_type, settings):
-    from quail.physical.base import input_ports
-
-    scan = Scan(node_id="input:d", alias="d", input_id="d")
-    call = node_type(
-        node_id="call", inputs=input_ports((PortRef(scan.node_id, "ids:d"),)),
-        backend_name="quail", model="qwen3-4b-fp8",
-        spec=node_type.spec_type(
-            name="answer", aliases=("d",), query_template="{0}",
-            arguments=(("d", "text"),), expected_inputs=2, estimated_seconds=1,
-            **settings))
-    filtered = Filter(
-        node_id="filter", inputs=input_ports((PortRef("call", "rows"),)),
-        predicate=Comparison("answer", ">", 0.5), aliases=("d",))
-    graph = PhysicalGraph((scan, call, filtered), PortRef("filter", "rows"))
-    codecs = built_in_registry().codecs
-    current = encode_graph(graph, codecs)
-    saved = copy.deepcopy(current)
-    saved["root"]["port"] = "scores"
-    port = saved["nodes"][-1]["inputs"][0]
-    port["source"]["port"] = port["value_type"] = "scores"
-    original = copy.deepcopy(saved)
-    assert decode_graph(current, codecs) == graph
-    assert decode_graph(saved, codecs) == graph
-    assert saved == original
 
 
 @dataclass(frozen=True)

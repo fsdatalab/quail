@@ -518,8 +518,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         children = dict.fromkeys(port.source.node_id for port in node.inputs)
         for child in children:
             visit(graph.node(child), depth + 1)
-        for child in node.embedded_nodes():
-            visit(child, depth + 1)
 
     visit(graph.node(graph.root.node_id), 0)
     for node in graph.topological_nodes():

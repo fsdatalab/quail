@@ -13,61 +13,6 @@ from dataclasses import dataclass
 import numpy as np
 
 
-def orient(mean_left_tokens, mean_right_tokens):
-    """Which side anchors: the longer one.
-
-    Anchor tokens are paid once per document; partner tokens are paid
-    once per pair.
-    """
-    return "left" if mean_left_tokens >= mean_right_tokens else "right"
-
-
-def gate(answer_rows):
-    """Anchors that survive a conjunctive stage: any TRUE in the row.
-
-    answer_rows: dict anchor_index -> iterable of 0/1 answers.
-    Returns the sorted surviving anchor indices.
-    """
-    return sorted(a for a, row in answer_rows.items() if any(row))
-
-
-def matches(answer_rows):
-    """anchor_index -> sorted list of partner indices answered TRUE."""
-    return {a: sorted(i for i, v in enumerate(row) if v)
-            for a, row in answer_rows.items()}
-
-
-def assemble(ans1_rows, ans2_rows):
-    """Output triples from two pairwise join stages sharing one anchor.
-
-    ans1_rows: b -> row of 0/1 over A (stage 1, anchored on b).
-    ans2_rows: b -> row of 0/1 over C, present only for gated
-    survivors.
-    """
-    m1, m2 = matches(ans1_rows), matches(ans2_rows)
-    out = []
-    for b in sorted(ans2_rows):
-        for a in m1.get(b, ()):
-            for c in m2[b]:
-                out.append((a, b, c))
-    return sorted(out)
-
-
-def brute_force_triples(ans1_rows, ans2_rows):
-    """Nested-loop reference over recorded answers without gating."""
-    out = []
-    for b, row1 in sorted(ans1_rows.items()):
-        for a, v1 in enumerate(row1):
-            if v1:
-                for c, v2 in enumerate(ans2_rows[b]):
-                    if v2:
-                        out.append((a, b, c))
-    return sorted(out)
-
-
-# --------------------------------------------- continuous admission
-
-
 def pages_for(tokens: int, page_tokens: int) -> int:
     """Pages needed for `tokens` rows (suffix KV is never paged)."""
     return -(-tokens // page_tokens)
@@ -118,12 +63,6 @@ class Borrowing:
         self.skipped = set()       # documents that never run a chunk
         self.chosen = {}           # admitted borrower -> (parent, shared)
         self.borrowed_tokens = 0   # prefix tokens read from a parent
-
-    def add(self):
-        """A document streamed in after construction; it borrows nothing."""
-        self.tree_parent.append(None)
-        self.tree_shared.append(0)
-        return len(self.tree_parent) - 1
 
     def detach(self, doc):
         """The document's KV is already resident, so it borrows nothing."""
@@ -565,31 +504,6 @@ class JoinAdmission:
         for event in events:
             self._settle_group(event.anchor, event.survived)
         return events
-
-    def buildable_tokens(self):
-        """Tokens the next chunk could pack, capped at the chunk budget.
-
-        Counts every placed anchor's remaining stream and every pending
-        anchor's first chunk. Chunk room, not pages: a page-blocked
-        anchor still counts.
-        """
-        total = 0
-        for a in self.ready:
-            j, i = self._stage[a], self._next[a]
-            cum = self._cum_of(a, j)
-            total += (self.frame_rows[j] if i == 0 else 0) + cum[-1] - cum[i]
-            if total >= self.chunk_budget:
-                return self.chunk_budget
-        for a in self.pending:
-            if self._stage[a] == _DONE:
-                continue
-            total += (self._carried[a] + self.frame_rows[0]
-                      + self._cum_of(a, 0)[-1])
-            if total >= self.chunk_budget:
-                return self.chunk_budget
-        return total
-
-    # ---- chunk building ------------------------------------------------
 
     def _first_cost(self, a, j, i):
         return self._suffix(a, j, i) + (self.frame_rows[j] if i == 0 else 0)

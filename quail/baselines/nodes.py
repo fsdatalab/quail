@@ -227,8 +227,8 @@ class RequestExtractSpec:
             tail_text=str(value.get("tail_text", "")),
             preamble_token_ids=tuple(value.get("preamble_token_ids", ())),
             preamble_text=str(value.get("preamble_text", "")),
-            max_answer_tokens=value.get("max_answer_tokens", value.get(
-                "config", {}).get("max_answer_tokens", cls.max_answer_tokens)),
+            max_answer_tokens=value.get("max_answer_tokens",
+                                        cls.max_answer_tokens),
         )
 
     def to_dict(self) -> dict:

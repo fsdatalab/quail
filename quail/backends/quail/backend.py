@@ -27,7 +27,6 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     AiScore,
-    Barrier,
     PhysicalNode,
 )
 from quail.planner import pricing
@@ -147,20 +146,6 @@ class QuailModelExecution:
     def execute_pipeline(self, pipeline, inputs, context) -> dict:
         """Execute a model pipeline with this executor's loaded state."""
         return execute_pipeline(self.query, pipeline, inputs, context)
-
-
-def expected_join_nodes(plan) -> tuple[PhysicalNode, ...]:
-    """Return the join nodes selected from Quail's planning estimates."""
-    return tuple(
-        node for node in plan.nodes if isinstance(node, (AiJoin, Barrier))
-    )
-
-
-def expected_join_predicates(plan) -> tuple:
-    """Return Quail's join predicates in execution order."""
-    return tuple(
-        node for node in expected_join_nodes(plan) if isinstance(node, AiJoin)
-    )
 
 
 class QuailBackend:
