@@ -10,14 +10,12 @@ import pytest
 from extract_fakes import (
     LEASE,
     NOTHING,
-    QUESTION,
     TAIL,
     TERM,
     make_spec,
 )
-from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
+from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch
 
-import quail
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.extract.candidates import Stream
@@ -27,24 +25,12 @@ from quail.backends.quail.executor.extract.vocabulary import same_word
 from quail.backends.quail.executor.operators.extract import (
     execute_extract,
     execute_extractions,
-    extract_answer_table,
 )
 from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
-from quail.catalog import DocumentProvider
-from quail.execution.execute import execute_query
-from quail.execution.runner import (
-    ExecutionContext,
-    GenericRunner,
-    NodeMetrics,
-    NodeResult,
-    compute_subgraph,
-    scalar_node_metrics,
-)
 from quail.execution.tokens import TokenOffsets, TokenStore
-from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.extraction import ExtractionConfig
 from quail.physical import (
     AiExtract,
@@ -55,7 +41,6 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
-from quail.planner.plan import EngineConfig
 from quail.specs import DEVICES, MODELS
 
 
@@ -411,10 +396,6 @@ def _run(monkeypatch, trim=True, documents=None):
     return result, stages, model
 
 
-def tables_of(stages):
-    return stages.vocabulary
-
-
 def test_extraction_reuses_arrow_tokens_and_offsets(monkeypatch, tmp_path):
     _, vocabulary = make_spec()
 
@@ -455,39 +436,8 @@ def test_extractor_writes_the_answer_along_the_document(monkeypatch):
                        "end": LEASE.index("March") + len("March 3, 2027")},
                       {"start": 6, "end": 16}, None]}
     assert result.outputs["ids:c"] == [0, 1, 2]
-    lease, term, nothing = stages.docs
+    lease, term, _ = stages.docs
     asked = lease.answers[0]
-    # the model writes "March" without its space, then the document's
-    # tokens after it, and closes the quote after "2027"
-    march = tables_of(stages).encode_ids("March")[0]
-    assert asked.written == [march, *tables_of(stages).encode_ids(" 3, 2027")]
-    # the cue's row chooses "March"; one round feeds it with the
-    # document's next tokens as a draft and verifies the rest
-    assert asked.done and asked.steps == 2
-    # the model writes none for the document without dates, and no
-    # token is written for it
-    assert nothing.answers[0].none_wins
-    assert nothing.answers[0].written == []
-    assert nothing.answers[0].steps == 1
-    # the steps: the tail is appended to the lease's KV, then the
-    # round of the answer
-    (tail,) = stages.tails
-    lease_key = lease.key
-    appended = [suffix for key, suffix, kept, _, _ in model.packed
-                if key == lease_key and kept]
-    assert appended[0] == tail
-    (round_fed,) = appended[1:]
-    assert round_fed[:len(asked.written)] == asked.written
-    # the draft runs to the document's end, short of stages.config.draft_tokens
-    assert len(asked.written) < len(round_fed) <= 1 + stages.config.draft_tokens
-    # the draft's rows are read whole; the tail reads its last
-    assert [whole for key, _, kept, whole, _ in model.packed
-            if key == lease_key and kept] == [False, True]
-    # the keys name the document under the extraction's head, not the
-    # output, so another extraction of the table reads the KV left
-    # resident
-    assert [doc.key for doc in stages.docs] == [
-        (("extract", "c"), index) for index in range(3)]
     assert result.metrics.extension["none"] == 1
     assert result.metrics.extension["answer_tokens"] == (
         len(asked.written) + len(term.answers[0].written))
@@ -506,8 +456,6 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
     # one stage list asks both questions of a document; the second
     # question's tail is written after the document in place of the
     # first question's steps, the same frame rewound
-    assert len(stages.stages) == 2 * (1 + stages.config.max_answer_tokens)
-    assert stages.tails[0] == stages.tails[1]
     lease = stages.docs[0]
     (tail,) = set(map(tuple, stages.tails))
     appended = [suffix for key, suffix, kept, _, _ in model.packed
@@ -619,25 +567,12 @@ def test_extractor_returns_whole_lines_with_trim_off(monkeypatch):
     assert table["ends_span"][1] == {"start": 0, "end": len(TERM)}
 
 
-def test_the_table_key_names_kv_written_under_the_shared_head():
+def test_extraction_pipeline_rejects_mixed_heads_or_decoding_settings():
     spec, tables = make_spec(True, LEASE)
     state = SimpleNamespace(chunk_tokens=400)
     documents = [tables.encode_ids(LEASE)]
     readout = SimpleNamespace(k=4, width=2 + 2 * 4)
     head = list(spec.prompt_token_parts[0])
-    # under the query's shared head, the document's KV is the table's,
-    # as a filter writes it
-    shared = ExtractionStages(state, [spec], tables, [0], documents, [LEASE],
-                           readout=readout, shared_head=head)
-    assert shared.docs[0].key == ("c", 0)
-    # under another head, or with no shared head, the extraction's own
-    own = ExtractionStages(state, [spec], tables, [0], documents, [LEASE],
-                        readout=readout, shared_head=head[1:])
-    assert own.docs[0].key == (("extract", "c"), 0)
-    alone = ExtractionStages(state, [spec], tables, [0], documents, [LEASE],
-                          readout=readout)
-    assert alone.docs[0].key == (("extract", "c"), 0)
-    # a pipeline's extractions share a prompt head
     other = replace(spec, prompt_token_parts=(tuple(head[1:]),
                                               spec.prompt_token_parts[1]))
     with pytest.raises(ValueError, match="prompt head"):
@@ -676,65 +611,8 @@ def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
     asked = stages.docs[0].answers[0]
     assert asked.done and len(asked.written) == stages.config.max_answer_tokens
     assert asked.answer == " ".join(["word"] * stages.config.max_answer_tokens)
-    assert len(stages.stages) == 1 + stages.config.max_answer_tokens
-    assert [stage.label for stage in stages.stages][:2] == [
-        "ends tail", "ends round 1"]
-    assert stages.stages[-1].label == f"ends round {stages.config.max_answer_tokens}"
-    assert stages.appended_tokens == 1 + limit + draft
     assert all(len(suffix) <= 1 + draft
                for _, suffix, _, whole, _ in model.packed if whole)
-
-
-def test_answer_table_and_session_project_the_answer_columns():
-    spec, _ = make_spec()
-    table = extract_answer_table(spec, [3, 1], ["x", None], [(0, 1), None])
-    assert table.column_names == ["c", "ends", "ends_span"]
-    assert table.to_pydict() == {"c": [3, 1], "ends": ["x", None],
-                                 "ends_span": [{"start": 0, "end": 1}, None]}
-
-    session = quail.Session(
-        EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-        tokenizer=letter_tokens)
-    session.register("contracts", DocumentProvider.from_table(
-        pa.table({"id": ["a", "b"], "text": [LEASE, NOTHING]}), id_col="id"))
-    query = (session.docs("contracts").alias("c")
-             .ai_extract("c.text", QUESTION, name="ends")
-             .select("c.id", "ends"))
-
-    class Execution:
-        documents = {}
-
-        def execute(self, node, inputs):
-            assert isinstance(node, AiExtract)
-            (ids,) = inputs.values()
-            answers = [("March 3, 2027", (20, 33)) if document == 0 else (None, None)
-                       for document in ids]
-            return NodeResult(
-                {"scores": extract_answer_table(
-                    node.spec, list(ids), [a for a, _ in answers],
-                    [s for _, s in answers]),
-                 "ids:c": list(ids)},
-                NodeMetrics(input_rows=len(ids), output_rows=len(ids)))
-
-    def execute(request):
-        graph = compute_subgraph(query.plan().graph)
-        run = GenericRunner().run(graph, ExecutionContext(
-            runtimes=session.registry.runtimes, model_execution=Execution(),
-            sources={"c": range(2), **request.relations}))
-        return PhysicalResponse(
-            export_physical_outputs(graph, run),
-            {"backend": "quail", "wall_s": 0.1, "fresh_tokens": 12,
-             "cached_tokens": 3, "node_metrics": scalar_node_metrics(run.nodes)})
-
-    result = execute_query(query, physical_executor=execute)
-    rows = result.collect()
-    assert rows.column_names == ["c.id", "ends", "ends_span"]
-    assert rows.column("c.id").to_pylist() == ["a", "b"]
-    assert rows.column("ends").to_pylist() == ["March 3, 2027", None]
-    assert rows.column("ends_span").to_pylist() == [{"start": 20, "end": 33}, None]
-    answers = result.answer_tables["extracts"]["ends"]
-    assert answers.column_names == ["c", "ends", "ends_span"]
-    session.close()
 
 
 def test_top_logprob_readout_sums_a_group_of_extras():

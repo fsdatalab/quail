@@ -20,6 +20,7 @@ from quail.logical import (
 from quail.physical import (
     AiClassify,
     AiExtract,
+    AiFilter,
     AiJoin,
     ExtractSpec,
     Filter,

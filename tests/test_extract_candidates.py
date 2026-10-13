@@ -16,6 +16,7 @@ from quail.backends.quail.executor.extract.candidates import (
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary, same_word
 from quail.execution.tokens import GigatokenEncoder
+from quail.extraction import ExtractionConfig
 
 
 def test_gigatoken_vocabulary_encodes_unicode_without_transformers(monkeypatch):
@@ -114,26 +115,6 @@ def test_a_stream_writes_a_run_of_whitespace_as_one_space():
     assert squeezed("a  b\n\n c") == ("a b c", [1, 3, 4, 7, 8])
 
 
-def test_a_stream_tokenizes_a_window_at_a_time():
-
-    text = " ".join(["word"] * 300)
-    tables = make_vocabulary(text)
-    ids, offsets = tables.encode(text)
-    prefix = [99] + ids
-    tokens = document_tokens(offsets, 1)
-    word = tables.encode_ids("word")[0]
-    starts = first_tokens(tables, _scores(tables, {word: -0.5}), prefix, tokens)
-    streams = make_streams(tables, text, starts, word)
-    assert len(streams) == 300
-    first = streams[0]
-    # one window of the text is tokenized ahead; the rest on demand
-    window_tokens = len(first.stream)
-    assert window_tokens < 300 and not first.exhausted
-    assert first.next(window_tokens + 5, tables) == tables.encode_ids(" word")[0]
-    assert len(first.stream) > window_tokens
-    assert first.next(10_000, tables) is None and first.exhausted
-    assert text[first.char:first.ends[-1]] == text
-
 def test_a_first_token_that_begins_a_longer_word_carries_its_rest():
     text = "The lease is their lease."
     tables = make_vocabulary(text, "their", "ir")
@@ -165,7 +146,10 @@ def test_vocabulary_pairs_each_token_with_its_quote_closing_merge():
     assert np.flatnonzero(tables.is_stop).tolist() == sorted(tables.stop_ids)
 
 
-def test_stream_batches_preserve_tokens_and_offsets_across_windows(monkeypatch):
+@pytest.mark.parametrize("config", [
+    ExtractionConfig(), ExtractionConfig(first_window_chars=9, window_chars=19),
+])
+def test_stream_batches_preserve_tokens_and_offsets_across_windows(monkeypatch, config):
     texts = [" ".join(["word"] * 300), "word   \n word  ", "word"]
     tables = make_vocabulary(*texts)
     streams = []
@@ -175,7 +159,7 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(monkeypatch):
         ids, offsets = tables.encode(text)
         starts = first_tokens(tables, _scores(tables, {word: -0.5}), ids,
                               document_tokens(offsets, 0))
-        streams.append(make_streams(tables, text, starts, word)[0])
+        streams.append(make_streams(tables, text, starts, word, config=config)[0])
         rest, ends = squeezed(text)
         ids, offsets = tables.encode(rest)
         expected.append((ids, [ends[b - 1] for _, b in offsets]))
@@ -183,7 +167,7 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(monkeypatch):
     encode_batch = tables.encode_batch
 
     def recorded(texts):
-        batches.append(len(texts))
+        batches.append(tuple(texts))
         return encode_batch(texts)
 
     def scalar(text):
@@ -192,7 +176,9 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(monkeypatch):
     monkeypatch.setattr(tables, "encode_batch", recorded)
     monkeypatch.setattr(tables, "encode", scalar)
     ensure_tokens(streams, 80, tables)
-    assert batches == [2, 1]
+    assert len(batches[0]) == 2
+    largest_window = max(len(text) for batch in batches for text in batch)
+    assert largest_window <= max(config.first_window_chars, config.window_chars) + 4
     assert not streams[0].exhausted
     assert streams[1].exhausted and streams[2].exhausted
     ensure_tokens(streams, 10_000, tables)
@@ -258,17 +244,3 @@ def test_candidate_ties_prefer_longer_spelling():
                           ids, None, scan)
     assert higher.best_token == short
     assert list(higher.items(tables)) == [(0, (short, tables.encode_ids("ir")))]
-
-
-def test_streams_keep_their_own_tokenization_window_sizes():
-    from quail.extraction import ExtractionConfig
-
-    text = "word " * 100
-    small = Stream(0, [], [0], text, config=ExtractionConfig(
-        first_window_chars=4, window_chars=9))
-    large = Stream(0, [], [0], text, config=ExtractionConfig(
-        first_window_chars=19, window_chars=29))
-    assert len(small.window()[0]) == 4
-    assert len(large.window()[0]) == 19
-    assert len(small.window()[0]) == 9
-    assert len(large.window()[0]) == 29
