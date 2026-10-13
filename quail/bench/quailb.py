@@ -352,7 +352,7 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
             "memory_trace", [])
         output.measurements["memory_trace_started"] = result.report.get(
             "memory_trace_started")
-        for name in ("memory_events", "memory_capacity"):
+        for name in ("memory_events", "memory_capacity", "memory_bytes"):
             output.measurements[name] = result.report.get(name)
         output.measurements["kernel_cache_files"] = {
             "before": cache_before, "after": kernel_cache_files()}
