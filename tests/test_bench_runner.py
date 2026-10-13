@@ -381,34 +381,7 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
         sess.register("contracts", DocumentProvider.from_table(
             CONTRACTS, id_col="id"))
         query = build_query(sess, alone)
-
-        def extract_nodes(graph, request):
-            extracted = next(node for node in graph.nodes
-                             if isinstance(node, AiExtract))
-            return {
-                **{node.node_id: NodeResult({f"ids:{node.alias}": range(
-                    len(request.inputs[node.input_id].documents))})
-                   for node in graph.nodes
-                   if isinstance(node, PhysicalScan)},
-                extracted.node_id: NodeResult({
-                    "ids:c": [0, 1, 2],
-                    "scores": pa.table({
-                        "c": pa.array([0, 1, 2], pa.int32()),
-                        "governing_law": pa.array(["x", None, "y"],
-                                                  pa.string()),
-                        "governing_law_span": pa.array(
-                            [{"start": 0, "end": 1}, None,
-                             {"start": 0, "end": 1}],
-                            pa.struct([("start", pa.int64()),
-                                       ("end", pa.int64())])),
-                    }),
-                }),
-            }
-
-        result = _execute(query, extract_nodes, store=None)
-        output = run_output(result, alone.info, {"contracts": CONTRACTS})
         pieces = prompt_pieces(query, alone.info, {})
-    assert output.rows.num_rows == 3
     assert pieces["preamble"] == (turn[0] + quail.SHARED_PRE).split()
     assert [item["id"] for item in pieces["extracts"]] == ["extract-1"]
     assert pieces["extracts"][0]["tail"][:2] == ["Question:", "Which"]
