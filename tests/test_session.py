@@ -16,7 +16,13 @@ from fakes import register_claims_evidence
 import quail
 from demos import quickstart, quickstart_modal
 from quail.execution import execute as execution
-from quail.execution.pairs import estimate_pair_fraction, pair_table, partner_map
+from quail.execution.pairs import (
+    allowed_members,
+    estimate_pair_fraction,
+    members_by_partner,
+    pair_table,
+    partner_map,
+)
 from quail.execution.result import (
     QueryResult,
     build_result_declaration,
@@ -438,7 +444,18 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
     ) == 5 / 12
     assert estimate_pair_fraction(
         [pa.array(["u1"])], [pa.array([], pa.string())]) == 0.0
-    assert partner_map(pairs, "e", "c") == {0: [1], 1: [0, 3], 2: [0, 3]}
+    grouped = partner_map(pairs, "e", "c")
+    assert [grouped.get(key).tolist() for key in range(3)] == [[1], [0, 3], [0, 3]]
+    assert grouped.get(10) == ()
+    unsorted = pa.table({"a": [5, 2, 5, 5], "b": [7, 3, 7, 1]})
+    grouped = partner_map(unsorted, "a", "b")
+    assert grouped.get(5).tolist() == [7, 7, 1]
+    members = members_by_partner([[7], [1], [7], [3]], 0)
+    assert allowed_members(grouped, members, 5).tolist() == [0, 0, 1, 2, 2]
+    assert allowed_members({5: [7, 99]}, members, 5).tolist() == [0, 2]
+    assert allowed_members(grouped, members, 9).size == 0
+    assert allowed_members(grouped, members_by_partner([], 0), 5).size == 0
+    assert partner_map(unsorted.slice(0, 0), "a", "b").get(5) == ()
     # two equalities: both key columns must match; integer keys on one
     # side are cast to the other side's type
     pairs = pair_table(

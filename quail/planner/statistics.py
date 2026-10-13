@@ -8,10 +8,13 @@ on the plan's nodes: each table's filter order and the join sequence.
 """
 
 import math
-from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
 from operator import mul
+
+import pyarrow as pa
+import pyarrow.compute as pc
 
 from quail.cost import budgets
 from quail.cost.filters import filter_chain_work, filter_cost
@@ -66,26 +69,33 @@ class AliasStats:
             for length, count in self.short_counts if length + offset < cap)
 
 
-def summarize_alias(lengths, window: int = 0) -> AliasStats:
-    """Summarize document lengths in one pass."""
-    count = total = squared = maximum = 0
-    short_counts = Counter()
-    for raw in lengths:
-        length = int(raw)
-        count += 1
-        total += length
-        squared += length * length
-        maximum = max(maximum, length)
-        if length < window:
-            short_counts[length] += 1
-    return AliasStats(
-        count=count,
-        total=total,
-        squared=squared,
-        maximum=maximum,
+def summarize_alias(lengths, window: int = 0, *, memo=None) -> AliasStats:
+    """Summarize a length column, optionally reusing a query's cached summary."""
+    key = ("alias_stats", id(lengths), window)
+    if memo is not None and key in memo:
+        return memo[key][1]
+    values = getattr(lengths, "arrow_array", lengths)
+    if not isinstance(values, (pa.Array, pa.ChunkedArray)):
+        values = pa.array(values, type=pa.int64())
+    else:
+        values = values.cast(pa.int64())
+    short_counts = ()
+    if window:
+        counts = pc.value_counts(pc.filter(values, pc.less(values, window)))
+        short_counts = tuple(sorted(zip(
+            counts.field("values").to_pylist(), counts.field("counts").to_pylist())))
+    summary = AliasStats(
+        count=len(values),
+        total=pc.sum(values).as_py() or 0,
+        squared=pc.sum(pc.multiply(values, values)).as_py() or 0,
+        maximum=pc.max(values).as_py() or 0,
         window=window,
-        short_counts=tuple(sorted(short_counts.items())),
+        short_counts=short_counts,
     )
+    if memo is not None:
+        # Keep the source alive so another column cannot reuse its identity.
+        memo[key] = (lengths, summary)
+    return summary
 
 
 def scale_alias(stats: AliasStats, fraction: float) -> AliasStats:
@@ -297,7 +307,8 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
     ask_filters = {alias: [operators.filters[alias][position]
                            for position in positions]
                    for alias, positions in asks.items() if positions}
-    lengths = {a: summarize_alias(t, model.sliding_window)
+    lengths = {a: summarize_alias(t, model.sliding_window,
+                                  memo=context.memo if context is not None else None)
                for a, t in doc_tokens.items()}
     for alias, fraction in (scan_fractions or {}).items():
         if alias in lengths:
@@ -435,7 +446,9 @@ def score_statistics(prompt, context, chunk, *, mean_tokens=None):
     aliases = prompt_aliases(prompt)
     lengths = tuple(context.document_tokens[alias] for alias in aliases)
     if mean_tokens is None:
-        mean_tokens = sum(sum(values) / max(1, len(values)) for values in lengths)
+        mean_tokens = sum(summarize_alias(
+            values, context.model.sliding_window, memo=context.memo).mean
+            for values in lengths)
     cost = ScoreCost(
         token_lengths=tuple(map(len, parts)), lengths=lengths,
         mean_tokens=mean_tokens, model=context.model, device=context.device,
@@ -481,19 +494,20 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
     Returns:
         The table's document lengths, budgets, and model settings.
     """
-    lengths = [int(length) for length in context.document_tokens[alias]]
-    count = len(lengths)
-    total = sum(lengths)
+    lengths = context.document_tokens[alias]
+    summary = summarize_alias(lengths, context.model.sliding_window, memo=context.memo)
+    if hasattr(lengths, "arrow_array"):
+        lengths = lengths.arrow_array.to_numpy()
     chunk = budgets.chunk_budget(context.model, context.device)
     capacity = budgets.arena_tokens(context.model, context.device, chunk)
     return ClassifyStatistics(
-        alias=alias, mean=total / max(1, count),
-        longest=max(lengths, default=0), budget=min(chunk, capacity),
+        alias=alias, mean=summary.mean,
+        longest=summary.maximum, budget=min(chunk, capacity),
         chunk=chunk,
         draws=context.canvas_draws if context.model.answer_canvas else 1,
         model=context.model,
         device=context.device,
-        capacity=capacity, lengths=tuple(lengths), shared=tuple(shared),
+        capacity=capacity, lengths=lengths, shared=tuple(shared),
         tree=(budgets.tree_attention_allowed(context.model)
               and getattr(context, "attention", None) != "unified"))
 
@@ -528,6 +542,6 @@ class ClassifyStatistics:
     device: object
     capacity: int = 0
     draws: int = 1
-    lengths: tuple = ()
+    lengths: Sequence = ()
     shared: tuple = ()
     tree: bool = False

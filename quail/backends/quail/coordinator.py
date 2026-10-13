@@ -1,14 +1,12 @@
 """Coordinator: split plan payloads across GPU workers and merge answers.
 
-Pure dict-and-list logic (no torch). Called by the worker's parent
-process between child GPUs.
+Called by the worker's parent process between child GPUs.
 """
 
-from quail.backends.quail.graph import (
-    partner_maps,
-    runs_over_pairs,
-    stop_groups,
-)
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from quail.backends.quail.graph import runs_over_pairs, stop_groups
 from quail.execution.pairs import pair_partner
 from quail.execution.tokens import select_documents
 from quail.execution.types import join_answer_cells
@@ -203,16 +201,17 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
             "docs": select_documents(payload["docs"][alias], indices),
         }
     # a pair stage ships each worker its anchors' live partner rows
-    maps = partner_maps(group, pair_tables or {})
     pair_rows = {}
     for j in group:
         if not runs_over_pairs(j):
             continue
-        live_partners = set(partners[pair_partner(
-            anchor_alias, j["partners"])]["index"])
-        pair_rows[j["written_pos"]] = {
-            anchor: [p for p in matched if p in live_partners]
-            for anchor, matched in maps[j["written_pos"]].items()}
+        partner = pair_partner(anchor_alias, j["partners"])
+        table = (pair_tables or {}).get(j["written_pos"])
+        if table is None:
+            raise ValueError(f"join {j['written_pos']} received no pair table")
+        pair_rows[j["written_pos"]] = table.filter(pc.is_in(
+            table[partner], value_set=pa.array(partners[partner]["index"],
+                                               type=table[partner].type)))
     subs = []
     for w in range(k):
         sub = _common_payload(payload)
@@ -224,9 +223,10 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
                        payload["docs"][anchor_alias], anchor_shards[w]
                    ),
                    partners=partners,
-                   pairs={position: {anchor: rows.get(anchor, [])
-                                     for anchor in anchor_shards[w]}
-                          for position, rows in pair_rows.items()},
+                   pairs={position: table.filter(pc.is_in(
+                       table[anchor_alias], value_set=pa.array(
+                           anchor_shards[w], type=table[anchor_alias].type)))
+                          for position, table in pair_rows.items()},
                    worker=w, workers=k)
         subs.append(sub)
     return subs

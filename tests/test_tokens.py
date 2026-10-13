@@ -18,9 +18,10 @@ from quail.execution.tokens import (
     shared_prefix_lengths,
 )
 from quail.planner.prefixes import shared_prefix_tokens
+from quail.planner.statistics import AliasStats, summarize_alias
 
 
-def test_token_views_store_chains_and_shared_prefixes(tmp_path):
+def test_token_views_store_chains_and_shared_prefixes(tmp_path, monkeypatch):
     tokens = pa.chunked_array([
         pa.array([[1, 2, 3], [], [4, 5]], type=pa.large_list(pa.int32()))
     ])
@@ -63,6 +64,17 @@ def test_token_views_store_chains_and_shared_prefixes(tmp_path):
         ["one", "two"], ["three"], ["four", "five", "six"]]
     assert store._reader.schema.names == [
         "__quail_token_ids", "__quail_token_count"]
+    with monkeypatch.context() as patch:
+        patch.setattr(type(store.lengths), "__getitem__",
+                      lambda *_: pytest.fail("statistics read an Arrow scalar"))
+        memo = {}
+        summary = summarize_alias(store.lengths, 3, memo=memo)
+        assert summary == AliasStats(3, 6, 14, 3, 3, ((1, 1), (2, 1)))
+        assert summarize_alias(store.lengths, 3, memo=memo) is summary
+        assert summarize_alias(store.lengths, memo=memo).short_counts == ()
+        assert summarize_alias([4], 3, memo=memo) == AliasStats(1, 4, 16, 4, 3)
+    assert summarize_alias(pa.array([], pa.int32()), 3) == AliasStats(0, 0, 0, 0, 3)
+    assert summarize_alias(pa.array([100_000], pa.int32())).squared == 10_000_000_000
     store.close()
 
     schema = pa.schema({"body": pa.string()})

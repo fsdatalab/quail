@@ -190,14 +190,18 @@ def plan_request_backend(
     ask_filters = {alias: list(ps) for alias, ps in filters.items() if ps}
     # the regular predicates keep an estimated fraction of each table, as
     # the Quail planner's statistics do
+    summaries = {
+        alias: summarize_alias(lengths, context.model.sliding_window, memo=context.memo)
+        for alias, lengths in context.document_tokens.items()
+    }
     stats = {
         alias: CorpusStats(
-            n_docs=round(len(lengths) * context.scan_fractions.get(alias, 1.0)),
-            total_tokens=round(sum(int(length) for length in lengths)
+            n_docs=round(summary.count * context.scan_fractions.get(alias, 1.0)),
+            total_tokens=round(summary.total
                                * context.scan_fractions.get(alias, 1.0)),
-            max_doc_tokens=max((int(length) for length in lengths), default=0),
+            max_doc_tokens=summary.maximum,
         )
-        for alias, lengths in context.document_tokens.items()
+        for alias, summary in summaries.items()
     }
     nodes = []
     input_refs = []
@@ -206,13 +210,13 @@ def plan_request_backend(
         if scan.alias not in stats:
             raise ValueError(f"no document tokens for alias {scan.alias!r}")
         summary = stats[scan.alias]
-        n_docs = len(context.document_tokens[scan.alias])
+        n_docs = summaries[scan.alias].count
         node = Scan(
             node_id=f"scan:{scan.alias}",
             alias=scan.alias,
             input_id=scan.alias,
             n_docs=n_docs,
-            total_tokens=sum(context.document_tokens[scan.alias]),
+            total_tokens=summaries[scan.alias].total,
             shard_ranges=((0, n_docs),),
             shard_token_loads=(summary.total_tokens,),
             predicates=regular_predicates(scan),
@@ -250,10 +254,7 @@ def plan_request_backend(
     join_search = search_joins(
         search_specs,
         live,
-        {
-            alias: summarize_alias(lengths, context.model.sliding_window)
-            for alias, lengths in context.document_tokens.items()
-        },
+        summaries,
         {},
         preamble_count,
         chunk_tokens,

@@ -189,7 +189,7 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
         members = stage["anchor_partners"]
         for local, document in enumerate(stage["anchor_index"]):
             mine = sorted(allowed[document])
-            assert members[local] == mine
+            assert list(members[local]) == mine
             assert stage["rows"].get(local, []) == [
                 join_truth[("r", document)][i] for i in mine]
         table = result["_outputs"][PortRef("group:0", "join_answers:0")]

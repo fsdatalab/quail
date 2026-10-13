@@ -9,6 +9,7 @@ key columns the request carries as ``columns:<alias>`` relations.
 
 from __future__ import annotations
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -104,25 +105,55 @@ def estimate_pair_fraction(left_keys, right_keys) -> float:
     return max(pairs, 1) / (n_left * n_right)
 
 
+class RowGroups:
+    """Row IDs grouped by a sorted key column, preserving order within each key."""
+
+    def __init__(self, keys, rows):
+        keys = np.asarray(keys, dtype=np.int64)
+        order = np.argsort(keys, kind="stable")
+        sorted_keys = keys[order]
+        starts = np.flatnonzero(np.r_[True, sorted_keys[1:] != sorted_keys[:-1]])
+        if not len(keys):
+            starts = np.empty(0, dtype=np.int64)
+        self.keys = sorted_keys[starts]
+        self.offsets = np.r_[starts, len(keys)]
+        self.rows = np.asarray(rows, dtype=np.int64)[order]
+
+    def get(self, key, default=()):
+        """Return a view of one key's rows, or the supplied default."""
+        position = np.searchsorted(self.keys, key)
+        if position == len(self.keys) or self.keys[position] != key:
+            return default
+        return self.rows[self.offsets[position]:self.offsets[position + 1]]
+
+    def take(self, keys):
+        """Return the rows for each supplied key, including repeated keys."""
+        keys = np.asarray(keys, dtype=np.int64)
+        positions = np.searchsorted(self.keys, keys)
+        valid = positions < len(self.keys)
+        positions, keys = positions[valid], keys[valid]
+        positions = positions[self.keys[positions] == keys]
+        starts = self.offsets[positions]
+        counts = self.offsets[positions + 1] - starts
+        ends = np.cumsum(counts)
+        indices = np.repeat(starts - ends + counts, counts)
+        indices += np.arange(ends[-1] if len(ends) else 0)
+        return self.rows[indices]
+
+
 def partner_map(pairs: pa.Table, anchor_alias: str,
-                partner_alias: str) -> dict[int, list[int]]:
+                partner_alias: str) -> RowGroups:
     """Anchor row -> its partner rows, from a pair table."""
-    out: dict[int, list[int]] = {}
-    for anchor, partner in zip(pairs.column(anchor_alias).to_pylist(),
-                               pairs.column(partner_alias).to_pylist()):
-        out.setdefault(int(anchor), []).append(int(partner))
-    return out
+    return RowGroups(pairs.column(anchor_alias).to_numpy(),
+                     pairs.column(partner_alias).to_numpy())
 
 
-def members_by_partner(members, position: int) -> dict:
+def members_by_partner(members, position: int) -> RowGroups:
     """Partner row -> indices of the member tuples that hold it."""
-    by_partner = {}
-    for index, member in enumerate(members):
-        by_partner.setdefault(int(member[position]), []).append(index)
-    return by_partner
+    keys = np.asarray(members, dtype=np.int64)[:, position] if len(members) else ()
+    return RowGroups(keys, np.arange(len(members)))
 
 
-def allowed_members(rows: dict, by_partner: dict, anchor) -> list:
+def allowed_members(rows, by_partner: RowGroups, anchor) -> np.ndarray:
     """The sorted member indices one anchor's pair rows allow."""
-    return sorted(index for partner in rows.get(int(anchor), ())
-                  for index in by_partner.get(int(partner), ()))
+    return np.sort(by_partner.take(rows.get(int(anchor), ())))

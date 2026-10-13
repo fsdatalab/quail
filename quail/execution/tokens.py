@@ -166,6 +166,10 @@ class TokenLengths(Sequence):
     def __len__(self):
         return len(self._store)
 
+    @property
+    def arrow_array(self) -> pa.ChunkedArray:
+        return pa.chunked_array(self._store._length_batches, type=pa.int64())
+
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]

@@ -452,7 +452,7 @@ def test_classification_tree_scoring_follows_the_executor_gate():
     def table(model):
         context = SimpleNamespace(
             document_tokens={"d": [100, 200]}, model=model, device=H100_SXM,
-            canvas_draws=1, tokenizer=_tokens)
+            canvas_draws=1, tokenizer=_tokens, memo={})
         return classify_statistics(context, "d")
 
     assert not table(DECISION_2_KAI_0_6B_BF16).tree

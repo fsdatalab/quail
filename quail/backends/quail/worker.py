@@ -26,6 +26,7 @@ from quail.backends.quail.graph import (
     execute_single_graph,
     join_suffixes,
     partner_list_builder,
+    partner_maps,
     stage_partner_lists,
 )
 from quail.backends.quail.prompts import join_request
@@ -604,9 +605,7 @@ def _child_joins(state, sub):
         # this GPU's anchors only
         lists_for = partner_list_builder(
             group, tuple_globs,
-            {int(position): {int(anchor): partners
-                             for anchor, partners in rows.items()}
-             for position, rows in sub.get("pairs", {}).items()})
+            partner_maps(group, sub.get("pairs", {})))
         prefixes = DocumentPrefixes(pre, anchor_docs, range(len(anchor_docs)))
         anchor_keys = [(anchor_alias, g) for g in anchors_glob]
         round_kv = _join_round_kv(anchor_keys, arena)

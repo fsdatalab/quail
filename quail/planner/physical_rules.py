@@ -38,7 +38,11 @@ from quail.physical import (
 from quail.planner import retention
 from quail.planner.kv import plan_kv_retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
-from quail.planner.statistics import cached_statistics, live_after_filters
+from quail.planner.statistics import (
+    cached_statistics,
+    live_after_filters,
+    summarize_alias,
+)
 
 
 class LimitPushdown:
@@ -275,6 +279,11 @@ class PrefixSharing:
         nodes = []
         changed = False
         pipelines = build_pipelines(graph, context.gpu_count)
+        summaries = {
+            alias: summarize_alias(lengths, context.model.sliding_window,
+                                   memo=context.memo)
+            for alias, lengths in context.document_tokens.items()
+        }
         for node in graph.nodes:
             if isinstance(node, AiFilter) and not node.share_prefixes:
                 lengths = context.document_tokens.get(node.alias)
@@ -282,7 +291,7 @@ class PrefixSharing:
                 if store is not None and sharing_pays(
                         context.model, context.device,
                         shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=sum(lengths),
+                        total_tokens=summaries[node.alias].total,
                         writes_pages=node.arena_writes):
                     node = replace(node, share_prefixes=True,
                                    arena_writes=True)
@@ -293,7 +302,7 @@ class PrefixSharing:
                 if store is not None and sharing_pays(
                         context.model, context.device,
                         shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=sum(lengths), writes_pages=True):
+                        total_tokens=summaries[node.anchor].total, writes_pages=True):
                     node = replace(node, share_prefixes=True)
                     changed = True
             elif (isinstance(node, AiClassify) and node.spec is not None
@@ -303,7 +312,8 @@ class PrefixSharing:
                 if store is not None and sharing_pays(
                         context.model, context.device,
                         shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=sum(lengths), writes_pages=True):
+                        total_tokens=summaries[node.spec.aliases[0]].total,
+                        writes_pages=True):
                     pipeline = pipelines.get(node.node_id)
                     resident = (pipeline is not None
                                 and pipeline[0].node_id != node.node_id)
@@ -317,7 +327,8 @@ class PrefixSharing:
                 if store is not None and sharing_pays(
                         context.model, context.device,
                         shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=sum(lengths), writes_pages=True):
+                        total_tokens=summaries[node.spec.alias].total,
+                        writes_pages=True):
                     pipeline = pipelines.get(node.node_id)
                     resident = (pipeline is not None
                                 and pipeline[0].node_id != node.node_id)
@@ -333,9 +344,10 @@ class PrefixSharing:
                           else page_aligned_shared_tokens(store))
                 if store is not None and sharing_pays(
                         context.model, context.device, shared_tokens=shared,
-                        total_tokens=sum(lengths), writes_pages=False):
+                        total_tokens=summaries[node.spec.aliases[0]].total,
+                        writes_pages=False):
                     node = replace(node, spec=_shared_score_spec(
-                        node.spec, shared, lengths,
+                        node.spec, shared, summaries[node.spec.aliases[0]],
                         context.model.canvas_tokens))
                     changed = True
             nodes.append(node)
@@ -368,7 +380,7 @@ def _shared_extract_spec(node, context, store, *, resident=False):
     return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
 
 
-def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):
+def _shared_score_spec(spec, shared_tokens, summary, canvas_tokens):
     """Enable prefix sharing and scale the score's estimate by its fresh tokens.
 
     Assumes time is proportional to the tokens the score computes, and
@@ -377,7 +389,7 @@ def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):
     """
     fixed = score_fixed_tokens(tuple(map(len, spec.prompt_token_parts)),
                                canvas_tokens, spec.draws)
-    total = sum(lengths) + len(lengths) * fixed
+    total = summary.total + summary.count * fixed
     fresh = max(0.0, 1.0 - shared_tokens / total) if total else 1.0
     return replace(spec, share_prefixes=True,
                    estimated_seconds=spec.estimated_seconds * fresh)

@@ -179,8 +179,8 @@ def test_join_merge_gates_thins_and_ships_partner_lists():
     subs = join_group_payloads(p, 2, {"r": [0, 2, 3, 5], "p": [1, 3]},
                                group, pair_tables={0: pairs})
     assert [sub["anchor_index"] for sub in subs] == [[0, 2], [3, 5]]
-    assert [sub["pairs"] for sub in subs] == [
-        {0: {0: [3], 2: [1]}}, {0: {3: [], 5: [3]}}]
+    assert [sub["pairs"][0].to_pydict() for sub in subs] == [
+        {"r": [0, 2], "p": [3, 1]}, {"r": [5], "p": [3]}]
 
 
 def test_stop_key_groups_ride_the_filter_payload_and_shard_together():
