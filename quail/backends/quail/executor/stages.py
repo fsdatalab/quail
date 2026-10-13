@@ -133,7 +133,7 @@ class OwnRequests(list):
 
     def __init__(self, lengths):
         super().__init__(range(len(lengths)))
-        self.lengths = [int(n) for n in lengths]
+        self.lengths = np.asarray(lengths, dtype=np.int64)
 
 
 def shared_preamble_tokens(question_ids) -> int:
@@ -390,7 +390,7 @@ class _StageExecutor:
             prefix_tree = None
         self.sched = JoinAdmission(
             self.prefix_lengths,
-            [(s.lengths + rows).tolist()
+            [s.lengths + rows
              for s, rows in zip(self.suffixes, self.canvas_rows)],
             budget,
             self.arena.n_pages if self.paged else 1 << 62,

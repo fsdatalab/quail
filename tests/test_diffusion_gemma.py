@@ -100,12 +100,12 @@ def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
     sched = JoinAdmission([20, 30], [[1 + 3], [2 + 3]], 200, arena_pages=64,
                           page_tokens=16, frame_tokens=[2, 2],
                           frame_writes=[True, False], frame_canvas_tokens=3)
-    assert sched.stages == [[1 + 3], [2 + 3]]
+    assert [lengths.tolist() for lengths in sched.stages] == [[1 + 3], [2 + 3]]
     assert sched.frame_rows == [2 + 3, 0]
 
     sched = JoinAdmission([10], [[9, 9]], 100, arena_pages=100, page_tokens=16,
                           frame_tokens=[3], frame_canvas_tokens=4)
-    assert sched.stages == [[9, 9]]
+    assert [lengths.tolist() for lengths in sched.stages] == [[9, 9]]
     assert sched.frame_rows == [7]
 
     # a model whose attention reads paged KV writes pages even when the

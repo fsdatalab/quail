@@ -224,15 +224,8 @@ def filter_attention(model, device, store, lengths, question_tokens: int) -> str
     path that wins on the most borrowed tokens wins the filter.
     """
     tree = page_tree(store)
-    groups = {}
-    for doc, parent in enumerate(tree.parent):
-        if parent is None:
-            continue
-        readers, rows = groups.get((parent, tree.shared[doc]), (0, 0))
-        groups[(parent, tree.shared[doc])] = (
-            readers + 1, rows + lengths[doc] - tree.shared[doc])
     votes = {"tree": 0, "unified": 0}
-    for (_, shared), (readers, rows) in groups.items():
+    for shared, readers, rows in zip(*tree.reader_groups(lengths)):
         path = choose_attention_path(
             model, device, readers=readers,
             reader_rows=rows / readers + question_tokens, node_tokens=shared)

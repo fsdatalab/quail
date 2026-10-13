@@ -14,13 +14,14 @@ import quail
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
 from quail.execution.execute import _execute_physical
-from quail.execution.runner import NodeResult
+from quail.execution.runner import BarrierRuntime, NodeResult
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
 from quail.logical import LogicalPlan
 from quail.physical import (
     AiClassify,
     AiExtract,
     AiScore,
+    Barrier,
     Comparison,
     ExecutionLocation,
     Filter,
@@ -38,6 +39,25 @@ from quail.physical import (
 )
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import EngineConfig, PhysicalPlan
+
+
+def test_barrier_preserves_survivor_order_and_duplicates():
+    from quail.physical.base import input_ports
+
+    node = Barrier(node_id="barrier", aliases=("a", "b"), inputs=input_ports((
+        PortRef("scan:a", "ids:a"), PortRef("scan:b", "ids:b"),
+        PortRef("join", "join_answers:0"))))
+    for arrow in (False, True):
+        for keep in (False, True):
+            ids = ([3, 1, 3, 2], [8, 7])
+            inputs = {f"input:{i}": pa.table({alias: values}) if arrow else values
+                      for i, (alias, values) in enumerate(zip(node.aliases, ids))}
+            inputs["input:2"] = pa.table({"a": [1, 3, 2, 9], "b": [7, 8, 7, 8],
+                                          "answer": [keep, keep, False, keep]})
+            outputs = BarrierRuntime().execute(node, inputs, None).outputs
+            values = [outputs[f"ids:{alias}"].column(alias).to_pylist() if arrow
+                      else outputs[f"ids:{alias}"] for alias in node.aliases]
+            assert values == ([[3, 1, 3], [8, 7]] if keep else [[], []])
 
 
 @pytest.mark.parametrize("node_type, settings", [

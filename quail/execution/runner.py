@@ -370,8 +370,10 @@ class BarrierRuntime:
                 alias = port.source.port.split(":", 1)[1]
                 if isinstance(value, pa.Table):
                     arrow_inputs.add(alias)
-                    value = value.column(alias).to_pylist()
-                survivors[alias] = list(value)
+                    value = value.column(alias)
+                else:
+                    value = pa.array(value, type=pa.int32())
+                survivors[alias] = value
             elif port.value_type is ValueType.JOIN_ANSWERS:
                 tables.append(value if isinstance(value, pa.Table)
                               else _join_answers_table(value))
@@ -380,19 +382,17 @@ class BarrierRuntime:
             for alias in table.column_names:
                 if alias in survivors:
                     table = table.filter(pc.is_in(
-                        table[alias], value_set=pa.array(
-                            survivors[alias], type=table.schema.field(alias).type
-                        )
+                        table[alias], value_set=survivors[alias].cast(table[alias].type)
                     ))
             for alias in table.column_names:
                 if alias in survivors:
-                    live = set(pc.unique(table[alias]).to_pylist())
-                    survivors[alias] = [document for document in survivors[alias]
-                                        if document in live]
+                    ids = survivors[alias]
+                    survivors[alias] = pc.filter(ids, pc.is_in(
+                        ids, value_set=pc.unique(table[alias]).cast(ids.type)))
         return NodeResult({
             f"ids:{alias}": (
-                pa.table({alias: pa.array(survivors[alias], type=pa.int32())})
-                if alias in arrow_inputs else survivors[alias]
+                pa.table({alias: survivors[alias]})
+                if alias in arrow_inputs else survivors[alias].to_pylist()
             )
             for alias in node.aliases
         })

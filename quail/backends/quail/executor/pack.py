@@ -306,7 +306,7 @@ class JoinAdmission:
         self._page_cums = {}
         self._page_reserve = 0
         self.prefix = []
-        self.stages = [list(s) for s in stage_suffixes]
+        self.stages = [np.asarray(s, dtype=np.int64) for s in stage_suffixes]
         # frames: the rows a frame entry keeps in the anchor's KV;
         # frame_rows: the rows it packs, canvas included
         self.frames = (list(frame_tokens) if frame_tokens
@@ -328,13 +328,11 @@ class JoinAdmission:
         k = len(self.stages)
         self._cum = []
         for j, (lens, frame) in enumerate(zip(self.stages, self.frame_rows)):
-            cum = [0]
-            for t in lens:
-                cum.append(cum[-1] + t)
-            self._cum.append(cum)
-            if lens and frame + max(lens) > chunk_budget:
+            self._cum.append(np.concatenate(([0], np.cumsum(lens))))
+            longest = int(lens.max()) if len(lens) else 0
+            if len(lens) and frame + longest > chunk_budget:
                 raise ValueError(
-                    f"stage {j}: a {frame + max(lens)}-token partner "
+                    f"stage {j}: a {frame + longest}-token partner "
                     f"exceeds the {chunk_budget}-token chunk budget "
                     f"(suffixes are atomic)")
         self._extra = max(self.frame_rows)
@@ -432,18 +430,15 @@ class JoinAdmission:
         if lst is None:
             return None, None
         lengths = getattr(lst, "lengths", None)
-        lst = list(lst)
-        cum = [0]
-        if lengths is not None:
-            for n in lengths:
-                cum.append(cum[-1] + int(n))
-            return lst, cum
-        for i in lst:
-            if not 0 <= i < len(self.stages[j]):
+        lst = np.asarray(lst, dtype=np.int64)
+        if lengths is None:
+            invalid = (lst < 0) | (lst >= len(self.stages[j]))
+            if invalid.any():
+                i = lst[invalid][0]
                 raise ValueError(
                     f"anchor {a} stage {j}: partner {i} is out of range")
-            cum.append(cum[-1] + self.stages[j][i])
-        return lst, cum
+            lengths = self.stages[j][lst]
+        return lst, np.concatenate(([0], np.cumsum(lengths, dtype=np.int64)))
 
     def _cum_of(self, a, j):
         return self._cum[j] if self._lists[a][j] is None else self._cums[a][j]
@@ -526,8 +521,8 @@ class JoinAdmission:
             if lazy is not None:
                 largest = max([largest] + [
                     partner_pages(self.page_cost, self.page_tokens, prefix,
-                                  self.frames[j], max(self.stages[j]))
-                    for j in range(1, k) if self.stages[j]])
+                                  self.frames[j], int(self.stages[j].max()))
+                    for j in range(1, k) if len(self.stages[j])])
             needed = self.page_cost(prefix + self._extra) + largest
             if needed > self.arena_pages:
                 raise ValueError("anchor and one suffix exceed the KV arena")

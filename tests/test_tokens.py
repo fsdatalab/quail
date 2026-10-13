@@ -78,12 +78,20 @@ def test_token_views_store_chains_and_shared_prefixes(tmp_path, monkeypatch):
     assert summarize_alias([]).variance == 0
     assert summarize_alias([100_000_000, 100_000_001]).variance == 0.25
     assert summarize_alias(pa.array([100_000], pa.int32())).squared == 10_000_000_000
+    index = store.prefix_index
+    with monkeypatch.context() as patch:
+        patch.setattr("quail.execution.tokens._token_array",
+                      lambda *_: pytest.fail("prefix preparation ran twice"))
+        assert prefix_tree(store, 1) is index.tree(1)
+        assert prefix_tree(store, 16) is index.tree(16)
     store.close()
 
     schema = pa.schema({"body": pa.string()})
     store = TokenStore.write(
         str(path), [pa.record_batch([["word " * 1000] * 10], schema=schema)],
         document_column="body", tokenizer=str.split, token_type=pa.string())
+    assert store.prefix_index is not index
+    assert prefix_tree(store, 16).shared_tokens == 9 * 992
     encoded = pickle.dumps(store.select(range(10)))
     restored = pickle.loads(encoded)
     assert len(encoded) < 1000
@@ -103,6 +111,9 @@ def test_prefix_tree_borrows_whole_pages_and_siblings_share_one_parent():
     assert tree.parent == [None, 0, 0, None, None]
     assert tree.shared == [0, 32, 32, 0, 0]
     assert tree.shared_tokens == 64
+    groups = tree.reader_groups([len(doc) for doc in docs])
+    assert [values.tolist() for values in groups] == [[32], [2], [38]]
+    assert tree.reader_groups([len(doc) for doc in docs]) is groups
     parents_first = {index: position for position, index in enumerate(tree.order)}
     assert all(parent is None or parents_first[parent] < parents_first[index]
                for index, parent in enumerate(tree.parent))
@@ -126,6 +137,9 @@ def test_prefix_tree_borrows_whole_pages_and_siblings_share_one_parent():
     tree = prefix_tree(docs, 16)
     assert tree.parent == [None, 0, 0]
     assert tree.shared == [0, 96, 96]
+    left = [7] * 4096 + [8, 9]
+    right = [7] * 4096 + [9, 9]
+    assert prefix_tree([left, right], 1).shared == [0, 4096]
 
 
 @pytest.mark.parametrize("vocab_size", [256, 300])

@@ -432,6 +432,7 @@ class TokenStore(Sequence):
             total += len(batch)
             self._ends.append(total)
         self._lengths = TokenLengths(self)
+        self._prefix_index = None
 
     @classmethod
     def write(
@@ -458,6 +459,13 @@ class TokenStore(Sequence):
     def lengths(self) -> TokenLengths:
         """Return the file backed document length sequence."""
         return self._lengths
+
+    @property
+    def prefix_index(self) -> "PrefixIndex":
+        """Return the document order and common prefix lengths, computed once."""
+        if self._prefix_index is None:
+            self._prefix_index = PrefixIndex(self)
+        return self._prefix_index
 
     @property
     def arrow_array(self) -> pa.ChunkedArray:
@@ -487,6 +495,7 @@ class TokenStore(Sequence):
 
     def close(self) -> None:
         """Close the memory mapped Arrow file."""
+        self._prefix_index = None
         self._source.close()
 
     def select(self, indices) -> "TokenSelection":
@@ -678,11 +687,77 @@ class PrefixTree:
         self.order = order
         self.parent = parent
         self.shared = shared
+        self._reader_groups = None
 
     @property
     def shared_tokens(self) -> int:
         """Tokens the tree lets the engine read instead of compute."""
         return sum(self.shared)
+
+    def reader_groups(self, lengths):
+        """Group document rows by their borrowed parent and prefix length."""
+        if self._reader_groups is None:
+            lengths = getattr(lengths, "arrow_array", lengths)
+            rows = pc.subtract(pa.array(lengths), pa.array(self.shared, pa.int64()))
+            table = pa.table({"parent": pa.array(self.parent, pa.int64()),
+                              "shared": pa.array(self.shared, pa.int64()),
+                              "rows": rows}).drop_null()
+            groups = table.group_by(["parent", "shared"]).aggregate(
+                [("rows", "count"), ("rows", "sum")])
+            self._reader_groups = tuple(
+                groups[name].to_numpy()
+                for name in ("shared", "rows_count", "rows_sum"))
+        return self._reader_groups
+
+
+class PrefixIndex:
+    """Sorted document positions and common prefixes shared by page-size trees."""
+
+    def __init__(self, documents):
+        n = len(documents)
+        try:
+            arrays = [_token_array(documents[i]) for i in range(n)]
+        except (TypeError, ValueError):
+            # Test tokenizers may return words instead of integer token IDs.
+            arrays = [tuple(documents[i]) for i in range(n)]
+            keys = arrays
+            common = longest_common_prefix
+        else:
+            # Big-endian bytes sort in token order for nonnegative token IDs.
+            keys = [a.astype(">i4").tobytes() for a in arrays]
+            common = _array_common_prefix
+        self.order = sorted(range(n), key=keys.__getitem__)
+        self.shared = np.zeros(n, dtype=np.int64)
+        # Every document computes its final token, including exact duplicates.
+        for previous, index in zip(self.order, self.order[1:]):
+            self.shared[index] = min(common(arrays[previous], arrays[index]),
+                                     max(len(arrays[index]) - 1, 0))
+        self._trees = {}
+
+    def tree(self, page_tokens: int) -> PrefixTree:
+        """Return borrowed parents and lengths rounded to a page size."""
+        if page_tokens not in self._trees:
+            shared = (self.shared // page_tokens * page_tokens).tolist()
+            parent = [None] * len(shared)
+            for previous, index in zip(self.order, self.order[1:]):
+                pages = shared[index]
+                if pages:
+                    owner = previous
+                    while parent[owner] is not None and shared[owner] >= pages:
+                        owner = parent[owner]
+                    parent[index] = owner
+            self._trees[page_tokens] = PrefixTree(self.order, parent, shared)
+        return self._trees[page_tokens]
+
+
+def _array_common_prefix(left, right) -> int:
+    """Find the first unequal token without materializing every mismatch index."""
+    limit = min(len(left), len(right))
+    if not limit:
+        return 0
+    differ = left[:limit] != right[:limit]
+    first = int(differ.argmax())
+    return first if differ[first] else limit
 
 
 def prefix_tree(documents, page_tokens: int) -> PrefixTree:
@@ -692,41 +767,6 @@ def prefix_tree(documents, page_tokens: int) -> PrefixTree:
         documents: Token sequences, indexable by position.
         page_tokens: Tokens per KV page; shares round down to it.
     """
-    import numpy as np
-
-    n = len(documents)
-    try:
-        arrays = [_token_array(documents[i]) for i in range(n)]
-    except (TypeError, ValueError):
-        # tokens that are not integers (a test tokenizer's words)
-        arrays = [tuple(documents[i]) for i in range(n)]
-        keys = arrays
-        common = longest_common_prefix
-    else:
-        # big-endian bytes sort like the token ids they encode
-        keys = [a.astype(">i4").tobytes() for a in arrays]
-
-        def common(a, b):
-            limit = min(len(a), len(b))
-            differ = np.flatnonzero(a[:limit] != b[:limit])
-            return int(differ[0]) if len(differ) else limit
-    order = sorted(range(n), key=keys.__getitem__)
-    parent = [None] * n
-    shared = [0] * n
-    previous = None
-    for index in order:
-        if previous is not None:
-            # a document computes at least its last token, so a
-            # duplicate still packs a prefix of its own
-            lcp = min(common(arrays[previous], arrays[index]),
-                      max(len(arrays[index]) - 1, 0))
-            pages = lcp // page_tokens * page_tokens
-            if pages:
-                # climb while the ancestor borrowed these pages too
-                owner = previous
-                while parent[owner] is not None and shared[owner] >= pages:
-                    owner = parent[owner]
-                parent[index] = owner
-                shared[index] = pages
-        previous = index
-    return PrefixTree(order, parent, shared)
+    index = (documents.prefix_index if isinstance(documents, TokenStore)
+             else PrefixIndex(documents))
+    return index.tree(page_tokens)
