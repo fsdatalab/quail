@@ -281,7 +281,7 @@ def test_unpriced_operators_are_refused(tmp_path):
             quail.speed_of_light_estimate(exists, _answer)
 
 
-def test_a_distinct_key_stops_reading_a_key_at_its_first_survivor(tmp_path):
+def test_a_distinct_key_reads_only_its_shortest_survivor(tmp_path):
     # sorted token order: awful film, bad acting, bad film, good film,
     # zebra film; a document passes when it starts with good or zebra
     pq.write_table(pa.table({
@@ -302,7 +302,6 @@ def test_a_distinct_key_stops_reading_a_key_at_its_first_survivor(tmp_path):
         filtered = (sess.docs("traces").alias("r")
                     .ai_filter(quail.prompt(FILTER, quail.col("r.body"))))
         query = filtered.select("r.trajectory")
-        preamble = query.logical.operators().filters["r"][0].prompt.preamble_tokens
         every = quail.speed_of_light_estimate(query, answer)
         stopped = quail.speed_of_light_estimate(
             filtered.distinct().select("r.trajectory"), answer)
@@ -312,12 +311,12 @@ def test_a_distinct_key_stops_reading_a_key_at_its_first_survivor(tmp_path):
 
     assert (every.filter_stages[0]["evaluated"],
             every.filter_stages[0]["passed"]) == (5, 2)
-    # g1 reads bad film and good film and skips zebra film; g2 reads both
+    # g1 reads only good film, which ties zebra film on tokens and comes
+    # first in sorted token order; g2 has no survivor and reads both
     assert (stopped.filter_stages[0]["evaluated"],
-            stopped.filter_stages[0]["passed"]) == (4, 1)
+            stopped.filter_stages[0]["passed"]) == (3, 1)
     assert stopped.post_filter_counts == {"r": 1}
     assert stopped.assumptions()["stop_key"].startswith("a filter under")
-    # of the four documents read, only bad acting and bad film share a
-    # token, with the preamble before it
-    assert stopped.fresh_tokens == per_document.fresh_tokens - preamble - 1
+    # no two of the three documents read share a first token
+    assert stopped.fresh_tokens == per_document.fresh_tokens
     assert stopped.seconds < every.seconds

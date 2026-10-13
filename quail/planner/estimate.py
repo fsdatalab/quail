@@ -6,8 +6,9 @@ forward passes packed across the whole query, and no host, scheduling,
 or kernel overhead. On each alias the AI.IF filters run first in the
 planner's order, then its classifications, each followed by the label
 filters that test it. A filter under a DISTINCT over its table's
-columns reads each key's documents in sorted token order until one
-survives, as the executor's stop key does. Joins are searched over
+columns, which the executor stops at each key's first survivor, reads
+only each key's shortest survivor, or every document of a key with
+none. Joins are searched over
 every feasible eager binary full left deep plan and anchor choice,
 with exact survivors from
 caller supplied answer and label oracles at every step. A
@@ -143,8 +144,8 @@ class SpeedOfLightEstimate:
             "survivors": "exact, from the caller's answers and labels",
             "stop_key": (
                 "a filter under a DISTINCT over its table's columns reads "
-                "each key's documents in sorted token order until one "
-                "survives"),
+                "only each key's shortest survivor, or every document of "
+                "a key with none"),
             "filter_order": (
                 "the planner's rule for this query; an alias's "
                 "classifications follow its AI.IF filters"),
@@ -513,27 +514,33 @@ class _Search:
     def stop_key_rows(self, alias, live, order, predicates) -> list[list[int]]:
         """Return per stage the rows read when each key stops at a survivor.
 
-        The rows of one key value are read in sorted token order, the
-        executor's queue order. A row goes on to the next stage while
-        it passes, and the key's remaining rows are skipped once one
-        row survives every stage.
+        A key with a row that survives every stage reads only its
+        survivor with the fewest tokens, the earliest in sorted token
+        order on a tie: no execution of the stop key reads less. A key
+        with no survivor reads each row until the first stage it fails.
         """
         rank = self.token_rank[alias]
+        tokens = self.aliases[alias].tokens
         groups: dict[tuple, list[int]] = {}
         for row in live:
             groups.setdefault(self.stop_groups[alias][row], []).append(row)
         reached: list[list[int]] = [[] for _ in order]
         for rows in groups.values():
-            for row in sorted(rows, key=rank.__getitem__):
-                survived = True
+            survivors = [
+                row for row in rows
+                if all(self.answer(predicates[written_pos].prompt, {alias: row})
+                       for written_pos in order)]
+            if survivors:
+                shortest = min(survivors, key=lambda row: (tokens[row], rank[row]))
+                for stage in reached:
+                    stage.append(shortest)
+                continue
+            for row in rows:
                 for index, written_pos in enumerate(order):
                     reached[index].append(row)
                     if not self.answer(predicates[written_pos].prompt,
                                        {alias: row}):
-                        survived = False
                         break
-                if survived:
-                    break
         return [sorted(rows) for rows in reached]
 
     def run_filters(self):
@@ -543,8 +550,8 @@ class _Search:
         classification runs once over the live documents, followed by
         the label filters that test it, in written order; the
         classifications no label filter tests follow. An alias whose
-        filters carry a stop key reads each key's documents in sorted
-        token order until one survives, as the executor does.
+        filters carry a stop key reads only each key's shortest
+        survivor, or every document of a key with none.
 
         Returns:
             (survivors by alias, work, stage records).
