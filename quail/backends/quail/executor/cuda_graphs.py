@@ -6,9 +6,27 @@ from dataclasses import dataclass
 from quail.backends.quail.executor.chunk import Chunk
 from quail.progress import logger
 
-DECODE_ROWS = (32, 64, 128, 256, 512)
-DECODE_CONTEXT = 65536
-DECODE_QUERY = 32
+
+@dataclass(frozen=True)
+class DecodeGraphConfig:
+    """Capture shapes owned by one worker's decode graphs."""
+
+    row_buckets: tuple[int, ...] = (32, 64, 128, 256, 512)
+    max_context_tokens: int = 65536
+    max_query_tokens: int = 32
+
+    def __post_init__(self):
+        if (not isinstance(self.row_buckets, tuple) or not self.row_buckets
+                or any(type(row) is not int or row < 1 for row in self.row_buckets)
+                or any(left >= right for left, right in zip(
+                    self.row_buckets, self.row_buckets[1:]))):
+            raise ValueError("row_buckets must be increasing positive integers")
+        if (type(self.max_context_tokens) is not int
+                or self.max_context_tokens < 1
+                or type(self.max_query_tokens) is not int
+                or self.max_query_tokens < 1):
+            raise ValueError(
+                "capture context and query limits must be positive integers")
 
 
 class DecodeBuffers:
@@ -18,7 +36,9 @@ class DecodeBuffers:
     query forms a separate sequence so it cannot affect real rows.
     """
 
-    def __init__(self, torch, rows, page_tokens, *, device="cuda"):
+    def __init__(self, torch, rows, page_tokens, *,
+                 config: DecodeGraphConfig | None = None, device="cuda"):
+        config = DecodeGraphConfig() if config is None else config
         self.rows = rows
         self.indices = torch.arange(rows + 1, dtype=torch.int32, device=device)
 
@@ -33,7 +53,7 @@ class DecodeBuffers:
         self.read_rows = self.indices[:-1].to(torch.int64)
         self.cu_q = self.indices.clone()
         self.used = zeros(rows, torch.int32)
-        self.table = zeros((rows, (DECODE_CONTEXT + page_tokens - 1)
+        self.table = zeros((rows, (config.max_context_tokens + page_tokens - 1)
                             // page_tokens), torch.int32)
         self.source = zeros(rows, torch.int32)
         self.chunk = Chunk(
@@ -41,10 +61,10 @@ class DecodeBuffers:
             final_indices=self.indices[:-1].to(torch.int64),
             meta=dict(layer=0, canvas=None, unified=None,
                       kv_src=self.src, kv_dst=self.dst,
-                      cu_a=self.cu_a, max_a=DECODE_QUERY,
+                      cu_a=self.cu_a, max_a=config.max_query_tokens,
                       reads=dict(rows=self.read_rows, cu_q=self.cu_q,
-                                 max_q=DECODE_QUERY, used=self.used,
-                                 max_used=DECODE_CONTEXT, table=self.table,
+                                 max_q=config.max_query_tokens, used=self.used,
+                                 max_used=config.max_context_tokens, table=self.table,
                                  source=self.source)),
             attention_mode="tree", tokens=rows, layout=[])
 
@@ -110,7 +130,8 @@ class DecodeGraphs:
     returning so a subsequent replay can reuse the graph's output storage.
     """
 
-    def __init__(self, pipeline):
+    def __init__(self, pipeline, *, config: DecodeGraphConfig | None = None):
+        self._config = DecodeGraphConfig() if config is None else config
         self.pipeline = pipeline
         self.enabled = True
         self.graphs = []
@@ -118,6 +139,11 @@ class DecodeGraphs:
         self.replays = 0
         self.fallbacks = 0
         self.capture_s = 0.0
+
+    @property
+    def config(self) -> DecodeGraphConfig:
+        """Return the immutable limits used for capture and replay."""
+        return self._config
 
     def invalidate(self):
         """Release graphs before replacing their KV allocation."""
@@ -149,8 +175,9 @@ class DecodeGraphs:
                 v[start:start + arena.page_tokens].zero_()
             stream.wait_stream(current)
             with torch.cuda.stream(stream), torch.inference_mode():
-                for rows in DECODE_ROWS:
-                    buffers = DecodeBuffers(torch, rows, arena.page_tokens)
+                for rows in self.config.row_buckets:
+                    buffers = DecodeBuffers(torch, rows, arena.page_tokens,
+                                            config=self.config)
                     buffers.synthetic(page)
                     for _ in range(3):
                         self.pipeline.forward_chunk(buffers.chunk)
@@ -176,16 +203,17 @@ class DecodeGraphs:
         """Whether the batch fits the captured tree-attention layout."""
         if (not self.enabled or self.storage is not self.pipeline.engine.arena.k
                 or chunk.attention_mode != "tree"
-                or not 0 < chunk.tokens <= DECODE_ROWS[-1]
+                or not 0 < chunk.tokens <= self.config.row_buckets[-1]
                 or chunk.meta.get("canvas") is not None
-                or chunk.meta["max_a"] > DECODE_QUERY):
+                or chunk.meta["max_a"] > self.config.max_query_tokens):
             return False
         reads = chunk.meta["reads"]
         if (reads is None or reads.get("nodes") is not None
-                or reads["max_q"] > DECODE_QUERY
-                or reads["max_used"] > DECODE_CONTEXT
+                or reads["max_q"] > self.config.max_query_tokens
+                or reads["max_used"] > self.config.max_context_tokens
                 or reads["table"].shape[1] > (
-                    DECODE_CONTEXT + self.pipeline.engine.arena.page_tokens - 1
+                    self.config.max_context_tokens
+                    + self.pipeline.engine.arena.page_tokens - 1
                 ) // self.pipeline.engine.arena.page_tokens):
             return False
         return True

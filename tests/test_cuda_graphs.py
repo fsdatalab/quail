@@ -116,3 +116,35 @@ def test_replay_returns_independent_output_storage():
     graphs.invalidate()
     assert not graphs.graphs
     assert graphs.storage is None
+
+
+def test_worker_capture_limits_control_buffers_and_replay_admission():
+    from dataclasses import FrozenInstanceError
+
+    from quail.backends.quail.executor.cuda_graphs import DecodeGraphConfig
+
+    config = DecodeGraphConfig(row_buckets=(8, 16), max_context_tokens=31,
+                               max_query_tokens=3)
+    buffers = DecodeBuffers(torch, 8, 16, config=config, device="cpu")
+    assert buffers.table.shape == (8, 2)
+    assert buffers.chunk.meta["max_a"] == 3
+    assert buffers.chunk.meta["reads"]["max_used"] == 31
+    source = chunk()
+    arena = SimpleNamespace(k=[], page_tokens=16)
+    pipeline = SimpleNamespace(engine=SimpleNamespace(arena=arena))
+    graphs = DecodeGraphs(pipeline, config=config)
+    other = DecodeGraphs(pipeline)
+    graphs.storage = other.storage = arena.k
+    assert graphs.supports(source)
+    source.tokens = 17
+    assert not graphs.supports(source) and other.supports(source)
+    source.tokens = 5
+    source.meta["reads"]["max_used"] = 32
+    assert not graphs.supports(source) and other.supports(source)
+    source.meta["reads"]["max_used"] = 9
+    source.meta["max_a"] = 4
+    assert not graphs.supports(source) and other.supports(source)
+    with pytest.raises(FrozenInstanceError):
+        config.max_context_tokens = 100
+    with pytest.raises(AttributeError):
+        graphs.config = other.config
