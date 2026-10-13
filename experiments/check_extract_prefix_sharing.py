@@ -95,7 +95,7 @@ def compare(run: str, diagnose: bool = False):
                 metrics = token_metrics(spec, output, tables, stores)
                 report = output.measurements
                 borrowed = sum(score["borrowed_prefix_tokens"]
-                               for score in report["backend_metrics"]["scores"])
+                               for score in report["backend_metrics"]["inferences"])
                 record = dict(
                     configuration=name, query_s=output.runtime_s,
                     boot_s=report["boot_s"], borrowed_prefix_tokens=borrowed,

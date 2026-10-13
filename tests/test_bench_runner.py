@@ -341,7 +341,7 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
             }),
             extracted.node_id: NodeResult({
                 "ids:c": [0, 2],
-                "scores": pa.table({
+                "rows": pa.table({
                     "c": pa.array([0, 2], pa.int32()),
                     "audit_rights": pa.array(["audit yearly", None],
                                              pa.string()),
