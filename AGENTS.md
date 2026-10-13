@@ -34,7 +34,7 @@ Write like two engineers talking at a whiteboard.
 
 CI runs these on every pull request. Run them before pushing:
 
-    uv run ruff check quail bench tests experiments tools
+    uv run ruff check quail bench calibrate tests experiments tools
     uv run python tools/check_long_strings.py
     uv run vulture
     uv run lint-imports
@@ -62,6 +62,9 @@ CI runs these on every pull request. Run them before pushing:
   `quail_b`, pinned to a commit in `pyproject.toml`. `bench/` is
   Quail's runner for it. Change queries or labels there first, then
   move the pin here.
+- `calibrate/` measures a GPU's sustained GEMM, attention, and memory
+  rates with vendor libraries, never Quail's kernels. Its results
+  fill the measured fields of `quail/specs/<device>.py`.
 - The execution mechanisms are "pipelining", "token-based admission",
   "KV rewind", and "prefix sharing".
 - The attention paths are "unified" and "tree".

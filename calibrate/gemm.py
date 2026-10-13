@@ -1,23 +1,25 @@
-"""Measure H100 fp8 GEMM ceilings with stas00's mamf-finder, independent of Quail.
+r"""Measure a GPU's fp8 GEMM ceilings with stas00's mamf-finder.
 
-Runs mamf-finder.py unchanged, at the commit and on the NGC image the
-published H100 SXM rows were measured with, on one H100. Nothing here
-imports quail. The runs share one container, so they share one GPU:
+Runs mamf-finder.py unchanged, at a pinned commit, on the NGC image the
+published H100 SXM rows were measured with. mamf-finder times
+torch._scaled_mm with one fp8 scale per tensor and an fp8 output:
+cuBLAS, not Quail's DeepGEMM kernels. The runs share one container, so
+they share one GPU:
 
-  published_fp8  the published H100 fp8 MAMF and MSMF shapes, to check
-                 this GPU against the published 1550 and 1358 TFLOPS
-  qkv, o,        Qwen3 4B's four linear projections at their N and K,
-  gate_up, down  sweeping M, the tokens in a chunk, from 16 to 131072
-
-mamf-finder times torch._scaled_mm with one fp8 scale per tensor and an
-fp8 output: cuBLAS, not DeepGEMM with block scales and a bf16 output.
+  published_fp8  the GPU's published MAMF and MSMF shapes, to check it
+                 against the published rates; a GPU without published
+                 rates runs mamf-finder's own shape search as "search"
+  qkv, o,        a model's four projections at their N and K, sweeping
+  gate_up, down  M, the tokens in a chunk, from 16 to 131072; --smoke
+                 skips these
 
     mkdir -p results/benchmark
-    log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-gemm-ceilings.log"
-    uv run modal run --detach experiments/gemm_ceilings.py 2>&1 | tee "$log"
+    log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-gemm.log"
+    uv run modal run --detach calibrate/gemm.py --device h100-sxm \
+        --model qwen3-4b-fp8 --prediction "..." 2>&1 | tee "$log"
 
-The mamf-finder logs go under /results/ablations/gemm_ceilings/<stamp>/
-and the summary to /results/ablations/gemm_ceilings_h100_fp8.json.
+The mamf-finder logs go under /results/calibrate/<device>/gemm/<stamp>/
+and the summary to /results/calibrate/<device>/gemm.json.
 """
 
 from __future__ import annotations
@@ -36,42 +38,11 @@ MAMF_URL = ("https://raw.githubusercontent.com/stas00/ml-engineering/"
 MAMF_SHA256 = "24239a3cba82746cabb1cf756afbd4467ed1a1b884eafd842b67cbf948ef7256"
 MAMF_PATH = "/opt/mamf-finder.py"
 NGC_IMAGE = "nvcr.io/nvidia/pytorch:26.04-py3"
+RESULTS = Path("/results/calibrate")
 
-RUNS_DIR = Path("/results/ablations/gemm_ceilings")
-SUMMARY_PATH = Path("/results/ablations/gemm_ceilings_h100_fp8.json")
-
-# H100 SXM rows of the comparison table and its note 17, README of
-# stas00/ml-engineering compute/accelerator at 8d028c29.
-PUBLISHED_FP8 = {
-    "mamf_tflops": 1550, "mamf_shape": "1280x16896x16384",
-    "msmf_tflops": 1358, "msmf_shape": "1536x2816x16384",
-    "msmf_watts": 674, "msmf_mhz": 1824,
-    "stack": "NGC 26.04, torch 2.12.0a0, CUDA 13.2, 700 W, siblings idle",
-}
-
-# Qwen/Qwen3-4B-FP8 config.json: hidden_size 2560, 32 query heads and 8
-# KV heads of head_dim 128, intermediate_size 9728. (N, K) per layer.
-QWEN3_4B_GEMMS = {
-    "qkv": (6144, 2560),
-    "o": (2560, 4096),
-    "gate_up": (19456, 2560),
-    "down": (2560, 9728),
-}
 M_TOKENS = (16, 32, 64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
             4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536,
             98304, 110376, 131072)
-
-PREDICTION_TEXT = (
-    "published_fp8: MAMF within 5% of 1550 TFLOPS and MSMF within 5% of "
-    "1358 TFLOPS, if Modal's H100 has a 700 W power limit; lower MSMF would "
-    "point at a lower power limit or busy GPUs on the same board. Qwen3 4B "
-    "GEMMs: K of 2560 to 9728 is short next to the K of 16384 at the "
-    "published peaks, so each projection's best MSMF lands at 75-95% of the "
-    "published 1358 TFLOPS, reached at M of 8192 or more. Below M of about "
-    "400 the weight read sets the time, so TFLOPS grows about linearly with "
-    "M; for example, gate_up at M = 16 cannot exceed 106 TFLOPS (49.8 MB of "
-    "weights at 3.35 TB/s)."
-)
 
 app = modal.App("quail-milestone1")
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
@@ -82,6 +53,7 @@ image = (
         f"curl -fsSL {MAMF_URL} -o {MAMF_PATH}",
         f"echo '{MAMF_SHA256}  {MAMF_PATH}' | sha256sum -c -",
     )
+    .add_local_python_source("calibrate")
 )
 
 HEADLINE = re.compile(
@@ -89,7 +61,7 @@ HEADLINE = re.compile(
     r"(?:\s+(\d+)W)?(?: (\d+)MHz)?(?: (\d+)C)?")
 SCOUT_ROW = re.compile(
     r"^\s*\d+\s+(\d+)x(\d+)x(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+[\d.]+"
-    r"(?:\s+(\d+)\s+(\d+))?\s*$")
+    r"(?:\s+(\d+)\s+(\d+))?(?:\s+<-.*)?\s*$")
 
 
 def parse_log(text: str) -> dict:
@@ -124,10 +96,30 @@ def parse_log(text: str) -> dict:
     return out
 
 
+def mamf_runs(published: dict | None, shapes: dict, run_dir: Path) -> dict:
+    """Return mamf-finder's shape arguments for each run, by run name.
+
+    Args:
+        published: The GPU's published fp8 rates and shapes, or None.
+        shapes: Projection name -> (N, K).
+        run_dir: Where the published shapes file is written.
+    """
+    if published is None:
+        runs = {"search": ["--search", "auto"]}
+    else:
+        shapes_file = run_dir / "published_fp8_shapes.txt"
+        shapes_file.write_text(
+            f"{published['mamf_shape']}\n{published['msmf_shape']}\n")
+        runs = {"published_fp8": ["--shapes_file", str(shapes_file)]}
+    for name, (n, k) in shapes.items():
+        runs[name] = ["--m", *map(str, M_TOKENS), "--n", str(n), "--k", str(k)]
+    return runs
+
+
 def gpu_info() -> dict:
     """Return nvidia-smi's name, power limits, clocks, and driver for GPU 0."""
     fields = ("name", "power.limit", "power.max_limit", "clocks.max.sm",
-              "driver_version", "pci.bus_id")
+              "driver_version")
     row = subprocess.run(
         ["nvidia-smi", f"--query-gpu={','.join(fields)}",
          "--format=csv,noheader", "-i", "0"],
@@ -137,35 +129,38 @@ def gpu_info() -> dict:
 
 @app.function(image=image, gpu="H100!", timeout=3 * 3600,
               volumes={"/results": results_vol})
-def measure(stamp: str) -> dict:
+def measure(stamp: str, device: str, model: str, published: dict | None,
+            shapes: dict, smoke: bool, prediction: str) -> dict:
     """Run every mamf-finder configuration on one GPU and save the summary.
 
     Args:
         stamp: The UTC timestamp naming this run's directory.
+        device: The quail.specs device name.
+        model: The quail.specs model name the shapes are from.
+        published: The GPU's published fp8 rates and shapes, or None.
+        shapes: Projection name -> (N, K).
+        smoke: Time only the published shapes or the search; the
+            summary stays in the run's directory.
+        prediction: The prediction stated before the run.
 
     Returns:
-        The summary also written to SUMMARY_PATH.
+        The summary, also written to /results/calibrate/<device>/gemm.json
+        unless smoke.
     """
-    run_dir = RUNS_DIR / stamp
+    run_dir = RESULTS / device / "gemm" / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
-    shapes_file = run_dir / "published_fp8_shapes.txt"
-    shapes_file.write_text(
-        f"{PUBLISHED_FP8['mamf_shape']}\n{PUBLISHED_FP8['msmf_shape']}\n")
-    runs = {"published_fp8": ["--shapes_file", str(shapes_file)]}
-    for name, (n, k) in QWEN3_4B_GEMMS.items():
-        runs[name] = (["--m", *map(str, M_TOKENS)]
-                      + ["--n", str(n), "--k", str(k)])
-
     gpu = gpu_info()
     print(f"gpu: {json.dumps(gpu)}", flush=True)
-    summary = {"stamp": stamp, "gpu": gpu, "image": NGC_IMAGE,
-               "mamf_finder": MAMF_URL, "published_fp8": PUBLISHED_FP8,
-               "prediction": PREDICTION_TEXT, "runs": {}}
+    summary = {"stamp": stamp, "device": device, "model": model, "gpu": gpu,
+               "image": NGC_IMAGE, "mamf_finder": MAMF_URL,
+               "published_fp8": published, "smoke": smoke,
+               "prediction": prediction, "runs": {}}
+    runs = mamf_runs(published, {} if smoke else shapes, run_dir)
     for name, shape_args in runs.items():
         log_path = run_dir / f"{name}.txt"
         argv = [sys.executable, MAMF_PATH, "--dtype", "float8_e4m3fn",
                 *shape_args, "--output_file", str(log_path), "--no-verbose",
-                "--notes", f"quail gemm_ceilings {stamp} {name}"]
+                "--notes", f"quail calibrate {stamp} {name}"]
         print(f"{name}: {' '.join(argv[1:])}", flush=True)
         subprocess.run(argv, check=True)
         parsed = parse_log(log_path.read_text())
@@ -175,24 +170,31 @@ def measure(stamp: str) -> dict:
               f"MSMF {json.dumps(parsed['msmf'])}", flush=True)
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
         results_vol.commit()
-    SUMMARY_PATH.write_text(json.dumps(summary, indent=2))
-    results_vol.commit()
+    if not smoke:
+        (RESULTS / device / "gemm.json").write_text(json.dumps(summary, indent=2))
+        results_vol.commit()
     return summary
 
 
 @app.local_entrypoint()
-def main():
-    """Start the measurement and print each configuration's headlines."""
+def main(device: str = "h100-sxm", model: str = "qwen3-4b-fp8",
+         smoke: bool = False, prediction: str = ""):
+    """Start the measurement on the device's GPU and print each run's headlines."""
     from datetime import datetime, timezone
 
-    print(f"prediction: {PREDICTION_TEXT}", flush=True)
+    from calibrate.targets import TARGETS, gemm_shapes
+    from quail.specs import MODELS
+
+    target = TARGETS[device]
+    shapes = gemm_shapes(MODELS[model])
+    print(f"prediction: {prediction or '(none stated)'}", flush=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    call = measure.spawn(stamp)
+    call = measure.with_options(gpu=target.modal_gpu).spawn(
+        stamp, device, model, target.published_fp8, shapes, smoke, prediction)
     print(f"function call id: {call.object_id}", flush=True)
-    print(f"logs: {RUNS_DIR / stamp}", flush=True)
+    print(f"logs: {RESULTS / device / 'gemm' / stamp}", flush=True)
     summary = call.get()
-    print(f"gpu: {json.dumps(summary['gpu'])}", flush=True)
     for name, run in summary["runs"].items():
         print(f"{name}: MAMF {json.dumps(run['mamf'])} "
               f"MSMF {json.dumps(run['msmf'])}", flush=True)
-    print(f"summary: {SUMMARY_PATH}", flush=True)
+    print(f"summary: {RESULTS / device / 'gemm.json'}", flush=True)
