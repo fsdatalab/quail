@@ -62,6 +62,22 @@ def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     return max(b, int(compute_knee(model, device)))
 
 
+def sliding_kv_fits(model: ModelSpec, device: DeviceSpec,
+                    chunk_tokens: int | None = None) -> bool:
+    """Whether the leftover arena holds one chunk's sliding KV.
+
+    Models without a sliding window always fit. The default chunk is
+    the budget; DiffusionGemma's 65536-token cap does not fit L40S.
+    """
+    if not model.sliding_window:
+        return True
+    try:
+        arena_pages(model, device, chunk_tokens)
+    except ValueError:
+        return False
+    return True
+
+
 def arena_bytes(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int) -> float:
     """Bytes left for KV after resident weights and the activation reserve."""

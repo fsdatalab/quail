@@ -278,4 +278,17 @@ def validate_query(plan, operators, context, model, device, gpus):
             ),
             constraint="weights_need_more_cards",
             needed=weight_gpus, available=1, unit="cards")
+    if not budgets.sliding_kv_fits(model, device):
+        chunk = budgets.chunk_budget(model, device)
+        free = budgets.arena_bytes(model, device, chunk)
+        floor = budgets.transient_sliding_pages(chunk, model.sliding_window)
+        needed = floor * model.kappa_sliding * budgets.PAGE_TOKENS
+        return Refusal(
+            reasons=(
+                f"{model.name} does not fit {device.name}: a "
+                f"{chunk}-token chunk's sliding KV exceeds leftover "
+                f"GPU memory",
+            ),
+            constraint="sliding_kv_needs_more_memory",
+            needed=needed, available=max(0.0, free), unit="bytes")
     return None
