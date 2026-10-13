@@ -16,8 +16,9 @@ import pyarrow as pa
 import quail
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.executor.arena import KVArena, PageArena
+from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.models.base import ModelPipeline
+from quail.backends.quail.executor.pages import PageArena
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.physical import (

@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from quail.backends.quail.executor.arena import PageArena
+from quail.backends.quail.executor.pages import PageArena
 
 
 def test_allocation_retention_rewind_and_pinning():
