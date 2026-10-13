@@ -5,6 +5,7 @@ from sqlglot import exp
 from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
+from quail.frontend.scope import Scope
 from quail.logical import (
     ColumnRef,
     Compare,
@@ -162,9 +163,10 @@ class ExpressionBinder:
     def __init__(self, catalog: Catalog, prompts: PromptBinder):
         self.catalog = catalog
         self.prompts = prompts
-        self.tables: list[tuple[str, str]] = []
+        self.scope = Scope(catalog)
+        self.tables = self.scope.tables
         self.regular_predicates: dict[str, list[RegularPredicate]] = {}
-        self.doc_columns: dict[str, str] = {}
+        self.doc_columns = self.scope.doc_columns
         self.filters: dict[str, list[FilterPredicate]] = {}
         self.label_tests: dict[
             str, list[tuple[ModelCall, tuple[str, ...], float | None]]
@@ -174,49 +176,16 @@ class ExpressionBinder:
     # ---- scope ------------------------------------------------------
 
     def add_table(self, table: exp.Table) -> str:
-        name = table.name
-        alias = table.alias or name
-        self.catalog.get(name)  # unknown provider -> CompileError
-        if alias in dict(self.tables):
-            raise CompileError(f"duplicate table alias {alias!r}")
-        self.tables.append((alias, name))
+        alias = table.alias or table.name
+        self.scope.add_table(alias, table.name)
         return alias
 
     def resolve_column(self, col: exp.Column, scope=None) -> ColumnRef:
-        scope = dict(self.tables) if scope is None else dict(scope)
-        column = col.name
-        if col.table:
-            if col.table not in scope:
-                raise CompileError(
-                    f"unknown table alias {col.table!r} in column {col.sql()}"
-                )
-            provider = scope[col.table]
-            if column not in self.catalog.get(provider).columns:
-                raise CompileError(
-                    f"column {column!r} not in provider {provider!r} "
-                    f"(schema: {self.catalog.get(provider).columns})"
-                )
-            return ColumnRef(alias=col.table, provider=provider, column=column)
-        owners = [
-            (a, p) for a, p in scope.items() if column in self.catalog.get(p).columns
-        ]
-        if len(owners) != 1:
-            raise CompileError(
-                f"column {column!r} is {'ambiguous' if owners else 'unknown'};"
-                f" qualify it with a table alias"
-            )
-        return ColumnRef(alias=owners[0][0], provider=owners[0][1], column=column)
+        return self.scope.resolve(col.name, col.table or None, tables=scope,
+                                  shown=col.sql())
 
     def note_doc_column(self, ref: ColumnRef) -> None:
-        seen = self.doc_columns.get(ref.alias)
-        if seen and seen != ref.column:
-            raise CompileError(
-                f"alias {ref.alias!r} is referenced through two "
-                f"columns ({seen!r}, {ref.column!r}); predicates over "
-                f"one table must share one document column so its KV "
-                f"is computed once"
-            )
-        self.doc_columns[ref.alias] = ref.column
+        self.scope.note_doc_column(ref)
 
     # ---- AI predicate parsing ----------------------------------------
 

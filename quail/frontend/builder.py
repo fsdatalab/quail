@@ -6,6 +6,7 @@ from typing import Optional
 from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
+from quail.frontend.scope import Scope
 from quail.logical import (
     AggregateCall,
     Aggregation,
@@ -23,7 +24,11 @@ from quail.logical import (
     RegularPredicate,
     SortKey,
 )
-from quail.logical.expressions import SPAN_SUFFIX, validate_task_description
+from quail.logical.expressions import (
+    SPAN_SUFFIX,
+    column_name,
+    validate_task_description,
+)
 
 
 @dataclass(frozen=True, eq=False)
@@ -209,11 +214,12 @@ class Query:
     def __init__(self, catalog: Catalog, provider: str, tokenizer=None,
                  turn: tuple[str, str] = ("", ""), layout: str = "ai-if",
                  prompts: PromptBinder | None = None):
-        catalog.get(provider)     # unknown provider -> CompileError
         self._catalog = catalog
         self._prompts = prompts or PromptBinder(tokenizer, turn=turn, layout=layout)
-        self._tables = [(provider, provider)]   # (alias, provider)
-        self._doc_columns = {}
+        self._scope_ = Scope(catalog)
+        self._scope_.add_table(provider, provider)
+        self._tables = self._scope_.tables      # (alias, provider)
+        self._doc_columns = self._scope_.doc_columns
         self._filters = {}
         self._label_filters = {}     # alias -> [(name, labels, selectivity)]
         self._joins = []
@@ -247,36 +253,10 @@ class Query:
         return dict(self._tables)
 
     def _resolve(self, c: ColSpec) -> ColumnRef:
-        scope = self._scope()
-        if c.alias is not None:
-            if c.alias not in scope:
-                raise CompileError(f"unknown table alias {c.alias!r}")
-            provider = scope[c.alias]
-            if c.column not in self._catalog.get(provider).columns:
-                raise CompileError(
-                    f"column {c.column!r} not in provider {provider!r} "
-                    f"(schema: {self._catalog.get(provider).columns})")
-            return ColumnRef(alias=c.alias, provider=provider,
-                             column=c.column)
-        owners = [(a, p) for a, p in scope.items()
-                  if c.column in self._catalog.get(p).columns]
-        if len(owners) != 1:
-            raise CompileError(
-                f"column {c.column!r} is "
-                f"{'ambiguous' if owners else 'unknown'}; qualify it "
-                f"with a table alias")
-        return ColumnRef(alias=owners[0][0], provider=owners[0][1],
-                         column=c.column)
+        return self._scope_.resolve(c.column, c.alias)
 
     def _note_doc_column(self, ref: ColumnRef) -> None:
-        seen = self._doc_columns.get(ref.alias)
-        if seen and seen != ref.column:
-            raise CompileError(
-                f"alias {ref.alias!r} is referenced through two "
-                f"columns ({seen!r}, {ref.column!r}); predicates over "
-                f"one table must share one document column so its KV "
-                f"is computed once")
-        self._doc_columns[ref.alias] = ref.column
+        self._scope_.note_doc_column(ref)
 
     def _bind(self, p: PromptSpec, join: bool = False):
         refs = tuple(self._resolve(c) for c in p.cols)
@@ -625,7 +605,7 @@ class Query:
                 if name in self._labels or name in self._scope():
                     raise CompileError(f"the name {name!r} is already used")
                 self._labels[name] = column
-            self._tables.append((alias, provider))
+            self._scope_.add_table(alias, provider)
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
             for a, tests in other._label_filters.items():
@@ -894,8 +874,7 @@ class Query:
                 column = self._resolve(col(c) if isinstance(c, str) else c)
             if column not in columns:
                 columns.append(column)
-            return (column.name if isinstance(column, Alias)
-                    else f"{column.alias}.{column.column}")
+            return column_name(column)
 
         keys = tuple(project(c) for c in self._group)
         aggregates = []

@@ -432,9 +432,7 @@ class SortKey:
     @property
     def name(self) -> str:
         """Return the result column name the key sorts on."""
-        if isinstance(self.expression, ColumnRef):
-            return f"{self.expression.alias}.{self.expression.column}"
-        return self.expression.name
+        return column_name(self.expression)
 
     def validate(self) -> None:
         if isinstance(self.expression, (Alias, AggregateCall)):
