@@ -6,7 +6,7 @@ import math
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-import quail.bench.labeling as labeling
+import bench.labeling as labeling
 from experiments.cells import classify_labels as cell
 from quail_b.data import GROUND_TRUTH_ROOT
 from quail_b.labels import load_ground_truth

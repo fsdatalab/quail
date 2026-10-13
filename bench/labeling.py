@@ -11,15 +11,15 @@ Scale factors 0.1, 0.5 and 1.0 are supported; a smaller one samples a
 prefix of a larger one's documents, so its labels are derived from the
 larger pass on the CPU by matching document content.
 
-    uv run modal run --detach -m quail.bench.labeling --sf 1.0
-    uv run modal run --detach -m quail.bench.labeling --sf 0.1 \
+    uv run modal run --detach -m bench.labeling --sf 1.0
+    uv run modal run --detach -m bench.labeling --sf 0.1 \
       --derive-from-collection <collection>
 
 Publish finished collections to the public bucket, with the AWS
 credentials of the machine that runs the command (a profile, the
 environment, or SSO, resolved the way the aws CLI resolves them):
 
-    uv run modal run -m quail.bench.labeling \
+    uv run modal run -m bench.labeling \
       --publish-collections <collection>,<collection>
 
 Label-set and collection ids come from `quail_b.predicates` and

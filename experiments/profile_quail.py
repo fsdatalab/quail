@@ -168,7 +168,7 @@ def _boot_state(model, **pipeline_kwargs):
 def _quailb_session(model, sf, gpus=1):
     """Build the QUAIL-B tables and a registered session."""
     import quail
-    from quail.bench.quailb import queries, register_tables
+    from bench.quailb import queries, register_tables
     from quail.planner.plan import EngineConfig
     from quail_b.data import build_sets
 

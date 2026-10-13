@@ -10,6 +10,7 @@ from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
 from test_score import _finish
 
 import quail
+from bench.quailb import run_output
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.label_stages import label_requests
 from quail.backends.quail.executor.operators.classify import QuailClassifier
@@ -19,7 +20,6 @@ from quail.backends.quail.reranker import RerankerBatch
 from quail.baselines import (
     RequestExecution,
 )
-from quail.bench.quailb import run_output
 from quail.catalog import DocumentProvider
 from quail.execution.labels import (
     GreedyDecoder,

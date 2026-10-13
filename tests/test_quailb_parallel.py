@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from quail.bench.quailb_parallel import _merge_suites, _query_groups
+from bench.quailb_parallel import _merge_suites, _query_groups
 
 
 def test_bio_queries_use_separate_groups():

@@ -34,7 +34,7 @@ Write like two engineers talking at a whiteboard.
 
 CI runs these on every pull request. Run them before pushing:
 
-    uv run ruff check quail tests experiments tools
+    uv run ruff check quail bench tests experiments tools
     uv run python tools/check_long_strings.py
     uv run vulture
     uv run lint-imports
@@ -59,7 +59,7 @@ CI runs these on every pull request. Run them before pushing:
   `quail`.
 - quail-b, the benchmark, lives in
   https://github.com/fsdatalab/quail-bench and is installed here as
-  `quail_b`, pinned to a commit in `pyproject.toml`. `quail/bench/` is
+  `quail_b`, pinned to a commit in `pyproject.toml`. `bench/` is
   Quail's runner for it. Change queries or labels there first, then
   move the pin here.
 - The execution mechanisms are "pipelining", "token-based admission",
@@ -208,7 +208,7 @@ how they release and explain changes.
   each query's bars in the latency and throughput panels. Compute it on
   the CPU with `quail.speed_of_light_estimate`, passing the saved
   reference labels as the answer and label oracles
-  (`quail.bench.quailb.answer_oracle`), and save it to the results
+  (`bench.quailb.answer_oracle`), and save it to the results
   volume. Its throughput is the Quail run's input tokens over the SoL
   seconds. Label it as an estimate, give its KV capacity and survivor
   assumptions, and never give it an accuracy. Check the query

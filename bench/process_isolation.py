@@ -66,8 +66,8 @@ def run_backend_group(
     Raises:
         ValueError: No backend methods were supplied.
     """
+    from bench.quailb import run_suite
     from quail import EngineConfig
-    from quail.bench.quailb import run_suite
     from quail_b.queries import query_family_name
 
     query_ids = tuple(query_ids)

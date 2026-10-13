@@ -63,7 +63,7 @@ def profile_worker(directory, connection, query="FEV-9"):
         import vllm
 
         import quail.baselines.request as request_module
-        from quail.bench.process_isolation import run_backend_group
+        from bench.process_isolation import run_backend_group
 
         original_init = vllm.LLM.__init__
 

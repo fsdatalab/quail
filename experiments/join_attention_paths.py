@@ -89,7 +89,7 @@ def measure(query_ids: list[str], stamp: str, model: str = "qwen3-4b-fp8",
 
     import quail
     import quail_b as benchmark
-    from quail.bench.quailb import run_query
+    from bench.quailb import run_query
     from quail.builtins import built_in_registry
 
     force = ForceJoinAttention()

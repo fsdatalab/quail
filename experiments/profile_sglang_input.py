@@ -13,8 +13,8 @@ import multiprocessing as mp
 from datetime import datetime, timezone
 from pathlib import Path
 
+from bench.quailb_parallel import VOLUMES, app, results_vol, sglang_image
 from experiments.sglang_input_profile_worker import PREDICTION_TEXT
-from quail.bench.quailb_parallel import VOLUMES, app, results_vol, sglang_image
 
 
 @app.function(
@@ -23,8 +23,8 @@ from quail.bench.quailb_parallel import VOLUMES, app, results_vol, sglang_image
 )
 def profile():
     """Run the profiler in a child process and save its traces."""
+    from bench.process_isolation import _stop_process_group
     from experiments.sglang_input_profile_worker import profile_worker
-    from quail.bench.process_isolation import _stop_process_group
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root = Path(f"/results/ablations/sglang-input-profile-{stamp}")

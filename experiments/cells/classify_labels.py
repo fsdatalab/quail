@@ -24,7 +24,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench import labeling as labels
+from bench import labeling as labels
 from quail_b import prompts
 from quail_b.data import GROUND_TRUTH_ROOT
 from quail_b.predicates import (

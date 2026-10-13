@@ -31,9 +31,9 @@ def compare(run: str, diagnose: bool = False):
     import pyarrow.parquet as pq
 
     import quail
+    from bench import quailb
     from quail.backends.quail.executor.extract.decode import Decoder
     from quail.backends.quail.executor.operators import extract
-    from quail.bench import quailb
     from quail.planner.plan import EngineConfig
     from quail.specs import H100_USD_PER_HOUR
     from quail_b import get_query
@@ -129,7 +129,7 @@ def compare(run: str, diagnose: bool = False):
         sources = {}
         for relative in ("quail/planner/physical_rules.py", "quail/cost/extract.py",
                          "quail/backends/quail/executor/operators/extract.py",
-                         "quail/baselines/request.py", "quail/bench/quailb.py"):
+                         "quail/baselines/request.py", "bench/quailb.py"):
             source = Path("/root") / relative
             sources[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
         summary["source_sha256"] = sources

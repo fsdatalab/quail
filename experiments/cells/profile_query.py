@@ -22,7 +22,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.quailb_parallel import (
+from bench.quailb_parallel import (
     DATA_DIR,
     VOLUMES,
     app,
@@ -300,7 +300,7 @@ def child(arguments: str) -> None:
 
     import quail
     import quail.backends.quail.graph as graph_module
-    from quail.bench.quailb import run_query
+    from bench.quailb import run_query
     from quail_b.benchmark import load_benchmark
 
     args = json.loads(arguments)

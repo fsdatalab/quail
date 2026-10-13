@@ -95,7 +95,7 @@ def _marked_executor(scheduler, torch):
 
 def _query(session, query_id):
     """Build the benchmark query on the session."""
-    from quail.bench import quailb
+    from bench import quailb
     from quail_b import get_query
 
     return quailb.build_query(session, get_query(query_id))

@@ -7,7 +7,7 @@ operator ids, as QUAIL-B scores them.
 Runs on any machine with a supported GPU and saves to a local directory;
 no Modal or volume is involved:
 
-    uv run python -m quail.bench.quailb --sf 0.1 --only IMDB-4 \
+    uv run python -m bench.quailb --sf 0.1 --only IMDB-4 \
       --model qwen3-4b-fp8 --device h100-sxm \
       --output-dir results/quailb/imdb-4
 """
@@ -25,9 +25,9 @@ import pyarrow.compute as pc
 
 import quail
 import quail_b as benchmark
+from bench import substrait
+from bench.results import write_json
 from quail.baselines import RequestExecution
-from quail.bench import substrait
-from quail.bench.results import write_json
 from quail.logical.expressions import SPAN_SUFFIX
 from quail.logical.prompts import bind_classify_prompt
 from quail.physical import AiClassify, AiExtract, AiScore

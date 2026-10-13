@@ -1,4 +1,8 @@
-"""The Modal images the benchmark and experiment scripts run on."""
+"""The Modal images the benchmark and experiment scripts run on.
+
+Each image mounts the quail package and the bench package, which is
+not in the wheel, so the benchmark runner imports inside a container.
+"""
 
 from importlib.metadata import version
 
@@ -49,7 +53,7 @@ def gpu_image(*local_dirs: tuple[str, str],
     image = _cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
-    image = image.add_local_python_source("quail")
+    image = image.add_local_python_source("quail", "bench")
     for local, remote in local_dirs:
         image = image.add_local_dir(local, remote_path=remote)
     return image
@@ -75,7 +79,7 @@ def sglang_image() -> modal.Image:
             .uv_sync(groups=["dev"], uv_version=UV_VERSION,
                      extra_options="--no-install-package vllm")
             .uv_pip_install("sglang==0.5.18")
-            .add_local_python_source("quail"))
+            .add_local_python_source("quail", "bench"))
 
 
 def cpu_image() -> modal.Image:
@@ -84,4 +88,4 @@ def cpu_image() -> modal.Image:
             .apt_install("git")
             .uv_sync(groups=["dev"], uv_version=UV_VERSION,
                      extra_options="--no-install-package vllm")
-            .add_local_python_source("quail"))
+            .add_local_python_source("quail", "bench"))

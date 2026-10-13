@@ -81,9 +81,9 @@ def compare(run: str):
     import torch
 
     import quail
+    from bench import quailb
     from experiments.compare_extract_tokenization import _trace_metrics
     from quail.backends.quail.executor import stages
-    from quail.bench import quailb
     from quail.planner.plan import EngineConfig
     from quail.specs import H100_USD_PER_HOUR
     from quail_b import get_query

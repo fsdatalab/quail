@@ -7,9 +7,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import bench.labeling as labeling
 import quail
-import quail.bench.labeling as labeling
-from quail.bench.labeling import (
+from bench.labeling import (
     _check_reused_label_set,
     _compact_label_parts,
     _corpus_identity,

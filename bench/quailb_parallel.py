@@ -5,7 +5,7 @@ in a second child process and share one loaded model. SGLang runs in a
 separate container because its package version conflicts with vLLM.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
-    uv run modal run --detach -m quail.bench.quailb_parallel \
+    uv run modal run --detach -m bench.quailb_parallel \
       --model qwen3-4b-fp8 --sf 0.1 \
       2>&1 | tee "$run_log"
 
@@ -20,7 +20,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.results import combine_measurements, write_json
+from bench.results import combine_measurements, write_json
 from quail.deploy.images import gpu_image, sglang_image
 
 image = gpu_image()
@@ -95,7 +95,7 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
     process. The family's result, without the per-method suites, is
     saved under `families/` in the run directory.
     """
-    from quail.bench.process_isolation import run_backend_group_in_fresh_process
+    from bench.process_isolation import run_backend_group_in_fresh_process
     from quail_b.queries import query_family_name
 
     query_ids = tuple(

@@ -19,7 +19,7 @@ from fakes import letter_tokens
 from test_quailb import _standin_sets
 
 import quail
-from quail.bench.quailb import queries, register_tables
+from bench.quailb import queries, register_tables
 from quail.planner.plan import EngineConfig, Refusal
 
 SNAPSHOTS = Path(__file__).parent / "fixtures" / "plans"

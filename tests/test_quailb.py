@@ -7,7 +7,7 @@ import pyarrow.parquet as pq
 from fakes import letter_tokens
 
 import quail
-from quail.bench.quailb import (
+from bench.quailb import (
     _submission_to_answer_s,
     queries,
     register_tables,
@@ -170,7 +170,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
 
 
 def test_kernel_cache_files_counts_each_cache_directory(tmp_path, monkeypatch):
-    from quail.bench.quailb import kernel_cache_files
+    from bench.quailb import kernel_cache_files
 
     monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path / "missing"))
     assert kernel_cache_files() == {}
@@ -184,7 +184,7 @@ def test_kernel_cache_files_counts_each_cache_directory(tmp_path, monkeypatch):
 
 
 def test_request_benchmark_counts_prompt_tokens_without_decode_tokens(monkeypatch):
-    from quail.bench import quailb
+    from bench import quailb
 
     result = SimpleNamespace(report={
         "model_wall_s": 1.0, "finish_s": 0.0,

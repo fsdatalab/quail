@@ -76,9 +76,9 @@ def compare(run: str, query_id: str, baseline: str, sources: dict,
     import torch
 
     import quail
+    from bench import quailb
     from quail.backends.quail.executor import stages as scheduler
     from quail.backends.quail.executor.operators import extract as operator
-    from quail.bench import quailb
     from quail.planner.plan import EngineConfig
     from quail.specs import H100_USD_PER_HOUR
     from quail_b import get_query

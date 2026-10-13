@@ -19,8 +19,8 @@ import multiprocessing as mp
 from datetime import datetime, timezone
 from pathlib import Path
 
+from bench.quailb_parallel import VOLUMES, app, image, results_vol
 from experiments.vllm_join_profile_worker import PREDICTION_TEXTS
-from quail.bench.quailb_parallel import VOLUMES, app, image, results_vol
 
 
 @app.function(
@@ -29,8 +29,8 @@ from quail.bench.quailb_parallel import VOLUMES, app, image, results_vol
 )
 def profile(query="FEV-9"):
     """Run the profiler in a child process and save its traces."""
+    from bench.process_isolation import _stop_process_group
     from experiments.vllm_join_profile_worker import profile_worker
-    from quail.bench.process_isolation import _stop_process_group
 
     if query not in PREDICTION_TEXTS:
         raise ValueError(f"Unsupported profiling query: {query}")

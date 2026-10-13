@@ -47,7 +47,8 @@ Include the tests and documentation needed to check and use your change.
 | `quail/backends/` | The Quail inference engine. |
 | `quail/baselines/` | The stock vLLM and SGLang backends the benchmark compares against. |
 | `quail/remote/`, `quail/server/` | The client and server of Quail Server. |
-| `quail/bench/`, `quail/deploy/` | The QUAIL-B runner and the Modal images. |
+| `quail/deploy/` | The Modal images. |
+| `bench/` | The QUAIL-B runner, outside the wheel. |
 | `tests/`, `experiments/` | CPU tests and Modal GPU scripts. |
 | `docs/`, `demos/` | Documentation and examples. |
 
@@ -65,7 +66,7 @@ See [Extending Quail](/docs/extending) for the extension interfaces.
 Run these commands from the repository root:
 
 ```bash
-uv run ruff check quail tests experiments tools
+uv run ruff check quail bench tests experiments tools
 uv run python tools/check_long_strings.py
 uv run vulture
 uv run lint-imports

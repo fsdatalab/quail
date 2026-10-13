@@ -98,7 +98,7 @@ def run_rules(run: str, queries=QUERIES, rules=RULES) -> dict:
     from pathlib import Path
 
     import quail
-    from quail.bench import quailb
+    from bench import quailb
     from quail.planner.label_scoring import ClassifyScoring
 
     original = ClassifyScoring.choose

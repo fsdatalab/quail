@@ -7,10 +7,10 @@ from fakes import letter_tokens
 from test_quail_backend import graph_state
 
 import quail
+from bench import quailb
 from quail.api.execute import execute_query
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.reranker import _score_table
-from quail.bench import quailb
 from quail.execution.runner import NodeMetrics, NodeResult
 from quail.execution.types import PhysicalResponse
 from quail.logical.nodes import CompileError

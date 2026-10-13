@@ -532,7 +532,7 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
 IMPORT_TEXT = """
 import sys
 import quail
-from quail.bench import quailb
+from bench import quailb
 from quail.api import execute
 from demos import quickstart
 

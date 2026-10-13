@@ -42,8 +42,8 @@ def estimate(model: str, sf: float, query_ids: list[str],
 
     import quail
     import quail_b
-    from quail.bench.quailb import answer_oracle, build_query
-    from quail.bench.substrait import read_plan
+    from bench.quailb import answer_oracle, build_query
+    from bench.substrait import read_plan
 
     directory = f"/results/quailb_data/sf{sf}"
     suite = quail_b.load_benchmark(list(query_ids), scale_factor=sf,
