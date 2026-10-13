@@ -95,14 +95,14 @@ def _tflops(values) -> str:
 def spec_text(gemm: dict, attention: dict) -> str:
     """Return the DeviceSpec fields and attention table as Python source."""
     rates = attention_rates(attention)
-    n_q, n_kv, d_head = attention["layout"]
-    model = attention["model"].upper().replace("-", "_")
+    n_q, n_kv, d_head = attention["heads"]
+    table = f"ATTENTION_{n_q}_{n_kv}_{d_head}"
     read_rows = ",\n          ".join(f"({_tflops(line)})" for line in rates.read)
     return (
         f"# Faster of FlashAttention 3 and FlashInfer at each point, each held\n"
         f"# 2 s; cached reads on private 16-token pages: calibrate run\n"
         f"# {attention['stamp']} on {attention['gpu']['name']}\n"
-        f"{model}_ATTENTION = AttentionRates(\n"
+        f"{table} = AttentionRates(\n"
         f"    causal_tokens={rates.causal_tokens},\n"
         f"    causal=({_tflops(rates.causal)}),\n"
         f"    read_rows={rates.read_rows},\n"
@@ -113,7 +113,7 @@ def spec_text(gemm: dict, attention: dict) -> str:
         f"  # best MSMF, calibrate run {gemm['stamp']}\n"
         f"    sustained_hbm_bw={sustained_hbm_bw(attention):.4g},"
         f"  # 4 GB copy held 2 s\n"
-        f"    attention_rates=((({n_q}, {n_kv}, {d_head}), {model}_ATTENTION),),\n")
+        f"    attention_rates=((({n_q}, {n_kv}, {d_head}), {table}),),\n")
 
 
 def main(argv=None) -> None:

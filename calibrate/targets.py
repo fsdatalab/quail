@@ -1,4 +1,4 @@
-"""The GPUs calibrate runs on, and the model shapes it measures."""
+"""The GPUs calibrate runs on, and a model's projection shapes."""
 
 from __future__ import annotations
 
@@ -56,7 +56,3 @@ def gemm_shapes(model) -> dict[str, tuple[int, int]]:
         "down": (model.hidden, model.intermediate),
     }
 
-
-def head_layout(model) -> tuple[int, int, int]:
-    """Return a model's (query heads, KV heads, head dimension)."""
-    return model.n_q, model.n_kv, model.d_head

@@ -2,10 +2,10 @@
 
 import pytest
 
-from calibrate.attention import points, summary_name
-from calibrate.gemm import mamf_runs, parse_log
-from calibrate.targets import TARGETS, gemm_shapes, head_layout
-from calibrate.timing import window_stats
+from calibrate.attention import AttentionSweep, summary_name
+from calibrate.gemm import ProjectionSweep, mamf_runs, parse_log
+from calibrate.targets import TARGETS, gemm_shapes
+from calibrate.timing import Window, window_stats
 from calibrate.to_spec import (
     attention_rates,
     spec_text,
@@ -37,41 +37,45 @@ def test_parse_log_reads_headlines_and_scout_rows():
 
 
 def test_mamf_runs_time_published_shapes_or_search(tmp_path):
-    shapes = {"qkv": (6144, 2560)}
-    runs = mamf_runs(TARGETS["h100-sxm"].published_fp8, shapes, tmp_path)
-    assert list(runs) == ["published_fp8", "qkv"]
+    published = TARGETS["h100-sxm"].published_fp8
+    assert list(mamf_runs(published, None, tmp_path)) == ["published_fp8"]
     assert (tmp_path / "published_fp8_shapes.txt").read_text() == \
         "1280x16896x16384\n1536x2816x16384\n"
+    assert list(mamf_runs(None, None, tmp_path)) == ["search"]
+    sweep = ProjectionSweep("qwen3-4b-fp8", {"qkv": (6144, 2560)})
+    runs = mamf_runs(published, sweep, tmp_path)
+    assert list(runs) == ["published_fp8", "qkv"]
     assert runs["qkv"][-4:] == ["--n", "6144", "--k", "2560"]
     assert "131072" in runs["qkv"]
-    assert list(mamf_runs(None, {}, tmp_path)) == ["search"]
 
 
 def test_model_shapes_match_qwen3_4b():
     assert gemm_shapes(QWEN3_4B_FP8) == {
         "qkv": (6144, 2560), "o": (2560, 4096),
         "gate_up": (19456, 2560), "down": (2560, 9728)}
-    assert head_layout(QWEN3_4B_FP8) == (32, 8, 128)
     assert summary_name((32, 8, 128)) == "attention_32_8_128.json"
 
 
 def test_sweep_has_copy_documents_and_cached_reads():
-    sweep = points(smoke=False)
-    kinds = [point["kind"] for point in sweep]
+    kinds = [point["kind"] for point in AttentionSweep().points()]
     assert kinds[0] == "copy"
     assert kinds.count("packed") == 9 and kinds.count("cached") == 56
-    assert [point["kind"] for point in points(smoke=True)] == \
+    smoke = AttentionSweep.smoke()
+    assert [point["kind"] for point in smoke.points()] == \
         ["copy", "packed", "cached", "cached"]
+    assert smoke.window.seconds == 0.5 and AttentionSweep().window == Window()
 
 
 def test_window_is_steady_only_without_drop_or_spread():
     # FlashAttention 3 over 32k-token documents on an H100: no slowdown,
     # but the sub-windows differ by 11%
-    drop, spread, steady = window_stats([696, 701, 656, 626, 686, 695, 666, 629])
+    subs = [696, 701, 656, 626, 686, 695, 666, 629]
+    drop, spread, steady = window_stats(subs, Window())
     assert drop < 1.0
     assert spread == pytest.approx(10.93, abs=0.01)
     assert not steady
-    assert window_stats([195.0] * 8) == (0.0, 0.0, True)
+    assert window_stats([195.0] * 8, Window()) == (0.0, 0.0, True)
+    assert window_stats(subs, Window(max_spread_pct=11.0))[2]
 
 
 def _measured(tflops, steady=True):
@@ -95,9 +99,8 @@ def _attention_summary():
             rows.append({"kind": "cached", "query_rows": q_rows,
                          "context": context, "pages": "shared",
                          "fa3": _measured(9999.0, steady=False)})
-    return {"stamp": "20261012T235536Z", "model": "qwen3-4b-fp8",
-            "layout": [32, 8, 128], "gpu": {"name": "NVIDIA H100 80GB HBM3"},
-            "points": rows}
+    return {"stamp": "20261012T235536Z", "heads": [32, 8, 128],
+            "gpu": {"name": "NVIDIA H100 80GB HBM3"}, "points": rows}
 
 
 def test_attention_rates_take_the_faster_library_on_private_pages():
@@ -122,7 +125,7 @@ def test_spec_fields_use_the_best_msmf_and_flag_unsteady_points():
     assert sustained_fp8_flops(gemm) == 1352e12
     text = spec_text(gemm, _attention_summary())
     assert "sustained_fp8_flops=1.352e+15" in text
-    assert "attention_rates=(((32, 8, 128), QWEN3_4B_FP8_ATTENTION),)" in text
+    assert "attention_rates=(((32, 8, 128), ATTENTION_32_8_128),)" in text
     unsteady = unsteady_points(_attention_summary())
     assert len(unsteady) == 2
     assert all("'query_rows': 64" in line for line in unsteady)

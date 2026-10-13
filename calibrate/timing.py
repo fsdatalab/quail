@@ -1,21 +1,42 @@
 """Sustained-rate timing of one GPU call, as mamf-finder times MSMF.
 
 A call is timed with GPU events after the L2 cache is flushed, over a
-2 s window split into 8 sub-windows, after the clock has settled at
-full load. The window is steady when its second half is at most 1%
-slower than its first and its sub-windows differ by at most 10%:
-mamf-finder's msmf_max_drop and msmf_max_spread defaults.
+window split into sub-windows, after the clock has settled at full
+load. Window holds the lengths and the steadiness limits.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
 
-WINDOW_S, WARM_S, SUB_WINDOWS = 2.0, 1.0, 8
-MAX_DROP_PCT, MAX_SPREAD_PCT = 1.0, 10.0
-SETTLE_S = 20.0
-L2_FLUSH_BYTES = 256 * 2**20
+
+@dataclass(frozen=True)
+class Window:
+    """How long to time a call, and when its rate counts as steady.
+
+    The defaults are mamf-finder's MSMF settings: 2 s in 8 sub-windows,
+    steady when the second half is at most 1% slower than the first
+    (msmf_max_drop) and the sub-windows differ by at most 10% of their
+    median (msmf_max_spread).
+
+    Attributes:
+        seconds: Timed seconds.
+        warm_seconds: Untimed seconds of the same call before the timing.
+        sub_windows: Equal parts of the timed calls.
+        max_drop_pct: Largest slowdown of the second half against the first.
+        max_spread_pct: Largest gap between sub-windows, against their median.
+        l2_flush_bytes: Size of the buffer zeroed before each call; at
+            least the GPU's L2 size.
+    """
+
+    seconds: float = 2.0
+    warm_seconds: float = 1.0
+    sub_windows: int = 8
+    max_drop_pct: float = 1.0
+    max_spread_pct: float = 10.0
+    l2_flush_bytes: int = 256 * 2**20
 
 
 class Telemetry:
@@ -54,7 +75,7 @@ class Telemetry:
                 "driver": nvml.nvmlSystemGetDriverVersion()}
 
 
-def settle_clock(torch, telem: Telemetry, seconds: float = SETTLE_S) -> float:
+def settle_clock(torch, telem: Telemetry, seconds: float = 20.0) -> float:
     """Run a bf16 matmul at full load until the SM clock stops dropping.
 
     Args:
@@ -78,22 +99,23 @@ def settle_clock(torch, telem: Telemetry, seconds: float = SETTLE_S) -> float:
     return prev
 
 
-def window_stats(subs: list[float]) -> tuple[float, float, bool]:
+def window_stats(subs: list[float], window: Window) -> tuple[float, float, bool]:
     """Return a window's drop and spread in percent, and whether it was steady.
 
     Args:
         subs: The rate of each sub-window, in order.
+        window: The window's steadiness limits.
     """
     half = len(subs) // 2
     first, second = sum(subs[:half]) / half, sum(subs[half:]) / half
     drop = (1 - second / first) * 100
     spread = (max(subs) - min(subs)) / sorted(subs)[half] * 100
-    return drop, spread, drop <= MAX_DROP_PCT and spread <= MAX_SPREAD_PCT
+    return (drop, spread,
+            drop <= window.max_drop_pct and spread <= window.max_spread_pct)
 
 
 def measure_window(torch, op, flops: float, nbytes: float, flush: bool,
-                   telem: Telemetry, window_s: float = WINDOW_S,
-                   warm_s: float = WARM_S) -> dict:
+                   telem: Telemetry, window: Window) -> dict:
     """Time op back to back over a sustained window.
 
     Args:
@@ -103,15 +125,14 @@ def measure_window(torch, op, flops: float, nbytes: float, flush: bool,
         nbytes: Bytes one call must move.
         flush: Zero an L2-sized buffer before each call, outside the timing.
         telem: The telemetry sampled every 20 ms.
-        window_s: Timed seconds.
-        warm_s: Untimed seconds before the window.
+        window: The window's lengths and steadiness limits.
 
     Returns:
         TFLOPS and GB/s over the window, the rate of each sub-window,
         the drop and spread in percent, whether it was steady, and the
         mean power, clock, and temperature.
     """
-    l2 = torch.empty(L2_FLUSH_BYTES // 4, dtype=torch.int32, device="cuda")
+    l2 = torch.empty(window.l2_flush_bytes // 4, dtype=torch.int32, device="cuda")
 
     def run(count, starts=None, ends=None):
         for i in range(count):
@@ -130,8 +151,8 @@ def measure_window(torch, op, flops: float, nbytes: float, flush: bool,
     e.record()
     torch.cuda.synchronize()
     per_call = max(s.elapsed_time(e) / 5 / 1000, 1e-6)
-    run(max(1, int(warm_s / per_call)))
-    n = max(SUB_WINDOWS, int(window_s / per_call))
+    run(max(1, int(window.warm_seconds / per_call)))
+    n = max(window.sub_windows, int(window.seconds / per_call))
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
     torch.cuda.synchronize()
@@ -151,11 +172,11 @@ def measure_window(torch, op, flops: float, nbytes: float, flush: bool,
         stop.set()
         thread.join()
     times = [a.elapsed_time(b) / 1000 for a, b in zip(starts, ends)]
-    size = n // SUB_WINDOWS
+    size = n // window.sub_windows
     work, scale = (flops, 1e12) if flops else (nbytes, 1e9)
     subs = [work * size / sum(times[i * size:(i + 1) * size]) / scale
-            for i in range(SUB_WINDOWS)]
-    drop, spread, steady = window_stats(subs)
+            for i in range(window.sub_windows)]
+    drop, spread, steady = window_stats(subs, window)
     total = sum(times)
 
     def mean(i):

@@ -3,7 +3,7 @@ from .base import AttentionRates, DeviceSpec
 # Faster of FlashAttention 3 and FlashInfer at each point, each held
 # 2 s; cached reads on private 16-token pages:
 # /results/ablations/attention_ceilings_h100.json
-QWEN3_4B_ATTENTION = AttentionRates(
+ATTENTION_32_8_128 = AttentionRates(
     causal_tokens=(128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768),
     causal=(104.1e12, 191.7e12, 301.0e12, 411.2e12, 506.1e12, 583.5e12,
             628.6e12, 652.4e12, 667.6e12),
@@ -35,7 +35,7 @@ H100_SXM = DeviceSpec(
     #                                /results/ablations/gemm_ceilings_h100_fp8.json
     sustained_hbm_bw=3.048e12,     # 4 GB copy held 2 s:
     #                                /results/ablations/attention_ceilings_h100.json
-    attention_rates=(((32, 8, 128), QWEN3_4B_ATTENTION),),
+    attention_rates=(((32, 8, 128), ATTENTION_32_8_128),),
 )
 
 # The price every $/query number in reports uses: query hours times

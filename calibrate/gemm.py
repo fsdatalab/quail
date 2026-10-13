@@ -9,14 +9,13 @@ they share one GPU:
   published_fp8  the GPU's published MAMF and MSMF shapes, to check it
                  against the published rates; a GPU without published
                  rates runs mamf-finder's own shape search as "search"
-  qkv, o,        a model's four projections at their N and K, sweeping
-  gate_up, down  M, the tokens in a chunk, from 16 to 131072; --smoke
-                 skips these
+  qkv, o,        with --model only: the model's four projections at
+  gate_up, down  their N and K, sweeping M, the tokens in a chunk
 
     mkdir -p results/benchmark
     log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-gemm.log"
     uv run modal run --detach calibrate/gemm.py --device h100-sxm \
-        --model qwen3-4b-fp8 --prediction "..." 2>&1 | tee "$log"
+        --prediction "..." 2>&1 | tee "$log"
 
 The mamf-finder logs go under /results/calibrate/<device>/gemm/<stamp>/
 and the summary to /results/calibrate/<device>/gemm.json.
@@ -28,6 +27,7 @@ import json
 import re
 import subprocess
 import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import modal
@@ -38,11 +38,8 @@ MAMF_URL = ("https://raw.githubusercontent.com/stas00/ml-engineering/"
 MAMF_SHA256 = "24239a3cba82746cabb1cf756afbd4467ed1a1b884eafd842b67cbf948ef7256"
 MAMF_PATH = "/opt/mamf-finder.py"
 NGC_IMAGE = "nvcr.io/nvidia/pytorch:26.04-py3"
+# the results volume is mounted at /results
 RESULTS = Path("/results/calibrate")
-
-M_TOKENS = (16, 32, 64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
-            4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536,
-            98304, 110376, 131072)
 
 app = modal.App("quail-milestone1")
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
@@ -96,12 +93,31 @@ def parse_log(text: str) -> dict:
     return out
 
 
-def mamf_runs(published: dict | None, shapes: dict, run_dir: Path) -> dict:
+@dataclass(frozen=True)
+class ProjectionSweep:
+    """A model's dense projections, timed across chunk sizes.
+
+    Attributes:
+        model: The quail.specs model name the shapes are from.
+        shapes: Projection name -> (N, K).
+        m_tokens: The chunk sizes M, in tokens.
+    """
+
+    model: str
+    shapes: dict[str, tuple[int, int]]
+    m_tokens: tuple[int, ...] = (16, 32, 64, 128, 256, 384, 512, 768, 1024,
+                                 1536, 2048, 3072, 4096, 6144, 8192, 12288,
+                                 16384, 24576, 32768, 49152, 65536, 98304,
+                                 131072)
+
+
+def mamf_runs(published: dict | None, projections: ProjectionSweep | None,
+              run_dir: Path) -> dict:
     """Return mamf-finder's shape arguments for each run, by run name.
 
     Args:
         published: The GPU's published fp8 rates and shapes, or None.
-        shapes: Projection name -> (N, K).
+        projections: A model's projections to sweep, or None.
         run_dir: Where the published shapes file is written.
     """
     if published is None:
@@ -111,8 +127,10 @@ def mamf_runs(published: dict | None, shapes: dict, run_dir: Path) -> dict:
         shapes_file.write_text(
             f"{published['mamf_shape']}\n{published['msmf_shape']}\n")
         runs = {"published_fp8": ["--shapes_file", str(shapes_file)]}
-    for name, (n, k) in shapes.items():
-        runs[name] = ["--m", *map(str, M_TOKENS), "--n", str(n), "--k", str(k)]
+    if projections is not None:
+        m_args = ["--m", *map(str, projections.m_tokens)]
+        for name, (n, k) in projections.shapes.items():
+            runs[name] = [*m_args, "--n", str(n), "--k", str(k)]
     return runs
 
 
@@ -129,33 +147,31 @@ def gpu_info() -> dict:
 
 @app.function(image=image, gpu="H100!", timeout=3 * 3600,
               volumes={"/results": results_vol})
-def measure(stamp: str, device: str, model: str, published: dict | None,
-            shapes: dict, smoke: bool, prediction: str) -> dict:
+def measure(stamp: str, device: str, published: dict | None,
+            projections: dict | None, prediction: str) -> dict:
     """Run every mamf-finder configuration on one GPU and save the summary.
 
     Args:
         stamp: The UTC timestamp naming this run's directory.
         device: The quail.specs device name.
-        model: The quail.specs model name the shapes are from.
         published: The GPU's published fp8 rates and shapes, or None.
-        shapes: Projection name -> (N, K).
-        smoke: Time only the published shapes or the search; the
-            summary stays in the run's directory.
+        projections: A ProjectionSweep's fields, or None.
         prediction: The prediction stated before the run.
 
     Returns:
-        The summary, also written to /results/calibrate/<device>/gemm.json
-        unless smoke.
+        The summary, also written to /results/calibrate/<device>/gemm.json.
     """
     run_dir = RESULTS / device / "gemm" / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
     gpu = gpu_info()
     print(f"gpu: {json.dumps(gpu)}", flush=True)
-    summary = {"stamp": stamp, "device": device, "model": model, "gpu": gpu,
+    summary = {"stamp": stamp, "device": device, "gpu": gpu,
                "image": NGC_IMAGE, "mamf_finder": MAMF_URL,
-               "published_fp8": published, "smoke": smoke,
-               "prediction": prediction, "runs": {}}
-    runs = mamf_runs(published, {} if smoke else shapes, run_dir)
+               "published_fp8": published,
+               "projections": projections, "prediction": prediction,
+               "runs": {}}
+    sweep = projections and ProjectionSweep(**projections)
+    runs = mamf_runs(published, sweep, run_dir)
     for name, shape_args in runs.items():
         log_path = run_dir / f"{name}.txt"
         argv = [sys.executable, MAMF_PATH, "--dtype", "float8_e4m3fn",
@@ -170,32 +186,37 @@ def measure(stamp: str, device: str, model: str, published: dict | None,
               f"MSMF {json.dumps(parsed['msmf'])}", flush=True)
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
         results_vol.commit()
-    if not smoke:
-        (RESULTS / device / "gemm.json").write_text(json.dumps(summary, indent=2))
-        results_vol.commit()
+    (RESULTS / device / "gemm.json").write_text(json.dumps(summary, indent=2))
+    results_vol.commit()
     return summary
 
 
 @app.local_entrypoint()
-def main(device: str = "h100-sxm", model: str = "qwen3-4b-fp8",
-         smoke: bool = False, prediction: str = ""):
-    """Start the measurement on the device's GPU and print each run's headlines."""
+def main(device: str = "h100-sxm", model: str = "", prediction: str = ""):
+    """Start the measurement on the device's GPU and print each run's headlines.
+
+    Args:
+        device: The calibrate target, by quail.specs device name.
+        model: A quail.specs model name whose projections to sweep, or "".
+        prediction: The prediction stated before the run.
+    """
     from datetime import datetime, timezone
 
     from calibrate.targets import TARGETS, gemm_shapes
-    from quail.specs import MODELS
 
     target = TARGETS[device]
-    shapes = gemm_shapes(MODELS[model])
+    projections = None
+    if model:
+        from quail.specs import MODELS
+        projections = asdict(ProjectionSweep(model, gemm_shapes(MODELS[model])))
     print(f"prediction: {prediction or '(none stated)'}", flush=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     call = measure.with_options(gpu=target.modal_gpu).spawn(
-        stamp, device, model, target.published_fp8, shapes, smoke, prediction)
+        stamp, device, target.published_fp8, projections, prediction)
     print(f"function call id: {call.object_id}", flush=True)
     print(f"logs: {RESULTS / device / 'gemm' / stamp}", flush=True)
     summary = call.get()
     for name, run in summary["runs"].items():
         print(f"{name}: MAMF {json.dumps(run['mamf'])} "
               f"MSMF {json.dumps(run['msmf'])}", flush=True)
-    if not smoke:
-        print(f"summary: {RESULTS / device / 'gemm.json'}", flush=True)
+    print(f"summary: {RESULTS / device / 'gemm.json'}", flush=True)

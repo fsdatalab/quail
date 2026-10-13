@@ -1,28 +1,29 @@
-r"""Measure a GPU's attention and memory-bandwidth ceilings at a head layout.
+r"""Measure a GPU's attention and memory-bandwidth ceilings at one head layout.
 
 Times upstream FlashAttention 3 and FlashInfer, bf16, one layer per
 call, on one GPU, with calibrate.timing's sustained window. Three kinds
-of point:
+of point, set by AttentionSweep:
 
-  packed  causal attention over 65,536 tokens of equal-length documents,
-          sweeping the document length
-  cached  query rows reading cached KV in 16-token pages, non-causal,
-          sweeping query rows and context length; each call reads about
-          2 GB of KV, with every sequence on its own pages ("private") or
-          all on the same pages ("shared")
-  copy    one 4 GB device-to-device tensor copy
+  packed  causal attention over a fixed number of tokens of
+          equal-length documents, sweeping the document length
+  cached  query rows reading cached KV in pages, non-causal, sweeping
+          query rows and context length; each call reads a fixed amount
+          of KV, with every sequence on its own pages ("private") or all
+          on the same pages ("shared")
+  copy    one device-to-device tensor copy
 
 FLOPs are 4 * query heads * head dimension per query-key pair; a causal
 document of L tokens has L(L+1)/2 pairs. The smoke run times one point
-of each kind for 0.5 s and checks both libraries against torch's
+of each kind briefly and checks both libraries against torch's
 scaled_dot_product_attention.
 
     mkdir -p results/benchmark
     log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-attention.log"
     uv run modal run --detach calibrate/attention.py --device h100-sxm \
-        --model qwen3-4b-fp8 --smoke 2>&1 | tee "$log"
+        --heads 32,8,128 --smoke 2>&1 | tee "$log"
 
-Drop --smoke for the full sweep. Results go under
+--heads is query heads, KV heads, and head dimension. Drop --smoke for
+the full sweep. Results go under
 /results/calibrate/<device>/attention/<stamp>/, and the full sweep's
 summary to /results/calibrate/<device>/attention_<q>_<kv>_<d>.json.
 """
@@ -32,23 +33,62 @@ from __future__ import annotations
 import json
 import time
 import traceback
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import modal
 
-from calibrate.timing import Telemetry, measure_window, settle_clock
+from calibrate.timing import Telemetry, Window, measure_window, settle_clock
 
-PAGE_TOKENS = 16
-PACKED_TOKENS = 65536
-PACKED_LENGTHS = (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
-CACHED_QUERY_ROWS = (16, 32, 64, 128, 256, 512, 1024)
-CACHED_CONTEXTS = (1024, 4096, 8192, 32768)
-CACHED_KV_BYTES = 2 * 2**30
-CACHED_MIN_SEQUENCES = 8
-COPY_BYTES = 4 * 2**30
-SMOKE_WINDOW_S, SMOKE_WARM_S = 0.5, 0.2
-LIBRARIES = ("fa3", "flashinfer")
+# the results volume is mounted at /results
 RESULTS = Path("/results/calibrate")
+
+
+@dataclass(frozen=True)
+class AttentionSweep:
+    """The points an attention run measures, and how long it times each.
+
+    Attributes:
+        packed_tokens: Tokens per packed call, split into equal documents.
+        packed_lengths: Document lengths of the packed points.
+        page_tokens: Tokens per KV page of the cached points.
+        cached_query_rows: Query rows per sequence of the cached points.
+        cached_contexts: Cached tokens per sequence of the cached points.
+        cached_pages: "private", "shared", or both.
+        cached_kv_bytes: KV one cached call reads; sets the sequence count.
+        cached_min_sequences: Fewest sequences in a cached call.
+        copy_bytes: Size of the copied tensor.
+        window: The timing window of every point.
+    """
+
+    packed_tokens: int = 65536
+    packed_lengths: tuple[int, ...] = (128, 256, 512, 1024, 2048, 4096, 8192,
+                                       16384, 32768)
+    page_tokens: int = 16
+    cached_query_rows: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024)
+    cached_contexts: tuple[int, ...] = (1024, 4096, 8192, 32768)
+    cached_pages: tuple[str, ...] = ("private", "shared")
+    cached_kv_bytes: int = 2 * 2**30
+    cached_min_sequences: int = 8
+    copy_bytes: int = 4 * 2**30
+    window: Window = field(default_factory=Window)
+
+    @classmethod
+    def smoke(cls) -> AttentionSweep:
+        """Return one point of each kind, timed for 0.5 s."""
+        return cls(packed_lengths=(1024,), cached_query_rows=(64,),
+                   cached_contexts=(8192,),
+                   window=Window(seconds=0.5, warm_seconds=0.2))
+
+    def points(self) -> list[dict]:
+        """Return one dict per point, naming its kind and shape, copy first."""
+        out = [{"kind": "copy"}]
+        out += [{"kind": "packed", "length": n} for n in self.packed_lengths]
+        out += [{"kind": "cached", "query_rows": q, "context": c, "pages": p}
+                for c in self.cached_contexts for q in self.cached_query_rows
+                for p in self.cached_pages]
+        return out
+
 
 app = modal.App("quail-milestone1")
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
@@ -64,39 +104,16 @@ image = (
 )
 
 
-def summary_name(layout) -> str:
-    """Return the summary file name for a (query heads, KV heads, head dim) layout."""
-    n_q, n_kv, d_head = layout
+def summary_name(heads) -> str:
+    """Return the summary file name for (query heads, KV heads, head dim)."""
+    n_q, n_kv, d_head = heads
     return f"attention_{n_q}_{n_kv}_{d_head}.json"
 
 
-def points(smoke: bool) -> list[dict]:
-    """Return the points to measure, copy first.
-
-    Args:
-        smoke: Return one point of each kind instead of the full sweep.
-
-    Returns:
-        One dict per point, naming its kind and shape.
-    """
-    if smoke:
-        return [{"kind": "copy"}, {"kind": "packed", "length": 1024},
-                {"kind": "cached", "query_rows": 64, "context": 8192,
-                 "pages": "private"},
-                {"kind": "cached", "query_rows": 64, "context": 8192,
-                 "pages": "shared"}]
-    out = [{"kind": "copy"}]
-    out += [{"kind": "packed", "length": n} for n in PACKED_LENGTHS]
-    out += [{"kind": "cached", "query_rows": q, "context": c, "pages": p}
-            for c in CACHED_CONTEXTS for q in CACHED_QUERY_ROWS
-            for p in ("private", "shared")]
-    return out
-
-
-def packed_case(torch, layout, length):
+def packed_case(torch, heads, sweep, length):
     """Return inputs, FLOPs, and bytes for causal attention over equal documents."""
-    n_q, n_kv, d_head = layout
-    docs = PACKED_TOKENS // length
+    n_q, n_kv, d_head = heads
+    docs = sweep.packed_tokens // length
     total = docs * length
     q = torch.randn(total, n_q, d_head, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(total, n_kv, d_head, dtype=torch.bfloat16, device="cuda")
@@ -108,15 +125,16 @@ def packed_case(torch, layout, length):
             "flops": 4 * n_q * d_head * pairs, "bytes": nbytes}
 
 
-def cached_case(torch, layout, query_rows, context, pages):
+def cached_case(torch, heads, sweep, query_rows, context, pages):
     """Return inputs, FLOPs, and bytes for query rows reading paged cached KV."""
-    n_q, n_kv, d_head = layout
+    n_q, n_kv, d_head = heads
+    page_tokens = sweep.page_tokens
     kv_bytes_per_token = 2 * n_kv * d_head * 2
-    seqs = max(CACHED_MIN_SEQUENCES,
-               CACHED_KV_BYTES // (context * kv_bytes_per_token))
-    per_seq = context // PAGE_TOKENS
+    seqs = max(sweep.cached_min_sequences,
+               sweep.cached_kv_bytes // (context * kv_bytes_per_token))
+    per_seq = context // page_tokens
     n_pages = per_seq if pages == "shared" else seqs * per_seq
-    shape = (n_pages, PAGE_TOKENS, n_kv, d_head)
+    shape = (n_pages, page_tokens, n_kv, d_head)
     k_cache = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
     v_cache = torch.randn_like(k_cache)
     if pages == "shared":
@@ -132,10 +150,10 @@ def cached_case(torch, layout, query_rows, context, pages):
     return {"q": q, "k_cache": k_cache, "v_cache": v_cache, "table": table,
             "seqs": seqs, "pairs": pairs, "flops": 4 * n_q * d_head * pairs,
             "kv_bytes": kv_bytes, "bytes": kv_bytes + 2 * q.numel() * 2,
-            "unique_kv_bytes": n_pages * PAGE_TOKENS * kv_bytes_per_token}
+            "unique_kv_bytes": n_pages * page_tokens * kv_bytes_per_token}
 
 
-def fa3_op(torch, layout, point, case):
+def fa3_op(torch, heads, point, case):
     """Return the FlashAttention 3 call for one point."""
     from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 
@@ -151,11 +169,11 @@ def fa3_op(torch, layout, point, case):
         page_table=case["table"], causal=False, num_splits=0)
 
 
-def flashinfer_op(torch, layout, point, case):
+def flashinfer_op(torch, heads, point, case):
     """Return the FlashInfer call for one point, planned once."""
     import flashinfer
 
-    n_q, n_kv, d_head = layout
+    n_q, n_kv, d_head = heads
     workspace = torch.empty(512 * 2**20, dtype=torch.uint8, device="cuda")
     if point["kind"] == "packed":
         wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD")
@@ -164,23 +182,24 @@ def flashinfer_op(torch, layout, point, case):
         return lambda: wrapper.run(case["q"], case["k"], case["v"])
     seqs, rows = case["seqs"], point["query_rows"]
     per_seq = case["table"].shape[1]
+    page_tokens = case["k_cache"].shape[1]
     qo = torch.arange(0, (seqs + 1) * rows, rows, dtype=torch.int32, device="cuda")
     kv = torch.arange(0, (seqs + 1) * per_seq, per_seq, dtype=torch.int32,
                       device="cuda")
-    last = torch.full((seqs,), PAGE_TOKENS, dtype=torch.int32, device="cuda")
+    last = torch.full((seqs,), page_tokens, dtype=torch.int32, device="cuda")
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
     wrapper.plan(qo, kv, case["table"].flatten(), last, n_q, n_kv,
-                 d_head, PAGE_TOKENS, causal=False, q_data_type=torch.bfloat16)
+                 d_head, page_tokens, causal=False, q_data_type=torch.bfloat16)
     q = case["q"].view(seqs * rows, n_q, d_head)
     kv_cache = (case["k_cache"], case["v_cache"])
     return lambda: wrapper.run(q, kv_cache)
 
 
-def reference_error(torch, layout, point, case, out) -> float:
+def reference_error(torch, heads, point, case, out) -> float:
     """Return the largest absolute difference from torch SDPA on two sequences."""
     import torch.nn.functional as F
 
-    n_q, _, d_head = layout
+    n_q, _, d_head = heads
     out = (out[0] if isinstance(out, tuple) else out).float()
     worst = 0.0
     for i in range(2):
@@ -205,16 +224,17 @@ def reference_error(torch, layout, point, case, out) -> float:
 
 @app.function(image=image, gpu="H100!", timeout=2 * 3600,
               volumes={"/results": results_vol})
-def measure(stamp: str, device: str, model: str, layout: tuple, smoke: bool,
+def measure(stamp: str, device: str, heads: tuple, smoke: bool,
             prediction: str) -> dict:
     """Measure every point with every library on one GPU and save the summary.
 
     Args:
         stamp: The UTC timestamp naming this run's directory.
         device: The quail.specs device name.
-        model: The quail.specs model name the head layout is from.
-        layout: (query heads, KV heads, head dimension).
-        smoke: Measure one point of each kind briefly and check correctness.
+        heads: (query heads, KV heads, head dimension).
+        smoke: Measure AttentionSweep.smoke() and check each library
+            against torch, keeping the summary in the run's directory;
+            otherwise measure AttentionSweep().
         prediction: The prediction stated before the run.
 
     Returns:
@@ -222,11 +242,11 @@ def measure(stamp: str, device: str, model: str, layout: tuple, smoke: bool,
     """
     import torch
 
-    layout = tuple(layout)
+    heads = tuple(heads)
+    sweep = AttentionSweep.smoke() if smoke else AttentionSweep()
     run_dir = RESULTS / device / "attention" / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
     out_path = run_dir / ("smoke.json" if smoke else "summary.json")
-    window = (SMOKE_WINDOW_S, SMOKE_WARM_S) if smoke else ()
     telem = Telemetry()
     versions = {"torch": torch.__version__, "cuda": torch.version.cuda}
     for name in ("flash_attn_3", "flashinfer-python"):
@@ -235,24 +255,25 @@ def measure(stamp: str, device: str, model: str, layout: tuple, smoke: bool,
             versions[name] = version(name)
         except Exception as error:
             versions[name] = f"not installed: {error}"
-    summary = {"stamp": stamp, "device": device, "model": model,
-               "layout": list(layout), "smoke": smoke, "gpu": telem.info(),
+    summary = {"stamp": stamp, "device": device, "heads": list(heads),
+               "sweep": asdict(sweep), "smoke": smoke, "gpu": telem.info(),
                "versions": versions, "prediction": prediction, "points": []}
     print(json.dumps({"gpu": summary["gpu"], "versions": versions}), flush=True)
     summary["settled_mhz"] = settle_clock(torch, telem)
 
-    for point in points(smoke):
+    for point in sweep.points():
         row = dict(point)
         if point["kind"] == "copy":
-            src = torch.ones(COPY_BYTES, dtype=torch.uint8, device="cuda")
+            src = torch.ones(sweep.copy_bytes, dtype=torch.uint8, device="cuda")
             dst = torch.empty_like(src)
             row["copy"] = measure_window(torch, lambda: dst.copy_(src), 0,
-                                         2 * COPY_BYTES, False, telem, *window)
+                                         2 * sweep.copy_bytes, False, telem,
+                                         sweep.window)
             del src, dst
         else:
-            case = (packed_case(torch, layout, point["length"])
+            case = (packed_case(torch, heads, sweep, point["length"])
                     if point["kind"] == "packed"
-                    else cached_case(torch, layout, point["query_rows"],
+                    else cached_case(torch, heads, sweep, point["query_rows"],
                                      point["context"], point["pages"]))
             row.update({key: case[key] for key in case
                         if isinstance(case[key], int)})
@@ -261,17 +282,17 @@ def measure(stamp: str, device: str, model: str, layout: tuple, smoke: bool,
             for lib, make in (("fa3", fa3_op), ("flashinfer", flashinfer_op)):
                 try:
                     started = time.time()
-                    op = make(torch, layout, point, case)
+                    op = make(torch, heads, point, case)
                     out = op()
                     torch.cuda.synchronize()
                     row[f"{lib}_setup_s"] = time.time() - started
                     if smoke:
                         row[f"{lib}_max_abs_error"] = reference_error(
-                            torch, layout, point, case, out)
+                            torch, heads, point, case, out)
                     del out
                     row[lib] = measure_window(torch, op, case["flops"],
                                               case["bytes"], flush, telem,
-                                              *window)
+                                              sweep.window)
                 except Exception as error:
                     row[lib] = {"error": f"{type(error).__name__}: {error}"[:500]}
                     traceback.print_exc()
@@ -282,29 +303,35 @@ def measure(stamp: str, device: str, model: str, layout: tuple, smoke: bool,
         out_path.write_text(json.dumps(summary, indent=2, default=str))
         results_vol.commit()
     if not smoke:
-        (RESULTS / device / summary_name(layout)).write_text(
+        (RESULTS / device / summary_name(heads)).write_text(
             json.dumps(summary, indent=2, default=str))
         results_vol.commit()
     return summary
 
 
 @app.local_entrypoint()
-def main(device: str = "h100-sxm", model: str = "qwen3-4b-fp8",
-         smoke: bool = False, prediction: str = ""):
-    """Start the measurement on the device's GPU and print one line per point."""
+def main(heads: str, device: str = "h100-sxm", smoke: bool = False,
+         prediction: str = ""):
+    """Start the measurement on the device's GPU and print one line per point.
+
+    Args:
+        heads: Query heads, KV heads, and head dimension, such as "32,8,128".
+        device: The calibrate target, by quail.specs device name.
+        smoke: Measure one point of each kind briefly and check correctness.
+        prediction: The prediction stated before the run.
+    """
     from datetime import datetime, timezone
 
-    from calibrate.targets import TARGETS, head_layout
-    from quail.specs import MODELS
+    from calibrate.targets import TARGETS
 
     target = TARGETS[device]
-    layout = head_layout(MODELS[model])
+    n_q, n_kv, d_head = (int(part) for part in heads.split(","))
     print(f"prediction: {prediction or '(none stated)'}", flush=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     call = measure.with_options(
         gpu=target.modal_gpu,
         env={"FLASHINFER_CUDA_ARCH_LIST": target.flashinfer_arch},
-    ).spawn(stamp, device, model, layout, smoke, prediction)
+    ).spawn(stamp, device, (n_q, n_kv, d_head), smoke, prediction)
     print(f"function call id: {call.object_id}", flush=True)
     print(f"results: {RESULTS / device / 'attention' / stamp}", flush=True)
     summary = call.get()
@@ -312,7 +339,7 @@ def main(device: str = "h100-sxm", model: str = "qwen3-4b-fp8",
         shape = {k: row[k] for k in ("kind", "length", "query_rows", "context",
                                      "pages") if k in row}
         cells = []
-        for lib in ("copy", *LIBRARIES):
+        for lib in ("copy", "fa3", "flashinfer"):
             r = row.get(lib)
             if r and "error" in r:
                 cells.append(f"{lib}: {r['error'][:80]}")
