@@ -340,7 +340,7 @@ class GraphBuilder:
             anchor = group[0][1]
             for spec, _ in group:
                 if any(apply.kind == "barrier"
-                       for apply in self.join_applies.get(spec["written_pos"], ())):
+                       for apply in self.join_applies.get(spec.written_pos, ())):
                     barrier_aliases.add(anchor)
         self.chained = retention.chained_aliases(
             self.sequence_groups, set(self.ask_filters), barrier_aliases, self.workers)
@@ -420,8 +420,8 @@ class GraphBuilder:
         """Create joins and the exchanges between anchor groups."""
         # group consecutive full stages on the same anchor; gates run
         # alone; anchor switches become barriers
-        records = iter(self.decisions.join_records)
-        groups = [[(spec, next(records)) for spec, _ in group]
+        steps = iter(self.decisions.join_steps)
+        groups = [[(spec, next(steps)) for spec, _ in group]
                   for group in self.sequence_groups]
         exec_idx = 0
         self.pairs_edges = []     # every full stage's passing-pairs edge
@@ -429,10 +429,10 @@ class GraphBuilder:
         self.score_pairs = None
         for g, group in enumerate(groups):
             anchor = self.sequence_groups[g][0][1]
-            if "cost" in group[0][0]:
+            if group[0][0].cost is not None:
                 try:
                     for spec, _ in group:
-                        position = spec["written_pos"]
+                        position = spec.written_pos
                         join = self.operators.joins[position]
                         pair_inputs = ()
                         if position in self.pairs_src:
@@ -441,10 +441,10 @@ class GraphBuilder:
                                                   f"pairs:{position}"),)
                         if self.score_pairs is None:
                             self.score_pairs = self.emit_score_pair(
-                                join.prompt, position, spec["pair_fraction"],
+                                join.prompt, position, spec.pair_fraction,
                                 pair_inputs)
                         self.score_pairs = self.scoring.comparison(
-                            join, self.score_pairs, spec["aliases"], position)
+                            join, self.score_pairs, spec.aliases, position)
                 except ScoreRefusedError as refused:
                     return refused.refusal
                 continue
@@ -470,18 +470,18 @@ class GraphBuilder:
                     anchor=anchor))
                 self.ids_src[anchor] = PortRef(xid, f"ids:{anchor}")
             gid = self.group_ids[g]
-            for rank, (spec, record) in enumerate(group):
-                jid = gid if rank == 0 else f"{gid}:predicate:{spec['written_pos']}"
-                self.join_ids[spec["written_pos"]] = jid
+            for rank, (spec, step) in enumerate(group):
+                jid = gid if rank == 0 else f"{gid}:predicate:{spec.written_pos}"
+                self.join_ids[spec.written_pos] = jid
                 pair_inputs = []
-                partners = [a for a in spec["aliases"] if a != anchor]
+                partners = [a for a in spec.aliases if a != anchor]
                 pairs_from = ""
-                if spec["written_pos"] in self.pairs_src:
-                    producer = self.pairs_src[spec["written_pos"]]
+                if spec.written_pos in self.pairs_src:
+                    producer = self.pairs_src[spec.written_pos]
                     pair_inputs.append(
-                        PortRef(producer.node_id, f"pairs:{spec['written_pos']}"))
+                        PortRef(producer.node_id, f"pairs:{spec.written_pos}"))
                     pairs_from = producer.node_id
-                for apply in self.join_applies.get(spec["written_pos"], ()):
+                for apply in self.join_applies.get(spec.written_pos, ()):
                     # the function's pairs reach the join on their own port
                     aid = f"apply:{apply.function}"
                     self.nodes.append(Foreign(
@@ -492,29 +492,29 @@ class GraphBuilder:
                         columns=tuple((ref.alias, ref.column)
                                       for ref in apply.columns),
                         aliases=tuple(apply.aliases),
-                        written_pos=spec["written_pos"]))
-                    pair_inputs.append(PortRef(aid, f"pairs:{spec['written_pos']}"))
+                        written_pos=spec.written_pos))
+                    pair_inputs.append(PortRef(aid, f"pairs:{spec.written_pos}"))
                     pairs_from = aid
                 self.nodes.append(AiJoin(
                     node_id=jid,
                     inputs=input_ports(tuple(
                         self.ids_src[a] for a in [anchor, *partners])
                                        + tuple(pair_inputs)),
-                    written_pos=spec["written_pos"], exec_idx=exec_idx,
+                    written_pos=spec.written_pos, exec_idx=exec_idx,
                     anchor=anchor, partners=tuple(partners),
-                    semantics=spec["semantics"],
-                    selectivity=spec["selectivity"],
-                    expected_tuples=round(record["tuples"], 1),
-                    anchor_frame_tokens=spec["frame_tokens"][anchor],
-                    pair_tail_tokens=spec["tail_tokens"],
-                    anchor_resident=record["resident"],
-                    tuple_tokens=round(record["tokens"], 1),
+                    semantics=spec.semantics,
+                    selectivity=spec.selectivity,
+                    expected_tuples=round(step.tuples, 1),
+                    anchor_frame_tokens=spec.frame_tokens[anchor],
+                    pair_tail_tokens=spec.tail_tokens,
+                    anchor_resident=step.resident,
+                    tuple_tokens=round(step.tokens, 1),
                     pairs_from=pairs_from))
                 exec_idx += 1
                 self.ids_src[anchor] = PortRef(jid, f"ids:{anchor}")
-                if spec["semantics"] == "full":
+                if spec.semantics == "full":
                     self.pairs_edges.append(PortRef(
-                        jid, f"join_answers:{spec['written_pos']}"
+                        jid, f"join_answers:{spec.written_pos}"
                     ))
                     for a in [anchor] + partners:
                         if a not in self.out_aliases:
@@ -531,7 +531,7 @@ class GraphBuilder:
                 for g, group in enumerate(self.sequence_groups):
                     anchor = group[0][1]
                     stage = next((spec for spec, _ in group
-                                  if set(spec["aliases"]) == set(aliases)), None)
+                                  if set(spec.aliases) == set(aliases)), None)
                     if stage is not None:
                         break
                 else:
@@ -539,15 +539,15 @@ class GraphBuilder:
                         "a classification of joined rows without its join")
                 partner = next(alias for alias in aliases if alias != anchor)
                 table = classify_builder(self.context, anchor, "quail")
-                join = self.operators.joins[stage["written_pos"]]
+                join = self.operators.joins[stage.written_pos]
                 pairs = (effective_selectivity(join.selectivity)
                          * self.decisions.live[anchor] * self.decisions.live[partner])
                 spec, _ = table.classify_joined(
                     call, self.operators.labels.names[call], partner, pairs,
                     stats[partner].mean_doc_tokens)
                 node = table.node(
-                    spec, PortRef(self.join_ids[stage["written_pos"]],
-                                  f"join_answers:{stage['written_pos']}"),
+                    spec, PortRef(self.join_ids[stage.written_pos],
+                                  f"join_answers:{stage.written_pos}"),
                     sum(isinstance(n, AiClassify) for n in self.nodes))
                 self.nodes.append(node)
                 if call in self.operators.labels.projected:
@@ -626,16 +626,16 @@ class GraphBuilder:
         """Build the plan and bind its work estimator."""
         stats = self.decisions.statistics.stats
         statistics = self.decisions.statistics
-        stage_work = sum((record["work"] for record in self.decisions.join_records
+        stage_work = sum((step.work for step in self.decisions.join_steps
                           if not is_score(
-                              self.operators.joins[record["written_pos"]].predicate)),
+                              self.operators.joins[step.written_pos].predicate)),
                          Work())
         estimate = (speed_of_light(
             sum(self.decisions.filter_work.values(), Work()) + stage_work,
             self.model, self.device,
             statistics.chunk).seconds + inference_seconds(self.nodes))
-        stage_works = {record["written_pos"]: record["work"]
-                       for record in self.decisions.join_records}
+        stage_works = {step.written_pos: step.work
+                       for step in self.decisions.join_steps}
 
         estimator = partial(
             node_estimates, filter_works=self.decisions.filter_work,

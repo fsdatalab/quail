@@ -256,8 +256,8 @@ def plan_request_backend(
         fixed_order=rule == "as_written",
     )
     join_sequence = (
-        join_search["seq"] if join_search is not None else [
-            (position, spec["anchor"] or spec["aliases"][0])
+        list(join_search.seq) if join_search is not None else [
+            (position, spec.anchor or spec.aliases[0])
             for position, spec in enumerate(search_specs)
         ]
     )

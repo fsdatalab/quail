@@ -96,4 +96,4 @@ def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
     if found is None:
         found = joinsearch.search_joins(
             *arguments, base_work=base_work, fixed_order=True)
-    return found["seq"]
+    return list(found.seq)

@@ -12,6 +12,7 @@ import quail
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, DocumentProvider
 from quail.cost.filters import filter_cost
+from quail.cost.joins import PricedJoin
 from quail.cost.sol import speed_of_light
 from quail.cost.work import ask, scan, stream
 from quail.explain import explain, physical_tree
@@ -533,8 +534,8 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
 
 
 def _join_search_spec(position, aliases, anchor):
-    return dict(
-        written_pos=position, aliases=list(aliases), anchor=anchor,
+    return PricedJoin(
+        written_pos=position, aliases=tuple(aliases), anchor=anchor,
         anchor_free=False, semantics="full", selectivity=None,
         frame_tokens={alias: 5 for alias in aliases},
         label_tokens={alias: 4 for alias in aliases}, tail_tokens=6)
@@ -547,11 +548,12 @@ def test_join_search_matches_enumeration_and_tracks_residency():
         walk,
     )
 
-    specs = [{"written_pos": index, "aliases": list(aliases),
-              "anchor": aliases[0], "anchor_free": True, "semantics": "full",
-              "selectivity": selectivity,
-              "frame_tokens": {alias: 8 for alias in aliases},
-              "label_tokens": {alias: 4 for alias in aliases}, "tail_tokens": 2}
+    specs = [PricedJoin(written_pos=index, aliases=aliases, anchor=aliases[0],
+                        anchor_free=True, semantics="full",
+                        selectivity=selectivity,
+                        frame_tokens={alias: 8 for alias in aliases},
+                        label_tokens={alias: 4 for alias in aliases},
+                        tail_tokens=2)
              for index, (aliases, selectivity) in enumerate([
                  (("a", "b"), 0.01), (("b", "c"), 0.1),
              ])]
@@ -564,17 +566,17 @@ def test_join_search_matches_enumeration_and_tracks_residency():
                           QWEN3_4B_FP8, H100_SXM)
     costs = []
     for order in itertools.permutations(specs):
-        for anchors in itertools.product(*(spec["aliases"] for spec in order)):
+        for anchors in itertools.product(*(spec.aliases for spec in order)):
             work, records = walk(list(zip(order, anchors)), live, lengths,
                                  filtered, 5, QWEN3_4B_FP8, H100_SXM)
             seen = set()
             for record in records:
-                if record["anchor"] in seen:
-                    assert record["resident"] != "filter"
-                seen.add(record["anchor"])
+                if record.anchor in seen:
+                    assert record.resident != "filter"
+                seen.add(record.anchor)
             costs.append(speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 8192).seconds)
     assert speed_of_light(
-        result["work"], QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)
+        result.work, QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)
 
     specs = [
         _join_search_spec(0, ("a", "b"), "a"),
@@ -590,11 +592,11 @@ def test_join_search_matches_enumeration_and_tracks_residency():
         QWEN3_4B_FP8, H100_SXM, fixed_order=True)
     # a's filter computed its prefixes: its first anchor use pays no
     # prefix, and neither does its later use (kept after group 0)
-    assert current["records"][0]["resident"] == "filter"
-    assert current["records"][0]["resident_docs"] == 3
-    assert current["records"][1]["resident"] == "none"
-    assert current["records"][2]["resident"] == "kept"
-    assert current["records"][2]["resident_docs"] == 3
+    assert current.steps[0].resident == "filter"
+    assert current.steps[0].resident_docs == 3
+    assert current.steps[1].resident == "none"
+    assert current.steps[2].resident == "kept"
+    assert current.steps[2].resident_docs == 3
 
     specs = [
         _join_search_spec(0, ("a", "b"), "b"),
@@ -608,7 +610,7 @@ def test_join_search_matches_enumeration_and_tracks_residency():
     found = search_joins(specs, live, lengths, {}, 10, 100_000,
                          QWEN3_4B_FP8, H100_SXM, already_joined={"b", "c"})
     assert found is not None
-    assert {position for position, _ in found["seq"]} == {0, 2}
+    assert {position for position, _ in found.seq} == {0, 2}
 
     million = AliasStats(count=1_000_000, total=100_000_000,
                          squared=10_000_000_000, maximum=100)
@@ -622,9 +624,7 @@ def test_join_search_matches_enumeration_and_tracks_residency():
     found = search_joins(specs, live, stats, {}, 10, 100_000,
                          QWEN3_4B_FP8, H100_SXM)
     assert found is not None
-    assert len(found["seq"]) == 3
-    assert all("resident_positions" not in record
-               for record in found["records"])
+    assert len(found.seq) == 3
 
 
 def _claims_session(gpus=1, backend="quail"):

@@ -5,6 +5,7 @@ from fakes import bare_arena
 
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.retention import apply_retention, policy
+from quail.cost.joins import PricedJoin
 from quail.cost.retention import RetentionPolicy, coefficients
 from quail.cost.sol import prefix_recompute_seconds
 from quail.planner.retention import schedule
@@ -76,12 +77,15 @@ def test_retention_priority_capacity_eviction_and_its_report():
 
 def test_retention_costs_and_future_use():
     def stage(position, aliases):
-        return {'written_pos': position, 'aliases': aliases, 'anchor': aliases[0],
-                'semantics': 'full', 'selectivity': 0.1}
+        return PricedJoin(
+            written_pos=position, aliases=aliases, anchor=aliases[0],
+            anchor_free=False, semantics='full', selectivity=0.1,
+            frame_tokens={alias: 0 for alias in aliases},
+            label_tokens={alias: 0 for alias in aliases}, tail_tokens=0)
 
-    result = schedule([(stage(0, ['a', 'b']), 'a'),
-                       (stage(1, ['b', 'c']), 'c'),
-                       (stage(2, ['a', 'c']), 'a')], dict(a=10., b=10., c=10.))
+    result = schedule([(stage(0, ('a', 'b')), 'a'),
+                       (stage(1, ('b', 'c')), 'c'),
+                       (stage(2, ('a', 'c')), 'a')], dict(a=10., b=10., c=10.))
     assert result['initial']['a'] == [1.0, 0]
     assert result['initial']['c'] == [1.0, 1]
     assert set(result['after']['group:0']) == {'a', 'c'}

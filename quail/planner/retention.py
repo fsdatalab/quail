@@ -7,8 +7,8 @@ def group_sequence(seq):
     """Group consecutive full joins that share an anchor."""
     groups = []
     for spec, anchor in seq:
-        if (groups and spec["semantics"] == "full"
-                and groups[-1][-1][0]["semantics"] == "full"
+        if (groups and spec.semantics == "full"
+                and groups[-1][-1][0].semantics == "full"
                 and groups[-1][0][1] == anchor):
             groups[-1].append((spec, anchor))
         else:
@@ -43,7 +43,7 @@ def chained_aliases(groups, ask_aliases, barrier_aliases, workers: int) -> set:
                 and anchor not in barrier_aliases:
             chained.add(anchor)
         for spec, _ in group:
-            for alias in spec["aliases"]:
+            for alias in spec.aliases:
                 if alias != anchor and alias not in chained:
                     partner_before.add(alias)
     return chained

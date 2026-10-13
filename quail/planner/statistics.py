@@ -18,6 +18,7 @@ import pyarrow.compute as pc
 
 from quail.cost import budgets
 from quail.cost.filters import filter_chain_work, filter_cost
+from quail.cost.joins import PricedJoin
 from quail.cost.retention import retention_pages
 from quail.cost.score import ScoreCost
 from quail.cost.work import Work, triangle
@@ -134,10 +135,10 @@ def surviving_docs(n_docs: float, n_partners: float,
                      ** max(1.0, n_partners))
 
 
-def thin(live: dict, spec: dict) -> None:
+def thin(live: dict, spec: PricedJoin) -> None:
     """Update live document counts after one join's selectivity."""
-    sel = spec["selectivity"]
-    aliases = spec["aliases"]
+    sel = spec.selectivity
+    aliases = spec.aliases
 
     def others(x):
         out = 1.0
@@ -146,27 +147,27 @@ def thin(live: dict, spec: dict) -> None:
                 out *= live[a]
         return out
 
-    if spec["semantics"] == "full":
+    if spec.semantics == "full":
         new = {a: surviving_docs(live[a], others(a), sel)
                for a in aliases}
         live.update(new)
     else:
-        anchor = spec["anchor"]
+        anchor = spec.anchor
         matched = surviving_docs(live[anchor], others(anchor), sel)
-        live[anchor] = (matched if spec["semantics"] == "exists"
+        live[anchor] = (matched if spec.semantics == "exists"
                         else live[anchor] - matched)
 
 
-def cross_tuples(spec: dict, live: dict) -> float:
+def cross_tuples(spec: PricedJoin, live: dict) -> float:
     """Expected tuples of one join.
 
     The live cross product, or the fraction of it the join's equality
     conditions keep.
     """
     tuples = 1.0
-    for a in spec["aliases"]:
+    for a in spec.aliases:
         tuples *= live[a]
-    return tuples * spec.get("pair_fraction", 1.0)
+    return tuples * spec.pair_fraction
 
 
 def question_tokens(prompt, canvas: int = 0) -> int:
@@ -210,8 +211,8 @@ def _label_counts(join) -> dict:
 
 
 def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
-               context=None, chunk: int = 0) -> list:
-    """The joins as the search's spec dicts, in written order.
+               context=None, chunk: int = 0) -> list[PricedJoin]:
+    """The joins as the cost model prices them, in written order.
 
     pair_fractions maps a written position to the fraction of the
     cross product its equality conditions keep; a join with
@@ -227,26 +228,27 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
             parts, cost = score_statistics(j.prompt, context, chunk)
             left, right = prompt_aliases(j.prompt)
             head, middle, tail = map(len, parts)
-            out.append(dict(
-                written_pos=i, aliases=[left, right], anchor=left,
+            out.append(PricedJoin(
+                written_pos=i, aliases=(left, right), anchor=left,
                 anchor_free=False, semantics=j.semantics,
                 selectivity=j.selectivity,
                 frame_tokens={left: head + middle, right: 0},
                 label_tokens={left: 0, right: 0}, tail_tokens=tail + canvas,
-                on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
-                    for c in conditions], pair_fraction=fraction,
+                on=tuple((c.left.alias, c.left.column, c.right.alias,
+                          c.right.column) for c in conditions),
+                pair_fraction=fraction,
                 cost=ScoreJoinCost((left, right), cost, fraction)))
             continue
         labels = _label_counts(j)
-        out.append(dict(
-            written_pos=i, aliases=_join_aliases(j), anchor=j.anchor,
+        out.append(PricedJoin(
+            written_pos=i, aliases=tuple(_join_aliases(j)), anchor=j.anchor,
             anchor_free=(j.anchor is None and j.semantics == "full"),
             semantics=j.semantics, selectivity=j.selectivity,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
             tail_tokens=question_tokens(j.prompt, canvas),
-            on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
-                for c in conditions],
+            on=tuple((c.left.alias, c.left.column, c.right.alias,
+                      c.right.column) for c in conditions),
             pair_fraction=fraction))
     return out
 
@@ -264,7 +266,7 @@ class PlanStatistics:
         admission: The admission budget in tokens.
         cap_pages: Pages the retention pool may hold.
         pre: The engine preamble's token count.
-        specs: The joins as the search's spec dicts, in written order.
+        specs: The joins as PricedJoin records, in written order.
         asks: alias -> written positions of its AI.IF predicates.
     """
 

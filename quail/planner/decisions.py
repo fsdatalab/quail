@@ -33,7 +33,7 @@ class PlanDecisions:
     statistics: PlanStatistics
     filter_orders: dict
     join_sequence: list
-    join_records: list
+    join_steps: list
     live: dict[str, float]
     filter_work: dict[str, Work]
     order_rule: str
@@ -127,10 +127,10 @@ def choose_plan(plan, operators, model, device, doc_tokens, order,
     seq = [(specs[position], anchor) for position, anchor in
            choose_join_sequence(plan, statistics, orders, model=model,
                                 device=device, rule=rule)]
-    _, stage_records = joinsearch.walk(
+    _, join_steps = joinsearch.walk(
         seq, live0, statistics.lengths, set(operators.all_filters()), pre,
         model, device)
-    anchors = {spec["written_pos"]: anchor for spec, anchor in seq}
+    anchors = {spec.written_pos: anchor for spec, anchor in seq}
     for s in scans:
         fq = max((question_tokens(p.prompt, model.canvas_tokens)
                   for p in ask_filters.get(s.alias, ())), default=None)
@@ -145,12 +145,12 @@ def choose_plan(plan, operators, model, device, doc_tokens, order,
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
     for spec in specs:
-        if "cost" in spec:
+        if spec.cost is not None:
             continue
-        anchor = anchors[spec["written_pos"]]
+        anchor = anchors[spec.written_pos]
         need = join_input_tokens(
             spec, anchor, {alias: stats[alias].max_doc_tokens
-                           for alias in spec["aliases"]}, pre)
+                           for alias in spec.aliases}, pre)
         if need > chunk:
             return Refusal(
                 reasons=(f"one join pair anchored on {anchor!r} needs "
@@ -159,5 +159,5 @@ def choose_plan(plan, operators, model, device, doc_tokens, order,
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
 
-    return PlanDecisions(operators, statistics, orders, seq, stage_records,
+    return PlanDecisions(operators, statistics, orders, seq, join_steps,
                          live0, works, rule, source)

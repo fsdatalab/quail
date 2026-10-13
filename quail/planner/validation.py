@@ -1,5 +1,6 @@
 """Execution constraints checked during planning and graph construction."""
 
+from quail.cost.joins import PricedJoin
 from quail.logical import (
     Alias,
     Apply,
@@ -175,25 +176,26 @@ class ClassifyRefusedError(Exception):
                        needed=self.needed, available=self.available, unit="tokens")
 
 
-def anchor_candidates(spec: dict, honor_forced: bool = True) -> list:
+def anchor_candidates(spec: PricedJoin, honor_forced: bool = True) -> list:
     """Candidate anchors for one join.
 
     Gates keep their outer table, a forced full anchor is honored, a
     free full join offers every table.
     """
-    if spec["semantics"] != "full":
-        return [spec["anchor"]]
-    if honor_forced and not spec.get("anchor_free"):
-        return [spec["anchor"]]
-    return list(spec["aliases"])
+    if spec.semantics != "full":
+        return [spec.anchor]
+    if honor_forced and not spec.anchor_free:
+        return [spec.anchor]
+    return list(spec.aliases)
 
 
-def join_input_tokens(spec, anchor: str, maximum: dict, pre: int) -> int:
+def join_input_tokens(spec: PricedJoin, anchor: str, maximum: dict,
+                      pre: int) -> int:
     """Count tokens for the longest input under one join orientation."""
-    return (pre + maximum[anchor] + spec["frame_tokens"][anchor]
-            + spec["tail_tokens"]
-            + sum(spec["label_tokens"][partner] + maximum[partner]
-                  for partner in spec["aliases"] if partner != anchor))
+    return (pre + maximum[anchor] + spec.frame_tokens[anchor]
+            + spec.tail_tokens
+            + sum(spec.label_tokens[partner] + maximum[partner]
+                  for partner in spec.aliases if partner != anchor))
 
 
 def score_input_tokens(spec, context) -> tuple[int, int]:
