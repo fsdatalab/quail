@@ -62,7 +62,7 @@ def profile_worker(directory, connection, query="FEV-9"):
         import torch
         import vllm
 
-        import quail.baselines.request as request_module
+        import quail.baselines.execution as execution_module
         from bench.process_isolation import run_backend_group
 
         original_init = vllm.LLM.__init__
@@ -85,8 +85,8 @@ def profile_worker(directory, connection, query="FEV-9"):
 
         vllm.LLM.__init__ = initialize
         phase = "filter" if query == "AGENT-1" else "join"
-        function = "_pipelined_filter" if phase == "filter" else "run_join_grouped"
-        original_join = getattr(request_module, function)
+        function = "pipelined_filter" if phase == "filter" else "run_join_grouped"
+        original_join = getattr(execution_module, function)
         joins = []
         model_info = {}
 
@@ -153,7 +153,7 @@ def profile_worker(directory, connection, query="FEV-9"):
             print(f"[profile] {phase} {number}: {json.dumps(record)}", flush=True)
             return result
 
-        setattr(request_module, function, profile_join)
+        setattr(execution_module, function, profile_join)
         result = run_backend_group(
             data_dir="/results/quailb_data", model="qwen3-4b-fp8", sf=0.1,
             query_ids=(query,), run_dir=str(root),

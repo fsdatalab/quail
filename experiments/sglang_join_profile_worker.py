@@ -46,10 +46,10 @@ def profile_worker(directory, connection, input_detail=False):
         import sglang
         import torch
 
-        import quail.baselines.request as request_module
+        import quail.baselines.execution as execution_module
         from bench.process_isolation import run_backend_group
 
-        original = request_module.run_join_grouped
+        original = execution_module.run_join_grouped
         joins = []
         model_info = {}
         details = None
@@ -130,7 +130,7 @@ def profile_worker(directory, connection, input_detail=False):
             print(f"[profile] join {number}: {json.dumps(record)}", flush=True)
             return result
 
-        request_module.run_join_grouped = profiled_join
+        execution_module.run_join_grouped = profiled_join
         result = run_backend_group(
             data_dir="/results/quailb_data", model="qwen3-4b-fp8", sf=0.1,
             query_ids=("FEV-9",), run_dir=str(root),
