@@ -6,7 +6,8 @@ import pytest
 from fakes import keep_even, same_key
 
 from quail.catalog import Catalog, DocumentProvider
-from quail.frontend.builder import col, docs, prompt
+from quail.frontend.builder import docs
+from quail.frontend.expressions import col, prompt
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
     ANSWER_CUE,

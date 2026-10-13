@@ -16,7 +16,8 @@ from quail.cost.joins import PricedJoin
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan, stream
 from quail.explain import explain, physical_tree
-from quail.frontend.builder import col, docs, prompt
+from quail.frontend.builder import docs
+from quail.frontend.expressions import col, prompt
 from quail.logical import ModelCall, SemanticJoin
 from quail.physical import (
     AiFilter,

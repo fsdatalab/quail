@@ -6,7 +6,7 @@ from test_session import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
 from quail.execution.selection import evaluate_predicate, selected_rows
-from quail.frontend.builder import col, prompt
+from quail.frontend.expressions import col, prompt
 from quail.logical import ColumnRef, CompileError, RegularPredicate, Scan
 
 REF = ColumnRef("r", "reviews", "stars")

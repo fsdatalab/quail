@@ -10,7 +10,8 @@ from quail.catalog import Catalog, DocumentProvider
 from quail.execution.result import QueryResult
 from quail.execution.runtimes.relational import AggregateRuntime, aggregate_table
 from quail.explain import explain
-from quail.frontend.builder import avg, col, count, docs, max_, prompt, sum_
+from quail.frontend.builder import docs
+from quail.frontend.expressions import avg, col, count, max_, prompt, sum_
 from quail.logical import AggregateCall, Aggregation, CompileError, HavingTest
 from quail.physical import Aggregate, Sort
 from quail.physical.base import input_ports

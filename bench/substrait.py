@@ -10,7 +10,7 @@ aggregate, having, sort, and fetch steps, then the projection.
 from __future__ import annotations
 
 import quail
-from quail.frontend.builder import AggSpec, HavingSpec, PredicateSpec
+from quail.frontend.expressions import AggSpec, HavingSpec, PredicateSpec
 from quail_b.substrait import (
     Aggregate,
     Classify,

@@ -4,7 +4,7 @@ from quail.api import Query, RefusalError, Session
 from quail.catalog import DocumentProvider, ScanRequest, TableProvider
 from quail.execution.result import QueryResult
 from quail.extensions import ExtensionRegistry
-from quail.frontend.builder import col, prompt
+from quail.frontend.expressions import col, prompt
 from quail.frontend.sql import SQLDialect
 from quail.logical import (
     SHARED_PRE,

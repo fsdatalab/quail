@@ -10,7 +10,8 @@ from quail.execution.metrics import NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.runtimes import SortRuntime
 from quail.explain import explain
-from quail.frontend.builder import col, count, docs, prompt
+from quail.frontend.builder import docs
+from quail.frontend.expressions import col, count, prompt
 from quail.logical import Result, Scan, SemanticFilter
 from quail.physical import AiFilter, Project, Sort
 from quail.physical.base import input_ports

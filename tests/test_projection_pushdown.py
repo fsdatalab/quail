@@ -10,7 +10,8 @@ from test_session import _run, fake_tok, make_executor
 
 import quail
 from quail.catalog import Catalog
-from quail.frontend.builder import col, docs, prompt
+from quail.frontend.builder import docs
+from quail.frontend.expressions import col, prompt
 from quail.logical import (
     Apply,
     ColumnRef,
