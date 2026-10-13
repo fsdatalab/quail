@@ -767,7 +767,7 @@ def _extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
         counts, and the generation seconds.
     """
     tail = _token_list(spec.tail_token_ids)
-    params = client.decode_params(spec.config.max_answer_tokens, stop=['"'])
+    params = client.decode_params(spec.max_answer_tokens, stop=['"'])
     if body_texts is not None:
         prompts = [body_text + spec.tail_text for body_text in body_texts]
     else:

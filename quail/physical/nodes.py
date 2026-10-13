@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
-
-from quail.extraction import ExtractionConfig
 
 from .base import (
     ExecutionLocation,
@@ -406,6 +404,12 @@ class Scan(PhysicalNode):
         )
 
 
+def _validate_integer_setting(name: str, value: int, minimum: int = 1) -> None:
+    """Validate an integer execution setting."""
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+
+
 @dataclass(frozen=True)
 class RequestExtractSpec:
     """Specification for one decoded answer per document, located in its text.
@@ -428,7 +432,10 @@ class RequestExtractSpec:
     tail_text: str = ""
     preamble_token_ids: tuple[Any, ...] = ()
     preamble_text: str = ""
-    config: ExtractionConfig = field(default_factory=ExtractionConfig)
+    max_answer_tokens: int = 64
+
+    def __post_init__(self):
+        _validate_integer_setting("max_answer_tokens", self.max_answer_tokens)
 
     @property
     def span_output(self) -> str:
@@ -446,7 +453,8 @@ class RequestExtractSpec:
             tail_text=str(value.get("tail_text", "")),
             preamble_token_ids=tuple(value.get("preamble_token_ids", ())),
             preamble_text=str(value.get("preamble_text", "")),
-            config=ExtractionConfig.from_mapping(value.get("config", {})),
+            max_answer_tokens=value.get("max_answer_tokens", value.get(
+                "config", {}).get("max_answer_tokens", cls.max_answer_tokens)),
         )
 
     def to_dict(self) -> dict:
@@ -459,7 +467,7 @@ class RequestExtractSpec:
             "tail_text": self.tail_text,
             "preamble_token_ids": list(self.preamble_token_ids),
             "preamble_text": self.preamble_text,
-            "config": self.config.to_dict(),
+            "max_answer_tokens": self.max_answer_tokens,
         }
 
 
@@ -1042,14 +1050,34 @@ class ExtractSpec(ScoreSpec):
 
     Attributes:
         question: The question the answer is copied for.
-        config: Execution limits carried with the plan.
+        max_answer_tokens: Maximum tokens in an extracted answer.
+        draft_tokens: Source tokens to verify after each chosen token.
+        top_tokens: Vocabulary candidates returned by each GPU readout.
+        first_window_chars: Source characters tokenized in the first window.
+        window_chars: Source characters tokenized in later windows.
         trim: Whether the answer is the fewest words that answer the
             question, or the whole lines that hold them.
     """
 
     question: str = ""
     trim: bool = True
-    config: ExtractionConfig = field(default_factory=ExtractionConfig)
+    max_answer_tokens: int = 64
+    draft_tokens: int = 16
+    top_tokens: int = 1024
+    first_window_chars: int = 64
+    window_chars: int = 512
+
+    def __post_init__(self):
+        for name in ("max_answer_tokens", "draft_tokens", "top_tokens",
+                     "first_window_chars", "window_chars"):
+            _validate_integer_setting(name, getattr(self, name),
+                                      minimum=0 if name == "draft_tokens" else 1)
+
+    def same_decoding(self, other: "ExtractSpec") -> bool:
+        """Return whether two extractions can use the same decoder."""
+        return all(getattr(self, name) == getattr(other, name) for name in (
+            "max_answer_tokens", "draft_tokens", "top_tokens",
+            "first_window_chars", "window_chars"))
 
     @property
     def alias(self) -> str:
@@ -1071,7 +1099,10 @@ class ExtractSpec(ScoreSpec):
                 "prompt_token_parts", "draws", "share_prefixes")},
             question=str(value["question"]),
             trim=bool(value.get("trim", True)),
-            config=ExtractionConfig.from_mapping(value.get("config", {})),
+            **{name: value.get(name, value.get("config", {}).get(
+                name, getattr(cls, name)))
+               for name in ("max_answer_tokens", "draft_tokens", "top_tokens",
+                            "first_window_chars", "window_chars")},
         )
 
     def to_dict(self) -> dict:
@@ -1079,7 +1110,11 @@ class ExtractSpec(ScoreSpec):
             **super().to_dict(),
             "question": self.question,
             "trim": self.trim,
-            "config": self.config.to_dict(),
+            "max_answer_tokens": self.max_answer_tokens,
+            "draft_tokens": self.draft_tokens,
+            "top_tokens": self.top_tokens,
+            "first_window_chars": self.first_window_chars,
+            "window_chars": self.window_chars,
         }
 
 

@@ -6,6 +6,7 @@ import sqlglot
 from sqlglot import exp
 
 from quail.catalog import Catalog
+from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql_binding.expressions import (
     ExpressionBinder,
 )
@@ -205,7 +206,7 @@ def compile_sql(
     dialect: SQLDialect | str = SQLDialect.SNOWFLAKE,
     turn: tuple[str, str] = ("", ""),
     layout: str = "ai-if",
-    extract_turn: tuple[str, str] | None = None,
+    prompts: PromptBinder | None = None,
 ) -> LogicalPlan:
     """Compile AI SQL text into a LogicalPlan.
 
@@ -216,8 +217,7 @@ def compile_sql(
         dialect: SQL dialect used to parse the statement.
         turn: Model chat text placed before and after each prompt.
         layout: Prompt layout used by the model.
-        extract_turn: Model chat text around AI.EXTRACT prompts, when it
-            differs from `turn`.
+        prompts: Model-aware prompt binder. Overrides tokenizer, turn, and layout.
 
     Returns:
         The bound logical query plan.
@@ -245,8 +245,8 @@ def compile_sql(
     offset = _parse_offset(tree)
     distinct = _parse_distinct(tree)
 
-    b = ExpressionBinder(catalog, tokenizer, turn, layout,
-                         extract_turn=extract_turn)
+    b = ExpressionBinder(catalog, prompts or PromptBinder(
+        tokenizer, turn=turn, layout=layout))
 
     joins = JoinBinder(b)
     joins.bind_tables(tree)

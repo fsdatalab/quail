@@ -6,7 +6,7 @@ from quail.cost.extract import (
     estimate,
 )
 from quail.cost.work import Work, ask, scan
-from quail.extraction import ExtractionConfig
+from quail.physical import ExtractSpec
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 HEAD, TAIL = 2, 40
@@ -14,29 +14,37 @@ CHUNK = 10000
 
 
 def _cost(lengths, **kwargs):
-    options = dict(chunk=CHUNK, model=QWEN3_4B_FP8, device=H100_SXM)
+    options = dict(chunk=CHUNK, model=QWEN3_4B_FP8, device=H100_SXM,
+                   max_answer_tokens=ExtractSpec.max_answer_tokens,
+                   draft_tokens=ExtractSpec.draft_tokens)
     options.update(kwargs)
     live = options.pop("live", len(lengths))
     return estimate(live, lengths, HEAD, TAIL, **options)
 
 
+
+def _document(length, **kwargs):
+    return document_work(length, HEAD, TAIL,
+                         max_answer_tokens=ExtractSpec.max_answer_tokens,
+                         draft_tokens=ExtractSpec.draft_tokens, **kwargs)
+
+
 def test_a_document_scans_once_then_writes_its_answer_in_rounds():
-    work, fed, rows = document_work(100, HEAD, TAIL)
+    work, fed, rows = _document(100)
     context = HEAD + 100 + TAIL
-    config = ExtractionConfig()
-    answer = 1 + config.draft_tokens
+    answer = 1 + ExtractSpec.draft_tokens
     expected = scan(HEAD + 100, TAIL) + ask(context, answer)
     assert work == expected
     assert fed == TAIL + answer
     assert rows == 1 + answer
     # resident KV turns the scan into a question over it
-    resident, _, _ = document_work(100, HEAD, TAIL, resident=True)
+    resident, _, _ = _document(100, resident=True)
     assert resident == ask(HEAD + 100, TAIL) + ask(context, answer)
     assert resident.tokens < work.tokens
-    shared, _, _ = document_work(100, HEAD, TAIL, shared=80)
+    shared, _, _ = _document(100, shared=80)
     assert shared == ask(80, HEAD + 100 + TAIL - 80) + ask(context, answer)
     assert shared.tokens == work.tokens - 80
-    assert document_work(100, HEAD, TAIL, resident=True, shared=80)[0] == resident
+    assert _document(100, resident=True, shared=80)[0] == resident
 
 
 def test_estimate_sums_documents_scales_to_live_and_prices_passes():
@@ -45,7 +53,7 @@ def test_estimate_sums_documents_scales_to_live_and_prices_passes():
     expected = Work()
     fed = rows = 0.0
     for length in lengths:
-        work, own_fed, own_rows = document_work(length, HEAD, TAIL)
+        work, own_fed, own_rows = _document(length)
         expected += work
         fed += own_fed
         rows += own_rows
@@ -71,22 +79,22 @@ def test_estimate_sums_documents_scales_to_live_and_prices_passes():
 
 
 def test_cost_uses_plan_limits_and_separate_answer_assumptions():
-    config = ExtractionConfig(max_answer_tokens=8, draft_tokens=3)
     assumptions = ExtractAssumptions(answer_tokens=40)
-    cost = _cost([100], config=config, assumptions=assumptions)
+    cost = _cost([100], max_answer_tokens=8, draft_tokens=3, assumptions=assumptions)
     # Both rounds read KV. The second also reads the first round's four tokens.
     assert cost.work.kv_read == 142 + 146
     assert cost.work.pairs == 142 * 143 / 2 + 4 * 142 + 10 + 4 * 146 + 10
     assert cost.work.tokens == 150
     assert cost.suffix_tokens == TAIL + 8
     assert cost.rows == 9
-    shorter = _cost([100], config=config,
+    shorter = _cost([100], max_answer_tokens=8, draft_tokens=3,
                     assumptions=ExtractAssumptions(answer_tokens=2))
     assert shorter.work == scan(HEAD + 100, TAIL) + ask(HEAD + 100 + TAIL, 4)
-    capped = _cost([100], config=ExtractionConfig(max_answer_tokens=1),
+    capped = _cost([100], max_answer_tokens=1,
                    assumptions=assumptions)
     assert capped.work == scan(HEAD + 100, TAIL)
     windowed, _, _ = document_work(
-        100, HEAD, TAIL, window=128, config=config, assumptions=assumptions)
+        100, HEAD, TAIL, window=128, max_answer_tokens=8, draft_tokens=3,
+        assumptions=assumptions)
     assert windowed.sliding_kv_read == 2 * 127
     assert windowed.sliding_pairs == 128 * 142 - 128 * 127 / 2 + 8 * 128

@@ -85,6 +85,24 @@ See the complete implementations of
 and
 [`ScanRuntime`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py).
 
+## Built-in AI operators
+
+Built-in AI operators store execution settings directly on immutable plan
+specs. For example, `ClassifySpec.scoring` selects the classification rule,
+and `ExtractSpec.draft_tokens` sets how many source tokens extraction proposes
+per round. Cost estimation and execution read the same settings. Each spec's
+`to_dict()` and `from_mapping()` methods preserve them in saved plans.
+
+SQL and the Python builder use `quail.frontend.prompts.PromptBinder` to bind
+operator prompts with the session's model and tokenizer. The binder selects
+the model's prompt format. Extraction's physical planner and request backend
+reuse the bound prompt text and tokens.
+
+Classification and extraction use `quail.cost.work.decode` to count sequential
+decode work. Each round reads the accumulated context from KV and adds its
+accepted tokens to the context for the next round. Their execution uses the
+common stage scheduler; each operator supplies its own token-selection rule.
+
 ## Register the operator
 
 Create an [extension registry](/docs/extending#registration) with

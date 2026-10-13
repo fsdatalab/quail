@@ -430,7 +430,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             title += f": {spec.name} over {spec.alias}"
             details.append(f"question={spec.question!r}, "
                            f"trim={'on' if spec.trim else 'off'}, "
-                           f"up to {spec.config.max_answer_tokens} answer tokens")
+                           f"up to {spec.max_answer_tokens} answer tokens")
         elif isinstance(node, Filter):
             title += f": {node.predicate.describe()}"
         elif isinstance(node, AiJoin):

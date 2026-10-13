@@ -12,7 +12,6 @@ from fakes import letter_tokens
 import quail
 from quail.catalog import DocumentProvider
 from quail.execution.spans import line_span, locate_span, read_phrase
-from quail.extraction import ExtractionConfig
 from quail.logical import (
     SHARED_PRE,
     ColumnRef,
@@ -141,8 +140,15 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
     assert "up to 64 answer tokens" in text
 
 
-def test_extract_plans_one_physical_node_with_both_prompts(session):
+def test_extract_plans_one_physical_node_with_both_prompts(session, monkeypatch):
     query = _ends(session)
+    tokenizer = session.tokenizer
+
+    def reuse_prompt(text):
+        assert QUESTION not in text, "planning must reuse the bound extraction prompt"
+        return tokenizer(text)
+
+    monkeypatch.setattr(session, "_tok", reuse_prompt)
     plan = query.plan()
     assert not isinstance(plan, Refusal)
     (node,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
@@ -382,10 +388,10 @@ TEXTS = [LEASE, "No dates here.", "Term: five years\nmore text",
 def test_request_backend_decodes_and_locates_one_answer_per_document(limit):
     documents = {"c": [request_tests._tokens(text) for text in TEXTS]}
     specs = (
-        RequestExtractSpec(config=ExtractionConfig(max_answer_tokens=limit),
+        RequestExtractSpec(max_answer_tokens=limit,
                            alias="c", output="ends", question=QUESTION,
                            tail_token_ids=(90,)),
-        RequestExtractSpec(config=ExtractionConfig(max_answer_tokens=limit),
+        RequestExtractSpec(max_answer_tokens=limit,
                            alias="c", output="lines", question=QUESTION,
                            tail_token_ids=(90,), trim=False),
     )
@@ -499,19 +505,23 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
 
 
 def test_extraction_settings_survive_plan_serialization(session):
-    config = ExtractionConfig(max_answer_tokens=7, draft_tokens=2, top_tokens=32,
-                              first_window_chars=16, window_chars=96)
     query = _ends(session)
-    plan = query.plan()
-    node = next(node for node in plan.nodes if isinstance(node, AiExtract))
-    spec = replace(node.spec, config=config)
-    assert ExtractSpec.from_mapping(spec.to_dict()).config == config
+    node = next(node for node in query.plan().nodes if isinstance(node, AiExtract))
+    settings = dict(max_answer_tokens=7, draft_tokens=2, top_tokens=32,
+                    first_window_chars=16, window_chars=96)
+    spec = replace(node.spec, **settings)
+    assert ExtractSpec.from_mapping(spec.to_dict()) == spec
     legacy = spec.to_dict()
-    legacy.pop("config")
-    assert ExtractSpec.from_mapping(legacy).config == ExtractionConfig()
+    for name in settings:
+        legacy.pop(name)
+    assert ExtractSpec.from_mapping(legacy) == node.spec
+    legacy["config"] = settings
+    assert ExtractSpec.from_mapping(legacy) == spec
     request = RequestExtractSpec(alias="c", output="ends", question=QUESTION,
-                                 tail_token_ids=(1, 2), config=config)
-    assert RequestExtractSpec.from_mapping(request.to_dict()).config == config
+                                 tail_token_ids=(1, 2), max_answer_tokens=7)
+    assert RequestExtractSpec.from_mapping(request.to_dict()) == request
     legacy = request.to_dict()
-    legacy.pop("config")
-    assert RequestExtractSpec.from_mapping(legacy).config == ExtractionConfig()
+    legacy.pop("max_answer_tokens")
+    assert RequestExtractSpec.from_mapping(legacy).max_answer_tokens == 64
+    legacy["config"] = settings
+    assert RequestExtractSpec.from_mapping(legacy) == request

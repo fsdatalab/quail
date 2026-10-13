@@ -12,11 +12,10 @@ the document, question, and previously accepted answer tokens from KV.
 """
 
 from dataclasses import dataclass
+from itertools import repeat
 
-from quail.cost.dense_decoder_cost import dense_decoder_components
-from quail.cost.roofline import CostComponent, component_latencies
-from quail.cost.work import Work, ask, scan
-from quail.extraction import ExtractionConfig
+from quail.cost.dense_decoder_cost import decoder_seconds
+from quail.cost.work import Work, ask, decode, scan
 
 
 @dataclass(frozen=True)
@@ -33,13 +32,13 @@ class ExtractAssumptions:
         if type(self.answer_tokens) is not int or self.answer_tokens < 0:
             raise ValueError("answer_tokens must be a nonnegative integer")
 
-    def rounds(self, config: ExtractionConfig) -> int:
+    def rounds(self, max_answer_tokens: int, draft_tokens: int) -> int:
         """Return expected rounds, limited by the configured answer length."""
-        tokens = min(self.answer_tokens, config.max_answer_tokens)
-        if tokens == config.max_answer_tokens:
+        tokens = min(self.answer_tokens, max_answer_tokens)
+        if tokens == max_answer_tokens:
             # The first token comes from the cue; the cap needs no stop read.
             tokens -= 1
-        return -(-tokens // (1 + config.draft_tokens))
+        return -(-tokens // (1 + draft_tokens))
 
 
 @dataclass(frozen=True)
@@ -61,16 +60,9 @@ class ExtractCost:
     rows: float
 
 
-def _readout(model, rows: float, passes: float) -> CostComponent:
-    """Price the full-vocabulary readout of the answer rows."""
-    head = 2.0 * model.hidden * model.vocab
-    return CostComponent(name="readout", flops=head * rows,
-                         bytes_moved=head * passes, precision="bf16")
-
-
 def document_work(length: int, head_tokens: int, tail_tokens: int, *,
                   window: int = 0, resident: bool = False,
-                  shared: int = 0, config: ExtractionConfig | None = None,
+                  shared: int = 0, max_answer_tokens: int, draft_tokens: int,
                   assumptions: ExtractAssumptions | None = None,
                   ) -> tuple[Work, float, float]:
     """Return one document's work, its fed tokens, and its readout rows.
@@ -83,10 +75,10 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
         resident: Whether the document's KV is already available, as
             it is for the second and later extractions of a pipeline.
         shared: Prefix tokens borrowed from an earlier document.
-        config: Execution limits carried by the extraction plan.
+        max_answer_tokens: Answer limit from the extraction plan.
+        draft_tokens: Source tokens proposed per round from the extraction plan.
         assumptions: Expected answer length, separate from execution limits.
     """
-    config = ExtractionConfig() if config is None else config
     assumptions = ExtractAssumptions() if assumptions is None else assumptions
     prefix = head_tokens + length
     if resident:
@@ -100,11 +92,9 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     rows = 1.0
     # each round appends the chosen token and the draft, and reads
     # every row; the last row read decides the closing quote
-    round_tokens = 1 + config.draft_tokens
-    rounds = assumptions.rounds(config)
-    for _ in range(rounds):
-        work += ask(context, round_tokens, window=window)
-        context += round_tokens
+    round_tokens = 1 + draft_tokens
+    rounds = assumptions.rounds(max_answer_tokens, draft_tokens)
+    work += decode(context, repeat(round_tokens, rounds), window=window)
     fed += rounds * round_tokens
     rows += rounds * round_tokens
     return work, fed, rows
@@ -112,7 +102,7 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
 
 def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
              chunk: int, model, device, resident: bool = False,
-             shared=None, config: ExtractionConfig | None = None,
+             shared=None, max_answer_tokens: int, draft_tokens: int,
              assumptions: ExtractAssumptions | None = None) -> ExtractCost:
     """Estimate the cost of one extraction over a table.
 
@@ -126,7 +116,8 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
         device: Device specification.
         resident: Whether the documents' KV is already available.
         shared: Per-document borrowed prefix lengths, or None.
-        config: Execution limits carried by the extraction plan.
+        max_answer_tokens: Answer limit from the extraction plan.
+        draft_tokens: Source tokens proposed per round from the extraction plan.
         assumptions: Expected answer length, separate from execution limits.
 
     Returns:
@@ -135,7 +126,6 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
     n = len(lengths)
     if live <= 0 or n == 0:
         return ExtractCost(0.0, 0.0, Work(), 0.0, 0.0)
-    config = ExtractionConfig() if config is None else config
     assumptions = ExtractAssumptions() if assumptions is None else assumptions
     work = Work()
     fed = rows = 0.0
@@ -144,15 +134,13 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
             int(length), head_tokens, tail_tokens,
             window=model.sliding_window, resident=resident,
             shared=0 if shared is None else int(shared[index]),
-            config=config, assumptions=assumptions)
+            max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
+            assumptions=assumptions)
         work += own
         fed += own_fed
         rows += own_rows
     scale = live / n
     total = work * scale
     passes = total.tokens / chunk
-    components = dense_decoder_components(total, model, passes=passes)
-    components += (_readout(model, rows * scale, passes),)
-    seconds = sum(component.seconds
-                  for component in component_latencies(components, device))
+    seconds = decoder_seconds(total, rows * scale, passes, model, device)
     return ExtractCost(seconds, passes, total, fed * scale, rows * scale)

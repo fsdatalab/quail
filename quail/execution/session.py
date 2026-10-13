@@ -35,6 +35,7 @@ from quail.execution.tokens import (
 from quail.execution.types import PhysicalRequest, document_input
 from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
+from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
     Alias,
@@ -232,9 +233,8 @@ class Session:
             return RemoteQuery(self, text, order=order,
                                dialect=SQLDialect(dialect).value)
         logical = compile_sql(
-            text, self.catalog, self.tokenizer, dialect=dialect,
-            turn=self.model.turn, layout=self.model.prompt_layout,
-            extract_turn=self.model.extract_turn,
+            text, self.catalog, dialect=dialect,
+            prompts=PromptBinder(self.tokenizer, model=self.model),
         )
         return Query(self, logical, order=order)
 
@@ -256,11 +256,8 @@ class Session:
                 "the builder API is not available on a remote Session; "
                 "write the query with sql()")
         return BoundBuilder(self,
-                            BuilderQuery(self.catalog, name,
-                                         self.tokenizer,
-                                         turn=self.model.turn,
-                                         layout=self.model.prompt_layout,
-                                         extract_turn=self.model.extract_turn))
+                            BuilderQuery(self.catalog, name, prompts=PromptBinder(
+                                self.tokenizer, model=self.model)))
 
     @property
     def tokenizer(self):

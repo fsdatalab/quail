@@ -4,6 +4,7 @@ from sqlglot import exp
 
 from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
+from quail.frontend.prompts import PromptBinder
 from quail.logical import (
     ColumnRef,
     Compare,
@@ -12,12 +13,8 @@ from quail.logical import (
     JoinSpec,
     ModelCall,
     RegularPredicate,
-    bind_join_prompt,
-    bind_prompt,
-    bind_score_prompt,
 )
 from quail.logical.expressions import validate_task_description
-from quail.logical.prompts import bind_classify_prompt, bind_extract_prompt
 
 JOIN_OPTION_KEYS = {"selectivity", "anchor"}
 
@@ -162,13 +159,9 @@ def _is_ai_score_comparison(node) -> bool:
 
 
 class ExpressionBinder:
-    def __init__(self, catalog: Catalog, tokenizer, turn=("", ""), layout="ai-if",
-                 extract_turn=None):
+    def __init__(self, catalog: Catalog, prompts: PromptBinder):
         self.catalog = catalog
-        self.tokenizer = tokenizer
-        self.turn = turn
-        self.extract_turn = turn if extract_turn is None else extract_turn
-        self.layout = layout
+        self.prompts = prompts
         self.tables: list[tuple[str, str]] = []
         self.regular_predicates: dict[str, list[RegularPredicate]] = {}
         self.doc_columns: dict[str, str] = {}
@@ -310,26 +303,13 @@ class ExpressionBinder:
                 "in words"
             )
         if classify is not None:
-            prompt = bind_classify_prompt(
-                template,
-                tuple(refs),
-                tokenizer=self.tokenizer,
-                turn=self.turn,
-                layout=self.layout,
-                **classify,
-            )
+            prompt = self.prompts.bind("label", template, tuple(refs), **classify)
         else:
             if function == "AI_SCORE":
-                binder = bind_score_prompt
+                kind = "score"
             else:
-                binder = bind_join_prompt if join else bind_prompt
-            prompt = binder(
-                template,
-                tuple(refs),
-                self.tokenizer,
-                turn=self.turn,
-                layout=self.layout,
-            )
+                kind = "join" if join else "filter"
+            prompt = self.prompts.bind(kind, template, tuple(refs))
         for r in refs:
             self.note_doc_column(r)
         return prompt, options, aliases
@@ -421,8 +401,7 @@ class ExpressionBinder:
         ref = self.resolve_column(args[0])
         question = str(args[1].this)
         options = self.parse_extract_options(args[2] if len(args) == 3 else None)
-        prompt = bind_extract_prompt(
-            (ref,), question, self.tokenizer, turn=self.extract_turn)
+        prompt = self.prompts.bind("extract", question, (ref,))
         self.note_doc_column(ref)
         call = ModelCall(prompt, "extract", question=question,
                          trim=options.get("trim", True))

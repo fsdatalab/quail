@@ -1,13 +1,12 @@
 """Build the physical plan of a decided logical plan."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from quail.cost import budgets
 from quail.cost import classify as classify_cost
 from quail.cost import extract as extract_cost
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, scan
-from quail.extraction import ExtractionConfig
 from quail.labels import DECISION_SCORING, LETTERS_SCORING, word_starts
 from quail.logical import (
     PROBABILITIES_SUFFIX,
@@ -24,7 +23,6 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.logical.prompts import (
-    bind_extract_prompt,
     choice_token_parts,
     classify_prompt_tokens,
     prompt_aliases,
@@ -960,25 +958,23 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         shared: Whether an extraction of the same table runs right
             before this one.
     """
-    turn = context.model.extract_turn
-    prompt = bind_extract_prompt(call.prompt.args, call.question,
-                                 context.tokenizer, turn)
+    prompt = call.prompt
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
-    config = ExtractionConfig()
-    cost = extract_cost.estimate(
-        live, [int(length) for length in lengths],
-        len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
-        chunk=budgets.chunk_budget(context.model, context.device),
-        model=context.model, device=context.device, resident=shared, config=config)
-    return ExtractSpec(
+    spec = ExtractSpec(
         name=name, aliases=call.aliases(),
-        query_template=call.prompt.template,
-        arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
-        expected_inputs=live, estimated_seconds=cost.seconds,
+        query_template=prompt.template,
+        arguments=tuple((ref.alias, ref.column) for ref in prompt.args),
+        expected_inputs=live, estimated_seconds=0.0,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
-        question=call.question, trim=call.trim, config=config)
+        question=call.question, trim=call.trim)
+    cost = extract_cost.estimate(
+        live, lengths, len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
+        chunk=budgets.chunk_budget(context.model, context.device),
+        model=context.model, device=context.device, resident=shared,
+        max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens)
+    return replace(spec, estimated_seconds=cost.seconds)
 
 
 def classify_builder(context, alias, backend_name):

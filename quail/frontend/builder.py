@@ -5,6 +5,7 @@ from typing import Optional
 
 from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
+from quail.frontend.prompts import PromptBinder
 from quail.logical import (
     AggregateCall,
     Aggregation,
@@ -21,11 +22,6 @@ from quail.logical import (
     ModelCall,
     RegularPredicate,
     SortKey,
-    bind_classify_prompt,
-    bind_extract_prompt,
-    bind_join_prompt,
-    bind_prompt,
-    bind_score_prompt,
 )
 from quail.logical.expressions import SPAN_SUFFIX, validate_task_description
 
@@ -212,13 +208,10 @@ def prompt(template: str, *cols: ColSpec) -> PromptSpec:
 class Query:
     def __init__(self, catalog: Catalog, provider: str, tokenizer=None,
                  turn: tuple[str, str] = ("", ""), layout: str = "ai-if",
-                 extract_turn: tuple[str, str] | None = None):
+                 prompts: PromptBinder | None = None):
         catalog.get(provider)     # unknown provider -> CompileError
         self._catalog = catalog
-        self._tokenizer = tokenizer
-        self._turn = turn
-        self._extract_turn = turn if extract_turn is None else extract_turn
-        self._layout = layout
+        self._prompts = prompts or PromptBinder(tokenizer, turn=turn, layout=layout)
         self._tables = [(provider, provider)]   # (alias, provider)
         self._doc_columns = {}
         self._filters = {}
@@ -287,9 +280,7 @@ class Query:
 
     def _bind(self, p: PromptSpec, join: bool = False):
         refs = tuple(self._resolve(c) for c in p.cols)
-        binder = bind_join_prompt if join else bind_prompt
-        bound = binder(p.template, refs, self._tokenizer, turn=self._turn,
-                       layout=self._layout)
+        bound = self._prompts.bind("join" if join else "filter", p.template, refs)
         for r in refs:
             self._note_doc_column(r)
         aliases = []
@@ -335,8 +326,7 @@ class Query:
                 f"a score needs a column name without a dot, got {name!r}")
         self._claim_name(name)
         refs = tuple(self._resolve(c) for c in p.cols)
-        bound = bind_score_prompt(p.template, refs, self._tokenizer,
-                                  turn=self._turn)
+        bound = self._prompts.bind("score", p.template, refs)
         for ref in refs:
             self._note_doc_column(ref)
         call = ModelCall(bound, "score")
@@ -396,10 +386,9 @@ class Query:
         descriptions = tuple(descriptions or ())
         validate_task_description(task_description)
         refs = tuple(self._resolve(c) for c in p.cols)
-        bound = bind_classify_prompt(p.template, refs, labels, descriptions,
-                                     self._tokenizer, turn=self._turn,
-                                     task_description=task_description,
-                                     layout=self._layout)
+        bound = self._prompts.bind(
+            "label", p.template, refs, labels=labels, descriptions=descriptions,
+            task_description=task_description)
         for ref in refs:
             self._note_doc_column(ref)
         call = ModelCall(bound, "label", labels, descriptions,
@@ -447,8 +436,7 @@ class Query:
         self._claim_name(name)
         self._claim_name(name + SPAN_SUFFIX)
         ref = self._resolve(col(c) if isinstance(c, str) else c)
-        bound = bind_extract_prompt((ref,), question, self._tokenizer,
-                                    turn=self._extract_turn)
+        bound = self._prompts.bind("extract", question, (ref,))
         self._note_doc_column(ref)
         call = ModelCall(bound, "extract", question=question, trim=trim)
         call.validate()
