@@ -45,7 +45,7 @@ from quail.execution.runner import (
 )
 from quail.execution.tokens import TokenOffsets, TokenStore
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.extraction import ANSWER_MAX_TOKENS, DRAFT_TOKENS
+from quail.extraction import ExtractionConfig
 from quail.physical import (
     AiExtract,
     AiFilter,
@@ -73,7 +73,7 @@ def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
     vocabulary = SimpleNamespace(vocab=range(64), merged=merged,
                                  is_stop=np.zeros(64, dtype=bool), none_id=63)
     vocabulary.is_stop[62] = True
-    decoder = Decoder(vocabulary, 4, 10, [True])
+    decoder = Decoder(vocabulary, 4, 10, [True], ExtractionConfig())
     text = "abcdefghij"
     streams = [Stream(at, [0, token], [at + 1, at + 2], text, exhausted=True)
                for at, token in enumerate(tokens)]
@@ -95,7 +95,7 @@ def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
 
 def test_readout_scores_reset_between_rows_and_keep_token_order():
     _, vocabulary = make_spec()
-    decoder = Decoder(vocabulary, 4, 10, [True])
+    decoder = Decoder(vocabulary, 4, 10, [True], ExtractionConfig())
     scores, none, stop = decoder.lp([-4, -5, 5, 2, 3, 4, -1, -1, -2, -3])
     assert decoder.top == 5 and none == -4 and stop == -5
     assert scores[5] == scores[2] == -1
@@ -478,8 +478,8 @@ def test_extractor_writes_the_answer_along_the_document(monkeypatch):
     assert appended[0] == tail
     (round_fed,) = appended[1:]
     assert round_fed[:len(asked.written)] == asked.written
-    # the draft runs to the document's end, short of DRAFT_TOKENS
-    assert len(asked.written) < len(round_fed) <= 1 + DRAFT_TOKENS
+    # the draft runs to the document's end, short of stages.config.draft_tokens
+    assert len(asked.written) < len(round_fed) <= 1 + stages.config.draft_tokens
     # the draft's rows are read whole; the tail reads its last
     assert [whole for key, _, kept, whole, _ in model.packed
             if key == lease_key and kept] == [False, True]
@@ -506,7 +506,7 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
     # one stage list asks both questions of a document; the second
     # question's tail is written after the document in place of the
     # first question's steps, the same frame rewound
-    assert len(stages.stages) == 2 * (1 + ANSWER_MAX_TOKENS)
+    assert len(stages.stages) == 2 * (1 + stages.config.max_answer_tokens)
     assert stages.tails[0] == stages.tails[1]
     lease = stages.docs[0]
     (tail,) = set(map(tuple, stages.tails))
@@ -643,13 +643,20 @@ def test_the_table_key_names_kv_written_under_the_shared_head():
     with pytest.raises(ValueError, match="prompt head"):
         ExtractionStages(state, [spec, other], tables, [0], documents, [LEASE],
                       readout=readout)
+    other = replace(spec, config=ExtractionConfig(draft_tokens=2))
+    with pytest.raises(ValueError, match="decoding settings"):
+        ExtractionStages(state, [spec, other], tables, [0], documents, [LEASE],
+                         readout=readout)
 
 
-def test_extractor_stops_at_the_answer_token_cap(monkeypatch):
+@pytest.mark.parametrize("limit,draft", [(64, 16), (5, 1), (3, 0), (1, 0)])
+def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
     # a model that never closes the quote keeps writing the document;
-    # the answer ends at ANSWER_MAX_TOKENS
+    # the answer ends at stages.config.max_answer_tokens
     long = " ".join(["word"] * 200)
     spec, tables = make_spec(True, long)
+    spec = replace(spec, config=ExtractionConfig(
+        max_answer_tokens=limit, draft_tokens=draft))
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
@@ -667,12 +674,15 @@ def test_extractor_stops_at_the_answer_token_cap(monkeypatch):
                state.chunk_tokens, anchor_keys=stages.keys)
     stages.finish()
     asked = stages.docs[0].answers[0]
-    assert asked.done and len(asked.written) == ANSWER_MAX_TOKENS
-    assert asked.answer == " ".join(["word"] * ANSWER_MAX_TOKENS)
-    assert len(stages.stages) == 1 + ANSWER_MAX_TOKENS
+    assert asked.done and len(asked.written) == stages.config.max_answer_tokens
+    assert asked.answer == " ".join(["word"] * stages.config.max_answer_tokens)
+    assert len(stages.stages) == 1 + stages.config.max_answer_tokens
     assert [stage.label for stage in stages.stages][:2] == [
         "ends tail", "ends round 1"]
-    assert stages.stages[-1].label == f"ends round {ANSWER_MAX_TOKENS}"
+    assert stages.stages[-1].label == f"ends round {stages.config.max_answer_tokens}"
+    assert stages.appended_tokens == 1 + limit + draft
+    assert all(len(suffix) <= 1 + draft
+               for _, suffix, _, whole, _ in model.packed if whole)
 
 
 def test_answer_table_and_session_project_the_answer_columns():

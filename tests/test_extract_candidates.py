@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 from extract_fakes import LEASE, RANKED, TAIL, FakeTokenizer, make_vocabulary
 
-from quail.backends.quail.executor.extract import candidates as candidates_mod
 from quail.backends.quail.executor.extract.candidates import (
     DocumentTokens,
     SqueezedText,
@@ -134,7 +133,6 @@ def test_a_stream_tokenizes_a_window_at_a_time():
     assert len(first.stream) > window_tokens
     assert first.next(10_000, tables) is None and first.exhausted
     assert text[first.char:first.ends[-1]] == text
-    assert candidates_mod.STREAM_WINDOW == 512
 
 def test_a_first_token_that_begins_a_longer_word_carries_its_rest():
     text = "The lease is their lease."
@@ -260,3 +258,17 @@ def test_candidate_ties_prefer_longer_spelling():
                           ids, None, scan)
     assert higher.best_token == short
     assert list(higher.items(tables)) == [(0, (short, tables.encode_ids("ir")))]
+
+
+def test_streams_keep_their_own_tokenization_window_sizes():
+    from quail.extraction import ExtractionConfig
+
+    text = "word " * 100
+    small = Stream(0, [], [0], text, config=ExtractionConfig(
+        first_window_chars=4, window_chars=9))
+    large = Stream(0, [], [0], text, config=ExtractionConfig(
+        first_window_chars=19, window_chars=29))
+    assert len(small.window()[0]) == 4
+    assert len(large.window()[0]) == 19
+    assert len(small.window()[0]) == 9
+    assert len(large.window()[0]) == 29

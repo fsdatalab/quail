@@ -391,7 +391,7 @@ def _shared_extract_spec(node, context, store, *, resident=False):
         spec.expected_inputs, context.document_tokens[spec.alias],
         len(head), len(tail), chunk=chunk_budget(context.model, context.device),
         model=context.model, device=context.device, resident=resident,
-        shared=page_tree(store).shared)
+        shared=page_tree(store).shared, config=spec.config)
     return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
 
 

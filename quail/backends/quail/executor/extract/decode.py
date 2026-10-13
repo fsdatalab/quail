@@ -23,9 +23,7 @@ from quail.backends.quail.executor.extract.candidates import (
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.execution.spans import line_span
-from quail.extraction import ANSWER_MAX_TOKENS, DRAFT_TOKENS
-
-CUE_TOP = 1024      # vocabulary entries read at the cue and each round
+from quail.extraction import ExtractionConfig
 
 
 @dataclass
@@ -69,9 +67,12 @@ class Decoder:
             k ids and k log probabilities.
         trim: Per question, whether the answer is the copied words or
             the whole lines that hold them.
+        config: Execution limits carried by the extraction plan.
     """
 
-    def __init__(self, vocabulary: Vocabulary, k: int, width: int, trim):
+    def __init__(self, vocabulary: Vocabulary, k: int, width: int, trim,
+                 config: ExtractionConfig):
+        self.config = config
         self.vocabulary = vocabulary
         self.k = k
         self.width = width
@@ -97,7 +98,7 @@ class Decoder:
         at = len(answer.written)
         stream = min(answer.live, key=lambda s: s.char)
         draft = []
-        for i in range(DRAFT_TOKENS):
+        for i in range(self.config.draft_tokens):
             token = stream.next(at + i, self.vocabulary)
             if token is None:
                 break
@@ -149,7 +150,7 @@ class Decoder:
         would write with the closing quote, such as `."`, ends the
         answer after that token. The answer also ends when closing the
         quote is at least as likely as every continuation, when no
-        stream continues, or at ANSWER_MAX_TOKENS.
+        stream continues, or at the configured answer limit.
 
         Returns:
             The token written, or None when the answer ended.
@@ -168,7 +169,7 @@ class Decoder:
                 self.settle(doc, q)
                 return None
             token = starts.best_token
-            answer.live = make_streams(vocabulary, doc.text, starts, token)
+            answer.live = make_streams(vocabulary, doc.text, starts, token, self.config)
         else:
             at = len(answer.written)
             ensure_tokens(answer.live, at, vocabulary)
@@ -191,7 +192,7 @@ class Decoder:
                 answer.live = [s for s, keep in zip(answer.live, next_tokens == token)
                                if keep]
         answer.written.append(token)
-        if len(answer.written) >= ANSWER_MAX_TOKENS:
+        if len(answer.written) >= self.config.max_answer_tokens:
             self.settle(doc, q)
         return token
 

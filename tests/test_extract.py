@@ -132,6 +132,14 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
         extract.node_id for extract in extracts)
     assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
     assert extracts[2].spec.estimated_seconds < extracts[0].spec.estimated_seconds
+    different = replace(extracts[1], spec=replace(
+        extracts[1].spec, config=ExtractionConfig(draft_tokens=2)))
+    graph = replace(plan.graph, nodes=tuple(
+        different if node.node_id == different.node_id else node
+        for node in plan.nodes))
+    separated = build_pipelines(graph)
+    assert separated[extracts[0].node_id].node_ids == (extracts[0].node_id,)
+    assert separated[extracts[1].node_id].node_ids == (extracts[1].node_id,)
     # a plain extraction shows the document under the query's shared
     # head, as the filter does, so it continues the filter's pipeline
     # and asks its question of the KV the filter wrote

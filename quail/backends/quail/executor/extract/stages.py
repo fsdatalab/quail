@@ -5,7 +5,7 @@ documents: a question's tail is the frame of its stages, written right
 after the document in place of the tokens the question before it
 appended, so a document is read once however many questions it takes.
 Each question is the tail stage, whose row chooses the answer's first
-token, then up to ANSWER_MAX_TOKENS rounds, each feeding the chosen
+token, then up to the configured answer limit in rounds, each feeding the chosen
 token and a draft of the document's next tokens and verifying them.
 """
 
@@ -15,7 +15,6 @@ import numpy as np
 
 from quail.backends.quail.executor.extract.candidates import DocumentTokens
 from quail.backends.quail.executor.extract.decode import (
-    CUE_TOP,
     AnswerState,
     Decoder,
     Document,
@@ -25,7 +24,6 @@ from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
 from quail.backends.quail.executor.stages import Stage
 from quail.execution.tokens import chain_tokens
-from quail.extraction import ANSWER_MAX_TOKENS, DRAFT_TOKENS
 
 
 class ExtractionStages:
@@ -45,13 +43,16 @@ class ExtractionStages:
             writes the documents' KV; None when the query has none.
 
     Raises:
-        ValueError: The specs differ in their table or head.
+        ValueError: The specs differ in their table, head, or decoding settings.
     """
 
     def __init__(self, state, specs, vocabulary: Vocabulary, document_ids,
                  documents, texts, readout=None, shared_head=None):
         self.specs = list(specs)
         first = self.specs[0]
+        self.config = first.config
+        if any(spec.config != self.config for spec in self.specs):
+            raise ValueError("a pipeline's extractions share decoding settings")
         if any(spec.alias != first.alias for spec in self.specs):
             raise ValueError("a pipeline's extractions share a table")
         parts = [spec.prompt_token_parts for spec in self.specs]
@@ -78,7 +79,7 @@ class ExtractionStages:
         self.keys = [doc.key for doc in self.docs]
         self.readout = self._readout(state) if readout is None else readout
         self.decoder = Decoder(vocabulary, self.readout.k, self.readout.width,
-                               [spec.trim for spec in self.specs])
+                               [spec.trim for spec in self.specs], self.config)
         self.stages = []
         for q, (spec, tail) in enumerate(zip(self.specs, self.tails)):
             self.stages.extend(self._question_stages(q, spec.name, tail))
@@ -99,11 +100,11 @@ class ExtractionStages:
             single=True, append=True, label=f"{name} tail")]
         stages.extend(
             Stage(suffixes=partial(self._step_suffix, q),
-                  suffix_tokens=1 + DRAFT_TOKENS, frame=frame,
+                  suffix_tokens=1 + self.config.draft_tokens, frame=frame,
                   readout=self.readout, decide=partial(self._step_decide, q),
                   discard=partial(self._step_discard, q), read_all_rows=True,
                   single=True, append=True, label=f"{name} round {t}")
-            for t in range(1, ANSWER_MAX_TOKENS + 1))
+            for t in range(1, self.config.max_answer_tokens + 1))
         return stages
 
     @property
@@ -113,14 +114,15 @@ class ExtractionStages:
         The cue, and the answer's tokens with the last round's draft
         past them.
         """
-        return 1 + ANSWER_MAX_TOKENS + DRAFT_TOKENS
+        return 1 + self.config.max_answer_tokens + self.config.draft_tokens
 
     def _readout(self, state):
         """The readout of every row: none, the stop, then the top tokens."""
         torch = state.torch
         head = full_output_head(state.loaded_model.model)
         vocabulary = self.vocabulary
-        return AsyncTopLogprobs(torch, torch.nn.functional, head, CUE_TOP,
+        return AsyncTopLogprobs(torch, torch.nn.functional, head,
+                                self.config.top_tokens,
                                 [vocabulary.none_id, vocabulary.stop_ids],
                                 ragged=True)
 
