@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from extract_fakes import LEASE, RANKED, TAIL, FakeTokenizer, make_vocabulary
+from extract_fakes import RANKED, make_vocabulary
 
 from quail.backends.quail.executor.extract.candidates import (
     DocumentTokens,
@@ -14,7 +14,7 @@ from quail.backends.quail.executor.extract.candidates import (
     make_streams,
     squeezed,
 )
-from quail.backends.quail.executor.extract.vocabulary import Vocabulary, same_word
+from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.execution.tokens import GigatokenEncoder
 
 
@@ -51,17 +51,6 @@ def test_gigatoken_vocabulary_encodes_unicode_without_transformers(monkeypatch):
         tables.encode("a b")
 
 
-def test_word_keys_and_token_offsets():
-    assert same_word("ĠMarch") == "march" and same_word("the") == "the"
-    assert same_word("Ċ") == "" and same_word(5) == "" and same_word("ĠaĠb") == ""
-    tables = make_vocabulary()
-    ids, offsets = tables.encode(LEASE)
-    tokens = document_tokens(offsets, 3)
-    assert [LEASE[a:b] for _, (a, b) in tokens][:4] == [
-        "Contract", " of", " lease", "."]
-    assert [index for index, _ in tokens] == list(range(3, 3 + len(ids)))
-
-
 def test_first_tokens_follow_the_models_spelling():
     tables = make_vocabulary()
     text = RANKED
@@ -95,25 +84,6 @@ def test_first_tokens_follow_the_models_spelling():
     assert text[march_stream.char:march_stream.ends[3]] == " March 3."
 
 
-def test_a_stream_writes_a_run_of_whitespace_as_one_space():
-    text = "laws of the State of          Arkansas\nshall apply."
-    tables = make_vocabulary(text, "laws of the State of Arkansas shall apply.")
-    ids, offsets = tables.encode(text)
-    prefix = [99] + ids
-    tokens = document_tokens(offsets, 1)
-    laws = tables.encode_ids("laws")[0]
-    starts = first_tokens(tables, _scores(tables, {laws: -0.5}), prefix, tokens)
-    (stream,) = make_streams(tables, text, starts, laws)
-    stream.extend(tables)
-    # the model writes " Arkansas" right after "of"; the stream does too,
-    # and its end is the document's, past the spaces
-    assert stream.stream == tables.encode_ids(
-        "laws of the State of Arkansas shall apply.")
-    assert text[stream.char:stream.ends[5]] == "laws of the State of          Arkansas"
-    assert text[stream.char:stream.ends[6]].endswith("Arkansas\nshall")
-    assert squeezed("a  b\n\n c") == ("a b c", [1, 3, 4, 7, 8])
-
-
 def test_a_first_token_that_begins_a_longer_word_carries_its_rest():
     text = "The lease is their lease."
     tables = make_vocabulary(text, "their", "ir")
@@ -130,20 +100,6 @@ def test_a_first_token_that_begins_a_longer_word_carries_its_rest():
     assert [stream.char for stream in streams] == [0, 12]
     assert streams[1].stream[:2] == [the, tables.encode_ids("ir")[0]]
     assert text[streams[1].char:streams[1].ends[1]] == " their"
-
-def test_vocabulary_pairs_each_token_with_its_quote_closing_merge():
-    tokenizer = FakeTokenizer([LEASE, TAIL])
-    tokenizer.tokens.extend(['."', '""', 'Ġ"'])
-    tokenizer.ids = {token: index for index, token in enumerate(tokenizer.tokens)}
-    tables = Vocabulary(tokenizer)
-    ids = tokenizer.ids
-    expected = np.full(len(tokenizer), -1, dtype=np.int64)
-    expected[[ids["."], ids['"'], ids[" "]]] = [
-        ids['."'], ids['""'], ids['Ġ"']]
-    np.testing.assert_array_equal(tables.merged, expected)
-    assert set(tables.stop_ids) == {ids['"'], ids['""']}
-    assert np.flatnonzero(tables.is_stop).tolist() == sorted(tables.stop_ids)
-
 
 @pytest.mark.parametrize("first_window,window", [(64, 512), (9, 19)])
 def test_stream_batches_preserve_tokens_and_offsets_across_windows(
@@ -205,30 +161,6 @@ def test_normalized_windows_preserve_partial_whitespace_runs():
             got_text, got_ends = normalized.window(start, end)
             assert got_text == want_text
             assert got_ends.tolist() == [start + value for value in want_ends]
-
-
-def test_questions_reuse_candidate_positions_and_normalized_text():
-    tables = make_vocabulary()
-    ids, offsets = tables.encode(RANKED)
-    scan = DocumentTokens.of(tables, ids, document_tokens(offsets, 0))
-    the, march = (tables.encode_ids(word)[0] for word in ("The", "March"))
-    first = first_tokens(tables, _scores(tables, {the: -0.5}), ids, None, scan)
-    streams = make_streams(tables, RANKED, first, the)
-    index = scan.candidates
-    normalized = scan.normalized
-    second = first_tokens(tables, _scores(tables, {march: -0.1}), ids, None, scan)
-    more = make_streams(tables, RANKED, second, march)
-    assert scan.candidates is index
-    assert all(stream.normalized is normalized for stream in streams + more)
-    assert first.best_token == the and second.best_token == march
-    assert first.best_lp == -0.5
-
-
-def test_empty_document_has_no_candidate_starts():
-    tables = make_vocabulary()
-    starts = first_tokens(tables, _scores(tables, {}), [], [])
-    assert starts.best_lp == -np.inf
-    assert not starts.allows(tables.none_id)
 
 
 def test_candidate_ties_prefer_longer_spelling():

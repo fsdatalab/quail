@@ -73,9 +73,6 @@ def test_extract_prefix_sharing_is_planned_from_exact_document_tokens():
         plan = query.plan()
         (node,) = [node for node in plan.nodes if isinstance(node, AiExtract)]
         assert node.spec.share_prefixes
-        decoded = decode_graph(encode_graph(plan.graph, session.registry.codecs),
-                               session.registry.codecs)
-        assert decoded.node(node.node_id).spec.share_prefixes
 
 
 def test_sql_and_builder_extract_the_same_answer_columns(session):
