@@ -39,20 +39,23 @@ from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan, triangle
 from quail.execution.pairs import pair_table
 from quail.logical import (
+    Aggregate,
     Filter,
     Join,
     ModelCall,
     Project,
+    Result,
     Scan,
     SemanticClassify,
     SemanticFilter,
     SemanticJoin,
     oriented_join_conditions,
 )
-from quail.planner.filters import default_order_rule, order_filters_indexed
+from quail.planner.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
 from quail.planner.prefixes import document_shared_tokens
+from quail.planner.statistics import prepare_filter_costs
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
@@ -68,7 +71,7 @@ CLASSIFY = "AI.CLASSIFY"
 LABEL_IN = "IN"
 
 _PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, Filter, Join,
-                 SemanticJoin, Project)
+                 SemanticJoin, Project, Aggregate, Result)
 
 
 @dataclass(frozen=True)
@@ -241,7 +244,11 @@ def _refuse_unpriced(logical) -> None:
         if not isinstance(node, _PRICED_NODES):
             raise NotImplementedError(
                 f"the speed of light estimate does not price {node.type_name}")
-        if isinstance(node, Project) and node.limit is not None:
+        if isinstance(node, Result) and node.limit is not None \
+                and not (node.order or node.distinct or node.offset
+                         or isinstance(node.input, Aggregate)):
+            # a sorted, distinct, offset, or grouped result runs every
+            # document, which the estimate prices; a bare LIMIT stops early
             raise NotImplementedError(
                 "the speed of light estimate does not price LIMIT")
     operators = logical.operators()
@@ -505,10 +512,11 @@ class _Search:
             tokens = self.aliases[alias].tokens
             mean_tokens = sum(tokens) / len(tokens) if tokens else 0
             order = [asks[index] for index in order_filters_indexed(
-                [predicates[position] for position in asks], rule,
-                prefix_tokens=self.pre + mean_tokens,
-                model=self.model, device=self.device,
-                chunk_tokens=self.chunk_tokens)] if asks else []
+                prepare_filter_costs(
+                    [predicates[position] for position in asks],
+                    prefix_tokens=self.pre + mean_tokens,
+                    model=self.model, device=self.device,
+                    chunk_tokens=self.chunk_tokens), rule)] if asks else []
             live = survivors[alias]
             first = True
             for written_pos in order:

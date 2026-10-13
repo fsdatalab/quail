@@ -48,7 +48,7 @@ def test_labels_copy_by_content_and_join_a_reused_collection(
     old = next(p for p in PREDICATES if p.left_table == "reviews")
     monkeypatch.setattr(labeling, "ROOT", root)
     monkeypatch.setattr(labeling, "PREDICATES", (old,))
-    monkeypatch.setattr(cell, "PUBLISHED_CORPORA",
+    monkeypatch.setattr(cell, "CORPORA",
                         {1.0: "c_big", 0.1: "c_small"})
     _corpus(root, "c_big", 1.0, [("c0", "Paris"), ("c1", "Messi"),
                                  ("c2", "Lincoln")])
@@ -96,3 +96,27 @@ def test_labels_copy_by_content_and_join_a_reused_collection(
                       .read_text())["collection_id"] == summary["collection_id"]
 
 
+def test_joined_rows_take_the_classification_sides(monkeypatch, tmp_path):
+    import quail_b.labels
+
+    root = tmp_path / GROUND_TRUTH_ROOT
+    spec = PREDICATE_BY_KEY["quailb.support.message.disagreement"]
+    monkeypatch.setattr(labeling, "ROOT", root)
+    monkeypatch.setattr(cell, "CORPORA", {1.0: "c_t"})
+    corpus = root / "corpora/c_t"
+    corpus.mkdir(parents=True)
+    (corpus / "manifest.json").write_text("{}")
+    pq.write_table(pa.table({"id": ["a1", "u1"],
+                             "content": ["here is the fee", "that is wrong"]}),
+                   corpus / "support_messages.parquet")
+    join = PREDICATE_BY_KEY["quailb.support.message.customer_pushes_back"]
+    # the pushback join pairs the agent message, on its left, with the reply
+    truth = type("Truth", (), {
+        "key_for_template": lambda self, _template: join.key,
+        "predicates": {join.key: type("Labels", (), {"true_pairs": pa.table(
+            {"left_id": ["a1"], "right_id": ["u1"]})})()}})()
+    monkeypatch.setattr(quail_b.labels, "load_ground_truth",
+                        lambda *_, **__: truth)
+    _, rows = cell.corpus_rows(1.0, spec)
+    assert rows == [{"id": "u1", "right_id": "a1", "content": "that is wrong",
+                     cell.RIGHT_TEXT: "here is the fee"}]

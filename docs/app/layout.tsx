@@ -1,4 +1,5 @@
 import { RootProvider } from 'fumadocs-ui/provider/next';
+import type { Metadata } from 'next';
 import './global.css';
 import { Inter, Lora, IBM_Plex_Mono } from 'next/font/google';
 
@@ -19,6 +20,14 @@ const mono = IBM_Plex_Mono({
   variable: '--font-quail-mono',
   weight: ['400', '500'],
 });
+
+export const metadata: Metadata = {
+  metadataBase: new URL('https://fsdatalab.github.io/quail'),
+  title: { default: 'Quail', template: '%s | Quail' },
+  description: 'Quail is a query engine for AI functions in SQL.',
+  openGraph: { siteName: 'Quail', type: 'website' },
+  twitter: { card: 'summary_large_image' },
+};
 
 export default function Layout({ children }: LayoutProps<'/'>) {
   return (

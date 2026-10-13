@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from .base import InputPort, PhysicalGraph, PhysicalNode, PortRef, ValueType
 from .nodes import (
+    Aggregate,
     AiClassify,
     AiFilter,
     AiJoin,
@@ -21,6 +22,7 @@ from .nodes import (
     Recombine,
     RequestExecution,
     Scan,
+    Sort,
 )
 
 
@@ -148,6 +150,8 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         AiJoin,
         Recombine,
         Project,
+        Aggregate,
+        Sort,
         Limit,
     ))
 

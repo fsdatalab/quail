@@ -408,6 +408,11 @@ class TokenSelection(Sequence):
         self._path, self._indices = state
         self._store = None
 
+    def select(self, indices) -> "TokenSelection":
+        """Return a file reference for positions of this selection."""
+        return TokenSelection(
+            self._path, [self._indices[index] for index in indices])
+
 
 class DocumentPrefixes(Sequence):
     """Add common prefix tokens when a document is accessed."""
@@ -447,7 +452,7 @@ class DocumentKeys(Sequence):
 
 def select_documents(documents, indices):
     """Select documents without copying file backed token buffers."""
-    if isinstance(documents, TokenStore):
+    if isinstance(documents, (TokenStore, TokenSelection)):
         return documents.select(indices)
     return [documents[index] for index in indices]
 

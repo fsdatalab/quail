@@ -1,14 +1,15 @@
 """Build the QUAIL-B reference labels with Quail, one H100 per workload.
 
 Each predicate runs as a Quail query over the corpus with Qwen3 32B
-fp8: a filter over every document, a full join over every pair. FEVER
-and LePaRD supply source truth where the dataset gives the exact
-answer. Every part file is written under a content-addressed path on
-the `quail-results` volume and skipped when it already exists, so an
-interrupted pass resumes where it stopped. Scale factors 0.1, 0.5 and
-1.0 are supported; a smaller one samples a prefix of a larger one's
-documents, so its labels are derived from the larger pass on the CPU
-by matching document content.
+fp8: a filter over every document, a full join over every pair, or,
+for a join whose predicate names pair columns, over the pairs whose
+columns are equal. FEVER and LePaRD supply source truth where the
+dataset gives the exact answer. Every part file is written under a
+content-addressed path on the `quail-results` volume and skipped when
+it already exists, so an interrupted pass resumes where it stopped.
+Scale factors 0.1, 0.5 and 1.0 are supported; a smaller one samples a
+prefix of a larger one's documents, so its labels are derived from the
+larger pass on the CPU by matching document content.
 
     uv run modal run --detach -m quail.bench.labeling --sf 1.0
     uv run modal run --detach -m quail.bench.labeling --sf 0.1 \
@@ -42,6 +43,7 @@ from quail.bench.images import cpu_image, gpu_image
 from quail_b import data
 from quail_b.data import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 from quail_b.predicates import (
+    CLASSIFY_PREDICATES,
     MODEL_NAME,
     MODEL_REVISION,
     PREDICATE_BY_KEY,
@@ -50,6 +52,7 @@ from quail_b.predicates import (
     SCHEMA_VERSION,
     WORKLOADS,
     PredicateSpec,
+    _canonical,
     _full_hash,
     _named_id,
     _text_hash,
@@ -189,16 +192,27 @@ def join_specs(specs) -> tuple:
     return tuple(p for p in specs if p.kind == "join")
 
 
-def _load_corpus(corpus_id: str) -> tuple[Path, dict, dict]:
-    """Read a corpus already materialized on the volume."""
+def _load_corpus(corpus_id: str, tables: tuple[str, ...] | None = None
+                 ) -> tuple[Path, dict, dict]:
+    """Read a corpus already materialized on the volume.
+
+    Args:
+        corpus_id: The corpus to read.
+        tables: The tables to read. None reads every table in
+            CORPUS_COLUMNS.
+    """
     target = ROOT / "corpora" / corpus_id
     with open(target / "manifest.json") as f:
         manifest = json.load(f)
-    return target, manifest, _read_rows(target)
+    return target, manifest, _read_rows(target, tables)
 
 
-# Every table here feeds corpus_id, so adding or removing one
-# invalidates every label-set identity and forces a full relabel.
+# Every table here feeds corpus_id, so adding or removing one mints a
+# new corpus id; a collection for the new corpus reuses the label sets
+# of the predicates whose tables did not change.
+MESSAGE_COLUMNS = ("id", "trace_id", "turn_index", "role", "content",
+                   "tool_call_id", "prev_id", "prev_user_id",
+                   "prev_assistant_id")
 CORPUS_COLUMNS = {
     "reviews": ("id", "body"),
     "aspects": ("id", "aspect"),
@@ -211,7 +225,65 @@ CORPUS_COLUMNS = {
     "citation_passages": ("id", "passage_text", "passage_ids"),
     "agent_traces": ("id", "trace", "trajectory_id", "turn_index",
                      "token_count"),
+    "support_traces": ("id", "request", "transcript", "message_count",
+                       "task_id", "domain", "model", "trial", "reward"),
+    "support_messages": MESSAGE_COLUMNS,
+    "issue_runs": ("id", "request", "transcript", "patch", "message_count",
+                   "instance_id", "repo", "resolved", "token_count"),
+    "issue_messages": MESSAGE_COLUMNS,
+    "wrench_runs": ("id", "task_id", "model", "mode", "transcript",
+                    "step_count", "token_count"),
+    "wrench_steps": ("id", "run_id", "step_index", "model", "text"),
+    "sales_calls": ("id", "domain", "deal_id", "call_index", "prev_call_id",
+                    "deal_stage", "deal_amount", "transcript"),
 }
+
+
+def _pair_columns(spec: PredicateSpec):
+    """The (left, right) columns a join's labeled pairs must agree on, or None.
+
+    Older quail-b releases have no such field, so every pair is labeled.
+    """
+    return getattr(spec, "pair_columns", None)
+
+
+def _where_rows(rows: list[dict], condition) -> list[int]:
+    """Indices of the rows whose column equals the condition's value.
+
+    Args:
+        rows: The rows of one join side.
+        condition: (column, value), or None to keep every row.
+    """
+    if condition is None:
+        return list(range(len(rows)))
+    column, value = condition
+    return [i for i, row in enumerate(rows) if row.get(column) == value]
+
+
+def _matching_pairs(spec: PredicateSpec, left_rows: list[dict],
+                    right_rows: list[dict]) -> list[tuple[int, int]]:
+    """(left index, right index) of the pairs a restricted join labels.
+
+    A pair's columns are equal, and each row passes its side's WHERE
+    condition when the predicate names one.
+    """
+    left_column, right_column = spec.pair_columns
+    partners = {}
+    for j in _where_rows(right_rows, getattr(spec, "right_where", None)):
+        value = right_rows[j].get(right_column)
+        if value is not None:
+            partners.setdefault(value, []).append(j)
+    return [(i, j)
+            for i in _where_rows(left_rows, getattr(spec, "left_where", None))
+            for j in partners.get(left_rows[i].get(left_column), ())]
+
+
+def _join_step(spec: PredicateSpec, identity: dict, right_rows: int) -> int:
+    """Left rows per join part: by pairs, or by left rows for a restricted join."""
+    if _pair_columns(spec):
+        return rows_per_call(1, identity.get("prompts_per_call",
+                                             LEGACY_PROMPTS_PER_CALL))
+    return join_anchor_batch(identity, right_rows)
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -222,13 +294,10 @@ def _atomic_json(path: Path, payload: dict) -> None:
     os.replace(temp, path)
 
 
-def _atomic_parquet(path: Path, rows: list[dict]) -> None:
+def _part_schema():
     import pyarrow as pa
-    import pyarrow.parquet as pq
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    schema = pa.schema([
+    return pa.schema([
         ("judgment_id", pa.string()),
         ("example_id", pa.string()),
         ("example_full_hash", pa.string()),
@@ -247,17 +316,33 @@ def _atomic_parquet(path: Path, rows: list[dict]) -> None:
         ("right_content_sha256", pa.string()),
         ("selected_token_id", pa.int64()),
     ])
-    table = pa.Table.from_pylist(rows, schema=schema)
-    pq.write_table(table, temp, compression="zstd",
+
+
+def _atomic_parquet(path: Path, rows: list[dict]) -> None:
+    import pyarrow as pa
+
+    _atomic_parquet_table(path, pa.Table.from_pylist(rows,
+                                                     schema=_part_schema()))
+
+
+def _atomic_parquet_table(path: Path, table) -> None:
+    import pyarrow.parquet as pq
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    pq.write_table(table.cast(_part_schema()), temp, compression="zstd",
                    use_dictionary=True)
     os.replace(temp, path)
 
 
-def _read_rows(data_dir: Path) -> dict[str, list[dict]]:
+def _read_rows(data_dir: Path, tables: tuple[str, ...] | None = None
+               ) -> dict[str, list[dict]]:
     import pyarrow.parquet as pq
 
     rows = {}
     for table, columns in CORPUS_COLUMNS.items():
+        if tables is not None and table not in tables:
+            continue
         rows[table] = pq.read_table(
             data_dir / f"{table}.parquet", columns=list(columns)).to_pylist()
     return rows
@@ -378,8 +463,7 @@ def _part_bounds(spec: PredicateSpec, identity: dict,
     elif spec.source_policy == "lepard_citation_edge":
         step = 50
     else:
-        step = join_anchor_batch(identity,
-                                 len(corpus_rows[spec.right_table]))
+        step = _join_step(spec, identity, len(corpus_rows[spec.right_table]))
     return [(start, min(start + step, left))
             for start in range(0, left, step)]
 
@@ -478,7 +562,8 @@ class QuailJudge:
     def close(self) -> None:
         self.session.close()
 
-    def _register(self, rows: list[dict], column: str) -> str:
+    def _register(self, rows: list[dict], column: str,
+                  extra: tuple[str, ...] = ()) -> str:
         import quail
 
         self._tables += 1
@@ -486,6 +571,8 @@ class QuailJudge:
         table = pa.table({
             "id": pa.array([str(row["id"]) for row in rows], pa.string()),
             column: pa.array([row[column] for row in rows], pa.string()),
+            **{name: pa.array([row[name] for row in rows])
+               for name in extra if name not in ("id", column)},
         })
         self.session.register(
             name, quail.DocumentProvider.from_table(table, id_col="id"))
@@ -524,25 +611,55 @@ class QuailJudge:
 
     def join(self, spec: PredicateSpec, left_rows: list[dict],
              right_rows: list[dict]) -> dict[tuple[int, int], bool]:
-        """Answers for every (left index, right index) pair."""
+        """Answers by (left index, right index) pair.
+
+        Every pair is asked, or, when the predicate names pair columns,
+        only the pairs whose columns are equal and whose rows pass the
+        predicate's WHERE conditions.
+        """
         import quail
 
         if not left_rows or not right_rows:
             return {}
-        left = self._register(left_rows, spec.left_column)
-        right = self._register(right_rows, spec.right_column)
-        query = (self.session.docs(left).alias("l")
-                 .ai_join(self.session.docs(right).alias("r"),
-                          quail.prompt(spec.template,
-                                       quail.col(f"l.{spec.left_column}"),
-                                       quail.col(f"r.{spec.right_column}")),
-                          anchor="l", semantics="full")
-                 .select("l.id", "r.id"))
-        expected = len(left_rows) * len(right_rows)
+        pairs = _pair_columns(spec)
+        prompt = quail.prompt(spec.template,
+                              quail.col(f"l.{spec.left_column}"),
+                              quail.col(f"r.{spec.right_column}"))
+        keep_left = list(range(len(left_rows)))
+        keep_right = list(range(len(right_rows)))
+        if pairs:
+            # Quail answers by position in the registered rows, so the
+            # rows a WHERE condition drops are left out and mapped back
+            keep_left = _where_rows(left_rows,
+                                    getattr(spec, "left_where", None))
+            keep_right = _where_rows(right_rows,
+                                     getattr(spec, "right_where", None))
+            if not keep_left or not keep_right:
+                return {}
+            left = self._register([left_rows[i] for i in keep_left],
+                                  spec.left_column, (pairs[0],))
+            right = self._register([right_rows[j] for j in keep_right],
+                                   spec.right_column, (pairs[1],))
+            query = (self.session.docs(left).alias("l")
+                     .join(self.session.docs(right).alias("r"),
+                           on=quail.col(f"l.{pairs[0]}")
+                           == quail.col(f"r.{pairs[1]}"))
+                     .ai_filter(prompt)
+                     .select("l.id", "r.id"))
+            expected = len(_matching_pairs(spec, left_rows, right_rows))
+        else:
+            left = self._register(left_rows, spec.left_column)
+            right = self._register(right_rows, spec.right_column)
+            query = (self.session.docs(left).alias("l")
+                     .ai_join(self.session.docs(right).alias("r"), prompt,
+                              anchor="l", semantics="full")
+                     .select("l.id", "r.id"))
+            expected = len(left_rows) * len(right_rows)
         result = self._run(query, expected)
         table = result.answer_tables["joins"][0]
         answers = {
-            (int(left_index), int(right_index)): bool(answer)
+            (keep_left[int(left_index)], keep_right[int(right_index)]):
+                bool(answer)
             for left_index, right_index, answer in zip(
                 table.column("l").to_pylist(),
                 table.column("r").to_pylist(),
@@ -653,32 +770,39 @@ def _write_qwen_join_parts(judge: QuailJudge,
                            spec: PredicateSpec, left_rows: list[dict],
                            right_rows: list[dict], identity: dict,
                            corpus_id: str, source_label=None) -> None:
-    anchor_batch = join_anchor_batch(identity, len(right_rows))
+    anchor_batch = _join_step(spec, identity, len(right_rows))
     for start in range(0, len(left_rows), anchor_batch):
         end = min(start + anchor_batch, len(left_rows))
         part = _part_path(spec, identity, start, end)
         if part.exists():
             continue
-        # every pair goes through the model; a source label, where the
-        # dataset gives one, replaces the model's answer for that pair
-        answers = judge.join(spec, left_rows[start:end], right_rows)
+        # every pair goes through the model, or every pair the pair
+        # columns allow; a source label, where the dataset gives one,
+        # replaces the model's answer for that pair
+        batch = left_rows[start:end]
+        answers = judge.join(spec, batch, right_rows)
+        if _pair_columns(spec):
+            asked = _matching_pairs(spec, batch, right_rows)
+        else:
+            asked = [(i, j) for i in range(len(batch))
+                     for j in range(len(right_rows))]
         output_rows = []
         model_rows = 0
-        for i, left in enumerate(left_rows[start:end]):
-            for j, right in enumerate(right_rows):
-                known = source_label(left, right) if source_label else None
-                if known is not None:
-                    label, source = known
-                    output_rows.append(_answer_row(
-                        spec, identity, corpus_id, left, right,
-                        label, source, None))
-                    continue
-                answer = answers[(i, j)]
+        for i, j in asked:
+            left, right = batch[i], right_rows[j]
+            known = source_label(left, right) if source_label else None
+            if known is not None:
+                label, source = known
                 output_rows.append(_answer_row(
                     spec, identity, corpus_id, left, right,
-                    answer, MODEL_NAME, None))
-                verification.add(spec, left, right, answer)
-                model_rows += 1
+                    label, source, None))
+                continue
+            answer = answers[(i, j)]
+            output_rows.append(_answer_row(
+                spec, identity, corpus_id, left, right,
+                answer, MODEL_NAME, None))
+            verification.add(spec, left, right, answer)
+            model_rows += 1
         output_rows.sort(key=lambda row: (row["left_id"], row["right_id"]))
         _atomic_parquet(part, output_rows)
         after_write()
@@ -718,6 +842,9 @@ def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
 def _expected_rows(spec: PredicateSpec,
                    corpus_rows: dict[str, list[dict]]) -> int:
     count = len(corpus_rows[spec.left_table])
+    if spec.kind == "join" and _pair_columns(spec):
+        return len(_matching_pairs(spec, corpus_rows[spec.left_table],
+                                   corpus_rows[spec.right_table]))
     if spec.kind == "join":
         count *= len(corpus_rows[spec.right_table])
     return count
@@ -746,8 +873,12 @@ def _activate_collection(corpus_id: str, collection_id: str) -> None:
 
 
 def _required_tables(spec: PredicateSpec) -> tuple[str, ...]:
+    """The tables a predicate reads: two for a join or joined rows.
+
+    Must match quail_b.labels, which checks this list on reuse.
+    """
     tables = {spec.left_table}
-    if spec.kind == "join":
+    if spec.kind == "join" or spec.right_table:
         tables.add(spec.right_table)
     return tuple(sorted(tables))
 
@@ -1070,7 +1201,9 @@ def activate_reused_collection(
         relabeled_predicates: Keys of other predicates with new labels.
         new_specs: Predicates outside PREDICATES, such as classifications,
             whose finished label sets the collection adds. Their label-set
-            ids use quail_b's own judge for their kind.
+            ids use quail_b's own judge for their kind. A classification
+            the source collection labels and new_specs leaves out is
+            reused like an unchanged predicate.
     """
     with open(ROOT / "corpora" / target_corpus_id / "manifest.json") as f:
         target_corpus = json.load(f)
@@ -1105,15 +1238,20 @@ def activate_reused_collection(
     if unknown_predicates:
         raise ValueError(f"unknown relabeled predicates: {sorted(unknown_predicates)}")
 
+    new_keys = {spec.key for spec in new_specs}
+    carried = tuple(spec for spec in CLASSIFY_PREDICATES
+                    if spec.key in source_collection["label_sets"]
+                    and spec.key not in new_keys)
     identities = {}
     manifests = {}
     reused = {}
-    for spec in PREDICATES + tuple(new_specs):
+    for spec in PREDICATES + tuple(new_specs) + carried:
         if spec in new_specs:
             identity = _label_set_identity(
                 spec, target_corpus["corpus_id"],
                 target_corpus["corpus_full_hash"])
-        elif spec.workload in names or spec.key in relabeled_predicates:
+        elif spec not in carried and (spec.workload in names
+                                      or spec.key in relabeled_predicates):
             identity = label_set_identity(
                 spec, target_corpus["corpus_id"],
                 target_corpus["corpus_full_hash"])
@@ -1196,12 +1334,19 @@ def activate_reused_collection(
 
 def _source_labels_by_content(
         spec: PredicateSpec, source_label_set_id: str,
-        target_rows: dict[str, list[dict]]) -> dict:
-    """Read one finished label set, keyed by document content hashes.
+        target_rows: dict[str, list[dict]]):
+    """Read one finished label set's answers, keyed by document content.
 
-    Only rows whose documents also appear in the target corpus are
-    kept, so a join over a large corpus does not have to fit in memory
-    as Python objects.
+    Args:
+        spec: The predicate.
+        source_label_set_id: The finished label set to read.
+        target_rows: The target corpus rows. Only labels whose documents
+            appear here are kept.
+
+    Returns:
+        A table of left_content_sha256, right_content_sha256, answer and
+        label_source, with one row per content pair. When the source
+        corpus repeats a document, the pair's last label is kept.
     """
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -1210,7 +1355,9 @@ def _source_labels_by_content(
     _, manifest = _label_manifest(source_label_set_id)
     if manifest.get("status") != "complete":
         raise ValueError(f"label set {source_label_set_id} is not complete")
-    _, _source_manifest, source_rows = _load_corpus(manifest["corpus_id"])
+    # An older source corpus can lack tables added since it was built.
+    _, _source_manifest, source_rows = _load_corpus(
+        manifest["corpus_id"], _required_tables(spec))
     source_identity = {"label_set_id": source_label_set_id,
                        **part_size_fields(manifest)}
     label_dir = _label_dir_by_id(spec, source_label_set_id)
@@ -1219,25 +1366,66 @@ def _source_labels_by_content(
     table = pq.read_table(compact_path, columns=[
         "left_content_sha256", "right_content_sha256", "answer",
         "label_source"])
-    left_hashes = pa.array(
-        sorted({_content_hash(row, spec.left_column)
-                for row in target_rows[spec.left_table]}))
+    left_hashes = pa.array(sorted(
+        {_content_hash(row, spec.left_column)
+         for row in target_rows[spec.left_table]}), pa.string())
     table = table.filter(
         pc.is_in(table["left_content_sha256"], value_set=left_hashes))
+    keys = ["left_content_sha256"]
     if spec.kind == "join":
-        right_hashes = pa.array(
-            sorted({_content_hash(row, spec.right_column)
-                    for row in target_rows[spec.right_table]}))
+        right_hashes = pa.array(sorted(
+            {_content_hash(row, spec.right_column)
+             for row in target_rows[spec.right_table]}), pa.string())
         table = table.filter(
             pc.is_in(table["right_content_sha256"], value_set=right_hashes))
-    return {
-        (left, right): (bool(answer), source)
-        for left, right, answer, source in zip(
-            table["left_content_sha256"].to_pylist(),
-            table["right_content_sha256"].to_pylist(),
-            table["answer"].to_pylist(),
-            table["label_source"].to_pylist())
-    }
+        keys.append("right_content_sha256")
+    table = table.group_by(keys, use_threads=False).aggregate(
+        [("answer", "last"), ("label_source", "last")])
+    return table.rename_columns(keys + ["answer", "label_source"])
+
+
+def _pair_ids(corpus_id: str, label_set_id: str, left_json: list[bytes],
+              right_json: list[bytes], left_index, right_index
+              ) -> tuple[list[str], list[str], list[str]]:
+    """The example ids, example hashes, and judgment ids of many pairs.
+
+    Gives the same ids as example_identity and judgment_identity from
+    operands encoded once, instead of once per pair.
+
+    Args:
+        corpus_id: The corpus the examples belong to.
+        label_set_id: The label set the judgments belong to.
+        left_json: The canonical JSON of every left operand.
+        right_json: The canonical JSON of every right operand, each
+            after a comma; empty for a filter.
+        left_index: The left row of each pair.
+        right_index: The right row of each pair, or None for a filter.
+
+    Returns:
+        The example ids, example full hashes, and judgment ids, in pair
+        order.
+    """
+    import hashlib
+
+    # canonical JSON sorts keys: corpus_id before operands, and
+    # example_full_hash before label_set_id
+    head = b'{"corpus_id":' + _canonical(corpus_id) + b',"operands":['
+    judgment_head = b'{"example_full_hash":"'
+    judgment_tail = b'","label_set_id":' + _canonical(label_set_id) + b"}"
+    example_ids, example_fulls, judgment_ids = [], [], []
+    sha256 = hashlib.sha256
+    if right_index is None:
+        pairs = ((left_json[i], b"") for i in left_index.tolist())
+    else:
+        pairs = zip((left_json[i] for i in left_index.tolist()),
+                    (right_json[j] for j in right_index.tolist()))
+    for left, right in pairs:
+        full = sha256(head + left + right + b"]}").hexdigest()
+        example_ids.append(_named_id("ex", full))
+        example_fulls.append(full)
+        judgment = sha256(judgment_head + full.encode() + judgment_tail)
+        judgment_ids.append(_named_id("jd", judgment.hexdigest()))
+    return example_ids, example_fulls, judgment_ids
 
 
 def _copy_label_set(spec: PredicateSpec, source_label_set_id: str,
@@ -1245,45 +1433,115 @@ def _copy_label_set(spec: PredicateSpec, source_label_set_id: str,
                     rows: dict[str, list[dict]]) -> int:
     """Write one predicate's target parts from a larger corpus's labels.
 
-    Returns the number of labels written. Raises when a target document
-    or pair has no label in the source set.
+    Args:
+        spec: The predicate.
+        source_label_set_id: The finished label set to copy from.
+        identity: The target label set's identity.
+        corpus_id: The target corpus.
+        rows: The target corpus rows.
+
+    Returns:
+        The number of labels written.
+
+    Raises:
+        ValueError: A target document or pair has no label in the source
+            set.
     """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
     parts = _expected_parts(spec, identity, rows)
     if all(part.exists() for part in parts):
         return 0
     labels = _source_labels_by_content(spec, source_label_set_id, rows)
+    join = spec.kind == "join"
     left_rows = rows[spec.left_table]
-    right_rows = rows[spec.right_table] if spec.kind == "join" else [None]
-    right_hashes = [
-        None if right is None else _content_hash(right, spec.right_column)
-        for right in right_rows]
+    right_rows = rows[spec.right_table] if join else []
+    left_ops = [_operand(spec.left_role, spec.left_table, row,
+                         spec.left_column) for row in left_rows]
+    right_ops = [_operand(spec.right_role, spec.right_table, row,
+                          spec.right_column) for row in right_rows]
+    left_ids = pa.array([op["row_id"] for op in left_ops], pa.string())
+    left_hashes = pa.array([op["content_sha256"] for op in left_ops],
+                           pa.string())
+    right_ids = pa.array([op["row_id"] for op in right_ops], pa.string())
+    right_hashes = pa.array([op["content_sha256"] for op in right_ops],
+                            pa.string())
+    left_json = [_canonical(op) for op in left_ops]
+    right_json = [b"," + _canonical(op) for op in right_ops]
+    keys = ["left_content_sha256"]
+    if join:
+        keys.append("right_content_sha256")
+    restricted = join and _pair_columns(spec)
     written = 0
     for part, (start, end) in zip(parts,
                                   _part_bounds(spec, identity, rows)):
         if part.exists():
             continue
-        output = []
-        missing = 0
-        for left in left_rows[start:end]:
-            left_hash = _content_hash(left, spec.left_column)
-            for right, right_hash in zip(right_rows, right_hashes):
-                found = labels.get((left_hash, right_hash))
-                if found is None:
-                    missing += 1
-                    continue
-                answer, source = found
-                output.append(_answer_row(
-                    spec, identity, corpus_id, left, right, answer, source,
-                    None))
+        if restricted:
+            pairs = _matching_pairs(spec, left_rows[start:end], right_rows)
+            left_index = np.array([start + i for i, _ in pairs], np.int64)
+            right_index = np.array([j for _, j in pairs], np.int64)
+        elif join:
+            left_index = np.repeat(np.arange(start, end), len(right_rows))
+            right_index = np.tile(np.arange(len(right_rows)), end - start)
+        else:
+            left_index = np.arange(start, end)
+            right_index = None
+        # the join does not keep row order; the sort below restores it
+        target = {"left_index": left_index,
+                  "left_content_sha256": left_hashes.take(left_index)}
+        if join:
+            target["right_index"] = right_index
+            target["right_content_sha256"] = right_hashes.take(right_index)
+        found = pa.table(target).join(labels, keys=keys,
+                                      join_type="left outer")
+        missing = found["answer"].null_count
         if missing:
             raise ValueError(
                 f"{spec.key}: {missing} target labels are not in "
                 f"{source_label_set_id}")
-        if spec.kind == "join":
-            output.sort(key=lambda row: (row["left_id"], row["right_id"]))
-        _atomic_parquet(part, output)
+        left_index = found["left_index"].to_numpy()
+        right_index = found["right_index"].to_numpy() if join else None
+        example_ids, example_fulls, judgment_ids = _pair_ids(
+            corpus_id, identity["label_set_id"], left_json, right_json,
+            left_index, right_index)
+        size = found.num_rows
+        nulls = pa.nulls(size, pa.string())
+
+        def constant(value):
+            return pa.repeat(pa.scalar(value, pa.string()), size)
+
+        output = pa.table({
+            "judgment_id": pa.array(judgment_ids, pa.string()),
+            "example_id": pa.array(example_ids, pa.string()),
+            "example_full_hash": pa.array(example_fulls, pa.string()),
+            "label_set_id": constant(identity["label_set_id"]),
+            "predicate_key": constant(spec.key),
+            "predicate_version": constant(identity["predicate_version"]),
+            "answer": found["answer"],
+            "label_source": found["label_source"],
+            "left_role": constant(spec.left_role),
+            "left_table": constant(spec.left_table),
+            "left_id": left_ids.take(left_index),
+            "left_content_sha256": found["left_content_sha256"],
+            "right_role": constant(spec.right_role),
+            "right_table": constant(spec.right_table),
+            "right_id": right_ids.take(right_index) if join else nulls,
+            "right_content_sha256": (found["right_content_sha256"] if join
+                                     else nulls),
+            "selected_token_id": pa.nulls(size, pa.int64()),
+        })
+        if join:
+            output = output.sort_by([("left_id", "ascending"),
+                                     ("right_id", "ascending")])
+        else:
+            # a filter part keeps the corpus order
+            output = output.take(pc.sort_indices(pa.array(left_index)))
+        _atomic_parquet_table(part, output)
         after_write()
-        written += len(output)
+        written += size
         print(f"[derive] {spec.key} rows {start}:{end}", flush=True)
     return written
 

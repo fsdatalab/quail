@@ -4,7 +4,11 @@ Pure dict-and-list logic (no torch). Called by the worker's parent
 process between child GPUs.
 """
 
-from quail.backends.quail.graph import partner_maps, runs_over_pairs
+from quail.backends.quail.graph import (
+    partner_maps,
+    runs_over_pairs,
+    stop_groups,
+)
 from quail.execution.pairs import pair_partner
 from quail.execution.tokens import select_documents
 from quail.execution.types import join_answer_cells
@@ -58,12 +62,33 @@ def filter_node_payloads(payload: dict, node, shards: dict,
         sub.update(
             docs={node.alias: select_documents(tokens, indices)},
             doc_index={node.alias: indices},
+            stop_groups=stop_groups(
+                node, payload.get("columns", {}).get(node.alias), indices),
             node_id=node.node_id,
             worker=worker,
             workers=k,
         )
         outputs.append(sub)
     return outputs
+
+
+def keyed_shards(groups, doc_tokens, k: int) -> tuple:
+    """Shard documents by stop key group, balanced by token count.
+
+    Every document of a group lands on one worker, so the worker's
+    per-key stop sees the whole group.
+    """
+    tokens = {}
+    for group, length in zip(groups, doc_tokens):
+        tokens[group] = tokens.get(group, 0) + length
+    ordered = list(tokens)
+    shards, _ = balanced_shards([tokens[group] for group in ordered], k)
+    placed = {ordered[index]: worker
+              for worker, shard in enumerate(shards) for index in shard}
+    out = [[] for _ in range(k)]
+    for document, group in enumerate(groups):
+        out[placed[group]].append(document)
+    return tuple(tuple(shard) for shard in out)
 
 
 def merge_filter_round(outs: list, limit: int | None = None) -> dict:

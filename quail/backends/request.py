@@ -36,6 +36,7 @@ from quail.execution.runner import (
     scalar_node_metrics,
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
+from quail.logical import Aggregate as LogicalAggregate
 from quail.logical import (
     Alias,
     Apply,
@@ -66,14 +67,16 @@ from quail.planner import (
     hash_join_nodes,
     order_filters_indexed,
     preamble_tokens,
+    regular_predicates,
 )
 from quail.planner import (
     join_specs as logical_join_specs,
 )
-from quail.planner.classify import has_label
-from quail.planner.joins import search_joins, summarize_alias
+from quail.planner.join_order import search_joins
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
+from quail.planner.statistics import prepare_filter_costs, summarize_alias
+from quail.planner.validation import has_label
 from quail.specs import DEVICES
 
 
@@ -120,10 +123,22 @@ def plan_request_backend(
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),
         ),)
+    root = region.logical_plan.result
+    if root.order or root.distinct or root.offset \
+            or isinstance(root.input, LogicalAggregate):
+        return (PhysicalCandidate(
+            graph=None,
+            plan=Refusal(
+                reasons=("ORDER BY, DISTINCT, OFFSET, and GROUP BY run on "
+                         "the Quail backend only",),
+                constraint="sort_needs_quail_backend",
+                needed=1, available=0, unit="backends"),
+            estimated_seconds=float("inf"),
+        ),)
     classifies = has_label(region.logical_plan)
     if any(isinstance(column, Alias)
            and getattr(column.expression, "probabilities", False)
-           for column in region.logical_plan.root.columns):
+           for column in region.logical_plan.projection.columns):
         return (PhysicalCandidate(
             graph=None,
             plan=Refusal(
@@ -156,10 +171,13 @@ def plan_request_backend(
     operators = region.logical_plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     ask_filters = {alias: list(ps) for alias, ps in filters.items() if ps}
+    # the regular predicates keep an estimated fraction of each table, as
+    # the Quail planner's statistics do
     stats = {
         alias: CorpusStats(
-            n_docs=len(lengths),
-            total_tokens=sum(int(length) for length in lengths),
+            n_docs=round(len(lengths) * context.scan_fractions.get(alias, 1.0)),
+            total_tokens=round(sum(int(length) for length in lengths)
+                               * context.scan_fractions.get(alias, 1.0)),
             max_doc_tokens=max((int(length) for length in lengths), default=0),
         )
         for alias, lengths in context.document_tokens.items()
@@ -171,14 +189,17 @@ def plan_request_backend(
         if scan.alias not in stats:
             raise ValueError(f"no document tokens for alias {scan.alias!r}")
         summary = stats[scan.alias]
+        n_docs = len(context.document_tokens[scan.alias])
         node = Scan(
             node_id=f"scan:{scan.alias}",
             alias=scan.alias,
             input_id=scan.alias,
-            n_docs=summary.n_docs,
-            total_tokens=summary.total_tokens,
-            shard_ranges=((0, summary.n_docs),),
+            n_docs=n_docs,
+            total_tokens=sum(context.document_tokens[scan.alias]),
+            shard_ranges=((0, n_docs),),
             shard_token_loads=(summary.total_tokens,),
+            predicates=regular_predicates(scan),
+            expected_docs=float(summary.n_docs) if scan.predicates else None,
         )
         nodes.append(node)
         input_refs.append(PortRef(node.node_id, f"ids:{scan.alias}"))
@@ -191,16 +212,15 @@ def plan_request_backend(
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
     preamble_count = preamble_tokens(ask_filters, joins)
     filter_orders = {
-        alias: order_filters_indexed(
+        alias: order_filters_indexed(prepare_filter_costs(
             predicates,
-            rule,
             prefix_tokens=(
                 preamble_count + stats[alias].mean_doc_tokens
             ),
             model=context.model,
             device=context.device,
             chunk_tokens=chunk_tokens,
-        )
+        ), rule)
         for alias, predicates in ask_filters.items()
     }
     live = {
@@ -410,14 +430,14 @@ def plan_request_backend(
         columns=tuple(
             column.name if isinstance(column, Alias)
             else f"{column.alias}.{column.column}"
-            for column in region.logical_plan.root.columns
+            for column in region.logical_plan.projection.columns
         ),
     ))
-    if region.logical_plan.root.limit is not None:
+    if region.logical_plan.result.limit is not None:
         nodes.append(Limit(
             node_id="limit",
             inputs=input_ports((PortRef("project", "rows"),)),
-            count=region.logical_plan.root.limit,
+            count=region.logical_plan.result.limit,
         ))
 
     true_ids, false_ids = _answer_ids(context.tokenizer)
@@ -778,10 +798,17 @@ class RequestModelExecution:
                 position = int(port.source.port.split(":", 1)[1])
                 self.pairs[position] = inputs[port.name]
         started = time.perf_counter()
+        # the scans supply the documents their regular predicates kept
         survivors = {
             alias: list(range(len(self.documents[alias])))
             for alias in node.aliases
         }
+        for port in node.inputs:
+            if port.source.port.startswith("ids:"):
+                alias = port.source.port.split(":", 1)[1]
+                if alias in survivors:
+                    survivors[alias] = [int(document)
+                                        for document in inputs[port.name]]
         outputs = {}
         steps = []
         fresh_tokens = cached_tokens = requests = 0

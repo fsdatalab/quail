@@ -12,8 +12,8 @@ import pyarrow as pa
 
 import quail
 from quail import EngineConfig, col, prompt
+from quail.explain import explain
 from quail.physical import Barrier
-from quail.planner.decide import explain
 from quail.planner.plan import PlanEditError
 
 PERSON = "Is the claim in DOCUMENT {0} about a person?"

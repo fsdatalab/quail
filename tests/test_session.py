@@ -16,7 +16,7 @@ from fakes import register_claims_evidence
 import quail
 from demos import quickstart, quickstart_modal
 from quail.execution import execute as execution
-from quail.execution.pairs import pair_fraction, pair_table, partner_map
+from quail.execution.pairs import estimate_pair_fraction, pair_table, partner_map
 from quail.execution.result import (
     QueryResult,
     build_result_declaration,
@@ -71,12 +71,17 @@ def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
             assert text == "hello"
             return np.array([1, 2], dtype=np.uint32)
 
+        def decode(self, ids):
+            return b"hello"[:len(ids)]
+
     monkeypatch.setitem(sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer))
     with quail.Session(CONFIG) as session:
         token_ids = session.tokenizer("hello")
+        piece = session.tokenizer.decode([1])
     assert sources == ["Qwen/Qwen3-4B-FP8"]
     assert token_ids == [1, 2]
     assert all(type(token_id) is int for token_id in token_ids)
+    assert piece == b"h"
 
 
 def make_executor(filter_truth, join_truth=None):
@@ -318,6 +323,46 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
     assert not hasattr(result, "rows")
 
 
+def test_order_by_offset_and_distinct_run_on_the_result():
+    registry = quail.ExtensionRegistry.with_built_ins().register_observer(
+        NodeTypes)
+    session = quail.Session(CONFIG, tokenizer=fake_tok, registry=registry)
+    session.register("reviews", quail.DocumentProvider.from_table(
+        pa.table({"id": [f"r{i}" for i in range(6)],
+                  "review": [f"review {i} " + "pad " * 20 for i in range(6)],
+                  "stars": [3, 1, 4, 5, None, 2]}), id_col="id"))
+    # survivors of both predicates are r0 and r3; sorted by a column the
+    # query does not return, so the first survivor to finish is not first
+    result = _run(session.sql(FILTER_SQL + " ORDER BY r.stars DESC LIMIT 1"),
+                  make_executor(TRUTH))
+    assert result.to_rows() == [("r3",)]
+    assert result.count() == 1
+    assert result.observer(NodeTypes)["types"] == [
+        "quail.scan", "quail.ai_filter", "quail.project", "quail.sort"]
+    assert "Sort: r.stars DESC NULLS FIRST" in result.explain()
+
+    result = _run(session.sql(
+        "SELECT r.id, r.stars FROM reviews r WHERE AI_FILTER(PROMPT("
+        "'q1: {0}', r.review)) ORDER BY r.stars NULLS FIRST OFFSET 1"
+    ), make_executor(TRUTH))
+    assert result.to_rows() == [("r1", 1), ("r0", 3), ("r3", 5)]
+
+    result = _run(session.sql(
+        "SELECT DISTINCT r.stars FROM reviews r WHERE AI_FILTER(PROMPT("
+        "'q2: {0}', r.review)) ORDER BY r.stars LIMIT 2"
+    ), make_executor({"r": {"q2:": [1, 1, 1, 1, 1, 1]}}))
+    assert result.to_rows() == [(1,), (2,)]
+
+    from quail.frontend.builder import col, prompt
+    built = (session.docs("reviews").alias("r")
+             .ai_filter(prompt("q2: {0}", col("r.review")))
+             .order_by(col("r.stars").desc().nulls_last()).offset(1).distinct()
+             .limit(2).select("r.stars"))
+    result = _run(built, make_executor({"r": {"q2:": [1, 1, 1, 1, 1, 1]}}))
+    assert result.to_rows() == [(4,), (3,)]
+    session.close()
+
+
 class NodeTypes:
     """Observer that records the node types it saw."""
 
@@ -349,7 +394,13 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
         "c", [pa.array(["u1", "u2", None, "u1"])],
         "e", [pa.array(["u2", "u1", "u1"])])
     assert pairs.to_pydict() == {"c": [0, 0, 1, 3, 3], "e": [1, 2, 0, 1, 2]}
-    assert pair_fraction(pairs, 4, 3) == 5 / 12
+    # the planner estimates the fraction from key samples: u1 twice
+    # against twice, u2 once against once, and a null never matches
+    assert estimate_pair_fraction(
+        [pa.array(["u1", "u2", None, "u1"])], [pa.array(["u2", "u1", "u1"])]
+    ) == 5 / 12
+    assert estimate_pair_fraction(
+        [pa.array(["u1"])], [pa.array([], pa.string())]) == 0.0
     assert partner_map(pairs, "e", "c") == {0: [1], 1: [0, 3], 2: [0, 3]}
     # two equalities: both key columns must match; integer keys on one
     # side are cast to the other side's type

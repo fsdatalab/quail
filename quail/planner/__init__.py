@@ -8,15 +8,16 @@ No wall prediction. KV is always bf16.
 The names below are the planning interface a model backend uses.
 """
 
-from .decide import (
+from quail.explain import explain
+
+from .api import plan_query, refine_plan
+from .build import (
     balanced_shards,
     build_physical_plan,
-    explain,
     hash_join_nodes,
-    plan_query,
-    refine_plan,
+    regular_predicates,
 )
-from .filters import default_order_rule, order_filters_indexed
+from .filter_order import default_order_rule, order_filters_indexed
 from .plan import CorpusStats, EngineConfig, PhysicalPlan, Refusal
 from .statistics import join_specs, preamble_tokens
 
@@ -26,6 +27,7 @@ __all__ = [
     "PhysicalPlan",
     "Refusal",
     "balanced_shards",
+    "regular_predicates",
     "build_physical_plan",
     "default_order_rule",
     "hash_join_nodes",

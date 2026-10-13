@@ -5,8 +5,9 @@ from collections.abc import Mapping
 
 from quail import logical as logical_nodes
 from quail.execution.pipelines import build_pipelines
-from quail.logical import DEFAULT_SELECTIVITY, effective_selectivity
+from quail.logical import DEFAULT_SELECTIVITY, LogicalPlan, effective_selectivity
 from quail.physical import (
+    Aggregate,
     AiClassify,
     AiFilter,
     AiJoin,
@@ -21,6 +22,7 @@ from quail.physical import (
     Recombine,
     RequestExecution,
     Scan,
+    Sort,
 )
 
 
@@ -58,24 +60,41 @@ def logical_tree(logical):
 
     def visit(node, depth):
         details = []
-        if isinstance(node, logical_nodes.Project):
-            columns = ", ".join(node.explain_fields()["columns"])
-            title = f"Project: {columns}"
+        if isinstance(node, logical_nodes.Result):
             if node.limit is not None:
                 lines.append(f"{'  ' * depth}Limit: {node.limit:,}")
                 depth += 1
+            if node.offset:
+                lines.append(f"{'  ' * depth}Offset: {node.offset:,}")
+                depth += 1
+            if node.order:
+                keys = ", ".join(str(key) for key in node.order)
+                lines.append(f"{'  ' * depth}Sort: {keys}")
+                depth += 1
+            if node.distinct:
+                lines.append(f"{'  ' * depth}Distinct")
+                depth += 1
+            visit(node.input, depth)
+            return
+        if isinstance(node, logical_nodes.Aggregate):
+            title = f"Aggregate: {node.specification()}"
+        elif isinstance(node, logical_nodes.Project):
+            columns = ", ".join(node.explain_fields()["columns"])
+            title = f"Project: {columns}"
         elif isinstance(node, logical_nodes.Scan):
             title = f"Scan {node.provider} as {node.alias}"
             columns = ", ".join(dict.fromkeys((node.column, *node.columns)))
             title += f" [{columns}]"
+            if node.predicates:
+                title += " where " + " and ".join(
+                    str(predicate) for predicate in node.predicates)
         elif isinstance(node, logical_nodes.SemanticFilter):
             title = "SemanticFilter"
             details = [f"{_prompt(p.prompt)} "
                        f"(selectivity={_selectivity(p.selectivity)})"
                        for p in node.predicates]
-            if node.order:
-                title += " order=" + ",".join(
-                    str(position + 1) for position in node.order)
+            if node.stop_key:
+                title += " stop_key=" + ",".join(node.stop_key)
         elif isinstance(node, logical_nodes.Filter):
             title = (f"Filter: {node.explain_fields()['condition']} "
                      f"(selectivity={_selectivity(node.selectivity)})")
@@ -85,9 +104,6 @@ def logical_tree(logical):
                        f"(selectivity={_selectivity(node.selectivity)})"]
             if node.anchor is not None:
                 title += f" anchor={node.anchor}"
-            if node.exec_idx is not None:
-                title += (f" stage={node.exec_idx + 1}"
-                          f" exec_anchor={node.exec_anchor}")
         elif isinstance(node, logical_nodes.SemanticClassify):
             title = f"SemanticClassify: {node.name}"
             if node.probabilities:
@@ -259,18 +275,27 @@ def _estimated_rows(graph):
         inputs = [rows.get(port.source) for port in node.inputs]
         value = None
         if isinstance(node, Scan):
-            value = node.n_docs
+            value = (node.n_docs if node.expected_docs is None
+                     else node.expected_docs)
         elif isinstance(node, AiFilter):
             value = inputs[0] if inputs else None
             for stage in node.stages:
                 if value is not None:
                     value *= effective_selectivity(stage.selectivity)
-        elif isinstance(node, (Project, Limit, Exchange)) and len(inputs) == 1:
+        elif isinstance(node, (Project, Limit, Sort, Exchange)) \
+                and len(inputs) == 1:
             value = inputs[0]
             if isinstance(node, Limit) and value is not None:
                 value = min(value, node.count)
+            if isinstance(node, Sort) and value is not None:
+                value = max(value - node.offset, 0)
+                if node.fetch is not None:
+                    value = min(value, node.fetch)
         elif isinstance(node, Foreign) and node.ids == "preserve":
             value = inputs[0] if inputs else None
+        elif isinstance(node, Aggregate):
+            # the group count is not estimated
+            value = None
         # Join nodes expose both document ids and predicate answers.
         # Their evaluated tuple counts are not output row estimates.
         for output in node.outputs:
@@ -326,10 +351,38 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             mean = node.total_tokens / node.n_docs if node.n_docs else 0
             details.append(f"tokens={node.total_tokens:,}, "
                            f"mean_doc_tokens={_number(mean)}")
+            if source is not None and source.predicates:
+                details.append("where " + " and ".join(
+                    str(predicate) for predicate in source.predicates))
         elif isinstance(node, Project):
             title += ": " + ", ".join(node.columns)
         elif isinstance(node, Limit):
             title += f": {node.count:,}"
+        elif isinstance(node, Aggregate):
+            title += ": " + ", ".join(node.columns)
+            if node.keys:
+                details.append("group by " + ", ".join(node.keys))
+            details.append(", ".join(
+                f"{name} = {function}({argument or '*'})"
+                for name, function, argument in node.aggregates))
+            if node.having:
+                details.append("having " + " and ".join(
+                    f"{name} {comparison} {value!r}"
+                    for name, comparison, value in node.having))
+        elif isinstance(node, Sort):
+            title += ": " + ", ".join(
+                f"{column} {'DESC' if descending else 'ASC'} "
+                f"NULLS {'FIRST' if nulls_first else 'LAST'}"
+                for column, descending, nulls_first in node.keys)
+            bounds = []
+            if node.distinct:
+                bounds.append("distinct")
+            if node.offset:
+                bounds.append(f"offset={node.offset:,}")
+            if node.fetch is not None:
+                bounds.append(f"fetch={node.fetch:,}")
+            if bounds:
+                details.append(", ".join(bounds))
         elif isinstance(node, AiFilter):
             title += f": {node.alias}"
             kv = []
@@ -339,6 +392,11 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 kv.append("retain KV for later joins")
             details.append(", ".join(kv) if kv else
                            "KV: stored" if node.arena_writes else "KV: not stored")
+            if node.stop_key:
+                details.append(
+                    f"stop per key: {', '.join(node.stop_key)} "
+                    f"(one document at a time, the rest skipped once "
+                    f"one survives)")
             written = filters.get(node.alias, ())
             order = [stage.written_pos for stage in node.stages]
             reordered = order != sorted(order)
@@ -493,4 +551,92 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                      "resident)")
     if used_default:
         lines.append(DEFAULT_NOTE)
+    return "\n".join(lines)
+
+
+def rule_lines(logical_rules, physical_rules) -> list[str]:
+    """Return the optimizer rules in run order, each marked by kind.
+
+    A rule is cost-based when its ``cost_based`` attribute is true and
+    heuristic otherwise.
+    """
+    def names(rules):
+        return ", ".join(
+            rule.name + ("*" if getattr(rule, "cost_based", False) else "")
+            for rule in rules) or "none"
+
+    return ["rules, in run order (* cost-based, others heuristic):",
+            f"  logical: {names(logical_rules)}",
+            "  physical: building the plan (filter order*, join order and "
+            "anchors*, and on Quail classification placement*), then "
+            f"{names(physical_rules)}"]
+
+
+def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
+            result=None, usd_per_hour: float | None = None,
+            rules=None) -> str:
+    """Format the logical and physical operator trees.
+
+    Args:
+        logical: The optimized logical plan.
+        physical: The physical plan or planning refusal.
+        verbose: Include runtime settings, internal node fields, and
+            the optimizer rules.
+        result: The QueryResult of running the plan. When given, each
+            node shows its measured rows, time, and tokens next to the
+            estimates, and the measured totals follow the tree.
+        usd_per_hour: Price of one GPU, for the measured cost per query.
+        rules: The registered logical rules and physical rules, as a
+            pair of sequences, listed when verbose.
+    """
+    from quail.planner.plan import Refusal
+
+    lines = ["logical:"]
+    lines.extend("  " + line for line in logical_tree(logical).splitlines())
+    if isinstance(physical, Refusal):
+        lines.append(f"refusal: {physical.constraint}: needed "
+                     f"{physical.needed} {physical.unit}, available "
+                     f"{physical.available}")
+        lines.extend(f"  {reason}" for reason in physical.reasons)
+        return "\n".join(lines)
+    lines.append("")
+    lines.append(f"physical: backend={physical.backend}, "
+                 f"model={physical.model}, workers={physical.workers}")
+    if physical.backend == "quail":
+        chunk = physical.settings.get("chunk_tokens")
+        admission = physical.settings.get("admission_tokens")
+        budgets = ["KV=bf16"]
+        if chunk is not None:
+            budgets.append(f"chunk budget={chunk:,} tokens")
+        if admission is not None:
+            budgets.append(f"admission budget={admission:,} tokens")
+        lines.append("  " + ", ".join(budgets))
+    lines.append("")
+    lines.extend("  " + line for line in physical_tree(
+        physical.graph, logical=logical, verbose=verbose,
+        estimates=getattr(physical, "estimates", None),
+        metrics=None if result is None else result.node_metrics,
+        stages=None if result is None else measured_stages(result.report),
+    ).splitlines())
+    if getattr(physical, "estimates", None):
+        lines.append("  est. time is each node's work alone; node times do "
+                     "not add up to the plan estimate")
+        lines.append("  because chunk packing shares forward passes across "
+                     "nodes")
+    if result is not None:
+        lines.append("")
+        lines.append("run:")
+        lines.extend("  " + line for line in run_summary(
+            result.report, physical.graph, physical.workers, usd_per_hour))
+    if verbose:
+        lines.append("")
+        lines.append("settings:")
+        lines.extend(_fields({"model": physical.model,
+                              "device": physical.device,
+                              **physical.settings}, 1))
+        if physical.backend == "quail":
+            lines.append("  KV dtype=bf16")
+        if rules is not None:
+            lines.append("")
+            lines.extend(rule_lines(*rules))
     return "\n".join(lines)

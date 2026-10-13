@@ -1,5 +1,6 @@
 """AI.SCORE parsing, planning, execution, and score semantics."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -260,10 +261,10 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
 
 def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     from quail.backends.quail.graph import throughput
+    from quail.cost.score import score_work
     from quail.cost.work import ask, scan
     from quail.execution.runner import NodeMetrics
     from quail.explain import run_summary
-    from quail.planner.reranker import _score_work
 
     for model, canvas in (("qwen3-4b-fp8", 0), ("diffusion-gemma-26b-a4b-fp8", 1)):
         session = _session(catalog, model=model, tokenizer=list)
@@ -282,12 +283,12 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
             pytest.approx(expected), model
 
     # Two query documents, three candidates each, and a shared prompt.
-    work = _score_work(
+    work = score_work(
         6, 15, 9, prefix_tokens=17, groups=2, shared_tokens=3,
     )
     expected = scan(0, 24) + ask(3, 21) + ask(17, 7) * 4
     assert work == expected
-    assert _score_work(0, 15, 9).tokens == 0
+    assert score_work(0, 15, 9).tokens == 0
 
     session = _session(catalog)
     query = session.sql(
@@ -357,6 +358,36 @@ def test_score_filters_compare_values_and_keep_pair_answers(catalog):
     assert result.schema.field("s").type == pa.float64()
     assert result.report["estimated_seconds"] > 0
     assert reranker.calls == 1
+    session.close()
+
+
+@pytest.mark.parametrize("model", ["qwen3-reranker-0.6b-bf16", "qwen3-4b-fp8"])
+def test_score_filter_order_is_chosen_by_cost_and_honors_override(catalog, model):
+    session = _session(catalog, model=model)
+    sql = (
+        "SELECT d.id FROM documents d WHERE "
+        f"AI.SCORE(PROMPT('{'long ' * 100}{{0}}', d.body)) > 0.5 AND "
+        "AI.SCORE(PROMPT('Short? {0}', d.body)) > 0.5")
+    for rule, expected in (("by_cost", [1, 0]), ("as_written", [0, 1])):
+        query = session.sql(sql, order=rule)
+        physical = query.plan()
+        assert [node.written_pos for node in physical.nodes
+                if isinstance(node, Filter)] == expected
+        assert physical.settings["order_rule"] == rule
+        scores = [node for node in physical.nodes if isinstance(node, AiScore)]
+        assert [node.spec.expected_inputs for node in scores] == [2.0, 0.4]
+    session.close()
+
+
+def test_score_join_runs_on_its_legal_anchor(catalog):
+    session = _session(catalog)
+    query = session.sql(
+        "SELECT q.id, d.id FROM queries q JOIN documents d ON "
+        "AI.SCORE(PROMPT('Is {1} relevant to {0}?', q.text, d.body)) > 0.5")
+    physical = query.plan()
+    score = next(node for node in physical.nodes if isinstance(node, AiScore))
+    assert score.spec.aliases == ("q", "d")
+    assert physical.estimated_seconds == pytest.approx(score.spec.estimated_seconds)
     session.close()
 
 
@@ -526,6 +557,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     # one table on a canvas model: each document's KV, then one draw; an
     # uncertain first score takes three more draws and their mean
     drawn = SimpleNamespace(name="score", aliases=("b",), draws=4,
+                            share_prefixes=False,
                             prompt_token_parts=((1,), (2, 3)))
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
@@ -618,6 +650,125 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     session.close()
 
 
+def _shared_store(path, bodies):
+    from quail.execution.tokens import TokenStore
+
+    schema = pa.schema({"body": pa.string()})
+    return TokenStore.write(
+        str(path), [pa.record_batch([bodies], schema=schema)],
+        document_column="body",
+        tokenizer=lambda text: [int(token) for token in text.split()],
+        token_type=pa.int32())
+
+
+def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
+    from quail.physical import PhysicalGraph, PortRef, Scan, ScoreSpec
+    from quail.physical.base import input_ports
+    from quail.planner.api import apply_plan_rules
+    from quail.planner.physical_optimizer import PlanningContext
+    from quail.planner.physical_rules import PrefixSharing
+    from quail.planner.plan import PhysicalPlan
+    from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+    def graph(aliases, draws=1):
+        spec = ScoreSpec(
+            name="score", aliases=aliases, query_template="", arguments=(),
+            expected_inputs=20, estimated_seconds=10.0,
+            prompt_token_parts=((1,),) * (len(aliases) + 1), draws=draws)
+        nodes = tuple(Scan(node_id=f"input:{alias}", alias=alias,
+                           input_id=alias) for alias in aliases)
+        score = AiScore(
+            node_id="score", backend_name="quail", model="qwen3-4b-fp8",
+            inputs=input_ports(tuple(PortRef(f"input:{alias}", f"ids:{alias}")
+                                     for alias in aliases)),
+            spec=spec)
+        return PhysicalGraph(nodes + (score,), PortRef("score", "scores"))
+
+    def scored(rewritten):
+        return next(node for node in rewritten.nodes
+                    if isinstance(node, AiScore)).spec
+
+    # 20 documents of 401 tokens whose first 400 are the same: each
+    # after the first borrows 400 tokens, 25 pages of 16
+    shared = " ".join(str(i) for i in range(400))
+    store = _shared_store(tmp_path / "shared.arrow",
+                          [f"{shared} {9000 + r}" for r in range(20)])
+    plain = _shared_store(tmp_path / "plain.arrow",
+                          [f"{9000 + r} 1 2" for r in range(20)])
+    context = PlanningContext(model=QWEN3_4B_FP8, device=H100_SXM, gpu_count=2,
+                              document_tokens={"d": store.lengths,
+                                               "e": plain.lengths},
+                              backend="quail")
+    spec = scored(PrefixSharing().rewrite(graph(("d",)), context))
+    assert spec.share_prefixes
+    # 19 x 400 of 20 x (401 + 2) tokens are borrowed
+    assert spec.estimated_seconds == pytest.approx(10.0 * (1 - 19 * 400 / 8060))
+    # the plan's total moves by the score's change
+    unshared = graph(("d",))
+    plan = apply_plan_rules(
+        PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", workers=2,
+                     estimated_seconds=12.0, nodes=unshared.nodes,
+                     root=unshared.root),
+        (PrefixSharing(),), context)
+    assert plan.estimated_seconds == pytest.approx(
+        12.0 - 10.0 + spec.estimated_seconds)
+    # a 256-token canvas and four draws add 2 + 256 + 3 x 257 = 1,029
+    # tokens per document that sharing does not save
+    canvas = replace(context, model=replace(QWEN3_4B_FP8, canvas_tokens=256))
+    spec = scored(PrefixSharing().rewrite(graph(("d",), draws=4), canvas))
+    assert spec.estimated_seconds == pytest.approx(
+        10.0 * (1 - 19 * 400 / (8020 + 20 * 1029)))
+    assert ScoreSpec.from_mapping(spec.to_dict()) == spec
+    # documents with nothing in common share nothing
+    assert PrefixSharing().rewrite(graph(("e",)), context) is None
+    # a pair score borrows each anchor's KV already
+    assert PrefixSharing().rewrite(graph(("d", "e")), context) is None
+
+
+def test_shared_score_borrows_prefixes_and_reads_the_cue(monkeypatch):
+    from quail.backends.quail.executor import score as module
+    from quail.execution.tokens import TokenView
+
+    documents = {"d": [TokenView(pa.array(tokens, type=pa.int32()))
+                       for tokens in ([10, 11, 12, 13], [10, 11, 12, 14], [20])]}
+    spec = SimpleNamespace(name="score", aliases=("d",), draws=1,
+                           share_prefixes=True,
+                           prompt_token_parts=((1,), (2, 3)))
+    state = QueryExecutionState(
+        loaded_model=LoadedModelState(
+            model=object(), arena=SimpleNamespace(page_tokens=2),
+            pipeline=SimpleNamespace(canvas_ids=())),
+        torch=object(), async_answers=object(), answer_rows=object(),
+        chunk_tokens=1234)
+    monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
+    seen = []
+
+    def run_stages(torch, arena, pipeline, stages, prefixes, budget, **kwargs):
+        (stage,) = stages
+        assert [list(prefix) for prefix in prefixes] == [
+            [1, 10, 11, 12, 14], [1, 10, 11, 12, 13], [1, 20]]
+        assert (stage.frame, stage.suffixes, stage.single) == ([2], [[3]], True)
+        # the second document borrows the first's two whole pages
+        tree = kwargs["prefix_tree"]
+        assert tree.shared_tokens == 4
+        for anchor, value in enumerate([0.25, 0.5, 0.75]):
+            stage.decide(anchor, [value])
+        kwargs["on_chunk"]([(0, 0, True), (2, 0, True)])
+        kwargs["stats"]["borrowed_tokens"] = 4
+        return [], [], 7
+
+    monkeypatch.setattr(module, "run_stages", run_stages)
+    result = module.QuailScorer(state).score(
+        spec, [(1,), (0,), (2,)], documents,
+        on_answers=lambda positions, values: seen.append(
+            (positions.tolist(), values)))
+    np.testing.assert_allclose(result.scores, [0.25, 0.5, 0.75])
+    # each document's head, tokens, frame, and cue: 7 + 7 + 4
+    assert (result.fresh_tokens, result.cached_tokens) == (7, 18 - 7)
+    assert result.borrowed_tokens == 4
+    assert seen == [([0, 2], [0.25, 0.75]), ([1], [0.5])]
+
+
 def test_score_query_shape_errors_are_compile_errors(catalog):
     for sql, message in SHAPE_ERRORS:
         try:
@@ -659,15 +810,13 @@ def test_score_refusals_name_oversized_documents_and_missing_scores(
 
 def test_reranker_prompts_render_stored_documents_and_the_ai_if_frame(catalog):
     from quail.logical.prompts import (
+        QWEN3_RERANKER_SYSTEM_TEXT,
         bind_join_prompt,
         bind_prompt,
         render_filter_prompt_ids,
         render_join_prompt_ids,
-        true_false_token_ids,
-    )
-    from quail.reranker import (
-        QWEN3_RERANKER_SYSTEM_TEXT,
         render_qwen3_reranker_input,
+        true_false_token_ids,
     )
     from quail.specs import MODELS
 

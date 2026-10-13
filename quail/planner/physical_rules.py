@@ -5,10 +5,11 @@
   KV for a join anchored on its table, and a join keeps its anchor's
   KV for a later group on the same anchor.
 - label_scoring: each classification gets the label scoring rule
-  (letters, trie_tree, or trie_decode) whose simulated time is lowest.
+  (letters, trie_tree, or trie_decode) whose estimated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
-  computing it again.
+  computing it again, in filters, joins, classifications, and scores
+  of one table.
 - tree_attention: each join is annotated with the attention path the
   cost model prefers for its partners' reads of the anchor's KV.
 """
@@ -19,19 +20,56 @@ from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
+from quail.cost.score import score_fixed_tokens
 from quail.execution.pipelines import build_pipelines
 from quail.logical import classified_above_joins
+from quail.logical.prompts import classify_prompt_tokens
 from quail.physical import (
+    Aggregate,
     AiClassify,
     AiFilter,
     AiJoin,
+    AiScore,
     Filter,
     Foreign,
+    Limit,
     PhysicalGraph,
+    Sort,
 )
 from quail.planner import retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
 from quail.planner.statistics import cached_statistics, live_after_filters
+
+
+class LimitPushdown:
+    """Let a LIMIT end the filter run once enough documents survived.
+
+    The rule puts the limit in the ``filter_limit`` setting, which the
+    executor reads to stop admitting documents once that many survived
+    the chain's last stage. The pushdown keeps the first survivors to
+    finish, so it is sound only when those are the rows the query
+    returns: the graph ends in a Limit and has no Sort or Aggregate (an
+    ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
+    AiJoin (survivors are settled per join round), and no AiScore (a
+    score comparison after the chain can drop survivors). Otherwise the
+    rule removes the setting.
+    """
+
+    name = "limit_pushdown"
+    cost_based = False
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None:
+            return None
+        limit = next((node for node in graph.nodes
+                      if isinstance(node, Limit)), None)
+        blocked = any(isinstance(node, (Sort, Aggregate, AiJoin, AiScore))
+                      for node in graph.nodes)
+        if limit is None or blocked:
+            context.settings.pop("filter_limit", None)
+        else:
+            context.settings["filter_limit"] = limit.count
+        return None
 
 
 class KvRetention:
@@ -57,6 +95,7 @@ class KvRetention:
     """
 
     name = "kv_retention"
+    cost_based = False
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None or context.logical_plan is None \
@@ -66,7 +105,8 @@ class KvRetention:
         statistics = cached_statistics(
             logical, context.memo, model=context.model, device=context.device,
             doc_tokens=context.document_tokens,
-            pair_fractions=context.pair_fractions)
+            pair_fractions=context.pair_fractions,
+            scan_fractions=context.scan_fractions, context=context)
         joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
         groups = [[(statistics.specs[stage.written_pos], stage.anchor)
                    for stage in node.stages] for node in joins]
@@ -108,13 +148,13 @@ class KvRetention:
 
 
 class LabelScoring:
-    """Pick each classification's label scoring rule by simulated time.
+    """Pick each classification's label scoring rule by estimated time.
 
     Fires for every AiClassify whose spec has no scoring rule yet and
     leaves chosen ones alone, so a later pass keeps the first choice.
     The candidates are letters, when the prompt has a one-token letter
     per label; trie_tree, under the tree attention path; and
-    trie_decode, over documents without resident KV (_Table.choose).
+    trie_decode, when no label starts another.
     The documents count as resident, with their KV in the arena, when
     the classification continues its table's filter chain on one GPU
     before any join, or follows a classification with the same prompt
@@ -127,6 +167,7 @@ class LabelScoring:
     """
 
     name = "label_scoring"
+    cost_based = True
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -140,17 +181,21 @@ class LabelScoring:
             raise ValueError(
                 "label_scoring needs the logical plan on the planning context "
                 "to score a classification without a scoring rule")
-        from quail.planner.classify import classify_table
+        from quail.planner.label_scoring import classify_scoring
 
         logical = context.logical_plan
         calls = {node.name: node.call for node in logical.operators().classifies}
         after_joins = classified_above_joins(logical.root)
         chosen = {}
         for node in pending:
-            table = classify_table(context, node.spec.anchor, node.backend_name)
-            resident = _resident(node, graph, context, calls, after_joins, table)
+            table = classify_scoring(context, node.spec.anchor)
+            resident = _resident(node, graph, context, calls, after_joins)
             chosen[node.node_id] = replace(node, spec=table.choose_scoring(
                 node.spec, calls[node.spec.name], resident))
+            if "estimated_fresh_tokens" in context.settings:
+                work = table.estimate_spec(chosen[node.node_id].spec, resident).work
+                context.settings["estimated_fresh_tokens"] += work.tokens
+                context.settings["estimated_attention_pairs"] += work.pairs
         context.settings["search_seconds"] = (
             context.settings.get("search_seconds", 0.0)
             + sum(node.spec.estimated_seconds for node in chosen.values())
@@ -160,7 +205,7 @@ class LabelScoring:
             graph.root)
 
 
-def _resident(node, graph, context, calls, after_joins, table) -> bool:
+def _resident(node, graph, context, calls, after_joins) -> bool:
     """Return whether a classification's documents have their KV in the arena.
 
     True on one GPU when the classification continues its table's
@@ -174,8 +219,11 @@ def _resident(node, graph, context, calls, after_joins, table) -> bool:
     while isinstance(source, (Filter, Foreign)):
         source = graph.node(source.inputs[0].source.node_id)
     if isinstance(source, AiClassify) and source.spec is not None:
-        return (table.head(calls[source.spec.name])
-                == table.head(calls[node.spec.name]))
+        previous = classify_prompt_tokens(
+            calls[source.spec.name].prompt, (), context.tokenizer)[0]
+        current = classify_prompt_tokens(
+            calls[node.spec.name].prompt, (), context.tokenizer)[0]
+        return previous == current
     return isinstance(source, AiFilter) and node.spec.anchor not in after_joins
 
 
@@ -237,10 +285,13 @@ class PrefixSharing:
     on. The filter then writes pages even when it has one stage, since
     borrowed pages must exist. A join always writes its anchors' KV,
     so it fires for any join whose anchors share a whole page; a
-    classification writes its documents' KV the same way.
+    classification writes its documents' KV the same way. A score of
+    one table is priced like a filter that writes no pages, since
+    without sharing its documents follow one shared prompt head.
     """
 
     name = "prefix_sharing"
+    cost_based = True
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -283,6 +334,20 @@ class PrefixSharing:
                     node = replace(node, spec=_shared_classify_spec(
                         node, context, store, resident=resident))
                     changed = True
+            elif (type(node) is AiScore and node.spec is not None
+                  and len(node.spec.aliases) == 1
+                  and not node.spec.share_prefixes):
+                lengths = context.document_tokens.get(node.spec.aliases[0])
+                store = _token_store(lengths)
+                shared = (0 if store is None
+                          else page_aligned_shared_tokens(store))
+                if store is not None and sharing_pays(
+                        context.model, context.device, shared_tokens=shared,
+                        total_tokens=sum(lengths), writes_pages=False):
+                    node = replace(node, spec=_shared_score_spec(
+                        node.spec, shared, lengths,
+                        context.model.canvas_tokens))
+                    changed = True
             nodes.append(node)
         if not changed:
             return None
@@ -291,11 +356,26 @@ class PrefixSharing:
 
 def _shared_classify_spec(node, context, store, *, resident=False):
     """Enable prefix sharing and update the classification cost estimate."""
-    from quail.planner.classify import classify_table
+    from quail.planner.label_scoring import classify_scoring
 
-    table = classify_table(context, node.spec.aliases[0], node.backend_name,
+    table = classify_scoring(context, node.spec.aliases[0],
                            shared=document_shared_tokens(store))
     return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
+
+
+def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):
+    """Enable prefix sharing and scale the score's estimate by its fresh tokens.
+
+    Assumes time is proportional to the tokens the score computes, and
+    that the scored documents borrow the same share of their tokens as
+    the whole table.
+    """
+    fixed = score_fixed_tokens(tuple(map(len, spec.prompt_token_parts)),
+                               canvas_tokens, spec.draws)
+    total = sum(lengths) + len(lengths) * fixed
+    fresh = max(0.0, 1.0 - shared_tokens / total) if total else 1.0
+    return replace(spec, share_prefixes=True,
+                   estimated_seconds=spec.estimated_seconds * fresh)
 
 
 def _mean(values) -> float:
@@ -323,6 +403,7 @@ class TreeAttention:
     """
 
     name = "tree_attention"
+    cost_based = True
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -373,10 +454,11 @@ class TreeAttention:
 def built_in_physical_rules() -> tuple:
     """Return the physical rules registered with the built in registry.
 
-    In order: kv_retention, label_scoring, prefix_sharing, and
-    tree_attention. prefix_sharing follows kv_retention because it
-    weighs the page writes a chain already makes, and tree_attention
-    follows prefix_sharing because a filter's attention path depends
-    on the prefixes it shares.
+    In order: limit_pushdown, kv_retention, label_scoring,
+    prefix_sharing, and tree_attention. prefix_sharing follows
+    kv_retention because it weighs the page writes a chain already
+    makes, and tree_attention follows prefix_sharing because a filter's
+    attention path depends on the prefixes it shares.
     """
-    return (KvRetention(), LabelScoring(), PrefixSharing(), TreeAttention())
+    return (LimitPushdown(), KvRetention(), LabelScoring(), PrefixSharing(),
+            TreeAttention())

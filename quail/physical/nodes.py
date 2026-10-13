@@ -299,7 +299,13 @@ class RequestJoinSpec:
 
 @dataclass(frozen=True)
 class Scan(PhysicalNode):
-    """Read one tokenized document input supplied by the coordinator."""
+    """Read one tokenized document input supplied by the coordinator.
+
+    ``predicates`` are the regular predicates, as (column, comparison, value)
+    triples; the runtime keeps the documents that pass every one and
+    reads nothing else for the rest. ``expected_docs`` is the planner's
+    estimate of how many pass, from a sample; None without tests.
+    """
 
     alias: str = ""
     input_id: str = ""
@@ -307,6 +313,8 @@ class Scan(PhysicalNode):
     total_tokens: int = 0
     shard_ranges: tuple[tuple[int, int], ...] = ()
     shard_token_loads: tuple[int, ...] = ()
+    predicates: tuple[tuple[str, str, Any], ...] = ()
+    expected_docs: float | None = None
 
     type_name: ClassVar[str] = "quail.scan"
     runtime_key: ClassVar[str] = type_name
@@ -345,6 +353,11 @@ class Scan(PhysicalNode):
             "total_tokens": self.total_tokens,
             "shard_token_loads": list(self.shard_token_loads),
             "shard_ranges": [list(bounds) for bounds in self.shard_ranges],
+            "predicates": [
+                [column, comparison,
+                 list(value) if isinstance(value, tuple) else value]
+                for column, comparison, value in self.predicates],
+            "expected_docs": self.expected_docs,
         }
 
     @property
@@ -361,6 +374,10 @@ class Scan(PhysicalNode):
             "shard_token_loads": list(self.shard_token_loads),
             "shard_docs": [stop - start
                            for start, stop in self.shard_ranges],
+            "predicates": [
+                f"{column} {comparison}" + ("" if value is None else f" {value!r}")
+                for column, comparison, value in self.predicates],
+            "expected_docs": self.expected_docs,
         }
 
     @classmethod
@@ -377,6 +394,13 @@ class Scan(PhysicalNode):
                 for start, stop in attributes["shard_ranges"]
             ),
             shard_token_loads=tuple(attributes["shard_token_loads"]),
+            predicates=tuple(
+                (str(column), str(comparison),
+                 tuple(value) if isinstance(value, list) else value)
+                for column, comparison, value
+                in attributes.get("predicates", ())),
+            expected_docs=(None if attributes.get("expected_docs") is None
+                           else float(attributes["expected_docs"])),
         )
 
 
@@ -496,7 +520,9 @@ class ScoreSpec:
 
     draws is the most noise draws a diffusion model averages per answer;
     an answer whose first draw is certain enough uses one. An
-    autoregressive model always uses one.
+    autoregressive model always uses one. share_prefixes lets each
+    document borrow the KV pages of a document sharing its prefix; it
+    applies to scores of one table.
     """
 
     name: str
@@ -508,6 +534,7 @@ class ScoreSpec:
     pair_fraction: float = 1.0
     prompt_token_parts: tuple[tuple[int, ...], ...] = ()
     draws: int = 1
+    share_prefixes: bool = False
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ScoreSpec":
@@ -526,6 +553,7 @@ class ScoreSpec:
                 tuple(part) for part in value.get("prompt_token_parts", ())
             ),
             draws=int(value.get("draws", 1)),
+            share_prefixes=bool(value.get("share_prefixes", False)),
         )
 
     def to_dict(self) -> dict:
@@ -539,6 +567,7 @@ class ScoreSpec:
             "pair_fraction": self.pair_fraction,
             "prompt_token_parts": [list(part) for part in self.prompt_token_parts],
             "draws": self.draws,
+            "share_prefixes": self.share_prefixes,
         }
 
 
@@ -588,6 +617,7 @@ class AiScore(PhysicalNode):
             "estimated_seconds": (
                 0 if spec is None else spec.estimated_seconds
             ),
+            "share_prefixes": False if spec is None else spec.share_prefixes,
         }
 
     @classmethod
@@ -610,10 +640,13 @@ class ClassifySpec(ScoreSpec):
         labels: Labels in query order.
         label_token_ids: Token ids for each label: its letter for the
             letters rule, its text for the trie rules.
+        label_word_starts: Per label, which of its tokens begin a new
+            word, from ``quail.labels.word_starts``; empty marks none.
+            The trie_tree rule reads a label through the end of the
+            word that tells it apart.
         scoring: The label scoring rule: letters, trie_tree, or trie_decode.
             The planner leaves it empty until the label_scoring rule
             picks one.
-        share_prefixes: Whether documents may reuse shared prefix KV pages.
         probabilities: Whether to add a name + "_probabilities" map column.
         join_layout: Anchor note and partner label token sequences for pair
             classification, or None for individual documents. The question
@@ -625,8 +658,8 @@ class ClassifySpec(ScoreSpec):
 
     labels: tuple[str, ...] = ()
     label_token_ids: tuple[tuple[int, ...], ...] = ()
+    label_word_starts: tuple[tuple[bool, ...], ...] = ()
     scoring: str = "letters"
-    share_prefixes: bool = False
     probabilities: bool = False
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     frame_tokens: int = 0
@@ -651,13 +684,15 @@ class ClassifySpec(ScoreSpec):
             **{name: getattr(base, name) for name in (
                 "name", "aliases", "query_template", "arguments",
                 "expected_inputs", "estimated_seconds", "pair_fraction",
-                "prompt_token_parts", "draws")},
+                "prompt_token_parts", "draws", "share_prefixes")},
             labels=tuple(str(label) for label in value["labels"]),
             label_token_ids=tuple(
                 tuple(int(token) for token in ids)
                 for ids in value["label_token_ids"]),
+            label_word_starts=tuple(
+                tuple(bool(flag) for flag in flags)
+                for flags in value.get("label_word_starts", ())),
             scoring=str(value.get("scoring", "letters")),
-            share_prefixes=bool(value.get("share_prefixes", False)),
             probabilities=bool(value.get("probabilities", False)),
             join_layout=(None if value.get("join_layout") is None else tuple(
                 tuple(int(token) for token in part)
@@ -670,8 +705,8 @@ class ClassifySpec(ScoreSpec):
             **super().to_dict(),
             "labels": list(self.labels),
             "label_token_ids": [list(ids) for ids in self.label_token_ids],
+            "label_word_starts": [list(flags) for flags in self.label_word_starts],
             "scoring": self.scoring,
-            "share_prefixes": self.share_prefixes,
             "probabilities": self.probabilities,
             "join_layout": (None if self.join_layout is None
                             else [list(part) for part in self.join_layout]),
@@ -706,8 +741,6 @@ class AiClassify(AiScore):
             **super().explain_fields(),
             "labels": [] if self.spec is None else list(self.spec.labels),
             "scoring": None if self.spec is None else self.spec.scoring,
-            "share_prefixes": (False if self.spec is None
-                               else self.spec.share_prefixes),
             "draws": 1 if self.spec is None else self.spec.draws,
             "probabilities": (False if self.spec is None
                               else self.spec.probabilities),
@@ -860,6 +893,9 @@ class AiFilter(PhysicalNode):
     # "unified" or "tree": the attention path the tree_attention rule
     # chose; empty leaves the executor's default
     attention: str = ""
+    # value columns of the alias; the executor reads one document of
+    # each key value at a time and skips the rest once one survives
+    stop_key: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.ai_filter"
     runtime_key: ClassVar[str] = type_name
@@ -892,6 +928,7 @@ class AiFilter(PhysicalNode):
             ],
             "share_prefixes": self.share_prefixes,
             "attention": self.attention,
+            "stop_key": list(self.stop_key),
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -917,6 +954,8 @@ class AiFilter(PhysicalNode):
             ),
             share_prefixes=bool(attributes.get("share_prefixes", False)),
             attention=str(attributes.get("attention", "")),
+            stop_key=tuple(str(column)
+                           for column in attributes.get("stop_key", ())),
         )
 
 
@@ -1214,6 +1253,104 @@ class Project(PhysicalNode):
             node_id=node_id,
             inputs=inputs,
             columns=tuple(attributes["columns"]),
+        )
+
+
+@dataclass(frozen=True)
+class Aggregate(PhysicalNode):
+    """Group the result rows and compute aggregates on the coordinator.
+
+    ``keys`` name input columns. ``aggregates`` are (name, function,
+    argument) triples, the argument an input column or None for
+    ``count(*)``. ``having`` are (name, comparison, value) tests over
+    the aggregates. ``columns`` are the output columns, keys and
+    aggregate names in result order.
+    """
+
+    keys: tuple[str, ...] = ()
+    aggregates: tuple[tuple[str, str, str | None], ...] = ()
+    having: tuple[tuple[str, str, float], ...] = ()
+    columns: tuple[str, ...] = ()
+
+    type_name: ClassVar[str] = "quail.aggregate"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
+
+    def attributes(self) -> dict:
+        return {
+            "keys": list(self.keys),
+            "aggregates": [list(aggregate) for aggregate in self.aggregates],
+            "having": [list(test) for test in self.having],
+            "columns": list(self.columns),
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            keys=tuple(attributes["keys"]),
+            aggregates=tuple(
+                (str(name), str(function),
+                 None if argument is None else str(argument))
+                for name, function, argument in attributes["aggregates"]),
+            having=tuple((str(name), str(comparison), value)
+                         for name, comparison, value
+                         in attributes.get("having", ())),
+            columns=tuple(attributes["columns"]),
+        )
+
+
+@dataclass(frozen=True)
+class Sort(PhysicalNode):
+    """Order, deduplicate, and bound the result rows on the coordinator.
+
+    ``keys`` are (column, descending, nulls_first) triples over the
+    input columns. ``columns`` are the output columns; an input column
+    not among them is read by a key only. Distinct runs before the
+    sort, and ``offset`` and ``fetch`` after it.
+    """
+
+    keys: tuple[tuple[str, bool, bool], ...] = ()
+    columns: tuple[str, ...] = ()
+    distinct: bool = False
+    offset: int = 0
+    fetch: int | None = None
+
+    type_name: ClassVar[str] = "quail.sort"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
+
+    def attributes(self) -> dict:
+        return {
+            "keys": [list(key) for key in self.keys],
+            "columns": list(self.columns),
+            "distinct": self.distinct,
+            "offset": self.offset,
+            "fetch": self.fetch,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            keys=tuple((str(column), bool(descending), bool(nulls_first))
+                       for column, descending, nulls_first
+                       in attributes["keys"]),
+            columns=tuple(attributes["columns"]),
+            distinct=bool(attributes.get("distinct", False)),
+            offset=int(attributes.get("offset", 0)),
+            fetch=(None if attributes.get("fetch") is None
+                   else int(attributes["fetch"])),
         )
 
 

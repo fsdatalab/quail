@@ -285,15 +285,14 @@ def test_vllm_loads_a_decision2_backbone_in_place(tmp_path):
 
 
 def test_a_decision_classification_is_reestimated(session):
-    from quail.planner.classify import _Table
+    from quail.planner.label_scoring import ClassifyScoring
 
     plan = session.sql(
         "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['x', 'y']) AS c "
         "FROM documents d").plan()
     (node,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    table = _Table(alias="d", mean=100, longest=100, budget=65_536,
-                   chunk=65_536, backend_name="quail",
-                   model=DECISION_2_KAI_0_6B_BF16, device=H100_SXM,
+    table = ClassifyScoring(alias="d", mean=100, longest=100, budget=65_536,
+                   chunk=65_536, model=DECISION_2_KAI_0_6B_BF16, device=H100_SXM,
                    tokenizer=_tokens, capacity=1_000_000,
                    lengths=(100,) * 50, shared=(0,) + (60,) * 49)
     spec = table.reestimate(node.spec, resident=True)
@@ -447,14 +446,14 @@ def test_vllm_decision_client_reruns_a_request_without_its_rows():
 
 
 def test_classification_tree_scoring_follows_the_executor_gate():
-    from quail.planner.classify import classify_table
+    from quail.planner.statistics import classify_statistics
     from quail.specs import MODELS
 
     def table(model):
         context = SimpleNamespace(
             document_tokens={"d": [100, 200]}, model=model, device=H100_SXM,
             canvas_draws=1, tokenizer=_tokens)
-        return classify_table(context, "d", "quail")
+        return classify_statistics(context, "d")
 
     assert not table(DECISION_2_KAI_0_6B_BF16).tree
     assert table(MODELS["qwen3-4b-fp8"]).tree

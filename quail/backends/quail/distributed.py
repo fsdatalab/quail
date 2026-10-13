@@ -8,6 +8,7 @@ from quail.backends.quail import coordinator
 from quail.backends.quail.graph import (
     executed_join_plan,
     model_answers,
+    stop_groups,
     throughput,
 )
 from quail.execution.pairs import columns_key
@@ -66,6 +67,14 @@ class DistributedQuailExecution:
                     gpu_count,
                 )
                 self.shards[alias] = shards
+        # a per-key stop needs a key's documents on one worker
+        for node in graph.nodes:
+            if isinstance(node, AiFilter) and node.stop_key and gpu_count > 1:
+                documents = self.docs[node.alias]
+                self.shards[node.alias] = coordinator.keyed_shards(
+                    stop_groups(node, payload.get("columns", {}).get(
+                        node.alias), range(len(documents))),
+                    [len(document) for document in documents], gpu_count)
         self.joins = tuple(stage for node in graph.nodes
                            if isinstance(node, AiJoin) for stage in node.stages)
         self.pre = payload.get("pre_ids") or []

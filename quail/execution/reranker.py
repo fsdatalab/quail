@@ -430,8 +430,8 @@ class RerankerModelExecution:
                     "output": spec.name,
                     "aliases": list(spec.aliases),
                     "input_rows": count,
+                    "borrowed_prefix_tokens": batch.borrowed_tokens,
                     **({"suffix_tokens": batch.suffix_tokens,
-                        "borrowed_prefix_tokens": batch.borrowed_tokens,
                         "pack_s": batch.pack_s}
                        if isinstance(spec, ClassifySpec) else {}),
                 },

@@ -27,9 +27,10 @@ import quail
 import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.results import write_json
-from quail.bench.substrait import QueryPlan, read_plan
 from quail.logical.prompts import bind_classify_prompt
+from quail.physical import AiClassify, AiScore
 from quail.planner.plan import Refusal
+from quail.progress import say
 from quail.specs import DEVICES, MODELS
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
@@ -42,6 +43,7 @@ from quail_b.queries import (
 )
 from quail_b.queries import queries as query_specs
 from quail_b.scoring import RunOutput, reference_answer
+from quail_b.substrait import Filter, InList, PlanInfo, output_name
 
 # the fixed planner inputs, by prompt, and by prompt and accepted
 # labels for an IN-list filter; a predicate without an estimate here gets
@@ -62,13 +64,13 @@ def register_tables(session, data_dir):
             str(path), id_col="id"))
 
 
-def _build(session, plan: QueryPlan):
-    return substrait.build_query(session, plan, SELECTIVITY, order="by_cost")
+def _build(session, info: PlanInfo):
+    return substrait.build_query(session, info, SELECTIVITY, order="by_cost")
 
 
 def build_query(session, spec: QuerySpec):
     """Build the Quail query of one benchmark query on a session."""
-    return _build(session, read_plan(spec.plan))
+    return _build(session, spec.info)
 
 
 def queries(session) -> dict:
@@ -79,10 +81,10 @@ def queries(session) -> dict:
     """
     listed = {}
     for spec in query_specs(include_privacy=True).values():
-        plan = read_plan(spec.plan)
-        if all(relation.table in session.catalog for relation in plan.relations):
+        info = spec.info
+        if all(relation.table in session.catalog for relation in info.relations):
             listed[spec.id] = (
-                spec.description, lambda plan=plan: _build(session, plan))
+                spec.description, lambda info=info: _build(session, info))
     return listed
 
 
@@ -134,18 +136,18 @@ def answer_oracle(ground_truth, tables):
     return answer
 
 
-def run_output(result, plan: QueryPlan, tables) -> RunOutput:
+def run_output(result, info: PlanInfo, tables) -> RunOutput:
     """Translate a Quail result's row indices into benchmark ids by operator."""
     ids = {relation.alias: pa.array(_ids(tables[relation.table]), pa.string())
-           for relation in plan.relations}
+           for relation in info.relations}
 
     def id_column(alias, indices):
         return pc.take(ids[alias], indices)
 
     filter_answers = {}
     for (alias, position), table in result.answer_tables["filters"].items():
-        operator = _alias_filters(plan, alias)[position]
-        if isinstance(operator, substrait.InList):
+        operator = _alias_filters(info, alias)[position]
+        if isinstance(operator, InList):
             # QUAIL-B scores an IN-list filter from the classification's labels
             continue
         filter_answers[operator.id] = pa.table({
@@ -153,7 +155,7 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
             "answer": table.column("answer"),
         })
     classify_answers = {}
-    for operator in plan.classifies:
+    for operator in info.classifies:
         table = result.answer_tables["classifies"][operator.output]
         classify_answers[operator.id] = pa.table({
             **{alias: id_column(alias, table.column(alias))
@@ -162,36 +164,37 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
         })
     join_answers = {}
     for position, table in result.answer_tables["joins"].items():
-        join = plan.joins[position]
+        join = info.joins[position]
         join_answers[join.id] = pa.table({
             **{alias: id_column(alias, table.column(alias))
-               for alias in join.aliases},
+               for alias in join.relations},
             "answer": table.column("answer"),
         })
-    outputs = {(operator.alias, operator.output)
-               for operator in plan.classifies}
-    names = []
-    for name in plan.select:
-        alias, column = name.split(".", 1)
-        if column != "id" and (alias, column) not in outputs:
-            raise NotImplementedError(
-                "QUAIL-B output accuracy needs id and label columns in the "
-                "select list")
-        names.append(alias if column == "id" else column)
+    score_answers = {}
+    for operator in info.scores:
+        table = result.answer_tables["scores"][operator.output]
+        score_answers[operator.id] = pa.table({
+            operator.relation: id_column(
+                operator.relation, table.column(operator.relation)),
+            "score": table.column(operator.output).cast(pa.float64()),
+        })
+    # quail-b checks that a plan selects ids, labels, scores, and measures
+    names = [output_name(name) for name in info.select]
     started = time.perf_counter()
     rows = result.collect()
     collection_s = time.perf_counter() - started
     return RunOutput(
         filter_answers, join_answers, rows.rename_columns(names),
         result.report["wall_s"], dict(result.report, collection_s=collection_s),
-        classify_answers=classify_answers or None)
+        classify_answers=classify_answers or None,
+        score_answers=score_answers or None)
 
 
-def _alias_filters(plan: QueryPlan, alias: str) -> list:
+def _alias_filters(info: PlanInfo, alias: str) -> list:
     """Return an alias's AI filters and IN-list filters, in written order."""
-    return [operator for operator in plan.operators
-            if isinstance(operator, (substrait.Filter, substrait.InList))
-            and operator.alias == alias]
+    return [operator for operator in info.operators
+            if isinstance(operator, (Filter, InList))
+            and operator.relation == alias]
 
 
 def join_anchors(result) -> dict:
@@ -202,17 +205,19 @@ def join_anchors(result) -> dict:
     }
 
 
-def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
+def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
     """Return the prompt token ids around each document, for QUAIL-B.
 
     QUAIL-B sizes the prefix trie of the run's requests from these
     pieces and the saved answer tables, after the run; nothing is
     tracked while the query runs. A classification's pieces come from
     its prompt, which names every label, whatever rule reads the label.
+    A score laid out with its own head cannot be described with one
+    preamble, so the query reports no pieces and no token minimum.
 
     Args:
         query: The built query, with bound prompts.
-        plan: The query's plan, for the operator ids.
+        info: The query's plan reading, for the operator ids.
         anchors: Written join position -> the anchor alias.
     """
     operators = query.logical.operators()
@@ -221,11 +226,11 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
                      for prompt in operators.prompts
                      if prompt.preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
-              "filters": [], "joins": [], "classifies": []}
+              "filters": [], "joins": [], "classifies": [], "scores": []}
     for alias, predicates in filters.items():
-        written = _alias_filters(plan, alias)
+        written = _alias_filters(info, alias)
         for position, predicate in enumerate(predicates):
-            if isinstance(written[position], substrait.InList):
+            if isinstance(written[position], InList):
                 continue
             pieces["filters"].append({
                 "id": written[position].id,
@@ -233,12 +238,12 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
     for position, join in enumerate(joins):
         anchor = anchors[position]
         pieces["joins"].append({
-            "id": plan.join_id(position), "anchor": anchor,
+            "id": info.joins[position].id, "anchor": anchor,
             **_pair_pieces(join.prompt, anchor)})
-    if plan.classifies:
+    if info.classifies:
         labels = operators.labels
         calls = {labels.names[call]: call for call, _ in labels.calls}
-        for operator in plan.classifies:
+        for operator in info.classifies:
             call = calls[operator.output]
             if operator.partner is None:
                 piece = {"tail": list(call.prompt.tail_token_ids)}
@@ -247,6 +252,21 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
                 anchor = call.aliases()[0]
                 piece = {"anchor": anchor, **_pair_pieces(call.prompt, anchor)}
             pieces["classifies"].append({"id": operator.id, **piece})
+    # the planner lays a score out as the AI.IF prompt of its document,
+    # so its head is the preamble and its tail follows the document
+    for operator in info.scores:
+        node = next(node for node in query.plan().nodes
+                    if isinstance(node, AiScore)
+                    and not isinstance(node, AiClassify)
+                    and node.spec.name == operator.output)
+        head, tail = node.spec.prompt_token_parts
+        if not pieces["preamble"]:
+            pieces["preamble"] = list(head)
+        elif list(head) != pieces["preamble"]:
+            say(f"score {operator.id} has its own prompt head; the query "
+                f"reports no prompt pieces")
+            return None
+        pieces["scores"].append({"id": operator.id, "tail": list(tail)})
     return pieces
 
 
@@ -306,12 +326,12 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
         if name not in session.catalog:
             session.register(
                 name, quail.DocumentProvider.from_table(table, id_col="id"))
-    plan = read_plan(spec.plan)
-    query = _build(session, plan)
+    info = spec.info
+    query = _build(session, info)
     frontend_s = time.perf_counter() - submitted
     result = query.run()
     answer_started = time.perf_counter()
-    output = run_output(result, plan, tables)
+    output = run_output(result, info, tables)
     answer_prepare_s = time.perf_counter() - answer_started
     runtime_s = _submission_to_answer_s(
         session.config.backend,
@@ -334,7 +354,7 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
         output.measurements["input_tokens"] = (
             result.report["fresh_tokens"] + result.report["cached_tokens"]
         )
-    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
+    output.prompt_pieces = prompt_pieces(query, info, join_anchors(result))
     return output
 
 

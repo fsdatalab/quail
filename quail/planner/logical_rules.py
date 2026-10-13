@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from quail.cost import budgets
-from quail.cost.work import Work
 from quail.logical import (
+    Aggregate,
     Alias,
     Apply,
     ColumnRef,
@@ -19,24 +18,17 @@ from quail.logical import (
     LogicalNode,
     LogicalPlan,
     ModelCall,
+    Operators,
     Project,
+    RegularPredicate,
+    Result,
     Scan,
     SemanticClassify,
     SemanticFilter,
     SemanticJoin,
-    has_score,
+    SortKey,
+    is_score,
     model_call,
-)
-from quail.planner import joins as joinsearch
-from quail.planner import pricing
-from quail.planner.filters import default_order_rule, order_filters_indexed
-from quail.planner.statistics import (
-    PlanStatistics,
-    cached_statistics,
-    filter_orders,
-    filter_works,
-    live_after_filters,
-    undecided,
 )
 
 
@@ -48,10 +40,12 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return _column_refs(expression.expression)
     if isinstance(expression, (ModelCall, Compare, Alias)):
         return tuple(model_call(expression).prompt.args)
-    if isinstance(expression, InList):
+    if isinstance(expression, (InList, RegularPredicate)):
         return (expression.column,)
     if isinstance(expression, Equality):
         return (expression.left, expression.right)
+    if isinstance(expression, SortKey):
+        return _column_refs(expression.expression)
     return ()
 
 
@@ -67,21 +61,29 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     The document column is always tokenized. It is kept as a value too
     only when the root projection returns it.
     """
+    plan = LogicalPlan(root)
+    projection = next((node for node in reversed(plan.walk())
+                       if isinstance(node, Project)), None)
+    result = plan.result
     returned = {
         (ref.alias, ref.column)
-        for ref in (root.output_schema() if isinstance(root, Project)
-                    else ())
+        for ref in (projection.output_schema() if projection is not None else ())
+    } | {
+        (ref.alias, ref.column)
+        for key in result.order
+        for ref in _column_refs(key)
     }
     score_inputs = {
         (ref.alias, ref.column)
-        for expression in (root.columns if isinstance(root, Project) else ())
+        for expression in (projection.columns if projection is not None else ())
         if isinstance(expression, Alias)
         for ref in _column_refs(expression)
     }
 
     def descend(node, needed):
         needed = {alias: dict(columns) for alias, columns in needed.items()}
-        for expression in node.expressions():
+        expressions = node.expressions()
+        for expression in expressions:
             for ref in _column_refs(expression):
                 needed.setdefault(ref.alias, {})[ref.column] = None
         if isinstance(node, SemanticClassify):
@@ -89,11 +91,13 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
             for field in node.output_schema()[len(node.input.output_schema()):]:
                 needed.get(field.alias, {}).pop(field.column, None)
         if isinstance(node, Scan):
+            tested = {predicate.column.column for predicate in node.predicates}
             columns = tuple(
                 column for column in needed.get(node.alias, ())
                 if column != node.column
                 or (node.alias, column) in returned
                 or (node.alias, column) in score_inputs
+                or column in tested
             )
             return node if columns == node.columns else replace(
                 node, columns=columns)
@@ -109,6 +113,7 @@ class ProjectionPushdown:
     """Push the projected column set down to each Scan."""
 
     name = "projection_pushdown"
+    cost_based = False
 
     def rewrite(self, root, context):
         rewritten = push_down_projection(root)
@@ -221,6 +226,7 @@ class FilterPushdown:
     """
 
     name = "filter_pushdown"
+    cost_based = False
 
     def rewrite(self, root, context):
         return push_down_filters(root)
@@ -258,6 +264,9 @@ def lift_classifications(root: LogicalNode) -> LogicalNode | None:
     Returns:
         The rewritten root, or None when no classification moved.
     """
+    if isinstance(root, (Result, Aggregate)):
+        rewritten = lift_classifications(root.input)
+        return None if rewritten is None else root.with_children((rewritten,))
     joined = {alias for node in LogicalPlan(root).walk()
               if isinstance(node, SemanticJoin)
               for alias in model_call(node.predicate).aliases()}
@@ -293,195 +302,114 @@ def lift_classifications(root: LogicalNode) -> LogicalNode | None:
     return None if lifted == root else lifted
 
 
-class ClassifyPlacement:
-    """Classify a joined table before its joins or after them, by cost.
+class DistinctElimination:
+    """Clear a DISTINCT that cannot remove rows.
 
-    Before the joins, a classification labels every document its
-    AI.IF filters kept, and a filter on its label thins the join's
-    input. After the joins, it labels only the documents the joins
-    matched. The rule keeps the plan as written unless the plan with
-    every joined table's classifications above the joins
-    (lift_classifications) costs less.
-
-    The cost is the estimated seconds of the candidate's physical plan
-    with the label_scoring rule applied (quail.planner.pricing). The
-    rule does nothing when prices() is false for the context.
+    A filter returns each document at most once and a join pairs each
+    row pair once, so the result rows are unique when the projection
+    returns the id column of every scanned table. The id column is
+    taken as a key: nothing checks it, since that would read the
+    whole column, and a table that repeats an id gets the repeated
+    rows back. The rule reads the id columns from the catalog and
+    leaves a plan alone without one, or when an apply() supplies the
+    rows. A GROUP BY whose output returns every key is unique as well.
     """
 
-    name = "classify_placement"
-
-    def __init__(self, cost=None):
-        """Make the rule with a cost function.
-
-        Args:
-            cost: Callable mapping a LogicalPlan and the context to the
-                plan's estimated seconds, or None when the plan is
-                refused. The default prices build_physical_plan's plan.
-        """
-        self.cost = pricing.estimated_seconds if cost is None else cost
+    name = "distinct_elimination"
+    cost_based = False
 
     def rewrite(self, root, context):
-        if context is not None and not prices(root, context):
+        if not isinstance(root, Result) or not root.distinct:
             return None
-        lifted = lift_classifications(root)
-        if lifted is None:
-            return None
-        before = self.cost(LogicalPlan(root), context)
-        after = self.cost(LogicalPlan(lifted), context)
-        if before is None or after is None or not after < before:
-            return None
-        return lifted
-
-
-def prices(root, context) -> bool:
-    """Return whether the Quail cost model applies to a plan and context.
-
-    It applies when the context has a model, the backend is quail, the
-    model's weights fit one GPU, the default chunk's sliding KV fits,
-    and the plan has no AI.SCORE, which the reranker planner plans.
-    """
-    return (context.model is not None and context.backend == "quail"
-            and budgets.minimum_weight_gpus(context.model, context.device) == 1
-            and budgets.sliding_kv_fits(context.model, context.device)
-            and not has_score(LogicalPlan(root)))
-
-
-def _statistics(root, context) -> PlanStatistics:
-    """Return the plan's statistics, shared through the context's memo."""
-    return cached_statistics(
-        LogicalPlan(root), context.memo, model=context.model,
-        device=context.device, doc_tokens=context.document_tokens,
-        pair_fractions=context.pair_fractions)
-
-
-def _order_rule(context) -> str:
-    return context.order or default_order_rule({}, ())[0]
-
-
-class FilterOrder:
-    """Order each table's AI.IF predicates by expected cost.
-
-    Each SemanticFilter's predicates get the order that minimizes the
-    chain's ideal expected time (order_filters_indexed): the first
-    predicate scans every document's prefix, each later one asks over
-    the KV the chain keeps, and a predicate's selectivity thins what
-    follows. The rule records the order on the node when it differs
-    from the written order. With order="as_written", it clears every
-    recorded order. Both front ends put a table's AI.IF predicates in
-    one SemanticFilter, so the order covers the whole chain.
-    """
-
-    name = "filter_order"
-
-    def rewrite(self, root, context):
-        if not prices(root, context):
-            return None
-        rule = _order_rule(context)
-        statistics = _statistics(root, context)
-        model, device = context.model, context.device
-
-        def visit(node):
-            children = tuple(visit(child) for child in node.children())
-            if children != node.children():
-                node = node.with_children(children)
-            if not isinstance(node, SemanticFilter):
-                return node
-            if rule == "as_written":
-                return node if not node.order else replace(node, order=())
-            (alias,) = model_call(node.predicates[0].expression).aliases()
-            ordered = order_filters_indexed(
-                list(node.predicates), rule,
-                prefix_tokens=(statistics.pre
-                               + statistics.stats[alias].mean_doc_tokens),
-                model=model, device=device, chunk_tokens=statistics.chunk)
-            order = () if ordered == list(range(len(ordered))) else tuple(ordered)
-            return node if order == node.order else replace(node, order=order)
-
-        rewritten = visit(root)
-        return None if rewritten == root else rewritten
-
-
-class JoinOrder:
-    """Choose the joins' stage order and each stage's anchor by cost.
-
-    The left-deep search (quail.planner.joins.search_joins) prices
-    every connected stage order with every anchor choice together,
-    because a stage's cost depends on which table's KV is computed once
-    and which documents' KV earlier stages left resident. It ranks each
-    candidate by the whole query's estimated seconds, including the
-    filter chains in their decided order. A written anchor is kept.
-    With order="as_written", only the anchors are chosen. When no
-    connected left-deep order exists, the written order is priced. The
-    rule records each join's execution position and anchor on its
-    SemanticJoin.
-    """
-
-    name = "join_order"
-
-    def rewrite(self, root, context):
-        if not prices(root, context):
+        if isinstance(root.input, Aggregate):
+            # a group's keys name it once in the aggregate's output
+            return (replace(root, distinct=False)
+                    if set(root.input.keys) <= set(root.input.output)
+                    else None)
+        if not isinstance(root.input, Project) or context.catalog is None:
             return None
         plan = LogicalPlan(root)
-        joins = plan.operators().joins
-        if not joins:
+        if any(isinstance(node, Apply) for node in plan.walk()):
             return None
-        found = self._search(plan, context)
-        decided = {position: anchor for position, anchor in found["seq"]}
-        exec_idx = {position: index
-                    for index, (position, _) in enumerate(found["seq"])}
-        position = 0
+        returned = {(ref.alias, ref.column)
+                    for ref in root.input.output_schema()}
+        for scan in plan.operators().scans:
+            id_column = context.catalog.get(scan.provider).id_col
+            if (scan.alias, id_column) not in returned:
+                return None
+        return replace(root, distinct=False)
 
-        def visit(node):
-            nonlocal position
-            children = tuple(visit(child) for child in node.children())
-            if children != node.children():
-                node = node.with_children(children)
-            if isinstance(node, SemanticJoin):
-                stage = (exec_idx[position], decided[position])
-                position += 1
-                if (node.exec_idx, node.exec_anchor) != stage:
-                    node = replace(node, exec_idx=stage[0], exec_anchor=stage[1])
-            return node
 
-        rewritten = visit(root)
-        if rewritten == root:
+def _filtered_alias(operators: Operators) -> str | None:
+    """Return the one alias whose AI.IF predicates are the only model calls."""
+    if (operators.joins or operators.classifies or operators.applies
+            or operators.projections or operators.label_filters
+            or len(operators.filters) != 1):
+        return None
+    (alias,) = operators.filters
+    if any(is_score(p.expression) for p in operators.filters[alias]):
+        return None
+    return alias
+
+
+def _stop_key(columns, alias) -> tuple[str, ...] | None:
+    """Return the alias's columns the projection returns, or None."""
+    key = []
+    for column in columns:
+        if not isinstance(column, ColumnRef) or column.alias != alias:
             return None
-        return rewritten
+        if column.column not in key:
+            key.append(column.column)
+    return tuple(key)
 
-    def _search(self, plan, context) -> dict:
-        """Run the search once per plan and filter order; return its result."""
-        key = ("join_order", undecided(plan.root),
-               tuple(sorted((alias, tuple(order)) for alias, order
-                            in filter_orders(plan).items())))
-        if key in context.memo:
-            return context.memo[key]
-        statistics = _statistics(plan.root, context)
-        model, device = context.model, context.device
-        base_work = sum(filter_works(plan, statistics, model).values(), Work())
-        live = live_after_filters(plan, statistics)
-        filtered = set(plan.operators().all_filters())
-        fixed = _order_rule(context) == "as_written"
 
-        found = joinsearch.search_joins(
-            statistics.specs, live, statistics.lengths, filtered,
-            statistics.pre, statistics.chunk, model, device,
-            base_work=base_work, fixed_order=fixed)
-        if found is None:
-            found = joinsearch.search_joins(
-                statistics.specs, live, statistics.lengths, filtered,
-                statistics.pre, statistics.chunk, model, device,
-                base_work=base_work, fixed_order=True)
-        context.memo[key] = found
-        return found
+class DistinctPushdown:
+    """Push a DISTINCT into a filter: stop a key once one document passes.
+
+    A DISTINCT over columns of one table asks only whether any document
+    of each key value passes. When that table's AI.IF predicates are
+    the plan's only model calls, the rule puts the key on its
+    SemanticFilter nodes. The executor then reads a key's documents one
+    at a time and skips the rest once one survives, so the answer
+    tables list only the documents it read. The result rows do not
+    change: each key value appears once either way.
+    """
+
+    name = "distinct_pushdown"
+    cost_based = False
+
+    def rewrite(self, root, context):
+        if not isinstance(root, Result) or not root.distinct:
+            return None
+        if not isinstance(root.input, Project):
+            return None
+        alias = _filtered_alias(LogicalPlan(root).operators())
+        if alias is None:
+            return None
+        key = _stop_key(root.input.columns, alias)
+        if not key:
+            return None
+
+        def mark(node):
+            if isinstance(node, SemanticFilter):
+                return node if node.stop_key == key else replace(
+                    node, stop_key=key)
+            children = tuple(mark(child) for child in node.children())
+            return node if children == node.children() else (
+                node.with_children(children))
+
+        marked = mark(root)
+        return None if marked == root else marked
 
 
 def built_in_logical_rules() -> tuple:
     """Return the logical rules registered with the built in registry.
 
-    In order: projection_pushdown, filter_pushdown, classify_placement,
-    filter_order, and join_order. join_order follows filter_order
-    because it ranks candidates by the whole query's seconds, the
-    filter chains in their decided order included.
+    In order: distinct_elimination, distinct_pushdown, projection_pushdown,
+    and filter_pushdown. Every one is heuristic: it rewrites the plan
+    without pricing it. The cost-based choices (where classifications
+    run, filter order, join order and anchors) are made in the physical
+    phase (quail.planner.ordering and the Quail backend's candidates).
     """
-    return (ProjectionPushdown(), FilterPushdown(), ClassifyPlacement(),
-            FilterOrder(), JoinOrder())
+    return (DistinctElimination(), DistinctPushdown(), ProjectionPushdown(),
+            FilterPushdown())

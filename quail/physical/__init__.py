@@ -19,6 +19,7 @@ from .codec import (
     plan_envelope,
 )
 from .nodes import (
+    Aggregate,
     AiClassify,
     AiFilter,
     AiJoin,
@@ -42,9 +43,11 @@ from .nodes import (
     RequestJoinSpec,
     Scan,
     ScoreSpec,
+    Sort,
 )
 
 __all__ = [
+    "Aggregate",
     "AiClassify",
     "AiJoin",
     "AiScore",
@@ -65,6 +68,7 @@ __all__ = [
     "InputPort",
     "JoinStage",
     "Limit",
+    "Sort",
     "NodeCodec",
     "OutputPort",
     "AiFilter",

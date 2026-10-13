@@ -33,6 +33,12 @@ def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
     assert estimates == lengths
     assert session.estimate_lengths("docs", "body") is estimates
     session.close()
+    # a larger table repeats the sample's lengths over the row count
+    # instead of scanning the column
+    monkeypatch.setattr("quail.execution.session.ESTIMATE_SAMPLE", 2)
+    session = _session()
+    assert session.estimate_lengths("docs", "body") == [2, 4] * 3
+    session.close()
 
     monkeypatch.setattr(execution, "gpu_problem", lambda: None)
     monkeypatch.setattr(execution, "_prepare_backend", lambda *args: None)

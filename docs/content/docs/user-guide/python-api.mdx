@@ -101,6 +101,27 @@ Using both raises a compilation error. The
 [SQL reference](/docs/user-guide/sql#aiclassify) lists label requirements,
 probability output, and limits on classifications of joined rows.
 
+### ai_score
+
+`ai_score(prompt, name=...)`
+
+Add an [`AI.SCORE`](/docs/user-guide/sql#aiscore) column with the given
+`name`. Use that name to select, sort, or aggregate the scores.
+
+E.g., the following query returns up to ten reviews with the highest
+scores for requesting a refund:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_score(prompt('Does the customer request a refund?\n\n{0}',
+                     col("r.body")), name="refund_score")
+    .order_by(col("refund_score").desc())
+    .limit(10)
+    .select("r.id", "refund_score")
+)
+```
+
 ### label_in
 
 `label_in(name: str, labels: Iterable[str], selectivity: float | None = None)`
@@ -166,6 +187,40 @@ query = (
 result = query.collect()
 ```
 
+### where
+
+`where(*tests)`
+
+Keep rows that satisfy all the given conditions. Use `col("name")` to
+refer to a column in a condition.
+
+| Condition | Syntax |
+| --- | --- |
+| Compare with a value | `==`, `!=`, `<`, `<=`, `>`, `>=` |
+| Match a value in a collection | `col(...).isin(values)` |
+| Keep null values | `col(...).is_null()` |
+| Keep non-null values | `col(...).is_not_null()` |
+
+`isin()` takes a non-empty iterable of values. Use `is_null()` to test
+for nulls rather than comparing with `None`.
+
+E.g., the following query returns the IDs of reviews from 2024 with at
+least four stars that mention shipping:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .where(col("r.year") == 2024, col("r.stars") >= 4)
+    .ai_if(prompt('Does the review mention shipping?\n\n{0}', col("r.body")))
+    .select("r.id")
+)
+result = query.collect()
+```
+
+Quail applies `where()` before AI operators even if it appears later
+in the builder chain. To compare columns from different tables, use
+[`join()`](#join).
+
 ### limit
 
 `limit(n)`
@@ -180,6 +235,105 @@ query = (
     .select("r.id", "r.body")
 )
 ```
+
+### order_by
+
+`order_by(*keys)`
+
+Sort result rows by table columns or AI output columns. Pass each column
+as a string or a `col()` expression.
+
+Use `.asc()` or `.desc()` on a `col()` expression to set the direction.
+The default is ascending. Use `.nulls_first()` or `.nulls_last()` to set
+where nulls appear. By default, ascending order puts nulls last and
+descending order puts them first.
+
+E.g., imagine a `reviews` table with text in `body` and ratings in `stars`.
+The query below returns up to ten positive reviews with the highest ratings:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .order_by(col("r.stars").desc().nulls_last(), "r.id")
+    .limit(10)
+    .select("r.id", "r.body")
+)
+result = query.collect()
+```
+
+Quail evaluates every review before sorting the positive reviews. In this
+query, Quail uses `"r.id"` to order reviews with equal ratings. The limit
+applies after sorting.
+
+Sorting columns need not appear in `select()`, except when using
+`distinct()`.
+
+### group_by
+
+`group_by(*keys)`
+
+Group rows by the given columns. Each column can be a name or a `col()`
+expression, including a name assigned by `ai_classify()` or `ai_score()`.
+
+### agg
+
+`agg(**aggregates)`
+
+Compute aggregates for each group. Without `group_by()`, compute them
+over all rows that pass the query's filters.
+
+Use `count()`, `count_distinct()`, `sum_()`, `avg()`, `min_()`, or `max_()`
+from `quail.frontend.builder`. Each keyword argument names an output
+column. In `select()`, use grouping columns or those output names.
+See [aggregate functions](/docs/user-guide/sql#aggregate-functions)
+for the supported functions and their treatment of nulls.
+
+### having
+
+`having(*tests)`
+
+Keep groups that satisfy all the given conditions. Compare an aggregate
+with a number using `==`, `!=`, `<`, `<=`, `>`, or `>=`.
+
+E.g., the following query returns the review count and average star rating
+for each sentiment. It keeps sentiments with more than ten reviews:
+
+```python
+from quail.frontend.builder import avg, count
+
+query = (
+    session.docs("reviews").alias("r")
+    .ai_classify(
+        prompt('What is the sentiment of this review?\n\n{0}', col("r.body")),
+        ["positive", "negative", "mixed"], name="sentiment")
+    .group_by("sentiment")
+    .agg(review_count=count(), avg_stars=avg("r.stars"))
+    .having(count() > 10)
+    .order_by(col("review_count").desc())
+    .select("sentiment", "review_count", "avg_stars")
+)
+result = query.collect()
+```
+
+### offset
+
+`offset(n)`
+
+Skip `n` rows before applying `limit()`. The argument must be an integer
+greater than or equal to zero. Use `order_by()` to specify which rows to
+skip. Without an explicit order, the skipped rows can differ between runs.
+
+### distinct
+
+`distinct()`
+
+Remove duplicate rows by comparing all columns passed to `select()`.
+Quail removes duplicates before sorting and applying `offset()` or
+`limit()`. Every sorting column must appear in `select()`.
+
+Sorting or removing duplicates prevents `limit()` from stopping AI
+evaluation early. An offset greater than zero has the same effect.
 
 ### select
 

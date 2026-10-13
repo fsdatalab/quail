@@ -247,7 +247,7 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
             def check(request, graph):
                 assert sum(len(group.stages)
                            for group in graph.nodes_by_type(AiJoin.type_name)) == 3
-                patch.setattr("quail.planner.joins.search_joins",
+                patch.setattr("quail.planner.join_order.search_joins",
                               unexpected_search)
                 return {}
 

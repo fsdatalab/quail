@@ -489,6 +489,7 @@ def _child_filters(state, sub):
                     ),
                     "document_ids": index,
                     "limit": filter_limit,
+                    "stop_groups": sub.get("stop_groups"),
                     "retain_survivors": node.keep_kv,
                 },
                 runtime_context,
