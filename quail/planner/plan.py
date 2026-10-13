@@ -18,6 +18,7 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.codec import plan_envelope
+from quail.planner.kv import plan_kv_retention
 from quail.specs import MODELS
 
 
@@ -122,7 +123,9 @@ class PhysicalPlan:
         Raises:
             PlanEditError: The edited operator graph is invalid.
         """
-        nodes = _rederive_kv(tuple(nodes))
+        nodes = plan_kv_retention(
+            PhysicalGraph(tuple(nodes), self.graph.root), self.workers,
+            tuple(self.settings.get("pre_ids", ()))).nodes
         try:
             edited = replace(self, nodes=nodes, root=None, estimates={})
         except GraphValidationError as error:
@@ -131,13 +134,13 @@ class PhysicalPlan:
         if base is None:
             return edited
         scheduled = set(self.settings.get("retention", {}).get("initial", {}))
-        pipelines = build_pipelines(edited.graph)
+        pipelines = build_pipelines(edited.graph, self.workers)
         recompute = sum(
             edited.estimates.get(node.node_id, {}).get(
                 "release_recompute_seconds", 0.0)
             for node in edited.nodes
             if isinstance(node, AiFilter) and node.alias not in scheduled
-            and not isinstance(pipelines[node.node_id].sink, AiJoin))
+            and not isinstance(pipelines[node.node_id][-1], AiJoin))
         return replace(edited, estimated_seconds=base + recompute,
                        estimates=edited.estimates)
 
@@ -231,26 +234,6 @@ class PhysicalPlan:
             codecs=codecs,
             settings=self.settings,
         )
-
-def _rederive_kv(nodes: tuple) -> tuple:
-    """Set keep_kv and arena_writes on each filter whose alias anchors a join.
-
-    A filter whose pipeline does not end at that join, for example
-    because a Barrier sits between them, keeps its survivors' KV for it.
-    """
-    graph = PhysicalGraph(nodes, PortRef(nodes[-1].node_id,
-                                         nodes[-1].outputs[0].name))
-    joins = {node.anchor for node in nodes if isinstance(node, AiJoin)}
-    pipelines = build_pipelines(graph)
-    out = []
-    for node in nodes:
-        if not isinstance(node, AiFilter) or node.alias not in joins:
-            out.append(node)
-            continue
-        cut = not isinstance(pipelines[node.node_id].sink, AiJoin)
-        out.append(replace(node, keep_kv=cut, arena_writes=True))
-    return tuple(out)
-
 
 def resolve_model(name: str, models=None):
     """Return a ModelSpec by name, or a Refusal if unknown."""

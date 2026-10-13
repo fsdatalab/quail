@@ -272,7 +272,9 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         ]
         root = PortRef("group:0", "ids:r")
     graph = PhysicalGraph(tuple(nodes), root)
-    chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
+    chains = {tuple(
+        member.node_id for member in pipeline)
+        for pipeline in build_pipelines(graph).values()}
     assert chains == {{
         "filter": ("filter:r", "classify:r"),
         "draws": ("filter:r", "classify:r"),
@@ -475,6 +477,10 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
                   for d in range(n_docs)}
     model = LabelingModel([] if classify_only else filter_truth,
                           join_truth, label_truth)
+    events = []
+    monkeypatch.setattr(
+        "quail.backends.quail.executor.operators.classify.answer_sink",
+        lambda: lambda event: events.append((len(model.launched), event)))
     torch = fake_torch()
     arena = cpu_arena(64)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
@@ -518,6 +524,10 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     assert not arena.accounting.owned
 
     passed = [d for d in range(n_docs) if classify_only or filter_truth[d][0]]
+    batches = [(step, event) for step, event in events
+               if event["node"] == "classify:r"]
+    assert sorted(row for _, event in batches for row in event["rows"]) == passed
+    assert batches[0][0] < len(model.launched)
     accepted = [d for d in passed if label_truth[d] == 0]
     matched = [d for d in accepted if any(join_truth[("r", d)])]
     outputs = result["_outputs"]
@@ -612,7 +622,9 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     from quail.execution.pipelines import build_pipelines
 
     graph = joined_graph(two_joins)
-    chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
+    chains = {tuple(
+        member.node_id for member in pipeline)
+        for pipeline in build_pipelines(graph).values()}
     assert chains == {("group:0", "group:1", "classify:rp") if two_joins
                       else ("group:0", "classify:rp")}
 

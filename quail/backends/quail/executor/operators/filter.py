@@ -31,9 +31,7 @@ def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
     chunk_tokens = state.chunk_tokens
 
     document_ids = inputs["document_ids"]
-    retain_survivors = inputs.get("retain_survivors", nodes[-1].keep_kv)
-    if retain_survivors is False:
-        retain_survivors = ()
+    retain_survivors = True if nodes[-1].keep_kv else ()
     # sorted admission would change which rows a limit keeps
     tree = (None if inputs.get("limit") is not None
             else execution_prefix_tree(node, inputs["documents"], arena))

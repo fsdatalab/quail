@@ -11,6 +11,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.execution.pairs import columns_key, pair_ids_table, pair_table
+from quail.execution.pipelines import build_pipelines
 from quail.execution.result import (
     IndexRelation,
     QueryResult,
@@ -162,9 +163,7 @@ class ExecutionContext:
     state: dict[str, Any] = field(default_factory=dict)
     observers: tuple[ExecutionObserver, ...] = ()
     functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
-    # member node id -> the pipeline the executor runs it in, and the
-    # callable(pipeline, inputs by member, context) -> results by member
-    pipelines: Mapping[str, Any] = field(default_factory=dict)
+    workers: int = 1
     run_pipeline: Callable[..., Mapping[str, "NodeResult"]] | None = None
 
     def execute_graph(self, graph: PhysicalGraph) -> RunResult:
@@ -186,9 +185,8 @@ def _check_ports(node, result) -> None:
 class GenericRunner:
     """Graph runner that executes operators after their inputs are ready.
 
-    When context.pipelines groups operators and context.run_pipeline is
-    set, a pipeline runs at its final operator once all external inputs
-    are ready. Results for every pipeline member are recorded together.
+    Compatible graph paths run together once their external inputs are ready.
+    Each document advances through the path while its KV remains resident.
     """
 
     def run(
@@ -217,23 +215,26 @@ class GenericRunner:
             for observer in context.observers:
                 observer.after_node(node, result)
 
-        pipelines = context.pipelines if context.run_pipeline else {}
+        completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
+        pipelines = (build_pipelines(graph, context.workers, completed)
+                     if context.run_pipeline else {})
         for node in graph.topological_nodes():
             pipeline = pipelines.get(node.node_id)
-            if pipeline is not None and len(pipeline.members) > 1:
-                if node is not pipeline.sink:
+            if pipeline is not None and (context.workers == 1
+                                         or pipeline[0].worker_pipelining):
+                if node is not pipeline[-1]:
                     continue
-                inside = set(pipeline.node_ids)
+                inside = {member.node_id for member in pipeline}
                 inputs = {
                     member.node_id: {
                         port.name: values[(port.source.node_id,
                                            port.source.port)]
                         for port in member.inputs
                         if port.source.node_id not in inside}
-                    for member in pipeline.members}
+                    for member in pipeline}
                 started = time.perf_counter()
                 results = context.run_pipeline(pipeline, inputs, context)
-                for member in pipeline.members:
+                for member in pipeline:
                     record(member, results[member.node_id], started)
                 continue
             supplied = {

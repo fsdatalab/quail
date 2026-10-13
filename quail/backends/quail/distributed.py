@@ -17,7 +17,6 @@ from quail.backends.quail.graph import (
 )
 from quail.backends.quail.prompts import join_request
 from quail.execution.pairs import columns_key
-from quail.execution.pipelines import Pipeline, build_pipelines
 from quail.execution.reranker import score_in_batches
 from quail.execution.runner import (
     ExecutionContext,
@@ -117,14 +116,14 @@ class DistributedQuailExecution:
 
     def execute_pipeline(self, pipeline, inputs, context):
         """Run compatible predicates or extraction questions together on each worker."""
-        first = pipeline.members[0]
+        first = pipeline[0]
         if isinstance(first, AiFilter):
-            return self._execute_filters(pipeline.members, inputs[first.node_id])
+            return self._execute_filters(pipeline, inputs[first.node_id])
         if isinstance(first, AiJoin):
             prepared = prepare_distributed_inputs(
-                first, inputs, context, nodes=pipeline.members)
-            return self._execute_joins(pipeline.members, prepared)
-        return self._execute_extractions(pipeline.members, inputs[first.node_id])
+                first, inputs, context, nodes=pipeline)
+            return self._execute_joins(pipeline, prepared)
+        return self._execute_extractions(pipeline, inputs[first.node_id])
 
     def _extraction_positions(self, alias, ids):
         """Keep documents on their previous worker, partitioning unplaced rows."""
@@ -313,7 +312,6 @@ class DistributedQuailExecution:
         for sub in subs:
             sub.pop("joins", None)
             sub.update(
-                retain_anchor=nodes[-1].keep_anchor_kv,
                 final_group=nodes[-1].node_id == self.graph.nodes_by_type(
                     AiJoin.type_name)[-1].node_id
                 and not self.graph.nodes_by_type(AiExtract.type_name),
@@ -430,21 +428,6 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
     }
     for alias, table in payload.get("columns", {}).items():
         sources[columns_key(alias)] = table
-    pipelines = {}
-    for pipeline in build_pipelines(graph).values():
-        if pipeline.members[0].node_id in pipelines:
-            continue
-        members = []
-        for member in pipeline.members:
-            if not isinstance(member, (AiFilter, AiJoin, AiExtract)):
-                members = []
-                continue
-            if members and type(member) is not type(members[0]):
-                members = []
-            members.append(member)
-            grouped = Pipeline(pipeline.alias, tuple(members))
-            for node in members:
-                pipelines[node.node_id] = grouped
     context = ExecutionContext(
         runtimes=runtimes,
         model_execution=execution,
@@ -452,7 +435,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         model_inputs=prepare_distributed_inputs,
         state={"distributed_execution": execution},
         functions=registry.functions,
-        pipelines=pipelines,
+        workers=execution.gpu_count,
         run_pipeline=execution.execute_pipeline,
     )
     started = time.perf_counter()

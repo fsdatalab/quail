@@ -139,7 +139,7 @@ class FixedFeverAnswers:
         if isinstance(node, AiFilter):
             document_ids = list(inputs["document_ids"])
             answers, live = self._answers(document_ids)
-            if inputs["retain_survivors"]:
+            if node.keep_kv:
                 for document in live[:self.capacity]:
                     self.state["arena"].retain((node.alias, document), 16)
             return NodeResult({
@@ -343,7 +343,8 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         # one pipeline; the join joins it only when it anchors on the
         # claims
         test, join, project = plan.nodes[4], plan.nodes[5], plan.nodes[6]
-        members = build_pipelines(plan.graph)["ai_filter:c"].node_ids
+        members = tuple(
+            member.node_id for member in build_pipelines(plan.graph)["ai_filter:c"])
         assert members == (("ai_filter:c", "ai-classify:0", test.node_id)
                            + ((join.node_id,) if join.anchor == "c" else ()))
         (claims_port,) = [port.source for port in join.inputs
@@ -390,7 +391,8 @@ def test_a_classification_of_joined_rows_follows_its_join(monkeypatch):
                                                     "join_answers:0")
         assert [port.source.port for port in project.inputs] == [
             "join_answers:0", "rows"]
-        members = build_pipelines(plan.graph)[join.node_id].node_ids
+        members = tuple(
+            member.node_id for member in build_pipelines(plan.graph)[join.node_id])
         assert members == (join.node_id, classify.node_id)
         codecs = session.registry.codecs
         assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph

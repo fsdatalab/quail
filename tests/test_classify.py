@@ -702,7 +702,8 @@ def test_chained_classifications_share_one_pipeline(session):
     classifies = [n for n in plan.nodes if isinstance(n, AiClassify)]
     topic, kind = classifies
     assert [node.spec.name for node in classifies] == ["topic", "kind"]
-    assert build_pipelines(plan.graph)[topic.node_id].node_ids == (
+    assert tuple(
+        member.node_id for member in build_pipelines(plan.graph)[topic.node_id]) == (
         topic.node_id, "filter:d:0", kind.node_id)
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
@@ -719,12 +720,16 @@ def test_chained_classifications_share_one_pipeline(session):
     assert scorer.calls == [("topic", [[0], [1]]), ("kind", [[0]])]
 
     split = _chain(session, filters=2)
-    assert build_pipelines(split.plan().graph)[topic.node_id].node_ids == (
+    assert tuple(
+        member.node_id for member in build_pipelines(
+            split.plan().graph)[topic.node_id]) == (
         topic.node_id, "filter:d:0", "filter:d:1", kind.node_id)
 
     interleaved = _chain(session, later_filters=(
         ("kind", ("complaint",)), ("topic", ("refund",))))
-    assert build_pipelines(interleaved.plan().graph)[topic.node_id].node_ids == (
+    assert tuple(
+        member.node_id for member in build_pipelines(
+            interleaved.plan().graph)[topic.node_id]) == (
         topic.node_id, "filter:d:0", kind.node_id, "filter:d:1", "filter:d:2")
     scorer = _Labels(["shipping", "praise"])
     result = _finish(interleaved, session, scorer)
@@ -833,7 +838,9 @@ def test_planner_reads_letters_on_a_diffusion_model(tmp_path):
     chained = _chain(session).plan()
     classifies = [n for n in chained.nodes if isinstance(n, AiClassify)]
     assert len(classifies) == 2
-    assert build_pipelines(chained.graph)[classifies[0].node_id].node_ids == (
+    assert tuple(
+        member.node_id for member in build_pipelines(
+            chained.graph)[classifies[0].node_id]) == (
         classifies[0].node_id, "filter:d:0", classifies[1].node_id)
     session.close()
 

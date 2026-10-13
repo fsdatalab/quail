@@ -213,3 +213,21 @@ def gpu_seconds(torch, spans, inputs) -> float:
 def chunks(spans, inputs) -> int:
     """Return the number of timed forward chunks, or zero if timing is disabled."""
     return len(spans) if inputs.get("gpu_timing") else 0
+
+
+def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
+    """Return a callback that applies the final operator's KV retention setting."""
+    if keep_kv and arena.retention_cap_pages is None:
+        arena.retention_cap_pages = max(
+            0, arena.n_pages - arena.pages_needed(2 * budget))
+
+    def settled(anchor, survived, row):
+        key = keys[anchor]
+        if not arena.is_resident(key):
+            return
+        if survived and keep_kv:
+            arena.retain(key, len(prefixes[anchor]))
+        else:
+            arena.free_key(key)
+
+    return settled

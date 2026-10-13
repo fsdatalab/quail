@@ -351,8 +351,8 @@ def _setup(monkeypatch, trim=True, documents=None, token_documents=None,
                                else document_ids), "documents": tokens,
               "texts": {"c": documents}, "pre": [], "gpu_timing": False}
 
-    def run(name="ends"):
-        result = execute_extract(state, node(name), inputs)
+    def run(name="ends", keep_kv=False):
+        result = execute_extract(state, replace(node(name), keep_kv=keep_kv), inputs)
         return result, stages_seen["stages"]
 
     def run_pipeline(*names):
@@ -460,7 +460,8 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
         nodes.append(AiExtract(
             node_id=f"ai-extract:{name}", backend_name="quail", model="qwen3-4b-fp8",
             inputs=input_ports((PortRef(previous.node_id, port),)),
-            spec=replace(spec, name=name, share_prefixes=True)))
+            spec=replace(spec, name=name, share_prefixes=True),
+            keep_kv=name == "starts"))
     graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "rows"))
     registry = built_in_registry()
     children = []
@@ -589,7 +590,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
 
 def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
     state, model, run, _ = _setup(monkeypatch)
-    first, stages = run("ends")
+    first, stages = run("ends", keep_kv=True)
     arena = state.loaded_model.arena
     # every document's KV stays resident after the extraction
     assert all(arena.is_resident(doc.key) for doc in stages.docs)
@@ -605,6 +606,7 @@ def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
     prefixes = sum(len(doc.prefix) for doc in stages.docs)
     assert first.metrics.fresh_tokens > prefixes
     assert second.metrics.fresh_tokens == first.metrics.fresh_tokens - prefixes
+    assert not arena.resident_keys()
 
 
 def test_extractor_returns_whole_lines_with_trim_off(monkeypatch):

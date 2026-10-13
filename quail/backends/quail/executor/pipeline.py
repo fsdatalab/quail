@@ -24,6 +24,7 @@ from quail.backends.quail.executor.parts import (
     gated_stages,
     input_staging,
     report_chain_transitions,
+    settle_documents,
 )
 from quail.backends.quail.executor.stages import run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
@@ -46,7 +47,7 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
 
     Args:
         state: The loaded model and current query state.
-        pipeline: The Pipeline (quail.execution.pipelines).
+        pipeline: Compatible physical nodes in graph order.
         inputs: Member node id -> its inputs from outside the
             pipeline, by port name.
         context: The graph's execution context.
@@ -55,8 +56,8 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
         Node id -> NodeResult for every member.
     """
     state.gpu_timing = bool(context.state.get("gpu_timing", False))
-    members = list(pipeline.members)
-    alias = pipeline.alias
+    members = list(pipeline)
+    alias = pipeline[0].document_aliases[0]
     first = members[0]
     # the first member's documents: its ids input, or its one input
     anchor_port = next((port.name for port in first.inputs
@@ -73,7 +74,6 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
             context.model_inputs(first, inputs[first.node_id], context))
     if all(isinstance(member, AiFilter) for member in members):
         prepared = context.model_inputs(first, inputs[first.node_id], context)
-        prepared["retain_survivors"] = members[-1].keep_kv
         return execute_filters(state, members, prepared)
     gpu_inputs = {"gpu_timing": context.state.get("gpu_timing", False)}
     # the members with stages, then the gates after the last of them
@@ -120,10 +120,14 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
         stats = {}
         appended = [part.appended_tokens for part in parts
                     if isinstance(part, ExtractPart)]
+        keys = DocumentKeys(alias, ids)
         every, spans, tokens = run_stages(
             state.torch, state.loaded_model.arena, state.loaded_model.pipeline, stages,
             prefixes, state.chunk_tokens,
-            anchor_keys=DocumentKeys(alias, ids),
+            anchor_keys=keys,
+            on_settled=settle_documents(
+                state.loaded_model.arena, keys, prefixes,
+                staged[-1].keep_kv, state.chunk_tokens),
             attention_mode=getattr(first, "attention", None) or None,
             prefix_tree=execution_prefix_tree(
                 first, prefixes, state.loaded_model.arena),

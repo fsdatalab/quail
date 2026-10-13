@@ -443,8 +443,8 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     groups = plan.graph.nodes_by_type(AiJoin.type_name)
     assert len(groups) == 2
     assert [group.anchor for group in groups] == ["r", "r"]
-    assert groups[0].keep_anchor_kv is True
-    assert groups[1].keep_anchor_kv is False
+    assert groups[0].keep_kv is True
+    assert groups[1].keep_kv is False
     assert groups[1].anchor_resident == "kept"
 
 
@@ -487,7 +487,7 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
     assert retention["initial"] == {"r": [1.0, 0]}
     assert retention["after"][groups[0].node_id] == {"r": [1.0, 1]}
     assert retention["after"][groups[1].node_id] == {}
-    assert [group.keep_anchor_kv for group in groups] == [True, False]
+    assert [group.keep_kv for group in groups] == [True, False]
 
     # on one GPU a filtered anchor streams into its join, so its chain
     # keeps no KV; on two GPUs the chain keeps its survivors for the
@@ -503,7 +503,8 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
     assert one.settings["retention"]["initial"] == {}
     chain = filter_chain(one, "r")
     assert (chain.keep_kv, chain.arena_writes) == (False, True)
-    assert build_pipelines(one.graph)[chain.node_id].node_ids == (
+    assert tuple(
+        member.node_id for member in build_pipelines(one.graph)[chain.node_id]) == (
         "ai_filter:r", "ai_join:r")
     two = _plan(filtered, toks, gpus=2)
     assert two.settings["retention"]["initial"] == {"r": [1.0, 0]}
@@ -645,7 +646,9 @@ def test_foreign_node_placement_and_pipelines():
         foreign = per_batch.graph.node("apply:keep_even")
         join = per_batch.graph.nodes_by_type(AiJoin.type_name)[0]
         # the chain, the per-batch apply, and the join run as one pipeline
-        assert build_pipelines(per_batch.graph)[chain.node_id].node_ids == (
+        assert tuple(
+            member.node_id for member in build_pipelines(
+                per_batch.graph)[chain.node_id]) == (
             chain.node_id, foreign.node_id, join.node_id)
         assert isinstance(foreign, Foreign) and foreign.kind == "per_batch"
         assert foreign.inputs[0].source == PortRef("ai_filter:c", "ids:c")
@@ -656,7 +659,9 @@ def test_foreign_node_placement_and_pipelines():
         assert "Foreign: keep_even (per_batch, drop) on c" in text
         # a barrier needs every survivor at once: the chain materializes
         barrier = _apply_query(session, "barrier").plan()
-        assert build_pipelines(barrier.graph)["ai_filter:c"].node_ids == (
+        assert tuple(
+            member.node_id for member in build_pipelines(
+                barrier.graph)["ai_filter:c"]) == (
             "ai_filter:c",)
         assert barrier.graph.node("apply:keep_even").kind == "barrier"
         request = _apply_query(session, "barrier")._prepare_physical()
@@ -675,7 +680,7 @@ def test_foreign_node_placement_and_pipelines():
         assert plan.constraint == "apply_needs_quail_backend"
 
     def chains(graph):
-        return sorted({pipeline.node_ids
+        return sorted({tuple(member.node_id for member in pipeline)
                        for pipeline in build_pipelines(graph).values()})
 
     assert chains(two_alias_graph(True)) == [("filter:r", "group:0")]
@@ -714,7 +719,8 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
         "scan:r", "scan:p", "ai_filter:r", "ai_join:r", "project"]
     chain = plan.graph.node("ai_filter:r")
     assert not chain.keep_kv
-    assert build_pipelines(plan.graph)["ai_filter:r"].node_ids == (
+    assert tuple(
+        member.node_id for member in build_pipelines(plan.graph)["ai_filter:r"]) == (
         "ai_filter:r", "ai_join:r")
     assert plan.graph.node("ai_join:r").anchor_resident == "filter"
     seconds = {node_id: entry["seconds"]
@@ -746,7 +752,8 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
         "scan:r", "scan:p", "ai_filter:r", "barrier:r", "ai_join:r", "project"]
     new_chain = edited.graph.node("ai_filter:r")
     assert new_chain.keep_kv
-    assert build_pipelines(edited.graph)["ai_filter:r"].node_ids == (
+    assert tuple(
+        member.node_id for member in build_pipelines(edited.graph)["ai_filter:r"]) == (
         "ai_filter:r",)
     assert edited.graph.node("barrier:r").inputs[0].source.node_id == "ai_filter:r"
     assert [port.source.node_id for port in edited.graph.node("ai_join:r").inputs] == [

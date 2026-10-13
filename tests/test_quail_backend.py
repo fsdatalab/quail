@@ -93,7 +93,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     execution.bind_query(torch=fake_torch(), async_answers=object(),
                          answer_rows=object(), chunk_tokens=8192)
     result = execution.execute(filtered, {
-        "documents": [[1]], "document_ids": [10], "retain_survivors": False})
+        "documents": [[1]], "document_ids": [10]})
     assert received["retain_survivors"] == ()
     assert result.outputs["ids:d"] == [10]
 
@@ -243,10 +243,10 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
                for metrics in per_node.values())
 
 
-@pytest.mark.parametrize("semantics, keep_anchor_kv",
+@pytest.mark.parametrize("semantics, keep_kv",
                          [("full", False), ("anti", True)])
 def test_a_join_without_a_filter_settles_anchors_with_no_pairs(
-        monkeypatch, semantics, keep_anchor_kv):
+        monkeypatch, semantics, keep_kv):
     # document d has key d % 4 and partner i key i % 3: a document with
     # key 3 has no pairs and settles without loading its KV
     columns = _key_columns([d % 4 for d in range(14)], [0, 1, 2, 0])
@@ -254,7 +254,7 @@ def test_a_join_without_a_filter_settles_anchors_with_no_pairs(
     result, _, _, join_truth = run_graph_on_arena(
         monkeypatch, two_alias_graph(
             False, hash_join=True, filtered=False, semantics=semantics,
-            keep_anchor_kv=keep_anchor_kv),
+            keep_kv=keep_kv),
         columns=columns, streamed_anchors=False)
     stage = result["joins"][0]
     assert sorted(stage["anchor_index"]) == list(range(14))
@@ -333,10 +333,11 @@ def test_predicate_nodes_keep_documents_and_join_frames_in_kv(monkeypatch, worke
     from dataclasses import replace
 
     from quail.execution.pipelines import build_pipelines
+    from quail.planner.kv import plan_kv_retention
 
     graph = two_alias_graph(True, stages=2)
     graph = PhysicalGraph(tuple(
-        replace(node, keep_kv=workers > 1, share_prefixes=True)
+        replace(node, share_prefixes=True)
         if isinstance(node, AiFilter) else node
         for node in graph.nodes), graph.root)
     first_join = graph.nodes[-1]
@@ -346,8 +347,9 @@ def test_predicate_nodes_keep_documents_and_join_frames_in_kv(monkeypatch, worke
                             PortRef("input:p", "ids:p"))))
     graph = PhysicalGraph((*graph.nodes, second_join),
                           PortRef(second_join.node_id, "ids:r"))
-    assert build_pipelines(graph)["filter:r"].node_ids == (
+    assert tuple(member.node_id for member in build_pipelines(graph)["filter:r"]) == (
         "filter:r", "filter:r:1", "group:0", "join:second")
+    graph = plan_kv_retention(graph, workers)
     result, model, filters, joins = run_graph_on_arena(
         monkeypatch, graph, stages=2, workers=workers, shared_prefix=16)
     prefixes = [(spec["key"], spec["prefix"])

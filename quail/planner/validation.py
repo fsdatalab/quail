@@ -116,7 +116,7 @@ def joined_classification_refusal(graph, workers: int) -> Refusal | None:
         if pipeline is not None and any(
                 isinstance(member, AiJoin)
                 and any(port.source.node_id == member.node_id for port in node.inputs)
-                for member in pipeline.members):
+                for member in pipeline):
             continue
         return Refusal(
             reasons=(f"AI.CLASSIFY {node.spec.name!r} over a document pair "

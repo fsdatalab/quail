@@ -549,10 +549,16 @@ class AiInference(PhysicalNode):
     backend_name: str = ""
     model: str = ""
     spec: InferenceSpec | None = None
+    keep_kv: bool = False
 
     spec_type: ClassVar[type[InferenceSpec]] = InferenceSpec
     document_ids: ClassVar[bool] = False
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def document_head(self) -> tuple[int, ...] | None:
+        return (self.spec.prompt_token_parts[0]
+                if self.spec and self.spec.prompt_token_parts else ())
 
     @property
     def backend(self) -> str:
@@ -574,6 +580,7 @@ class AiInference(PhysicalNode):
     def attributes(self) -> dict:
         return {
             "backend_name": self.backend_name,
+            "keep_kv": self.keep_kv,
             "model": self.model,
             "spec": None if self.spec is None else self.spec.to_dict(),
         }
@@ -582,6 +589,7 @@ class AiInference(PhysicalNode):
         spec = self.spec
         return {
             "backend": self.backend_name,
+            "keep_kv": self.keep_kv,
             "model": self.model,
             "batching": "token_based_admission",
             "output": None if spec is None else spec.name,
@@ -600,6 +608,7 @@ class AiInference(PhysicalNode):
             node_id=node_id,
             inputs=inputs,
             backend_name=str(attributes["backend_name"]),
+            keep_kv=bool(attributes.get("keep_kv", False)),
             model=str(attributes["model"]),
             spec=None if value is None else cls.spec_type.from_mapping(value),
         )
@@ -714,6 +723,27 @@ class AiClassify(AiInference):
     type_name: ClassVar[str] = "quail.ai_classify"
     runtime_key: ClassVar[str] = type_name
 
+    @property
+    def document_aliases(self) -> tuple[str, ...]:
+        return () if self.spec is None else (self.spec.anchor,)
+
+    def document_outputs(self, alias: str) -> tuple[str, ...]:
+        return ("rows", f"ids:{alias}")
+
+    def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
+        if isinstance(previous, AiJoin):
+            return self.classifies_join(previous)
+        if isinstance(first, AiClassify):
+            return (self.spec.partner is None
+                    and self.document_head == first.document_head)
+        return self.spec.partner is None
+
+    def classifies_join(self, join: "AiJoin") -> bool:
+        """Return whether this classification reads the join's surviving pairs."""
+        return (self.spec is not None and self.spec.partner is not None
+                and self.spec.anchor == join.anchor
+                and sorted(self.spec.aliases) == sorted((join.anchor, *join.partners)))
+
     def explain_fields(self) -> Mapping[str, Any]:
         return {
             **super().explain_fields(),
@@ -798,6 +828,13 @@ class Filter(PhysicalNode):
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
 
     @property
+    def document_aliases(self) -> tuple[str, ...]:
+        return self.aliases if len(self.aliases) == 1 else ()
+
+    def document_outputs(self, alias: str) -> tuple[str, ...]:
+        return ("rows", f"ids:{alias}")
+
+    @property
     def column(self) -> str:
         """Return the column tested by the predicate."""
         return self.predicate.column
@@ -872,6 +909,12 @@ class AiFilter(PhysicalNode):
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
     backend: ClassVar[str] = "quail"
+
+    worker_pipelining: ClassVar[bool] = True
+
+    @property
+    def document_aliases(self) -> tuple[str, ...]:
+        return (self.alias,)
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
@@ -1031,6 +1074,35 @@ class AiExtract(AiInference):
     type_name: ClassVar[str] = "quail.ai_extract"
     runtime_key: ClassVar[str] = type_name
 
+    worker_pipelining: ClassVar[bool] = True
+
+    @property
+    def document_head(self) -> tuple[int, ...] | None:
+        return (None if self.spec and self.spec.shares_head
+                else super().document_head)
+
+    @property
+    def document_aliases(self) -> tuple[str, ...]:
+        return () if self.spec is None else (self.spec.alias,)
+
+    def document_outputs(self, alias: str) -> tuple[str, ...]:
+        return ("rows", f"ids:{alias}")
+
+    def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
+        if isinstance(previous, AiExtract):
+            return (previous.spec.same_decoding(self.spec)
+                    and previous.document_head == self.document_head)
+        if not self.spec.shares_head:
+            return False
+        if isinstance(first, AiClassify):
+            return (first.spec.partner is None
+                    and first.spec.prompt_token_parts[0]
+                    == self.spec.prompt_token_parts[0])
+        return isinstance(first, AiFilter)
+
+    def can_precede(self, consumer: PhysicalNode) -> bool:
+        return isinstance(consumer, AiExtract)
+
     def explain_fields(self) -> Mapping[str, Any]:
         return {
             **super().explain_fields(),
@@ -1080,7 +1152,7 @@ class AiJoin(PhysicalNode):
 
     anchor: str = ""
     anchor_resident: str = "none"
-    keep_anchor_kv: bool = False
+    keep_kv: bool = False
     written_pos: int = 0
     exec_idx: int = 0
     partners: tuple[str, ...] = ()
@@ -1105,6 +1177,21 @@ class AiJoin(PhysicalNode):
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
     backend: ClassVar[str] = "quail"
+
+    worker_pipelining: ClassVar[bool] = True
+
+    @property
+    def document_aliases(self) -> tuple[str, ...]:
+        return (self.anchor,)
+
+    def document_outputs(self, alias: str) -> tuple[str, ...]:
+        return (f"join_answers:{self.written_pos}", f"ids:{alias}")
+
+    def can_precede(self, consumer: PhysicalNode) -> bool:
+        if isinstance(consumer, AiJoin):
+            return (self.anchor == consumer.anchor
+                    and self.semantics == consumer.semantics == "full")
+        return isinstance(consumer, AiClassify) and consumer.classifies_join(self)
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
@@ -1134,7 +1221,7 @@ class AiJoin(PhysicalNode):
             "anchor_resident": self.anchor_resident,
             "tuple_tokens": self.tuple_tokens,
             "pairs_from": self.pairs_from,
-            "keep_anchor_kv": self.keep_anchor_kv,
+            "keep_kv": self.keep_kv,
             "attention": self.attention,
             "share_prefixes": self.share_prefixes,
         }
@@ -1152,7 +1239,7 @@ class AiJoin(PhysicalNode):
     def from_attributes(cls, node_id, inputs, value):
         return cls(
             node_id=node_id, inputs=inputs,
-            keep_anchor_kv=bool(value["keep_anchor_kv"]),
+            keep_kv=bool(value["keep_kv"]),
             attention=str(value["attention"]),
             share_prefixes=bool(value["share_prefixes"]),
             written_pos=int(value["written_pos"]),
@@ -1196,6 +1283,17 @@ class Foreign(PhysicalNode):
     type_name: ClassVar[str] = "quail.foreign"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def document_aliases(self) -> tuple[str, ...]:
+        if self.kind != "per_batch":
+            return ()
+        return self.aliases if self.ids == "pairs" else self.aliases[:1]
+
+    def document_outputs(self, alias: str) -> tuple[str, ...]:
+        if self.ids == "pairs":
+            return (f"pairs:{self.written_pos}",)
+        return super().document_outputs(alias)
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:

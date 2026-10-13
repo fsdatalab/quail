@@ -198,7 +198,7 @@ def expected_filter_rows(filter_truth):
 
 
 def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
-                    filtered=True, semantics="full", keep_anchor_kv=False):
+                    filtered=True, semantics="full", keep_kv=False):
     """R's filter chain into a join with p.
 
     Args:
@@ -213,7 +213,7 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
         filtered: Whether r's filter chain runs at all; otherwise the
             join reads r's scan and loads every anchor itself.
         semantics: The join stage's semantics, "full" or "anti".
-        keep_anchor_kv: Whether the join retains surviving anchors' KV.
+        keep_kv: Whether the join retains surviving anchors' KV.
     """
     nodes = [Scan(node_id="input:r", alias="r", input_id="r"),
              Scan(node_id="input:p", alias="p", input_id="p")]
@@ -264,7 +264,7 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
         node_id='group:0',
         anchor='r',
         anchor_resident=resident,
-        keep_anchor_kv=keep_anchor_kv,
+        keep_kv=keep_kv,
         inputs=input_ports((anchor_src, PortRef('input:p', 'ids:p'),
                             *join_inputs)),
         written_pos=0,

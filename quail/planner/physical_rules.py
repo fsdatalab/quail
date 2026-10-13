@@ -23,8 +23,6 @@ from quail.cost.extract import estimate as extract_estimate
 from quail.cost.retention import coefficients
 from quail.cost.score import score_fixed_tokens
 from quail.execution.pipelines import build_pipelines
-from quail.logical import classified_above_joins
-from quail.logical.prompts import classify_prompt_tokens
 from quail.physical import (
     Aggregate,
     AiClassify,
@@ -33,13 +31,12 @@ from quail.physical import (
     AiInference,
     AiJoin,
     AiScore,
-    Filter,
-    Foreign,
     Limit,
     PhysicalGraph,
     Sort,
 )
 from quail.planner import retention
+from quail.planner.kv import plan_kv_retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
 from quail.planner.statistics import cached_statistics, live_after_filters
 
@@ -86,7 +83,7 @@ class KvRetention:
     - A filter chain keeps its survivors' KV (keep_kv) when a later join
       anchors on its table, unless the chain streams into that join in
       one pipeline on one GPU.
-    - A join keeps its anchor's KV (keep_anchor_kv) when a later group
+    - A join keeps its anchor's KV (keep_kv) when a later group
       anchors on the same table.
     - A chain writes KV pages only when a later stage, the next operator
       of its pipeline, or the retention pool reads them.
@@ -132,45 +129,19 @@ class KvRetention:
             node.node_id: (after[group[0].node_id] if node is group[-1]
                            else before[group[0].node_id])
             for group in grouped for node in group}
-        ask_aliases = {node.alias for node in graph.nodes
-                       if isinstance(node, AiFilter)}
-        barriers = [node for node in graph.nodes
-                    if isinstance(node, Foreign) and node.kind == "barrier"]
-        barrier_aliases = {node.aliases[0] for node in barriers
-                           if node.ids != "pairs"}
-        for node in joins:
-            positions = {node.written_pos}
-            if any(barrier.ids == "pairs" and barrier.written_pos in positions
-                   for barrier in barriers):
-                barrier_aliases.add(node.anchor)
-        chained = retention.chained_aliases(
-            groups, ask_aliases, barrier_aliases, context.gpu_count)
+        paths = build_pipelines(graph, context.gpu_count)
+        chained = {
+            node.alias for node in graph.nodes if isinstance(node, AiFilter)
+            and any(isinstance(member, AiJoin)
+                    for member in paths[node.node_id])}
         schedule["initial"] = {
             alias: use for alias, use in schedule["initial"].items()
-            if alias not in chained
-        }
+            if alias not in chained}
         schedule.update(**coefficients(context.model, context.device),
                         cap_pages=statistics.cap_pages)
-        extracts = [(index, node.spec.alias) for index, node in enumerate(graph.nodes)
-                    if isinstance(node, AiExtract) and node.spec.shares_head]
-        nodes = []
-        for index, node in enumerate(graph.nodes):
-            if isinstance(node, AiFilter):
-                keep = (node.alias in schedule["initial"]
-                        or context.gpu_count > 1 and any(
-                            alias == node.alias and after > index
-                            for after, alias in extracts))
-                writes = node.arena_writes or keep
-                node = replace(node, keep_kv=keep, arena_writes=writes)
-            elif isinstance(node, AiJoin):
-                node = replace(node, keep_anchor_kv=(
-                    node.anchor in schedule["after"].get(node.node_id, {})
-                    or context.gpu_count > 1 and any(
-                        alias == node.anchor and after > index
-                        for after, alias in extracts)))
-            nodes.append(node)
         context.settings["retention"] = schedule
-        return PhysicalGraph(tuple(nodes), graph.root)
+        return plan_kv_retention(
+            graph, context.gpu_count, tuple(context.settings.get("pre_ids", ())))
 
 
 class LabelScoring:
@@ -211,11 +182,11 @@ class LabelScoring:
 
         logical = context.logical_plan
         calls = {node.name: node.call for node in logical.operators().classifies}
-        after_joins = classified_above_joins(logical.root)
+        paths = build_pipelines(graph, context.gpu_count)
         chosen = {}
         for node in pending:
             table = classify_scoring(context, node.spec.anchor)
-            resident = _resident(node, graph, context, calls, after_joins)
+            resident = paths[node.node_id][0] is not node
             chosen[node.node_id] = replace(node, spec=table.choose_scoring(
                 node.spec, calls[node.spec.name], resident))
             if "estimated_fresh_tokens" in context.settings:
@@ -229,28 +200,6 @@ class LabelScoring:
         return PhysicalGraph(
             tuple(chosen.get(node.node_id, node) for node in graph.nodes),
             graph.root)
-
-
-def _resident(node, graph, context, calls, after_joins) -> bool:
-    """Return whether a classification's documents have their KV in the arena.
-
-    True on one GPU when the classification continues its table's
-    AI.IF filter chain before any join, through any filters on labels
-    and applies between them, or follows a classification whose prompt
-    head is the same.
-    """
-    if context.gpu_count != 1:
-        return False
-    source = graph.node(node.inputs[0].source.node_id)
-    while isinstance(source, (Filter, Foreign)):
-        source = graph.node(source.inputs[0].source.node_id)
-    if isinstance(source, AiClassify) and source.spec is not None:
-        previous = classify_prompt_tokens(
-            calls[source.spec.name].prompt, (), context.tokenizer)[0]
-        current = classify_prompt_tokens(
-            calls[node.spec.name].prompt, (), context.tokenizer)[0]
-        return previous == current
-    return isinstance(source, AiFilter) and node.spec.anchor not in after_joins
 
 
 def _token_store(document_tokens):
@@ -325,7 +274,7 @@ class PrefixSharing:
             return None
         nodes = []
         changed = False
-        pipelines = build_pipelines(graph)
+        pipelines = build_pipelines(graph, context.gpu_count)
         for node in graph.nodes:
             if isinstance(node, AiFilter) and not node.share_prefixes:
                 lengths = context.document_tokens.get(node.alias)
@@ -356,8 +305,8 @@ class PrefixSharing:
                         shared_tokens=page_aligned_shared_tokens(store),
                         total_tokens=sum(lengths), writes_pages=True):
                     pipeline = pipelines.get(node.node_id)
-                    resident = (context.gpu_count == 1 and pipeline is not None
-                                and pipeline.members[0].node_id != node.node_id)
+                    resident = (pipeline is not None
+                                and pipeline[0].node_id != node.node_id)
                     node = replace(node, spec=_shared_classify_spec(
                         node, context, store, resident=resident))
                     changed = True
@@ -370,11 +319,8 @@ class PrefixSharing:
                         shared_tokens=page_aligned_shared_tokens(store),
                         total_tokens=sum(lengths), writes_pages=True):
                     pipeline = pipelines.get(node.node_id)
-                    preceding = (() if pipeline is None else
-                                 pipeline.members[:pipeline.members.index(node)])
-                    resident = bool(preceding) and (
-                        context.gpu_count == 1
-                        or any(isinstance(member, AiExtract) for member in preceding))
+                    resident = (pipeline is not None
+                                and pipeline[0].node_id != node.node_id)
                     node = replace(node, spec=_shared_extract_spec(
                         node, context, store, resident=resident))
                     changed = True

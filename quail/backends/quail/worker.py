@@ -521,7 +521,6 @@ def _child_filters(state, sub):
                     "document_ids": index,
                     "limit": filter_limit,
                     "stop_groups": sub.get("stop_groups"),
-                    "retain_survivors": nodes[-1].keep_kv,
                 },
             )
             out["results"] = results
@@ -531,10 +530,6 @@ def _child_filters(state, sub):
                 for document, row in results[member.node_id].outputs[
                         f"filter_answers:{alias}"].items():
                     answers.setdefault(document, []).extend(row)
-            if node.keep_kv:
-                out["retained"][alias] = sorted(
-                    key[1] for key in arena.retained_keys()
-                    if key[0] == alias)
             out["fresh_tokens"] += sum(result.metrics.fresh_tokens
                                        for result in results.values())
             out["filters"][alias] = {
@@ -599,7 +594,7 @@ def _child_joins(state, sub):
     live[anchor_alias] = anchors_glob
     apply_retention(arena, config,
                     config.get("before", {}).get(node.node_id, {}), live)
-    retain_anchor = bool(sub.get("retain_anchor"))
+    retain_anchor = nodes[-1].keep_kv
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():

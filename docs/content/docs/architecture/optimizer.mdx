@@ -242,9 +242,16 @@ how these limits affect batching.
 
 ### KV retention
 
-The `kv_retention` rule identifies document KV that later operators can
-reuse. A filter can retain the KV of passing documents for a later join anchored on that
-table. A join can retain anchor KV for a later join with the same anchors.
+The `kv_retention` rule sets each native operator's `keep_kv` flag. You can
+inspect it in the physical plan. It controls whether document KV stays available
+**after** the operator finishes, based on later consumers and their prompt heads.
+Compatible operators process each document in one scheduler run. Worker dispatch
+uses the same compatibility rules, with separate runs for consecutive filters,
+consecutive joins, and consecutive extractions.
+
+Decoding keeps KV while the operator is running, regardless of `keep_kv`.
+Classification and extraction append accepted answer tokens between decode
+rounds. A new question uses KV rewind to return to the document prefix.
 
 Retained KV has a memory limit. When pages run out, the executor removes
 the KV with the lowest estimated future savings per page. An operator

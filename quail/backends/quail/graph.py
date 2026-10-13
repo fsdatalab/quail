@@ -14,7 +14,6 @@ from quail.execution.pairs import (
     pair_partner,
     partner_map,
 )
-from quail.execution.pipelines import build_pipelines
 from quail.execution.reranker import FilterRuntime
 from quail.execution.runner import (
     ExecutionContext,
@@ -252,7 +251,6 @@ def filter_inputs(state, node, document_ids) -> dict:
         "limit": state["filter_limit"],
         "stop_groups": stop_groups(
             node, state.get("columns", {}).get(node.alias), document_ids),
-        "retain_survivors": node.keep_kv,
         "document_done": filter_document_sink(node, document_ids),
     }
 
@@ -403,7 +401,7 @@ def _model_inputs(node, inputs, context: ExecutionContext, chain=None,
             else matched
         # an anchor with no pairs settles without loading its KV
         if state["arena"].is_resident(key):
-            if alive and last_node.keep_anchor_kv:
+            if alive and last_node.keep_kv:
                 retain_after_join(
                     state["arena"], key, len(prefixes[local_index]), config,
                     config.get("after", {}).get(last_node.node_id, {}))
@@ -450,7 +448,7 @@ def record_model_result(node, result: NodeResult,
         live = set(result.outputs[f"ids:{node.anchor}"])
         for key, prefix in zip(keys, prepared["prefixes"]):
             if state["arena"].is_resident(key):
-                if node.keep_anchor_kv and key[1] in live:
+                if node.keep_kv and key[1] in live:
                     config = state["retention"]
                     retain_after_join(state["arena"], key, len(prefix), config,
                                       config.get("after", {}).get(node.node_id, {}))
@@ -501,7 +499,6 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         model_result=record_model_result,
         state=runtime_state,
         functions=state.get("functions", {}),
-        pipelines=build_pipelines(graph),
         run_pipeline=getattr(execution, "execute_pipeline", None),
     )
     started = time.perf_counter()

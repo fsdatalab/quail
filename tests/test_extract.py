@@ -130,7 +130,7 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
     pipelines = build_pipelines(plan.graph)
     # the three run as one pipeline: the later ones read the KV the
     # first leaves and are priced without reading the document
-    assert pipelines[extracts[0].node_id].node_ids == tuple(
+    assert tuple(member.node_id for member in pipelines[extracts[0].node_id]) == tuple(
         extract.node_id for extract in extracts)
     assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
     assert extracts[2].spec.estimated_seconds < extracts[0].spec.estimated_seconds
@@ -140,8 +140,25 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
         different if node.node_id == different.node_id else node
         for node in plan.nodes))
     separated = build_pipelines(graph)
-    assert separated[extracts[0].node_id].node_ids == (extracts[0].node_id,)
-    assert separated[extracts[1].node_id].node_ids == (extracts[1].node_id,)
+    assert tuple(
+        member.node_id for member in separated[extracts[0].node_id]) == (
+            extracts[0].node_id,)
+    assert tuple(
+        member.node_id for member in separated[extracts[1].node_id]) == (
+            extracts[1].node_id,)
+    from quail.planner.kv import plan_kv_retention
+
+    retained = plan_kv_retention(graph)
+    assert [node.keep_kv for node in retained.nodes
+            if isinstance(node, AiExtract)] == [True, True, False]
+    head, tail = different.spec.prompt_token_parts
+    different = replace(different, spec=replace(
+        different.spec, prompt_token_parts=((head[0] + 1, *head[1:]), tail),
+        shares_head=False))
+    changed_head = replace(graph, nodes=tuple(
+        different if node.node_id == different.node_id else node
+        for node in graph.nodes))
+    assert not plan_kv_retention(changed_head).node(extracts[0].node_id).keep_kv
     # a plain extraction shows the document under the query's shared
     # head, as the filter does, so it continues the filter's pipeline
     # and asks its question of the KV the filter wrote
@@ -155,7 +172,7 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
     assert extract.spec.shares_head
     assert list(extract.spec.prompt_token_parts[0]) == plan.settings["pre_ids"]
     pipelines = build_pipelines(plan.graph)
-    assert pipelines[ai_filter.node_id].node_ids == (
+    assert tuple(member.node_id for member in pipelines[ai_filter.node_id]) == (
         ai_filter.node_id, extract.node_id)
     # a classification of the table writes the documents under the
     # same head, so the extraction continues its pipeline too
@@ -170,7 +187,7 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
     assert (tuple(classify.spec.prompt_token_parts[0])
             == tuple(extract.spec.prompt_token_parts[0]))
     pipelines = build_pipelines(plan.graph)
-    assert pipelines[classify.node_id].node_ids == (
+    assert tuple(member.node_id for member in pipelines[classify.node_id]) == (
         classify.node_id, extract.node_id)
 
 

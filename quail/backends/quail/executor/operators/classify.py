@@ -3,7 +3,11 @@
 import numpy as np
 import pyarrow as pa
 
-from quail.backends.quail.executor.classify import ClassifyStages, JoinPartners
+from quail.backends.quail.executor.classify import (
+    AnswerStream,
+    ClassifyStages,
+    JoinPartners,
+)
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.reranker import (
     _score_table,
@@ -79,6 +83,13 @@ class ClassifyPart:
         self.stages = plan.stages
         self.reached = 0
         self.suffix_tokens = 0
+        sink = answer_sink()
+        rows = np.asarray(ids).reshape(-1, 1) if sink is not None else None
+        self.stream = AnswerStream(
+            (lambda positions, values: sink(scored_batch(
+                node, rows[positions], values)))
+            if sink is not None and plan.partners is None else None)
+        self.document_done = self.stream.chunk(lambda anchor: plan.labels[anchor])
 
     def label(self, document) -> str | None:
         """Return the category assigned to a document ID, or None if unresolved."""
@@ -97,6 +108,8 @@ class ClassifyPart:
         """
         self.reached = len(every[0]) if every else 0
         self.suffix_tokens, streamed = self.plan.finish(every)
+        self.stream.finish(range(len(self.ids)),
+                           lambda anchor: self.plan.labels[anchor])
         return streamed
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
@@ -138,9 +151,6 @@ class ClassifyPart:
         priors.update({spec.aliases[0]: part.result_value.outputs[port]
                        for part, port in self.priors})
         table = attach_prior_columns(table, priors)
-        sink = answer_sink()
-        if sink is not None and len(rows):
-            sink(scored_batch(self.node, rows, table))
         return NodeResult(classify_outputs(self.node, table), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),
             evaluated_documents=self.reached, fresh_tokens=tokens,

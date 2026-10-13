@@ -13,6 +13,7 @@ from quail.backends.quail.executor.parts import (
     chunks,
     gpu_seconds,
     input_staging,
+    settle_documents,
     shared_prefix_tree,
     stage_spans,
 )
@@ -74,15 +75,8 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
     fresh = 0
     spans = []
     arena = state.loaded_model.arena
-    if arena.retention_cap_pages is None:
-        arena.retention_cap_pages = max(
-            0, arena.n_pages - arena.pages_needed(2 * state.chunk_tokens))
-
-    def on_settled(anchor, survived, row):
-        # the document's KV stays for a later extraction of the table
-        key = stages.keys[anchor]
-        if arena.is_resident(key):
-            arena.retain(key, len(stages.prefixes[anchor]))
+    on_settled = settle_documents(arena, stages.keys, stages.prefixes,
+                                  nodes[-1].keep_kv, state.chunk_tokens)
 
     if document_ids:
         tree = (shared_prefix_tree(nodes[0].spec.name, stages.prefixes, arena)

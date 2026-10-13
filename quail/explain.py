@@ -432,7 +432,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             source = {"none": "not resident", "filter": "from filters",
                       "kept": "from an earlier join"}.get(
                           node.anchor_resident, node.anchor_resident)
-            keep = "yes" if node.keep_anchor_kv else "no"
+            keep = "yes" if node.keep_kv else "no"
             details.append(f"KV: anchor={source}, retain after join={keep}")
             label = (f"join {node.written_pos + 1} {node.semantics} "
                      f"({node.anchor}, {', '.join(node.partners)})")
@@ -547,11 +547,11 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
     lines = _table(rows)
     seen = set()
     for member_id, pipeline in build_pipelines(graph).items():
-        if id(pipeline) in seen or len(pipeline.members) < 2:
+        if id(pipeline) in seen or len(pipeline) < 2:
             continue
         seen.add(id(pipeline))
-        lines.append(f"Pipeline on {pipeline.alias}: "
-                     + " -> ".join(pipeline.node_ids)
+        lines.append(f"Pipeline on {pipeline[0].document_aliases[0]}: "
+                     + " -> ".join(member.node_id for member in pipeline)
                      + " (each document runs every operator with its KV "
                      "resident)")
     if used_default:

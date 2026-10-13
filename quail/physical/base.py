@@ -94,6 +94,30 @@ class PhysicalNode:
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
     backend: ClassVar[str | None] = None
 
+    worker_pipelining: ClassVar[bool] = False
+
+    @property
+    def document_aliases(self) -> tuple[str, ...]:
+        """Return aliases this operator can process one document at a time."""
+        return ()
+
+    @property
+    def document_head(self) -> tuple[int, ...] | None:
+        """Return the document's prompt head, or None for the shared preamble."""
+        return None
+
+    def document_outputs(self, alias: str) -> tuple[str, ...]:
+        """Return outputs that can feed the next operator for a document."""
+        return (f"ids:{alias}",)
+
+    def can_follow(self, previous: "PhysicalNode", first: "PhysicalNode") -> bool:
+        """Return whether this operator can use the preceding document KV."""
+        return True
+
+    def can_precede(self, consumer: "PhysicalNode") -> bool:
+        """Return whether a consumer can run before other documents finish."""
+        return True
+
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         raise NotImplementedError
