@@ -24,7 +24,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench import labeling as labels
+from bench import labeling as labels
 from quail_b import prompts
 from quail_b.data import GROUND_TRUTH_ROOT
 from quail_b.predicates import (
@@ -293,7 +293,7 @@ class VLLMJudge:
     def __init__(self, repo: str = MODEL_REPO, revision: str = MODEL_REVISION):
         from vllm import LLM
 
-        from quail.backends.vllm import _capacity
+        from quail.baselines.vllm import _capacity
 
         started = time.perf_counter()
         self.llm = LLM(
@@ -680,7 +680,7 @@ def check_collection(sf: float, collection_id: str) -> dict:
     root = str(labels.ROOT)[:-len(GROUND_TRUTH_ROOT) - 1]
     directory = labels.ROOT / "corpora" / CORPORA[sf]
     counts = {}
-    for query_id, spec in queries(include_pending=True).items():
+    for query_id, spec in queries().items():
         if not spec.info.classifies:
             continue
         tables = {relation.table: pq.read_table(

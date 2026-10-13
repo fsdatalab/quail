@@ -57,17 +57,12 @@ def score_work(count, mean_tokens, fixed_tokens, *, variance=0.0,
     ) * shared_reuses
 
 
-def _variance(lengths) -> float:
-    mean = sum(lengths) / max(1, len(lengths))
-    return sum((length - mean) ** 2 for length in lengths) / max(1, len(lengths))
-
-
 @dataclass(frozen=True)
 class ScoreCost:
     """Prepared numeric inputs for one score's cost at any survivor count."""
 
     token_lengths: tuple[int, ...]
-    lengths: tuple
+    summaries: tuple
     mean_tokens: float
     model: ModelSpec
     device: DeviceSpec
@@ -78,7 +73,7 @@ class ScoreCost:
 
     def estimate(self, expected_inputs, *, prefix_groups=None) -> tuple[Work, float]:
         """Return model work and seconds for the expected inputs."""
-        lengths = self.lengths
+        summaries = self.summaries
         canvas = self.model.canvas_tokens
         # a one-table score on a canvas model may average noise draws, each
         # the cue and its canvas after the document's KV; every draw is priced
@@ -89,21 +84,21 @@ class ScoreCost:
         prefix_variance = 0.0
         groups = min(float(self.workers), expected_inputs)
         capacity = self.capacity
-        if len(lengths) == 2:
-            prefix += sum(lengths[0]) / max(1, len(lengths[0])) + self.token_lengths[1]
-            prefix_variance = _variance(lengths[0])
+        if len(summaries) == 2:
+            prefix += summaries[0].mean + self.token_lengths[1]
+            prefix_variance = summaries[0].variance
             groups = min(
                 expected_inputs,
-                len(lengths[0]) if prefix_groups is None else prefix_groups,
+                summaries[0].count if prefix_groups is None else prefix_groups,
             )
-            longest = sum(max(values, default=0) for values in lengths) + fixed_tokens
+            longest = sum(summary.maximum for summary in summaries) + fixed_tokens
             if longest > capacity:
                 prefix = float(shared)
                 prefix_variance = 0.0
                 groups = min(float(self.workers), expected_inputs)
         work = score_work(
             expected_inputs, self.mean_tokens, fixed_tokens,
-            variance=sum(_variance(values) for values in lengths),
+            variance=sum(summary.variance for summary in summaries),
             prefix_tokens=prefix, prefix_variance=prefix_variance,
             groups=groups, shared_tokens=shared, copies=self.workers,
         )

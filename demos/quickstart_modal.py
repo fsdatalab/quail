@@ -11,7 +11,7 @@ from pathlib import Path
 import modal
 
 from demos import quickstart
-from quail.bench.images import pypi_gpu_image
+from quail.deploy.images import pypi_gpu_image
 
 app = modal.App("quail-engine")
 volume = modal.Volume.from_name("quail-results", create_if_missing=True)

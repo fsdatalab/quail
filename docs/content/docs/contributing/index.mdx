@@ -38,12 +38,23 @@ Include the tests and documentation needed to check and use your change.
 
 | Path | Contents |
 | --- | --- |
-| `quail/frontend/` | SQL parsing and the Python query API. |
+| `quail/api/` | `Session`, `Query`, and running a query in this process. |
+| `quail/frontend/` | SQL parsing and the Python query builder. |
+| `quail/catalog/` | Table providers and the tokenized inputs of a session. |
 | `quail/logical/`, `quail/physical/` | Logical and physical plan definitions. |
 | `quail/planner/`, `quail/cost/`, `quail/specs/` | Planning rules, cost estimates, and model and device specifications. |
-| `quail/execution/`, `quail/backends/` | Query execution and inference engines. |
+| `quail/execution/` | The runner and the CPU operators. |
+| `quail/backends/` | The Quail inference engine. |
+| `quail/baselines/` | The stock vLLM and SGLang backends the benchmark compares against. |
+| `quail/remote/`, `quail/server/` | The client and server of Quail Server. |
+| `quail/deploy/` | The Modal images. |
+| `bench/` | The QUAIL-B runner, outside the wheel. |
 | `tests/`, `experiments/` | CPU tests and Modal GPU scripts. |
 | `docs/`, `demos/` | Documentation and examples. |
+
+Each package imports only the packages below it in the list in
+`pyproject.toml` under `[tool.importlinter]`; `uv run lint-imports`
+checks that.
 
 See [Architecture](/docs/architecture) for the query execution flow.
 See [Extending Quail](/docs/extending) for the extension interfaces.
@@ -55,9 +66,10 @@ See [Extending Quail](/docs/extending) for the extension interfaces.
 Run these commands from the repository root:
 
 ```bash
-uv run ruff check quail tests experiments tools
+uv run ruff check quail bench tests experiments tools
 uv run python tools/check_long_strings.py
 uv run vulture
+uv run lint-imports
 uv run pytest -q
 ```
 

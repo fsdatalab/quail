@@ -48,9 +48,19 @@ class ModelExecution(Protocol):
 
 
 class ModelBackend(Protocol):
-    """Planner and execution factory for one model backend."""
+    """Planner and execution factory for one model backend.
+
+    Attributes:
+        name: The registered backend name.
+        reads_document_text: Whether the backend reads each scanned
+            document as text, so the scan carries its text column.
+        locates_answers_in_text: Whether the backend locates extracted
+            answers by character offsets, so tokenization keeps them.
+    """
 
     name: str
+    reads_document_text: bool
+    locates_answers_in_text: bool
 
     def supports(
         self,

@@ -19,7 +19,7 @@ The following command runs `IMDB-4` with Qwen3 4B fp8 at scale factor
 to the full benchmark dataset.
 
 ```bash
-uv run python -m quail.bench.quailb --sf 0.1 --only IMDB-4 \
+uv run python -m bench.quailb --sf 0.1 --only IMDB-4 \
   --model qwen3-4b-fp8 --device h100-sxm \
   --output-dir results/quailb/imdb-4
 ```
@@ -35,7 +35,7 @@ The following command runs the same query with Quail on one H100.
 ```bash
 mkdir -p results/benchmark
 run_log="results/benchmark/quailb-$(date -u +%Y%m%dT%H%M%SZ).log"
-uv run modal run --detach -m quail.bench.quailb_parallel \
+uv run modal run --detach -m bench.quailb_parallel \
   --sf 0.1 --model qwen3-4b-fp8 --query IMDB-4 \
   --no-include-baselines --no-include-sglang \
   --output-dir /results/benchmarks/quailb \
@@ -102,7 +102,7 @@ inputs. Quail's benchmark runner reads these plans and builds Quail queries.
 Query definitions and reference labels belong in
 [quail-bench](https://github.com/fsdatalab/quail-bench).
 Quail's runner is in
-[`quail/bench/`](https://github.com/fsdatalab/quail/tree/main/quail/bench).
+[`bench/`](https://github.com/fsdatalab/quail/tree/main/bench).
 
 Add or change the query in quail-bench first. Then update the `quail-b`
 commit in `pyproject.toml` and update `uv.lock`.

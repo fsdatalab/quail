@@ -6,6 +6,7 @@ import sqlglot
 from sqlglot import exp
 
 from quail.catalog import Catalog
+from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql_binding.expressions import (
     ExpressionBinder,
 )
@@ -66,6 +67,8 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
             replacement = "AI_SCORE("
         elif function == "CLASSIFY":
             replacement = "AI_CLASSIFY("
+        elif function == "EXTRACT":
+            replacement = "AI_EXTRACT("
         elif function == "IF" and dialect is SQLDialect.BQ:
             replacement = "AI_FILTER("
         if (
@@ -99,10 +102,11 @@ def _reject_forbidden(tree) -> None:
         if name.startswith("AI_") and name not in {
             "AI_FILTER",
             "AI_SCORE",
+            "AI_EXTRACT",
         }:
             raise CompileError(
                 f"{name} is not supported; supported AI functions are "
-                "AI_FILTER and AI_SCORE"
+                "AI_FILTER, AI_SCORE, AI_CLASSIFY, and AI_EXTRACT"
             )
     # subqueries are legal only as the EXISTS form, checked
     # structurally; any other subquery is refused here
@@ -198,20 +202,20 @@ def _bind_label_names(b: ExpressionBinder, columns: tuple[ColumnRef | Alias, ...
 def compile_sql(
     sql: str,
     catalog: Catalog,
-    tokenizer=None,
     dialect: SQLDialect | str = SQLDialect.SNOWFLAKE,
     turn: tuple[str, str] = ("", ""),
     layout: str = "ai-if",
+    prompts: PromptBinder | None = None,
 ) -> LogicalPlan:
     """Compile AI SQL text into a LogicalPlan.
 
     Args:
         sql: A SELECT statement in the chosen dialect.
         catalog: Registered tables and their schemas.
-        tokenizer: Tokenizer used to bind AI prompts.
         dialect: SQL dialect used to parse the statement.
         turn: Model chat text placed before and after each prompt.
         layout: Prompt layout used by the model.
+        prompts: Model-aware prompt binder. Overrides turn and layout.
 
     Returns:
         The bound logical query plan.
@@ -239,7 +243,8 @@ def compile_sql(
     offset = _parse_offset(tree)
     distinct = _parse_distinct(tree)
 
-    b = ExpressionBinder(catalog, tokenizer, turn, layout)
+    b = ExpressionBinder(catalog, prompts or PromptBinder(
+        turn=turn, layout=layout))
 
     joins = JoinBinder(b)
     joins.bind_tables(tree)
@@ -250,6 +255,12 @@ def compile_sql(
     order = bind_order(tree, b, columns, aggregation)
     _validate_query(b, joins, columns)
     named, labels = _bind_label_names(b, columns)
+    extracts = {}
+    for column in columns:
+        if isinstance(column, Alias) and column.expression.kind == "extract":
+            extracts.setdefault(column.expression.aliases()[0], []).append(
+                (column.expression, column.name)
+            )
 
     logical = LogicalPlanBuilder()
     for alias, provider in b.tables:
@@ -264,6 +275,7 @@ def compile_sql(
                 (labels[alias][call], accepted, selectivity)
                 for call, accepted, selectivity in b.label_tests.get(alias, ())
             ),
+            extracts=tuple(extracts.get(alias, ())),
         )
     for join in b.joins:
         logical.add_join(join)

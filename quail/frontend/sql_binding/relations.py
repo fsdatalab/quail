@@ -203,6 +203,9 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
             raise CompileError(
                 "AI.CLASSIFY in WHERE is tested with = 'label' or IN ('label', ...)"
             )
+        if any(_is_call(call, "AI_EXTRACT") for call in term.walk()):
+            raise CompileError(
+                "AI.EXTRACT is a SELECT column, not a predicate")
         if _is_ai_score_comparison(term):
             predicate, options, aliases = b.bind_ai_score(term, SCORE_OPTION_KEYS)
         else:

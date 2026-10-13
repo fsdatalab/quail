@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from quail.backends.quail.executor.model import answer_weights
-from quail.logical import true_false_ids
+from quail.planner.prompt_lowering import true_false_ids
 
 
 class AnswerRows:
@@ -105,7 +105,34 @@ def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
             np.arange(int(counts.sum())) - starts)
 
 
-class AsyncLabelLogprobs:
+class _HostReadout:
+    """Copy readout tensors asynchronously using reusable pinned buffers."""
+
+    def __init__(self, torch):
+        self.torch = torch
+        self.available = []
+
+    def _copy(self, values):
+        host = self.available.pop() if self.available else None
+        if host is None or host.shape[0] < values.shape[0]:
+            host = self.torch.empty(values.shape, dtype=values.dtype, pin_memory=True)
+        host[:values.shape[0]].copy_(values, non_blocking=True)
+        event = self.torch.cuda.Event()
+        event.record()
+        return event, host, values.shape[0]
+
+    def result(self, handle, *, copy=True):
+        """Read completed values; an uncopied view expires when its buffer is reused."""
+        event, host, count = handle
+        event.synchronize()
+        values = host[:count].numpy()
+        if copy:
+            values = values.copy()
+        self.available.append(host)
+        return values
+
+
+class AsyncLabelLogprobs(_HostReadout):
     """Asynchronous readout of selected tokens' log probabilities or logits.
 
     With normalize=True, each token's log probability is normalized over
@@ -127,7 +154,7 @@ class AsyncLabelLogprobs:
     BLOCK_ROWS = 512
 
     def __init__(self, torch, F, head, targets, rows=1, normalize=True):
-        self.torch = torch
+        super().__init__(torch)
         self.F = F
         self.head = head
         self.targets = torch.tensor(list(targets), device=head.device,
@@ -138,7 +165,6 @@ class AsyncLabelLogprobs:
             0, self.targets)
         self.dtype = np.dtype((np.float32, (rows, len(targets)) if rows > 1
                                else (len(targets),)))
-        self.available = []
 
     def logprobs(self, normed):
         """Compute selected token values from normalized hidden states.
@@ -189,33 +215,98 @@ class AsyncLabelLogprobs:
         elif rows_per_answer is not None and any(
                 n != 1 for n in rows_per_answer):
             raise ValueError("this readout holds one row per answer")
-        host = self.available.pop() if self.available else None
-        if host is None or host.shape[0] < values.shape[0]:
-            host = torch.empty(values.shape, dtype=torch.float32,
-                               pin_memory=True)
-        host[:values.shape[0]].copy_(values, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        return event, host, values.shape[0]
+        return self._copy(values)
+
+
+class AsyncTopLogprobs(_HostReadout):
+    """Asynchronous readout of each row's likeliest tokens' log probabilities.
+
+    A row's values are the log probabilities of the extra tokens, then
+    the ids of its k likeliest tokens, then their log probabilities,
+    all normalized over the full vocabulary at temperature 1. A token
+    outside the k likeliest has no value: the reader treats it as
+    impossible.
+
+    Args:
+        torch: Torch module.
+        F: Torch functional module.
+        head: Full output head with shape (vocabulary, hidden size).
+        k: How many likeliest tokens each row returns.
+        extras: Token ids whose log probability every row returns. An
+            entry that is a tuple of ids returns one value, the log
+            probability of any of them.
+        ragged: Whether answers have several rows each: submit then
+            takes rows_per_answer and result returns one (rows, width)
+            array per answer, in an object array.
+    """
+
+    BLOCK_ROWS = AsyncLabelLogprobs.BLOCK_ROWS
+
+    def __init__(self, torch, F, head, k, extras, ragged=False):
+        super().__init__(torch)
+        self.F = F
+        self.head = head
+        self.k = k
+        ids, self.groups = [], []
+        for extra in extras:
+            members = list(extra) if isinstance(extra, tuple) else [extra]
+            self.groups.append(slice(len(ids), len(ids) + len(members)))
+            ids.extend(members)
+        self.extras = torch.tensor(ids, device=head.device, dtype=torch.long)
+        self.width = len(extras) + 2 * k
+        self.ragged = ragged
+        self.dtype = (np.dtype(object) if ragged
+                      else np.dtype((np.float32, (self.width,))))
+
+    def values(self, normed):
+        """Compute each row's values from normalized hidden states."""
+        torch = self.torch
+        out = torch.empty((normed.shape[0], self.width), dtype=torch.float32,
+                          device=normed.device)
+        n = len(self.groups)
+        for start in range(0, normed.shape[0], self.BLOCK_ROWS):
+            block = normed[start:start + self.BLOCK_ROWS]
+            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
+            logits -= torch.logsumexp(logits, dim=1, keepdim=True)
+            rows = slice(start, start + block.shape[0])
+            picked = logits.index_select(1, self.extras)
+            for column, group in enumerate(self.groups):
+                out[rows, column] = torch.logsumexp(picked[:, group], dim=1)
+            top, ids = torch.topk(logits, self.k, dim=1)
+            out[rows, n:n + self.k] = ids.float()
+            out[rows, n + self.k:] = top
+        return out
+
+    def submit(self, normed, rows_per_answer=None):
+        return (*self._copy(self.values(normed)), rows_per_answer)
 
     def result(self, handle):
-        event, host, count = handle
-        event.synchronize()
-        values = host[:count].numpy().copy()
-        self.available.append(host)
-        return values
+        *transfer, rows_per_answer = handle
+        values = super().result(transfer)
+        return split_rows(values, rows_per_answer) if self.ragged else values
 
 
-class AsyncScores:
+def split_rows(values, rows_per_answer):
+    """Split stacked answer rows into one array per answer, in an object array."""
+    if rows_per_answer is None:
+        rows_per_answer = [1] * len(values)
+    out = np.empty(len(rows_per_answer), dtype=object)
+    row = 0
+    for index, count in enumerate(rows_per_answer):
+        out[index] = values[row:row + count]
+        row += count
+    return out
+
+
+class AsyncScores(_HostReadout):
     """Non-blocking yes-against-no sigmoid readout for AI.SCORE."""
 
     dtype = np.float32
 
     def __init__(self, torch, rows):
-        self.torch = torch
+        super().__init__(torch)
         self.rows = rows
         self.weights = rows.weights.float()
-        self.available = []
 
     def submit(self, normed):
         torch, rows = self.torch, self.rows
@@ -224,22 +315,8 @@ class AsyncScores:
         no = logits.index_select(1, rows.false_cols).amax(dim=1)
         return self._copy(torch.sigmoid(yes - no))
 
-    def _copy(self, scores):
-        """Copy scores to a pinned host buffer behind an event."""
-        torch = self.torch
-        host = self.available.pop() if self.available else None
-        if host is None or host.numel() < scores.shape[0]:
-            host = torch.empty(scores.shape[0], dtype=torch.float32, pin_memory=True)
-        host[:scores.shape[0]].copy_(scores, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        return event, host, scores.shape[0]
-
     def result(self, handle):
-        event, host, count = handle
-        event.synchronize()
-        self.available.append(host)
-        return host[:count].numpy()
+        return super().result(handle, copy=False)
 
 
 class DecisionHead:

@@ -1,11 +1,11 @@
 # Quail
 
-Quail (QUery Aware Inference Layer) is an open-source, extensible
-execution engine for AI-SQL, being developed at
-[Full Stack Data Lab](https://fsdatalab.github.io/) at CMU.
+Quail (QUery-Aware Inference Layer) is an open-source execution engine
+for AI-SQL. The [Full Stack Data Lab](https://fsdatalab.github.io/)
+at CMU develops Quail.
 
-AI-SQL is a variant of SQL with operators that let you write logic
-in natural language for an LLM to evaluate on every row.
+With AI-SQL, you write instructions in natural language inside your SQL
+queries. A language model evaluates those instructions for each row.
 
 ```sql
 SELECT r.id
@@ -26,7 +26,7 @@ The package is named `quail-engine`; in Python, import `quail`.
 uv pip install quail-engine
 ```
 
-Requires Python 3.12 and a CUDA GPU.
+You need Python 3.12 and a CUDA GPU.
 
 ## Example
 
@@ -58,11 +58,10 @@ with quail.Session(config=config) as session:
 
 ## Quail Server
 
-Quail Server is an optional HTTP server that runs on the machine with
-the GPU. You start it once, send queries to it with `endpoint`, and
-the query keeps running after the client disconnects. `submit()`
-returns once the server has saved the record, and `get_run` reads
-that record later.
+You can use Quail Server to run queries on the machine with your GPU.
+Start the HTTP server and set `endpoint` to its address. Your queries
+continue if you disconnect. `submit()` returns after the server saves
+your query. Use `get_run(query_id)` to reconnect later.
 
 ```bash
 uv pip install "quail-engine[server]"
@@ -103,15 +102,16 @@ See [Quail Server](https://fsdatalab.github.io/quail/docs/user-guide/server).
 
 ## Supported operators
 
-Quail supports AI-powered filters, joins, `EXISTS` / `NOT EXISTS`,
-numeric scores (`AI.SCORE`), and classification (`AI.CLASSIFY`).
-`AI.EXTRACT` and `AI.MAP` are planned additions.
+You can use filters and joins evaluated by a language model,
+`EXISTS` / `NOT EXISTS`, numeric scores (`AI.SCORE`), classification
+(`AI.CLASSIFY`), and extracting text that answers a question (`AI.EXTRACT`).
+`AI.MAP` is planned.
 
-We support two AI-SQL dialects:
+You can write queries in two AI-SQL dialects:
 [Snowflake `AI_FILTER`](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
 and
 [BigQuery `AI.IF`](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions),
-plus a Python builder API.
+or use the Python builder API.
 
 ## Supported models and GPUs
 
@@ -120,9 +120,11 @@ plus a Python builder API.
 | Qwen3 4B fp8 | NVIDIA H100 SXM |
 | Qwen3 32B fp8 | NVIDIA RTX PRO 6000 Blackwell Server Edition |
 | DiffusionGemma 26B-A4B fp8 | NVIDIA H100 SXM |
+| Decision 2.0 Kai 0.6B bf16 | NVIDIA H100 SXM |
 
-1, 2, 4, or 8 GPUs per query. We are actively adding more models
-and hardware.
+You can use 1, 2, 4, or 8 GPUs per query.
+
+We are actively adding more hardware and models.
 
 ## Development
 

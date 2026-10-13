@@ -44,6 +44,11 @@ def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
     return int(free // model.act_per_token) // CHUNK_SLACK
 
 
+def pages(tokens: int) -> int:
+    """Return the KV pages that hold tokens."""
+    return -(-tokens // PAGE_TOKENS)
+
+
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     """Effective chunk budget, floored at the compute knee.
 
@@ -154,19 +159,6 @@ def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
     return ridge * tot_p * model.w_bytes / denom
 
 
-def _projection_time(model: ModelSpec, device: DeviceSpec,
-                     chunk: int) -> float:
-    """Ideal seconds for all dense projections in one chunk, all layers."""
-    t = 0.0
-    for din, dout in _projection_shapes(model):
-        params = din * dout
-        flops = 2.0 * params * chunk
-        moved = (params * model.w_bytes
-                 + chunk * (din + dout) * ACT_BYTES)
-        t += max(flops / device.gemm_flops, moved / device.memory_bw)
-    return t * model.layers
-
-
 def _attention_time(model: ModelSpec, device: DeviceSpec,
                     chunk: int, context: int) -> float:
     """Ideal seconds for chunk query rows reading context KV tokens, all layers.
@@ -232,37 +224,3 @@ def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
     merge = 3 * rows * model.n_q * model.d_head * ACT_BYTES / device.memory_bw
     tree += merge * model.layers
     return "tree" if tree < unified else "unified"
-
-
-def attention_crossover(model: ModelSpec, device: DeviceSpec,
-                        chunk_tokens: int | None = None) -> float:
-    """Document length (tokens) where attention overtakes dense projections.
-
-    At the given chunk size.
-    """
-    if chunk_tokens is None:
-        chunk_tokens = chunk_budget(model, device)
-    t_dense = _projection_time(model, device, chunk_tokens)
-    lo, hi = 1.0, 1e7
-    for _ in range(200):
-        mid = (lo + hi) / 2
-        if _attention_time(model, device, chunk_tokens, int(mid)) < t_dense:
-            lo = mid
-        else:
-            hi = mid
-    return (lo + hi) / 2
-
-
-def derived_table(model: ModelSpec, device: DeviceSpec) -> dict:
-    """Return all derived budget quantities as a dict."""
-    chunk = chunk_budget(model, device)
-    return {
-        "minimum_weight_gpus": minimum_weight_gpus(model, device),
-        "arena_tokens": arena_tokens(model, device, chunk),
-        "arena_pages": arena_pages(model, device, chunk),
-        "chunk_memory_bound": chunk_memory_bound(model, device),
-        "kernel_index_cap": kernel_index_cap(model),
-        "chunk_budget": chunk,
-        "compute_knee": compute_knee(model, device),
-        "attention_crossover": attention_crossover(model, device, chunk),
-    }

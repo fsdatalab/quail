@@ -29,7 +29,7 @@ The number of available pages depends on GPU memory remaining after model
 weights and execution memory are reserved. See
 [physical plan settings](/docs/architecture/optimizer#execution-limits).
 The arena implementations are
-[`PageArena` and `KVArena`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py).
+[`PageArena`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pages.py) and [`KVArena`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py).
 
 ## KV rewind
 
@@ -54,7 +54,6 @@ evaluates the pair, and removes the partner's KV before reusing the anchor
 for other partners. A compatible classification can also reuse document
 KV from earlier pipeline stages.
 
-The code calls KV rewind "chain mode".
 
 ## Prefix sharing
 
@@ -76,7 +75,7 @@ adjacent documents to find common prefixes.
 Only complete pages are shared. Quail also leaves the final token of each
 document to be computed so the request can produce its output.
 
-[`PrefixTree`](https://github.com/fsdatalab/quail/blob/main/quail/execution/tokens.py)
+[`PrefixTree`](https://github.com/fsdatalab/quail/blob/main/quail/catalog/tokens.py)
 stores the sharing plan:
 
 | Field | Contents |

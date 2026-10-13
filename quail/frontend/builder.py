@@ -1,10 +1,21 @@
 """Python builder that mirrors AI SQL construct for construct."""
 
-from dataclasses import dataclass
 from typing import Optional
 
 from quail.catalog import Catalog
+from quail.frontend.expressions import (
+    AggSpec,
+    ColSpec,
+    EqualsSpec,
+    HavingSpec,
+    PredicateSpec,
+    PromptSpec,
+    SortSpec,
+    col,
+)
 from quail.frontend.label_tables import read_label_table
+from quail.frontend.prompts import PromptBinder
+from quail.frontend.scope import Scope
 from quail.logical import (
     AggregateCall,
     Aggregation,
@@ -21,203 +32,24 @@ from quail.logical import (
     ModelCall,
     RegularPredicate,
     SortKey,
-    bind_classify_prompt,
-    bind_join_prompt,
-    bind_prompt,
-    bind_score_prompt,
 )
-from quail.logical.expressions import validate_task_description
-
-
-@dataclass(frozen=True, eq=False)
-class ColSpec:
-    alias: Optional[str]
-    column: str
-
-    def __eq__(self, other):
-        """``col("c.url") == col("e.url")`` is a join condition.
-
-        Compared with a literal, it is a regular predicate for ``where()``.
-        """
-        if isinstance(other, ColSpec):
-            return EqualsSpec(self, other)
-        return PredicateSpec(self, "=", other)
-
-    def __ne__(self, other):
-        return PredicateSpec(self, "<>", other)
-
-    def __lt__(self, other):
-        return PredicateSpec(self, "<", other)
-
-    def __le__(self, other):
-        return PredicateSpec(self, "<=", other)
-
-    def __gt__(self, other):
-        return PredicateSpec(self, ">", other)
-
-    def __ge__(self, other):
-        return PredicateSpec(self, ">=", other)
-
-    def isin(self, values) -> "PredicateSpec":
-        return PredicateSpec(self, "in", tuple(values))
-
-    def is_null(self) -> "PredicateSpec":
-        return PredicateSpec(self, "is null")
-
-    def is_not_null(self) -> "PredicateSpec":
-        return PredicateSpec(self, "is not null")
-
-    def asc(self) -> "SortSpec":
-        return SortSpec(self)
-
-    def desc(self) -> "SortSpec":
-        return SortSpec(self, descending=True)
-
-    def nulls_first(self) -> "SortSpec":
-        return SortSpec(self, nulls="first")
-
-    def nulls_last(self) -> "SortSpec":
-        return SortSpec(self, nulls="last")
-
-    def __hash__(self):
-        return hash((self.alias, self.column))
-
-
-@dataclass(frozen=True)
-class SortSpec:
-    """A sort key for ``order_by()``: ``col("r.stars").desc().nulls_last()``.
-
-    Attributes:
-        col: The column or projected name to sort by.
-        descending: Whether to sort from the largest value down.
-        nulls: ``"first"`` or ``"last"``, or None for the default: nulls
-            last when ascending and first when descending.
-    """
-
-    col: ColSpec
-    descending: bool = False
-    nulls: Optional[str] = None
-
-    def asc(self) -> "SortSpec":
-        return SortSpec(self.col, False, self.nulls)
-
-    def desc(self) -> "SortSpec":
-        return SortSpec(self.col, True, self.nulls)
-
-    def nulls_first(self) -> "SortSpec":
-        return SortSpec(self.col, self.descending, "first")
-
-    def nulls_last(self) -> "SortSpec":
-        return SortSpec(self.col, self.descending, "last")
-
-
-@dataclass(frozen=True)
-class EqualsSpec:
-    """An unresolved ``col(...) == col(...)`` join condition."""
-    left: ColSpec
-    right: ColSpec
-
-
-@dataclass(frozen=True)
-class PredicateSpec:
-    """An unresolved regular predicate for ``where()``."""
-    col: ColSpec
-    comparison: str
-    value: object = None
-
-
-@dataclass(frozen=True)
-class PromptSpec:
-    template: str
-    cols: tuple
-
-
-@dataclass(frozen=True)
-class AggSpec:
-    """An unresolved aggregate for ``agg()``."""
-    function: str
-    col: object = None    # ColSpec, a label or score name, or None
-
-    def _test(self, comparison, value):
-        return HavingSpec(self, comparison, value)
-
-    def __eq__(self, other):
-        return self._test("=", other)
-
-    def __ne__(self, other):
-        return self._test("<>", other)
-
-    def __lt__(self, other):
-        return self._test("<", other)
-
-    def __le__(self, other):
-        return self._test("<=", other)
-
-    def __gt__(self, other):
-        return self._test(">", other)
-
-    def __ge__(self, other):
-        return self._test(">=", other)
-
-    def __hash__(self):
-        return hash((self.function, self.col))
-
-
-@dataclass(frozen=True)
-class HavingSpec:
-    """An unresolved ``having()`` test of an aggregate against a number."""
-    agg: AggSpec
-    comparison: str
-    value: object
-
-
-def count(c=None) -> AggSpec:
-    """``count()`` counts rows; ``count("r.id")`` counts non-null values."""
-    return AggSpec("count", c)
-
-
-def count_distinct(c) -> AggSpec:
-    return AggSpec("count_distinct", c)
-
-
-def sum_(c) -> AggSpec:
-    return AggSpec("sum", c)
-
-
-def avg(c) -> AggSpec:
-    return AggSpec("avg", c)
-
-
-def min_(c) -> AggSpec:
-    return AggSpec("min", c)
-
-
-def max_(c) -> AggSpec:
-    return AggSpec("max", c)
-
-
-def col(ref: str) -> ColSpec:
-    """"r.review" or "review" (unqualified resolves when unambiguous)."""
-    if "." in ref:
-        alias, column = ref.split(".", 1)
-        return ColSpec(alias=alias, column=column)
-    return ColSpec(alias=None, column=ref)
-
-
-def prompt(template: str, *cols: ColSpec) -> PromptSpec:
-    return PromptSpec(template=template, cols=tuple(cols))
+from quail.logical.expressions import (
+    SPAN_SUFFIX,
+    column_name,
+    validate_task_description,
+)
 
 
 class Query:
-    def __init__(self, catalog: Catalog, provider: str, tokenizer=None,
-                 turn: tuple[str, str] = ("", ""), layout: str = "ai-if"):
-        catalog.get(provider)     # unknown provider -> CompileError
+    def __init__(self, catalog: Catalog, provider: str,
+                 turn: tuple[str, str] = ("", ""), layout: str = "ai-if",
+                 prompts: PromptBinder | None = None):
         self._catalog = catalog
-        self._tokenizer = tokenizer
-        self._turn = turn
-        self._layout = layout
-        self._tables = [(provider, provider)]   # (alias, provider)
-        self._doc_columns = {}
+        self._prompts = prompts or PromptBinder(turn=turn, layout=layout)
+        self._scope_ = Scope(catalog)
+        self._scope_.add_table(provider, provider)
+        self._tables = self._scope_.tables      # (alias, provider)
+        self._doc_columns = self._scope_.doc_columns
         self._filters = {}
         self._label_filters = {}     # alias -> [(name, labels, selectivity)]
         self._joins = []
@@ -228,6 +60,7 @@ class Query:
         self._functions = {}         # name -> the Python function
         self._labels = {}            # name -> Alias of an AI.CLASSIFY call
         self._scores = {}            # name -> Alias of an AI.SCORE call
+        self._extracts = {}          # name -> Alias of an AI.EXTRACT call
         self._regular_predicates = {}  # alias -> [RegularPredicate]
         self._limit = None
         self._order = []             # (column or name, descending, nulls_first)
@@ -250,42 +83,14 @@ class Query:
         return dict(self._tables)
 
     def _resolve(self, c: ColSpec) -> ColumnRef:
-        scope = self._scope()
-        if c.alias is not None:
-            if c.alias not in scope:
-                raise CompileError(f"unknown table alias {c.alias!r}")
-            provider = scope[c.alias]
-            if c.column not in self._catalog.get(provider).columns:
-                raise CompileError(
-                    f"column {c.column!r} not in provider {provider!r} "
-                    f"(schema: {self._catalog.get(provider).columns})")
-            return ColumnRef(alias=c.alias, provider=provider,
-                             column=c.column)
-        owners = [(a, p) for a, p in scope.items()
-                  if c.column in self._catalog.get(p).columns]
-        if len(owners) != 1:
-            raise CompileError(
-                f"column {c.column!r} is "
-                f"{'ambiguous' if owners else 'unknown'}; qualify it "
-                f"with a table alias")
-        return ColumnRef(alias=owners[0][0], provider=owners[0][1],
-                         column=c.column)
+        return self._scope_.resolve(c.column, c.alias)
 
     def _note_doc_column(self, ref: ColumnRef) -> None:
-        seen = self._doc_columns.get(ref.alias)
-        if seen and seen != ref.column:
-            raise CompileError(
-                f"alias {ref.alias!r} is referenced through two "
-                f"columns ({seen!r}, {ref.column!r}); predicates over "
-                f"one table must share one document column so its KV "
-                f"is computed once")
-        self._doc_columns[ref.alias] = ref.column
+        self._scope_.note_doc_column(ref)
 
     def _bind(self, p: PromptSpec, join: bool = False):
         refs = tuple(self._resolve(c) for c in p.cols)
-        binder = bind_join_prompt if join else bind_prompt
-        bound = binder(p.template, refs, self._tokenizer, turn=self._turn,
-                       layout=self._layout)
+        bound = self._prompts.bind("join" if join else "filter", p.template, refs)
         for r in refs:
             self._note_doc_column(r)
         aliases = []
@@ -329,11 +134,9 @@ class Query:
         if not name or "." in name:
             raise CompileError(
                 f"a score needs a column name without a dot, got {name!r}")
-        if name in self._labels or name in self._scores or name in self._scope():
-            raise CompileError(f"the name {name!r} is already used")
+        self._claim_name(name)
         refs = tuple(self._resolve(c) for c in p.cols)
-        bound = bind_score_prompt(p.template, refs, self._tokenizer,
-                                  turn=self._turn)
+        bound = self._prompts.bind("score", p.template, refs)
         for ref in refs:
             self._note_doc_column(ref)
         call = ModelCall(bound, "score")
@@ -377,8 +180,7 @@ class Query:
             raise CompileError(
                 f"a classification needs a column name without a dot, "
                 f"got {name!r}")
-        if name in self._labels or name in self._scope():
-            raise CompileError(f"the name {name!r} is already used")
+        self._claim_name(name)
         if isinstance(labels, str):
             labels, table_descriptions = read_label_table(self._catalog, labels)
             descriptions = descriptions or table_descriptions
@@ -394,10 +196,9 @@ class Query:
         descriptions = tuple(descriptions or ())
         validate_task_description(task_description)
         refs = tuple(self._resolve(c) for c in p.cols)
-        bound = bind_classify_prompt(p.template, refs, labels, descriptions,
-                                     self._tokenizer, turn=self._turn,
-                                     task_description=task_description,
-                                     layout=self._layout)
+        bound = self._prompts.bind(
+            "label", p.template, refs, labels=labels, descriptions=descriptions,
+            task_description=task_description)
         for ref in refs:
             self._note_doc_column(ref)
         call = ModelCall(bound, "label", labels, descriptions,
@@ -405,6 +206,60 @@ class Query:
         call.validate()
         self._labels[name] = Alias(call, name)
         return self
+
+    def ai_extract(self, c, question: str, *, name: str,
+                   trim: bool = True) -> "Query":
+        """Copy the words that answer a question from each document.
+
+        The result column ``name`` holds the copied words, or null when
+        the document does not answer the question. The column ``name``
+        plus "_span" holds the answer's character span in the document
+        as a (start, end) pair. Use select() to return the columns.
+
+        For example, ``ai_extract("c.text", "When does the lease end?",
+        name="end")`` adds the columns ``end`` and ``end_span``.
+
+        Args:
+            c: The document column, as "alias.column" or a col().
+            question: The question the answer is copied for.
+            name: Result column name, without a dot.
+            trim: Whether the answer is the fewest words that answer the
+                question. With trim off, the answer is the whole lines
+                of the document that hold them, as the document's own
+                line breaks divide it.
+
+        Returns:
+            This query builder, with the extraction added.
+
+        Raises:
+            CompileError: The name, column, or question is invalid, or
+                a pending join has no AI predicate yet.
+        """
+        if self._pending_join is not None:
+            raise CompileError(
+                "join() is waiting for the ai_filter over its pairs; "
+                "extract before joining")
+        if not name or "." in name:
+            raise CompileError(
+                f"an extraction needs a column name without a dot, "
+                f"got {name!r}")
+        self._claim_name(name)
+        self._claim_name(name + SPAN_SUFFIX)
+        ref = self._resolve(col(c) if isinstance(c, str) else c)
+        bound = self._prompts.bind("extract", question, (ref,))
+        self._note_doc_column(ref)
+        call = ModelCall(bound, "extract", question=question, trim=trim)
+        call.validate()
+        self._extracts[name] = Alias(call, name)
+        return self
+
+    def _claim_name(self, name: str) -> None:
+        """Check that no earlier call or table alias uses the name."""
+        if (name in self._labels or name in self._scores
+                or name in self._extracts
+                or any(name == n + SPAN_SUFFIX for n in self._extracts)
+                or name in self._scope()):
+            raise CompileError(f"the name {name!r} is already used")
 
     def label_in(self, name: str, labels,
                  selectivity: Optional[float] = None) -> "Query":
@@ -580,7 +435,7 @@ class Query:
                 if name in self._labels or name in self._scope():
                     raise CompileError(f"the name {name!r} is already used")
                 self._labels[name] = column
-            self._tables.append((alias, provider))
+            self._scope_.add_table(alias, provider)
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
             for a, tests in other._label_filters.items():
@@ -761,7 +616,8 @@ class Query:
                 f"join() of {self._pending_join[0]} has no AI predicate "
                 f"over its pairs; a plain join belongs in the database "
                 f"the ids came from")
-        if not (self._joins or self._filters or self._labels or self._scores):
+        if not (self._joins or self._filters or self._labels or self._scores
+                or self._extracts):
             raise CompileError("the query has no AI predicate; a plain "
                                "scan belongs in the database the ids "
                                "came from")
@@ -775,6 +631,9 @@ class Query:
                 continue
             if isinstance(c, str) and c in self._scores:
                 columns.append(self._scores[c])
+                continue
+            if isinstance(c, str) and c in self._extracts:
+                columns.append(self._extracts[c])
                 continue
             if isinstance(c, str) and c == "*":
                 for alias, provider in self._tables:
@@ -791,6 +650,9 @@ class Query:
                   for name, _, _ in tests}
         wanted = [column for column in self._labels.values()
                   if column in columns or column.name in tested]
+        # an extraction is planned when the query returns its answer
+        extracted = [column for column in self._extracts.values()
+                     if column in columns]
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(
@@ -804,6 +666,9 @@ class Query:
                 tuple(self._label_filters.get(alias, ())),
                 regular_predicates=tuple(
                     self._regular_predicates.get(alias, ())),
+                extracts=tuple((column.expression, column.name)
+                               for column in extracted
+                               if column.expression.aliases() == (alias,)),
             )
         for join in self._joins:
             logical.add_join(join)
@@ -839,8 +704,7 @@ class Query:
                 column = self._resolve(col(c) if isinstance(c, str) else c)
             if column not in columns:
                 columns.append(column)
-            return (column.name if isinstance(column, Alias)
-                    else f"{column.alias}.{column.column}")
+            return column_name(column)
 
         keys = tuple(project(c) for c in self._group)
         aggregates = []
@@ -868,6 +732,6 @@ class Query:
                                     tuple(tests))
 
 
-def docs(catalog: Catalog, provider: str, tokenizer=None,
+def docs(catalog: Catalog, provider: str,
          turn: tuple[str, str] = ("", ""), layout: str = "ai-if") -> Query:
-    return Query(catalog, provider, tokenizer, turn, layout)
+    return Query(catalog, provider, turn, layout)

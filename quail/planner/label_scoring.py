@@ -10,8 +10,8 @@ from quail.labels import (
     TREE_SCORING,
     decodable,
 )
-from quail.logical.prompts import classify_prompt_tokens
 from quail.physical import ClassifySpec
+from quail.planner.prompt_lowering import classify_prompt_tokens, lower_prompt
 from quail.planner.statistics import ClassifyStatistics, classify_statistics
 from quail.planner.validation import ClassifyRefusedError
 
@@ -19,7 +19,8 @@ from quail.planner.validation import ClassifyRefusedError
 def classify_scoring(context, alias, shared=()):
     """Prepare scoring-method choices for one table and execution context."""
     stats = classify_statistics(context, alias, shared)
-    return ClassifyScoring(**vars(stats), tokenizer=context.tokenizer)
+    return ClassifyScoring(**vars(stats), tokenizer=context.tokenizer,
+                           lower=context.lowered)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -27,6 +28,7 @@ class ClassifyScoring(ClassifyStatistics):
     """Choose and price the scoring method of a prepared classification."""
 
     tokenizer: object
+    lower: object = None
 
     def choose_scoring(self, spec: ClassifySpec, call,
                        resident: bool) -> ClassifySpec:
@@ -50,9 +52,11 @@ class ClassifyScoring(ClassifyStatistics):
         head, tail = spec.prompt_token_parts
         labels, starts = spec.label_token_ids, spec.label_word_starts
         lettered = None
-        if call.prompt.lettered is not None:
+        lower = self.lower or (lambda prompt: lower_prompt(prompt, self.tokenizer))
+        lettered_prompt = lower(call.prompt).lettered
+        if lettered_prompt is not None:
             letter_head, letter_tail, letter_ids = classify_prompt_tokens(
-                call.prompt.lettered, call.prompt.lettered.letters, self.tokenizer)
+                lettered_prompt, lettered_prompt.letters, self.tokenizer)
             lettered = (len(letter_head), len(letter_tail) - 1, letter_ids)
         scoring, estimated = self.choose(
             spec.expected_inputs, len(head), len(tail) - 1, labels, resident,
@@ -71,10 +75,8 @@ class ClassifyScoring(ClassifyStatistics):
         # together within the forward pass and KV budget
         need = len(head) + self.longest + len(tail) + max(suffixes)
         if need > self.budget:
-            raise ClassifyRefusedError(
-                f"a document in {self.alias!r} needs {need} tokens with its "
-                f"classification prompt, but the forward pass budget is "
-                f"{self.budget} tokens", need, self.budget)
+            raise ClassifyRefusedError.over_budget(
+                f"a document in {self.alias!r}", need, self.budget)
         return replace(
             spec, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), label_token_ids=labels,
@@ -119,7 +121,7 @@ class ClassifyScoring(ClassifyStatistics):
         """
         head, tail = spec.prompt_token_parts
         if spec.scoring == DECISION_SCORING:
-            return classify_cost.estimate_chains(
+            return classify_cost.estimate_suffixes(
                 len(head), spec.frame_tokens, [len(tail) - spec.frame_tokens],
                 live=spec.expected_inputs, lengths=self.lengths,
                 shared=self.shared, chunk=self.chunk, model=self.model,

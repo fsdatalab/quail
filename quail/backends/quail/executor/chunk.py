@@ -33,7 +33,7 @@ class Chunk:
             trims their sliding pages after the pass.
         rows_per_answer: Rows of final_indices each answer takes, one
             entry per suffix in chunk order, when some suffix reads
-            more than its last row; empty when every answer is one row.
+            more than its last row; None when every answer is one row.
     """
 
     input_ids: Any
@@ -45,7 +45,7 @@ class Chunk:
     layout: list
     temporary_keys: tuple = ()
     fresh_keys: tuple = ()
-    rows_per_answer: tuple = ()
+    rows_per_answer: np.ndarray | None = None
 
 
 class ArenaFullError(RuntimeError):
@@ -313,7 +313,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     * read_all_rows: Whether every suffix row feeds the answer readout.
     * read_rows: Number of trailing rows to read from each suffix.
     * single: Whether the prefix and sole suffix form one request.
-    * chains: Trie chains and ancestor rows from trie_chains(). The document
+    * paths: Trie paths and ancestor rows from trie_paths(). The document
       KV must already be resident.
     * canvas: Per-group answer canvas tokens, overriding the default canvas.
 
@@ -380,7 +380,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     read_keys, read_used, cu_q = [], [], [0]
     max_q = 0
     unified_groups = []
-    # call C: chain rows reading their off-chain ancestor rows
+    # call C: path rows reading their off-path ancestor rows
     node_q, node_k, node_cu_q, node_cu_k = [], [], [0], [0]
     for g in groups:
         fresh = g.get("prefix") is not None
@@ -508,28 +508,28 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             else:
                 finals.append(s_row0 + ends - 1)
                 rows_per_answer.append(np.ones(n, dtype=np.int64))
-        chains = g.get("chains")
-        if chains is not None:
+        paths = g.get("paths")
+        if paths is not None:
             if n != 1 or not read_all or not tree_path:
-                raise ValueError("chains pack one suffix, every row read, "
+                raise ValueError("paths pack one suffix, every row read, "
                                  "under tree attention")
-            lengths = np.array([len(nodes) for nodes, _, _ in chains])
-            starts = np.array([start for _, start, _ in chains])
-            chain_ends = s_row0 + np.cumsum(lengths)
-            chain_row0 = chain_ends - lengths
+            lengths = np.array([len(nodes) for nodes, _, _ in paths])
+            starts = np.array([start for _, start, _ in paths])
+            path_ends = s_row0 + np.cumsum(lengths)
+            path_row0 = path_ends - lengths
             pos.append(f + np.repeat(starts, lengths)
                        + (np.arange(total, dtype=np.int64)
-                          - np.repeat(chain_row0 - s_row0, lengths)))
-            cu_a.append(chain_ends)
-            # a chain's rows read the rows above its first node, which
-            # earlier chains hold, in call C
-            for index, (_, _, gathers) in enumerate(chains):
+                          - np.repeat(path_row0 - s_row0, lengths)))
+            cu_a.append(path_ends)
+            # a path's rows read the rows above its first node, which
+            # earlier paths hold, in call C
+            for index, (_, _, gathers) in enumerate(paths):
                 if not gathers:
                     continue
                 keys = np.concatenate([
-                    np.arange(chain_row0[c], chain_row0[c] + count,
+                    np.arange(path_row0[c], path_row0[c] + count,
                               dtype=np.int64) for c, count in gathers])
-                node_q.append(np.arange(chain_row0[index], chain_ends[index],
+                node_q.append(np.arange(path_row0[index], path_ends[index],
                                         dtype=np.int64))
                 node_k.append(keys)
                 node_cu_q.append(node_cu_q[-1] + int(lengths[index]))
@@ -612,7 +612,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 # each node row's index among call B's rows
                 b_index=_staged(torch, source[q_rows], torch.int64, pinned))
     elif node_q:
-        raise ValueError("chain rows read their document in call B; "
+        raise ValueError("path rows read their document in call B; "
                          "the document needs arena pages")
     t = _tick(timing, "pack_reads", t)
 
@@ -787,8 +787,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         meta=meta, attention_mode=attention_mode, tokens=token_count,
         layout=layout, temporary_keys=tuple(temporary_keys),
         fresh_keys=tuple(fresh_keys),
-        rows_per_answer=(tuple(np.concatenate(rows_per_answer).tolist())
-                         if multi_row else ()))
+        rows_per_answer=(np.concatenate(rows_per_answer) if multi_row else None))
     _tick(timing, "pack_h2d", t)
     return out
 

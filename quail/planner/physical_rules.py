@@ -1,14 +1,14 @@
 """Built in physical optimizer rules.
 
 - kv_retention: the KV later operators read stays resident, within
-  the retention pool's page cap: a filter chain keeps its survivors'
+  the retention pool's page cap: a filter sequence keeps its survivors'
   KV for a join anchored on its table, and a join keeps its anchor's
   KV for a later group on the same anchor.
 - label_scoring: each classification gets the label scoring rule
   (letters, trie_tree, or trie_decode) whose estimated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
-  computing it again, in filters, joins, classifications, and scores
+  computing it again, in filters, joins, extractions, classifications, and scores
   of one table.
 - tree_attention: each join is annotated with the attention path the
   cost model prefers for its partners' reads of the anchor's KV.
@@ -19,26 +19,30 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
+from quail.cost.extract import estimate as extract_estimate
 from quail.cost.retention import coefficients
 from quail.cost.score import score_fixed_tokens
-from quail.execution.pipelines import build_pipelines
-from quail.logical import classified_above_joins
-from quail.logical.prompts import classify_prompt_tokens
 from quail.physical import (
     Aggregate,
     AiClassify,
+    AiExtract,
     AiFilter,
+    AiInference,
     AiJoin,
     AiScore,
-    Filter,
-    Foreign,
     Limit,
     PhysicalGraph,
     Sort,
 )
+from quail.physical.pipelines import build_pipelines
 from quail.planner import retention
+from quail.planner.kv import plan_kv_retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
-from quail.planner.statistics import cached_statistics, live_after_filters
+from quail.planner.statistics import (
+    cached_statistics,
+    live_after_filters,
+    summarize_alias,
+)
 
 
 class LimitPushdown:
@@ -46,12 +50,12 @@ class LimitPushdown:
 
     The rule puts the limit in the ``filter_limit`` setting, which the
     executor reads to stop admitting documents once that many survived
-    the chain's last stage. The pushdown keeps the first survivors to
+    the sequence's last stage. The pushdown keeps the first survivors to
     finish, so it is sound only when those are the rows the query
     returns: the graph ends in a Limit and has no Sort or Aggregate (an
     ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
-    AiJoin (survivors are settled per join round), and no AiScore (a
-    score comparison after the chain can drop survivors). Otherwise the
+    AiJoin (survivors are settled per join round), and no AiInference (a
+    score comparison after the sequence can drop survivors). Otherwise the
     rule removes the setting.
     """
 
@@ -63,7 +67,7 @@ class LimitPushdown:
             return None
         limit = next((node for node in graph.nodes
                       if isinstance(node, Limit)), None)
-        blocked = any(isinstance(node, (Sort, Aggregate, AiJoin, AiScore))
+        blocked = any(isinstance(node, (Sort, Aggregate, AiJoin, AiInference))
                       for node in graph.nodes)
         if limit is None or blocked:
             context.settings.pop("filter_limit", None)
@@ -80,12 +84,12 @@ class KvRetention:
     likely each document is to survive to that use. The executor's
     retention pool keeps their KV by that priority, up to the page cap.
 
-    - A filter chain keeps its survivors' KV (keep_kv) when a later join
-      anchors on its table, unless the chain streams into that join in
+    - A filter sequence keeps its survivors' KV (keep_kv) when a later join
+      anchors on its table, unless the sequence streams into that join in
       one pipeline on one GPU.
-    - A join keeps its anchor's KV (keep_anchor_kv) when a later group
+    - A join keeps its anchor's KV (keep_kv) when a later group
       anchors on the same table.
-    - A chain writes KV pages only when a later stage, the next operator
+    - A sequence writes KV pages only when a later stage, the next operator
       of its pipeline, or the retention pool reads them.
 
     The rule needs the logical plan on the context and fires only on a
@@ -108,43 +112,40 @@ class KvRetention:
             pair_fractions=context.pair_fractions,
             scan_fractions=context.scan_fractions, context=context)
         joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
-        groups = [[(statistics.specs[stage.written_pos], stage.anchor)
-                   for stage in node.stages] for node in joins]
-        schedule = retention.schedule(
-            [stage for group in groups for stage in group],
-            live_after_filters(logical, statistics),
-            [node.node_id for node in joins])
-        ask_aliases = {node.alias for node in graph.nodes
-                       if isinstance(node, AiFilter)}
-        barriers = [node for node in graph.nodes
-                    if isinstance(node, Foreign) and node.kind == "barrier"]
-        barrier_aliases = {node.aliases[0] for node in barriers
-                           if node.ids != "pairs"}
+        grouped = []
         for node in joins:
-            positions = {stage.written_pos for stage in node.stages}
-            if any(barrier.ids == "pairs" and barrier.written_pos in positions
-                   for barrier in barriers):
-                barrier_aliases.add(node.anchor)
-        chained = retention.chained_aliases(
-            groups, ask_aliases, barrier_aliases, context.gpu_count)
+            if (not grouped or grouped[-1][-1].anchor != node.anchor
+                    or grouped[-1][-1].semantics != "full"
+                    or node.semantics != "full"):
+                grouped.append([])
+            grouped[-1].append(node)
+        groups = [[(statistics.specs[node.written_pos], node.anchor)
+                   for node in group] for group in grouped]
+        schedule = retention.schedule(
+            [predicate for group in groups for predicate in group],
+            live_after_filters(logical, statistics),
+            [group[0].node_id for group in grouped])
+        before, after = schedule["before"], schedule["after"]
+        schedule["before"] = {
+            node.node_id: before[group[0].node_id]
+            for group in grouped for node in group}
+        schedule["after"] = {
+            node.node_id: (after[group[0].node_id] if node is group[-1]
+                           else before[group[0].node_id])
+            for group in grouped for node in group}
+        paths = build_pipelines(graph, context.gpu_count)
+        streamed = {
+            node.alias for node in graph.nodes if isinstance(node, AiFilter)
+            and any(isinstance(member, AiJoin)
+                    for member in paths[node.node_id])}
         schedule["initial"] = {
             alias: use for alias, use in schedule["initial"].items()
-            if alias not in chained
-        }
+            if alias not in streamed}
         schedule.update(**coefficients(context.model, context.device),
                         cap_pages=statistics.cap_pages)
-        nodes = []
-        for node in graph.nodes:
-            if isinstance(node, AiFilter):
-                keep = node.alias in schedule["initial"]
-                writes = node.arena_writes or keep
-                node = replace(node, keep_kv=keep, arena_writes=writes)
-            elif isinstance(node, AiJoin):
-                node = replace(node, keep_anchor_kv=(
-                    node.anchor in schedule["after"][node.node_id]))
-            nodes.append(node)
         context.settings["retention"] = schedule
-        return PhysicalGraph(tuple(nodes), graph.root)
+        return plan_kv_retention(
+            graph, context.gpu_count, tuple(context.settings.get("pre_ids", ())))
 
 
 class LabelScoring:
@@ -156,7 +157,7 @@ class LabelScoring:
     per label; trie_tree, under the tree attention path; and
     trie_decode, when no label starts another.
     The documents count as resident, with their KV in the arena, when
-    the classification continues its table's filter chain on one GPU
+    the classification continues its table's filter sequence on one GPU
     before any join, or follows a classification with the same prompt
     head. A classification of joined rows always uses letters and
     arrives chosen.
@@ -185,11 +186,11 @@ class LabelScoring:
 
         logical = context.logical_plan
         calls = {node.name: node.call for node in logical.operators().classifies}
-        after_joins = classified_above_joins(logical.root)
+        paths = build_pipelines(graph, context.gpu_count)
         chosen = {}
         for node in pending:
             table = classify_scoring(context, node.spec.anchor)
-            resident = _resident(node, graph, context, calls, after_joins)
+            resident = paths[node.node_id][0] is not node
             chosen[node.node_id] = replace(node, spec=table.choose_scoring(
                 node.spec, calls[node.spec.name], resident))
             if "estimated_fresh_tokens" in context.settings:
@@ -203,28 +204,6 @@ class LabelScoring:
         return PhysicalGraph(
             tuple(chosen.get(node.node_id, node) for node in graph.nodes),
             graph.root)
-
-
-def _resident(node, graph, context, calls, after_joins) -> bool:
-    """Return whether a classification's documents have their KV in the arena.
-
-    True on one GPU when the classification continues its table's
-    AI.IF filter chain before any join, through any filters on labels
-    and applies between them, or follows a classification whose prompt
-    head is the same.
-    """
-    if context.gpu_count != 1:
-        return False
-    source = graph.node(node.inputs[0].source.node_id)
-    while isinstance(source, (Filter, Foreign)):
-        source = graph.node(source.inputs[0].source.node_id)
-    if isinstance(source, AiClassify) and source.spec is not None:
-        previous = classify_prompt_tokens(
-            calls[source.spec.name].prompt, (), context.tokenizer)[0]
-        current = classify_prompt_tokens(
-            calls[node.spec.name].prompt, (), context.tokenizer)[0]
-        return previous == current
-    return isinstance(source, AiFilter) and node.spec.anchor not in after_joins
 
 
 def _token_store(document_tokens):
@@ -245,15 +224,8 @@ def filter_attention(model, device, store, lengths, question_tokens: int) -> str
     path that wins on the most borrowed tokens wins the filter.
     """
     tree = page_tree(store)
-    groups = {}
-    for doc, parent in enumerate(tree.parent):
-        if parent is None:
-            continue
-        readers, rows = groups.get((parent, tree.shared[doc]), (0, 0))
-        groups[(parent, tree.shared[doc])] = (
-            readers + 1, rows + lengths[doc] - tree.shared[doc])
     votes = {"tree": 0, "unified": 0}
-    for (_, shared), (readers, rows) in groups.items():
+    for shared, readers, rows in zip(*tree.reader_groups(lengths)):
         path = choose_attention_path(
             model, device, readers=readers,
             reader_rows=rows / readers + question_tokens, node_tokens=shared)
@@ -285,7 +257,8 @@ class PrefixSharing:
     on. The filter then writes pages even when it has one stage, since
     borrowed pages must exist. A join always writes its anchors' KV,
     so it fires for any join whose anchors share a whole page; a
-    classification writes its documents' KV the same way. A score of
+    classification or extraction writes its documents' KV the same way.
+    A score of
     one table is priced like a filter that writes no pages, since
     without sharing its documents follow one shared prompt head.
     """
@@ -298,57 +271,52 @@ class PrefixSharing:
             return None
         nodes = []
         changed = False
-        pipelines = build_pipelines(graph) if context.gpu_count == 1 else {}
+        pipelines = build_pipelines(graph, context.gpu_count)
+        summaries = {
+            alias: summarize_alias(lengths, context.model.sliding_window,
+                                   memo=context.memo)
+            for alias, lengths in context.document_tokens.items()
+        }
+        shared_by_alias = {}
         for node in graph.nodes:
-            if isinstance(node, AiFilter) and not node.share_prefixes:
-                lengths = context.document_tokens.get(node.alias)
-                store = _token_store(lengths)
-                if store is not None and sharing_pays(
-                        context.model, context.device,
-                        shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=sum(lengths),
-                        writes_pages=node.arena_writes):
-                    node = replace(node, share_prefixes=True,
-                                   arena_writes=True)
-                    changed = True
-            elif isinstance(node, AiJoin) and not node.share_prefixes:
-                lengths = context.document_tokens.get(node.anchor)
-                store = _token_store(lengths)
-                if store is not None and sharing_pays(
-                        context.model, context.device,
-                        shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=sum(lengths), writes_pages=True):
-                    node = replace(node, share_prefixes=True)
-                    changed = True
-            elif (isinstance(node, AiClassify) and node.spec is not None
-                  and not node.spec.share_prefixes):
-                lengths = context.document_tokens.get(node.spec.aliases[0])
-                store = _token_store(lengths)
-                if store is not None and sharing_pays(
-                        context.model, context.device,
-                        shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=sum(lengths), writes_pages=True):
-                    pipeline = pipelines.get(node.node_id)
-                    resident = (pipeline is not None
-                                and pipeline.members[0].node_id != node.node_id)
-                    node = replace(node, spec=_shared_classify_spec(
-                        node, context, store, resident=resident))
-                    changed = True
-            elif (type(node) is AiScore and node.spec is not None
-                  and len(node.spec.aliases) == 1
-                  and not node.spec.share_prefixes):
-                lengths = context.document_tokens.get(node.spec.aliases[0])
-                store = _token_store(lengths)
-                shared = (0 if store is None
-                          else page_aligned_shared_tokens(store))
-                if store is not None and sharing_pays(
-                        context.model, context.device, shared_tokens=shared,
-                        total_tokens=sum(lengths), writes_pages=False):
-                    node = replace(node, spec=_shared_score_spec(
-                        node.spec, shared, lengths,
-                        context.model.canvas_tokens))
-                    changed = True
+            settings = getattr(node, "spec", node)
+            if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract, AiScore))
+                    or settings is None or settings.share_prefixes
+                    or (isinstance(node, AiScore) and len(settings.aliases) != 1)):
+                nodes.append(node)
+                continue
+            alias = (settings.aliases[0] if isinstance(node, AiScore)
+                     else node.document_aliases[0])
+            store = _token_store(context.document_tokens.get(alias))
+            if store is None:
+                nodes.append(node)
+                continue
+            if alias not in shared_by_alias:
+                shared_by_alias[alias] = page_aligned_shared_tokens(store)
+            shared = shared_by_alias[alias]
+            writes_pages = (node.arena_writes if isinstance(node, AiFilter)
+                            else not isinstance(node, AiScore))
+            if not sharing_pays(
+                    context.model, context.device, shared_tokens=shared,
+                    total_tokens=summaries[alias].total, writes_pages=writes_pages):
+                nodes.append(node)
+                continue
+            if isinstance(node, AiFilter):
+                node = replace(node, share_prefixes=True, arena_writes=True)
+            elif isinstance(node, AiJoin):
+                node = replace(node, share_prefixes=True)
+            elif isinstance(node, AiScore):
+                node = replace(node, spec=_shared_score_spec(
+                    node.spec, shared, summaries[alias], context.model.canvas_tokens))
+            else:
+                pipeline = pipelines.get(node.node_id)
+                resident = pipeline is not None and pipeline[0].node_id != node.node_id
+                prepare = (_shared_classify_spec if isinstance(node, AiClassify)
+                           else _shared_extract_spec)
+                node = replace(node, spec=prepare(
+                    node, context, store, resident=resident))
             nodes.append(node)
+            changed = True
         if not changed:
             return None
         return PhysicalGraph(tuple(nodes), graph.root)
@@ -363,7 +331,22 @@ def _shared_classify_spec(node, context, store, *, resident=False):
     return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
 
 
-def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):
+def _shared_extract_spec(node, context, store, *, resident=False):
+    """Enable extraction prefix sharing and price the borrowed document KV."""
+    from quail.cost.budgets import chunk_budget
+
+    spec = node.spec
+    head, tail = spec.prompt_token_parts
+    cost = extract_estimate(
+        spec.expected_inputs, context.document_tokens[spec.alias],
+        len(head), len(tail), chunk=chunk_budget(context.model, context.device),
+        model=context.model, device=context.device, resident=resident,
+        shared=page_tree(store).shared, max_answer_tokens=spec.max_answer_tokens,
+        draft_tokens=spec.draft_tokens, workers=context.gpu_count)
+    return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
+
+
+def _shared_score_spec(spec, shared_tokens, summary, canvas_tokens):
     """Enable prefix sharing and scale the score's estimate by its fresh tokens.
 
     Assumes time is proportional to the tokens the score computes, and
@@ -372,7 +355,7 @@ def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):
     """
     fixed = score_fixed_tokens(tuple(map(len, spec.prompt_token_parts)),
                                canvas_tokens, spec.draws)
-    total = sum(lengths) + len(lengths) * fixed
+    total = summary.total + summary.count * fixed
     fresh = max(0.0, 1.0 - shared_tokens / total) if total else 1.0
     return replace(spec, share_prefixes=True,
                    estimated_seconds=spec.estimated_seconds * fresh)
@@ -425,12 +408,12 @@ class TreeAttention:
                 if tree_available and node.share_prefixes and store is not None:
                     path = filter_attention(
                         model, device, store, lengths,
-                        node.stages[0].question_tokens if node.stages else 0)
+                        node.question_tokens)
             elif isinstance(node, AiJoin):
                 lengths = context.document_tokens.get(node.anchor, ())
                 path = "unified"
-                if tree_available and node.stages:
-                    stage = node.stages[0]
+                if tree_available:
+                    stage = node
                     readers = (stage.expected_tuples / len(lengths)
                                if len(lengths) else 1.0)
                     # a partner's rows: its document and the question tail
@@ -456,7 +439,7 @@ def built_in_physical_rules() -> tuple:
 
     In order: limit_pushdown, kv_retention, label_scoring,
     prefix_sharing, and tree_attention. prefix_sharing follows
-    kv_retention because it weighs the page writes a chain already
+    kv_retention because it weighs the page writes a sequence already
     makes, and tree_attention follows prefix_sharing because a filter's
     attention path depends on the prefixes it shares.
     """

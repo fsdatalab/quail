@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.physical.base import PhysicalGraph
+from quail.planner.prompt_lowering import LoweredPrompt, lower_prompt
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -30,6 +31,20 @@ class ModelRegion:
     """Connected logical model work planned by one backend."""
 
     logical_plan: Any
+
+
+def lowered_prompt(context, prompt) -> LoweredPrompt:
+    """Lower a prompt through a context's tokenizer, memoized on the context.
+
+    Raises:
+        ValueError: The context has no tokenizer.
+    """
+    key = ("lowered", prompt)
+    if key not in context.memo:
+        if context.tokenizer is None:
+            raise ValueError("planning needs a tokenizer to lower prompts")
+        context.memo[key] = lower_prompt(prompt, context.tokenizer)
+    return context.memo[key]
 
 
 @dataclass(frozen=True)
@@ -65,6 +80,10 @@ class PlanningContext:
     # results computed once per query, such as the plan's statistics,
     # shared with the logical rules that planned it
     memo: dict = field(default_factory=dict, compare=False, repr=False)
+
+    def lowered(self, prompt) -> LoweredPrompt:
+        """Return the prompt lowered with the session tokenizer, once per query."""
+        return lowered_prompt(self, prompt)
 
 
 @dataclass(frozen=True)

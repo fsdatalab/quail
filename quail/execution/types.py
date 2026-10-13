@@ -7,11 +7,14 @@ from dataclasses import dataclass, field
 from itertools import chain
 from typing import Any
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.execution.pairs import COLUMNS_PREFIX
-from quail.execution.tokens import decode_token_documents
+from quail.catalog.pairs import COLUMNS_PREFIX
+from quail.catalog.tokens import decode_token_documents
+from quail.execution.ids import document_ids
+from quail.execution.result import filter_answer_table
 from quail.physical import (
     AiFilter,
     OutputPort,
@@ -51,7 +54,7 @@ class PhysicalRequest:
     """A physical plan, its token input bindings, and its relations.
 
     relations holds one value table per alias a HashJoin or an apply()
-    function reads, keyed ``columns:<alias>``; see quail.execution.pairs.
+    function reads, keyed ``columns:<alias>``; see quail.catalog.pairs.
     """
 
     plan: Mapping[str, Any]
@@ -119,63 +122,26 @@ def _document_ids_table(port: OutputPort, value: Any) -> pa.Table:
             b"quail.kind": b"document_ids",
         },
     )
-    return pa.Table.from_arrays(
-        [pa.array(value, type=pa.int32())], schema=schema
-    )
+    return pa.Table.from_arrays([document_ids(value)], schema=schema)
 
 
 def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
-    documents = []
-    positions = []
-    answers = []
-    for document, row in value.items():
-        for stage_index, answer in enumerate(row):
-            documents.append(int(document))
-            positions.append(node.stages[stage_index].written_pos)
-            answers.append(bool(answer))
-    schema = pa.schema(
-        [
-            pa.field(node.alias, pa.int32(), nullable=False),
-            pa.field("predicate", pa.int32(), nullable=False),
-            pa.field("answer", pa.bool_(), nullable=False),
-        ],
-        metadata={
-            b"quail.kind": b"filter_answers",
-            b"quail.alias": node.alias.encode("utf-8"),
-        },
-    )
-    return pa.Table.from_arrays(
-        [
-            pa.array(documents, type=pa.int32()),
-            pa.array(positions, type=pa.int32()),
-            pa.array(answers, type=pa.bool_()),
-        ],
-        schema=schema,
-    )
-
-
-def join_answer_cells(value: Mapping[str, Any]):
-    """Yield (anchor local index, partner member index, answer) triples.
-
-    rows[local] runs over the partner members the anchor streamed:
-    every member of partner_index, or the member indices listed in
-    anchor_partners[local] when the join ran over pairs.
-    """
-    members = value.get("anchor_partners") or {}
-    for raw_local, row in value["rows"].items():
-        local = int(raw_local)
-        streamed = members.get(local)
-        for position, answer in enumerate(row):
-            yield (local,
-                   position if streamed is None else int(streamed[position]),
-                   answer)
+    """One row per answer a document gave, repeating the document id."""
+    lengths = np.fromiter((len(row) for row in value.values()), dtype=np.int64,
+                          count=len(value))
+    documents = np.repeat(
+        np.fromiter(value.keys(), dtype=np.int64, count=len(value)), lengths)
+    answers = (np.concatenate([np.asarray(row, dtype=bool) for row in value.values()])
+               if len(value) else np.zeros(0, dtype=bool))
+    return filter_answer_table(
+        node.alias, documents, np.full(len(documents), node.written_pos), answers)
 
 
 def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     """Build the join answer table without visiting pairs in Python.
 
     A join can hold tens of millions of pairs. Python visits the
-    anchors; the pairs are concatenated by chain and converted by
+    anchors; the pairs are concatenated across anchors and converted by
     Arrow, and the partner ids come from one take.
     """
     anchor = str(value["anchor"])

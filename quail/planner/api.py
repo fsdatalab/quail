@@ -8,7 +8,7 @@ from quail.planner.physical_optimizer import (
     PlanningContext,
     apply_physical_rules,
 )
-from quail.planner.plan import Refusal, score_seconds
+from quail.planner.plan import Refusal, inference_seconds
 from quail.planner.validation import ClassifyRefusedError
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -16,7 +16,7 @@ from quail.specs import DeviceSpec, ModelSpec
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
-               registry=None, tokenizer=None, pair_fractions=None,
+               registry, tokenizer=None, pair_fractions=None,
                scan_fractions=None,
                canvas_draws: int = 4,
                attention: str | None = None, memo=None):
@@ -35,7 +35,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             classification or score. One disables repeated draws.
         attention: An attention path, "tree" or "unified", forced for
             every filter and join; None lets the planner choose.
-        registry: Optional session extension registry.
+        registry: The session extension registry: its backends, rules,
+            and codecs.
         tokenizer: Optional callable (text -> token list) handed to the
             planning context.
         scan_fractions: alias -> the fraction of its documents the
@@ -52,11 +53,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         return Refusal(
             reasons=(f"canvas_draws must be at least 1, got {canvas_draws}",),
             constraint="canvas_draws", needed=1, available=canvas_draws)
-    if registry is None:
-        # the built in registry imports every backend, and backends
-        # import this planner; build it only when no session gave one
-        from quail.builtins import built_in_registry
-        registry = built_in_registry()
     try:
         selected = registry.backend(backend)
     except ValueError as error:
@@ -125,7 +121,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 
 def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
                 doc_tokens: dict, gpus: int = 1, backend: str = "quail",
-                registry=None, order: str | None = None,
+                registry, order: str | None = None,
                 tokenizer=None, pair_fractions=None,
                 canvas_draws: int = 4,
                 attention: str | None = None):
@@ -138,9 +134,6 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
     """
     if isinstance(plan, Refusal):
         return plan
-    if registry is None:
-        from quail.builtins import built_in_registry
-        registry = built_in_registry()
     context = PlanningContext(
         model=model,
         device=device,
@@ -183,7 +176,7 @@ def apply_plan_rules(plan, rules, context):
     # a rule that re-estimates a classification or score moves the
     # plan's total by the same amount
     seconds = plan.estimated_seconds + (
-        score_seconds(graph.nodes) - score_seconds(plan.nodes))
+        inference_seconds(graph.nodes) - inference_seconds(plan.nodes))
     return replace(
         plan, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
         settings=context.settings)

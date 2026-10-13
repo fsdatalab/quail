@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from quail.server.records import (
+from quail.remote.records import (
     ACTIVE_STATES,
     TERMINAL_STATES,
     InvalidRequestError,

@@ -1,7 +1,7 @@
 """The HTTP application of Quail Server.
 
 Needs the ``server`` installation extra (Starlette and uvicorn). The
-Python client in ``quail.server.client`` and a browser both talk to
+Python client in ``quail.remote.client`` and a browser both talk to
 these routes. Control messages are JSON; table data is Arrow IPC.
 Status reads return the complete saved snapshot; a client can wait for
 a newer revision with ``?after=<revision>&wait=<s>`` or subscribe with
@@ -18,7 +18,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import pyarrow.ipc as ipc
@@ -36,28 +36,28 @@ from starlette.responses import (
 )
 from starlette.routing import Route
 
+from quail.api import RefusalError, Session
 from quail.builtins import built_in_registry
-from quail.execution.session import RefusalError, Session
 from quail.logical import CompileError
 from quail.planner.plan import EngineConfig
-from quail.server.artifacts import (
+from quail.remote.artifacts import (
     ANSWERS_FILE,
     RESULT_FILE,
     iter_ipc_stream,
     read_answers,
 )
-from quail.server.executor import (
-    ChildProcessExecutor,
-    Hooks,
-    InProcessExecutor,
-)
-from quail.server.inputs import resolve
-from quail.server.records import (
+from quail.remote.inputs import resolve
+from quail.remote.records import (
     InvalidRequestError,
     NotReadyError,
     QueryStatus,
     ServerError,
     check_query_id,
+)
+from quail.server.executor import (
+    ChildProcessExecutor,
+    Hooks,
+    InProcessExecutor,
 )
 from quail.server.scheduler import DEFAULT_TIMEOUT_S, Scheduler
 from quail.server.store import Store
@@ -278,8 +278,7 @@ class Server:
             raise InvalidRequestError("session_id must be a string")
         paths = self.snapshot_paths(inputs)
         self.compile(spec, engine, inputs, paths)
-        config = {"model": engine.model, "device": engine.device,
-                  "gpus": engine.gpus, "backend": engine.backend}
+        config = asdict(engine)
         existed = query_id is not None and self.store.find(query_id) is not None
         status = self.store.create(spec=spec, config=config, inputs=inputs,
                                    timeout_s=float(timeout_s),

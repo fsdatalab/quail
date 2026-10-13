@@ -19,6 +19,7 @@ from quail.logical import (
     CompileError,
     HavingTest,
     SortKey,
+    column_name,
 )
 
 
@@ -106,14 +107,6 @@ _AGGREGATE_CLASSES = {
 }
 
 
-def _column_name(column) -> str:
-    return (
-        f"{column.alias}.{column.column}"
-        if isinstance(column, ColumnRef)
-        else column.name
-    )
-
-
 @dataclass(frozen=True)
 class BoundSelect:
     """Columns needed before aggregation and the requested aggregate outputs."""
@@ -146,7 +139,7 @@ class SelectBinder:
             ref = b.resolve_column(node)
             if ref not in columns:
                 columns.append(ref)
-            return _column_name(ref)
+            return column_name(ref)
         if not (_is_call(node, "AI_SCORE") or isinstance(node, exp.AIClassify)):
             raise CompileError(f"{node.sql()} is not a column or an AI expression")
         call = b.bind_ai_value(node)
@@ -195,8 +188,8 @@ class SelectBinder:
             for column in selected:
                 if column not in columns:
                     columns.append(column)
-            self.plain.extend(_column_name(column) for column in selected)
-            self.output.extend(_column_name(column) for column in selected)
+            self.plain.extend(column_name(column) for column in selected)
+            self.output.extend(column_name(column) for column in selected)
 
     def bind_group(self, tree: exp.Select) -> list[str]:
         """Resolve GROUP BY expressions and SELECT positions."""
@@ -313,13 +306,19 @@ def _compile_projection(b: ExpressionBinder, expressions) -> list:
             call = b.bind_ai_value(e)
             columns.append(Alias(call, alias))
             continue
+        if _is_call(e, "AI_EXTRACT"):
+            if not alias:
+                raise CompileError("AI.EXTRACT needs an AS name in SELECT")
+            columns.append(Alias(b.bind_ai_extract(e), alias))
+            continue
         if any(
-            _is_call(call, "AI_SCORE") or isinstance(call, exp.AIClassify)
+            _is_call(call, "AI_SCORE") or _is_call(call, "AI_EXTRACT")
+            or isinstance(call, exp.AIClassify)
             for call in e.walk()
         ):
             raise CompileError(
-                "AI.SCORE and AI.CLASSIFY in SELECT must be direct "
-                "expressions with an AS name"
+                "AI.SCORE, AI.CLASSIFY, and AI.EXTRACT in SELECT must be "
+                "direct expressions with an AS name"
             )
         if not isinstance(e, exp.Column):
             raise CompileError(

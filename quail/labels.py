@@ -4,8 +4,6 @@ from dataclasses import dataclass
 
 # The label scoring rules the executor runs; each rule returns one of
 # the classification's labels.
-LABEL_SCORINGS = ("letters", "trie_tree", "trie_decode", "decision_choice")
-
 # every label is one letter token, read at one row
 LETTERS_SCORING = "letters"
 # every trie node once, in one request: tree attention only

@@ -411,7 +411,7 @@ class Engine:
             s = tl.load(src_rows_ptr + i)
             d = tl.load(dst_rows_ptr + i)
             offs = tl.arange(0, ROW_POW2)
-            mask = offs < ROW
+            mask = (offs < ROW) & (d >= 0)
             k = tl.load(k_src_ptr + s * ROW + offs, mask=mask)
             tl.store(k_dst_ptr + d * ROW + offs, k, mask=mask)
             v = tl.load(v_src_ptr + s * ROW + offs, mask=mask)
@@ -573,49 +573,14 @@ class Engine:
                           stride_ko, stride_vo, eps, QH: tl.constexpr,
                           KH: tl.constexpr, HD: tl.constexpr,
                           HALF: tl.constexpr):
+            qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, pos_ptr,
+                         qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
+                         eps, QH, KH, HD, HALF)
             t = tl.program_id(0)
-            pos = tl.load(pos_ptr + t)
             half_offs = tl.arange(0, HALF)
-            cos = tl.load(cs_ptr + pos * HD + half_offs).to(tl.float32)
-            sin = tl.load(cs_ptr + pos * HD + HALF + half_offs).to(tl.float32)
-            qw_a = tl.load(qw_ptr + half_offs).to(tl.float32)
-            qw_b = tl.load(qw_ptr + HALF + half_offs).to(tl.float32)
-            kw_a = tl.load(kw_ptr + half_offs).to(tl.float32)
-            kw_b = tl.load(kw_ptr + HALF + half_offs).to(tl.float32)
-
-            q_heads = tl.arange(0, QH)
-            qa_offs = q_heads[:, None] * HD + half_offs[None, :]
-            qb_offs = qa_offs + HALF
-            qa = tl.load(qkv_ptr + t * stride_qkv + qa_offs).to(tl.float32)
-            qb = tl.load(qkv_ptr + t * stride_qkv + qb_offs).to(tl.float32)
-            ms = (tl.sum(qa * qa, axis=1) + tl.sum(qb * qb, axis=1)) / HD
-            rstd = 1.0 / tl.sqrt(ms + eps)
-            qa = qa * rstd[:, None] * qw_a[None, :]
-            qb = qb * rstd[:, None] * qw_b[None, :]
-            out_a = qa * cos[None, :] - qb * sin[None, :]
-            out_b = qb * cos[None, :] + qa * sin[None, :]
-            tl.store(q_out_ptr + t * stride_qo + qa_offs,
-                     out_a.to(q_out_ptr.dtype.element_ty))
-            tl.store(q_out_ptr + t * stride_qo + qb_offs,
-                     out_b.to(q_out_ptr.dtype.element_ty))
-
             k_heads = tl.arange(0, KH)
             ka_offs = k_heads[:, None] * HD + half_offs[None, :]
             kb_offs = ka_offs + HALF
-            base = qkv_ptr + t * stride_qkv + QH * HD
-            ka = tl.load(base + ka_offs).to(tl.float32)
-            kb = tl.load(base + kb_offs).to(tl.float32)
-            ms = (tl.sum(ka * ka, axis=1) + tl.sum(kb * kb, axis=1)) / HD
-            rstd = 1.0 / tl.sqrt(ms + eps)
-            ka = ka * rstd[:, None] * kw_a[None, :]
-            kb = kb * rstd[:, None] * kw_b[None, :]
-            out_a = ka * cos[None, :] - kb * sin[None, :]
-            out_b = kb * cos[None, :] + ka * sin[None, :]
-            tl.store(k_out_ptr + t * stride_ko + ka_offs,
-                     out_a.to(k_out_ptr.dtype.element_ty))
-            tl.store(k_out_ptr + t * stride_ko + kb_offs,
-                     out_b.to(k_out_ptr.dtype.element_ty))
-
             base = qkv_ptr + t * stride_qkv + (QH + KH) * HD
             va = tl.load(base + ka_offs).to(tl.float32)
             vb = tl.load(base + kb_offs).to(tl.float32)
@@ -721,7 +686,7 @@ class Engine:
     def kv_row_scatter(self, k3, v3, src, dst, layer):
         """Scatter fresh KV rows from the packed chunk into arena pages.
 
-        One kernel launch per layer.
+        Negative destination rows are padding and perform no reads or writes.
         """
         assert k3.is_contiguous() and v3.is_contiguous()
         n = src.shape[0]
@@ -870,8 +835,8 @@ class Engine:
             block_table=reads["table"], seqused_k=reads["used"])
         nodes = reads.get("nodes")
         if nodes is not None:
-            # call C: chain rows over their ancestor rows in earlier
-            # chains of the chunk, merged into their call B result
+            # call C: path rows over their ancestor rows in earlier
+            # paths of the chunk, merged into their call B result
             out_c, lse_c = self._fa(
                 q3.index_select(0, nodes["rows"]),
                 k3.index_select(0, nodes["key_rows"]),

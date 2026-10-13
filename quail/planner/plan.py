@@ -3,11 +3,10 @@
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
-from quail.execution.pipelines import build_pipelines
 from quail.physical import (
     AiFilter,
+    AiInference,
     AiJoin,
-    AiScore,
     Barrier,
     Exchange,
     Foreign,
@@ -18,13 +17,15 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.codec import plan_envelope
+from quail.physical.pipelines import build_pipelines
+from quail.planner.kv import plan_kv_retention
 from quail.specs import MODELS
 
 
-def score_seconds(nodes) -> float:
-    """Sum the score operators' estimated seconds in a physical graph."""
+def inference_seconds(nodes) -> float:
+    """Sum the inference operators' estimated seconds in a physical graph."""
     return sum(node.spec.estimated_seconds for node in nodes
-               if isinstance(node, AiScore) and node.spec is not None)
+               if isinstance(node, AiInference) and node.spec is not None)
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,17 @@ class Refusal:
     unit: str          # "cards" | "tokens" | "bytes"
 
 
+class RefusalError(RuntimeError):
+    """Raised when run() is called on a refused plan."""
+
+    def __init__(self, refusal: Refusal):
+        self.refusal = refusal
+        super().__init__(
+            f"{refusal.constraint}: needed {refusal.needed} "
+            f"{refusal.unit}, available {refusal.available}. "
+            + " ".join(refusal.reasons))
+
+
 class PlanEditError(ValueError):
     """Raised by insert, remove, and move when an edit breaks a rule."""
 
@@ -57,7 +69,7 @@ class PhysicalPlan:
     """A typed physical graph with its settings and estimates.
 
     estimates holds, per node id, the node's own estimated seconds
-    and, for a filter chain a later join anchors on, the recompute it
+    and, for a filter sequence a later join anchors on, the recompute it
     would pay if its KV were released instead of pinned. estimator
     recomputes them for an edited graph; it is not compared or shown.
     """
@@ -122,7 +134,9 @@ class PhysicalPlan:
         Raises:
             PlanEditError: The edited operator graph is invalid.
         """
-        nodes = _rederive_kv(tuple(nodes))
+        nodes = plan_kv_retention(
+            PhysicalGraph(tuple(nodes), self.graph.root), self.workers,
+            tuple(self.settings.get("pre_ids", ()))).nodes
         try:
             edited = replace(self, nodes=nodes, root=None, estimates={})
         except GraphValidationError as error:
@@ -131,13 +145,13 @@ class PhysicalPlan:
         if base is None:
             return edited
         scheduled = set(self.settings.get("retention", {}).get("initial", {}))
-        pipelines = build_pipelines(edited.graph)
+        pipelines = build_pipelines(edited.graph, self.workers)
         recompute = sum(
             edited.estimates.get(node.node_id, {}).get(
                 "release_recompute_seconds", 0.0)
             for node in edited.nodes
             if isinstance(node, AiFilter) and node.alias not in scheduled
-            and not isinstance(pipelines[node.node_id].sink, AiJoin))
+            and not isinstance(pipelines[node.node_id][-1], AiJoin))
         return replace(edited, estimated_seconds=base + recompute,
                        estimates=edited.estimates)
 
@@ -231,26 +245,6 @@ class PhysicalPlan:
             codecs=codecs,
             settings=self.settings,
         )
-
-def _rederive_kv(nodes: tuple) -> tuple:
-    """Set keep_kv and arena_writes on each filter whose alias anchors a join.
-
-    A filter whose pipeline does not end at that join, for example
-    because a Barrier sits between them, keeps its survivors' KV for it.
-    """
-    graph = PhysicalGraph(nodes, PortRef(nodes[-1].node_id,
-                                         nodes[-1].outputs[0].name))
-    joins = {node.anchor for node in nodes if isinstance(node, AiJoin)}
-    pipelines = build_pipelines(graph)
-    out = []
-    for node in nodes:
-        if not isinstance(node, AiFilter) or node.alias not in joins:
-            out.append(node)
-            continue
-        cut = not isinstance(pipelines[node.node_id].sink, AiJoin)
-        out.append(replace(node, keep_kv=cut, arena_writes=True))
-    return tuple(out)
-
 
 def resolve_model(name: str, models=None):
     """Return a ModelSpec by name, or a Refusal if unknown."""
