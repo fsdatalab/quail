@@ -33,6 +33,7 @@ class ModelPipeline:
     needs_pages = False
     tree_attention = True
     gemm_warmup = True
+    decode_graphs = None
 
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.

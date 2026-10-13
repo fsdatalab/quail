@@ -262,6 +262,18 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     ).run()
 
 
+@dataclass
+class PendingAnswers:
+    """One launched chunk's readout and progress through its document decisions."""
+
+    groups: list
+    handles: list
+    values: list | None = None
+    positions: np.ndarray | None = None
+    at: int = 0
+    step: int = 0
+
+
 class _StageExecutor:
     """Admission state, packed inputs, pending answers, and metrics for one run."""
 
@@ -408,7 +420,8 @@ class _StageExecutor:
         self.spans = []
         self.tokens = 0
         self.pack_s = 0.0
-        self.outstanding = []     # (groups, handles) in launch order
+        self.outstanding = []     # PendingAnswers in launch order
+        self.split_answers = any(s.append and s.own_suffixes for s in stages)
 
         if self.label is None:
             self.label = " > ".join(stage.label or f"stage {j}"
@@ -423,15 +436,18 @@ class _StageExecutor:
         # Combine stages sharing a readout in one submission per chunk.
         self.shared_readout = all(stage.readout is self.stages[0].readout
                                   for stage in self.stages)
-        groups_of = {}
-        self.group_key = {}
-        for j, stage in enumerate(self.stages):
-            self.group_key[j] = (None if self.shared_readout else groups_of.setdefault(
-                (id(stage.readout), stage.read_all_rows), len(groups_of)))
-        self.readout_of = {self.group_key[j]: stage.readout
-                           for j, stage in enumerate(self.stages)}
-        self.read_all_of = {self.group_key[j]: stage.read_all_rows
-                            for j, stage in enumerate(self.stages)}
+        groups = []
+        self.group_key = []
+        self.readout_of = []
+        self.read_all_of = []
+        for stage in self.stages:
+            key = (id(stage.readout),
+                   False if self.shared_readout else stage.read_all_rows)
+            if key not in groups:
+                groups.append(key)
+                self.readout_of.append(stage.readout)
+                self.read_all_of.append(stage.read_all_rows)
+            self.group_key.append(groups.index(key))
 
     def _stop_width(self, stop_groups, budget) -> int:
         """Anchors of one stop key group in flight at once.
@@ -631,27 +647,29 @@ class _StageExecutor:
         """Submit answer rows to readouts and return handles by readout group.
 
         With one readout for every stage the whole chunk goes in one
-        call, keyed None; otherwise each readout's stages' rows go to
+        call, in group zero; otherwise each readout's stages' rows go to
         it in one call, selected with one index.
         """
         rows_per_answer = chunk.rows_per_answer
         if self.shared_readout:
             readout = self.stages[0].readout
-            return {None: (readout.submit(normed, rows_per_answer=rows_per_answer)
-                           if rows_per_answer else readout.submit(normed))}
-        spans = {}          # group -> its entries' row spans, in chunk order
+            return [(0, (readout.submit(normed, rows_per_answer=rows_per_answer)
+                         if rows_per_answer else readout.submit(normed)))]
+        spans = [[] for _ in self.readout_of]
         row = 0
         for j, rows in entries:
-            spans.setdefault(self.group_key[j], []).append((row, row + rows))
+            spans[self.group_key[j]].append((row, row + rows))
             row += rows
-        handles = {}
+        handles = []
         per_answer = list(rows_per_answer) if rows_per_answer else None
-        for key, spans_key in spans.items():
+        for key, spans_key in enumerate(spans):
+            if not spans_key:
+                continue
             readout = self.readout_of[key]
             selected = self._select_rows(normed, spans_key)
             # a stage reading one row per answer takes no row counts
             if per_answer is None or not self.read_all_of[key]:
-                handles[key] = readout.submit(selected)
+                handles.append((key, readout.submit(selected)))
             else:
                 # answers of this readout's stages, in entry order
                 counts = []
@@ -663,14 +681,17 @@ class _StageExecutor:
                         if self.group_key[jj] == key:
                             counts.append(per_answer[answer])
                         answer += 1
-                handles[key] = readout.submit(selected, rows_per_answer=counts)
+                handles.append((key, readout.submit(selected, rows_per_answer=counts)))
         return handles
 
     def _report(self, entry):
-        groups, handles = entry
-        values = {key: self.readout_of[key].result(handle)
-                  for key, handle in handles.items()}
-        pos = {key: 0 for key in handles}
+        if entry.values is None:
+            entry.values = [None] * len(self.readout_of)
+            for key, handle in entry.handles:
+                entry.values[key] = self.readout_of[key].result(handle)
+            entry.positions = np.zeros(len(self.readout_of), dtype=np.int64)
+        groups = entry.groups[entry.at:entry.at + entry.step]
+        values, pos = entry.values, entry.positions
         transitions = []
         for a, j, start, end, _ in groups:
             key = self.group_key[j]
@@ -685,12 +706,25 @@ class _StageExecutor:
                 self._event(settlement)
             transitions.extend(result.transitions)
             pos[key] += cnt
+        entry.at += len(groups)
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)
             if self.counting_answers else self.finished)
         if transitions and self.on_chunk is not None:
             self.on_chunk(transitions)
         self._release_skipped()
+
+    def _report_next(self, partial=False):
+        """Decide the oldest results, splitting append stages when no work is ready."""
+        entry = self.outstanding[0]
+        if not entry.step:
+            entry.step = len(entry.groups)
+            if partial and self.split_answers and all(
+                    self.stages[j].append for _, j, _, _, _ in entry.groups):
+                entry.step = (entry.step + 1) // 2
+        self._report(entry)
+        if entry.at == len(entry.groups):
+            self.outstanding.pop(0)
 
     def _release_skipped(self):
         """Let go of what the documents a stop key skipped would have used.
@@ -751,10 +785,7 @@ class _StageExecutor:
             by_stage[entry[1]] = by_stage.get(entry[1], 0) + self._entry_rows(*entry)
         self.spans.append((by_stage, chunk.tokens, e0, e1))
         handles = self._submit(normed, entries, chunk)
-        self.outstanding.append((part, handles))
-        # read the previous chunk's answers while this one runs
-        while len(self.outstanding) > 1:
-            self._report(self.outstanding.pop(0))
+        self.outstanding.append(PendingAnswers(part, handles))
 
     def run(self):
         """Drive admission and drain the launched answer handles in order."""
@@ -764,6 +795,8 @@ class _StageExecutor:
                 self._event(settlement)
             if self.sched.done():
                 break
+            if len(self.outstanding) > 1:
+                self._report_next()
             if self.sched.blocked_pages:
                 # the free list is short for the next fresh document:
                 # retained KV nothing here reads makes room
@@ -772,7 +805,7 @@ class _StageExecutor:
                 self.arena.free_pages if self.paged else 1 << 62)
             if not groups:
                 if self.outstanding:
-                    self._report(self.outstanding.pop(0))
+                    self._report_next(partial=True)
                     continue
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):
@@ -790,7 +823,7 @@ class _StageExecutor:
                 if carried and start == 0 and parent is not None:
                     self.arena.release(self.keys[parent])
         while self.outstanding:
-            self._report(self.outstanding.pop(0))
+            self._report_next()
         self._release_skipped()
         # a limit ends the run with documents still queued
         for anchor in self.sched.drain():

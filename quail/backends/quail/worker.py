@@ -124,6 +124,11 @@ class LoadedGpu:
         survives in the arena between queries.
         """
         if arena_pages is not None:
+            graphs = getattr(self.pipeline, "decode_graphs", None)
+            if (graphs is not None and tuple(arena_pages)
+                    != (self.arena.n_pages, self.arena.n_sliding_pages)):
+                self.torch.cuda.synchronize()
+                graphs.invalidate()
             self.arena.resize(*arena_pages, free_resident=True)
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
@@ -149,18 +154,24 @@ class LoadedGpu:
         Returns:
             Tuple of (seconds spent warming, compilation tier).
         """
-        if self._warmed:
-            return 0.0, None
         t0 = time.perf_counter()
+        tier = None
         with self.torch.inference_mode():
-            warm = warm_kernels(self.torch, self.arena, self.pipeline,
-                                self.async_ans, self.chunk_tokens,
-                                model_name=self.spec.hf_name,
-                                model=self.model)
+            if not self._warmed:
+                warm = warm_kernels(self.torch, self.arena, self.pipeline,
+                                    self.async_ans, self.chunk_tokens,
+                                    model_name=self.spec.hf_name,
+                                    model=self.model)
+                tier = warm["tier"]
+            graphs = getattr(self.pipeline, "decode_graphs", None)
+            if graphs is not None and graphs.prepare():
+                tier = tier or "graphs"
+        if tier is None:
+            return 0.0, None
         self.torch.cuda.synchronize()
         warm_s = time.perf_counter() - t0
         self._warmed = True
-        return warm_s, warm["tier"]
+        return warm_s, tier
 
     def close(self):
         """Release GPU resources held by the execution context."""

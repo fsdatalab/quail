@@ -411,7 +411,7 @@ class Engine:
             s = tl.load(src_rows_ptr + i)
             d = tl.load(dst_rows_ptr + i)
             offs = tl.arange(0, ROW_POW2)
-            mask = offs < ROW
+            mask = (offs < ROW) & (d >= 0)
             k = tl.load(k_src_ptr + s * ROW + offs, mask=mask)
             tl.store(k_dst_ptr + d * ROW + offs, k, mask=mask)
             v = tl.load(v_src_ptr + s * ROW + offs, mask=mask)
@@ -721,7 +721,7 @@ class Engine:
     def kv_row_scatter(self, k3, v3, src, dst, layer):
         """Scatter fresh KV rows from the packed chunk into arena pages.
 
-        One kernel launch per layer.
+        Negative destination rows are padding and perform no reads or writes.
         """
         assert k3.is_contiguous() and v3.is_contiguous()
         n = src.shape[0]

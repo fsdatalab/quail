@@ -8,6 +8,7 @@ architecture with bf16 weights and run through this file too.
 """
 
 from quail.backends.quail.executor.attention import Engine
+from quail.backends.quail.executor.cuda_graphs import DecodeGraphs
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.cost.budgets import tree_attention_allowed
 
@@ -35,6 +36,7 @@ class Qwen3Pipeline(ModelPipeline):
                      for layer in self.layers)
         self.max_chunk_tokens = (2**31 - 1) // widest
         self.tree_attention = spec is None or tree_attention_allowed(spec)
+        self.decode_graphs = DecodeGraphs(self)
 
     def linears(self):
         # every layer has the same four shapes

@@ -5,6 +5,7 @@ from fakes import cpu_staging
 from kv_checker import Run, Setup, answer, chain, passthrough
 
 from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.execution.tokens import prefix_tree
 
 DOCS = [[1, 2, 3, 4], [5, 6, 7]]
 QUESTION = [40]
@@ -45,4 +46,40 @@ def test_a_resident_prefix_of_another_length_is_fed_afresh(path, monkeypatch):
     for d, doc in enumerate(DOCS):
         assert out[0][d] == [answers[chain(HEAD + doc + CUE)]], f"document {d}"
     assert tokens == sum(len(prefix) for prefix in headed) + len(DOCS)
+    assert not run.arena.accounting.owned
+
+
+@pytest.mark.parametrize("path", ["unified", "tree"])
+def test_borrowed_prefix_and_accepted_decode_tokens_survive_rounds(path, monkeypatch):
+    cpu_staging(monkeypatch)
+    shared = list(range(1000, 1016))
+    docs = [shared + [1020, 1021], shared + [1030, 1031]]
+    frame = [30, 31]
+    paths = [frame + [32], frame + [32, 41, 42, 43],
+             frame + [32, 41, 42, 44, 45], [50, 51, 52], [50, 51, 52, 53]]
+    expected = {chain(doc + tail): float(index + 1)
+                for doc in docs for index, tail in enumerate(paths)}
+    setup = Setup(path=path)
+    run = Run(setup, expected)
+    stages = [
+        Stage(suffixes=[[32]], frame=frame, single=True, append=True,
+              rewind=True, readout=passthrough()),
+        Stage(suffixes=[[41, 42, 43]], frame=frame, single=True, append=True,
+              readout=passthrough()),
+        Stage(suffixes=[[44, 45]], frame=frame, single=True, append=True,
+              discard=lambda key: 1, readout=passthrough()),
+        Stage(suffixes=[[52]], frame=[50, 51], single=True, append=True,
+              rewind=True, readout=passthrough()),
+        Stage(suffixes=[[53]], frame=[50, 51], single=True, append=True,
+              readout=passthrough()),
+    ]
+    stats = {}
+    output, _, tokens = run_stages(
+        run.torch, run.arena, run.pipeline, stages, docs, setup.budget,
+        attention_mode=path, prefix_tree=prefix_tree(docs, setup.page_tokens),
+        stats=stats)
+    assert stats["borrowed_tokens"] == 16
+    assert tokens == sum(map(len, docs)) - 16 + len(docs) * (3 + 3 + 2 + 3 + 1)
+    for index in range(len(stages)):
+        assert output[index] == {0: [float(index + 1)], 1: [float(index + 1)]}
     assert not run.arena.accounting.owned

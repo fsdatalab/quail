@@ -25,6 +25,9 @@ def _forward(pipeline, arena, chunk):
     temporaries whether the pass returns or raises.
     """
     try:
+        graphs = getattr(pipeline, "decode_graphs", None)
+        if graphs is not None:
+            return graphs.forward(chunk)
         return pipeline.forward_chunk(chunk)
     finally:
         keys, chunk.temporary_keys = chunk.temporary_keys, ()
