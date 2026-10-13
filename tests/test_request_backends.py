@@ -413,6 +413,8 @@ def test_request_backends_classify_with_one_decode_request_per_document():
     assert (step["generated_tokens"], step["unmatched"]) == (4, 0)
     # two 3-token prompts, and each answer's first token fed back
     assert result.metrics.fresh_tokens == 2 * 3 + 2 * (2 - 1)
+    assert step["prompt_tokens"] == 6
+    assert result.metrics.extension["prompt_tokens"] == 6
 
     session = _session("stock_vllm", docs=DOCS)
     query = (session.docs("docs").alias("d")

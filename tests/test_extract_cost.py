@@ -2,11 +2,11 @@
 
 from quail.cost.extract import (
     ANSWER_ROUNDS,
-    DRAFT_TOKENS,
     document_work,
     estimate,
 )
 from quail.cost.work import Work, ask, scan, stream
+from quail.extraction import DRAFT_TOKENS
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 HEAD, TAIL = 2, 40
@@ -33,6 +33,10 @@ def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     resident, _, _ = document_work(100, HEAD, TAIL, resident=True)
     assert resident == ask(HEAD + 100, TAIL) + stream(context, rounds)
     assert resident.tokens < work.tokens
+    shared, _, _ = document_work(100, HEAD, TAIL, shared=80)
+    assert shared == ask(80, HEAD + 100 + TAIL - 80) + stream(context, rounds)
+    assert shared.tokens == work.tokens - 80
+    assert document_work(100, HEAD, TAIL, resident=True, shared=80)[0] == resident
 
 
 def test_estimate_sums_documents_scales_to_live_and_prices_passes():
@@ -59,3 +63,8 @@ def test_estimate_sums_documents_scales_to_live_and_prices_passes():
     # a smaller chunk means more passes and more time
     small = _cost(lengths, chunk=100)
     assert small.passes > cost.passes and small.seconds > cost.seconds
+    shared = _cost(lengths, shared=[0, 80, 32])
+    assert shared.work.tokens == cost.work.tokens - 112
+    assert shared.suffix_tokens == cost.suffix_tokens
+    assert shared.rows == cost.rows
+    assert shared.seconds < cost.seconds

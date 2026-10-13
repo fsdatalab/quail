@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.roofline import CostComponent, component_latencies
 from quail.cost.work import Work, ask, scan, stream
+from quail.extraction import DRAFT_TOKENS
 
 # the executor's settings
 # the answer's tokens, as a mean: the answers measured were 2.8 words
@@ -24,11 +25,6 @@ from quail.cost.work import Work, ask, scan, stream
 # (/results/extract_spans/20261011T010106Z_qwen3-4b-fp8_squad.json and
 # 20261011T005925Z_qwen3-4b-fp8_cuad.json)
 ANSWER_TOKENS = 16
-# tokens an answer may take, as the stock path's EXTRACT_MAX_TOKENS
-ANSWER_MAX_TOKENS = 64
-# document tokens a round feeds after the chosen token, as a draft of
-# the answer's next tokens, each verified by the row before it
-DRAFT_TOKENS = 16
 # rounds an answer of ANSWER_TOKENS takes when every draft is accepted
 ANSWER_ROUNDS = -(-ANSWER_TOKENS // (DRAFT_TOKENS + 1))
 
@@ -60,7 +56,8 @@ def _readout(model, rows: float, passes: float) -> CostComponent:
 
 
 def document_work(length: int, head_tokens: int, tail_tokens: int, *,
-                  window: int = 0, resident: bool = False) -> tuple[Work, float, float]:
+                  window: int = 0, resident: bool = False,
+                  shared: int = 0) -> tuple[Work, float, float]:
     """Return one document's work, its fed tokens, and its readout rows.
 
     Args:
@@ -70,10 +67,15 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
         window: The model's sliding window, 0 for none.
         resident: Whether the document's KV is already available, as
             it is for the second and later extractions of a pipeline.
+        shared: Prefix tokens borrowed from an earlier document.
     """
     prefix = head_tokens + length
-    work = (ask(prefix, tail_tokens, window=window) if resident
-            else scan(prefix, tail_tokens, window=window))
+    if resident:
+        work = ask(prefix, tail_tokens, window=window)
+    elif shared:
+        work = ask(shared, prefix + tail_tokens - shared, window=window)
+    else:
+        work = scan(prefix, tail_tokens, window=window)
     context = prefix + tail_tokens
     fed = float(tail_tokens)
     rows = 1.0
@@ -87,7 +89,8 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
 
 
 def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
-             chunk: int, model, device, resident: bool = False) -> ExtractCost:
+             chunk: int, model, device, resident: bool = False,
+             shared=None) -> ExtractCost:
     """Estimate the cost of one extraction over a table.
 
     Args:
@@ -99,6 +102,7 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
         model: Model specification.
         device: Device specification.
         resident: Whether the documents' KV is already available.
+        shared: Per-document borrowed prefix lengths, or None.
 
     Returns:
         Estimated execution time, work, and token counts.
@@ -108,10 +112,11 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
         return ExtractCost(0.0, 0.0, Work(), 0.0, 0.0)
     work = Work()
     fed = rows = 0.0
-    for length in lengths:
+    for index, length in enumerate(lengths):
         own, own_fed, own_rows = document_work(
             int(length), head_tokens, tail_tokens,
-            window=model.sliding_window, resident=resident)
+            window=model.sliding_window, resident=resident,
+            shared=0 if shared is None else int(shared[index]))
         work += own
         fed += own_fed
         rows += own_rows

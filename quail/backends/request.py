@@ -38,6 +38,7 @@ from quail.execution.runner import (
 )
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.execution.types import PhysicalResponse, export_physical_outputs
+from quail.extraction import ANSWER_MAX_TOKENS
 from quail.logical import (
     SPAN_SUFFIX,
     Alias,
@@ -741,7 +742,6 @@ def _classify_documents(client, spec, bodies) -> dict:
 
 # the most tokens an answer may run to; the measured answers of a
 # 16-token chunk fit, and a clause of a contract runs longer
-EXTRACT_MAX_TOKENS = 64
 EXTRACT_SPAN_TYPE = pa.struct([("start", pa.int32()), ("end", pa.int32())])
 
 
@@ -768,7 +768,7 @@ def _extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
         counts, and the generation seconds.
     """
     tail = _token_list(spec.tail_token_ids)
-    params = client.decode_params(EXTRACT_MAX_TOKENS, stop=['"'])
+    params = client.decode_params(ANSWER_MAX_TOKENS, stop=['"'])
     if body_texts is not None:
         prompts = [body_text + spec.tail_text for body_text in body_texts]
     else:
@@ -1000,6 +1000,7 @@ class RequestModelExecution:
                 "n_out": len(survivors[spec.alias]),
                 "wall_s": result["wall_s"],
                 "requests": result["requests"],
+                "prompt_tokens": result["prompt_tokens"],
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
                 "doc_cap": result["doc_cap"],
@@ -1052,6 +1053,7 @@ class RequestModelExecution:
                 "n_out": len(survivors[spec.alias]),
                 "wall_s": result["wall_s"],
                 "requests": result["requests"],
+                "prompt_tokens": result["prompt_tokens"],
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
                 "generated_tokens": result["generated_tokens"],
@@ -1206,6 +1208,7 @@ class RequestModelExecution:
                 "pairs": len(rows),
                 "true_pairs": len(true_rows),
                 "wall_s": result["wall"],
+                "prompt_tokens": result["prompt_tokens"],
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
             })
@@ -1249,6 +1252,7 @@ class RequestModelExecution:
                 "n_out": len(labeled),
                 "wall_s": result["wall_s"],
                 "requests": result["requests"],
+                "prompt_tokens": result["prompt_tokens"],
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
                 "unmatched": result["unmatched"],
@@ -1287,6 +1291,7 @@ class RequestModelExecution:
                 "n_out": len(document_ids) - result["unanswered"],
                 "wall_s": result["wall_s"],
                 "requests": result["requests"],
+                "prompt_tokens": result["prompt_tokens"],
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
                 "generated_tokens": result["generated_tokens"],
@@ -1313,6 +1318,7 @@ class RequestModelExecution:
                 cached_tokens=cached_tokens,
                 extension={
                     "steps": steps,
+                    "prompt_tokens": sum(step["prompt_tokens"] for step in steps),
                     "requests": requests,
                     "capacity": dict(self.capacity),
                 },

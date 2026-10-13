@@ -10,9 +10,9 @@ import test_request_backends as request_tests
 from fakes import letter_tokens
 
 import quail
-from quail.backends.request import EXTRACT_MAX_TOKENS
 from quail.catalog import DocumentProvider
 from quail.execution.spans import line_span, locate_span, read_phrase
+from quail.extraction import ANSWER_MAX_TOKENS
 from quail.logical import (
     SHARED_PRE,
     Alias,
@@ -389,7 +389,7 @@ class _PhraseClient(request_tests._Client):
         return ("decode", max_tokens)
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
-        assert sampling_params == ("decode", EXTRACT_MAX_TOKENS)
+        assert sampling_params == ("decode", ANSWER_MAX_TOKENS)
         outputs = []
         for prompt in prompts:
             ids = prompt["prompt_token_ids"]
@@ -440,7 +440,7 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     execution = request_tests._execution(
         documents, client=client, document_texts={"c": TEXTS})
     result = execution.execute(node, {"input:0": [0, 1, 2, 3]})
-    assert client.params == [(EXTRACT_MAX_TOKENS, ['"'])] * 2
+    assert client.params == [(ANSWER_MAX_TOKENS, ['"'])] * 2
     trimmed = result.outputs["extract_answers:ends"].to_pydict()
     assert trimmed == {
         "c": [0, 1, 2, 3],
@@ -464,6 +464,9 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     # answer's tokens but the last, fed back
     assert step["fresh_tokens"] == sum(
         2 + len(ids) for ids in documents["c"]) + (3 + 0 + 1 + 2)
+    prompt_tokens = sum(2 + len(ids) for ids in documents["c"])
+    assert step["prompt_tokens"] == prompt_tokens
+    assert result.metrics.extension["prompt_tokens"] == 2 * prompt_tokens
     assert result.metrics.evaluated_documents == 8
     # the executor needs the document text to locate an answer
     with pytest.raises(ValueError, match="needs the text"):
