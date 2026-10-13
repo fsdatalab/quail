@@ -12,7 +12,7 @@ from fakes import letter_tokens
 import quail
 from quail.catalog import DocumentProvider
 from quail.execution.spans import line_span, locate_span, read_phrase
-from quail.extraction import ANSWER_MAX_TOKENS
+from quail.extraction import ExtractionConfig
 from quail.logical import (
     SHARED_PRE,
     Alias,
@@ -389,7 +389,7 @@ class _PhraseClient(request_tests._Client):
         return ("decode", max_tokens)
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
-        assert sampling_params == ("decode", ANSWER_MAX_TOKENS)
+        assert sampling_params == ("decode", self.params[-1][0])
         outputs = []
         for prompt in prompts:
             ids = prompt["prompt_token_ids"]
@@ -425,12 +425,15 @@ TEXTS = [LEASE, "No dates here.", "Term: five years\nmore text",
          "the absent one"]
 
 
-def test_request_backend_decodes_and_locates_one_answer_per_document():
+@pytest.mark.parametrize("limit", [64, 7])
+def test_request_backend_decodes_and_locates_one_answer_per_document(limit):
     documents = {"c": [request_tests._tokens(text) for text in TEXTS]}
     specs = (
-        RequestExtractSpec(alias="c", output="ends", question=QUESTION,
+        RequestExtractSpec(config=ExtractionConfig(max_answer_tokens=limit),
+                           alias="c", output="ends", question=QUESTION,
                            tail_token_ids=(90,)),
-        RequestExtractSpec(alias="c", output="lines", question=QUESTION,
+        RequestExtractSpec(config=ExtractionConfig(max_answer_tokens=limit),
+                           alias="c", output="lines", question=QUESTION,
                            tail_token_ids=(90,), trim=False),
     )
     node = RequestExecution(
@@ -440,7 +443,7 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     execution = request_tests._execution(
         documents, client=client, document_texts={"c": TEXTS})
     result = execution.execute(node, {"input:0": [0, 1, 2, 3]})
-    assert client.params == [(ANSWER_MAX_TOKENS, ['"'])] * 2
+    assert client.params == [(limit, ['"'])] * 2
     trimmed = result.outputs["extract_answers:ends"].to_pydict()
     assert trimmed == {
         "c": [0, 1, 2, 3],
@@ -544,3 +547,22 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     (step,) = result.report["backend_metrics"]["steps"]
     assert step["kind"] == "extract" and step["requests"] == 4
     session.close()
+
+
+def test_extraction_settings_survive_plan_serialization(session):
+    config = ExtractionConfig(max_answer_tokens=7, draft_tokens=2, top_tokens=32,
+                              first_window_chars=16, window_chars=96)
+    query = _ends(session)
+    plan = query.plan()
+    node = next(node for node in plan.nodes if isinstance(node, AiExtract))
+    spec = replace(node.spec, config=config)
+    assert ExtractSpec.from_mapping(spec.to_dict()).config == config
+    legacy = spec.to_dict()
+    legacy.pop("config")
+    assert ExtractSpec.from_mapping(legacy).config == ExtractionConfig()
+    request = RequestExtractSpec(alias="c", output="ends", question=QUESTION,
+                                 tail_token_ids=(1, 2), config=config)
+    assert RequestExtractSpec.from_mapping(request.to_dict()).config == config
+    legacy = request.to_dict()
+    legacy.pop("config")
+    assert RequestExtractSpec.from_mapping(legacy).config == ExtractionConfig()

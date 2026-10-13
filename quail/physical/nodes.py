@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar, Mapping
+
+from quail.extraction import ExtractionConfig
 
 from .base import (
     ExecutionLocation,
@@ -426,6 +428,7 @@ class RequestExtractSpec:
     tail_text: str = ""
     preamble_token_ids: tuple[Any, ...] = ()
     preamble_text: str = ""
+    config: ExtractionConfig = field(default_factory=ExtractionConfig)
 
     @property
     def span_output(self) -> str:
@@ -443,6 +446,7 @@ class RequestExtractSpec:
             tail_text=str(value.get("tail_text", "")),
             preamble_token_ids=tuple(value.get("preamble_token_ids", ())),
             preamble_text=str(value.get("preamble_text", "")),
+            config=ExtractionConfig.from_mapping(value.get("config", {})),
         )
 
     def to_dict(self) -> dict:
@@ -455,6 +459,7 @@ class RequestExtractSpec:
             "tail_text": self.tail_text,
             "preamble_token_ids": list(self.preamble_token_ids),
             "preamble_text": self.preamble_text,
+            "config": self.config.to_dict(),
         }
 
 
@@ -1037,12 +1042,14 @@ class ExtractSpec(ScoreSpec):
 
     Attributes:
         question: The question the answer is copied for.
+        config: Execution limits carried with the plan.
         trim: Whether the answer is the fewest words that answer the
             question, or the whole lines that hold them.
     """
 
     question: str = ""
     trim: bool = True
+    config: ExtractionConfig = field(default_factory=ExtractionConfig)
 
     @property
     def alias(self) -> str:
@@ -1064,6 +1071,7 @@ class ExtractSpec(ScoreSpec):
                 "prompt_token_parts", "draws", "share_prefixes")},
             question=str(value["question"]),
             trim=bool(value.get("trim", True)),
+            config=ExtractionConfig.from_mapping(value.get("config", {})),
         )
 
     def to_dict(self) -> dict:
@@ -1071,6 +1079,7 @@ class ExtractSpec(ScoreSpec):
             **super().to_dict(),
             "question": self.question,
             "trim": self.trim,
+            "config": self.config.to_dict(),
         }
 
 

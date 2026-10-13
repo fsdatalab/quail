@@ -7,6 +7,7 @@ from quail.cost import classify as classify_cost
 from quail.cost import extract as extract_cost
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, scan
+from quail.extraction import ExtractionConfig
 from quail.labels import DECISION_SCORING, LETTERS_SCORING, word_starts
 from quail.logical import (
     PROBABILITIES_SUFFIX,
@@ -964,11 +965,12 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
                                  context.tokenizer, turn)
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
+    config = ExtractionConfig()
     cost = extract_cost.estimate(
         live, [int(length) for length in lengths],
         len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),
-        model=context.model, device=context.device, resident=shared)
+        model=context.model, device=context.device, resident=shared, config=config)
     return ExtractSpec(
         name=name, aliases=call.aliases(),
         query_template=call.prompt.template,
@@ -976,7 +978,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         expected_inputs=live, estimated_seconds=cost.seconds,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
-        question=call.question, trim=call.trim)
+        question=call.question, trim=call.trim, config=config)
 
 
 def classify_builder(context, alias, backend_name):

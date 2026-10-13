@@ -38,7 +38,6 @@ from quail.execution.runner import (
 )
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.extraction import ANSWER_MAX_TOKENS
 from quail.logical import (
     SPAN_SUFFIX,
     Alias,
@@ -768,7 +767,7 @@ def _extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
         counts, and the generation seconds.
     """
     tail = _token_list(spec.tail_token_ids)
-    params = client.decode_params(ANSWER_MAX_TOKENS, stop=['"'])
+    params = client.decode_params(spec.config.max_answer_tokens, stop=['"'])
     if body_texts is not None:
         prompts = [body_text + spec.tail_text for body_text in body_texts]
     else:

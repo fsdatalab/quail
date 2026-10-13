@@ -5,7 +5,6 @@ from collections.abc import Mapping
 
 from quail import logical as logical_nodes
 from quail.execution.pipelines import build_pipelines
-from quail.extraction import ANSWER_MAX_TOKENS
 from quail.logical import DEFAULT_SELECTIVITY, LogicalPlan, effective_selectivity
 from quail.physical import (
     Aggregate,
@@ -431,7 +430,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             title += f": {spec.name} over {spec.alias}"
             details.append(f"question={spec.question!r}, "
                            f"trim={'on' if spec.trim else 'off'}, "
-                           f"up to {ANSWER_MAX_TOKENS} answer tokens")
+                           f"up to {spec.config.max_answer_tokens} answer tokens")
         elif isinstance(node, Filter):
             title += f": {node.predicate.describe()}"
         elif isinstance(node, AiJoin):

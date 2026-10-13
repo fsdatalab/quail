@@ -1,12 +1,12 @@
 """Extraction costs: the executor's rounds priced like a classification."""
 
 from quail.cost.extract import (
-    ANSWER_ROUNDS,
+    ExtractAssumptions,
     document_work,
     estimate,
 )
 from quail.cost.work import Work, ask, scan, stream
-from quail.extraction import DRAFT_TOKENS
+from quail.extraction import ExtractionConfig
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 HEAD, TAIL = 2, 40
@@ -23,10 +23,11 @@ def _cost(lengths, **kwargs):
 def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     work, fed, rows = document_work(100, HEAD, TAIL)
     context = HEAD + 100 + TAIL
-    rounds = [1 + DRAFT_TOKENS] * ANSWER_ROUNDS
+    config = ExtractionConfig()
+    rounds = [1 + config.draft_tokens] * ExtractAssumptions().rounds(config)
     expected = scan(HEAD + 100, TAIL) + stream(context, rounds)
     assert work == expected
-    answer = ANSWER_ROUNDS * (1 + DRAFT_TOKENS)
+    answer = sum(rounds)
     assert fed == TAIL + answer
     assert rows == 1 + answer
     # resident KV turns the scan into a question over it
@@ -68,3 +69,19 @@ def test_estimate_sums_documents_scales_to_live_and_prices_passes():
     assert shared.suffix_tokens == cost.suffix_tokens
     assert shared.rows == cost.rows
     assert shared.seconds < cost.seconds
+
+
+def test_cost_uses_plan_limits_and_separate_answer_assumptions():
+    config = ExtractionConfig(max_answer_tokens=8, draft_tokens=3)
+    assumptions = ExtractAssumptions(answer_tokens=40)
+    cost = _cost([100], config=config, assumptions=assumptions)
+    expected = scan(HEAD + 100, TAIL) + stream(HEAD + 100 + TAIL, [4, 4])
+    assert cost.work == expected
+    assert cost.suffix_tokens == TAIL + 8
+    assert cost.rows == 9
+    shorter = _cost([100], config=config,
+                    assumptions=ExtractAssumptions(answer_tokens=2))
+    assert shorter.work == scan(HEAD + 100, TAIL) + stream(HEAD + 100 + TAIL, [4])
+    capped = _cost([100], config=ExtractionConfig(max_answer_tokens=1),
+                   assumptions=assumptions)
+    assert capped.work == scan(HEAD + 100, TAIL)
