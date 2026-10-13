@@ -231,6 +231,12 @@ class QuailScorer:
 class ScoreBatch(SingleResultPart):
     """Prepared score requests, streamed answers, and execution metrics."""
 
+    @staticmethod
+    def model_inputs(node, inputs, context, chain=None, nodes=None):
+        # scored through the reranker readout over the documents
+        return {"score_inputs": inputs, "documents": context.state["docs"],
+                "pre": context.state.get("pre", [])}
+
     def __init__(self, name, stages, scores, total_tokens, on_answers):
         self.name = name
         self.stages = stages

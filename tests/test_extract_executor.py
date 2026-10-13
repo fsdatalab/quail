@@ -27,7 +27,6 @@ from quail.backends.quail.executor.extract.decode import AnswerState, Decoder
 from quail.backends.quail.executor.extract.stages import ExtractionStages
 from quail.backends.quail.executor.extract.vocabulary import same_word
 from quail.backends.quail.executor.operators.extract import (
-    execute_extract,
     execute_extractions,
 )
 from quail.backends.quail.executor.readout import split_rows
@@ -352,7 +351,8 @@ def _setup(monkeypatch, trim=True, documents=None, token_documents=None,
               "texts": {"c": documents}, "pre": [], "gpu_timing": gpu_timing}
 
     def run(name="ends", keep_kv=False):
-        result = execute_extract(state, replace(node(name), keep_kv=keep_kv), inputs)
+        result = execute_extractions(
+            state, [replace(node(name), keep_kv=keep_kv)], inputs)[node(name).node_id]
         return result, stages_seen["stages"]
 
     def run_pipeline(*names):

@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import time
 
-import numpy as np
-
-from quail.backends.quail.executor.operators.filter import filter_inputs
-from quail.backends.quail.executor.operators.join import prepare_join_inputs
+from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.reranker import FilterRuntime
 from quail.backends.quail.retention import apply_retention
 from quail.catalog.pairs import columns_key
@@ -62,29 +59,13 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext,
         A scheduler input mapping for filters, joins, and scores. Other
         operators receive the original input mapping.
     """
-    if isinstance(node, AiExtract):
-        # the one input carries the documents' ids, or the rows of an
-        # earlier operator over them
-        (value,) = inputs.values()
-        ids = (value.column(node.spec.alias).to_numpy()
-               if hasattr(value, "column") else np.asarray(value, dtype=np.int64))
-        return {"document_ids": ids,
-                "documents": context.state["docs"],
-                "texts": context.state.get("texts", {}),
-                "pre": context.state.get("pre", []),
-                "gpu_timing": context.state.get("gpu_timing", False)}
-    if isinstance(node, (AiScore, AiClassify)):
-        return {"score_inputs": inputs, "documents": context.state["docs"],
-                "pre": context.state.get("pre", []),
-                "gpu_timing": context.state.get("gpu_timing", False)}
-    if not isinstance(node, (AiFilter, AiJoin)):
+    implementation = execution_parts().get(node.type_name)
+    prepared = (None if implementation is None
+                else implementation.model_inputs(node, inputs, context, chain, nodes))
+    if prepared is None:
         return inputs
-    return {
-        **(filter_inputs(context.state, node, next(iter(inputs.values())))
-           if isinstance(node, AiFilter) else
-           prepare_join_inputs(node, inputs, context, chain, nodes)),
-        "gpu_timing": context.state.get("gpu_timing", False),
-    }
+    return {**prepared,
+            "gpu_timing": context.state.get("gpu_timing", False)}
 
 
 def record_model_result(node, result: NodeResult,

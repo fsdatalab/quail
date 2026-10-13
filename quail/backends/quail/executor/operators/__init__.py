@@ -8,8 +8,18 @@ def execution_parts() -> dict:
     from quail.backends.quail.executor.operators.extract import ExtractPart
     from quail.backends.quail.executor.operators.filter import FilterPart, LabelGate
     from quail.backends.quail.executor.operators.join import JoinPart
-    from quail.physical import AiClassify, AiExtract, AiFilter, AiJoin, Filter, Foreign
+    from quail.backends.quail.executor.operators.score import ScoreBatch
+    from quail.physical import (
+        AiClassify,
+        AiExtract,
+        AiFilter,
+        AiJoin,
+        AiScore,
+        Filter,
+        Foreign,
+    )
 
     return {AiFilter.type_name: FilterPart, AiClassify.type_name: ClassifyPart,
             AiExtract.type_name: ExtractPart, AiJoin.type_name: JoinPart,
+            AiScore.type_name: ScoreBatch,
             Filter.type_name: LabelGate, Foreign.type_name: ApplyGate}

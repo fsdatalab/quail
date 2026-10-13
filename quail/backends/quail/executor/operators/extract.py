@@ -22,12 +22,6 @@ from quail.execution.runner import NodeMetrics, NodeResult
 from quail.physical import AiExtract
 
 
-def execute_extract(state: QueryExecutionState, node, inputs) -> NodeResult:
-    """Copy each document's answer to one extraction's question."""
-    (result,) = execute_extractions(state, [node], inputs).values()
-    return result
-
-
 def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
     """Run a pipeline's extractions over its documents as one stage run.
 
@@ -116,6 +110,18 @@ class ExtractPart(ExecutionPart):
 
     combine = True
     execute_group = staticmethod(execute_extractions)
+
+    @staticmethod
+    def model_inputs(node, inputs, context, chain=None, nodes=None):
+        # the one input carries the documents' ids, or the rows of an
+        # earlier operator over them
+        (value,) = inputs.values()
+        ids = (value.column(node.spec.alias).to_numpy()
+               if hasattr(value, "column") else np.asarray(value, dtype=np.int64))
+        return {"document_ids": ids,
+                "documents": context.state["docs"],
+                "texts": context.state.get("texts", {}),
+                "pre": context.state.get("pre", [])}
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):

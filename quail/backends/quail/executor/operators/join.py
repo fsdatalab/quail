@@ -37,11 +37,6 @@ from quail.execution.runner import (
 from quail.progress import answer_sink
 
 
-def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
-    """Run one join predicate."""
-    return execute_joins(state, (node,), inputs)[node.node_id]
-
-
 def execute_joins(state: QueryExecutionState, nodes, inputs) -> dict:
     """Run consecutive join predicates through the document scheduler."""
     state.gpu_timing = bool(inputs.get("gpu_timing", False))
@@ -58,6 +53,10 @@ class JoinPart(ExecutionPart):
     """Join predicates and their anchor KV within one scheduler run."""
 
     combine = True
+
+    @staticmethod
+    def model_inputs(node, inputs, context, chain=None, nodes=None):
+        return prepare_join_inputs(node, inputs, context, chain, nodes)
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):

@@ -68,6 +68,22 @@ class ExecutionPart(ABC):
         raise NotImplementedError(f"{cls.__name__} needs prepared requests")
 
     @staticmethod
+    def model_inputs(node, inputs, context, chain=None, nodes=None):
+        """Turn the node's graph input ports into scheduler inputs.
+
+        Returns None for an operator that reads its port values as
+        they are.
+
+        Args:
+            node: The physical node.
+            inputs: Port values from the preceding operators.
+            context: The execution context with the documents.
+            chain: The preceding pipeline state of a join, or None.
+            nodes: The nodes sharing one scheduler run, or None.
+        """
+        return None
+
+    @staticmethod
     def prepare_group(parts):
         """Prepare stages shared by consecutive parts of the same type."""
 

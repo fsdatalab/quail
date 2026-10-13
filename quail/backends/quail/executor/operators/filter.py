@@ -19,11 +19,6 @@ from quail.execution.runner import (
 from quail.progress import answer_sink
 
 
-def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
-    """Run one model filter and collect its results."""
-    return execute_filters(state, (node,), inputs)[node.node_id]
-
-
 def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
     """Run filter predicates together while each document retains its KV."""
     state.gpu_timing = bool(inputs.get("gpu_timing", False))
@@ -49,6 +44,10 @@ class FilterPart(SingleResultPart):
     """Filter stages and result tables within a pipeline."""
 
     execute_group = staticmethod(execute_filters)
+
+    @staticmethod
+    def model_inputs(node, inputs, context, chain=None, nodes=None):
+        return filter_inputs(context.state, node, next(iter(inputs.values())))
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):

@@ -8,12 +8,7 @@ from typing import Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
-from quail.backends.quail.executor.operators.extract import execute_extract
-from quail.backends.quail.executor.operators.filter import (
-    execute_filter,
-    execute_filters,
-)
-from quail.backends.quail.executor.operators.join import execute_join, execute_joins
+from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.executor.operators.score import QuailScorer
 from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
@@ -23,7 +18,6 @@ from quail.logical import LogicalPlan, has_score, shared_preamble
 from quail.logical.prompts import answer_ids
 from quail.physical import (
     AiClassify,
-    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -107,20 +101,20 @@ class QuailModelExecution:
         node: PhysicalNode,
         inputs: Mapping[str, Any],
     ) -> Any:
-        if isinstance(node, AiExtract):
-            return execute_extract(self.query, node, inputs)
+        implementation = execution_parts().get(node.type_name)
+        if implementation is not None and implementation.execute_group is not None:
+            return implementation.execute_group(
+                self.query, (node,), inputs)[node.node_id]
         if isinstance(node, (AiScore, AiClassify)):
+            # a score or classification on its own runs through the
+            # reranker readout, not the document scheduler
             execution = self._reranker_execution(inputs["documents"])
             self.query.gpu_timing = bool(inputs.get("gpu_timing", False))
             if "score_rows" in inputs:
                 return execution.execute_rows(node, inputs["score_rows"])
             return execution.execute(node, inputs["score_inputs"])
-        if not isinstance(node, (AiFilter, AiJoin)):
-            raise TypeError(
-                f"Quail cannot execute physical node {node.type_name!r}")
-        if isinstance(node, AiFilter):
-            return execute_filter(self.query, node, inputs)
-        return execute_join(self.query, node, inputs)
+        raise TypeError(
+            f"Quail cannot execute physical node {node.type_name!r}")
 
     def _reranker_execution(self, documents) -> RerankerModelExecution:
         """Return the reranker bound to this query's document tokens."""
@@ -140,8 +134,8 @@ class QuailModelExecution:
 
     def execute_predicates(self, nodes, inputs) -> dict:
         """Run consecutive filter or join predicates with resident document KV."""
-        execute = execute_filters if isinstance(nodes[0], AiFilter) else execute_joins
-        return execute(self.query, nodes, inputs)
+        return execution_parts()[nodes[0].type_name].execute_group(
+            self.query, nodes, inputs)
 
     def execute_pipeline(self, pipeline, inputs, context) -> dict:
         """Execute a model pipeline with this executor's loaded state."""
