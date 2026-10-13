@@ -106,7 +106,7 @@ def _same_prompt_head(node: PhysicalNode, consumer: PhysicalNode,
     """
     if isinstance(consumer, AiExtract):
         if isinstance(node, AiExtract):
-            return node.spec.config == consumer.spec.config
+            return node.spec.same_decoding(consumer.spec)
         if not consumer.spec.shares_head:
             return False
         if isinstance(first, AiClassify):

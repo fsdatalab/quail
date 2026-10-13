@@ -9,12 +9,12 @@ time as the writing reaches it.
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.extraction import ExtractionConfig
+from quail.physical import ExtractSpec
 
 NEG = float("-inf")
 
@@ -129,7 +129,8 @@ class Stream:
     exhausted: bool = False
     windows: int = 0    # windows tokenized so far
     normalized: SqueezedText | None = None
-    config: ExtractionConfig = field(default_factory=ExtractionConfig)
+    first_window_chars: int = ExtractSpec.first_window_chars
+    window_chars: int = ExtractSpec.window_chars
 
     def extend(self, vocabulary: Vocabulary) -> None:
         """Tokenize the next window of the document past the stream's end.
@@ -142,8 +143,8 @@ class Stream:
     def window(self) -> tuple:
         """Return the next squeezed window and its document character ends."""
         start = self.ends[-1]
-        cut = start + (self.config.first_window_chars if not self.windows
-                       else self.config.window_chars)
+        cut = start + (self.first_window_chars if not self.windows
+                       else self.window_chars)
         self.windows += 1
         if cut < len(self.text):
             boundary = re.compile(r"\s").search(self.text, cut)
@@ -323,7 +324,8 @@ def squeezed(text: str) -> tuple:
 
 
 def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,
-                 first, config: ExtractionConfig | None = None) -> list:
+                 first, *, first_window_chars: int = ExtractSpec.first_window_chars,
+                 window_chars: int = ExtractSpec.window_chars) -> list:
     """Return a stream for each start the chosen first token begins.
 
     A stream's tokens are the text from the start as the model writes
@@ -331,7 +333,6 @@ def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,
     at a time as the writing reaches it; its ends map each token back
     to the document.
     """
-    config = ExtractionConfig() if config is None else config
     scan = starts.scan
     if scan.normalized is None:
         scan.normalized = SqueezedText(text)
@@ -343,5 +344,7 @@ def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,
             end = int(scan.ends[at])
             streams.append(Stream(int(scan.starts[at]), [first, *filler],
                                   [end] * (1 + len(filler)), text,
-                                  normalized=scan.normalized, config=config))
+                                  normalized=scan.normalized,
+                                  first_window_chars=first_window_chars,
+                                  window_chars=window_chars))
     return streams

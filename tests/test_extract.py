@@ -134,7 +134,7 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
     assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
     assert extracts[2].spec.estimated_seconds < extracts[0].spec.estimated_seconds
     different = replace(extracts[1], spec=replace(
-        extracts[1].spec, config=ExtractionConfig(draft_tokens=2)))
+        extracts[1].spec, draft_tokens=2))
     graph = replace(plan.graph, nodes=tuple(
         different if node.node_id == different.node_id else node
         for node in plan.nodes))

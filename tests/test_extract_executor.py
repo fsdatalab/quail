@@ -31,7 +31,6 @@ from quail.backends.quail.executor.state import LoadedModelState, QueryExecution
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.execution.tokens import TokenOffsets, TokenStore
-from quail.extraction import ExtractionConfig
 from quail.physical import (
     AiExtract,
     AiFilter,
@@ -58,7 +57,7 @@ def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
     vocabulary = SimpleNamespace(vocab=range(64), merged=merged,
                                  is_stop=np.zeros(64, dtype=bool), none_id=63)
     vocabulary.is_stop[62] = True
-    decoder = Decoder(vocabulary, 4, 10, [True], ExtractionConfig())
+    decoder = Decoder(vocabulary, 4, 10, [True], make_spec()[0])
     text = "abcdefghij"
     streams = [Stream(at, [0, token], [at + 1, at + 2], text, exhausted=True)
                for at, token in enumerate(tokens)]
@@ -80,7 +79,7 @@ def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
 
 def test_readout_scores_reset_between_rows_and_keep_token_order():
     _, vocabulary = make_spec()
-    decoder = Decoder(vocabulary, 4, 10, [True], ExtractionConfig())
+    decoder = Decoder(vocabulary, 4, 10, [True], make_spec()[0])
     scores, none, stop = decoder.lp([-4, -5, 5, 2, 3, 4, -1, -1, -2, -3])
     assert decoder.top == 5 and none == -4 and stop == -5
     assert scores[5] == scores[2] == -1
@@ -578,7 +577,7 @@ def test_extraction_pipeline_rejects_mixed_heads_or_decoding_settings():
     with pytest.raises(ValueError, match="prompt head"):
         ExtractionStages(state, [spec, other], tables, [0], documents, [LEASE],
                       readout=readout)
-    other = replace(spec, config=ExtractionConfig(draft_tokens=2))
+    other = replace(spec, draft_tokens=2)
     with pytest.raises(ValueError, match="decoding settings"):
         ExtractionStages(state, [spec, other], tables, [0], documents, [LEASE],
                          readout=readout)
@@ -587,11 +586,10 @@ def test_extraction_pipeline_rejects_mixed_heads_or_decoding_settings():
 @pytest.mark.parametrize("limit,draft", [(64, 16), (5, 1), (3, 0), (1, 0)])
 def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
     # a model that never closes the quote keeps writing the document;
-    # the answer ends at stages.config.max_answer_tokens
+    # the answer ends at stages.spec.max_answer_tokens
     long = " ".join(["word"] * 200)
     spec, tables = make_spec(True, long)
-    spec = replace(spec, config=ExtractionConfig(
-        max_answer_tokens=limit, draft_tokens=draft))
+    spec = replace(spec, max_answer_tokens=limit, draft_tokens=draft)
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
@@ -609,8 +607,8 @@ def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
                state.chunk_tokens, anchor_keys=stages.keys)
     stages.finish()
     asked = stages.docs[0].answers[0]
-    assert asked.done and len(asked.written) == stages.config.max_answer_tokens
-    assert asked.answer == " ".join(["word"] * stages.config.max_answer_tokens)
+    assert asked.done and len(asked.written) == stages.spec.max_answer_tokens
+    assert asked.answer == " ".join(["word"] * stages.spec.max_answer_tokens)
     assert all(len(suffix) <= 1 + draft
                for _, suffix, _, whole, _ in model.packed if whole)
 

@@ -50,8 +50,8 @@ class ExtractionStages:
                  documents, texts, readout=None, shared_head=None):
         self.specs = list(specs)
         first = self.specs[0]
-        self.config = first.config
-        if any(spec.config != self.config for spec in self.specs):
+        self.spec = first
+        if any(not first.same_decoding(spec) for spec in self.specs):
             raise ValueError("a pipeline's extractions share decoding settings")
         if any(spec.alias != first.alias for spec in self.specs):
             raise ValueError("a pipeline's extractions share a table")
@@ -79,7 +79,7 @@ class ExtractionStages:
         self.keys = [doc.key for doc in self.docs]
         self.readout = self._readout(state) if readout is None else readout
         self.decoder = Decoder(vocabulary, self.readout.k, self.readout.width,
-                               [spec.trim for spec in self.specs], self.config)
+                               [spec.trim for spec in self.specs], self.spec)
         self.stages = []
         for q, (spec, tail) in enumerate(zip(self.specs, self.tails)):
             self.stages.extend(self._question_stages(q, spec.name, tail))
@@ -100,11 +100,11 @@ class ExtractionStages:
             single=True, append=True, label=f"{name} tail")]
         stages.extend(
             Stage(suffixes=partial(self._step_suffix, q),
-                  suffix_tokens=1 + self.config.draft_tokens, frame=frame,
+                  suffix_tokens=1 + self.spec.draft_tokens, frame=frame,
                   readout=self.readout, decide=partial(self._step_decide, q),
                   discard=partial(self._step_discard, q), read_all_rows=True,
                   single=True, append=True, label=f"{name} round {t}")
-            for t in range(1, self.config.max_answer_tokens + 1))
+            for t in range(1, self.spec.max_answer_tokens + 1))
         return stages
 
     @property
@@ -114,7 +114,7 @@ class ExtractionStages:
         The cue, and the answer's tokens with the last round's draft
         past them.
         """
-        return 1 + self.config.max_answer_tokens + self.config.draft_tokens
+        return 1 + self.spec.max_answer_tokens + self.spec.draft_tokens
 
     def _readout(self, state):
         """The readout of every row: none, the stop, then the top tokens."""
@@ -122,7 +122,7 @@ class ExtractionStages:
         head = full_output_head(state.loaded_model.model)
         vocabulary = self.vocabulary
         return AsyncTopLogprobs(torch, torch.nn.functional, head,
-                                self.config.top_tokens,
+                                self.spec.top_tokens,
                                 [vocabulary.none_id, vocabulary.stop_ids],
                                 ragged=True)
 

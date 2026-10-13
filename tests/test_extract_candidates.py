@@ -16,7 +16,6 @@ from quail.backends.quail.executor.extract.candidates import (
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary, same_word
 from quail.execution.tokens import GigatokenEncoder
-from quail.extraction import ExtractionConfig
 
 
 def test_gigatoken_vocabulary_encodes_unicode_without_transformers(monkeypatch):
@@ -146,10 +145,9 @@ def test_vocabulary_pairs_each_token_with_its_quote_closing_merge():
     assert np.flatnonzero(tables.is_stop).tolist() == sorted(tables.stop_ids)
 
 
-@pytest.mark.parametrize("config", [
-    ExtractionConfig(), ExtractionConfig(first_window_chars=9, window_chars=19),
-])
-def test_stream_batches_preserve_tokens_and_offsets_across_windows(monkeypatch, config):
+@pytest.mark.parametrize("first_window,window", [(64, 512), (9, 19)])
+def test_stream_batches_preserve_tokens_and_offsets_across_windows(
+        monkeypatch, first_window, window):
     texts = [" ".join(["word"] * 300), "word   \n word  ", "word"]
     tables = make_vocabulary(*texts)
     streams = []
@@ -159,7 +157,9 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(monkeypatch, 
         ids, offsets = tables.encode(text)
         starts = first_tokens(tables, _scores(tables, {word: -0.5}), ids,
                               document_tokens(offsets, 0))
-        streams.append(make_streams(tables, text, starts, word, config=config)[0])
+        streams.append(make_streams(tables, text, starts, word,
+                                    first_window_chars=first_window,
+                                    window_chars=window)[0])
         rest, ends = squeezed(text)
         ids, offsets = tables.encode(rest)
         expected.append((ids, [ends[b - 1] for _, b in offsets]))
@@ -178,7 +178,7 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(monkeypatch, 
     ensure_tokens(streams, 80, tables)
     assert len(batches[0]) == 2
     largest_window = max(len(text) for batch in batches for text in batch)
-    assert largest_window <= max(config.first_window_chars, config.window_chars) + 4
+    assert largest_window <= max(first_window, window) + 4
     assert not streams[0].exhausted
     assert streams[1].exhausted and streams[2].exhausted
     ensure_tokens(streams, 10_000, tables)
