@@ -396,7 +396,7 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
             "before": cache_before, "after": kernel_cache_files()}
     if session.config.backend in TEXT_VLLM_BACKENDS:
         output.measurements["input_tokens"] = (
-            result.report["fresh_tokens"] + result.report["cached_tokens"]
+            result.report["backend_metrics"]["prompt_tokens"]
         )
     output.prompt_pieces = prompt_pieces(query, info, join_anchors(result))
     return output
