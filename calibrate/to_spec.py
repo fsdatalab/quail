@@ -1,11 +1,14 @@
 """Turn calibrate's saved summaries into a device's DeviceSpec fields.
 
-Pull the two summaries from the results volume, then print the fields
-to paste into quail/specs/<device>.py:
+Print the fields to paste into quail/specs/<device>.py from the two
+summaries. For example, after a run on Modal, pull them from the
+results volume first:
 
     modal volume get quail-results calibrate/h100-sxm/gemm.json .
     modal volume get quail-results calibrate/h100-sxm/attention_32_8_128.json .
     uv run python -m calibrate.to_spec gemm.json attention_32_8_128.json
+
+After a local run, pass the files under the results directory instead.
 
 sustained_fp8_flops is the best MSMF of any run: the GPU's best shape,
 so the speed of light estimate stays a bound for every model's shapes.

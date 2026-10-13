@@ -1,10 +1,10 @@
 r"""Measure a GPU's fp8 GEMM ceilings with stas00's mamf-finder.
 
-Runs mamf-finder.py unchanged, at a pinned commit, on the NGC image the
-published H100 SXM rows were measured with. mamf-finder times
+Runs mamf-finder.py unchanged, at a pinned commit. mamf-finder times
 torch._scaled_mm with one fp8 scale per tensor and an fp8 output:
-cuBLAS, not Quail's DeepGEMM kernels. The runs share one container, so
-they share one GPU:
+cuBLAS, not Quail's DeepGEMM kernels. The published H100 SXM rows were
+measured on the NGC image calibrate.modal_app uses. The runs share one
+process's GPU:
 
   published_fp8  the GPU's published MAMF and MSMF shapes, to check it
                  against the published rates; a GPU without published
@@ -12,46 +12,33 @@ they share one GPU:
   qkv, o,        with --model only: the model's four projections at
   gate_up, down  their N and K, sweeping M, the tokens in a chunk
 
-    mkdir -p results/benchmark
-    log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-gemm.log"
-    uv run modal run --detach calibrate/gemm.py --device h100-sxm \
-        --prediction "..." 2>&1 | tee "$log"
+On a machine with the GPU:
 
-The mamf-finder logs go under /results/calibrate/<device>/gemm/<stamp>/
-and the summary to /results/calibrate/<device>/gemm.json.
+    uv run python -m calibrate.gemm --device h100-sxm --root results/calibrate
+
+The mamf-finder logs go under <root>/<device>/gemm/<stamp>/ and the
+summary to <root>/<device>/gemm.json. calibrate.modal_app runs the same
+code on Modal.
 """
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import re
 import subprocess
 import sys
+import urllib.request
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-
-import modal
 
 MAMF_COMMIT = "30ddd97054eb01035c0a5079a58f011df603b525"
 MAMF_URL = ("https://raw.githubusercontent.com/stas00/ml-engineering/"
             f"{MAMF_COMMIT}/compute/accelerator/benchmarks/mamf-finder.py")
 MAMF_SHA256 = "24239a3cba82746cabb1cf756afbd4467ed1a1b884eafd842b67cbf948ef7256"
-MAMF_PATH = "/opt/mamf-finder.py"
-NGC_IMAGE = "nvcr.io/nvidia/pytorch:26.04-py3"
-# the results volume is mounted at /results
-RESULTS = Path("/results/calibrate")
-
-app = modal.App("quail-milestone1")
-results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
-image = (
-    modal.Image.from_registry(NGC_IMAGE)
-    .pip_install("nvidia-ml-py")
-    .run_commands(
-        f"curl -fsSL {MAMF_URL} -o {MAMF_PATH}",
-        f"echo '{MAMF_SHA256}  {MAMF_PATH}' | sha256sum -c -",
-    )
-    .add_local_python_source("calibrate")
-)
+MAMF_NAME = f"mamf-finder-{MAMF_COMMIT[:8]}.py"
 
 HEADLINE = re.compile(
     r"^(MAMF|MSMF) \(max .*?\):\s+(\d+) TFLOPS @ (\d+x\d+x\d+) \(MxNxK\)"
@@ -145,36 +132,55 @@ def gpu_info() -> dict:
     return dict(zip(fields, (value.strip() for value in row.split(","))))
 
 
-@app.function(image=image, gpu="H100!", timeout=3 * 3600,
-              volumes={"/results": results_vol})
-def measure(stamp: str, device: str, published: dict | None,
-            projections: dict | None, prediction: str) -> dict:
-    """Run every mamf-finder configuration on one GPU and save the summary.
+def fetch_mamf_finder(directory: Path) -> Path:
+    """Return the pinned mamf-finder.py in directory, downloading it if absent.
 
     Args:
-        stamp: The UTC timestamp naming this run's directory.
+        directory: Where to keep the script.
+
+    Raises:
+        ValueError: If the file's sha256 is not the pinned one.
+    """
+    path = directory / MAMF_NAME
+    if not path.exists():
+        directory.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(MAMF_URL) as response:
+            path.write_bytes(response.read())
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != MAMF_SHA256:
+        raise ValueError(f"{path} has sha256 {digest}, expected {MAMF_SHA256}")
+    return path
+
+
+def run(root: Path, device: str, stamp: str, published: dict | None,
+        projections: ProjectionSweep | None, mamf_finder: Path,
+        prediction: str = "", on_save: Callable[[], None] = lambda: None) -> dict:
+    """Run every mamf-finder configuration on GPU 0 and save the summary.
+
+    Args:
+        root: The results directory.
         device: The quail.specs device name.
+        stamp: The UTC timestamp naming this run's directory.
         published: The GPU's published fp8 rates and shapes, or None.
-        projections: A ProjectionSweep's fields, or None.
+        projections: A model's projections to sweep, or None.
+        mamf_finder: The pinned mamf-finder.py.
         prediction: The prediction stated before the run.
+        on_save: Called after each file is written.
 
     Returns:
-        The summary, also written to /results/calibrate/<device>/gemm.json.
+        The summary, also written to <root>/<device>/gemm.json.
     """
-    run_dir = RESULTS / device / "gemm" / stamp
+    run_dir = root / device / "gemm" / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
     gpu = gpu_info()
     print(f"gpu: {json.dumps(gpu)}", flush=True)
     summary = {"stamp": stamp, "device": device, "gpu": gpu,
-               "image": NGC_IMAGE, "mamf_finder": MAMF_URL,
-               "published_fp8": published,
-               "projections": projections, "prediction": prediction,
-               "runs": {}}
-    sweep = projections and ProjectionSweep(**projections)
-    runs = mamf_runs(published, sweep, run_dir)
-    for name, shape_args in runs.items():
+               "mamf_finder": MAMF_URL, "published_fp8": published,
+               "projections": projections and asdict(projections),
+               "prediction": prediction, "runs": {}}
+    for name, shape_args in mamf_runs(published, projections, run_dir).items():
         log_path = run_dir / f"{name}.txt"
-        argv = [sys.executable, MAMF_PATH, "--dtype", "float8_e4m3fn",
+        argv = [sys.executable, str(mamf_finder), "--dtype", "float8_e4m3fn",
                 *shape_args, "--output_file", str(log_path), "--no-verbose",
                 "--notes", f"quail calibrate {stamp} {name}"]
         print(f"{name}: {' '.join(argv[1:])}", flush=True)
@@ -185,38 +191,44 @@ def measure(stamp: str, device: str, published: dict | None,
         print(f"{name}: MAMF {json.dumps(parsed['mamf'])} "
               f"MSMF {json.dumps(parsed['msmf'])}", flush=True)
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-        results_vol.commit()
-    (RESULTS / device / "gemm.json").write_text(json.dumps(summary, indent=2))
-    results_vol.commit()
+        on_save()
+    (root / device / "gemm.json").write_text(json.dumps(summary, indent=2))
+    on_save()
     return summary
 
 
-@app.local_entrypoint()
-def main(device: str = "h100-sxm", model: str = "", prediction: str = ""):
-    """Start the measurement on the device's GPU and print each run's headlines.
+def projection_sweep(model: str) -> ProjectionSweep:
+    """Return the projection sweep of a quail.specs model."""
+    from calibrate.targets import gemm_shapes
+    from quail.specs import MODELS
 
-    Args:
-        device: The calibrate target, by quail.specs device name.
-        model: A quail.specs model name whose projections to sweep, or "".
-        prediction: The prediction stated before the run.
-    """
-    from datetime import datetime, timezone
+    return ProjectionSweep(model, gemm_shapes(MODELS[model]))
 
-    from calibrate.targets import TARGETS, gemm_shapes
 
-    target = TARGETS[device]
-    projections = None
-    if model:
-        from quail.specs import MODELS
-        projections = asdict(ProjectionSweep(model, gemm_shapes(MODELS[model])))
-    print(f"prediction: {prediction or '(none stated)'}", flush=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    call = measure.with_options(gpu=target.modal_gpu).spawn(
-        stamp, device, target.published_fp8, projections, prediction)
-    print(f"function call id: {call.object_id}", flush=True)
-    print(f"logs: {RESULTS / device / 'gemm' / stamp}", flush=True)
-    summary = call.get()
-    for name, run in summary["runs"].items():
-        print(f"{name}: MAMF {json.dumps(run['mamf'])} "
-              f"MSMF {json.dumps(run['msmf'])}", flush=True)
-    print(f"summary: {RESULTS / device / 'gemm.json'}", flush=True)
+def main(argv=None) -> None:
+    """Measure the GPU this process sees and print where the summary went."""
+    from calibrate import utc_stamp
+    from calibrate.targets import TARGETS
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--device", required=True,
+                        help="quail.specs device name, such as h100-sxm")
+    parser.add_argument("--root", type=Path, default=Path("results/calibrate"),
+                        help="results directory")
+    parser.add_argument("--model", default="",
+                        help="quail.specs model whose projections to sweep")
+    parser.add_argument("--mamf-finder", type=Path,
+                        help="pinned mamf-finder.py; downloaded into --root "
+                             "when omitted")
+    parser.add_argument("--prediction", default="")
+    args = parser.parse_args(argv)
+    target = TARGETS.get(args.device)
+    run(args.root, args.device, utc_stamp(),
+        target and target.published_fp8,
+        projection_sweep(args.model) if args.model else None,
+        args.mamf_finder or fetch_mamf_finder(args.root), args.prediction)
+    print(f"summary: {args.root / args.device / 'gemm.json'}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

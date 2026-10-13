@@ -1,9 +1,12 @@
 """CPU checks for the hardware calibration package."""
 
+import json
+
 import pytest
 
-from calibrate.attention import AttentionSweep, summary_name
-from calibrate.gemm import ProjectionSweep, mamf_runs, parse_log
+from calibrate import gemm
+from calibrate.attention import AttentionSweep, parse_heads, summary_name
+from calibrate.gemm import ProjectionSweep, fetch_mamf_finder, mamf_runs, parse_log
 from calibrate.targets import TARGETS, gemm_shapes
 from calibrate.timing import Window, window_stats
 from calibrate.to_spec import (
@@ -49,11 +52,38 @@ def test_mamf_runs_time_published_shapes_or_search(tmp_path):
     assert "131072" in runs["qkv"]
 
 
+def test_gemm_run_writes_under_the_given_root(tmp_path, monkeypatch):
+    # stands in for mamf-finder: writes the README example to --output_file
+    fake = tmp_path / "fake_mamf.py"
+    fake.write_text(
+        "import sys\n"
+        "out = sys.argv[sys.argv.index('--output_file') + 1]\n"
+        f"open(out, 'w').write({MAMF_LOG_TEXT!r})\n")
+    monkeypatch.setattr(gemm, "gpu_info", lambda: {"name": "test"})
+    saves = []
+    root = tmp_path / "results"
+    summary = gemm.run(root, "h100-sxm", "20261013T000000Z",
+                       TARGETS["h100-sxm"].published_fp8, None, fake,
+                       on_save=lambda: saves.append(1))
+    assert summary["runs"]["published_fp8"]["msmf"]["tflops"] == 722
+    assert (root / "h100-sxm" / "gemm" / "20261013T000000Z"
+            / "published_fp8.txt").exists()
+    assert json.loads((root / "h100-sxm" / "gemm.json").read_text()) == summary
+    assert len(saves) == 2
+
+
+def test_fetch_mamf_finder_rejects_a_wrong_file(tmp_path):
+    (tmp_path / gemm.MAMF_NAME).write_text("print('not mamf-finder')\n")
+    with pytest.raises(ValueError, match="sha256"):
+        fetch_mamf_finder(tmp_path)
+
+
 def test_model_shapes_match_qwen3_4b():
     assert gemm_shapes(QWEN3_4B_FP8) == {
         "qkv": (6144, 2560), "o": (2560, 4096),
         "gate_up": (19456, 2560), "down": (2560, 9728)}
     assert summary_name((32, 8, 128)) == "attention_32_8_128.json"
+    assert parse_heads("32,8,128") == (32, 8, 128)
 
 
 def test_sweep_has_copy_documents_and_cached_reads():

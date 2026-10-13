@@ -17,31 +17,28 @@ document of L tokens has L(L+1)/2 pairs. The smoke run times one point
 of each kind briefly and checks both libraries against torch's
 scaled_dot_product_attention.
 
-    mkdir -p results/benchmark
-    log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-attention.log"
-    uv run modal run --detach calibrate/attention.py --device h100-sxm \
-        --heads 32,8,128 --smoke 2>&1 | tee "$log"
+On a machine with the GPU, FlashAttention 3, and FlashInfer:
+
+    uv run python -m calibrate.attention --device h100-sxm --heads 32,8,128 \
+        --root results/calibrate --smoke
 
 --heads is query heads, KV heads, and head dimension. Drop --smoke for
-the full sweep. Results go under
-/results/calibrate/<device>/attention/<stamp>/, and the full sweep's
-summary to /results/calibrate/<device>/attention_<q>_<kv>_<d>.json.
+the full sweep. Results go under <root>/<device>/attention/<stamp>/, and
+the full sweep's summary to <root>/<device>/attention_<q>_<kv>_<d>.json.
+calibrate.modal_app runs the same code on Modal.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import time
 import traceback
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-import modal
-
 from calibrate.timing import Telemetry, Window, measure_window, settle_clock
-
-# the results volume is mounted at /results
-RESULTS = Path("/results/calibrate")
 
 
 @dataclass(frozen=True)
@@ -88,20 +85,6 @@ class AttentionSweep:
                 for c in self.cached_contexts for q in self.cached_query_rows
                 for p in self.cached_pages]
         return out
-
-
-app = modal.App("quail-milestone1")
-results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
-image = (
-    modal.Image.from_registry("nvidia/cuda:13.0.3-devel-ubuntu24.04",
-                              add_python="3.12")
-    .pip_install("torch==2.13.0",
-                 index_url="https://download.pytorch.org/whl/cu130")
-    .pip_install("flash-attn-3==3.0.0", extra_options="--no-deps",
-                 index_url="https://download.pytorch.org/whl/cu130")
-    .pip_install("flashinfer-python==0.7.1", "nvidia-ml-py", "numpy")
-    .add_local_python_source("calibrate")
-)
 
 
 def summary_name(heads) -> str:
@@ -222,29 +205,29 @@ def reference_error(torch, heads, point, case, out) -> float:
     return worst
 
 
-@app.function(image=image, gpu="H100!", timeout=2 * 3600,
-              volumes={"/results": results_vol})
-def measure(stamp: str, device: str, heads: tuple, smoke: bool,
-            prediction: str) -> dict:
-    """Measure every point with every library on one GPU and save the summary.
+def run(root: Path, device: str, stamp: str, heads: tuple, smoke: bool,
+        prediction: str = "", on_save: Callable[[], None] = lambda: None) -> dict:
+    """Measure every point with every library on GPU 0 and save the summary.
 
     Args:
-        stamp: The UTC timestamp naming this run's directory.
+        root: The results directory.
         device: The quail.specs device name.
+        stamp: The UTC timestamp naming this run's directory.
         heads: (query heads, KV heads, head dimension).
         smoke: Measure AttentionSweep.smoke() and check each library
             against torch, keeping the summary in the run's directory;
             otherwise measure AttentionSweep().
         prediction: The prediction stated before the run.
+        on_save: Called after each file is written.
 
     Returns:
-        The summary also written to the results volume.
+        The summary, also written under root.
     """
     import torch
 
     heads = tuple(heads)
     sweep = AttentionSweep.smoke() if smoke else AttentionSweep()
-    run_dir = RESULTS / device / "attention" / stamp
+    run_dir = root / device / "attention" / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
     out_path = run_dir / ("smoke.json" if smoke else "summary.json")
     telem = Telemetry()
@@ -301,49 +284,55 @@ def measure(stamp: str, device: str, heads: tuple, smoke: bool,
         summary["points"].append(row)
         print(json.dumps(row, default=str), flush=True)
         out_path.write_text(json.dumps(summary, indent=2, default=str))
-        results_vol.commit()
+        on_save()
     if not smoke:
-        (RESULTS / device / summary_name(heads)).write_text(
+        (root / device / summary_name(heads)).write_text(
             json.dumps(summary, indent=2, default=str))
-        results_vol.commit()
+        on_save()
     return summary
 
 
-@app.local_entrypoint()
-def main(heads: str, device: str = "h100-sxm", smoke: bool = False,
-         prediction: str = ""):
-    """Start the measurement on the device's GPU and print one line per point.
+def point_line(row: dict) -> str:
+    """Return one printed line for a measured point."""
+    shape = {k: row[k] for k in ("kind", "length", "query_rows", "context",
+                                 "pages") if k in row}
+    cells = []
+    for lib in ("copy", "fa3", "flashinfer"):
+        r = row.get(lib)
+        if r and "error" in r:
+            cells.append(f"{lib}: {r['error'][:80]}")
+        elif r:
+            cells.append(f"{lib}: {r['tflops']:.0f} TFLOPS {r['gbps']:.0f} GB/s "
+                         f"{r['mhz'] or 0:.0f} MHz steady={r['steady']}")
+    return f"{json.dumps(shape)} {' | '.join(cells)}"
 
-    Args:
-        heads: Query heads, KV heads, and head dimension, such as "32,8,128".
-        device: The calibrate target, by quail.specs device name.
-        smoke: Measure one point of each kind briefly and check correctness.
-        prediction: The prediction stated before the run.
-    """
-    from datetime import datetime, timezone
 
-    from calibrate.targets import TARGETS
+def parse_heads(text: str) -> tuple[int, int, int]:
+    """Return (query heads, KV heads, head dimension) from text like "32,8,128"."""
+    n_q, n_kv, d_head = (int(part) for part in text.split(","))
+    return n_q, n_kv, d_head
 
-    target = TARGETS[device]
-    n_q, n_kv, d_head = (int(part) for part in heads.split(","))
-    print(f"prediction: {prediction or '(none stated)'}", flush=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    call = measure.with_options(
-        gpu=target.modal_gpu,
-        env={"FLASHINFER_CUDA_ARCH_LIST": target.flashinfer_arch},
-    ).spawn(stamp, device, (n_q, n_kv, d_head), smoke, prediction)
-    print(f"function call id: {call.object_id}", flush=True)
-    print(f"results: {RESULTS / device / 'attention' / stamp}", flush=True)
-    summary = call.get()
+
+def main(argv=None) -> None:
+    """Measure the GPU this process sees and print one line per point."""
+    from calibrate import utc_stamp
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--device", required=True,
+                        help="quail.specs device name, such as h100-sxm")
+    parser.add_argument("--heads", type=parse_heads, required=True,
+                        help="query heads, KV heads, head dimension: 32,8,128")
+    parser.add_argument("--root", type=Path, default=Path("results/calibrate"),
+                        help="results directory")
+    parser.add_argument("--smoke", action="store_true",
+                        help="one point of each kind, checked against torch")
+    parser.add_argument("--prediction", default="")
+    args = parser.parse_args(argv)
+    summary = run(args.root, args.device, utc_stamp(), args.heads, args.smoke,
+                  args.prediction)
     for row in summary["points"]:
-        shape = {k: row[k] for k in ("kind", "length", "query_rows", "context",
-                                     "pages") if k in row}
-        cells = []
-        for lib in ("copy", "fa3", "flashinfer"):
-            r = row.get(lib)
-            if r and "error" in r:
-                cells.append(f"{lib}: {r['error'][:80]}")
-            elif r:
-                cells.append(f"{lib}: {r['tflops']:.0f} TFLOPS {r['gbps']:.0f} GB/s "
-                             f"{r['mhz'] or 0:.0f} MHz steady={r['steady']}")
-        print(json.dumps(shape), " | ".join(cells), flush=True)
+        print(point_line(row), flush=True)
+
+
+if __name__ == "__main__":
+    main()

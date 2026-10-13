@@ -95,11 +95,24 @@ vendor libraries, not Quail's kernels: fp8 matmuls with
 (cuBLAS), attention with FlashAttention 3 and FlashInfer, and a 4 GB
 copy. Each rate is the one the GPU holds for 2 s at full load.
 Attention rates depend on the head layout: query heads, KV heads, and
-head dimension. For example, for an H100 and the layout of Qwen3 4B:
+head dimension. For example, for an H100 and the layout of Qwen3 4B,
+on a machine with the GPU:
 
 ```bash
-uv run modal run --detach calibrate/gemm.py --device h100-sxm
-uv run modal run --detach calibrate/attention.py --device h100-sxm --heads 32,8,128
+uv run python -m calibrate.gemm --device h100-sxm --root results/calibrate
+uv run python -m calibrate.attention --device h100-sxm --heads 32,8,128 \
+    --root results/calibrate
+uv run python -m calibrate.to_spec results/calibrate/h100-sxm/gemm.json \
+    results/calibrate/h100-sxm/attention_32_8_128.json
+```
+
+The attention run needs FlashAttention 3 and FlashInfer installed. To
+run on Modal instead, use `calibrate/modal_app.py`, which writes to the
+`quail-results` volume:
+
+```bash
+uv run modal run --detach calibrate/modal_app.py::gemm --device h100-sxm
+uv run modal run --detach calibrate/modal_app.py::attention --device h100-sxm --heads 32,8,128
 modal volume get quail-results calibrate/h100-sxm/gemm.json .
 modal volume get quail-results calibrate/h100-sxm/attention_32_8_128.json .
 uv run python -m calibrate.to_spec gemm.json attention_32_8_128.json
