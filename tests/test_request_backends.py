@@ -11,13 +11,13 @@ import pytest
 
 import quail
 from quail.backends.base import BackendExecutionContext, GpuContext
+from quail.baselines.execution import RequestModelExecution
 from quail.baselines.nodes import (
     RequestClassifySpec,
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
 )
-from quail.baselines.request import RequestModelExecution
 from quail.baselines.sglang import SGLangClient, pipelined_sglang_backend
 from quail.baselines.vllm import VLLMEngine, sampling_kwargs, stock_vllm_backend
 from quail.builtins import built_in_registry
@@ -481,7 +481,7 @@ def test_request_backends_decode_one_request_per_row_the_join_keeps():
 
 
 def test_match_label_takes_the_longest_label_the_answer_starts_with():
-    from quail.baselines.request import match_label
+    from quail.execution.labels import match_label
 
     labels = ("cardiac", "cardiac disorders", "vascular disorders")
     assert match_label(" Cardiac disorders\nbecause", labels) == "cardiac disorders"
