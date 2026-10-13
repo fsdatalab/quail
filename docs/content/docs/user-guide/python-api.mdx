@@ -130,6 +130,21 @@ Pass `trim=False` to return the complete source lines that contain the
 answer. You can call `ai_extract()` again with a different question and
 name, then include both names in `select()`.
 
+To get several answers as one struct column, pass a dictionary that
+maps each field name to its question:
+
+```python
+query = (
+    session.docs("contracts").alias("c")
+    .ai_extract("c.text", {"end_date": "When does the lease end?",
+                           "signer": "Who signed the lease?"}, name="lease")
+    .select("c.id", "lease")
+)
+```
+
+You get `c.id`, `lease`, and `lease_span`. `lease` has the fields
+`end_date` and `signer`; `lease_span` has their spans.
+
 See [`AI.EXTRACT`](/docs/user-guide/sql#aiextract) for output examples
 and supported queries.
 

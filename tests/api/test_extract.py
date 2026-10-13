@@ -19,6 +19,7 @@ from quail.execution.result import extract_answer_table
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.logical import (
     CompileError,
+    ExtractStruct,
     extracted_above_joins,
 )
 from quail.physical import (
@@ -28,6 +29,7 @@ from quail.physical import (
     AiJoin,
     ExtractSpec,
     Filter,
+    Project,
 )
 from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import EngineConfig, Refusal
@@ -484,3 +486,146 @@ def test_extraction_settings_survive_plan_serialization(session):
     legacy = request.to_dict()
     legacy.pop("max_answer_tokens")
     assert RequestExtractSpec.from_mapping(legacy).max_answer_tokens == 64
+
+
+FIELDS = {"ends": QUESTION, "rent": "What is the rent?"}
+STRUCT_SQL = ("SELECT c.id, AI.EXTRACT(c.text, {'ends': '" + QUESTION
+              + "', 'rent': 'What is the rent?'}) AS lease FROM contracts c")
+
+
+def _lease(session):
+    return (session.docs("contracts").alias("c")
+            .ai_extract("c.text", FIELDS, name="lease")
+            .select("c.id", "lease"))
+
+
+def test_struct_extract_plans_one_extraction_per_field(session):
+    built = _lease(session)
+    for dialect in ("snowflake", "bq"):
+        assert session.sql(STRUCT_SQL, dialect=dialect).logical == built.logical
+    projection = built.logical.projection
+    assert projection.structs == (ExtractStruct("lease", ("ends", "rent")),)
+    assert projection.result_columns() == ("c.id", "lease")
+    plan = built.plan()
+    extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    assert [n.spec.name for n in extracts] == ["lease.ends", "lease.rent"]
+    assert [n.spec.question for n in extracts] == list(FIELDS.values())
+    # the fields run as one pipeline; the second reads the document KV
+    # the first wrote
+    pipelines = build_pipelines(plan.graph)
+    assert tuple(member.node_id for member in pipelines[extracts[0].node_id]) == (
+        extracts[0].node_id, extracts[1].node_id)
+    project = next(n for n in plan.nodes if isinstance(n, Project))
+    assert project.columns == ("c.id", "lease.ends", "lease.ends_span",
+                               "lease.rent", "lease.rent_span")
+    assert project.structs == (
+        ("lease", (("ends", "lease.ends"), ("rent", "lease.rent"))),
+        ("lease_span", (("ends", "lease.ends_span"), ("rent", "lease.rent_span"))))
+    assert project.outputs[0].schema == ("c.id", "lease", "lease_span")
+    assert Project.from_attributes(
+        project.node_id, project.inputs, project.attributes()) == project
+    assert "lease = struct(lease.ends, lease.rent)" in built.explain()
+
+
+def _fake_struct_answers(monkeypatch):
+    execute = RerankerModelExecution.execute
+    answers = {"lease.ends": ["March 3, 2027", None],
+               "lease.rent": ["$2,000", None]}
+
+    def answer(self, node, inputs):
+        if not isinstance(node, AiExtract):
+            return execute(self, node, inputs)
+        (source,) = inputs.values()
+        ids = (source.column("c") if hasattr(source, "column")
+               else source).to_pylist()
+        found = answers[node.spec.name]
+        spans = {"lease.ends": (14, 27), "lease.rent": (37, 43)}
+        table = extract_answer_table(
+            node.spec.alias, node.spec.name, node.spec.span_name, ids,
+            [found[i] for i in ids],
+            [spans[node.spec.name] if found[i] else None for i in ids])
+        return NodeResult({"rows": table, "ids:c": ids})
+
+    monkeypatch.setattr(RerankerModelExecution, "execute", answer)
+
+
+@pytest.mark.parametrize("suffix", [
+    "", " ORDER BY c.id DESC LIMIT 1",
+    " WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.05"])
+def test_struct_extract_returns_answer_and_span_structs(
+        session, monkeypatch, suffix):
+    _fake_struct_answers(monkeypatch)
+    result = score_tests._finish(session.sql(STRUCT_SQL + suffix), session,
+                                 score_tests._RowReranker())
+    rows = result.collect()
+    assert rows.column_names == ["c.id", "lease", "lease_span"]
+    span = pa.struct([("start", pa.int32()), ("end", pa.int32())])
+    assert rows.schema.field("lease").type == pa.struct(
+        [("ends", pa.string()), ("rent", pa.string())])
+    assert rows.schema.field("lease_span").type == pa.struct(
+        [("ends", span), ("rent", span)])
+    expected = [
+        {"c.id": 1, "lease": {"ends": "March 3, 2027", "rent": "$2,000"},
+         "lease_span": {"ends": {"start": 14, "end": 27},
+                        "rent": {"start": 37, "end": 43}}},
+        {"c.id": 2, "lease": {"ends": None, "rent": None},
+         "lease_span": {"ends": None, "rent": None}},
+    ]
+    assert rows.to_pylist() == (expected[1:] if "DESC" in suffix else expected)
+
+
+def test_stock_vllm_runs_a_struct_extraction(monkeypatch):
+    session = request_tests._session(
+        "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
+    query = session.sql(
+        "SELECT c.id, AI.EXTRACT(c.text, {'ends': '" + QUESTION + "', "
+        "'term': 'How long is the term?'}) AS lease FROM contracts c")
+    boot = {"client": _PhraseClient(), "sampling_params": object(),
+            "capacity": request_tests.CAPACITY}
+    monkeypatch.setattr(
+        "quail.baselines.vllm.VLLMEngine.boot",
+        lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
+    rows = request_tests._run_stock_vllm(session, query).collect()
+    assert rows.column_names == ["c.id", "lease", "lease_span"]
+    # the fake client answers from the document, whatever the question
+    answers = ["March 3, 2027", None, "five years", "a phrase the document lacks"]
+    assert rows.column("lease").to_pylist() == [
+        {"ends": answer, "term": answer} for answer in answers]
+    assert rows.column("lease_span").to_pylist()[2] == {
+        "ends": {"start": 6, "end": 16}, "term": {"start": 6, "end": 16}}
+    session.close()
+
+
+def test_struct_extract_errors(session):
+    for bad, message in (
+            ("SELECT c.id, AI.EXTRACT(c.text, {'a': 'x?'}) FROM contracts c",
+             "AS name"),
+            ("SELECT c.id, AI.EXTRACT(c.text, {}) AS x FROM contracts c",
+             "at least one field"),
+            ("SELECT c.id, AI.EXTRACT(c.text, {'a': 'x?', 'a': 'y?'}) AS x "
+             "FROM contracts c", "names 'a' twice"),
+            ("SELECT c.id, AI.EXTRACT(c.text, {'a': 1}) AS x FROM contracts c",
+             "question string"),
+            ("SELECT c.id, AI.EXTRACT(c.text, {'a': ''}) AS x FROM contracts c",
+             "at least one word"),
+            ("SELECT c.id, AI.EXTRACT(c.text, {'a': 'x?'}) AS c FROM contracts c",
+             "also a table alias"),
+            ("SELECT c.id, AI.EXTRACT(c.text, {'a': 'x?'}) AS x, "
+             "AI.EXTRACT(c.text, 'y?') AS x_span FROM contracts c", "unique"),
+            ("SELECT c.id, AI.EXTRACT(c.text, {'a': 'x?'}) AS x "
+             "FROM contracts c ORDER BY x", "ORDER BY does not compare"),
+            ("SELECT DISTINCT AI.EXTRACT(c.text, {'a': 'x?'}) AS x "
+             "FROM contracts c", "DISTINCT does not compare"),
+            ("SELECT COUNT(*) AS n, AI.EXTRACT(c.text, {'a': 'x?'}) AS x "
+             "FROM contracts c GROUP BY x", "GROUP BY does not read")):
+        with pytest.raises(CompileError, match=message):
+            session.sql(bad)
+    builder = session.docs("contracts").alias("c")
+    with pytest.raises(CompileError, match="field needs a name without a dot"):
+        builder.ai_extract("c.text", {"a.b": "x?"}, name="x")
+    with pytest.raises(CompileError, match="at least one field"):
+        builder.ai_extract("c.text", {}, name="x")
+    with pytest.raises(CompileError, match="ORDER BY does not compare"):
+        (session.docs("contracts").alias("c")
+         .ai_extract("c.text", FIELDS, name="lease")
+         .order_by("lease").select("c.id", "lease"))

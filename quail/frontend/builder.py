@@ -1,5 +1,6 @@
 """Python builder that mirrors AI SQL construct for construct."""
 
+from collections.abc import Mapping
 from typing import Optional
 
 from quail.catalog import Catalog
@@ -23,6 +24,7 @@ from quail.logical import (
     ColumnRef,
     CompileError,
     Equality,
+    ExtractStruct,
     FilterPredicate,
     HavingTest,
     InList,
@@ -60,7 +62,9 @@ class Query:
         self._functions = {}         # name -> the Python function
         self._labels = {}            # name -> Alias of an AI.CLASSIFY call
         self._scores = {}            # name -> Alias of an AI.SCORE call
-        self._extracts = {}          # name -> Alias of an AI.EXTRACT call
+        # name -> Alias of an AI.EXTRACT call, or an ExtractStruct and
+        # its fields' Aliases
+        self._extracts = {}
         self._regular_predicates = {}  # alias -> [RegularPredicate]
         self._limit = None
         self._order = []             # (column or name, descending, nulls_first)
@@ -207,7 +211,7 @@ class Query:
         self._labels[name] = Alias(call, name)
         return self
 
-    def ai_extract(self, c, question: str, *, name: str,
+    def ai_extract(self, c, question, *, name: str,
                    trim: bool = True) -> "Query":
         """Copy the words that answer a question from each document.
 
@@ -219,9 +223,19 @@ class Query:
         For example, ``ai_extract("c.text", "When does the lease end?",
         name="end")`` adds the columns ``end`` and ``end_span``.
 
+        A mapping from field names to questions asks every question of
+        each document and returns struct columns with one field per
+        question. For example, ``ai_extract("r.body", {"name": "What is
+        the patient's name?", "age": "How old is the patient?"},
+        name="patient")`` adds ``patient``, a struct of the fields
+        ``name`` and ``age``, and ``patient_span``, a struct of their
+        spans. Each field is its own extraction; the fields of one
+        document read the document's KV, written once.
+
         Args:
             c: The document column, as "alias.column" or a col().
-            question: The question the answer is copied for.
+            question: The question the answer is copied for, or a
+                mapping from field names to questions.
             name: Result column name, without a dot.
             trim: Whether the answer is the fewest words that answer the
                 question. With trim off, the answer is the whole lines
@@ -232,8 +246,8 @@ class Query:
             This query builder, with the extraction added.
 
         Raises:
-            CompileError: The name, column, or question is invalid, or
-                a pending join has no AI predicate yet.
+            CompileError: The name, column, fields, or question is
+                invalid, or a pending join has no AI predicate yet.
         """
         if self._pending_join is not None:
             raise CompileError(
@@ -246,11 +260,22 @@ class Query:
         self._claim_name(name)
         self._claim_name(name + SPAN_SUFFIX)
         ref = self._resolve(col(c) if isinstance(c, str) else c)
-        bound = self._prompts.bind("extract", question, (ref,))
+
+        def extraction(text):
+            bound = self._prompts.bind("extract", text, (ref,))
+            call = ModelCall(bound, "extract", question=text, trim=trim)
+            call.validate()
+            return call
+
+        if isinstance(question, Mapping):
+            struct = ExtractStruct(name, tuple(question))
+            struct.validate()
+            members = tuple(Alias(extraction(question[field]), struct.member(field))
+                            for field in struct.fields)
+            self._extracts[name] = (struct, members)
+        else:
+            self._extracts[name] = Alias(extraction(question), name)
         self._note_doc_column(ref)
-        call = ModelCall(bound, "extract", question=question, trim=trim)
-        call.validate()
-        self._extracts[name] = Alias(call, name)
         return self
 
     def _claim_name(self, name: str) -> None:
@@ -622,8 +647,14 @@ class Query:
                                "scan belongs in the database the ids "
                                "came from")
         columns = []
+        structs = []
         aggregation = None
         if self._group or self._aggs or self._having:
+            if any(isinstance(self._extracts.get(c), tuple) for c in cols
+                   if isinstance(c, str)):
+                raise CompileError(
+                    "GROUP BY does not read AI.EXTRACT struct columns; "
+                    "extract each field as its own column")
             columns, aggregation = self._aggregation(cols)
         for c in () if aggregation is not None else cols:
             if isinstance(c, str) and c in self._labels:
@@ -633,7 +664,13 @@ class Query:
                 columns.append(self._scores[c])
                 continue
             if isinstance(c, str) and c in self._extracts:
-                columns.append(self._extracts[c])
+                extraction = self._extracts[c]
+                if isinstance(extraction, Alias):
+                    columns.append(extraction)
+                else:
+                    struct, members = extraction
+                    structs.append(struct)
+                    columns.extend(members)
                 continue
             if isinstance(c, str) and c == "*":
                 for alias, provider in self._tables:
@@ -651,8 +688,8 @@ class Query:
         wanted = [column for column in self._labels.values()
                   if column in columns or column.name in tested]
         # an extraction is planned when the query returns its answer
-        extracted = [column for column in self._extracts.values()
-                     if column in columns]
+        extracted = [column for column in columns if isinstance(column, Alias)
+                     and column.expression.kind == "extract"]
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(
@@ -679,13 +716,18 @@ class Query:
                  if isinstance(column, Alias)}
         if aggregation is not None:
             named.update({a.name: a for a in aggregation.aggregates})
+        for name, _, _ in self._order:
+            if name in self._extracts and not isinstance(self._extracts[name], Alias):
+                raise CompileError(
+                    f"ORDER BY does not compare the AI.EXTRACT struct column "
+                    f"{name!r}; extract the field as its own column")
         order = tuple(
             SortKey(named[name] if name in named else self._resolve(col(name)),
                     descending=descending, nulls_first=nulls_first)
             for name, descending, nulls_first in self._order)
         return logical.project(tuple(columns), self._limit, order=order,
                                offset=self._offset, distinct=self._distinct,
-                               aggregation=aggregation)
+                               aggregation=aggregation, structs=tuple(structs))
 
     def _aggregation(self, cols) -> tuple:
         """Bind group_by(), agg(), and having() to the selected names.

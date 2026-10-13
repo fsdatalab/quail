@@ -227,12 +227,21 @@ class LogicalPlanBuilder:
         offset: int = 0,
         distinct: bool = False,
         aggregation: Aggregation | None = None,
+        structs: tuple = (),
     ) -> LogicalPlan:
         if self._root is None:
             raise CompileError("a logical plan needs an input table")
         if not columns and aggregation is None:
             raise CompileError("Project needs at least one column")
-        node = Project(self._root, tuple(columns))
+        if structs and aggregation is not None:
+            raise CompileError(
+                "GROUP BY does not read AI.EXTRACT struct columns; extract "
+                "each field as its own column")
+        if structs and distinct:
+            raise CompileError(
+                "DISTINCT does not compare AI.EXTRACT struct columns; extract "
+                "each field as its own column")
+        node = Project(self._root, tuple(columns), tuple(structs))
         if aggregation is not None:
             node = Aggregate(
                 node,

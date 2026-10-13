@@ -364,7 +364,7 @@ You can recover the answer in Python with `text[start:end]`.
 | Argument | Type | Description |
 | --- | --- | --- |
 | `input` | `STRING` column | The document to read. Pass a column reference such as `c.text`. |
-| `question` | String literal | The question you want to answer, such as `'When does the lease end?'`. |
+| `question` | String literal or object | The question you want to answer, such as `'When does the lease end?'`, or an object of field questions, described below. |
 | `options` | Object | Optional `trim` setting, described below. |
 
 ### Return the surrounding lines
@@ -398,6 +398,37 @@ FROM contracts c
 You get `end_date` and `end_date_span` for the first question, and
 `signer` and `signer_span` for the second question.
 
+To get the answers as one struct column, pass an object that maps each
+field name to its question:
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(
+           c.text,
+           {'end_date': 'When does the lease end?',
+            'signer': 'Who signed the lease?'}
+       ) AS lease
+FROM contracts c
+```
+
+If a contract reads `Lease ends on March 3, 2027. Signed by Ana Ruiz.`,
+you get two struct columns, each with one field per question:
+
+| Column | Value |
+| --- | --- |
+| `lease` | `{"end_date": "March 3, 2027", "signer": "Ana Ruiz"}` |
+| `lease_span` | `{"end_date": {"start": 14, "end": 27}, "signer": {"start": 39, "end": 47}}` |
+
+A field the document does not answer is null, as are its span's
+fields. The `trim` option applies to every field.
+
+Each field is its own extraction, named `lease.end_date` and
+`lease.signer` in `explain()`. The struct form changes only the result
+columns: the plan is the same as two separate `AI.EXTRACT` calls. On
+the Quail backend, the extractions of one table run as one pipeline:
+each document's KV is written once, and every later question reads it,
+so a later field costs only its question and answer tokens.
+
 ### Current limits
 
 - Use Qwen3 4B or Qwen3 32B. You can distribute documents across GPUs
@@ -407,6 +438,9 @@ You get `end_date` and `end_date_span` for the first question, and
   use it in a `WHERE` condition or inside another expression.
 - You can combine extraction with filters, joins, classification, and scoring.
   Each extraction reads one document column.
+- A struct column cannot be used in `ORDER BY`, `DISTINCT`, or
+  `GROUP BY`. Extract the field as its own column instead.
+- Every field is a string, copied from the document.
 
 For the equivalent Python query, see
 [`ai_extract()`](/docs/user-guide/python-api#ai_extract).

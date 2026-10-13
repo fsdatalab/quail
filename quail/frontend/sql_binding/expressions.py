@@ -7,9 +7,11 @@ from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
 from quail.logical import (
+    Alias,
     ColumnRef,
     Compare,
     CompileError,
+    ExtractStruct,
     FilterPredicate,
     JoinSpec,
     ModelCall,
@@ -354,22 +356,77 @@ class ExpressionBinder:
         Raises:
             CompileError: The column, question, or options are invalid.
         """
+        ref, question, options = self._extract_arguments(node)
+        if isinstance(question, exp.Struct):
+            raise CompileError(
+                "an AI.EXTRACT over several fields is a SELECT column "
+                "with an AS name")
+        return self._extract_call(ref, str(question.this), options)
+
+    def bind_ai_extract_struct(self, node, name: str) -> tuple:
+        """Parse an AI.EXTRACT call over several fields.
+
+        The call is ``AI.EXTRACT(column, {'field': 'question', ...}[,
+        {'trim': false}])``. Each field is its own extraction, named
+        ``name.field``; the options apply to every field.
+
+        Args:
+            node: The AI_EXTRACT call.
+            name: The struct column's AS name.
+
+        Returns:
+            The ExtractStruct and one extraction Alias per field, in
+            written order.
+
+        Raises:
+            CompileError: The column, fields, or options are invalid.
+        """
+        ref, fields, options = self._extract_arguments(node)
+        questions = {}
+        for prop in fields.expressions:
+            if not isinstance(prop, exp.PropertyEQ):
+                raise CompileError(f"malformed AI.EXTRACT field {prop.sql()}")
+            field, question = str(prop.this.name), prop.expression
+            if field in questions:
+                raise CompileError(f"AI.EXTRACT {name!r} names {field!r} twice")
+            if not (isinstance(question, exp.Literal) and question.is_string):
+                raise CompileError(
+                    f"AI.EXTRACT field {field!r} is a question string, "
+                    f"got {question.sql()}")
+            questions[field] = str(question.this)
+        struct = ExtractStruct(name, tuple(questions))
+        struct.validate()
+        return struct, tuple(
+            Alias(self._extract_call(ref, question, options), struct.member(field))
+            for field, question in questions.items())
+
+    def _extract_arguments(self, node) -> tuple:
+        """Check an AI.EXTRACT call's arguments and resolve its column.
+
+        Returns:
+            The column reference, the question literal or field object,
+            and the parsed options.
+        """
         args = list(node.expressions)
         if len(args) not in (2, 3):
             raise CompileError(
-                "AI.EXTRACT takes a document column, a question string, "
-                "and at most one option object")
+                "AI.EXTRACT takes a document column, a question string or "
+                "an object of field questions, and at most one option object")
         if not isinstance(args[0], exp.Column):
             raise CompileError(
                 f"AI.EXTRACT's first argument is a document column, "
                 f"got {args[0].sql()}")
-        if not (isinstance(args[1], exp.Literal) and args[1].is_string):
+        if not ((isinstance(args[1], exp.Literal) and args[1].is_string)
+                or isinstance(args[1], exp.Struct)):
             raise CompileError(
-                f"AI.EXTRACT's second argument is the question as a "
-                f"string, got {args[1].sql()}")
+                f"AI.EXTRACT's second argument is the question as a string, "
+                f"or an object of field questions, got {args[1].sql()}")
         ref = self.resolve_column(args[0])
-        question = str(args[1].this)
         options = self.parse_extract_options(args[2] if len(args) == 3 else None)
+        return ref, args[1], options
+
+    def _extract_call(self, ref, question: str, options: dict) -> ModelCall:
+        """Bind one extraction's prompt over the document column."""
         prompt = self.prompts.bind("extract", question, (ref,))
         self.note_doc_column(ref)
         call = ModelCall(prompt, "extract", question=question,

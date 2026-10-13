@@ -6,15 +6,18 @@ from dataclasses import dataclass, replace
 from typing import ClassVar
 
 from quail.logical.expressions import (
+    SPAN_SUFFIX,
     AggregateCall,
     Aggregation,
     Alias,
     ColumnRef,
     CompileError,
+    ExtractStruct,
     HavingTest,
     SortKey,
     _explain,
     column_name,
+    packed_columns,
 )
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.classify import classifications
@@ -23,10 +26,15 @@ from quail.logical.nodes.extract import extractions
 
 @dataclass(frozen=True)
 class Project:
-    """Select source columns and named model outputs."""
+    """Select source columns and named model outputs.
+
+    The fields of each ExtractStruct are extraction Aliases among the
+    columns; the result returns them packed into the struct's columns.
+    """
 
     input: LogicalNode
     columns: tuple[ColumnRef | Alias, ...]
+    structs: tuple[ExtractStruct, ...] = ()
     type_name: ClassVar[str] = "quail.logical_project"
 
     def children(self) -> tuple[LogicalNode, ...]:
@@ -73,10 +81,47 @@ class Project:
         ]
         if len(names) != len(set(names)):
             raise CompileError(f"projection names must be unique, got {names}")
+        self._validate_structs()
+
+    def _validate_structs(self) -> None:
+        extracted = {column.name: column for column in self.columns
+                     if isinstance(column, Alias)
+                     and column.expression.kind == "extract"}
+        members = set()
+        for struct in self.structs:
+            struct.validate()
+            for member in struct.members:
+                if member not in extracted:
+                    raise CompileError(
+                        f"the struct column {struct.name!r} needs the "
+                        f"extraction {member!r} in the projection")
+                members.add(member)
+            if len({extracted[member].expression.aliases()
+                    for member in struct.members}) != 1:
+                raise CompileError(
+                    f"the fields of {struct.name!r} read one document column")
+        for name in extracted:
+            if "." in name and name not in members:
+                raise CompileError(
+                    f"the extraction {name!r} is a field of no struct column")
+        others = [column_name(column) for column in self.columns
+                  if column_name(column) not in members]
+        others += [name + SPAN_SUFFIX for name in extracted
+                   if name not in members]
+        packed = [name for struct in self.structs
+                  for name, _ in struct.packing()]
+        if len(set(others + packed)) != len(others) + len(packed):
+            raise CompileError(
+                f"projection names must be unique, got {others + packed}")
+
+    def packing(self) -> tuple:
+        """Return every struct column and its member columns, answers and spans."""
+        return tuple(entry for struct in self.structs for entry in struct.packing())
 
     def result_columns(self) -> tuple[str, ...]:
-        """Return the selected column names."""
-        return tuple(column_name(column) for column in self.columns)
+        """Return the selected column names, with struct fields packed."""
+        return packed_columns(
+            (column_name(column) for column in self.columns), self.packing())
 
     def with_children(self, children: tuple[LogicalNode, ...]) -> "Project":
         if len(children) != 1:
@@ -87,7 +132,7 @@ class Project:
         return replace(self, columns=expressions)
 
     def explain_fields(self) -> dict:
-        return {
+        fields = {
             "columns": [
                 column_name(column)
                 if isinstance(column, ColumnRef)
@@ -95,6 +140,10 @@ class Project:
                 for column in self.columns
             ]
         }
+        if self.structs:
+            fields["structs"] = {struct.name: list(struct.members)
+                                 for struct in self.structs}
+        return fields
 
 
 @dataclass(frozen=True)

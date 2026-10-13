@@ -67,7 +67,8 @@ class SemanticExtract:
         self.call.validate()
         if self.call.kind != "extract":
             raise CompileError("SemanticExtract needs an AI.EXTRACT call")
-        if not self.name or "." in self.name:
+        # a field of an ExtractStruct is named "struct.field"
+        if not all(self.name.split(".")) or self.name.count(".") > 1:
             raise CompileError(
                 f"an extraction needs a column name without a dot, got {self.name!r}"
             )
