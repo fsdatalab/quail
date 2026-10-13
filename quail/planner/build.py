@@ -800,8 +800,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             columns.append(c.name + PROBABILITIES_SUFFIX)
         if isinstance(c, Alias) and c.expression.kind == "extract":
             columns.append(c.name + SPAN_SUFFIX)
-    score_ports = tuple(PortRef(node.node_id, "scores") for node in nodes
-                        if type(node) is AiScore
+    score_ports = tuple(PortRef(node.node_id, "rows") for node in nodes
+                        if isinstance(node, AiScore)
                         and any(node.spec.name == item.name
                                 for item in projected_scores))
     result_inputs = (*sink_inputs,

@@ -312,7 +312,7 @@ def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
         table = extract_answer_table(
             node.spec, ids, ["March 3, 2027" if i == 0 else None for i in ids],
             [(14, 27) if i == 0 else None for i in ids])
-        return NodeResult({"scores": table, "ids:c": ids})
+        return NodeResult({"rows": table, "ids:c": ids})
 
     monkeypatch.setattr(RerankerModelExecution, "execute", mixed)
     query = session.sql(

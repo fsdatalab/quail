@@ -112,7 +112,7 @@ def test_writing_that_begins_outside_the_document_answers_none(monkeypatch):
 
     model._cue_row = straying
     result, stages = run()
-    assert result.outputs["scores"].column("ends").to_pylist() == [
+    assert result.outputs["rows"].column("ends").to_pylist() == [
         None, "five years", None]
     assert stages.docs[0].answers[0].none_wins
 
@@ -136,7 +136,7 @@ def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
 
     model._answer_row = straying
     result, stages = run()
-    assert result.outputs["scores"].column("ends").to_pylist() == [
+    assert result.outputs["rows"].column("ends").to_pylist() == [
         "March", "five years", None]
     assert not stages.docs[0].answers[0].none_wins
 
@@ -372,7 +372,7 @@ def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
     _, model, shared, _ = _setup(
         monkeypatch, documents=documents, share_prefixes=True)
     result, stages = shared()
-    assert result.outputs["scores"].equals(unshared.outputs["scores"])
+    assert result.outputs["rows"].equals(unshared.outputs["rows"])
     borrowed = result.metrics.extension["borrowed_prefix_tokens"]
     assert borrowed > 0
     assert result.metrics.fresh_tokens == unshared.metrics.fresh_tokens - borrowed
@@ -389,7 +389,7 @@ def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
 def test_extraction_preserves_selected_document_order(monkeypatch, document_ids):
     _, _, run, _ = _setup(monkeypatch, document_ids=document_ids)
     result, _ = run()
-    table = result.outputs["scores"]
+    table = result.outputs["rows"]
     assert table.column("c").to_pylist() == document_ids
     assert table.column("ends").to_pylist() == [GOLD[i] for i in document_ids]
     assert table.column("ends_span").is_null().to_pylist() == [
@@ -420,8 +420,8 @@ def test_extraction_reuses_arrow_tokens_and_offsets(monkeypatch, tmp_path):
 
     monkeypatch.setattr(model.tables, "encode_batch", windows_only)
     result, stages = run()
-    assert result.outputs["scores"].column("ends").to_pylist() == GOLD
-    assert result.outputs["scores"].column("ends_span").to_pylist() == [
+    assert result.outputs["rows"].column("ends").to_pylist() == GOLD
+    assert result.outputs["rows"].column("ends_span").to_pylist() == [
         {"start": LEASE.index("March"),
          "end": LEASE.index("March") + len(GOLD[0])},
         {"start": 6, "end": 16}, None]
@@ -433,7 +433,7 @@ def test_extraction_reuses_arrow_tokens_and_offsets(monkeypatch, tmp_path):
 
 def test_extractor_writes_the_answer_along_the_document(monkeypatch):
     result, stages, model = _run(monkeypatch)
-    table = result.outputs["scores"].to_pydict()
+    table = result.outputs["rows"].to_pydict()
     assert table == {
         "c": [0, 1, 2],
         "ends": ["March 3, 2027", "five years", None],
@@ -454,10 +454,10 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
     state, model, _, run_pipeline = _setup(monkeypatch)
     results, stages = run_pipeline("ends", "starts")
     first, second = results["ai-extract:ends"], results["ai-extract:starts"]
-    assert second.outputs["scores"].column("starts").to_pylist() == \
-        first.outputs["scores"].column("ends").to_pylist()
-    assert second.outputs["scores"].column("starts_span").to_pylist() == \
-        first.outputs["scores"].column("ends_span").to_pylist()
+    assert second.outputs["rows"].column("starts").to_pylist() == \
+        first.outputs["rows"].column("ends").to_pylist()
+    assert second.outputs["rows"].column("starts_span").to_pylist() == \
+        first.outputs["rows"].column("ends_span").to_pylist()
     # one stage list asks both questions of a document; the second
     # question's tail is written after the document in place of the
     # first question's steps, the same frame rewound
@@ -491,12 +491,12 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
     nodes = [Scan(node_id="input:c", alias="c", input_id="c")]
     for name in ("ends", "starts"):
         previous = nodes[-1]
-        port = "ids:c" if isinstance(previous, Scan) else "scores"
+        port = "ids:c" if isinstance(previous, Scan) else "rows"
         nodes.append(AiExtract(
             node_id=f"ai-extract:{name}", backend_name="quail", model="qwen3-4b-fp8",
             inputs=input_ports((PortRef(previous.node_id, port),)),
             spec=replace(spec, name=name, share_prefixes=True)))
-    graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "scores"))
+    graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "rows"))
     registry = built_in_registry()
     children = []
     for _ in range(workers):
@@ -534,12 +534,12 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
         DEVICES["h100-sxm"], registry.runtimes, registry)
     assert len(rounds) == 1
     for node in nodes[1:]:
-        actual = result["_outputs"][PortRef(node.node_id, "scores")]
-        assert actual.equals(expected[node.node_id].outputs["scores"])
+        actual = result["_outputs"][PortRef(node.node_id, "rows")]
+        assert actual.equals(expected[node.node_id].outputs["rows"])
     assert result["fresh_tokens"] == sum(
         item.metrics.fresh_tokens for item in expected.values())
     assert result["evaluated_documents"] == 2 * len(DOCS)
-    assert result["backend_metrics"]["scores"][0]["none"] == 1
+    assert result["backend_metrics"]["inferences"][0]["none"] == 1
 
     execution = DistributedQuailExecution(
         payload, graph, workers, round_fn, MODELS["qwen3-4b-fp8"],
@@ -549,8 +549,8 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
         {"retained": {"c": sub["inputs"]["document_ids"]}}
         for sub in rounds[0]])
     again = execution.execute(nodes[1], {"input": pa.table({"c": [2, 0]})})
-    assert again.outputs["scores"].equals(
-        expected[nodes[1].node_id].outputs["scores"].take(pa.array([2, 0])))
+    assert again.outputs["rows"].equals(
+        expected[nodes[1].node_id].outputs["rows"].take(pa.array([2, 0])))
     assert again.metrics.fresh_tokens < expected[nodes[1].node_id].metrics.fresh_tokens
 
 
@@ -581,7 +581,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
         AiExtract(node_id="ai-extract:ends",
                   inputs=input_ports((PortRef("ai_filter:c", "ids:c"),)),
                   backend_name="quail", model="qwen3-4b-fp8", spec=plain),
-    ), PortRef("ai-extract:ends", "scores"))
+    ), PortRef("ai-extract:ends", "rows"))
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
@@ -602,7 +602,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
              "texts": {"c": list(DOCS)}}
     report = execute_single_graph(
         state, {"filter_limit": None, "pre_ids": head, "retention": {}}, graph)
-    table = report["_outputs"][PortRef("ai-extract:ends", "scores")].to_pydict()
+    table = report["_outputs"][PortRef("ai-extract:ends", "rows")].to_pydict()
     assert table["c"] == [0, 1]
     assert table["ends"] == ["March 3, 2027", "five years"]
     # every document was packed once: the extraction's tail followed
@@ -627,8 +627,8 @@ def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
     model.kv = {}
     second, again = run("starts")
     assert [doc.key for doc in again.docs] == [doc.key for doc in stages.docs]
-    assert second.outputs["scores"].column("starts").to_pylist() == \
-        first.outputs["scores"].column("ends").to_pylist()
+    assert second.outputs["rows"].column("starts").to_pylist() == \
+        first.outputs["rows"].column("ends").to_pylist()
     # the second extraction feeds no document: only its tail, lines,
     # cue, and spans are fresh
     prefixes = sum(len(doc.prefix) for doc in stages.docs)
@@ -638,7 +638,7 @@ def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
 
 def test_extractor_returns_whole_lines_with_trim_off(monkeypatch):
     result, stages, _ = _run(monkeypatch, trim=False)
-    table = result.outputs["scores"].to_pydict()
+    table = result.outputs["rows"].to_pydict()
     line = LEASE.index("March 3, 2027 at noon.")
     assert table["ends"] == ["March 3, 2027 at noon.", "Term: five years", None]
     assert table["ends_span"][0] == {"start": line, "end": line + 22}

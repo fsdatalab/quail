@@ -163,7 +163,7 @@ def extraction_results(nodes, stages, document_ids, *, wall, fresh, own,
         first = q == 0
         gpu_s, timed = own(q)
         results[node.node_id] = NodeResult(
-            {"scores": table, f"ids:{spec.alias}": document_ids},
+            {"rows": table, f"ids:{spec.alias}": document_ids},
             NodeMetrics(
                 wall_s=wall if first else 0.0,
                 input_rows=len(document_ids), output_rows=len(document_ids),

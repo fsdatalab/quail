@@ -169,7 +169,7 @@ class DistributedQuailExecution:
         results = {}
         for index, node in enumerate(nodes):
             parts = [output["results"][node.node_id] for output in outputs]
-            table = pa.concat_tables([part.outputs["scores"] for part in parts])
+            table = pa.concat_tables([part.outputs["rows"] for part in parts])
             metrics = sum((part.metrics for part in parts), NodeMetrics())
             extension = dict(parts[0].metrics.extension)
             for name in ("input_rows", "none", "steps", "answer_tokens",
@@ -177,7 +177,7 @@ class DistributedQuailExecution:
                 extension[name] = sum(part.metrics.extension.get(name, 0)
                                       for part in parts)
             results[node.node_id] = NodeResult(
-                {"scores": table.take(order), f"ids:{alias}": ids},
+                {"rows": table.take(order), f"ids:{alias}": ids},
                 replace(metrics, wall_s=wall if index == 0 else 0.0,
                         extension=extension))
         return results
