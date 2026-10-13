@@ -13,6 +13,7 @@ from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.model import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
+from quail.backends.quail.executor.operators.extract import execute_extractions
 from quail.backends.quail.executor.readout import (
     AnswerRows,
     AsyncAnswers,
@@ -132,6 +133,11 @@ class LoadedGpu:
         if arena_pages is not None:
             slots = checkpoint_arena_args(
                 self.spec, self.device, chunk_tokens, arena_pages[0])
+            graphs = getattr(self.pipeline, "decode_graphs", None)
+            if (graphs is not None and tuple(arena_pages)
+                    != (self.arena.n_pages, self.arena.n_sliding_pages)):
+                self.torch.cuda.synchronize()
+                graphs.invalidate()
             self.arena.resize(*arena_pages, free_resident=True,
                               **{k: v for k, v in slots.items()
                                  if k == "n_state_slots"})
@@ -159,18 +165,24 @@ class LoadedGpu:
         Returns:
             Tuple of (seconds spent warming, compilation tier).
         """
-        if self._warmed:
-            return 0.0, None
         t0 = time.perf_counter()
+        tier = None
         with self.torch.inference_mode():
-            warm = warm_kernels(self.torch, self.arena, self.pipeline,
-                                self.async_ans, self.chunk_tokens,
-                                model_name=self.spec.hf_name,
-                                model=self.model)
+            if not self._warmed:
+                warm = warm_kernels(self.torch, self.arena, self.pipeline,
+                                    self.async_ans, self.chunk_tokens,
+                                    model_name=self.spec.hf_name,
+                                    model=self.model)
+                tier = warm["tier"]
+            graphs = getattr(self.pipeline, "decode_graphs", None)
+            if graphs is not None and graphs.prepare():
+                tier = tier or "graphs"
+        if tier is None:
+            return 0.0, None
         self.torch.cuda.synchronize()
         warm_s = time.perf_counter() - t0
         self._warmed = True
-        return warm_s, warm["tier"]
+        return warm_s, tier
 
     def close(self):
         """Release GPU resources held by the execution context."""
@@ -272,15 +284,19 @@ def quail_runtime_payload(request, graph) -> dict:
     """Build private Quail scheduler state from a standard request."""
     envelope = request.plan
     docs = {}
+    texts = {}
     for node in graph.nodes:
         if not isinstance(node, Scan):
             continue
         docs[node.alias] = request.inputs[node.input_id].documents
+        if request.inputs[node.input_id].texts is not None:
+            texts[node.alias] = request.inputs[node.input_id].texts
     return {
         "physical_plan": envelope,
         "model": envelope["model"],
         "workers": envelope["workers"],
         "docs": docs,
+        "texts": texts,
         "columns": request.column_tables(),
         **dict(envelope["settings"]),
     }
@@ -437,6 +453,7 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
     runtime_state = {
         **state,
         "docs": decode_payload_documents(payload["docs"]),
+        "texts": payload.get("texts", {}),
         "columns": payload.get("columns", {}),
         "functions": registry.functions,
         "runtimes": registry.runtimes,
@@ -487,6 +504,8 @@ def _child_main(gpu_idx, conn):
                 conn.send(("ok", result))
             elif kind == "joins":
                 conn.send(("ok", _child_joins(state, data)))
+            elif kind == "extract":
+                conn.send(("ok", _child_extract(state, data)))
         except Exception:
             import traceback
             conn.send(("err", traceback.format_exc()))
@@ -583,6 +602,29 @@ def _child_filters(state, sub):
     out["peak_gib"] = round(
         torch.cuda.max_memory_allocated() / 2**30, 2)
     return out
+
+
+def _child_extract(state, sub):
+    """Extract answers on one worker and report its retained document KV."""
+    gpu = state["gpu"]
+    with gpu.torch.inference_mode():
+        results = execute_extractions(gpu.execution.query, sub["nodes"], sub["inputs"])
+    gpu.torch.cuda.synchronize()
+    retained = {}
+    for alias, document in gpu.arena.retained_keys():
+        if isinstance(alias, tuple) and alias[0] == "extract":
+            alias = alias[1]
+        retained.setdefault(alias, []).append(document)
+    return {
+        "results": results,
+        "retained": retained,
+        "kv_totals": {
+            "evicted_keys": gpu.arena.evicted_keys,
+            "evicted_pages": gpu.arena.evicted_pages,
+            "evicted_prefix_tokens": gpu.arena.evicted_prefix_tokens,
+        },
+        "peak_gib": gpu.torch.cuda.max_memory_allocated() / 2**30,
+    }
 
 
 def _child_joins(state, sub):

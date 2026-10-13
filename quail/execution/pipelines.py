@@ -4,6 +4,9 @@ A pipeline processes each document through its filters, classifications,
 and per-batch functions while its KV remains available. Materializing
 operators, incompatible prompt heads, and independent consumers end a
 pipeline. A join can continue into classification of the pairs it keeps.
+Extractions show the document inside their own prompt head, so they form
+pipelines of their own, one per table, unless their head is the shared
+preamble a filter or classification of the table already wrote.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from dataclasses import dataclass
 
 from quail.physical import (
     AiClassify,
+    AiExtract,
     AiFilter,
     AiJoin,
     Filter,
@@ -51,6 +55,8 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
     """
     if isinstance(node, AiFilter):
         return (node.alias,)
+    if isinstance(node, AiExtract):
+        return () if node.spec is None else (node.spec.alias,)
     if isinstance(node, AiClassify):
         # a classification of joined rows takes the join's anchors,
         # with the partners the join kept for each
@@ -72,8 +78,8 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
 
 def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
     """Return output ports carrying documents for the given alias."""
-    if isinstance(node, (AiClassify, Filter)):
-        return ("scores", f"ids:{alias}")
+    if isinstance(node, (AiClassify, AiExtract, Filter)):
+        return ("rows", f"ids:{alias}")
     if isinstance(node, Foreign) and node.ids == "pairs":
         return (f"pairs:{node.written_pos}",)
     if isinstance(node, AiJoin):
@@ -81,6 +87,34 @@ def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
         return tuple(f"join_answers:{stage.written_pos}"
                      for stage in node.stages) + (f"ids:{alias}",)
     return (f"ids:{alias}",)
+
+
+def _same_prompt_head(node: PhysicalNode, consumer: PhysicalNode,
+                      first: PhysicalNode) -> bool:
+    """Return whether the consumer shows the document as the pipeline does.
+
+    An extraction continues an extraction. One whose head is the
+    query's shared preamble also continues a pipeline a filter
+    started, which wrote the documents under that preamble, or one a
+    classification of the table started under the same head. Nothing
+    else continues an extraction.
+
+    Args:
+        node: The pipeline's last member.
+        consumer: The operator that would follow it.
+        first: The pipeline's first member.
+    """
+    if isinstance(consumer, AiExtract):
+        if isinstance(node, AiExtract):
+            return node.spec.same_decoding(consumer.spec)
+        if not consumer.spec.shares_head:
+            return False
+        if isinstance(first, AiClassify):
+            return (first.spec is not None and first.spec.partner is None
+                    and tuple(first.spec.prompt_token_parts[0])
+                    == tuple(consumer.spec.prompt_token_parts[0]))
+        return isinstance(first, AiFilter)
+    return not isinstance(node, AiExtract)
 
 
 def _classifies_rows_of(node: PhysicalNode, join: AiJoin) -> bool:
@@ -117,7 +151,8 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         return any(port.source.node_id == producer.node_id
                    for port in consumer.inputs)
 
-    def continuation(node: PhysicalNode, alias: str) -> list[PhysicalNode]:
+    def continuation(node: PhysicalNode, alias: str,
+                     first: PhysicalNode) -> list[PhysicalNode]:
         """Find consumers that can continue this operator's pipeline.
 
         One consumer continues the chain. Several continue it only
@@ -131,6 +166,8 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         for port in _document_ports(node, alias):
             for consumer in consumers.get((node.node_id, port), ()):
                 if isinstance(node, AiJoin) and not _classifies_rows_of(consumer, node):
+                    continue
+                if not _same_prompt_head(node, consumer, first):
                     continue
                 if takes(consumer, alias) and consumer not in following:
                     following.append(consumer)
@@ -146,14 +183,16 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         aliases = operator_aliases(node)
         if not aliases or node.node_id in followed:
             continue
-        # only an AI filter, classification, or join starts a pipeline
-        if not isinstance(node, (AiFilter, AiClassify, AiJoin)):
+        # only an AI filter, classification, extraction, or join
+        # starts a pipeline
+        if not isinstance(node, (AiFilter, AiClassify, AiExtract, AiJoin)):
             continue
         (alias,) = aliases
         members = [node]
         followed.add(node.node_id)
         while True:
-            after = [consumer for consumer in continuation(members[-1], alias)
+            after = [consumer
+                     for consumer in continuation(members[-1], alias, members[0])
                      if consumer.node_id not in followed]
             if not after:
                 break

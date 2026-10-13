@@ -1,20 +1,23 @@
 """Build the physical plan of a decided logical plan."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from quail.cost import budgets
 from quail.cost import classify as classify_cost
+from quail.cost import extract as extract_cost
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, scan
 from quail.labels import DECISION_SCORING, LETTERS_SCORING, word_starts
 from quail.logical import (
     PROBABILITIES_SUFFIX,
+    SPAN_SUFFIX,
     Alias,
     CompileError,
     LabelWork,
     LogicalPlan,
     classified_above_joins,
     effective_selectivity,
+    extracted_above_joins,
     has_score,
     is_score,
     oriented_join_conditions,
@@ -22,11 +25,12 @@ from quail.logical import (
 from quail.logical.prompts import (
     choice_token_parts,
     classify_prompt_tokens,
-    prompt_aliases,
     score_query_template,
+    shared_preamble,
 )
 from quail.physical import (
     AiClassify,
+    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -34,6 +38,7 @@ from quail.physical import (
     ClassifySpec,
     Comparison,
     Exchange,
+    ExtractSpec,
     Filter,
     FilterStage,
     Foreign,
@@ -51,9 +56,10 @@ from quail.physical.base import input_ports
 from quail.planner import join_order as joinsearch
 from quail.planner import retention
 from quail.planner.filter_order import default_order_rule
+from quail.planner.inference import bind_inference, inference_node
 from quail.planner.ordering import choose_filter_orders, choose_join_sequence
 from quail.planner.physical_optimizer import PlanningContext
-from quail.planner.plan import PhysicalPlan, Refusal, score_seconds
+from quail.planner.plan import PhysicalPlan, Refusal, inference_seconds
 from quail.planner.results import result_nodes
 from quail.planner.statistics import (
     ClassifyStatistics,
@@ -70,6 +76,7 @@ from quail.planner.validation import (
     ClassifyRefusedError,
     ScoreRefusedError,
     classification_refusal,
+    extraction_refusal,
     join_input_tokens,
     score_input_tokens,
     score_projections,
@@ -144,6 +151,8 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
             for stage in node.stages:
                 work = work + stage_works.get(stage.written_pos, Work())
             entry["seconds"] = speed_of_light(work, model, device, chunk).seconds
+        elif isinstance(node, AiExtract) and node.spec is not None:
+            entry["seconds"] = node.spec.estimated_seconds
         # other nodes do no model work and get no seconds
         out[node.node_id] = entry
     return out
@@ -278,6 +287,17 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 constraint="unsupported_classify_query",
                 needed=1, available=0, unit="queries")
         refusal = classification_refusal(context)
+        if refusal is not None:
+            return refusal
+    extracts = operators.extracts
+    extract_after = extracted_above_joins(plan.root)
+    if extracts:
+        if context is None:
+            return Refusal(
+                reasons=("AI.EXTRACT planning needs a planning context",),
+                constraint="unsupported_extract_query",
+                needed=1, available=0, unit="queries")
+        refusal = extraction_refusal(context)
         if refusal is not None:
             return refusal
     alias_applies = {}
@@ -523,7 +543,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 node = table.node(spec, scores or rows_src.get(alias, ids_src[alias]),
                                   sum(isinstance(n, AiClassify) for n in nodes))
                 nodes.append(node)
-                scores = PortRef(node.node_id, "scores")
+                scores = PortRef(node.node_id, "rows")
                 ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
                 if call in labels.projected:
                     label_ports.append(scores)
@@ -535,11 +555,37 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                     predicate=InList(labels.names[call], test.values),
                     aliases=(alias,), selectivity=test.selectivity,
                     written_pos=test.position))
-                scores = PortRef(lid, "scores")
+                scores = PortRef(lid, "rows")
                 ids_src[alias] = PortRef(lid, f"ids:{alias}")
                 live *= effective_selectivity(test.selectivity)
         if scores is not None:
             rows_src[alias] = scores
+
+    def emit_extract(alias, live=None):
+        """Copy the answers of the alias's documents, after its labels."""
+        calls = [node for node in extracts if node.alias == alias]
+        if not calls or (alias in extract_after and live is None):
+            return
+        if live is None:
+            live = live_asked.get(alias, float(stats[alias].n_docs))
+            for test in operators.label_filters.get(alias, ()):
+                live *= effective_selectivity(test.selectivity)
+        for index, logical_node in enumerate(calls):
+            # the extractions of a table run in one pipeline
+            # (quail.execution.pipelines): a document is read once
+            # for all of them
+            shared = index > 0
+            spec = extract_spec(context, logical_node.call,
+                                logical_node.name, live, shared=shared)
+            node = inference_node(
+                AiExtract, spec, (rows_src.get(alias, ids_src[alias]),),
+                index=sum(isinstance(n, AiExtract) for n in nodes),
+                backend="quail", model=model.name)
+            nodes.append(node)
+            scores = PortRef(node.node_id, "rows")
+            ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
+            rows_src[alias] = scores
+            label_ports.append(scores)
 
     try:
         for s in scans:
@@ -550,6 +596,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             else:
                 emit_applies(s.alias)
             emit_classify(s.alias)
+            emit_extract(s.alias)
     except ClassifyRefusedError as refused:
         return refused.refusal()
     except ScoreRefusedError as refused:
@@ -697,7 +744,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 sum(isinstance(n, AiClassify) for n in nodes))
             nodes.append(node)
             if call in labels.projected:
-                label_ports.append(PortRef(node.node_id, "scores"))
+                label_ports.append(PortRef(node.node_id, "rows"))
     except ClassifyRefusedError as refused:
         return refused.refusal()
 
@@ -705,14 +752,17 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     # matched: a document with at least one true pair, expected as the
     # join selectivity times the partners it met, at most every document
     try:
-        for alias in sorted(after_joins):
+        for alias in sorted(after_joins | extract_after):
             met = sum(
                 effective_selectivity(join.selectivity)
                 * sum(live0[argument.alias] for argument in join.prompt.args
                       if argument.alias != alias)
                 for join in joins
                 if alias in {argument.alias for argument in join.prompt.args})
-            emit_classify(alias, live=live0[alias] * min(1.0, met))
+            if alias in after_joins:
+                emit_classify(alias, live=live0[alias] * min(1.0, met))
+            if alias in extract_after:
+                emit_extract(alias, live=live0[alias] * min(1.0, met))
     except ClassifyRefusedError as refused:
         return refused.refusal()
 
@@ -748,13 +798,21 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                        else f"{c.alias}.{c.column}")
         if isinstance(c, Alias) and getattr(c.expression, "probabilities", False):
             columns.append(c.name + PROBABILITIES_SUFFIX)
-    nodes.extend(result_nodes(
-        plan.result, tuple(sink_inputs) + tuple(label_ports), tuple(columns)))
+        if isinstance(c, Alias) and c.expression.kind == "extract":
+            columns.append(c.name + SPAN_SUFFIX)
+    score_ports = tuple(PortRef(node.node_id, "rows") for node in nodes
+                        if isinstance(node, AiScore)
+                        and any(node.spec.name == item.name
+                                for item in projected_scores))
+    result_inputs = (*sink_inputs,
+                     *(port for port in score_ports if port not in sink_inputs),
+                     *label_ports)
+    nodes.extend(result_nodes(plan.result, result_inputs, tuple(columns)))
 
     stage_work = sum((record["work"] for record in stage_records
                       if not is_score(joins[record["written_pos"]].predicate)), Work())
     estimate = (speed_of_light(base_work + stage_work, model, device,
-                               chunk).seconds + score_seconds(nodes))
+                               chunk).seconds + inference_seconds(nodes))
     stage_works = {record["written_pos"]: record["work"]
                    for record in stage_records}
 
@@ -815,10 +873,9 @@ def score_spec(prompt, *, name, expected_inputs, mean_tokens, context,
     parts, cost = score_statistics(
         prompt, context, chunk_tokens, mean_tokens=mean_tokens)
     work, seconds = cost.estimate(expected_inputs, prefix_groups=prefix_groups)
-    return ScoreSpec(
-        name=name, aliases=prompt_aliases(prompt),
+    return bind_inference(
+        ScoreSpec, prompt, name=name,
         query_template=score_query_template(prompt),
-        arguments=tuple((ref.alias, ref.column) for ref in prompt.args),
         expected_inputs=expected_inputs, estimated_seconds=seconds,
         pair_fraction=pair_fraction, prompt_token_parts=parts, draws=cost.draws), work
 
@@ -856,15 +913,14 @@ class ScoreLowering:
                          f"but the execution budget is {available} {unit}",),
                 constraint="suffix_over_chunk", needed=needed,
                 available=available, unit=unit))
-        node = AiScore(
-            node_id=f"ai-score:{self.index}", inputs=input_ports(tuple(inputs)),
-            backend_name=self.context.backend, model=self.context.model.name,
-            spec=spec)
+        node = inference_node(
+            AiScore, spec, inputs, index=self.index,
+            backend=self.context.backend, model=self.context.model.name)
         self.index += 1
         self.nodes.append(node)
         self.names[prompt] = name
         self.work += work
-        return PortRef(node.node_id, "scores")
+        return PortRef(node.node_id, "rows")
 
     def comparison(self, predicate, source, aliases, position) -> PortRef:
         alias = aliases[0] if len(aliases) == 1 else "join"
@@ -878,7 +934,46 @@ class ScoreLowering:
             aliases=tuple(aliases), selectivity=predicate.selectivity,
             written_pos=position)
         self.nodes.append(node)
-        return PortRef(node.node_id, "scores")
+        return PortRef(node.node_id, "rows")
+
+
+def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
+    """Build an extraction's specification and price it.
+
+    The specification carries the token ids of the prompt around the
+    document. The documents' KV is priced as computed afresh unless
+    the extraction shares a pipeline with the one before it, which
+    read the documents.
+
+    Args:
+        context: The planning context, with the model and tokenizer.
+        call: Logical AI.EXTRACT call.
+        name: Result column name.
+        live: Expected number of documents to extract from.
+        shared: Whether an extraction of the same table runs right
+            before this one.
+    """
+    prompt = call.prompt
+    # under the query's shared preamble, the prompt's document KV is
+    # the one a filter writes
+    shares_head = context.tokenizer is not None and tuple(
+        prompt.preamble_token_ids) == tuple(context.tokenizer(shared_preamble(
+            context.model.turn_prefix, context.model.prompt_layout)))
+    (ref,) = call.prompt.args
+    lengths = context.document_tokens[ref.alias]
+    spec = bind_inference(
+        ExtractSpec, prompt, name=name,
+        expected_inputs=live, estimated_seconds=0.0,
+        prompt_token_parts=(tuple(prompt.preamble_token_ids),
+                            tuple(prompt.tail_token_ids)),
+        question=call.question, trim=call.trim, shares_head=shares_head)
+    cost = extract_cost.estimate(
+        live, lengths, len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
+        chunk=budgets.chunk_budget(context.model, context.device),
+        model=context.model, device=context.device, resident=shared,
+        max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens,
+        workers=context.gpu_count)
+    return replace(spec, estimated_seconds=cost.seconds)
 
 
 def classify_builder(context, alias, backend_name):
@@ -917,10 +1012,8 @@ class ClassifyBuilder(ClassifyStatistics):
                                      tuple(self.tokenizer(call.prompt.preamble)))
         head, tail, labels = classify_prompt_tokens(
             call.prompt, call.labels, self.tokenizer)
-        return ClassifySpec(
-            name=name, aliases=(self.alias,),
-            query_template=call.prompt.template,
-            arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
+        return bind_inference(
+            ClassifySpec, call.prompt, name=name, aliases=(self.alias,),
             expected_inputs=live, estimated_seconds=0.0,
             prompt_token_parts=(head, tail),
             labels=tuple(call.labels),
@@ -932,10 +1025,9 @@ class ClassifyBuilder(ClassifyStatistics):
 
     def node(self, spec, input_port, index, *ports) -> AiClassify:
         """Build the physical node for one classification."""
-        return AiClassify(node_id=f"ai-classify:{index}",
-                          inputs=input_ports((input_port, *ports)),
-                          backend_name=self.backend_name,
-                          model=self.model.name, spec=spec)
+        return inference_node(
+            AiClassify, spec, (input_port, *ports), index=index,
+            backend=self.backend_name, model=self.model.name)
 
     def classify_joined(self, call, name, partner, pairs, partner_tokens):
         """Build a classification specification for joined document pairs.
@@ -991,10 +1083,8 @@ class ClassifyBuilder(ClassifyStatistics):
                 f"a row of {self.alias!r} x {partner!r} needs {need} tokens "
                 f"with its classification prompt, but the forward pass "
                 f"budget is {self.budget} tokens", need, self.budget)
-        return ClassifySpec(
-            name=name, aliases=(self.alias, partner),
-            query_template=call.prompt.template,
-            arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
+        return bind_inference(
+            ClassifySpec, call.prompt, name=name, aliases=(self.alias, partner),
             expected_inputs=pairs, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=labels, scoring=LETTERS_SCORING,
@@ -1019,10 +1109,8 @@ class ClassifyBuilder(ClassifyStatistics):
             len(head), frame, [request], live=live, lengths=self.lengths,
             shared=self.shared, chunk=self.chunk, model=self.model,
             device=self.device, answer_rows=len(blocks) + 1)
-        return ClassifySpec(
-            name=name, aliases=aliases,
-            query_template=call.prompt.template,
-            arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
+        return bind_inference(
+            ClassifySpec, call.prompt, name=name, aliases=aliases,
             expected_inputs=live, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=blocks, scoring=DECISION_SCORING,
@@ -1053,10 +1141,8 @@ class ClassifyBuilder(ClassifyStatistics):
                 f"a row of {self.alias!r} x {partner!r} needs {need} tokens "
                 f"with its classification prompt, but the forward pass "
                 f"budget is {self.budget} tokens", need, self.budget)
-        return ClassifySpec(
-            name=name, aliases=(self.alias, partner),
-            query_template=prompt.template,
-            arguments=tuple((ref.alias, ref.column) for ref in prompt.args),
+        return bind_inference(
+            ClassifySpec, call.prompt, name=name, aliases=(self.alias, partner),
             expected_inputs=pairs, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=blocks, scoring=DECISION_SCORING,

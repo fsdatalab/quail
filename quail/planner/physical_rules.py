@@ -8,7 +8,7 @@
   (letters, trie_tree, or trie_decode) whose estimated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
-  computing it again, in filters, joins, classifications, and scores
+  computing it again, in filters, joins, extractions, classifications, and scores
   of one table.
 - tree_attention: each join is annotated with the attention path the
   cost model prefers for its partners' reads of the anchor's KV.
@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
+from quail.cost.extract import estimate as extract_estimate
 from quail.cost.retention import coefficients
 from quail.cost.score import score_fixed_tokens
 from quail.execution.pipelines import build_pipelines
@@ -27,7 +28,9 @@ from quail.logical.prompts import classify_prompt_tokens
 from quail.physical import (
     Aggregate,
     AiClassify,
+    AiExtract,
     AiFilter,
+    AiInference,
     AiJoin,
     AiScore,
     Filter,
@@ -50,7 +53,7 @@ class LimitPushdown:
     finish, so it is sound only when those are the rows the query
     returns: the graph ends in a Limit and has no Sort or Aggregate (an
     ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
-    AiJoin (survivors are settled per join round), and no AiScore (a
+    AiJoin (survivors are settled per join round), and no AiInference (a
     score comparison after the chain can drop survivors). Otherwise the
     rule removes the setting.
     """
@@ -63,7 +66,7 @@ class LimitPushdown:
             return None
         limit = next((node for node in graph.nodes
                       if isinstance(node, Limit)), None)
-        blocked = any(isinstance(node, (Sort, Aggregate, AiJoin, AiScore))
+        blocked = any(isinstance(node, (Sort, Aggregate, AiJoin, AiInference))
                       for node in graph.nodes)
         if limit is None or blocked:
             context.settings.pop("filter_limit", None)
@@ -133,15 +136,23 @@ class KvRetention:
         }
         schedule.update(**coefficients(context.model, context.device),
                         cap_pages=statistics.cap_pages)
+        extracts = [(index, node.spec.alias) for index, node in enumerate(graph.nodes)
+                    if isinstance(node, AiExtract) and node.spec.shares_head]
         nodes = []
-        for node in graph.nodes:
+        for index, node in enumerate(graph.nodes):
             if isinstance(node, AiFilter):
-                keep = node.alias in schedule["initial"]
+                keep = (node.alias in schedule["initial"]
+                        or context.gpu_count > 1 and any(
+                            alias == node.alias and after > index
+                            for after, alias in extracts))
                 writes = node.arena_writes or keep
                 node = replace(node, keep_kv=keep, arena_writes=writes)
             elif isinstance(node, AiJoin):
                 node = replace(node, keep_anchor_kv=(
-                    node.anchor in schedule["after"][node.node_id]))
+                    node.anchor in schedule["after"][node.node_id]
+                    or context.gpu_count > 1 and any(
+                        alias == node.anchor and after > index
+                        for after, alias in extracts)))
             nodes.append(node)
         context.settings["retention"] = schedule
         return PhysicalGraph(tuple(nodes), graph.root)
@@ -285,7 +296,8 @@ class PrefixSharing:
     on. The filter then writes pages even when it has one stage, since
     borrowed pages must exist. A join always writes its anchors' KV,
     so it fires for any join whose anchors share a whole page; a
-    classification writes its documents' KV the same way. A score of
+    classification or extraction writes its documents' KV the same way.
+    A score of
     one table is priced like a filter that writes no pages, since
     without sharing its documents follow one shared prompt head.
     """
@@ -298,7 +310,7 @@ class PrefixSharing:
             return None
         nodes = []
         changed = False
-        pipelines = build_pipelines(graph) if context.gpu_count == 1 else {}
+        pipelines = build_pipelines(graph)
         for node in graph.nodes:
             if isinstance(node, AiFilter) and not node.share_prefixes:
                 lengths = context.document_tokens.get(node.alias)
@@ -329,12 +341,29 @@ class PrefixSharing:
                         shared_tokens=page_aligned_shared_tokens(store),
                         total_tokens=sum(lengths), writes_pages=True):
                     pipeline = pipelines.get(node.node_id)
-                    resident = (pipeline is not None
+                    resident = (context.gpu_count == 1 and pipeline is not None
                                 and pipeline.members[0].node_id != node.node_id)
                     node = replace(node, spec=_shared_classify_spec(
                         node, context, store, resident=resident))
                     changed = True
-            elif (type(node) is AiScore and node.spec is not None
+            elif (isinstance(node, AiExtract) and node.spec is not None
+                  and not node.spec.share_prefixes):
+                lengths = context.document_tokens.get(node.spec.alias)
+                store = _token_store(lengths)
+                if store is not None and sharing_pays(
+                        context.model, context.device,
+                        shared_tokens=page_aligned_shared_tokens(store),
+                        total_tokens=sum(lengths), writes_pages=True):
+                    pipeline = pipelines.get(node.node_id)
+                    preceding = (() if pipeline is None else
+                                 pipeline.members[:pipeline.members.index(node)])
+                    resident = bool(preceding) and (
+                        context.gpu_count == 1
+                        or any(isinstance(member, AiExtract) for member in preceding))
+                    node = replace(node, spec=_shared_extract_spec(
+                        node, context, store, resident=resident))
+                    changed = True
+            elif (isinstance(node, AiScore) and node.spec is not None
                   and len(node.spec.aliases) == 1
                   and not node.spec.share_prefixes):
                 lengths = context.document_tokens.get(node.spec.aliases[0])
@@ -361,6 +390,21 @@ def _shared_classify_spec(node, context, store, *, resident=False):
     table = classify_scoring(context, node.spec.aliases[0],
                            shared=document_shared_tokens(store))
     return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
+
+
+def _shared_extract_spec(node, context, store, *, resident=False):
+    """Enable extraction prefix sharing and price the borrowed document KV."""
+    from quail.cost.budgets import chunk_budget
+
+    spec = node.spec
+    head, tail = spec.prompt_token_parts
+    cost = extract_estimate(
+        spec.expected_inputs, context.document_tokens[spec.alias],
+        len(head), len(tail), chunk=chunk_budget(context.model, context.device),
+        model=context.model, device=context.device, resident=resident,
+        shared=page_tree(store).shared, max_answer_tokens=spec.max_answer_tokens,
+        draft_tokens=spec.draft_tokens, workers=context.gpu_count)
+    return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
 
 
 def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):

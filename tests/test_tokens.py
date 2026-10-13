@@ -2,10 +2,15 @@
 
 import pickle
 
+import numpy as np
 import pyarrow as pa
+import pytest
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers
 
 from quail.execution.tokens import (
     ArrowTokenDocuments,
+    GigatokenEncoder,
+    TokenOffsets,
     TokenStore,
     chain_tokens,
     decode_token_documents,
@@ -106,3 +111,57 @@ def test_prefix_tree_borrows_whole_pages_and_siblings_share_one_parent():
     tree = prefix_tree(docs, 16)
     assert tree.parent == [None, 0, 0]
     assert tree.shared == [0, 96, 96]
+
+
+@pytest.mark.parametrize("vocab_size", [256, 300])
+def test_token_offsets_survive_batches_slices_and_process_selection(tmp_path,
+                                                                  vocab_size):
+    texts = ["  Café\n\n東京", "", "🙂 repeated  words", "last"]
+    tokenizer = Tokenizer(models.BPE())
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.train_from_iterator(texts, trainers.BpeTrainer(
+        vocab_size=vocab_size, initial_alphabet=pre_tokenizers.ByteLevel.alphabet()))
+    expected = tokenizer.encode_batch(texts, add_special_tokens=False)
+    fast = GigatokenEncoder(tokenizer)
+    batches = [pa.record_batch({"text": texts[:2]}),
+               pa.record_batch({"text": texts[2:]})]
+    calls = []
+
+    def encoded(values):
+        calls.append(values.to_pylist())
+        return fast.batch_arrow(values)
+
+    def no_scalar(text):
+        raise AssertionError("batch tokenization must provide both IDs and offsets")
+
+    no_scalar.batch_arrow = encoded
+    store = TokenStore.write(str(tmp_path / "offsets.arrow"), batches,
+                             document_column="text", tokenizer=no_scalar,
+                             token_type=pa.int32(),
+                             offsets_encoder=TokenOffsets(fast.token_bytes()))
+    assert store.has_offsets and calls == [texts[:2], texts[2:]]
+    restored = pickle.loads(pickle.dumps(store.select([2, 0, 1])))
+    for index, original in enumerate([2, 0, 1]):
+        view = restored[index]
+        assert list(view) == expected[original].ids
+        assert view.character_offsets.tolist() == [
+            list(pair) for pair in expected[original].offsets]
+        np.testing.assert_array_equal(view[1:].character_offsets,
+                                      view.character_offsets[1:])
+    assert np.shares_memory(store[0].character_offsets,
+                            store[0][1:].character_offsets)
+    store.close()
+
+
+def test_offsets_reject_changed_text_and_preserve_sliced_rows():
+    mapper = TokenOffsets({0: b"a", 1: b"b", 2: b"\xc3", 3: b"\xa9"})
+    ids = pa.array([[0], [0, 1], [], [2, 3]], type=pa.large_list(pa.int32()))
+    texts = pa.array(["a", "a b", "", "é"])
+    offsets = mapper(ids.slice(1), texts.slice(1))
+    assert offsets.to_pylist() == [None, [], [[0, 1], [0, 1]]]
+    documents = ArrowTokenDocuments(ids.slice(1), offsets)
+    assert documents[0].character_offsets is None
+    assert documents[1].character_offsets.shape == (0, 2)
+    assert documents[2].character_offsets.tolist() == [[0, 1], [0, 1]]
+    empty = pa.array([], type=pa.large_list(pa.int32()))
+    assert mapper(empty, pa.array([], type=pa.string())).to_pylist() == []

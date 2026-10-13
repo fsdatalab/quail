@@ -1014,6 +1014,10 @@ class KVArena:
     def is_resident(self, key) -> bool:
         return key in self.accounting.owned
 
+    def prefix_tokens(self, key) -> int:
+        """The tokens a resident key's KV holds before any suffix."""
+        return self.accounting.tokens[key]
+
     def resident_keys(self) -> list:
         """Every key holding pages, in allocation order."""
         return list(self.accounting.owned)

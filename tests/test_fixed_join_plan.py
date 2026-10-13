@@ -113,14 +113,14 @@ class FixedFeverAnswers:
                 rows, node.spec.aliases, node.spec.name,
                 [self.stances[pair if claim_first else pair[::-1]]
                  for pair in labeled], pa.string())
-            return NodeResult({"scores": table}, NodeMetrics(
+            return NodeResult({"rows": table}, NodeMetrics(
                 input_rows=len(pairs), output_rows=len(labeled)))
         if isinstance(node, AiClassify):
             (ids,) = inputs["score_inputs"].values()
             (alias,) = node.spec.aliases
             labeled, table = self._label_table(node, ids)
             return NodeResult(
-                {"scores": table, f"ids:{alias}": labeled},
+                {"rows": table, f"ids:{alias}": labeled},
                 NodeMetrics(input_rows=len(ids), output_rows=len(ids)))
         if isinstance(node, AiFilter):
             document_ids = list(inputs["document_ids"])
@@ -336,7 +336,7 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
                           if port.source.port == "ids:c"]
         assert claims_port == PortRef(test.node_id, "ids:c")
         assert [port.source.port for port in project.inputs] == [
-            "join_answers:0", "scores"]
+            "join_answers:0", "rows"]
         codecs = session.registry.codecs
         assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
         execute = fever_executor(session, monkeypatch, 1, capacity=10)
@@ -375,7 +375,7 @@ def test_a_classification_of_joined_rows_follows_its_join(monkeypatch):
         assert classify.inputs[0].source == PortRef(join.node_id,
                                                     "join_answers:0")
         assert [port.source.port for port in project.inputs] == [
-            "join_answers:0", "scores"]
+            "join_answers:0", "rows"]
         members = build_pipelines(plan.graph)[join.node_id].node_ids
         assert members == (join.node_id, classify.node_id)
         codecs = session.registry.codecs

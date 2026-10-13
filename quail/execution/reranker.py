@@ -15,7 +15,7 @@ from quail.execution.runner import (
     NodeResult,
 )
 from quail.logical import PROBABILITIES_SUFFIX
-from quail.physical import AiScore, ClassifySpec, Filter, InList, ValueType
+from quail.physical import AiClassify, AiScore, ClassifySpec, Filter, InList, ValueType
 from quail.progress import answer_sink
 
 # one kernel per entry of quail.logical.SCORE_COMPARISONS
@@ -187,7 +187,7 @@ def _candidate_rows(node, inputs):
         if port.value_type is ValueType.PAIRS:
             pairs = value
             continue
-        if port.value_type is ValueType.SCORES:
+        if port.value_type is ValueType.ROWS:
             for alias in spec.aliases:
                 if alias in value.column_names:
                     by_alias[alias] = _ids(value, alias)
@@ -262,7 +262,7 @@ def scored_batch(node, rows, values) -> dict:
 
 def classify_outputs(node, table) -> dict:
     """Return the label table and, for one alias, the labeled document IDs."""
-    outputs = {"scores": table}
+    outputs = {"rows": table}
     if len(node.spec.aliases) == 1:
         (alias,) = node.spec.aliases
         outputs[f"ids:{alias}"] = table.column(alias).to_pylist()
@@ -287,14 +287,14 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         inputs: Its input values by port name.
         score_batches: Callable (node, batches) taking one row batch per
             shard and returning one NodeResult per batch, each with a
-            "scores" table holding one row per input row in order.
+            "rows" table holding one row per input row in order.
         shards: Row shards scored side by side; rows that share a first
             document land in the same shard.
         streamed: Whether ``score_batches`` sends its answers to the
             answer sink itself. Otherwise each batch's answers are sent
             when the batch is scored.
     """
-    if not isinstance(node, AiScore):
+    if not isinstance(node, (AiScore, AiClassify)):
         raise TypeError(type(node).__name__)
     if node.spec is None:
         raise ValueError("AI.SCORE needs a score specification")
@@ -324,7 +324,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         ]
         results = score_batches(node, [batch for _, batch in batches])
         for (where, batch), result in zip(batches, results):
-            tables.append(result.outputs["scores"])
+            tables.append(result.outputs["rows"])
             positions.append(where)
             metrics += result.metrics
             suffix_tokens += result.metrics.extension.get("suffix_tokens", 0)
@@ -335,13 +335,13 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
             if sink is not None and not streamed and len(batch):
                 sink(scored_batch(
                     node, batch,
-                    result.outputs["scores"].column(node.spec.name).to_pylist()))
+                    result.outputs["rows"].column(node.spec.name).to_pylist()))
     table = pa.concat_tables(tables)
     order = np.concatenate(positions)
     if len(order) and np.any(np.diff(order) < 0):
         table = table.take(pa.array(np.argsort(order, kind="stable")))
     table = attach_prior_columns(table, priors)
-    outputs = {"scores": table}
+    outputs = {"rows": table}
     if isinstance(node.spec, ClassifySpec):
         # a document whose decoded answer names no label leaves the query
         table = table.filter(pc.is_valid(table.column(node.spec.name)))
@@ -411,7 +411,7 @@ class RerankerModelExecution:
                     if batch.probabilities is None else batch.probabilities))
         count = len(rows)
         return NodeResult(
-            {"scores": table},
+            {"rows": table},
             NodeMetrics(
                 wall_s=time.perf_counter() - started,
                 input_rows=count,
@@ -501,7 +501,7 @@ def filter_scores(node, table) -> NodeResult:
                 "threshold": node.predicate.value,
             },
         )
-    outputs = {"scores": filtered, answer_name: answer_relation}
+    outputs = {"rows": filtered, answer_name: answer_relation}
     if len(node.aliases) == 1:
         outputs[f"ids:{node.aliases[0]}"] = (
             filtered.column(node.aliases[0]).to_pylist())

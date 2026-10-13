@@ -31,6 +31,8 @@ class LoadedModelState:
     label_readout: AsyncLabelLogprobs | None = None
     # a decision model's option-scoring head; None for other models
     decision_head: Any = None
+    # the tokenizer and vocabulary index AI.EXTRACT reads, loaded on first use
+    vocabulary: Any = None
 
 
 @dataclass

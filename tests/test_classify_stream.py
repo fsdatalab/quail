@@ -135,17 +135,17 @@ def fused_graph(*, classify_only=False):
             backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         Filter(
             node_id="label:r",
-            inputs=input_ports((PortRef("classify:r", "scores"),)),
+            inputs=input_ports((PortRef("classify:r", "rows"),)),
             predicate=InList("topic", ("a",)), aliases=("r",),
             selectivity=0.5, written_pos=1),
         Filter(
             node_id="label:again",
-            inputs=input_ports((PortRef("label:r", "scores"),)),
+            inputs=input_ports((PortRef("label:r", "rows"),)),
             predicate=InList("topic", ("a",)), aliases=("r",),
             selectivity=1.0, written_pos=2),
         AiClassify(
             node_id="classify:kind",
-            inputs=input_ports((PortRef("label:again", "scores"),)),
+            inputs=input_ports((PortRef("label:again", "rows"),)),
             backend_name="quail", model="qwen3-4b-fp8",
             spec=replace(spec, name="kind", labels=("b", "a"),
                          prompt_token_parts=((), (CLASSIFY_FRAME + 1, CUE)))),
@@ -166,7 +166,7 @@ def fused_graph(*, classify_only=False):
             "input:p", "filter:r", "group:0")]
         nodes = [replace(node, inputs=input_ports((PortRef("input:r", "ids:r"),)))
                  if node.node_id == "classify:r" else node for node in nodes]
-        return PhysicalGraph(tuple(nodes), PortRef("classify:kind", "scores"))
+        return PhysicalGraph(tuple(nodes), PortRef("classify:kind", "rows"))
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
@@ -215,14 +215,14 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         node_id="classify:r",
         inputs=input_ports((PortRef(
             "score:r" if shape == "score_first" else "input:r" if first else "filter:r",
-            "scores" if shape == "score_first" else "ids:r"),)),
+            "rows" if shape == "score_first" else "ids:r"),)),
         backend_name="quail", model="diffusion-gemma-26b-a4b-fp8",
         spec=spec))
-    root = PortRef("classify:r", "scores")
+    root = PortRef("classify:r", "rows")
     if first:
         nodes.append(Filter(
             node_id="label:r",
-            inputs=input_ports((PortRef("classify:r", "scores"),)),
+            inputs=input_ports((PortRef("classify:r", "rows"),)),
             predicate=InList("topic", ("b",)), aliases=("r",),
             selectivity=0.5, written_pos=1))
         root = PortRef("label:r", "ids:r")
@@ -231,7 +231,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
             Scan(node_id="input:p", alias="p", input_id="p"),
             Filter(
                 node_id="label:r",
-                inputs=input_ports((PortRef("classify:r", "scores"),)),
+                inputs=input_ports((PortRef("classify:r", "rows"),)),
                 predicate=InList("topic", ("a",)), aliases=("r",),
                 selectivity=0.5, written_pos=1),
             AiJoin(
@@ -372,7 +372,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         def with_score(node, inputs):
             if node.node_id == "score:r":
                 rows = np.arange(4, dtype=np.int32).reshape(-1, 1)
-                return NodeResult({"scores": _score_table(
+                return NodeResult({"rows": _score_table(
                     rows, ("r",), "score", [0.1, 0.2, 0.3, 0.4])})
             return execute(node, inputs)
 
@@ -381,13 +381,13 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     assert not arena.accounting.owned
     outputs = result["_outputs"]
     metrics = result["node_metrics"]
-    labels = outputs[PortRef("classify:r", "scores")]
+    labels = outputs[PortRef("classify:r", "rows")]
     if first:
         assert labels.column("topic").to_pylist() == ["a", "a", "b", "b"]
         assert outputs[root].column("r").to_pylist() == [2, 3]
         if shape == "score_first":
             assert labels.column("score").to_pylist() == [0.1, 0.2, 0.3, 0.4]
-            filtered = outputs[PortRef("label:r", "scores")]
+            filtered = outputs[PortRef("label:r", "rows")]
             assert filtered.column("score").to_pylist() == [0.3, 0.4]
         assert prefixes == {d: list(head) + docs["r"][d] for d in range(4)}
         return
@@ -498,7 +498,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     matched = [d for d in accepted if any(join_truth[("r", d)])]
     outputs = result["_outputs"]
     metrics = result["node_metrics"]
-    labels = outputs[PortRef("classify:r", "scores")]
+    labels = outputs[PortRef("classify:r", "rows")]
     assert labels.column("r").to_pylist() == passed
     assert labels.column("topic").to_pylist() == [
         ("a", "b")[label_truth[d]] for d in passed]
@@ -507,7 +507,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() \
         == accepted
     assert metrics["label:again"]["input_rows"] == len(accepted)
-    later = outputs[PortRef("classify:kind", "scores")]
+    later = outputs[PortRef("classify:kind", "rows")]
     assert later.to_pydict() == {
         "r": accepted, "kind": ["b"] * len(accepted),
         "topic": ["a"] * len(accepted)}
@@ -573,7 +573,7 @@ def joined_graph(two_joins=False):
             stages=join.stages + (replace(
                 join.stages[0], written_pos=3, exec_idx=1, partners=("q",),
                 frame_token_ids=(FRAME + 1,), label_token_ids=(("q", ()),)),))
-    return PhysicalGraph(tuple(nodes), PortRef("classify:rp", "scores"))
+    return PhysicalGraph(tuple(nodes), PortRef("classify:rp", "rows"))
 
 
 @pytest.mark.parametrize("two_joins", [False, True])
@@ -651,7 +651,7 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     metrics = result["node_metrics"]
     assert outputs[PortRef("group:0", "ids:r")].column("r").to_pylist() \
         == [0, 1]
-    labels = outputs[PortRef("classify:rp", "scores")]
+    labels = outputs[PortRef("classify:rp", "rows")]
     assert labels.column("r").to_pylist() == [0, 0, 1]
     assert labels.column("p").to_pylist() == [0, 1, 1]
     assert labels.column("stance").to_pylist() == ["a", "b", "a"]

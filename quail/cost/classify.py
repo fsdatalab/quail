@@ -9,13 +9,12 @@ order do not enter, just as they do not enter filter and join costs.
 """
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
-from quail.cost.dense_decoder_cost import dense_decoder_components
-from quail.cost.roofline import CostComponent, component_latencies
-from quail.cost.work import Work
+from quail.cost.dense_decoder_cost import decoder_seconds
+from quail.cost.work import Work, ask, decode, stream
 from quail.labels import (
     DECODE_SCORING,
     LETTERS_SCORING,
@@ -57,36 +56,6 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
     raise ValueError(f"unknown label scoring rule {scoring!r}")
 
 
-def _readout(model, rows: float, passes: float, head_rows: int) -> CostComponent:
-    """Price the answer readout: the decision head, or output-head rows.
-
-    A decision model passes each option row and the prompt's last row
-    through its fp32 head: four projections of the hidden size to the
-    head width per row, and the head's weights once per pass. Any other
-    model multiplies each answer row by head_rows rows of the bf16
-    output head, the whole vocabulary when head_rows is 0, read once per
-    pass.
-    """
-    if model.role == "decision":
-        width, hidden = model.decision_head_dim, model.hidden
-        return CostComponent(
-            name="readout", flops=4.0 * width * hidden * rows,
-            bytes_moved=4.0 * (4 * width * hidden + 2 * width + 4 * hidden) * passes,
-            precision="fp32")
-    head = 2.0 * model.hidden * (head_rows or model.vocab)
-    return CostComponent(name="readout", flops=head * rows,
-                         bytes_moved=head * passes, precision="bf16")
-
-
-def _seconds(work: Work, rows: float, passes: float, model, device,
-             head_rows: int) -> float:
-    """Price work, answer rows, and forward passes with the component roofline."""
-    components = dense_decoder_components(work, model, passes=passes)
-    components += (_readout(model, rows, passes, head_rows),)
-    return sum(component.seconds
-               for component in component_latencies(components, device))
-
-
 @dataclass(frozen=True)
 class ClassifyCost:
     """Estimated classification time, work, and token counts.
@@ -106,59 +75,29 @@ class ClassifyCost:
     rounds: int
 
 
-def _triangle(n, window: int = 0):
-    """Vectorized causal pair count, within the window when one is set."""
-    n = np.asarray(n, dtype=float)
-    full = n * (n + 1) / 2
-    if not window:
-        return full
-    return np.where(n > window, window * n - window * (window - 1) / 2, full)
-
-
-def _total(tokens, pairs, written, read, sliding_pairs, sliding_read,
-           state_written=0.0, state_read=0.0) -> Work:
-    """Sum per-document work arrays into one Work record."""
-    return Work(float(np.sum(tokens)), float(np.sum(pairs)), float(np.sum(written)),
-                float(np.sum(read)), float(np.sum(sliding_pairs)),
-                float(np.sum(sliding_read)), float(np.sum(state_written)),
-                float(np.sum(state_read)))
-
-
 def _first_work(prefix, shared, tail: int, resident: bool, window: int) -> Work:
     """Sum every document's prefix-and-tail work: scan, or ask on resident KV."""
     if resident:
-        # ask(prefix, tail)
-        suffix = np.full_like(prefix, tail)
-        return _total(
-            suffix, tail * prefix + _triangle(tail), suffix, prefix,
-            _triangle(prefix + tail, window) - _triangle(prefix, window)
-            if window else 0.0,
-            np.minimum(prefix, window - 1) if window else 0.0,
-            state_read=np.ones_like(prefix))
-    # scan(prefix, tail) without a shared prefix, ask(shared, rest) with one
+        return ask(prefix, np.full_like(prefix, tail), window=window).total()
     fresh = prefix - shared + tail
-    return _total(
-        fresh, fresh * shared + _triangle(fresh), fresh, shared,
-        _triangle(prefix + tail, window) - _triangle(shared, window)
-        if window else 0.0,
-        np.minimum(shared, window - 1) if window else 0.0,
-        state_written=np.ones_like(prefix),
-        state_read=(shared > 0).astype(float))
+    work = ask(shared, fresh, window=window).total()
+    # a document with no shared prefix scans from nothing and writes a
+    # checkpoint; one that shares a prefix reads its parent's checkpoint
+    return replace(work, state_written=float(len(prefix)),
+                   state_read=float(np.sum(shared > 0)))
 
 
 def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:
     """Sum every document's stream of the suffixes after its context tokens."""
-    total = sum(suffixes)
-    pairs = sum(s * context + _triangle(s) for s in suffixes)
-    sliding_pairs = (sum(_triangle(context + s, window) - _triangle(context, window)
-                         for s in suffixes) if window else 0.0)
-    work = _total(
-        np.full_like(context, total), pairs, np.full_like(context, total),
-        context, sliding_pairs,
-        np.minimum(context, window - 1) if window else 0.0,
-        state_read=np.full_like(context, len(suffixes)))
+    # Every document receives the same suffixes in this forward pass.
+    work = stream(context, [np.full_like(context, s) for s in suffixes],
+                  window=window).total()
+    return _canvas_work(work, canvas_rows)
+
+
+def _canvas_work(work: Work, canvas_rows: int) -> Work:
+    """Include the second attention read of a multi-row answer canvas."""
     if canvas_rows > 1:
-        # a canvas longer than one row reads the document a second time
         work += Work(pairs=work.pairs, kv_read=work.kv_read,
                      sliding_pairs=work.sliding_pairs,
                      sliding_kv_read=work.sliding_kv_read)
@@ -175,10 +114,8 @@ def _rounds_work(prefix, shared, frame_tokens: int, runs, resident: bool,
     first_tail = frame_tokens + runs[0]
     work = _first_work(prefix, shared, first_tail, resident, window)
     context = prefix + first_tail
-    for fed in runs[1:]:
-        work += _stream_work(context, [fed], window, canvas_rows)
-        context = context + fed
-    return work
+    rounds = decode(context, runs[1:], window=window).total()
+    return work + _canvas_work(rounds, canvas_rows)
 
 
 def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
@@ -243,7 +180,7 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
         rows = answer_rows
     total = work * (live / n)
     passes = total.tokens / chunk
-    seconds = _seconds(total, rows * live, passes, model, device, head_rows)
+    seconds = decoder_seconds(total, rows * live, passes, model, device, head_rows)
     return ClassifyCost(seconds, passes, total, suffix_tokens * live, rounds)
 
 

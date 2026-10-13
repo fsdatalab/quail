@@ -27,10 +27,10 @@ def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
     by_node = {part.node.node_id: part for part in parts}
     priors = [(by_node[port.source.node_id], port.source.port)
               for port in node.inputs
-              if port.value_type is ValueType.SCORES
+              if port.value_type is ValueType.ROWS
               and port.source.node_id in by_node]
     prior_tables = [inputs[port.name] for port in node.inputs
-                    if port.value_type is ValueType.SCORES
+                    if port.value_type is ValueType.ROWS
                     and port.source.node_id not in by_node]
     return ClassifyPart(node, ids, plan, priors, prior_tables=prior_tables)
 

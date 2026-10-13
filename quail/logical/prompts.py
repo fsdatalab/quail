@@ -3,7 +3,12 @@
 import json
 from dataclasses import dataclass, replace
 
-from quail.logical.expressions import LABEL_PREFIX, CompileError, Prompt
+from quail.logical.expressions import (
+    LABEL_PREFIX,
+    CompileError,
+    Prompt,
+    validate_question,
+)
 
 # Fixed preamble before every document. Must be a formatting label,
 # not an instruction; instruction text here biases short-document
@@ -717,6 +722,71 @@ def bind_score_prompt(template: str, args: tuple,
             f"each AI.SCORE placeholder must name a distinct table, got "
             f"aliases {aliases}")
     return Prompt(template=template, args=tuple(args), preamble="", tail="")
+
+
+# AI.EXTRACT: the document, the question, the instruction, and the
+# answer template. The answer opens with the phrase field's quote;
+# the model writes the rest.
+EXTRACT_QUESTION_LABEL = "\n\nQuestion: "
+EXTRACT_INSTRUCTION = (
+    "Copy the words that answer the question from the document. Copy them "
+    "exactly. Use the fewest words that answer it. If the document does not "
+    "answer the question, write none.")
+EXTRACT_FORMAT = "Answer in this format:"
+EXTRACT_PHRASE_FORMAT = 'Phrase: "<copied words>"'
+EXTRACT_PHRASE_CUE = 'Phrase: "'
+EXTRACT_NONE = "none"
+
+
+def render_extract_question(question: str) -> str:
+    """Return the text after the document: question, instruction, and template."""
+    lines = [EXTRACT_INSTRUCTION, EXTRACT_FORMAT, EXTRACT_PHRASE_FORMAT]
+    return EXTRACT_QUESTION_LABEL + question + "\n\n" + "\n".join(lines)
+
+
+def bind_extract_prompt(args: tuple, question: str, tokenizer=None,
+                        turn: tuple[str, str] = ("", "")) -> Prompt:
+    """Bind an AI.EXTRACT prompt over one document column.
+
+    The prompt is the document label, the document, the question, the
+    instruction, the answer template, the model's turn text, and the
+    cue that opens the answer. The document's KV stays query
+    independent: every text that depends on the question follows it.
+
+    Args:
+        args: One column reference.
+        question: The question the answer is copied for.
+        tokenizer: Optional callable mapping text to token IDs.
+        turn: Chat text before the prompt and after the answer template.
+            Without it, a line break separates the template and the cue.
+
+    Returns:
+        A Prompt whose template is ``{0}`` and whose tail is the text
+        after the document.
+
+    Raises:
+        CompileError: The prompt reads more than one column, or the
+            question is empty.
+    """
+    if len(args) != 1:
+        raise CompileError("AI.EXTRACT reads one document column")
+    validate_question(question)
+    preamble = turn[0] + SHARED_PRE
+    # the cue opens the model's turn; without turn text it opens a line
+    after = (render_extract_question(question) + (turn[1] or "\n")
+             + EXTRACT_PHRASE_CUE)
+    pre_tok = tail_tok = frame_tok = None
+    pre_ids = tail_ids = ()
+    if tokenizer is not None:
+        pre_ids = tuple(tokenizer(preamble))
+        pre_tok = len(pre_ids)
+        tail_ids = tuple(tokenizer(after))
+        tail_tok = len(tail_ids)
+        frame_tok = 0
+    return Prompt(template="{0}", args=tuple(args), preamble=preamble,
+                  tail="{0}" + after, preamble_tokens=pre_tok,
+                  tail_tokens=tail_tok, frame="", frame_tokens=frame_tok,
+                  preamble_token_ids=pre_ids, tail_token_ids=tail_ids)
 
 
 def bind_join_prompt(template: str, args: tuple,

@@ -58,6 +58,7 @@ def ensure_data(sf: float, query_ids: list[str], collection_id: str,
     import pyarrow.parquet as pq
 
     import quail_b as benchmark
+    from quail_b.data import CORPUS_COLUMNS
 
     names = {
         relation.table for query_id in query_ids
@@ -67,8 +68,11 @@ def ensure_data(sf: float, query_ids: list[str], collection_id: str,
     directory.mkdir(parents=True, exist_ok=True)
     for name in sorted(names):
         path = directory / f"{name}.parquet"
-        if not path.exists():
-            pq.write_table(benchmark.load_table(name, scale_factor=sf), path)
+        # a table an earlier benchmark version wrote lacks its columns
+        if (path.exists() and set(CORPUS_COLUMNS[name])
+                <= set(pq.read_schema(path).names)):
+            continue
+        pq.write_table(benchmark.load_table(name, scale_factor=sf), path)
     suite = benchmark.load_benchmark(
         query_ids, scale_factor=sf, data_dir=directory,
         collection_id=collection_id or None, root=label_root or None)

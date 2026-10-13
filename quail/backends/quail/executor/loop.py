@@ -25,7 +25,11 @@ def _forward(pipeline, arena, chunk):
     temporaries whether the pass returns or raises.
     """
     try:
-        out = pipeline.forward_chunk(chunk)
+        graphs = getattr(pipeline, "decode_graphs", None)
+        if graphs is not None:
+            out = graphs.forward(chunk)
+        else:
+            out = pipeline.forward_chunk(chunk)
         sample = getattr(arena, "sample_memory", None)
         if sample is not None:
             sample(getattr(chunk, "tokens", 0),

@@ -35,6 +35,7 @@ class ModelPipeline:
     gemm_warmup = True
     warm_row_classes = True    # row-count classes keep one KV row per reader
     warm_joins = True          # join and classification chunks borrow prefixes
+    decode_graphs = None
 
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.

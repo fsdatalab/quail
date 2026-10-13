@@ -8,6 +8,13 @@ from .base import ModelSpec
 
 # The FP8 layout the executor's DeepGEMM path reads.
 FP8_BLOCK = [128, 128]
+# The chat turn an AI.EXTRACT prompt closes with, its thinking channel
+# closed; AI.IF prompts stay raw. The turn has no opener, so an
+# extraction's prompt head is the AI.IF preamble and the document KV a
+# filter wrote is the extraction's.
+EXTRACT_TURN_PREFIX = ""
+EXTRACT_TURN_SUFFIX = ("<|im_end|>\n<|im_start|>assistant\n"
+                       "<think>\n\n</think>\n\n")
 
 
 def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
@@ -86,7 +93,11 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
         weight_precision=weight_precision,
         arch="qwen3",
     )
-    return replace(spec, **fields)
+    spec = replace(spec, **fields)
+    if spec.role == "generative":
+        spec = replace(spec, extract_turn_prefix=EXTRACT_TURN_PREFIX,
+                       extract_turn_suffix=EXTRACT_TURN_SUFFIX)
+    return spec
 
 
 def _read_config(hf_name, revision, config, config_file) -> dict:

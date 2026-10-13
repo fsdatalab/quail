@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
+
+import numpy as np
+import pyarrow as pa
 
 from quail.backends.quail import coordinator
 from quail.backends.quail.graph import (
@@ -12,6 +16,7 @@ from quail.backends.quail.graph import (
     throughput,
 )
 from quail.execution.pairs import columns_key
+from quail.execution.pipelines import Pipeline, build_pipelines
 from quail.execution.reranker import score_in_batches
 from quail.execution.runner import (
     ExecutionContext,
@@ -24,7 +29,10 @@ from quail.execution.runner import (
 from quail.execution.tokens import select_documents
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
+    AiClassify,
+    AiExtract,
     AiFilter,
+    AiInference,
     AiJoin,
     AiScore,
     PhysicalGraph,
@@ -96,7 +104,9 @@ class DistributedQuailExecution:
         return dict(self.payload)
 
     def execute(self, node, inputs):
-        if isinstance(node, AiScore):
+        if isinstance(node, AiExtract):
+            return self._execute_extractions((node,), inputs)[node.node_id]
+        if isinstance(node, (AiScore, AiClassify)):
             return self._execute_score(node, inputs)
         if isinstance(node, AiFilter):
             return self._execute_filter(node, inputs)
@@ -104,6 +114,73 @@ class DistributedQuailExecution:
             return self._execute_join(node, inputs)
         raise TypeError(
             f"distributed Quail cannot execute {node.type_name!r}")
+
+    def execute_pipeline(self, pipeline, inputs, context):
+        """Run each worker's extraction questions over its documents together."""
+        first = pipeline.members[0]
+        return self._execute_extractions(pipeline.members, inputs[first.node_id])
+
+    def _extraction_positions(self, alias, ids):
+        """Keep documents on their previous worker, partitioning unplaced rows."""
+        owners = np.full(len(self.docs[alias]), -1, dtype=np.int32)
+        for worker, shard in enumerate(self.shards.get(alias, ())):
+            owners[np.asarray(shard, dtype=np.int64)] = worker
+        for worker, shard in enumerate(self.prior_shards.get(alias, ())):
+            owners[np.asarray(shard, dtype=np.int64)] = worker
+        missing = ids[owners[ids] < 0]
+        shards, _ = balanced_shards(
+            [len(self.docs[alias][document]) for document in missing],
+            self.gpu_count)
+        for worker, shard in enumerate(shards):
+            owners[missing[np.asarray(shard, dtype=np.int64)]] = worker
+        return [np.flatnonzero(owners[ids] == worker)
+                for worker in range(self.gpu_count)]
+
+    def _execute_extractions(self, nodes, inputs):
+        if not self.started:
+            self.begin()
+        alias = nodes[0].spec.alias
+        (source,) = inputs.values()
+        ids = (source.column(alias).to_numpy() if isinstance(source, pa.Table)
+               else np.asarray(source, dtype=np.int64))
+        positions = self._extraction_positions(alias, ids)
+        texts = self.payload["texts"][alias]
+        if not isinstance(texts, (pa.Array, pa.ChunkedArray)):
+            texts = pa.array(texts, type=pa.large_string())
+        subs = []
+        for part in positions:
+            documents = ids[part]
+            subs.append({"nodes": nodes, "inputs": {
+                "document_ids": documents,
+                "document_positions": range(len(documents)),
+                "documents": {alias: select_documents(self.docs[alias], documents)},
+                "texts": {alias: texts.take(pa.array(documents))},
+                "pre": self.pre,
+                "gpu_timing": self.payload.get("gpu_timing", False),
+            }})
+        started = time.perf_counter()
+        outputs = self.round_fn("extract", subs)
+        wall = time.perf_counter() - started
+        self._retained_placement(outputs)
+        for worker, output in enumerate(outputs):
+            self.child_totals[worker] = output["kv_totals"]
+            self.peak_gib = max(self.peak_gib, output["peak_gib"])
+        order = pa.array(np.argsort(np.concatenate(positions)))
+        results = {}
+        for index, node in enumerate(nodes):
+            parts = [output["results"][node.node_id] for output in outputs]
+            table = pa.concat_tables([part.outputs["rows"] for part in parts])
+            metrics = sum((part.metrics for part in parts), NodeMetrics())
+            extension = dict(parts[0].metrics.extension)
+            for name in ("input_rows", "none", "steps", "answer_tokens",
+                         "suffix_tokens", "borrowed_prefix_tokens", "pack_s"):
+                extension[name] = sum(part.metrics.extension.get(name, 0)
+                                      for part in parts)
+            results[node.node_id] = NodeResult(
+                {"rows": table.take(order), f"ids:{alias}": ids},
+                replace(metrics, wall_s=wall if index == 0 else 0.0,
+                        extension=extension))
+        return results
 
     def _execute_score(self, node, inputs):
         return score_in_batches(
@@ -220,7 +297,8 @@ class DistributedQuailExecution:
             sub.update(
                 retain_anchor=node.keep_anchor_kv,
                 final_group=node.node_id == self.graph.nodes_by_type(
-                    AiJoin.type_name)[-1].node_id,
+                    AiJoin.type_name)[-1].node_id
+                and not self.graph.nodes_by_type(AiExtract.type_name),
                 start_query=not self.started,
                 physical_node=encoded_node,
             )
@@ -349,6 +427,15 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
     }
     for alias, table in payload.get("columns", {}).items():
         sources[columns_key(alias)] = table
+    pipelines = {}
+    for pipeline in build_pipelines(graph).values():
+        members = tuple(node for node in pipeline.members
+                        if isinstance(node, AiExtract))
+        if not members or members[0].node_id in pipelines:
+            continue
+        extracted = Pipeline(pipeline.alias, members)
+        for node in members:
+            pipelines[node.node_id] = extracted
     context = ExecutionContext(
         runtimes=runtimes,
         model_execution=execution,
@@ -356,6 +443,8 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         model_inputs=prepare_distributed_inputs,
         state={"distributed_execution": execution},
         functions=registry.functions,
+        pipelines=pipelines,
+        run_pipeline=execution.execute_pipeline,
     )
     started = time.perf_counter()
     if not any(isinstance(node, AiFilter) for node in graph.nodes):
@@ -378,13 +467,15 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
             None if device.usd_per_hour is None
             else elapsed / 3600 * gpu_count * device.usd_per_hour
         ),
-        backend_metrics={"scores": [
+        backend_metrics={"inferences": [
             dict(value.metrics.extension)
             for node_id, value in result.nodes.items()
-            if isinstance(graph.node(node_id), AiScore)
+            if isinstance(graph.node(node_id), AiInference)
         ]},
         executed_join_plan=executed_join_plan(graph),
         node_metrics=scalar_node_metrics(result.nodes),
     )
     report.update(throughput(graph, result.metrics, elapsed))
+    if payload.get("gpu_timing"):
+        report.update(gpu_s=result.metrics.gpu_s, chunks=result.metrics.chunks)
     return report

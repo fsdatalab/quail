@@ -6,7 +6,7 @@ title: SQL reference
 
 AI-SQL extends standard SQL with operators that call a language model
 during query execution. You can filter rows, join tables, score documents,
-and assign labels using natural language instructions.
+assign labels, and extract answers using natural language instructions.
 
 For example, suppose you registered a `reviews` table with columns `id`
 and `body`. This query returns IDs of reviews that discuss the movie's
@@ -329,6 +329,88 @@ For labels computed before later filters, see
 For the scoring methods, see
 [Label scoring](/docs/architecture/execution#label-scoring).
 
+## AI.EXTRACT
+
+Use `AI.EXTRACT` to copy the text that answers your question from each
+document. You get the answer and its character positions in the source.
+If no answer is found, both values are null.
+
+For example, imagine you registered a `contracts` table with an `id`
+column and the contract text in `text`. Ask when each lease ends:
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.text, 'When does the lease end?') AS ends
+FROM contracts c
+```
+
+Give the answer a name with `AS`. Quail also returns a column with
+`_span` added to that name. If the model selects `March 3, 2027` from
+`Lease ends on March 3, 2027.`, you get:
+
+| Column | Value |
+| --- | --- |
+| `ends` | `"March 3, 2027"` |
+| `ends_span` | `{"start": 14, "end": 27}` |
+
+`ends` is a string. `ends_span` is a struct with integer `start` and
+`end` fields. Positions count characters from zero, with `end` excluded.
+You can recover the answer in Python with `text[start:end]`.
+
+### Arguments
+
+`AI.EXTRACT(input, question[, options])`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `input` | `STRING` column | The document to read. Pass a column reference such as `c.text`. |
+| `question` | String literal | The question you want to answer, such as `'When does the lease end?'`. |
+| `options` | Object | Optional `trim` setting, described below. |
+
+### Return the surrounding lines
+
+By default, Quail asks the model to copy the fewest words that answer
+your question. Set `trim` to `false` to return the complete source lines
+that contain the answer:
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.text, 'When does the lease end?', {'trim': false}) AS ends
+FROM contracts c
+```
+
+For the same answer, `ends` contains `Lease ends on March 3, 2027.` and
+`ends_span` contains `{"start": 0, "end": 28}`. Line boundaries follow
+the line breaks in your source text.
+
+### Ask more than one question
+
+For the same `contracts` table, you can ask for both the lease end date
+and the person who signed it:
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.text, 'When does the lease end?') AS end_date,
+       AI.EXTRACT(c.text, 'Who signed the lease?') AS signer
+FROM contracts c
+```
+
+You get `end_date` and `end_date_span` for the first question, and
+`signer` and `signer_span` for the second question.
+
+### Current limits
+
+- Use Qwen3 4B or Qwen3 32B. You can distribute documents across GPUs
+  with the session's `gpus` setting. See
+  [Supported models and GPUs](/docs/user-guide/models).
+- Put each extraction directly in `SELECT` with an `AS` name. You cannot
+  use it in a `WHERE` condition or inside another expression.
+- You can combine extraction with filters, joins, classification, and scoring.
+  Each extraction reads one document column.
+
+For the equivalent Python query, see
+[`ai_extract()`](/docs/user-guide/python-api#ai_extract).
+
 ## WHERE and ON
 
 `WHERE` keeps rows that satisfy the given conditions. `ON` specifies
@@ -471,6 +553,6 @@ rows that pass `WHERE`.
 - Queries with no AI operator
 - `JOIN` with only relational predicates (no AI operator)
 - Outer joins (`LEFT`, `RIGHT`, `FULL`)
-- `AI.EXTRACT` and `AI.MAP`
+- `AI.MAP`
 
 Using any of these raises `quail.logical.CompileError`.

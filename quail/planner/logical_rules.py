@@ -24,6 +24,7 @@ from quail.logical import (
     Result,
     Scan,
     SemanticClassify,
+    SemanticExtract,
     SemanticFilter,
     SemanticJoin,
     SortKey,
@@ -86,8 +87,9 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         for expression in expressions:
             for ref in _column_refs(expression):
                 needed.setdefault(ref.alias, {})[ref.column] = None
-        if isinstance(node, SemanticClassify):
-            # the label columns a classification adds are not read below it
+        if isinstance(node, (SemanticClassify, SemanticExtract)):
+            # the columns a classification or extraction adds are not
+            # read below it
             for field in node.output_schema()[len(node.input.output_schema()):]:
                 needed.get(field.alias, {}).pop(field.column, None)
         if isinstance(node, Scan):
@@ -148,6 +150,8 @@ def _lets_through(node, alias: str) -> bool:
         return node.semantics == "full"
     if isinstance(node, SemanticClassify):
         return len(node.call.aliases()) == 2 or node.alias != alias
+    if isinstance(node, SemanticExtract):
+        return node.alias != alias
     if isinstance(node, Apply):
         return node.ids != "pairs" and node.aliases[0] != alias
     if isinstance(node, Filter):
@@ -233,33 +237,36 @@ class FilterPushdown:
 
 
 def _label_chain(node) -> tuple:
-    """Split a table's chain at its classifications.
+    """Split a table's chain at its classifications and extractions.
 
     Returns:
-        The node below the table's lowest SemanticClassify, and the
-        SemanticClassify and label filter nodes above it, lowest first.
+        The node below the table's lowest SemanticClassify or
+        SemanticExtract, and the SemanticClassify, label filter, and
+        SemanticExtract nodes above it, lowest first.
     """
     lifted = []
-    while isinstance(node, (SemanticClassify, Filter)):
+    while isinstance(node, (SemanticClassify, SemanticExtract, Filter)):
         lifted.append(node)
         node = node.input
     return node, tuple(reversed(lifted))
 
 
 def _chain_alias(node) -> str:
-    """Return the table alias a classification or label filter node reads."""
-    if isinstance(node, SemanticClassify):
+    """Return the table alias a classification, extraction, or label filter reads."""
+    if isinstance(node, (SemanticClassify, SemanticExtract)):
         return node.alias
     return node.condition.column.alias
 
 
 def lift_classifications(root: LogicalNode) -> LogicalNode | None:
-    """Move every joined table's classifications above the joins.
+    """Move every joined table's classifications and extractions above the joins.
 
     Each one-table SemanticClassify of a table that a SemanticJoin
-    reads, with the Filters on its label column, leaves the table's
-    chain and moves above the topmost join, under the root Project, in
-    scan order. A classification of a table that no join reads stays.
+    reads, with the Filters on its label column, and each
+    SemanticExtract of such a table, leaves the table's chain and
+    moves above the topmost join, under the root Project, in scan
+    order. A classification or extraction of a table that no join
+    reads stays.
 
     Returns:
         The rewritten root, or None when no classification moved.

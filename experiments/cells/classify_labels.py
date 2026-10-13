@@ -680,7 +680,7 @@ def check_collection(sf: float, collection_id: str) -> dict:
     root = str(labels.ROOT)[:-len(GROUND_TRUTH_ROOT) - 1]
     directory = labels.ROOT / "corpora" / CORPORA[sf]
     counts = {}
-    for query_id, spec in queries(include_pending=True).items():
+    for query_id, spec in queries().items():
         if not spec.info.classifies:
             continue
         tables = {relation.table: pq.read_table(
