@@ -2,6 +2,8 @@
 
 from functools import partial
 
+import numpy as np
+
 from quail.backends.quail.executor.parts import (
     ExecutionPart,
     execute_parts,
@@ -188,13 +190,17 @@ def _predicate_tokens(join_stages, answers, lists_for, anchor_keys,
         frame = list(stage.frame)
         writes = bool(frame) and frame != previous
         previous = frame
-        lengths = [len(suffix) + canvas_tokens for suffix in stage.suffixes]
-        total = 0
-        for anchor in rows:
-            indices = (None if lists_for is None
-                       else lists_for(anchor_keys[anchor][1])[j])
-            total += (len(frame) + canvas_tokens if writes else 0) + (
-                sum(lengths) if indices is None
-                else sum(lengths[i] for i in indices))
+        lengths = np.fromiter(
+            (len(suffix) + canvas_tokens for suffix in stage.suffixes),
+            dtype=np.int64, count=len(stage.suffixes))
+        suffix_tokens = int(lengths.sum())
+        total = len(rows) * (len(frame) + canvas_tokens if writes else 0)
+        if lists_for is None:
+            total += len(rows) * suffix_tokens
+        else:
+            for anchor in rows:
+                indices = lists_for(anchor_keys[anchor][1])[j]
+                total += (suffix_tokens if indices is None
+                          else int(lengths[indices].sum()))
         totals.append(total)
     return totals

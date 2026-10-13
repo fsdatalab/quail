@@ -51,6 +51,12 @@ class AliasStats:
     def mean(self) -> float:
         return self.total / self.count if self.count else 0.0
 
+    @property
+    def variance(self) -> float:
+        if not self.count:
+            return 0.0
+        return (self.squared * self.count - self.total * self.total) / self.count**2
+
     def window_pairs(self, offset: float) -> float:
         """Sum sliding pairs for document lengths plus an offset."""
         window = self.window
@@ -444,13 +450,13 @@ def score_statistics(prompt, context, chunk, *, mean_tokens=None):
         context.memo[key] = score_token_parts(prompt, context.model, context.tokenizer)
     parts = context.memo[key]
     aliases = prompt_aliases(prompt)
-    lengths = tuple(context.document_tokens[alias] for alias in aliases)
+    summaries = tuple(summarize_alias(
+        context.document_tokens[alias], context.model.sliding_window,
+        memo=context.memo) for alias in aliases)
     if mean_tokens is None:
-        mean_tokens = sum(summarize_alias(
-            values, context.model.sliding_window, memo=context.memo).mean
-            for values in lengths)
+        mean_tokens = sum(summary.mean for summary in summaries)
     cost = ScoreCost(
-        token_lengths=tuple(map(len, parts)), lengths=lengths,
+        token_lengths=tuple(map(len, parts)), summaries=summaries,
         mean_tokens=mean_tokens, model=context.model, device=context.device,
         chunk_tokens=chunk,
         capacity=budgets.arena_tokens(context.model, context.device, chunk),

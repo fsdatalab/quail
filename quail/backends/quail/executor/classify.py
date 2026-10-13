@@ -294,12 +294,12 @@ class ClassifyStages:
         self.pair_labels = {}
         self.labels = np.full(count, None, dtype=object)
         self.decoder = None
-        question = list(request.frame)
+        question = request.frame
         (cue,) = request.suffixes[0]
         # suffix p is partner p's block and the cue; its last row is read
-        blocks = [list(document) + question for document in partners.documents]
-        self.block_tokens = [len(tokens) for tokens in blocks]
-        suffixes = [tokens + [cue] for tokens in blocks]
+        suffixes = [chain_tokens(document, question, (cue,))
+                    for document in partners.documents]
+        self.block_tokens = [len(tokens) - 1 for tokens in suffixes]
 
         def ask(key):
             return list(partners.kept(self.index_of(key)))
@@ -352,7 +352,8 @@ class ClassifyStages:
         note, partner_label = spec.join_layout
         self.partners = partners
         self.pair_labels = {}
-        blocks = [list(document) + frame + request for document in partners.documents]
+        blocks = [chain_tokens(document, frame, request)
+                  for document in partners.documents]
         self.block_tokens = [len(tokens) - 1 for tokens in blocks]
 
         def ask(key):

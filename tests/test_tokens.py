@@ -70,10 +70,13 @@ def test_token_views_store_chains_and_shared_prefixes(tmp_path, monkeypatch):
         memo = {}
         summary = summarize_alias(store.lengths, 3, memo=memo)
         assert summary == AliasStats(3, 6, 14, 3, 3, ((1, 1), (2, 1)))
+        assert summary.variance == pytest.approx(2 / 3)
         assert summarize_alias(store.lengths, 3, memo=memo) is summary
         assert summarize_alias(store.lengths, memo=memo).short_counts == ()
         assert summarize_alias([4], 3, memo=memo) == AliasStats(1, 4, 16, 4, 3)
     assert summarize_alias(pa.array([], pa.int32()), 3) == AliasStats(0, 0, 0, 0, 3)
+    assert summarize_alias([]).variance == 0
+    assert summarize_alias([100_000_000, 100_000_001]).variance == 0.25
     assert summarize_alias(pa.array([100_000], pa.int32())).squared == 10_000_000_000
     store.close()
 

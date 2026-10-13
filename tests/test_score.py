@@ -261,10 +261,12 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
 
 def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     from quail.backends.quail.graph import throughput
-    from quail.cost.score import score_work
-    from quail.cost.work import ask, scan
+    from quail.cost.score import ScoreCost, score_work
+    from quail.cost.work import Work, ask, scan
     from quail.execution.runner import NodeMetrics
     from quail.explain import run_summary
+    from quail.planner.statistics import summarize_alias
+    from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     for model, canvas in (("qwen3-4b-fp8", 0), ("diffusion-gemma-26b-a4b-fp8", 1)):
         session = _session(catalog, model=model, tokenizer=list)
@@ -289,6 +291,23 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     expected = scan(0, 24) + ask(3, 21) + ask(17, 7) * 4
     assert work == expected
     assert score_work(0, 15, 9).tokens == 0
+
+    lengths = ([5, 9], [2, 4, 8])
+    summaries = tuple(summarize_alias(values) for values in lengths)
+    for capacity in (100, 1):
+        cost = ScoreCost(
+            token_lengths=(3, 4, 2), summaries=summaries,
+            mean_tokens=sum(summary.mean for summary in summaries),
+            model=QWEN3_4B_FP8, device=H100_SXM, chunk_tokens=8192,
+            capacity=capacity, workers=1, draws=1)
+        expected = Work()
+        for a, left in enumerate(lengths[0]):
+            for b, right in enumerate(lengths[1]):
+                prefix = 3 + left + 4 if b and capacity == 100 else 3 if a or b else 0
+                expected += ask(prefix, 3 + left + 4 + right + 2 - prefix)
+        work, _ = cost.estimate(6)
+        assert vars(work) == pytest.approx(vars(expected))
+        assert cost.estimate(0)[0] == Work()
 
     session = _session(catalog)
     query = session.sql(

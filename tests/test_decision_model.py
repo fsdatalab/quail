@@ -317,7 +317,7 @@ def test_decision_readouts_return_their_host_values():
 
 def test_choice_stage_reads_each_option_end_and_the_last_row(session):
     torch = pytest.importorskip("torch")
-    from quail.backends.quail.executor.classify import ClassifyStages
+    from quail.backends.quail.executor.classify import ClassifyStages, JoinPartners
 
     plan = session.sql(
         "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['x', 'yy', 'zzz']) AS c "
@@ -343,6 +343,16 @@ def test_choice_stage_reads_each_option_end_and_the_last_row(session):
                for o in offsets[:-1])
     stage.decide(0, np.array([0.1, 2.0, 0.3], dtype=np.float32))
     assert labeled == ["yy"]
+
+    document = ["document"] * 100
+    partners = JoinPartners([0], [document], lambda anchor: [0])
+    paired = ClassifyStages(
+        state, replace(spec, join_layout=(("note",), ("partner",))),
+        1, lambda key: key, partners=partners)
+    (suffix,) = paired.stages[0].suffixes
+    assert suffix.token_parts[0] is document
+    assert list(suffix) == document + list(tail)
+    assert paired.block_tokens == [len(suffix) - 1]
 
 
 def test_stock_vllm_plans_decision_readouts_from_the_layout(session):
