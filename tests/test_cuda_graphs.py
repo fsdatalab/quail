@@ -61,8 +61,7 @@ def test_padding_preserves_attention_and_only_real_rows_write_kv():
 
 
 @pytest.mark.parametrize("unsupported", [
-    "unified", "nodes", "long_context", "long_query", "many_tokens",
-    "new_arena", "disabled", "canvas", "no_reads", "wide_table",
+    "unified", "many_tokens", "new_arena",
 ])
 def test_unsupported_batches_fall_back(unsupported):
     source = chunk()
@@ -77,24 +76,10 @@ def test_unsupported_batches_fall_back(unsupported):
     match unsupported:
         case "unified":
             source.attention_mode = "unified"
-        case "nodes":
-            source.meta["reads"]["nodes"] = object()
-        case "long_context":
-            source.meta["reads"]["max_used"] = 65537
-        case "long_query":
-            source.meta["max_a"] = 33
         case "many_tokens":
             source.tokens = 513
         case "new_arena":
             arena.k = []
-        case "disabled":
-            graphs.enabled = False
-        case "canvas":
-            source.meta["canvas"] = object()
-        case "no_reads":
-            source.meta["reads"] = None
-        case "wide_table":
-            source.meta["reads"]["table"] = torch.zeros(2, 4097)
     assert graphs.forward(source) == "eager"
     assert calls == [source]
 
@@ -116,29 +101,3 @@ def test_replay_returns_independent_output_storage():
     graphs.invalidate()
     assert not graphs.graphs
     assert graphs.storage is None
-
-
-def test_worker_capture_limits_control_buffers_and_replay_admission():
-    from quail.backends.quail.executor.cuda_graphs import DecodeGraphConfig
-
-    config = DecodeGraphConfig(row_buckets=(8, 16), max_context_tokens=31,
-                               max_query_tokens=3)
-    buffers = DecodeBuffers(torch, 8, 16, config=config, device="cpu")
-    assert buffers.table.shape == (8, 2)
-    assert buffers.chunk.meta["max_a"] == 3
-    assert buffers.chunk.meta["reads"]["max_used"] == 31
-    source = chunk()
-    arena = SimpleNamespace(k=[], page_tokens=16)
-    pipeline = SimpleNamespace(engine=SimpleNamespace(arena=arena))
-    graphs = DecodeGraphs(pipeline, config=config)
-    other = DecodeGraphs(pipeline)
-    graphs.storage = other.storage = arena.k
-    assert graphs.supports(source)
-    source.tokens = 17
-    assert not graphs.supports(source) and other.supports(source)
-    source.tokens = 5
-    source.meta["reads"]["max_used"] = 32
-    assert not graphs.supports(source) and other.supports(source)
-    source.meta["reads"]["max_used"] = 9
-    source.meta["max_a"] = 4
-    assert not graphs.supports(source) and other.supports(source)

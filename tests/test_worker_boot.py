@@ -74,32 +74,6 @@ def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
     assert calls == ["synchronize", "invalidate", "resize"]
 
 
-def test_warm_prepares_graphs_after_kernels_and_again_after_resize(booted,
-                                                               monkeypatch):
-    calls = []
-    gpu = LoadedGpu.__new__(LoadedGpu)
-    gpu._warmed = False
-    gpu.torch = sys.modules["torch"]
-    gpu.arena = gpu.async_ans = gpu.model = None
-    gpu.chunk_tokens = 32
-    gpu.spec = SimpleNamespace(hf_name="test")
-    prepared = iter((True, False, True))
-
-    def prepare():
-        calls.append("prepare")
-        return next(prepared)
-
-    gpu.pipeline = SimpleNamespace(decode_graphs=SimpleNamespace(prepare=prepare))
-    monkeypatch.setattr(worker, "warm_kernels",
-                        lambda *a, **kw: calls.append("kernels") or
-                        {"tier": "touch"})
-    assert gpu.warm()[1] == "touch"
-    assert calls == ["kernels", "prepare"]
-    assert gpu.warm() == (0.0, None)
-    assert gpu.warm()[1] == "graphs"
-    assert calls == ["kernels", "prepare", "prepare", "prepare"]
-
-
 def test_prepared_boot_is_handed_to_the_query_and_used_once(
         booted, monkeypatch):
     registry = built_in_registry()

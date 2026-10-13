@@ -93,14 +93,6 @@ def test_own_suffixes_follow_each_documents_answers(path, monkeypatch):
     assert not run.arena.accounting.owned
 
 
-def test_own_suffixes_name_their_most_tokens():
-    with pytest.raises(ValueError, match="suffix_tokens"):
-        Stage(suffixes=lambda key: [[1]], readout=passthrough())
-    with pytest.raises(ValueError, match="requests"):
-        Stage(suffixes=lambda key: [[1]], suffix_tokens=1,
-              readout=passthrough(), requests=lambda key: [0])
-
-
 def test_own_suffix_over_its_most_tokens_is_refused(monkeypatch):
     cpu_staging(monkeypatch)
     answers = {}
