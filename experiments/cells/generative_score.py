@@ -44,7 +44,7 @@ import uuid
 import modal
 import numpy as np
 
-from quail.bench.images import gpu_image
+from quail.deploy.images import gpu_image
 
 app = modal.App("quail-milestone1")
 image = gpu_image()

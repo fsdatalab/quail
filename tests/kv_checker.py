@@ -21,7 +21,7 @@ from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.operators.filter import FilterPart
 from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
-from quail.execution.tokens import prefix_tree
+from quail.catalog.tokens import prefix_tree
 
 
 @dataclass(frozen=True)

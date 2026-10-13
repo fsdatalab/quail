@@ -8,7 +8,7 @@ import server_fakes
 import quail
 from quail.api import Query, QueryLike
 from quail.planner.plan import EngineConfig
-from quail.server.records import QueryFailedError, ServerError
+from quail.remote.records import QueryFailedError, ServerError
 
 pytest.importorskip("starlette")
 pytest.importorskip("uvicorn")

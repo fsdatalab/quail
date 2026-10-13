@@ -26,7 +26,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.images import gpu_image
+from quail.deploy.images import gpu_image
 
 app = modal.App("quail-milestone1")
 image = gpu_image()
@@ -102,7 +102,7 @@ def compare(run: str, query_id: str, baseline: str, sources: dict,
     if "tokens.py" in sources:
         _load_source("baseline_tokens", sources["tokens.py"])
         vocabulary_source = vocabulary_source.replace(
-            "quail.execution.tokens", "baseline_tokens")
+            "quail.catalog.tokens", "baseline_tokens")
     baseline_vocabulary = _load_source("baseline_vocabulary", vocabulary_source)
     vocabularies = {}
     methods = {

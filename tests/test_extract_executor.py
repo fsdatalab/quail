@@ -35,7 +35,7 @@ from quail.backends.quail.executor.state import LoadedModelState, QueryExecution
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_extract
 from quail.builtins import built_in_registry
-from quail.execution.tokens import TokenOffsets, TokenStore
+from quail.catalog.tokens import TokenOffsets, TokenStore
 from quail.physical import (
     AiExtract,
     AiFilter,

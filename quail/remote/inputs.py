@@ -22,8 +22,8 @@ from quail.catalog import (
     ScanRequest,
     TableProvider,
 )
-from quail.server.artifacts import write_ipc_file
-from quail.server.records import InvalidRequestError
+from quail.remote.artifacts import write_ipc_file
+from quail.remote.records import InvalidRequestError
 
 SUPPORTED = (
     "DocumentProvider.from_table, from_parquet, from_ipc, from_dataset, "

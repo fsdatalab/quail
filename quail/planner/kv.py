@@ -2,8 +2,8 @@
 
 from dataclasses import replace
 
-from quail.execution.pipelines import build_pipelines
 from quail.physical import AiFilter, AiJoin, PhysicalGraph
+from quail.physical.pipelines import build_pipelines
 
 
 def plan_kv_retention(graph: PhysicalGraph, workers: int = 1,

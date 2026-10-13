@@ -11,7 +11,7 @@ import numpy as np
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.execution.tokens import prefix_tree
+from quail.catalog.tokens import prefix_tree
 from quail.progress import logger
 
 

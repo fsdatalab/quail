@@ -792,7 +792,7 @@ class GraphBuilder:
                 live *= effective_selectivity(test.selectivity)
         for index, logical_node in enumerate(calls):
             # the extractions of a table run in one pipeline
-            # (quail.execution.pipelines): a document is read once
+            # (quail.physical.pipelines): a document is read once
             # for all of them
             shared = index > 0
             spec = extract_spec(self.context, logical_node.call,

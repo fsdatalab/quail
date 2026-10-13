@@ -12,7 +12,7 @@ import server_fakes
 import quail
 from quail import progress
 from quail.builtins import built_in_registry
-from quail.server import artifacts, inputs
+from quail.remote import artifacts, inputs
 from quail.server.executor import ChildProcessExecutor, InProcessExecutor, load_hooks
 from quail.server.scheduler import Scheduler
 from quail.server.store import Store

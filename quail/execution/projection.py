@@ -5,7 +5,7 @@ import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
 
-from quail.execution.pairs import pair_keys
+from quail.catalog.pairs import pair_keys
 from quail.execution.result import IndexRelation, QueryResult, true_answer_rows
 from quail.logical import (
     Alias,

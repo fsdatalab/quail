@@ -37,10 +37,16 @@ CI runs these on every pull request. Run them before pushing:
     uv run ruff check quail tests experiments tools
     uv run python tools/check_long_strings.py
     uv run vulture
+    uv run lint-imports
     uv run pytest -q
 
 - Ruff enforces line length 88, import order, naming, and Google style
   docstrings (`[tool.ruff]` in `pyproject.toml`).
+- `lint-imports` checks that each package imports only packages
+  below it, in the order `[tool.importlinter]` in `pyproject.toml`
+  lists: `api` on top of `execution`, `planner`, `physical`,
+  `logical`, and so on down to `specs`. Put shared code in the lower
+  package rather than importing upward.
 - `tools/check_long_strings.py` flags string literals over 200
   characters. Long content is allowed when named as content (a name
   containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a

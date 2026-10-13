@@ -8,7 +8,7 @@ import pyarrow as pa
 import pytest
 from tokenizers import Tokenizer, models, pre_tokenizers, trainers
 
-from quail.execution.tokens import (
+from quail.catalog.tokens import (
     ArrowTokenDocuments,
     GigatokenEncoder,
     TokenOffsets,
@@ -85,7 +85,7 @@ def test_token_views_store_chains_and_shared_prefixes(tmp_path, monkeypatch):
     assert summarize_alias(pa.array([100_000], pa.int32())).squared == 10_000_000_000
     index = store.prefix_index
     with monkeypatch.context() as patch:
-        patch.setattr("quail.execution.tokens._token_array",
+        patch.setattr("quail.catalog.tokens._token_array",
                       lambda *_: pytest.fail("prefix preparation ran twice"))
         assert prefix_tree(store, 1) is index.tree(1)
         assert prefix_tree(store, 16) is index.tree(16)

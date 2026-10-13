@@ -34,10 +34,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
+from quail.catalog.pairs import pair_table
 from quail.cost import budgets
 from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan, triangle
-from quail.execution.pairs import pair_table
 from quail.logical import (
     Aggregate,
     Filter,

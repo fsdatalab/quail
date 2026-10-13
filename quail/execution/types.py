@@ -10,9 +10,9 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.execution.pairs import COLUMNS_PREFIX
+from quail.catalog.pairs import COLUMNS_PREFIX
+from quail.catalog.tokens import decode_token_documents
 from quail.execution.result import filter_answer_table
-from quail.execution.tokens import decode_token_documents
 from quail.physical import (
     AiFilter,
     OutputPort,
@@ -52,7 +52,7 @@ class PhysicalRequest:
     """A physical plan, its token input bindings, and its relations.
 
     relations holds one value table per alias a HashJoin or an apply()
-    function reads, keyed ``columns:<alias>``; see quail.execution.pairs.
+    function reads, keyed ``columns:<alias>``; see quail.catalog.pairs.
     """
 
     plan: Mapping[str, Any]

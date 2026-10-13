@@ -1,6 +1,5 @@
 """Execution constraints checked during planning and graph construction."""
 
-from quail.execution.pipelines import build_pipelines
 from quail.logical import (
     Alias,
     Apply,
@@ -11,6 +10,7 @@ from quail.logical import (
 )
 from quail.logical.prompts import prompt_aliases
 from quail.physical import AiClassify, AiJoin
+from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import Refusal
 
 

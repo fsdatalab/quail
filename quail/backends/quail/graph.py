@@ -8,9 +8,9 @@ import numpy as np
 
 from quail.backends.quail.executor.operators.filter import filter_inputs
 from quail.backends.quail.executor.operators.join import prepare_join_inputs
+from quail.backends.quail.reranker import FilterRuntime
 from quail.backends.quail.retention import apply_retention
-from quail.execution.pairs import columns_key
-from quail.execution.reranker import FilterRuntime
+from quail.catalog.pairs import columns_key
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,

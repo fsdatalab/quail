@@ -23,7 +23,7 @@ from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
 from quail.backends.quail.executor.stages import Stage
-from quail.execution.tokens import chain_tokens
+from quail.catalog.tokens import chain_tokens
 
 
 class ExtractionStages:

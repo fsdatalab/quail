@@ -26,9 +26,9 @@ import pyarrow.ipc as ipc
 
 from quail.execution.result import QueryResult
 from quail.progress import say
-from quail.server.artifacts import result_from_parts
-from quail.server.inputs import PreparedInput, describe
-from quail.server.records import QueryFailedError, QueryStatus, ServerError
+from quail.remote.artifacts import result_from_parts
+from quail.remote.inputs import PreparedInput, describe
+from quail.remote.records import QueryFailedError, QueryStatus, ServerError
 
 DEFAULT_POLL_S = 30.0
 TOKEN_VARIABLE = "QUAIL_SERVER_TOKEN"

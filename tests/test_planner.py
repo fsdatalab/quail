@@ -10,12 +10,12 @@ from fakes import keep_even, register_claims_evidence, two_alias_graph
 
 import quail
 from quail.backends.quail import expected_join_predicates
+from quail.builtins import built_in_registry
 from quail.catalog import Catalog, DocumentProvider
 from quail.cost.filters import filter_cost
 from quail.cost.sol import speed_of_light
 from quail.cost.work import ask, scan, stream
-from quail.execution.pipelines import build_pipelines
-from quail.explain import explain
+from quail.explain import explain, physical_tree
 from quail.frontend.builder import col, docs, prompt
 from quail.logical import ModelCall, SemanticJoin
 from quail.physical import (
@@ -29,6 +29,7 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
+from quail.physical.pipelines import build_pipelines
 from quail.planner.api import plan_query, refine_plan
 from quail.planner.filter_order import order_filters_indexed
 from quail.planner.logical_optimizer import (
@@ -111,6 +112,7 @@ def _plan(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
     """Plan as a session would: the logical rules, then the physical planner."""
     optimized, _ = _optimize(logical, doc_tokens, model, **kwargs)
     return plan_query(optimized, model=model, device=H100_SXM,
+                      registry=built_in_registry(),
                       doc_tokens=doc_tokens, **kwargs)
 
 
@@ -525,7 +527,8 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
     forced = _plan(_chain(catalog, anchors=("t", None)), toks)
     assert searches == [True]
     refined = refine_plan(
-        forced, model=QWEN3_4B_FP8, device=H100_SXM, doc_tokens=toks)
+        forced, model=QWEN3_4B_FP8, device=H100_SXM, doc_tokens=toks,
+        registry=built_in_registry())
     assert refined.settings["retention"] == forced.settings["retention"]
     assert refined.nodes == forced.nodes
 
@@ -662,7 +665,7 @@ def test_foreign_node_placement_and_pipelines():
         assert PortRef("apply:keep_even", "ids:c") in {
             port.source for port in join.inputs}
         assert "keep_even" in session.registry.functions
-        text = per_batch.graph.explain()
+        text = physical_tree(per_batch.graph)
         assert "Foreign: keep_even (per_batch, drop) on c" in text
         # a barrier needs every survivor at once: the chain materializes
         barrier = _apply_query(session, "barrier").plan()
@@ -784,7 +787,7 @@ def _int_tokens(text):
 
 
 def _token_store(path, bodies):
-    from quail.execution.tokens import TokenStore
+    from quail.catalog.tokens import TokenStore
 
     schema = pa.schema({"body": pa.string()})
     return TokenStore.write(

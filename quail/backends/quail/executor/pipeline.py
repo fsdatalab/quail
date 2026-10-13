@@ -8,7 +8,7 @@ import pyarrow as pa
 from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.executor.parts import execute_parts, execution_prefix_tree
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.execution.tokens import DocumentKeys, DocumentPrefixes
+from quail.catalog.tokens import DocumentKeys, DocumentPrefixes
 
 
 def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> dict:

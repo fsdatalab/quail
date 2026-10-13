@@ -11,13 +11,12 @@ import test_score as score_tests
 from fakes import letter_tokens
 
 import quail
+from quail.backends.quail.reranker import RerankerModelExecution
 from quail.baselines import (
     RequestExecution,
     RequestExtractSpec,
 )
 from quail.catalog import DocumentProvider
-from quail.execution.pipelines import build_pipelines
-from quail.execution.reranker import RerankerModelExecution
 from quail.execution.result import extract_answer_table
 from quail.execution.runner import NodeResult
 from quail.execution.spans import line_span, locate_span, read_phrase
@@ -33,6 +32,7 @@ from quail.physical import (
     ExtractSpec,
     Filter,
 )
+from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import EngineConfig, Refusal
 
 QUESTION = "When does the lease end?"

@@ -57,7 +57,7 @@ from collections import Counter
 
 import modal
 
-from quail.bench.images import gpu_image
+from quail.deploy.images import gpu_image
 
 image = gpu_image()
 app = modal.App("quail-milestone1")

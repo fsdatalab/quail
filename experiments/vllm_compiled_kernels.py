@@ -54,7 +54,7 @@ import os
 import modal
 
 from quail.backends.quail.executor.attention import GROUP, Engine
-from quail.bench.images import gpu_image
+from quail.deploy.images import gpu_image
 
 image = gpu_image()
 

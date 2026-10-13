@@ -6,7 +6,7 @@ from quail.api.builder import BoundBuilder
 from quail.api.query import Query, QueryLike
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, InputStore, TableProvider
-from quail.execution.tokens import GigatokenEncoder
+from quail.catalog.tokens import GigatokenEncoder
 from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.prompts import PromptBinder
@@ -61,7 +61,7 @@ class Session:
             tokenizer_name="configured tokenizer" if tokenizer else "Gigatoken")
         self._remote = None
         if endpoint is not None:
-            from quail.server.client import RemoteConnection
+            from quail.remote.client import RemoteConnection
 
             self._remote = RemoteConnection(endpoint, self.registry.codecs)
         elif tokenizer is None:
@@ -123,7 +123,7 @@ class Session:
             session returns ``RemoteQuery`` and the server compiles the SQL.
         """
         if self._remote is not None:
-            from quail.server.client import RemoteQuery
+            from quail.remote.client import RemoteQuery
 
             return RemoteQuery(self, text, order=order,
                                dialect=SQLDialect(dialect).value)

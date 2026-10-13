@@ -22,7 +22,6 @@ from quail.cost.budgets import choose_attention_path, tree_attention_allowed
 from quail.cost.extract import estimate as extract_estimate
 from quail.cost.retention import coefficients
 from quail.cost.score import score_fixed_tokens
-from quail.execution.pipelines import build_pipelines
 from quail.physical import (
     Aggregate,
     AiClassify,
@@ -35,6 +34,7 @@ from quail.physical import (
     PhysicalGraph,
     Sort,
 )
+from quail.physical.pipelines import build_pipelines
 from quail.planner import retention
 from quail.planner.kv import plan_kv_retention
 from quail.planner.prefixes import document_shared_tokens, page_tree

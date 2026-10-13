@@ -19,7 +19,7 @@ import pyarrow as pa
 
 import quail
 from demos.quickstart import FILTER_PROMPT, load_reviews
-from quail.bench.images import pypi_gpu_image
+from quail.deploy.images import pypi_gpu_image
 
 app = modal.App("quail-engine")
 ASPECTS = (

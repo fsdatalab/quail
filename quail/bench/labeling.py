@@ -39,7 +39,7 @@ from pathlib import Path
 import modal
 import pyarrow as pa
 
-from quail.bench.images import cpu_image, gpu_image
+from quail.deploy.images import cpu_image, gpu_image
 from quail_b import data
 from quail_b.data import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 from quail_b.predicates import (

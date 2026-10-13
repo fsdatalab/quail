@@ -15,7 +15,7 @@ from quail.backends.quail.executor.parts import (
     shared_prefix_tree,
 )
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.execution.reranker import (
+from quail.backends.quail.reranker import (
     RerankerBatch,
     _score_table,
     attach_prior_columns,

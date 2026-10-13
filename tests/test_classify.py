@@ -15,6 +15,7 @@ from quail.backends.quail.executor.label_stages import label_requests
 from quail.backends.quail.executor.operators.classify import QuailClassifier
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs, answer_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
+from quail.backends.quail.reranker import RerankerBatch
 from quail.baselines import (
     RequestExecution,
 )
@@ -24,8 +25,6 @@ from quail.execution.labels import (
     GreedyDecoder,
     best_label,
 )
-from quail.execution.pipelines import build_pipelines
-from quail.execution.reranker import RerankerBatch
 from quail.labels import label_trie
 from quail.logical import (
     Alias,
@@ -45,6 +44,7 @@ from quail.physical import (
     decode_graph,
     encode_graph,
 )
+from quail.physical.pipelines import build_pipelines
 from quail.planner.logical_rules import push_down_projection
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import H100_SXM, QWEN3_4B_FP8

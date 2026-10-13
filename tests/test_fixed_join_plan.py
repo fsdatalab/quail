@@ -9,9 +9,8 @@ from test_quail_backend import graph_state
 import quail
 from quail.api.execute import execute_query
 from quail.backends.quail.graph import execute_single_graph
+from quail.backends.quail.reranker import _score_table
 from quail.bench import quailb
-from quail.execution.pipelines import build_pipelines
-from quail.execution.reranker import _score_table
 from quail.execution.runner import NodeMetrics, NodeResult
 from quail.execution.types import PhysicalResponse
 from quail.logical.nodes import CompileError
@@ -26,6 +25,7 @@ from quail.physical import (
     decode_graph,
     encode_graph,
 )
+from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import EngineConfig
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES

@@ -300,9 +300,3 @@ class PhysicalGraph:
         for node in self.nodes:
             visit(node)
         return tuple(found)
-
-    def explain(self, *, verbose: bool = False) -> str:
-        """Return an operator tree, optionally including internal fields."""
-        from quail.explain import physical_tree
-
-        return physical_tree(self, verbose=verbose)

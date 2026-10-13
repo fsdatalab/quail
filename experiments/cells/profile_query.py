@@ -22,7 +22,6 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.images import gpu_image
 from quail.bench.quailb_parallel import (
     DATA_DIR,
     VOLUMES,
@@ -30,6 +29,7 @@ from quail.bench.quailb_parallel import (
     ensure_data,
     results_vol,
 )
+from quail.deploy.images import gpu_image
 
 PROFILE_DIR = "/results/ablations/profiles"
 # caching allocator counters: a retry flushes the cache after a failed

@@ -7,14 +7,14 @@ from quail.backends.quail.executor.parts import (
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.execution.reranker import filter_scores
+from quail.backends.quail.reranker import filter_scores
+from quail.catalog.tokens import (
+    DocumentKeys,
+    DocumentPrefixes,
+)
 from quail.execution.runner import (
     NodeMetrics,
     NodeResult,
-)
-from quail.execution.tokens import (
-    DocumentKeys,
-    DocumentPrefixes,
 )
 from quail.progress import answer_sink
 

@@ -16,23 +16,23 @@ from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, join_settlement
-from quail.execution.pairs import (
+from quail.catalog.pairs import (
     RowGroups,
     allowed_members,
     members_by_partner,
     pair_partner,
     partner_map,
 )
-from quail.execution.runner import (
-    ExecutionContext,
-    NodeMetrics,
-    NodeResult,
-)
-from quail.execution.tokens import (
+from quail.catalog.tokens import (
     DocumentKeys,
     DocumentPrefixes,
     chain_tokens,
     select_documents,
+)
+from quail.execution.runner import (
+    ExecutionContext,
+    NodeMetrics,
+    NodeResult,
 )
 from quail.progress import answer_sink
 

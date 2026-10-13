@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from quail.catalog.tokens import PrefixTree, prefix_tree
 from quail.cost.budgets import PAGE_TOKENS
-from quail.execution.tokens import PrefixTree, prefix_tree
 
 
 def _documents(store):

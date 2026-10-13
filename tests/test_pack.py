@@ -14,7 +14,7 @@ from quail.backends.quail.executor.pack import (
     pages_for,
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
-from quail.execution.tokens import PrefixTree
+from quail.catalog.tokens import PrefixTree
 
 
 def _drive_join(sched, truth, arena_pages, resident=None,

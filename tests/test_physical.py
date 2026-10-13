@@ -326,7 +326,7 @@ def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
                             PortRef(second.node_id, "ids:d"))))
     graph = PhysicalGraph((source, first, second, project),
                           PortRef(project.node_id, "rows"))
-    text = graph.explain()
+    text = physical_tree(graph)
     assert text.splitlines()[0].split() == ["est.", "rows"]
     assert text.splitlines()[1].startswith("Project: d.id")
     assert text.count("Scan: d [1]") == 1
@@ -334,7 +334,7 @@ def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
     assert "count=5" in text and "count=10" in text
     assert "test.first_documents" in text
     assert "input:d" not in text
-    assert "input:d[ids:d]" in graph.explain(verbose=True)
+    assert "input:d[ids:d]" in physical_tree(graph, verbose=True)
 
     node = Scan(node_id="input:d", alias="d", n_docs=100)
     graph = PhysicalGraph((node,), PortRef(node.node_id, "ids:d"))

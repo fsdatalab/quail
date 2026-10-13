@@ -20,8 +20,8 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.images import gpu_image, sglang_image
 from quail.bench.results import combine_measurements, write_json
+from quail.deploy.images import gpu_image, sglang_image
 
 image = gpu_image()
 sglang_gpu_image = sglang_image()

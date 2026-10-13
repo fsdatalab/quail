@@ -11,7 +11,7 @@ import pyarrow.ipc as ipc
 import pytest
 import server_fakes
 
-from quail.server import inputs
+from quail.remote import inputs
 
 pytest.importorskip("starlette")
 

@@ -10,7 +10,7 @@ import pyarrow as pa
 
 from quail.api.execute import execute_query
 from quail.catalog import inputs
-from quail.execution.pairs import columns_key, estimate_pair_fraction
+from quail.catalog.pairs import columns_key, estimate_pair_fraction
 from quail.execution.projection import projection_for
 from quail.execution.reporting import (
     collect_answers,
@@ -26,13 +26,14 @@ from quail.execution.runner import (
 )
 from quail.execution.selection import selected_rows
 from quail.execution.types import PhysicalRequest, document_input
+from quail.explain import explain
 from quail.logical import (
     LogicalPlan,
     join_conditions,
     oriented_join_conditions,
 )
 from quail.physical import Scan, encode_graph
-from quail.planner import explain, plan_query, refine_plan
+from quail.planner import plan_query, refine_plan
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import Refusal, RefusalError
 from quail.planner.statistics import filter_stop_keys
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
 class QueryLike(Protocol):
     """What ``Session.sql`` returns, whether the query runs here or remotely.
 
-    ``Query`` runs in this process; ``quail.server.client.RemoteQuery``
+    ``Query`` runs in this process; ``quail.remote.client.RemoteQuery``
     sends the SQL to Quail Server. Both offer these methods, so code
     written against one works with the other.
     """

@@ -2,7 +2,7 @@
 
 import pytest
 
-from quail.server.records import (
+from quail.remote.records import (
     InvalidRequestError,
     QueryIdConflictError,
     QueryStatus,

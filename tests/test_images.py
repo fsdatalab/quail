@@ -3,7 +3,7 @@
 import tomllib
 from pathlib import Path
 
-from quail.bench import images
+from quail.deploy import images
 
 
 def test_image_uv_version_is_the_required_one():

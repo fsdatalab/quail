@@ -20,6 +20,7 @@ from quail.backends.quail.executor.readout import (
 )
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
+from quail.catalog.tokens import chain_tokens
 from quail.execution.labels import (
     GreedyDecoder,
     best_label,
@@ -28,7 +29,6 @@ from quail.execution.labels import (
     tree_scores,
     trie_chains,
 )
-from quail.execution.tokens import chain_tokens
 from quail.labels import DECISION_SCORING, decode_runs, read_nodes
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 

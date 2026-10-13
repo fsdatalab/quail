@@ -25,14 +25,14 @@ from quail.baselines.request_scheduling import (
     text_answer,
     true_bit,
 )
-from quail.cost import budgets
-from quail.execution.labels import match_label
-from quail.execution.pairs import (
+from quail.catalog.pairs import (
     allowed_members,
     members_by_partner,
     pair_partner,
     partner_map,
 )
+from quail.cost import budgets
+from quail.execution.labels import match_label
 from quail.execution.result import (
     answer_table,
     extract_answer_table,

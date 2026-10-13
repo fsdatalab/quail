@@ -13,7 +13,7 @@ from quail.backends.quail.executor.extract.candidates import (
     make_streams,
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.execution.tokens import GigatokenEncoder
+from quail.catalog.tokens import GigatokenEncoder
 
 
 def test_gigatoken_vocabulary_encodes_unicode_without_transformers(monkeypatch):

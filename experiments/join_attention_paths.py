@@ -26,7 +26,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.images import gpu_image
+from quail.deploy.images import gpu_image
 from quail.specs import H100_USD_PER_HOUR
 
 QUERIES = ("LEP-4", "FEV-4")

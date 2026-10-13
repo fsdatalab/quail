@@ -414,7 +414,7 @@ def test_join_anchor_keeps_its_window_for_a_later_child(monkeypatch):
 
     from fakes import fake_pipeline, fake_torch
 
-    from quail.execution.tokens import prefix_tree
+    from quail.catalog.tokens import prefix_tree
 
     cpu_staging(monkeypatch)
     # anchor 1 shares 80 tokens with anchor 0, anchor 2 only the first

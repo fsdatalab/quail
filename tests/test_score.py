@@ -13,8 +13,7 @@ import quail
 from quail.api.execute import execute_query
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
-from quail.catalog import Catalog, DocumentProvider
-from quail.execution.reranker import (
+from quail.backends.quail.reranker import (
     FilterRuntime,
     RerankerBatch,
     RerankerModelExecution,
@@ -22,6 +21,7 @@ from quail.execution.reranker import (
     compare_score,
     score_in_batches,
 )
+from quail.catalog import Catalog, DocumentProvider
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -535,7 +535,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     from quail.backends.quail.executor import parts as executor_parts
     from quail.backends.quail.executor.operators import score as module
     from quail.backends.quail.worker import quail_runtime_payload
-    from quail.execution.tokens import TokenView
+    from quail.catalog.tokens import TokenView
 
     documents = {
         "a": [TokenView(pa.array([10, 11], type=pa.int32()))],
@@ -676,7 +676,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
 
 
 def _shared_store(path, bodies):
-    from quail.execution.tokens import TokenStore
+    from quail.catalog.tokens import TokenStore
 
     schema = pa.schema({"body": pa.string()})
     return TokenStore.write(
@@ -753,7 +753,7 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
 def test_shared_score_borrows_prefixes_and_reads_the_cue(monkeypatch):
     from quail.backends.quail.executor import parts as executor_parts
     from quail.backends.quail.executor.operators import score as module
-    from quail.execution.tokens import TokenView
+    from quail.catalog.tokens import TokenView
 
     documents = {"d": [TokenView(pa.array(tokens, type=pa.int32()))
                        for tokens in ([10, 11, 12, 13], [10, 11, 12, 14], [20])]}

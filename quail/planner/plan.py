@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
-from quail.execution.pipelines import build_pipelines
 from quail.physical import (
     AiFilter,
     AiInference,
@@ -18,6 +17,7 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.codec import plan_envelope
+from quail.physical.pipelines import build_pipelines
 from quail.planner.kv import plan_kv_retention
 from quail.specs import MODELS
 

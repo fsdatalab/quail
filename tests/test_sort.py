@@ -4,6 +4,7 @@ import pyarrow as pa
 import pytest
 from test_planner import _optimize, _plan, node_kinds, tok
 
+from quail.builtins import built_in_registry
 from quail.catalog import Catalog, DocumentProvider
 from quail.execution.result import QueryResult
 from quail.execution.runner import NodeResult, SortRuntime
@@ -129,6 +130,7 @@ def test_distinct_is_dropped_when_every_tables_id_is_selected(catalog):
     assert "distinct_elimination" in changed
     assert not isinstance(optimized.root, Result) or not optimized.root.distinct
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
+                      registry=built_in_registry(),
                       doc_tokens=tokens)
     assert node_kinds(plan)[-2:] == ["Project", "Limit"]
     assert plan.settings["filter_limit"] == 3
@@ -157,6 +159,7 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
                 if isinstance(node, SemanticFilter))
     assert node.stop_key == ("author",)
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
+                      registry=built_in_registry(),
                       doc_tokens=tokens)
     ai_filter = next(node for node in plan.nodes if isinstance(node, AiFilter))
     assert ai_filter.stop_key == ("author",)

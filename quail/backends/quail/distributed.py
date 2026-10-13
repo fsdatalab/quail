@@ -12,8 +12,9 @@ from quail.backends.quail import coordinator
 from quail.backends.quail.executor.operators.filter import stop_groups
 from quail.backends.quail.graph import graph_report
 from quail.backends.quail.prompts import join_request
-from quail.execution.pairs import columns_key
-from quail.execution.reranker import score_in_batches
+from quail.backends.quail.reranker import score_in_batches
+from quail.catalog.pairs import columns_key
+from quail.catalog.tokens import select_documents
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -21,7 +22,6 @@ from quail.execution.runner import (
     NodeResult,
     compute_subgraph,
 )
-from quail.execution.tokens import select_documents
 from quail.physical import (
     AiClassify,
     AiExtract,

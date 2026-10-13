@@ -180,7 +180,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     from dataclasses import replace
 
     from quail.backends.quail.executor import label_stages as label_stages_module
-    from quail.execution.pipelines import build_pipelines
+    from quail.physical.pipelines import build_pipelines
     from quail.specs.base import AnswerCanvas
 
     settings = AnswerCanvas(rows=4, turn_close_id=6, pad_id=0)
@@ -359,7 +359,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     # the settings' shared preamble is empty, as a classification plan's is
     assert SETTINGS["pre_ids"] == []
     if shape == "score_first":
-        from quail.execution.reranker import _score_table
+        from quail.backends.quail.reranker import _score_table
         from quail.execution.runner import NodeResult
 
         execute = execution.execute
@@ -577,7 +577,7 @@ def joined_graph(two_joins=False):
 @pytest.mark.parametrize("two_joins", [False, True])
 def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
         monkeypatch, two_joins):
-    from quail.execution.pipelines import build_pipelines
+    from quail.physical.pipelines import build_pipelines
 
     graph = joined_graph(two_joins)
     chains = {tuple(

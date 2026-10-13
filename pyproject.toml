@@ -52,6 +52,7 @@ dev = [
     # downloads
     "pandas==3.0.5",
     "hf-transfer==0.1.9",
+    "import-linter==2.3",
 ]
 
 [tool.uv.sources]
@@ -103,6 +104,36 @@ convention = "google"
 
 [tool.ruff.lint.isort]
 known-first-party = ["quail", "quail_b", "experiments"]
+
+# Each package imports only the packages below it. `uv run lint-imports`
+# checks the contract; the one exception is the lazy import that lets
+# ExtensionRegistry.with_built_ins() build the built in registry.
+[tool.importlinter]
+root_package = "quail"
+
+[[tool.importlinter.contracts]]
+name = "Packages import downward only"
+type = "layers"
+layers = [
+    "quail.bench",
+    "quail.server",
+    "quail.api",
+    "quail.builtins",
+    "quail.baselines",
+    "quail.extensions",
+    "quail.backends",
+    "quail.remote",
+    "quail.execution",
+    "quail.explain",
+    "quail.planner",
+    "quail.physical",
+    "quail.frontend",
+    "quail.catalog",
+    "quail.logical",
+    "quail.cost",
+    "quail.specs | quail.labels | quail.progress | quail.deploy",
+]
+ignore_imports = ["quail.extensions -> quail.builtins"]
 
 [tool.vulture]
 paths = ["quail"]

@@ -19,7 +19,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.catalog.providers import Catalog, ScanRequest
-from quail.execution.tokens import (
+from quail.catalog.tokens import (
     ColumnStoreWriter,
     ScanInput,
     TokenOffsets,

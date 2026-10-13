@@ -5,7 +5,7 @@ from fakes import cpu_staging
 from kv_checker import Run, Setup, answer, chain, passthrough
 
 from quail.backends.quail.executor.stages import Stage, run_stages
-from quail.execution.tokens import prefix_tree
+from quail.catalog.tokens import prefix_tree
 
 DOCS = [[1, 2, 3, 4], [5, 6, 7]]
 QUESTION = [40]

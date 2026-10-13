@@ -16,7 +16,7 @@ from fakes import register_claims_evidence
 import quail
 from demos import quickstart, quickstart_modal
 from quail.api import execute as execution
-from quail.execution.pairs import (
+from quail.catalog.pairs import (
     allowed_members,
     estimate_pair_fraction,
     members_by_partner,

@@ -12,8 +12,8 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.readout import AsyncScores
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.execution.reranker import RerankerBatch
-from quail.execution.tokens import DocumentPrefixes, chain_tokens
+from quail.backends.quail.reranker import RerankerBatch
+from quail.catalog.tokens import DocumentPrefixes, chain_tokens
 from quail.physical import ClassifySpec
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 

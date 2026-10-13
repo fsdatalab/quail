@@ -4,7 +4,6 @@ from collections import Counter
 from collections.abc import Mapping
 
 from quail import logical as logical_nodes
-from quail.execution.pipelines import build_pipelines
 from quail.logical import DEFAULT_SELECTIVITY, LogicalPlan, effective_selectivity
 from quail.physical import (
     Aggregate,
@@ -24,6 +23,8 @@ from quail.physical import (
     Scan,
     Sort,
 )
+from quail.physical.pipelines import build_pipelines
+from quail.planner.plan import Refusal
 
 
 def _number(value):
@@ -574,8 +575,6 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         rules: The registered logical rules and physical rules, as a
             pair of sequences, listed when verbose.
     """
-    from quail.planner.plan import Refusal
-
     lines = ["logical:"]
     lines.extend("  " + line for line in logical_tree(logical).splitlines())
     if isinstance(physical, Refusal):

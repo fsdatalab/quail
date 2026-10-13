@@ -13,9 +13,9 @@ import threading
 import time
 from pathlib import Path
 
-from quail.server.artifacts import ANSWERS_FILE, Answers, verify_result
+from quail.remote.artifacts import ANSWERS_FILE, Answers, verify_result
+from quail.remote.records import InvalidRequestError, QueryStatus
 from quail.server.executor import Executor, Job
-from quail.server.records import InvalidRequestError, QueryStatus
 from quail.server.store import Store
 
 logger = logging.getLogger("quail.server")

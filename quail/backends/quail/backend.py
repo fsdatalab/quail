@@ -17,8 +17,8 @@ from quail.backends.quail.executor.operators.join import execute_join, execute_j
 from quail.backends.quail.executor.operators.score import QuailScorer
 from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
+from quail.backends.quail.reranker import RerankerModelExecution
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
-from quail.execution.reranker import RerankerModelExecution
 from quail.logical import LogicalPlan, has_score, shared_preamble
 from quail.logical.prompts import answer_ids
 from quail.physical import (

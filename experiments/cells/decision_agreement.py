@@ -25,7 +25,7 @@ import time
 import modal
 
 try:
-    from quail.bench.images import gpu_image
+    from quail.deploy.images import gpu_image
     quail_image = gpu_image()
 except ImportError:    # the reference container has no quail package
     quail_image = None
