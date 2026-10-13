@@ -268,17 +268,17 @@ class ClassifyBuilder(ClassifyStatistics):
                  for alias, label, frame in prompt.label_token_ids}
         note, partner_label = parts[self.alias][1], parts[partner][0]
         block = int(round(partner_tokens)) + len(tail) - 1
-        chains = [
+        suffixes = [
             block + length
             for length in classify_cost.suffix_lengths(LETTERS_SCORING, labels)
         ]
-        estimated = classify_cost.estimate_chains(
-            len(head), len(note) + len(partner_label), chains, live=pairs,
+        estimated = classify_cost.estimate_suffixes(
+            len(head), len(note) + len(partner_label), suffixes, live=pairs,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=True,
             canvas_rows=self.model.canvas_tokens,
             head_rows=len({tuple(ids) for ids in labels}))
-        need = len(head) + self.longest + len(note) + max(chains)
+        need = len(head) + self.longest + len(note) + max(suffixes)
         if need > self.budget:
             raise ClassifyRefusedError.over_budget(
                 f"a row of {self.alias!r} x {partner!r}", need, self.budget)
@@ -302,7 +302,7 @@ class ClassifyBuilder(ClassifyStatistics):
         if need > self.budget:
             raise ClassifyRefusedError.over_budget(
                 f"a document in {self.alias!r}", need, self.budget)
-        estimated = classify_cost.estimate_chains(
+        estimated = classify_cost.estimate_suffixes(
             len(head), frame, [request], live=live, lengths=self.lengths,
             shared=self.shared, chunk=self.chunk, model=self.model,
             device=self.device, answer_rows=len(blocks) + 1)
@@ -327,7 +327,7 @@ class ClassifyBuilder(ClassifyStatistics):
                  for alias, label, note in prompt.label_token_ids}
         note, partner_label = parts[self.alias][1], parts[partner][0]
         request = int(round(partner_tokens)) + len(tail)
-        estimated = classify_cost.estimate_chains(
+        estimated = classify_cost.estimate_suffixes(
             len(head), len(note) + len(partner_label), [request], live=pairs,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=True,

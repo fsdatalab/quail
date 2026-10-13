@@ -24,7 +24,7 @@ from quail.physical.base import (
 
 @dataclass(frozen=True)
 class RequestFilterSpec:
-    """One filter chain submitted as model requests."""
+    """One filter sequence submitted as model requests."""
 
     alias: str
     written_positions: tuple[int, ...]

@@ -10,7 +10,7 @@ from quail.baselines.request import RequestBackend
 from quail.baselines.request_scheduling import (
     MAX_BATCHED_TOKENS,
     MAX_SEQUENCES,
-    run_filter_chain_async,
+    run_filter_sequence_async,
 )
 
 PAGE_SIZE = 16
@@ -84,11 +84,11 @@ class SGLangClient:
             int(result["meta_info"].get("cached_tokens") or 0),
         )
 
-    def run_filter_chain(self, sampling_params, body_ids, question_ids,
+    def run_filter_sequence(self, sampling_params, body_ids, question_ids,
                          read_answer, *, tag="q"):
         """Submit each document's next filter as soon as it passes."""
         del tag
-        return self.engine.loop.run_until_complete(run_filter_chain_async(
+        return self.engine.loop.run_until_complete(run_filter_sequence_async(
             self._generate_one,
             sampling_params,
             body_ids,

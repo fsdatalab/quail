@@ -154,15 +154,15 @@ class GreedyDecoder:
             self.pending[doc] = run
 
 
-def trie_chains(label_ids, read=None) -> list:
-    """Split the fed trie nodes into chains that together hold each once.
+def trie_paths(label_ids, read=None) -> list:
+    """Split the fed trie nodes into paths that together hold each once.
 
     The fed nodes are the read nodes and their ancestors. The first
-    chain starts at the root, the answer cue's row, and follows each
-    node's first fed child; every other fed child starts a new chain.
-    A chain is one causal segment of the forward pass, so a row sees
-    the chain's earlier rows; the rows above the chain's first node
-    lie in earlier chains and are gathered separately.
+    path starts at the root, the answer cue's row, and follows each
+    node's first fed child; every other fed child starts a new path.
+    A path is one causal segment of the forward pass, so a row sees
+    the path's earlier rows; the rows above the path's first node
+    lie in earlier paths and are gathered separately.
 
     Args:
         label_ids: One token id sequence per label.
@@ -170,57 +170,57 @@ def trie_chains(label_ids, read=None) -> list:
             None reads every node with children.
 
     Returns:
-        One (nodes, start, gathers) per chain: the trie nodes whose
-        rows the chain holds, in order; the depth of its first node,
+        One (nodes, start, gathers) per path: the trie nodes whose
+        rows the path holds, in order; the depth of its first node,
         which is the position offset past the answer cue; and the
-        ancestor rows outside it as (chain, leading rows) pairs.
+        ancestor rows outside it as (path, leading rows) pairs.
     """
     trie = label_trie(label_ids)
     if read is None:
         read = set(trie)
     fed = fed_nodes(read)
-    chains = []
-    placed = {}       # node -> (chain, row)
+    paths = []
+    placed = {}       # node -> (path, row)
 
-    def extend(chain, node):
-        placed[node] = (chain, len(chains[chain][0]))
-        chains[chain][0].append(node)
+    def extend(path, node):
+        placed[node] = (path, len(paths[path][0]))
+        paths[path][0].append(node)
         children = [node + (token,) for token in trie[node]
                     if node + (token,) in fed]
         for index, child in enumerate(children):
             if index == 0:
-                extend(chain, child)
+                extend(path, child)
             else:
-                chains.append(([], len(child), []))
-                extend(len(chains) - 1, child)
+                paths.append(([], len(child), []))
+                extend(len(paths) - 1, child)
 
-    chains.append(([], 0, []))
+    paths.append(([], 0, []))
     extend(0, ())
-    for index, (nodes, _, gathers) in enumerate(chains):
+    for index, (nodes, _, gathers) in enumerate(paths):
         if index == 0:
             continue
         parent = nodes[0][:-1]
         counts = {}
         for depth in range(len(parent) + 1):
-            chain, row = placed[tuple(parent[:depth])]
-            counts[chain] = max(counts.get(chain, 0), row + 1)
+            path, row = placed[tuple(parent[:depth])]
+            counts[path] = max(counts.get(path, 0), row + 1)
         gathers.extend(sorted(counts.items()))
-    return chains
+    return paths
 
 
-def chain_reads(chains, read=None) -> list[bool]:
-    """Return which chain rows, in chain order, are read.
+def path_reads(paths, read=None) -> list[bool]:
+    """Return which path rows, in path order, are read.
 
     Args:
-        chains: The chains ``trie_chains`` built.
+        paths: The paths ``trie_paths`` built.
         read: The read nodes, from ``read_nodes``; None reads every row.
     """
     return [read is None or node in read
-            for nodes, _, _ in chains for node in nodes]
+            for nodes, _, _ in paths for node in nodes]
 
 
-def tree_scores(label_ids, chains, targets, logprobs, read=None) -> np.ndarray:
-    """Return every label's log probability from packed trie chains.
+def tree_scores(label_ids, paths, targets, logprobs, read=None) -> np.ndarray:
+    """Return every label's log probability from packed trie paths.
 
     A label's probability is the product of its tokens' probabilities
     at the read nodes on its path. A label that starts another gets
@@ -230,9 +230,9 @@ def tree_scores(label_ids, chains, targets, logprobs, read=None) -> np.ndarray:
 
     Args:
         label_ids: One token id sequence per label.
-        chains: The chains ``trie_chains`` built.
+        paths: The paths ``trie_paths`` built.
         targets: The token ids, one per column of ``logprobs``.
-        logprobs: Shape (read rows, targets): the chains' read rows
+        logprobs: Shape (read rows, targets): the paths' read rows
             back to back, each read after the trie node it holds.
         read: The read nodes, from ``read_nodes``; None reads every row.
 
@@ -241,8 +241,8 @@ def tree_scores(label_ids, chains, targets, logprobs, read=None) -> np.ndarray:
         extensions hold all of its probability scores minus infinity.
     """
     row_of = {}
-    for node, is_read in zip((node for nodes, _, _ in chains for node in nodes),
-                             chain_reads(chains, read)):
+    for node, is_read in zip((node for nodes, _, _ in paths for node in nodes),
+                             path_reads(paths, read)):
         if is_read:
             row_of[node] = len(row_of)
     column = {token: index for index, token in enumerate(targets)}

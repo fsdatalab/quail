@@ -129,8 +129,8 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                 query = build()
                 operators = query.logical.operators()
                 selectivities = [
-                    predicate.selectivity for chain in operators.filters.values()
-                    for predicate in chain]
+                    predicate.selectivity for sequence in operators.filters.values()
+                    for predicate in sequence]
                 selectivities += [join.selectivity for join in operators.joins]
                 assert all((s is None) == qid.startswith("PRIV-")
                            for s in selectivities), case

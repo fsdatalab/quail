@@ -8,15 +8,15 @@ from quail.physical import AiExtract, AiFilter, AiJoin
 
 def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
                    cap_pages, model, device, chunk) -> dict:
-    """Price each node's own work, and each chain's recompute if released.
+    """Price each node's own work, and each sequence's recompute if released.
 
-    Returns node id -> {"seconds", and for a filter chain a later join
+    Returns node id -> {"seconds", and for a filter sequence a later join
     anchors on, "release_recompute_tokens" and
     "release_recompute_seconds"}. A node's seconds price its work
     alone; nodes do not add up to the plan's estimate because chunk
     packing shares forward passes across them. The recompute figure
     is the expected survivors past the retention pool cap times their
-    prefix cost: what the join pays if the chain's KV is not pinned.
+    prefix cost: what the join pays if the sequence's KV is not pinned.
     """
     anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
     out = {}

@@ -109,7 +109,7 @@ built-in rules of the same kind, in registration order.
 | `distinct_pushdown` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
 | `projection_pushdown` | Logical | Load only columns the query uses. | No |
 | `filter_pushdown` | Logical | Move eligible CPU filters and Python functions before joins. | No |
-| `limit_pushdown` | Physical | Stop an eligible filter chain after enough documents pass. | No |
+| `limit_pushdown` | Physical | Stop an eligible filter sequence after enough documents pass. | No |
 | `kv_retention` | Physical | Keep selected document KV for later operators. | Yes |
 | `label_scoring` | Physical | Choose a classification's label scoring method. | Yes |
 | `prefix_sharing` | Physical | Reuse KV between documents with a shared prefix. | Yes |

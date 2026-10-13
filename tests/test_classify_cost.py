@@ -6,7 +6,7 @@ from dataclasses import asdict, replace
 import numpy as np
 import pytest
 
-from quail.cost.classify import estimate, estimate_chains
+from quail.cost.classify import estimate, estimate_suffixes
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.sol import unrounded_seconds
 from quail.cost.work import Work, ask, scan, stream
@@ -234,7 +234,7 @@ def test_decision_models_read_option_rows_through_their_head(resident):
     model = DECISION_2_KAI_0_6B_BF16
     assert model.decision_head_dim == 256
     lengths, options = (10, 20, 30), 26
-    cost = estimate_chains(HEAD, FRAME, [50], live=len(lengths), lengths=lengths,
+    cost = estimate_suffixes(HEAD, FRAME, [50], live=len(lengths), lengths=lengths,
                            shared=(), chunk=CHUNK, model=model, device=H100_SXM,
                            resident=resident, answer_rows=options + 1)
     work = Work()
@@ -253,7 +253,7 @@ def test_decision_models_read_option_rows_through_their_head(resident):
     assert cost.seconds < unrounded_seconds(work, model, H100_SXM, CHUNK) + vocabulary
     without_rate = replace(H100_SXM, fp32_flops=0.0)
     with pytest.raises(ValueError, match="fp32"):
-        estimate_chains(HEAD, FRAME, [50], live=3, lengths=lengths, shared=(),
+        estimate_suffixes(HEAD, FRAME, [50], live=3, lengths=lengths, shared=(),
                         chunk=CHUNK, model=model, device=without_rate,
                         answer_rows=options + 1)
 

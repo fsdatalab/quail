@@ -130,7 +130,7 @@ def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
     assert built == plan
 
     # one prompt, three placeholders, all three documents in the same
-    # model call - never a chain of pairwise stages
+    # model call - never a sequence of pairwise stages
     on_plan = compile_sql(THREE_WAY_ON, catalog, tok)
     join = on_plan.root.input
     assert isinstance(join, SemanticJoin)
@@ -236,7 +236,7 @@ PAIR_JOIN_SQL = """
 
 
 def test_join_predicates_semantics_and_equality_pruning(catalog):
-    # a chain: each multi-table AI_FILTER is its own pairwise join
+    # a sequence: each multi-table AI_FILTER is its own pairwise join
     plan = compile_sql(TWO_ONS, catalog, tok)
     outer = plan.root.input
     inner = join_outer_input(outer)
@@ -514,12 +514,12 @@ def test_builder_places_apply_nodes_in_the_logical_tree():
         "same_key", "barrier", "pairs", 0)
     assert pairs.aliases == ("c", "e")
     assert isinstance(pairs.input, Join)
-    chain = pairs.input.left
-    assert isinstance(chain, Apply)
-    assert (chain.function, chain.kind, chain.ids, chain.aliases) == (
+    sequence = pairs.input.left
+    assert isinstance(sequence, Apply)
+    assert (sequence.function, sequence.kind, sequence.ids, sequence.aliases) == (
         "keep_even", "per_batch", "drop", ("c",))
-    assert isinstance(chain.input, SemanticFilter)
-    assert [str(ref.column) for ref in chain.columns] == ["url"]
+    assert isinstance(sequence.input, SemanticFilter)
+    assert [str(ref.column) for ref in sequence.columns] == ["url"]
 
     base = docs(cat, "claims", tok).alias("c")
     with pytest.raises(CompileError, match="must work on one table"):

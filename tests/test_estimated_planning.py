@@ -107,12 +107,12 @@ def test_prefix_sharing_and_attention_path_are_decided_from_exact_tokens():
     session = _table_session([shared + f"tail {i} " * (i + 1) for i in range(4)])
     query = session.sql(SQL)
     first = query.plan()
-    chain = next(n for n in first.nodes if n.type_name == "quail.ai_filter")
-    assert query._estimated == ("d",) and not chain.share_prefixes
+    sequence = next(n for n in first.nodes if n.type_name == "quail.ai_filter")
+    assert query._estimated == ("d",) and not sequence.share_prefixes
     query.wait_for_tokens()
     refined = query.plan()
-    chain = next(n for n in refined.nodes if n.type_name == "quail.ai_filter")
-    assert chain.share_prefixes and chain.arena_writes
+    sequence = next(n for n in refined.nodes if n.type_name == "quail.ai_filter")
+    assert sequence.share_prefixes and sequence.arena_writes
     # nothing left to refine: the plan is stable
     query.wait_for_tokens()
     assert query.plan() is refined
@@ -126,7 +126,7 @@ def test_prefix_sharing_and_attention_path_are_decided_from_exact_tokens():
     query = session.sql(SQL)
     query.plan()
     query.wait_for_tokens()
-    chain = next(n for n in query.plan().nodes
+    sequence = next(n for n in query.plan().nodes
                  if n.type_name == "quail.ai_filter")
-    assert chain.share_prefixes and chain.attention == "tree"
+    assert sequence.share_prefixes and sequence.attention == "tree"
     session.close()

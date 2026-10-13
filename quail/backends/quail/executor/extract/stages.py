@@ -23,7 +23,7 @@ from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
 from quail.backends.quail.executor.stages import Stage
-from quail.catalog.tokens import chain_tokens
+from quail.catalog.tokens import concat_tokens
 
 
 class ExtractionStages:
@@ -152,7 +152,7 @@ class ExtractionStages:
             same_tokens = np.array_equal(prior, tokens)
         if shared and stored is not None and same_tokens:
             key = (alias, int(document))
-        prefix = chain_tokens(self.head, ids)
+        prefix = concat_tokens(self.head, ids)
         scan = DocumentTokens.from_tokens(
             self.vocabulary, tokens, ids.character_offsets, len(self.head))
         return Document(index=index, text=text, prefix=prefix, scan=scan, key=key,

@@ -17,7 +17,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from quail.cost import budgets
-from quail.cost.filters import filter_chain_work, filter_cost
+from quail.cost.filters import filter_cost, filter_sequence_work
 from quail.cost.joins import PricedJoin
 from quail.cost.retention import retention_pages
 from quail.cost.score import ScoreCost
@@ -396,9 +396,9 @@ def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
 
 def filter_alias_work(preds, stats, order, pre: int,
                       canvas: int = 0, window: int = 0) -> Work:
-    """Prepare a filter chain's counts and price its recorded order."""
+    """Prepare a filter sequence's counts and price its recorded order."""
     predicates = [preds[index] for index in order]
-    return filter_chain_work(
+    return filter_sequence_work(
         [question_tokens(predicate.prompt, canvas) for predicate in predicates],
         [effective_selectivity(predicate.selectivity) for predicate in predicates],
         pre + stats.mean_doc_tokens, float(stats.n_docs), window)
@@ -406,7 +406,7 @@ def filter_alias_work(preds, stats, order, pre: int,
 
 def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
                  model: ModelSpec, orders: dict) -> dict:
-    """Return the expected Work of each table's filter chain in run order.
+    """Return the expected Work of each table's filter sequence in run order.
 
     Args:
         plan: The logical plan.

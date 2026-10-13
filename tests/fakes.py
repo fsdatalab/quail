@@ -201,18 +201,18 @@ def expected_filter_rows(filter_truth):
 
 def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
                     filtered=True, semantics="full", keep_kv=False):
-    """R's filter chain into a join with p.
+    """R's filter sequence into a join with p.
 
     Args:
-        pipelined: Whether the chain and the join run as one pipeline;
+        pipelined: Whether the sequence and the join run as one pipeline;
             otherwise a Barrier between them materializes the
-            survivors and the chain retains their KV.
+            survivors and the sequence retains their KV.
         stages: Filter stages on r.
         hash_join: Pair r and p on their "key" columns with a HashJoin
             over the scans that feeds the join its pairs port.
-        foreign: (kind, ids) of a Foreign node between the chain and
+        foreign: (kind, ids) of a Foreign node between the sequence and
             the join; ids "pairs" feeds the join its pairs port.
-        filtered: Whether r's filter chain runs at all; otherwise the
+        filtered: Whether r's filter sequence runs at all; otherwise the
             join reads r's scan and loads every anchor itself.
         semantics: The join stage's semantics, "full" or "anti".
         keep_kv: Whether the join retains surviving anchors' KV.

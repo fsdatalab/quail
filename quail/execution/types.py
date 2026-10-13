@@ -158,7 +158,7 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     """Build the join answer table without visiting pairs in Python.
 
     A join can hold tens of millions of pairs. Python visits the
-    anchors; the pairs are concatenated by chain and converted by
+    anchors; the pairs are concatenated across anchors and converted by
     Arrow, and the partner ids come from one take.
     """
     anchor = str(value["anchor"])

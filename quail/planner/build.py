@@ -212,7 +212,7 @@ class GraphBuilder:
             self.group_ids.append(f"ai_join:{anchor}" if self.seen_ids[anchor] == 1
                              else f"ai_join:{anchor}:{self.seen_ids[anchor]}")
 
-        # a chain streams only into its alias's first use, and never through
+        # a sequence streams only into its alias's first use, and never through
         # a barrier apply
         barrier_aliases = {alias for alias, group in self.alias_applies.items()
                            if any(apply.kind == "barrier" for apply in group)}
@@ -222,7 +222,7 @@ class GraphBuilder:
                 if any(apply.kind == "barrier"
                        for apply in self.join_applies.get(spec.written_pos, ())):
                     barrier_aliases.add(anchor)
-        self.chained = retention.chained_aliases(
+        self.streamed = retention.streamed_aliases(
             self.sequence_groups, set(self.ask_filters), barrier_aliases, self.workers)
 
         self.nodes = []
@@ -261,10 +261,10 @@ class GraphBuilder:
             self.nodes.append(node)
             self.pairs_src[node.written_pos] = node
 
-        # aliases whose filter chain runs in one pipeline with the
+        # aliases whose filter sequence runs in one pipeline with the
         # classification or join after it
         between = self.classified - self.after_joins
-        self.pipelined = self.chained | {
+        self.pipelined = self.streamed | {
             alias for alias in self.ask_filters
             if self.workers == 1 and alias in between}
 

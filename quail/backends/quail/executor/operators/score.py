@@ -13,7 +13,7 @@ from quail.backends.quail.executor.readout import AsyncScores
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.reranker import RerankerBatch
-from quail.catalog.tokens import DocumentPrefixes, chain_tokens
+from quail.catalog.tokens import DocumentPrefixes, concat_tokens
 from quail.physical import ClassifySpec
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 
@@ -55,7 +55,7 @@ class QuailScorer:
             return self._shared(spec, rows, documents, on_answers)
         if len(spec.aliases) == 1:
             prefixes = [parts[0]]
-            suffixes = [chain_tokens(documents[spec.aliases[0]][doc], parts[1])
+            suffixes = [concat_tokens(documents[spec.aliases[0]][doc], parts[1])
                         for doc in rows[:, 0]]
             partners = None
             order = np.arange(len(rows))
@@ -65,9 +65,9 @@ class QuailScorer:
             left, right = spec.aliases
             anchors, anchor_index = np.unique(rows[:, 0], return_inverse=True)
             candidates, candidate_index = np.unique(rows[:, 1], return_inverse=True)
-            prefixes = [chain_tokens(parts[0], documents[left][doc], parts[1])
+            prefixes = [concat_tokens(parts[0], documents[left][doc], parts[1])
                         for doc in anchors]
-            suffixes = [chain_tokens(documents[right][doc], parts[2])
+            suffixes = [concat_tokens(documents[right][doc], parts[2])
                         for doc in candidates]
             order = np.argsort(anchor_index, kind="stable")
             offsets = np.concatenate(([0], np.cumsum(np.bincount(anchor_index))))
@@ -232,7 +232,7 @@ class ScoreBatch(SingleResultPart):
     """Prepared score requests, streamed answers, and execution metrics."""
 
     @staticmethod
-    def model_inputs(node, inputs, context, chain=None, nodes=None):
+    def model_inputs(node, inputs, context, sequence=None, nodes=None):
         # scored through the reranker readout over the documents
         return {"score_inputs": inputs, "documents": context.state["docs"],
                 "pre": context.state.get("pre", [])}

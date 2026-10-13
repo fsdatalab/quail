@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from quail.baselines.request_scheduling import (
-    run_filter_chain,
-    run_filter_chain_async,
+    run_filter_sequence,
+    run_filter_sequence_async,
     run_join_grouped,
     true_bit,
 )
@@ -84,9 +84,9 @@ class _FakeFilterEngine:
         )]
 
 
-def test_filter_chains_pipeline_refill_fail_and_take_empty_input():
+def test_filter_sequences_pipeline_refill_fail_and_take_empty_input():
     engine = _FakeFilterEngine()
-    result = run_filter_chain(
+    result = run_filter_sequence(
         engine,
         sampling_params=object(),
         body_ids=[[1] * 5, [2] * 17],
@@ -129,7 +129,7 @@ def test_filter_chains_pipeline_refill_fail_and_take_empty_input():
                 outputs=[SimpleNamespace(token_ids=[1 if answer else 0])],
             )
 
-        result = await asyncio.wait_for(run_filter_chain_async(
+        result = await asyncio.wait_for(run_filter_sequence_async(
             generate, {}, [[1] * 10, [2] * 20, [3] * 30],
             [[8] * 3, [9] * 4], 64, read_answer=READ_ANSWER, block_size=16,
         ), timeout=2)
@@ -162,7 +162,7 @@ def test_filter_chains_pipeline_refill_fail_and_take_empty_input():
                 cancelled.set()
 
         with pytest.raises(ExceptionGroup, match="TaskGroup"):
-            await run_filter_chain_async(
+            await run_filter_sequence_async(
                 generate, {}, [[1], [2]], [[9]], 100, read_answer=READ_ANSWER,
                 max_num_seqs=2,
             )
@@ -174,7 +174,8 @@ def test_filter_chains_pipeline_refill_fail_and_take_empty_input():
         raise AssertionError("no documents")
 
     result = asyncio.run(
-        run_filter_chain_async(generate, {}, [], [[9]], 100, read_answer=READ_ANSWER))
+        run_filter_sequence_async(
+            generate, {}, [], [[9]], 100, read_answer=READ_ANSWER))
     assert result["requests"] == 0
     assert result["survivors"] == []
 

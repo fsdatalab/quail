@@ -485,8 +485,8 @@ def test_benchmark_query_prompts_labels_and_raw_rendering():
             filters, joins = operators.filters, operators.joins
             tables = {relation.alias: relation.table for relation in info.relations}
             assert [scan.alias for scan in operators.scans] == list(tables), backend
-            assert {alias: [p.prompt.template for p in chain]
-                    for alias, chain in filters.items()} == {
+            assert {alias: [p.prompt.template for p in sequence]
+                    for alias, sequence in filters.items()} == {
                 alias: [
                     quail.bind_prompt(item.prompt, (quail.ColumnRef(
                         alias, tables[alias],

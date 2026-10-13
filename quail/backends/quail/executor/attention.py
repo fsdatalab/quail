@@ -835,8 +835,8 @@ class Engine:
             block_table=reads["table"], seqused_k=reads["used"])
         nodes = reads.get("nodes")
         if nodes is not None:
-            # call C: chain rows over their ancestor rows in earlier
-            # chains of the chunk, merged into their call B result
+            # call C: path rows over their ancestor rows in earlier
+            # paths of the chunk, merged into their call B result
             out_c, lse_c = self._fa(
                 q3.index_select(0, nodes["rows"]),
                 k3.index_select(0, nodes["key_rows"]),

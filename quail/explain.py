@@ -501,7 +501,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 title += " (metrics unavailable)"
         if "release_recompute_tokens" in estimate:
             details.append(
-                "expected recompute at the join if the chain's KV is "
+                "expected recompute at the join if the sequence's KV is "
                 "released: "
                 f"{estimate['release_recompute_tokens']:,} tokens, "
                 f"{estimate['release_recompute_seconds']:.3f} s")

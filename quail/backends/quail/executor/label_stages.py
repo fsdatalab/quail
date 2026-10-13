@@ -20,14 +20,14 @@ from quail.backends.quail.executor.readout import (
 )
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.catalog.tokens import chain_tokens
+from quail.catalog.tokens import concat_tokens
 from quail.execution.labels import (
     GreedyDecoder,
     best_label,
-    chain_reads,
     letter_scores,
+    path_reads,
     tree_scores,
-    trie_chains,
+    trie_paths,
 )
 from quail.labels import DECISION_SCORING, decode_runs, read_nodes
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
@@ -50,8 +50,8 @@ class LabelRequests:
         score: Callback converting one document's readout values to label
             scores. Values have shape (suffixes, rows, targets) when all rows
             are read, otherwise (suffixes, targets). None uses greedy decoding.
-        chains: Optional trie chains packed into the sole suffix for tree scoring.
-        read_mask: Which rows of the sole chains suffix are read, in chain
+        paths: Optional trie paths packed into the sole suffix for tree scoring.
+        read_mask: Which rows of the sole paths suffix are read, in path
             order; None reads every row.
         rounds: Maximum decoder rounds. Each round feeds one run, kept in
             the document's KV after the frame. Zero scores all labels in one
@@ -63,7 +63,7 @@ class LabelRequests:
     targets: list
     read_all_rows: bool
     score: Callable[[np.ndarray], np.ndarray] | None
-    chains: list | None = None
+    paths: list | None = None
     read_mask: list | None = None
     rounds: int = 0
 
@@ -91,13 +91,13 @@ def label_requests(spec, targets=None) -> LabelRequests:
         targets = sorted({token for label in ids for token in label})
     if spec.scoring == "trie_tree":
         read = read_nodes(ids, spec.label_word_starts)
-        chains = trie_chains(ids, read)
+        paths = trie_paths(ids, read)
         tokens = [cue if node == () else node[-1]
-                  for nodes, _, _ in chains for node in nodes]
+                  for nodes, _, _ in paths for node in nodes]
         return LabelRequests(
             frame, [tokens], targets, True,
-            lambda logprobs: tree_scores(ids, chains, targets, logprobs[0], read),
-            chains=chains, read_mask=chain_reads(chains, read))
+            lambda logprobs: tree_scores(ids, paths, targets, logprobs[0], read),
+            paths=paths, read_mask=path_reads(paths, read))
     if spec.scoring == "letters":
         return LabelRequests(
             frame, [[cue]], targets, True,
@@ -123,7 +123,7 @@ def document_prefixes(spec, documents, rows) -> list:
     """
     head, _ = spec.prompt_token_parts
     (alias,) = spec.aliases
-    return [chain_tokens(head, documents[alias][doc]) for doc in rows]
+    return [concat_tokens(head, documents[alias][doc]) for doc in rows]
 
 
 @dataclass
@@ -242,7 +242,7 @@ class ClassifyStages:
                 suffixes=request.suffixes, readout=readout,
                 frame=request.frame, decide=whole,
                 read_all_rows=read_all, label=spec.name,
-                chains=request.chains, read_mask=request.read_mask,
+                paths=request.paths, read_mask=request.read_mask,
                 **({} if canvas is None else dict(
                     single=True, canvas=lambda anchor: canvas(anchor, 0),
                     canvas_rows=self.canvas_rows))))
@@ -291,7 +291,7 @@ class ClassifyStages:
         question = request.frame
         (cue,) = request.suffixes[0]
         # suffix p is partner p's block and the cue; its last row is read
-        suffixes = [chain_tokens(document, question, (cue,))
+        suffixes = [concat_tokens(document, question, (cue,))
                     for document in partners.documents]
         self.block_tokens = [len(tokens) - 1 for tokens in suffixes]
 
@@ -346,7 +346,7 @@ class ClassifyStages:
         note, partner_label = spec.join_layout
         self.partners = partners
         self.pair_labels = {}
-        blocks = [chain_tokens(document, frame, request)
+        blocks = [concat_tokens(document, frame, request)
                   for document in partners.documents]
         self.block_tokens = [len(tokens) - 1 for tokens in blocks]
 

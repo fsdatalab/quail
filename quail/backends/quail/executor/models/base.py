@@ -21,7 +21,7 @@ class ModelPipeline:
     the answer at canvas_answer_row of them. needs_pages says every
     chunk must carry arena pages, for a model whose attention kernel
     reads paged KV only. warm_tokens are the chunk sizes the warmup
-    builds one small chunk of: a gated chain's trailing chunks are
+    builds one small chunk of: a gated sequence's trailing chunks are
     100-500 tokens, a shape the full-size warm chunks do not cover.
     """
 

@@ -75,7 +75,7 @@ class PhysicalPlan:
     """A typed physical graph with its settings and estimates.
 
     estimates holds, per node id, the node's own estimated seconds
-    and, for a filter chain a later join anchors on, the recompute it
+    and, for a filter sequence a later join anchors on, the recompute it
     would pay if its KV were released instead of pinned. estimator
     recomputes them for an edited graph; it is not compared or shown.
     """

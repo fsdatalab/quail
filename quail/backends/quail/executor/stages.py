@@ -72,9 +72,9 @@ class Stage:
             this stage's request replaces: the tokens the stage before
             fed past what it verified.
         label: Name displayed in progress messages.
-        chains: Optional trie chains and ancestor references from trie_chains().
-        read_mask: Optional mask of the rows read in the sole chains
-            suffix, in chain order; None reads every row.
+        paths: Optional trie paths and ancestor references from trie_paths().
+        read_mask: Optional mask of the rows read in the sole paths
+            suffix, in path order; None reads every row.
         canvas: Optional callback from document index to diffusion canvas
             tokens, shared by its suffixes or supplied per suffix. None uses
             the pipeline's default canvas.
@@ -96,7 +96,7 @@ class Stage:
     discard: Callable | None = None
     append: bool = False
     label: str = ""
-    chains: list | None = None
+    paths: list | None = None
     read_mask: Any = None
     canvas: Callable | None = None
     canvas_rows: int = 0
@@ -107,10 +107,10 @@ class Stage:
             if self.suffix_tokens < 1:
                 raise ValueError("a stage whose suffixes come from a callback "
                                  "names its most tokens in suffix_tokens")
-            if (self.requests is not None or self.chains is not None
+            if (self.requests is not None or self.paths is not None
                     or self.read_rows is not None or self.canvas is not None):
                 raise ValueError("a stage whose suffixes come from a callback "
-                                 "takes no requests, chains, read_rows, or canvas")
+                                 "takes no requests, paths, read_rows, or canvas")
             return
         trailing = getattr(self.readout, "trailing_rows", 1)
         if self.read_rows is None and trailing > 1:
@@ -333,8 +333,8 @@ class _StageExecutor:
         self.read_masks = [None if stage.read_mask is None
                            else np.asarray(stage.read_mask, dtype=bool)
                            for stage in self.stages]
-        # Stages packing label chains always need tree attention.
-        if any(stage.chains is not None for stage in self.stages):
+        # Stages packing label paths always need tree attention.
+        if any(stage.paths is not None for stage in self.stages):
             attention_mode = "tree"
         self.mode = attention_path(
             self.pipeline, attention_mode, default=default_attention)
@@ -601,7 +601,7 @@ class _StageExecutor:
                     key=key, prefix=None, f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
                     write_suffix_tokens=kept,
-                    chains=self.stages[j].chains, **own))
+                    paths=self.stages[j].paths, **own))
             else:
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
@@ -609,7 +609,7 @@ class _StageExecutor:
                     suffixes=sufs, read_all_rows=read_all,
                     write_suffix_tokens=kept,
                     single=self.stages[j].single and end - start == 1,
-                    chains=self.stages[j].chains, **own))
+                    paths=self.stages[j].paths, **own))
             entries.append((j, rows))
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,

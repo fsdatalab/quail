@@ -69,7 +69,7 @@ def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
 
     The left-deep search (join_order.search_joins) prices every
     connected stage order with every anchor choice together, ranking
-    each by the whole query's estimated seconds with the filter chains
+    each by the whole query's estimated seconds with the filter sequences
     in their chosen order. A written anchor is kept. With rule
     "as_written", only the anchors are chosen. When no connected
     left-deep order exists, the written order is priced.

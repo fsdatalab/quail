@@ -26,7 +26,7 @@ from quail.catalog.pairs import (
 from quail.catalog.tokens import (
     DocumentKeys,
     DocumentPrefixes,
-    chain_tokens,
+    concat_tokens,
     select_documents,
 )
 from quail.execution.runner import (
@@ -55,8 +55,8 @@ class JoinPart(ExecutionPart):
     combine = True
 
     @staticmethod
-    def model_inputs(node, inputs, context, chain=None, nodes=None):
-        return prepare_join_inputs(node, inputs, context, chain, nodes)
+    def model_inputs(node, inputs, context, upstream=None, nodes=None):
+        return prepare_join_inputs(node, inputs, context, upstream, nodes)
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
@@ -68,10 +68,11 @@ class JoinPart(ExecutionPart):
         prefixes = DocumentPrefixes(
             context.state["pre"] if head is None else head,
             context.state["docs"][nodes[0].anchor], ids)
-        chain = {"documents": prefixes, "document_ids": ids, "parts": tuple(parts),
+        upstream = {"documents": prefixes, "document_ids": ids, "parts": tuple(parts),
                  "pairs": {part.node.written_pos: part.rows for part in parts
                            if isinstance(part, ApplyGate) and part.node.ids == "pairs"}}
-        prepared = context.model_inputs(nodes[0], inputs, context, chain, nodes=nodes)
+        prepared = context.model_inputs(
+            nodes[0], inputs, context, upstream, nodes=nodes)
         return cls(state, nodes, prepared, ids, context=context)
 
     def __init__(self, state, nodes, inputs, ids, *, context=None):
@@ -123,8 +124,8 @@ class JoinPart(ExecutionPart):
         self.own_tokens = _predicate_tokens(
             self.stages, every, self.inputs.get("anchor_partners"),
             self.inputs["anchor_keys"], self.canvas_tokens)
-        chain = self.inputs.get("chain")
-        if chain is not None:
+        upstream = self.inputs.get("upstream")
+        if upstream is not None:
             if every:
                 self.settled[np.fromiter(every[0], dtype=np.int64)] = True
             reached = np.flatnonzero(self.settled)
@@ -134,7 +135,7 @@ class JoinPart(ExecutionPart):
                 {local_of[position]: row for position, row in answers.items()}
                 for answers in every]
             self.anchor_ids = [self.ids[position] for position in reached]
-            self.kv_round = ({"hits": len(reached), "misses": 0} if chain["parts"]
+            self.kv_round = ({"hits": len(reached), "misses": 0} if upstream["parts"]
                              else {"hits": 0, "misses": len(reached)})
         else:
             self.answers = every
@@ -239,7 +240,7 @@ def _tuple_suffix(join, docs, member):
     for alias, document in zip(join["partners"], member):
         parts.extend((join["labels"][alias], docs[alias][document]))
     parts.append(join["tail"])
-    return chain_tokens(*parts)
+    return concat_tokens(*parts)
 
 
 def join_suffixes(group, documents, indices):
@@ -346,7 +347,7 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
     return out
 
 
-def prepare_join_inputs(node, inputs, context: ExecutionContext, chain=None,
+def prepare_join_inputs(node, inputs, context: ExecutionContext, upstream=None,
                         nodes=None) -> dict:
     """Prepare join requests from graph ports and preceding operator state."""
     state = context.state
@@ -359,7 +360,7 @@ def prepare_join_inputs(node, inputs, context: ExecutionContext, chain=None,
         values = inputs[member.node_id] if grouped else inputs
         port = input_port.source.port
         if input_port.name not in values:
-            continue           # fed by the chain itself
+            continue           # fed by the upstream itself
         value = values[input_port.name]
         if port.startswith("pairs:"):
             port_pairs[int(port.split(":", 1)[1])] = value
@@ -387,32 +388,32 @@ def prepare_join_inputs(node, inputs, context: ExecutionContext, chain=None,
                  for member in nodes for alias in member.partners}
     prefixes = (DocumentPrefixes(state["pre"], state["docs"][node.anchor],
                                  by_alias[node.anchor])
-                if chain is None else chain["documents"])
+                if upstream is None else upstream["documents"])
     prepared = join_inputs(nodes, documents, by_alias, prefixes, state["gpu"].arena,
-                           config, port_pairs, chain=chain, report_answers=True)
-    if chain is None:
+                           config, port_pairs, upstream=upstream, report_answers=True)
+    if upstream is None:
         counts = prepared["kv_round"]
         state["kv_stats"]["join_anchor_hits"] += counts["hits"]
         state["kv_stats"]["join_anchor_misses"] += counts["misses"]
-    state["join_chained"] = chain is not None
+    state["join_streamed"] = upstream is not None
     return prepared
 
 
 def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tables,
-                *, chain=None, report_answers=False) -> dict:
+                *, upstream=None, report_answers=False) -> dict:
     """Build join requests and KV settlement for local or worker execution."""
     node = nodes[0]
     group = [join_request(member) for member in nodes]
     stage_suffixes, tuple_indices = join_suffixes(group, documents, indices)
-    chain_pairs = {} if chain is None else chain["pairs"]
-    maps = partner_maps(group, pair_tables, streamed=chain_pairs)
-    maps.update(chain_pairs)
+    streamed_pairs = {} if upstream is None else upstream["pairs"]
+    maps = partner_maps(group, pair_tables, streamed=streamed_pairs)
+    maps.update(streamed_pairs)
     lists_for = partner_list_builder(
         group, [tuple_indices[stage.written_pos] for stage in nodes], maps)
-    anchor_ids = indices[node.anchor] if chain is None else None
-    anchor_keys = DocumentKeys(node.anchor, anchor_ids if chain is None
-                               else chain["document_ids"])
-    round_kv = _join_round_kv(anchor_keys, arena) if chain is None else None
+    anchor_ids = indices[node.anchor] if upstream is None else None
+    anchor_keys = DocumentKeys(node.anchor, anchor_ids if upstream is None
+                               else upstream["document_ids"])
+    round_kv = _join_round_kv(anchor_keys, arena) if upstream is None else None
     last = group[-1]
     last_tuples = tuple_indices[last["written_pos"]]
 
@@ -450,7 +451,7 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
         "stage_frames": [join.get("frame") or [] for join in group],
         "anchor_keys": anchor_keys,
         "anchor_done": anchor_done,
-        "chain": chain,
+        "upstream": upstream,
         "kv_round": round_kv,
         "anchor_ids": anchor_ids,
         "partner_indices": tuple_indices,

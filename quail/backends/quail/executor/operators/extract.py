@@ -112,7 +112,7 @@ class ExtractPart(ExecutionPart):
     execute_group = staticmethod(execute_extractions)
 
     @staticmethod
-    def model_inputs(node, inputs, context, chain=None, nodes=None):
+    def model_inputs(node, inputs, context, sequence=None, nodes=None):
         # the one input carries the documents' ids, or the rows of an
         # earlier operator over them
         (value,) = inputs.values()

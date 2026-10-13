@@ -140,7 +140,7 @@ class ClassifyPart(ClassifyBatch):
     """Classification stages and result tables within a pipeline."""
 
     @staticmethod
-    def model_inputs(node, inputs, context, chain=None, nodes=None):
+    def model_inputs(node, inputs, context, sequence=None, nodes=None):
         # scored through the reranker readout over the documents
         return {"score_inputs": inputs, "documents": context.state["docs"],
                 "pre": context.state.get("pre", [])}

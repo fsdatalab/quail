@@ -35,10 +35,10 @@ def build_pipelines(
                      first: PhysicalNode) -> list[PhysicalNode]:
         """Find consumers that can continue this operator's pipeline.
 
-        One consumer continues the chain. Several continue it only
+        One consumer continues the sequence. Several continue it only
         when each reads the one before it, as a per-batch apply
         returning pairs and the join reading those pairs do; any
-        other fan-out needs the documents at once and ends the chain.
+        other fan-out needs the documents at once and ends the sequence.
         Full joins on the same anchor share one scheduler run. A
         classification of the rows they keep can follow them.
         """

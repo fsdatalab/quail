@@ -1,6 +1,6 @@
 """Request scheduling shared by the vLLM and SGLang backends.
 
-Filter chains advance on individual request completions under a shared
+Filter sequences advance on individual request completions under a shared
 KV admission calculation. Joins submit one request per document pair.
 """
 
@@ -79,8 +79,8 @@ def filter_document_cap(
     return document_cap
 
 
-class _FilterChain:
-    """Answers, survivors, and counters for one filter chain."""
+class _FilterSequence:
+    """Answers, survivors, and counters for one filter sequence."""
 
     def __init__(self, body_ids, question_ids, read_answer):
         self.body_ids = body_ids
@@ -126,7 +126,7 @@ def _cap_settings(document_cap, budget_tokens, block_size, max_num_seqs):
     }
 
 
-def run_filter_chain(
+def run_filter_sequence(
     engine,
     sampling_params,
     body_ids,
@@ -151,7 +151,7 @@ def run_filter_chain(
         body_ids, question_ids, budget_tokens,
         block_size=block_size, max_num_seqs=max_num_seqs,
     )
-    chain = _FilterChain(body_ids, question_ids, read_answer)
+    sequence = _FilterSequence(body_ids, question_ids, read_answer)
     inflight = {}
 
     def submit(document, stage):
@@ -179,18 +179,18 @@ def run_filter_chain(
             if not output.finished or output.request_id not in inflight:
                 continue
             document, stage = inflight.pop(output.request_id)
-            if chain.record(document, stage, output):
+            if sequence.record(document, stage, output):
                 submit(document, stage + 1)
             else:
                 live -= 1
-    return chain.result(
+    return sequence.result(
         time.perf_counter() - started,
         **_cap_settings(document_cap, budget_tokens, block_size,
                         max_num_seqs),
     )
 
 
-async def run_filter_chain_async(
+async def run_filter_sequence_async(
     generate,
     sampling_params,
     body_ids,
@@ -206,21 +206,21 @@ async def run_filter_chain_async(
         body_ids, question_ids, budget_tokens,
         block_size=block_size, max_num_seqs=max_num_seqs,
     )
-    chain = _FilterChain(body_ids, question_ids, read_answer)
+    sequence = _FilterSequence(body_ids, question_ids, read_answer)
     documents = iter(range(len(body_ids)))
 
     async def worker():
         for document in documents:
             for stage, question in enumerate(question_ids):
                 output = await generate(body_ids[document] + question, sampling_params)
-                if not chain.record(document, stage, output):
+                if not sequence.record(document, stage, output):
                     break
 
     started = time.perf_counter()
     async with asyncio.TaskGroup() as group:
         for _ in range(min(document_cap, len(body_ids))):
             group.create_task(worker())
-    return chain.result(
+    return sequence.result(
         time.perf_counter() - started,
         **_cap_settings(document_cap, budget_tokens, block_size, max_num_seqs),
     )

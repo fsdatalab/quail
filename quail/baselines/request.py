@@ -289,7 +289,7 @@ def plan_request_backend(
         ))
 
     # each classification labels the alias's documents after its AI.IF
-    # chain; the filters on its labels keep the accepted documents for the joins
+    # sequence; the filters on its labels keep the accepted documents for the joins
     label_plan = operators.labels
     classify_specs = []
     for call, alias in label_plan.calls:
@@ -627,7 +627,7 @@ def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
             "stages": [],
             "doc_cap": 0,
         }
-    result = client.run_filter_chain(
+    result = client.run_filter_sequence(
         sampling_params,
         bodies,
         [list(question) for question in questions],
@@ -1374,7 +1374,7 @@ class RequestBackend:
     """A model backend that submits one request per prompt to an engine.
 
     The engine adapter boots vLLM or SGLang and returns a client with
-    generate, reset_prefix_cache, and run_filter_chain. The submission
+    generate, reset_prefix_cache, and run_filter_sequence. The submission
     strategies decide how filter stages and join tuples become
     requests.
     """

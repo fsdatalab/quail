@@ -56,13 +56,13 @@ class TokenView(Sequence):
         return (self,)
 
 
-class TokenChain(Sequence):
+class TokenConcat(Sequence):
     """Token parts read in sequence without copying them."""
 
     def __init__(self, *parts):
         flattened = []
         for part in parts:
-            if isinstance(part, TokenChain):
+            if isinstance(part, TokenConcat):
                 flattened.extend(part.token_parts)
             elif len(part):
                 flattened.append(part)
@@ -81,7 +81,7 @@ class TokenChain(Sequence):
             start, stop, step = index.indices(self._length)
             if step != 1:
                 return list(self)[index]
-            return TokenChain(*self._sliced_parts(start, stop))
+            return TokenConcat(*self._sliced_parts(start, stop))
         if index < 0:
             index += self._length
         if not 0 <= index < self._length:
@@ -579,7 +579,7 @@ class DocumentPrefixes(Sequence):
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]
-        return chain_tokens(
+        return concat_tokens(
             self._prefix,
             self._documents[self._indices[index]],
         )
@@ -608,8 +608,8 @@ def select_documents(documents, indices):
     return [documents[index] for index in indices]
 
 
-def chain_tokens(*parts):
-    return TokenChain(*parts)
+def concat_tokens(*parts):
+    return TokenConcat(*parts)
 
 
 def decode_token_documents(value):

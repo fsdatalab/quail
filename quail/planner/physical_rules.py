@@ -1,7 +1,7 @@
 """Built in physical optimizer rules.
 
 - kv_retention: the KV later operators read stays resident, within
-  the retention pool's page cap: a filter chain keeps its survivors'
+  the retention pool's page cap: a filter sequence keeps its survivors'
   KV for a join anchored on its table, and a join keeps its anchor's
   KV for a later group on the same anchor.
 - label_scoring: each classification gets the label scoring rule
@@ -50,12 +50,12 @@ class LimitPushdown:
 
     The rule puts the limit in the ``filter_limit`` setting, which the
     executor reads to stop admitting documents once that many survived
-    the chain's last stage. The pushdown keeps the first survivors to
+    the sequence's last stage. The pushdown keeps the first survivors to
     finish, so it is sound only when those are the rows the query
     returns: the graph ends in a Limit and has no Sort or Aggregate (an
     ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
     AiJoin (survivors are settled per join round), and no AiInference (a
-    score comparison after the chain can drop survivors). Otherwise the
+    score comparison after the sequence can drop survivors). Otherwise the
     rule removes the setting.
     """
 
@@ -84,12 +84,12 @@ class KvRetention:
     likely each document is to survive to that use. The executor's
     retention pool keeps their KV by that priority, up to the page cap.
 
-    - A filter chain keeps its survivors' KV (keep_kv) when a later join
-      anchors on its table, unless the chain streams into that join in
+    - A filter sequence keeps its survivors' KV (keep_kv) when a later join
+      anchors on its table, unless the sequence streams into that join in
       one pipeline on one GPU.
     - A join keeps its anchor's KV (keep_kv) when a later group
       anchors on the same table.
-    - A chain writes KV pages only when a later stage, the next operator
+    - A sequence writes KV pages only when a later stage, the next operator
       of its pipeline, or the retention pool reads them.
 
     The rule needs the logical plan on the context and fires only on a
@@ -134,13 +134,13 @@ class KvRetention:
                            else before[group[0].node_id])
             for group in grouped for node in group}
         paths = build_pipelines(graph, context.gpu_count)
-        chained = {
+        streamed = {
             node.alias for node in graph.nodes if isinstance(node, AiFilter)
             and any(isinstance(member, AiJoin)
                     for member in paths[node.node_id])}
         schedule["initial"] = {
             alias: use for alias, use in schedule["initial"].items()
-            if alias not in chained}
+            if alias not in streamed}
         schedule.update(**coefficients(context.model, context.device),
                         cap_pages=statistics.cap_pages)
         context.settings["retention"] = schedule
@@ -157,7 +157,7 @@ class LabelScoring:
     per label; trie_tree, under the tree attention path; and
     trie_decode, when no label starts another.
     The documents count as resident, with their KV in the arena, when
-    the classification continues its table's filter chain on one GPU
+    the classification continues its table's filter sequence on one GPU
     before any join, or follows a classification with the same prompt
     head. A classification of joined rows always uses letters and
     arrives chosen.
@@ -439,7 +439,7 @@ def built_in_physical_rules() -> tuple:
 
     In order: limit_pushdown, kv_retention, label_scoring,
     prefix_sharing, and tree_attention. prefix_sharing follows
-    kv_retention because it weighs the page writes a chain already
+    kv_retention because it weighs the page writes a sequence already
     makes, and tree_attention follows prefix_sharing because a filter's
     attention path depends on the prefixes it shares.
     """

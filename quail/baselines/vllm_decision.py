@@ -188,14 +188,14 @@ class VLLMDecisionClient:
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()
 
-    def run_filter_chain(self, params, body_ids, question_ids, read_answer, *,
+    def run_filter_sequence(self, params, body_ids, question_ids, read_answer, *,
                          tag="q", body_texts=None, question_texts=None):
         """Pipeline filter stages through the engine's step loop."""
-        from quail.baselines.request_scheduling import run_filter_chain
+        from quail.baselines.request_scheduling import run_filter_sequence
 
         if body_texts is not None or question_texts is not None:
             raise ValueError("decision prompts are submitted as token ids")
-        return run_filter_chain(
+        return run_filter_sequence(
             _RetryingEngine(self), params, body_ids, question_ids,
             self.capacity["kv_cache_size_tokens"], tag=tag,
             read_answer=read_answer, block_size=self.capacity["block_size"],

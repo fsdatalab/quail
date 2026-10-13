@@ -68,7 +68,7 @@ class ExecutionPart(ABC):
         raise NotImplementedError(f"{cls.__name__} needs prepared requests")
 
     @staticmethod
-    def model_inputs(node, inputs, context, chain=None, nodes=None):
+    def model_inputs(node, inputs, context, upstream=None, nodes=None):
         """Turn the node's graph input ports into scheduler inputs.
 
         Returns None for an operator that reads its port values as
@@ -78,7 +78,7 @@ class ExecutionPart(ABC):
             node: The physical node.
             inputs: Port values from the preceding operators.
             context: The execution context with the documents.
-            chain: The preceding pipeline state of a join, or None.
+            upstream: The preceding pipeline state of a join, or None.
             nodes: The nodes sharing one scheduler run, or None.
         """
         return None
@@ -143,7 +143,7 @@ def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
         stop_groups=stop_groups, paged=paged,
         on_chunk=transition_reporter(parts), on_answers=on_answers,
         appended_tokens=max(part.appended_tokens for part in parts) or None)
-    complete_chain(parts, every, spans, tokens, stats)
+    complete_parts(parts, every, spans, tokens, stats)
     return {node_id: result for part in parts
             for node_id, result in part.results().items()}
 
@@ -225,7 +225,7 @@ def transition_reporter(parts):
     return report
 
 
-def complete_chain(parts, every, spans, tokens, stats):
+def complete_parts(parts, every, spans, tokens, stats):
     """Finalize pipeline parts and store each operator's result.
 
     The first part with stages receives document token costs, prefix-sharing

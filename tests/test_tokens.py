@@ -13,7 +13,7 @@ from quail.catalog.tokens import (
     GigatokenEncoder,
     TokenOffsets,
     TokenStore,
-    chain_tokens,
+    concat_tokens,
     decode_token_documents,
     prefix_tree,
 )
@@ -21,7 +21,7 @@ from quail.planner.shards import contiguous_shards
 from quail.planner.statistics import AliasStats, summarize_alias
 
 
-def test_token_views_store_chains_and_shared_prefixes(tmp_path, monkeypatch):
+def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypatch):
     tokens = pa.chunked_array([
         pa.array([[1, 2, 3], [], [4, 5]], type=pa.large_list(pa.int32()))
     ])
@@ -37,7 +37,7 @@ def test_token_views_store_chains_and_shared_prefixes(tmp_path, monkeypatch):
     assert hasattr(documents[2].arrow_array, "__dlpack__")
 
     first = documents[0]
-    combined = chain_tokens([1, 2], first, [20])
+    combined = concat_tokens([1, 2], first, [20])
     assert list(combined) == [1, 2, 1, 2, 3, 20]
     assert combined.token_parts[1] is first
 

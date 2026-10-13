@@ -141,7 +141,7 @@ def _lets_through(node, alias: str) -> bool:
 
     True for a Join, a full SemanticJoin, a classification of joined
     rows, and any node on another table. False for the table's own
-    chain, a gate (an exists or anti join), an Apply returning a join's
+    sequence, a gate (an exists or anti join), an Apply returning a join's
     pairs, and any other node.
     """
     if isinstance(node, Join):
@@ -168,7 +168,7 @@ def _place_filter(filter_node, node, alias: str):
     Returns:
         The subtree under node with the filter as low as it goes, or
         None when a gate, an Apply returning pairs, or the table's own
-        chain stops it before any Join.
+        sequence stops it before any Join.
     """
     if isinstance(node, Join):
         left = {field.alias for field in node.left.output_schema()}
@@ -191,7 +191,7 @@ def push_down_filters(root: LogicalNode) -> LogicalNode | None:
     An Apply returning ids and a Filter on a label column read one
     table, so they commute with the joins, the classifications of
     joined rows, and the other tables' operators above that table.
-    Each moves to the top of its own table's chain and keeps its order
+    Each moves to the top of its own table's sequence and keeps its order
     with the table's other filters. A filter stays where it is when a
     gate (an exists or anti join) or an Apply returning a join's pairs
     sits between it and the first Join below.
@@ -236,8 +236,8 @@ class FilterPushdown:
         return push_down_filters(root)
 
 
-def _label_chain(node) -> tuple:
-    """Split a table's chain at its classifications and extractions.
+def _label_sequence(node) -> tuple:
+    """Split a table's sequence at its classifications and extractions.
 
     Returns:
         The node below the table's lowest SemanticClassify or
@@ -251,7 +251,7 @@ def _label_chain(node) -> tuple:
     return node, tuple(reversed(lifted))
 
 
-def _chain_alias(node) -> str:
+def _sequence_alias(node) -> str:
     """Return the table alias a classification, extraction, or label filter reads."""
     if isinstance(node, (SemanticClassify, SemanticExtract)):
         return node.alias
@@ -263,7 +263,7 @@ def lift_classifications(root: LogicalNode) -> LogicalNode | None:
 
     Each one-table SemanticClassify of a table that a SemanticJoin
     reads, with the Filters on its label column, and each
-    SemanticExtract of such a table, leaves the table's chain and
+    SemanticExtract of such a table, leaves the table's sequence and
     moves above the topmost join, under the root Project, in scan
     order. A classification or extraction of a table that no join
     reads stays.
@@ -277,12 +277,12 @@ def lift_classifications(root: LogicalNode) -> LogicalNode | None:
     joined = {alias for node in LogicalPlan(root).walk()
               if isinstance(node, SemanticJoin)
               for alias in model_call(node.predicate).aliases()}
-    chains = {}
+    sequences = {}
 
     def cut(node):
-        base, chain = _label_chain(node)
-        if chain and _chain_alias(chain[0]) in joined:
-            chains.setdefault(_chain_alias(chain[0]), []).extend(chain)
+        base, sequence = _label_sequence(node)
+        if sequence and _sequence_alias(sequence[0]) in joined:
+            sequences.setdefault(_sequence_alias(sequence[0]), []).extend(sequence)
             return base
         return node
 
@@ -295,15 +295,15 @@ def lift_classifications(root: LogicalNode) -> LogicalNode | None:
             return node.with_children((visit(node.input),))
         return cut(node)
 
-    top, lifted = _label_chain(root.input)
+    top, lifted = _label_sequence(root.input)
     for node in lifted:
-        chains.setdefault(_chain_alias(node), []).append(node)
+        sequences.setdefault(_sequence_alias(node), []).append(node)
     spine = visit(top)
-    if not chains:
+    if not sequences:
         return None
     for scan in LogicalPlan(root).walk():
         if isinstance(scan, Scan):
-            for node in chains.get(scan.alias, ()):
+            for node in sequences.get(scan.alias, ()):
                 spine = node.with_children((spine,))
     lifted = root.with_children((spine,))
     return None if lifted == root else lifted

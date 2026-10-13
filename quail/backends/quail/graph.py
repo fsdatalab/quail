@@ -44,7 +44,7 @@ def quail_runtimes() -> dict:
 
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext,
-                         chain=None, nodes=None):
+                         upstream=None, nodes=None):
     """Convert graph input ports into backend scheduler inputs.
 
     Args:
@@ -52,7 +52,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext,
         inputs: Port values supplied by preceding operators.
         context: Execution context containing document tokens and settings.
         nodes: Join predicates sharing one scheduler run.
-        chain: Optional preceding pipeline state for a join, containing its
+        upstream: Optional preceding pipeline state for a join, containing its
             documents, document IDs, operator parts, and selected pairs.
 
     Returns:
@@ -61,7 +61,8 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext,
     """
     implementation = execution_parts().get(node.type_name)
     prepared = (None if implementation is None
-                else implementation.model_inputs(node, inputs, context, chain, nodes))
+                else implementation.model_inputs(
+                    node, inputs, context, upstream, nodes))
     if prepared is None:
         return inputs
     return {**prepared,
@@ -72,7 +73,7 @@ def record_model_result(node, result: NodeResult,
                         context: ExecutionContext) -> None:
     """Record reuse of anchor KV supplied by preceding operators."""
     state = context.state
-    if isinstance(node, AiJoin) and state["join_chained"]:
+    if isinstance(node, AiJoin) and state["join_streamed"]:
         state["kv_stats"]["join_anchor_hits"] += result.metrics.kv_hits
 
 

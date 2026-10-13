@@ -10,7 +10,7 @@ from quail.baselines.request import RequestBackend
 from quail.baselines.request_scheduling import (
     MAX_BATCHED_TOKENS,
     MAX_SEQUENCES,
-    run_filter_chain,
+    run_filter_sequence,
 )
 
 GPU_MEMORY_UTILIZATION = 0.91
@@ -157,11 +157,11 @@ class VLLMClient:
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()
 
-    def run_filter_chain(self, sampling_params, body_ids, question_ids,
+    def run_filter_sequence(self, sampling_params, body_ids, question_ids,
                          read_answer, *, tag="q", body_texts=None,
                          question_texts=None):
         """Pipeline filter stages through the engine's step loop."""
-        return run_filter_chain(
+        return run_filter_sequence(
             self.llm.llm_engine,
             sampling_params,
             body_ids,

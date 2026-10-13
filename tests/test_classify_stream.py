@@ -167,7 +167,7 @@ def fused_graph(*, classify_only=False):
 
 @pytest.mark.parametrize("shape", ["filter", "joined", "classify_first",
                                    "draws", "score_first"])
-def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
+def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         monkeypatch, shape):
     """Read each survivor's seeded canvas over its resident KV.
 
@@ -240,17 +240,17 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         ]
         root = PortRef("group:0", "ids:r")
     graph = PhysicalGraph(tuple(nodes), root)
-    chains = {tuple(
+    pipelines = {tuple(
         member.node_id for member in pipeline)
         for pipeline in build_pipelines(graph).values()}
-    assert chains == {{
+    assert pipelines == {{
         "filter": ("filter:r", "classify:r"),
         "draws": ("filter:r", "classify:r"),
         "joined": ("filter:r", "classify:r", "label:r", "group:0"),
         "classify_first": ("classify:r", "label:r"),
         "score_first": ("classify:r", "label:r")}[shape]}
     if shape == "score_first":
-        assert ("score:r",) not in chains
+        assert ("score:r",) not in pipelines
 
     filter_truth = [[1], [0], [1], [1]]
     # the letter each survivor's first canvas row favors
@@ -529,7 +529,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     assert metrics["classify:r"]["suffix_tokens"] == len(passed)
     assert metrics["classify:kind"]["fresh_tokens"] == 2 * len(accepted)
     assert metrics["classify:kind"]["evaluated_documents"] == len(accepted)
-    # some chunk held documents at the chain's stage beside documents
+    # some chunk held documents at the sequence's stage beside documents
     # at the classification's or the join's
     heads = [{suffix[0] for spec in specs for suffix in spec["suffixes"]}
              for specs in model.launched]
@@ -580,10 +580,10 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     from quail.physical.pipelines import build_pipelines
 
     graph = joined_graph(two_joins)
-    chains = {tuple(
+    pipelines = {tuple(
         member.node_id for member in pipeline)
         for pipeline in build_pipelines(graph).values()}
-    assert chains == {("group:0", "group:1", "classify:rp") if two_joins
+    assert pipelines == {("group:0", "group:1", "classify:rp") if two_joins
                       else ("group:0", "classify:rp")}
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)

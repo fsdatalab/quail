@@ -217,7 +217,7 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
                for metrics in off["node_metrics"].values())
     on, model, _, _ = run_graph_on_arena(
         monkeypatch, two_alias_graph(True), pages=48, gpu_timing=True)
-    # join chunks run before the filter chain finishes: one pipeline
+    # join chunks run before the filter sequence finishes: one pipeline
     kinds = [kind for kind, _ in model.launched]
     assert kinds.index("join") < len(kinds) - 1 - kinds[::-1].index("filter")
     # the fake torch reports 2 ms per event pair, one pair per chunk; a

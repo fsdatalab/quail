@@ -63,8 +63,7 @@ CI runs these on every pull request. Run them before pushing:
   Quail's runner for it. Change queries or labels there first, then
   move the pin here.
 - The execution mechanisms are "pipelining", "token-based admission",
-  "KV rewind", and "prefix sharing". "Chain mode" is the code name for
-  KV rewind; prefer "KV rewind" in prose.
+  "KV rewind", and "prefix sharing".
 - The attention paths are "unified" and "tree".
 - Compare against "stock vLLM", and say which submission strategy it
   used: operator-at-a-time or pipelining.

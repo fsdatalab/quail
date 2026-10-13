@@ -47,7 +47,7 @@ def order_filters(predicates, rule, **kwargs):
     costs = prepare_filter_costs(predicates, **kwargs)
     return [predicates[i] for i in order_filters_indexed(costs, rule)]
 
-def filter_chain(plan, alias=None):
+def filter_sequence(plan, alias=None):
     return next(n for n in plan.nodes if isinstance(n, AiFilter)
                 and (alias is None or n.alias == alias))
 
@@ -161,15 +161,15 @@ def test_filter_ordering_and_kv_writes(catalog):
     toks = {"r": [400] * 100}
 
     by_cost = _plan(logical, toks)
-    chain = filter_chain(by_cost)
+    sequence = filter_sequence(by_cost)
     assert by_cost.settings["order_rule"] == "by_cost"
-    assert chain.selectivity == 0.2
+    assert sequence.selectivity == 0.2
     second = by_cost.graph.nodes_by_type(AiFilter.type_name)[1]
     assert second.expected_docs == pytest.approx(20.0)
     # the physical planner chooses the order; the logical plan keeps
     # the predicates as written
     optimized, _ = _optimize(logical, toks)
-    assert chain.written_pos == 2
+    assert sequence.written_pos == 2
     assert "predicate 3" in explain(optimized, by_cost)
 
     as_written = _plan(logical, toks, order="as_written")
@@ -234,13 +234,13 @@ def test_filter_ordering_and_kv_writes(catalog):
     # one stage: nothing reads the KV again
     single = _five_filter_plan(catalog, (0.9,))
     plan = _plan(single, {"r": [400] * 100})
-    chain = filter_chain(plan)
-    assert chain.arena_writes is False
+    sequence = filter_sequence(plan)
+    assert sequence.arena_writes is False
     assert "arena_writes=False" in explain(single, plan, verbose=True)
 
     plan = _plan(_five_filter_plan(catalog, (0.9, 0.9)), {"r": [400] * 100})
-    chain = filter_chain(plan)
-    assert chain.arena_writes is True
+    sequence = filter_sequence(plan)
+    assert sequence.arena_writes is True
 
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_filter(prompt("a: {0}", col("r.review")))
@@ -360,7 +360,7 @@ def test_work_matches_attention_masks_and_component_costs():
     assert not work.dominates(replace(work, sliding_kv_read=1022))
 
 
-def _chain(catalog, sels=(0.1, 0.1), anchors=(None, None)):
+def _join_sequence(catalog, sels=(0.1, 0.1), anchors=(None, None)):
     return (docs(catalog, "reviews", tok).alias("r")
             .ai_join(docs(catalog, "threads", tok).alias("t"),
                      prompt("m1 {0} {1}", col("r.review"),
@@ -391,13 +391,13 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     # streaming r's 3,000-token documents as partners would pay them once
     # per pair, so r anchors stage 1 and p stage 2, with a barrier between
     toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
-    plan = _plan(_chain(catalog), toks, order="as_written")
+    plan = _plan(_join_sequence(catalog), toks, order="as_written")
     stages = join_stages(plan)
     assert [s["anchor"] for s in stages] == ["r", "p"]
     assert [s["written_pos"] for s in stages] == [0, 1]
     # the physical planner chooses the stage order and anchors; the
     # logical plan keeps the joins as written
-    optimized, _ = _optimize(_chain(catalog), toks, order="as_written")
+    optimized, _ = _optimize(_join_sequence(catalog), toks, order="as_written")
     joins = [node for node in optimized.walk() if isinstance(node, SemanticJoin)]
     assert [join.anchor for join in joins] == [None, None]
     assert [(s["exec_idx"], s["anchor"]) for s in stages] == [(0, "r"), (1, "p")]
@@ -417,16 +417,16 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
 
     # t, shared by both joins, has the long documents: one group anchors it
     toks = {"r": [50] * 10, "t": [3000] * 8, "p": [50] * 6}
-    plan = _plan(_chain(catalog), toks, order="as_written")
+    plan = _plan(_join_sequence(catalog), toks, order="as_written")
     assert [s["anchor"] for s in join_stages(plan)] == ["t", "t"]
     kinds = node_kinds(plan)
     assert (kinds.count("AiJoin"), kinds.count("Barrier")) == (2, 0)
 
     # a forced anchor is honored
     toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
-    plan = _plan(_chain(catalog, anchors=("t", None)), toks, order="as_written")
+    plan = _plan(_join_sequence(catalog, anchors=("t", None)), toks, order="as_written")
     assert join_stages(plan)[0]["anchor"] == "t"
-    same = _plan(_chain(catalog, anchors=("r", None)), toks, order="as_written")
+    same = _plan(_join_sequence(catalog, anchors=("r", None)), toks, order="as_written")
     assert join_stages(same)[0]["anchor"] == "r"
 
     # by_cost runs the cheap .01 exists gate before the .9 full join
@@ -498,8 +498,8 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
     assert retention["after"][groups[1].node_id] == {}
     assert [group.keep_kv for group in groups] == [True, False]
 
-    # on one GPU a filtered anchor streams into its join, so its chain
-    # keeps no KV; on two GPUs the chain keeps its survivors for the
+    # on one GPU a filtered anchor streams into its join, so its sequence
+    # keeps no KV; on two GPUs the sequence keeps its survivors for the
     # join, and writes KV pages to do so
     filtered = (docs(catalog, "reviews", tok).alias("r")
                 .ai_filter(prompt("negative: {0}", col("r.review")),
@@ -510,21 +510,21 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
                 .select("r.id", "p.asin"))
     one = _plan(filtered, toks)
     assert one.settings["retention"]["initial"] == {}
-    chain = filter_chain(one, "r")
-    assert (chain.keep_kv, chain.arena_writes) == (False, True)
+    sequence = filter_sequence(one, "r")
+    assert (sequence.keep_kv, sequence.arena_writes) == (False, True)
     assert tuple(
-        member.node_id for member in build_pipelines(one.graph)[chain.node_id]) == (
+        member.node_id for member in build_pipelines(one.graph)[sequence.node_id]) == (
         "ai_filter:r", "ai_join:r")
     two = _plan(filtered, toks, gpus=2)
     assert two.settings["retention"]["initial"] == {"r": [1.0, 0]}
-    chain = filter_chain(two, "r")
-    assert (chain.keep_kv, chain.arena_writes) == (True, True)
+    sequence = filter_sequence(two, "r")
+    assert (sequence.keep_kv, sequence.arena_writes) == (True, True)
 
     # a forced anchor takes one search too; refining a planned query
     # on exact tokens keeps the schedule it was made with
     searches.clear()
     toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
-    forced = _plan(_chain(catalog, anchors=("t", None)), toks)
+    forced = _plan(_join_sequence(catalog, anchors=("t", None)), toks)
     assert searches == [True]
     refined = refine_plan(
         forced, model=QWEN3_4B_FP8, device=H100_SXM, doc_tokens=toks,
@@ -675,14 +675,14 @@ def test_foreign_node_placement_and_pipelines():
     # claims are the long side, so the planner anchors on them
     with _claims_session() as session:
         per_batch = _apply_query(session, "per_batch").plan()
-        chain = per_batch.graph.node("ai_filter:c")
+        sequence = per_batch.graph.node("ai_filter:c")
         foreign = per_batch.graph.node("apply:keep_even")
         join = per_batch.graph.nodes_by_type(AiJoin.type_name)[0]
-        # the chain, the per-batch apply, and the join run as one pipeline
+        # the sequence, the per-batch apply, and the join run as one pipeline
         assert tuple(
             member.node_id for member in build_pipelines(
-                per_batch.graph)[chain.node_id]) == (
-            chain.node_id, foreign.node_id, join.node_id)
+                per_batch.graph)[sequence.node_id]) == (
+            sequence.node_id, foreign.node_id, join.node_id)
         assert isinstance(foreign, Foreign) and foreign.kind == "per_batch"
         assert foreign.inputs[0].source == PortRef("ai_filter:c", "ids:c")
         assert PortRef("apply:keep_even", "ids:c") in {
@@ -690,7 +690,7 @@ def test_foreign_node_placement_and_pipelines():
         assert "keep_even" in session.registry.functions
         text = physical_tree(per_batch.graph)
         assert "Foreign: keep_even (per_batch, drop) on c" in text
-        # a barrier needs every survivor at once: the chain materializes
+        # a barrier needs every survivor at once: the sequence materializes
         barrier = _apply_query(session, "barrier").plan()
         assert tuple(
             member.node_id for member in build_pipelines(
@@ -712,27 +712,27 @@ def test_foreign_node_placement_and_pipelines():
         assert isinstance(plan, Refusal)
         assert plan.constraint == "apply_needs_quail_backend"
 
-    def chains(graph):
+    def sequences(graph):
         return sorted({tuple(member.node_id for member in pipeline)
                        for pipeline in build_pipelines(graph).values()})
 
-    assert chains(two_alias_graph(True)) == [("filter:r", "group:0")]
-    assert chains(two_alias_graph(True, foreign=("per_batch", "drop"))) == [
+    assert sequences(two_alias_graph(True)) == [("filter:r", "group:0")]
+    assert sequences(two_alias_graph(True, foreign=("per_batch", "drop"))) == [
         ("filter:r", "apply:keep_even", "group:0")]
-    assert chains(two_alias_graph(True, foreign=("per_batch", "pairs"))) == [
+    assert sequences(two_alias_graph(True, foreign=("per_batch", "pairs"))) == [
         ("filter:r", "apply:same_key", "group:0")]
     # a barrier apply and a Barrier each need every survivor at once
-    assert chains(two_alias_graph(True, foreign=("barrier", "drop"))) == [
+    assert sequences(two_alias_graph(True, foreign=("barrier", "drop"))) == [
         ("filter:r",), ("group:0",)]
-    assert chains(two_alias_graph(False)) == [("filter:r",), ("group:0",)]
+    assert sequences(two_alias_graph(False)) == [("filter:r",), ("group:0",)]
     graph = two_alias_graph(True)
-    # a join reading the scan takes nothing from the chain
+    # a join reading the scan takes nothing from the sequence
     orphan = PhysicalGraph(
         tuple(node for node in graph.nodes if node.node_id != "group:0")
         + (graph.node("group:0").with_inputs(input_ports(
             (PortRef("input:r", "ids:r"), PortRef("input:p", "ids:p")))),),
         graph.root)
-    assert chains(orphan) == [("filter:r",), ("group:0",)]
+    assert sequences(orphan) == [("filter:r",), ("group:0",)]
 
 
 def _big_plan(catalog):
@@ -750,8 +750,8 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     logical, plan = _big_plan(catalog)
     assert [node.node_id for node in plan.nodes] == [
         "scan:r", "scan:p", "ai_filter:r", "ai_join:r", "project"]
-    chain = plan.graph.node("ai_filter:r")
-    assert not chain.keep_kv
+    sequence = plan.graph.node("ai_filter:r")
+    assert not sequence.keep_kv
     assert tuple(
         member.node_id for member in build_pipelines(plan.graph)["ai_filter:r"]) == (
         "ai_filter:r", "ai_join:r")
@@ -765,13 +765,13 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert plan.estimated_seconds <= sum(seconds.values()) \
         <= 3 * plan.estimated_seconds
     # 10,000 expected survivors of 400 tokens do not fit the retention
-    # pool, so releasing the chain's KV would recompute most of them
+    # pool, so releasing the sequence's KV would recompute most of them
     recompute = plan.estimates["ai_filter:r"]
     assert recompute["release_recompute_tokens"] > 0.9 * 10000 * 401
     assert recompute["release_recompute_seconds"] > 0
     text = explain(logical, plan)
     assert "est. time" in text
-    assert "expected recompute at the join if the chain's KV is released" in text
+    assert "expected recompute at the join if the sequence's KV is released" in text
     assert "do not add up to the plan estimate" in text
     assert "KV: anchor=from filters" in text
     assert _cell(text, "AiJoin: anchor=")[-1] in ("ms", "s")
@@ -783,8 +783,8 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
         between=("ai_filter:r", "ai_join:r"))
     assert [node.node_id for node in edited.nodes] == [
         "scan:r", "scan:p", "ai_filter:r", "barrier:r", "ai_join:r", "project"]
-    new_chain = edited.graph.node("ai_filter:r")
-    assert new_chain.keep_kv
+    new_sequence = edited.graph.node("ai_filter:r")
+    assert new_sequence.keep_kv
     assert tuple(
         member.node_id for member in build_pipelines(edited.graph)["ai_filter:r"]) == (
         "ai_filter:r",)
@@ -835,13 +835,13 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
         prompt("flag: {0}", col("r.review")), selectivity=0.5).select("r.id")
 
     plan = _plan(logical, {"r": store.lengths})
-    chain = filter_chain(plan)
-    assert chain.share_prefixes and chain.arena_writes
+    sequence = filter_sequence(plan)
+    assert sequence.share_prefixes and sequence.arena_writes
     assert "share_prefixes=True" in explain(logical, plan, verbose=True)
 
     plan = _plan(logical, {"r": plain.lengths})
-    chain = filter_chain(plan)
-    assert not chain.share_prefixes and not chain.arena_writes
+    sequence = filter_sequence(plan)
+    assert not sequence.share_prefixes and not sequence.arena_writes
 
     # one shared page in 20,000 tokens saves less forward-pass time
     # than writing KV pages for every token costs (about 1.2% on
@@ -851,7 +851,7 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
         tmp_path / "little.arrow",
         [body, " ".join(str(i) for i in range(16)) + " 5"])
     assert page_aligned_shared_tokens(little) == 16
-    assert not filter_chain(_plan(logical, {"r": little.lengths})).share_prefixes
+    assert not filter_sequence(_plan(logical, {"r": little.lengths})).share_prefixes
     # a filter that already writes pages shares any whole page
     assert sharing_pays(QWEN3_4B_FP8, H100_SXM, shared_tokens=16,
                         total_tokens=10_017, writes_pages=True)
@@ -861,21 +861,21 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     header = " ".join(str(i) for i in range(2048))
     records = [header + " " + " ".join([str(9000 + r)] * 8) for r in range(40)]
     store = _token_store(tmp_path / "records.arrow", records)
-    # a chain of snapshots each 3,000 tokens longer than the last: one
+    # a sequence of snapshots each 3,000 tokens longer than the last: one
     # reader per node with more rows than the node saves
     snapshots = [" ".join(str(i) for i in range(3000 * (k + 1)))
                  for k in range(4)]
-    chain = _token_store(tmp_path / "chain.arrow", snapshots)
+    sequence = _token_store(tmp_path / "sequence.arrow", snapshots)
     plan = _plan(logical, {"r": store.lengths})
-    node = filter_chain(plan)
+    node = filter_sequence(plan)
     assert node.share_prefixes and node.attention == "tree"
     assert "attention=tree" in explain(logical, plan, verbose=True)
-    plan = _plan(logical, {"r": chain.lengths})
-    node = filter_chain(plan)
+    plan = _plan(logical, {"r": sequence.lengths})
+    node = filter_sequence(plan)
     assert node.share_prefixes and node.attention == "unified"
     # a filter without shared prefixes has one reader per node
     plan = _plan(logical, {"r": [40, 42, 3]})
-    assert filter_chain(plan).attention == "unified"
+    assert filter_sequence(plan).attention == "unified"
 
     shared = " ".join(str(i) for i in range(400))
     reviews = _token_store(tmp_path / "anchors.arrow",
@@ -896,11 +896,11 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
 
 def test_attention_setting_forces_every_filter_and_join(catalog):
     filters = _five_filter_plan(catalog, (0.5,))
-    joins = _chain(catalog)
+    joins = _join_sequence(catalog)
     tokens = {"r": [40, 42, 3], "t": [50] * 4, "p": [100] * 3}
     for path in ("tree", "unified"):
         plan = _plan(filters, tokens, attention=path)
-        assert filter_chain(plan).attention == path
+        assert filter_sequence(plan).attention == path
         plan = _plan(joins, tokens, attention=path)
         assert {node.attention for node in plan.nodes
                 if isinstance(node, AiJoin)} == {path}

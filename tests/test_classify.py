@@ -355,7 +355,7 @@ def test_classify_plans_filters_and_returns_labels(session):
         [("refund", 0.1), ("shipping", 0.8), ("praise", 0.1)]]
 
 
-def _chain(session, *, filters=1, later_filters=()):
+def _classify_then_filter(session, *, filters=1, later_filters=()):
     query = session.docs("documents").alias("d").ai_classify(
         quail.prompt("What is {0} about?", quail.col("d.body")),
         ["refund", "shipping", "praise"], name="topic")
@@ -407,7 +407,7 @@ def test_frontends_place_classifications_on_their_table(session):
     # a classification sits above its table's AI.IF filters, below the
     # first filter on its label; a later classification sits above
     # that filter
-    query = _chain(session, later_filters=(("kind", ("complaint",)),))
+    query = _classify_then_filter(session, later_filters=(("kind", ("complaint",)),))
     query.plan()
     plan = query.logical
     kinds = [type(node).__name__ for node in plan.walk()]
@@ -711,8 +711,8 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
         unified.choose(1000, 20, 30, prefixed, True)
 
 
-def test_chained_classifications_share_one_pipeline(session):
-    query = _chain(session)
+def test_streamed_classifications_share_one_pipeline(session):
+    query = _classify_then_filter(session)
     plan = query.plan()
     classifies = [n for n in plan.nodes if isinstance(n, AiClassify)]
     topic, kind = classifies
@@ -734,13 +734,13 @@ def test_chained_classifications_share_one_pipeline(session):
         "d": [0], "kind": ["complaint"]}
     assert scorer.calls == [("topic", [[0], [1]]), ("kind", [[0]])]
 
-    split = _chain(session, filters=2)
+    split = _classify_then_filter(session, filters=2)
     assert tuple(
         member.node_id for member in build_pipelines(
             split.plan().graph)[topic.node_id]) == (
         topic.node_id, "filter:d:0", "filter:d:1", kind.node_id)
 
-    interleaved = _chain(session, later_filters=(
+    interleaved = _classify_then_filter(session, later_filters=(
         ("kind", ("complaint",)), ("topic", ("refund",))))
     assert tuple(
         member.node_id for member in build_pipelines(
@@ -850,31 +850,31 @@ def test_planner_reads_letters_on_a_diffusion_model(tmp_path):
     assert [list(ids) for ids in classify.spec.label_token_ids] == [
         _bytes(letter) for letter in "ABC"[:len(classify.spec.labels)]]
     assert classify.spec.estimated_seconds > 0
-    chained = _chain(session).plan()
-    classifies = [n for n in chained.nodes if isinstance(n, AiClassify)]
+    streamed = _classify_then_filter(session).plan()
+    classifies = [n for n in streamed.nodes if isinstance(n, AiClassify)]
     assert len(classifies) == 2
     assert tuple(
         member.node_id for member in build_pipelines(
-            chained.graph)[classifies[0].node_id]) == (
+            streamed.graph)[classifies[0].node_id]) == (
         classifies[0].node_id, "filter:d:0", classifies[1].node_id)
     session.close()
 
 
-def test_trie_chains_cover_every_node_once_and_gather_ancestors():
-    from quail.execution.labels import tree_scores, trie_chains
+def test_trie_paths_cover_every_node_once_and_gather_ancestors():
+    from quail.execution.labels import tree_scores, trie_paths
 
     # labels a=[1,2,3], b=[1,2,4], c=[1,5,6], d=[7,8]: the rows are the
     # nodes with children, (), (1,), (1,2), (1,5), and (7,)
     labels = ((1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8))
-    chains = trie_chains(labels)
-    assert [nodes for nodes, _, _ in chains] == [
+    paths = trie_paths(labels)
+    assert [nodes for nodes, _, _ in paths] == [
         [(), (1,), (1, 2)], [(1, 5)], [(7,)]]
-    assert [start for _, start, _ in chains] == [0, 2, 1]
+    assert [start for _, start, _ in paths] == [0, 2, 1]
     # (1, 5) reads the cue row and the (1,) row; (7,) reads the cue row
-    assert [gathers for _, _, gathers in chains] == [[], [(0, 2)], [(0, 1)]]
-    nodes = [node for chain, _, _ in chains for node in chain]
+    assert [gathers for _, _, gathers in paths] == [[], [(0, 2)], [(0, 1)]]
+    nodes = [node for path, _, _ in paths for node in path]
     assert sorted(nodes) == sorted(label_trie(labels))
-    # a label whose node is not on the first chain reads the right row
+    # a label whose node is not on the first path reads the right row
     targets = [1, 2, 3, 4, 5, 6, 7, 8]
     logprobs = np.full((len(nodes), len(targets)), -9.0)
     logprobs[0, 0] = -1.0     # () -> 1
@@ -885,7 +885,7 @@ def test_trie_chains_cover_every_node_once_and_gather_ancestors():
     logprobs[2, 3] = -0.1     # (1, 2) -> 4
     logprobs[3, 5] = -0.5     # (1, 5) -> 6
     logprobs[4, 7] = -0.3     # (7,) -> 8
-    scores = tree_scores(labels, chains, targets, logprobs)
+    scores = tree_scores(labels, paths, targets, logprobs)
     assert scores.tolist() == [-4.5, -1.6, -1.75, -2.3]
     assert best_label(scores) == 1
     assert best_label([-1.0, -2.0, -1.0]) == 0
@@ -897,47 +897,47 @@ def test_trie_chains_cover_every_node_once_and_gather_ancestors():
         prompt_token_parts=((90,), (91, 93)), labels=("a", "b", "c", "d"),
         label_token_ids=labels, scoring="trie_tree")
     requests = label_requests(spec)
-    # the cue, then each node's last token in chain order
+    # the cue, then each node's last token in path order
     assert requests.suffixes == [[93, 1, 2, 5, 7]]
-    assert requests.chains == chains
+    assert requests.paths == paths
 
 
 def test_tree_scores_give_a_prefix_label_only_its_longest_matches():
-    from quail.execution.labels import tree_scores, trie_chains
+    from quail.execution.labels import tree_scores, trie_paths
 
     # yes=[1], "yes, partly"=[1,2,3], no=[4]; rows (), (1,), (1, 2)
     labels = ((1,), (1, 2, 3), (4,))
-    chains = trie_chains(labels)
+    paths = trie_paths(labels)
     targets = [1, 2, 3, 4]
     logprobs = np.full((3, 4), -9.0)
     logprobs[0, 0] = np.log(0.7)     # () -> yes
     logprobs[0, 3] = np.log(0.3)     # () -> no
     logprobs[1, 1] = np.log(0.8)     # yes -> ,
     logprobs[2, 2] = np.log(0.9)     # yes, -> partly
-    scores = tree_scores(labels, chains, targets, logprobs)
+    scores = tree_scores(labels, paths, targets, logprobs)
     assert np.exp(scores) == pytest.approx([0.196, 0.504, 0.3])
     assert best_label(scores) == 1
 
     # a=[1], ab=[1,2], abc=[1,2,3]: a gives up only ab's share, which
     # already holds abc's
     labels = ((1,), (1, 2), (1, 2, 3))
-    chains = trie_chains(labels)
+    paths = trie_paths(labels)
     logprobs = np.full((3, 4), -9.0)
     logprobs[0, 0] = np.log(0.5)
     logprobs[1, 1] = np.log(0.6)
     logprobs[2, 2] = np.log(0.5)
-    scores = tree_scores(labels, chains, targets, logprobs)
+    scores = tree_scores(labels, paths, targets, logprobs)
     assert np.exp(scores) == pytest.approx([0.2, 0.15, 0.15])
 
     # an extension that holds all of a label's probability leaves it none
     logprobs[1, 1] = 0.0
-    scores = tree_scores(labels, chains, targets, logprobs)
+    scores = tree_scores(labels, paths, targets, logprobs)
     assert scores[0] == -np.inf
     assert np.exp(scores[1:]) == pytest.approx([0.25, 0.25])
 
 
 def test_trie_tree_reads_through_the_deciding_word():
-    from quail.execution.labels import chain_reads, tree_scores, trie_chains
+    from quail.execution.labels import path_reads, tree_scores, trie_paths
     from quail.labels import fed_nodes, read_nodes, word_starts
 
     pieces = {1: b" hello", 2: b" my", 3: b" name", 4: b" is", 5: b" sh",
@@ -951,9 +951,9 @@ def test_trie_tree_reads_through_the_deciding_word():
     # and no label token is fed
     read = read_nodes(hello, starts)
     assert read == {()} and fed_nodes(read) == {()}
-    chains = trie_chains(hello, read)
-    assert chains == [([()], 0, [])] and chain_reads(chains, read) == [True]
-    scores = tree_scores(hello, chains, [1, 8], np.log([[0.5, 0.4]]), read)
+    paths = trie_paths(hello, read)
+    assert paths == [([()], 0, [])] and path_reads(paths, read) == [True]
+    scores = tree_scores(hello, paths, [1, 8], np.log([[0.5, 0.4]]), read)
     assert np.exp(scores) == pytest.approx([0.5, 0.4])
     # " sp" + "am" against " ham": the deciding token is part of a
     # word, so the word is read to its end, and " special" does not
@@ -962,9 +962,9 @@ def test_trie_tree_reads_through_the_deciding_word():
     starts = word_starts(spam, lambda ids: {1: b" sp", 2: b"am", 3: b" ham"}[ids[0]])
     read = read_nodes(spam, starts)
     assert read == {(), (1,)}
-    chains = trie_chains(spam, read)
+    paths = trie_paths(spam, read)
     logprobs = np.log([[0.45, 1e-9, 0.40], [1e-9, 0.6, 1e-9]])
-    scores = tree_scores(spam, chains, [1, 2, 3], logprobs, read)
+    scores = tree_scores(spam, paths, [1, 2, 3], logprobs, read)
     assert np.exp(scores) == pytest.approx([0.27, 0.40])
     # " category" ":" " alpha" / " beta" / " other": the punctuation
     # joins the word after it; " alpha" and " beta" are whole words
@@ -979,11 +979,11 @@ def test_trie_tree_reads_through_the_deciding_word():
     cat = ((1, 2, 3), (1, 2, 4))
     read = read_nodes(cat, word_starts(cat, lambda ids: pieces[ids[0]]))
     assert read == {(), (1, 2)} and fed_nodes(read) == {(), (1,), (1, 2)}
-    chains = trie_chains(cat, read)
-    assert chains == [([(), (1,), (1, 2)], 0, [])]
-    assert chain_reads(chains, read) == [True, False, True]
+    paths = trie_paths(cat, read)
+    assert paths == [([(), (1,), (1, 2)], 0, [])]
+    assert path_reads(paths, read) == [True, False, True]
     logprobs = np.log([[0.9, 1e-9, 1e-9, 1e-9], [1e-9, 1e-9, 0.3, 0.6]])
-    scores = tree_scores(cat, chains, [1, 2, 3, 4], logprobs, read)
+    scores = tree_scores(cat, paths, [1, 2, 3, 4], logprobs, read)
     assert np.exp(scores) == pytest.approx([0.27, 0.54])
     # digits after a lone space token continue its word
     year = ((1, 2, 3), (1, 2, 4))
@@ -994,19 +994,19 @@ def test_trie_tree_reads_through_the_deciding_word():
     assert word_starts(hello, None) == tuple((False,) * len(ids) for ids in hello)
 
 
-def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
+def test_pack_chunk_packs_paths_as_segments_reading_ancestors(monkeypatch):
     from fakes import cpu_staging
     from test_sliding_kv import plain_arena
 
-    from quail.execution.labels import trie_chains
+    from quail.execution.labels import trie_paths
 
     torch = cpu_staging(monkeypatch)
     arena = plain_arena()
     key = ("d", 0)
     arena.activate(key, 4, capacity_tokens=16, base_tokens=4)
-    chains = trie_chains(((1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8)))
+    paths = trie_paths(((1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8)))
     group = dict(key=key, prefix=None, f=4, suffixes=[[93, 1, 2, 5, 7]],
-                 read_all_rows=True, chains=chains)
+                 read_all_rows=True, paths=paths)
     chunk = chunk_mod.pack_chunk(torch, arena, [group], attention_mode="tree")
     # rows: cue, (1,), (1,2) | (1,5) | (7,): positions past the frame
     assert chunk.positions.tolist() == [4, 5, 6, 6, 5]
@@ -1060,7 +1060,7 @@ def test_merge_partial_equals_attention_over_the_union_of_keys():
 
 @pytest.mark.parametrize("worded", [False, True])
 def test_classifier_scores_the_packed_trie(monkeypatch, worded):
-    from quail.execution.labels import trie_chains
+    from quail.execution.labels import trie_paths
     from quail.labels import read_nodes
 
     # "a b c" / "a b d" / "a e f" / "g h": with word starts the shared
@@ -1068,7 +1068,7 @@ def test_classifier_scores_the_packed_trie(monkeypatch, worded):
     labels = ((1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8))
     starts = tuple((False,) + (True,) * (len(ids) - 1) for ids in labels)
     read = read_nodes(labels, starts if worded else ())
-    chains = trie_chains(labels, read)
+    paths = trie_paths(labels, read)
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
         expected_inputs=2, estimated_seconds=0.0,
@@ -1077,7 +1077,7 @@ def test_classifier_scores_the_packed_trie(monkeypatch, worded):
         label_word_starts=starts if worded else ())
     requests = label_requests(spec)
     targets = requests.targets
-    nodes = [node for chain, _, _ in chains for node in chain]
+    nodes = [node for path, _, _ in paths for node in path]
     # "a e" and "g" are decided at their first word, so " e" and " g"
     # are never fed
     assert requests.suffixes == ([[93, 1, 2]] if worded else [[93, 1, 2, 5, 7]])
@@ -1090,10 +1090,10 @@ def test_classifier_scores_the_packed_trie(monkeypatch, worded):
         for entry in chunk.specs:
             document = entry["key"][2]
             wanted = labels[1 if document == 0 else 3]
-            if entry.get("chains") is None:
+            if entry.get("paths") is None:
                 rows.append([0.0] * len(targets))     # the frame entry
                 continue
-            assert entry["chains"] == chains
+            assert entry["paths"] == paths
             for node, is_read in zip(nodes, requests.read_mask):
                 if is_read:
                     rows.append([

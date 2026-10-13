@@ -281,15 +281,15 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
         query = quailb.queries(session)["FEV-9"][1]()
         plan = query.plan()
         join = next(node for node in plan.nodes if isinstance(node, AiJoin))
-        chain = next(node for node in plan.nodes
+        sequence = next(node for node in plan.nodes
                      if isinstance(node, AiFilter) and node.alias == join.anchor)
-        assert not chain.keep_kv
+        assert not sequence.keep_kv
         edited = plan.insert(
-            Barrier(node_id=f"barrier:{chain.alias}", next_anchor=chain.alias,
-                    aliases=(chain.alias,)),
-            between=(chain.node_id, join.node_id))
-        # cut off from its join by the barrier, the chain retains KV
-        assert edited.graph.node(chain.node_id).keep_kv
+            Barrier(node_id=f"barrier:{sequence.alias}", next_anchor=sequence.alias,
+                    aliases=(sequence.alias,)),
+            between=(sequence.node_id, join.node_id))
+        # cut off from its join by the barrier, the sequence retains KV
+        assert edited.graph.node(sequence.node_id).keep_kv
         assert edited != plan
 
         seen = []
@@ -303,8 +303,8 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
         edited_result = execute_query(
             quailb.queries(session)["FEV-9"][1](), physical_executor=execute,
             plan=edited)
-        assert f"barrier:{chain.alias}" in seen[1]
-        assert f"barrier:{chain.alias}" not in seen[0]
+        assert f"barrier:{sequence.alias}" in seen[1]
+        assert f"barrier:{sequence.alias}" not in seen[0]
         assert edited_result.collect().to_pylist() == rows.to_pylist() == FEV9_ROWS
 
 
@@ -344,7 +344,7 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         assert [type(node).__name__ for node in plan.nodes] == [
             "Scan", "Scan", "AiFilter", "AiClassify", "Filter", "AiJoin",
             "Project"]
-        # the chain, the classification, and the filter on its label run as
+        # the sequence, the classification, and the filter on its label run as
         # one pipeline; the join joins it only when it anchors on the
         # claims
         test, join, project = plan.nodes[4], plan.nodes[5], plan.nodes[6]

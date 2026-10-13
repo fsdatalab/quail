@@ -124,9 +124,9 @@ def test_operators_walk_lists_each_operator_in_written_order():
     tested = Filter(Filter(classified, InList(named_column, ("a",))),
                     InList(named_column, ("b",)))
     hidden_node = SemanticClassify(tested, hidden, "__label_r_3")
-    chain = Filter(hidden_node,
+    sequence = Filter(hidden_node,
                    InList(ColumnRef("r", "reviews", "__label_r_3"), ("a",)))
-    joined = SemanticJoin(Join(chain, p), _pair_call())
+    joined = SemanticJoin(Join(sequence, p), _pair_call())
     pair_node = SemanticClassify(joined, pair, "pair_label")
     plan = LogicalPlan(Project(pair_node, (
         Alias(named, "projected_name"), Alias(pair, "pair_label"),
@@ -167,7 +167,7 @@ def test_operators_walk_lists_each_operator_in_written_order():
     # a label is tested or returned only above the node computing it
     with pytest.raises(CompileError, match="nothing below computes"):
         Filter(r, InList(named_column, ("a",))).validate()
-    assert chain.explain_fields() == {
+    assert sequence.explain_fields() == {
         "condition": "r.__label_r_3 IN ['a']", "selectivity": None}
     with pytest.raises(CompileError, match="needs a SemanticClassify"):
         Project(classified, (Alias(hidden, "x"),)).validate()

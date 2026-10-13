@@ -46,7 +46,7 @@ class FilterPart(SingleResultPart):
     execute_group = staticmethod(execute_filters)
 
     @staticmethod
-    def model_inputs(node, inputs, context, chain=None, nodes=None):
+    def model_inputs(node, inputs, context, sequence=None, nodes=None):
         return filter_inputs(context.state, node, next(iter(inputs.values())))
 
     @classmethod
@@ -179,7 +179,7 @@ def filter_result(node, answers, tokens, document_ids,
 
 
 def filter_document_sink(node, document_ids):
-    """The chain's document_done callback, or None when nobody listens.
+    """The sequence's document_done callback, or None when nobody listens.
 
     Reports each chunk's finished documents to the answer sink as
     ``{"kind": "filter", "node", "alias", "stages", "documents"}`` where
@@ -229,7 +229,7 @@ def stop_groups(node, columns, document_ids) -> list | None:
 
 
 def filter_inputs(state, node, document_ids) -> dict:
-    """Scheduler inputs for one filter chain over the given documents."""
+    """Scheduler inputs for one filter sequence over the given documents."""
     return {
         "documents": DocumentPrefixes(
             state["pre"], state["docs"][node.alias], document_ids

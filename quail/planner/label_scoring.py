@@ -117,7 +117,7 @@ class ClassifyScoring(ClassifyStatistics):
         """
         head, tail = spec.prompt_token_parts
         if spec.scoring == DECISION_SCORING:
-            return classify_cost.estimate_chains(
+            return classify_cost.estimate_suffixes(
                 len(head), spec.frame_tokens, [len(tail) - spec.frame_tokens],
                 live=spec.expected_inputs, lengths=self.lengths,
                 shared=self.shared, chunk=self.chunk, model=self.model,
