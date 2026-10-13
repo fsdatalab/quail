@@ -1,15 +1,12 @@
-"""Tests for the coordinator's round splitting, merging, gating, and thinning."""
+"""Tests for the coordinator's round splitting and answer merging."""
 
 import pyarrow as pa
 
 from quail.backends.quail.coordinator import (
     filter_node_payloads,
-    gate_group,
     join_group_payloads,
     keyed_shards,
-    merge_filter_round,
-    merge_join_round,
-    thin_survivors,
+    merge_join_answers,
 )
 from quail.execution.types import join_answer_cells
 from quail.physical import AiFilter
@@ -44,24 +41,6 @@ def test_filter_and_join_rounds_split_and_place_documents():
     assert [sub["doc_index"]["r"] for sub in subs] == [[0, 2, 4], [1, 3, 5]]
     assert subs[1]["docs"]["r"][0] == [1] * 11
     assert "p" not in subs[0]["docs"]
-
-    outs = [
-        dict(filters={"r": {0: [1], 2: [0], 4: [1]}},
-             survivors={"r": [0, 4]},
-             fresh_tokens=100,
-             boot_s=1.0, wall_s=2.0, peak_gib=10),
-        dict(filters={"r": {1: [1], 3: [1], 5: [0]}},
-             survivors={"r": [1, 3]},
-             fresh_tokens=50,
-             boot_s=1.5, wall_s=2.0, peak_gib=11),
-    ]
-    m = merge_filter_round(outs)
-    assert m["filters"]["r"] == {0: [1], 1: [1], 2: [0], 3: [1],
-                                 4: [1], 5: [0]}
-    assert m["survivors"]["r"] == [0, 1, 3, 4]
-    assert m["fresh_tokens"] == 150
-    limited = merge_filter_round(outs, limit=3)
-    assert limited["survivors"]["r"] == [0, 1, 3]
 
     # an anchor that ran no filter round has no KV to stay near: its scan
     # shard is ignored and shards balance over the live documents
@@ -110,25 +89,7 @@ def test_filter_and_join_rounds_split_and_place_documents():
     assert len(assigned) == len(set(assigned))
 
 
-def test_join_merge_gates_thins_and_ships_partner_lists():
-    out = dict(rows={0: [1, 0], 1: [0, 0], 2: [0, 1]},
-               anchor_index=[5, 7, 9])
-    assert gate_group(out, "full") == [5, 9]
-    assert gate_group(out, "exists") == [5, 9]
-    assert gate_group(out, "anti") == [7]
-    # an anchor gated out mid-group has no last-stage row: dropped
-    partial = dict(rows={0: [1]}, anchor_index=[5, 7])
-    assert gate_group(partial, "full") == [5]
-
-    # two finished stages touching p: a p document must appear in a
-    # surviving pair of BOTH to stay live
-    s1 = dict(anchor="r", partners=["p"], rows={0: [1, 1, 0, 0]},
-              anchor_index=[0], partner_index=[[0], [1], [2], [3]])
-    s2 = dict(s1, anchor="g", rows={0: [0, 1, 1, 0]})
-    survivors = {"r": [0], "g": [0], "p": [0, 1, 2, 3]}
-    thin_survivors([s1, s2], survivors)
-    assert survivors["p"] == [1]
-
+def test_join_merge_and_partner_lists():
     # the merge keeps stages aligned though stage 2 skips gated anchors
     outs = [
         dict(joins=[dict(rows={0: [1, 0], 1: [0, 0]}, anchor_index=[0, 4],
@@ -142,7 +103,8 @@ def test_join_merge_gates_thins_and_ships_partner_lists():
                          partner_index=[[0], [1], [2]])],
              fresh_tokens=10, wall_s=1.0),
     ]
-    merged = merge_join_round(outs)
+    merged = [merge_join_answers([out["joins"][i] for out in outs])
+              for i in range(len(outs[0]["joins"]))]
     assert len(merged) == 2
     assert merged[0]["anchor_index"] == [0, 4, 3]
     assert merged[0]["rows"] == {0: [1, 0], 1: [0, 0], 2: [1, 1]}
@@ -160,17 +122,10 @@ def test_join_merge_gates_thins_and_ships_partner_lists():
                          anchor_partners={0: [1, 2]})],
              fresh_tokens=1, wall_s=1.0),
     ]
-    merged = merge_join_round(outs)[0]
+    merged = merge_join_answers([out["joins"][0] for out in outs])
     assert merged["anchor_partners"] == {0: [2], 1: [0, 1], 2: [1, 2]}
     assert list(join_answer_cells(merged)) == [
         (0, 2, 1), (1, 0, 0), (1, 1, 1), (2, 1, 1), (2, 2, 0)]
-    # thinning reads the member list: anchor 0 matched partner 3
-    # (member 2), anchor 4 matched partner 2, anchor 3 matched partner 2
-    merged.update(anchor="r", partners=["p"])
-    survivors = {"r": [0, 3, 4], "p": [1, 2, 3]}
-    thin_survivors([merged], survivors)
-    assert survivors == {"r": [0, 3, 4], "p": [2, 3]}
-
     # a pair stage ships each worker's anchors with their live partners only
     pairs = pa.table({"r": pa.array([0, 0, 2, 3, 5], pa.int32()),
                       "p": pa.array([0, 3, 1, 2, 3], pa.int32())})
@@ -198,4 +153,3 @@ def test_stop_key_groups_ride_the_filter_payload_and_shard_together():
     # every document of a key lands on one worker
     shards = keyed_shards([0, 1, 0, 2, 1, 0], [10, 11, 12, 13, 14, 15], 2)
     assert shards == ((0, 2, 5), (1, 3, 4))
-

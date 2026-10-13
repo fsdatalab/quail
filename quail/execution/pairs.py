@@ -16,6 +16,13 @@ import pyarrow.compute as pc
 COLUMNS_PREFIX = "columns:"
 
 
+def pair_keys(anchors, partners):
+    """Encode document ID pairs as int64 keys or an Arrow expression."""
+    keys = pc.add(pc.shift_left(anchors.cast(pa.int64()), 32),
+                  partners.cast(pa.int64()))
+    return keys.combine_chunks() if isinstance(keys, pa.ChunkedArray) else keys
+
+
 def columns_key(alias: str) -> str:
     """The request relation key of one alias's value table."""
     return f"{COLUMNS_PREFIX}{alias}"

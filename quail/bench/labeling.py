@@ -865,6 +865,13 @@ def _expected_rows(spec: PredicateSpec,
     return count
 
 
+def _label_set_identities(corpus_manifest, specs) -> dict:
+    """Return content identities for the corpus's requested label sets."""
+    return {spec.key: label_set_identity(
+        spec, corpus_manifest["corpus_id"], corpus_manifest["corpus_full_hash"])
+        for spec in specs}
+
+
 def _collection_identity(corpus_manifest: dict,
                          identities: dict[str, dict]) -> dict:
     mapping = {key: identities[key]["label_set_id"]
@@ -1031,12 +1038,7 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> dict:
         raise ValueError(
             f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}")
     _, corpus_manifest, _ = _materialize_corpus(sf)
-    identities = {
-        spec.key: label_set_identity(
-            spec, corpus_manifest["corpus_id"],
-            corpus_manifest["corpus_full_hash"])
-        for spec in judged_predicates()
-    }
+    identities = _label_set_identities(corpus_manifest, judged_predicates())
     collection = _collection_identity(corpus_manifest, identities)
     path = (ROOT / "collections" / collection["collection_id"]
             / "manifest.json")
@@ -1063,12 +1065,7 @@ def judge_workload(corpus_id: str, workload: str) -> dict:
         raise ValueError(f"no predicates for workload {workload!r}")
     t_total = time.perf_counter()
     _, corpus_manifest, rows = _load_corpus(corpus_id)
-    identities = {
-        spec.key: label_set_identity(
-            spec, corpus_manifest["corpus_id"],
-            corpus_manifest["corpus_full_hash"])
-        for spec in specs
-    }
+    identities = _label_set_identities(corpus_manifest, specs)
     for spec in specs:
         label_dir = _label_dir(spec, identities[spec.key])
         label_dir.mkdir(parents=True, exist_ok=True)
@@ -1130,12 +1127,7 @@ def finalize_collection(sf: float, corpus_id: str,
                         partials: dict[str, dict]) -> dict:
     """Assemble five workloads and activate their ground truth."""
     _, corpus_manifest, _ = _load_corpus(corpus_id)
-    identities = {
-        spec.key: label_set_identity(
-            spec, corpus_manifest["corpus_id"],
-            corpus_manifest["corpus_full_hash"])
-        for spec in judged_predicates()
-    }
+    identities = _label_set_identities(corpus_manifest, judged_predicates())
     collection = _collection_identity(corpus_manifest, identities)
     collection_dir = (ROOT / "collections"
                       / collection["collection_id"])
@@ -1752,7 +1744,6 @@ results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
 image = gpu_image()
 # the dev group carries boto3 for the upload; no GPU stack here
 publish_image = cpu_image()
-
 
 
 def _aws_credentials() -> dict[str, str]:

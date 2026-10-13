@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from quail.execution.pairs import COLUMNS_PREFIX
+from quail.execution.result import filter_answer_table
 from quail.execution.tokens import decode_token_documents
 from quail.physical import (
     AiFilter,
@@ -133,25 +134,7 @@ def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
             documents.append(int(document))
             positions.append(node.written_pos)
             answers.append(bool(answer))
-    schema = pa.schema(
-        [
-            pa.field(node.alias, pa.int32(), nullable=False),
-            pa.field("predicate", pa.int32(), nullable=False),
-            pa.field("answer", pa.bool_(), nullable=False),
-        ],
-        metadata={
-            b"quail.kind": b"filter_answers",
-            b"quail.alias": node.alias.encode("utf-8"),
-        },
-    )
-    return pa.Table.from_arrays(
-        [
-            pa.array(documents, type=pa.int32()),
-            pa.array(positions, type=pa.int32()),
-            pa.array(answers, type=pa.bool_()),
-        ],
-        schema=schema,
-    )
+    return filter_answer_table(node.alias, documents, positions, answers)
 
 
 def join_answer_cells(value: Mapping[str, Any]):

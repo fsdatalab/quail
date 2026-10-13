@@ -1,12 +1,9 @@
 """Execute LLM filters and conditions on classification results."""
 
-from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.parts import (
     ExecutionPart,
+    execute_parts,
     execution_prefix_tree,
-    gpu_seconds,
-    input_staging,
-    stage_spans,
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
@@ -23,67 +20,23 @@ def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
 
 def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
     """Run filter predicates together while each document retains its KV."""
+    state.gpu_timing = bool(inputs.get("gpu_timing", False))
     node = nodes[0]
-    torch = state.torch
-    arena = state.loaded_model.arena
-    pipeline = state.loaded_model.pipeline
-    async_answers = state.async_answers
-    chunk_tokens = state.chunk_tokens
-
-    document_ids = inputs["document_ids"]
-    retain_survivors = True if nodes[-1].keep_kv else ()
-    # sorted admission would change which rows a limit keeps
-    tree = (None if inputs.get("limit") is not None
-            else execution_prefix_tree(node, inputs["documents"], arena))
-    sinks = [filter_document_sink(member, document_ids) for member in nodes]
-
-    def document_done(finished):
-        for j, sink in enumerate(sinks):
-            if sink is not None:
-                rows = [(document, 0, passed if stage == j else True)
-                        for document, stage, passed in finished if stage >= j]
-                if rows:
-                    sink(rows)
-
-    stats = {}
-    answers, spans, tokens = loop.run_filter(
-        torch,
-        arena,
-        pipeline,
-        async_answers,
-        inputs["documents"],
-        [list(member.question_token_ids) for member in nodes],
-        chunk_tokens,
-        limit=inputs.get("limit"),
-        stop_groups=inputs.get("stop_groups"),
-        arena_writes=node.arena_writes or len(nodes) > 1,
-        arena_keys=DocumentKeys(node.alias, document_ids),
-        retain_survivors=retain_survivors,
-        document_done=(inputs.get("document_done") if len(nodes) == 1
-                       else document_done),
-        prefix_tree=tree,
-        attention_mode=node.attention or None,
-        stats=stats, staging=input_staging(state),
-        gpu_timing=bool(inputs.get("gpu_timing")),
-    )
-    counts = [sum(len(row) > j for row in answers.values())
-              for j in range(len(nodes))]
-    own = [count * (len(member.question_token_ids) + len(pipeline.canvas_ids))
-           for count, member in zip(counts, nodes)]
-    own[0] = tokens - sum(own[1:])
-    results = {}
-    for j, member in enumerate(nodes):
-        rows = {document: [row[j]] for document, row in answers.items()
-                if len(row) > j}
-        own_spans = stage_spans(spans, j, j + 1)
-        result = filter_result(
-            member, rows, own[j], document_ids,
-            gpu_s=gpu_seconds(own_spans),
-            chunks=len(own_spans),
-            borrowed_tokens=stats.get("borrowed_tokens", 0) if j == 0 else 0,
-            pack_s=stats.get("pack_s", 0.0) if j == 0 else 0.0)
-        results[member.node_id] = result
-    return results
+    documents, ids = inputs["documents"], inputs["document_ids"]
+    parts = [FilterPart(member, ids, state.async_answers,
+                        len(state.loaded_model.pipeline.canvas_ids))
+             for member in nodes]
+    if len(parts) == 1 and "document_done" in inputs:
+        parts[0].document_done = inputs["document_done"]
+    # Sorted admission would change which rows a limit keeps.
+    tree = (None if inputs.get("limit") is not None else execution_prefix_tree(
+        node, documents, state.loaded_model.arena))
+    return execute_parts(
+        state, parts, documents, DocumentKeys(node.alias, ids),
+        keep_kv=nodes[-1].keep_kv, tree=tree, attention=node.attention or "unified",
+        limit=inputs.get("limit"), stop_groups=inputs.get("stop_groups"),
+        paged=node.arena_writes or len(nodes) > 1,
+        label=f"filter ({len(nodes)} predicates)")
 
 
 class FilterPart(ExecutionPart):

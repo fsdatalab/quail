@@ -9,7 +9,6 @@ import pyarrow.compute as pc
 from quail.backends.quail.graph import runs_over_pairs, stop_groups
 from quail.execution.pairs import pair_partner
 from quail.execution.tokens import select_documents
-from quail.execution.types import join_answer_cells
 from quail.planner import balanced_shards
 
 
@@ -87,62 +86,6 @@ def keyed_shards(groups, doc_tokens, k: int) -> tuple:
     for document, group in enumerate(groups):
         out[placed[group]].append(document)
     return tuple(tuple(shard) for shard in out)
-
-
-def merge_filter_round(outs: list, limit: int | None = None) -> dict:
-    """Merge workers' filter answers, survivors, and token counts."""
-    filters, survivors = {}, {}
-    tokens = 0
-    for out in outs:
-        tokens += out["fresh_tokens"]
-        for alias, rows in out["filters"].items():
-            filters.setdefault(alias, {}).update(rows)
-        for alias, surv in out["survivors"].items():
-            survivors.setdefault(alias, []).extend(surv)
-    merged = {a: sorted(v) for a, v in survivors.items()}
-    if limit is not None:
-        merged = {a: v[:limit] for a, v in merged.items()}
-    return dict(filters=filters, survivors=merged,
-                fresh_tokens=tokens)
-
-
-def gate_group(stage_out: dict, semantics: str) -> list:
-    """Return surviving anchor indices after one group's last stage.
-
-    Full/exists keep anchors with any TRUE; anti keeps those with none.
-    """
-    evaluated = list(stage_out["anchor_index"])
-    kept = {evaluated[a] for a, row in stage_out["rows"].items()
-            if any(row)}
-    if semantics == "anti":
-        return [g for g in evaluated if g not in kept]
-    return sorted(kept)
-
-
-def thin_survivors(full_stage_outs: list, survivors: dict) -> dict:
-    """Thin survivor lists at a barrier.
-
-    A document stays live only if every finished full stage touching
-    its table has it in at least one surviving pair. Affects what later
-    stages evaluate, never the final query result.
-    """
-    for out in full_stage_outs:
-        anchor, partners = out["anchor"], out["partners"]
-        alive = set(survivors.get(anchor, out["anchor_index"]))
-        seen = {al: set() for al in (anchor, *partners)}
-        for la, ti, bit in join_answer_cells(out):
-            ga = out["anchor_index"][la]
-            if ga not in alive or not bit:
-                continue
-            seen[anchor].add(ga)
-            for al, gp in zip(partners, out["partner_index"][ti]):
-                seen[al].add(gp)
-        for al, ids in seen.items():
-            if al in survivors:
-                survivors[al] = [g for g in survivors[al] if g in ids]
-            else:
-                survivors[al] = sorted(ids)
-    return survivors
 
 
 def join_group_payloads(payload: dict, k: int, survivors: dict,
@@ -232,27 +175,18 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
     return subs
 
 
-def merge_join_round(outs: list) -> list:
-    """Merge workers' per-stage join answer rows."""
-    if not outs:
-        return []
-    n_stages = len(outs[0]["joins"])
-    merged = []
-    for s in range(n_stages):
-        rows, anchor_index = {}, []
-        members = None
-        partner_index = outs[0]["joins"][s]["partner_index"]
-        for out in outs:
-            stage = out["joins"][s]
-            base = len(anchor_index)
-            anchor_index.extend(stage["anchor_index"])
-            for local, row in stage["rows"].items():
-                rows[base + int(local)] = row
-            if stage.get("anchor_partners") is not None:
-                members = members or {}
-                for local, streamed in stage["anchor_partners"].items():
-                    members[base + int(local)] = streamed
-        merged.append(dict(rows=rows, anchor_index=anchor_index,
-                           partner_index=partner_index,
-                           anchor_partners=members))
-    return merged
+def merge_join_answers(parts: list) -> dict:
+    """Merge answer rows while translating each worker's local anchor indices."""
+    rows, anchor_index = {}, []
+    members = None
+    for part in parts:
+        base = len(anchor_index)
+        anchor_index.extend(part["anchor_index"])
+        rows.update((base + int(local), row) for local, row in part["rows"].items())
+        if part.get("anchor_partners") is not None:
+            if members is None:
+                members = {}
+            members.update((base + int(local), streamed)
+                           for local, streamed in part["anchor_partners"].items())
+    return dict(parts[0], rows=rows, anchor_index=anchor_index,
+                anchor_partners=members)

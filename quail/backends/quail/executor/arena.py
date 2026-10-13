@@ -680,12 +680,15 @@ class KVArena:
             return
         self._holds[key] -= 1
         if not self._holds[key]:
-            del self._holds[key]
-            if key in self._deferred:
-                self._deferred.discard(key)
-                self.free_key(key)
-            else:
-                self._lift_floor(key)
+            self._release_hold(key)
+
+    def _release_hold(self, key):
+        del self._holds[key]
+        if key in self._deferred:
+            self._deferred.discard(key)
+            self.free_key(key)
+        else:
+            self._lift_floor(key)
 
     def drop_holds(self, keys=None) -> bool:
         """Release every hold on the keys (all keys by default).
@@ -697,12 +700,7 @@ class KVArena:
         keys = list(self._holds) if keys is None else [
             key for key in keys if key in self._holds]
         for key in keys:
-            del self._holds[key]
-            if key in self._deferred:
-                self._deferred.discard(key)
-                self.free_key(key)
-            else:
-                self._lift_floor(key)
+            self._release_hold(key)
         return bool(keys)
 
     def free_key(self, key):

@@ -150,8 +150,7 @@ def lowest_borrows(borrowing):
 
 
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
-               question_ids, budget, timing=None,
-               pinned=True, limit=None, *, arena_writes,
+               question_ids, budget, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=(), attention_mode=None,
                document_done=None, prefix_tree=None, stats=None,
                staging=None, stop_groups=None, gpu_timing=False):
@@ -165,8 +164,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         doc_ids: Per-document token lists.
         question_ids: Per-stage question token lists.
         budget: Chunk token budget.
-        timing: Unused.
-        pinned: Unused.
         limit: Stop admitting documents after this many survivors.
         arena_writes: Whether document KV is written to the arena.
             Must be True with multiple stages.

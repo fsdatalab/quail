@@ -27,7 +27,6 @@ from quail.backends.quail.graph import (
     join_suffixes,
     partner_list_builder,
     partner_maps,
-    stage_partner_lists,
 )
 from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, join_settlement
@@ -490,7 +489,7 @@ def _child_filters(state, sub):
         _reset_child_query(state)
         config = sub.get("retention", {})
         apply_retention(arena, config, config.get("initial", {}))
-    out = dict(filters={}, survivors={}, retained={}, fresh_tokens=0)
+    results = {}
     pre = sub.get("pre_ids") or []
     filter_limit = sub.get("filter_limit")
     t0 = time.perf_counter()
@@ -523,30 +522,31 @@ def _child_filters(state, sub):
                     "stop_groups": sub.get("stop_groups"),
                 },
             )
-            out["results"] = results
-            result = results[nodes[-1].node_id]
-            answers = {}
-            for member in nodes:
-                for document, row in results[member.node_id].outputs[
-                        f"filter_answers:{alias}"].items():
-                    answers.setdefault(document, []).extend(row)
-            out["fresh_tokens"] += sum(result.metrics.fresh_tokens
-                                       for result in results.values())
-            out["filters"][alias] = {
-                int(document): row for document, row in answers.items()
-            }
-            out["survivors"][alias] = list(
-                result.outputs[f"ids:{alias}"]
-            )
-    for alias, document in arena.retained_keys():
-        out["retained"].setdefault(alias, []).append(document)
-    out["retained"] = {alias: sorted(set(documents))
-                       for alias, documents in out["retained"].items()}
+    return _child_results(torch, arena, results, wall_started=t0)
+
+
+def _child_results(torch, arena, results, *, wall_started=None, **metrics):
+    """Collect worker outputs and measurements after GPU work completes."""
     torch.cuda.synchronize()
-    out["wall_s"] = round(time.perf_counter() - t0, 2)
-    out["peak_gib"] = round(
-        torch.cuda.max_memory_allocated() / 2**30, 2)
-    return out
+    retained = {}
+    for alias, document in arena.retained_keys():
+        if isinstance(alias, tuple) and alias[0] == "extract":
+            alias = alias[1]
+        retained.setdefault(alias, []).append(document)
+    return {
+        "results": results,
+        "retained": {alias: sorted(documents)
+                     for alias, documents in retained.items()},
+        "kv_totals": {
+            "evicted_keys": arena.evicted_keys,
+            "evicted_pages": arena.evicted_pages,
+            "evicted_prefix_tokens": arena.evicted_prefix_tokens,
+        },
+        "peak_gib": torch.cuda.max_memory_allocated() / 2**30,
+        **({"wall_s": round(time.perf_counter() - wall_started, 2)}
+           if wall_started is not None else {}),
+        **metrics,
+    }
 
 
 def _child_extract(state, sub):
@@ -554,22 +554,7 @@ def _child_extract(state, sub):
     gpu = state["gpu"]
     with gpu.torch.inference_mode():
         results = execute_extractions(gpu.execution.query, sub["nodes"], sub["inputs"])
-    gpu.torch.cuda.synchronize()
-    retained = {}
-    for alias, document in gpu.arena.retained_keys():
-        if isinstance(alias, tuple) and alias[0] == "extract":
-            alias = alias[1]
-        retained.setdefault(alias, []).append(document)
-    return {
-        "results": results,
-        "retained": retained,
-        "kv_totals": {
-            "evicted_keys": gpu.arena.evicted_keys,
-            "evicted_pages": gpu.arena.evicted_pages,
-            "evicted_prefix_tokens": gpu.arena.evicted_prefix_tokens,
-        },
-        "peak_gib": gpu.torch.cuda.max_memory_allocated() / 2**30,
-    }
+    return _child_results(gpu.torch, gpu.arena, results)
 
 
 def _child_joins(state, sub):
@@ -594,7 +579,6 @@ def _child_joins(state, sub):
     live[anchor_alias] = anchors_glob
     apply_retention(arena, config,
                     config.get("before", {}).get(node.node_id, {}), live)
-    out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():
         stage_suffixes, tuple_indices = join_suffixes(
@@ -631,32 +615,10 @@ def _child_joins(state, sub):
                 "group": group,
             },
         )
-        ans = [results[member.node_id].metrics.extension["answers"][0]
-               for member in nodes]
-        tokens_total += sum(result.metrics.fresh_tokens for result in results.values())
-        partner_lists = stage_partner_lists(group, lists_for, anchors_glob)
-        for si, j in enumerate(group):
-            out_joins.append(dict(
-                rows={int(a): row for a, row in ans[si].items()},
-                anchor_index=anchors_glob,
-                partner_index=tuple_globs[si],
-                anchor_partners=partner_lists[si]))
     if sub.get("final_group"):
         for key in arena.resident_keys():
             arena.free_key(key)
-    torch.cuda.synchronize()
-    retained = {}
-    for alias, document in arena.retained_keys():
-        retained.setdefault(alias, []).append(document)
-    return dict(joins=out_joins, results=results, fresh_tokens=tokens_total,
-                retained={alias: sorted(documents)
-                          for alias, documents in retained.items()},
-                kv_round=round_kv,
-                kv_totals=dict(
-                    evicted_keys=arena.evicted_keys,
-                    evicted_pages=arena.evicted_pages,
-                    evicted_prefix_tokens=arena.evicted_prefix_tokens),
-                wall_s=round(time.perf_counter() - t0, 2))
+    return _child_results(torch, arena, results, wall_started=t0, kv_round=round_kv)
 
 
 def _reset_child_query(state):

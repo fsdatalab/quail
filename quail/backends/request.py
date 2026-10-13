@@ -26,7 +26,11 @@ from quail.execution.pairs import (
     pair_partner,
     partner_map,
 )
-from quail.execution.result import answer_table
+from quail.execution.result import (
+    answer_table,
+    extract_answer_table,
+    filter_answer_table,
+)
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -50,6 +54,7 @@ from quail.logical import (
     label_text,
     render_join_frame,
     shared_preamble,
+    true_false_token_ids,
 )
 from quail.logical import Aggregate as LogicalAggregate
 from quail.physical import (
@@ -81,20 +86,6 @@ from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planner.statistics import prepare_filter_costs, summarize_alias
 from quail.planner.validation import extraction_refusal, has_extract, has_label
-
-
-def _answer_ids(tokenizer) -> tuple[list[int], list[int]]:
-    true_ids = set()
-    false_ids = set()
-    for word in ("TRUE", " TRUE", "True", " True"):
-        tokens = tokenizer(word)
-        if tokens:
-            true_ids.add(int(tokens[0]))
-    for word in ("FALSE", " FALSE", "False", " False"):
-        tokens = tokenizer(word)
-        if tokens:
-            false_ids.add(int(tokens[0]))
-    return sorted(true_ids), sorted(false_ids)
 
 
 def plan_request_backend(
@@ -480,7 +471,7 @@ def plan_request_backend(
             count=region.logical_plan.result.limit,
         ))
 
-    true_ids, false_ids = _answer_ids(context.tokenizer)
+    true_ids, false_ids = true_false_token_ids(context.tokenizer)
     plan = PhysicalPlan(
         model=context.model.name,
         device=context.device.name,
@@ -525,25 +516,7 @@ def _filter_answer_table(alias, written_positions, answers) -> pa.Table:
         documents.append(int(document))
         predicates.append(int(written_positions[stage_index]))
         values.append(bool(answer))
-    schema = pa.schema(
-        [
-            pa.field(alias, pa.int32(), nullable=False),
-            pa.field("predicate", pa.int32(), nullable=False),
-            pa.field("answer", pa.bool_(), nullable=False),
-        ],
-        metadata={
-            b"quail.kind": b"filter_answers",
-            b"quail.alias": alias.encode("utf-8"),
-        },
-    )
-    return pa.Table.from_arrays(
-        [
-            pa.array(documents, type=pa.int32()),
-            pa.array(predicates, type=pa.int32()),
-            pa.array(values, type=pa.bool_()),
-        ],
-        schema=schema,
-    )
+    return filter_answer_table(alias, documents, predicates, values)
 
 
 def _allowed_members(anchor, partners, anchor_ids, members, pairs) -> list:
@@ -691,6 +664,22 @@ def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
     }
 
 
+def _generation_counts(outputs) -> dict:
+    """Count prompt reuse and generated tokens fed into later decode steps."""
+    prompt_tokens = cached_tokens = generated_tokens = fed_back = 0
+    for output in outputs:
+        prompt_tokens += len(output.prompt_token_ids)
+        cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
+        generated = len(output.outputs[0].token_ids)
+        generated_tokens += generated
+        fed_back += max(generated - 1, 0)
+    return {
+        "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens,
+        "fresh_tokens": prompt_tokens - cached_tokens + fed_back,
+        "generated_tokens": generated_tokens,
+    }
+
+
 def _classify_documents(client, spec, bodies) -> dict:
     """Decode one label per prompt body with greedy generation.
 
@@ -716,14 +705,7 @@ def _classify_documents(client, spec, bodies) -> dict:
     wall_s = time.perf_counter() - started
     labels = []
     unmatched = 0
-    prompt_tokens = cached_tokens = generated_tokens = fed_back = 0
     for output in outputs:
-        prompt_tokens += len(output.prompt_token_ids)
-        cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
-        generated = len(output.outputs[0].token_ids)
-        generated_tokens += generated
-        # each generated token but the last is fed back through the model
-        fed_back += max(generated - 1, 0)
         text = output.outputs[0].text or ""
         label = match_label(text, spec.labels)
         unmatched += label is None
@@ -732,17 +714,9 @@ def _classify_documents(client, spec, bodies) -> dict:
         "labels": labels,
         "wall_s": wall_s,
         "requests": len(prompts),
-        "prompt_tokens": prompt_tokens,
-        "cached_tokens": cached_tokens,
-        "fresh_tokens": prompt_tokens - cached_tokens + fed_back,
-        "generated_tokens": generated_tokens,
+        **_generation_counts(outputs),
         "unmatched": unmatched,
     }
-
-
-# the most tokens an answer may run to; the measured answers of a
-# 16-token chunk fit, and a clause of a contract runs longer
-EXTRACT_SPAN_TYPE = pa.struct([("start", pa.int32()), ("end", pa.int32())])
 
 
 def _extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
@@ -778,13 +752,7 @@ def _extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
     wall_s = time.perf_counter() - started
     answers, spans = [], []
     unanswered = unaligned = 0
-    prompt_tokens = cached_tokens = generated_tokens = fed_back = 0
     for output, document in zip(outputs, texts):
-        prompt_tokens += len(output.prompt_token_ids)
-        cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
-        generated = len(output.outputs[0].token_ids)
-        generated_tokens += generated
-        fed_back += max(generated - 1, 0)
         phrase = read_phrase(output.outputs[0].text or "")
         span = None if phrase is None else locate_span(document, phrase)
         if phrase is None:
@@ -800,24 +768,16 @@ def _extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
         "spans": spans,
         "wall_s": wall_s,
         "requests": len(prompts),
-        "prompt_tokens": prompt_tokens,
-        "cached_tokens": cached_tokens,
-        "fresh_tokens": prompt_tokens - cached_tokens + fed_back,
-        "generated_tokens": generated_tokens,
+        **_generation_counts(outputs),
         "unanswered": unanswered,
         "unaligned": unaligned,
     }
 
 
 def _extract_answer_table(spec, document_ids, answers, spans) -> pa.Table:
-    """Return one row per document: its id, its answer, and the answer's span."""
-    return pa.table({
-        spec.alias: pa.array(document_ids, pa.int32()),
-        spec.output: pa.array(answers, pa.string()),
-        spec.span_output: pa.array(
-            [None if span is None else {"start": span[0], "end": span[1]}
-             for span in spans], EXTRACT_SPAN_TYPE),
-    })
+    """Return each document's answer and character span."""
+    return extract_answer_table(spec.alias, spec.output, spec.span_output,
+                                document_ids, answers, spans)
 
 
 def _choose_documents(client, spec, bodies) -> dict:

@@ -15,15 +15,15 @@ import numpy as np
 
 from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.parts import (
-    gpu_seconds,
-    input_staging,
+    ExecutionPart,
+    execute_parts,
     shared_prefix_tree,
 )
 from quail.backends.quail.executor.readout import (
     AsyncDecisionChoices,
     AsyncLabelLogprobs,
 )
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.labels import (
     GreedyDecoder,
@@ -566,6 +566,37 @@ class AnswerStream:
             self.send(anchors, value_of)
 
 
+class ClassifyBatch(ExecutionPart):
+    """Classification stages, answer streaming, and batch results."""
+
+    def __init__(self, plan, on_answers=None, prefix_tokens=0):
+        self.plan = plan
+        self.stages = plan.stages
+        self.prefix_tokens = prefix_tokens
+        self.stream = AnswerStream(on_answers)
+        self.document_done = self.stream.chunk(lambda anchor: plan.labels[anchor])
+
+    def finish(self, every) -> int:
+        """Finalize labels and count tokens processed after the documents."""
+        self.reached = len(every[0]) if every else 0
+        self.suffix_tokens, self.streamed_tokens = self.plan.finish(every)
+        self.stream.finish(range(len(self.plan.labels)),
+                           lambda anchor: self.plan.labels[anchor])
+        return self.streamed_tokens
+
+    def result(self, tokens, gpu_s, chunks, stats) -> RerankerBatch:
+        return RerankerBatch(
+            self.plan.labels, fresh_tokens=tokens,
+            cached_tokens=self.prefix_tokens + self.streamed_tokens - tokens,
+            suffix_tokens=self.suffix_tokens,
+            borrowed_tokens=stats.get("borrowed_tokens", 0),
+            pack_s=stats.get("pack_s", 0.0), gpu_s=gpu_s, chunks=chunks,
+            probabilities=self.plan.probabilities)
+
+    def results(self) -> dict:
+        return {self.plan.spec.name: self.result_value}
+
+
 class QuailClassifier:
     """Classify document rows with Quail's token admission and KV arena."""
 
@@ -589,7 +620,6 @@ class QuailClassifier:
         state = self.state
         rows = np.asarray(rows, dtype=np.int32).reshape(-1)
         prefixes = document_prefixes(spec, documents, rows)
-        staging = input_staging(state)
         keys = [("classify", spec.name, index) for index in range(len(rows))]
         tree = (shared_prefix_tree(spec.name, prefixes, state.loaded_model.arena)
                 if spec.share_prefixes else None)
@@ -597,28 +627,7 @@ class QuailClassifier:
         # a canvas is drawn from the document's row, so an answer is
         # the same in any batch
         plan.seeds = rows
-        stats = {}
-        stream = AnswerStream(on_answers)
-        answers, spans, fresh = run_stages(
-            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
-            plan.stages,
-            prefixes, state.chunk_tokens, anchor_keys=keys,
-            staging=staging, prefix_tree=tree, stats=stats, gpu_timing=state.gpu_timing,
-            label=f"classify {spec.name}",
-            on_chunk=stream.chunk(lambda anchor: plan.labels[anchor]))
-        suffix_tokens, streamed = plan.finish(answers)
-        stream.finish(range(len(rows)), lambda anchor: plan.labels[anchor])
-        total = sum(map(len, prefixes)) + streamed
-        return self._batch(plan.labels, fresh, total - fresh, suffix_tokens,
-                           stats, spans, plan.probabilities)
-
-    def _batch(self, labels, fresh, cached, suffix_tokens, stats,
-               spans, probabilities=None) -> RerankerBatch:
-        """Build a classification batch with token counts and optional GPU timing."""
-        return RerankerBatch(
-            labels, fresh_tokens=fresh, cached_tokens=cached,
-            suffix_tokens=suffix_tokens,
-            borrowed_tokens=stats.get("borrowed_tokens", 0),
-            pack_s=stats.get("pack_s", 0.0),
-            gpu_s=gpu_seconds(spans), chunks=len(spans),
-            probabilities=probabilities)
+        part = ClassifyBatch(plan, on_answers, sum(map(len, prefixes)))
+        return execute_parts(
+            state, [part], prefixes, keys, keep_kv=False, tree=tree,
+            label=f"classify {spec.name}")[spec.name]

@@ -25,21 +25,10 @@ def shared_preamble(turn_prefix: str, layout: str = "ai-if") -> str:
 
 
 def true_false_ids(tok):
-    """The token ids that mean TRUE and FALSE.
-
-    Args:
-        tok: A HuggingFace tokenizer; called with add_special_tokens=False.
-    """
-    true, false = set(), set()
-    for w in ("TRUE", " TRUE", "True", " True"):
-        ids = tok(w, add_special_tokens=False)["input_ids"]
-        if ids:
-            true.add(ids[0])
-    for w in ("FALSE", " FALSE", "False", " False"):
-        ids = tok(w, add_special_tokens=False)["input_ids"]
-        if ids:
-            false.add(ids[0])
-    return true, false
+    """Return TRUE and FALSE token sets from a Hugging Face tokenizer."""
+    true, false = true_false_token_ids(
+        lambda text: tok(text, add_special_tokens=False)["input_ids"])
+    return set(true), set(false)
 
 
 def true_false_token_ids(tokenizer) -> tuple[list[int], list[int]]:

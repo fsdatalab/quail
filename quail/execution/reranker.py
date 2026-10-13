@@ -9,7 +9,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.backends.base import GpuContext
-from quail.execution.result import DEFAULT_BATCH_ROWS, answer_table
+from quail.execution.result import DEFAULT_BATCH_ROWS, answer_table, filter_answer_table
 from quail.execution.runner import (
     NodeMetrics,
     NodeResult,
@@ -442,18 +442,9 @@ class RerankerModelExecution:
 def _filter_answer_table(node: Filter, table, answers) -> pa.Table:
     """Build one answer row per document using the filter answer schema."""
     alias = node.aliases[0]
-    schema = pa.schema(
-        [pa.field(alias, pa.int32(), nullable=False),
-         pa.field("predicate", pa.int32(), nullable=False),
-         pa.field("answer", pa.bool_(), nullable=False)],
-        metadata={b"quail.kind": b"filter_answers",
-                  b"quail.alias": alias.encode("utf-8")})
-    return pa.Table.from_arrays([
-        pc.cast(table.column(alias), pa.int32()),
-        pa.array(np.full(table.num_rows, node.written_pos, dtype=np.int32),
-                 type=pa.int32()),
-        pa.array(answers, type=pa.bool_()),
-    ], schema=schema)
+    return filter_answer_table(
+        alias, table.column(alias),
+        np.full(table.num_rows, node.written_pos, dtype=np.int32), answers)
 
 
 class FilterRuntime:

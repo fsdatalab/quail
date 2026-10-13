@@ -555,17 +555,9 @@ def classifications(node) -> tuple:
 
 
 def classified_above_joins(root) -> frozenset:
-    """Return the aliases whose one-table classification sits above a join.
-
-    The planner runs such a classification after the joins, over the
-    documents the joins matched.
-    """
-    return frozenset(
-        node.alias
-        for node in classifications(root)
-        if len(node.call.aliases()) == 1
-        and any(isinstance(below, SemanticJoin) for below in _subtree(node.input))
-    )
+    """Return aliases classified one document at a time after a join."""
+    return _above_joins(node for node in classifications(root)
+                        if len(node.call.aliases()) == 1)
 
 
 def extractions(node) -> tuple:
@@ -576,16 +568,14 @@ def extractions(node) -> tuple:
 
 
 def extracted_above_joins(root) -> frozenset:
-    """Return the aliases whose extraction sits above a join.
+    """Return aliases whose extraction runs after a join."""
+    return _above_joins(extractions(root))
 
-    The planner runs such an extraction after the joins, over the
-    documents the joins matched.
-    """
-    return frozenset(
-        node.alias
-        for node in extractions(root)
-        if any(isinstance(below, SemanticJoin) for below in _subtree(node.input))
-    )
+
+def _above_joins(nodes) -> frozenset:
+    return frozenset(node.alias for node in nodes
+                     if any(isinstance(below, SemanticJoin)
+                            for below in _subtree(node.input)))
 
 
 APPLY_KINDS = ("per_batch", "barrier")

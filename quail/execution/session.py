@@ -18,7 +18,7 @@ from pyarrow import compute as pc
 
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
-from quail.execution.pairs import columns_key, estimate_pair_fraction
+from quail.execution.pairs import columns_key, estimate_pair_fraction, pair_keys
 from quail.execution.result import IndexRelation, QueryResult, true_answer_rows
 from quail.execution.runner import (
     ExecutionContext,
@@ -1099,11 +1099,12 @@ class Query:
                                  and column.name == name), None)
                     order = (None if call is None
                              else pa.array(call.labels, pa.string()))
-                    keys = _pair_keys(table.column(aliases[0]),
+                    keys = pair_keys(table.column(aliases[0]),
                                       table.column(aliases[1]))
                     declaration = acero.Declaration(
                         "filter", acero.FilterNodeOptions(
-                            _pair_key_expression(*aliases).isin(keys)),
+                            pair_keys(*(pc.field(alias) for alias in aliases))
+                            .isin(keys)),
                         inputs=[declaration])
                     projection.append((tuple(aliases), (keys, table, order)))
                     fields.append(pa.field(
@@ -1433,17 +1434,3 @@ class Query:
         result.survivor_indices = survivors
         result.true_join_tables = true_join_tables
         return result
-
-
-
-def _pair_keys(anchors, partners) -> pa.Array:
-    """Encode each anchor and partner index pair as one int64 key."""
-    keys = pc.add(pc.shift_left(pc.cast(anchors, pa.int64()), 32),
-                  pc.cast(partners, pa.int64()))
-    return keys.combine_chunks() if isinstance(keys, pa.ChunkedArray) else keys
-
-
-def _pair_key_expression(anchor: str, partner: str):
-    """Build an Arrow expression encoding anchor and partner indices."""
-    return pc.add(pc.shift_left(pc.field(anchor).cast(pa.int64()), 32),
-                  pc.field(partner).cast(pa.int64()))

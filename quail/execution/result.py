@@ -6,9 +6,12 @@ from collections.abc import Iterable
 from copy import copy
 from dataclasses import dataclass
 
+import numpy as np
 import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
+
+from quail.execution.pairs import pair_keys
 
 DEFAULT_BATCH_ROWS = 65_536
 
@@ -70,6 +73,35 @@ def answer_table(columns: dict[str, Iterable[int]],
               for field in schema if field.name != "answer"]
     arrays.append(pa.array(answers, type=pa.bool_()))
     return pa.Table.from_arrays(arrays, schema=schema)
+
+
+def filter_answer_table(alias, documents, positions, answers) -> pa.Table:
+    """Build filter answers with predicate positions and alias metadata."""
+    schema = pa.schema(
+        [pa.field(alias, pa.int32(), nullable=False),
+         pa.field("predicate", pa.int32(), nullable=False),
+         pa.field("answer", pa.bool_(), nullable=False)],
+        metadata={b"quail.kind": b"filter_answers",
+                  b"quail.alias": alias.encode("utf-8")})
+    return pa.Table.from_arrays(
+        [pa.array(documents, pa.int32()), pa.array(positions, pa.int32()),
+         pa.array(answers, pa.bool_())], schema=schema)
+
+
+def extract_answer_table(alias, name, span_name, document_ids, answers,
+                         spans) -> pa.Table:
+    """Build extraction answers and nullable character spans."""
+    valid = np.fromiter((span is not None for span in spans), dtype=bool,
+                        count=len(spans))
+    bounds = np.zeros((len(spans), 2), dtype=np.int32)
+    bounds[valid] = np.asarray([span for span in spans if span is not None],
+                               dtype=np.int32).reshape(-1, 2)
+    span_array = pa.StructArray.from_arrays(
+        [pa.array(bounds[:, 0]), pa.array(bounds[:, 1])],
+        names=["start", "end"], mask=pa.array(~valid))
+    return pa.Table.from_arrays(
+        [pa.array(document_ids, pa.int32()), pa.array(answers, pa.string()),
+         span_array], names=[alias, name, span_name])
 
 
 def true_answer_rows(table: pa.Table) -> pa.Table:
@@ -334,7 +366,7 @@ class QueryResult:
                             # a label of joined rows, looked up by the row's ids
                             keys, table, order = values
                             positions = pc.index_in(
-                                _pair_keys(*(batch.column(
+                                pair_keys(*(batch.column(
                                     batch.schema.get_field_index(name))
                                     for name in alias)),
                                 value_set=keys)
@@ -451,10 +483,3 @@ class QueryResult:
 
     def __len__(self) -> int:
         return self.count()
-
-
-
-def _pair_keys(anchors, partners) -> pa.Array:
-    """Encode each anchor and partner index pair as one int64 key."""
-    return pc.add(pc.shift_left(pc.cast(anchors, pa.int64()), 32),
-                  pc.cast(partners, pa.int64()))

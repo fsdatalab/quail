@@ -65,9 +65,15 @@ class ExecutionPart:
 
 
 def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
-                  attention=None, label="") -> dict:
+                  attention=None, label="", limit=None, stop_groups=None,
+                  paged=True) -> dict:
     """Run prepared operator work together and collect per-node results."""
     stages = gated_stages(parts)
+    paged = paged or state.loaded_model.pipeline.needs_pages
+    if keep_kv and not paged:
+        raise ValueError("retaining document KV requires arena writes")
+    if tree is not None and not tree.shared_tokens:
+        tree = None
     settled = next((part.on_settled for part in parts
                     if part.on_settled is not None), None)
     if settled is None:
@@ -80,7 +86,8 @@ def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
         on_settled=settled, prefix_tree=tree, stats=stats, gpu_timing=state.gpu_timing,
         attention_mode=next((part.attention for part in parts if part.attention),
                             attention),
-        staging=input_staging(state), label=label,
+        staging=input_staging(state), label=label, limit=limit,
+        stop_groups=stop_groups, paged=paged,
         on_chunk=transition_reporter(parts),
         appended_tokens=max(part.appended_tokens for part in parts) or None)
     complete_chain(parts, every, spans, tokens, stats)
@@ -145,7 +152,7 @@ def transition_reporter(parts):
             continue
         index = len(listeners)
         listeners.append(part.document_done)
-        owners.extend([(index, low, high)] * (high - low))
+        owners.extend([(index, low)] * (high - low))
     if not listeners:
         return None
 
@@ -154,9 +161,8 @@ def transition_reporter(parts):
         for anchor, stage, passed in transitions:
             owner = owners[stage]
             if owner is not None:
-                index, low, high = owner
-                if not passed or stage == high - 1:
-                    finished[index].append((anchor, stage - low, passed))
+                index, low = owner
+                finished[index].append((anchor, stage - low, passed))
         for listener, records in zip(listeners, finished):
             if records:
                 listener(records)

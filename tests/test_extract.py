@@ -11,10 +11,10 @@ import test_score as score_tests
 from fakes import letter_tokens
 
 import quail
-from quail.backends.quail.executor.operators.extract import extract_answer_table
 from quail.catalog import DocumentProvider
 from quail.execution.pipelines import build_pipelines
 from quail.execution.reranker import RerankerModelExecution
+from quail.execution.result import extract_answer_table
 from quail.execution.runner import NodeResult
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.logical import (
@@ -86,7 +86,6 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
         f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}', {{'trim': false}}) "
         f"AS ends FROM contracts c")
     assert loose.logical == _ends(session, trim=False).logical
-
 
 
 def test_planning_reuses_bound_extraction_tokens(session, monkeypatch):
@@ -311,7 +310,8 @@ def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
         (source,) = inputs.values()
         ids = source.column("c").to_pylist()
         table = extract_answer_table(
-            node.spec, ids, ["March 3, 2027" if i == 0 else None for i in ids],
+            node.spec.alias, node.spec.name, node.spec.span_name,
+            ids, ["March 3, 2027" if i == 0 else None for i in ids],
             [(14, 27) if i == 0 else None for i in ids])
         return NodeResult({"rows": table, "ids:c": ids})
 

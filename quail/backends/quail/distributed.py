@@ -10,10 +10,8 @@ import pyarrow as pa
 
 from quail.backends.quail import coordinator
 from quail.backends.quail.graph import (
-    executed_join_plan,
-    model_answers,
+    graph_report,
     stop_groups,
-    throughput,
 )
 from quail.backends.quail.prompts import join_request
 from quail.execution.pairs import columns_key
@@ -24,15 +22,12 @@ from quail.execution.runner import (
     NodeMetrics,
     NodeResult,
     compute_subgraph,
-    scalar_node_metrics,
 )
 from quail.execution.tokens import select_documents
-from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
-    AiInference,
     AiJoin,
     AiScore,
     PhysicalGraph,
@@ -259,13 +254,6 @@ class DistributedQuailExecution:
             self.peak_gib,
             *(output.get("peak_gib", 0.0) for output in outputs),
         )
-        merged = coordinator.merge_filter_round(
-            outputs,
-            limit=(
-                None if self.joins
-                else self.payload.get("filter_limit")
-            ),
-        )
         self._retained_placement(outputs)
         results = {}
         for j, member in enumerate(nodes):
@@ -275,8 +263,8 @@ class DistributedQuailExecution:
                         f"filter_answers:{node.alias}"].items()}
             survivors = sorted(document for part in parts
                                for document in part.outputs[f"ids:{node.alias}"])
-            if j == len(nodes) - 1:
-                survivors = merged["survivors"].get(node.alias, survivors)
+            if j == len(nodes) - 1 and not self.joins:
+                survivors = survivors[:self.payload.get("filter_limit")]
             results[member.node_id] = NodeResult(
                 {f"ids:{node.alias}": survivors,
                  f"filter_answers:{node.alias}": rows},
@@ -322,12 +310,9 @@ class DistributedQuailExecution:
         outputs = self.round_fn("joins", subs)
         wall = time.perf_counter() - started
         self.started = True
-        stage_outputs = coordinator.merge_join_round(outputs)
         hits = 0
         misses = 0
-        fresh_tokens = 0
         for index, output in enumerate(outputs):
-            fresh_tokens += output["fresh_tokens"]
             hits += output["kv_round"]["hits"]
             misses += output["kv_round"]["misses"]
             self.child_totals[index] = output["kv_totals"]
@@ -335,13 +320,13 @@ class DistributedQuailExecution:
         self.kv_stats["join_anchor_misses"] += misses
 
         results = {}
-        for j, (member, output) in enumerate(zip(nodes, stage_outputs)):
-            output.update(anchor=member.anchor, partners=list(member.partners),
-                          semantics=member.semantics, selectivity=member.selectivity,
-                          written_pos=member.written_pos)
-            survivors = coordinator.gate_group(output, member.semantics)
-            metrics = sum((item["results"][member.node_id].metrics
-                           for item in outputs), NodeMetrics())
+        for j, member in enumerate(nodes):
+            parts = [item["results"][member.node_id] for item in outputs]
+            output = coordinator.merge_join_answers([
+                part.outputs[f"join_answers:{member.written_pos}"] for part in parts])
+            survivors = sorted(document for part in parts
+                               for document in part.outputs[f"ids:{member.anchor}"])
+            metrics = sum((part.metrics for part in parts), NodeMetrics())
             results[member.node_id] = NodeResult(
                 {f"ids:{member.anchor}": survivors,
                  f"join_answers:{member.written_pos}": output},
@@ -443,31 +428,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         execution.begin()
     result = GenericRunner().run(compute_subgraph(graph), context)
     elapsed = time.perf_counter() - started
-    filters, joins = model_answers(graph, result)
     report = execution.report()
-
-    report.update(
-        filters=filters,
-        joins=joins,
-        _outputs=export_physical_outputs(compute_subgraph(graph), result),
-        wall_s=round(elapsed, 2),
-        fresh_tokens=result.metrics.fresh_tokens,
-        cached_tokens=result.metrics.cached_tokens,
-        evaluated_documents=result.metrics.evaluated_documents,
-        evaluated_document_pairs=result.metrics.evaluated_document_pairs,
-        usd_per_query=(
-            None if device.usd_per_hour is None
-            else elapsed / 3600 * gpu_count * device.usd_per_hour
-        ),
-        backend_metrics={"inferences": [
-            dict(value.metrics.extension)
-            for node_id, value in result.nodes.items()
-            if isinstance(graph.node(node_id), AiInference)
-        ]},
-        executed_join_plan=executed_join_plan(graph),
-        node_metrics=scalar_node_metrics(result.nodes),
-    )
-    report.update(throughput(graph, result.metrics, elapsed))
-    if payload.get("gpu_timing"):
-        report.update(gpu_s=result.metrics.gpu_s, chunks=result.metrics.chunks)
+    report.update(graph_report(graph, result, elapsed, device, workers=gpu_count,
+                               gpu_timing=payload.get("gpu_timing", False)))
     return report

@@ -507,8 +507,6 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     torch.cuda.synchronize()
     wall = time.perf_counter() - started
 
-    filters, joins = model_answers(graph, result)
-
     for key in arena.resident_keys():
         arena.free_key(key)
     kv_manager = {
@@ -518,6 +516,16 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "evicted_prefix_tokens": arena.evicted_prefix_tokens,
     }
 
+    report = graph_report(graph, result, wall, state["device"],
+                          gpu_timing=state.get("gpu_timing", False))
+    report.update(kv_manager=kv_manager,
+                  peak_gib=round(torch.cuda.max_memory_allocated() / 2**30, 2))
+    return report
+
+
+def graph_report(graph, result, wall, device, *, workers=1, gpu_timing=False):
+    """Collect graph outputs, execution metrics, and GPU cost."""
+    filters, joins = model_answers(graph, result)
     report = {
         "filters": filters,
         "joins": joins,
@@ -528,8 +536,8 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "evaluated_documents": result.metrics.evaluated_documents,
         "evaluated_document_pairs": result.metrics.evaluated_document_pairs,
         "usd_per_query": (
-            None if state["device"].usd_per_hour is None
-            else wall / 3600 * state["device"].usd_per_hour
+            None if device.usd_per_hour is None
+            else wall / 3600 * workers * device.usd_per_hour
         ),
         "backend_metrics": {"inferences": [
             dict(value.metrics.extension)
@@ -538,13 +546,9 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         ]},
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),
-        "kv_manager": kv_manager,
-        "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
     }
     report.update(throughput(graph, result.metrics, wall))
-    if state.get("gpu_timing"):
-        # seconds a forward chunk was running on the GPU, summed over
-        # the model nodes; wall_s minus this is time the GPU sat idle
+    if gpu_timing:
         report["gpu_s"] = round(result.metrics.gpu_s, 3)
         report["chunks"] = result.metrics.chunks
     return report

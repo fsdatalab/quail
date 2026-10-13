@@ -327,16 +327,17 @@ class ProfilerWindows:
 class LoopRecorder:
     """Records the execution loops from outside the engine.
 
-    Wraps quail.backends.quail.executor.loop.run_filter / run_join (module
-    attributes, bound at the worker's call time), the pipeline's
-    forward_chunk, and the arena's blocked-admission eviction method.
+    Wraps the shared stage executor, the pipeline's forward_chunk,
+    and the arena's blocked-admission eviction method.
     Restores everything in unpatch().
     """
 
     def __init__(self, state, profiler=None):
-        import quail.backends.quail.executor.loop as loop_mod
+        import quail.backends.quail.executor.parts as parts_mod
+        import quail.backends.quail.executor.stages as stages_mod
 
-        self.loop_mod = loop_mod
+        self.parts_mod = parts_mod
+        self.stages_mod = stages_mod
         self.torch = state["torch"]
         self.arena = state["arena"]
         self.pipeline = state["pipeline"]
@@ -347,18 +348,18 @@ class LoopRecorder:
         self.seen = {}          # key -> prefix tokens computed before
         self.chunk_seq = 0
         self._phase = None      # (record, launches, phase chunk idx)
-        self._orig = dict(run_filter=loop_mod.run_filter,
-                          run_join=loop_mod.run_join,
+        self._orig = dict(parts_run=parts_mod.run_stages,
+                          stages_run=stages_mod.run_stages,
                           forward=self.pipeline.forward_chunk,
                           evict=self.arena.evict_retained)
-        loop_mod.run_filter = self._run_filter
-        loop_mod.run_join = self._run_join
+        parts_mod.run_stages = self._run_stages
+        stages_mod.run_stages = self._run_stages
         self.pipeline.forward_chunk = self._forward_chunk
         self.arena.evict_retained = self._evict_retained
 
     def unpatch(self):
-        self.loop_mod.run_filter = self._orig["run_filter"]
-        self.loop_mod.run_join = self._orig["run_join"]
+        self.parts_mod.run_stages = self._orig["parts_run"]
+        self.stages_mod.run_stages = self._orig["stages_run"]
         self.pipeline.forward_chunk = self._orig["forward"]
         self.arena.evict_retained = self._orig["evict"]
 
@@ -368,7 +369,7 @@ class LoopRecorder:
     # ---- wrapped engine entry points --------------------------------
 
     def _forward_chunk(self, chunk):
-        if self._phase is None:     # a forward outside the two loops
+        if self._phase is None:
             return self._orig["forward"](chunk)
         record, launches, idx = self._phase
         if self.profiler is not None:
@@ -413,32 +414,13 @@ class LoopRecorder:
               f"chunks {record['n_chunks']} tokens {record['tokens']}",
               flush=True)
 
-    def _run_filter(self, torch, arena, pipeline, async_ans, doc_ids,
-                    question_ids, budget, **kw):
-        keys = kw.get("arena_keys") or list(range(len(doc_ids)))
-        record, t_call = self._open_phase(
-            "filter", f"{len(doc_ids)} docs x {len(question_ids)} stages")
-        kw.setdefault("timing", {})
-        kw["gpu_timing"] = True
-        out = self._orig["run_filter"](
-            torch, arena, pipeline, async_ans, doc_ids, question_ids,
-            budget, **kw)
-        answers, spans, tokens = out
-        record["timing"] = {k: round(v, 4) if isinstance(v, float)
-                            else v for k, v in kw["timing"].items()}
-        # answers is keyed by document position; every answered
-        # document's prefix was computed once in this query
-        for d in answers:
-            self.seen.setdefault(keys[d], len(doc_ids[d]))
-        self._close_phase(record, t_call, spans, tokens)
-        return out
-
-    def _run_join(self, torch, arena, pipeline, async_ans,
-                  anchor_prefixes, stage_suffixes, budget, **kw):
-        keys = kw.get("anchor_keys") or list(range(len(anchor_prefixes)))
+    def _run_stages(self, torch, arena, pipeline, stages, prefixes, budget, **kw):
+        keys = kw.get("anchor_keys")
+        if keys is None:
+            keys = range(len(prefixes))
         kv = dict(anchors=len(keys), hits=0, hit_tokens=0,
                   regret_tokens=0, first_tokens=0)
-        for key, prefix in zip(keys, anchor_prefixes):
+        for key, prefix in zip(keys, prefixes):
             if self.arena.is_resident(key):
                 kv["hits"] += 1
                 kv["hit_tokens"] += len(prefix)
@@ -446,16 +428,15 @@ class LoopRecorder:
                 kv["regret_tokens"] += len(prefix)
             else:
                 kv["first_tokens"] += len(prefix)
-        tuples = sum(len(s) for s in stage_suffixes)
-        record, t_call = self._open_phase(
-            "join", f"{len(keys)} anchors, {tuples} tuples", kv)
+        label = kw.get("label") or "operators"
+        record, t_call = self._open_phase(label.split()[0], label, kv)
         kw["gpu_timing"] = True
-        out = self._orig["run_join"](
-            torch, arena, pipeline, async_ans, anchor_prefixes,
-            stage_suffixes, budget, **kw)
-        _, spans, tokens = out
-        for k, p in zip(keys, anchor_prefixes):
-            self.seen.setdefault(k, len(p))
+        out = self._orig["stages_run"](
+            torch, arena, pipeline, stages, prefixes, budget, **kw)
+        every, spans, tokens = out
+        for answers in every:
+            for document in answers:
+                self.seen.setdefault(keys[document], len(prefixes[document]))
         self._close_phase(record, t_call, spans, tokens)
         return out
 

@@ -50,9 +50,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
                 NodeMetrics(fresh_tokens=len(indices)))
             outputs.append({
                 "results": {"filter:d": result},
-                "filters": {"d": {index: [index % 2 == 0] for index in indices}},
-                "survivors": {"d": [index for index in indices if index % 2 == 0]},
-                "retained": {}, "fresh_tokens": len(indices), "boot_s": 0.0,
+                "retained": {}, "boot_s": 0.0,
                 "boot_kind": "warm", "boot": {}, "peak_gib": 1.0,
             })
         return outputs
@@ -74,22 +72,23 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     assert result["filters"]["d"] == {0: [True], 1: [False], 2: [True], 3: [False]}
     assert result["fresh_tokens"] == 4
 
-    received = {}
+    arena = FakeArena()
+    arena.owned.add(("d", 10))
 
-    def fake_run_filter(*args, retain_survivors, **kwargs):
-        received["retain_survivors"] = retain_survivors
-        return {0: [True]}, [], 3
+    def fake_run_stages(*args, on_settled, **kwargs):
+        on_settled(0, True, [True])
+        return [{0: [True]}], [], 3
 
-    monkeypatch.setattr("quail.backends.quail.executor.loop.run_filter",
-                        fake_run_filter)
+    monkeypatch.setattr("quail.backends.quail.executor.parts.run_stages",
+                        fake_run_stages)
     execution = QuailModelExecution(SimpleNamespace())
     execution.bind_loaded_model(
-        model=object(), arena=SimpleNamespace(), pipeline=fake_pipeline())
+        model=object(), arena=arena, pipeline=fake_pipeline())
     execution.bind_query(torch=fake_torch(), async_answers=object(),
                          answer_rows=object(), chunk_tokens=8192)
     result = execution.execute(filtered, {
         "documents": [[1]], "document_ids": [10]})
-    assert received["retain_survivors"] == ()
+    assert not arena.owned
     assert result.outputs["ids:d"] == [10]
 
 

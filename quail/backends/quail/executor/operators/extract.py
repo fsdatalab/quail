@@ -4,7 +4,6 @@ import time
 from dataclasses import replace
 
 import numpy as np
-import pyarrow as pa
 
 from quail.backends.quail.executor.extract import (
     ExtractionStages,
@@ -18,25 +17,9 @@ from quail.backends.quail.executor.parts import (
     stage_spans,
 )
 from quail.backends.quail.executor.state import QueryExecutionState
+from quail.execution.result import extract_answer_table
 from quail.execution.runner import NodeMetrics, NodeResult
 from quail.physical import AiExtract
-
-SPAN_TYPE = pa.struct([("start", pa.int32()), ("end", pa.int32())])
-
-
-def extract_answer_table(spec, document_ids, answers, spans) -> pa.Table:
-    """Return one row per document: its id, its answer, and the answer's span."""
-    valid = np.fromiter((span is not None for span in spans), dtype=bool,
-                        count=len(spans))
-    bounds = np.zeros((len(spans), 2), dtype=np.int32)
-    bounds[valid] = np.asarray([span for span in spans if span is not None],
-                               dtype=np.int32).reshape(-1, 2)
-    span_array = pa.StructArray.from_arrays(
-        [pa.array(bounds[:, 0]), pa.array(bounds[:, 1])],
-        fields=list(SPAN_TYPE), mask=pa.array(~valid))
-    return pa.Table.from_arrays(
-        [pa.array(document_ids, pa.int32()), pa.array(answers, pa.string()),
-         span_array], names=[spec.alias, spec.name, spec.span_name])
 
 
 def execute_extract(state: QueryExecutionState, node, inputs) -> NodeResult:
@@ -85,7 +68,7 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
 
 
 def extraction_results(nodes, stages, document_ids, *, fresh, own,
-                       stats, kept=None) -> dict:
+                       stats, counts, kept=None) -> dict:
     """Build each extraction node's answer table and metrics.
 
     Args:
@@ -96,10 +79,10 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
             less the later questions' suffix tokens.
         own: Question index -> (its GPU seconds, its timed chunks).
         stats: The run's packing time and borrowed tokens.
+        counts: Per-question counts collected when answers finished.
         kept: The indices of the documents the answer tables hold;
             None holds every document.
     """
-    counts = [stages.counts(q) for q in range(len(nodes))]
     later = sum(count["suffix_tokens"] for count in counts[1:])
     if kept is not None:
         document_ids = document_ids[kept]
@@ -107,7 +90,8 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
     for q, node in enumerate(nodes):
         spec = node.spec
         answers, answer_spans = stages.answers(q, kept)
-        table = extract_answer_table(spec, document_ids, answers, answer_spans)
+        table = extract_answer_table(spec.alias, spec.name, spec.span_name,
+                                     document_ids, answers, answer_spans)
         first = q == 0
         gpu_s, timed = own(q)
         results[node.node_id] = NodeResult(
@@ -178,8 +162,8 @@ class ExtractPart(ExecutionPart):
     def finish(self, every) -> int:
         """Settle every answer; return the tokens the questions fed."""
         self.extraction.finish()
-        return sum(self.extraction.counts(q)["suffix_tokens"]
-                   for q in range(len(self.nodes)))
+        self.counts = [self.extraction.counts(q) for q in range(len(self.nodes))]
+        return sum(count["suffix_tokens"] for count in self.counts)
 
     def complete(self, tokens, spans, stats, offset):
         """Build each question's answer table and attribute its GPU work."""
@@ -191,7 +175,7 @@ class ExtractPart(ExecutionPart):
             return gpu_seconds(selected), len(selected)
 
         self._results = extraction_results(
-            self.nodes, self.extraction, self.ids, fresh=tokens,
+            self.nodes, self.extraction, self.ids, fresh=tokens, counts=self.counts,
             own=own, stats=stats, kept=self.extraction.asked())
         self.result_value = self._results[self.node.node_id]
 

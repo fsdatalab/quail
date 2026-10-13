@@ -4,11 +4,10 @@ import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail.executor.classify import (
-    AnswerStream,
+    ClassifyBatch,
     ClassifyStages,
     JoinPartners,
 )
-from quail.backends.quail.executor.parts import ExecutionPart
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.reranker import (
     _score_table,
@@ -63,7 +62,7 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
     return ClassifyPart(node, ids, plan, kept=kept)
 
 
-class ClassifyPart(ExecutionPart):
+class ClassifyPart(ClassifyBatch):
     """Classification stages and result tables within a pipeline."""
 
     @classmethod
@@ -83,35 +82,18 @@ class ClassifyPart(ExecutionPart):
                  prior_tables=()):
         self.node = node
         self.ids = ids
-        self.plan = plan
         self.priors = priors      # (part, port) of each label table read
         self.prior_tables = prior_tables
         self.kept = kept          # KeptPairs, for joined rows
-        self.stages = plan.stages
-        self.reached = 0
-        self.suffix_tokens = 0
         sink = answer_sink()
         rows = np.asarray(ids).reshape(-1, 1) if sink is not None else None
-        self.stream = AnswerStream(
+        super().__init__(plan,
             (lambda positions, values: sink(scored_batch(
                 node, rows[positions], values)))
             if sink is not None and plan.partners is None else None)
-        self.document_done = self.stream.chunk(lambda anchor: plan.labels[anchor])
 
-    def finish(self, every) -> int:
-        """Finalize labels, set reached and suffix_tokens, and count tokens.
-
-        Args:
-            every: Per-stage answer mappings for this classification.
-
-        Returns:
-            Total streamed tokens, including the classification frame.
-        """
-        self.reached = len(every[0]) if every else 0
-        self.suffix_tokens, streamed = self.plan.finish(every)
-        self.stream.finish(range(len(self.ids)),
-                           lambda anchor: self.plan.labels[anchor])
-        return streamed
+    def results(self) -> dict:
+        return {self.node.node_id: self.result_value}
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         spec = self.node.spec
