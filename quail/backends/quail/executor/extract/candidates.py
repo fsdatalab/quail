@@ -19,16 +19,6 @@ from quail.physical import ExtractSpec
 NEG = float("-inf")
 
 
-def document_tokens(offsets, shift: int) -> list:
-    """Return (token index, (start, end) in the document) of each document token.
-
-    Args:
-        offsets: Each token's character range in the document.
-        shift: The token index of the document's first token.
-    """
-    return [(shift + index, (int(a), int(b))) for index, (a, b) in enumerate(offsets)]
-
-
 @dataclass
 class DocumentTokens:
     """A document's tokens as the first-token scan reads them.
@@ -50,12 +40,12 @@ class DocumentTokens:
     normalized: "SqueezedText | None" = None
 
     @classmethod
-    def of(cls, vocabulary, prefix, tokens) -> "DocumentTokens":
-        """Build a document's tokens from its prefix and document_tokens list."""
-        positions = np.array([i for i, _ in tokens], dtype=np.int64)
-        spans = np.array([span for _, span in tokens], dtype=np.int64).reshape(-1, 2)
-        ids = np.asarray(prefix, dtype=np.int64)[positions]
-        return cls(positions, spans[:, 0], spans[:, 1], ids, vocabulary.key_of[ids])
+    def from_tokens(cls, vocabulary, tokens, offsets, shift=0) -> "DocumentTokens":
+        """Build candidate arrays from document tokens and character offsets."""
+        tokens = np.asarray(tokens)
+        offsets = np.asarray(offsets).reshape(-1, 2)
+        return cls(np.arange(len(tokens), dtype=np.int64) + shift,
+                   offsets[:, 0], offsets[:, 1], tokens, vocabulary.key_of[tokens])
 
 
 class SqueezedText:
@@ -263,8 +253,7 @@ class FirstTokens:
                 yield int(self.scan.positions[at]), (int(self.token[k]), filler)
 
 
-def first_tokens(vocabulary: Vocabulary, lp, prefix, tokens,
-                 scan: DocumentTokens | None = None) -> FirstTokens:
+def first_tokens(vocabulary: Vocabulary, lp, scan: DocumentTokens) -> FirstTokens:
     """Return each start position's first token, as the model writes it.
 
     The model may write a word without its leading space, in another
@@ -277,14 +266,8 @@ def first_tokens(vocabulary: Vocabulary, lp, prefix, tokens,
     Args:
         vocabulary: The model's vocabulary index.
         lp: The row's log probabilities indexed by token id.
-        prefix: The document's prefix tokens.
-        tokens: The document tokens, as document_tokens returns them,
-            or None with scan.
-        scan: The document's tokens, built from prefix and tokens when
-            not given.
+        scan: The document's tokens and character offsets.
     """
-    if scan is None:
-        scan = DocumentTokens.of(vocabulary, prefix, tokens)
     if scan.candidates is None:
         scan.candidates = CandidateIndex.of(scan, vocabulary)
     index = scan.candidates
@@ -297,30 +280,6 @@ def first_tokens(vocabulary: Vocabulary, lp, prefix, tokens,
     return FirstTokens(scan=scan, kids=index.kids, inverse=index.inverse,
                        token=index.token[best], lp=values[best],
                        length=index.length[best], anchor=index.anchor)
-
-
-def squeezed(text: str) -> tuple:
-    """Return the text with each run of whitespace as one space, and a map back.
-
-    The model writes a run of spaces or line breaks as one space, so
-    the stream follows the squeezed text; the map gives, for each
-    squeezed character, the document character it ends at.
-    """
-    out, ends = [], []
-    run = False
-    for at, char in enumerate(text):
-        if char.isspace():
-            if not run:
-                out.append(" ")
-                ends.append(at + 1)
-            else:
-                ends[-1] = at + 1
-            run = True
-        else:
-            out.append(char)
-            ends.append(at + 1)
-            run = False
-    return "".join(out), ends
 
 
 def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,

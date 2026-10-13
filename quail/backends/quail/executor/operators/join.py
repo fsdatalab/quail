@@ -121,6 +121,7 @@ class JoinPart(ExecutionPart):
 
     def complete(self, tokens, spans, stats, torch, inputs, offset):
         """Build each join predicate's answers and measured costs."""
+        timing = inputs
         nodes, inputs = self.nodes, self.inputs
         node = self.node
         anchor_ids, answers = self.anchor_ids, self.answers
@@ -160,8 +161,8 @@ class JoinPart(ExecutionPart):
                     kv_hits=kv_round.get("hits", 0) if j == 0 else len(rows),
                     kv_misses=kv_round.get("misses", 0) if j == 0 else 0,
                     fresh_tokens=own_tokens[j],
-                    gpu_s=gpu_seconds(torch, own_spans, inputs),
-                    chunks=chunks(own_spans, inputs),
+                    gpu_s=gpu_seconds(torch, own_spans, timing),
+                    chunks=chunks(own_spans, timing),
                     extension={
                         "answers": [rows],
                         **({"borrowed_prefix_tokens": stats["borrowed_tokens"]}

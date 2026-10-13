@@ -1,6 +1,7 @@
 """Run a pipeline's extractions and build their answer tables."""
 
 import time
+from dataclasses import replace
 
 import numpy as np
 import pyarrow as pa
@@ -12,13 +13,11 @@ from quail.backends.quail.executor.extract import (
 from quail.backends.quail.executor.parts import (
     ExecutionPart,
     chunks,
+    execute_parts,
     gpu_seconds,
-    input_staging,
-    settle_documents,
     shared_prefix_tree,
     stage_spans,
 )
-from quail.backends.quail.executor.stages import run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.runner import NodeMetrics, NodeResult
 from quail.physical import AiExtract
@@ -51,9 +50,9 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
     """Run a pipeline's extractions over its documents as one stage run.
 
     Each document is read once and asked every node's question while
-    its KV is resident. The first node is charged the documents'
-    tokens, the GPU time, and the wall time; each later node is charged
-    the tokens fed after the documents for its question.
+    its KV is resident. The first node is charged the documents' tokens
+    and the wall time. Each question is charged its own suffix tokens
+    and GPU time.
 
     Args:
         state: The loaded model and current query state.
@@ -71,66 +70,22 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
     """
     state.gpu_timing = bool(inputs.get("gpu_timing", False))
     started = time.perf_counter()
-    document_ids, stages = extract_stages(state, nodes, inputs)
-    stats = {}
-    fresh = 0
-    spans = []
-    arena = state.loaded_model.arena
-    on_settled = settle_documents(arena, stages.keys, stages.prefixes,
-                                  nodes[-1].keep_kv, state.chunk_tokens)
-
-    if document_ids:
-        tree = (shared_prefix_tree(nodes[0].spec.name, stages.prefixes, arena)
-                if nodes[0].spec.share_prefixes else None)
-        _, spans, fresh = run_stages(
-            state.torch, arena, state.loaded_model.pipeline,
-            stages.stages, stages.prefixes, state.chunk_tokens,
-            anchor_keys=stages.keys, on_settled=on_settled,
-            staging=input_staging(state), prefix_tree=tree, stats=stats,
-            label=f"extract {', '.join(node.spec.name for node in nodes)}",
-            appended_tokens=stages.appended_tokens)
-    stages.finish()
-    wall = time.perf_counter() - started
-    timing = {"gpu_timing": state.gpu_timing}
-    per_question = len(stages.stages) // len(nodes)
-
-    def own(q):
-        # GPU time by the rows each question's stages read in a chunk
-        spans_q = stage_spans(spans, q * per_question, (q + 1) * per_question)
-        return gpu_seconds(state.torch, spans_q, timing), chunks(spans_q, timing)
-
-    return extraction_results(nodes, stages, document_ids, wall=wall,
-                              fresh=fresh, own=own, stats=stats)
+    part = ExtractPart(state, nodes, inputs["document_ids"], inputs)
+    stages = part.extraction
+    tree = (shared_prefix_tree(nodes[0].spec.name, stages.prefixes,
+                               state.loaded_model.arena)
+            if nodes[0].spec.share_prefixes else None)
+    results = execute_parts(
+        state, [part], stages.prefixes, stages.keys,
+        keep_kv=nodes[-1].keep_kv, tree=tree,
+        label=f"extract {', '.join(node.spec.name for node in nodes)}")
+    first = nodes[0].node_id
+    results[first] = replace(results[first], metrics=replace(
+        results[first].metrics, wall_s=time.perf_counter() - started))
+    return results
 
 
-def extract_stages(state: QueryExecutionState, nodes, inputs) -> tuple:
-    """Build the stages that ask every node's question of the documents.
-
-    Returns:
-        The documents' ids and the ExtractionStages.
-
-    Raises:
-        TypeError: A node is not an extraction.
-        ValueError: The table's text was not loaded.
-    """
-    if any(not isinstance(node, AiExtract) for node in nodes):
-        raise TypeError("an extraction pipeline holds AiExtract nodes only")
-    specs = [node.spec for node in nodes]
-    alias = specs[0].alias
-    document_ids = [int(document) for document in inputs["document_ids"]]
-    texts = inputs.get("texts", {}).get(alias)
-    if texts is None:
-        raise ValueError(
-            f"AI.EXTRACT needs the text of {alias!r}, which the scan did "
-            f"not load")
-    stages = ExtractionStages(state, specs, load_vocabulary(state), document_ids,
-                           inputs["documents"][alias], texts,
-                           shared_head=inputs.get("pre"),
-                           document_positions=inputs.get("document_positions"))
-    return document_ids, stages
-
-
-def extraction_results(nodes, stages, document_ids, *, wall, fresh, own,
+def extraction_results(nodes, stages, document_ids, *, fresh, own,
                        stats, kept=None) -> dict:
     """Build each extraction node's answer table and metrics.
 
@@ -138,7 +93,6 @@ def extraction_results(nodes, stages, document_ids, *, wall, fresh, own,
         nodes: The AiExtract nodes, in question order.
         stages: The finished ExtractionStages.
         document_ids: The documents' ids.
-        wall: The run's wall seconds, charged to the first node.
         fresh: The run's fresh tokens; the first node is charged them
             less the later questions' suffix tokens.
         own: Question index -> (its GPU seconds, its timed chunks).
@@ -149,7 +103,7 @@ def extraction_results(nodes, stages, document_ids, *, wall, fresh, own,
     counts = [stages.counts(q) for q in range(len(nodes))]
     later = sum(count["suffix_tokens"] for count in counts[1:])
     if kept is not None:
-        document_ids = [document_ids[index] for index in kept]
+        document_ids = document_ids[kept]
     results = {}
     for q, node in enumerate(nodes):
         spec = node.spec
@@ -160,7 +114,6 @@ def extraction_results(nodes, stages, document_ids, *, wall, fresh, own,
         results[node.node_id] = NodeResult(
             {"rows": table, f"ids:{spec.alias}": document_ids},
             NodeMetrics(
-                wall_s=wall if first else 0.0,
                 input_rows=len(document_ids), output_rows=len(document_ids),
                 evaluated_documents=len(document_ids),
                 fresh_tokens=(fresh - later if first
@@ -176,47 +129,46 @@ def extraction_results(nodes, stages, document_ids, *, wall, fresh, own,
 
 
 class ExtractPart(ExecutionPart):
-    """The extractions that continue a filter's pipeline.
-
-    The documents are resident from the filter's stages, so the part
-    is charged only the tokens its questions feed after them.
-
-    Args:
-        state: The loaded model and current query state.
-        nodes: The consecutive AiExtract members, in pipeline order.
-        ids: The pipeline's document ids.
-        inputs: The first node's scheduler inputs.
-
-    Raises:
-        ValueError: A document's prompt differs from the pipeline's,
-            in its head or its tokens.
-    """
+    """Extraction stages and per-question results for the shared executor."""
 
     combine = True
     execute_group = staticmethod(execute_extractions)
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
-        """Prepare consecutive questions over the preceding operator's documents."""
+        """Prepare consecutive questions over the preceding operator's documents.
+
+        Raises:
+            ValueError: A document uses a different prompt or token sequence.
+        """
         first = parts[0].node
         head = first.document_head
-        return cls(state, nodes, ids, {
+        part = cls(state, nodes, ids, {
             "documents": context.state["docs"],
             "texts": context.state.get("texts", {}),
-            "pre": list(context.state["pre"] if head is None else head)})
+            "pre": context.state["pre"] if head is None else head})
+        alias = part.node.spec.alias
+        for doc, document in zip(part.extraction.docs, part.ids):
+            if doc.key != (alias, document):
+                raise ValueError(
+                    f"AI.EXTRACT {part.node.spec.name!r} shows document "
+                    f"{document} of {alias!r} unlike the pipeline before it")
+        return part
 
     def __init__(self, state, nodes, ids, inputs):
         self.nodes = list(nodes)
         self.node = self.nodes[0]
-        self.ids = [int(document) for document in ids]
-        _, self.extraction = extract_stages(
-            state, self.nodes, {**inputs, "document_ids": self.ids})
+        self.ids = np.asarray(ids, dtype=np.int64)
+        if any(not isinstance(node, AiExtract) for node in nodes):
+            raise TypeError("an extraction pipeline holds AiExtract nodes only")
         alias = self.node.spec.alias
-        for doc, document in zip(self.extraction.docs, self.ids):
-            if doc.key != (alias, document):
-                raise ValueError(
-                    f"AI.EXTRACT {self.node.spec.name!r} shows document "
-                    f"{document} of {alias!r} unlike the pipeline before it")
+        texts = inputs.get("texts", {}).get(alias)
+        if texts is None:
+            raise ValueError(f"AI.EXTRACT needs the text of {alias!r}")
+        self.extraction = ExtractionStages(
+            state, [node.spec for node in nodes], load_vocabulary(state), self.ids,
+            inputs["documents"][alias], texts, shared_head=inputs.get("pre"),
+            document_positions=inputs.get("document_positions"))
         self.stages = self.extraction.stages
         self._results = {}
 
@@ -230,13 +182,19 @@ class ExtractPart(ExecutionPart):
         return sum(self.extraction.counts(q)["suffix_tokens"]
                    for q in range(len(self.nodes)))
 
-    def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
-        # the answer tables hold the documents the stages before let through
+    def complete(self, tokens, spans, stats, torch, inputs, offset):
+        """Build each question's answer table and attribute its GPU work."""
+        per_question = len(self.stages) // len(self.nodes)
+
+        def own(q):
+            start = offset + q * per_question
+            selected = stage_spans(spans, start, start + per_question)
+            return gpu_seconds(torch, selected, inputs), chunks(selected, inputs)
+
         self._results = extraction_results(
-            self.nodes, self.extraction, self.ids, wall=0.0, fresh=tokens,
-            own=lambda q: (gpu_s, chunks) if q == 0 else (0.0, 0), stats={},
-            kept=self.extraction.asked())
-        return self._results[self.node.node_id]
+            self.nodes, self.extraction, self.ids, fresh=tokens,
+            own=own, stats=stats, kept=self.extraction.asked())
+        self.result_value = self._results[self.node.node_id]
 
     def results(self) -> dict:
         """Return the answer table and metrics for each extraction."""

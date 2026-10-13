@@ -159,7 +159,7 @@ class Decoder:
         vocabulary = self.vocabulary
         lp, none_lp, stop_lp = self.lp(values)
         if not answer.written:
-            starts = first_tokens(vocabulary, lp, doc.prefix, None, scan=doc.scan)
+            starts = first_tokens(vocabulary, lp, doc.scan)
             answer.none_lp = none_lp
             answer.best_lp = starts.best_lp
             answer.none_wins = (max(none_lp, stop_lp) > answer.best_lp

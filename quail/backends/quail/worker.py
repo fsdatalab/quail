@@ -5,7 +5,6 @@ per GPU, each with its own CUDA context and arena.
 """
 
 import gc
-import itertools
 import time
 
 from quail.backends.base import GpuContext
@@ -24,13 +23,13 @@ from quail.backends.quail.executor.readout import (
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import (
     _join_round_kv,
-    _tuple_suffix,
     execute_single_graph,
+    join_suffixes,
     partner_list_builder,
     stage_partner_lists,
 )
 from quail.backends.quail.prompts import join_request
-from quail.backends.quail.retention import apply_retention, retain_after_join
+from quail.backends.quail.retention import apply_retention, join_settlement
 from quail.cost import budgets
 from quail.execution.runner import ExecutionContext
 from quail.execution.tokens import (
@@ -594,24 +593,14 @@ def _child_joins(state, sub):
     live[anchor_alias] = anchors_glob
     apply_retention(arena, config,
                     config.get("before", {}).get(node.node_id, {}), live)
-    retain_anchor = nodes[-1].keep_kv
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():
-        stage_suffixes, tuple_globs = [], []
-        for j in group:
-            locals_ = [range(len(sub["partners"][p]["index"]))
-                       for p in j["partners"]]
-            combos = list(itertools.product(*locals_))
-            tuple_globs.append(
-                [[sub["partners"][p]["index"][c]
-                  for p, c in zip(j["partners"], combo)]
-                 for combo in combos])
-            part_docs = {p: sub["partners"][p]["docs"]
-                         for p in j["partners"]}
-            stage_suffixes.append(
-                [_tuple_suffix(j, part_docs, combo)
-                 for combo in combos])
+        stage_suffixes, tuple_indices = join_suffixes(
+            group, {alias: partner["docs"]
+                    for alias, partner in sub["partners"].items()},
+            live)
+        tuple_globs = [tuple_indices[member.written_pos] for member in nodes]
         # this GPU's anchors only
         lists_for = partner_list_builder(
             group, tuple_globs,
@@ -622,15 +611,7 @@ def _child_joins(state, sub):
         anchor_keys = [(anchor_alias, g) for g in anchors_glob]
         round_kv = _join_round_kv(anchor_keys, arena)
 
-        def anchor_done(a, row):
-            matched = any(row)
-            alive = (not matched if group[-1]["semantics"] == "anti"
-                     else matched)
-            if alive and retain_anchor:
-                retain_after_join(arena, anchor_keys[a], len(prefixes[a]), config,
-                                  config.get("after", {}).get(nodes[-1].node_id, {}))
-            else:
-                arena.free_key(anchor_keys[a])
+        anchor_done = join_settlement(arena, anchor_keys, prefixes, nodes[-1], config)
 
         runtime_context = state["runtime_context"]
         results = _execute_predicates(
@@ -646,28 +627,13 @@ def _child_joins(state, sub):
                 "chain": None,
                 "kv_round": round_kv,
                 "anchor_ids": anchors_glob,
-                "partner_indices": {
-                    stage.written_pos: tuples
-                    for stage, tuples in zip(nodes, tuple_globs)
-                },
+                "partner_indices": tuple_indices,
                 "anchor_partners": lists_for,
                 "group": group,
             },
         )
         ans = [results[member.node_id].metrics.extension["answers"][0]
                for member in nodes]
-        last = ans[-1] if ans else {}
-        for a, key in enumerate(anchor_keys):
-            if not arena.is_resident(key):
-                continue
-            matched = any(last.get(a, []))
-            alive = (not matched if group[-1]["semantics"] == "anti"
-                     else matched)
-            if alive and retain_anchor:
-                retain_after_join(arena, key, len(prefixes[a]), config,
-                                  config.get("after", {}).get(nodes[-1].node_id, {}))
-            else:
-                arena.free_key(key)
         tokens_total += sum(result.metrics.fresh_tokens for result in results.values())
         partner_lists = stage_partner_lists(group, lists_for, anchors_glob)
         for si, j in enumerate(group):

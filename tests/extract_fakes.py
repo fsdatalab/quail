@@ -2,7 +2,6 @@
 
 import re
 
-from quail.backends.quail.executor.extract.candidates import squeezed
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.physical import ExtractSpec
 
@@ -102,3 +101,27 @@ def make_spec(trim=True, *extra):
         prompt_token_parts=(tuple(tables.encode_ids(HEAD)),
                             tuple(tables.encode_ids(TAIL))),
         question=QUESTION, trim=trim), tables
+
+
+def squeezed(text: str) -> tuple:
+    """Return the text with each run of whitespace as one space, and a map back.
+
+    The model writes a run of spaces or line breaks as one space, so
+    the stream follows the squeezed text; the map gives, for each
+    squeezed character, the document character it ends at.
+    """
+    out, ends = [], []
+    run = False
+    for at, char in enumerate(text):
+        if char.isspace():
+            if not run:
+                out.append(" ")
+                ends.append(at + 1)
+            else:
+                ends[-1] = at + 1
+            run = True
+        else:
+            out.append(char)
+            ends.append(at + 1)
+            run = False
+    return "".join(out), ends

@@ -2,6 +2,7 @@
 
 from itertools import groupby
 
+import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail.executor.operators import execution_parts
@@ -26,8 +27,8 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
                         if port.source.port == f"ids:{alias}"), None)
     source = (inputs[first.node_id][anchor_port] if anchor_port is not None
               else next(iter(inputs[first.node_id].values())))
-    ids = (source.column(alias).to_pylist() if isinstance(source, pa.Table)
-           else list(source))
+    ids = (source.column(alias).to_numpy() if isinstance(source, pa.Table)
+           else np.asarray(source, dtype=np.int64))
     last = max(index for index, node in enumerate(pipeline)
                if node.backend is not None)
     members, trailing = pipeline[:last + 1], pipeline[last + 1:]

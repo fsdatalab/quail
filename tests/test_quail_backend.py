@@ -15,6 +15,7 @@ from fakes import (
 
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.distributed import execute_distributed_graph
+from quail.backends.quail.executor.arena import KVArena
 from quail.builtins import built_in_registry
 from quail.physical import (
     AiFilter,
@@ -241,6 +242,14 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
                          [("full", False), ("anti", True)])
 def test_a_join_without_a_filter_settles_anchors_with_no_pairs(
         monkeypatch, semantics, keep_kv):
+    retained = []
+    retain = KVArena.retain
+
+    def record_retention(arena, key, *args, **kwargs):
+        retained.append(key)
+        return retain(arena, key, *args, **kwargs)
+
+    monkeypatch.setattr(KVArena, "retain", record_retention)
     # document d has key d % 4 and partner i key i % 3: a document with
     # key 3 has no pairs and settles without loading its KV
     columns = _key_columns([d % 4 for d in range(14)], [0, 1, 2, 0])
@@ -250,6 +259,8 @@ def test_a_join_without_a_filter_settles_anchors_with_no_pairs(
             False, hash_join=True, filtered=False, semantics=semantics,
             keep_kv=keep_kv),
         columns=columns, streamed_anchors=False)
+    assert len(retained) == len(set(retained))
+    assert bool(retained) == keep_kv
     stage = result["joins"][0]
     assert sorted(stage["anchor_index"]) == list(range(14))
     for local, document in enumerate(stage["anchor_index"]):

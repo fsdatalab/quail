@@ -98,12 +98,6 @@ class ClassifyPart(ExecutionPart):
             if sink is not None and plan.partners is None else None)
         self.document_done = self.stream.chunk(lambda anchor: plan.labels[anchor])
 
-    def label(self, document) -> str | None:
-        """Return the category assigned to a document ID, or None if unresolved."""
-        return self.plan.labels[self.ids.index(document)] \
-            if not hasattr(self, "_position") else \
-            self.plan.labels[self._position[document]]
-
     def finish(self, every) -> int:
         """Finalize labels, set reached and suffix_tokens, and count tokens.
 

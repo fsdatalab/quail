@@ -81,7 +81,7 @@ def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
         attention_mode=next((part.attention for part in parts if part.attention),
                             attention),
         staging=input_staging(state), label=label,
-        on_chunk=lambda transitions: report_chain_transitions(parts, transitions),
+        on_chunk=transition_reporter(parts),
         appended_tokens=max(part.appended_tokens for part in parts) or None)
     complete_chain(parts, every, spans, tokens, stats, state.torch,
                    {"gpu_timing": state.gpu_timing})
@@ -136,23 +136,33 @@ def _part_slices(parts) -> list:
     return slices
 
 
-def report_chain_transitions(parts, transitions) -> None:
-    """Notify filter parts when documents pass or fail their final stage.
-
-    Args:
-        parts: Pipeline parts in execution order.
-        transitions: (document index, stage index, passed) completion records.
-            Intermediate successful stages do not complete a filter part.
-    """
+def transition_reporter(parts):
+    """Build a stage-indexed callback for operators that report completions."""
+    listeners = []
+    owners = []
     for part, (low, high) in zip(parts, _part_slices(parts)):
         if part.document_done is None:
+            owners.extend([None] * (high - low))
             continue
-        finished = [(anchor, stage - low, passed)
-                    for anchor, stage, passed in transitions
-                    if low <= stage < high
-                    and (not passed or stage == high - 1)]
-        if finished:
-            part.document_done(finished)
+        index = len(listeners)
+        listeners.append(part.document_done)
+        owners.extend([(index, low, high)] * (high - low))
+    if not listeners:
+        return None
+
+    def report(transitions):
+        finished = [[] for _ in listeners]
+        for anchor, stage, passed in transitions:
+            owner = owners[stage]
+            if owner is not None:
+                index, low, high = owner
+                if not passed or stage == high - 1:
+                    finished[index].append((anchor, stage - low, passed))
+        for listener, records in zip(listeners, finished):
+            if records:
+                listener(records)
+
+    return report
 
 
 def complete_chain(parts, every, spans, tokens, stats, torch, inputs):

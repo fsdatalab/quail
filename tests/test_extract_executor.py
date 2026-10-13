@@ -318,7 +318,7 @@ GOLD = ["March 3, 2027", "five years", None]
 
 
 def _setup(monkeypatch, trim=True, documents=None, token_documents=None,
-           share_prefixes=False, document_ids=None):
+           share_prefixes=False, document_ids=None, gpu_timing=False):
     """A state, its scripted model, and a node builder for one spec name."""
     spec, tables = make_spec(trim)
     documents = DOCS if documents is None else documents
@@ -349,7 +349,7 @@ def _setup(monkeypatch, trim=True, documents=None, token_documents=None,
 
     inputs = {"document_ids": (list(range(len(documents))) if document_ids is None
                                else document_ids), "documents": tokens,
-              "texts": {"c": documents}, "pre": [], "gpu_timing": False}
+              "texts": {"c": documents}, "pre": [], "gpu_timing": gpu_timing}
 
     def run(name="ends", keep_kv=False):
         result = execute_extract(state, replace(node(name), keep_kv=keep_kv), inputs)
@@ -430,7 +430,7 @@ def test_extraction_reuses_arrow_tokens_and_offsets(monkeypatch, tmp_path):
 
 
 def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
-    state, model, _, run_pipeline = _setup(monkeypatch)
+    state, model, _, run_pipeline = _setup(monkeypatch, gpu_timing=True)
     results, stages = run_pipeline("ends", "starts")
     first, second = results["ai-extract:ends"], results["ai-extract:starts"]
     assert second.outputs["rows"].column("starts").to_pylist() == \
@@ -444,6 +444,7 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
     fed = [stages.counts(q)["suffix_tokens"] for q in range(2)]
     assert first.metrics.fresh_tokens == prefixes + fed[0]
     assert second.metrics.fresh_tokens == fed[1] > 0
+    assert first.metrics.gpu_s > 0 and second.metrics.gpu_s > 0
 
 
 @pytest.mark.parametrize("workers", [2, 4])
@@ -547,7 +548,11 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
         AiExtract(node_id="ai-extract:ends",
                   inputs=input_ports((PortRef("ai_filter:c", "ids:c"),)),
                   backend_name="quail", model="qwen3-4b-fp8", spec=plain),
-    ), PortRef("ai-extract:ends", "rows"))
+        AiExtract(node_id="ai-extract:starts",
+                  inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
+                  backend_name="quail", model="qwen3-4b-fp8",
+                  spec=replace(plain, name="starts")),
+    ), PortRef("ai-extract:starts", "rows"))
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
@@ -565,7 +570,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
              "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
              "chunk_tokens": 400,
              "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
-             "texts": {"c": list(DOCS)}}
+             "texts": {"c": list(DOCS)}, "gpu_timing": True}
     report = execute_single_graph(
         state, {"filter_limit": None, "pre_ids": head, "retention": {}}, graph)
     table = report["_outputs"][PortRef("ai-extract:ends", "rows")].to_pydict()
@@ -579,6 +584,11 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
     assert metrics["ai-extract:ends"]["fresh_tokens"] < documents
     assert metrics["ai_filter:c"]["fresh_tokens"] >= documents
     assert metrics["ai-extract:ends"]["evaluated_documents"] == 2
+    later = report["_outputs"][PortRef("ai-extract:starts", "rows")].to_pydict()
+    assert later["starts"] == table["ends"]
+    assert later["starts_span"] == table["ends_span"]
+    assert metrics["ai-extract:ends"]["gpu_s"] > 0
+    assert metrics["ai-extract:starts"]["gpu_s"] > 0
     assert not arena.accounting.owned
 
 

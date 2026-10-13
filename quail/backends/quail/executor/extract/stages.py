@@ -153,10 +153,8 @@ class ExtractionStages:
         if shared and stored is not None and same_tokens:
             key = (alias, int(document))
         prefix = chain_tokens(self.head, ids)
-        bounds = ids.character_offsets
-        scan = DocumentTokens(
-            np.arange(len(ids), dtype=np.int64) + len(self.head),
-            bounds[:, 0], bounds[:, 1], tokens, self.vocabulary.key_of[tokens])
+        scan = DocumentTokens.from_tokens(
+            self.vocabulary, tokens, ids.character_offsets, len(self.head))
         return Document(index=index, text=text, prefix=prefix, scan=scan, key=key,
                         answers=[AnswerState() for _ in self.specs])
 

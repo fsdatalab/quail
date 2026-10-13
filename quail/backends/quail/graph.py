@@ -5,8 +5,10 @@ from __future__ import annotations
 import itertools
 import time
 
+import numpy as np
+
 from quail.backends.quail.prompts import join_request
-from quail.backends.quail.retention import apply_retention, retain_after_join
+from quail.backends.quail.retention import apply_retention, join_settlement
 from quail.execution.pairs import (
     allowed_members,
     columns_key,
@@ -24,7 +26,12 @@ from quail.execution.runner import (
     compute_subgraph,
     scalar_node_metrics,
 )
-from quail.execution.tokens import DocumentKeys, DocumentPrefixes, chain_tokens
+from quail.execution.tokens import (
+    DocumentKeys,
+    DocumentPrefixes,
+    chain_tokens,
+    select_documents,
+)
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiClassify,
@@ -65,6 +72,26 @@ def _tuple_suffix(join, docs, member):
         parts.extend((join["labels"][alias], docs[alias][document]))
     parts.append(join["tail"])
     return chain_tokens(*parts)
+
+
+def join_suffixes(group, documents, indices):
+    """Build partner suffixes and their global document IDs in the same order.
+
+    Args:
+        group: Join request descriptions in execution order.
+        documents: Selected partner documents indexed by local position.
+        indices: Global document IDs for those local positions, by alias.
+    """
+    suffixes, tuples = [], {}
+    for join in group:
+        partners = join["partners"]
+        members, tokens = [], []
+        for positions in itertools.product(*(range(len(indices[p])) for p in partners)):
+            members.append([indices[p][i] for p, i in zip(partners, positions)])
+            tokens.append(_tuple_suffix(join, documents, positions))
+        tuples[join["written_pos"]] = members
+        suffixes.append(tokens)
+    return suffixes, tuples
 
 
 def runs_over_pairs(join: dict) -> bool:
@@ -275,9 +302,9 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext,
         # the one input carries the documents' ids, or the rows of an
         # earlier operator over them
         (value,) = inputs.values()
-        ids = (value.column(node.spec.alias).to_pylist()
-               if hasattr(value, "column") else list(value))
-        return {"document_ids": [int(document) for document in ids],
+        ids = (value.column(node.spec.alias).to_numpy()
+               if hasattr(value, "column") else np.asarray(value, dtype=np.int64))
+        return {"document_ids": ids,
                 "documents": context.state["docs"],
                 "texts": context.state.get("texts", {}),
                 "pre": context.state.get("pre", []),
@@ -336,17 +363,9 @@ def _model_inputs(node, inputs, context: ExecutionContext, chain=None,
     apply_retention(state["arena"], config,
                     config.get("before", {}).get(node.node_id, {}), by_alias)
     group = [join_request(member) for member in nodes]
-    stage_suffixes = []
-    tuple_indices = {}
-    for stage, join in zip(nodes, group):
-        tuples = [list(member) for member in itertools.product(
-            *[by_alias[alias] for alias in join["partners"]]
-        )]
-        tuple_indices[stage.written_pos] = tuples
-        stage_suffixes.append([
-            _tuple_suffix(join, state["docs"], member)
-            for member in tuples
-        ])
+    documents = {alias: select_documents(state["docs"][alias], by_alias[alias])
+                 for join in group for alias in join["partners"]}
+    stage_suffixes, tuple_indices = join_suffixes(group, documents, by_alias)
     # pairs come from the request, a Foreign table, or a per-batch
     # apply in the chain, which fills its rows as documents reach the join
     maps = partner_maps(group, port_pairs, streamed=set(chain_pairs))
@@ -394,32 +413,17 @@ def _model_inputs(node, inputs, context: ExecutionContext, chain=None,
                 "semantics": last["semantics"], "document": int(document),
                 "asked": len(row), "matches": matches}
 
+    settle = join_settlement(state["arena"], anchor_keys, prefixes, last_node, config)
+
     def anchor_done(local_index, row):
         key = anchor_keys[local_index]
-        matched = any(row)
-        alive = not matched if group[-1]["semantics"] == "anti" \
-            else matched
-        # an anchor with no pairs settles without loading its KV
-        if state["arena"].is_resident(key):
-            if alive and last_node.keep_kv:
-                retain_after_join(
-                    state["arena"], key, len(prefixes[local_index]), config,
-                    config.get("after", {}).get(last_node.node_id, {}))
-            else:
-                state["arena"].free_key(key)
+        settle(local_index, row)
         sink = answer_sink()
         # scores are floats, not yes/no answers; they arrive with the result
         if sink is not None and getattr(row, "dtype", None) is None:
             sink(finished_answers(key[1], row))
 
-    state["prepared_join"] = {
-        "node": node,
-        "group": group,
-        "anchor_keys": anchor_keys,
-        "prefixes": prefixes,
-        "tuple_indices": tuple_indices,
-        "chained": chain is not None,
-    }
+    state["join_chained"] = chain is not None
     return {
         "prefixes": prefixes,
         "stage_suffixes": stage_suffixes,
@@ -437,23 +441,10 @@ def _model_inputs(node, inputs, context: ExecutionContext, chain=None,
 
 def record_model_result(node, result: NodeResult,
                         context: ExecutionContext) -> None:
-    """Release or retain each join anchor's KV once its group has run."""
+    """Record reuse of anchor KV supplied by preceding operators."""
     state = context.state
-    if isinstance(node, AiJoin):
-        prepared = state["prepared_join"]
-        keys = prepared["anchor_keys"]
-        if prepared["chained"]:
-            # every survivor the chain handed over read its KV there
-            state["kv_stats"]["join_anchor_hits"] += result.metrics.kv_hits
-        live = set(result.outputs[f"ids:{node.anchor}"])
-        for key, prefix in zip(keys, prepared["prefixes"]):
-            if state["arena"].is_resident(key):
-                if node.keep_kv and key[1] in live:
-                    config = state["retention"]
-                    retain_after_join(state["arena"], key, len(prefix), config,
-                                      config.get("after", {}).get(node.node_id, {}))
-                else:
-                    state["arena"].free_key(key)
+    if isinstance(node, AiJoin) and state["join_chained"]:
+        state["kv_stats"]["join_anchor_hits"] += result.metrics.kv_hits
 
 
 def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:

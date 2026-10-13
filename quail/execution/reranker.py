@@ -265,7 +265,7 @@ def classify_outputs(node, table) -> dict:
     outputs = {"rows": table}
     if len(node.spec.aliases) == 1:
         (alias,) = node.spec.aliases
-        outputs[f"ids:{alias}"] = table.column(alias).to_pylist()
+        outputs[f"ids:{alias}"] = table.column(alias).to_numpy()
     return outputs
 
 
