@@ -15,7 +15,7 @@ import quail
 from quail.backends.quail.executor import model
 from quail.backends.quail.executor.readout import DecisionHead, DecisionRows
 from quail.backends.quail.executor.stages import Stage
-from quail.baselines import RequestExecution
+from quail.baselines.nodes import RequestExecution
 from quail.baselines.request import RequestBackend
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (

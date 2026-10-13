@@ -4,49 +4,16 @@ These backends exist to measure Quail against; a user runs the
 ``quail`` backend. ``register_baselines`` adds them to a registry.
 """
 
-from .nodes import (
-    RequestClassifySpec,
-    RequestExecution,
-    RequestExtractSpec,
-    RequestFilterSpec,
-    RequestJoinSpec,
-)
-from .request import RequestBackend, RequestModelExecution, request_runtimes
-from .sglang import SGLangClient, SGLangEngine, pipelined_sglang_backend
-from .vllm import (
-    DefaultVLLMEngine,
-    VLLMClient,
-    VLLMEngine,
-    dumb_vllm_backend,
-    pipelined_vllm_backend,
-    stock_vllm_backend,
-)
-
-__all__ = [
-    "DefaultVLLMEngine",
-    "RequestBackend",
-    "RequestClassifySpec",
-    "RequestExecution",
-    "RequestExtractSpec",
-    "RequestFilterSpec",
-    "RequestJoinSpec",
-    "RequestModelExecution",
-    "SGLangClient",
-    "SGLangEngine",
-    "VLLMClient",
-    "VLLMEngine",
-    "dumb_vllm_backend",
-    "pipelined_sglang_backend",
-    "pipelined_vllm_backend",
-    "register_baselines",
-    "request_runtimes",
-    "stock_vllm_backend",
-]
 
 
 def register_baselines(registry):
     """Register the comparison backends, their node, and their runtimes."""
     from quail.physical import NodeCodec
+
+    from .nodes import RequestExecution
+    from .request import request_runtimes
+    from .sglang import pipelined_sglang_backend
+    from .vllm import dumb_vllm_backend, pipelined_vllm_backend, stock_vllm_backend
 
     for backend in (stock_vllm_backend(), pipelined_vllm_backend(),
                     dumb_vllm_backend(), pipelined_sglang_backend()):

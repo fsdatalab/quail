@@ -12,10 +12,7 @@ from fakes import letter_tokens
 
 import quail
 from quail.backends.quail.reranker import RerankerModelExecution
-from quail.baselines import (
-    RequestExecution,
-    RequestExtractSpec,
-)
+from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
 from quail.execution.result import extract_answer_table
 from quail.execution.runner import NodeResult

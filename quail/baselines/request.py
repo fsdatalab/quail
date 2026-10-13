@@ -12,7 +12,7 @@ from typing import Any, Mapping
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
-from quail.baselines import (
+from quail.baselines.nodes import (
     RequestClassifySpec,
     RequestExecution,
     RequestExtractSpec,

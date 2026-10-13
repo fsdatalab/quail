@@ -17,9 +17,7 @@ from quail.backends.quail.executor.operators.classify import QuailClassifier
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs, answer_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.reranker import RerankerBatch
-from quail.baselines import (
-    RequestExecution,
-)
+from quail.baselines.nodes import RequestExecution
 from quail.catalog import DocumentProvider
 from quail.execution.labels import (
     GreedyDecoder,

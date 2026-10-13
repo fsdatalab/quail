@@ -11,17 +11,15 @@ import pytest
 
 import quail
 from quail.backends.base import BackendExecutionContext, GpuContext
-from quail.baselines import (
+from quail.baselines.nodes import (
     RequestClassifySpec,
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
-    pipelined_sglang_backend,
-    stock_vllm_backend,
 )
 from quail.baselines.request import RequestModelExecution
-from quail.baselines.sglang import SGLangClient
-from quail.baselines.vllm import VLLMEngine, sampling_kwargs
+from quail.baselines.sglang import SGLangClient, pipelined_sglang_backend
+from quail.baselines.vllm import VLLMEngine, sampling_kwargs, stock_vllm_backend
 from quail.builtins import built_in_registry
 from quail.physical import (
     Project,
