@@ -17,6 +17,7 @@ from quail.execution.tokens import (
     prefix_tree,
     shared_prefix_lengths,
 )
+from quail.planner.build import contiguous_shards
 from quail.planner.prefixes import shared_prefix_tokens
 from quail.planner.statistics import AliasStats, summarize_alias
 
@@ -71,6 +72,9 @@ def test_token_views_store_chains_and_shared_prefixes(tmp_path, monkeypatch):
         summary = summarize_alias(store.lengths, 3, memo=memo)
         assert summary == AliasStats(3, 6, 14, 3, 3, ((1, 1), (2, 1)))
         assert summary.variance == pytest.approx(2 / 3)
+        assert contiguous_shards(store.lengths, 1, total=summary.total) == (
+            ((0, 3),), [6])
+        assert contiguous_shards(store.lengths, 2) == (((0, 2), (2, 3)), [3, 3])
         assert summarize_alias(store.lengths, 3, memo=memo) is summary
         assert summarize_alias(store.lengths, memo=memo).short_counts == ()
         assert summarize_alias([4], 3, memo=memo) == AliasStats(1, 4, 16, 4, 3)

@@ -383,15 +383,23 @@ def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
 
 
 
-def test_extraction_accepts_empty_input(monkeypatch):
+def test_extraction_accepts_empty_input_and_sparse_document_ids(monkeypatch):
     document_ids = []
-    _, _, run, _ = _setup(monkeypatch, document_ids=document_ids)
+    state, _, run, _ = _setup(monkeypatch, document_ids=document_ids)
     result, _ = run()
     table = result.outputs["rows"]
     assert table.column("c").to_pylist() == document_ids
     assert table.column("ends").to_pylist() == [GOLD[i] for i in document_ids]
     assert table.column("ends_span").is_null().to_pylist() == [
         GOLD[i] is None for i in document_ids]
+    spec, vocabulary = make_spec()
+    stages = ExtractionStages(
+        state, [spec], vocabulary, [10_000_000, 2], None, DOCS,
+        document_positions=[0, 1])
+    assert stages.document_ids.nbytes + stages.document_order.nbytes == 32
+    for i, doc in enumerate(stages.docs):
+        doc.answers[0].discard = i + 1
+        assert stages._step_discard(0, doc.key) == i + 1
 
 def _run(monkeypatch, trim=True, documents=None):
     _, model, run, _ = _setup(monkeypatch, trim, documents)

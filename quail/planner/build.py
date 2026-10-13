@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, replace
 
+import numpy as np
+
 from quail.cost import budgets
 from quail.cost import classify as classify_cost
 from quail.cost import extract as extract_cost
@@ -69,6 +71,7 @@ from quail.planner.statistics import (
     pair_counts,
     question_tokens,
     score_statistics,
+    summarize_alias,
 )
 from quail.planner.validation import (
     ClassifyRefusedError,
@@ -166,23 +169,28 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
 
 def balanced_shards(doc_tokens, workers: int):
     """Greedily partition documents into shards balanced by token count."""
+    lengths = np.asarray(getattr(doc_tokens, "arrow_array", doc_tokens), dtype=np.int64)
     if workers == 1:
-        return (tuple(range(len(doc_tokens))),), [sum(doc_tokens)]
-    order = sorted(range(len(doc_tokens)), key=lambda i: -doc_tokens[i])
+        return (tuple(range(len(lengths))),), [int(lengths.sum())]
+    order = np.argsort(-lengths, kind="stable")
     loads = [0] * workers
     shards = [[] for _ in range(workers)]
     for i in order:
         w = loads.index(min(loads))
-        shards[w].append(i)
-        loads[w] += doc_tokens[i]
+        shards[w].append(int(i))
+        loads[w] += int(lengths[i])
     return tuple(tuple(sorted(s)) for s in shards), loads
 
 
-def contiguous_shards(doc_tokens, workers: int):
+def contiguous_shards(doc_tokens, workers: int, *, total=None):
     """Split ordered documents into compact token balanced ranges."""
-    lengths = doc_tokens
-    n_docs = len(lengths)
-    total = sum(lengths)
+    n_docs = len(doc_tokens)
+    if workers == 1 and total is not None:
+        return ((0, n_docs),), [total]
+    lengths = np.asarray(getattr(doc_tokens, "arrow_array", doc_tokens), dtype=np.int64)
+    cumulative = np.concatenate(([0], np.cumsum(lengths)))
+    total = int(cumulative[-1])
+    zeros = np.flatnonzero(lengths == 0)
     ranges = []
     loads = []
     start = 0
@@ -194,17 +202,18 @@ def contiguous_shards(doc_tokens, workers: int):
         else:
             remaining_workers = workers - worker
             target = (total - consumed) / remaining_workers
-            stop = start
-            load = 0
-            while stop < n_docs:
-                next_length = int(lengths[stop])
-                with_next = load + next_length
-                if load and abs(target - load) <= abs(target - with_next):
-                    break
-                load = with_next
-                stop += 1
-                if load >= target:
-                    break
+            stop = min(n_docs, max(start + 1, int(np.searchsorted(
+                cumulative, consumed + target))))
+            before = int(cumulative[max(start, stop - 1)]) - consumed
+            after = int(cumulative[stop]) - consumed
+            if before > 0 and abs(target - before) <= abs(target - after):
+                stop -= 1
+            # The greedy rule stops before a zero-length document once load is positive.
+            positive = np.searchsorted(cumulative, consumed, side="right")
+            zero = np.searchsorted(zeros, positive)
+            if zero < len(zeros):
+                stop = min(stop, int(zeros[zero]))
+            load = int(cumulative[stop]) - consumed
         ranges.append((start, stop))
         loads.append(load)
         start = stop
@@ -429,15 +438,18 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     rows_src = {}
     scoring = ScoreLowering(context, nodes, projected_scores, chunk) if scored else None
     for s in scans:
+        summary = summarize_alias(
+            doc_tokens[s.alias], model.sliding_window,
+            memo=context.memo if context is not None else None)
         shard_ranges, loads = contiguous_shards(
-            doc_tokens[s.alias], workers
+            doc_tokens[s.alias], workers, total=summary.total
         )
         sid = f"scan:{s.alias}"
         nodes.append(PhysicalScan(
             node_id=sid,
             alias=s.alias, input_id=s.alias,
             n_docs=len(doc_tokens[s.alias]),
-            total_tokens=sum(doc_tokens[s.alias]),
+            total_tokens=summary.total,
             shard_ranges=shard_ranges,
             shard_token_loads=tuple(loads),
             predicates=regular_predicates(s),

@@ -10,6 +10,7 @@ import numpy as np
 from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, join_settlement
 from quail.execution.pairs import (
+    RowGroups,
     allowed_members,
     columns_key,
     members_by_partner,
@@ -130,7 +131,7 @@ def partner_list_builder(group, tuples_by_stage, maps):
         maps: written position -> anchor row -> partner rows.
 
     Returns:
-        callable(anchor global id) -> per stage, the sorted member
+        callable(anchor global id, stage) -> the sorted member
         indices the anchor streams, or None for every member; or None
         when no stage runs over pairs.
     """
@@ -141,19 +142,27 @@ def partner_list_builder(group, tuples_by_stage, maps):
             continue
         position = join["partners"].index(
             pair_partner(join["anchor"], join["partners"]))
-        stage_maps.append((maps[join["written_pos"]],
-                           members_by_partner(tuples, position)))
+        rows = maps[join["written_pos"]]
+        cache = (np.full(len(rows.keys), None, dtype=object)
+                 if isinstance(rows, RowGroups) else None)
+        stage_maps.append((rows, members_by_partner(tuples, position), cache))
     if all(entry is None for entry in stage_maps):
         return None
 
-    def lists_for(anchor):
-        out = []
-        for entry in stage_maps:
-            if entry is None:
-                out.append(None)
-                continue
-            out.append(allowed_members(*entry, anchor))
-        return out
+    def lists_for(anchor, stage):
+        entry = stage_maps[stage]
+        if entry is None:
+            return None
+        rows, members, cache = entry
+        if cache is None:
+            # Per-batch apply results can arrive after the lookup is constructed.
+            return allowed_members(rows, members, anchor)
+        position = np.searchsorted(rows.keys, anchor)
+        if position == len(rows.keys) or rows.keys[position] != anchor:
+            return np.empty(0, dtype=np.int64)
+        if cache[position] is None:
+            cache[position] = allowed_members(rows, members, anchor)
+        return cache[position]
 
     return lists_for
 
@@ -165,7 +174,7 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
         if lists_for is None or not runs_over_pairs(join):
             out.append(None)
             continue
-        out.append({local: lists_for(anchor)[index]
+        out.append({local: lists_for(anchor, index)
                     for local, anchor in enumerate(anchor_ids)})
     return out
 
@@ -402,7 +411,7 @@ def _model_inputs(node, inputs, context: ExecutionContext, chain=None,
         """
         members = None
         if lists_for is not None and runs_over_pairs(last):
-            members = lists_for(document)[len(group) - 1]
+            members = lists_for(document, len(group) - 1)
         matches = []
         for position, answer in enumerate(row):
             if answer:

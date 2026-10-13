@@ -97,7 +97,7 @@ class FixedFeverAnswers:
             value = self.execute(node, {
                 **inputs, "_live": live,
                 "anchor_partners": (None if partners is None else
-                                    lambda key, j=index: [partners(key)[j]])})
+                                    lambda key, stage, j=index: partners(key, j))})
             results[node.node_id] = value
             rows = value.metrics.extension["answers"][0]
             live = {local for local, row in rows.items() if any(row)}
@@ -164,7 +164,7 @@ class FixedFeverAnswers:
         rows = {}
         for local in sorted(live):
             mine = (range(len(partners)) if members is None
-                    else lists_for(anchor_ids[local])[0])
+                    else lists_for(anchor_ids[local], 0))
             if members is not None:
                 members[local] = list(mine)
             rows[local] = []

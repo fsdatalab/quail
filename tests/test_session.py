@@ -456,6 +456,19 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
     assert allowed_members(grouped, members, 9).size == 0
     assert allowed_members(grouped, members_by_partner([], 0), 5).size == 0
     assert partner_map(unsorted.slice(0, 0), "a", "b").get(5) == ()
+    from quail.backends.quail.graph import partner_list_builder
+
+    streamed = {}
+    group = [dict(anchor="a", partners=["b"], written_pos=j, pairs_from="pairs")
+             for j in range(2)]
+    lookup = partner_list_builder(
+        group, [[[7], [1], [7], [3]]] * 2, {0: grouped, 1: streamed})
+    selected = lookup(5, 0)
+    assert selected.tolist() == [0, 0, 1, 2, 2]
+    assert lookup(5, 0) is selected
+    assert lookup(5, 1).size == 0
+    streamed[5] = [1]
+    assert lookup(5, 1).tolist() == [1]
     # two equalities: both key columns must match; integer keys on one
     # side are cast to the other side's type
     pairs = pair_table(

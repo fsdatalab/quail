@@ -71,7 +71,7 @@ class JoinPart(ExecutionPart):
         self.stages = [
             Stage(suffixes=suffixes, readout=state.async_answers, frame=frame,
                   requests=(None if lists_for is None
-                            else lambda key, j=j: lists_for(key[1])[j]),
+                            else lambda key, j=j: lists_for(key[1], j)),
                   label=f"join predicate {j}")
             for j, (suffixes, frame) in enumerate(
                 zip(inputs["stage_suffixes"], inputs["stage_frames"]))]
@@ -86,7 +86,7 @@ class JoinPart(ExecutionPart):
     def _record(self, index, anchor, row):
         lists_for = self.inputs.get("anchor_partners")
         key = self.inputs["anchor_keys"][anchor]
-        indices = None if lists_for is None else lists_for(key[1])[index]
+        indices = None if lists_for is None else lists_for(key[1], index)
         for reader in self.readers:
             if reader.stage == index:
                 reader.record(anchor, row, indices)
@@ -141,8 +141,8 @@ class JoinPart(ExecutionPart):
             if member.semantics == "anti":
                 candidates = anchor_ids if j == 0 else results[
                     nodes[j - 1].node_id].outputs[f"ids:{node.anchor}"]
-                survivors = [document for document in candidates
-                             if document not in matched]
+                candidates = np.asarray(candidates, dtype=np.int64)
+                survivors = candidates[~np.isin(candidates, matched)].tolist()
             answer = {
                 "rows": rows, "anchor_index": anchor_ids,
                 "partner_index": inputs["partner_indices"][member.written_pos],
@@ -199,7 +199,7 @@ def _predicate_tokens(join_stages, answers, lists_for, anchor_keys,
             total += len(rows) * suffix_tokens
         else:
             for anchor in rows:
-                indices = lists_for(anchor_keys[anchor][1])[j]
+                indices = lists_for(anchor_keys[anchor][1], j)
                 total += (suffix_tokens if indices is None
                           else int(lengths[indices].sum()))
         totals.append(total)
