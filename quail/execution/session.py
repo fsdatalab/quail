@@ -1218,25 +1218,24 @@ class Query:
             name: table
             for node in plan.nodes
             if isinstance(node, AiClassify)
-            and PortRef(node.node_id, "scores") in response.outputs
+            and PortRef(node.node_id, "rows") in response.outputs
             for name, table in classify_label_tables(
-                node.spec, response.outputs[PortRef(node.node_id, "scores")]
+                node.spec, response.outputs[PortRef(node.node_id, "rows")]
             ).items()
         }, "scores": {
             # every scored document's score, before any sort or fetch
             node.spec.name: response.outputs[
-                PortRef(node.node_id, "scores")
+                PortRef(node.node_id, "rows")
             ].select([*node.spec.aliases, node.spec.name])
             for node in plan.nodes
             if isinstance(node, AiScore)
-            and not isinstance(node, (AiClassify, AiExtract))
-            and PortRef(node.node_id, "scores") in response.outputs
+            and PortRef(node.node_id, "rows") in response.outputs
         }, "extracts": {
             # every document's answer and span, null for no answer
-            node.spec.name: response.outputs[PortRef(node.node_id, "scores")]
+            node.spec.name: response.outputs[PortRef(node.node_id, "rows")]
             for node in plan.nodes
             if isinstance(node, AiExtract)
-            and PortRef(node.node_id, "scores") in response.outputs
+            and PortRef(node.node_id, "rows") in response.outputs
         }}
         survivors = {
             scan.alias: pa.array(

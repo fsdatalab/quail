@@ -321,7 +321,7 @@ def test_score_filters_compare_values_and_keep_pair_answers(catalog):
     )
     answers = result.outputs["join_answers:0"]
     assert answers.column("answer").to_pylist() == [True, False, False, True]
-    assert result.outputs["scores"].num_rows == 2
+    assert result.outputs["rows"].num_rows == 2
 
     for comparison, expected in COMPARISONS:
         answer = compare_score(
@@ -485,7 +485,7 @@ def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
         "aliases": ["d"], "rows": [0, 1], "scores": [0.1, 0.2]}
     assert [(entry["rows"], entry["scores"]) for entry in streamed[1:]] == [
         ([0], [0.1]), ([1], [0.2])]
-    assert result.outputs["scores"].column("d").to_pylist() == [0, 1]
+    assert result.outputs["rows"].column("d").to_pylist() == [0, 1]
 
     rows = ScoreRows((np.arange(100_000), np.arange(100_000)), product=True)
     assert len(rows) == 10_000_000_000
@@ -638,7 +638,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     execution.begin()
     assert execution.started
     result = execution.execute(node, {port.name: [1, 0] for port in node.inputs})
-    assert result.outputs["scores"].to_pylist() == [
+    assert result.outputs["rows"].to_pylist() == [
         {"q": 1, "d": 1, "score": 0.75},
         {"q": 1, "d": 0, "score": 0.5},
         {"q": 0, "d": 1, "score": 0.25},
@@ -682,7 +682,7 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
             inputs=input_ports(tuple(PortRef(f"input:{alias}", f"ids:{alias}")
                                      for alias in aliases)),
             spec=spec)
-        return PhysicalGraph(nodes + (score,), PortRef("score", "scores"))
+        return PhysicalGraph(nodes + (score,), PortRef("score", "rows"))
 
     def scored(rewritten):
         return next(node for node in rewritten.nodes

@@ -597,15 +597,8 @@ class RequestExecution(PhysicalNode):
 
 
 @dataclass(frozen=True)
-class ScoreSpec:
-    """Specification for a batched AI.SCORE computation.
-
-    draws is the most noise draws a diffusion model averages per answer;
-    an answer whose first draw is certain enough uses one. An
-    autoregressive model always uses one. share_prefixes lets each
-    document borrow the KV pages of a document sharing its prefix; it
-    applies to scores of one table.
-    """
+class InferenceSpec:
+    """Bound inputs, output columns, and cost of one model call."""
 
     name: str
     aliases: tuple[str, ...]
@@ -613,13 +606,11 @@ class ScoreSpec:
     arguments: tuple[tuple[str, str], ...]
     expected_inputs: float
     estimated_seconds: float
-    pair_fraction: float = 1.0
     prompt_token_parts: tuple[tuple[int, ...], ...] = ()
-    draws: int = 1
     share_prefixes: bool = False
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "ScoreSpec":
+    def from_mapping(cls, value: Mapping[str, Any]) -> "InferenceSpec":
         return cls(
             name=str(value["name"]),
             aliases=tuple(value["aliases"]),
@@ -630,11 +621,9 @@ class ScoreSpec:
             ),
             expected_inputs=float(value["expected_inputs"]),
             estimated_seconds=float(value["estimated_seconds"]),
-            pair_fraction=float(value.get("pair_fraction", 1.0)),
             prompt_token_parts=tuple(
                 tuple(part) for part in value.get("prompt_token_parts", ())
             ),
-            draws=int(value.get("draws", 1)),
             share_prefixes=bool(value.get("share_prefixes", False)),
         )
 
@@ -646,23 +635,46 @@ class ScoreSpec:
             "arguments": [list(argument) for argument in self.arguments],
             "expected_inputs": self.expected_inputs,
             "estimated_seconds": self.estimated_seconds,
-            "pair_fraction": self.pair_fraction,
             "prompt_token_parts": [list(part) for part in self.prompt_token_parts],
-            "draws": self.draws,
             "share_prefixes": self.share_prefixes,
         }
 
+    @property
+    def output_columns(self) -> tuple[str, ...]:
+        """Return the document IDs and computed columns."""
+        return (*self.aliases, self.name)
+
 
 @dataclass(frozen=True)
-class AiScore(PhysicalNode):
-    """Append one FLOAT64 reranker score to candidate rows."""
+class ScoreSpec(InferenceSpec):
+    """Settings for scoring documents or pairs, including diffusion draws."""
+
+    pair_fraction: float = 1.0
+    draws: int = 1
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ScoreSpec":
+        return cls(
+            **vars(InferenceSpec.from_mapping(value)),
+            pair_fraction=float(value.get("pair_fraction", 1.0)),
+            draws=int(value.get("draws", 1)),
+        )
+
+    def to_dict(self) -> dict:
+        return {**super().to_dict(), "pair_fraction": self.pair_fraction,
+                "draws": self.draws}
+
+
+@dataclass(frozen=True)
+class AiInference(PhysicalNode):
+    """Append model outputs to candidate rows."""
 
     backend_name: str = ""
     model: str = ""
-    spec: ScoreSpec | None = None
+    spec: InferenceSpec | None = None
 
-    type_name: ClassVar[str] = "quail.ai_score"
-    runtime_key: ClassVar[str] = type_name
+    spec_type: ClassVar[type[InferenceSpec]] = InferenceSpec
+    document_ids: ClassVar[bool] = False
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
 
     @property
@@ -674,11 +686,13 @@ class AiScore(PhysicalNode):
     def outputs(self) -> tuple[OutputPort, ...]:
         if self.spec is None:
             return ()
-        return (OutputPort(
-            "scores",
-            ValueType.SCORES,
-            schema=(*self.spec.aliases, self.spec.name),
-        ),)
+        ports = (OutputPort("rows", ValueType.ROWS,
+                            schema=self.spec.output_columns),)
+        if self.document_ids and len(self.spec.aliases) == 1:
+            (alias,) = self.spec.aliases
+            ports += (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
+                                 schema=(alias,)),)
+        return ports
 
     def attributes(self) -> dict:
         return {
@@ -710,12 +724,22 @@ class AiScore(PhysicalNode):
             inputs=inputs,
             backend_name=str(attributes["backend_name"]),
             model=str(attributes["model"]),
-            spec=None if value is None else ScoreSpec.from_mapping(value),
+            spec=None if value is None else cls.spec_type.from_mapping(value),
         )
 
 
 @dataclass(frozen=True)
-class ClassifySpec(ScoreSpec):
+class AiScore(AiInference):
+    """Append one FLOAT64 reranker score to candidate rows."""
+
+    spec: ScoreSpec | None = None
+    spec_type: ClassVar[type[InferenceSpec]] = ScoreSpec
+    type_name: ClassVar[str] = "quail.ai_score"
+    runtime_key: ClassVar[str] = type_name
+
+
+@dataclass(frozen=True)
+class ClassifySpec(InferenceSpec):
     """Specification for classifying individual documents or joined pairs.
 
     Attributes:
@@ -738,6 +762,8 @@ class ClassifySpec(ScoreSpec):
             blocks and the closing line follow.
     """
 
+    pair_fraction: float = 1.0
+    draws: int = 1
     labels: tuple[str, ...] = ()
     label_token_ids: tuple[tuple[int, ...], ...] = ()
     label_word_starts: tuple[tuple[bool, ...], ...] = ()
@@ -761,12 +787,10 @@ class ClassifySpec(ScoreSpec):
         if value.get("stages"):
             raise ValueError(
                 "nested classification stages are unsupported; replan query")
-        base = ScoreSpec.from_mapping(value)
         return cls(
-            **{name: getattr(base, name) for name in (
-                "name", "aliases", "query_template", "arguments",
-                "expected_inputs", "estimated_seconds", "pair_fraction",
-                "prompt_token_parts", "draws", "share_prefixes")},
+            **vars(InferenceSpec.from_mapping(value)),
+            pair_fraction=float(value.get("pair_fraction", 1.0)),
+            draws=int(value.get("draws", 1)),
             labels=tuple(str(label) for label in value["labels"]),
             label_token_ids=tuple(
                 tuple(int(token) for token in ids)
@@ -785,6 +809,8 @@ class ClassifySpec(ScoreSpec):
     def to_dict(self) -> dict:
         return {
             **super().to_dict(),
+            "pair_fraction": self.pair_fraction,
+            "draws": self.draws,
             "labels": list(self.labels),
             "label_token_ids": [list(ids) for ids in self.label_token_ids],
             "label_word_starts": [list(flags) for flags in self.label_word_starts],
@@ -797,26 +823,19 @@ class ClassifySpec(ScoreSpec):
 
 
 @dataclass(frozen=True)
-class AiClassify(AiScore):
+class AiClassify(AiInference):
     """Physical operator that appends a label to each input row.
 
     The spec names the label scoring rule. The backend runs any decode
-    rounds within this node and returns the labels through its scores port.
+    rounds within this node and returns the labels through its rows port.
     """
 
     spec: ClassifySpec | None = None
 
+    spec_type: ClassVar[type[InferenceSpec]] = ClassifySpec
+    document_ids: ClassVar[bool] = True
     type_name: ClassVar[str] = "quail.ai_classify"
-
-    @property
-    def outputs(self) -> tuple[OutputPort, ...]:
-        """Return ports for label rows and the IDs of labeled documents."""
-        ports = super().outputs
-        if self.spec is not None and len(self.spec.aliases) == 1:
-            (alias,) = self.spec.aliases
-            ports += (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
-                                 schema=(alias,)),)
-        return ports
+    runtime_key: ClassVar[str] = type_name
 
     def explain_fields(self) -> Mapping[str, Any]:
         return {
@@ -827,17 +846,6 @@ class AiClassify(AiScore):
             "probabilities": (False if self.spec is None
                               else self.spec.probabilities),
         }
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        value = attributes["spec"]
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            backend_name=str(attributes["backend_name"]),
-            model=str(attributes["model"]),
-            spec=None if value is None else ClassifySpec.from_mapping(value),
-        )
 
 
 @dataclass(frozen=True)
@@ -922,13 +930,13 @@ class Filter(PhysicalNode):
         if len(self.aliases) == 1:
             (alias,) = self.aliases
             return (
-                OutputPort("scores", ValueType.SCORES),
+                OutputPort("rows", ValueType.ROWS),
                 OutputPort(f"filter_answers:{alias}", ValueType.FILTER_ANSWERS),
                 OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
                            schema=(alias,)),
             )
         return (
-            OutputPort("scores", ValueType.SCORES),
+            OutputPort("rows", ValueType.ROWS),
             OutputPort(f"join_answers:{self.written_pos}",
                        ValueType.JOIN_ANSWERS),
         )
@@ -1042,7 +1050,7 @@ class AiFilter(PhysicalNode):
 
 
 @dataclass(frozen=True)
-class ExtractSpec(ScoreSpec):
+class ExtractSpec(InferenceSpec):
     """Specification for copying each document's answer to a question.
 
     The prompt token parts are the head before the document and the
@@ -1089,14 +1097,15 @@ class ExtractSpec(ScoreSpec):
         """Return the name of the span column."""
         return self.name + "_span"
 
+    @property
+    def output_columns(self) -> tuple[str, ...]:
+        """Return the document ID, answer, and source span columns."""
+        return (*super().output_columns, self.span_name)
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ExtractSpec":
-        base = ScoreSpec.from_mapping(value)
         return cls(
-            **{name: getattr(base, name) for name in (
-                "name", "aliases", "query_template", "arguments",
-                "expected_inputs", "estimated_seconds", "pair_fraction",
-                "prompt_token_parts", "draws", "share_prefixes")},
+            **vars(InferenceSpec.from_mapping(value)),
             question=str(value["question"]),
             trim=bool(value.get("trim", True)),
             **{name: value.get(name, value.get("config", {}).get(
@@ -1119,10 +1128,10 @@ class ExtractSpec(ScoreSpec):
 
 
 @dataclass(frozen=True)
-class AiExtract(AiScore):
+class AiExtract(AiInference):
     """Physical operator that appends each row's answer and its span.
 
-    The scores port carries one row per input document: its id, the
+    The rows port carries one row per input document: its id, the
     answer text, and the answer's (start, end) character span in the
     document; both are null when the document does not answer the
     question. The ids port carries the same documents.
@@ -1130,20 +1139,10 @@ class AiExtract(AiScore):
 
     spec: ExtractSpec | None = None
 
+    spec_type: ClassVar[type[InferenceSpec]] = ExtractSpec
+    document_ids: ClassVar[bool] = True
     type_name: ClassVar[str] = "quail.ai_extract"
     runtime_key: ClassVar[str] = type_name
-
-    @property
-    def outputs(self) -> tuple[OutputPort, ...]:
-        if self.spec is None:
-            return ()
-        spec = self.spec
-        return (
-            OutputPort("scores", ValueType.SCORES,
-                       schema=(spec.alias, spec.name, spec.span_name)),
-            OutputPort(f"ids:{spec.alias}", ValueType.DOCUMENT_IDS,
-                       schema=(spec.alias,)),
-        )
 
     def explain_fields(self) -> Mapping[str, Any]:
         return {
@@ -1151,17 +1150,6 @@ class AiExtract(AiScore):
             "question": None if self.spec is None else self.spec.question,
             "trim": True if self.spec is None else self.spec.trim,
         }
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        value = attributes["spec"]
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            backend_name=str(attributes["backend_name"]),
-            model=str(attributes["model"]),
-            spec=None if value is None else ExtractSpec.from_mapping(value),
-        )
 
 
 @dataclass(frozen=True)

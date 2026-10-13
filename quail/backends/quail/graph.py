@@ -27,8 +27,10 @@ from quail.execution.runner import (
 from quail.execution.tokens import DocumentKeys, DocumentPrefixes, chain_tokens
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
+    AiClassify,
     AiExtract,
     AiFilter,
+    AiInference,
     AiJoin,
     AiScore,
     Filter,
@@ -45,6 +47,7 @@ def quail_runtimes() -> dict:
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
         AiScore.runtime_key: model_runtime,
+        AiClassify.runtime_key: model_runtime,
         AiExtract.runtime_key: model_runtime,
         Filter.runtime_key: FilterRuntime(),
     }
@@ -268,7 +271,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext,
         A scheduler input mapping for filters, joins, and scores. Other
         operators receive the original input mapping.
     """
-    if isinstance(node, AiScore):
+    if isinstance(node, (AiScore, AiClassify)):
         return {"score_inputs": inputs, "documents": context.state["docs"],
                 "pre": context.state.get("pre", []),
                 "gpu_timing": context.state.get("gpu_timing", False)}
@@ -512,10 +515,10 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
             None if state["device"].usd_per_hour is None
             else wall / 3600 * state["device"].usd_per_hour
         ),
-        "backend_metrics": {"scores": [
+        "backend_metrics": {"inferences": [
             dict(value.metrics.extension)
             for node_id, value in result.nodes.items()
-            if isinstance(graph.node(node_id), AiScore)
+            if isinstance(graph.node(node_id), AiInference)
         ]},
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),

@@ -24,7 +24,6 @@ class ValueType(str, Enum):
     LABEL_ANSWERS = "label_answers"
     EXTRACT_ANSWERS = "extract_answers"
     PAIRS = "pairs"
-    SCORES = "scores"
     ROWS = "rows"
     ANY = "any"
 
@@ -66,8 +65,6 @@ def value_type_for_port(name: str) -> ValueType:
         return ValueType.JOIN_ANSWERS
     if name.startswith("pairs:"):
         return ValueType.PAIRS
-    if name == "scores":
-        return ValueType.SCORES
     if name in {"tuples", "rows"}:
         return ValueType.ROWS
     return ValueType.ANY

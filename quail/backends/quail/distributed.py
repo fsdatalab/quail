@@ -24,7 +24,9 @@ from quail.execution.runner import (
 from quail.execution.tokens import select_documents
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
+    AiClassify,
     AiFilter,
+    AiInference,
     AiJoin,
     AiScore,
     PhysicalGraph,
@@ -96,7 +98,7 @@ class DistributedQuailExecution:
         return dict(self.payload)
 
     def execute(self, node, inputs):
-        if isinstance(node, AiScore):
+        if isinstance(node, (AiScore, AiClassify)):
             return self._execute_score(node, inputs)
         if isinstance(node, AiFilter):
             return self._execute_filter(node, inputs)
@@ -378,10 +380,10 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
             None if device.usd_per_hour is None
             else elapsed / 3600 * gpu_count * device.usd_per_hour
         ),
-        backend_metrics={"scores": [
+        backend_metrics={"inferences": [
             dict(value.metrics.extension)
             for node_id, value in result.nodes.items()
-            if isinstance(graph.node(node_id), AiScore)
+            if isinstance(graph.node(node_id), AiInference)
         ]},
         executed_join_plan=executed_join_plan(graph),
         node_metrics=scalar_node_metrics(result.nodes),

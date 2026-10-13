@@ -6,8 +6,8 @@ from typing import Any, Mapping
 from quail.execution.pipelines import build_pipelines
 from quail.physical import (
     AiFilter,
+    AiInference,
     AiJoin,
-    AiScore,
     Barrier,
     Exchange,
     Foreign,
@@ -21,10 +21,10 @@ from quail.physical.codec import plan_envelope
 from quail.specs import MODELS
 
 
-def score_seconds(nodes) -> float:
-    """Sum the score operators' estimated seconds in a physical graph."""
+def inference_seconds(nodes) -> float:
+    """Sum the inference operators' estimated seconds in a physical graph."""
     return sum(node.spec.estimated_seconds for node in nodes
-               if isinstance(node, AiScore) and node.spec is not None)
+               if isinstance(node, AiInference) and node.spec is not None)
 
 
 @dataclass(frozen=True)

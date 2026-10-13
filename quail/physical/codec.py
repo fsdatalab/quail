@@ -11,6 +11,7 @@ from .nodes import (
     AiClassify,
     AiExtract,
     AiFilter,
+    AiInference,
     AiJoin,
     AiScore,
     Barrier,
@@ -180,20 +181,38 @@ def decode_graph(
 ) -> PhysicalGraph:
     """Decode and validate one physical graph."""
     _require_fields(value, {"nodes", "root"}, "physical graph")
+    row_nodes = tuple(
+        encoded["id"] for encoded in value["nodes"]
+        if encoded["type"] in codecs
+        and issubclass(codecs[encoded["type"]].node_type, (AiInference, Filter)))
     nodes = []
     for encoded in value["nodes"]:
         type_name = encoded["type"]
         if type_name not in codecs:
             raise ValueError(f"unknown physical node type {type_name!r}")
-        nodes.append(codecs[type_name].decode(encoded))
+        inputs = []
+        for port in encoded["inputs"]:
+            source = _row_port(port["source"], row_nodes)
+            if source is not port["source"]:
+                port = {**port, "source": source, "value_type": "rows"}
+            inputs.append(port)
+        nodes.append(codecs[type_name].decode({**encoded, "inputs": inputs}))
     root = value["root"]
     _require_fields(root, {"node_id", "port"}, "physical graph root")
+    root = _row_port(root, row_nodes)
     graph = PhysicalGraph(
         nodes=tuple(nodes),
         root=PortRef(root["node_id"], root["port"]),
     )
     graph.validate()
     return graph
+
+
+def _row_port(source, row_nodes):
+    """Read the score port name used by earlier serialized plans."""
+    if source["node_id"] in row_nodes and source["port"] == "scores":
+        return {**source, "port": "rows"}
+    return source
 
 
 def plan_envelope(
