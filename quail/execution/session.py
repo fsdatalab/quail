@@ -4,22 +4,26 @@ import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import fields, replace
+from dataclasses import replace
 from itertools import chain
 from numbers import Integral
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Protocol, runtime_checkable
 
-import numpy as np
 import pyarrow as pa
-from pyarrow import acero
 from pyarrow import compute as pc
 
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
-from quail.execution.pairs import columns_key, estimate_pair_fraction, pair_keys
-from quail.execution.result import IndexRelation, QueryResult, true_answer_rows
+from quail.execution.pairs import columns_key, estimate_pair_fraction
+from quail.execution.projection import projection_for
+from quail.execution.reporting import (
+    collect_answers,
+    execution_report,
+    restore_node_metrics,
+)
+from quail.execution.result import QueryResult
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -40,27 +44,16 @@ from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
-    Alias,
-    CompileError,
     LogicalPlan,
     join_conditions,
     oriented_join_conditions,
 )
-from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
+from quail.physical import Scan, encode_graph
 from quail.planner import explain, plan_query, refine_plan
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.planner.statistics import filter_stop_keys
 from quail.progress import Progress, say
-
-
-def _node_metrics(metrics: dict) -> NodeMetrics:
-    """Rebuild a node's metrics from a report; extra numbers go to extension."""
-    names = {field.name for field in fields(NodeMetrics)} - {"extension"}
-    return NodeMetrics(
-        **{name: value for name, value in metrics.items() if name in names},
-        extension={name: value for name, value in metrics.items()
-                   if name not in names})
 
 
 class RefusalError(RuntimeError):
@@ -1009,199 +1002,7 @@ class Query:
         """Finish the physical graph and attach execution details."""
         plan = self.plan()
         out = response.metrics
-        from quail.physical import AiJoin, Barrier
-
-        expected_nodes = tuple(node for node in plan.nodes
-                               if isinstance(node, (AiJoin, Barrier)))
-        report = dict(
-            backend=out.get("backend", plan.backend),
-            wall_s=out["wall_s"], boot_s=out.get("boot_s"),
-            estimated_seconds=plan.estimated_seconds,
-            boot_kind=out.get("boot_kind"),
-            boot=out.get("boot"),
-            coordinator_wall_s=round(coordinator_wall, 2),
-            fresh_tokens=out["fresh_tokens"],
-            cached_tokens=out.get("cached_tokens"),
-            stages=[],
-            peak_gib=out.get("peak_gib"),
-            order_rule=plan.settings.get("order_rule"),
-            expected_join_plan=[
-                {
-                    "type": node.type_name,
-                    "id": node.node_id,
-                    **node.explain_fields(),
-                }
-                for node in expected_nodes
-            ],
-            executed_join_plan=out.get("executed_join_plan", []),
-            kv_manager=out.get("kv_manager"),
-            node_metrics=out.get("node_metrics", {}),
-            backend_metrics=out.get("backend_metrics"),
-            remarks=list(self.session.notes))
-        for key in ("gpu_s", "chunks"):
-            if key in out:
-                report[key] = out[key]
-        for key in (
-            "evaluated_documents",
-            "evaluated_document_pairs",
-            "documents_per_second",
-            "document_pairs_per_second",
-            "usd_per_query",
-        ):
-            if key in out:
-                report[key] = out[key]
-
-        operators = self.logical.operators()
-        scans, logical_filters, logical_joins = (
-            operators.scans, operators.all_filters(), operators.joins
-        )
-        scans_by_alias = {scan.alias: scan for scan in scans}
-
-        def project(node, value, labels=None):
-            if not isinstance(node, Project):
-                raise TypeError(type(node).__name__)
-            if node.inputs[0].value_type is ValueType.JOIN_ANSWERS:
-                value = true_answer_rows(value)
-            relation = (
-                IndexRelation.from_table(value)
-                if isinstance(value, pa.Table) else value
-            )
-            if not isinstance(relation, IndexRelation):
-                raise TypeError("Project needs an index relation")
-            projection = []
-            fields = []
-            declaration = relation.declaration
-            for name in node.columns:
-                if name in relation.schema.names:
-                    # a score column the graph computed; document
-                    # index columns are aliases, never "alias.column"
-                    projection.append((name, None))
-                    fields.append(pa.field(
-                        name, relation.schema.field(name).type
-                    ))
-                    continue
-                table = next((table for table in (labels or {}).values()
-                              if name in table.column_names), None)
-                if (table is not None and table.column_names.index(name) == 2
-                        and pa.types.is_integer(table.schema.field(1).type)):
-                    # a label of joined rows: each result row looks its
-                    # label up by its two ids; a row without one leaves
-                    # the result
-                    aliases = table.column_names[:2]
-                    if any(alias not in relation.schema.names
-                           for alias in aliases):
-                        raise CompileError(
-                            f"label column {name!r} belongs to the joined "
-                            f"rows of {aliases}, not all in the result")
-                    call = next((column.expression
-                                 for column in self.logical.projection.columns
-                                 if isinstance(column, Alias)
-                                 and column.name == name), None)
-                    order = (None if call is None
-                             else pa.array(call.labels, pa.string()))
-                    keys = pair_keys(table.column(aliases[0]),
-                                      table.column(aliases[1]))
-                    declaration = acero.Declaration(
-                        "filter", acero.FilterNodeOptions(
-                            pair_keys(*(pc.field(alias) for alias in aliases))
-                            .isin(keys)),
-                        inputs=[declaration])
-                    projection.append((tuple(aliases), (keys, table, order)))
-                    fields.append(pa.field(
-                        name,
-                        pa.string() if order is None
-                        else pa.dictionary(pa.int32(), pa.string()),
-                        nullable=True,
-                        metadata={b"quail.alias": aliases[0].encode("utf-8"),
-                                  b"quail.label": name.encode("utf-8")}))
-                    continue
-                if table is not None:
-                    # a label the graph computed for some of an alias's
-                    # documents, widened to every document of the alias
-                    alias = table.column_names[0]
-                    if alias not in relation.schema.names:
-                        raise CompileError(
-                            f"label column {name!r} belongs to {alias!r}, "
-                            f"which is not in the result")
-                    labeled = table.column(name).combine_chunks()
-                    if pa.types.is_dictionary(labeled.type):
-                        labeled = labeled.cast(labeled.type.value_type)
-                    # a document whose answer names no label has no row
-                    # in the table, and leaves the result
-                    declaration = acero.Declaration(
-                        "filter", acero.FilterNodeOptions(
-                            pc.field(alias).isin(table.column(alias))),
-                        inputs=[declaration])
-                    # position of each document's label, or the null
-                    # appended past the labels for an unlabeled one
-                    slots = np.full(len(self._doc_tokens[alias]), len(labeled),
-                                    dtype=np.int64)
-                    slots[table.column(alias).to_numpy()] = np.arange(
-                        len(labeled))
-                    widened = pc.take(
-                        pa.concat_arrays([labeled, pa.array([None], labeled.type)]),
-                        pa.array(slots))
-                    call = next((column.expression
-                                 for column in self.logical.projection.columns
-                                 if isinstance(column, Alias)
-                                 and column.name == name), None)
-                    if call is not None and call.kind == "label":
-                        order = pa.array(call.labels, pa.string())
-                        values = pa.DictionaryArray.from_arrays(
-                            pc.index_in(widened, order).cast(pa.int32()),
-                            order)
-                    else:
-                        values = widened
-                    projection.append((alias, values))
-                    fields.append(pa.field(
-                        name, values.type, nullable=True,
-                        metadata={b"quail.alias": alias.encode("utf-8"),
-                                  b"quail.label": name.encode("utf-8")}))
-                    continue
-                try:
-                    alias, column = name.split(".", 1)
-                    scan = scans_by_alias[alias]
-                except (ValueError, KeyError) as error:
-                    raise CompileError(
-                        f"unknown projection column {name!r}"
-                    ) from error
-                if alias not in relation.schema.names:
-                    raise CompileError(
-                        f"projection column {name!r} is not in the result"
-                    )
-                store = self._token_inputs[alias]
-                if column not in store.projected_columns:
-                    raise CompileError(
-                        f"projection column {name!r} was not loaded by the "
-                        f"scan of {alias!r}; the projection_pushdown "
-                        f"logical rule is not registered")
-                values = store.column(column)
-                projection.append((alias, values))
-                fields.append(pa.field(
-                    name,
-                    values.type,
-                    nullable=values.null_count > 0,
-                    metadata={
-                        b"quail.alias": alias.encode("utf-8"),
-                        b"quail.provider": scan.provider.encode("utf-8"),
-                        b"quail.column": column.encode("utf-8"),
-                    },
-                ))
-            return QueryResult(
-                columns=list(node.columns),
-                declaration=declaration,
-                document_index_schema=relation.schema,
-                output_schema=pa.schema(
-                    fields,
-                    metadata={b"quail.kind": b"query_result"},
-                ),
-                projection=projection,
-                report={},
-                row_count=(value.num_rows if isinstance(value, pa.Table)
-                           and declaration is relation.declaration
-                           else None),
-            )
-
+        report = execution_report(plan, out, self.session.notes, coordinator_wall)
         sources = {
             node.input_id: range(node.n_docs)
             for node in plan.nodes
@@ -1213,12 +1014,13 @@ class Query:
             ExecutionContext(
                 runtimes=self.session.registry.runtimes,
                 sources=sources,
-                project=project,
+                project=projection_for(
+                    self.logical, self._token_inputs, self._doc_tokens),
                 observers=observers,
             ),
             initial_outputs=response.outputs,
             initial_metrics={
-                node_id: _node_metrics(metrics)
+                node_id: restore_node_metrics(metrics)
                 for node_id, metrics in out.get("node_metrics", {}).items()
             },
         )
@@ -1242,195 +1044,7 @@ class Query:
             report["observers"] = observer_reports
         result.report = report
 
-        from quail.execution.reranker import classify_label_tables
-        from quail.physical import AiClassify, AiExtract, AiScore
-
-        # every classified document's label, before any filter on it;
-        # a chain's later stages label the documents their gate passed
-        answer_tables = {"filters": {}, "joins": {}, "classifies": {
-            name: table
-            for node in plan.nodes
-            if isinstance(node, AiClassify)
-            and PortRef(node.node_id, "rows") in response.outputs
-            for name, table in classify_label_tables(
-                node.spec, response.outputs[PortRef(node.node_id, "rows")]
-            ).items()
-        }, "scores": {
-            # every scored document's score, before any sort or fetch
-            node.spec.name: response.outputs[
-                PortRef(node.node_id, "rows")
-            ].select([*node.spec.aliases, node.spec.name])
-            for node in plan.nodes
-            if isinstance(node, AiScore)
-            and PortRef(node.node_id, "rows") in response.outputs
-        }, "extracts": {
-            # every document's answer and span, null for no answer
-            node.spec.name: response.outputs[PortRef(node.node_id, "rows")]
-            for node in plan.nodes
-            if isinstance(node, AiExtract)
-            and PortRef(node.node_id, "rows") in response.outputs
-        }}
-        survivors = {
-            scan.alias: pa.array(
-                range(len(self._doc_tokens[scan.alias])), pa.int32())
-            for scan in scans
-        }
-
-        output_types = {
-            PortRef(node.node_id, output.name): output.value_type
-            for node in plan.nodes
-            for output in node.outputs
-        }
-        filter_relations = {}
-        join_relations = {}
-        for ref, table in response.outputs.items():
-            value_type = output_types.get(ref)
-            metadata = table.schema.metadata or {}
-            if value_type is ValueType.FILTER_ANSWERS:
-                alias = metadata.get(b"quail.alias")
-                if alias is None:
-                    raise ValueError(
-                        "a filter answer relation needs quail.alias metadata"
-                    )
-                filter_relations.setdefault(
-                    alias.decode("utf-8"), []
-                ).append(table)
-            elif value_type is ValueType.LABEL_ANSWERS:
-                # the label column follows the alias columns: one, or
-                # the anchor and partner of a classification of joined rows
-                answer_tables["classifies"][table.column_names[-1]] = table
-            elif value_type is ValueType.EXTRACT_ANSWERS:
-                # the alias column, the answer, and its span
-                answer_tables["extracts"][table.column_names[1]] = table
-            elif value_type is ValueType.JOIN_ANSWERS:
-                written_pos = metadata.get(b"quail.written_pos")
-                if written_pos is None:
-                    raise ValueError(
-                        "a join answer relation needs "
-                        "quail.written_pos metadata"
-                    )
-                position = int(written_pos.decode("ascii"))
-                if position in join_relations:
-                    raise ValueError(
-                        f"duplicate join answer relation {position}"
-                    )
-                join_relations[position] = table
-
-        missing_filter_relations = set(logical_filters) - set(
-            filter_relations
-        )
-        if missing_filter_relations:
-            raise ValueError(
-                "execution response is missing filter answer relations for "
-                f"{sorted(missing_filter_relations)}"
-            )
-        missing_join_relations = set(range(len(logical_joins))) - set(
-            join_relations
-        )
-        if missing_join_relations:
-            raise ValueError(
-                "execution response is missing join answer relations for "
-                f"{sorted(missing_join_relations)}"
-            )
-
-        for node in plan.graph.topological_nodes():
-            for output in node.outputs:
-                if output.value_type is not ValueType.DOCUMENT_IDS:
-                    continue
-                ref = PortRef(node.node_id, output.name)
-                if ref not in response.outputs:
-                    continue
-                table = response.outputs[ref]
-                if len(table.column_names) != 1:
-                    raise ValueError(
-                        "a document id relation needs one alias column"
-                    )
-                alias = table.column_names[0]
-                survivors[alias] = (
-                    table.column(alias).combine_chunks().cast(pa.int32()))
-
-        for alias, relations in filter_relations.items():
-            table = relations[0] if len(relations) == 1 else \
-                pa.concat_tables(relations)
-            # predicates in the order their first answers appear
-            predicate_order = [
-                int(pos) for pos in pc.unique(table.column("predicate")).to_pylist()]
-            predicate_order.extend(
-                position for position in range(len(logical_filters[alias]))
-                if position not in predicate_order
-            )
-            for index, written_pos in enumerate(predicate_order):
-                mask = pc.equal(table.column("predicate"), written_pos)
-                stage_table = table.filter(mask)
-                evaluated = stage_table.num_rows
-                passed = pc.sum(stage_table.column("answer")).as_py() or 0
-                answer_tables["filters"][(alias, written_pos)] = stage_table
-                report["stages"].append(dict(
-                    op="filter", alias=alias, stage=index,
-                    written_pos=written_pos,
-                    provided_selectivity=(
-                        logical_filters[alias][written_pos].selectivity
-                    ),
-                    observed_selectivity=round(
-                        passed / max(1, evaluated), 4
-                    ),
-                    evaluated=evaluated,
-                ))
-
-        true_join_tables = {}
-        expected_order = []
-        for node in expected_nodes:
-            for output in node.outputs:
-                if not output.name.startswith("join_answers:"):
-                    continue
-                expected_order.append(int(output.name.split(":", 1)[1]))
-        expected_order.extend(
-            position for position in sorted(join_relations)
-            if position not in expected_order
-        )
-        for written_pos in expected_order:
-            if written_pos not in join_relations:
-                continue
-            table = join_relations[written_pos]
-            metadata = table.schema.metadata or {}
-            logical_join = logical_joins[written_pos]
-            logical_aliases = [
-                argument.alias for argument in logical_join.prompt.args
-            ]
-            required_metadata = {
-                b"quail.anchor", b"quail.partners", b"quail.semantics"
-            }
-            missing = required_metadata - set(metadata)
-            if missing:
-                raise ValueError(
-                    "a join answer relation is missing metadata "
-                    f"{sorted(key.decode('utf-8') for key in missing)}"
-                )
-            anchor = metadata[b"quail.anchor"].decode("utf-8")
-            partner_text = metadata[b"quail.partners"].decode("utf-8")
-            partners = [] if not partner_text else partner_text.split(",")
-            semantics = metadata[b"quail.semantics"].decode("utf-8")
-            missing_columns = set(logical_aliases) - set(table.column_names)
-            if missing_columns:
-                raise ValueError(
-                    "a join answer relation is missing alias columns "
-                    f"{sorted(missing_columns)}"
-                )
-            answers = table.column("answer")
-            answer_tables["joins"][written_pos] = table
-            report["stages"].append(dict(
-                op="join", written_pos=written_pos, anchor=anchor,
-                partners=partners,
-                semantics=semantics,
-                provided_selectivity=logical_join.selectivity,
-                observed_selectivity=round(
-                    (pc.sum(answers).as_py() or 0) / max(1, len(answers)), 4
-                ),
-                tuples=len(answers),
-            ))
-            if semantics == "full":
-                true_join_tables[written_pos] = true_answer_rows(table)
-        result.answer_tables = answer_tables
-        result.survivor_indices = survivors
-        result.true_join_tables = true_join_tables
+        (result.answer_tables, result.survivor_indices,
+         result.true_join_tables, report["stages"]) = collect_answers(
+             self.logical, plan, response.outputs, self._doc_tokens)
         return result

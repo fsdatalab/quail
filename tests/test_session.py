@@ -456,7 +456,7 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
     assert allowed_members(grouped, members, 9).size == 0
     assert allowed_members(grouped, members_by_partner([], 0), 5).size == 0
     assert partner_map(unsorted.slice(0, 0), "a", "b").get(5) == ()
-    from quail.backends.quail.graph import partner_list_builder
+    from quail.backends.quail.executor.operators.join import partner_list_builder
 
     streamed = {}
     group = [dict(anchor="a", partners=["b"], written_pos=j, pairs_from="pairs")

@@ -1,5 +1,6 @@
 """A fake model that checks every KV read, and runners for filters and joins.
 
+from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
 A fake model stands in for the network. Each packed row gets a hash of
 its token and the hash its attention reads at the row before it, and
 every write stores (token, position, hash) in the arena's rows. A
@@ -16,7 +17,6 @@ import numpy as np
 import torch
 from fakes import fake_pipeline, fake_torch
 
-from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.operators.filter import FilterPart
 from quail.backends.quail.executor.parts import gated_stages
@@ -389,11 +389,14 @@ def check_join(anchors, frame, partners, setup, retain=False):
         else:
             run.arena.free_key(keys[a])
 
-    loop.run_join(
-        run.torch, run.arena, run.pipeline, passthrough(), anchors,
-        [partners], setup.budget, stage_frames=[frame], anchor_keys=keys,
-        anchor_done=anchor_done, attention_mode=setup.path,
-        prefix_tree=run.tree(anchors))
+    run_stages(
+        run.torch, run.arena, run.pipeline,
+        [Stage(suffixes=partners, readout=passthrough(), frame=frame)],
+        anchors, setup.budget,
+        anchor_keys=keys,
+        attention_mode=setup.path,
+        prefix_tree=run.tree(anchors),
+        on_settled=lambda anchor, survived, row: anchor_done(anchor, row))
     for a, anchor in enumerate(anchors):
         assert rows[a] == [answers[chain(anchor + frame + p + tail)]
                            for p in partners], f"anchor {a}"
@@ -443,11 +446,14 @@ def check_join_after_join(anchors, frame, partners, setup):
     def retain(a, row):
         run.arena.retain(keys[a], len(anchors[a]))
 
-    loop.run_join(
-        run.torch, run.arena, run.pipeline, passthrough(), first,
-        [partners], setup.budget, stage_frames=[frame], anchor_keys=keys[:1],
-        anchor_done=retain, attention_mode=setup.path,
-        prefix_tree=run.tree(first))
+    run_stages(
+        run.torch, run.arena, run.pipeline,
+        [Stage(suffixes=partners, readout=passthrough(), frame=frame)],
+        first, setup.budget,
+        anchor_keys=keys[:1],
+        attention_mode=setup.path,
+        prefix_tree=run.tree(first),
+        on_settled=lambda anchor, survived, row: retain(anchor, row))
     assert run.arena.is_resident(keys[0])
     rows = {}
 
@@ -455,11 +461,14 @@ def check_join_after_join(anchors, frame, partners, setup):
         rows[a] = list(row)
         run.arena.free_key(keys[a])
 
-    loop.run_join(
-        run.torch, run.arena, run.pipeline, passthrough(), anchors,
-        [partners], setup.budget, stage_frames=[frame], anchor_keys=keys,
-        anchor_done=free, attention_mode=setup.path,
-        prefix_tree=run.tree(anchors))
+    run_stages(
+        run.torch, run.arena, run.pipeline,
+        [Stage(suffixes=partners, readout=passthrough(), frame=frame)],
+        anchors, setup.budget,
+        anchor_keys=keys,
+        attention_mode=setup.path,
+        prefix_tree=run.tree(anchors),
+        on_settled=lambda anchor, survived, row: free(anchor, row))
     for a, anchor in enumerate(anchors):
         assert rows[a] == [answers[chain(anchor + frame + p + tail)]
                            for p in partners], f"anchor {a}"

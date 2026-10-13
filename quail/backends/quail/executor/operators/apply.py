@@ -1,11 +1,11 @@
 """Execute per-batch apply calls within a model pipeline."""
 
-from quail.backends.quail.executor.parts import ExecutionPart
+from quail.backends.quail.executor.parts import SingleResultPart
 from quail.backends.quail.executor.stages import Stage
 from quail.execution.runner import NodeResult, foreign_call, foreign_outputs
 
 
-class ApplyGate(ExecutionPart):
+class ApplyGate(SingleResultPart):
     """User function applied as each document reaches this pipeline position."""
 
     stages = ()

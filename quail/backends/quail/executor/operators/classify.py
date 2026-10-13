@@ -10,7 +10,7 @@ from quail.backends.quail.executor.label_stages import (
 )
 from quail.backends.quail.executor.parts import (
     AnswerStream,
-    ExecutionPart,
+    SingleResultPart,
     execute_parts,
     shared_prefix_tree,
 )
@@ -29,7 +29,7 @@ from quail.physical import ValueType
 from quail.progress import answer_sink
 
 
-class ClassifyBatch(ExecutionPart):
+class ClassifyBatch(SingleResultPart):
     """Classification stages, answer streaming, and batch results."""
 
     def __init__(self, plan, on_answers=None, prefix_tokens=0):

@@ -108,15 +108,15 @@ class Timeline:
 
     def __init__(self, torch):
         import quail.backends.quail.executor.chunk as chunk
-        import quail.backends.quail.executor.loop as loop
         import quail.backends.quail.executor.pack as pack
         import quail.backends.quail.executor.readout as readout
+        import quail.backends.quail.executor.stages as stages
 
         self.torch = torch
         self.entries = []
         self.active = False
         self._wrap(chunk, "pack_chunk", "pack")
-        self._wrap(loop, "_forward", "forward", gpu=True)
+        self._wrap(stages, "forward_chunk", "forward", gpu=True)
         self._wrap(pack.JoinAdmission, "next_chunk", "next_chunk")
         for owner in (readout.AsyncLabelLogprobs, readout.AsyncAnswers,
                       readout.AsyncScores):

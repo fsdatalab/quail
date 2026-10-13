@@ -99,11 +99,10 @@ def test_forward_warm_runs_a_classification_chunk(monkeypatch):
     from types import SimpleNamespace
 
     joins = []
-    monkeypatch.setattr(warmup, "run_filter", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        warmup, "run_join",
-        lambda torch, arena, pipeline, ans, docs, stages, budget, **kw:
-        joins.append((stages, kw)))
+    def run_stages(torch, arena, pipeline, stages, docs, budget, **kw):
+        joins.extend(stage for stage in stages if len(stage.suffixes) > 1)
+
+    monkeypatch.setattr(warmup, "run_stages", run_stages)
     classes = []
     monkeypatch.setattr(warmup, "_warm_row_classes",
                         lambda torch, arena, pipeline, mode: classes.append(mode))
@@ -113,18 +112,18 @@ def test_forward_warm_runs_a_classification_chunk(monkeypatch):
     # the row-count classes run on each attention path the model has
     assert classes == ["unified"]
     (join, classify) = joins
-    assert len(join[0][0]) == 8 and join[1] == {}
-    suffixes = classify[0][0]
+    assert len(join.suffixes) == 8 and join.frame == []
+    suffixes = classify.suffixes
     question = list(range(10, 26))
     # 26 suffixes of one to six tokens, after the question as the frame
     assert len(suffixes) == 26 and {len(s) for s in suffixes} == set(range(1, 7))
     assert all(s == question[:len(s)] for s in suffixes)
-    assert classify[1] == {"stage_frames": [question]}
+    assert classify.frame == question
 
     # a decision readout reads 31 trailing rows: the warmup question is
     # that long, and the classification chunk is left out
     joins.clear()
     readout = SimpleNamespace(trailing_rows=31)
     warmup._forward_warm(None, None, pipeline, readout, 2048, join_chunk=True)
-    ((stages, _),) = joins
-    assert len(stages[0][0]) == 31
+    (stage,) = joins
+    assert len(stage.suffixes[0]) == 31

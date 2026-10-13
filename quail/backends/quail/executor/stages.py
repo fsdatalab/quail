@@ -259,7 +259,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         torch, arena, pipeline, stages, anchor_prefixes, budget,
         anchor_keys=anchor_keys, on_settled=on_settled, staging=staging,
         attention_mode=attention_mode, prefix_tree=prefix_tree, stats=stats,
-        limit=limit, paged=paged, unit=unit, count_answers=count_answers,
+        limit=limit, paged=paged or pipeline.needs_pages,
+        unit=unit, count_answers=count_answers,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,
         appended_tokens=appended_tokens, gpu_timing=gpu_timing,
@@ -287,11 +288,7 @@ class _StageExecutor:
                  default_attention, on_chunk, on_answers, stop_groups=None,
                  appended_tokens=None, gpu_timing=False):
         from quail.backends.quail.executor.chunk import Suffixes
-        from quail.backends.quail.executor.loop import (
-            attention_path,
-            borrow_check,
-            lowest_borrows,
-        )
+
 
         self.torch = torch
         self.arena = arena
@@ -770,8 +767,6 @@ class _StageExecutor:
             self._run_part(part[half:])
 
     def _run_one(self, part):
-        from quail.backends.quail.executor.loop import _forward
-
         started = time.perf_counter()
         chunk, entries = self._build(part)
         self.pack_s += time.perf_counter() - started
@@ -780,7 +775,7 @@ class _StageExecutor:
             e0 = self.torch.cuda.Event(enable_timing=True)
             e1 = self.torch.cuda.Event(enable_timing=True)
             e0.record()
-        normed = _forward(self.pipeline, self.arena, chunk)
+        normed = forward_chunk(self.pipeline, self.arena, chunk)
         if self.gpu_timing:
             e1.record()
             by_stage = {}
@@ -843,3 +838,60 @@ class _StageExecutor:
         if self.spans:
             self.torch.cuda.synchronize()
         return self.sched.answers, self.spans, self.tokens
+
+
+def attention_path(pipeline, requested, default="unified") -> str:
+    """The path a filter stream or join runs: the plan's request where the model has it.
+
+    None asks for the default. A model without tree attention, and a
+    canvas model (whose rows the tree path does not pack), run unified.
+    """
+    if requested is None:
+        requested = default
+    if requested == "tree" and pipeline.tree_attention and not pipeline.canvas_ids:
+        return "tree"
+    return "unified"
+
+
+def forward_chunk(pipeline, arena, chunk):
+    """Run the forward pass, then release the chunk's temporary pages.
+
+    The loop owns every page it hands the forward pass, so it frees the
+    temporaries whether the pass returns or raises.
+    """
+    try:
+        graphs = getattr(pipeline, "decode_graphs", None)
+        if graphs is not None:
+            return graphs.forward(chunk)
+        return pipeline.forward_chunk(chunk)
+    finally:
+        keys, chunk.temporary_keys = chunk.temporary_keys, ()
+        for key in keys:
+            arena.free_key(key)
+
+
+def borrow_check(arena, keys, borrowing):
+    """can_borrow for Borrowing: whether the arena can serve a borrow.
+
+    A fresh parent admitted in the same chunk is not allocated yet;
+    its sliding pages will start at the window origin below the tokens
+    it borrows itself. A parent already resident, admitted in this
+    chunk or earlier, has the pages it has: it may have trimmed its
+    window in an earlier query.
+    """
+    def can_borrow(doc, parent, same_chunk):
+        shared = borrowing.tree_shared[doc]
+        if not same_chunk or arena.is_resident(keys[parent]):
+            return arena.can_borrow(keys[parent], shared)
+        return arena.origin(borrowing.shared(parent)) <= arena.origin(shared)
+    return can_borrow
+
+
+def lowest_borrows(borrowing):
+    """Per document, the fewest tokens any of its borrowers shares."""
+    lowest = {}
+    for doc, parent in enumerate(borrowing.tree_parent):
+        if parent is not None:
+            shared = borrowing.tree_shared[doc]
+            lowest[parent] = min(lowest.get(parent, shared), shared)
+    return lowest

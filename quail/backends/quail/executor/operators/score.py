@@ -2,15 +2,15 @@
 
 import numpy as np
 
-from quail.backends.quail.executor.loop import run_join
 from quail.backends.quail.executor.operators.classify import QuailClassifier
 from quail.backends.quail.executor.parts import (
     AnswerStream,
-    input_staging,
+    SingleResultPart,
+    execute_parts,
     shared_prefix_tree,
 )
 from quail.backends.quail.executor.readout import AsyncScores
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import DocumentPrefixes, chain_tokens
@@ -77,40 +77,41 @@ class QuailScorer:
             suffix_lengths = np.asarray([len(suffix) for suffix in suffixes])
             total = int(prefix_lengths[anchor_index].sum()
                         + suffix_lengths[candidate_index].sum())
-        keys = [("score", spec.name, index) for index in range(len(prefixes))]
-        async_scores = self._scores()
-        staging = state.loaded_model.input_staging
+        scores = np.full(len(rows), np.nan, dtype=np.float32)
+        stages = [Stage(suffixes=suffixes, readout=self._scores(),
+                        requests=(None if partners is None else
+                                  lambda key: partners[key[2]]))]
+        batch = ScoreBatch(spec.name, stages, scores, lambda: total, on_answers)
+
+        batch.document_done = None
 
         def report(anchor, stage, start, end, values):
             first = offsets[anchor]
-            on_answers(order[first + start:first + end], np.asarray(values))
+            positions = order[first + start:first + end]
+            scores[positions] = values
+            if on_answers is not None:
+                batch.stream.send(positions, lambda position: scores[position])
 
-        answers, _, fresh = run_join(
-            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
-            async_scores,
-            prefixes, [suffixes], state.chunk_tokens, anchor_keys=keys,
-            anchor_partners=(None if partners is None
-                             else lambda key: [partners[key[2]]]),
-            staging=staging,
-            on_answers=None if on_answers is None else report,
-        )
-        scores = np.empty(len(rows), dtype=np.float32)
-        for anchor, values in answers[0].items():
-            scores[order[offsets[anchor]:offsets[anchor + 1]]] = values
-        return RerankerBatch(scores, fresh_tokens=fresh, cached_tokens=total - fresh)
+        return self._execute(spec, batch, prefixes, on_answers=report)
+
+    def _execute(self, spec, batch, prefixes, *, tree=None, on_answers=None):
+        """Execute prepared scores and collect common timing and token metrics."""
+        return execute_parts(
+            self.state, [batch], prefixes,
+            [("score", spec.name, index) for index in range(len(prefixes))],
+            keep_kv=False, tree=tree, label=f"score {spec.name}",
+            on_answers=on_answers)[spec.name]
 
     def _scores(self) -> AsyncScores:
-        """Return the cached score readout and clear its input staging cache."""
+        """Return the score readout for the current model."""
         state = self.state
         if state.score_readout is not None:
-            input_staging(state)
             return state.score_readout
         answer_rows = state.answer_rows
         async_scores = state.async_scores
         if async_scores is None or async_scores.rows is not answer_rows:
             async_scores = AsyncScores(state.torch, answer_rows)
             state.async_scores = async_scores
-        input_staging(state)
         return async_scores
 
     def _shared(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
@@ -150,24 +151,11 @@ class QuailScorer:
         stages = [Stage(suffixes=[[tail[-1]]], readout=self._scores(),
                         frame=list(tail[:-1]), decide=keep, single=True,
                         label=f"score {spec.name}")]
-        stats = {}
-        stream = AnswerStream(on_answers)
-        _, _, fresh = run_stages(
-            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
-            stages, prefixes, state.chunk_tokens,
-            anchor_keys=[("score", spec.name, index) for index in range(len(docs))],
-            staging=state.loaded_model.input_staging,
-            prefix_tree=shared_prefix_tree(
-                spec.name, prefixes, state.loaded_model.arena),
-            stats=stats, label=f"score {spec.name}",
-            on_chunk=stream.chunk(lambda anchor: (
-                None if np.isnan(scores[anchor]) else scores[anchor])))
-        stream.finish(range(len(docs)), lambda anchor: scores[anchor])
         total = sum(len(head) + len(documents[alias][doc]) + len(tail)
                     for doc in docs)
-        return RerankerBatch(scores, fresh_tokens=fresh,
-                             cached_tokens=total - fresh,
-                             borrowed_tokens=stats.get("borrowed_tokens", 0))
+        batch = ScoreBatch(spec.name, stages, scores, lambda: total, on_answers)
+        return self._execute(spec, batch, prefixes, tree=shared_prefix_tree(
+            spec.name, prefixes, state.loaded_model.arena))
 
     def _drawn(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
         """Score documents with reproducible diffusion draws.
@@ -232,19 +220,38 @@ class QuailScorer:
         prefixes = DocumentPrefixes(head, documents[alias], docs)
         tree = (shared_prefix_tree(spec.name, prefixes, state.loaded_model.arena)
                 if spec.share_prefixes else None)
-        stats = {}
-        stream = AnswerStream(on_answers)
-        _, _, fresh = run_stages(
-            state.torch, state.loaded_model.arena, pipeline, stages, prefixes,
-            state.chunk_tokens, prefix_tree=tree, stats=stats,
-            anchor_keys=[("score", spec.name, index) for index in range(len(docs))],
-            staging=state.loaded_model.input_staging, label=f"score {spec.name}",
-            on_chunk=stream.chunk(lambda anchor: (
-                None if np.isnan(scores[anchor]) else scores[anchor])))
-        stream.finish(range(len(docs)), lambda anchor: scores[anchor])
         read = len(cue) + width
-        total = (sum(len(head) + len(documents[alias][doc]) for doc in docs)
-                 + len(docs) * (len(tail) - 1 + read) + extended[0] * more * read)
-        return RerankerBatch(scores, fresh_tokens=fresh,
-                             cached_tokens=total - fresh,
-                             borrowed_tokens=stats.get("borrowed_tokens", 0))
+        base = (sum(len(head) + len(documents[alias][doc]) for doc in docs)
+                + len(docs) * (len(tail) - 1 + read))
+        batch = ScoreBatch(spec.name, stages, scores,
+                           lambda: base + extended[0] * more * read, on_answers)
+        return self._execute(spec, batch, prefixes, tree=tree)
+
+
+class ScoreBatch(SingleResultPart):
+    """Prepared score requests, streamed answers, and execution metrics."""
+
+    def __init__(self, name, stages, scores, total_tokens, on_answers):
+        self.name = name
+        self.stages = stages
+        self.scores = scores
+        self.total_tokens = total_tokens
+        self.stream = AnswerStream(on_answers)
+        self.document_done = self.stream.chunk(lambda anchor: (
+            None if np.isnan(scores[anchor]) else scores[anchor]))
+
+    def finish(self, every) -> int:
+        """Deliver remaining scores and return their full prompt token count."""
+        self.stream.finish(range(len(self.scores)), lambda index: self.scores[index])
+        return self.total_tokens()
+
+    def result(self, tokens, gpu_s, chunks, stats) -> RerankerBatch:
+        """Build scores with the metrics collected by the common executor."""
+        return RerankerBatch(
+            self.scores, fresh_tokens=tokens,
+            cached_tokens=self.total_tokens() - tokens,
+            borrowed_tokens=stats.get("borrowed_tokens", 0),
+            pack_s=stats.get("pack_s", 0.0), gpu_s=gpu_s, chunks=chunks)
+
+    def results(self) -> dict:
+        return {self.name: self.result_value}

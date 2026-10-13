@@ -2,36 +2,22 @@
 
 from __future__ import annotations
 
-import itertools
 import time
 
 import numpy as np
 
-from quail.backends.quail.prompts import join_request
-from quail.backends.quail.retention import apply_retention, join_settlement
-from quail.execution.pairs import (
-    RowGroups,
-    allowed_members,
-    columns_key,
-    members_by_partner,
-    pair_partner,
-    partner_map,
-)
+from quail.backends.quail.executor.operators.filter import filter_inputs
+from quail.backends.quail.executor.operators.join import prepare_join_inputs
+from quail.backends.quail.retention import apply_retention
+from quail.execution.pairs import columns_key
 from quail.execution.reranker import FilterRuntime
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
     ModelNodeRuntime,
-    NodeMetrics,
     NodeResult,
     compute_subgraph,
     scalar_node_metrics,
-)
-from quail.execution.tokens import (
-    DocumentKeys,
-    DocumentPrefixes,
-    chain_tokens,
-    select_documents,
 )
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
@@ -45,7 +31,6 @@ from quail.physical import (
     PhysicalGraph,
     Scan,
 )
-from quail.progress import answer_sink
 
 
 def quail_runtimes() -> dict:
@@ -58,236 +43,6 @@ def quail_runtimes() -> dict:
         AiClassify.runtime_key: model_runtime,
         AiExtract.runtime_key: model_runtime,
         Filter.runtime_key: FilterRuntime(),
-    }
-
-
-def _join_round_kv(anchor_keys, arena) -> dict:
-    hits = sum(arena.is_resident(key) for key in anchor_keys)
-    return {"hits": hits, "misses": len(anchor_keys) - hits}
-
-
-def _tuple_suffix(join, docs, member):
-
-    parts = []
-    for alias, document in zip(join["partners"], member):
-        parts.extend((join["labels"][alias], docs[alias][document]))
-    parts.append(join["tail"])
-    return chain_tokens(*parts)
-
-
-def join_suffixes(group, documents, indices):
-    """Build partner suffixes and their global document IDs in the same order.
-
-    Args:
-        group: Join request descriptions in execution order.
-        documents: Selected partner documents indexed by local position.
-        indices: Global document IDs for those local positions, by alias.
-    """
-    suffixes, tuples = [], {}
-    for join in group:
-        partners = join["partners"]
-        members, tokens = [], []
-        for positions in itertools.product(*(range(len(indices[p])) for p in partners)):
-            members.append([indices[p][i] for p, i in zip(partners, positions)])
-            tokens.append(_tuple_suffix(join, documents, positions))
-        tuples[join["written_pos"]] = members
-        suffixes.append(tokens)
-    return suffixes, tuples
-
-
-def runs_over_pairs(join: dict) -> bool:
-    """Whether a stage streams each anchor's own pairs."""
-    return bool(join.get("pairs_from"))
-
-
-def partner_maps(group, pair_tables, streamed=()) -> dict:
-    """Written position -> anchor row -> partner rows, per pair stage.
-
-    streamed names the written positions whose pairs arrive per batch
-    and need no table here.
-    """
-    maps = {}
-    for join in group:
-        if not runs_over_pairs(join) or join["written_pos"] in streamed:
-            continue
-        table = pair_tables.get(join["written_pos"])
-        if table is None:
-            raise ValueError(
-                f"join {join['written_pos']} runs over pairs but no pair "
-                f"table reached it")
-        maps[join["written_pos"]] = partner_map(
-            table, join["anchor"],
-            pair_partner(join["anchor"], join["partners"]))
-    return maps
-
-
-def partner_list_builder(group, tuples_by_stage, maps):
-    """Per-anchor partner member lists for the stages that run over pairs.
-
-    Args:
-        group: The stages' runtime specs.
-        tuples_by_stage: Per stage, its partner member tuples of global
-            document ids, in partner order.
-        maps: written position -> anchor row -> partner rows.
-
-    Returns:
-        callable(anchor global id, stage) -> the sorted member
-        indices the anchor streams, or None for every member; or None
-        when no stage runs over pairs.
-    """
-    stage_maps = []
-    for join, tuples in zip(group, tuples_by_stage):
-        if not runs_over_pairs(join):
-            stage_maps.append(None)
-            continue
-        position = join["partners"].index(
-            pair_partner(join["anchor"], join["partners"]))
-        rows = maps[join["written_pos"]]
-        cache = (np.full(len(rows.keys), None, dtype=object)
-                 if isinstance(rows, RowGroups) else None)
-        stage_maps.append((rows, members_by_partner(tuples, position), cache))
-    if all(entry is None for entry in stage_maps):
-        return None
-
-    def lists_for(anchor, stage):
-        entry = stage_maps[stage]
-        if entry is None:
-            return None
-        rows, members, cache = entry
-        if cache is None:
-            # Per-batch apply results can arrive after the lookup is constructed.
-            return allowed_members(rows, members, anchor)
-        position = np.searchsorted(rows.keys, anchor)
-        if position == len(rows.keys) or rows.keys[position] != anchor:
-            return np.empty(0, dtype=np.int64)
-        if cache[position] is None:
-            cache[position] = allowed_members(rows, members, anchor)
-        return cache[position]
-
-    return lists_for
-
-
-def stage_partner_lists(group, lists_for, anchor_ids) -> list:
-    """Per stage, anchor local index -> member indices, or None."""
-    out = []
-    for index, join in enumerate(group):
-        if lists_for is None or not runs_over_pairs(join):
-            out.append(None)
-            continue
-        out.append({local: lists_for(anchor, index)
-                    for local, anchor in enumerate(anchor_ids)})
-    return out
-
-
-def filter_result(node, answers, tokens, document_ids,
-                  gpu_s: float = 0.0, chunks: int = 0,
-                  borrowed_tokens: int = 0, pack_s: float = 0.0) -> NodeResult:
-    """Build a filter result using global document IDs and execution metrics.
-
-    Args:
-        node: Physical filter node.
-        answers: Mapping from local document index to Boolean stage answers.
-        tokens: Fresh tokens processed by the model.
-        document_ids: Global document IDs in local index order.
-        gpu_s: Forward-pass GPU seconds.
-        chunks: Number of timed forward passes.
-        borrowed_tokens: Prefix tokens read from another document's KV.
-        pack_s: Host seconds spent building forward chunks.
-
-    Returns:
-        A NodeResult containing surviving IDs, filter answers, and metrics.
-    """
-    global_answers = {
-        document_ids[int(local)]: row
-        for local, row in answers.items()
-    }
-    survivors = sorted(
-        document
-        for document, row in global_answers.items()
-        if len(row) == 1 and all(row)
-    )
-    return NodeResult(
-        outputs={
-            f"ids:{node.alias}": survivors,
-            f"filter_answers:{node.alias}": global_answers,
-        },
-        metrics=NodeMetrics(
-            input_rows=len(document_ids),
-            output_rows=len(survivors),
-            evaluated_documents=len(global_answers),
-            fresh_tokens=tokens,
-            gpu_s=gpu_s,
-            chunks=chunks,
-            extension={
-                **({"borrowed_prefix_tokens": borrowed_tokens}
-                   if borrowed_tokens else {}),
-                **({"pack_s": round(pack_s, 3)} if pack_s else {}),
-            },
-        ),
-    )
-
-
-def filter_document_sink(node, document_ids):
-    """The chain's document_done callback, or None when nobody listens.
-
-    Reports each chunk's finished documents to the answer sink as
-    ``{"kind": "filter", "node", "alias", "stages", "documents"}`` where
-    ``documents`` lists ``[row index, last stage asked, passed]`` per
-    document. A document that passed its last stage survived the filter;
-    every other listed document failed at the stage given.
-    """
-    sink = answer_sink()
-    if sink is None:
-        return None
-    stages = 1
-
-    def document_done(finished):
-        sink({"kind": "filter", "node": node.node_id, "alias": node.alias,
-              "stages": stages,
-              "documents": [[int(document_ids[position]), stage, passed]
-                            for position, stage, passed in finished]})
-
-    return document_done
-
-
-def stop_groups(node, columns, document_ids) -> list | None:
-    """Return each document's stop key group, or None without a stop key.
-
-    Documents with equal values in the node's ``stop_key`` columns
-    share a group number; the scheduler reads one document of a group
-    at a time and skips the rest once one survives.
-
-    Args:
-        node: The AiFilter.
-        columns: The alias's value table, one row per document.
-        document_ids: The documents' positions in that table.
-    """
-    if not node.stop_key:
-        return None
-    if columns is None:
-        raise KeyError(
-            f"the stop key of {node.alias!r} needs its value columns")
-    import pyarrow as pa
-
-    positions = pa.array([int(document) for document in document_ids],
-                         pa.int64())
-    values = zip(*(columns.column(name).take(positions).to_pylist()
-                   for name in node.stop_key))
-    groups = {}
-    return [groups.setdefault(value, len(groups)) for value in values]
-
-
-def filter_inputs(state, node, document_ids) -> dict:
-    """Scheduler inputs for one filter chain over the given documents."""
-    return {
-        "documents": DocumentPrefixes(
-            state["pre"], state["docs"][node.alias], document_ids
-        ),
-        "document_ids": document_ids,
-        "limit": state["filter_limit"],
-        "stop_groups": stop_groups(
-            node, state.get("columns", {}).get(node.alias), document_ids),
-        "document_done": filter_document_sink(node, document_ids),
     }
 
 
@@ -325,126 +80,10 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext,
     if not isinstance(node, (AiFilter, AiJoin)):
         return inputs
     return {
-        **_model_inputs(node, inputs, context, chain, nodes),
+        **(filter_inputs(context.state, node, next(iter(inputs.values())))
+           if isinstance(node, AiFilter) else
+           prepare_join_inputs(node, inputs, context, chain, nodes)),
         "gpu_timing": context.state.get("gpu_timing", False),
-    }
-
-
-def _model_inputs(node, inputs, context: ExecutionContext, chain=None,
-                  nodes=None) -> dict:
-    state = context.state
-    if isinstance(node, AiFilter):
-        return filter_inputs(state, node, next(iter(inputs.values())))
-
-    grouped = nodes is not None
-    nodes = (node,) if nodes is None else nodes
-    last_node = nodes[-1]
-    by_alias = {}
-    port_pairs = {}        # written position -> pair table from a port
-    chain_pairs = {} if chain is None else chain["pairs"]
-    for member, input_port in ((member, port) for member in nodes
-                               for port in member.inputs):
-        values = inputs[member.node_id] if grouped else inputs
-        port = input_port.source.port
-        if input_port.name not in values:
-            continue           # fed by the chain itself
-        value = values[input_port.name]
-        if port.startswith("pairs:"):
-            port_pairs[int(port.split(":", 1)[1])] = value
-            continue
-        if not port.startswith("ids:"):
-            continue
-        by_alias[port.split(":", 1)[1]] = list(value)
-    if not state["joins_started"]:
-        state["joins_started"] = True
-        arena = state["arena"]
-        retained = arena.retained_keys()
-        state["kv_stats"].update(
-            retained_after_filters=len(retained),
-            retained_pages_after_filters=arena.retained_pages,
-            retained_prefix_tokens_after_filters=arena.retained_prefix_tokens,
-            retained_by_alias_after_filters={
-                alias: sum(key[0] == alias for key in retained)
-                for alias in state["docs"]
-            },
-        )
-    config = state["retention"]
-    apply_retention(state["arena"], config,
-                    config.get("before", {}).get(node.node_id, {}), by_alias)
-    group = [join_request(member) for member in nodes]
-    documents = {alias: select_documents(state["docs"][alias], by_alias[alias])
-                 for join in group for alias in join["partners"]}
-    stage_suffixes, tuple_indices = join_suffixes(group, documents, by_alias)
-    # pairs come from the request, a Foreign table, or a per-batch
-    # apply in the chain, which fills its rows as documents reach the join
-    maps = partner_maps(group, port_pairs, streamed=set(chain_pairs))
-    maps.update(chain_pairs)
-    lists_for = partner_list_builder(
-        group, [tuple_indices[stage.written_pos] for stage in nodes],
-        maps)
-    if chain is None:
-        anchor_ids = by_alias[node.anchor]
-        prefixes = [
-            chain_tokens(state["pre"], state["docs"][node.anchor][document])
-            for document in anchor_ids
-        ]
-        anchor_keys = [(node.anchor, document) for document in anchor_ids]
-        round_kv = _join_round_kv(anchor_keys, state["arena"])
-        state["kv_stats"]["join_anchor_hits"] += round_kv["hits"]
-        state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
-    else:
-        # every document of the chain is an anchor; the chain's stages
-        # lead the join's, so only its survivors reach them
-        anchor_ids = None
-        prefixes = chain["documents"]
-        anchor_keys = DocumentKeys(node.anchor, chain["document_ids"])
-        round_kv = None
-
-    last = group[-1]
-    last_tuples = tuple_indices[last["written_pos"]]
-
-    def finished_answers(document, row) -> dict:
-        """The anchor's last-stage matches: partner tuples that answered true.
-
-        Every pair the anchor was asked about and is not listed answered
-        false; ``asked`` says how many pairs that covers.
-        """
-        members = None
-        if lists_for is not None and runs_over_pairs(last):
-            members = lists_for(document, len(group) - 1)
-        matches = []
-        for position, answer in enumerate(row):
-            if answer:
-                member = position if members is None else int(members[position])
-                matches.append(list(last_tuples[member]))
-        return {"kind": "join", "node": node.node_id, "anchor": node.anchor,
-                "partners": list(last["partners"]),
-                "semantics": last["semantics"], "document": int(document),
-                "asked": len(row), "matches": matches}
-
-    settle = join_settlement(state["arena"], anchor_keys, prefixes, last_node, config)
-
-    def anchor_done(local_index, row):
-        key = anchor_keys[local_index]
-        settle(local_index, row)
-        sink = answer_sink()
-        # scores are floats, not yes/no answers; they arrive with the result
-        if sink is not None and getattr(row, "dtype", None) is None:
-            sink(finished_answers(key[1], row))
-
-    state["join_chained"] = chain is not None
-    return {
-        "prefixes": prefixes,
-        "stage_suffixes": stage_suffixes,
-        "stage_frames": [join.get("frame") or [] for join in group],
-        "anchor_keys": anchor_keys,
-        "anchor_done": anchor_done,
-        "chain": chain,
-        "kv_round": round_kv,
-        "anchor_ids": anchor_ids,
-        "partner_indices": tuple_indices,
-        "anchor_partners": lists_for,
-        "group": group,
     }
 
 

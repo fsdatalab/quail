@@ -1,16 +1,22 @@
 """Execute LLM filters and conditions on classification results."""
 
 from quail.backends.quail.executor.parts import (
-    ExecutionPart,
+    SingleResultPart,
     execute_parts,
     execution_prefix_tree,
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.backends.quail.graph import filter_document_sink, filter_result
 from quail.execution.reranker import filter_scores
-from quail.execution.runner import NodeResult
-from quail.execution.tokens import DocumentKeys
+from quail.execution.runner import (
+    NodeMetrics,
+    NodeResult,
+)
+from quail.execution.tokens import (
+    DocumentKeys,
+    DocumentPrefixes,
+)
+from quail.progress import answer_sink
 
 
 def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
@@ -39,7 +45,7 @@ def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
         label=f"filter ({len(nodes)} predicates)")
 
 
-class FilterPart(ExecutionPart):
+class FilterPart(SingleResultPart):
     """Filter stages and result tables within a pipeline."""
 
     execute_group = staticmethod(execute_filters)
@@ -87,7 +93,7 @@ class FilterPart(ExecutionPart):
             pack_s=stats.get("pack_s", 0.0))
 
 
-class LabelGate(ExecutionPart):
+class LabelGate(SingleResultPart):
     """Pipeline condition that keeps documents with selected categories."""
 
     stages = ()
@@ -123,3 +129,115 @@ class LabelGate(ExecutionPart):
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         return filter_scores(self.node,
                              self.source.result_value.outputs["rows"])
+
+
+def filter_result(node, answers, tokens, document_ids,
+                  gpu_s: float = 0.0, chunks: int = 0,
+                  borrowed_tokens: int = 0, pack_s: float = 0.0) -> NodeResult:
+    """Build a filter result using global document IDs and execution metrics.
+
+    Args:
+        node: Physical filter node.
+        answers: Mapping from local document index to Boolean stage answers.
+        tokens: Fresh tokens processed by the model.
+        document_ids: Global document IDs in local index order.
+        gpu_s: Forward-pass GPU seconds.
+        chunks: Number of timed forward passes.
+        borrowed_tokens: Prefix tokens read from another document's KV.
+        pack_s: Host seconds spent building forward chunks.
+
+    Returns:
+        A NodeResult containing surviving IDs, filter answers, and metrics.
+    """
+    global_answers = {
+        document_ids[int(local)]: row
+        for local, row in answers.items()
+    }
+    survivors = sorted(
+        document
+        for document, row in global_answers.items()
+        if len(row) == 1 and all(row)
+    )
+    return NodeResult(
+        outputs={
+            f"ids:{node.alias}": survivors,
+            f"filter_answers:{node.alias}": global_answers,
+        },
+        metrics=NodeMetrics(
+            input_rows=len(document_ids),
+            output_rows=len(survivors),
+            evaluated_documents=len(global_answers),
+            fresh_tokens=tokens,
+            gpu_s=gpu_s,
+            chunks=chunks,
+            extension={
+                **({"borrowed_prefix_tokens": borrowed_tokens}
+                   if borrowed_tokens else {}),
+                **({"pack_s": round(pack_s, 3)} if pack_s else {}),
+            },
+        ),
+    )
+
+
+def filter_document_sink(node, document_ids):
+    """The chain's document_done callback, or None when nobody listens.
+
+    Reports each chunk's finished documents to the answer sink as
+    ``{"kind": "filter", "node", "alias", "stages", "documents"}`` where
+    ``documents`` lists ``[row index, last stage asked, passed]`` per
+    document. A document that passed its last stage survived the filter;
+    every other listed document failed at the stage given.
+    """
+    sink = answer_sink()
+    if sink is None:
+        return None
+    stages = 1
+
+    def document_done(finished):
+        sink({"kind": "filter", "node": node.node_id, "alias": node.alias,
+              "stages": stages,
+              "documents": [[int(document_ids[position]), stage, passed]
+                            for position, stage, passed in finished]})
+
+    return document_done
+
+
+def stop_groups(node, columns, document_ids) -> list | None:
+    """Return each document's stop key group, or None without a stop key.
+
+    Documents with equal values in the node's ``stop_key`` columns
+    share a group number; the scheduler reads one document of a group
+    at a time and skips the rest once one survives.
+
+    Args:
+        node: The AiFilter.
+        columns: The alias's value table, one row per document.
+        document_ids: The documents' positions in that table.
+    """
+    if not node.stop_key:
+        return None
+    if columns is None:
+        raise KeyError(
+            f"the stop key of {node.alias!r} needs its value columns")
+    import pyarrow as pa
+
+    positions = pa.array([int(document) for document in document_ids],
+                         pa.int64())
+    values = zip(*(columns.column(name).take(positions).to_pylist()
+                   for name in node.stop_key))
+    groups = {}
+    return [groups.setdefault(value, len(groups)) for value in values]
+
+
+def filter_inputs(state, node, document_ids) -> dict:
+    """Scheduler inputs for one filter chain over the given documents."""
+    return {
+        "documents": DocumentPrefixes(
+            state["pre"], state["docs"][node.alias], document_ids
+        ),
+        "document_ids": document_ids,
+        "limit": state["filter_limit"],
+        "stop_groups": stop_groups(
+            node, state.get("columns", {}).get(node.alias), document_ids),
+        "document_done": filter_document_sink(node, document_ids),
+    }

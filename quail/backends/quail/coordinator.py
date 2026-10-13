@@ -6,7 +6,8 @@ Called by the worker's parent process between child GPUs.
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.backends.quail.graph import runs_over_pairs, stop_groups
+from quail.backends.quail.executor.operators.filter import stop_groups
+from quail.backends.quail.executor.operators.join import runs_over_pairs
 from quail.execution.pairs import pair_partner
 from quail.execution.tokens import select_documents
 from quail.planner import balanced_shards

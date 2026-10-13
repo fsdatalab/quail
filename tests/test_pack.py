@@ -13,6 +13,7 @@ from quail.backends.quail.executor.pack import (
     Settlement,
     pages_for,
 )
+from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
 from quail.execution.tokens import PrefixTree
 
 
@@ -216,7 +217,6 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
     )
 
     from quail.backends.quail.executor import chunk as chunk_mod
-    from quail.backends.quail.executor import loop
 
     # a test recording the packed specs keeps its own pack_chunk
     if not getattr(chunk_mod.pack_chunk, "recording", False):
@@ -233,11 +233,16 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
         tree = PrefixTree(order=list(order), parent=[None, 0, None],
                           shared=[0, 32, 0])
     stats = {}
-    got, _, tokens = loop.run_filter(
-        fake_torch(), arena, pipeline, answers, docs, [[QUESTION]], budget,
-        arena_writes=True, arena_keys=[("r", d) for d in range(len(docs))],
-        prefix_tree=tree, retain_survivors=retain, limit=limit,
-        attention_mode=attention_mode, stats=stats, stop_groups=stop_groups)
+    from quail.backends.quail.executor.parts import settle_documents
+
+    keys = [("r", d) for d in range(len(docs))]
+    got, _, tokens = run_stages(
+        fake_torch(), arena, pipeline, filter_stages([[QUESTION]], answers),
+        docs, budget, anchor_keys=keys, prefix_tree=tree, limit=limit,
+        on_settled=settle_documents(arena, keys, docs, bool(retain), budget),
+        attention_mode=attention_mode, stats=stats, stop_groups=stop_groups,
+        default_attention="unified")
+    got = {document: list(row) for document, row in got[0].items()}
     return got, tokens, stats["borrowed_tokens"], arena
 
 
@@ -423,7 +428,6 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
     )
 
     from quail.backends.quail.executor import chunk as chunk_mod
-    from quail.backends.quail.executor import loop
 
     packed = []
 
@@ -448,10 +452,14 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
     arena = cpu_arena(64)
     stats = {}
-    out, _, tokens = loop.run_join(
-        fake_torch(), arena, pipeline, answers, prefixes,
-        [[[PARTNER + 0], [PARTNER + 1]]], 500, stage_frames=[[FRAME]],
-        anchor_keys=keys, prefix_tree=tree, stats=stats)
+    out, _, tokens = run_stages(
+        fake_torch(), arena, pipeline,
+        [Stage(suffixes=[[PARTNER], [PARTNER + 1]],
+               readout=answers, frame=[FRAME])],
+        prefixes, 500,
+        anchor_keys=keys,
+        prefix_tree=tree,
+        stats=stats)
     assert out == [{0: [1, 0], 1: [1, 0], 2: [1, 0]}]
     # the child packs its 32 own tokens from position 32
     assert packed == [(keys[0], 0, 64), (keys[1], 32, 32), (keys[2], 0, 64)]
@@ -464,10 +472,13 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
     # until the child borrows them
     packed.clear()
     arena = cpu_arena(64)
-    out, _, tokens = loop.run_join(
-        fake_torch(), arena, pipeline, answers, prefixes,
-        [[[PARTNER + 0], [PARTNER + 1]]], 67, stage_frames=[[FRAME]],
-        anchor_keys=keys, stats=stats,
+    out, _, tokens = run_stages(
+        fake_torch(), arena, pipeline,
+        [Stage(suffixes=[[PARTNER], [PARTNER + 1]],
+               readout=answers, frame=[FRAME])],
+        prefixes, 67,
+        anchor_keys=keys,
+        stats=stats,
         prefix_tree=PrefixTree(order=[0, 2, 1], parent=[None, 0, None],
                                shared=[0, 32, 0]))
     assert out == [{0: [1, 0], 1: [1, 0], 2: [1, 0]}]

@@ -20,7 +20,8 @@ from fakes import (
 
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.graph import _tuple_suffix, execute_single_graph
+from quail.backends.quail.executor.operators.join import _tuple_suffix
+from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.physical import (
     AiClassify,

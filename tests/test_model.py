@@ -9,9 +9,10 @@ import pytest
 from fakes import cpu_arena, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.executor import loop, model
+from quail.backends.quail.executor import model
 from quail.backends.quail.executor.model import answer_weights, retain_answer_head
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
+from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.builtins import built_in_registry
 
 
@@ -106,9 +107,10 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
                         lambda need: evictions.append(need) or ())
     pipeline = fake_pipeline(forward_chunk=lambda chunk: [1] * len(chunk.specs))
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
-    answers_out, _, _ = loop.run_join(fake_torch(), arena, pipeline, answers,
-                                      [[1] * 8, [2] * 8], [[[3, 4]]], 64,
-                                      anchor_keys=[("a", 0), ("a", 1)])
+    answers_out, _, _ = run_stages(
+        fake_torch(), arena, pipeline,
+        [Stage(suffixes=[[3, 4]], readout=answers)], [[1] * 8, [2] * 8], 64,
+        anchor_keys=[('a', 0), ('a', 1)])
     # nothing retained to evict, so the two-group chunk ran as two chunks
     assert failed == [2] and len(evictions) == 1 and evictions[0] > 0
     assert sizes == [1, 1]

@@ -82,7 +82,7 @@ def compare(run: str):
 
     import quail
     from experiments.compare_extract_tokenization import _trace_metrics
-    from quail.backends.quail.executor import loop
+    from quail.backends.quail.executor import stages
     from quail.bench import quailb
     from quail.planner.plan import EngineConfig
     from quail.specs import H100_USD_PER_HOUR
@@ -104,7 +104,7 @@ def compare(run: str):
     validate = False
     managers = []
     checked = 0
-    original = loop._forward
+    original = stages.forward_chunk
 
     def forward(pipeline, arena, chunk):
         nonlocal checked
@@ -123,7 +123,7 @@ def compare(run: str):
         finally:
             graphs.enabled = previous
 
-    loop._forward = forward
+    stages.forward_chunk = forward
     reference = None
     fresh = None
     stores = {}
@@ -205,7 +205,7 @@ def compare(run: str):
         print(json.dumps(summary), flush=True)
         return summary
     finally:
-        loop._forward = original
+        stages.forward_chunk = original
         session.close()
 
 

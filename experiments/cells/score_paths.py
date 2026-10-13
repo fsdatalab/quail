@@ -124,15 +124,15 @@ def decision_side(run: str) -> dict:
               volumes=VOLUMES)
 def reranker_side(run: str) -> dict:
     """AI.SCORE forced onto unified and tree attention, alternating."""
-    import quail.backends.quail.executor.score as score_module
+    import quail.backends.quail.executor.operators.score as score_module
 
-    run_join = score_module.run_join
+    execute_parts = score_module.execute_parts
     path = {"mode": None}
 
     def forced(*args, **kwargs):
-        return run_join(*args, attention_mode=path["mode"], **kwargs)
+        return execute_parts(*args, attention=path["mode"], **kwargs)
 
-    score_module.run_join = forced
+    score_module.execute_parts = forced
     session = _session("qwen3-reranker-4b-bf16")
     _timed(session.sql(SCORE_SQL))    # boot and warm-up
     summary = {}

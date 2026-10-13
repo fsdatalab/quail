@@ -4,8 +4,8 @@ import pytest
 from fakes import cpu_staging
 
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.stages import Stage, run_stages
 
 torch = pytest.importorskip("torch")
 
@@ -435,10 +435,11 @@ def test_join_anchor_keeps_its_window_for_a_later_child(monkeypatch):
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
     arena = cpu_arena(pages=64, sliding_pages=32)
     stats = {}
-    _, _, tokens = loop.run_join(
-        cpu, arena, fake_pipeline(forward_chunk=forward), answers,
-        prefixes, [[[9], [10]]], 130, stage_frames=[[5]],
-        anchor_keys=[("a", d) for d in range(3)], prefix_tree=tree,
+    _, _, tokens = run_stages(
+        cpu, arena, fake_pipeline(forward_chunk=forward),
+        [Stage(suffixes=[[9], [10]], readout=answers, frame=[5])], prefixes, 130,
+        anchor_keys=[('a', d) for d in range(3)],
+        prefix_tree=tree,
         stats=stats)
     assert stats["borrowed_tokens"] == 80 + 32
     assert tokens == 96 + 16 + 64 + 3 * 3

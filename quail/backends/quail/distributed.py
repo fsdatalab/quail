@@ -9,10 +9,8 @@ import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail import coordinator
-from quail.backends.quail.graph import (
-    graph_report,
-    stop_groups,
-)
+from quail.backends.quail.executor.operators.filter import stop_groups
+from quail.backends.quail.graph import graph_report
 from quail.backends.quail.prompts import join_request
 from quail.execution.pairs import columns_key
 from quail.execution.reranker import score_in_batches
@@ -189,7 +187,9 @@ class DistributedQuailExecution:
 
     def _score_round(self, node, batches):
         """Score one batch per GPU child and return their results in order."""
-        subs = [{"node": node, "inputs": {"score_rows": batch}}
+        subs = [{"node": node, "inputs": {
+            "score_rows": batch,
+            "gpu_timing": self.payload.get("gpu_timing", False)}}
                 for batch in batches]
         if not self.score_documents_sent:
             documents = {

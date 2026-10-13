@@ -1,7 +1,10 @@
 """Compose operator stages and collect their execution metrics."""
 
 import time
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
 from itertools import groupby
+from typing import Any, ClassVar
 
 import numpy as np
 
@@ -40,7 +43,7 @@ def input_staging(state: QueryExecutionState):
     return state.loaded_model.input_staging
 
 
-class ExecutionPart:
+class ExecutionPart(ABC):
     """Operator work prepared for the shared document scheduler.
 
     Implementations prepare stages, finish their answers, and return node
@@ -49,15 +52,44 @@ class ExecutionPart:
     optionally handles a run containing only that operator type.
     """
 
-    combine = False
-    execute_group = None
-    prepare_group = None
+    stages: Sequence[Stage]
+    combine: ClassVar[bool] = False
+    execute_group: ClassVar[Callable | None] = None
     gate = None
     document_done = None
     result_value = None
     appended_tokens = 0
     on_settled = None
     attention = None
+
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        """Prepare physical nodes for execution through an operator adapter."""
+        raise NotImplementedError(f"{cls.__name__} needs prepared requests")
+
+    @staticmethod
+    def prepare_group(parts):
+        """Prepare stages shared by consecutive parts of the same type."""
+
+    @abstractmethod
+    def finish(self, every) -> int | None:
+        """Finalize answers and return this part's suffix token count."""
+
+    @abstractmethod
+    def complete(self, tokens, spans, stats, offset) -> None:
+        """Build results from the scheduler's token counts and timing spans."""
+
+    @abstractmethod
+    def results(self) -> dict:
+        """Return completed results keyed by node or output name."""
+
+
+class SingleResultPart(ExecutionPart):
+    """Prepared work whose execution produces one result."""
+
+    @abstractmethod
+    def result(self, tokens, gpu_s, chunks, stats) -> Any:
+        """Build the result with its measured execution work."""
 
     def complete(self, tokens, spans, stats, offset):
         """Build the operator's result from its measured work."""
@@ -71,7 +103,7 @@ class ExecutionPart:
 
 def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
-                  paged=True) -> dict:
+                  paged=True, on_answers=None) -> dict:
     """Run prepared operator work together and collect per-node results."""
     stages = gated_stages(parts)
     paged = paged or state.loaded_model.pipeline.needs_pages
@@ -93,7 +125,7 @@ def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
                             attention),
         staging=input_staging(state), label=label, limit=limit,
         stop_groups=stop_groups, paged=paged,
-        on_chunk=transition_reporter(parts),
+        on_chunk=transition_reporter(parts), on_answers=on_answers,
         appended_tokens=max(part.appended_tokens for part in parts) or None)
     complete_chain(parts, every, spans, tokens, stats)
     return {node_id: result for part in parts
@@ -114,8 +146,7 @@ def gated_stages(parts) -> list:
         ValueError: A trailing condition has no following stage.
     """
     for implementation, group in groupby(parts, type):
-        if implementation.prepare_group is not None:
-            implementation.prepare_group(list(group))
+        implementation.prepare_group(list(group))
     stages = []
     pending = []
     for part in parts:

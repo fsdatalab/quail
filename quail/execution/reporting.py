@@ -1,0 +1,265 @@
+"""Build execution reports and collect model answer relations."""
+
+from dataclasses import fields
+
+import pyarrow as pa
+from pyarrow import compute as pc
+
+from quail.execution.result import true_answer_rows
+from quail.execution.runner import NodeMetrics
+from quail.physical import AiJoin, Barrier, PortRef, ValueType
+
+
+def restore_node_metrics(metrics: dict) -> NodeMetrics:
+    """Rebuild a node's metrics from a report; extra numbers go to extension."""
+    names = {field.name for field in fields(NodeMetrics)} - {"extension"}
+    return NodeMetrics(
+        **{name: value for name, value in metrics.items() if name in names},
+        extension={name: value for name, value in metrics.items()
+                   if name not in names})
+
+
+def execution_report(plan, metrics, notes, coordinator_wall):
+    """Build a query report from its plan and backend measurements."""
+    out = metrics
+
+    expected_nodes = tuple(node for node in plan.nodes
+                           if isinstance(node, (AiJoin, Barrier)))
+    report = dict(
+        backend=out.get("backend", plan.backend),
+        wall_s=out["wall_s"], boot_s=out.get("boot_s"),
+        estimated_seconds=plan.estimated_seconds,
+        boot_kind=out.get("boot_kind"),
+        boot=out.get("boot"),
+        coordinator_wall_s=round(coordinator_wall, 2),
+        fresh_tokens=out["fresh_tokens"],
+        cached_tokens=out.get("cached_tokens"),
+        stages=[],
+        peak_gib=out.get("peak_gib"),
+        order_rule=plan.settings.get("order_rule"),
+        expected_join_plan=[
+            {
+                "type": node.type_name,
+                "id": node.node_id,
+                **node.explain_fields(),
+            }
+            for node in expected_nodes
+        ],
+        executed_join_plan=out.get("executed_join_plan", []),
+        kv_manager=out.get("kv_manager"),
+        node_metrics=out.get("node_metrics", {}),
+        backend_metrics=out.get("backend_metrics"),
+        remarks=list(notes))
+    for key in ("gpu_s", "chunks"):
+        if key in out:
+            report[key] = out[key]
+    for key in (
+        "evaluated_documents",
+        "evaluated_document_pairs",
+        "documents_per_second",
+        "document_pairs_per_second",
+        "usd_per_query",
+    ):
+        if key in out:
+            report[key] = out[key]
+
+    return report
+
+
+def collect_answers(logical, plan, outputs, documents):
+    """Collect answer tables, surviving rows, and measured predicate selectivity."""
+    operators = logical.operators()
+    scans, logical_filters, logical_joins = (
+        operators.scans, operators.all_filters(), operators.joins)
+    expected_nodes = tuple(node for node in plan.nodes
+                           if isinstance(node, (AiJoin, Barrier)))
+    report = {"stages": []}
+    from quail.execution.reranker import classify_label_tables
+    from quail.physical import AiClassify, AiExtract, AiScore
+
+    # every classified document's label, before any filter on it;
+    # a chain's later stages label the documents their gate passed
+    answer_tables = {"filters": {}, "joins": {}, "classifies": {
+        name: table
+        for node in plan.nodes
+        if isinstance(node, AiClassify)
+        and PortRef(node.node_id, "rows") in outputs
+        for name, table in classify_label_tables(
+            node.spec, outputs[PortRef(node.node_id, "rows")]
+        ).items()
+    }, "scores": {
+        # every scored document's score, before any sort or fetch
+        node.spec.name: outputs[
+            PortRef(node.node_id, "rows")
+        ].select([*node.spec.aliases, node.spec.name])
+        for node in plan.nodes
+        if isinstance(node, AiScore)
+        and PortRef(node.node_id, "rows") in outputs
+    }, "extracts": {
+        # every document's answer and span, null for no answer
+        node.spec.name: outputs[PortRef(node.node_id, "rows")]
+        for node in plan.nodes
+        if isinstance(node, AiExtract)
+        and PortRef(node.node_id, "rows") in outputs
+    }}
+    survivors = {
+        scan.alias: pa.array(
+            range(len(documents[scan.alias])), pa.int32())
+        for scan in scans
+    }
+
+    output_types = {
+        PortRef(node.node_id, output.name): output.value_type
+        for node in plan.nodes
+        for output in node.outputs
+    }
+    filter_relations = {}
+    join_relations = {}
+    for ref, table in outputs.items():
+        value_type = output_types.get(ref)
+        metadata = table.schema.metadata or {}
+        if value_type is ValueType.FILTER_ANSWERS:
+            alias = metadata.get(b"quail.alias")
+            if alias is None:
+                raise ValueError(
+                    "a filter answer relation needs quail.alias metadata"
+                )
+            filter_relations.setdefault(
+                alias.decode("utf-8"), []
+            ).append(table)
+        elif value_type is ValueType.LABEL_ANSWERS:
+            # the label column follows the alias columns: one, or
+            # the anchor and partner of a classification of joined rows
+            answer_tables["classifies"][ref.port.partition(":")[2]] = table
+        elif value_type is ValueType.EXTRACT_ANSWERS:
+            # the alias column, the answer, and its span
+            answer_tables["extracts"][ref.port.partition(":")[2]] = table
+        elif value_type is ValueType.JOIN_ANSWERS:
+            written_pos = metadata.get(b"quail.written_pos")
+            if written_pos is None:
+                raise ValueError(
+                    "a join answer relation needs "
+                    "quail.written_pos metadata"
+                )
+            position = int(written_pos.decode("ascii"))
+            if position in join_relations:
+                raise ValueError(
+                    f"duplicate join answer relation {position}"
+                )
+            join_relations[position] = table
+
+    missing_filter_relations = set(logical_filters) - set(
+        filter_relations
+    )
+    if missing_filter_relations:
+        raise ValueError(
+            "execution response is missing filter answer relations for "
+            f"{sorted(missing_filter_relations)}"
+        )
+    missing_join_relations = set(range(len(logical_joins))) - set(
+        join_relations
+    )
+    if missing_join_relations:
+        raise ValueError(
+            "execution response is missing join answer relations for "
+            f"{sorted(missing_join_relations)}"
+        )
+
+    for node in plan.graph.topological_nodes():
+        for output in node.outputs:
+            if output.value_type is not ValueType.DOCUMENT_IDS:
+                continue
+            ref = PortRef(node.node_id, output.name)
+            if ref not in outputs:
+                continue
+            table = outputs[ref]
+            if len(table.column_names) != 1:
+                raise ValueError(
+                    "a document id relation needs one alias column"
+                )
+            alias = table.column_names[0]
+            survivors[alias] = (
+                table.column(alias).combine_chunks().cast(pa.int32()))
+
+    for alias, relations in filter_relations.items():
+        table = relations[0] if len(relations) == 1 else \
+            pa.concat_tables(relations)
+        # predicates in the order their first answers appear
+        predicate_order = [
+            int(pos) for pos in pc.unique(table.column("predicate")).to_pylist()]
+        predicate_order.extend(
+            position for position in range(len(logical_filters[alias]))
+            if position not in predicate_order
+        )
+        for index, written_pos in enumerate(predicate_order):
+            mask = pc.equal(table.column("predicate"), written_pos)
+            stage_table = table.filter(mask)
+            evaluated = stage_table.num_rows
+            passed = pc.sum(stage_table.column("answer")).as_py() or 0
+            answer_tables["filters"][(alias, written_pos)] = stage_table
+            report["stages"].append(dict(
+                op="filter", alias=alias, stage=index,
+                written_pos=written_pos,
+                provided_selectivity=(
+                    logical_filters[alias][written_pos].selectivity
+                ),
+                observed_selectivity=round(
+                    passed / max(1, evaluated), 4
+                ),
+                evaluated=evaluated,
+            ))
+
+    true_join_tables = {}
+    expected_order = []
+    for node in expected_nodes:
+        for output in node.outputs:
+            if not output.name.startswith("join_answers:"):
+                continue
+            expected_order.append(int(output.name.split(":", 1)[1]))
+    expected_order.extend(
+        position for position in sorted(join_relations)
+        if position not in expected_order
+    )
+    for written_pos in expected_order:
+        if written_pos not in join_relations:
+            continue
+        table = join_relations[written_pos]
+        metadata = table.schema.metadata or {}
+        logical_join = logical_joins[written_pos]
+        logical_aliases = [
+            argument.alias for argument in logical_join.prompt.args
+        ]
+        required_metadata = {
+            b"quail.anchor", b"quail.partners", b"quail.semantics"
+        }
+        missing = required_metadata - set(metadata)
+        if missing:
+            raise ValueError(
+                "a join answer relation is missing metadata "
+                f"{sorted(key.decode('utf-8') for key in missing)}"
+            )
+        anchor = metadata[b"quail.anchor"].decode("utf-8")
+        partner_text = metadata[b"quail.partners"].decode("utf-8")
+        partners = [] if not partner_text else partner_text.split(",")
+        semantics = metadata[b"quail.semantics"].decode("utf-8")
+        missing_columns = set(logical_aliases) - set(table.column_names)
+        if missing_columns:
+            raise ValueError(
+                "a join answer relation is missing alias columns "
+                f"{sorted(missing_columns)}"
+            )
+        answers = table.column("answer")
+        answer_tables["joins"][written_pos] = table
+        report["stages"].append(dict(
+            op="join", written_pos=written_pos, anchor=anchor,
+            partners=partners,
+            semantics=semantics,
+            provided_selectivity=logical_join.selectivity,
+            observed_selectivity=round(
+                (pc.sum(answers).as_py() or 0) / max(1, len(answers)), 4
+            ),
+            tuples=len(answers),
+        ))
+        if semantics == "full":
+            true_join_tables[written_pos] = true_answer_rows(table)
+    return answer_tables, survivors, true_join_tables, report["stages"]

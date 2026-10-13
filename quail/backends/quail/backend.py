@@ -14,8 +14,8 @@ from quail.backends.quail.executor.operators.filter import (
     execute_filters,
 )
 from quail.backends.quail.executor.operators.join import execute_join, execute_joins
+from quail.backends.quail.executor.operators.score import QuailScorer
 from quail.backends.quail.executor.pipeline import execute_pipeline
-from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.execution.reranker import RerankerModelExecution

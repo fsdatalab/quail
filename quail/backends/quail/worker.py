@@ -13,6 +13,7 @@ from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.model import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.operators.extract import execute_extractions
+from quail.backends.quail.executor.operators.join import join_inputs
 from quail.backends.quail.executor.readout import (
     AnswerRows,
     AsyncAnswers,
@@ -21,15 +22,8 @@ from quail.backends.quail.executor.readout import (
     DecisionHead,
 )
 from quail.backends.quail.executor.warmup import warm_kernels
-from quail.backends.quail.graph import (
-    _join_round_kv,
-    execute_single_graph,
-    join_suffixes,
-    partner_list_builder,
-    partner_maps,
-)
-from quail.backends.quail.prompts import join_request
-from quail.backends.quail.retention import apply_retention, join_settlement
+from quail.backends.quail.graph import execute_single_graph
+from quail.backends.quail.retention import apply_retention
 from quail.cost import budgets
 from quail.execution.runner import ExecutionContext
 from quail.execution.tokens import (
@@ -520,6 +514,7 @@ def _child_filters(state, sub):
                     "document_ids": index,
                     "limit": filter_limit,
                     "stop_groups": sub.get("stop_groups"),
+                    "gpu_timing": sub.get("gpu_timing", False),
                 },
             )
     return _child_results(torch, arena, results, wall_started=t0)
@@ -570,7 +565,6 @@ def _child_joins(state, sub):
     node = nodes[0]
     if not isinstance(node, AiJoin):
         raise TypeError(f"child join received {node.type_name!r}")
-    group = [join_request(member) for member in nodes]
     anchor_alias = node.anchor
     anchors_glob = list(sub["anchor_index"])
     anchor_docs = sub["anchor_docs"]
@@ -581,40 +575,14 @@ def _child_joins(state, sub):
                     config.get("before", {}).get(node.node_id, {}), live)
     t0 = time.perf_counter()
     with torch.inference_mode():
-        stage_suffixes, tuple_indices = join_suffixes(
-            group, {alias: partner["docs"]
-                    for alias, partner in sub["partners"].items()},
-            live)
-        tuple_globs = [tuple_indices[member.written_pos] for member in nodes]
-        # this GPU's anchors only
-        lists_for = partner_list_builder(
-            group, tuple_globs,
-            partner_maps(group, sub.get("pairs", {})))
         prefixes = DocumentPrefixes(pre, anchor_docs, range(len(anchor_docs)))
-        anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-        round_kv = _join_round_kv(anchor_keys, arena)
-
-        anchor_done = join_settlement(arena, anchor_keys, prefixes, nodes[-1], config)
-
-        runtime_context = state["runtime_context"]
-        results = _execute_predicates(
-            runtime_context, nodes,
-            {
-                "prefixes": prefixes,
-                "stage_suffixes": stage_suffixes,
-                "stage_frames": [
-                    join.get("frame") or [] for join in group
-                ],
-                "anchor_keys": anchor_keys,
-                "anchor_done": anchor_done,
-                "chain": None,
-                "kv_round": round_kv,
-                "anchor_ids": anchors_glob,
-                "partner_indices": tuple_indices,
-                "anchor_partners": lists_for,
-                "group": group,
-            },
-        )
+        prepared = join_inputs(
+            nodes, {alias: partner["docs"]
+                    for alias, partner in sub["partners"].items()},
+            live, prefixes, arena, config, sub.get("pairs", {}))
+        round_kv = prepared["kv_round"]
+        prepared["gpu_timing"] = sub.get("gpu_timing", False)
+        results = _execute_predicates(state["runtime_context"], nodes, prepared)
     if sub.get("final_group"):
         for key in arena.resident_keys():
             arena.free_key(key)

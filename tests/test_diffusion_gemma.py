@@ -9,14 +9,11 @@ import pytest
 from fakes import cpu_arena, cpu_staging, fake_pack, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.executor import loop
-from quail.backends.quail.executor.models.diffusion_gemma import (
-    DiffusionGemmaPipeline,
-)
+from quail.backends.quail.executor.models.diffusion_gemma import DiffusionGemmaPipeline
 from quail.backends.quail.executor.operators.filter import FilterPart
 from quail.backends.quail.executor.pack import JoinAdmission
 from quail.backends.quail.executor.parts import gated_stages
-from quail.backends.quail.executor.stages import frame_writes
+from quail.backends.quail.executor.stages import filter_stages, frame_writes, run_stages
 from quail.cost import budgets
 from quail.cost.dense_decoder_cost import mlp_params, mlp_weight_params
 from quail.logical.prompts import (
@@ -132,9 +129,12 @@ def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
     arena.activate = activate
     real_pack = chunk_mod.pack_chunk
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    loop.run_filter(fake_torch(), arena, paged, answers, docs[:1],
-                    questions[:1], 200, arena_writes=False,
-                    arena_keys=[("d", 0)])
+    run_stages(
+        fake_torch(), arena, paged,
+        filter_stages(questions[:1], answers), docs[:1], 200,
+        paged=False,
+        default_attention='unified',
+        anchor_keys=[('d', 0)])
     monkeypatch.setattr(chunk_mod, "pack_chunk", real_pack)
     assert activated == [("d", 0)]
     assert arena.retention_cap_pages == 8
@@ -424,9 +424,6 @@ def test_tuned_moe_configs_merge_upstream_or_fall_back(tmp_path):
         (folder / name).write_text("{}")
     write_configs(folder, tmp_path / "missing")
     assert list(folder.glob("*.json")) == []
-
-
-
 
 
 def test_canvas_rows_pass_through_the_self_conditioning_norm(monkeypatch):

@@ -532,7 +532,8 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     import pickle
 
     from quail.backends.quail.distributed import DistributedQuailExecution
-    from quail.backends.quail.executor import score as module
+    from quail.backends.quail.executor import parts as executor_parts
+    from quail.backends.quail.executor.operators import score as module
     from quail.backends.quail.worker import quail_runtime_payload
     from quail.execution.tokens import TokenView
 
@@ -558,20 +559,25 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     )
     monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
 
-    def run_join(*args, **kwargs):
-        prefixes, suffixes, budget = args[4:7]
-        assert budget == 1234
+    state.gpu_timing = True
+
+    def run_stages(torch, arena, pipeline, stages, prefixes, budget, **kwargs):
+        (stage,) = stages
+        assert budget == 1234 and kwargs["gpu_timing"]
         assert list(prefixes[0]) == [1, 10, 11, 2]
         assert prefixes[0].token_parts[1] is documents["a"][0]
-        assert [list(part) for part in suffixes[0]] == [[20, 3], [30, 3]]
-        assert list(kwargs["anchor_partners"](("score", "score", 0))[0]) == [1, 0]
-        return [{0: [0.9, 0.2]}], [], 8
+        assert [list(part) for part in stage.suffixes] == [[20, 3], [30, 3]]
+        assert list(stage.requests(("score", "score", 0))) == [1, 0]
+        kwargs["on_answers"](0, 0, 0, 2, [0.9, 0.2])
+        start = SimpleNamespace(elapsed_time=lambda end: 20.0)
+        return [{0: [0.9, 0.2]}], [({0: 8}, 8, start, object())], 8
 
-    monkeypatch.setattr(module, "run_join", run_join)
+    monkeypatch.setattr(executor_parts, "run_stages", run_stages)
     result = module.QuailScorer(state).score(spec, [(0, 1), (0, 0)], documents)
     np.testing.assert_allclose(result.scores, [0.9, 0.2])
     assert result.fresh_tokens == 8
     assert result.cached_tokens == 4
+    assert result.gpu_s == 0.02 and result.chunks == 1
 
     # one table on a canvas model: each document's KV, then one draw; an
     # uncertain first score takes three more draws and their mean
@@ -601,7 +607,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
         more.decide(1, [0.2, 0.2, 0.2])
         return [], [], 9
 
-    monkeypatch.setattr(module, "run_stages", run_stages)
+    monkeypatch.setattr(executor_parts, "run_stages", run_stages)
     result = module.QuailScorer(state).score(drawn, [(1,), (0,)], documents)
     np.testing.assert_allclose(result.scores, [0.999, 0.3], rtol=1e-6)
     # heads and documents, then each frame, cue, and canvas, then the
@@ -745,7 +751,8 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
 
 
 def test_shared_score_borrows_prefixes_and_reads_the_cue(monkeypatch):
-    from quail.backends.quail.executor import score as module
+    from quail.backends.quail.executor import parts as executor_parts
+    from quail.backends.quail.executor.operators import score as module
     from quail.execution.tokens import TokenView
 
     documents = {"d": [TokenView(pa.array(tokens, type=pa.int32()))
@@ -776,7 +783,7 @@ def test_shared_score_borrows_prefixes_and_reads_the_cue(monkeypatch):
         kwargs["stats"]["borrowed_tokens"] = 4
         return [], [], 7
 
-    monkeypatch.setattr(module, "run_stages", run_stages)
+    monkeypatch.setattr(executor_parts, "run_stages", run_stages)
     result = module.QuailScorer(state).score(
         spec, [(1,), (0,), (2,)], documents,
         on_answers=lambda positions, values: seen.append(
