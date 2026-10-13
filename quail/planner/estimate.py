@@ -5,8 +5,11 @@ distinct document prefix computed once and kept in KV without limit,
 forward passes packed across the whole query, and no host, scheduling,
 or kernel overhead. On each alias the AI.IF filters run first in the
 planner's order, then its classifications, each followed by the label
-filters that test it. Joins are searched over every feasible eager
-binary full left deep plan and anchor choice, with exact survivors from
+filters that test it. A filter under a DISTINCT over its table's
+columns reads each key's documents in sorted token order until one
+survives, as the executor's stop key does. Joins are searched over
+every feasible eager binary full left deep plan and anchor choice,
+with exact survivors from
 caller supplied answer and label oracles at every step. A
 classification of joined rows follows its join on the join's anchor.
 
@@ -54,8 +57,12 @@ from quail.logical import (
 from quail.planner.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
-from quail.planner.prefixes import document_shared_tokens
-from quail.planner.statistics import prepare_filter_costs
+from quail.planner.prefixes import (
+    document_shared_tokens,
+    document_token_order,
+    subset_shared_tokens,
+)
+from quail.planner.statistics import filter_stop_keys, prepare_filter_costs
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
@@ -134,6 +141,10 @@ class SpeedOfLightEstimate:
             "persistent_kv_capacity": "unlimited",
             "gpu_count": 1,
             "survivors": "exact, from the caller's answers and labels",
+            "stop_key": (
+                "a filter under a DISTINCT over its table's columns reads "
+                "each key's documents in sorted token order until one "
+                "survives"),
             "filter_order": (
                 "the planner's rule for this query; an alias's "
                 "classifications follow its AI.IF filters"),
@@ -247,8 +258,9 @@ def _refuse_unpriced(logical) -> None:
         if isinstance(node, Result) and node.limit is not None \
                 and not (node.order or node.distinct or node.offset
                          or isinstance(node.input, Aggregate)):
-            # a sorted, distinct, offset, or grouped result runs every
-            # document, which the estimate prices; a bare LIMIT stops early
+            # a sorted, offset, or grouped result runs every document,
+            # and a distinct one stops each key at its first survivor;
+            # the estimate prices both. A bare LIMIT stops early.
             raise NotImplementedError(
                 "the speed of light estimate does not price LIMIT")
     operators = logical.operators()
@@ -350,6 +362,18 @@ class _Search:
                 tokens=tokens,
                 shared=shared,
             )
+        self.stores = stores
+        # alias -> per row, its stop key value, and per row, its rank in
+        # sorted token order, for the aliases whose filters stop a key
+        # at its first survivor
+        self.stop_groups: dict[str, list[tuple]] = {}
+        self.token_rank: dict[str, dict[int, int]] = {}
+        for alias, key in filter_stop_keys(query.logical).items():
+            columns = [stores[alias].column(name).to_pylist() for name in key]
+            self.stop_groups[alias] = list(zip(*columns))
+            self.token_rank[alias] = {
+                row: rank
+                for rank, row in enumerate(document_token_order(stores[alias]))}
         # column -> rows every filtered alias of that column computed
         # as prefixes; another alias of the column may reuse them
         self.computed_rows_by_column: dict[str, set[int]] = {}
@@ -486,13 +510,41 @@ class _Search:
 
     # ---- filters and classifications --------------------------------
 
+    def stop_key_rows(self, alias, live, order, predicates) -> list[list[int]]:
+        """Return per stage the rows read when each key stops at a survivor.
+
+        The rows of one key value are read in sorted token order, the
+        executor's queue order. A row goes on to the next stage while
+        it passes, and the key's remaining rows are skipped once one
+        row survives every stage.
+        """
+        rank = self.token_rank[alias]
+        groups: dict[tuple, list[int]] = {}
+        for row in live:
+            groups.setdefault(self.stop_groups[alias][row], []).append(row)
+        reached: list[list[int]] = [[] for _ in order]
+        for rows in groups.values():
+            for row in sorted(rows, key=rank.__getitem__):
+                survived = True
+                for index, written_pos in enumerate(order):
+                    reached[index].append(row)
+                    if not self.answer(predicates[written_pos].prompt,
+                                       {alias: row}):
+                        survived = False
+                        break
+                if survived:
+                    break
+        return [sorted(rows) for rows in reached]
+
     def run_filters(self):
         """Apply each alias's filters and classifications with exact answers.
 
         The AI.IF filters run first in the planner's order. Then each
         classification runs once over the live documents, followed by
         the label filters that test it, in written order; the
-        classifications no label filter tests follow.
+        classifications no label filter tests follow. An alias whose
+        filters carry a stop key reads each key's documents in sorted
+        token order until one survives, as the executor does.
 
         Returns:
             (survivors by alias, work, stage records).
@@ -521,8 +573,17 @@ class _Search:
                     model=self.model, device=self.device,
                     chunk_tokens=self.chunk_tokens), rule)] if asks else []
             live = survivors[alias]
+            reached = None
+            if order and alias in self.stop_groups:
+                reached = self.stop_key_rows(alias, live, order, predicates)
+                if self.credit_shared:
+                    # a skipped document computes no prefix for another
+                    self.aliases[alias].shared = subset_shared_tokens(
+                        self.stores[alias], reached[0])
             first = True
-            for written_pos in order:
+            for index, written_pos in enumerate(order):
+                if reached is not None:
+                    live = reached[index]
                 predicate = predicates[written_pos]
                 stage_work = self.question_work(
                     alias, live, predicate.prompt.tail_tokens, first)

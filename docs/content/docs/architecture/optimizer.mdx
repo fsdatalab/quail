@@ -112,6 +112,10 @@ conditions for comparison with measured runs. It assumes:
 - No time spent on CPU work, scheduling, or kernel launches.
 - Rows that pass filters and joins are determined by answers supplied
   by the caller, such as saved reference answers and classification labels.
+- A filter under `SELECT DISTINCT` over its table's columns reads each
+  key's documents in sorted token order until one passes, as the
+  executor's stop key does; the rest of that key's documents are not
+  evaluated.
 
 For classification, this estimate counts the question and category text
 but excludes the extra steps used to select a label. The optimizer's
