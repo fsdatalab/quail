@@ -142,7 +142,7 @@ def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
 
     That is where they cross the roofline ridge.
     """
-    ridge = device.peak_flops / device.hbm_bw
+    ridge = device.gemm_flops / device.memory_bw
     tot_p = tot_io = 0.0
     for din, dout in _projection_shapes(model):
         tot_p += din * dout
@@ -162,7 +162,7 @@ def _projection_time(model: ModelSpec, device: DeviceSpec,
         flops = 2.0 * params * chunk
         moved = (params * model.w_bytes
                  + chunk * (din + dout) * ACT_BYTES)
-        t += max(flops / device.peak_flops, moved / device.hbm_bw)
+        t += max(flops / device.gemm_flops, moved / device.memory_bw)
     return t * model.layers
 
 
@@ -173,7 +173,7 @@ def _attention_time(model: ModelSpec, device: DeviceSpec,
     moved = (context * model.kappa / model.layers
              + 2.0 * chunk * model.n_q * model.d_head * ACT_BYTES)
     return max(flops / device.peak_flops,
-               moved / device.hbm_bw) * model.layers
+               moved / device.memory_bw) * model.layers
 
 
 # Below this many dense parameters a model runs unified attention only.
@@ -222,7 +222,7 @@ def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
     tree = _attention_time(model, device, rows, node_tokens)
     # the merge kernel reads two partial outputs and writes one, in
     # bf16, once per layer
-    merge = 3 * rows * model.n_q * model.d_head * ACT_BYTES / device.hbm_bw
+    merge = 3 * rows * model.n_q * model.d_head * ACT_BYTES / device.memory_bw
     tree += merge * model.layers
     return "tree" if tree < unified else "unified"
 

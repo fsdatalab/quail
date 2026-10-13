@@ -59,7 +59,7 @@ def component_latency(component: CostComponent,
         compute_seconds=(
             component.flops
             / device.arithmetic_bandwidth(component.precision)),
-        memory_seconds=component.bytes_moved / device.hbm_bw,
+        memory_seconds=component.bytes_moved / device.memory_bw,
     )
 
 

@@ -216,16 +216,32 @@ class DeviceSpec:
     usd_per_hour: float = 0.0    # rental price of one device; 0 means
     #                              no price is known
     price_source: str = ""       # where usd_per_hour was read from
+    sustained_fp8_flops: float = 0.0    # measured fp8 GEMM rate held
+    #                                     at the power limit; 0 means
+    #                                     none was measured
+    sustained_hbm_bw: float = 0.0       # measured device-to-device copy
+    #                                     bandwidth, bytes/s; 0 means
+    #                                     none was measured
 
     @property
     def attn_flops(self) -> float:
         """Dense peak for the attention kernels, FLOP/s."""
         return self.bf16_flops or self.peak_flops / 2
 
+    @property
+    def gemm_flops(self) -> float:
+        """Return the fp8 GEMM rate: sustained when measured, else the peak."""
+        return self.sustained_fp8_flops or self.peak_flops
+
+    @property
+    def memory_bw(self) -> float:
+        """Return memory bandwidth in bytes/s: sustained when measured, else spec."""
+        return self.sustained_hbm_bw or self.hbm_bw
+
     def arithmetic_bandwidth(self, precision: Precision) -> float:
         """Return arithmetic throughput for one component precision."""
         if precision == "fp8":
-            return self.peak_flops
+            return self.gemm_flops
         if precision == "bf16":
             return self.attn_flops
         if precision == "fp32" and self.fp32_flops:

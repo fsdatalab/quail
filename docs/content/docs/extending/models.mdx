@@ -78,6 +78,8 @@ compute rates. Quail represents it with `DeviceSpec`.
 | `hbm_bw` | GPU memory bandwidth in bytes per second. |
 | `peak_flops` | Peak dense FP8 operations per second. |
 | `bf16_flops` | Peak dense BF16 operations per second. |
+| `sustained_fp8_flops` | Optional. The FP8 GEMM rate the GPU holds at its power limit, measured. The cost model prices dense projections at this rate when it is set, and at `peak_flops` otherwise. |
+| `sustained_hbm_bw` | Optional. The device-to-device copy bandwidth, measured, in bytes per second. The cost model prices memory traffic at this rate when it is set, and at `hbm_bw` otherwise. |
 
 All values describe one GPU. Use compute rates without structured
 sparsity. The

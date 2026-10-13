@@ -12,6 +12,11 @@ H100_SXM = DeviceSpec(
     #                        (https://www.nvidia.com/en-us/data-center/h100/)
     usd_per_hour=3.9492,
     price_source="https://modal.com/pricing",
+    sustained_fp8_flops=1.352e15,  # mamf-finder MSMF at 30ddd970, the
+    #                                fastest shape held at 700 W:
+    #                                /results/ablations/gemm_ceilings_h100_fp8.json
+    sustained_hbm_bw=3.048e12,     # 4 GB copy held 2 s:
+    #                                /results/ablations/attention_ceilings_h100.json
 )
 
 # The price every $/query number in reports uses: query hours times

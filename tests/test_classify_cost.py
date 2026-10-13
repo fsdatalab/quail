@@ -35,7 +35,7 @@ def _head_bytes():
 
 def _readout_seconds(rows, passes):
     return max(_head_bytes() * rows / H100_SXM.arithmetic_bandwidth("bf16"),
-               _head_bytes() * passes / H100_SXM.hbm_bw)
+               _head_bytes() * passes / H100_SXM.memory_bw)
 
 
 def _decode_outcome_work(lengths, runs, window=0, shared=None, resident=False):
@@ -164,7 +164,8 @@ def test_one_token_labels_decode_as_a_merged_letters_request():
 
 
 def test_smaller_chunks_pay_more_weight_reads_without_changing_work():
-    device = replace(H100_SXM, peak_flops=float("inf"), bf16_flops=float("inf"))
+    device = replace(H100_SXM, peak_flops=float("inf"), bf16_flops=float("inf"),
+                     sustained_fp8_flops=float("inf"))
     large = _cost((10, 20, 30), device=device)
     small = _cost((10, 20, 30), device=device, chunk=40)
     assert asdict(small.work) == pytest.approx(asdict(large.work))
@@ -176,7 +177,7 @@ def test_smaller_chunks_pay_more_weight_reads_without_changing_work():
     for cost in (large, small):
         kv = QWEN3_4B_FP8.kappa * (cost.work.kv_written + cost.work.kv_read)
         assert cost.seconds == pytest.approx(
-            ((weights + _head_bytes()) * cost.passes + kv) / device.hbm_bw)
+            ((weights + _head_bytes()) * cost.passes + kv) / device.memory_bw)
 
 
 def test_time_falls_with_chunk_size_and_rises_with_label_choices():
@@ -226,7 +227,7 @@ def _decision_readout_seconds(model, rows, passes):
     width, hidden = model.decision_head_dim, model.hidden
     weights = 4 * (4 * width * hidden + 2 * width + 4 * hidden)
     return max(4 * width * hidden * rows / H100_SXM.fp32_flops,
-               weights * passes / H100_SXM.hbm_bw)
+               weights * passes / H100_SXM.memory_bw)
 
 
 @pytest.mark.parametrize("resident", [False, True])
@@ -249,7 +250,7 @@ def test_decision_models_read_option_rows_through_their_head(resident):
         unrounded_seconds(work, model, H100_SXM, CHUNK)
         + _decision_readout_seconds(model, (options + 1) * len(lengths),
                                     cost.passes))
-    vocabulary = 2 * model.hidden * model.vocab * cost.passes / H100_SXM.hbm_bw
+    vocabulary = 2 * model.hidden * model.vocab * cost.passes / H100_SXM.memory_bw
     assert cost.seconds < unrounded_seconds(work, model, H100_SXM, CHUNK) + vocabulary
     without_rate = replace(H100_SXM, fp32_flops=0.0)
     with pytest.raises(ValueError, match="fp32"):
@@ -269,7 +270,7 @@ def test_one_token_labels_read_only_their_target_rows():
     assert cost.seconds == pytest.approx(
         unrounded_seconds(work, QWEN3_4B_FP8, H100_SXM, CHUNK)
         + max(targets * len(lengths) / H100_SXM.arithmetic_bandwidth("bf16"),
-              targets * cost.passes / H100_SXM.hbm_bw))
+              targets * cost.passes / H100_SXM.memory_bw))
     longer = _cost(lengths, ((10,), (20, 21), (30,)), scoring="letters")
     assert longer.work == cost.work
     assert longer.seconds == pytest.approx(

@@ -720,7 +720,7 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert set(seconds) == {"ai_filter:r", "ai_join:r"}
     # each node priced alone: the parts add up to at least the packed
     # whole, and to no more than three times it
-    assert plan.estimated_seconds <= sum(seconds.values()) \
+    assert plan.estimated_seconds <= sum(seconds.values()) * (1 + 1e-12) \
         <= 3 * plan.estimated_seconds
     # 10,000 expected survivors of 400 tokens do not fit the retention
     # pool, so releasing the chain's KV would recompute most of them
