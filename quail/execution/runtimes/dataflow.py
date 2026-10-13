@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+
 from quail.catalog.pairs import columns_key, pair_ids_table, pair_table
+from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import (
     IndexRelation,
@@ -37,24 +42,15 @@ class BarrierRuntime:
     def execute(self, node, inputs, context) -> NodeResult:
         if not isinstance(node, Barrier):
             raise TypeError(type(node).__name__)
-        import pyarrow as pa
-        import pyarrow.compute as pc
-
         from quail.execution.types import _join_answers_table
 
         survivors = {}
         tables = []
-        arrow_inputs = set()
         for port in node.inputs:
             value = inputs[port.name]
             if port.value_type is ValueType.DOCUMENT_IDS:
                 alias = port.source.port.split(":", 1)[1]
-                if isinstance(value, pa.Table):
-                    arrow_inputs.add(alias)
-                    value = value.column(alias)
-                else:
-                    value = pa.array(value, type=pa.int32())
-                survivors[alias] = value
+                survivors[alias] = document_ids(value)
             elif port.value_type is ValueType.JOIN_ANSWERS:
                 tables.append(value if isinstance(value, pa.Table)
                               else _join_answers_table(value))
@@ -70,46 +66,29 @@ class BarrierRuntime:
                     ids = survivors[alias]
                     survivors[alias] = pc.filter(ids, pc.is_in(
                         ids, value_set=pc.unique(table[alias]).cast(ids.type)))
-        return NodeResult({
-            f"ids:{alias}": (
-                pa.table({alias: survivors[alias]})
-                if alias in arrow_inputs else survivors[alias].to_pylist()
-            )
-            for alias in node.aliases
-        })
+        return NodeResult({f"ids:{alias}": survivors[alias]
+                           for alias in node.aliases})
 
 
-def _ids_of(value) -> list:
-    """Ids from a list, an Arrow array, or a one-column Arrow table."""
-    import pyarrow as pa
-
-    if isinstance(value, pa.Table):
-        if value.num_columns != 1:
-            raise ValueError("an apply() returning ids must return one "
-                             "column, an array, or a list of ids")
-        value = value.column(0)
-    if isinstance(value, (pa.Array, pa.ChunkedArray)):
-        value = value.to_pylist()
-    ids = []
-    for document in value:
-        if document is None:
-            raise ValueError(
-                "an apply() function returned a null id; an outer join "
-                "leaves nulls, use join_type='inner'")
-        ids.append(int(document))
-    return ids
+def _ids_of(value) -> np.ndarray:
+    """Ids an apply() returned, from a sequence, an array, or a one-column table."""
+    try:
+        return id_positions(value)
+    except ValueError as error:
+        raise ValueError(
+            "an apply() function returned a null id; an outer join "
+            "leaves nulls, use join_type='inner'") from error
 
 
-def _pairs_of(value, left: str, right: str) -> list:
-    """(left, right) id pairs from an Arrow table with both alias columns."""
-    import pyarrow as pa
-
+def _pairs_of(value, left: str, right: str) -> np.ndarray:
+    """(left, right) id pairs, one row each, from a table with both alias columns."""
     if not isinstance(value, pa.Table) or not {left, right} <= set(
             value.column_names):
         raise ValueError(
             f"an apply() returning pairs must return an Arrow table with "
             f"columns {left!r} and {right!r}")
-    return list(zip(_ids_of(value.column(left)), _ids_of(value.column(right))))
+    return np.column_stack(
+        [_ids_of(value.column(left)), _ids_of(value.column(right))])
 
 
 def alias_table(alias: str, ids, columns, names):
@@ -118,15 +97,13 @@ def alias_table(alias: str, ids, columns, names):
     Its first column is the alias's row indices under the alias
     name; the rest are the requested value columns for those rows.
     """
-    import pyarrow as pa
-
-    ids = [int(document) for document in ids]
-    arrays = {alias: pa.array(ids, type=pa.int32())}
+    ids = document_ids(ids)
+    arrays = {alias: ids}
     for name in names:
         if columns is None or name not in columns.column_names:
             raise KeyError(
                 f"column {alias}.{name} is not among the request's relations")
-        arrays[name] = columns.column(name).take(pa.array(ids, pa.int64()))
+        arrays[name] = columns.column(name).take(ids)
     return pa.table(arrays)
 
 
@@ -172,25 +149,27 @@ def foreign_call(node, values, context):
         if node.ids == "pairs":
             left, right = node.aliases
             pairs = _pairs_of(result, left, right)
-            allowed = {alias: set(ids) for alias, ids in ids_by_alias.items()}
-            for a, b in pairs:
-                if a not in allowed[left] or b not in allowed[right]:
-                    raise ValueError(
-                        f"apply() {node.function!r} returned pair "
-                        f"({a}, {b}) outside its input ids")
+            outside = ~(np.isin(pairs[:, 0], id_positions(ids_by_alias[left]))
+                        & np.isin(pairs[:, 1], id_positions(ids_by_alias[right])))
+            if outside.any():
+                a, b = pairs[np.flatnonzero(outside)[0]]
+                raise ValueError(
+                    f"apply() {node.function!r} returned pair "
+                    f"({a}, {b}) outside its input ids")
             counters["output_rows"] += len(pairs)
             return pairs
         (alias,) = node.aliases
         kept = _ids_of(result)
-        given = set(ids_by_alias[alias])
-        if not set(kept) <= given:
+        given = np.unique(id_positions(ids_by_alias[alias]))
+        if not np.isin(kept, given).all():
             raise ValueError(
                 f"apply() {node.function!r} returned ids it was not "
                 f"given; a function never invents an id")
-        if node.ids == "preserve" and set(kept) != given:
+        distinct = len(np.unique(kept))
+        if node.ids == "preserve" and distinct != len(given):
             raise ValueError(
                 f"apply() {node.function!r} preserves ids but dropped "
-                f"{len(given) - len(set(kept))}")
+                f"{len(given) - distinct}")
         counters["output_rows"] += len(kept)
         return kept
 
@@ -217,7 +196,7 @@ def foreign_outputs(node, result) -> dict:
     if node.ids == "pairs":
         return {f"pairs:{node.written_pos}":
                 pair_ids_table(*node.aliases, result)}
-    return {f"ids:{node.aliases[0]}": result}
+    return {f"ids:{node.aliases[0]}": document_ids(result)}
 
 
 class ForeignRuntime:
@@ -228,16 +207,10 @@ class ForeignRuntime:
     """
 
     def execute(self, node, inputs, context) -> NodeResult:
-        import pyarrow as pa
-
         values = foreign_ids(node, inputs)
         call, metrics = foreign_call(node, values, context)
-        ids_by_alias = {}
-        for alias in node.aliases:
-            value = values[alias]
-            if isinstance(value, pa.Table):
-                value = value.column(alias).to_pylist()
-            ids_by_alias[alias] = list(value)
+        ids_by_alias = {alias: id_positions(values[alias])
+                        for alias in node.aliases}
         return NodeResult(foreign_outputs(node, call(ids_by_alias)), metrics())
 
 
@@ -248,9 +221,6 @@ class RecombineRuntime:
         if not isinstance(node, Recombine):
             raise TypeError(type(node).__name__)
         if context.recombine is None:
-            import pyarrow as pa
-
-
             answer_tables = []
             survivors = {}
             for input_port in node.inputs:
@@ -303,9 +273,6 @@ class HashJoinRuntime:
     """Pair the rows of two tables whose key columns are equal."""
 
     def execute(self, node, inputs, context) -> NodeResult:
-        import pyarrow as pa
-        import pyarrow.compute as pc
-
         if not isinstance(node, HashJoin):
             raise TypeError(type(node).__name__)
         sides = {}

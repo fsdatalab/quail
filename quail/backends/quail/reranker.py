@@ -9,6 +9,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.backends.base import GpuContext
+from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import DEFAULT_BATCH_ROWS, answer_table, filter_answer_table
 from quail.logical import PROBABILITIES_SUFFIX
@@ -164,8 +165,8 @@ def _score_table(rows, aliases, name, scores, value_type=None) -> pa.Table:
 
 def _ids(value, alias: str) -> np.ndarray:
     if isinstance(value, pa.Table):
-        return value.column(alias).to_numpy()
-    return np.asarray(value, dtype=np.int32)
+        value = value.column(alias)
+    return id_positions(value)
 
 
 def _table_aliases(table: pa.Table) -> tuple[str, ...]:
@@ -262,7 +263,7 @@ def classify_outputs(node, table) -> dict:
     outputs = {"rows": table}
     if len(node.spec.aliases) == 1:
         (alias,) = node.spec.aliases
-        outputs[f"ids:{alias}"] = table.column(alias).to_numpy()
+        outputs[f"ids:{alias}"] = document_ids(table.column(alias))
     return outputs
 
 
@@ -474,8 +475,8 @@ def filter_scores(node, table) -> NodeResult:
         )
     outputs = {"rows": filtered, answer_name: answer_relation}
     if len(node.aliases) == 1:
-        outputs[f"ids:{node.aliases[0]}"] = (
-            filtered.column(node.aliases[0]).to_pylist())
+        outputs[f"ids:{node.aliases[0]}"] = document_ids(
+            filtered.column(node.aliases[0]))
     return NodeResult(
         outputs,
         NodeMetrics(

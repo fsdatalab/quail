@@ -30,6 +30,7 @@ from quail.baselines.request_scheduling import (
     text_answer,
     true_bit,
 )
+from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.physical import PhysicalNode
 
@@ -106,8 +107,8 @@ class RequestModelExecution:
             if port.source.port.startswith("ids:"):
                 alias = port.source.port.split(":", 1)[1]
                 if alias in survivors:
-                    survivors[alias] = [int(document)
-                                        for document in inputs[port.name]]
+                    # the request steps grow and reorder these lists
+                    survivors[alias] = id_positions(inputs[port.name]).tolist()
         outputs = {}
         steps = []
 
@@ -118,7 +119,7 @@ class RequestModelExecution:
         self._execute_extractions(node, survivors, outputs, steps)
 
         for alias in node.aliases:
-            outputs[f"ids:{alias}"] = survivors[alias]
+            outputs[f"ids:{alias}"] = document_ids(survivors[alias])
         wall_s = time.perf_counter() - started
         return NodeResult(
             outputs,

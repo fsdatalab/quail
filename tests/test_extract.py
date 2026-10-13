@@ -413,7 +413,7 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     assert whole["lines_span"] == [{"start": 0, "end": 28}, None,
                                    {"start": 0, "end": 16}, None]
     # an extraction keeps every document
-    assert result.outputs["ids:c"] == [0, 1, 2, 3]
+    assert result.outputs["ids:c"].to_pylist() == [0, 1, 2, 3]
     step, _ = result.metrics.extension["steps"]
     assert (step["kind"], step["output"], step["n_in"], step["n_out"]) == (
         "extract", "ends", 4, 3)

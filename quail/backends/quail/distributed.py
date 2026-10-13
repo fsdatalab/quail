@@ -15,6 +15,7 @@ from quail.backends.quail.prompts import join_request
 from quail.backends.quail.reranker import score_in_batches
 from quail.catalog.pairs import columns_key
 from quail.catalog.tokens import select_documents
+from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.runner import (
     ExecutionContext,
@@ -138,8 +139,7 @@ class DistributedQuailExecution:
             self.begin()
         alias = nodes[0].spec.alias
         (source,) = inputs.values()
-        ids = (source.column(alias).to_numpy() if isinstance(source, pa.Table)
-               else np.asarray(source, dtype=np.int64))
+        ids = id_positions(source)
         positions = self._extraction_positions(alias, ids)
         texts = self.payload["texts"][alias]
         if not isinstance(texts, (pa.Array, pa.ChunkedArray)):
@@ -169,7 +169,7 @@ class DistributedQuailExecution:
             table = pa.concat_tables([part.outputs["rows"] for part in parts])
             metrics = sum((part.metrics for part in parts), NodeMetrics())
             results[node.node_id] = NodeResult(
-                {"rows": table.take(order), f"ids:{alias}": ids},
+                {"rows": table.take(order), f"ids:{alias}": document_ids(ids)},
                 replace(metrics, wall_s=wall if index == 0 else 0.0))
         return results
 
@@ -214,16 +214,12 @@ class DistributedQuailExecution:
     def _execute_filters(self, nodes, inputs):
         node = nodes[0]
 
-        document_ids = next(iter(inputs.values()))
+        # the worker payloads are pickled, so ids cross as Python ints
+        live_ids = id_positions(next(iter(inputs.values()))).tolist()
         shards = self.shards
-        complete = (
-            isinstance(document_ids, range)
-            and document_ids.start == 0
-            and document_ids.stop == len(self.docs[node.alias])
-            and document_ids.step == 1
-        )
+        complete = len(live_ids) == len(self.docs[node.alias])
         if node.alias in shards and not complete:
-            live = set(document_ids)
+            live = set(live_ids)
             shards = dict(shards)
             shards[node.alias] = tuple(
                 tuple(document for document in shard if document in live)
@@ -254,12 +250,12 @@ class DistributedQuailExecution:
             rows = {document: row for part in parts
                     for document, row in part.outputs[
                         f"filter_answers:{node.alias}"].items()}
-            survivors = sorted(document for part in parts
-                               for document in part.outputs[f"ids:{node.alias}"])
+            survivors = np.sort(np.concatenate([
+                id_positions(part.outputs[f"ids:{node.alias}"]) for part in parts]))
             if j == len(nodes) - 1 and not self.joins:
                 survivors = survivors[:self.payload.get("filter_limit")]
             results[member.node_id] = NodeResult(
-                {f"ids:{node.alias}": survivors,
+                {f"ids:{node.alias}": document_ids(survivors),
                  f"filter_answers:{node.alias}": rows},
                 replace(sum((part.metrics for part in parts), NodeMetrics()),
                         wall_s=wall if j == 0 else 0.0))
@@ -314,11 +310,11 @@ class DistributedQuailExecution:
             parts = [item["results"][member.node_id] for item in outputs]
             output = coordinator.merge_join_answers([
                 part.outputs[f"join_answers:{member.written_pos}"] for part in parts])
-            survivors = sorted(document for part in parts
-                               for document in part.outputs[f"ids:{member.anchor}"])
+            survivors = np.sort(np.concatenate([
+                id_positions(part.outputs[f"ids:{member.anchor}"]) for part in parts]))
             metrics = sum((part.metrics for part in parts), NodeMetrics())
             results[member.node_id] = NodeResult(
-                {f"ids:{member.anchor}": survivors,
+                {f"ids:{member.anchor}": document_ids(survivors),
                  f"join_answers:{member.written_pos}": output},
                 replace(metrics, wall_s=wall if j == 0 else 0.0,
                         extension={**metrics.extension, "joins": [output]}))
@@ -381,7 +377,7 @@ def prepare_distributed_inputs(node, inputs, context, nodes=None):
                     raise TypeError(_ONE_GPU_APPLY)
                 pairs[int(port.source.port.split(":", 1)[1])] = value
                 continue
-            survivors[port.source.port.split(":", 1)[1]] = list(value)
+            survivors[port.source.port.split(":", 1)[1]] = id_positions(value).tolist()
         return {
             "survivors": survivors,
             "group": [join_request(member) for member in nodes],

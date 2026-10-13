@@ -89,7 +89,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     result = execution.execute(filtered, {
         "documents": [[1]], "document_ids": [10]})
     assert not arena.owned
-    assert result.outputs["ids:d"] == [10]
+    assert result.outputs["ids:d"].to_pylist() == [10]
 
 
 class FakeArena:

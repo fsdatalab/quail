@@ -17,6 +17,7 @@ from quail.backends.quail.executor.parts import (
     stage_spans,
 )
 from quail.backends.quail.executor.state import QueryExecutionState
+from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import extract_answer_table
 from quail.physical import AiExtract
@@ -89,7 +90,7 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
         first = q == 0
         gpu_s, timed = own(q)
         results[node.node_id] = NodeResult(
-            {"rows": table, f"ids:{spec.alias}": document_ids},
+            {"rows": table, f"ids:{spec.alias}": arrow_ids(document_ids)},
             NodeMetrics(
                 input_rows=len(document_ids), output_rows=len(document_ids),
                 evaluated_documents=len(document_ids),

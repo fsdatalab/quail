@@ -1,5 +1,8 @@
 """Execute LLM filters and conditions on classification results."""
 
+import numpy as np
+import pyarrow.compute as pc
+
 from quail.backends.quail.executor.parts import (
     SingleResultPart,
     execute_parts,
@@ -12,6 +15,8 @@ from quail.catalog.tokens import (
     DocumentKeys,
     DocumentPrefixes,
 )
+from quail.execution.ids import document_ids as arrow_ids
+from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.progress import answer_sink
 
@@ -145,15 +150,12 @@ def filter_result(node, answers, tokens, document_ids,
     Returns:
         A NodeResult containing surviving IDs, filter answers, and metrics.
     """
-    global_answers = {
-        document_ids[int(local)]: row
-        for local, row in answers.items()
-    }
-    survivors = sorted(
-        document
-        for document, row in global_answers.items()
-        if len(row) == 1 and all(row)
-    )
+    local = np.fromiter(answers, dtype=np.int64, count=len(answers))
+    passed = np.fromiter((len(row) == 1 and all(row) for row in answers.values()),
+                         dtype=bool, count=len(answers))
+    positions = np.asarray(document_ids, dtype=np.int64)
+    survivors = arrow_ids(np.sort(positions[local[passed]]))
+    global_answers = dict(zip(positions[local].tolist(), answers.values()))
     return NodeResult(
         outputs={
             f"ids:{node.alias}": survivors,
@@ -215,18 +217,18 @@ def stop_groups(node, columns, document_ids) -> list | None:
     if columns is None:
         raise KeyError(
             f"the stop key of {node.alias!r} needs its value columns")
-    import pyarrow as pa
-
-    positions = pa.array([int(document) for document in document_ids],
-                         pa.int64())
-    values = zip(*(columns.column(name).take(positions).to_pylist()
-                   for name in node.stop_key))
-    groups = {}
-    return [groups.setdefault(value, len(groups)) for value in values]
+    positions = arrow_ids(document_ids)
+    # a null key value forms one group, like any other value
+    codes = np.column_stack([
+        pc.fill_null(pc.dictionary_encode(columns.column(name).take(positions))
+                     .combine_chunks().indices, -1).to_numpy()
+        for name in node.stop_key])
+    return np.unique(codes, axis=0, return_inverse=True)[1].reshape(-1)
 
 
 def filter_inputs(state, node, document_ids) -> dict:
     """Scheduler inputs for one filter sequence over the given documents."""
+    document_ids = id_positions(document_ids)
     return {
         "documents": DocumentPrefixes(
             state["pre"], state["docs"][node.alias], document_ids

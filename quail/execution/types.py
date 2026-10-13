@@ -12,6 +12,7 @@ import pyarrow.compute as pc
 
 from quail.catalog.pairs import COLUMNS_PREFIX
 from quail.catalog.tokens import decode_token_documents
+from quail.execution.ids import document_ids
 from quail.execution.result import filter_answer_table
 from quail.physical import (
     AiFilter,
@@ -120,9 +121,7 @@ def _document_ids_table(port: OutputPort, value: Any) -> pa.Table:
             b"quail.kind": b"document_ids",
         },
     )
-    return pa.Table.from_arrays(
-        [pa.array(value, type=pa.int32())], schema=schema
-    )
+    return pa.Table.from_arrays([document_ids(value)], schema=schema)
 
 
 def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:

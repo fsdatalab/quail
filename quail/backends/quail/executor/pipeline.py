@@ -2,13 +2,13 @@
 
 from itertools import groupby
 
-import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.executor.parts import execute_parts, execution_prefix_tree
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import DocumentKeys, DocumentPrefixes
+from quail.execution.ids import id_positions
 
 
 def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> dict:
@@ -27,8 +27,8 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
                         if port.source.port == f"ids:{alias}"), None)
     source = (inputs[first.node_id][anchor_port] if anchor_port is not None
               else next(iter(inputs[first.node_id].values())))
-    ids = (source.column(alias).to_numpy() if isinstance(source, pa.Table)
-           else np.asarray(source, dtype=np.int64))
+    ids = id_positions(source.column(alias) if isinstance(source, pa.Table)
+                       else source)
     last = max(index for index, node in enumerate(pipeline)
                if node.backend is not None)
     members, trailing = pipeline[:last + 1], pipeline[last + 1:]

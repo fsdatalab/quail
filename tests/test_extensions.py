@@ -140,7 +140,7 @@ def test_node_registration_validation_and_execution():
         PhysicalGraph((node,), PortRef("custom", "ids:d")),
         ExecutionContext(runtimes=registry.runtimes, sources={"d": [3, 7]}),
     )
-    assert result.value == [3, 7]
+    assert result.value.to_pylist() == [3, 7]
 
     registry = built_in_registry()
     with pytest.raises(ValueError, match="codec must describe"):

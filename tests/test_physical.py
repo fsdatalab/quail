@@ -51,8 +51,7 @@ def test_barrier_preserves_survivor_order_and_duplicates():
             inputs["input:2"] = pa.table({"a": [1, 3, 2, 9], "b": [7, 8, 7, 8],
                                           "answer": [keep, keep, False, keep]})
             outputs = BarrierRuntime().execute(node, inputs, None).outputs
-            values = [outputs[f"ids:{alias}"].column(alias).to_pylist() if arrow
-                      else outputs[f"ids:{alias}"] for alias in node.aliases]
+            values = [outputs[f"ids:{alias}"].to_pylist() for alias in node.aliases]
             assert values == ([[3, 1, 3], [8, 7]] if keep else [[], []])
 
 

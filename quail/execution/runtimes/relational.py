@@ -7,6 +7,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.catalog.pairs import columns_key
+from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
 from quail.physical import Aggregate, Limit, Project, Scan, Sort
@@ -22,14 +23,14 @@ class ScanRuntime:
             raise KeyError(
                 f"no prepared source for input {node.input_id!r}"
             )
-        value = context.sources[node.input_id]
-        if node.predicates:
-            value = _tested_documents(node, context)
+        value = document_ids(
+            _tested_documents(node, context) if node.predicates
+            else context.sources[node.input_id])
         return NodeResult({f"ids:{node.alias}": value},
-                          NodeMetrics(output_rows=_row_count(value) or 0))
+                          NodeMetrics(output_rows=len(value)))
 
 
-def _tested_documents(node, context) -> list[int]:
+def _tested_documents(node, context) -> pa.Array:
     """Return the positions of the documents that pass a scan's regular predicates."""
     from quail.execution.selection import selected_rows
     from quail.logical import ColumnRef, RegularPredicate
@@ -43,7 +44,7 @@ def _tested_documents(node, context) -> list[int]:
         for column, comparison, value in node.predicates]
     values = {column: columns.column(column)
               for column, _, _ in node.predicates}
-    return selected_rows(values, predicates).to_pylist()
+    return selected_rows(values, predicates)
 
 
 def _row_count(value) -> int | None:

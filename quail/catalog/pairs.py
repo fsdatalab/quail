@@ -61,11 +61,11 @@ def pair_table(left_alias: str, left_keys, right_alias: str,
 
 
 def pair_ids_table(left_alias: str, right_alias: str, pairs) -> pa.Table:
-    """Build an int32 pair table from row-id tuples."""
-    rows = list(pairs)
+    """Build an int32 pair table from an array of (left, right) id rows."""
+    rows = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
     return pa.table({
-        left_alias: pa.array([left for left, _ in rows], type=pa.int32()),
-        right_alias: pa.array([right for _, right in rows], type=pa.int32()),
+        left_alias: pa.array(rows[:, 0], type=pa.int32()),
+        right_alias: pa.array(rows[:, 1], type=pa.int32()),
     })
 
 

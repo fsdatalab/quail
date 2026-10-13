@@ -143,7 +143,7 @@ def test_stop_key_groups_ride_the_filter_payload_and_shard_together():
     node = AiFilter(node_id="filter:r", alias="r", arena_writes=True,
                     question_token_ids=((7, 7),), stop_key=("key",))
     subs = filter_node_payloads(p, node, p["shards"], 2, has_joins=False)
-    assert [sub["stop_groups"] for sub in subs] == [[0, 0, 1], [0, 1, 2]]
+    assert [list(sub["stop_groups"]) for sub in subs] == [[0, 0, 1], [0, 1, 2]]
     plain = filter_node_payloads(p, filter_node(), p["shards"], 2,
                                  has_joins=False)
     assert all(sub["stop_groups"] is None for sub in plain)

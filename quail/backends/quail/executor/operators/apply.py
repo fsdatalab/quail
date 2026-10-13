@@ -1,7 +1,10 @@
 """Execute per-batch apply calls within a model pipeline."""
 
+import numpy as np
+
 from quail.backends.quail.executor.parts import SingleResultPart
 from quail.backends.quail.executor.stages import Stage
+from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeResult
 from quail.execution.runtimes.dataflow import foreign_call, foreign_outputs
 
@@ -25,15 +28,16 @@ class ApplyGate(SingleResultPart):
                     part.node.node_id for part in parts}
                 else inputs[node.node_id][port.name])
         call, metrics = foreign_call(node, values, context)
-        return cls(node, call, metrics, values)
+        return cls(node, call, metrics,
+                   {alias: id_positions(value) for alias, value in values.items()})
 
     def __init__(self, node, call, metrics, values):
         self.node = node
         self.call = call
         self.metrics = metrics
         self.values = values
-        self.produced = []
-        self.rows = {}          # anchor -> partners, for pairs
+        self.produced = []      # one array of kept ids or pair rows per call
+        self.rows = {}          # anchor -> its partners, for pairs
 
     def gate(self, key):
         document = key[1]
@@ -41,21 +45,21 @@ class ApplyGate(SingleResultPart):
         if node.ids == "pairs":
             partner = next(alias for alias in node.aliases
                            if alias != key[0])
-            partners = list(self.values[partner])
-            pairs = self.call({key[0]: [document], partner: partners})
-            self.produced.extend(pairs)
-            mine = [b if a == document else a for a, b in pairs]
-            if not mine:
-                return Stage.DROP
-            self.rows[document] = mine
-            return None
-        kept = self.call({key[0]: [document]})
-        self.produced.extend(kept)
-        return None if kept else Stage.DROP
+            produced = self.call({key[0]: [document],
+                                  partner: self.values[partner]})
+            if len(produced):
+                self.rows[document] = np.where(
+                    produced[:, 0] == document, produced[:, 1], produced[:, 0])
+        else:
+            produced = self.call({key[0]: [document]})
+        self.produced.append(produced)
+        return None if len(produced) else Stage.DROP
 
     def finish(self, every):
         return None
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
-        return NodeResult(foreign_outputs(self.node, self.produced),
-                          self.metrics())
+        produced = (np.concatenate(self.produced) if self.produced
+                    else np.zeros((0, 2) if self.node.ids == "pairs" else 0,
+                                  dtype=np.int64))
+        return NodeResult(foreign_outputs(self.node, produced), self.metrics())
