@@ -29,13 +29,16 @@ class Qwen35Pipeline(ModelPipeline):
     warm_joins = False
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine, use_gdn_kernels=True):
+                 engine_class=Engine, use_gdn_kernels=True,
+                 fused_norms=True):
         import torch
 
         text = getattr(model, "language_model", model)
         self.spec = spec
         self.arena = arena
         self.use_gdn_kernels = use_gdn_kernels
+        # False runs vLLM's norm modules, which are unfused PyTorch here
+        self.fused_norms = fused_norms
         # vLLM's norms and rotary dispatch read the current config
         self.vllm_config = getattr(model, "quail_vllm_config", None)
         self.layers = text.model.layers
@@ -121,6 +124,15 @@ class Qwen35Pipeline(ModelPipeline):
         d_in, d_scale = self.engine.activation_quant(gate_up)
         return self.engine.gemm(d_in, d_scale, mlp.down_proj)
 
+    def _norm(self, norm, x, residual):
+        """One Gemma-style norm with the residual add, as (normed, residual)."""
+        if self.fused_norms:
+            return self.engine.gemma_add_rms_norm(
+                x, residual, norm.weight, norm.variance_epsilon)
+        if residual is None:
+            return norm(x), x
+        return norm(x, residual)
+
     def forward_chunk(self, chunk):
         from contextlib import nullcontext
 
@@ -143,11 +155,7 @@ class Qwen35Pipeline(ModelPipeline):
         residual = None
         slot = 0
         for layer in self.layers:
-            if residual is None:
-                residual = hidden
-                x = layer.input_layernorm(hidden)
-            else:
-                x, residual = layer.input_layernorm(hidden, residual)
+            x, residual = self._norm(layer.input_layernorm, hidden, residual)
             if hasattr(layer, "linear_attn"):
                 x = self._gated_delta_net(layer.linear_attn, x, phases, slot)
                 slot += 1
@@ -155,9 +163,10 @@ class Qwen35Pipeline(ModelPipeline):
                 meta["layer"] += 1
             else:
                 x = self._attention(layer.self_attn, x, chunk.positions, chunk)
-            x, residual = layer.post_attention_layernorm(x, residual)
+            x, residual = self._norm(layer.post_attention_layernorm, x,
+                                     residual)
             hidden = self._mlp(layer.mlp, x)
         final = chunk.final_indices
-        normed, _ = self.final_norm(hidden.index_select(0, final),
-                                    residual.index_select(0, final))
+        normed, _ = self._norm(self.final_norm, hidden.index_select(0, final),
+                               residual.index_select(0, final))
         return normed

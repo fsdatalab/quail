@@ -15,9 +15,9 @@ contiguous and strided inputs alike; the long convolution matches the
 reference on its last rows within 0.05; none produces NaN.
 
     uv run modal run experiments/cells/hybrid_gdn_unit.py \
-        2>&1 | tee /tmp/hybrid_gdn_unit.log
+        --backend flashinfer 2>&1 | tee /tmp/hybrid_gdn_unit.log
 
-Record: /results/ablations/hybrid-gdn-unit.json.
+Record: /results/ablations/hybrid-gdn-unit-<backend>.json.
 """
 
 import json
@@ -39,8 +39,9 @@ TAIL_ROWS = 64
 
 @app.function(image=image, gpu="H100!", timeout=1800,
               volumes={"/results": results})
-def check() -> dict:
+def check(backend: str = "triton") -> dict:
     """Return the largest differences between the reference and the kernels."""
+    os.environ["QUAIL_GDN_PREFILL"] = backend
     import torch
 
     from quail.backends.quail.executor import gdn
@@ -56,7 +57,7 @@ def check() -> dict:
     rows = sum(LENGTHS)
     cu = torch.tensor([0] + list(torch.tensor(LENGTHS).cumsum(0)),
                       dtype=torch.int32, device=device)
-    out = {"lengths": LENGTHS}
+    out = {"lengths": LENGTHS, "backend": backend}
 
     x = torch.randn(rows, channels, device=device, dtype=torch.bfloat16)
     weight = torch.randn(channels, width, device=device,
@@ -137,14 +138,14 @@ def check() -> dict:
                                - long_out[-TAIL_ROWS:].float()).abs().max()),
     }
     os.makedirs("/results/ablations", exist_ok=True)
-    with open("/results/ablations/hybrid-gdn-unit.json", "w") as handle:
+    with open(f"/results/ablations/hybrid-gdn-unit-{backend}.json", "w") as handle:
         json.dump(out, handle)
     results.commit()
     return out
 
 
 @app.local_entrypoint()
-def main():
-    call = check.spawn()
+def main(backend: str = "triton"):
+    call = check.spawn(backend)
     print(f"function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=1))

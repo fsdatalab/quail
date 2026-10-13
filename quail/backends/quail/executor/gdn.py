@@ -429,12 +429,56 @@ def gated_delta_reference(q, k, v, g, beta, state, lengths, scale):
 
 # ---- kernel path ------------------------------------------------------
 
+def gdn_prefill_backend():
+    """Return "flashinfer" or "triton" for the chunked recurrence.
+
+    QUAIL_GDN_PREFILL is "triton" (default), "flashinfer", or "auto".
+    "auto" picks FlashInfer on Hopper, as vLLM's layer does.
+    """
+    import os
+
+    import torch
+
+    requested = os.environ.get("QUAIL_GDN_PREFILL", "triton")
+    if requested == "triton":
+        return "triton"
+    if requested not in ("flashinfer", "auto"):
+        raise ValueError(f"QUAIL_GDN_PREFILL={requested!r} is not "
+                         "triton, flashinfer, or auto")
+    if torch.cuda.get_device_capability() == (9, 0):
+        return "flashinfer"
+    if requested == "flashinfer":
+        raise ValueError("FlashInfer GDN prefill needs a Hopper GPU")
+    return "triton"
+
+
+def _flashinfer_delta_rule(q, k, v, g, beta, state, cu_seqlens):
+    """The same rule through FlashInfer's prefill kernel, as vLLM calls it."""
+    import torch
+    from flashinfer.gdn_prefill import chunk_gated_delta_rule
+    from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
+
+    out, final = chunk_gated_delta_rule(
+        q=l2norm_fwd(q[None].contiguous()).squeeze(0),
+        k=l2norm_fwd(k[None].contiguous()).squeeze(0),
+        v=v.contiguous(), g=torch.exp(g.float()).contiguous(),
+        beta=beta.float().contiguous(), initial_state=state.float(),
+        output_final_state=True, cu_seqlens=cu_seqlens.long())
+    return out, final
+
+
 def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale):
-    """The same rule through vLLM's chunked kernel; state is updated in place.
+    """The same rule through a chunked kernel; state is updated in place.
 
     The kernel normalizes q and k itself and takes key heads fewer than
-    value heads without repeating them.
+    value heads without repeating them. The backend is chosen by
+    gdn_prefill_backend().
     """
+    if gdn_prefill_backend() == "flashinfer":
+        out, final = _flashinfer_delta_rule(q, k, v, g, beta, state,
+                                            cu_seqlens)
+        state.copy_(final)
+        return out
     from vllm.third_party.flash_linear_attention.ops import (
         chunk_gated_delta_rule,
     )
@@ -448,6 +492,9 @@ def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale):
     return out[0]
 
 
+# rows and channels one convolution program covers
+CONV_ROWS = 16
+CONV_BLOCK = 128
 _CONV_KERNEL = None
 
 
@@ -461,40 +508,48 @@ def _conv_triton_kernel():
 
     @triton.jit
     def conv_silu(x_ptr, w_ptr, bias_ptr, hist_ptr, seq_ptr, within_ptr,
-                  out_ptr, channels, stride_x, stride_hs, stride_ht,
-                  stride_o, W: tl.constexpr, BLOCK: tl.constexpr,
-                  HAS_HIST: tl.constexpr, HAS_BIAS: tl.constexpr,
-                  ACTIVATE: tl.constexpr):
-        # int64 so row * stride cannot overflow on a long chunk
-        row = tl.program_id(0).to(tl.int64)
+                  out_ptr, rows, channels, stride_x, stride_hs, stride_ht,
+                  stride_o, W: tl.constexpr, ROWS: tl.constexpr,
+                  BLOCK: tl.constexpr, HAS_HIST: tl.constexpr,
+                  HAS_BIAS: tl.constexpr, ACTIVATE: tl.constexpr):
+        # A program owns ROWS consecutive packed rows by BLOCK channels.
+        index = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-        mask = cols < channels
-        sequence = tl.load(seq_ptr + row)
-        within = tl.load(within_ptr + row)
-        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        row_ok = index < rows
+        col_ok = cols < channels
+        sequence = tl.load(seq_ptr + index, mask=row_ok, other=0).to(tl.int64)
+        within = tl.load(within_ptr + index, mask=row_ok, other=0)
+        # int64 so row * stride cannot overflow on a long chunk
+        source = index.to(tl.int64)
+        acc = tl.zeros((ROWS, BLOCK), dtype=tl.float32)
         for back in tl.static_range(W):
-            tap = tl.load(w_ptr + cols * W + (W - 1 - back), mask=mask,
+            tap = tl.load(w_ptr + cols * W + (W - 1 - back), mask=col_ok,
                           other=0.0).to(tl.float32)
-            inside = (within - back) >= 0
-            value = tl.load(x_ptr + (row - back) * stride_x + cols,
-                            mask=mask & inside, other=0.0).to(tl.float32)
+            inside = row_ok & ((within - back) >= 0)
+            value = tl.load(
+                x_ptr + (source - back)[:, None] * stride_x + cols[None, :],
+                mask=inside[:, None] & col_ok[None, :],
+                other=0.0).to(tl.float32)
             if HAS_HIST:
+                outside = row_ok & ((within - back) < 0)
                 past = tl.load(
-                    hist_ptr + sequence * stride_hs
-                    + (W - 1 - back + within) * stride_ht + cols,
-                    mask=mask & (within - back < 0), other=0.0
-                ).to(tl.float32)
+                    hist_ptr + sequence[:, None] * stride_hs
+                    + (W - 1 - back + within)[:, None] * stride_ht
+                    + cols[None, :],
+                    mask=outside[:, None] & col_ok[None, :],
+                    other=0.0).to(tl.float32)
                 value = value + past
-            acc += value * tap
+            acc += value * tap[None, :]
         if HAS_BIAS:
-            acc += tl.load(bias_ptr + cols, mask=mask,
-                           other=0.0).to(tl.float32)
+            acc += tl.load(bias_ptr + cols, mask=col_ok,
+                           other=0.0).to(tl.float32)[None, :]
         if ACTIVATE:
             out = acc * tl.sigmoid(acc)
         else:
             out = acc
-        tl.store(out_ptr + row * stride_o + cols,
-                 out.to(out_ptr.dtype.element_ty), mask=mask)
+        tl.store(out_ptr + source[:, None] * stride_o + cols[None, :],
+                 out.to(out_ptr.dtype.element_ty),
+                 mask=row_ok[:, None] & col_ok[None, :])
 
     _CONV_KERNEL = conv_silu
     return _CONV_KERNEL
@@ -529,15 +584,15 @@ def causal_conv_kernel(x, weight, phase, history, bias=None, activate=True):
     out = torch.empty_like(x)
     x = x.contiguous()
     weight = weight.contiguous()
-    block = 1024
     has_history = history is not None
     hist = history if has_history else x
-    _conv_triton_kernel()[(rows, triton_cdiv(channels, block))](
+    _conv_triton_kernel()[(triton_cdiv(rows, CONV_ROWS),
+                           triton_cdiv(channels, CONV_BLOCK))](
         x, weight, bias if bias is not None else x, hist,
-        sequence.int(), within, out, channels, x.stride(0),
+        sequence.int(), within, out, rows, channels, x.stride(0),
         hist.stride(0) if has_history else 0,
         hist.stride(1) if has_history else 0, out.stride(0),
-        W=width, BLOCK=block, HAS_HIST=has_history,
+        W=width, ROWS=CONV_ROWS, BLOCK=CONV_BLOCK, HAS_HIST=has_history,
         HAS_BIAS=bias is not None, ACTIVATE=activate, num_warps=4)
     tails = _conv_tails(x, lengths, starts, history, width)
     return out, tails

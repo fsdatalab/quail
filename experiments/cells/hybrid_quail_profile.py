@@ -3,16 +3,22 @@
 Wraps the pipeline's mixers and the GDN kernels with synchronized
 timers and runs one filter over documents the size of IMDB reviews.
 The timers add launch gaps, so shares matter more than the totals.
+The convolution and the recurrence are also timed per phase: the prefix
+phase runs a document from zero state and saves its state; the suffix
+phase runs the question from that saved state.
 
 Prediction: the Gated DeltaNet layers (projection GEMMs, convolution,
 recurrence, gated norm) take at least 60 percent of the forward time,
 and the recurrence kernel plus the convolution take more than the
-attention layers do.
+attention layers do. The suffix phase, with the copies around its
+launches, takes at least 15 percent of the Gated DeltaNet core time.
 
     uv run modal run experiments/cells/hybrid_quail_profile.py \
-        --model qwen3.5-4b-bf16 2>&1 | tee /tmp/hybrid_quail_profile.log
+        --model qwen3.5-4b-bf16 --backend flashinfer \
+        2>&1 | tee /tmp/hybrid_quail_profile.log
 
-The record is written to /results/ablations/<model>-quail-profile.json.
+The record is written to
+/results/ablations/<model>-quail-profile-<backend>.json.
 """
 
 import json
@@ -43,8 +49,9 @@ QUESTION = "Is the text above about a person?"
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=VOLUMES)
-def profile(model: str) -> dict:
+def profile(model: str, backend: str = "triton") -> dict:
     """Return seconds by forward-pass part for one filter run."""
+    os.environ["QUAIL_GDN_PREFILL"] = backend
     import torch
     import torch.nn.functional as F
     from transformers import AutoTokenizer
@@ -101,7 +108,34 @@ def profile(model: str) -> dict:
     pipeline_module.gdn_core = timed("gdn_core", pipeline_module.gdn_core)
     pipeline._attention = timed("attention_layer", pipeline._attention)
     pipeline._mlp = timed("mlp", pipeline._mlp)
-    gdn.causal_conv_kernel = timed("gdn_convolution", gdn.causal_conv_kernel)
+    # the prefix phase starts from zero state; a suffix phase reads a slot
+    current = {"phase": ""}
+    phase_tokens = defaultdict(int)
+    phase_sequences = defaultdict(int)
+
+    def phase_name(phase):
+        return "prefix" if phase.read_slots is None else "suffix"
+
+    real_conv = gdn.causal_conv_kernel
+
+    def conv_by_phase(x, weight, phase, history, bias=None, activate=True):
+        name = phase_name(phase)
+        phase_tokens[name + "_conv"] += int(x.shape[0])
+        return timed(f"gdn_convolution_{name}", real_conv)(
+            x, weight, phase, history, bias, activate=activate)
+
+    gdn.causal_conv_kernel = conv_by_phase
+    real_batches = gdn._kernel_in_batches
+
+    def batches_by_phase(spec, q, k, v, g, beta, load, store, phase, scale):
+        name = phase_name(phase)
+        current["phase"] = name
+        phase_tokens[name + "_recurrence"] += int(q.shape[0])
+        phase_sequences[name] += len(phase.lengths)
+        return timed(f"gdn_recurrence_with_copies_{name}", real_batches)(
+            spec, q, k, v, g, beta, load, store, phase, scale)
+
+    gdn._kernel_in_batches = batches_by_phase
     gdn.causal_conv_reference = timed("gdn_convolution_reference",
                                       gdn.causal_conv_reference)
     mixer = pipeline.gdn_layer.linear_attn
@@ -111,8 +145,13 @@ def profile(model: str) -> dict:
                 module = getattr(layer.linear_attn, name)
                 module.forward = timed(f"gdn_{name}", module.forward)
     del mixer
-    gdn.gated_delta_kernel = timed("gdn_recurrence_kernel",
-                                   gdn.gated_delta_kernel)
+    real_kernel = gdn.gated_delta_kernel
+
+    def kernel_by_phase(*args, **kwargs):
+        return timed(f"gdn_recurrence_kernel_{current['phase']}",
+                     real_kernel)(*args, **kwargs)
+
+    gdn.gated_delta_kernel = kernel_by_phase
     pipeline.embed = timed("embedding", pipeline.embed)
 
     word = tokenizer("the review describes a film and its cast in detail "
@@ -138,19 +177,21 @@ def profile(model: str) -> dict:
         torch.cuda.synchronize()
         wall = time.perf_counter() - started
     tokens = sum(len(d) + len(question) for d in documents)
-    record = {"model": model, "documents": DOCUMENTS, "tokens": tokens,
+    record = {"model": model, "backend": backend,
+              "documents": DOCUMENTS, "tokens": tokens,
               "wall_s": wall, "tokens_per_second": tokens / wall,
               "chunk_budget": budget, "seconds": dict(seconds),
-              "calls": dict(calls)}
+              "calls": dict(calls), "phase_tokens": dict(phase_tokens),
+              "phase_sequences": dict(phase_sequences)}
     os.makedirs("/results/ablations", exist_ok=True)
-    with open(f"/results/ablations/{model}-quail-profile.json", "w") as out:
+    with open(f"/results/ablations/{model}-quail-profile-{backend}.json", "w") as out:
         json.dump(record, out, indent=1)
     results.commit()
     return record
 
 
 @app.local_entrypoint()
-def main(model: str = "qwen3.5-4b-bf16"):
-    call = profile.spawn(model)
+def main(model: str = "qwen3.5-4b-bf16", backend: str = "triton"):
+    call = profile.spawn(model, backend)
     print(f"function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=1), flush=True)
