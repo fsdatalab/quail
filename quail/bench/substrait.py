@@ -3,8 +3,8 @@
 quail-b reads each query's Substrait plan into relations, operators,
 and relational steps (`QuerySpec.info`). `build_query` maps that
 reading to builder calls: a filter, join, classification, label test,
-regular predicate, or score per operator, then the aggregate, having, sort,
-and fetch steps, then the projection.
+regular predicate, score, or extraction per operator, then the
+aggregate, having, sort, and fetch steps, then the projection.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from quail_b.substrait import (
     Aggregate,
     Classify,
     ColumnTest,
+    Extract,
     Fetch,
     Filter,
     Having,
@@ -43,13 +44,14 @@ def build_query(session, info: PlanInfo, selectivity=None,
     for item in info.operators:
         if isinstance(item, Classify) and item.partner is not None:
             continue    # labels a join's rows, so it follows the joins
-        if isinstance(item, (Filter, Classify, InList, ColumnTest, Score)):
+        if isinstance(item, (Filter, Classify, InList, ColumnTest, Score,
+                             Extract)):
             per_alias.setdefault(item.relation, []).append(item)
     prompts = {(item.relation, item.output): item.prompt
                for item in info.classifies}
-    # a label or score field is a named output of the builder
+    # a label, score, or answer field is a named output of the builder
     named = {f"{item.relation}.{item.output}": item.output
-             for item in (*info.classifies, *info.scores)}
+             for item in (*info.classifies, *info.scores, *info.extracts)}
 
     def field(name: str) -> str:
         return named.get(name, name)
@@ -68,6 +70,10 @@ def build_query(session, info: PlanInfo, selectivity=None,
                 query = query.ai_score(
                     quail.prompt(item.prompt, document(alias)),
                     name=item.output)
+            elif isinstance(item, Extract):
+                query = query.ai_extract(
+                    f"{alias}.{info.relation(alias).text_column}",
+                    item.prompt, name=item.output)
             elif isinstance(item, Filter):
                 query = query.ai_filter(
                     quail.prompt(item.prompt, document(alias)),
