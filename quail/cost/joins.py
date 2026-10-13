@@ -70,6 +70,6 @@ def stage_work(spec: dict, anchor: str, n: float, tuples: float, lengths: dict,
         sliding_kv_read=stats.window_reads(pre + frame) if window else 0.0,
         read_pairs=per_anchor * u * (prefix_sum + count * frame),
         read_rows=count * per_anchor * u,
-        reads=count * per_anchor if u > 0 else 0.0,
+        reads=count if u > 0 and per_anchor > 0 else 0.0,
     )
     return (start + stream) * frac

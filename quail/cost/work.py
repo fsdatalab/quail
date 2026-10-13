@@ -11,8 +11,10 @@ class Work:
 
     read_pairs, read_rows, and reads describe the part of pairs where
     new rows attend to a prefix already in KV: the pairs between the
-    rows and that prefix, the rows, and the sequences doing such a
-    read. The rest of pairs is causal attention within new tokens.
+    rows and that prefix, the rows, and the reads of a cached prefix.
+    A read is one prefix read in one call, however many suffixes stack
+    on it, so reads counts the same events as kv_read. The rest of
+    pairs is causal attention within new tokens.
     """
 
     tokens: float = 0.0
@@ -116,5 +118,5 @@ def stream(prefix: float, suffixes, *, window: int = 0) -> Work:
         sliding_kv_read=min(prefix, window - 1) if window else 0.0,
         read_pairs=prefix * sum(reading),
         read_rows=float(sum(reading)),
-        reads=float(len(reading)),
+        reads=1.0 if reading else 0.0,
     )

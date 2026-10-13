@@ -9,7 +9,9 @@ from quail.cost.dense_decoder_cost import (
     attention_pair_flops,
     dense_decoder_components,
 )
-from quail.cost.work import ask, scan, triangle
+from quail.cost.joins import stage_work
+from quail.cost.work import ask, scan, stream, triangle
+from quail.planner.statistics import summarize_alias
 from quail.specs import (
     H100_SXM,
     QWEN3_4B_FP8,
@@ -90,3 +92,20 @@ def test_attention_prices_at_measured_rates_for_the_measured_layout():
     assert dense_decoder_components(work, QWEN3_4B_FP8, 1)[2].compute_seconds is None
     assert dense_decoder_components(
         work, QWEN3_32B_FP8, 1, H100_SXM)[2].compute_seconds is None
+
+
+def test_reads_count_one_per_prefix_read_however_many_suffixes_stack():
+    branches = stream(100, [20, 0, 30])
+    assert branches.reads == 1
+    assert branches.read_rows == 50 and branches.read_pairs == 100 * 50
+    assert stream(0, [20]).reads == 0 and stream(100, [0]).reads == 0
+    spec = {"aliases": ("a", "b"), "tail_tokens": 4,
+            "label_tokens": {"a": 1, "b": 1}, "frame_tokens": {"a": 3, "b": 3}}
+    lengths = {"a": summarize_alias([100, 200, 300]),
+               "b": summarize_alias([50, 60])}
+    # each resident anchor reads its prefix once for the frame and once
+    # for the stacked partner suffixes
+    work = stage_work(spec, "a", 3, 6, lengths, 10, resident=True)
+    assert work.reads == 6
+    assert stage_work(spec, "a", 3, 6, lengths, 10).reads == 3
+    assert stage_work(spec, "a", 1.5, 3, lengths, 10).reads == 1.5

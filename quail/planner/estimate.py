@@ -480,7 +480,7 @@ class _Search:
                                  if self.window else 0.0),
                 read_pairs=anchor_prefix * suffix_tokens,
                 read_rows=suffix_tokens,
-                reads=float(sum(1 for suffix in streamed if suffix > 0)),
+                reads=1.0 if any(suffix > 0 for suffix in streamed) else 0.0,
             )
         return work
 

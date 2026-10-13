@@ -514,7 +514,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     assert classify.inputs[0].source.node_id == "ai_join:r"
     assert classify.spec.scoring == "trie_tree"
     assert classify.spec.expected_inputs == pytest.approx(1.8)
-    assert round(plan.estimated_seconds, 3) == 0.103
+    assert round(plan.estimated_seconds, 3) == 0.101
     assert plan.settings["search_seconds"] == plan.estimated_seconds
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
     assert [(stage.exec_idx, stage.anchor) for stage in staged.stages] == [

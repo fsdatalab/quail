@@ -160,7 +160,7 @@ def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:
         context, sliding_pairs,
         np.minimum(context, window - 1) if window else 0.0,
         sum(reading) * context, np.where(context > 0, sum(reading), 0.0),
-        np.where(context > 0, len(reading), 0.0))
+        np.where(context > 0, 1.0 if reading else 0.0, 0.0))
     if canvas_rows > 1:
         # a canvas longer than one row reads the document a second time
         work += Work(pairs=work.pairs, kv_read=work.kv_read,
