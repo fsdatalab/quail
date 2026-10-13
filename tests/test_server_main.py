@@ -53,6 +53,8 @@ def test_options_override_detection_and_defaults(tmp_path):
         settings_from_args(parse_args(["--model", "gpt-9"]), gpu_name=lambda: H100)
 
     assert detect_device(H100) == "h100-sxm"
+    assert detect_device("NVIDIA L40S") == "l40s"
+    assert detect_device("NVIDIA B200") == "b200"
     assert detect_device(
         "NVIDIA RTX PRO 6000 Blackwell Server Edition"
     ) == "rtx-pro-6000-blackwell-server"

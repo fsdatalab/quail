@@ -337,11 +337,12 @@ def prices(root, context) -> bool:
     """Return whether the Quail cost model applies to a plan and context.
 
     It applies when the context has a model, the backend is quail, the
-    model's weights fit one GPU, and the plan has no AI.SCORE, which the
-    reranker planner plans.
+    model's weights fit one GPU, the default chunk's sliding KV fits,
+    and the plan has no AI.SCORE, which the reranker planner plans.
     """
     return (context.model is not None and context.backend == "quail"
             and budgets.minimum_weight_gpus(context.model, context.device) == 1
+            and budgets.sliding_kv_fits(context.model, context.device)
             and not has_score(LogicalPlan(root)))
 
 
