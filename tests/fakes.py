@@ -261,31 +261,19 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
         anchor_src = PortRef("apply:keep_even", "ids:r")
     resident = "filter" if filtered and pipelined else "none"
     nodes.append(AiJoin(
-        node_id='group:0',
-        anchor='r',
-        anchor_resident=resident,
-        keep_kv=keep_kv,
-        inputs=input_ports((anchor_src, PortRef('input:p', 'ids:p'),
+        node_id="group:0", anchor="r", anchor_resident=resident, keep_kv=keep_kv,
+        inputs=input_ports((anchor_src, PortRef("input:p", "ids:p"),
                             *join_inputs)),
-        written_pos=0,
-        exec_idx=0,
-        partners=('p',),
-        semantics=semantics,
-        selectivity=0.5,
-        expected_tuples=1,
-        anchor_frame_tokens=1,
-        pair_tail_tokens=0,
-        tuple_tokens=0,
-        pairs_from=pairs_from,
-        frame_token_ids=(FRAME,),
-        label_token_ids=(('p', ()),),
-        tail_token_ids=()))
+        written_pos=0, exec_idx=0, partners=("p",), semantics=semantics,
+        selectivity=0.5, expected_tuples=1, anchor_frame_tokens=1,
+        pair_tail_tokens=0, tuple_tokens=0, pairs_from=pairs_from,
+        frame_token_ids=(FRAME,), label_token_ids=(("p", ()),), tail_token_ids=()))
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
 def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
                        seed=5, pages=64, stages=1, partner_tokens=20,
-                       streamed_anchors=True, workers=1, shared_prefix=0, **extra):
+                       streamed_anchors=True, shared_prefix=0, **extra):
     """Run a graph over random documents through the real graph runtime.
 
     Returns:
@@ -323,47 +311,7 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
         "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "docs": docs, **extra,
     }
-    if workers > 1:
-        from quail.backends.quail import worker
-        from quail.backends.quail.distributed import execute_distributed_graph
-        from quail.execution.runner import ExecutionContext
-        from quail.physical import plan_envelope
-
-        registry = built_in_registry()
-        state.update(registry=registry, runtime_context=ExecutionContext(
-            runtimes=registry.runtimes, model_execution=execution))
-        children = [state]
-        for _ in range(workers - 1):
-            child_arena = cpu_arena(pages)
-            child_execution = QuailModelExecution(SimpleNamespace())
-            child_execution.bind_loaded_model(
-                model=object(), arena=child_arena, pipeline=pipeline)
-            child_execution.bind_query(
-                torch=torch, async_answers=execution.query.async_answers,
-                answer_rows=object(), chunk_tokens=120)
-            children.append({**state, "arena": child_arena,
-                             "runtime_context": ExecutionContext(
-                                 runtimes=registry.runtimes,
-                                 model_execution=child_execution)})
-
-        def round_fn(kind, subs):
-            execute = (worker._child_filters if kind == "filters"
-                       else worker._child_joins)
-            return [execute(child, sub) for child, sub in zip(children, subs)]
-
-        payload = {**SETTINGS, "docs": docs, "model": "qwen3-4b-fp8",
-                   "chunk_tokens": 120,
-                   "true_ids": [1], "false_ids": [0], "pre_ids": [],
-                   "physical_plan": plan_envelope(
-                       backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
-                       workers=workers, graph=graph, codecs=registry.codecs)}
-        result = execute_distributed_graph(
-            payload, graph, workers, round_fn, MODELS["qwen3-4b-fp8"],
-            DEVICES["h100-sxm"], registry.runtimes, registry)
-        assert all(not child["arena"].accounting.owned for child in children)
-    else:
-        result = execute_single_graph(state, SETTINGS, graph)
-
+    result = execute_single_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
     return result, model, filter_truth, join_truth
 

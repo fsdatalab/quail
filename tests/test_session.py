@@ -157,19 +157,10 @@ def make_executor(filter_truth, join_truth=None):
         class FixedAnswers:
             def execute(self, node, inputs):
                 if isinstance(node, AiFilter):
-                    rows = {}
-                    for document in inputs["document_ids"]:
-                        row = []
-                        for question in (node.question_token_ids,):
-                            bit = filter_truth[node.alias][
-                                _match_key(node.alias, question)
-                            ][document]
-                            row.append(bit)
-                            if not bit:
-                                break
-                        rows[document] = row
-                    survivors = [d for d, row in rows.items()
-                                 if len(row) == 1 and all(row)]
+                    answers = filter_truth[node.alias][
+                        _match_key(node.alias, node.question_token_ids)]
+                    rows = {d: [answers[d]] for d in inputs["document_ids"]}
+                    survivors = [d for d, row in rows.items() if row[0]]
                     # the real loop reports a chunk's finished documents
                     # by position; the hook streams them
                     if inputs.get("document_done") is not None:
@@ -185,22 +176,21 @@ def make_executor(filter_truth, join_truth=None):
                                    fresh_tokens=10 * len(rows)))
                 anchors = list(inputs["anchor_ids"])
                 outputs = {}
-                for stage in (node,):
-                    partners = inputs["partner_indices"][stage.written_pos]
-                    rule = join_truth[(stage.anchor, *stage.partners)]
-                    rows = {i: [rule(a, *pair) for pair in partners]
-                            for i, a in enumerate(anchors)}
-                    outputs[f"join_answers:{stage.written_pos}"] = {
-                        "rows": rows, "anchor_index": anchors,
-                        "partner_index": partners, "anchor": stage.anchor,
-                        "partners": list(stage.partners),
-                        "semantics": stage.semantics,
-                        "selectivity": stage.selectivity,
-                        "written_pos": stage.written_pos,
-                    }
+                partners = inputs["partner_indices"][node.written_pos]
+                rule = join_truth[(node.anchor, *node.partners)]
+                rows = {i: [rule(a, *pair) for pair in partners]
+                        for i, a in enumerate(anchors)}
+                outputs[f"join_answers:{node.written_pos}"] = {
+                    "rows": rows, "anchor_index": anchors,
+                    "partner_index": partners, "anchor": node.anchor,
+                    "partners": list(node.partners),
+                    "semantics": node.semantics,
+                    "selectivity": node.selectivity,
+                    "written_pos": node.written_pos,
+                }
                 passing = {anchors[i] for i, row in rows.items() if any(row)}
                 outputs[f"ids:{node.anchor}"] = [a for a in anchors
-                    if (a not in passing if stage.semantics == "anti"
+                    if (a not in passing if node.semantics == "anti"
                         else a in passing)]
                 # the real loop reports each anchor's last-stage row as
                 # it finishes; the hook frees its KV and streams answers

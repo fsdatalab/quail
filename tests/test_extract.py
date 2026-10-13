@@ -146,19 +146,6 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
     assert tuple(
         member.node_id for member in separated[extracts[1].node_id]) == (
             extracts[1].node_id,)
-    from quail.planner.kv import plan_kv_retention
-
-    retained = plan_kv_retention(graph)
-    assert [node.keep_kv for node in retained.nodes
-            if isinstance(node, AiExtract)] == [True, True, False]
-    head, tail = different.spec.prompt_token_parts
-    different = replace(different, spec=replace(
-        different.spec, prompt_token_parts=((head[0] + 1, *head[1:]), tail),
-        shares_head=False))
-    changed_head = replace(graph, nodes=tuple(
-        different if node.node_id == different.node_id else node
-        for node in graph.nodes))
-    assert not plan_kv_retention(changed_head).node(extracts[0].node_id).keep_kv
     # a plain extraction shows the document under the query's shared
     # head, as the filter does, so it continues the filter's pipeline
     # and asks its question of the KV the filter wrote

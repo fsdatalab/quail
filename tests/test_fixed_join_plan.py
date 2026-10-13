@@ -152,40 +152,37 @@ class FixedFeverAnswers:
         outputs = {}
         anchor_ids = inputs["anchor_ids"]
         live = set(inputs.get("_live", range(len(anchor_ids))))
-        all_answers = []
         lists_for = inputs.get("anchor_partners")
-        for stage_index, stage in enumerate((node,)):
-            aliases = (stage.anchor, *stage.partners)
-            claim = next(alias for alias in aliases if alias.startswith("c"))
-            evidence = next(alias for alias in aliases if alias.startswith("e"))
-            passing = ({(1, 0), (2, 0), (0, 2)} if stage.written_pos == 1
-                       else {(0, 0), (1, 1), (2, 0), (1, 2)})
-            partners = inputs["partner_indices"][stage.written_pos]
-            # a stage over pairs asks each anchor about its own members
-            members = {} if lists_for and stage.pairs_from else None
-            rows = {}
-            for local in sorted(live):
-                mine = (range(len(partners)) if members is None
-                        else lists_for(anchor_ids[local])[stage_index])
-                if members is not None:
-                    members[local] = list(mine)
-                rows[local] = []
-                for member in mine:
-                    assignment = dict(zip(
-                        aliases, (anchor_ids[local], *partners[member])))
-                    rows[local].append((assignment[claim], assignment[evidence])
-                                       in passing)
-            live = {local for local, row in rows.items() if any(row)}
-            all_answers.append(rows)
-            outputs[f"join_answers:{stage.written_pos}"] = {
-                "rows": rows, "anchor_index": anchor_ids,
-                "partner_index": partners, "anchor_partners": members,
-                "anchor": stage.anchor,
-                "partners": list(stage.partners), "semantics": stage.semantics,
-                "selectivity": stage.selectivity, "written_pos": stage.written_pos,
-            }
+        aliases = (node.anchor, *node.partners)
+        claim = next(alias for alias in aliases if alias.startswith("c"))
+        evidence = next(alias for alias in aliases if alias.startswith("e"))
+        passing = ({(1, 0), (2, 0), (0, 2)} if node.written_pos == 1
+                   else {(0, 0), (1, 1), (2, 0), (1, 2)})
+        partners = inputs["partner_indices"][node.written_pos]
+        # a stage over pairs asks each anchor about its own members
+        members = {} if lists_for and node.pairs_from else None
+        rows = {}
+        for local in sorted(live):
+            mine = (range(len(partners)) if members is None
+                    else lists_for(anchor_ids[local])[0])
+            if members is not None:
+                members[local] = list(mine)
+            rows[local] = []
+            for member in mine:
+                assignment = dict(zip(
+                    aliases, (anchor_ids[local], *partners[member])))
+                rows[local].append((assignment[claim], assignment[evidence])
+                                   in passing)
+        live = {local for local, row in rows.items() if any(row)}
+        outputs[f"join_answers:{node.written_pos}"] = {
+            "rows": rows, "anchor_index": anchor_ids,
+            "partner_index": partners, "anchor_partners": members,
+            "anchor": node.anchor,
+            "partners": list(node.partners), "semantics": node.semantics,
+            "selectivity": node.selectivity, "written_pos": node.written_pos,
+        }
         outputs[f"ids:{node.anchor}"] = [anchor_ids[local] for local in sorted(live)]
-        return NodeResult(outputs, NodeMetrics(extension={"answers": all_answers}))
+        return NodeResult(outputs, NodeMetrics(extension={"answers": [rows]}))
 
 
 def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
@@ -259,8 +256,7 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
                 patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
 
             def check(request, graph):
-                assert sum(1
-                           for group in graph.nodes_by_type(AiJoin.type_name)) == 3
+                assert len(graph.nodes_by_type(AiJoin.type_name)) == 3
                 patch.setattr("quail.planner.join_order.search_joins",
                               unexpected_search)
                 return {}
