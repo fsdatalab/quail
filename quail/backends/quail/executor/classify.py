@@ -8,14 +8,13 @@ A decision model's head scores every label's option block in one pass.
 """
 
 import logging
-import time
 from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
 
 from quail.backends.quail.executor.model import full_output_head
-from quail.backends.quail.executor.parts import input_staging
+from quail.backends.quail.executor.parts import input_staging, shared_prefix_tree
 from quail.backends.quail.executor.readout import (
     AsyncDecisionChoices,
     AsyncLabelLogprobs,
@@ -31,7 +30,7 @@ from quail.execution.labels import (
     trie_chains,
 )
 from quail.execution.reranker import RerankerBatch
-from quail.execution.tokens import chain_tokens, prefix_tree
+from quail.execution.tokens import chain_tokens
 from quail.labels import DECISION_SCORING, decode_runs, read_nodes
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 
@@ -518,26 +517,6 @@ class ClassifyStages:
             if self.draws > 1:
                 suffix_tokens += self.extended * (self.draws - 1) * read
         return suffix_tokens, suffix_tokens + len(first) * len(self.request.frame)
-
-
-def shared_prefix_tree(name, prefixes, arena):
-    """Build the prefix tree of an operator's document prefixes.
-
-    Args:
-        name: The operator's output name, for the log line.
-        prefixes: Token sequences, one per document.
-        arena: KVArena whose page size the shares round down to.
-
-    Returns:
-        The PrefixTree over prefixes.
-    """
-    started = time.perf_counter()
-    tree = prefix_tree(prefixes, arena.page_tokens)
-    logger.info(
-        "prefix sharing on %s: %s documents borrow %s tokens "
-        "(tree built in %.2f s)", name, len(prefixes),
-        tree.shared_tokens, time.perf_counter() - started)
-    return tree
 
 
 class AnswerStream:

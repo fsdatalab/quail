@@ -8,6 +8,7 @@ from typing import Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
+from quail.backends.quail.executor.operators.extract import execute_extract
 from quail.backends.quail.executor.operators.filter import execute_filter
 from quail.backends.quail.executor.operators.join import execute_join
 from quail.backends.quail.executor.pipeline import execute_pipeline
@@ -105,11 +106,7 @@ class QuailModelExecution:
         inputs: Mapping[str, Any],
     ) -> Any:
         if isinstance(node, AiExtract):
-            # the Quail executor's AI.EXTRACT follows; the request
-            # backends run it
-            raise NotImplementedError(
-                "the Quail executor does not run AI.EXTRACT yet; use the "
-                "stock_vllm backend")
+            return execute_extract(self.query, node, inputs)
         if isinstance(node, (AiScore, AiClassify)):
             execution = self._reranker_execution(inputs["documents"])
             self.query.gpu_timing = bool(inputs.get("gpu_timing", False))

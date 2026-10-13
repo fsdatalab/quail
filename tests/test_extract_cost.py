@@ -1,5 +1,7 @@
 """Extraction costs: the executor's rounds priced like a classification."""
 
+import pytest
+
 from quail.cost.extract import (
     ExtractAssumptions,
     document_work,
@@ -45,6 +47,14 @@ def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     assert shared == ask(80, HEAD + 100 + TAIL - 80) + ask(context, answer)
     assert shared.tokens == work.tokens - 80
     assert _document(100, resident=True, shared=80)[0] == resident
+
+
+def test_parallel_estimate_preserves_work_and_limits_used_workers():
+    one = _cost([100, 100])
+    two = _cost([100, 100], workers=2)
+    assert two.work == one.work
+    assert two.seconds == pytest.approx(one.seconds / 2)
+    assert _cost([100], workers=8).seconds == _cost([100]).seconds
 
 
 def test_cost_uses_plan_limits_and_separate_answer_assumptions():

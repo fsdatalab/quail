@@ -13,6 +13,7 @@ from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.model import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
+from quail.backends.quail.executor.operators.extract import execute_extractions
 from quail.backends.quail.executor.readout import (
     AnswerRows,
     AsyncAnswers,
@@ -219,15 +220,19 @@ def quail_runtime_payload(request, graph) -> dict:
     """Build private Quail scheduler state from a standard request."""
     envelope = request.plan
     docs = {}
+    texts = {}
     for node in graph.nodes:
         if not isinstance(node, Scan):
             continue
         docs[node.alias] = request.inputs[node.input_id].documents
+        if request.inputs[node.input_id].texts is not None:
+            texts[node.alias] = request.inputs[node.input_id].texts
     return {
         "physical_plan": envelope,
         "model": envelope["model"],
         "workers": envelope["workers"],
         "docs": docs,
+        "texts": texts,
         "columns": request.column_tables(),
         **dict(envelope["settings"]),
     }
@@ -380,6 +385,7 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
     runtime_state = {
         **state,
         "docs": decode_payload_documents(payload["docs"]),
+        "texts": payload.get("texts", {}),
         "columns": payload.get("columns", {}),
         "functions": registry.functions,
         "runtimes": registry.runtimes,
@@ -430,6 +436,8 @@ def _child_main(gpu_idx, conn):
                 conn.send(("ok", result))
             elif kind == "joins":
                 conn.send(("ok", _child_joins(state, data)))
+            elif kind == "extract":
+                conn.send(("ok", _child_extract(state, data)))
         except Exception:
             import traceback
             conn.send(("err", traceback.format_exc()))
@@ -526,6 +534,29 @@ def _child_filters(state, sub):
     out["peak_gib"] = round(
         torch.cuda.max_memory_allocated() / 2**30, 2)
     return out
+
+
+def _child_extract(state, sub):
+    """Extract answers on one worker and report its retained document KV."""
+    gpu = state["gpu"]
+    with gpu.torch.inference_mode():
+        results = execute_extractions(gpu.execution.query, sub["nodes"], sub["inputs"])
+    gpu.torch.cuda.synchronize()
+    retained = {}
+    for alias, document in gpu.arena.retained_keys():
+        if isinstance(alias, tuple) and alias[0] == "extract":
+            alias = alias[1]
+        retained.setdefault(alias, []).append(document)
+    return {
+        "results": results,
+        "retained": retained,
+        "kv_totals": {
+            "evicted_keys": gpu.arena.evicted_keys,
+            "evicted_pages": gpu.arena.evicted_pages,
+            "evicted_prefix_tokens": gpu.arena.evicted_prefix_tokens,
+        },
+        "peak_gib": gpu.torch.cuda.max_memory_allocated() / 2**30,
+    }
 
 
 def _child_joins(state, sub):

@@ -7,17 +7,24 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import test_request_backends as request_tests
+import test_score as score_tests
 from fakes import letter_tokens
 
 import quail
+from quail.backends.quail.executor.operators.extract import extract_answer_table
 from quail.catalog import DocumentProvider
+from quail.execution.pipelines import build_pipelines
+from quail.execution.reranker import RerankerModelExecution
+from quail.execution.runner import NodeResult
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.logical import (
     CompileError,
     extracted_above_joins,
 )
 from quail.physical import (
+    AiClassify,
     AiExtract,
+    AiFilter,
     AiJoin,
     ExtractSpec,
     Filter,
@@ -49,6 +56,23 @@ def _ends(session, trim=True):
             .ai_extract("c.text", QUESTION, name="ends", trim=trim)
             .select("c.id", "ends"))
 
+
+def test_extract_prefix_sharing_is_planned_from_exact_document_tokens():
+    with quail.Session(
+        EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+        tokenizer=letter_tokens,
+    ) as session:
+        shared = "The following agreement is made between the parties. " * 4
+        session.register("contracts", DocumentProvider.from_table(pa.table({
+            "id": [1, 2, 3],
+            "text": [shared + LEASE, shared + "No dates here.", "Unrelated."],
+        }), id_col="id"))
+        query = _ends(session)
+        query.plan()
+        query.wait_for_tokens()
+        plan = query.plan()
+        (node,) = [node for node in plan.nodes if isinstance(node, AiExtract)]
+        assert node.spec.share_prefixes
 
 
 def test_sql_and_builder_extract_the_same_answer_columns(session):
@@ -92,6 +116,62 @@ def test_extract_follows_the_filters_and_labels_of_its_table(session):
     # half the documents pass the label filter
     assert node.spec.expected_inputs == pytest.approx(2 * 0.2 * 0.5)
     assert plan.nodes[-1].columns == ("c.id", "kind", "ends", "ends_span")
+
+
+def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
+        session):
+    query = (session.docs("contracts").alias("c")
+             .ai_extract("c.text", QUESTION, name="ends")
+             .ai_extract("c.text", "Who signs?", name="signer")
+             .ai_extract("c.text", "Where?", name="place")
+             .select("c.id", "ends", "signer", "place"))
+    plan = query.plan()
+    extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    pipelines = build_pipelines(plan.graph)
+    # the three run as one pipeline: the later ones read the KV the
+    # first leaves and are priced without reading the document
+    assert pipelines[extracts[0].node_id].node_ids == tuple(
+        extract.node_id for extract in extracts)
+    assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
+    assert extracts[2].spec.estimated_seconds < extracts[0].spec.estimated_seconds
+    different = replace(extracts[1], spec=replace(
+        extracts[1].spec, draft_tokens=2))
+    graph = replace(plan.graph, nodes=tuple(
+        different if node.node_id == different.node_id else node
+        for node in plan.nodes))
+    separated = build_pipelines(graph)
+    assert separated[extracts[0].node_id].node_ids == (extracts[0].node_id,)
+    assert separated[extracts[1].node_id].node_ids == (extracts[1].node_id,)
+    # a plain extraction shows the document under the query's shared
+    # head, as the filter does, so it continues the filter's pipeline
+    # and asks its question of the KV the filter wrote
+    filtered = (session.docs("contracts").alias("c")
+                .ai_filter(quail.prompt("Is {0} a lease?", quail.col("c.text")))
+                .ai_extract("c.text", QUESTION, name="ends")
+                .select("c.id", "ends"))
+    plan = filtered.plan()
+    (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    (ai_filter,) = [n for n in plan.nodes if isinstance(n, AiFilter)]
+    assert extract.spec.shares_head
+    assert list(extract.spec.prompt_token_parts[0]) == plan.settings["pre_ids"]
+    pipelines = build_pipelines(plan.graph)
+    assert pipelines[ai_filter.node_id].node_ids == (
+        ai_filter.node_id, extract.node_id)
+    # a classification of the table writes the documents under the
+    # same head, so the extraction continues its pipeline too
+    classified = (session.docs("contracts").alias("c")
+                  .ai_classify(quail.prompt("Which kind is {0}?", quail.col("c.text")),
+                               ["lease", "license"], name="kind")
+                  .ai_extract("c.text", QUESTION, name="ends")
+                  .select("c.id", "kind", "ends"))
+    plan = classified.plan()
+    (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert (tuple(classify.spec.prompt_token_parts[0])
+            == tuple(extract.spec.prompt_token_parts[0]))
+    pipelines = build_pipelines(plan.graph)
+    assert pipelines[classify.node_id].node_ids == (
+        classify.node_id, extract.node_id)
 
 
 def _candidates(session, query):
@@ -215,6 +295,37 @@ def test_span_helpers_read_locate_and_widen_an_answer():
     assert line_span(LEASE, (14, 27)) == (0, 28)
     assert line_span(LEASE, (29, 36)) == (29, len(LEASE))
     assert line_span("one\n\nthree", (4, 4)) == (4, 4)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
+    execute = RerankerModelExecution.execute
+
+    def mixed(self, node, inputs):
+        if not isinstance(node, AiExtract):
+            return execute(self, node, inputs)
+        (source,) = inputs.values()
+        ids = source.column("c").to_pylist()
+        table = extract_answer_table(
+            node.spec, ids, ["March 3, 2027" if i == 0 else None for i in ids],
+            [(14, 27) if i == 0 else None for i in ids])
+        return NodeResult({"rows": table, "ids:c": ids})
+
+    monkeypatch.setattr(RerankerModelExecution, "execute", mixed)
+    query = session.sql(
+        "SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score, "
+        f"AI.EXTRACT(c.text, '{QUESTION}') AS ends FROM contracts c "
+        + ("WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.15"
+           if filtered else ""))
+    result = score_tests._finish(query, session, score_tests._RowReranker())
+    rows = result.collect()
+    assert rows.column("score").type == pa.float64()
+    expected = [
+        {"c.id": 1, "score": 0.1, "ends": "March 3, 2027",
+         "ends_span": {"start": 14, "end": 27}},
+        {"c.id": 2, "score": 0.2, "ends": None, "ends_span": None},
+    ]
+    assert rows.to_pylist() == (expected[1:] if filtered else expected)
 
 
 class _PhraseClient(request_tests._Client):

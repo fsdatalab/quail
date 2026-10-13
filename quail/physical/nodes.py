@@ -1065,10 +1065,14 @@ class ExtractSpec(InferenceSpec):
         window_chars: Source characters tokenized in later windows.
         trim: Whether the answer is the fewest words that answer the
             question, or the whole lines that hold them.
+        shares_head: Whether the prompt's head is the query's shared
+            preamble, so the extraction reads the document KV a filter
+            wrote and continues its pipeline.
     """
 
     question: str = ""
     trim: bool = True
+    shares_head: bool = False
     max_answer_tokens: int = 64
     draft_tokens: int = 16
     top_tokens: int = 1024
@@ -1108,6 +1112,7 @@ class ExtractSpec(InferenceSpec):
             **vars(InferenceSpec.from_mapping(value)),
             question=str(value["question"]),
             trim=bool(value.get("trim", True)),
+            shares_head=bool(value.get("shares_head", False)),
             **{name: value.get(name, value.get("config", {}).get(
                 name, getattr(cls, name)))
                for name in ("max_answer_tokens", "draft_tokens", "top_tokens",
@@ -1119,6 +1124,7 @@ class ExtractSpec(InferenceSpec):
             **super().to_dict(),
             "question": self.question,
             "trim": self.trim,
+            "shares_head": self.shares_head,
             "max_answer_tokens": self.max_answer_tokens,
             "draft_tokens": self.draft_tokens,
             "top_tokens": self.top_tokens,

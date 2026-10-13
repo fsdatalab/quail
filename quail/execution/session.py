@@ -29,7 +29,9 @@ from quail.execution.runner import (
 from quail.execution.selection import selected_rows
 from quail.execution.tokens import (
     ColumnStoreWriter,
+    GigatokenEncoder,
     ScanInput,
+    TokenOffsets,
     TokenStoreWriter,
 )
 from quail.execution.types import PhysicalRequest, document_input
@@ -144,9 +146,11 @@ class Session:
             ))
         self.catalog = Catalog()
         self._tok = tokenizer      # injectable for tests
+        self._token_offsets = None
         self._tokenizer_name = "configured tokenizer" if tokenizer else "Gigatoken"
         self.notes = []            # tokenizer picks etc., for reports
         self._token_stores = {}
+        self._replaced_token_stores = []
         self._column_stores = {}
         self._store_count = 0
         self._token_directory = None
@@ -189,6 +193,9 @@ class Session:
         for store in self._token_stores.values():
             store.close()
         self._token_stores.clear()
+        for store in self._replaced_token_stores:
+            store.close()
+        self._replaced_token_stores.clear()
         for store in self._column_stores.values():
             store.close()
         self._column_stores.clear()
@@ -268,22 +275,20 @@ class Session:
         starts.
         """
         if self._tok is None:
-            from gigatoken import Tokenizer
-
-            fast = Tokenizer(self.model.hf_name)
-
-            def encode(text):
-                tokens = fast.encode(text)
-                if hasattr(tokens, "tolist"):
-                    return tokens.tolist()
-                return [int(token) for token in tokens]
-
-            encode.decode = fast.decode
-            self._tok = encode
+            self._tok = GigatokenEncoder(self.model.hf_name)
         return self._tok
 
+    def _offsets_encoder(self):
+        """Return the original-text offset mapper for the session tokenizer."""
+        token_bytes = getattr(self.tokenizer, "token_bytes", None)
+        if token_bytes is None:
+            return None
+        if self._token_offsets is None:
+            self._token_offsets = TokenOffsets(token_bytes())
+        return self._token_offsets
+
     def tokenize(self, provider_name: str, column: str,
-                 projected_columns=()) -> ScanInput:
+                 projected_columns=(), *, with_offsets=False) -> ScanInput:
         """Tokenize one document column and keep value columns beside it.
 
         The token file is cached per document column. Each value column
@@ -292,9 +297,10 @@ class Session:
         tokenize the documents again.
         """
         with self._lock:
-            return self._tokenize(provider_name, column, projected_columns)
+            return self._tokenize(provider_name, column, projected_columns,
+                                  with_offsets)
 
-    def _tokenize(self, provider_name, column, projected_columns):
+    def _tokenize(self, provider_name, column, projected_columns, with_offsets):
         provider = self.catalog.get(provider_name)
         identity = provider.content_identity()
         projected_columns = tuple(dict.fromkeys(projected_columns))
@@ -303,11 +309,16 @@ class Session:
             name for name in projected_columns
             if (identity, name) not in self._column_stores
         ]
-        if token_key not in self._token_stores or missing:
+        stored = self._token_stores.get(token_key)
+        offsets_encoder = (self._offsets_encoder() if with_offsets
+                           and (stored is None or not stored.has_offsets) else None)
+        needs_tokens = stored is None or offsets_encoder is not None
+        if needs_tokens or missing:
             self._load(
                 provider_name,
-                None if token_key in self._token_stores else column,
+                column if needs_tokens else None,
                 tuple(missing),
+                offsets_encoder=offsets_encoder,
             )
         return ScanInput(
             self._token_stores[token_key],
@@ -318,13 +329,14 @@ class Session:
         )
 
     def tokenize_async(self, provider_name: str, column: str,
-                       projected_columns=()) -> Future:
+                       projected_columns=(), *, with_offsets=False) -> Future:
         """Start tokenize() on a background thread and return its Future."""
         if self._background is None:
             self._background = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="quail-tokenize")
         return self._background.submit(
-            self.tokenize, provider_name, column, projected_columns)
+            self.tokenize, provider_name, column, projected_columns,
+            with_offsets=with_offsets)
 
     def register_functions(self, functions: dict) -> None:
         """Register a query's apply() functions once each, by name."""
@@ -461,7 +473,7 @@ class Session:
         return buffered, tok, token_type
 
     def _load(self, provider_name: str, column: str | None,
-              value_columns: tuple[str, ...]) -> None:
+              value_columns: tuple[str, ...], *, offsets_encoder=None) -> None:
         """Scan the provider once and write the missing store files.
 
         Args:
@@ -469,6 +481,7 @@ class Session:
             column: The document column to tokenize, or None when its
                 token file already exists.
             value_columns: Value columns without a column file yet.
+            offsets_encoder: Optional mapper from token IDs to character ranges.
         """
         provider = self.catalog.get(provider_name)
         identity = provider.content_identity()
@@ -483,14 +496,24 @@ class Session:
         try:
             batches = reader
             if column is not None:
-                buffered, tok, token_type = self._pick_tokenizer(
-                    reader, provider_name, column)
-                batches = chain(buffered, reader)
+                existing = self._token_stores.get((identity, column))
+                existing_tokens = existing.arrow_array if existing is not None else None
+                if existing_tokens is None:
+                    buffered, tok, token_type = self._pick_tokenizer(
+                        reader, provider_name, column)
+                    batches = chain(buffered, reader)
+                else:
+                    tok, token_type = self.tokenizer, existing_tokens.type.value_type
+                if offsets_encoder is not None:
+                    self.notes.append(f"{provider_name}.{column}: tokenizer: "
+                                      f"{self._tokenizer_name} with character offsets")
                 token_writer = TokenStoreWriter(
                     self._store_path(),
                     document_column=column,
                     tokenizer=tok,
                     token_type=token_type,
+                    offsets_encoder=offsets_encoder,
+                    existing_tokens=existing_tokens,
                 )
                 writers.append(token_writer)
             source_schema = provider.schema()
@@ -547,6 +570,10 @@ class Session:
                     f"earlier scan returned {known_rows}; the provider "
                     f"does not scan in a stable order")
         if token_store is not None:
+            previous = self._token_stores.get((identity, column))
+            if previous is not None:
+                # In-flight requests can still reference the previous store.
+                self._replaced_token_stores.append(previous)
             self._token_stores[(identity, column)] = token_store
         for name, store in column_stores.items():
             self._column_stores[(identity, name)] = store
@@ -723,18 +750,23 @@ class Query:
                 self.logical,
                 tuple(self.session.registry.logical_rules.values()),
                 context)
-            for s in self.logical.operators().scans:
+            rewritten = self.logical.operators()
+            offset_aliases = {alias for extract in rewritten.extracts
+                              for alias in extract.call.aliases()}
+            for s in rewritten.scans:
                 columns = s.columns
+                with_offsets = (config.backend == "quail"
+                                and s.alias in offset_aliases)
                 if config.backend in {
                     "stock_vllm", "pipelined_vllm", "dumb_vllm"
                 }:
                     columns = tuple(dict.fromkeys((*columns, s.column)))
                 if s.alias not in self._estimated:
                     self._token_inputs[s.alias] = self.session.tokenize(
-                        s.provider, s.column, columns)
+                        s.provider, s.column, columns, with_offsets=with_offsets)
                     continue
                 future = self.session.tokenize_async(
-                    s.provider, s.column, columns)
+                    s.provider, s.column, columns, with_offsets=with_offsets)
 
                 def record_finished(_future, alias=s.alias):
                     self._token_finished_at[alias] = time.perf_counter()
@@ -1091,8 +1123,8 @@ class Query:
                             f"label column {name!r} belongs to {alias!r}, "
                             f"which is not in the result")
                     labeled = table.column(name).combine_chunks()
-                    if not pa.types.is_nested(labeled.type):
-                        labeled = labeled.cast(pa.string())
+                    if pa.types.is_dictionary(labeled.type):
+                        labeled = labeled.cast(labeled.type.value_type)
                     # a document whose answer names no label has no row
                     # in the table, and leaves the result
                     declaration = acero.Declaration(
