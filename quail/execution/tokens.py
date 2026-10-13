@@ -5,6 +5,7 @@ from __future__ import annotations
 import bisect
 import os
 from collections.abc import Sequence
+from threading import local
 
 import numpy as np
 import pyarrow as pa
@@ -222,12 +223,22 @@ class _StoreWriter:
 
 
 class GigatokenEncoder:
-    """Encode individual texts and Arrow batches with one Gigatoken tokenizer."""
+    """Encode texts and Arrow batches with a Gigatoken instance per thread."""
 
     def __init__(self, source):
+        self._source = source
+        self._tokenizers = local()
+        _ = self.tokenizer
+
+    @property
+    def tokenizer(self):
+        """Return the calling thread's tokenizer with the same vocabulary."""
         from gigatoken import Tokenizer
 
-        self.tokenizer = Tokenizer(source)
+        # Gigatoken mutably borrows its backend while encoding a batch.
+        if not hasattr(self._tokenizers, "value"):
+            self._tokenizers.value = Tokenizer(self._source)
+        return self._tokenizers.value
 
     def __call__(self, text):
         return [int(token) for token in self.tokenizer.encode(text)]

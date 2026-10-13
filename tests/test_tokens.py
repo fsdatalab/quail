@@ -1,6 +1,7 @@
 """Arrow token payloads and shared prefix lengths."""
 
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pyarrow as pa
@@ -156,6 +157,15 @@ def test_token_offsets_survive_batches_slices_and_process_selection(tmp_path,
         vocab_size=vocab_size, initial_alphabet=pre_tokenizers.ByteLevel.alphabet()))
     expected = tokenizer.encode_batch(texts, add_special_tokens=False)
     fast = GigatokenEncoder(tokenizer)
+    foreground = fast.tokenizer
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(lambda: (
+            fast.tokenizer, fast.batch_arrow(pa.array(texts * 32))))
+        assert [fast(text) for text in texts] == [item.ids for item in expected]
+        background, encoded_batch = pending.result()
+        assert pool.submit(lambda: fast.tokenizer).result() is background
+    assert fast.tokenizer is foreground and background is not foreground
+    assert encoded_batch.to_pylist() == [item.ids for item in expected] * 32
     batches = [pa.record_batch({"text": texts[:2]}),
                pa.record_batch({"text": texts[2:]})]
     calls = []
