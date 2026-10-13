@@ -3,6 +3,21 @@
 Filters, joins, and classifications describe their work as Stage objects.
 The shared admission scheduler combines documents at different stages in
 each forward pass and releases KV when a document finishes or is removed.
+
+A stage list can also write after the document, for an operator that
+decodes an answer over several stages. An append stage's request
+tokens join the document's KV after its frame, so the next append
+stage reads them instead of feeding them again; a rewinding stage
+puts its request right after the frame in place of what earlier
+stages appended, as the first stage of a new question does; a stage
+with a discard callback replaces the last tokens an earlier stage
+appended, as a stage that verified only part of what the one before
+fed does. Admission reserves pages for the frame and for what the
+append stages leave in KV, bounded by appended_tokens when the stages
+replace some of their own tokens. A stage's suffixes can be each
+document's own, chosen when the document enters the stage from what
+earlier stages answered, and a stage can read every row of a request
+through a ragged readout.
 """
 
 import time
@@ -21,7 +36,14 @@ class Stage:
     """Token requests, answer readout, and advancement condition for one step.
 
     Attributes:
-        suffixes: Token sequences processed after each document and frame.
+        suffixes: Token sequences processed after each document and frame,
+            or a callback from document key to that document's own
+            sequences, asked when the document enters the stage, so a
+            stage can feed what an earlier stage's answer chose for it.
+            The callback may return DROP or SKIP as requests does; it
+            takes the place of requests, and suffix_tokens bounds it.
+        suffix_tokens: The most tokens one sequence of a callback
+            suffixes may have; admission and page capacity count it.
         readout: Converts selected hidden states to Boolean answers, scores,
             or category token values. Its dtype determines the answer array.
         frame: Tokens retained after the document. Consecutive identical
@@ -41,6 +63,13 @@ class Stage:
         append: Whether the request's tokens join the document's KV after
             the frame and any tokens earlier append stages added, so the
             next append stage reads them instead of feeding them again.
+        rewind: Whether the request's tokens follow the frame directly,
+            in place of the tokens earlier append stages added, as the
+            first stage of a new question over the same document does.
+        discard: Optional callback from document key to how many of the
+            tokens earlier append stages added, counted from the end,
+            this stage's request replaces: the tokens the stage before
+            fed past what it verified.
         label: Name displayed in progress messages.
         chains: Optional trie chains and ancestor references from trie_chains().
         read_mask: Optional mask of the rows read in the sole chains
@@ -54,7 +83,7 @@ class Stage:
     DROP = DROP
     SKIP = SKIP
 
-    suffixes: list
+    suffixes: Any
     readout: Any
     frame: list = field(default_factory=list)
     requests: Callable | None = None
@@ -62,18 +91,48 @@ class Stage:
     read_all_rows: bool = False
     read_rows: Any = None
     single: bool = False
+    rewind: bool = False
+    discard: Callable | None = None
     append: bool = False
     label: str = ""
     chains: list | None = None
     read_mask: Any = None
     canvas: Callable | None = None
     canvas_rows: int = 0
+    suffix_tokens: int = 0
 
     def __post_init__(self):
+        if self.own_suffixes:
+            if self.suffix_tokens < 1:
+                raise ValueError("a stage whose suffixes come from a callback "
+                                 "names its most tokens in suffix_tokens")
+            if (self.requests is not None or self.chains is not None
+                    or self.read_rows is not None or self.canvas is not None):
+                raise ValueError("a stage whose suffixes come from a callback "
+                                 "takes no requests, chains, read_rows, or canvas")
+            return
         trailing = getattr(self.readout, "trailing_rows", 1)
         if self.read_rows is None and trailing > 1:
             self.read_rows = [trailing] * len(self.suffixes)
             self.read_all_rows = True
+
+    @property
+    def own_suffixes(self) -> bool:
+        """Whether each document's suffixes come from the callback."""
+        return callable(self.suffixes)
+
+
+class OwnRequests(list):
+    """A document's requests at a stage whose suffixes are its own.
+
+    The indices run over the document's own sequences, and lengths
+    holds their token counts, which the admission prices in place of
+    the stage's shared list.
+    """
+
+    def __init__(self, lengths):
+        super().__init__(range(len(lengths)))
+        self.lengths = [int(n) for n in lengths]
 
 
 def shared_preamble_tokens(question_ids) -> int:
@@ -135,7 +194,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                attention_mode=None, prefix_tree=None, stats=None,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
-               on_answers=None, stop_groups=None):
+               on_answers=None, stop_groups=None, appended_tokens=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -180,6 +239,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             rows) run as each chunk's answers are read, with the
             document's answer rows for its requests start to end at
             the stage.
+        appended_tokens: The most tokens the append stages leave after
+            a document's frame, when stages discard tokens earlier ones
+            added; None sums every append stage's longest suffix.
 
     Returns:
         A tuple of answers, timing spans, and fresh token count. Answers is
@@ -196,7 +258,20 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         limit=limit, paged=paged, unit=unit, count_answers=count_answers,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,
+        appended_tokens=appended_tokens,
     ).run()
+
+
+@dataclass
+class PendingAnswers:
+    """One launched chunk's readout and progress through its document decisions."""
+
+    groups: list
+    handles: list
+    values: list | None = None
+    positions: np.ndarray | None = None
+    at: int = 0
+    step: int = 0
 
 
 class _StageExecutor:
@@ -205,7 +280,8 @@ class _StageExecutor:
     def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
-                 default_attention, on_chunk, on_answers, stop_groups=None):
+                 default_attention, on_chunk, on_answers, stop_groups=None,
+                 appended_tokens=None):
         from quail.backends.quail.executor.chunk import Suffixes
         from quail.backends.quail.executor.loop import (
             attention_path,
@@ -228,7 +304,8 @@ class _StageExecutor:
         k = len(self.stages)
         if not self.paged and (
                 k > 1 or prefix_tree is not None
-                or any(len(stage.suffixes) != 1 for stage in self.stages)):
+                or any(stage.own_suffixes or len(stage.suffixes) != 1
+                       for stage in self.stages)):
             raise ValueError("the unpaged path runs one stage of one suffix")
         if any(stage.append and not stage.single for stage in self.stages):
             raise ValueError("an append stage sends one request per document")
@@ -242,7 +319,12 @@ class _StageExecutor:
         self.frames = [list(stage.frame) for stage in self.stages]
         self.frame_ids = [np.asarray(frame, dtype=np.int64) for frame in self.frames]
         self.writes = frame_writes(self.stages)
-        self.suffixes = [Suffixes.of(stage.suffixes) for stage in self.stages]
+        # a stage whose suffixes are each document's own is priced by
+        # one sequence of its most tokens until a document enters it
+        self.suffixes = [Suffixes.of([[0] * stage.suffix_tokens])
+                         if stage.own_suffixes else Suffixes.of(stage.suffixes)
+                         for stage in self.stages]
+        self.own = {}      # (stage, document) -> its own Suffixes
         self.read_rows = [None if stage.read_rows is None
                           else np.asarray(stage.read_rows, dtype=np.int64)
                           for stage in self.stages]
@@ -265,9 +347,10 @@ class _StageExecutor:
         # A single suffix also occupies document pages on the unified path.
         if self.paged and self.mode == "unified":
             self.capacity_extra = max(
-                [frame_max] + [len(frame) + len(stage.suffixes[0]) + rows
-                               for frame, stage, rows in zip(
-                                   self.frames, self.stages, self.canvas_rows)
+                [frame_max] + [len(frame) + int(other.lengths.max()) + rows
+                               for frame, stage, other, rows in zip(
+                                   self.frames, self.stages, self.suffixes,
+                                   self.canvas_rows)
                                if stage.single])
         # an append stage's tokens stay in document pages after the
         # frame, so admission reserves the frame and every append round
@@ -277,20 +360,30 @@ class _StageExecutor:
                            for f, other, s in zip(self.frames, self.suffixes,
                                                   self.stages)
                            if s.append and f == frame)
+                if appended_tokens is not None:
+                    kept = min(kept, int(appended_tokens))
                 self.capacity_extra = max(self.capacity_extra,
                                           len(frame) + kept)
         # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
 
-        resident = ({a: self._held_pages(self.keys[a], self.prefix_lengths[a])
-                     for a, key in enumerate(self.keys)
-                     if self.arena.is_resident(key)}
-                    if self.paged else {})
+        resident = {}
+        if self.paged:
+            for a, key in enumerate(self.keys):
+                if not self.arena.is_resident(key):
+                    continue
+                if self.arena.prefix_tokens(key) != self.prefix_lengths[a]:
+                    # KV an earlier operator left under this key was
+                    # built for another prefix; it is fed afresh
+                    self.arena.free_key(key)
+                    continue
+                resident[a] = self._held_pages(key, self.prefix_lengths[a])
         # Pin resident documents while fresh admissions evict retained KV.
         for a in resident:
             self.arena.pin(self.keys[a])
 
-        self.asking = any(stage.requests is not None for stage in self.stages)
+        self.asking = any(stage.requests is not None or stage.own_suffixes
+                          for stage in self.stages)
         if prefix_tree is not None and not prefix_tree.shared_tokens:
             prefix_tree = None
         self.sched = JoinAdmission(
@@ -301,7 +394,7 @@ class _StageExecutor:
             self.arena.n_pages if self.paged else 1 << 62,
             self.arena.page_tokens,
             frame_tokens=[len(f) for f in self.frames], resident=resident,
-            anchor_partners={a: self._requests_of(key)
+            anchor_partners={a: self._requests_of(a, key)
                              for a, key in enumerate(self.keys)},
             # a windowed model may pack any chunk unified, so it reserves
             # the unified path's temporary pages throughout
@@ -327,7 +420,8 @@ class _StageExecutor:
         self.spans = []
         self.tokens = 0
         self.pack_s = 0.0
-        self.outstanding = []     # (groups, handles) in launch order
+        self.outstanding = []     # PendingAnswers in launch order
+        self.split_answers = any(s.append and s.own_suffixes for s in stages)
 
         if self.label is None:
             self.label = " > ".join(stage.label or f"stage {j}"
@@ -342,15 +436,18 @@ class _StageExecutor:
         # Combine stages sharing a readout in one submission per chunk.
         self.shared_readout = all(stage.readout is self.stages[0].readout
                                   for stage in self.stages)
-        groups_of = {}
-        self.group_key = {}
-        for j, stage in enumerate(self.stages):
-            self.group_key[j] = (None if self.shared_readout else groups_of.setdefault(
-                (id(stage.readout), stage.read_all_rows), len(groups_of)))
-        self.readout_of = {self.group_key[j]: stage.readout
-                           for j, stage in enumerate(self.stages)}
-        self.read_all_of = {self.group_key[j]: stage.read_all_rows
-                            for j, stage in enumerate(self.stages)}
+        groups = []
+        self.group_key = []
+        self.readout_of = []
+        self.read_all_of = []
+        for stage in self.stages:
+            key = (id(stage.readout),
+                   False if self.shared_readout else stage.read_all_rows)
+            if key not in groups:
+                groups.append(key)
+                self.readout_of.append(stage.readout)
+                self.read_all_of.append(stage.read_all_rows)
+            self.group_key.append(groups.index(key))
 
     def _stop_width(self, stop_groups, budget) -> int:
         """Anchors of one stop key group in flight at once.
@@ -367,10 +464,14 @@ class _StageExecutor:
         per_chunk = max(1, int(budget // max(1.0, mean)))
         return max(1, -(-per_chunk // groups))
 
+    def _suffixes_of(self, j, a):
+        """Return the suffixes document a requests at stage j."""
+        return self.own[(j, a)] if self.stages[j].own_suffixes else self.suffixes[j]
+
     def _entry_rows(self, a, j, start, end, carried):
         f = self.prefix_lengths[a]
         indices = self.sched.partner_indices(a, j, start, end)
-        lengths = self.suffixes[j].lengths_at(indices)
+        lengths = self._suffixes_of(j, a).lengths_at(indices)
         rows = ((f if carried else 0) + int(lengths.sum())
                 + self.canvas_rows[j] * len(lengths))
         if self.writes[j] and start == 0:
@@ -385,13 +486,36 @@ class _StageExecutor:
         return (self.arena.page_cost(capacity)
                 - self.arena.growth_cost(key, capacity))
 
-    def _requests_of(self, key):
-        """Return a stage request selector, or None if every request is selected."""
+    def _requests_of(self, a, key):
+        """Return a stage request selector, or None if every request is selected.
+
+        At a stage whose suffixes are each document's own, the selector
+        asks the stage for the document's sequences, keeps them for the
+        chunk builder, and hands the admission their token counts.
+        """
         if not self.asking:
             return None
+        from quail.backends.quail.executor.chunk import Suffixes
+
         stages = self.stages
-        return lambda j: (None if stages[j].requests is None
-                          else stages[j].requests(key))
+
+        def ask(j):
+            stage = stages[j]
+            if not stage.own_suffixes:
+                return None if stage.requests is None else stage.requests(key)
+            got = stage.suffixes(key)
+            if got is DROP or got is SKIP:
+                return got
+            own = Suffixes.of(got)
+            if len(own) and int(own.lengths.max()) > stage.suffix_tokens:
+                raise ValueError(
+                    f"{stage.label or f'stage {j}'}: a document's suffix has "
+                    f"{int(own.lengths.max())} tokens, over the stage's "
+                    f"{stage.suffix_tokens}")
+            self.own[(j, a)] = own
+            return OwnRequests(own.lengths)
+
+        return ask
 
     def _merged(self, j, start, end):
         """Return whether the group packs its frame and suffix as one entry."""
@@ -409,8 +533,12 @@ class _StageExecutor:
             f = self.prefix_lengths[a]
             frame = self.frames[j]
             append = self.stages[j].append
-            # a written frame replaces any path an earlier stage kept
-            path = 0 if self.writes[j] and start == 0 else self.appended[a]
+            # a written frame, or a rewinding stage, replaces any path
+            # an earlier stage kept
+            rewinds = self.writes[j] or self.stages[j].rewind
+            path = 0 if rewinds and start == 0 else self.appended[a]
+            if path and self.stages[j].discard is not None:
+                path = max(0, path - int(self.stages[j].discard(key)))
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
             if self.paged:
@@ -428,7 +556,7 @@ class _StageExecutor:
             if carried:
                 prefix = self.prefixes[a][shared:] if shared else self.prefixes[a]
             indices = self.sched.partner_indices(a, j, start, end)
-            sufs = self.suffixes[j].take(indices)
+            sufs = self._suffixes_of(j, a).take(indices)
             read_all = self.stages[j].read_all_rows
             rows = int(sufs.lengths.sum()) if read_all else len(sufs)
             own = {}
@@ -519,27 +647,29 @@ class _StageExecutor:
         """Submit answer rows to readouts and return handles by readout group.
 
         With one readout for every stage the whole chunk goes in one
-        call, keyed None; otherwise each readout's stages' rows go to
+        call, in group zero; otherwise each readout's stages' rows go to
         it in one call, selected with one index.
         """
         rows_per_answer = chunk.rows_per_answer
         if self.shared_readout:
             readout = self.stages[0].readout
-            return {None: (readout.submit(normed, rows_per_answer=rows_per_answer)
-                           if rows_per_answer else readout.submit(normed))}
-        spans = {}          # group -> its entries' row spans, in chunk order
+            return [(0, (readout.submit(normed, rows_per_answer=rows_per_answer)
+                         if rows_per_answer else readout.submit(normed)))]
+        spans = [[] for _ in self.readout_of]
         row = 0
         for j, rows in entries:
-            spans.setdefault(self.group_key[j], []).append((row, row + rows))
+            spans[self.group_key[j]].append((row, row + rows))
             row += rows
-        handles = {}
+        handles = []
         per_answer = list(rows_per_answer) if rows_per_answer else None
-        for key, spans_key in spans.items():
+        for key, spans_key in enumerate(spans):
+            if not spans_key:
+                continue
             readout = self.readout_of[key]
             selected = self._select_rows(normed, spans_key)
             # a stage reading one row per answer takes no row counts
             if per_answer is None or not self.read_all_of[key]:
-                handles[key] = readout.submit(selected)
+                handles.append((key, readout.submit(selected)))
             else:
                 # answers of this readout's stages, in entry order
                 counts = []
@@ -551,14 +681,17 @@ class _StageExecutor:
                         if self.group_key[jj] == key:
                             counts.append(per_answer[answer])
                         answer += 1
-                handles[key] = readout.submit(selected, rows_per_answer=counts)
+                handles.append((key, readout.submit(selected, rows_per_answer=counts)))
         return handles
 
     def _report(self, entry):
-        groups, handles = entry
-        values = {key: self.readout_of[key].result(handle)
-                  for key, handle in handles.items()}
-        pos = {key: 0 for key in handles}
+        if entry.values is None:
+            entry.values = [None] * len(self.readout_of)
+            for key, handle in entry.handles:
+                entry.values[key] = self.readout_of[key].result(handle)
+            entry.positions = np.zeros(len(self.readout_of), dtype=np.int64)
+        groups = entry.groups[entry.at:entry.at + entry.step]
+        values, pos = entry.values, entry.positions
         transitions = []
         for a, j, start, end, _ in groups:
             key = self.group_key[j]
@@ -573,12 +706,25 @@ class _StageExecutor:
                 self._event(settlement)
             transitions.extend(result.transitions)
             pos[key] += cnt
+        entry.at += len(groups)
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)
             if self.counting_answers else self.finished)
         if transitions and self.on_chunk is not None:
             self.on_chunk(transitions)
         self._release_skipped()
+
+    def _report_next(self, partial=False):
+        """Decide the oldest results, splitting append stages when no work is ready."""
+        entry = self.outstanding[0]
+        if not entry.step:
+            entry.step = len(entry.groups)
+            if partial and self.split_answers and all(
+                    self.stages[j].append for _, j, _, _, _ in entry.groups):
+                entry.step = (entry.step + 1) // 2
+        self._report(entry)
+        if entry.at == len(entry.groups):
+            self.outstanding.pop(0)
 
     def _release_skipped(self):
         """Let go of what the documents a stop key skipped would have used.
@@ -639,10 +785,7 @@ class _StageExecutor:
             by_stage[entry[1]] = by_stage.get(entry[1], 0) + self._entry_rows(*entry)
         self.spans.append((by_stage, chunk.tokens, e0, e1))
         handles = self._submit(normed, entries, chunk)
-        self.outstanding.append((part, handles))
-        # read the previous chunk's answers while this one runs
-        while len(self.outstanding) > 1:
-            self._report(self.outstanding.pop(0))
+        self.outstanding.append(PendingAnswers(part, handles))
 
     def run(self):
         """Drive admission and drain the launched answer handles in order."""
@@ -652,6 +795,8 @@ class _StageExecutor:
                 self._event(settlement)
             if self.sched.done():
                 break
+            if len(self.outstanding) > 1:
+                self._report_next()
             if self.sched.blocked_pages:
                 # the free list is short for the next fresh document:
                 # retained KV nothing here reads makes room
@@ -660,7 +805,7 @@ class _StageExecutor:
                 self.arena.free_pages if self.paged else 1 << 62)
             if not groups:
                 if self.outstanding:
-                    self._report(self.outstanding.pop(0))
+                    self._report_next(partial=True)
                     continue
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):
@@ -678,7 +823,7 @@ class _StageExecutor:
                 if carried and start == 0 and parent is not None:
                     self.arena.release(self.keys[parent])
         while self.outstanding:
-            self._report(self.outstanding.pop(0))
+            self._report_next()
         self._release_skipped()
         # a limit ends the run with documents still queued
         for anchor in self.sched.drain():

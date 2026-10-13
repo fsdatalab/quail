@@ -53,6 +53,27 @@ PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "workers": 1,
            "docs": {}, **ENVELOPE["settings"]}
 
 
+def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
+    calls = []
+    gpu = LoadedGpu.__new__(LoadedGpu)
+    gpu.torch = sys.modules["torch"]
+    monkeypatch.setattr(gpu.torch.cuda, "synchronize",
+                        lambda: calls.append("synchronize"))
+    gpu.pipeline = SimpleNamespace(decode_graphs=SimpleNamespace(
+        invalidate=lambda: calls.append("invalidate")))
+    gpu.arena = SimpleNamespace(
+        n_pages=8, n_sliding_pages=0,
+        resize=lambda *a, **kw: calls.append("resize"))
+    gpu.model = gpu.F = None
+    gpu.decision_head = None
+    gpu.execution = SimpleNamespace(bind_query=lambda **kw: None)
+    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
+    assert calls == ["resize"]
+    calls.clear()
+    gpu.bind_query([1], [2], 32, arena_pages=(16, 0))
+    assert calls == ["synchronize", "invalidate", "resize"]
+
+
 def test_prepared_boot_is_handed_to_the_query_and_used_once(
         booted, monkeypatch):
     registry = built_in_registry()
