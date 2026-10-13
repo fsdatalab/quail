@@ -277,73 +277,46 @@ class PrefixSharing:
                                    memo=context.memo)
             for alias, lengths in context.document_tokens.items()
         }
+        shared_by_alias = {}
         for node in graph.nodes:
-            if isinstance(node, AiFilter) and not node.share_prefixes:
-                lengths = context.document_tokens.get(node.alias)
-                store = _token_store(lengths)
-                if store is not None and sharing_pays(
-                        context.model, context.device,
-                        shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=summaries[node.alias].total,
-                        writes_pages=node.arena_writes):
-                    node = replace(node, share_prefixes=True,
-                                   arena_writes=True)
-                    changed = True
-            elif isinstance(node, AiJoin) and not node.share_prefixes:
-                lengths = context.document_tokens.get(node.anchor)
-                store = _token_store(lengths)
-                if store is not None and sharing_pays(
-                        context.model, context.device,
-                        shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=summaries[node.anchor].total, writes_pages=True):
-                    node = replace(node, share_prefixes=True)
-                    changed = True
-            elif (isinstance(node, AiClassify) and node.spec is not None
-                  and not node.spec.share_prefixes):
-                lengths = context.document_tokens.get(node.spec.aliases[0])
-                store = _token_store(lengths)
-                if store is not None and sharing_pays(
-                        context.model, context.device,
-                        shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=summaries[node.spec.aliases[0]].total,
-                        writes_pages=True):
-                    pipeline = pipelines.get(node.node_id)
-                    resident = (pipeline is not None
-                                and pipeline[0].node_id != node.node_id)
-                    node = replace(node, spec=_shared_classify_spec(
-                        node, context, store, resident=resident))
-                    changed = True
-            elif (isinstance(node, AiExtract) and node.spec is not None
-                  and not node.spec.share_prefixes):
-                lengths = context.document_tokens.get(node.spec.alias)
-                store = _token_store(lengths)
-                if store is not None and sharing_pays(
-                        context.model, context.device,
-                        shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=summaries[node.spec.alias].total,
-                        writes_pages=True):
-                    pipeline = pipelines.get(node.node_id)
-                    resident = (pipeline is not None
-                                and pipeline[0].node_id != node.node_id)
-                    node = replace(node, spec=_shared_extract_spec(
-                        node, context, store, resident=resident))
-                    changed = True
-            elif (isinstance(node, AiScore) and node.spec is not None
-                  and len(node.spec.aliases) == 1
-                  and not node.spec.share_prefixes):
-                lengths = context.document_tokens.get(node.spec.aliases[0])
-                store = _token_store(lengths)
-                shared = (0 if store is None
-                          else page_aligned_shared_tokens(store))
-                if store is not None and sharing_pays(
-                        context.model, context.device, shared_tokens=shared,
-                        total_tokens=summaries[node.spec.aliases[0]].total,
-                        writes_pages=False):
-                    node = replace(node, spec=_shared_score_spec(
-                        node.spec, shared, summaries[node.spec.aliases[0]],
-                        context.model.canvas_tokens))
-                    changed = True
+            settings = getattr(node, "spec", node)
+            if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract, AiScore))
+                    or settings is None or settings.share_prefixes
+                    or (isinstance(node, AiScore) and len(settings.aliases) != 1)):
+                nodes.append(node)
+                continue
+            alias = (settings.aliases[0] if isinstance(node, AiScore)
+                     else node.document_aliases[0])
+            store = _token_store(context.document_tokens.get(alias))
+            if store is None:
+                nodes.append(node)
+                continue
+            if alias not in shared_by_alias:
+                shared_by_alias[alias] = page_aligned_shared_tokens(store)
+            shared = shared_by_alias[alias]
+            writes_pages = (node.arena_writes if isinstance(node, AiFilter)
+                            else not isinstance(node, AiScore))
+            if not sharing_pays(
+                    context.model, context.device, shared_tokens=shared,
+                    total_tokens=summaries[alias].total, writes_pages=writes_pages):
+                nodes.append(node)
+                continue
+            if isinstance(node, AiFilter):
+                node = replace(node, share_prefixes=True, arena_writes=True)
+            elif isinstance(node, AiJoin):
+                node = replace(node, share_prefixes=True)
+            elif isinstance(node, AiScore):
+                node = replace(node, spec=_shared_score_spec(
+                    node.spec, shared, summaries[alias], context.model.canvas_tokens))
+            else:
+                pipeline = pipelines.get(node.node_id)
+                resident = pipeline is not None and pipeline[0].node_id != node.node_id
+                prepare = (_shared_classify_spec if isinstance(node, AiClassify)
+                           else _shared_extract_spec)
+                node = replace(node, spec=prepare(
+                    node, context, store, resident=resident))
             nodes.append(node)
+            changed = True
         if not changed:
             return None
         return PhysicalGraph(tuple(nodes), graph.root)

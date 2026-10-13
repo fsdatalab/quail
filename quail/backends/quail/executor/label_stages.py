@@ -1,4 +1,4 @@
-"""Execute classification with the shared stage scheduler.
+"""Prepare label scoring and decoding stages.
 
 Letter scoring reads label letters in one pass. Tree scoring reads the
 packed trie's rows where the labels split. Greedy decoding chooses one
@@ -14,11 +14,6 @@ from typing import Callable
 import numpy as np
 
 from quail.backends.quail.executor.model import full_output_head
-from quail.backends.quail.executor.parts import (
-    ExecutionPart,
-    execute_parts,
-    shared_prefix_tree,
-)
 from quail.backends.quail.executor.readout import (
     AsyncDecisionChoices,
     AsyncLabelLogprobs,
@@ -33,7 +28,6 @@ from quail.execution.labels import (
     tree_scores,
     trie_chains,
 )
-from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens
 from quail.labels import DECISION_SCORING, decode_runs, read_nodes
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
@@ -523,111 +517,3 @@ class ClassifyStages:
                 suffix_tokens += self.extended * (self.draws - 1) * read
         return suffix_tokens, suffix_tokens + len(first) * len(self.request.frame)
 
-
-class AnswerStream:
-    """Send documents' finished answers to a callback, each document once.
-
-    Args:
-        on_answers: Callable(document positions, values), or None to send
-            nothing.
-    """
-
-    def __init__(self, on_answers):
-        self.on_answers = on_answers
-        self.sent = set()
-
-    def chunk(self, value_of):
-        """Return an on_chunk callback for run_stages, or None.
-
-        Args:
-            value_of: Callable(document position) -> its answer, or None
-                while it has none.
-        """
-        if self.on_answers is None:
-            return None
-        return lambda transitions: self.send(
-            sorted({anchor for anchor, _, _ in transitions}), value_of)
-
-    def send(self, anchors, value_of):
-        """Send the answers of the anchors that have one and were not sent."""
-        ready = []
-        for anchor in anchors:
-            value = None if anchor in self.sent else value_of(anchor)
-            if value is not None:
-                ready.append((anchor, value))
-        if ready:
-            self.sent.update(anchor for anchor, _ in ready)
-            self.on_answers(np.asarray([anchor for anchor, _ in ready]),
-                            [value for _, value in ready])
-
-    def finish(self, anchors, value_of):
-        """Send every remaining answer after the run."""
-        if self.on_answers is not None:
-            self.send(anchors, value_of)
-
-
-class ClassifyBatch(ExecutionPart):
-    """Classification stages, answer streaming, and batch results."""
-
-    def __init__(self, plan, on_answers=None, prefix_tokens=0):
-        self.plan = plan
-        self.stages = plan.stages
-        self.prefix_tokens = prefix_tokens
-        self.stream = AnswerStream(on_answers)
-        self.document_done = self.stream.chunk(lambda anchor: plan.labels[anchor])
-
-    def finish(self, every) -> int:
-        """Finalize labels and count tokens processed after the documents."""
-        self.reached = len(every[0]) if every else 0
-        self.suffix_tokens, self.streamed_tokens = self.plan.finish(every)
-        self.stream.finish(range(len(self.plan.labels)),
-                           lambda anchor: self.plan.labels[anchor])
-        return self.streamed_tokens
-
-    def result(self, tokens, gpu_s, chunks, stats) -> RerankerBatch:
-        return RerankerBatch(
-            self.plan.labels, fresh_tokens=tokens,
-            cached_tokens=self.prefix_tokens + self.streamed_tokens - tokens,
-            suffix_tokens=self.suffix_tokens,
-            borrowed_tokens=stats.get("borrowed_tokens", 0),
-            pack_s=stats.get("pack_s", 0.0), gpu_s=gpu_s, chunks=chunks,
-            probabilities=self.plan.probabilities)
-
-    def results(self) -> dict:
-        return {self.plan.spec.name: self.result_value}
-
-
-class QuailClassifier:
-    """Classify document rows with Quail's token admission and KV arena."""
-
-    def __init__(self, state: QueryExecutionState):
-        self.state = state
-
-    def classify(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
-        """Classify document rows using the shared scheduler and KV arena.
-
-        Args:
-            spec: Classification specification.
-            rows: Document IDs to classify, in input order.
-            documents: Tokenized documents indexed by table alias and document ID.
-            on_answers: Optional callable(row positions, labels) run with each
-                chunk's newly labeled rows.
-
-        Returns:
-            A RerankerBatch containing labels, optional label probabilities,
-            token counts, and execution metrics.
-        """
-        state = self.state
-        rows = np.asarray(rows, dtype=np.int32).reshape(-1)
-        prefixes = document_prefixes(spec, documents, rows)
-        keys = [("classify", spec.name, index) for index in range(len(rows))]
-        tree = (shared_prefix_tree(spec.name, prefixes, state.loaded_model.arena)
-                if spec.share_prefixes else None)
-        plan = ClassifyStages(state, spec, len(rows), lambda key: key[2])
-        # a canvas is drawn from the document's row, so an answer is
-        # the same in any batch
-        plan.seeds = rows
-        part = ClassifyBatch(plan, on_answers, sum(map(len, prefixes)))
-        return execute_parts(
-            state, [part], prefixes, keys, keep_kv=False, tree=tree,
-            label=f"classify {spec.name}")[spec.name]

@@ -317,7 +317,7 @@ def test_decision_readouts_return_their_host_values():
 
 def test_choice_stage_reads_each_option_end_and_the_last_row(session):
     torch = pytest.importorskip("torch")
-    from quail.backends.quail.executor.classify import ClassifyStages, JoinPartners
+    from quail.backends.quail.executor.label_stages import ClassifyStages, JoinPartners
 
     plan = session.sql(
         "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['x', 'yy', 'zzz']) AS c "

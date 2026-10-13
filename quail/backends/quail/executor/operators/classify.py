@@ -3,13 +3,20 @@
 import numpy as np
 import pyarrow as pa
 
-from quail.backends.quail.executor.classify import (
-    ClassifyBatch,
+from quail.backends.quail.executor.label_stages import (
     ClassifyStages,
     JoinPartners,
+    document_prefixes,
+)
+from quail.backends.quail.executor.parts import (
+    AnswerStream,
+    ExecutionPart,
+    execute_parts,
+    shared_prefix_tree,
 )
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.reranker import (
+    RerankerBatch,
     _score_table,
     attach_prior_columns,
     classify_outputs,
@@ -21,6 +28,72 @@ from quail.logical import PROBABILITIES_SUFFIX
 from quail.physical import ValueType
 from quail.progress import answer_sink
 
+
+class ClassifyBatch(ExecutionPart):
+    """Classification stages, answer streaming, and batch results."""
+
+    def __init__(self, plan, on_answers=None, prefix_tokens=0):
+        self.plan = plan
+        self.stages = plan.stages
+        self.prefix_tokens = prefix_tokens
+        self.stream = AnswerStream(on_answers)
+        self.document_done = self.stream.chunk(lambda anchor: plan.labels[anchor])
+
+    def finish(self, every) -> int:
+        """Finalize labels and count tokens processed after the documents."""
+        self.reached = len(every[0]) if every else 0
+        self.suffix_tokens, self.streamed_tokens = self.plan.finish(every)
+        self.stream.finish(range(len(self.plan.labels)),
+                           lambda anchor: self.plan.labels[anchor])
+        return self.streamed_tokens
+
+    def result(self, tokens, gpu_s, chunks, stats) -> RerankerBatch:
+        return RerankerBatch(
+            self.plan.labels, fresh_tokens=tokens,
+            cached_tokens=self.prefix_tokens + self.streamed_tokens - tokens,
+            suffix_tokens=self.suffix_tokens,
+            borrowed_tokens=stats.get("borrowed_tokens", 0),
+            pack_s=stats.get("pack_s", 0.0), gpu_s=gpu_s, chunks=chunks,
+            probabilities=self.plan.probabilities)
+
+    def results(self) -> dict:
+        return {self.plan.spec.name: self.result_value}
+
+
+class QuailClassifier:
+    """Classify document rows with Quail's token admission and KV arena."""
+
+    def __init__(self, state: QueryExecutionState):
+        self.state = state
+
+    def classify(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
+        """Classify document rows using the shared scheduler and KV arena.
+
+        Args:
+            spec: Classification specification.
+            rows: Document IDs to classify, in input order.
+            documents: Tokenized documents indexed by table alias and document ID.
+            on_answers: Optional callable(row positions, labels) run with each
+                chunk's newly labeled rows.
+
+        Returns:
+            A RerankerBatch containing labels, optional label probabilities,
+            token counts, and execution metrics.
+        """
+        state = self.state
+        rows = np.asarray(rows, dtype=np.int32).reshape(-1)
+        prefixes = document_prefixes(spec, documents, rows)
+        keys = [("classify", spec.name, index) for index in range(len(rows))]
+        tree = (shared_prefix_tree(spec.name, prefixes, state.loaded_model.arena)
+                if spec.share_prefixes else None)
+        plan = ClassifyStages(state, spec, len(rows), lambda key: key[2])
+        # a canvas is drawn from the document's row, so an answer is
+        # the same in any batch
+        plan.seeds = rows
+        part = ClassifyBatch(plan, on_answers, sum(map(len, prefixes)))
+        return execute_parts(
+            state, [part], prefixes, keys, keep_kv=False, tree=tree,
+            label=f"classify {spec.name}")[spec.name]
 
 def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
     """Prepare a classification with the labels its inputs provide."""

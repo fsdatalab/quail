@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from quail.cost.joins import stage_work as join_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work
+from quail.planner.leftdeep import insert_nondominated
 from quail.planner.statistics import AliasStats, alias_stats, cross_tuples, thin
 from quail.planner.validation import anchor_candidates, join_input_tokens
 
@@ -79,6 +80,21 @@ def stage_work(spec, anchor, live, lengths, pre, *, resident=False, window=0):
                      lengths, pre, resident=resident, window=window)
 
 
+def _join_step(spec, anchor, live, lengths, resident, pre, state, window):
+    """Price one join and return its work, recorded inputs, and next KV state."""
+    same_group = (state.group_open and state.pending_anchor == anchor
+                  and spec["semantics"] == "full")
+    kind = residency(anchor, state, resident, same_group)
+    work = stage_work(spec, anchor, live, lengths, pre,
+                      resident=kind != "none", window=window)
+    step = dict(written_pos=spec["written_pos"], anchor=anchor, resident=kind,
+                resident_docs=lengths[anchor].count if kind != "none" else 0,
+                tuples=cross_tuples(spec, live), tokens=work.tokens, work=work)
+    next_state = KVState(anchor, spec["semantics"] == "full",
+                         state.used_anchors | {anchor})
+    return work, step, next_state
+
+
 def walk(seq, live0: dict, lengths: dict, resident, pre: int,
          model, device):
     """Cost one [(spec, anchor)] sequence.
@@ -99,22 +115,11 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
         live = dict(live0)
         for done in sorted(applied, key=lambda s: s["written_pos"]):
             thin(live, done)
-        same_group = (state.group_open
-                      and state.pending_anchor == anchor
-                      and spec["semantics"] == "full")
-        kind = residency(anchor, state, resident, same_group)
-        kept = lengths[anchor].count if kind != "none" else 0
-        w = stage_work(spec, anchor, live, lengths, pre,
-                       resident=kind != "none", window=model.sliding_window)
-        records.append(dict(written_pos=spec["written_pos"],
-                            anchor=anchor, resident=kind,
-                            resident_docs=kept,
-                            tuples=cross_tuples(spec, live),
-                            tokens=w.tokens, work=w))
-        total = total + w
+        work, step, state = _join_step(
+            spec, anchor, live, lengths, resident, pre, state, model.sliding_window)
+        records.append(step)
+        total = total + work
         applied.append(spec)
-        state = KVState(anchor, spec["semantics"] == "full",
-                        state.used_anchors | {anchor})
     return total, records
 
 
@@ -209,14 +214,6 @@ def search_joins(specs, live: dict, lengths: dict, resident,
         relation_order: tuple[str, ...]
         steps: tuple[dict, ...] = ()
 
-    def insert(frontier, candidate):
-        if any(old.work.dominates(candidate.work) for old in frontier):
-            return False
-        frontier[:] = [old for old in frontier
-                       if not candidate.work.dominates(old.work)]
-        frontier.append(candidate)
-        return True
-
     seed = frozenset(already_joined)
     unknown = seed - set(aliases)
     if unknown:
@@ -254,24 +251,9 @@ def search_joins(specs, live: dict, lengths: dict, resident,
                 next_applied = applied | {i}
                 for anchor in _feasible_anchors(
                         spec, honor_forced, lengths, pre, chunk_tokens):
-                    same_group = (
-                        state_now.group_open
-                        and state_now.pending_anchor == anchor
-                        and spec["semantics"] == "full")
-                    kind = residency(anchor, state_now, resident,
-                                     same_group)
-                    kept = lengths[anchor].count if kind != "none" else 0
-                    work = stage_work(spec, anchor, live_now, lengths, pre,
-                                      resident=kind != "none",
-                                      window=model.sliding_window)
-                    step = dict(
-                        written_pos=spec["written_pos"], anchor=anchor,
-                        resident=kind, resident_docs=kept,
-                        tuples=cross_tuples(spec, live_now),
-                        tokens=work.tokens, work=work)
-                    next_state = KVState(
-                        anchor, spec["semantics"] == "full",
-                        state_now.used_anchors | {anchor})
+                    work, step, next_state = _join_step(
+                        spec, anchor, live_now, lengths, resident, pre,
+                        state_now, model.sliding_window)
                     for old in frontier:
                         generated += 1
                         candidate = Candidate(
@@ -281,7 +263,7 @@ def search_joins(specs, live: dict, lengths: dict, resident,
                             old.steps + (step,))
                         target = states.setdefault(
                             (next_relations, next_applied, next_state), [])
-                        insert(target, candidate)
+                        insert_nondominated(target, candidate)
 
     finals = [
         candidate

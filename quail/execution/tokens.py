@@ -109,6 +109,16 @@ class TokenChain(Sequence):
         return self._parts
 
 
+def _locate_chunk(index, length, ends) -> tuple[int, int]:
+    """Locate a sequence index in chunks with cumulative end positions."""
+    if index < 0:
+        index += length
+    if not 0 <= index < length:
+        raise IndexError(index)
+    chunk = bisect.bisect_right(ends, index)
+    return chunk, index - (ends[chunk - 1] if chunk else 0)
+
+
 class ArrowTokenDocuments(Sequence):
     def __init__(self, array, character_offsets=None):
         self._array = array
@@ -136,13 +146,7 @@ class ArrowTokenDocuments(Sequence):
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]
-        if index < 0:
-            index += len(self)
-        if not 0 <= index < len(self):
-            raise IndexError(index)
-        chunk_index = bisect.bisect_right(self._ends, index)
-        prior = self._ends[chunk_index - 1] if chunk_index else 0
-        local = index - prior
+        chunk_index, local = _locate_chunk(index, len(self), self._ends)
         offsets = self._offsets[chunk_index]
         start = int(offsets[local])
         end = int(offsets[local + 1])
@@ -173,7 +177,7 @@ class TokenLengths(Sequence):
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]
-        batch_index, local = self._store._locate(index)
+        batch_index, local = _locate_chunk(index, len(self), self._store._ends)
         return self._store._length_batches[batch_index][local].as_py()
 
 
@@ -475,22 +479,13 @@ class TokenStore(Sequence):
              for index in range(self._reader.num_record_batches)],
             type=self._reader.schema.field(self._token_column).type)
 
-    def _locate(self, index: int) -> tuple[int, int]:
-        if index < 0:
-            index += len(self)
-        if not 0 <= index < len(self):
-            raise IndexError(index)
-        batch_index = bisect.bisect_right(self._ends, index)
-        prior = self._ends[batch_index - 1] if batch_index else 0
-        return batch_index, index - prior
-
     def __len__(self):
         return self._ends[-1] if self._ends else 0
 
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]
-        batch_index, local = self._locate(index)
+        batch_index, local = _locate_chunk(index, len(self), self._ends)
         return self._documents_by_batch[batch_index][local]
 
     def close(self) -> None:

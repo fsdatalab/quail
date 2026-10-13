@@ -2,6 +2,8 @@
 
 import time
 
+import numpy as np
+
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
@@ -253,3 +255,45 @@ def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
             arena.free_key(key)
 
     return settled
+
+
+class AnswerStream:
+    """Send documents' finished answers to a callback, each document once.
+
+    Args:
+        on_answers: Callable(document positions, values), or None to send
+            nothing.
+    """
+
+    def __init__(self, on_answers):
+        self.on_answers = on_answers
+        self.sent = set()
+
+    def chunk(self, value_of):
+        """Return an on_chunk callback for run_stages, or None.
+
+        Args:
+            value_of: Callable(document position) -> its answer, or None
+                while it has none.
+        """
+        if self.on_answers is None:
+            return None
+        return lambda transitions: self.send(
+            sorted({anchor for anchor, _, _ in transitions}), value_of)
+
+    def send(self, anchors, value_of):
+        """Send the answers of the anchors that have one and were not sent."""
+        ready = []
+        for anchor in anchors:
+            value = None if anchor in self.sent else value_of(anchor)
+            if value is not None:
+                ready.append((anchor, value))
+        if ready:
+            self.sent.update(anchor for anchor, _ in ready)
+            self.on_answers(np.asarray([anchor for anchor, _ in ready]),
+                            [value for _, value in ready])
+
+    def finish(self, anchors, value_of):
+        """Send every remaining answer after the run."""
+        if self.on_answers is not None:
+            self.send(anchors, value_of)

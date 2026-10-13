@@ -52,10 +52,7 @@ Extend = Callable[
 ]
 
 
-def _insert_nondominated(
-    frontier: list[Candidate[StateProperty, Step]],
-    candidate: Candidate[StateProperty, Step],
-) -> bool:
+def insert_nondominated(frontier: list, candidate) -> bool:
     """Keep one record unless another is no larger in every category."""
     if any(existing.work.dominates(candidate.work) for existing in frontier):
         return False
@@ -108,7 +105,7 @@ def optimize_left_deep(
                         frontier = states.setdefault(
                             (next_relations, extension.state_property), []
                         )
-                        _insert_nondominated(frontier, next_candidate)
+                        insert_nondominated(frontier, next_candidate)
 
     finals = tuple(
         candidate

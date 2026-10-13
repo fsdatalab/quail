@@ -2,12 +2,13 @@
 
 import numpy as np
 
-from quail.backends.quail.executor.classify import (
-    AnswerStream,
-    QuailClassifier,
-)
 from quail.backends.quail.executor.loop import run_join
-from quail.backends.quail.executor.parts import input_staging, shared_prefix_tree
+from quail.backends.quail.executor.operators.classify import QuailClassifier
+from quail.backends.quail.executor.parts import (
+    AnswerStream,
+    input_staging,
+    shared_prefix_tree,
+)
 from quail.backends.quail.executor.readout import AsyncScores
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState

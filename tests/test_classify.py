@@ -11,10 +11,8 @@ from test_score import _finish
 
 import quail
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.executor.classify import (
-    QuailClassifier,
-    label_requests,
-)
+from quail.backends.quail.executor.label_stages import label_requests
+from quail.backends.quail.executor.operators.classify import QuailClassifier
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs, answer_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.bench.quailb import run_output
@@ -124,7 +122,7 @@ def test_greedy_decoder_feeds_forced_tokens_with_the_next_choice():
     assert decoder.label.tolist() == [0]
 
 
-def test_label_readout_is_log_softmax_over_the_whole_vocabulary():
+def test_label_readout_is_log_softmax_over_the_whole_vocabulary(monkeypatch):
     torch = pytest.importorskip("torch")
     head = torch.randn(300, 8, dtype=torch.bfloat16)
     hidden = torch.randn(70, 8, dtype=torch.bfloat16)
@@ -138,6 +136,22 @@ def test_label_readout_is_log_softmax_over_the_whole_vocabulary():
     answers, rows = answer_rows([2, 1, 3])
     assert answers.tolist() == [0, 0, 1, 2, 2, 2]
     assert rows.tolist() == [0, 1, 0, 0, 1, 2]
+
+    empty = torch.empty
+    monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: empty(
+        *args, **{key: value for key, value in kwargs.items() if key != "pin_memory"}))
+    monkeypatch.setattr(torch.cuda, "Event", lambda: SimpleNamespace(
+        record=lambda: None, synchronize=lambda: None))
+    first = readout.submit(hidden)
+    second = readout.submit(hidden[:3])
+    assert first[1].data_ptr() != second[1].data_ptr()
+    smaller = readout.result(second)
+    actual = readout.result(first)
+    assert np.allclose(actual, expected.numpy(), atol=1e-5)
+    again = readout.result(readout.submit(hidden[:1] * 2))
+    assert again.shape == (1, 3)
+    assert np.allclose(smaller, expected[:3].numpy(), atol=1e-5)
+    assert np.allclose(actual, expected.numpy(), atol=1e-5)
 
 
 def test_classifier_decodes_one_choice_per_round(monkeypatch):

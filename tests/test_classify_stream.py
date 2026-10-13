@@ -178,7 +178,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     """
     from dataclasses import replace
 
-    from quail.backends.quail.executor import classify as classify_module
+    from quail.backends.quail.executor import label_stages as label_stages_module
     from quail.execution.pipelines import build_pipelines
     from quail.specs.base import AnswerCanvas
 
@@ -323,11 +323,11 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
             return rows
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    monkeypatch.setattr(classify_module, "full_output_head",
+    monkeypatch.setattr(label_stages_module, "full_output_head",
                         lambda model: SimpleNamespace(shape=(1, 1),
                                                       dtype="fake"))
     monkeypatch.setattr(
-        classify_module, "AsyncLabelLogprobs",
+        label_stages_module, "AsyncLabelLogprobs",
         lambda torch, F, head, targets, rows, normalize: FakeReadout(
             targets, rows))
     torch = fake_torch()
@@ -610,7 +610,7 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
         async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
                                       dtype=None),
         answer_rows=object(), chunk_tokens=120)
-    from quail.backends.quail.executor import classify as classify_module
+    from quail.backends.quail.executor import label_stages as label_stages_module
 
     class FakeReadout:
         def __init__(self, targets, rows):
@@ -633,11 +633,11 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
         def result(self, rows):
             return rows
 
-    monkeypatch.setattr(classify_module, "full_output_head",
+    monkeypatch.setattr(label_stages_module, "full_output_head",
                         lambda model: SimpleNamespace(shape=(1, 1),
                                                       dtype="fake"))
     monkeypatch.setattr(
-        classify_module, "AsyncLabelLogprobs",
+        label_stages_module, "AsyncLabelLogprobs",
         lambda torch, F, head, targets, rows, normalize: FakeReadout(
             targets, rows))
     state = {
