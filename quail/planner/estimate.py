@@ -36,8 +36,9 @@ from typing import Callable, Mapping
 
 from quail.catalog.pairs import pair_table
 from quail.cost import budgets
+from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import SpeedOfLight, speed_of_light
-from quail.cost.work import Work, ask, scan, triangle
+from quail.cost.work import Work, ask, scan
 from quail.logical import (
     Aggregate,
     Filter,
@@ -53,7 +54,7 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.planner.filter_order import default_order_rule, order_filters_indexed
-from quail.planner.leftdeep import Extension, optimize_left_deep
+from quail.planner.leftdeep import search_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
 from quail.planner.prefixes import document_shared_tokens
 from quail.planner.statistics import prepare_filter_costs
@@ -453,8 +454,6 @@ class _Search:
                   for index, (alias, row) in enumerate(zip(partners, partner_row)))
             for partner_row in partner_rows
         ]
-        all_tokens = sum(suffixes)
-        all_triangles = sum(triangle(suffix) for suffix in suffixes)
         frame = labels_by_alias[anchor]["frame"] + (
             labels_by_alias[partners[0]]["label"] if partners else 0)
         resident_rows = set(resident_rows)
@@ -464,35 +463,17 @@ class _Search:
         for row in survivors[anchor]:
             if allowed is None:
                 streamed = suffixes
-                suffix_tokens, suffix_triangles = all_tokens, all_triangles
             else:
                 mine = allowed.get(row, ())
                 streamed = [suffix for suffix, partner_row
                             in zip(suffixes, partner_rows)
                             if partner_row[0] in mine]
-                suffix_tokens = sum(streamed)
-                suffix_triangles = sum(triangle(suffix) for suffix in streamed)
             prefix = self.pre + self.aliases[anchor].tokens[row]
             work = work + (ask(prefix, frame, window=self.window)
                            if row in resident_rows
                            else self.first_use(anchor, row, frame))
-            anchor_prefix = prefix + frame
-            sliding_pairs = 0.0
-            if self.window:
-                sliding_pairs = (
-                    self.window * suffix_tokens if anchor_prefix >= self.window - 1
-                    else sum(triangle(anchor_prefix + suffix, self.window)
-                             - triangle(anchor_prefix, self.window)
-                             for suffix in streamed))
-            work = work + Work(
-                tokens=suffix_tokens,
-                pairs=anchor_prefix * suffix_tokens + suffix_triangles,
-                kv_written=suffix_tokens,
-                kv_read=anchor_prefix,
-                sliding_pairs=sliding_pairs,
-                sliding_kv_read=(min(anchor_prefix, self.window - 1)
-                                 if self.window else 0.0),
-            )
+            work = work + partner_stream_work(
+                prefix + frame, streamed, window=self.window)
         return work
 
     # ---- filters and classifications --------------------------------
@@ -595,28 +576,19 @@ class _Search:
     def anchor_fits(self, prompt, anchor, stage_aliases, live) -> bool:
         """Return whether the longest tuple fits one forward pass."""
         labels_by_alias, tail = _prompt_token_counts(prompt)
-        anchor_max = max(
-            (self.aliases[anchor].tokens[row] for row in live[anchor]),
-            default=0,
-        )
+
+        def longest(alias):
+            return max((self.aliases[alias].tokens[row] for row in live[alias]),
+                       default=0)
+
         partners = [alias for alias in stage_aliases if alias != anchor]
-        prefix = self.pre + anchor_max + labels_by_alias[anchor]["frame"]
+        frame = labels_by_alias[anchor]["frame"]
         if not live[anchor] or any(not live[partner] for partner in partners):
-            return prefix <= self.chunk_tokens
-        return (
-            prefix
-            + tail
-            + sum(
-                labels_by_alias[partner]["label"]
-                + max(
-                    (self.aliases[partner].tokens[row]
-                     for row in live[partner]),
-                    default=0,
-                )
-                for partner in partners
-            )
-            <= self.chunk_tokens
-        )
+            return self.pre + longest(anchor) + frame <= self.chunk_tokens
+        return longest_join_input(
+            self.pre, longest(anchor), frame, tail,
+            [(labels_by_alias[partner]["label"], longest(partner))
+             for partner in partners]) <= self.chunk_tokens
 
     def cross_resident(self, anchor, live, live_cache) -> set[int]:
         """Return anchor rows whose prefix another alias of its column holds.
@@ -661,8 +633,11 @@ class _Search:
             "fresh_tokens": work.tokens,
         }
 
-    def run_joins(self, base_rows, resident, base_work):
-        """Search every feasible left deep plan over the filtered rows.
+    def search_joins_sol(self, base_rows, resident, base_work):
+        """Search every feasible left deep plan over the exact filtered rows.
+
+        The planner's search_joins prices expected survivors; this
+        prices the rows the oracles kept, on the same search core.
 
         Returns:
             The best candidate and the search result it came from.
@@ -697,108 +672,64 @@ class _Search:
                 )
             return live_cache[active_edges]
 
-        def active_inside(relations: frozenset[str]) -> frozenset[int]:
-            return frozenset(
-                index for index, endpoints in enumerate(edge_aliases)
-                if endpoints <= relations
-            )
+        def price_step(edge_index, relations, applied, cached):
+            join = joins[edge_index]
+            relation = edge_relations[edge_index]
+            stage_aliases = (relation.left, relation.right)
+            added = edge_aliases[edge_index] - relations
+            live = live_for(applied)
+            classifications = self.joined_classifications.get(
+                frozenset(stage_aliases), ())
+            for anchor in stage_aliases:
+                if not all(
+                        self.anchor_fits(prompt, anchor, stage_aliases, live)
+                        for prompt in [join.prompt] + [
+                            call.prompt for call in classifications]):
+                    continue
+                partners = [alias for alias in stage_aliases if alias != anchor]
+                allowed = self.allowed_pairs.get(edge_index, {}).get(anchor)
+                stage_work = self.join_stage_work(
+                    anchor, partners, live, join.prompt,
+                    live[anchor] if anchor in cached else (),
+                    self.cross_resident(anchor, live, cached),
+                    allowed=allowed,
+                )
+                classified = []
+                for call in classifications:
+                    call_work, record = self.joined_classification_work(
+                        call, anchor, partners[0], live, relation)
+                    stage_work = stage_work + call_work
+                    classified.append(record)
+                next_cache = cached | {anchor}
+                passing = sum(
+                    1
+                    for left_row in live[relation.left]
+                    for right_row in live[relation.right]
+                    if (left_row, right_row) in relation.pairs
+                )
+                step = {
+                    "template": join.prompt.template,
+                    "written_pos": edge_index,
+                    "added_alias": next(iter(added), None),
+                    "aliases": list(stage_aliases),
+                    "anchor": anchor,
+                    "partners": partners,
+                    "evaluated_pairs": (
+                        math.prod(len(live[alias]) for alias in stage_aliases)
+                        if allowed is None else sum(
+                            sum(1 for partner_row in live[partners[0]]
+                                if partner_row in allowed.get(row, ()))
+                            for row in live[anchor])),
+                    "passing_pairs": passing,
+                    "fresh_tokens": stage_work.tokens,
+                    "classifications": classified,
+                    "cached_prefixes_after": sorted(next_cache),
+                }
+                yield stage_work, next_cache, step
 
-        extension_cache = {}
-
-        def extend(relations, cached, added):
-            cache_key = (relations, cached, added)
-            if cache_key in extension_cache:
-                return extension_cache[cache_key]
-            crossing = tuple(
-                index for index, endpoints in enumerate(edge_aliases)
-                if added in endpoints and endpoints & relations
-            )
-            if not crossing:
-                extension_cache[cache_key] = ()
-                return ()
-            initial_edges = active_inside(relations)
-            extensions = []
-
-            def visit_edges(order, position, active_edges, live, cached_now,
-                            work, steps):
-                if position == len(order):
-                    extensions.append(Extension(
-                        work=work, state_property=cached_now,
-                        steps=tuple(steps)))
-                    return
-                edge_index = order[position]
-                join = joins[edge_index]
-                relation = edge_relations[edge_index]
-                stage_aliases = (relation.left, relation.right)
-                classifications = self.joined_classifications.get(
-                    frozenset(stage_aliases), ())
-                for anchor in stage_aliases:
-                    if not all(
-                            self.anchor_fits(prompt, anchor, stage_aliases, live)
-                            for prompt in [join.prompt] + [
-                                call.prompt for call in classifications]):
-                        continue
-                    partners = [alias for alias in stage_aliases
-                                if alias != anchor]
-                    allowed = self.allowed_pairs.get(edge_index, {}).get(
-                        anchor)
-                    stage_work = self.join_stage_work(
-                        anchor, partners, live, join.prompt,
-                        live[anchor] if anchor in cached_now else (),
-                        self.cross_resident(anchor, live, cached_now),
-                        allowed=allowed,
-                    )
-                    classified = []
-                    for call in classifications:
-                        call_work, record = self.joined_classification_work(
-                            call, anchor, partners[0], live, relation)
-                        stage_work = stage_work + call_work
-                        classified.append(record)
-                    next_edges = active_edges | {edge_index}
-                    next_cache = cached_now | {anchor}
-                    passing = sum(
-                        1
-                        for left_row in live[relation.left]
-                        for right_row in live[relation.right]
-                        if (left_row, right_row) in relation.pairs
-                    )
-                    step = {
-                        "template": join.prompt.template,
-                        "written_pos": edge_index,
-                        "added_alias": added,
-                        "aliases": list(stage_aliases),
-                        "anchor": anchor,
-                        "partners": partners,
-                        "evaluated_pairs": (
-                            math.prod(len(live[alias])
-                                      for alias in stage_aliases)
-                            if allowed is None else sum(
-                                sum(1 for partner_row in live[partners[0]]
-                                    if partner_row in allowed.get(row, ()))
-                                for row in live[anchor])),
-                        "passing_pairs": passing,
-                        "fresh_tokens": stage_work.tokens,
-                        "classifications": classified,
-                        "cached_prefixes_after": sorted(next_cache),
-                    }
-                    visit_edges(
-                        order, position + 1, next_edges,
-                        live_for(next_edges), next_cache,
-                        work + stage_work, steps + [step],
-                    )
-
-            for order in itertools.permutations(crossing):
-                visit_edges(order, 0, initial_edges, live_for(initial_edges),
-                            cached, Work(), [])
-            extension_cache[cache_key] = tuple(extensions)
-            return extension_cache[cache_key]
-
-        search = optimize_left_deep(
+        search = search_left_deep(
             tuple(scan_node.alias for scan_node in self.scans),
-            frozenset(resident),
-            base_work,
-            extend,
-        )
+            edge_aliases, frozenset(resident), base_work, price_step)
         if not search.candidates:
             raise ValueError("query join graph has no connected left deep plan")
 
@@ -886,7 +817,7 @@ def speed_of_light_estimate(
     resident = frozenset(stage["alias"] for stage in filter_stages
                          if stage["operator"] != LABEL_IN)
     base_rows = {alias: tuple(rows) for alias, rows in survivors.items()}
-    best, result = search.run_joins(base_rows, resident, filter_work)
+    best, result = search.search_joins_sol(base_rows, resident, filter_work)
     return SpeedOfLightEstimate(
         model=model.name,
         device=device.name,

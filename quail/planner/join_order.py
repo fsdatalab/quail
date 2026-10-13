@@ -13,7 +13,7 @@ from quail.cost.joins import PricedJoin
 from quail.cost.joins import stage_work as join_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work
-from quail.planner.leftdeep import insert_nondominated
+from quail.planner.leftdeep import search_left_deep
 from quail.planner.statistics import AliasStats, alias_stats, cross_tuples, thin
 from quail.planner.validation import anchor_candidates, join_input_tokens
 
@@ -234,7 +234,8 @@ def search_joins(specs, live: dict, lengths: dict, resident,
         for a in s.aliases:
             if a not in aliases:
                 aliases.append(a)
-    edge_aliases = [frozenset(s.aliases) for s in specs]
+    seed = frozenset(already_joined)
+    aliases.extend(sorted(seed - set(aliases)))
     live_cache = {}
 
     def live_for(applied: frozenset):
@@ -245,73 +246,20 @@ def search_joins(specs, live: dict, lengths: dict, resident,
             live_cache[applied] = state
         return dict(live_cache[applied])
 
-    @dataclass(frozen=True)
-    class Candidate:
-        work: Work
-        state: KVState
-        relations: frozenset[str]
-        applied: frozenset[int]
-        relation_order: tuple[str, ...]
-        steps: tuple[JoinStep, ...] = ()
+    def price_step(index, relations, applied, state_now):
+        spec = specs[index]
+        live_now = live_for(applied)
+        for anchor in _feasible_anchors(
+                spec, honor_forced, lengths, pre, chunk_tokens):
+            work, step, next_state = _join_step(
+                spec, anchor, live_now, lengths, resident, pre,
+                state_now, model.sliding_window)
+            yield work, next_state, step
 
-    seed = frozenset(already_joined)
-    unknown = seed - set(aliases)
-    if unknown:
-        aliases.extend(sorted(unknown))
-    initial_relations = ([seed] if seed else
-                         [frozenset((alias,)) for alias in aliases])
-    states = {}
-    generated = 0
-    for relations in initial_relations:
-        candidate = Candidate(
-            Work(), KVState(), relations, frozenset(),
-            tuple(sorted(relations)))
-        states[(relations, frozenset(), KVState())] = [candidate]
-        generated += 1
-
-    for applied_count in range(len(specs)):
-        current = [
-            (key, tuple(frontier))
-            for key, frontier in states.items()
-            if len(key[1]) == applied_count
-        ]
-        for (relations, applied, state_now), frontier in current:
-            available = [
-                i for i, ends in enumerate(edge_aliases)
-                if i not in applied
-                and (ends <= relations
-                     or (ends & relations
-                         and len(ends - relations) == 1))
-            ]
-            for i in available:
-                spec = specs[i]
-                live_now = live_for(applied)
-                added = tuple(sorted(edge_aliases[i] - relations))
-                next_relations = relations | edge_aliases[i]
-                next_applied = applied | {i}
-                for anchor in _feasible_anchors(
-                        spec, honor_forced, lengths, pre, chunk_tokens):
-                    work, step, next_state = _join_step(
-                        spec, anchor, live_now, lengths, resident, pre,
-                        state_now, model.sliding_window)
-                    for old in frontier:
-                        generated += 1
-                        candidate = Candidate(
-                            old.work + work, next_state,
-                            next_relations, next_applied,
-                            old.relation_order + added,
-                            old.steps + (step,))
-                        target = states.setdefault(
-                            (next_relations, next_applied, next_state), [])
-                        insert_nondominated(target, candidate)
-
-    finals = [
-        candidate
-        for (relations, applied, _), frontier in states.items()
-        if len(applied) == len(specs)
-        and set(aliases) <= relations
-        for candidate in frontier
-    ]
+    search = search_left_deep(
+        aliases, [frozenset(s.aliases) for s in specs], KVState(), Work(),
+        price_step, seeds=seed)
+    finals = search.candidates
     if not finals:
         return None
     best = min(
@@ -320,5 +268,5 @@ def search_joins(specs, live: dict, lengths: dict, resident,
             c.relation_order,
             tuple((s.written_pos, s.anchor) for s in c.steps)))
     return JoinSearch(seq=tuple((s.written_pos, s.anchor) for s in best.steps),
-                      steps=best.steps, work=best.work, states=len(states),
-                      generated=generated)
+                      steps=best.steps, work=best.work,
+                      states=search.state_count, generated=search.generated_count)

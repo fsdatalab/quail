@@ -1,6 +1,6 @@
 """Execution constraints checked during planning and graph construction."""
 
-from quail.cost.joins import PricedJoin
+from quail.cost.joins import PricedJoin, longest_join_input
 from quail.logical import (
     Alias,
     Apply,
@@ -200,10 +200,10 @@ def anchor_candidates(spec: PricedJoin, honor_forced: bool = True) -> list:
 def join_input_tokens(spec: PricedJoin, anchor: str, maximum: dict,
                       pre: int) -> int:
     """Count tokens for the longest input under one join orientation."""
-    return (pre + maximum[anchor] + spec.frame_tokens[anchor]
-            + spec.tail_tokens
-            + sum(spec.label_tokens[partner] + maximum[partner]
-                  for partner in spec.aliases if partner != anchor))
+    return longest_join_input(
+        pre, maximum[anchor], spec.frame_tokens[anchor], spec.tail_tokens,
+        [(spec.label_tokens[partner], maximum[partner])
+         for partner in spec.aliases if partner != anchor])
 
 
 def score_input_tokens(spec, context) -> tuple[int, int]:

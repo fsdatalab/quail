@@ -45,6 +45,51 @@ class PricedJoin:
     cost: Any = None
 
 
+def longest_join_input(pre: int, anchor_max: int, frame: int, tail: int,
+                       partners) -> int:
+    """Count the tokens of the longest input one join orientation makes.
+
+    Args:
+        pre: The engine preamble's token count.
+        anchor_max: The longest anchor document.
+        frame: The anchor's frame tokens.
+        tail: The question tail's tokens.
+        partners: Per partner, (its label tokens, its longest document).
+    """
+    return (pre + anchor_max + frame + tail
+            + sum(label + longest for label, longest in partners))
+
+
+def partner_stream_work(anchor_prefix: float, suffixes, *,
+                        window: int = 0) -> Work:
+    """Work of streaming every partner suffix past one resident anchor.
+
+    The anchor's prefix and frame are resident; each suffix attends to
+    them and to itself. stage_work sums this over the expected anchors
+    in closed form from length summaries.
+
+    Args:
+        anchor_prefix: The resident tokens: preamble, document, frame.
+        suffixes: Per partner tuple, its tokens.
+        window: The model's sliding window, or 0.
+    """
+    tokens = sum(suffixes)
+    sliding_pairs = 0.0
+    if window:
+        sliding_pairs = (
+            window * tokens if anchor_prefix >= window - 1
+            else sum(triangle(anchor_prefix + suffix, window)
+                     - triangle(anchor_prefix, window) for suffix in suffixes))
+    return Work(
+        tokens=tokens,
+        pairs=anchor_prefix * tokens + sum(triangle(s) for s in suffixes),
+        kv_written=tokens,
+        kv_read=anchor_prefix,
+        sliding_pairs=sliding_pairs,
+        sliding_kv_read=min(anchor_prefix, window - 1) if window else 0.0,
+    )
+
+
 def stage_work(spec: PricedJoin, anchor: str, n: float, tuples: float,
                lengths: dict, pre: int, *, resident: bool = False,
                window: int = 0) -> Work:

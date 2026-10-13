@@ -14,7 +14,7 @@ from quail.catalog import Catalog, DocumentProvider
 from quail.cost.filters import filter_cost
 from quail.cost.joins import PricedJoin
 from quail.cost.sol import speed_of_light
-from quail.cost.work import ask, scan, stream
+from quail.cost.work import Work, ask, scan, stream
 from quail.explain import explain, physical_tree
 from quail.frontend.builder import col, docs, prompt
 from quail.logical import ModelCall, SemanticJoin
@@ -625,6 +625,30 @@ def test_join_search_matches_enumeration_and_tracks_residency():
                          QWEN3_4B_FP8, H100_SXM)
     assert found is not None
     assert len(found.seq) == 3
+
+
+def test_closed_form_join_work_sums_the_per_row_work():
+    """stage_work equals the per-row pricing the estimator uses, on uniform lengths."""
+    from quail.cost.joins import partner_stream_work, stage_work
+    from quail.cost.work import ask, scan
+
+    spec = _join_search_spec(0, ("a", "b"), "a")
+    pre, anchor_len, partner_len, docs, partners = 7, 50, 30, 4, 3
+    lengths = {"a": summarize_alias([anchor_len] * docs),
+               "b": summarize_alias([partner_len] * partners)}
+    frame = spec.frame_tokens["a"] + spec.label_tokens["b"]
+    suffixes = [spec.tail_tokens + partner_len] * partners
+    for resident in (False, True):
+        closed = stage_work(spec, "a", float(docs), float(docs * partners),
+                            lengths, pre, resident=resident)
+        prefix = pre + anchor_len
+        per_row = sum(
+            (((ask(prefix, frame) if resident else scan(prefix, frame))
+              + partner_stream_work(prefix + frame, suffixes))
+             for _ in range(docs)), Work())
+        for field in ("tokens", "pairs", "kv_written", "kv_read"):
+            assert getattr(closed, field) == pytest.approx(
+                getattr(per_row, field)), (field, resident)
 
 
 def _claims_session(gpus=1, backend="quail"):
