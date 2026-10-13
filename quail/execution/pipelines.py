@@ -84,8 +84,7 @@ def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
         return (f"pairs:{node.written_pos}",)
     if isinstance(node, AiJoin):
         # a classification of joined rows reads the join's answers
-        return tuple(f"join_answers:{stage.written_pos}"
-                     for stage in node.stages) + (f"ids:{alias}",)
+        return (f"join_answers:{node.written_pos}", f"ids:{alias}")
     return (f"ids:{alias}",)
 
 
@@ -123,8 +122,7 @@ def _classifies_rows_of(node: PhysicalNode, join: AiJoin) -> bool:
         return False
     spec = node.spec
     return (spec.partner is not None and spec.anchor == join.anchor
-            and any(set(spec.aliases) == {stage.anchor, *stage.partners}
-                    for stage in join.stages))
+            and set(spec.aliases) == {join.anchor, *join.partners})
 
 
 def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
@@ -159,18 +157,27 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         when each reads the one before it, as a per-batch apply
         returning pairs and the join reading those pairs do; any
         other fan-out needs the documents at once and ends the chain.
-        A join manages each anchor's KV itself and ends the chain,
-        unless a classification of the rows it kept follows it.
+        Full joins on the same anchor share one scheduler run. A
+        classification of the rows they keep can follow them.
         """
         following = []
         for port in _document_ports(node, alias):
             for consumer in consumers.get((node.node_id, port), ()):
-                if isinstance(node, AiJoin) and not _classifies_rows_of(consumer, node):
+                if (isinstance(node, AiJoin)
+                        and not (isinstance(consumer, AiJoin)
+                                 and consumer.anchor == node.anchor
+                                 and node.semantics == consumer.semantics == "full")
+                        and not _classifies_rows_of(consumer, node)):
                     continue
                 if not _same_prompt_head(node, consumer, first):
                     continue
                 if takes(consumer, alias) and consumer not in following:
                     following.append(consumer)
+        if isinstance(node, AiJoin):
+            next_joins = [consumer for consumer in following
+                          if isinstance(consumer, AiJoin)]
+            if next_joins:
+                following = next_joins
         following.sort(key=lambda consumer: order[consumer.node_id])
         for earlier, later in zip(following, following[1:]):
             if not reads(later, earlier):
@@ -198,6 +205,14 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
                 break
             members.extend(after)
             followed.update(consumer.node_id for consumer in after)
+        joins = [member for member in members if isinstance(member, AiJoin)]
+        for join in joins:
+            candidates = [consumer for consumer in consumers.get(
+                (join.node_id, f"join_answers:{join.written_pos}"), ())
+                if _classifies_rows_of(consumer, join)]
+            if len(candidates) == 1 and candidates[0].node_id not in followed:
+                members.append(candidates[0])
+                followed.add(candidates[0].node_id)
         pipeline = Pipeline(alias, tuple(members))
         for member in members:
             pipelines[member.node_id] = pipeline

@@ -14,129 +14,6 @@ from .base import (
 
 
 @dataclass(frozen=True)
-class FilterStage:
-    """One predicate inside a packed filter."""
-
-    written_pos: int
-    question_tokens: int
-    preamble_tokens: int
-    selectivity: float | None
-    expected_docs: float
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "FilterStage":
-        return cls(
-            written_pos=int(value["written_pos"]),
-            question_tokens=int(value["question_tokens"]),
-            preamble_tokens=int(value["preamble_tokens"]),
-            selectivity=value["selectivity"],
-            expected_docs=float(value["expected_docs"]),
-        )
-
-    def to_dict(self) -> dict:
-        return {
-            "written_pos": self.written_pos,
-            "question_tokens": self.question_tokens,
-            "preamble_tokens": self.preamble_tokens,
-            "selectivity": self.selectivity,
-            "expected_docs": self.expected_docs,
-        }
-
-
-@dataclass(frozen=True)
-class JoinStage:
-    """One predicate inside an anchored join."""
-
-    written_pos: int
-    exec_idx: int
-    anchor: str
-    partners: tuple[str, ...]
-    semantics: str
-    selectivity: float | None
-    expected_tuples: float
-    anchor_frame_tokens: int
-    pair_tail_tokens: int
-    anchor_resident: str
-    tuple_tokens: float
-    # empty for a cross join
-    pairs_from: str = ""
-    frame_token_ids: tuple[int, ...] = ()
-    label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()
-    tail_token_ids: tuple[int, ...] = ()
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "JoinStage":
-        return cls(
-            written_pos=int(value["written_pos"]),
-            exec_idx=int(value["exec_idx"]),
-            anchor=str(value["anchor"]),
-            partners=tuple(value["partners"]),
-            semantics=str(value["semantics"]),
-            selectivity=value["selectivity"],
-            expected_tuples=float(value["expected_tuples"]),
-            anchor_frame_tokens=int(value["anchor_frame_tokens"]),
-            pair_tail_tokens=int(value["pair_tail_tokens"]),
-            anchor_resident=str(value["anchor_resident"]),
-            tuple_tokens=float(value["tuple_tokens"]),
-            pairs_from=str(value.get("pairs_from", "")),
-            frame_token_ids=tuple(value.get("frame_token_ids", ())),
-            label_token_ids=tuple(
-                (alias, tuple(tokens))
-                for alias, tokens in value.get("label_token_ids", ())
-            ),
-            tail_token_ids=tuple(value.get("tail_token_ids", ())),
-        )
-
-    def explain_fields(self) -> dict:
-        return {
-            "written_pos": self.written_pos,
-            "exec_idx": self.exec_idx,
-            "anchor": self.anchor,
-            "partners": list(self.partners),
-            "semantics": self.semantics,
-            "selectivity": self.selectivity,
-            "expected_tuples": self.expected_tuples,
-            "anchor_frame_tokens": self.anchor_frame_tokens,
-            "pair_tail_tokens": self.pair_tail_tokens,
-            "anchor_resident": self.anchor_resident,
-            "tuple_tokens": self.tuple_tokens,
-            "pairs_from": self.pairs_from,
-        }
-
-    def to_dict(self) -> dict:
-        return {
-            **self.explain_fields(),
-            "frame_token_ids": list(self.frame_token_ids),
-            "label_token_ids": [[alias, list(tokens)]
-                                for alias, tokens in self.label_token_ids],
-            "tail_token_ids": list(self.tail_token_ids),
-        }
-
-    def runtime_spec(self) -> dict:
-        """Return the bound prompt and predicate for the join driver.
-
-        The frame includes the first partner's label, which every pair
-        of the anchor shares.
-        """
-        labels = dict(self.label_token_ids)
-        frame = tuple(self.frame_token_ids)
-        if self.partners and self.partners[0] in labels:
-            frame += tuple(labels[self.partners[0]])
-            labels[self.partners[0]] = ()
-        return {
-            "anchor": self.anchor,
-            "partners": list(self.partners),
-            "semantics": self.semantics,
-            "selectivity": self.selectivity,
-            "written_pos": self.written_pos,
-            "pairs_from": self.pairs_from,
-            "frame": frame,
-            "labels": labels,
-            "tail": self.tail_token_ids,
-        }
-
-
-@dataclass(frozen=True)
 class RequestFilterSpec:
     """One filter chain submitted as model requests."""
 
@@ -970,13 +847,17 @@ class Filter(PhysicalNode):
 
 @dataclass(frozen=True)
 class AiFilter(PhysicalNode):
-    """Evaluate ordered predicates on one document input."""
+    """Evaluate one predicate on a document input."""
 
     alias: str = ""
     arena_writes: bool = False
     keep_kv: bool = False
-    stages: tuple[FilterStage, ...] = ()
-    question_token_ids: tuple[tuple[Any, ...], ...] = ()
+    written_pos: int = 0
+    question_tokens: int = 0
+    preamble_tokens: int = 0
+    selectivity: float | None = None
+    expected_docs: float = 0.0
+    question_token_ids: tuple[Any, ...] = ()
     # documents borrow the KV pages of a document that shares their
     # token prefix (the prefix_sharing rule)
     share_prefixes: bool = False
@@ -1012,10 +893,12 @@ class AiFilter(PhysicalNode):
             "alias": self.alias,
             "arena_writes": self.arena_writes,
             "keep_kv": self.keep_kv,
-            "stages": [stage.to_dict() for stage in self.stages],
-            "question_token_ids": [
-                list(question) for question in self.question_token_ids
-            ],
+            "written_pos": self.written_pos,
+            "question_tokens": self.question_tokens,
+            "preamble_tokens": self.preamble_tokens,
+            "selectivity": self.selectivity,
+            "expected_docs": self.expected_docs,
+            "question_token_ids": list(self.question_token_ids),
             "share_prefixes": self.share_prefixes,
             "attention": self.attention,
             "stop_key": list(self.stop_key),
@@ -1034,14 +917,12 @@ class AiFilter(PhysicalNode):
             alias=attributes["alias"],
             arena_writes=bool(attributes["arena_writes"]),
             keep_kv=bool(attributes["keep_kv"]),
-            stages=tuple(
-                FilterStage.from_mapping(stage)
-                for stage in attributes["stages"]
-            ),
-            question_token_ids=tuple(
-                tuple(question)
-                for question in attributes["question_token_ids"]
-            ),
+            written_pos=int(attributes["written_pos"]),
+            question_tokens=int(attributes["question_tokens"]),
+            preamble_tokens=int(attributes["preamble_tokens"]),
+            selectivity=attributes["selectivity"],
+            expected_docs=float(attributes["expected_docs"]),
+            question_token_ids=tuple(attributes["question_token_ids"]),
             share_prefixes=bool(attributes.get("share_prefixes", False)),
             attention=str(attributes.get("attention", "")),
             stop_key=tuple(str(column)
@@ -1195,12 +1076,24 @@ class Barrier(PhysicalNode):
 
 @dataclass(frozen=True)
 class AiJoin(PhysicalNode):
-    """Evaluate join predicates that use one anchor alias."""
+    """Evaluate one join predicate using an anchor document."""
 
     anchor: str = ""
     anchor_resident: str = "none"
     keep_anchor_kv: bool = False
-    stages: tuple[JoinStage, ...] = ()
+    written_pos: int = 0
+    exec_idx: int = 0
+    partners: tuple[str, ...] = ()
+    semantics: str = "full"
+    selectivity: float | None = None
+    expected_tuples: float = 0.0
+    anchor_frame_tokens: int = 0
+    pair_tail_tokens: int = 0
+    tuple_tokens: float = 0.0
+    pairs_from: str = ""
+    frame_token_ids: tuple[int, ...] = ()
+    label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    tail_token_ids: tuple[int, ...] = ()
     # "unified" or "tree": the attention path the tree_attention rule
     # chose; empty leaves the model pipeline's default
     attention: str = ""
@@ -1220,41 +1113,66 @@ class AiJoin(PhysicalNode):
             ValueType.DOCUMENT_IDS,
             schema=(self.anchor,),
         )]
-        outputs.extend(OutputPort(
-            f"join_answers:{stage.written_pos}",
+        outputs.append(OutputPort(
+            f"join_answers:{self.written_pos}",
             ValueType.JOIN_ANSWERS,
-            schema=(stage.anchor, *stage.partners, "answer"),
-        ) for stage in self.stages)
+            schema=(self.anchor, *self.partners, "answer"),
+        ))
         return tuple(outputs)
 
-    def attributes(self) -> dict:
+    def explain_fields(self) -> dict:
         return {
+            "written_pos": self.written_pos,
+            "exec_idx": self.exec_idx,
             "anchor": self.anchor,
+            "partners": list(self.partners),
+            "semantics": self.semantics,
+            "selectivity": self.selectivity,
+            "expected_tuples": self.expected_tuples,
+            "anchor_frame_tokens": self.anchor_frame_tokens,
+            "pair_tail_tokens": self.pair_tail_tokens,
             "anchor_resident": self.anchor_resident,
+            "tuple_tokens": self.tuple_tokens,
+            "pairs_from": self.pairs_from,
             "keep_anchor_kv": self.keep_anchor_kv,
-            "stages": [stage.to_dict() for stage in self.stages],
             "attention": self.attention,
             "share_prefixes": self.share_prefixes,
         }
 
-    def explain_fields(self) -> dict:
-        return {**self.attributes(),
-                "stages": [stage.explain_fields() for stage in self.stages]}
+    def attributes(self) -> dict:
+        return {
+            **self.explain_fields(),
+            "frame_token_ids": list(self.frame_token_ids),
+            "label_token_ids": [[alias, list(tokens)]
+                                for alias, tokens in self.label_token_ids],
+            "tail_token_ids": list(self.tail_token_ids),
+        }
 
     @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
+    def from_attributes(cls, node_id, inputs, value):
         return cls(
-            node_id=node_id,
-            inputs=inputs,
-            anchor=attributes["anchor"],
-            anchor_resident=attributes["anchor_resident"],
-            keep_anchor_kv=bool(attributes["keep_anchor_kv"]),
-            stages=tuple(
-                JoinStage.from_mapping(stage)
-                for stage in attributes["stages"]
+            node_id=node_id, inputs=inputs,
+            keep_anchor_kv=bool(value["keep_anchor_kv"]),
+            attention=str(value["attention"]),
+            share_prefixes=bool(value["share_prefixes"]),
+            written_pos=int(value["written_pos"]),
+            exec_idx=int(value["exec_idx"]),
+            anchor=str(value["anchor"]),
+            partners=tuple(value["partners"]),
+            semantics=str(value["semantics"]),
+            selectivity=value["selectivity"],
+            expected_tuples=float(value["expected_tuples"]),
+            anchor_frame_tokens=int(value["anchor_frame_tokens"]),
+            pair_tail_tokens=int(value["pair_tail_tokens"]),
+            anchor_resident=str(value["anchor_resident"]),
+            tuple_tokens=float(value["tuple_tokens"]),
+            pairs_from=str(value.get("pairs_from", "")),
+            frame_token_ids=tuple(value.get("frame_token_ids", ())),
+            label_token_ids=tuple(
+                (alias, tuple(tokens))
+                for alias, tokens in value.get("label_token_ids", ())
             ),
-            attention=str(attributes.get("attention", "")),
-            share_prefixes=bool(attributes.get("share_prefixes", False)),
+            tail_token_ids=tuple(value.get("tail_token_ids", ())),
         )
 
 

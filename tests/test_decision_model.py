@@ -224,7 +224,7 @@ def test_plans_carry_the_decision_layout(session):
         "SELECT d.id FROM documents d "
         "WHERE AI_FILTER(PROMPT('Asks for a refund? {0}', d.body))").plan()
     (node,) = [n for n in plan.nodes if isinstance(n, AiFilter)]
-    (question,) = node.question_token_ids
+    question = node.question_token_ids
     assert "".join(question).endswith(OPTIONS + CLOSING)
     assert "".join(question).startswith("\n\nTask type: noul\nQuestion:\n")
     assert plan.settings["pre_ids"] == _tokens("Context:\n")
@@ -233,7 +233,7 @@ def test_plans_carry_the_decision_layout(session):
         "SELECT q.id, d.id FROM queries q JOIN documents d "
         "ON AI_FILTER(PROMPT('Does {1} answer {0}?', q.text, d.body))").plan()
     (node,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
-    (stage,) = node.stages
+    stage = node
     assert "".join(stage.tail_token_ids).endswith(OPTIONS + CLOSING)
     assert "".join(stage.frame_token_ids).endswith("Does {1} answer {0}?")
     assert "".join(stage.tail_token_ids).startswith("\nOptions:")

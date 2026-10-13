@@ -12,8 +12,12 @@ from quail.backends.quail.executor.operators.extract import (
     ExtractPart,
     execute_extractions,
 )
-from quail.backends.quail.executor.operators.filter import FilterPart, LabelGate
-from quail.backends.quail.executor.operators.join import execute_join
+from quail.backends.quail.executor.operators.filter import (
+    FilterPart,
+    LabelGate,
+    execute_filters,
+)
+from quail.backends.quail.executor.operators.join import execute_joins
 from quail.backends.quail.executor.parts import (
     complete_chain,
     execution_prefix_tree,
@@ -67,6 +71,10 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
         return execute_extractions(
             state, members,
             context.model_inputs(first, inputs[first.node_id], context))
+    if all(isinstance(member, AiFilter) for member in members):
+        prepared = context.model_inputs(first, inputs[first.node_id], context)
+        prepared["retain_survivors"] = members[-1].keep_kv
+        return execute_filters(state, members, prepared)
     gpu_inputs = {"gpu_timing": context.state.get("gpu_timing", False)}
     # the members with stages, then the gates after the last of them
     last_staged = max(index for index, member in enumerate(members)
@@ -89,7 +97,8 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
     if joins:
         # the join settles each anchor's KV; a classification of
         # the rows it keeps runs as stages after the join's
-        join = staged[joins[0]]
+        join_nodes = [staged[index] for index in joins]
+        join = join_nodes[0]
         chain = {"documents": prefixes, "document_ids": ids,
                  "parts": parts, "after": [],
                  "pairs": {part.node.written_pos: part.rows
@@ -97,12 +106,12 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
                            if isinstance(part, ApplyGate)
                            and part.node.ids == "pairs"}}
         join_inputs = context.model_inputs(
-            join, inputs[join.node_id], context, chain)
-        for member in staged[joins[0] + 1:]:
+            join, inputs, context, chain, nodes=join_nodes)
+        for member in staged[joins[-1] + 1:]:
             chain["after"].append(joined_classification(
-                state, member, join, ids, join_inputs, context))
-        results[join.node_id] = execute_join(state, join, join_inputs)
-        context.model_result(join, results[join.node_id], context)
+                state, member, join_nodes, ids, join_inputs, context))
+        results.update(execute_joins(state, join_nodes, join_inputs))
+        context.model_result(join_nodes[-1], results[join_nodes[-1].node_id], context)
         for part in chain["after"]:
             results[part.node.node_id] = part.result_value
     else:
@@ -177,7 +186,8 @@ def _extract_parts(state: QueryExecutionState, members, ids, head, inputs,
 def _part(state: QueryExecutionState, node, ids, parts, inputs, context):
     """Build a pipeline member's execution part using preceding parts."""
     if isinstance(node, AiFilter):
-        return FilterPart(node, ids, state.async_answers)
+        return FilterPart(node, ids, state.async_answers,
+                          len(state.loaded_model.pipeline.canvas_ids))
     if isinstance(node, AiClassify):
         return classification_part(state, node, ids, parts, inputs[node.node_id])
     if isinstance(node, Filter):

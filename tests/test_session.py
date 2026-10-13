@@ -160,7 +160,7 @@ def make_executor(filter_truth, join_truth=None):
                     rows = {}
                     for document in inputs["document_ids"]:
                         row = []
-                        for question in node.question_token_ids:
+                        for question in (node.question_token_ids,):
                             bit = filter_truth[node.alias][
                                 _match_key(node.alias, question)
                             ][document]
@@ -169,7 +169,7 @@ def make_executor(filter_truth, join_truth=None):
                                 break
                         rows[document] = row
                     survivors = [d for d, row in rows.items()
-                                 if len(row) == len(node.stages) and all(row)]
+                                 if len(row) == 1 and all(row)]
                     # the real loop reports a chunk's finished documents
                     # by position; the hook streams them
                     if inputs.get("document_done") is not None:
@@ -185,7 +185,7 @@ def make_executor(filter_truth, join_truth=None):
                                    fresh_tokens=10 * len(rows)))
                 anchors = list(inputs["anchor_ids"])
                 outputs = {}
-                for stage in node.stages:
+                for stage in (node,):
                     partners = inputs["partner_indices"][stage.written_pos]
                     rule = join_truth[(stage.anchor, *stage.partners)]
                     rows = {i: [rule(a, *pair) for pair in partners]
@@ -258,7 +258,7 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     assert header.split() == ["est.", "rows", "rows", "est.", "pass", "pass",
                               "est.", "time", "time", "fresh", "tokens"]
     assert re.search(
-        r"AiFilter: r\s+1\.5\s+2\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+60$",
+        r"AiFilter: r\s+3\s+4\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+60$",
         text, re.M)
     # Both predicates have equal estimated cost and pass four of six rows.
     first = re.search(r"(?:1st: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"
@@ -384,7 +384,8 @@ def test_order_by_offset_and_distinct_run_on_the_result():
     assert result.to_rows() == [("r3",)]
     assert result.count() == 1
     assert result.observer(NodeTypes)["types"] == [
-        "quail.scan", "quail.ai_filter", "quail.project", "quail.sort"]
+        "quail.scan", "quail.ai_filter", "quail.ai_filter",
+        "quail.project", "quail.sort"]
     assert "Sort: r.stars DESC NULLS FIRST" in result.explain()
 
     result = _run(session.sql(
@@ -460,8 +461,8 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
         paired = _pair_query(session, on=True)
         cross = _pair_query(session, on=False)
         paired_plan, cross_plan = paired.plan(), cross.plan()
-        paired_stage = paired_plan.graph.nodes_by_type(AiJoin.type_name)[0].stages[0]
-        cross_stage = cross_plan.graph.nodes_by_type(AiJoin.type_name)[0].stages[0]
+        paired_stage = paired_plan.graph.nodes_by_type(AiJoin.type_name)[0]
+        cross_stage = cross_plan.graph.nodes_by_type(AiJoin.type_name)[0]
         # c1 and c2 pair with e0 and e2, c0 with e1: 5 of 12 pairs
         hash_join = paired_plan.graph.node("hash_join:c-e")
         assert (hash_join.left, hash_join.right, hash_join.on) == (

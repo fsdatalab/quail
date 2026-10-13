@@ -29,9 +29,7 @@ from quail.physical import (
     AiScore,
     ClassifySpec,
     Filter,
-    FilterStage,
     InList,
-    JoinStage,
     PhysicalGraph,
     PortRef,
     Scan,
@@ -124,11 +122,16 @@ def fused_graph(*, classify_only=False):
         Scan(node_id="input:r", alias="r", input_id="r"),
         Scan(node_id="input:p", alias="p", input_id="p"),
         AiFilter(
-            node_id="filter:r",
-            inputs=input_ports((PortRef("input:r", "ids:r"),)),
-            alias="r", arena_writes=True,
-            stages=(FilterStage(0, 1, 0, 0.8, 14 * 0.8),),
-            question_token_ids=((QUESTION,),)),
+            node_id='filter:r',
+            inputs=input_ports((PortRef('input:r', 'ids:r'),)),
+            alias='r',
+            arena_writes=True,
+            question_token_ids=(QUESTION,),
+            written_pos=0,
+            question_tokens=1,
+            preamble_tokens=0,
+            selectivity=0.8,
+            expected_docs=14 * 0.8),
         AiClassify(
             node_id="classify:r",
             inputs=input_ports((PortRef("filter:r", "ids:r"),)),
@@ -150,16 +153,24 @@ def fused_graph(*, classify_only=False):
             spec=replace(spec, name="kind", labels=("b", "a"),
                          prompt_token_parts=((), (CLASSIFY_FRAME + 1, CUE)))),
         AiJoin(
-            node_id="group:0", anchor="r", anchor_resident="filter",
-            inputs=input_ports((PortRef("classify:kind", "ids:r"),
-                                PortRef("input:p", "ids:p"))),
-            stages=(JoinStage(
-                written_pos=2, exec_idx=0, anchor="r", partners=("p",),
-                semantics="full", selectivity=0.5, expected_tuples=1,
-                anchor_frame_tokens=1, pair_tail_tokens=0,
-                anchor_resident="filter", tuple_tokens=0, pairs_from="",
-                frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
-                tail_token_ids=()),)),
+            node_id='group:0',
+            anchor='r',
+            anchor_resident='filter',
+            inputs=input_ports((PortRef('classify:kind', 'ids:r'),
+                                PortRef('input:p', 'ids:p'))),
+            written_pos=2,
+            exec_idx=0,
+            partners=('p',),
+            semantics='full',
+            selectivity=0.5,
+            expected_tuples=1,
+            anchor_frame_tokens=1,
+            pair_tail_tokens=0,
+            tuple_tokens=0,
+            pairs_from='',
+            frame_token_ids=(FRAME,),
+            label_token_ids=(('p', ()),),
+            tail_token_ids=()),
     ]
     if classify_only:
         nodes = [node for node in nodes if node.node_id not in (
@@ -200,11 +211,16 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     nodes = [Scan(node_id="input:r", alias="r", input_id="r")]
     if not first:
         nodes.append(AiFilter(
-            node_id="filter:r",
-            inputs=input_ports((PortRef("input:r", "ids:r"),)),
-            alias="r", arena_writes=True,
-            stages=(FilterStage(0, 1, 0, 0.8, 4 * 0.8),),
-            question_token_ids=((QUESTION,),)))
+            node_id='filter:r',
+            inputs=input_ports((PortRef('input:r', 'ids:r'),)),
+            alias='r',
+            arena_writes=True,
+            question_token_ids=(QUESTION,),
+            written_pos=0,
+            question_tokens=1,
+            preamble_tokens=0,
+            selectivity=0.8,
+            expected_docs=4 * 0.8))
     if shape == "score_first":
         nodes.append(AiScore(
             node_id="score:r", inputs=input_ports((PortRef("input:r", "ids:r"),)),
@@ -235,16 +251,24 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
                 predicate=InList("topic", ("a",)), aliases=("r",),
                 selectivity=0.5, written_pos=1),
             AiJoin(
-                node_id="group:0", anchor="r", anchor_resident="filter",
-                inputs=input_ports((PortRef("label:r", "ids:r"),
-                                    PortRef("input:p", "ids:p"))),
-                stages=(JoinStage(
-                    written_pos=2, exec_idx=0, anchor="r", partners=("p",),
-                    semantics="full", selectivity=0.5, expected_tuples=1,
-                    anchor_frame_tokens=1, pair_tail_tokens=0,
-                    anchor_resident="filter", tuple_tokens=0, pairs_from="",
-                    frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
-                    tail_token_ids=()),)),
+                node_id='group:0',
+                anchor='r',
+                anchor_resident='filter',
+                inputs=input_ports((PortRef('label:r', 'ids:r'),
+                                    PortRef('input:p', 'ids:p'))),
+                written_pos=2,
+                exec_idx=0,
+                partners=('p',),
+                semantics='full',
+                selectivity=0.5,
+                expected_tuples=1,
+                anchor_frame_tokens=1,
+                pair_tail_tokens=0,
+                tuple_tokens=0,
+                pairs_from='',
+                frame_token_ids=(FRAME,),
+                label_token_ids=(('p', ()),),
+                tail_token_ids=()),
         ]
         root = PortRef("group:0", "ids:r")
     graph = PhysicalGraph(tuple(nodes), root)
@@ -425,7 +449,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     # survivor over its resident KV: no second prefill
     assert metrics["classify:r"]["fresh_tokens"] == 3 * (2 + 1 + 4)
     assert metrics["classify:r"]["evaluated_documents"] == 3
-    assert metrics["filter:r"]["fresh_tokens"] == sum(map(len, docs["r"])) + 4
+    assert metrics["filter:r"]["fresh_tokens"] == sum(map(len, docs["r"])) + 4 * 2
     if shape == "joined":
         # the filter keeps document 0, whose partner suffixes
         # ran over its resident KV after its read
@@ -433,7 +457,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
             == [0]
         joined_ids = outputs[PortRef("group:0", "ids:r")]
         assert joined_ids.column("r").to_pylist() == [0]
-        assert metrics["group:0"]["fresh_tokens"] == 1 + 2
+        assert metrics["group:0"]["fresh_tokens"] == 2 + 2 * 2
 
 
 @pytest.mark.parametrize("classify_only", [False, True])
@@ -548,16 +572,24 @@ def joined_graph(two_joins=False):
         Scan(node_id="input:r", alias="r", input_id="r"),
         Scan(node_id="input:p", alias="p", input_id="p"),
         AiJoin(
-            node_id="group:0", anchor="r", anchor_resident="fresh",
-            inputs=input_ports((PortRef("input:r", "ids:r"),
-                                PortRef("input:p", "ids:p"))),
-            stages=(JoinStage(
-                written_pos=2, exec_idx=0, anchor="r", partners=("p",),
-                semantics="full", selectivity=0.5, expected_tuples=3,
-                anchor_frame_tokens=1, pair_tail_tokens=0,
-                anchor_resident="fresh", tuple_tokens=0, pairs_from="",
-                frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
-                tail_token_ids=()),)),
+            node_id='group:0',
+            anchor='r',
+            anchor_resident='fresh',
+            inputs=input_ports((PortRef('input:r', 'ids:r'),
+                                PortRef('input:p', 'ids:p'))),
+            written_pos=2,
+            exec_idx=0,
+            partners=('p',),
+            semantics='full',
+            selectivity=0.5,
+            expected_tuples=3,
+            anchor_frame_tokens=1,
+            pair_tail_tokens=0,
+            tuple_tokens=0,
+            pairs_from='',
+            frame_token_ids=(FRAME,),
+            label_token_ids=(('p', ()),),
+            tail_token_ids=()),
         AiClassify(
             node_id="classify:rp",
             inputs=input_ports((PortRef("group:0", "join_answers:2"),)),
@@ -566,13 +598,11 @@ def joined_graph(two_joins=False):
     if two_joins:
         nodes.insert(2, Scan(node_id="input:q", alias="q", input_id="q"))
         join = nodes[3]
-        nodes[3] = replace(
-            join,
-            inputs=input_ports(tuple(port.source for port in join.inputs)
-                               + (PortRef("input:q", "ids:q"),)),
-            stages=join.stages + (replace(
-                join.stages[0], written_pos=3, exec_idx=1, partners=("q",),
-                frame_token_ids=(FRAME + 1,), label_token_ids=(("q", ()),)),))
+        nodes.insert(4, replace(
+            join, node_id="group:1", written_pos=3, exec_idx=1, partners=("q",),
+            inputs=input_ports((PortRef("group:0", "ids:r"),
+                                PortRef("input:q", "ids:q"))),
+            frame_token_ids=(FRAME + 1,), label_token_ids=(("q", ()),)))
     return PhysicalGraph(tuple(nodes), PortRef("classify:rp", "rows"))
 
 
@@ -583,7 +613,8 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
 
     graph = joined_graph(two_joins)
     chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
-    assert chains == {("group:0", "classify:rp")}
+    assert chains == {("group:0", "group:1", "classify:rp") if two_joins
+                      else ("group:0", "classify:rp")}
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     docs = {"r": [[DOC + d] * (5 + d) for d in range(3)],
@@ -662,18 +693,21 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     assert metrics["classify:rp"]["fresh_tokens"] == 2 * (1 + 1) + 3 * (block + 1)
     assert metrics["classify:rp"]["evaluated_document_pairs"] == 3
     # the join packed every anchor, its frame, and both partners' suffixes
-    assert metrics["group:0"]["fresh_tokens"] == sum(map(len, docs["r"])) \
+    assert sum(value["fresh_tokens"] for name, value in metrics.items()
+               if name.startswith("group:")) == sum(map(len, docs["r"])) \
         + 3 * 1 + 6 * 2 + (2 * (1 + 2) if two_joins else 0)
 
 
 def test_a_join_writes_its_first_partner_label_with_the_frame():
-    stage = JoinStage(
+    stage = AiJoin(node_id="join",
         written_pos=0, exec_idx=0, anchor="r", partners=("p", "q"),
         semantics="full", selectivity=0.5, expected_tuples=1,
         anchor_frame_tokens=2, pair_tail_tokens=1, anchor_resident="fresh",
         tuple_tokens=0, frame_token_ids=(1, 2),
         label_token_ids=(("p", (3, 4)), ("q", (5,))), tail_token_ids=(9,))
-    spec = stage.runtime_spec()
+    from quail.backends.quail.prompts import join_request
+
+    spec = join_request(stage)
 
     assert spec["frame"] == (1, 2, 3, 4)
     assert spec["labels"] == {"p": (), "q": (5,)}

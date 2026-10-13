@@ -29,6 +29,7 @@ from quail.backends.quail.graph import (
     partner_list_builder,
     stage_partner_lists,
 )
+from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.cost import budgets
 from quail.execution.runner import ExecutionContext
@@ -472,6 +473,15 @@ def _child_boot(state, sub):
     return boot
 
 
+def _execute_predicates(context, nodes, inputs):
+    """Dispatch one predicate or a pipeline of predicates on the worker."""
+    if len(nodes) == 1:
+        node = nodes[0]
+        return {node.node_id: context.runtimes[node.runtime_key].execute(
+            node, inputs, context)}
+    return context.model_execution.execute_predicates(nodes, inputs)
+
+
 def _child_filters(state, sub):
     gpu = state.get("gpu")
     torch = gpu.torch if gpu else state["torch"]
@@ -491,15 +501,17 @@ def _child_filters(state, sub):
                 sub["physical_plan"]["graph"],
                 state["registry"].codecs,
             )
-            node = graph.node(node_id)
+            nodes = tuple(graph.node(member)
+                          for member in sub.get("node_ids", (node_id,)))
+            node = nodes[0]
             if not isinstance(node, AiFilter):
                 raise TypeError(
                     f"child filter received {node.type_name!r}")
             alias = node.alias
             index = sub["doc_index"][alias]
             runtime_context = state["runtime_context"]
-            result = runtime_context.runtimes[node.runtime_key].execute(
-                node,
+            results = _execute_predicates(
+                runtime_context, nodes,
                 {
                     "documents": DocumentPrefixes(
                         pre,
@@ -509,16 +521,22 @@ def _child_filters(state, sub):
                     "document_ids": index,
                     "limit": filter_limit,
                     "stop_groups": sub.get("stop_groups"),
-                    "retain_survivors": node.keep_kv,
+                    "retain_survivors": nodes[-1].keep_kv,
                 },
-                runtime_context,
             )
-            answers = result.outputs[f"filter_answers:{alias}"]
+            out["results"] = results
+            result = results[nodes[-1].node_id]
+            answers = {}
+            for member in nodes:
+                for document, row in results[member.node_id].outputs[
+                        f"filter_answers:{alias}"].items():
+                    answers.setdefault(document, []).extend(row)
             if node.keep_kv:
                 out["retained"][alias] = sorted(
                     key[1] for key in arena.retained_keys()
                     if key[0] == alias)
-            out["fresh_tokens"] += result.metrics.fresh_tokens
+            out["fresh_tokens"] += sum(result.metrics.fresh_tokens
+                                       for result in results.values())
             out["filters"][alias] = {
                 int(document): row for document, row in answers.items()
             }
@@ -567,11 +585,12 @@ def _child_joins(state, sub):
         _reset_child_query(state)
     pre = sub.get("pre_ids") or []
     registry = state["registry"]
-    encoded_node = sub["physical_node"]
-    node = registry.codecs[encoded_node["type"]].decode(encoded_node)
+    nodes = tuple(registry.codecs[value["type"]].decode(value)
+                  for value in sub["physical_nodes"])
+    node = nodes[0]
     if not isinstance(node, AiJoin):
         raise TypeError(f"child join received {node.type_name!r}")
-    group = [stage.runtime_spec() for stage in node.stages]
+    group = [join_request(member) for member in nodes]
     anchor_alias = node.anchor
     anchors_glob = list(sub["anchor_index"])
     anchor_docs = sub["anchor_docs"]
@@ -614,13 +633,13 @@ def _child_joins(state, sub):
                      else matched)
             if alive and retain_anchor:
                 retain_after_join(arena, anchor_keys[a], len(prefixes[a]), config,
-                                  config.get("after", {}).get(node.node_id, {}))
+                                  config.get("after", {}).get(nodes[-1].node_id, {}))
             else:
                 arena.free_key(anchor_keys[a])
 
         runtime_context = state["runtime_context"]
-        result = runtime_context.runtimes[node.runtime_key].execute(
-            node,
+        results = _execute_predicates(
+            runtime_context, nodes,
             {
                 "prefixes": prefixes,
                 "stage_suffixes": stage_suffixes,
@@ -634,14 +653,14 @@ def _child_joins(state, sub):
                 "anchor_ids": anchors_glob,
                 "partner_indices": {
                     stage.written_pos: tuples
-                    for stage, tuples in zip(node.stages, tuple_globs)
+                    for stage, tuples in zip(nodes, tuple_globs)
                 },
                 "anchor_partners": lists_for,
                 "group": group,
             },
-            runtime_context,
         )
-        ans = result.metrics.extension["answers"]
+        ans = [results[member.node_id].metrics.extension["answers"][0]
+               for member in nodes]
         last = ans[-1] if ans else {}
         for a, key in enumerate(anchor_keys):
             if not arena.is_resident(key):
@@ -651,10 +670,10 @@ def _child_joins(state, sub):
                      else matched)
             if alive and retain_anchor:
                 retain_after_join(arena, key, len(prefixes[a]), config,
-                                  config.get("after", {}).get(node.node_id, {}))
+                                  config.get("after", {}).get(nodes[-1].node_id, {}))
             else:
                 arena.free_key(key)
-        tokens_total += result.metrics.fresh_tokens
+        tokens_total += sum(result.metrics.fresh_tokens for result in results.values())
         partner_lists = stage_partner_lists(group, lists_for, anchors_glob)
         for si, j in enumerate(group):
             out_joins.append(dict(
@@ -669,7 +688,7 @@ def _child_joins(state, sub):
     retained = {}
     for alias, document in arena.retained_keys():
         retained.setdefault(alias, []).append(document)
-    return dict(joins=out_joins, fresh_tokens=tokens_total,
+    return dict(joins=out_joins, results=results, fresh_tokens=tokens_total,
                 retained={alias: sorted(documents)
                           for alias, documents in retained.items()},
                 kv_round=round_kv,

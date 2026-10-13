@@ -284,9 +284,8 @@ def _estimated_rows(graph):
                      else node.expected_docs)
         elif isinstance(node, AiFilter):
             value = inputs[0] if inputs else None
-            for stage in node.stages:
-                if value is not None:
-                    value *= effective_selectivity(stage.selectivity)
+            if value is not None:
+                value *= effective_selectivity(node.selectivity)
         elif isinstance(node, (Project, Limit, Sort, Exchange)) \
                 and len(inputs) == 1:
             value = inputs[0]
@@ -391,7 +390,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         elif isinstance(node, AiFilter):
             title += f": {node.alias}"
             kv = []
-            if len(node.stages) > 1 and node.arena_writes:
+            if node.arena_writes:
                 kv.append("KV rewind=on")
             if node.keep_kv:
                 kv.append("retain KV for later joins")
@@ -403,19 +402,14 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                     f"(one document at a time, the rest skipped once "
                     f"one survives)")
             written = filters.get(node.alias, ())
-            order = [stage.written_pos for stage in node.stages]
-            reordered = order != sorted(order)
-            for index, stage in enumerate(node.stages, 1):
-                label = f"predicate {stage.written_pos + 1}"
-                if reordered:
-                    label = f"{_ordinal(index)}: {label}"
-                if stage.written_pos < len(written):
-                    label += "  " + _short_prompt(
-                        written[stage.written_pos].prompt)
-                predicates.append((label, stage_cells(
-                    stage.selectivity, stage.expected_docs,
-                    stages.get(("filter", node.alias, stage.written_pos)),
-                    "evaluated")))
+            label = f"predicate {node.written_pos + 1}"
+            if node.written_pos < len(written):
+                label += "  " + _short_prompt(
+                    written[node.written_pos].prompt)
+            predicates.append((label, stage_cells(
+                node.selectivity, node.expected_docs,
+                stages.get(("filter", node.alias, node.written_pos)),
+                "evaluated")))
         elif isinstance(node, AiClassify):
             spec = node.spec
             title += f": {spec.name} over {spec.aliases[0]}"
@@ -440,21 +434,16 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                           node.anchor_resident, node.anchor_resident)
             keep = "yes" if node.keep_anchor_kv else "no"
             details.append(f"KV: anchor={source}, retain after join={keep}")
-            order = [stage.written_pos for stage in node.stages]
-            reordered = order != sorted(order)
-            for index, stage in enumerate(node.stages, 1):
-                label = (f"join {stage.written_pos + 1} {stage.semantics} "
-                         f"({stage.anchor}, {', '.join(stage.partners)})")
-                if stage.pairs_from:
-                    label += f" over pairs from {stage.pairs_from}"
-                if reordered:
-                    label = f"{_ordinal(index)}: {label}"
-                if stage.written_pos < len(joins):
-                    label += "  " + _short_prompt(
-                        joins[stage.written_pos].prompt)
-                predicates.append((label, stage_cells(
-                    stage.selectivity, stage.expected_tuples,
-                    stages.get(("join", stage.written_pos)), "tuples")))
+            label = (f"join {node.written_pos + 1} {node.semantics} "
+                     f"({node.anchor}, {', '.join(node.partners)})")
+            if node.pairs_from:
+                label += f" over pairs from {node.pairs_from}"
+            if node.written_pos < len(joins):
+                label += "  " + _short_prompt(
+                    joins[node.written_pos].prompt)
+            predicates.append((label, stage_cells(
+                node.selectivity, node.expected_tuples,
+                stages.get(("join", node.written_pos)), "tuples")))
         elif isinstance(node, HashJoin):
             title += ": " + " and ".join(
                 f"{node.left}.{left} = {node.right}.{right}"

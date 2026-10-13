@@ -19,7 +19,13 @@ from quail.execution.tokens import DocumentKeys
 
 
 def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
-    """Run a join with any preceding and following pipeline parts."""
+    """Run one join predicate."""
+    return execute_joins(state, (node,), inputs)[node.node_id]
+
+
+def execute_joins(state: QueryExecutionState, nodes, inputs) -> dict:
+    """Run join predicates with any preceding and following pipeline parts."""
+    node = nodes[0]
     torch = state.torch
     arena = state.loaded_model.arena
     pipeline = state.loaded_model.pipeline
@@ -113,10 +119,11 @@ def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
             low = high
         spans = stage_spans(spans, 0, leading + len(join_stages))
         tokens -= after_tokens
+    own_tokens = _predicate_tokens(
+        join_stages, answers, lists_for, anchor_keys, len(pipeline.canvas_ids))
     if chain is not None:
         # the join packs frames and partner suffixes; the rest is the chain's
-        join_tokens = _streamed_tokens(join_stages, answers, lists_for,
-                                       anchor_keys)
+        join_tokens = sum(own_tokens)
         # the join's anchors are the documents that reached it, in
         # the chain's order: those with a first-stage row and those
         # that settled there with no partner to ask; their rows are
@@ -144,72 +151,64 @@ def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
         anchor_ids = list(inputs["anchor_ids"])
         kv_round = inputs.get("kv_round") or {}
     group = inputs["group"]
-    last = answers[-1] if answers else {}
-    matched = {
-        anchor_ids[int(local)]
-        for local, row in last.items() if any(row)
-    }
-    if group[-1]["semantics"] == "anti":
-        survivors = [document for document in anchor_ids
-                     if document not in matched]
-    else:
-        survivors = [document for document in anchor_ids
-                     if document in matched]
-    outputs = {f"ids:{node.anchor}": survivors}
     partner_lists = stage_partner_lists(group, lists_for, anchor_ids)
-    for stage, stage_answers, members in zip(
-            node.stages, answers, partner_lists):
-        outputs[f"join_answers:{stage.written_pos}"] = {
-            "rows": stage_answers,
-            "anchor_index": anchor_ids,
-            "partner_index": inputs["partner_indices"][
-                stage.written_pos
-            ],
-            "anchor_partners": members,
-            "anchor": node.anchor,
-            "partners": list(stage.partners),
-            "semantics": stage.semantics,
-            "selectivity": stage.selectivity,
-            "written_pos": stage.written_pos,
+    results = {}
+    own_tokens[0] = tokens - sum(own_tokens[1:])
+    for j, (member, rows, members) in enumerate(zip(nodes, answers, partner_lists)):
+        reached_ids = [anchor_ids[int(local)] for local in sorted(rows)]
+        matched = [anchor_ids[int(local)] for local in sorted(rows) if any(rows[local])]
+        survivors = matched
+        # Anchors with no candidates never launch a request.
+        if member.semantics == "anti":
+            candidates = anchor_ids if j == 0 else results[
+                nodes[j - 1].node_id].outputs[f"ids:{node.anchor}"]
+            survivors = [document for document in candidates if document not in matched]
+        answer = {
+            "rows": rows, "anchor_index": anchor_ids,
+            "partner_index": inputs["partner_indices"][member.written_pos],
+            "anchor_partners": members, "anchor": member.anchor,
+            "partners": list(member.partners), "semantics": member.semantics,
+            "selectivity": member.selectivity, "written_pos": member.written_pos,
         }
-    return NodeResult(
-        outputs=outputs,
-        metrics=NodeMetrics(
-            input_rows=len(anchor_ids),
-            output_rows=len(survivors),
-            evaluated_document_pairs=sum(
-                sum(len(row) for row in stage.values())
-                for stage in answers
-            ),
-            kv_hits=kv_round.get("hits", 0),
-            kv_misses=kv_round.get("misses", 0),
-            fresh_tokens=tokens,
-            gpu_s=gpu_seconds(torch, spans, inputs),
-            chunks=chunks(spans, inputs),
-            extension={
-                "answers": answers,
-                **({"borrowed_prefix_tokens": join_stats["borrowed_tokens"]}
-                   if join_stats.get("borrowed_tokens") else {}),
-                **({"pack_s": round(join_stats["pack_s"], 3)}
-                   if join_stats.get("pack_s") else {}),
-            },
-        ),
-    )
+        own_spans = stage_spans(spans, leading + j, leading + j + 1)
+        results[member.node_id] = NodeResult(
+            outputs={f"ids:{member.anchor}": survivors,
+                     f"join_answers:{member.written_pos}": answer},
+            metrics=NodeMetrics(
+                input_rows=len(anchor_ids) if j == 0 else len(reached_ids),
+                output_rows=len(survivors),
+                evaluated_document_pairs=sum(len(row) for row in rows.values()),
+                kv_hits=kv_round.get("hits", 0) if j == 0 else len(rows),
+                kv_misses=kv_round.get("misses", 0) if j == 0 else 0,
+                fresh_tokens=own_tokens[j],
+                gpu_s=gpu_seconds(torch, own_spans, inputs),
+                chunks=chunks(own_spans, inputs),
+                extension={
+                    "answers": [rows],
+                    **({"borrowed_prefix_tokens": join_stats["borrowed_tokens"]}
+                       if j == 0 and join_stats.get("borrowed_tokens") else {}),
+                    **({"pack_s": round(join_stats["pack_s"], 3)}
+                       if j == 0 and join_stats.get("pack_s") else {}),
+                }))
+    return results
 
 
-def _streamed_tokens(join_stages, answers, lists_for, anchor_keys) -> int:
-    """Count frame and partner suffix tokens processed by the join stages."""
-    total = 0
+def _predicate_tokens(join_stages, answers, lists_for, anchor_keys,
+                      canvas_tokens) -> list[int]:
+    """Count each predicate's fresh frame and partner suffix tokens."""
+    totals = []
     previous = None
     for j, (stage, rows) in enumerate(zip(join_stages, answers)):
         frame = list(stage.frame)
         writes = bool(frame) and frame != previous
         previous = frame
-        lengths = [len(suffix) for suffix in stage.suffixes]
+        lengths = [len(suffix) + canvas_tokens for suffix in stage.suffixes]
+        total = 0
         for anchor in rows:
             indices = (None if lists_for is None
                        else lists_for(anchor_keys[anchor][1])[j])
-            total += (len(frame) if writes else 0) + (
+            total += (len(frame) + canvas_tokens if writes else 0) + (
                 sum(lengths) if indices is None
                 else sum(lengths[i] for i in indices))
-    return total
+        totals.append(total)
+    return totals

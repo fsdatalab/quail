@@ -66,15 +66,12 @@ def test_in_process_run_saves_a_readable_and_verified_result(store, tmp_path):
 
     # each entry is (row index, last stage asked, passed)
     saved = artifacts.read_answers(directory / artifacts.ANSWERS_FILE)
-    assert [entry["kind"] for entry in saved] == ["filter"]
-    assert saved[0]["alias"] == "r" and saved[0]["stages"] == 2
-    finished = {row: (stage, passed) for row, stage, passed in saved[0]["documents"]}
-    assert {row for row, (_, passed) in finished.items() if passed} == {0, 3}
-    assert finished[0] == finished[3] == (1, True)
-    # the failing stage of each other row depends on the planner's order
-    assert sorted(stage for _, (stage, passed) in finished.items()
-                  if not passed) == [0, 0, 1, 1]
-    assert final.progress["answers_saved"] == 1
+    assert [entry["kind"] for entry in saved] == ["filter", "filter"]
+    assert all(entry["alias"] == "r" and entry["stages"] == 1 for entry in saved)
+    first, last = [entry["documents"] for entry in saved]
+    assert len(first) == 6 and len(last) == 4
+    assert {row for row, _, passed in last if passed} == {0, 3}
+    assert final.progress["answers_saved"] == 2
 
     # verification rejects a missing or short result file
     verified = tmp_path / "verified"

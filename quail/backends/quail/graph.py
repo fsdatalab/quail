@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import time
 
+from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution.pairs import (
     allowed_members,
@@ -168,7 +169,7 @@ def filter_result(node, answers, tokens, document_ids,
     survivors = sorted(
         document
         for document, row in global_answers.items()
-        if len(row) == len(node.question_token_ids) and all(row)
+        if len(row) == 1 and all(row)
     )
     return NodeResult(
         outputs={
@@ -203,7 +204,7 @@ def filter_document_sink(node, document_ids):
     sink = answer_sink()
     if sink is None:
         return None
-    stages = len(node.question_token_ids)
+    stages = 1
 
     def document_done(finished):
         sink({"kind": "filter", "node": node.node_id, "alias": node.alias,
@@ -257,13 +258,14 @@ def filter_inputs(state, node, document_ids) -> dict:
 
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext,
-                         chain=None):
+                         chain=None, nodes=None):
     """Convert graph input ports into backend scheduler inputs.
 
     Args:
         node: Physical operator to execute.
         inputs: Port values supplied by preceding operators.
         context: Execution context containing document tokens and settings.
+        nodes: Join predicates sharing one scheduler run.
         chain: Optional preceding pipeline state for a join, containing its
             documents, document IDs, operator parts, and selected pairs.
 
@@ -289,24 +291,30 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext,
     if not isinstance(node, (AiFilter, AiJoin)):
         return inputs
     return {
-        **_model_inputs(node, inputs, context, chain),
+        **_model_inputs(node, inputs, context, chain, nodes),
         "gpu_timing": context.state.get("gpu_timing", False),
     }
 
 
-def _model_inputs(node, inputs, context: ExecutionContext, chain=None) -> dict:
+def _model_inputs(node, inputs, context: ExecutionContext, chain=None,
+                  nodes=None) -> dict:
     state = context.state
     if isinstance(node, AiFilter):
         return filter_inputs(state, node, next(iter(inputs.values())))
 
+    grouped = nodes is not None
+    nodes = (node,) if nodes is None else nodes
+    last_node = nodes[-1]
     by_alias = {}
     port_pairs = {}        # written position -> pair table from a port
     chain_pairs = {} if chain is None else chain["pairs"]
-    for input_port in node.inputs:
+    for member, input_port in ((member, port) for member in nodes
+                               for port in member.inputs):
+        values = inputs[member.node_id] if grouped else inputs
         port = input_port.source.port
-        if input_port.name not in inputs:
+        if input_port.name not in values:
             continue           # fed by the chain itself
-        value = inputs[input_port.name]
+        value = values[input_port.name]
         if port.startswith("pairs:"):
             port_pairs[int(port.split(":", 1)[1])] = value
             continue
@@ -329,10 +337,10 @@ def _model_inputs(node, inputs, context: ExecutionContext, chain=None) -> dict:
     config = state["retention"]
     apply_retention(state["arena"], config,
                     config.get("before", {}).get(node.node_id, {}), by_alias)
-    group = [stage.runtime_spec() for stage in node.stages]
+    group = [join_request(member) for member in nodes]
     stage_suffixes = []
     tuple_indices = {}
-    for stage, join in zip(node.stages, group):
+    for stage, join in zip(nodes, group):
         tuples = [list(member) for member in itertools.product(
             *[by_alias[alias] for alias in join["partners"]]
         )]
@@ -346,7 +354,7 @@ def _model_inputs(node, inputs, context: ExecutionContext, chain=None) -> dict:
     maps = partner_maps(group, port_pairs, streamed=set(chain_pairs))
     maps.update(chain_pairs)
     lists_for = partner_list_builder(
-        group, [tuple_indices[stage.written_pos] for stage in node.stages],
+        group, [tuple_indices[stage.written_pos] for stage in nodes],
         maps)
     if chain is None:
         anchor_ids = by_alias[node.anchor]
@@ -395,10 +403,10 @@ def _model_inputs(node, inputs, context: ExecutionContext, chain=None) -> dict:
             else matched
         # an anchor with no pairs settles without loading its KV
         if state["arena"].is_resident(key):
-            if alive and node.keep_anchor_kv:
+            if alive and last_node.keep_anchor_kv:
                 retain_after_join(
                     state["arena"], key, len(prefixes[local_index]), config,
-                    config.get("after", {}).get(node.node_id, {}))
+                    config.get("after", {}).get(last_node.node_id, {}))
             else:
                 state["arena"].free_key(key)
         sink = answer_sink()
@@ -565,17 +573,18 @@ def throughput(graph, metrics, seconds: float) -> dict:
 
 
 def model_answers(graph, result) -> tuple[dict, list]:
-    """Collect filter and join answers from executed model nodes."""
+    """Collect predicate answers in execution order."""
     filters, joins = {}, []
     for node in graph.topological_nodes():
         if isinstance(node, AiFilter):
-            filters[node.alias] = result.nodes[node.node_id].outputs[
-                f"filter_answers:{node.alias}"
-            ]
+            rows = result.nodes[node.node_id].outputs[
+                f"filter_answers:{node.alias}"]
+            combined = filters.setdefault(node.alias, {})
+            for document, answers in rows.items():
+                combined.setdefault(document, []).extend(answers)
         elif isinstance(node, AiJoin):
-            joins.extend(result.nodes[node.node_id].outputs[
-                f"join_answers:{stage.written_pos}"
-            ] for stage in node.stages)
+            joins.append(result.nodes[node.node_id].outputs[
+                f"join_answers:{node.written_pos}"])
     return filters, joins
 
 

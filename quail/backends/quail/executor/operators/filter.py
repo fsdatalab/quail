@@ -6,6 +6,7 @@ from quail.backends.quail.executor.parts import (
     execution_prefix_tree,
     gpu_seconds,
     input_staging,
+    stage_spans,
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
@@ -17,6 +18,12 @@ from quail.execution.tokens import DocumentKeys
 
 def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
     """Run one model filter and collect its results."""
+    return execute_filters(state, (node,), inputs)[node.node_id]
+
+
+def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
+    """Run filter predicates together while each document retains its KV."""
+    node = nodes[0]
     torch = state.torch
     arena = state.loaded_model.arena
     pipeline = state.loaded_model.pipeline
@@ -24,12 +31,22 @@ def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
     chunk_tokens = state.chunk_tokens
 
     document_ids = inputs["document_ids"]
-    retain_survivors = inputs.get("retain_survivors", ())
+    retain_survivors = inputs.get("retain_survivors", nodes[-1].keep_kv)
     if retain_survivors is False:
         retain_survivors = ()
     # sorted admission would change which rows a limit keeps
     tree = (None if inputs.get("limit") is not None
             else execution_prefix_tree(node, inputs["documents"], arena))
+    sinks = [filter_document_sink(member, document_ids) for member in nodes]
+
+    def document_done(finished):
+        for j, sink in enumerate(sinks):
+            if sink is not None:
+                rows = [(document, 0, passed if stage == j else True)
+                        for document, stage, passed in finished if stage >= j]
+                if rows:
+                    sink(rows)
+
     stats = {}
     answers, spans, tokens = loop.run_filter(
         torch,
@@ -37,24 +54,37 @@ def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
         pipeline,
         async_answers,
         inputs["documents"],
-        [list(question) for question in node.question_token_ids],
+        [list(member.question_token_ids) for member in nodes],
         chunk_tokens,
         limit=inputs.get("limit"),
         stop_groups=inputs.get("stop_groups"),
-        arena_writes=node.arena_writes,
+        arena_writes=node.arena_writes or len(nodes) > 1,
         arena_keys=DocumentKeys(node.alias, document_ids),
         retain_survivors=retain_survivors,
-        document_done=inputs.get("document_done"),
+        document_done=(inputs.get("document_done") if len(nodes) == 1
+                       else document_done),
         prefix_tree=tree,
         attention_mode=node.attention or None,
         stats=stats, staging=input_staging(state),
     )
-    return filter_result(
-        node, answers, tokens, document_ids,
-        gpu_s=gpu_seconds(torch, spans, inputs),
-        chunks=chunks(spans, inputs),
-        borrowed_tokens=stats.get("borrowed_tokens", 0),
-        pack_s=stats.get("pack_s", 0.0))
+    counts = [sum(len(row) > j for row in answers.values())
+              for j in range(len(nodes))]
+    own = [count * (len(member.question_token_ids) + len(pipeline.canvas_ids))
+           for count, member in zip(counts, nodes)]
+    own[0] = tokens - sum(own[1:])
+    results = {}
+    for j, member in enumerate(nodes):
+        rows = {document: [row[j]] for document, row in answers.items()
+                if len(row) > j}
+        own_spans = stage_spans(spans, j, j + 1)
+        result = filter_result(
+            member, rows, own[j], document_ids,
+            gpu_s=gpu_seconds(torch, own_spans, inputs),
+            chunks=chunks(own_spans, inputs),
+            borrowed_tokens=stats.get("borrowed_tokens", 0) if j == 0 else 0,
+            pack_s=stats.get("pack_s", 0.0) if j == 0 else 0.0)
+        results[member.node_id] = result
+    return results
 
 
 class FilterPart:
@@ -63,11 +93,12 @@ class FilterPart:
     gate = None
     result_value = None
 
-    def __init__(self, node, ids, async_answers):
+    def __init__(self, node, ids, async_answers, canvas_tokens=0):
         self.node = node
         self.ids = ids
+        self.canvas_tokens = canvas_tokens
         self.stages = filter_stages(
-            [list(question) for question in node.question_token_ids],
+            [list(node.question_token_ids)],
             async_answers)
         self.document_done = filter_document_sink(node, ids)
         self.answers = {}
@@ -77,7 +108,8 @@ class FilterPart:
         for stage in every:
             for document, row in stage.items():
                 self.answers.setdefault(document, []).append(int(row[0]))
-        return None
+        return len(self.answers) * (len(self.node.question_token_ids)
+                                    + self.canvas_tokens)
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         return filter_result(

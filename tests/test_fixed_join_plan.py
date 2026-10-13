@@ -89,6 +89,20 @@ class FixedFeverAnswers:
     # the stance a classification gives each (claim, evidence) pair
     stances = {(0, 0): "supports", (1, 1): "refutes", (2, 0): "supports"}
 
+    def execute_predicates(self, nodes, inputs):
+        results = {}
+        live = set(range(len(inputs["anchor_ids"])))
+        partners = inputs.get("anchor_partners")
+        for index, node in enumerate(nodes):
+            value = self.execute(node, {
+                **inputs, "_live": live,
+                "anchor_partners": (None if partners is None else
+                                    lambda key, j=index: [partners(key)[j]])})
+            results[node.node_id] = value
+            rows = value.metrics.extension["answers"][0]
+            live = {local for local, row in rows.items() if any(row)}
+        return results
+
     def execute(self, node, inputs):
         if isinstance(node, AiClassify) and node.spec.partner is not None:
             # the join's true pairs, labeled from the table above; a
@@ -137,10 +151,10 @@ class FixedFeverAnswers:
 
         outputs = {}
         anchor_ids = inputs["anchor_ids"]
-        live = set(range(len(anchor_ids)))
+        live = set(inputs.get("_live", range(len(anchor_ids))))
         all_answers = []
         lists_for = inputs.get("anchor_partners")
-        for stage_index, stage in enumerate(node.stages):
+        for stage_index, stage in enumerate((node,)):
             aliases = (stage.anchor, *stage.partners)
             claim = next(alias for alias in aliases if alias.startswith("c"))
             evidence = next(alias for alias in aliases if alias.startswith("e"))
@@ -245,7 +259,7 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
                 patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
 
             def check(request, graph):
-                assert sum(len(group.stages)
+                assert sum(1
                            for group in graph.nodes_by_type(AiJoin.type_name)) == 3
                 patch.setattr("quail.planner.join_order.search_joins",
                               unexpected_search)
@@ -433,7 +447,7 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
         with _session(gpus=gpus) as session:
             query = quailb.queries(session)["FEV-10"][1]()
             plan = query.plan()
-            (stage,) = plan.graph.nodes_by_type(AiJoin.type_name)[0].stages
+            stage = plan.graph.nodes_by_type(AiJoin.type_name)[0]
             hash_join = plan.graph.node("hash_join:c-e")
             assert hash_join.on == (("evidence_wiki_url", "id"),)
             assert hash_join.pair_fraction == 3 / 9

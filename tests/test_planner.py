@@ -9,7 +9,7 @@ import pytest
 from fakes import keep_even, register_claims_evidence, two_alias_graph
 
 import quail
-from quail.backends.quail import expected_join_stages
+from quail.backends.quail import expected_join_predicates
 from quail.catalog import Catalog, DocumentProvider
 from quail.cost.filters import filter_cost
 from quail.cost.sol import speed_of_light
@@ -52,7 +52,7 @@ def filter_chain(plan, alias=None):
 
 
 def join_stages(plan):
-    return [stage.to_dict() for stage in expected_join_stages(plan)]
+    return [stage.attributes() for stage in expected_join_predicates(plan)]
 
 
 def node_kinds(plan):
@@ -154,16 +154,18 @@ def test_filter_ordering_and_kv_writes(catalog):
     by_cost = _plan(logical, toks)
     chain = filter_chain(by_cost)
     assert by_cost.settings["order_rule"] == "by_cost"
-    assert chain.stages[0].selectivity == 0.2
-    assert chain.stages[1].expected_docs == pytest.approx(20.0)
+    assert chain.selectivity == 0.2
+    second = by_cost.graph.nodes_by_type(AiFilter.type_name)[1]
+    assert second.expected_docs == pytest.approx(20.0)
     # the physical planner chooses the order; the logical plan keeps
     # the predicates as written
     optimized, _ = _optimize(logical, toks)
-    assert chain.stages[0].written_pos == 2
-    assert "1st: predicate 3" in explain(optimized, by_cost)
+    assert chain.written_pos == 2
+    assert "predicate 3" in explain(optimized, by_cost)
 
     as_written = _plan(logical, toks, order="as_written")
-    assert [stage.selectivity for stage in filter_chain(as_written).stages] \
+    assert [node.selectivity
+            for node in as_written.graph.nodes_by_type(AiFilter.type_name)] \
         == list(sels)
 
     class Predicate:
@@ -217,7 +219,8 @@ def test_filter_ordering_and_kv_writes(catalog):
                .ai_filter(prompt("short " * 10 + "{0}", col("r.review")),
                           selectivity=0.5).select("r.id"))
     plan = _plan(logical, {"r": [400] * 100})
-    assert [stage.written_pos for stage in filter_chain(plan).stages] == [1, 0]
+    assert [node.written_pos
+            for node in plan.graph.nodes_by_type(AiFilter.type_name)] == [1, 0]
 
     # one stage: nothing reads the KV again
     single = _five_filter_plan(catalog, (0.9,))
@@ -259,7 +262,7 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
         assert "tokens=40,000" in physical, sels
         assert "node_id=" not in text and "arena_writes" not in text, sels
         assert "KV=bf16, chunk budget=" in text and "KV rewind=on" in text, sels
-        for stage in filter_chain(plan).stages:
+        for stage in plan.graph.nodes_by_type(AiFilter.type_name):
             predicate = logical.root.input.predicates[stage.written_pos]
             assert (f"predicate {stage.written_pos + 1}  "
                     f"PROMPT({predicate.prompt.template!r})") in physical, sels
@@ -408,7 +411,7 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     plan = _plan(_chain(catalog), toks, order="as_written")
     assert [s["anchor"] for s in join_stages(plan)] == ["t", "t"]
     kinds = node_kinds(plan)
-    assert (kinds.count("AiJoin"), kinds.count("Barrier")) == (1, 0)
+    assert (kinds.count("AiJoin"), kinds.count("Barrier")) == (2, 0)
 
     # a forced anchor is honored
     toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}

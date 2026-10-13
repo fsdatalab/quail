@@ -15,6 +15,7 @@ from quail.backends.quail.graph import (
     stop_groups,
     throughput,
 )
+from quail.backends.quail.prompts import join_request
 from quail.execution.pairs import columns_key
 from quail.execution.pipelines import Pipeline, build_pipelines
 from quail.execution.reranker import score_in_batches
@@ -83,8 +84,7 @@ class DistributedQuailExecution:
                     stop_groups(node, payload.get("columns", {}).get(
                         node.alias), range(len(documents))),
                     [len(document) for document in documents], gpu_count)
-        self.joins = tuple(stage for node in graph.nodes
-                           if isinstance(node, AiJoin) for stage in node.stages)
+        self.joins = tuple(node for node in graph.nodes if isinstance(node, AiJoin))
         self.pre = payload.get("pre_ids") or []
         self.joins_started = False
         self.retained: dict[str, set[int]] = {}
@@ -116,8 +116,14 @@ class DistributedQuailExecution:
             f"distributed Quail cannot execute {node.type_name!r}")
 
     def execute_pipeline(self, pipeline, inputs, context):
-        """Run each worker's extraction questions over its documents together."""
+        """Run compatible predicates or extraction questions together on each worker."""
         first = pipeline.members[0]
+        if isinstance(first, AiFilter):
+            return self._execute_filters(pipeline.members, inputs[first.node_id])
+        if isinstance(first, AiJoin):
+            prepared = prepare_distributed_inputs(
+                first, inputs, context, nodes=pipeline.members)
+            return self._execute_joins(pipeline.members, prepared)
         return self._execute_extractions(pipeline.members, inputs[first.node_id])
 
     def _extraction_positions(self, alias, ids):
@@ -216,6 +222,10 @@ class DistributedQuailExecution:
         )
 
     def _execute_filter(self, node, inputs):
+        return self._execute_filters((node,), inputs)[node.node_id]
+
+    def _execute_filters(self, nodes, inputs):
+        node = nodes[0]
 
         document_ids = next(iter(inputs.values()))
         shards = self.shards
@@ -241,6 +251,7 @@ class DistributedQuailExecution:
         )
         for sub in subs:
             sub["start_query"] = not self.started
+            sub["node_ids"] = [member.node_id for member in nodes]
         started = time.perf_counter()
         outputs = self.round_fn("filters", subs)
         wall = time.perf_counter() - started
@@ -257,24 +268,30 @@ class DistributedQuailExecution:
             ),
         )
         self._retained_placement(outputs)
-        survivors = merged["survivors"].get(node.alias, [])
-        answers = merged["filters"].get(node.alias, {})
-        return NodeResult(
-            {
-                f"ids:{node.alias}": survivors,
-                f"filter_answers:{node.alias}": answers,
-            },
-            NodeMetrics(
-                wall_s=wall,
-                input_rows=len(document_ids),
-                output_rows=len(survivors),
-                evaluated_documents=len(answers),
-                fresh_tokens=merged["fresh_tokens"],
-            ),
-        )
+        results = {}
+        for j, member in enumerate(nodes):
+            parts = [output["results"][member.node_id] for output in outputs]
+            rows = {document: row for part in parts
+                    for document, row in part.outputs[
+                        f"filter_answers:{node.alias}"].items()}
+            survivors = sorted(document for part in parts
+                               for document in part.outputs[f"ids:{node.alias}"])
+            if j == len(nodes) - 1:
+                survivors = merged["survivors"].get(node.alias, survivors)
+            results[member.node_id] = NodeResult(
+                {f"ids:{node.alias}": survivors,
+                 f"filter_answers:{node.alias}": rows},
+                replace(sum((part.metrics for part in parts), NodeMetrics()),
+                        wall_s=wall if j == 0 else 0.0,
+                        extension={name: sum(part.metrics.extension.get(name, 0)
+                                             for part in parts)
+                                   for name in ("borrowed_prefix_tokens", "pack_s")}))
+        return results
 
     def _execute_join(self, node, inputs):
+        return self._execute_joins((node,), inputs)[node.node_id]
 
+    def _execute_joins(self, nodes, inputs):
         survivors = dict(inputs["survivors"])
         group = inputs["group"]
         filtered_aliases = set(self.retained)
@@ -291,16 +308,17 @@ class DistributedQuailExecution:
             shards=self.shards,
             pair_tables=inputs.get("pairs"),
         )
-        encoded_node = self.registry.codecs[node.type_name].encode(node)
+        encoded_nodes = [self.registry.codecs[member.type_name].encode(member)
+                         for member in nodes]
         for sub in subs:
             sub.pop("joins", None)
             sub.update(
-                retain_anchor=node.keep_anchor_kv,
-                final_group=node.node_id == self.graph.nodes_by_type(
+                retain_anchor=nodes[-1].keep_anchor_kv,
+                final_group=nodes[-1].node_id == self.graph.nodes_by_type(
                     AiJoin.type_name)[-1].node_id
                 and not self.graph.nodes_by_type(AiExtract.type_name),
                 start_query=not self.started,
-                physical_node=encoded_node,
+                physical_nodes=encoded_nodes,
             )
         started = time.perf_counter()
         outputs = self.round_fn("joins", subs)
@@ -318,42 +336,21 @@ class DistributedQuailExecution:
         self.kv_stats["join_anchor_hits"] += hits
         self.kv_stats["join_anchor_misses"] += misses
 
-        enriched = []
-        answer_outputs = {}
-        for stage, output, join in zip(node.stages, stage_outputs, group):
-            output.update(
-                anchor=node.anchor,
-                partners=list(stage.partners),
-                semantics=stage.semantics,
-                selectivity=stage.selectivity,
-                written_pos=stage.written_pos,
-            )
-            enriched.append(output)
-            answer_outputs[f"join_answers:{stage.written_pos}"] = output
-        anchor_survivors = coordinator.gate_group(
-            enriched[-1], node.stages[-1].semantics
-        )
-
+        results = {}
+        for j, (member, output) in enumerate(zip(nodes, stage_outputs)):
+            output.update(anchor=member.anchor, partners=list(member.partners),
+                          semantics=member.semantics, selectivity=member.selectivity,
+                          written_pos=member.written_pos)
+            survivors = coordinator.gate_group(output, member.semantics)
+            metrics = sum((item["results"][member.node_id].metrics
+                           for item in outputs), NodeMetrics())
+            results[member.node_id] = NodeResult(
+                {f"ids:{member.anchor}": survivors,
+                 f"join_answers:{member.written_pos}": output},
+                replace(metrics, wall_s=wall if j == 0 else 0.0,
+                        extension={"joins": [output]}))
         self._retained_placement(outputs)
-        return NodeResult(
-            {
-                f"ids:{node.anchor}": anchor_survivors,
-                **answer_outputs,
-            },
-            NodeMetrics(
-                wall_s=wall,
-                input_rows=len(enriched[-1]["anchor_index"]),
-                output_rows=len(anchor_survivors),
-                evaluated_document_pairs=sum(
-                    sum(len(row) for row in stage["rows"].values())
-                    for stage in enriched
-                ),
-                fresh_tokens=fresh_tokens,
-                kv_hits=hits,
-                kv_misses=misses,
-                extension={"joins": enriched},
-            ),
-        )
+        return results
 
     def _retained_placement(self, outputs):
         self.retained = {}
@@ -394,12 +391,18 @@ _ONE_GPU_APPLY = ("per-batch apply() functions run on one GPU; the "
                   "planner refuses them for several")
 
 
-def prepare_distributed_inputs(node, inputs, context):
+def prepare_distributed_inputs(node, inputs, context, nodes=None):
     if isinstance(node, AiJoin):
+        grouped = nodes is not None
+        nodes = (node,) if nodes is None else nodes
+        inside = {member.node_id for member in nodes}
         survivors = {}
         pairs = {}
-        for port in node.inputs:
-            value = inputs[port.name]
+        for member, port in ((member, port) for member in nodes
+                             for port in member.inputs):
+            if port.source.node_id in inside:
+                continue
+            value = (inputs[member.node_id] if grouped else inputs)[port.name]
             if port.source.port.startswith("pairs:"):
                 if not hasattr(value, "num_rows"):
                     raise TypeError(_ONE_GPU_APPLY)
@@ -408,7 +411,7 @@ def prepare_distributed_inputs(node, inputs, context):
             survivors[port.source.port.split(":", 1)[1]] = list(value)
         return {
             "survivors": survivors,
-            "group": [stage.runtime_spec() for stage in node.stages],
+            "group": [join_request(member) for member in nodes],
             "pairs": pairs,
         }
     return inputs
@@ -429,13 +432,19 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         sources[columns_key(alias)] = table
     pipelines = {}
     for pipeline in build_pipelines(graph).values():
-        members = tuple(node for node in pipeline.members
-                        if isinstance(node, AiExtract))
-        if not members or members[0].node_id in pipelines:
+        if pipeline.members[0].node_id in pipelines:
             continue
-        extracted = Pipeline(pipeline.alias, members)
-        for node in members:
-            pipelines[node.node_id] = extracted
+        members = []
+        for member in pipeline.members:
+            if not isinstance(member, (AiFilter, AiJoin, AiExtract)):
+                members = []
+                continue
+            if members and type(member) is not type(members[0]):
+                members = []
+            members.append(member)
+            grouped = Pipeline(pipeline.alias, tuple(members))
+            for node in members:
+                pipelines[node.node_id] = grouped
     context = ExecutionContext(
         runtimes=runtimes,
         model_execution=execution,

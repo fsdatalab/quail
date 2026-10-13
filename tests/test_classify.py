@@ -517,7 +517,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     assert round(plan.estimated_seconds, 3) == 0.062
     assert plan.settings["search_seconds"] == plan.estimated_seconds
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
-    assert [(stage.exec_idx, stage.anchor) for stage in staged.stages] == [
+    assert [(stage.exec_idx, stage.anchor) for stage in (staged,)] == [
         (0, "r")]
     # the logical plan keeps the classification where it was written;
     # the backend priced it there and above the join, and the lifted

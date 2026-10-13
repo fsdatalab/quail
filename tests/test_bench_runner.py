@@ -5,6 +5,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import quail
+from quail.backends.quail.prompts import join_request
 from quail.bench.quailb import (
     answer_oracle,
     build_query,
@@ -144,7 +145,7 @@ def _run(query, join_answers):
     def nodes(graph, request):
         filtered = next(node for node in graph.nodes if isinstance(node, AiFilter))
         anchored = next(node for node in graph.nodes if isinstance(node, AiJoin))
-        join = anchored.stages[0].runtime_spec()
+        join = join_request(anchored)
         return {
             **{node.node_id: NodeResult({f"ids:{node.alias}": range(
                 len(request.inputs[node.input_id].documents))})

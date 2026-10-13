@@ -111,12 +111,27 @@ class KvRetention:
             pair_fractions=context.pair_fractions,
             scan_fractions=context.scan_fractions, context=context)
         joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
-        groups = [[(statistics.specs[stage.written_pos], stage.anchor)
-                   for stage in node.stages] for node in joins]
+        grouped = []
+        for node in joins:
+            if (not grouped or grouped[-1][-1].anchor != node.anchor
+                    or grouped[-1][-1].semantics != "full"
+                    or node.semantics != "full"):
+                grouped.append([])
+            grouped[-1].append(node)
+        groups = [[(statistics.specs[node.written_pos], node.anchor)
+                   for node in group] for group in grouped]
         schedule = retention.schedule(
-            [stage for group in groups for stage in group],
+            [predicate for group in groups for predicate in group],
             live_after_filters(logical, statistics),
-            [node.node_id for node in joins])
+            [group[0].node_id for group in grouped])
+        before, after = schedule["before"], schedule["after"]
+        schedule["before"] = {
+            node.node_id: before[group[0].node_id]
+            for group in grouped for node in group}
+        schedule["after"] = {
+            node.node_id: (after[group[0].node_id] if node is group[-1]
+                           else before[group[0].node_id])
+            for group in grouped for node in group}
         ask_aliases = {node.alias for node in graph.nodes
                        if isinstance(node, AiFilter)}
         barriers = [node for node in graph.nodes
@@ -124,7 +139,7 @@ class KvRetention:
         barrier_aliases = {node.aliases[0] for node in barriers
                            if node.ids != "pairs"}
         for node in joins:
-            positions = {stage.written_pos for stage in node.stages}
+            positions = {node.written_pos}
             if any(barrier.ids == "pairs" and barrier.written_pos in positions
                    for barrier in barriers):
                 barrier_aliases.add(node.anchor)
@@ -149,7 +164,7 @@ class KvRetention:
                 node = replace(node, keep_kv=keep, arena_writes=writes)
             elif isinstance(node, AiJoin):
                 node = replace(node, keep_anchor_kv=(
-                    node.anchor in schedule["after"][node.node_id]
+                    node.anchor in schedule["after"].get(node.node_id, {})
                     or context.gpu_count > 1 and any(
                         alias == node.anchor and after > index
                         for after, alias in extracts)))
@@ -469,12 +484,12 @@ class TreeAttention:
                 if tree_available and node.share_prefixes and store is not None:
                     path = filter_attention(
                         model, device, store, lengths,
-                        node.stages[0].question_tokens if node.stages else 0)
+                        node.question_tokens)
             elif isinstance(node, AiJoin):
                 lengths = context.document_tokens.get(node.anchor, ())
                 path = "unified"
-                if tree_available and node.stages:
-                    stage = node.stages[0]
+                if tree_available:
+                    stage = node
                     readers = (stage.expected_tuples / len(lengths)
                                if len(lengths) else 1.0)
                     # a partner's rows: its document and the question tail

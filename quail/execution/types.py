@@ -129,9 +129,9 @@ def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
     positions = []
     answers = []
     for document, row in value.items():
-        for stage_index, answer in enumerate(row):
+        for answer in row:
             documents.append(int(document))
-            positions.append(node.stages[stage_index].written_pos)
+            positions.append(node.written_pos)
             answers.append(bool(answer))
     schema = pa.schema(
         [

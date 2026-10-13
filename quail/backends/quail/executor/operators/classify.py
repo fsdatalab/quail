@@ -42,7 +42,7 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
         raise TypeError(
             f"{node.type_name!r} cannot follow a join in its pipeline")
     spec = node.spec
-    stage = next(stage for stage in join.stages
+    stage = next(stage for stage in join
                  if set(spec.aliases) == {stage.anchor, *stage.partners})
     # the join's partner tuples, one partner alias each
     partner_ids = [int(entry[0]) if isinstance(entry, (tuple, list))
@@ -50,7 +50,7 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
                    for entry in join_inputs["partner_indices"][
                        stage.written_pos]]
     documents = context.state["docs"][spec.partner]
-    kept = KeptPairs(join.stages.index(stage))
+    kept = KeptPairs(join.index(stage))
     partners = JoinPartners(
         ids=partner_ids,
         documents=[documents[partner] for partner in partner_ids],

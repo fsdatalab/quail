@@ -24,10 +24,8 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     Barrier,
-    FilterStage,
     Foreign,
     HashJoin,
-    JoinStage,
     PhysicalGraph,
     PortRef,
     Scan,
@@ -161,11 +159,9 @@ def fake_torch():
 
 
 def fake_pack(torch, arena, specs, **kw):
-    # a group's own canvas rows are packed, one canvas per suffix; the
-    # chunk's are not counted
     def own_rows(spec):
         own = spec.get("canvas")
-        return 0 if own is None else np.shape(own)[-1]
+        return len(kw.get("canvas", ())) if own is None else np.shape(own)[-1]
 
     tokens = sum(
         (len(spec["prefix"]) if spec["prefix"] is not None else 0)
@@ -223,14 +219,15 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
              Scan(node_id="input:p", alias="p", input_id="p")]
     anchor_src = PortRef("input:r", "ids:r")
     if filtered:
-        nodes.insert(1, AiFilter(
-            node_id="filter:r",
-            inputs=input_ports((PortRef("input:r", "ids:r"),)),
-            alias="r", arena_writes=True, keep_kv=not pipelined,
-            stages=tuple(FilterStage(s, 1, 0, 0.8 - 0.1 * s, 14 * 0.8 ** s)
-                         for s in range(stages)),
-            question_token_ids=tuple((QUESTION + s,) for s in range(stages))))
-        anchor_src = PortRef("filter:r", "ids:r")
+        for index in range(stages):
+            node_id = "filter:r" if index == 0 else f"filter:r:{index}"
+            nodes.append(AiFilter(
+                node_id=node_id, inputs=input_ports((anchor_src,)), alias="r",
+                arena_writes=True, keep_kv=not pipelined, written_pos=index,
+                question_tokens=1, preamble_tokens=0,
+                selectivity=0.8 - 0.1 * index, expected_docs=14 * 0.8 ** index,
+                question_token_ids=(QUESTION + index,)))
+            anchor_src = PortRef(node_id, "ids:r")
     if filtered and not pipelined:
         nodes.append(Barrier(node_id="barrier:r",
                              inputs=input_ports((anchor_src,)),
@@ -264,24 +261,31 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
         anchor_src = PortRef("apply:keep_even", "ids:r")
     resident = "filter" if filtered and pipelined else "none"
     nodes.append(AiJoin(
-        node_id="group:0", anchor="r", anchor_resident=resident,
+        node_id='group:0',
+        anchor='r',
+        anchor_resident=resident,
         keep_anchor_kv=keep_anchor_kv,
-        inputs=input_ports((anchor_src, PortRef("input:p", "ids:p"),
+        inputs=input_ports((anchor_src, PortRef('input:p', 'ids:p'),
                             *join_inputs)),
-        stages=(JoinStage(
-            written_pos=0, exec_idx=0, anchor="r", partners=("p",),
-            semantics=semantics, selectivity=0.5, expected_tuples=1,
-            anchor_frame_tokens=1, pair_tail_tokens=0,
-            anchor_resident=resident, tuple_tokens=0,
-            pairs_from=pairs_from,
-            frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
-            tail_token_ids=()),)))
+        written_pos=0,
+        exec_idx=0,
+        partners=('p',),
+        semantics=semantics,
+        selectivity=0.5,
+        expected_tuples=1,
+        anchor_frame_tokens=1,
+        pair_tail_tokens=0,
+        tuple_tokens=0,
+        pairs_from=pairs_from,
+        frame_token_ids=(FRAME,),
+        label_token_ids=(('p', ()),),
+        tail_token_ids=()))
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
 def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
                        seed=5, pages=64, stages=1, partner_tokens=20,
-                       streamed_anchors=True, **extra):
+                       streamed_anchors=True, workers=1, shared_prefix=0, **extra):
     """Run a graph over random documents through the real graph runtime.
 
     Returns:
@@ -291,7 +295,8 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     rng = random.Random(seed)
     docs = {
-        "r": [[DOC + d] * rng.randrange(10, 40) for d in range(n_docs)],
+        "r": [[DOC - 1] * shared_prefix + [DOC + d] * rng.randrange(10, 40)
+              for d in range(n_docs)],
         "p": [[PARTNER + i] * partner_tokens for i in range(n_partners)],
     }
     filter_truth = [[1 if rng.random() < p else 0
@@ -318,7 +323,47 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
         "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "docs": docs, **extra,
     }
-    result = execute_single_graph(state, SETTINGS, graph)
+    if workers > 1:
+        from quail.backends.quail import worker
+        from quail.backends.quail.distributed import execute_distributed_graph
+        from quail.execution.runner import ExecutionContext
+        from quail.physical import plan_envelope
+
+        registry = built_in_registry()
+        state.update(registry=registry, runtime_context=ExecutionContext(
+            runtimes=registry.runtimes, model_execution=execution))
+        children = [state]
+        for _ in range(workers - 1):
+            child_arena = cpu_arena(pages)
+            child_execution = QuailModelExecution(SimpleNamespace())
+            child_execution.bind_loaded_model(
+                model=object(), arena=child_arena, pipeline=pipeline)
+            child_execution.bind_query(
+                torch=torch, async_answers=execution.query.async_answers,
+                answer_rows=object(), chunk_tokens=120)
+            children.append({**state, "arena": child_arena,
+                             "runtime_context": ExecutionContext(
+                                 runtimes=registry.runtimes,
+                                 model_execution=child_execution)})
+
+        def round_fn(kind, subs):
+            execute = (worker._child_filters if kind == "filters"
+                       else worker._child_joins)
+            return [execute(child, sub) for child, sub in zip(children, subs)]
+
+        payload = {**SETTINGS, "docs": docs, "model": "qwen3-4b-fp8",
+                   "chunk_tokens": 120,
+                   "true_ids": [1], "false_ids": [0], "pre_ids": [],
+                   "physical_plan": plan_envelope(
+                       backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
+                       workers=workers, graph=graph, codecs=registry.codecs)}
+        result = execute_distributed_graph(
+            payload, graph, workers, round_fn, MODELS["qwen3-4b-fp8"],
+            DEVICES["h100-sxm"], registry.runtimes, registry)
+        assert all(not child["arena"].accounting.owned for child in children)
+    else:
+        result = execute_single_graph(state, SETTINGS, graph)
+
     assert not arena.accounting.owned
     return result, model, filter_truth, join_truth
 

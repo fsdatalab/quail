@@ -6,7 +6,7 @@ from quail.cost import budgets
 from quail.cost import classify as classify_cost
 from quail.cost import extract as extract_cost
 from quail.cost.sol import speed_of_light
-from quail.cost.work import Work, scan
+from quail.cost.work import Work, ask, scan
 from quail.labels import DECISION_SCORING, LETTERS_SCORING, word_starts
 from quail.logical import (
     PROBABILITIES_SUFFIX,
@@ -40,11 +40,9 @@ from quail.physical import (
     Exchange,
     ExtractSpec,
     Filter,
-    FilterStage,
     Foreign,
     HashJoin,
     InList,
-    JoinStage,
     PortRef,
     Recombine,
     ScoreSpec,
@@ -131,12 +129,19 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
     """
     anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
     out = {}
+    priced_filters = set()
+    last_filters = {node.alias: node.node_id for node in graph.nodes
+                    if isinstance(node, AiFilter)}
     for node in graph.nodes:
         entry = {}
         if isinstance(node, AiFilter) and node.alias in filter_works:
+            operation = ask if node.alias in priced_filters else scan
+            priced_filters.add(node.alias)
+            work = operation(pre + stats[node.alias].mean_doc_tokens,
+                             node.question_tokens, window=model.sliding_window)
             entry["seconds"] = speed_of_light(
-                filter_works[node.alias], model, device, chunk).seconds
-            if node.alias in anchored:
+                work * node.expected_docs, model, device, chunk).seconds
+            if node.alias in anchored and last_filters[node.alias] == node.node_id:
                 mean = stats[node.alias].mean_doc_tokens
                 prefix = pre + mean
                 pages = -(-prefix // budgets.PAGE_TOKENS)
@@ -147,9 +152,7 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
                     scan(prefix, 0, window=model.sliding_window) * excess,
                     model, device, chunk).seconds
         elif isinstance(node, AiJoin):
-            work = Work()
-            for stage in node.stages:
-                work = work + stage_works.get(stage.written_pos, Work())
+            work = stage_works.get(node.written_pos, Work())
             entry["seconds"] = speed_of_light(work, model, device, chunk).seconds
         elif isinstance(node, AiExtract) and node.spec is not None:
             entry["seconds"] = node.spec.estimated_seconds
@@ -363,6 +366,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     # a second group on the same anchor gets :2, a third :3
     sequence_groups = retention.group_sequence(seq)
     group_ids = []
+    join_ids = {}
     seen_ids = {}
     for group in sequence_groups:
         anchor = group[0][1]
@@ -454,27 +458,20 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
 
     def emit_filter(alias):
         n = stats[alias].n_docs
-        stages, surv = [], 1.0
-        for i in orders[alias]:
+        surv = 1.0
+        for rank, i in enumerate(orders[alias]):
             p = filters[alias][i]
-            stages.append(FilterStage(
+            fid = f"ai_filter:{alias}" if rank == 0 else f"ai_filter:{alias}:{i}"
+            nodes.append(AiFilter(
+                node_id=fid, inputs=input_ports((ids_src[alias],)), alias=alias,
                 written_pos=i,
                 question_tokens=question_tokens(p.prompt, model.canvas_tokens),
                 preamble_tokens=p.prompt.preamble_tokens,
-                selectivity=p.selectivity,
-                expected_docs=round(n * surv, 1)))
+                selectivity=p.selectivity, expected_docs=round(n * surv, 1),
+                arena_writes=len(orders[alias]) > 1 or alias in pipelined,
+                stop_key=stop_keys.get(alias, ())))
             surv *= effective_selectivity(p.selectivity)
-        # a later stage, or the classification or join of its alias in
-        # the same pipeline, reads the KV the chain wrote
-        writes = len(stages) > 1 or alias in pipelined
-        fid = f"ai_filter:{alias}"
-        nodes.append(AiFilter(
-            node_id=fid,
-            inputs=input_ports((ids_src[alias],)),
-            alias=alias, arena_writes=writes,
-            stages=tuple(stages),
-            stop_key=stop_keys.get(alias, ())))
-        ids_src[alias] = PortRef(fid, f"ids:{alias}")
+            ids_src[alias] = PortRef(fid, f"ids:{alias}")
         emit_applies(alias)
 
     def emit_scores(alias):
@@ -661,10 +658,10 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 anchor=anchor))
             ids_src[anchor] = PortRef(xid, f"ids:{anchor}")
         gid = group_ids[g]
-        stage_dicts = []
-        in_aliases = [anchor]
-        pair_inputs = []
-        for spec, record in group:
+        for rank, (spec, record) in enumerate(group):
+            jid = gid if rank == 0 else f"{gid}:predicate:{spec['written_pos']}"
+            join_ids[spec["written_pos"]] = jid
+            pair_inputs = []
             partners = [a for a in spec["aliases"] if a != anchor]
             pairs_from = ""
             if spec["written_pos"] in pairs_src:
@@ -686,7 +683,10 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                     written_pos=spec["written_pos"]))
                 pair_inputs.append(PortRef(aid, f"pairs:{spec['written_pos']}"))
                 pairs_from = aid
-            stage_dicts.append(JoinStage(
+            nodes.append(AiJoin(
+                node_id=jid,
+                inputs=input_ports(tuple(ids_src[a] for a in [anchor, *partners])
+                                   + tuple(pair_inputs)),
                 written_pos=spec["written_pos"], exec_idx=exec_idx,
                 anchor=anchor, partners=tuple(partners),
                 semantics=spec["semantics"],
@@ -698,24 +698,14 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 tuple_tokens=round(record["tokens"], 1),
                 pairs_from=pairs_from))
             exec_idx += 1
-            for a in partners:
-                if a not in in_aliases:
-                    in_aliases.append(a)
+            ids_src[anchor] = PortRef(jid, f"ids:{anchor}")
             if spec["semantics"] == "full":
                 pairs_edges.append(PortRef(
-                    gid, f"join_answers:{spec['written_pos']}"
+                    jid, f"join_answers:{spec['written_pos']}"
                 ))
                 for a in [anchor] + partners:
                     if a not in out_aliases:
                         out_aliases.append(a)
-        nodes.append(AiJoin(
-            node_id=gid,
-            inputs=input_ports(tuple(ids_src[a] for a in in_aliases)
-                               + tuple(pair_inputs)),
-            anchor=anchor,
-            anchor_resident=group[0][1]["resident"],
-            stages=tuple(stage_dicts)))
-        ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
 
     # a classification of joined rows follows the join that keeps them,
     # in the join's pipeline: each kept row's partner block, question,
@@ -740,7 +730,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 call, labels.names[call], partner, pairs,
                 stats[partner].mean_doc_tokens)
             node = table.node(
-                spec, PortRef(group_ids[g], f"join_answers:{stage['written_pos']}"),
+                spec, PortRef(join_ids[stage["written_pos"]],
+                              f"join_answers:{stage['written_pos']}"),
                 sum(isinstance(n, AiClassify) for n in nodes))
             nodes.append(node)
             if call in labels.projected:

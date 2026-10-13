@@ -39,7 +39,6 @@ from quail.execution.tokens import TokenOffsets, TokenStore
 from quail.physical import (
     AiExtract,
     AiFilter,
-    FilterStage,
     PhysicalGraph,
     PortRef,
     Scan,
@@ -539,11 +538,17 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
     question = tables.encode_ids(" question")
     graph = PhysicalGraph((
         Scan(node_id="input:c", alias="c", input_id="c"),
-        AiFilter(node_id="ai_filter:c",
-                 inputs=input_ports((PortRef("input:c", "ids:c"),)),
-                 alias="c", arena_writes=True,
-                 stages=(FilterStage(0, len(question), len(head), 0.7, 2.0),),
-                 question_token_ids=(tuple(question),)),
+        AiFilter(
+            node_id='ai_filter:c',
+            inputs=input_ports((PortRef('input:c', 'ids:c'),)),
+            alias='c',
+            arena_writes=True,
+            question_token_ids=tuple(question),
+            written_pos=0,
+            question_tokens=len(question),
+            preamble_tokens=len(head),
+            selectivity=0.7,
+            expected_docs=2.0),
         AiExtract(node_id="ai-extract:ends",
                   inputs=input_ports((PortRef("ai_filter:c", "ids:c"),)),
                   backend_name="quail", model="qwen3-4b-fp8", spec=plain),

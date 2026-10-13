@@ -133,7 +133,7 @@ def quail_side(run: str) -> dict:
                 f"PROMPT('{JOIN_TEMPLATE}', a.body, b.body))")
     query = session.sql(join_sql)
     (node,) = [n for n in query.plan().nodes if isinstance(n, AiJoin)]
-    anchor = node.stages[0].anchor
+    anchor = node.anchor
     t0 = time.perf_counter()
     result = query.run()
     out["join_run"] = {"seconds": time.perf_counter() - t0,

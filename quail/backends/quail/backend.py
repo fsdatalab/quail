@@ -9,8 +9,11 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.operators.extract import execute_extract
-from quail.backends.quail.executor.operators.filter import execute_filter
-from quail.backends.quail.executor.operators.join import execute_join
+from quail.backends.quail.executor.operators.filter import (
+    execute_filter,
+    execute_filters,
+)
+from quail.backends.quail.executor.operators.join import execute_join, execute_joins
 from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
@@ -136,6 +139,11 @@ class QuailModelExecution:
             self._reranker = execution
         return execution
 
+    def execute_predicates(self, nodes, inputs) -> dict:
+        """Run consecutive filter or join predicates with resident document KV."""
+        execute = execute_filters if isinstance(nodes[0], AiFilter) else execute_joins
+        return execute(self.query, nodes, inputs)
+
     def execute_pipeline(self, pipeline, inputs, context) -> dict:
         """Execute a model pipeline with this executor's loaded state."""
         return execute_pipeline(self.query, pipeline, inputs, context)
@@ -148,13 +156,10 @@ def expected_join_nodes(plan) -> tuple[PhysicalNode, ...]:
     )
 
 
-def expected_join_stages(plan) -> tuple:
-    """Return Quail's expected join stages in execution order."""
+def expected_join_predicates(plan) -> tuple:
+    """Return Quail's join predicates in execution order."""
     return tuple(
-        stage
-        for node in expected_join_nodes(plan)
-        if isinstance(node, AiJoin)
-        for stage in node.stages
+        node for node in expected_join_nodes(plan) if isinstance(node, AiJoin)
     )
 
 
@@ -239,31 +244,21 @@ class QuailBackend:
         for node in plan.nodes:
             if isinstance(node, AiFilter):
                 predicates = filters[node.alias]
-                questions = tuple(
-                    tuple(predicates[stage.written_pos].prompt.tail_token_ids)
-                    for stage in node.stages
-                )
-                if any(not question for question in questions):
+                question = tuple(predicates[node.written_pos].prompt.tail_token_ids)
+                if not question:
                     raise ValueError("filter prompts have no token ids")
-                node = replace(node, question_token_ids=questions)
+                node = replace(node, question_token_ids=question)
             elif isinstance(node, AiJoin):
-                stages = []
-                for stage in node.stages:
-                    prompt = joins[stage.written_pos].prompt
-                    runtime_ids = {
-                        alias: (tuple(label), tuple(frame))
-                        for alias, label, frame in prompt.label_token_ids
-                    }
-                    stages.append(replace(
-                        stage,
-                        frame_token_ids=runtime_ids[stage.anchor][1],
-                        label_token_ids=tuple(
-                            (alias, runtime_ids[alias][0])
-                            for alias in stage.partners
-                        ),
-                        tail_token_ids=tuple(prompt.tail_token_ids),
-                    ))
-                node = replace(node, stages=tuple(stages))
+                prompt = joins[node.written_pos].prompt
+                runtime_ids = {
+                    alias: (tuple(label), tuple(frame))
+                    for alias, label, frame in prompt.label_token_ids
+                }
+                node = replace(
+                    node, frame_token_ids=runtime_ids[node.anchor][1],
+                    label_token_ids=tuple((alias, runtime_ids[alias][0])
+                                          for alias in node.partners),
+                    tail_token_ids=tuple(prompt.tail_token_ids))
             encoded_nodes.append(node)
 
         true_ids, false_ids = (
