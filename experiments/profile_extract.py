@@ -75,8 +75,8 @@ GAP_US = 500            # a GPU gap shorter than this is not a bubble
 
 def _marked_executor(scheduler, torch):
     """Wrap the stage executor so the trace marks each chunk and each read."""
-    original = {"run_one": scheduler._StageExecutor._run_one,
-                "report": scheduler._StageExecutor._report}
+    original = {"run_one": scheduler.StageExecutor._run_one,
+                "report": scheduler.StageExecutor._report}
 
     def run_one(self, part):
         kind = "read" if any(carried for *_, carried in part) else "round"
@@ -89,8 +89,8 @@ def _marked_executor(scheduler, torch):
         with torch.profiler.record_function("report"):
             original["report"](self, entry)
 
-    scheduler._StageExecutor._run_one = run_one
-    scheduler._StageExecutor._report = report
+    scheduler.StageExecutor._run_one = run_one
+    scheduler.StageExecutor._report = report
 
 
 def _query(session, query_id):
@@ -196,7 +196,7 @@ def profile(run: str, query_id: str) -> dict:
     import torch
 
     import quail
-    from quail.backends.quail.executor import stages as scheduler
+    from quail.backends.quail.executor import stage_executor as scheduler
     from quail.planner.plan import EngineConfig
     from quail_b.data import build_sets
 

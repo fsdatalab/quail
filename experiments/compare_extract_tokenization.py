@@ -77,7 +77,7 @@ def compare(run: str, query_id: str, baseline: str, sources: dict,
 
     import quail
     from bench import quailb
-    from quail.backends.quail.executor import stages as scheduler
+    from quail.backends.quail.executor import stage_executor as scheduler
     from quail.backends.quail.executor.operators import extract as operator
     from quail.planner.plan import EngineConfig
     from quail.specs import H100_USD_PER_HOUR
@@ -96,7 +96,7 @@ def compare(run: str, query_id: str, baseline: str, sources: dict,
             f"{prefix}.candidates", "baseline_candidates").replace(
                 f"{prefix}.decode", "baseline_decode"))
     scheduling = _load_source("baseline_stages", sources["stages.py"])
-    original = operator.ExtractionStages, scheduler._StageExecutor
+    original = operator.ExtractionStages, scheduler.StageExecutor
     original_loader = operator.load_vocabulary
     vocabulary_source = sources["extract/vocabulary.py"]
     if "tokens.py" in sources:
@@ -132,7 +132,7 @@ def compare(run: str, query_id: str, baseline: str, sources: dict,
 
     def execute(configuration, name):
         nonlocal reference, reference_fresh
-        operator.ExtractionStages, scheduler._StageExecutor = methods[configuration]
+        operator.ExtractionStages, scheduler.StageExecutor = methods[configuration]
 
         def load_vocabulary(state):
             key = configuration, id(state.loaded_model)
@@ -225,7 +225,7 @@ def compare(run: str, query_id: str, baseline: str, sources: dict,
                             "window", "choose", "_report", "_run_one",
                             "extract_stages", "_prepare", "positions_of")
             or "encode_batch" in function]
-    operator.ExtractionStages, scheduler._StageExecutor = original
+    operator.ExtractionStages, scheduler.StageExecutor = original
     traces = {}
     for configuration in methods:
         with torch.profiler.profile(activities=[
@@ -239,7 +239,7 @@ def compare(run: str, query_id: str, baseline: str, sources: dict,
               flush=True)
         VOLUMES["/results"].commit()
     summary["gpu_traces"] = traces
-    operator.ExtractionStages, scheduler._StageExecutor = original
+    operator.ExtractionStages, scheduler.StageExecutor = original
     operator.load_vocabulary = original_loader
     session.close()
     with open(f"{out}/{query_id}.json", "w") as stream:

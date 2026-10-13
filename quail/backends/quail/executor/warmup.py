@@ -117,7 +117,7 @@ def _warm_row_classes(torch, arena, pipeline, mode):
         mode: The attention path, "tree" or "unified".
     """
     from quail.backends.quail.executor.chunk import pack_chunk
-    from quail.backends.quail.executor.stages import forward_chunk
+    from quail.backends.quail.executor.stage_executor import forward_chunk
 
     cached = ROW_CLASS_CACHED
     readers = max(m for _, m in ROW_CLASSES)
