@@ -33,7 +33,7 @@ class Chunk:
             trims their sliding pages after the pass.
         rows_per_answer: Rows of final_indices each answer takes, one
             entry per suffix in chunk order, when some suffix reads
-            more than its last row; empty when every answer is one row.
+            more than its last row; None when every answer is one row.
     """
 
     input_ids: Any
@@ -45,7 +45,7 @@ class Chunk:
     layout: list
     temporary_keys: tuple = ()
     fresh_keys: tuple = ()
-    rows_per_answer: tuple = ()
+    rows_per_answer: np.ndarray | None = None
 
 
 class ArenaFullError(RuntimeError):
@@ -787,8 +787,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         meta=meta, attention_mode=attention_mode, tokens=token_count,
         layout=layout, temporary_keys=tuple(temporary_keys),
         fresh_keys=tuple(fresh_keys),
-        rows_per_answer=(tuple(np.concatenate(rows_per_answer).tolist())
-                         if multi_row else ()))
+        rows_per_answer=(np.concatenate(rows_per_answer) if multi_row else None))
     _tick(timing, "pack_h2d", t)
     return out
 

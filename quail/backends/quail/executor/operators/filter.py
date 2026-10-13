@@ -3,7 +3,6 @@
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.parts import (
     ExecutionPart,
-    chunks,
     execution_prefix_tree,
     gpu_seconds,
     input_staging,
@@ -65,6 +64,7 @@ def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
         prefix_tree=tree,
         attention_mode=node.attention or None,
         stats=stats, staging=input_staging(state),
+        gpu_timing=bool(inputs.get("gpu_timing")),
     )
     counts = [sum(len(row) > j for row in answers.values())
               for j in range(len(nodes))]
@@ -78,8 +78,8 @@ def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
         own_spans = stage_spans(spans, j, j + 1)
         result = filter_result(
             member, rows, own[j], document_ids,
-            gpu_s=gpu_seconds(torch, own_spans, inputs),
-            chunks=chunks(own_spans, inputs),
+            gpu_s=gpu_seconds(own_spans),
+            chunks=len(own_spans),
             borrowed_tokens=stats.get("borrowed_tokens", 0) if j == 0 else 0,
             pack_s=stats.get("pack_s", 0.0) if j == 0 else 0.0)
         results[member.node_id] = result

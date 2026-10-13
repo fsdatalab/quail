@@ -54,10 +54,10 @@ class ExecutionPart:
     on_settled = None
     attention = None
 
-    def complete(self, tokens, spans, stats, torch, inputs, offset):
+    def complete(self, tokens, spans, stats, offset):
         """Build the operator's result from its measured work."""
         self.result_value = self.result(
-            tokens, gpu_seconds(torch, spans, inputs), chunks(spans, inputs), stats)
+            tokens, gpu_seconds(spans), len(spans), stats)
 
     def results(self) -> dict:
         """Return results keyed by physical node ID."""
@@ -77,14 +77,13 @@ def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
     every, spans, tokens = run_stages(
         state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
         stages, prefixes, state.chunk_tokens, anchor_keys=keys,
-        on_settled=settled, prefix_tree=tree, stats=stats,
+        on_settled=settled, prefix_tree=tree, stats=stats, gpu_timing=state.gpu_timing,
         attention_mode=next((part.attention for part in parts if part.attention),
                             attention),
         staging=input_staging(state), label=label,
         on_chunk=transition_reporter(parts),
         appended_tokens=max(part.appended_tokens for part in parts) or None)
-    complete_chain(parts, every, spans, tokens, stats, state.torch,
-                   {"gpu_timing": state.gpu_timing})
+    complete_chain(parts, every, spans, tokens, stats)
     return {node_id: result for part in parts
             for node_id, result in part.results().items()}
 
@@ -165,7 +164,7 @@ def transition_reporter(parts):
     return report
 
 
-def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
+def complete_chain(parts, every, spans, tokens, stats):
     """Finalize pipeline parts and store each operator's result.
 
     The first part with stages receives document token costs, prefix-sharing
@@ -178,8 +177,6 @@ def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
         spans: Per-chunk row counts and timing events.
         tokens: Fresh token count excluding the final consumer's own work.
         stats: Packing time and prefix-sharing counts.
-        torch: Torch module used to synchronize timing events.
-        inputs: Execution settings, including whether GPU timing is enabled.
     """
     slices = _part_slices(parts)
     own = [part.finish(every[low:high])
@@ -191,7 +188,7 @@ def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
         part.complete(
             remainder if staged and index == staged[0] else (own[index] or 0),
             part_spans, stats if staged and index == staged[0] else {},
-            torch, inputs, low)
+            low)
 
 
 def execution_prefix_tree(node, documents, arena):
@@ -222,30 +219,16 @@ def stage_spans(spans, low, high) -> list:
     return narrowed
 
 
-def gpu_seconds(torch, spans, inputs) -> float:
+def gpu_seconds(spans) -> float:
     """Calculate GPU seconds attributable to the selected stage rows.
 
     Args:
-        torch: Torch module used to synchronize CUDA events.
-        spans: Selected stage row counts and timing events per chunk.
-        inputs: Execution settings, including gpu_timing.
-
-    Returns:
-        GPU seconds weighted by each span's fraction of chunk rows, or 0.0
-        if GPU timing is disabled.
+        spans: Stage row counts and completed CUDA timing events per chunk.
+            Empty when GPU timing is disabled.
     """
-    if not inputs.get("gpu_timing"):
-        return 0.0
-    # elapsed_time needs every end event to have completed
-    torch.cuda.synchronize()
     return sum(
         start.elapsed_time(end) * min(1.0, sum(rows.values()) / tokens)
         for rows, tokens, start, end in spans if tokens) / 1000.0
-
-
-def chunks(spans, inputs) -> int:
-    """Return the number of timed forward chunks, or zero if timing is disabled."""
-    return len(spans) if inputs.get("gpu_timing") else 0
 
 
 def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):

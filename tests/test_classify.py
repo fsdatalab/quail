@@ -1004,7 +1004,7 @@ def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
     assert nodes["cu_k"].tolist() == [0, 2, 3]
     assert nodes["b_index"].tolist() == [3, 4]
     assert chunk.final_indices.tolist() == [0, 1, 2, 3, 4]
-    assert chunk.rows_per_answer == (5,)
+    assert chunk.rows_per_answer.tolist() == [5]
     with pytest.raises(ValueError, match="tree attention"):
         chunk_mod.pack_chunk(torch, arena, [group], attention_mode="unified")
     # a read mask keeps every row in the pass and reads the marked ones
@@ -1012,7 +1012,7 @@ def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
     chunk = chunk_mod.pack_chunk(torch, arena, [masked], attention_mode="tree")
     assert chunk.positions.tolist() == [4, 5, 6, 6, 5]
     assert chunk.final_indices.tolist() == [0, 2, 3]
-    assert chunk.rows_per_answer == (3,)
+    assert chunk.rows_per_answer.tolist() == [3]
     with pytest.raises(ValueError, match="read_mask"):
         chunk_mod.pack_chunk(torch, arena, [dict(group, read_mask=[True])],
                              attention_mode="tree")

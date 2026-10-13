@@ -429,8 +429,19 @@ def test_extraction_reuses_arrow_tokens_and_offsets(monkeypatch, tmp_path):
     store.close()
 
 
-def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
-    state, model, _, run_pipeline = _setup(monkeypatch, gpu_timing=True)
+@pytest.mark.parametrize("gpu_timing", [False, True])
+def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch, gpu_timing):
+    state, model, _, run_pipeline = _setup(monkeypatch, gpu_timing=gpu_timing)
+    timing_calls = []
+    event = state.torch.cuda.Event
+
+    def timed_event(**kwargs):
+        timing_calls.append("event")
+        return event(**kwargs)
+
+    monkeypatch.setattr(state.torch.cuda, "Event", timed_event)
+    monkeypatch.setattr(state.torch.cuda, "synchronize",
+                        lambda: timing_calls.append("sync"))
     results, stages = run_pipeline("ends", "starts")
     first, second = results["ai-extract:ends"], results["ai-extract:starts"]
     assert second.outputs["rows"].column("starts").to_pylist() == \
@@ -444,7 +455,12 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
     fed = [stages.counts(q)["suffix_tokens"] for q in range(2)]
     assert first.metrics.fresh_tokens == prefixes + fed[0]
     assert second.metrics.fresh_tokens == fed[1] > 0
-    assert first.metrics.gpu_s > 0 and second.metrics.gpu_s > 0
+    assert (first.metrics.gpu_s > 0) == gpu_timing
+    assert (second.metrics.gpu_s > 0) == gpu_timing
+    if gpu_timing:
+        assert "event" in timing_calls and timing_calls.count("sync") == 1
+    else:
+        assert timing_calls == []
 
 
 @pytest.mark.parametrize("workers", [2, 4])

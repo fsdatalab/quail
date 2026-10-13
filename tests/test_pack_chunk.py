@@ -27,7 +27,7 @@ def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
     # each suffix's positions restart after the prefix
     assert chunk.positions.tolist() == [0, 1, 2, 3, 4, 5, 4, 4, 5, 6]
     assert chunk.final_indices.tolist() == [4, 5, 6, 7, 8, 9]
-    assert chunk.rows_per_answer == (2, 1, 3)
+    assert chunk.rows_per_answer.tolist() == [2, 1, 3]
     assert chunk.meta["cu_a"].tolist() == [0, 4, 6, 7, 10]
     assert chunk.meta["max_a"] == 4
     assert chunk.layout == [(key, 3)]
@@ -41,7 +41,7 @@ def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
         attention_mode="tree")
     assert chunk.input_ids.tolist() == [10, 11, 12, 13, 14, 15]
     assert chunk.final_indices.tolist() == [1, 2, 5]
-    assert chunk.rows_per_answer == ()
+    assert chunk.rows_per_answer is None
     assert chunk.meta["cu_a"].tolist() == [0, 2, 3, 6]
     reads = chunk.meta["reads"]
     assert reads["rows"].tolist() == [0, 1, 2, 3, 4, 5]

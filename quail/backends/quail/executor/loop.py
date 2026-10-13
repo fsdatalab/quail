@@ -42,7 +42,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              anchor_keys=None, anchor_done=None,
              anchor_partners=None, staging=None,
              attention_mode=None, prefix_tree=None, stats=None,
-             read_all_rows=False, advance=None, on_answers=None):
+             read_all_rows=False, advance=None, on_answers=None, gpu_timing=False):
     """Stream each stage's selected partner requests against anchor documents.
 
     Survivors are gated between stages.
@@ -73,6 +73,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         prefix_tree: A PrefixTree over anchor_prefixes, or None. A fresh
             anchor whose parent's pages are resident borrows them for
             its shared length and packs only the tokens after it.
+        gpu_timing: Record forward-pass timing spans.
         stats: When given, receives borrowed_tokens: the anchor prefix
             tokens read from a parent's KV pages instead of computed.
         read_all_rows: Feed every row of each partner suffix to the
@@ -116,7 +117,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         prefix_tree=prefix_tree, stats=stats,
         unit="scores" if scoring else "documents", count_answers=scoring,
         label="AI.SCORE" if scoring else f"join ({k} stages)",
-        on_answers=on_answers)
+        on_answers=on_answers, gpu_timing=gpu_timing)
 
 
 # ---------------------------------------------------------- the filter
@@ -153,7 +154,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                pinned=True, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=(), attention_mode=None,
                document_done=None, prefix_tree=None, stats=None,
-               staging=None, stop_groups=None):
+               staging=None, stop_groups=None, gpu_timing=False):
     """Run a sequence of Boolean filters with the shared stage scheduler.
 
     Args:
@@ -180,6 +181,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             stage asked, passed) tuples.
         prefix_tree: A PrefixTree over doc_ids, or None. Needs
             arena_writes.
+        gpu_timing: Record forward-pass timing spans.
         stats: When given, receives borrowed_tokens and pack_s.
         staging: Optional reusable input transfer buffers.
         stop_groups: Per document, its stop key group, or None. One
@@ -235,7 +237,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         anchor_keys=keys, on_settled=on_settled,
         attention_mode=attention_mode, prefix_tree=prefix_tree,
         stats=stats, limit=limit, stop_groups=stop_groups,
-        paged=arena_writes, staging=staging,
+        paged=arena_writes, staging=staging, gpu_timing=gpu_timing,
         label=f"filter ({k} stages)", default_attention="unified",
         on_chunk=on_chunk if document_done is not None else None)
     by_document = {}

@@ -181,7 +181,9 @@ def fake_pack(torch, arena, specs, **kw):
         else 1
         for spec in specs for index, suffix in enumerate(spec["suffixes"]))
     if all(rows == 1 for rows in rows_per_answer):
-        rows_per_answer = ()
+        rows_per_answer = None
+    else:
+        rows_per_answer = np.asarray(rows_per_answer, dtype=np.int64)
     meta = {}
     return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=(),
                            fresh_keys=(), rows_per_answer=rows_per_answer,

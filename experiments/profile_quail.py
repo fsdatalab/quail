@@ -397,13 +397,10 @@ class LoopRecorder:
         return record, time.perf_counter()
 
     def _close_phase(self, record, t_call, spans, tokens):
-        # the loops drain their answers before returning, so the
-        # events are complete once this synchronize returns
-        self.torch.cuda.synchronize()
         record["wall_s"] = round(time.perf_counter() - t_call, 4)
         record["tokens"] = int(tokens)
         _, launches, _ = self._phase
-        gpu_ms = [e0.elapsed_time(e1) for _, e0, e1 in spans]
+        gpu_ms = [e0.elapsed_time(e1) for _, _, e0, e1 in spans]
         record["n_chunks"] = len(launches)
         record["gpu_s"] = round(sum(gpu_ms) / 1e3, 4)
         record["chunks"] = [
@@ -422,6 +419,7 @@ class LoopRecorder:
         record, t_call = self._open_phase(
             "filter", f"{len(doc_ids)} docs x {len(question_ids)} stages")
         kw.setdefault("timing", {})
+        kw["gpu_timing"] = True
         out = self._orig["run_filter"](
             torch, arena, pipeline, async_ans, doc_ids, question_ids,
             budget, **kw)
@@ -451,6 +449,7 @@ class LoopRecorder:
         tuples = sum(len(s) for s in stage_suffixes)
         record, t_call = self._open_phase(
             "join", f"{len(keys)} anchors, {tuples} tuples", kv)
+        kw["gpu_timing"] = True
         out = self._orig["run_join"](
             torch, arena, pipeline, async_ans, anchor_prefixes,
             stage_suffixes, budget, **kw)

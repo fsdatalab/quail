@@ -23,6 +23,7 @@ through a ragged readout.
 import time
 from dataclasses import dataclass, field
 from functools import partial
+from itertools import groupby
 from typing import Any, Callable
 
 import numpy as np
@@ -194,7 +195,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                attention_mode=None, prefix_tree=None, stats=None,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
-               on_answers=None, stop_groups=None, appended_tokens=None):
+               on_answers=None, stop_groups=None, appended_tokens=None,
+               gpu_timing=False):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -215,6 +217,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         attention_mode: "tree" or "unified" as the plan chose; None
             and a model without tree attention run unified.
         prefix_tree: A PrefixTree over anchor_prefixes, or None.
+        gpu_timing: Record forward-pass CUDA events and synchronize them once
+            at the end of the run. False returns no timing spans.
         stats: When given, receives borrowed_tokens and pack_s, the
             host seconds spent building chunks.
         limit: Stop admitting documents once this many survived the
@@ -258,7 +262,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         limit=limit, paged=paged, unit=unit, count_answers=count_answers,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,
-        appended_tokens=appended_tokens,
+        appended_tokens=appended_tokens, gpu_timing=gpu_timing,
     ).run()
 
 
@@ -281,7 +285,7 @@ class _StageExecutor:
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
-                 appended_tokens=None):
+                 appended_tokens=None, gpu_timing=False):
         from quail.backends.quail.executor.chunk import Suffixes
         from quail.backends.quail.executor.loop import (
             attention_path,
@@ -300,6 +304,7 @@ class _StageExecutor:
         self.on_chunk = on_chunk
         self.on_answers = on_answers
         self.label = label
+        self.gpu_timing = gpu_timing
 
         k = len(self.stages)
         if not self.paged and (
@@ -352,18 +357,15 @@ class _StageExecutor:
                                    self.frames, self.stages, self.suffixes,
                                    self.canvas_rows)
                                if stage.single])
-        # an append stage's tokens stay in document pages after the
-        # frame, so admission reserves the frame and every append round
-        for frame, stage in zip(self.frames, self.stages):
-            if stage.append:
-                kept = sum(int(other.lengths.max())
-                           for f, other, s in zip(self.frames, self.suffixes,
-                                                  self.stages)
-                           if s.append and f == frame)
-                if appended_tokens is not None:
-                    kept = min(kept, int(appended_tokens))
-                self.capacity_extra = max(self.capacity_extra,
-                                          len(frame) + kept)
+        appended = sorted(
+            (tuple(frame), int(suffixes.lengths.max()))
+            for frame, suffixes, stage in zip(self.frames, self.suffixes, self.stages)
+            if stage.append)
+        for frame, group in groupby(appended, key=lambda entry: entry[0]):
+            kept = sum(tokens for _, tokens in group)
+            if appended_tokens is not None:
+                kept = min(kept, int(appended_tokens))
+            self.capacity_extra = max(self.capacity_extra, len(frame) + kept)
         # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
 
@@ -512,7 +514,8 @@ class _StageExecutor:
                     f"{stage.label or f'stage {j}'}: a document's suffix has "
                     f"{int(own.lengths.max())} tokens, over the stage's "
                     f"{stage.suffix_tokens}")
-            self.own[(j, a)] = own
+            if len(own):
+                self.own[(j, a)] = own
             return OwnRequests(own.lengths)
 
         return ask
@@ -654,34 +657,32 @@ class _StageExecutor:
         if self.shared_readout:
             readout = self.stages[0].readout
             return [(0, (readout.submit(normed, rows_per_answer=rows_per_answer)
-                         if rows_per_answer else readout.submit(normed)))]
+                         if rows_per_answer is not None else readout.submit(normed)))]
         spans = [[] for _ in self.readout_of]
-        row = 0
+        counts = [[] for _ in self.readout_of]
+        boundaries = (None if rows_per_answer is None else np.cumsum(rows_per_answer))
+        row = answer = 0
         for j, rows in entries:
-            spans[self.group_key[j]].append((row, row + rows))
+            key = self.group_key[j]
+            spans[key].append((row, row + rows))
             row += rows
+            if boundaries is not None:
+                end = int(np.searchsorted(boundaries, row)) + 1
+                if self.read_all_of[key]:
+                    counts[key].append(rows_per_answer[answer:end])
+                answer = end
         handles = []
-        per_answer = list(rows_per_answer) if rows_per_answer else None
         for key, spans_key in enumerate(spans):
             if not spans_key:
                 continue
             readout = self.readout_of[key]
             selected = self._select_rows(normed, spans_key)
-            # a stage reading one row per answer takes no row counts
-            if per_answer is None or not self.read_all_of[key]:
+            if not counts[key]:
                 handles.append((key, readout.submit(selected)))
             else:
-                # answers of this readout's stages, in entry order
-                counts = []
-                answer = 0
-                for jj, rows in entries:
-                    taken = 0
-                    while taken < rows:
-                        taken += per_answer[answer]
-                        if self.group_key[jj] == key:
-                            counts.append(per_answer[answer])
-                        answer += 1
-                handles.append((key, readout.submit(selected, rows_per_answer=counts)))
+                lengths = counts[key]
+                lengths = lengths[0] if len(lengths) == 1 else np.concatenate(lengths)
+                handles.append((key, readout.submit(selected, rows_per_answer=lengths)))
         return handles
 
     def _report(self, entry):
@@ -700,6 +701,8 @@ class _StageExecutor:
             cnt = end - start
             rows = values[key][pos[key]:pos[key] + cnt]
             result = self.sched.report(a, j, start, end, rows)
+            if self.stages[j].own_suffixes and end == self.sched.partner_count(a, j):
+                del self.own[(j, a)]
             if self.on_answers is not None:
                 self.on_answers(a, j, start, end, rows)
             for settlement in result.settlements:
@@ -773,17 +776,20 @@ class _StageExecutor:
         chunk, entries = self._build(part)
         self.pack_s += time.perf_counter() - started
         self.tokens += chunk.tokens
-        e0 = self.torch.cuda.Event(enable_timing=True)
-        e1 = self.torch.cuda.Event(enable_timing=True)
-        e0.record()
+        if self.gpu_timing:
+            e0 = self.torch.cuda.Event(enable_timing=True)
+            e1 = self.torch.cuda.Event(enable_timing=True)
+            e0.record()
         normed = _forward(self.pipeline, self.arena, chunk)
-        e1.record()
+        if self.gpu_timing:
+            e1.record()
+            by_stage = {}
+            for entry in part:
+                stage = entry[1]
+                by_stage[stage] = by_stage.get(stage, 0) + self._entry_rows(*entry)
+            self.spans.append((by_stage, chunk.tokens, e0, e1))
         for key in chunk.fresh_keys:
             self.arena.trim_window(key)
-        by_stage = {}
-        for entry in part:
-            by_stage[entry[1]] = by_stage.get(entry[1], 0) + self._entry_rows(*entry)
-        self.spans.append((by_stage, chunk.tokens, e0, e1))
         handles = self._submit(normed, entries, chunk)
         self.outstanding.append(PendingAnswers(part, handles))
 
@@ -834,4 +840,6 @@ class _StageExecutor:
         if self.stats is not None:
             self.stats["borrowed_tokens"] = self.borrowing.borrowed_tokens
             self.stats["pack_s"] = self.pack_s
+        if self.spans:
+            self.torch.cuda.synchronize()
         return self.sched.answers, self.spans, self.tokens

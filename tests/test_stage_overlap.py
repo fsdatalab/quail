@@ -27,9 +27,12 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
             answers[hashed] = answer(hashed)
             expected[a, j] = [answers[hashed]]
     events = []
+    executors = []
     original = stages_mod._StageExecutor._run_one
 
     def launch(self, groups):
+        assert len(self.own) <= len(docs)
+        executors[:] = [self]
         events.append(("launch", tuple(groups)))
         return original(self, groups)
 
@@ -55,6 +58,7 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
         assert out[j][a] == want
     assert tokens == sum(map(len, docs)) + len(docs) * (len(frame) + len(suffixes))
     assert not run.arena.accounting.owned
+    assert not executors[0].own
     first_round = next(i for i, event in enumerate(events)
                        if event[0] == "launch" and any(j > 0 for _, j, *_ in event[1]))
     assert any(event[0:2] == ("decide", 0) for event in events[first_round + 1:])

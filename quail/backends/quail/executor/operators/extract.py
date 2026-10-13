@@ -12,7 +12,6 @@ from quail.backends.quail.executor.extract import (
 )
 from quail.backends.quail.executor.parts import (
     ExecutionPart,
-    chunks,
     execute_parts,
     gpu_seconds,
     shared_prefix_tree,
@@ -182,14 +181,14 @@ class ExtractPart(ExecutionPart):
         return sum(self.extraction.counts(q)["suffix_tokens"]
                    for q in range(len(self.nodes)))
 
-    def complete(self, tokens, spans, stats, torch, inputs, offset):
+    def complete(self, tokens, spans, stats, offset):
         """Build each question's answer table and attribute its GPU work."""
         per_question = len(self.stages) // len(self.nodes)
 
         def own(q):
             start = offset + q * per_question
             selected = stage_spans(spans, start, start + per_question)
-            return gpu_seconds(torch, selected, inputs), chunks(selected, inputs)
+            return gpu_seconds(selected), len(selected)
 
         self._results = extraction_results(
             self.nodes, self.extraction, self.ids, fresh=tokens,

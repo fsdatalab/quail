@@ -14,7 +14,11 @@ from typing import Callable
 import numpy as np
 
 from quail.backends.quail.executor.model import full_output_head
-from quail.backends.quail.executor.parts import input_staging, shared_prefix_tree
+from quail.backends.quail.executor.parts import (
+    gpu_seconds,
+    input_staging,
+    shared_prefix_tree,
+)
 from quail.backends.quail.executor.readout import (
     AsyncDecisionChoices,
     AsyncLabelLogprobs,
@@ -598,7 +602,7 @@ class QuailClassifier:
             state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
             plan.stages,
             prefixes, state.chunk_tokens, anchor_keys=keys,
-            staging=staging, prefix_tree=tree, stats=stats,
+            staging=staging, prefix_tree=tree, stats=stats, gpu_timing=state.gpu_timing,
             label=f"classify {spec.name}",
             on_chunk=stream.chunk(lambda anchor: plan.labels[anchor]))
         suffix_tokens, streamed = plan.finish(answers)
@@ -610,18 +614,10 @@ class QuailClassifier:
     def _batch(self, labels, fresh, cached, suffix_tokens, stats,
                spans, probabilities=None) -> RerankerBatch:
         """Build a classification batch with token counts and optional GPU timing."""
-        state = self.state
-        gpu_s = 0.0
-        if state.gpu_timing:
-            # elapsed_time needs every end event to have completed
-            state.torch.cuda.synchronize()
-            gpu_s = sum(start.elapsed_time(end)
-                        for _, _, start, end in spans) / 1000.0
         return RerankerBatch(
             labels, fresh_tokens=fresh, cached_tokens=cached,
             suffix_tokens=suffix_tokens,
             borrowed_tokens=stats.get("borrowed_tokens", 0),
             pack_s=stats.get("pack_s", 0.0),
-            gpu_s=gpu_s,
-            chunks=len(spans) if state.gpu_timing else 0,
+            gpu_s=gpu_seconds(spans), chunks=len(spans),
             probabilities=probabilities)

@@ -305,7 +305,8 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
             self.dtype = np.dtype((np.float32, (rows, len(targets))))
 
         def submit(self, rows, rows_per_answer=None):
-            rows_per_answer = rows_per_answer or [1] * len(rows)
+            if rows_per_answer is None:
+                rows_per_answer = [1] * len(rows)
             padded = np.full((len(rows_per_answer), self.rows,
                               len(self.targets)), np.nan, np.float32)
             start = 0
@@ -463,7 +464,8 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     def submit(rows, rows_per_answer=None):
         # (answers, rows, targets), padded; a frame entry's one row is
         # not read and carries no log probabilities
-        rows_per_answer = rows_per_answer or [1] * len(rows)
+        if rows_per_answer is None:
+            rows_per_answer = [1] * len(rows)
         padded = np.full((len(rows_per_answer), 1, len(TARGETS)), np.nan,
                          np.float32)
         start = 0
@@ -617,7 +619,8 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
             self.dtype = np.dtype((np.float32, (rows, len(targets))))
 
         def submit(self, rows, rows_per_answer=None):
-            rows_per_answer = rows_per_answer or [1] * len(rows)
+            if rows_per_answer is None:
+                rows_per_answer = [1] * len(rows)
             padded = np.full((len(rows_per_answer), self.rows,
                               len(self.targets)), np.nan, np.float32)
             start = 0

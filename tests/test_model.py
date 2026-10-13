@@ -97,7 +97,7 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
         return SimpleNamespace(specs=specs, tokens=len(specs),
                                attention_mode=kw["attention_mode"],
                                temporary_keys=(), fresh_keys=(),
-                               rows_per_answer=())
+                               rows_per_answer=None)
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", pack)
     arena = cpu_arena(64)
