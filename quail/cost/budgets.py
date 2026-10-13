@@ -3,6 +3,7 @@
 Chunk budget, admission budget, and roofline arithmetic.
 """
 
+from quail.cost.dense_decoder_cost import attention_rates
 from quail.specs import DeviceSpec, ModelSpec
 
 POOL_FRACTION = 0.95    # fraction of device memory the executor claims
@@ -168,12 +169,18 @@ def _projection_time(model: ModelSpec, device: DeviceSpec,
 
 def _attention_time(model: ModelSpec, device: DeviceSpec,
                     chunk: int, context: int) -> float:
-    """Ideal seconds for the attention kernels in one chunk, all layers."""
+    """Ideal seconds for chunk query rows reading context KV tokens, all layers.
+
+    Prices at the device's measured cached-read rate when it has one for
+    the model's head layout.
+    """
     flops = 4.0 * chunk * context * model.n_q * model.d_head
     moved = (context * model.kappa / model.layers
              + 2.0 * chunk * model.n_q * model.d_head * ACT_BYTES)
-    return max(flops / device.peak_flops,
-               moved / device.memory_bw) * model.layers
+    rates = attention_rates(model, device)
+    rate = (rates.read_rate(chunk, context) if rates is not None
+            else device.peak_flops)
+    return max(flops / rate, moved / device.memory_bw) * model.layers
 
 
 # Below this many dense parameters a model runs unified attention only.

@@ -1,5 +1,7 @@
 """Model and device spec structs for the planner."""
 
+import bisect
+import math
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -197,6 +199,68 @@ class ModelSpec:
         return replace(self, kv_bytes=kv_bytes)
 
 
+def _log_interp(xs, ys, x: float) -> float:
+    """Interpolate ys over increasing xs linearly in log x, clamped at both ends."""
+    if x <= xs[0]:
+        return ys[0]
+    if x >= xs[-1]:
+        return ys[-1]
+    i = bisect.bisect_right(xs, x)
+    t = (math.log(x) - math.log(xs[i - 1])) / (math.log(xs[i]) - math.log(xs[i - 1]))
+    return ys[i - 1] + t * (ys[i] - ys[i - 1])
+
+
+def causal_rate(tokens_axis, rates, tokens: float) -> float:
+    """Return FLOP/s of causal attention over documents of this many tokens.
+
+    Below the shortest measured length the rate falls in proportion to
+    the length; past the longest it is held.
+    """
+    low = tokens_axis[0]
+    if tokens < low:
+        return rates[0] * max(tokens, 1.0) / low
+    return _log_interp(tokens_axis, rates, tokens)
+
+
+@dataclass(frozen=True)
+class AttentionRates:
+    """Measured attention FLOP rates for one head layout on one device.
+
+    Below the shortest document or the fewest query rows measured, the
+    time of a call no longer falls with its size, so the rate falls in
+    proportion to it. Past the other ends the rate is held.
+
+    Attributes:
+        causal_tokens: Document lengths of the causal measurements.
+        causal: FLOP/s of causal attention over packed documents of each
+            length.
+        read_rows: Query rows per sequence of the cached-read
+            measurements.
+        read_contexts: Cached context tokens of the cached-read
+            measurements.
+        read: FLOP/s of query rows reading cached KV, one row of the
+            table per read_rows value, one column per read_contexts value.
+    """
+
+    causal_tokens: tuple[int, ...]
+    causal: tuple[float, ...]
+    read_rows: tuple[int, ...]
+    read_contexts: tuple[int, ...]
+    read: tuple[tuple[float, ...], ...]
+
+    def causal_rate(self, tokens: float) -> float:
+        """Return FLOP/s of causal attention over documents of this length."""
+        return causal_rate(self.causal_tokens, self.causal, tokens)
+
+    def read_rate(self, rows: float, context: float) -> float:
+        """Return FLOP/s of this many query rows per sequence reading cached KV."""
+        low = self.read_rows[0]
+        scale = max(rows, 1.0) / low if rows < low else 1.0
+        by_rows = [_log_interp(self.read_contexts, line, context)
+                   for line in self.read]
+        return _log_interp(self.read_rows, by_rows, max(rows, low)) * scale
+
+
 @dataclass(frozen=True)
 class DeviceSpec:
     name: str
@@ -222,11 +286,22 @@ class DeviceSpec:
     sustained_hbm_bw: float = 0.0       # measured device-to-device copy
     #                                     bandwidth, bytes/s; 0 means
     #                                     none was measured
+    attention_rates: tuple[tuple[tuple[int, int, int], AttentionRates], ...] = ()
+    #   measured attention rates keyed by (query heads, KV heads, head
+    #   dimension); a layout without an entry prices at attn_flops
 
     @property
     def attn_flops(self) -> float:
         """Dense peak for the attention kernels, FLOP/s."""
         return self.bf16_flops or self.peak_flops / 2
+
+    def attention_rates_for(self, n_q: int, n_kv: int,
+                            d_head: int) -> AttentionRates | None:
+        """Return the measured attention rates of a head layout, or None."""
+        for layout, rates in self.attention_rates:
+            if layout == (n_q, n_kv, d_head):
+                return rates
+        return None
 
     @property
     def gemm_flops(self) -> float:

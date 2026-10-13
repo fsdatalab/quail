@@ -1,4 +1,22 @@
-from .base import DeviceSpec
+from .base import AttentionRates, DeviceSpec
+
+# Faster of FlashAttention 3 and FlashInfer at each point, each held
+# 2 s; cached reads on private 16-token pages:
+# /results/ablations/attention_ceilings_h100.json
+QWEN3_4B_ATTENTION = AttentionRates(
+    causal_tokens=(128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768),
+    causal=(104.1e12, 191.7e12, 301.0e12, 411.2e12, 506.1e12, 583.5e12,
+            628.6e12, 652.4e12, 667.6e12),
+    read_rows=(16, 32, 64, 128, 256, 512, 1024),
+    read_contexts=(1024, 4096, 8192, 32768),
+    read=((172e12, 191e12, 195e12, 195e12),
+          (317e12, 371e12, 385e12, 389e12),
+          (412e12, 481e12, 496e12, 510e12),
+          (439e12, 518e12, 533e12, 543e12),
+          (451e12, 539e12, 549e12, 561e12),
+          (489e12, 560e12, 572e12, 576e12),
+          (492e12, 564e12, 577e12, 578e12)),
+)
 
 H100_SXM = DeviceSpec(
     name="h100-sxm",
@@ -17,6 +35,7 @@ H100_SXM = DeviceSpec(
     #                                /results/ablations/gemm_ceilings_h100_fp8.json
     sustained_hbm_bw=3.048e12,     # 4 GB copy held 2 s:
     #                                /results/ablations/attention_ceilings_h100.json
+    attention_rates=(((32, 8, 128), QWEN3_4B_ATTENTION),),
 )
 
 # The price every $/query number in reports uses: query hours times

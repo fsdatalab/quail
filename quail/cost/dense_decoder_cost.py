@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from quail.cost.roofline import CostComponent
 from quail.cost.work import Work
-from quail.specs import ModelSpec
+from quail.specs import AttentionRates, DeviceSpec, ModelSpec
 
 
 def attention_projection_params(model: ModelSpec) -> int:
@@ -56,14 +56,65 @@ def attention_pair_flops(model: ModelSpec) -> tuple[int, int]:
     return full_flops, sliding_flops
 
 
-def dense_decoder_components(work: Work, model: ModelSpec,
-                             passes: float) -> tuple[CostComponent, ...]:
-    """Build the modeled decoder components for one work record."""
+def attention_rates(model: ModelSpec,
+                    device: DeviceSpec | None) -> AttentionRates | None:
+    """Return the device's measured attention rates for the model, or None.
+
+    Only a model whose layers all share one head layout has them.
+    """
+    if device is None or model.sliding_layer_set:
+        return None
+    if any(shape != (model.n_kv, model.d_head) for shape in model.kv_shapes):
+        return None
+    return device.attention_rates_for(model.n_q, model.n_kv, model.d_head)
+
+
+def measured_attention_seconds(work: Work, model: ModelSpec,
+                               rates: AttentionRates) -> float:
+    """Return attention compute time for the work at measured rates.
+
+    The causal pairs price at the rate of their pair-weighted document
+    length. The read pairs price at the rate of their mean query rows
+    per sequence and their row-weighted context.
+    """
+    full_flops, _ = attention_pair_flops(model)
+    causal_pairs = max(0.0, work.pairs - work.read_pairs)
+    seconds = 0.0
+    if causal_pairs > 0 and work.tokens > 0:
+        length = max(1.0, 2.0 * causal_pairs / work.tokens - 1.0)
+        seconds += full_flops * causal_pairs / rates.causal_rate(length)
+    if work.read_pairs > 0 and work.read_rows > 0 and work.reads > 0:
+        rows = work.read_rows / work.reads
+        context = work.read_pairs / work.read_rows
+        seconds += full_flops * work.read_pairs / rates.read_rate(rows, context)
+    return seconds
+
+
+def dense_decoder_components(work: Work, model: ModelSpec, passes: float,
+                             device: DeviceSpec | None = None,
+                             ) -> tuple[CostComponent, ...]:
+    """Build the modeled decoder components for one work record.
+
+    Args:
+        work: The work record.
+        model: The model that does it.
+        passes: Forward passes, each reading the weights once.
+        device: The device. When it has measured attention rates for
+            the model's head layout, the attention component carries its
+            compute time at those rates.
+
+    Returns:
+        The attn_proj, mlp, and attention components.
+
+    Raises:
+        ValueError: If passes is negative.
+    """
     if passes < 0:
         raise ValueError("passes must be nonnegative")
     attn_proj = attention_projection_params(model)
     mlp = mlp_params(model)
     full_flops, sliding_flops = attention_pair_flops(model)
+    rates = attention_rates(model, device)
     return (
         CostComponent(
             name="attn_proj",
@@ -84,5 +135,7 @@ def dense_decoder_components(work: Work, model: ModelSpec,
                 model.kappa_full * (work.kv_written + work.kv_read)
                 + model.kappa_sliding * (work.kv_written + work.sliding_kv_read)),
             precision=model.attention_precision,
+            compute_seconds=(measured_attention_seconds(work, model, rates)
+                             if rates is not None else None),
         ),
     )

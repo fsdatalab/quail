@@ -15,6 +15,9 @@ class CostComponent:
     flops: float
     bytes_moved: float
     precision: Precision
+    compute_seconds: float | None = None    # time at measured rates;
+    #                                         None prices flops at the
+    #                                         precision's rate
 
 
 @dataclass(frozen=True)
@@ -57,7 +60,8 @@ def component_latency(component: CostComponent,
     return ComponentLatency(
         component=component,
         compute_seconds=(
-            component.flops
+            component.compute_seconds if component.compute_seconds is not None
+            else component.flops
             / device.arithmetic_bandwidth(component.precision)),
         memory_seconds=component.bytes_moved / device.memory_bw,
     )

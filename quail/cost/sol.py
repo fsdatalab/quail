@@ -21,7 +21,7 @@ def _latencies(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
                passes: float) -> tuple[ComponentLatency, ...]:
     """Return the priced decoder components for one work record."""
     return component_latencies(
-        dense_decoder_components(work, model, passes), device)
+        dense_decoder_components(work, model, passes, device), device)
 
 
 def compute_seconds(work: _workload.Work, model: ModelSpec,

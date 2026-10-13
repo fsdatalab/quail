@@ -37,8 +37,9 @@ building the plan and by rules such as `label_scoring` and `kv_retention`.
 ## Cost estimates
 
 The *cost model* estimates GPU time from the computation and memory
-transfers a plan requires. It assumes peak GPU compute rates and memory
-bandwidth and excludes CPU work and kernel launch time.
+transfers a plan requires. It assumes the GPU's compute rates and memory
+bandwidth (measured sustained rates where the GPU specification has them,
+peak rates otherwise) and excludes CPU work and kernel launch time.
 Use `explain(analyze=True)` to compare an estimate with measured execution.
 
 The model computes key and value vectors when it processes a token.
@@ -73,6 +74,28 @@ The calculation is called the *roofline model*. Quail totals the work
 across layers for each part of the model calculation, applies the formula,
 and adds the resulting times.
 
+A GPU specification can replace the peak rates with rates measured while
+the GPU runs at its power limit. The H100 specification does: dense
+projections price at 1,352 FP8 TFLOPS instead of 1,979, and memory
+transfers at 3.05 TB/s instead of 3.35.
+
+Attention speed depends on the shape of each call, so for a measured head
+layout Quail prices attention from a table instead of one rate. For
+example, on an H100 with Qwen3 4B's 32 query heads, 8 KV heads, and head
+dimension 128, causal attention runs at 104 TFLOPS over documents of 128
+tokens and at 668 TFLOPS over documents of 32,768 tokens. The cost model
+counts two kinds of attention pairs:
+
+- Causal pairs, among new tokens. They price at the rate for their
+  pair-weighted mean document length.
+- Read pairs, between new tokens and a prefix already saved as KV. They
+  price at the rate for their mean query rows per read and their mean
+  context length.
+
+Each estimate prices all its pairs at one typical shape of each kind, not
+document by document. A layout without measurements prices attention at
+the GPU's peak BF16 rate.
+
 [Our blog post on filter cost estimates](https://fsdatalab.github.io/blog/ai-filter-cost-estimates/)
 explains the equations, GPU background, KV reuse, and filter ordering.
 Detailed explanations of join and classification costs are TBD.
@@ -82,7 +105,8 @@ Detailed explanations of join and classification costs are TBD.
 `quail.speed_of_light_estimate` estimates query time under ideal execution
 conditions for comparison with measured runs. It assumes:
 
-- One GPU running at peak compute rates and memory bandwidth.
+- One GPU running at the rates in its specification: measured sustained
+  rates where it has them, peak rates otherwise.
 - Unlimited KV capacity. By default, each distinct document prefix is
   computed once and reused.
 - No time spent on CPU work, scheduling, or kernel launches.
@@ -312,10 +336,11 @@ outputs and write the combined output.
   two billion parameters, excluding embeddings and output layers, and
   no extra answer positions. Other configurations use unified attention.
 
-The current comparison uses the FP8 compute rate for attention, although
-the kernel runs in BF16. It therefore underestimates attention compute
-time on an H100. It also excludes kernel launch time. These limits apply
-to the path comparison, rather than the main roofline attention estimate.
+When the GPU specification has measured attention rates for the model's
+head layout, `attention_seconds` uses the measured rate for `q` query rows
+reading a prefix of `s` tokens. Otherwise it uses the FP8 compute rate,
+although the kernel runs in BF16, and so underestimates attention compute
+time. Both exclude kernel launch time.
 
 The implementation is
 [`choose_attention_path`](https://github.com/fsdatalab/quail/blob/main/quail/cost/budgets.py).

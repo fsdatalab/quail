@@ -478,6 +478,9 @@ class _Search:
                 sliding_pairs=sliding_pairs,
                 sliding_kv_read=(min(anchor_prefix, self.window - 1)
                                  if self.window else 0.0),
+                read_pairs=anchor_prefix * suffix_tokens,
+                read_rows=suffix_tokens,
+                reads=float(sum(1 for suffix in streamed if suffix > 0)),
             )
         return work
 

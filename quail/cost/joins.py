@@ -43,6 +43,9 @@ def stage_work(spec: dict, anchor: str, n: float, tuples: float, lengths: dict,
             sliding_pairs=(stats.window_pairs(pre + frame) - stats.window_pairs(pre)
                            if window else 0.0),
             sliding_kv_read=stats.window_reads(pre) if window else 0.0,
+            read_pairs=frame * prefix_sum,
+            read_rows=count * frame,
+            reads=count if frame > 0 else 0.0,
         )
     else:
         scan_sum = prefix_sum + count * frame
@@ -65,5 +68,8 @@ def stage_work(spec: dict, anchor: str, n: float, tuples: float, lengths: dict,
                                     - stats.window_pairs(pre + frame))
                        if window else 0.0),
         sliding_kv_read=stats.window_reads(pre + frame) if window else 0.0,
+        read_pairs=per_anchor * u * (prefix_sum + count * frame),
+        read_rows=count * per_anchor * u,
+        reads=count * per_anchor if u > 0 else 0.0,
     )
     return (start + stream) * frac

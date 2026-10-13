@@ -8,7 +8,10 @@ def policy(config, uses):
     return RetentionPolicy(
         config["linear_seconds"], config["pair_seconds"], uses,
         sliding_pair_seconds=config.get("sliding_pair_seconds", 0.0),
-        sliding_window=config.get("sliding_window", 0))
+        sliding_window=config.get("sliding_window", 0),
+        pair_flops=config.get("pair_flops", 0.0),
+        causal_tokens=tuple(config.get("causal_tokens", ())),
+        causal_rates=tuple(config.get("causal_rates", ())))
 
 
 def apply_retention(arena, config, uses, survivors=None):

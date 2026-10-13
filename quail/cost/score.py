@@ -34,18 +34,26 @@ def score_work(count, mean_tokens, fixed_tokens, *, variance=0.0,
         kv_written=length,
     ) * count
     reused = max(0.0, count - groups)
+    rest = max(0.0, length - prefix_tokens)
     work += Work(
         tokens=-prefix_tokens,
         pairs=-triangle(prefix_tokens) - prefix_variance / 2,
         kv_written=-prefix_tokens,
         kv_read=prefix_tokens,
+        read_pairs=prefix_tokens * rest,
+        read_rows=rest if prefix_tokens > 0 else 0.0,
+        reads=1.0 if prefix_tokens > 0 and rest > 0 else 0.0,
     ) * reused
     shared_reuses = max(0.0, groups - copies)
+    rest = max(0.0, length - shared_tokens)
     return work + Work(
         tokens=-shared_tokens,
         pairs=-triangle(shared_tokens),
         kv_written=-shared_tokens,
         kv_read=shared_tokens,
+        read_pairs=shared_tokens * rest,
+        read_rows=rest if shared_tokens > 0 else 0.0,
+        reads=1.0 if shared_tokens > 0 and rest > 0 else 0.0,
     ) * shared_reuses
 
 

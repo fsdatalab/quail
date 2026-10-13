@@ -81,7 +81,8 @@ def _readout(model, rows: float, passes: float, head_rows: int) -> CostComponent
 def _seconds(work: Work, rows: float, passes: float, model, device,
              head_rows: int) -> float:
     """Price work, answer rows, and forward passes with the component roofline."""
-    components = dense_decoder_components(work, model, passes=passes)
+    components = dense_decoder_components(work, model, passes=passes,
+                                          device=device)
     components += (_readout(model, rows, passes, head_rows),)
     return sum(component.seconds
                for component in component_latencies(components, device))
@@ -115,11 +116,13 @@ def _triangle(n, window: int = 0):
     return np.where(n > window, window * n - window * (window - 1) / 2, full)
 
 
-def _total(tokens, pairs, written, read, sliding_pairs, sliding_read) -> Work:
+def _total(tokens, pairs, written, read, sliding_pairs, sliding_read,
+           read_pairs=0.0, read_rows=0.0, reads=0.0) -> Work:
     """Sum per-document work arrays into one Work record."""
     return Work(float(np.sum(tokens)), float(np.sum(pairs)), float(np.sum(written)),
                 float(np.sum(read)), float(np.sum(sliding_pairs)),
-                float(np.sum(sliding_read)))
+                float(np.sum(sliding_read)), float(np.sum(read_pairs)),
+                float(np.sum(read_rows)), float(np.sum(reads)))
 
 
 def _first_work(prefix, shared, tail: int, resident: bool, window: int) -> Work:
@@ -127,18 +130,22 @@ def _first_work(prefix, shared, tail: int, resident: bool, window: int) -> Work:
     if resident:
         # ask(prefix, tail)
         suffix = np.full_like(prefix, tail)
+        reading = (prefix > 0) & (suffix > 0)
         return _total(
             suffix, tail * prefix + _triangle(tail), suffix, prefix,
             _triangle(prefix + tail, window) - _triangle(prefix, window)
             if window else 0.0,
-            np.minimum(prefix, window - 1) if window else 0.0)
+            np.minimum(prefix, window - 1) if window else 0.0,
+            tail * prefix, np.where(reading, suffix, 0.0), reading)
     # scan(prefix, tail) without a shared prefix, ask(shared, rest) with one
     fresh = prefix - shared + tail
+    reading = (shared > 0) & (fresh > 0)
     return _total(
         fresh, fresh * shared + _triangle(fresh), fresh, shared,
         _triangle(prefix + tail, window) - _triangle(shared, window)
         if window else 0.0,
-        np.minimum(shared, window - 1) if window else 0.0)
+        np.minimum(shared, window - 1) if window else 0.0,
+        fresh * shared, np.where(reading, fresh, 0.0), reading)
 
 
 def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:
@@ -147,15 +154,20 @@ def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:
     pairs = sum(s * context + _triangle(s) for s in suffixes)
     sliding_pairs = (sum(_triangle(context + s, window) - _triangle(context, window)
                          for s in suffixes) if window else 0.0)
+    reading = [s for s in suffixes if s > 0]
     work = _total(
         np.full_like(context, total), pairs, np.full_like(context, total),
         context, sliding_pairs,
-        np.minimum(context, window - 1) if window else 0.0)
+        np.minimum(context, window - 1) if window else 0.0,
+        sum(reading) * context, np.where(context > 0, sum(reading), 0.0),
+        np.where(context > 0, len(reading), 0.0))
     if canvas_rows > 1:
         # a canvas longer than one row reads the document a second time
         work += Work(pairs=work.pairs, kv_read=work.kv_read,
                      sliding_pairs=work.sliding_pairs,
-                     sliding_kv_read=work.sliding_kv_read)
+                     sliding_kv_read=work.sliding_kv_read,
+                     read_pairs=work.read_pairs, read_rows=work.read_rows,
+                     reads=work.reads)
     return work
 
 

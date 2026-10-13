@@ -5,6 +5,11 @@ from dataclasses import replace
 import pytest
 
 from quail.cost import budgets
+from quail.cost.dense_decoder_cost import (
+    attention_pair_flops,
+    dense_decoder_components,
+)
+from quail.cost.work import ask, scan, triangle
 from quail.specs import (
     H100_SXM,
     QWEN3_4B_FP8,
@@ -50,3 +55,38 @@ def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
     small = replace(H100_SXM, mem_bytes=40e9)
     with pytest.raises(ValueError, match="one chunk's sliding KV"):
         budgets.arena_pages(DIFFUSION_GEMMA_26B_FP8, small)
+
+
+def test_measured_attention_rates_interpolate_and_fall_below_the_table():
+    rates = H100_SXM.attention_rates_for(32, 8, 128)
+    assert H100_SXM.attention_rates_for(64, 8, 128) is None
+    assert RTX_PRO_6000_BLACKWELL_SERVER.attention_rates_for(32, 8, 128) is None
+    # measured points, halfway in log length, and held past the longest
+    assert rates.causal_rate(1024) == 411.2e12
+    assert rates.causal_rate((1024 * 2048) ** 0.5) == pytest.approx(
+        (411.2e12 + 506.1e12) / 2)
+    assert rates.causal_rate(10**6) == 667.6e12
+    # below the shortest document a call takes as long as at the
+    # shortest, so the rate falls in proportion
+    assert rates.causal_rate(64) == pytest.approx(104.1e12 / 2)
+    assert rates.read_rate(64, 8192) == 496e12
+    assert rates.read_rate(8, 8192) == pytest.approx(195e12 / 2)
+    assert rates.read_rate(64, 100) == 412e12
+    assert rates.read_rate(4096, 10**6) == 578e12
+
+
+def test_attention_prices_at_measured_rates_for_the_measured_layout():
+    work = scan(1024, 0) * 10 + ask(8192, 64) * 5
+    full, _ = attention_pair_flops(QWEN3_4B_FP8)
+    rates = H100_SXM.attention_rates_for(32, 8, 128)
+    causal = 10 * triangle(1024) + 5 * triangle(64)
+    length = 2 * causal / (10 * 1024 + 5 * 64) - 1
+    attention = dense_decoder_components(work, QWEN3_4B_FP8, 1, H100_SXM)[2]
+    assert attention.compute_seconds == pytest.approx(
+        full * causal / rates.causal_rate(length)
+        + full * 5 * 64 * 8192 / rates.read_rate(64, 8192))
+    # without a device, or without a table for the layout, the flops
+    # price at the bf16 peak
+    assert dense_decoder_components(work, QWEN3_4B_FP8, 1)[2].compute_seconds is None
+    assert dense_decoder_components(
+        work, QWEN3_32B_FP8, 1, H100_SXM)[2].compute_seconds is None

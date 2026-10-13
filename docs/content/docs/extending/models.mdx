@@ -80,6 +80,7 @@ compute rates. Quail represents it with `DeviceSpec`.
 | `bf16_flops` | Peak dense BF16 operations per second. |
 | `sustained_fp8_flops` | Optional. The FP8 GEMM rate the GPU holds at its power limit, measured. The cost model prices dense projections at this rate when it is set, and at `peak_flops` otherwise. |
 | `sustained_hbm_bw` | Optional. The device-to-device copy bandwidth, measured, in bytes per second. The cost model prices memory traffic at this rate when it is set, and at `hbm_bw` otherwise. |
+| `attention_rates` | Optional. Measured attention rates as `((query heads, KV heads, head dimension), AttentionRates)` entries. `AttentionRates` holds the causal rate by document length and the cached-read rate by query rows and context length, in operations per second. A model whose head layout has an entry prices attention from it; others use `bf16_flops`. |
 
 All values describe one GPU. Use compute rates without structured
 sparsity. The

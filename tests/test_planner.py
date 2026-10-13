@@ -318,7 +318,8 @@ def test_work_matches_attention_masks_and_component_costs():
         assert branches.sliding_kv_read == continuation.sliding_kv_read
 
     work = ask(400, 50) * 1000
-    result = speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 110_376)
+    spec_rates = replace(H100_SXM, attention_rates=())
+    result = speed_of_light(work, QWEN3_4B_FP8, spec_rates, 110_376)
     assert result.bound_by == "mixed"
     assert [c.name for c in result.components] == [
         "attn_proj", "mlp", "attention"]
@@ -332,7 +333,7 @@ def test_work_matches_attention_masks_and_component_costs():
     assert dense_bytes == dense_params(QWEN3_4B_FP8) * result.passes
     larger_resident_copy = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
     assert speed_of_light(
-        work, larger_resident_copy, H100_SXM, 110_376).seconds \
+        work, larger_resident_copy, spec_rates, 110_376).seconds \
         == pytest.approx(result.seconds)
 
     model = DIFFUSION_GEMMA_26B_FP8

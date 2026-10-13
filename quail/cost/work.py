@@ -7,7 +7,13 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Work:
-    """Tokens, full and sliding attention pairs, and KV movement."""
+    """Tokens, full and sliding attention pairs, and KV movement.
+
+    read_pairs, read_rows, and reads describe the part of pairs where
+    new rows attend to a prefix already in KV: the pairs between the
+    rows and that prefix, the rows, and the sequences doing such a
+    read. The rest of pairs is causal attention within new tokens.
+    """
 
     tokens: float = 0.0
     pairs: float = 0.0
@@ -15,6 +21,9 @@ class Work:
     kv_read: float = 0.0
     sliding_pairs: float = 0.0
     sliding_kv_read: float = 0.0
+    read_pairs: float = 0.0
+    read_rows: float = 0.0
+    reads: float = 0.0
 
     def __add__(self, other: "Work") -> "Work":
         return Work(
@@ -24,6 +33,9 @@ class Work:
             self.kv_read + other.kv_read,
             self.sliding_pairs + other.sliding_pairs,
             self.sliding_kv_read + other.sliding_kv_read,
+            self.read_pairs + other.read_pairs,
+            self.read_rows + other.read_rows,
+            self.reads + other.reads,
         )
 
     def __mul__(self, count: float) -> "Work":
@@ -34,6 +46,9 @@ class Work:
             self.kv_read * count,
             self.sliding_pairs * count,
             self.sliding_kv_read * count,
+            self.read_pairs * count,
+            self.read_rows * count,
+            self.reads * count,
         )
 
     def dominates(self, other: "Work") -> bool:
@@ -45,6 +60,9 @@ class Work:
             and self.kv_read <= other.kv_read
             and self.sliding_pairs <= other.sliding_pairs
             and self.sliding_kv_read <= other.sliding_kv_read
+            and self.read_pairs <= other.read_pairs
+            and self.read_rows <= other.read_rows
+            and self.reads <= other.reads
         )
 
 
@@ -64,6 +82,7 @@ def scan(prefix: float, suffix: float, *, window: int = 0) -> Work:
 
 def ask(prefix: float, suffix: float, *, window: int = 0) -> Work:
     """Attach one suffix to a prefix already available in KV."""
+    reading = prefix > 0 and suffix > 0
     return Work(
         tokens=suffix,
         pairs=suffix * prefix + triangle(suffix),
@@ -72,6 +91,9 @@ def ask(prefix: float, suffix: float, *, window: int = 0) -> Work:
         sliding_pairs=(triangle(prefix + suffix, window) - triangle(prefix, window)
                        if window else 0.0),
         sliding_kv_read=min(prefix, window - 1) if window else 0.0,
+        read_pairs=suffix * prefix,
+        read_rows=suffix if reading else 0.0,
+        reads=1.0 if reading else 0.0,
     )
 
 
@@ -84,6 +106,7 @@ def stream(prefix: float, suffixes, *, window: int = 0) -> Work:
         if window:
             sliding_pairs += (triangle(prefix + suffix, window)
                               - triangle(prefix, window))
+    reading = [suffix for suffix in suffixes if suffix > 0] if prefix > 0 else []
     return Work(
         tokens=tokens,
         pairs=pairs,
@@ -91,4 +114,7 @@ def stream(prefix: float, suffixes, *, window: int = 0) -> Work:
         kv_read=prefix,
         sliding_pairs=sliding_pairs,
         sliding_kv_read=min(prefix, window - 1) if window else 0.0,
+        read_pairs=prefix * sum(reading),
+        read_rows=float(sum(reading)),
+        reads=float(len(reading)),
     )

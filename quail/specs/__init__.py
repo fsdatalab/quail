@@ -8,6 +8,7 @@ config.json.
 from .base import (
     ACT_BYTES_PER_HIDDEN,
     AnswerCanvas,
+    AttentionRates,
     DeviceSpec,
     ModelSpec,
     Precision,
@@ -36,7 +37,8 @@ DEVICES = {device.name: device for device in (
 MODAL_GPU_USD_PER_HOUR = {
     name: device.usd_per_hour for name, device in DEVICES.items()}
 
-__all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "DeviceSpec", "ModelSpec",
+__all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "AttentionRates",
+           "DeviceSpec", "ModelSpec",
            "Precision", "Role", "MODELS", "DEVICES", "QWEN3_4B_FP8", "QWEN3_32B_FP8",
            "QWEN3_RERANKER_0_6B_BF16",
            "QWEN3_RERANKER_4B_BF16", "DIFFUSION_GEMMA_26B_FP8",
