@@ -261,9 +261,9 @@ class JoinAdmission:
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
-    fresh anchors whose pages fit the free list. Pages are granted in
-    queue order; chunk room may be skipped. An anchor advances to its
-    next stage once its whole stream at the current stage is launched
+    fresh anchors whose pages fit the free list. Requests skipped for token
+    space take priority in the next chunk. Pages are granted in queue order.
+    An anchor advances to its next stage once its whole stream is launched
     and one partner has answered TRUE; the remaining answers fill in
     while the next stage runs. It drops out when every partner
     answered FALSE. An anchor with no partner at a stage settles
@@ -643,14 +643,17 @@ class JoinAdmission:
         room = self.chunk_budget
         groups = []
         continued = []
+        deferred = []
         temporary_pages = 0
         # 1) placed anchors: cut streams (front) and next-stage starts
         for _ in range(len(self.ready)):
+            if room == 0:
+                break
             a = self.ready.popleft()
             j, i = self._stage[a], self._next[a]
             if self._first_cost(a, j, i) > room:
-                self.ready.appendleft(a)    # FIFO; chunk nearly full
-                break
+                deferred.append(a)
+                continue
             end, tokens, pages = self._take(a, j, i, room, free_pages)
             if end == i:
                 self.blocked_pages = self._suffix_page_cost(a, j, i) - free_pages
@@ -723,6 +726,7 @@ class JoinAdmission:
                 continued.append(a)
         self.pending.extendleft(reversed(held))
         self.ready.extendleft(reversed(continued))
+        self.ready.extendleft(reversed(deferred))
         return groups
 
     # ---- gating --------------------------------------------------------

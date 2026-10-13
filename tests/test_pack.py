@@ -181,6 +181,21 @@ def test_admission_invariants_over_random_shapes():
                                stages, frames, budget, resident, lists)
 
 
+def test_ready_requests_fill_remaining_tokens_without_starving_skipped_requests():
+    sched = JoinAdmission(
+        [1] * 4, [[1], [10, 17, 6, 4, 6]], 20, 100, 1,
+        anchor_partners={a: [[0], [2, 4] if a == 2 else [a]]
+                         for a in range(4)})
+    for a, j, start, end, _ in sched.next_chunk(100):
+        sched.report(a, j, start, end, [True])
+
+    chunk = sched.next_chunk(96)
+    assert [a for a, *_ in chunk] == [0, 2, 3]
+    assert sum(sched.stages[1][a] for a, *_ in chunk) == 20
+    assert sched.next_chunk(96) == [(1, 1, 0, 1, False)]
+    assert sched.next_chunk(96) == [(2, 1, 1, 2, False)]
+
+
 def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
                  pages=64, cap=None, order=(0, 1, 2), attention_mode=None,
                  docs=None, tree=None, stop_groups=None):
