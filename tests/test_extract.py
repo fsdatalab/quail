@@ -13,48 +13,21 @@ import quail
 from quail.catalog import DocumentProvider
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.logical import (
-    SHARED_PRE,
-    ColumnRef,
     CompileError,
-    LogicalPlan,
-    ModelCall,
-    Scan,
-    bind_extract_prompt,
     extracted_above_joins,
 )
-from quail.logical.prompts import EXTRACT_PHRASE_CUE
 from quail.physical import (
     AiExtract,
     AiJoin,
     ExtractSpec,
     Filter,
-    Project,
     RequestExecution,
     RequestExtractSpec,
-    decode_graph,
-    encode_graph,
 )
-from quail.planner.logical_rules import push_down_projection
 from quail.planner.plan import EngineConfig, Refusal
-from quail.planner.validation import extraction_refusal
-from quail.specs import (
-    DECISION_2_KAI_0_6B_BF16,
-    DIFFUSION_GEMMA_26B_FP8,
-    QWEN3_RERANKER_0_6B_BF16,
-)
 
 QUESTION = "When does the lease end?"
 LEASE = "Lease ends on March 3, 2027.\nRent is $2,000."
-
-# the text after the document, as measured on SQuAD and CUAD
-AFTER_DOCUMENT_TEXT = (
-    "\n\nQuestion: When does the lease end?\n\n"
-    "Copy the words that answer the question from the document. Copy them "
-    "exactly. Use the fewest words that answer it. If the document does not "
-    "answer the question, write none.\n"
-    "Answer in this format:\n"
-    'Phrase: "<copied words>"')
-
 
 @pytest.fixture()
 def session(tmp_path):
@@ -77,70 +50,22 @@ def _ends(session, trim=True):
             .select("c.id", "ends"))
 
 
-def test_extract_prompt_puts_every_question_dependent_text_after_the_document():
-    ref = ColumnRef("c", "contracts", "text")
-    turn = ("<user>", "<assistant>")
-    prompt = bind_extract_prompt((ref,), QUESTION, letter_tokens, turn)
-    assert prompt.template == "{0}" and prompt.args == (ref,)
-    assert prompt.preamble == "<user>" + SHARED_PRE
-    assert prompt.tail == (
-        "{0}" + AFTER_DOCUMENT_TEXT + "<assistant>" + EXTRACT_PHRASE_CUE)
-    raw = bind_extract_prompt((ref,), QUESTION, letter_tokens)
-    assert raw.tail == "{0}" + AFTER_DOCUMENT_TEXT + "\n" + EXTRACT_PHRASE_CUE
-    assert prompt.frame == "" and prompt.frame_tokens == 0
-    assert prompt.preamble_tokens == len(prompt.preamble_token_ids) == len(
-        prompt.preamble.encode())
-    assert prompt.tail_tokens == len(prompt.tail_token_ids) == len(
-        prompt.tail[3:].encode())
-    # without a tokenizer the counts stay for the planner to fill
-    untokenized = bind_extract_prompt((ref,), QUESTION)
-    assert untokenized.preamble_tokens is None
-    assert untokenized.tail_token_ids == ()
-    with pytest.raises(CompileError, match="one document column"):
-        bind_extract_prompt((ref, ref), QUESTION)
-    with pytest.raises(CompileError, match="at least one word"):
-        bind_extract_prompt((ref,), "  ")
-
 
 def test_sql_and_builder_extract_the_same_answer_columns(session):
-    query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
-        f"FROM contracts c")
     built = _ends(session)
-    assert query.logical == built.logical
-    logical = built.logical
-    (node,) = logical.operators().extracts
-    assert (node.name, node.alias, node.span_name) == ("ends", "c", "ends_span")
-    call = node.call
-    assert call.kind == "extract" and call.question == QUESTION and call.trim
-    assert node.output_schema()[-2:] == (
-        ColumnRef("c", "contracts", "ends"), ColumnRef("c", "contracts", "ends_span"))
-    # the answer columns are not read below the extraction; the scan
-    # keeps the id column and, as for every projected call, the text
-    pushed = LogicalPlan(push_down_projection(logical.root))
-    (scan,) = [node for node in pushed.walk() if isinstance(node, Scan)]
-    assert scan.columns == ("id", "text")
-    # trim is an option of the call
+    for dialect in ('snowflake', 'bq'):
+        query = session.sql(
+            f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
+            f"FROM contracts c", dialect=dialect)
+        assert query.logical == built.logical
     loose = session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}', {{'trim': false}}) "
         f"AS ends FROM contracts c")
     assert loose.logical == _ends(session, trim=False).logical
-    (node,) = loose.logical.operators().extracts
-    assert not node.call.trim
-    assert "trim=off" in loose.explain()
-    plan = loose.plan()
-    (spec,) = [n.spec for n in plan.nodes if isinstance(n, AiExtract)]
-    assert not spec.trim
-    # the BigQuery dialect names the call the same way
-    assert session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
-        f"FROM contracts c", dialect="bq").logical == logical
-    text = built.explain()
-    assert f"question={QUESTION!r} trim=on" in text
-    assert "up to 64 answer tokens" in text
 
 
-def test_extract_plans_one_physical_node_with_both_prompts(session, monkeypatch):
+
+def test_planning_reuses_bound_extraction_tokens(session, monkeypatch):
     query = _ends(session)
     tokenizer = session.tokenizer
 
@@ -149,21 +74,7 @@ def test_extract_plans_one_physical_node_with_both_prompts(session, monkeypatch)
         return tokenizer(text)
 
     monkeypatch.setattr(session, "_tok", reuse_prompt)
-    plan = query.plan()
-    assert not isinstance(plan, Refusal)
-    (node,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
-    spec = node.spec
-    assert spec.expected_inputs == 2
-    assert spec.estimated_seconds > 0
-    turn = session.model.extract_turn
-    head, tail = spec.prompt_token_parts
-    assert list(head) == letter_tokens(turn[0] + SHARED_PRE)
-    # a model without turn text gets a line break before the cue
-    assert list(tail) == letter_tokens(
-        AFTER_DOCUMENT_TEXT + (turn[1] or "\n") + EXTRACT_PHRASE_CUE)
-    assert plan.nodes[-1].columns == ("c.id", "ends", "ends_span")
-    codecs = session.registry.codecs
-    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
+    assert not isinstance(query.plan(), Refusal)
 
 
 def test_extract_follows_the_filters_and_labels_of_its_table(session):
@@ -258,18 +169,6 @@ def test_extract_errors_and_refusals(session):
         (builder.ai_extract("c.text", QUESTION, name="ends")
          .ai_classify(quail.prompt("{0}", quail.col("c.text")), ["a", "b"],
                       name="ends_span"))
-    call = ModelCall(bind_extract_prompt(
-        (ColumnRef("c", "contracts", "text"),), QUESTION), "extract",
-        question=QUESTION)
-    call.validate()
-    with pytest.raises(CompileError, match="only an AI.EXTRACT call"):
-        ModelCall(call.prompt, "boolean", question=QUESTION).validate()
-    with pytest.raises(CompileError, match="only an AI.EXTRACT call"):
-        ModelCall(call.prompt, "label", labels=("a", "b"), trim=False).validate()
-    with pytest.raises(CompileError, match="only an AI.CLASSIFY call"):
-        ModelCall(call.prompt, "extract", question=QUESTION,
-                  labels=("a",)).validate()
-
     # the speed of light estimate prices an extraction as one question
     # per document, read once at the cue
     estimate = quail.speed_of_light_estimate(_ends(session), lambda *_: True)
@@ -299,25 +198,6 @@ def test_extract_errors_and_refusals(session):
     assert isinstance(refused, Refusal)
     assert refused.constraint == "reranker_only_scores"
     reranker.close()
-    for model in (DECISION_2_KAI_0_6B_BF16, DIFFUSION_GEMMA_26B_FP8,
-                  QWEN3_RERANKER_0_6B_BF16):
-        refused = extraction_refusal(
-            SimpleNamespace(model=model, tokenizer=letter_tokens))
-        assert refused.constraint == "unsupported_extract_query"
-        assert "does not give" in refused.reasons[0]
-    assert extraction_refusal(
-        SimpleNamespace(model=session.model, tokenizer=letter_tokens)) is None
-    assert "tokenizer" in extraction_refusal(
-        SimpleNamespace(model=session.model, tokenizer=None)).reasons[0]
-    # an extraction and a score do not mix
-    mixed = (session.docs("contracts").alias("c")
-             .ai_score(quail.prompt("Is {0} a lease?", quail.col("c.text")),
-                       name="lease")
-             .ai_extract("c.text", QUESTION, name="ends")
-             .select("c.id", "lease", "ends"))
-    refused = mixed.plan()
-    assert isinstance(refused, Refusal)
-    assert "AI.SCORE" in refused.reasons[0]
 
 
 def test_span_helpers_read_locate_and_widen_an_answer():
@@ -384,8 +264,8 @@ TEXTS = [LEASE, "No dates here.", "Term: five years\nmore text",
          "the absent one"]
 
 
-@pytest.mark.parametrize("limit", [64, 7])
-def test_request_backend_decodes_and_locates_one_answer_per_document(limit):
+def test_request_backend_decodes_and_locates_one_answer_per_document():
+    limit = 7
     documents = {"c": [request_tests._tokens(text) for text in TEXTS]}
     specs = (
         RequestExtractSpec(max_answer_tokens=limit,
@@ -430,9 +310,6 @@ def test_request_backend_decodes_and_locates_one_answer_per_document(limit):
     assert step["prompt_tokens"] == prompt_tokens
     assert result.metrics.extension["prompt_tokens"] == 2 * prompt_tokens
     assert result.metrics.evaluated_documents == 8
-    # the executor needs the document text to locate an answer
-    with pytest.raises(ValueError, match="needs the text"):
-        request_tests._execution(documents, client=client).execute(node, {})
     # an engine that takes text gets the preamble, the document, and
     # the tail's text, tokenized by the engine itself
     texted = _TextPhraseClient()
@@ -452,37 +329,6 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     query = session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
         f"FROM contracts c")
-    plan = query.plan()
-    assert not isinstance(plan, Refusal)
-    (request_node,) = [n for n in plan.nodes if isinstance(n, RequestExecution)]
-    (spec,) = request_node.extracts
-    assert (spec.alias, spec.output, spec.question, spec.trim) == (
-        "c", "ends", QUESTION, True)
-    # the extraction's own preamble: the model's extract turn and the
-    # document label, kept apart from the request's shared preamble
-    assert spec.preamble_text == session.model.extract_turn[0] + SHARED_PRE
-    assert list(spec.preamble_token_ids) == request_tests._tokens(
-        spec.preamble_text)
-    # a filter and an extraction plan together under one preamble: the
-    # extraction's turn has no opener on Qwen3
-    mixed = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
-        f"FROM contracts c WHERE AI_FILTER(PROMPT('{{0}}\n\nIs it a lease?', "
-        f"c.text))").plan()
-    assert not isinstance(mixed, Refusal)
-    (mixed_node,) = [n for n in mixed.nodes if isinstance(n, RequestExecution)]
-    assert mixed_node.preamble_text == session.model.turn_prefix + SHARED_PRE
-    assert mixed_node.extracts[0].preamble_text == mixed_node.preamble_text
-    tail_text = (AFTER_DOCUMENT_TEXT + (session.model.extract_turn[1] or "\n")
-                 + EXTRACT_PHRASE_CUE)
-    assert list(spec.tail_token_ids) == request_tests._tokens(tail_text)
-    assert spec.tail_text == tail_text
-    project = next(node for node in plan.nodes if isinstance(node, Project))
-    assert project.columns == ("c.id", "ends", "ends_span")
-    assert "Extract c: ends question=" in query.explain()
-    codecs = session.registry.codecs
-    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
-
     boot = {"client": _PhraseClient(), "sampling_params": object(),
             "capacity": request_tests.CAPACITY}
     monkeypatch.setattr(

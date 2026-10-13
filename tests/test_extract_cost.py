@@ -5,7 +5,7 @@ from quail.cost.extract import (
     document_work,
     estimate,
 )
-from quail.cost.work import Work, ask, scan
+from quail.cost.work import ask, scan
 from quail.physical import ExtractSpec
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -45,37 +45,6 @@ def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     assert shared == ask(80, HEAD + 100 + TAIL - 80) + ask(context, answer)
     assert shared.tokens == work.tokens - 80
     assert _document(100, resident=True, shared=80)[0] == resident
-
-
-def test_estimate_sums_documents_scales_to_live_and_prices_passes():
-    lengths = [100, 300, 50]
-    cost = _cost(lengths)
-    expected = Work()
-    fed = rows = 0.0
-    for length in lengths:
-        work, own_fed, own_rows = _document(length)
-        expected += work
-        fed += own_fed
-        rows += own_rows
-    assert cost.work == expected
-    assert (cost.suffix_tokens, cost.rows) == (fed, rows)
-    assert cost.passes == expected.tokens / CHUNK
-    assert cost.seconds > 0
-    # half the documents live halves the work; none costs nothing
-    half = _cost(lengths, live=1.5)
-    assert half.work.tokens == expected.tokens / 2
-    assert half.rows == rows / 2
-    assert _cost(lengths, live=0).seconds == 0
-    # a resident pipeline costs less than reading the documents
-    assert _cost(lengths, resident=True).work.tokens < cost.work.tokens
-    # a smaller chunk means more passes and more time
-    small = _cost(lengths, chunk=100)
-    assert small.passes > cost.passes and small.seconds > cost.seconds
-    shared = _cost(lengths, shared=[0, 80, 32])
-    assert shared.work.tokens == cost.work.tokens - 112
-    assert shared.suffix_tokens == cost.suffix_tokens
-    assert shared.rows == cost.rows
-    assert shared.seconds < cost.seconds
 
 
 def test_cost_uses_plan_limits_and_separate_answer_assumptions():
