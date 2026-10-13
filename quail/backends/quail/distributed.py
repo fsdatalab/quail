@@ -169,15 +169,9 @@ class DistributedQuailExecution:
             parts = [output["results"][node.node_id] for output in outputs]
             table = pa.concat_tables([part.outputs["rows"] for part in parts])
             metrics = sum((part.metrics for part in parts), NodeMetrics())
-            extension = dict(parts[0].metrics.extension)
-            for name in ("input_rows", "none", "steps", "answer_tokens",
-                         "suffix_tokens", "borrowed_prefix_tokens", "pack_s"):
-                extension[name] = sum(part.metrics.extension.get(name, 0)
-                                      for part in parts)
             results[node.node_id] = NodeResult(
                 {"rows": table.take(order), f"ids:{alias}": ids},
-                replace(metrics, wall_s=wall if index == 0 else 0.0,
-                        extension=extension))
+                replace(metrics, wall_s=wall if index == 0 else 0.0))
         return results
 
     def _execute_score(self, node, inputs):
@@ -269,10 +263,7 @@ class DistributedQuailExecution:
                 {f"ids:{node.alias}": survivors,
                  f"filter_answers:{node.alias}": rows},
                 replace(sum((part.metrics for part in parts), NodeMetrics()),
-                        wall_s=wall if j == 0 else 0.0,
-                        extension={name: sum(part.metrics.extension.get(name, 0)
-                                             for part in parts)
-                                   for name in ("borrowed_prefix_tokens", "pack_s")}))
+                        wall_s=wall if j == 0 else 0.0))
         return results
 
     def _execute_join(self, node, inputs):
@@ -331,7 +322,7 @@ class DistributedQuailExecution:
                 {f"ids:{member.anchor}": survivors,
                  f"join_answers:{member.written_pos}": output},
                 replace(metrics, wall_s=wall if j == 0 else 0.0,
-                        extension={"joins": [output]}))
+                        extension={**metrics.extension, "joins": [output]}))
         self._retained_placement(outputs)
         return results
 

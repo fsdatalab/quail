@@ -101,7 +101,7 @@ def _write(result, name):
 
 
 def _boot_state(model, **pipeline_kwargs):
-    """Boot the worker state dict, as the worker's own boot does.
+    """Load and warm a model for profiling.
 
     Mirrors quail.execution.execute._execute_physical's boot with the
     shipping pipeline; warm_kernels runs the same tiered warmup.
@@ -157,7 +157,9 @@ def _boot_state(model, **pipeline_kwargs):
                             chunk_tokens, model_name=spec.hf_name)
     torch.cuda.synchronize()
     kernel_cache.commit()
-    state = dict(model_execution=execution,
+    from types import SimpleNamespace
+
+    state = SimpleNamespace(execution=execution,
                  model=model_mod, arena=arena, pipeline=pipeline,
                  spec=spec, torch=torch, F=F)
     return state, chunk_tokens, warm
@@ -200,15 +202,15 @@ def _run_query(state, build, captured):
         graph, _ = _validate_physical_request(request, registry)
         payload = quail_runtime_payload(request, graph)
         rows = AnswerRows(
-            state["torch"], state["F"], state["model"],
+            state.torch, state.F, state.model,
             payload["true_ids"], payload["false_ids"],
         )
         arena_pages = payload.get("arena_pages")
         if arena_pages is not None:
-            state["arena"].resize(*arena_pages, free_resident=True)
-        state["model_execution"].bind_query(
-            torch=state["torch"],
-            async_answers=AsyncAnswers(state["torch"], rows),
+            state.arena.resize(*arena_pages, free_resident=True)
+        state.execution.bind_query(
+            torch=state.torch,
+            async_answers=AsyncAnswers(state.torch, rows),
             answer_rows=rows,
             chunk_tokens=payload["chunk_tokens"],
         )
@@ -338,9 +340,9 @@ class LoopRecorder:
 
         self.parts_mod = parts_mod
         self.stages_mod = stages_mod
-        self.torch = state["torch"]
-        self.arena = state["arena"]
-        self.pipeline = state["pipeline"]
+        self.torch = state.torch
+        self.arena = state.arena
+        self.pipeline = state.pipeline
         self.profiler = profiler
         self.t0 = time.perf_counter()
         self.phases = []
@@ -453,10 +455,10 @@ class LoopRecorder:
 # ------------------------------------------------------------ the cell
 
 def _measure(state, qdefs, qid, profiled, trace_dir):
-    torch = state["torch"]
+    torch = state.torch
     windows = None
     if profiled:
-        windows = ProfilerWindows(torch, state["arena"], _slug(qid),
+        windows = ProfilerWindows(torch, state.arena, _slug(qid),
                                   trace_dir)
     recorder = LoopRecorder(state, profiler=windows)
     captured = {}
@@ -491,7 +493,7 @@ def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
     if not queries:
         raise ValueError("pass at least one QuailB query id")
     state, chunk_tokens, warm = _boot_state(model)
-    _cupti_preinit(state["torch"])
+    _cupti_preinit(state.torch)
     sess, qdefs = _quailb_session(model, sf)
     missing = [q for q in queries if q not in qdefs]
     if missing:

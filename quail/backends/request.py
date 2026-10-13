@@ -891,9 +891,42 @@ class RequestModelExecution:
                                         for document in inputs[port.name]]
         outputs = {}
         steps = []
-        fresh_tokens = cached_tokens = requests = 0
-        evaluated_documents = evaluated_pairs = 0
 
+        self._execute_filters(node, survivors, outputs, steps)
+        self._execute_classifications(node, survivors, outputs, steps)
+        self._execute_joins(node, survivors, outputs, steps)
+        self._execute_joined_classifications(node, survivors, outputs, steps)
+        self._execute_extractions(node, survivors, outputs, steps)
+
+        for alias in node.aliases:
+            outputs[f"ids:{alias}"] = survivors[alias]
+        wall_s = time.perf_counter() - started
+        return NodeResult(
+            outputs,
+            NodeMetrics(
+                wall_s=wall_s,
+                input_rows=sum(len(self.documents[alias]) for alias in node.aliases),
+                output_rows=sum(len(value) for value in survivors.values()),
+                evaluated_documents=sum(
+                    step["requests"] if step["kind"] == "filter" else step["n_in"]
+                    for step in steps if not step.get("partner")
+                    and step["kind"] != "join"),
+                evaluated_document_pairs=sum(step["requests"] for step in steps
+                                             if step.get("partner")
+                                             or step["kind"] == "join"),
+                fresh_tokens=sum(step["fresh_tokens"] for step in steps),
+                cached_tokens=sum(step["cached_tokens"] for step in steps),
+                extension={
+                    "steps": steps,
+                    "prompt_tokens": sum(step["prompt_tokens"] for step in steps),
+                    "requests": sum(step["requests"] for step in steps),
+                    "capacity": dict(self.capacity),
+                },
+            ),
+        )
+
+    def _execute_filters(self, node, survivors, outputs, steps):
+        """Submit filters and collect their answers."""
         for filter_index, spec in enumerate(node.filters):
             document_ids = list(survivors[spec.alias])
             bodies = [
@@ -952,24 +985,17 @@ class RequestModelExecution:
             survivors[spec.alias] = [
                 document_ids[local] for local in result["survivors"]
             ]
-            steps.append({
-                "kind": "filter",
-                "alias": spec.alias,
-                "submission": self.filter_submission,
-                "n_in": len(document_ids),
-                "n_out": len(survivors[spec.alias]),
-                "wall_s": result["wall_s"],
-                "requests": result["requests"],
-                "prompt_tokens": result["prompt_tokens"],
-                "fresh_tokens": result["fresh_tokens"],
-                "cached_tokens": result["cached_tokens"],
-                "doc_cap": result["doc_cap"],
-            })
-            requests += result["requests"]
-            fresh_tokens += result["fresh_tokens"]
-            cached_tokens += result["cached_tokens"]
-            evaluated_documents += result["requests"]
+            steps.append(_request_step(result,
+                kind="filter",
+                alias=spec.alias,
+                submission=self.filter_submission,
+                n_in=len(document_ids),
+                n_out=len(survivors[spec.alias]),
+                doc_cap=result["doc_cap"],
+            ))
 
+    def _execute_classifications(self, node, survivors, outputs, steps):
+        """Submit classifications and collect their answers."""
         for spec in node.classifies:
             if spec.partner is not None:
                 continue
@@ -981,15 +1007,12 @@ class RequestModelExecution:
                     for document in document_ids])
             # a document whose answer names no label has no label row
             # and leaves the query
-            labeled = [(document, label) for document, label
-                       in zip(document_ids, result["labels"])
-                       if label is not None]
-            outputs[f"label_answers:{spec.output}"] = pa.table({
-                spec.alias: pa.array([d for d, _ in labeled], pa.int32()),
-                spec.output: pa.array([label for _, label in labeled],
-                                      pa.string()),
-            })
-            survivors[spec.alias] = [document for document, _ in labeled]
+            table = _classification_table(
+                spec, {spec.alias: document_ids}, result["labels"])
+            outputs[f"label_answers:{spec.output}"] = table
+            labeled = list(zip(table.column(spec.alias).to_pylist(),
+                               table.column(spec.output).to_pylist()))
+            survivors[spec.alias] = table.column(spec.alias).to_pylist()
             test_answers = {}
             for index, (position, accepted) in enumerate(spec.tests):
                 kept = set(accepted)
@@ -1005,25 +1028,17 @@ class RequestModelExecution:
                     _filter_answer_table(
                         spec.alias, [position for position, _ in spec.tests],
                         test_answers))
-            steps.append({
-                "kind": "classify",
-                "alias": spec.alias,
-                "output": spec.output,
-                "n_in": len(document_ids),
-                "n_out": len(survivors[spec.alias]),
-                "wall_s": result["wall_s"],
-                "requests": result["requests"],
-                "prompt_tokens": result["prompt_tokens"],
-                "fresh_tokens": result["fresh_tokens"],
-                "cached_tokens": result["cached_tokens"],
-                "generated_tokens": result["generated_tokens"],
-                "unmatched": result["unmatched"],
-            })
-            requests += result["requests"]
-            fresh_tokens += result["fresh_tokens"]
-            cached_tokens += result["cached_tokens"]
-            evaluated_documents += len(document_ids)
+            steps.append(_request_step(result,
+                kind="classify",
+                alias=spec.alias,
+                output=spec.output,
+                n_in=len(document_ids),
+                n_out=len(survivors[spec.alias]),
+                unmatched=result["unmatched"],
+            ))
 
+    def _execute_joins(self, node, survivors, outputs, steps):
+        """Submit joins and collect their answers."""
         for spec in node.joins:
             alias_documents = {
                 alias: list(survivors[alias]) for alias in spec.aliases
@@ -1159,24 +1174,18 @@ class RequestModelExecution:
                     ]
                 else:
                     survivors[anchor] = sorted(matched)
-            steps.append({
-                "kind": "join",
-                "written_pos": spec.written_pos,
-                "anchor": anchor,
-                "partners": list(partners),
-                "submission": submission,
-                "pairs": len(rows),
-                "true_pairs": len(true_rows),
-                "wall_s": result["wall"],
-                "prompt_tokens": result["prompt_tokens"],
-                "fresh_tokens": result["fresh_tokens"],
-                "cached_tokens": result["cached_tokens"],
-            })
-            requests += len(rows)
-            evaluated_pairs += len(rows)
-            fresh_tokens += result["fresh_tokens"]
-            cached_tokens += result["cached_tokens"]
+            steps.append(_request_step(result,
+                kind="join",
+                written_pos=spec.written_pos,
+                anchor=anchor,
+                partners=list(partners),
+                submission=submission,
+                pairs=len(rows),
+                true_pairs=len(true_rows),
+            ))
 
+    def _execute_joined_classifications(self, node, survivors, outputs, steps):
+        """Submit joined classifications and collect their answers."""
         for spec in node.classifies:
             if spec.partner is None:
                 continue
@@ -1195,33 +1204,22 @@ class RequestModelExecution:
                     + note + partner_label
                     + _token_list(self.documents[spec.partner][partner])
                     for anchor, partner in pairs])
-            labeled = [(pair, label) for pair, label
-                       in zip(pairs, result["labels"]) if label is not None]
-            outputs[f"label_answers:{spec.output}"] = pa.table({
-                spec.alias: pa.array([a for (a, _), _ in labeled], pa.int32()),
-                spec.partner: pa.array([p for (_, p), _ in labeled], pa.int32()),
-                spec.output: pa.array([label for _, label in labeled],
-                                      pa.string()),
-            })
-            steps.append({
-                "kind": "classify",
-                "alias": spec.alias,
-                "partner": spec.partner,
-                "output": spec.output,
-                "n_in": len(pairs),
-                "n_out": len(labeled),
-                "wall_s": result["wall_s"],
-                "requests": result["requests"],
-                "prompt_tokens": result["prompt_tokens"],
-                "fresh_tokens": result["fresh_tokens"],
-                "cached_tokens": result["cached_tokens"],
-                "unmatched": result["unmatched"],
-            })
-            requests += result["requests"]
-            fresh_tokens += result["fresh_tokens"]
-            cached_tokens += result["cached_tokens"]
-            evaluated_pairs += result["requests"]
+            table = _classification_table(
+                spec, {spec.alias: kept.column(spec.alias),
+                       spec.partner: kept.column(spec.partner)}, result["labels"])
+            outputs[f"label_answers:{spec.output}"] = table
+            steps.append(_request_step(result,
+                kind="classify",
+                alias=spec.alias,
+                partner=spec.partner,
+                output=spec.output,
+                n_in=len(pairs),
+                n_out=table.num_rows,
+                unmatched=result["unmatched"],
+            ))
 
+    def _execute_extractions(self, node, survivors, outputs, steps):
+        """Submit extractions and collect their answers."""
         for spec in node.extracts:
             document_ids = list(survivors[spec.alias])
             texts = self.document_texts.get(spec.alias)
@@ -1243,47 +1241,37 @@ class RequestModelExecution:
                             if self.submit_text else None))
             outputs[f"extract_answers:{spec.output}"] = _extract_answer_table(
                 spec, document_ids, result["answers"], result["spans"])
-            steps.append({
-                "kind": "extract",
-                "alias": spec.alias,
-                "output": spec.output,
-                "n_in": len(document_ids),
-                "n_out": len(document_ids) - result["unanswered"],
-                "wall_s": result["wall_s"],
-                "requests": result["requests"],
-                "prompt_tokens": result["prompt_tokens"],
-                "fresh_tokens": result["fresh_tokens"],
-                "cached_tokens": result["cached_tokens"],
-                "generated_tokens": result["generated_tokens"],
-                "unanswered": result["unanswered"],
-                "unaligned": result["unaligned"],
-            })
-            requests += result["requests"]
-            fresh_tokens += result["fresh_tokens"]
-            cached_tokens += result["cached_tokens"]
-            evaluated_documents += len(document_ids)
+            steps.append(_request_step(result,
+                kind="extract",
+                alias=spec.alias,
+                output=spec.output,
+                n_in=len(document_ids),
+                n_out=len(document_ids) - result["unanswered"],
+                unanswered=result["unanswered"],
+                unaligned=result["unaligned"],
+            ))
 
-        for alias in node.aliases:
-            outputs[f"ids:{alias}"] = survivors[alias]
-        wall_s = time.perf_counter() - started
-        return NodeResult(
-            outputs,
-            NodeMetrics(
-                wall_s=wall_s,
-                input_rows=sum(len(self.documents[alias]) for alias in node.aliases),
-                output_rows=sum(len(value) for value in survivors.values()),
-                evaluated_documents=evaluated_documents,
-                evaluated_document_pairs=evaluated_pairs,
-                fresh_tokens=fresh_tokens,
-                cached_tokens=cached_tokens,
-                extension={
-                    "steps": steps,
-                    "prompt_tokens": sum(step["prompt_tokens"] for step in steps),
-                    "requests": requests,
-                    "capacity": dict(self.capacity),
-                },
-            ),
-        )
+
+
+def _request_step(result, **details) -> dict:
+    """Attach common request measurements to an operator's execution details."""
+    return {
+        **details,
+        "wall_s": result.get("wall_s", result.get("wall", 0.0)),
+        "requests": result.get("requests", details.get("pairs", 0)),
+        **{name: result[name] for name in (
+            "prompt_tokens", "fresh_tokens", "cached_tokens", "generated_tokens")
+           if name in result},
+    }
+
+
+def _classification_table(spec, columns, labels):
+    """Build classified rows and remove rows without a matching label."""
+    table = pa.table({
+        **{alias: pa.array(values, pa.int32()) for alias, values in columns.items()},
+        spec.output: pa.array(labels, pa.string()),
+    })
+    return table.filter(table.column(spec.output).is_valid())
 
 
 def execute_request_graph(context, backend, engine_state, boot):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field, fields, replace
+from numbers import Real
 from typing import Any, Callable, Mapping, Protocol
 
 import numpy as np
@@ -81,8 +82,18 @@ class NodeMetrics:
             peak_gpu_bytes=max(self.peak_gpu_bytes, other.peak_gpu_bytes),
             gpu_s=self.gpu_s + other.gpu_s,
             chunks=self.chunks + other.chunks,
-            extension={**self.extension, **other.extension},
+            extension=merge_metric_extensions(self.extension, other.extension),
         )
+
+
+def merge_metric_extensions(left, right) -> dict:
+    """Sum extension counters and retain the latest descriptive values."""
+    merged = dict(left)
+    for name, value in right.items():
+        if isinstance(value, Real) and not isinstance(value, bool):
+            value += left.get(name, 0)
+        merged[name] = value
+    return merged
 
 
 def scalar_node_metrics(nodes: Mapping[str, "NodeResult"]) -> dict:

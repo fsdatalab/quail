@@ -33,7 +33,7 @@ from quail.backends.quail.executor.operators.extract import (
 from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.worker import _child_extract
+from quail.backends.quail.worker import ChildState, _child_extract
 from quail.builtins import built_in_registry
 from quail.execution.tokens import TokenOffsets, TokenStore
 from quail.physical import (
@@ -493,9 +493,9 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
     for _ in range(workers):
         query = _state(model)
         query.loaded_model.vocabulary = tables
-        children.append({"gpu": SimpleNamespace(
+        children.append(ChildState(gpu_index=0, gpu=SimpleNamespace(
             execution=SimpleNamespace(query=query), torch=query.torch,
-            arena=query.loaded_model.arena)})
+            arena=query.loaded_model.arena)))
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": state.chunk_tokens,
         "true_ids": [1], "false_ids": [2], "pre_ids": [],
@@ -588,10 +588,10 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
         async_answers=SimpleNamespace(
             submit=lambda rows: [float(np.asarray(r).ravel()[0]) for r in rows],
             result=lambda v: v, dtype=None))
-    state = {"torch": torch, "arena": arena, "pipeline": pipeline,
-             "model_execution": execution,
+    state = {"gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                                    execution=execution, spec=MODELS["qwen3-4b-fp8"]),
              "runtimes": built_in_registry().runtimes,
-             "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
+             "device": DEVICES["h100-sxm"],
              "chunk_tokens": 400,
              "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}, "gpu_timing": True}

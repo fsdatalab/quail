@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
 
 from .base import (
+    AnswerOutput,
     ExecutionLocation,
     OutputPort,
     PhysicalNode,
@@ -400,7 +401,11 @@ class RequestExecution(PhysicalNode):
             OutputPort(
                 f"label_answers:{spec.output}",
                 ValueType.LABEL_ANSWERS,
-                schema=(spec.alias, spec.output),
+                schema=(*(alias for alias in (spec.alias, spec.partner) if alias),
+                        spec.output),
+                answer=AnswerOutput("classifies", spec.output,
+                    (*(alias for alias in (spec.alias, spec.partner) if alias),
+                     spec.output)),
             )
             for spec in self.classifies
         )
@@ -418,6 +423,8 @@ class RequestExecution(PhysicalNode):
                 f"extract_answers:{spec.output}",
                 ValueType.EXTRACT_ANSWERS,
                 schema=(spec.alias, spec.output, spec.span_output),
+                answer=AnswerOutput("extracts", spec.output,
+                                    (spec.alias, spec.output, spec.span_output)),
             )
             for spec in self.extracts
         )
@@ -551,6 +558,7 @@ class AiInference(PhysicalNode):
     spec: InferenceSpec | None = None
     keep_kv: bool = False
 
+    answer_kind: ClassVar[str] = "scores"
     spec_type: ClassVar[type[InferenceSpec]] = InferenceSpec
     document_ids: ClassVar[bool] = False
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
@@ -569,8 +577,12 @@ class AiInference(PhysicalNode):
     def outputs(self) -> tuple[OutputPort, ...]:
         if self.spec is None:
             return ()
+        columns = (self.spec.output_columns if self.answer_kind == "extracts"
+                   else (*self.spec.aliases, self.spec.name))
         ports = (OutputPort("rows", ValueType.ROWS,
-                            schema=self.spec.output_columns),)
+                            schema=self.spec.output_columns,
+                            answer=AnswerOutput(self.answer_kind, self.spec.name,
+                                                columns)),)
         if self.document_ids and len(self.spec.aliases) == 1:
             (alias,) = self.spec.aliases
             ports += (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
@@ -718,6 +730,7 @@ class AiClassify(AiInference):
 
     spec: ClassifySpec | None = None
 
+    answer_kind: ClassVar[str] = "classifies"
     spec_type: ClassVar[type[InferenceSpec]] = ClassifySpec
     document_ids: ClassVar[bool] = True
     type_name: ClassVar[str] = "quail.ai_classify"
@@ -1069,6 +1082,7 @@ class AiExtract(AiInference):
 
     spec: ExtractSpec | None = None
 
+    answer_kind: ClassVar[str] = "extracts"
     spec_type: ClassVar[type[InferenceSpec]] = ExtractSpec
     document_ids: ClassVar[bool] = True
     type_name: ClassVar[str] = "quail.ai_extract"

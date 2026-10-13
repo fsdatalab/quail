@@ -24,6 +24,7 @@ from quail.execution.reranker import (
     scored_batch,
 )
 from quail.execution.runner import NodeMetrics, NodeResult
+from quail.execution.selection import document_positions
 from quail.logical import PROBABILITIES_SUFFIX
 from quail.physical import ValueType
 from quail.progress import answer_sink
@@ -97,7 +98,7 @@ class QuailClassifier:
 
 def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
     """Prepare a classification with the labels its inputs provide."""
-    position = {document: index for index, document in enumerate(ids)}
+    position = document_positions(ids)
     plan = ClassifyStages(state, node.spec, len(ids),
                           lambda key: position[key[1]])
     plan.seeds = ids
@@ -129,7 +130,7 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
         ids=partner_ids,
         documents=[documents[partner] for partner in partner_ids],
         kept=kept.of)
-    position = {document: index for index, document in enumerate(ids)}
+    position = document_positions(ids)
     plan = ClassifyStages(state, spec, len(ids),
                           lambda key: position[key[1]], partners=partners)
     return ClassifyPart(node, ids, plan, kept=kept)

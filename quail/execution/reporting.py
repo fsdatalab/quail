@@ -74,34 +74,18 @@ def collect_answers(logical, plan, outputs, documents):
     expected_nodes = tuple(node for node in plan.nodes
                            if isinstance(node, (AiJoin, Barrier)))
     report = {"stages": []}
-    from quail.execution.reranker import classify_label_tables
-    from quail.physical import AiClassify, AiExtract, AiScore
-
-    # every classified document's label, before any filter on it;
-    # a chain's later stages label the documents their gate passed
-    answer_tables = {"filters": {}, "joins": {}, "classifies": {
-        name: table
-        for node in plan.nodes
-        if isinstance(node, AiClassify)
-        and PortRef(node.node_id, "rows") in outputs
-        for name, table in classify_label_tables(
-            node.spec, outputs[PortRef(node.node_id, "rows")]
-        ).items()
-    }, "scores": {
-        # every scored document's score, before any sort or fetch
-        node.spec.name: outputs[
-            PortRef(node.node_id, "rows")
-        ].select([*node.spec.aliases, node.spec.name])
-        for node in plan.nodes
-        if isinstance(node, AiScore)
-        and PortRef(node.node_id, "rows") in outputs
-    }, "extracts": {
-        # every document's answer and span, null for no answer
-        node.spec.name: outputs[PortRef(node.node_id, "rows")]
-        for node in plan.nodes
-        if isinstance(node, AiExtract)
-        and PortRef(node.node_id, "rows") in outputs
-    }}
+    answer_tables = {kind: {} for kind in (
+        "filters", "joins", "classifies", "scores", "extracts")}
+    for node in plan.nodes:
+        for port in node.outputs:
+            answer = port.answer
+            ref = PortRef(node.node_id, port.name)
+            if answer is None or ref not in outputs:
+                continue
+            table = outputs[ref].select(answer.columns)
+            if answer.kind == "classifies":
+                table = table.filter(pc.is_valid(table.column(answer.name)))
+            answer_tables[answer.kind][answer.name] = table
     survivors = {
         scan.alias: pa.array(
             range(len(documents[scan.alias])), pa.int32())
@@ -127,13 +111,6 @@ def collect_answers(logical, plan, outputs, documents):
             filter_relations.setdefault(
                 alias.decode("utf-8"), []
             ).append(table)
-        elif value_type is ValueType.LABEL_ANSWERS:
-            # the label column follows the alias columns: one, or
-            # the anchor and partner of a classification of joined rows
-            answer_tables["classifies"][ref.port.partition(":")[2]] = table
-        elif value_type is ValueType.EXTRACT_ANSWERS:
-            # the alias column, the answer, and its span
-            answer_tables["extracts"][ref.port.partition(":")[2]] = table
         elif value_type is ValueType.JOIN_ANSWERS:
             written_pos = metadata.get(b"quail.written_pos")
             if written_pos is None:

@@ -141,7 +141,7 @@ class FixedFeverAnswers:
             answers, live = self._answers(document_ids)
             if node.keep_kv:
                 for document in live[:self.capacity]:
-                    self.state["arena"].retain((node.alias, document), 16)
+                    self.state["gpu"].arena.retain((node.alias, document), 16)
             return NodeResult({
                 f"ids:{node.alias}": live,
                 f"filter_answers:{node.alias}": {
@@ -182,7 +182,10 @@ class FixedFeverAnswers:
             "selectivity": node.selectivity, "written_pos": node.written_pos,
         }
         outputs[f"ids:{node.anchor}"] = [anchor_ids[local] for local in sorted(live)]
-        return NodeResult(outputs, NodeMetrics(extension={"answers": [rows]}))
+        return NodeResult(outputs, NodeMetrics(
+            gpu_s=0.02, peak_gpu_bytes=128,
+            extension={"answers": [rows], "pack_s": 0.125,
+                       "borrowed_prefix_tokens": 16}))
 
 
 def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
@@ -196,12 +199,11 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
     def child(docs):
         state = graph_state(None, docs)
         model = FixedFeverAnswers(state, capacity=1, empty=False)
-        state.update(
-            model_execution=model, registry=session.registry,
-            boot={"boot_s": 0, "kind": "warm"}, seen=set(),
+        state["gpu"].execution = model
+        return worker.ChildState(
+            gpu_index=0, gpu=state["gpu"], registry=session.registry,
             runtime_context=ExecutionContext(
                 runtimes=session.registry.runtimes, model_execution=model))
-        return state
 
     def execute(request):
         graph = decode_graph(request.plan["graph"], session.registry.codecs)
@@ -210,10 +212,10 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
         extra = check(request, graph) if check else {}
         if gpus == 1:
             state = graph_state(None, docs)
-            state["model_execution"] = FixedFeverAnswers(state, capacity, empty)
+            state["gpu"].execution = FixedFeverAnswers(state, capacity, empty)
             state.update(extra, functions=session.registry.functions)
             report = execute_single_graph(state, request.plan["settings"], graph)
-            assert not state["arena"].accounting.owned
+            assert not state["gpu"].arena.accounting.owned
             return PhysicalResponse(report.pop("_outputs"), report)
         children = [child(docs), child(docs)]
 
@@ -229,7 +231,14 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
             graph, 2, round_fn, QWEN3_4B_FP8, H100_SXM,
             session.registry.runtimes, session.registry,
         )
-        assert all(not child["arena"].accounting.owned for child in children)
+        assert all(not child.gpu.arena.accounting.owned for child in children)
+        for node in graph.nodes:
+            if isinstance(node, AiJoin):
+                metrics = report["node_metrics"][node.node_id]
+                assert metrics["pack_s"] == 0.25
+                assert metrics["borrowed_prefix_tokens"] == 32
+                assert metrics["gpu_s"] == 0.04
+                assert metrics["peak_gpu_bytes"] == 128
         return PhysicalResponse(report.pop("_outputs"), report)
 
     return execute

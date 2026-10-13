@@ -249,7 +249,7 @@ def _write(result, name):
 
 
 def _boot_state(model):
-    """Boot the worker state dict with the kernel-source pipeline.
+    """Load and warm a model with the kernel-source pipeline.
 
     Mirrors quail.execution.execute._execute_physical's boot, with the
     Engine subclass swapped in; warm_kernels runs the same tiered
@@ -300,7 +300,9 @@ def _boot_state(model):
                             chunk_tokens, model_name=spec.hf_name)
     torch.cuda.synchronize()
     kernel_cache.commit()
-    state = dict(model_execution=execution,
+    from types import SimpleNamespace
+
+    state = SimpleNamespace(execution=execution,
                  model=model_mod, arena=arena, pipeline=pipeline,
                  spec=spec, torch=torch, F=F)
     return state, tokenizer, chunk_tokens, warm
@@ -343,12 +345,12 @@ def _run_query(state, build, captured):
             request, query.session.registry)
         payload = quail_runtime_payload(request, graph)
         rows = AnswerRows(
-            state["torch"], state["F"], state["model"],
+            state.torch, state.F, state.model,
             payload["true_ids"], payload["false_ids"],
         )
-        state["model_execution"].bind_query(
-            torch=state["torch"],
-            async_answers=AsyncAnswers(state["torch"], rows),
+        state.execution.bind_query(
+            torch=state.torch,
+            async_answers=AsyncAnswers(state.torch, rows),
             answer_rows=rows,
             chunk_tokens=payload["chunk_tokens"],
         )
@@ -402,7 +404,7 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
     import torch
 
     state, tokenizer, chunk_tokens, warm = _boot_state(model)
-    pipeline = state["pipeline"]
+    pipeline = state.pipeline
     torch.manual_seed(20260829)
     report = dict(cell="kernel_source_probe", model=model, warm=warm,
                   vllm_ops={}, vllm_compiled={}, query_rows={})
@@ -669,7 +671,7 @@ def queries(model: str = "qwen3-4b-fp8", sf: float = 0.1,
     core. Writes kernel_source_imdb7.json and kernel_source_bio2.json.
     """
     state, tokenizer, chunk_tokens, warm = _boot_state(model)
-    pipeline = state["pipeline"]
+    pipeline = state.pipeline
     print(f"[kernel_source] warm: {warm}", flush=True)
     print(f"[kernel_source] predictions: {json.dumps(PREDICTIONS)}",
           flush=True)
@@ -845,7 +847,7 @@ def profile_queries(model: str = "qwen3-4b-fp8",
     import torch
 
     state, tokenizer, chunk_tokens, _ = _boot_state(model)
-    pipeline = state["pipeline"]
+    pipeline = state.pipeline
     sess, qdefs, _ = _quailb_session(model, sf)
     _, build = qdefs["IMDB-7"]
     sampler = _ClockSampler()

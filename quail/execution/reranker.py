@@ -269,12 +269,6 @@ def classify_outputs(node, table) -> dict:
     return outputs
 
 
-def classify_label_tables(spec, table) -> dict:
-    """Return the classification's label table, excluding rows without a label."""
-    labels = table.select([*spec.aliases, spec.name])
-    return {spec.name: labels.filter(pc.is_valid(labels.column(spec.name)))}
-
-
 def score_in_batches(node, inputs, score_batches, shards: int = 1,
                      streamed: bool = False) -> NodeResult:
     """Score the node's candidate rows, in input order.
@@ -305,9 +299,6 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     tables = []
     positions = []
     metrics = NodeMetrics()
-    suffix_tokens = 0
-    borrowed = 0
-    pack_s = 0.0
     # a product's pairs are built per batch: the whole product may not
     # fit in host memory
     streams = [_batches_with_positions(
@@ -327,10 +318,6 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
             tables.append(result.outputs["rows"])
             positions.append(where)
             metrics += result.metrics
-            suffix_tokens += result.metrics.extension.get("suffix_tokens", 0)
-            borrowed += result.metrics.extension.get(
-                "borrowed_prefix_tokens", 0)
-            pack_s += result.metrics.extension.get("pack_s", 0.0)
             sink = answer_sink()
             if sink is not None and not streamed and len(batch):
                 sink(scored_batch(
@@ -349,12 +336,8 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         outputs = classify_outputs(node, table)
     return NodeResult(outputs, replace(
         metrics, wall_s=time.perf_counter() - started,
-        extension={"output": node.spec.name, "aliases": list(node.spec.aliases),
-                   "input_rows": len(rows),
-                   **({"suffix_tokens": suffix_tokens,
-                       "borrowed_prefix_tokens": borrowed,
-                       "pack_s": round(pack_s, 3)}
-                      if isinstance(node.spec, ClassifySpec) else {})},
+        extension={**metrics.extension, "output": node.spec.name,
+                   "aliases": list(node.spec.aliases), "input_rows": len(rows)},
     ))
 
 

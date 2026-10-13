@@ -97,8 +97,8 @@ def record_model_result(node, result: NodeResult,
 
 def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     """Execute one Quail model graph on one GPU executor."""
-    torch = state["torch"]
-    arena = state["arena"]
+    torch = state["gpu"].torch
+    arena = state["gpu"].arena
     for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
@@ -129,7 +129,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
             "join_anchor_misses": 0,
         },
     }
-    execution = state["model_execution"]
+    execution = state["gpu"].execution
     context = ExecutionContext(
         runtimes=state["runtimes"],
         model_execution=execution,

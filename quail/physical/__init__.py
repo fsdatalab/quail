@@ -1,6 +1,7 @@
 """Typed physical plan interfaces and built in nodes."""
 
 from .base import (
+    AnswerOutput,
     ExecutionLocation,
     GraphValidationError,
     InputPort,
@@ -50,6 +51,7 @@ from .nodes import (
 )
 
 __all__ = [
+    "AnswerOutput",
     "Aggregate",
     "AiClassify",
     "AiExtract",

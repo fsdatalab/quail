@@ -307,10 +307,10 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
         answer_rows=object(),
         chunk_tokens=120)
     state = {
-        "torch": torch, "arena": arena, "pipeline": pipeline,
-        "model_execution": execution,
+        "gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                               execution=execution, spec=MODELS["qwen3-4b-fp8"]),
         "runtimes": built_in_registry().runtimes,
-        "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
+        "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "docs": docs, **extra,
     }
     result = execute_single_graph(state, SETTINGS, graph)

@@ -350,10 +350,10 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     docs = {"r": [[DOC + d] * (3 + d) for d in range(4)],
             "p": [[PARTNER + d] for d in range(2)]}
     state = {
-        "torch": torch, "arena": arena, "pipeline": pipeline,
-        "model_execution": execution,
+        "gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                               execution=execution, spec=model_spec),
         "runtimes": built_in_registry().runtimes,
-        "model_spec": model_spec, "device": DEVICES["h100-sxm"],
+        "device": DEVICES["h100-sxm"],
         "chunk_tokens": 64, "docs": docs,
     }
     # the settings' shared preamble is empty, as a classification plan's is
@@ -483,10 +483,9 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         dtype=np.dtype((np.float32, (1, len(TARGETS)))), submit=submit,
         result=lambda rows: rows)
     state = {
-        "torch": torch, "arena": arena, "pipeline": pipeline,
-        "model_execution": execution,
-        "runtimes": built_in_registry().runtimes,
-        "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
+        "gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                               execution=execution, spec=MODELS["qwen3-4b-fp8"]),
+        "runtimes": built_in_registry().runtimes, "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "docs": docs,
     }
     result = execute_single_graph(
@@ -642,10 +641,9 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
         lambda torch, F, head, targets, rows, normalize: FakeReadout(
             targets, rows))
     state = {
-        "torch": torch, "arena": arena, "pipeline": pipeline,
-        "model_execution": execution,
-        "runtimes": built_in_registry().runtimes,
-        "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
+        "gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                               execution=execution, spec=MODELS["qwen3-4b-fp8"]),
+        "runtimes": built_in_registry().runtimes, "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "docs": docs,
     }
     result = execute_single_graph(state, SETTINGS, graph)

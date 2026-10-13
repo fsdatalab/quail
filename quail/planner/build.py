@@ -1,6 +1,7 @@
 """Build the physical plan of a decided logical plan."""
 
 from dataclasses import dataclass, replace
+from functools import partial
 
 import numpy as np
 
@@ -14,7 +15,6 @@ from quail.logical import (
     PROBABILITIES_SUFFIX,
     SPAN_SUFFIX,
     Alias,
-    CompileError,
     LabelWork,
     LogicalPlan,
     classified_above_joins,
@@ -53,21 +53,16 @@ from quail.physical import (
     Scan as PhysicalScan,
 )
 from quail.physical.base import input_ports
-from quail.planner import join_order as joinsearch
 from quail.planner import retention
-from quail.planner.filter_order import default_order_rule
+from quail.planner.decisions import choose_plan, validate_query
 from quail.planner.inference import bind_inference, inference_node
-from quail.planner.ordering import choose_filter_orders, choose_join_sequence
 from quail.planner.physical_optimizer import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal, inference_seconds
 from quail.planner.results import result_nodes
 from quail.planner.statistics import (
     ClassifyStatistics,
-    cached_statistics,
     classify_statistics,
     filter_stop_keys,
-    filter_works,
-    live_after_filters,
     pair_counts,
     question_tokens,
     score_statistics,
@@ -76,12 +71,8 @@ from quail.planner.statistics import (
 from quail.planner.validation import (
     ClassifyRefusedError,
     ScoreRefusedError,
-    classification_refusal,
-    extraction_refusal,
-    join_input_tokens,
     score_input_tokens,
     score_projections,
-    score_refusal,
 )
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -273,589 +264,558 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
     """
     operators = plan.operators()
-    scans, filters, joins = operators.scans, operators.filters, operators.joins
-    applies = operators.applies
+    refusal = validate_query(plan, operators, context, model, device, gpus)
+    if refusal is not None:
+        return refusal
     if scan_fractions is None and context is not None:
         scan_fractions = context.scan_fractions
-    labels = operators.labels
-    classified = {alias for _, alias in labels.calls}
-    after_joins = classified_above_joins(plan.root)
-    scored = has_score(plan)
-    projected_scores = score_projections(plan)
-    if scored:
-        refusal = score_refusal(plan, context)
-        if refusal is not None:
-            return refusal
-    if labels.calls:
-        if context is None:
-            return Refusal(
-                reasons=("AI.CLASSIFY planning needs a planning context",),
-                constraint="unsupported_classify_query",
-                needed=1, available=0, unit="queries")
-        if any(len(call.aliases()) not in (1, 2) for call, _ in labels.calls):
-            return Refusal(
-                reasons=("AI.CLASSIFY reads one document, or one from each "
-                         "side of a join",),
-                constraint="unsupported_classify_query",
-                needed=1, available=0, unit="queries")
-        refusal = classification_refusal(context)
-        if refusal is not None:
-            return refusal
-    extracts = operators.extracts
-    extract_after = extracted_above_joins(plan.root)
-    if extracts:
-        if context is None:
-            return Refusal(
-                reasons=("AI.EXTRACT planning needs a planning context",),
-                constraint="unsupported_extract_query",
-                needed=1, available=0, unit="queries")
-        refusal = extraction_refusal(context)
-        if refusal is not None:
-            return refusal
-    alias_applies = {}
-    join_applies = {}
-    for apply in applies:
-        if apply.ids == "pairs":
-            join_applies.setdefault(apply.written_pos, []).append(apply)
+    decisions = choose_plan(plan, operators, model, device, doc_tokens, order,
+                            pair_fractions, context, scan_fractions)
+    if isinstance(decisions, Refusal):
+        return decisions
+    return GraphBuilder(plan, model, device, doc_tokens, gpus, context,
+                        pair_fractions, decisions).build()
+
+
+class GraphBuilder:
+    """Construct native physical nodes from validated planning decisions."""
+
+    def __init__(self, plan, model, device, doc_tokens, workers, context,
+                 pair_fractions, decisions):
+        self.plan = plan
+        self.model = model
+        self.device = device
+        self.doc_tokens = doc_tokens
+        self.workers = workers
+        self.context = context
+        self.pair_fractions = pair_fractions
+        self.decisions = decisions
+        self.operators = decisions.operators
+        self.classified = {alias for _, alias in self.operators.labels.calls}
+        self.after_joins = classified_above_joins(plan.root)
+        self.extract_after = extracted_above_joins(plan.root)
+        self.projected_scores = score_projections(plan)
+        self.alias_applies = {}
+        self.join_applies = {}
+        for apply in self.operators.applies:
+            if apply.ids == "pairs":
+                self.join_applies.setdefault(apply.written_pos, []).append(apply)
+            else:
+                self.alias_applies.setdefault(apply.aliases[0], []).append(apply)
+        self.ask_filters = {
+            alias: [self.operators.filters[alias][position] for position in positions]
+            for alias, positions in decisions.statistics.asks.items() if positions}
+        self.stop_keys = filter_stop_keys(plan)
+
+    def build(self):
+        """Wire scans, inference, joins, and result operators into a physical plan."""
+        self._prepare()
+        self._emit_scans()
+        for emit in (self._emit_documents, self._emit_joins, self._emit_join_answers):
+            refusal = emit()
+            if refusal is not None:
+                return refusal
+        self._emit_result()
+        return self._finish()
+
+    def _prepare(self):
+        """Prepare graph identities and KV compatibility."""
+        statistics = self.decisions.statistics
+        # a second group on the same anchor gets :2, a third :3
+        self.sequence_groups = retention.group_sequence(self.decisions.join_sequence)
+        self.group_ids = []
+        self.join_ids = {}
+        self.seen_ids = {}
+        for group in self.sequence_groups:
+            anchor = group[0][1]
+            self.seen_ids[anchor] = self.seen_ids.get(anchor, 0) + 1
+            self.group_ids.append(f"ai_join:{anchor}" if self.seen_ids[anchor] == 1
+                             else f"ai_join:{anchor}:{self.seen_ids[anchor]}")
+
+        # a chain streams only into its alias's first use, and never through
+        # a barrier apply
+        barrier_aliases = {alias for alias, group in self.alias_applies.items()
+                           if any(apply.kind == "barrier" for apply in group)}
+        for group in self.sequence_groups:
+            anchor = group[0][1]
+            for spec, _ in group:
+                if any(apply.kind == "barrier"
+                       for apply in self.join_applies.get(spec["written_pos"], ())):
+                    barrier_aliases.add(anchor)
+        self.chained = retention.chained_aliases(
+            self.sequence_groups, set(self.ask_filters), barrier_aliases, self.workers)
+
+        self.nodes = []
+        self.ids_src = {}
+        self.rows_src = {}
+        self.scoring = (ScoreLowering(self.context, self.nodes,
+                                     self.projected_scores, statistics.chunk)
+                        if has_score(self.plan) else None)
+
+    def _emit_scans(self):
+        """Create scan and equality-join inputs."""
+        stats = self.decisions.statistics.stats
+        for s in self.operators.scans:
+            summary = summarize_alias(
+                self.doc_tokens[s.alias], self.model.sliding_window,
+                memo=self.context.memo if self.context is not None else None)
+            shard_ranges, loads = contiguous_shards(
+                self.doc_tokens[s.alias], self.workers, total=summary.total
+            )
+            sid = f"scan:{s.alias}"
+            self.nodes.append(PhysicalScan(
+                node_id=sid,
+                alias=s.alias, input_id=s.alias,
+                n_docs=len(self.doc_tokens[s.alias]),
+                total_tokens=summary.total,
+                shard_ranges=shard_ranges,
+                shard_token_loads=tuple(loads),
+                predicates=regular_predicates(s),
+                expected_docs=(float(stats[s.alias].n_docs)
+                               if s.predicates else None)))
+            self.ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
+        # the hash join reads the scans; survivors thin its pairs at the AI join
+        self.pairs_src = {}
+        for node in hash_join_nodes(self.operators.joins, self.pair_fractions,
+                                    self.ids_src.values()):
+            self.nodes.append(node)
+            self.pairs_src[node.written_pos] = node
+
+        # aliases whose filter chain runs in one pipeline with the
+        # classification or join after it
+        between = self.classified - self.after_joins
+        self.pipelined = self.chained | {
+            alias for alias in self.ask_filters
+            if self.workers == 1 and alias in between}
+
+    def _emit_documents(self):
+        """Create inference nodes over individual tables."""
+        stats = self.decisions.statistics.stats
+        # documents expected after a table's model predicates, before its
+        # filters on labels
+        self.live_asked = {}
+        for alias, predicates in self.operators.filters.items():
+            survival = 1.0
+            for predicate in predicates:
+                survival *= effective_selectivity(predicate.selectivity)
+            self.live_asked[alias] = float(stats[alias].n_docs) * survival
+        self.label_ports = []
+
+        try:
+            for s in self.operators.scans:
+                if self.scoring is not None:
+                    self.emit_scores(s.alias)
+                elif s.alias in self.ask_filters:
+                    self.emit_filter(s.alias)
+                else:
+                    self.emit_applies(s.alias)
+                self.emit_classify(s.alias)
+                self.emit_extract(s.alias)
+        except ClassifyRefusedError as refused:
+            return refused.refusal()
+        except ScoreRefusedError as refused:
+            return refused.refusal
+
+    def _emit_joins(self):
+        """Create joins and the exchanges between anchor groups."""
+        # group consecutive full stages on the same anchor; gates run
+        # alone; anchor switches become barriers
+        records = iter(self.decisions.join_records)
+        groups = [[(spec, next(records)) for spec, _ in group]
+                  for group in self.sequence_groups]
+        exec_idx = 0
+        self.pairs_edges = []     # every full stage's passing-pairs edge
+        self.out_aliases = []     # recombination's output order
+        self.score_pairs = None
+        for g, group in enumerate(groups):
+            anchor = self.sequence_groups[g][0][1]
+            if "cost" in group[0][0]:
+                try:
+                    for spec, _ in group:
+                        position = spec["written_pos"]
+                        join = self.operators.joins[position]
+                        pair_inputs = ()
+                        if position in self.pairs_src:
+                            producer = self.pairs_src[position]
+                            pair_inputs = (PortRef(producer.node_id,
+                                                  f"pairs:{position}"),)
+                        if self.score_pairs is None:
+                            self.score_pairs = self.emit_score_pair(
+                                join.prompt, position, spec["pair_fraction"],
+                                pair_inputs)
+                        self.score_pairs = self.scoring.comparison(
+                            join, self.score_pairs, spec["aliases"], position)
+                except ScoreRefusedError as refused:
+                    return refused.refusal
+                continue
+            if g > 0:
+                ahead = [scan.alias for scan in self.operators.scans]
+                bid = self.unique_id("barrier", anchor)
+                exchange_inputs = tuple(self.pairs_edges) + tuple(
+                    self.ids_src[a] for a in ahead
+                )
+                self.nodes.append(Barrier(
+                    node_id=bid,
+                    inputs=input_ports(exchange_inputs),
+                    next_anchor=anchor,
+                    aliases=tuple(ahead)))
+                for a in ahead:
+                    self.ids_src[a] = PortRef(bid, f"ids:{a}")
+            if self.workers > 1:
+                # anchors go to the GPU holding their KV, else balanced
+                xid = self.unique_id("exchange", anchor)
+                self.nodes.append(Exchange(
+                    node_id=xid,
+                    inputs=input_ports((self.ids_src[anchor],)),
+                    anchor=anchor))
+                self.ids_src[anchor] = PortRef(xid, f"ids:{anchor}")
+            gid = self.group_ids[g]
+            for rank, (spec, record) in enumerate(group):
+                jid = gid if rank == 0 else f"{gid}:predicate:{spec['written_pos']}"
+                self.join_ids[spec["written_pos"]] = jid
+                pair_inputs = []
+                partners = [a for a in spec["aliases"] if a != anchor]
+                pairs_from = ""
+                if spec["written_pos"] in self.pairs_src:
+                    producer = self.pairs_src[spec["written_pos"]]
+                    pair_inputs.append(
+                        PortRef(producer.node_id, f"pairs:{spec['written_pos']}"))
+                    pairs_from = producer.node_id
+                for apply in self.join_applies.get(spec["written_pos"], ()):
+                    # the function's pairs reach the join on their own port
+                    aid = f"apply:{apply.function}"
+                    self.nodes.append(Foreign(
+                        node_id=aid,
+                        inputs=input_ports(tuple(
+                            self.ids_src[a] for a in apply.aliases)),
+                        function=apply.function, kind=apply.kind, ids="pairs",
+                        columns=tuple((ref.alias, ref.column)
+                                      for ref in apply.columns),
+                        aliases=tuple(apply.aliases),
+                        written_pos=spec["written_pos"]))
+                    pair_inputs.append(PortRef(aid, f"pairs:{spec['written_pos']}"))
+                    pairs_from = aid
+                self.nodes.append(AiJoin(
+                    node_id=jid,
+                    inputs=input_ports(tuple(
+                        self.ids_src[a] for a in [anchor, *partners])
+                                       + tuple(pair_inputs)),
+                    written_pos=spec["written_pos"], exec_idx=exec_idx,
+                    anchor=anchor, partners=tuple(partners),
+                    semantics=spec["semantics"],
+                    selectivity=spec["selectivity"],
+                    expected_tuples=round(record["tuples"], 1),
+                    anchor_frame_tokens=spec["frame_tokens"][anchor],
+                    pair_tail_tokens=spec["tail_tokens"],
+                    anchor_resident=record["resident"],
+                    tuple_tokens=round(record["tokens"], 1),
+                    pairs_from=pairs_from))
+                exec_idx += 1
+                self.ids_src[anchor] = PortRef(jid, f"ids:{anchor}")
+                if spec["semantics"] == "full":
+                    self.pairs_edges.append(PortRef(
+                        jid, f"join_answers:{spec['written_pos']}"
+                    ))
+                    for a in [anchor] + partners:
+                        if a not in self.out_aliases:
+                            self.out_aliases.append(a)
+
+    def _emit_join_answers(self):
+        """Create classification and extraction nodes after joins."""
+        stats = self.decisions.statistics.stats
+        # a classification of joined rows follows the join that keeps them,
+        # in the join's pipeline: each kept row's partner block, question,
+        # and label paths run over the anchor's resident KV
+        try:
+            for call, aliases in joined_calls(self.operators.labels):
+                for g, group in enumerate(self.sequence_groups):
+                    anchor = group[0][1]
+                    stage = next((spec for spec, _ in group
+                                  if set(spec["aliases"]) == set(aliases)), None)
+                    if stage is not None:
+                        break
+                else:
+                    raise AssertionError(
+                        "a classification of joined rows without its join")
+                partner = next(alias for alias in aliases if alias != anchor)
+                table = classify_builder(self.context, anchor, "quail")
+                join = self.operators.joins[stage["written_pos"]]
+                pairs = (effective_selectivity(join.selectivity)
+                         * self.decisions.live[anchor] * self.decisions.live[partner])
+                spec, _ = table.classify_joined(
+                    call, self.operators.labels.names[call], partner, pairs,
+                    stats[partner].mean_doc_tokens)
+                node = table.node(
+                    spec, PortRef(self.join_ids[stage["written_pos"]],
+                                  f"join_answers:{stage['written_pos']}"),
+                    sum(isinstance(n, AiClassify) for n in self.nodes))
+                self.nodes.append(node)
+                if call in self.operators.labels.projected:
+                    self.label_ports.append(PortRef(node.node_id, "rows"))
+        except ClassifyRefusedError as refused:
+            return refused.refusal()
+
+        # classifications after the joins run over the documents the joins
+        # matched: a document with at least one true pair, expected as the
+        # join selectivity times the partners it met, at most every document
+        try:
+            for alias in sorted(self.after_joins | self.extract_after):
+                met = sum(
+                    effective_selectivity(join.selectivity)
+                    * sum(self.decisions.live[argument.alias]
+                          for argument in join.prompt.args
+                          if argument.alias != alias)
+                    for join in self.operators.joins
+                    if alias in {argument.alias for argument in join.prompt.args})
+                if alias in self.after_joins:
+                    self.emit_classify(
+                        alias, live=self.decisions.live[alias] * min(1.0, met))
+                if alias in self.extract_after:
+                    self.emit_extract(
+                        alias, live=self.decisions.live[alias] * min(1.0, met))
+        except ClassifyRefusedError as refused:
+            return refused.refusal()
+
+        try:
+            for expression in self.projected_scores:
+                call = expression.expression
+                if len(call.aliases()) == 2 and call.prompt not in self.scoring.names:
+                    self.score_pairs = self.emit_score_pair(call.prompt, 0, 1.0, ())
+        except ScoreRefusedError as refused:
+            return refused.refusal
+
+    def _emit_result(self):
+        """Connect result operators to surviving rows and answers."""
+        if self.score_pairs is not None:
+            sink_inputs = (self.score_pairs,)
+        elif (len(self.pairs_edges) == 1 and len(self.decisions.join_sequence) == 1
+              and not self.after_joins):
+            # one full join and nothing after it: its true pairs are the
+            # result rows, so no recombination is needed
+            sink_inputs = (self.pairs_edges[0],)
+        elif self.pairs_edges:
+            self.nodes.append(Recombine(
+                node_id="recombine",
+                inputs=input_ports(
+                    tuple(self.pairs_edges)
+                    + tuple(self.ids_src[a] for a in self.out_aliases)
+                ),
+                alias_order=tuple(self.out_aliases)))
+            sink_inputs = (PortRef("recombine", "tuples"),)
         else:
-            alias_applies.setdefault(apply.aliases[0], []).append(apply)
-    names = [apply.function for apply in applies]
-    if len(set(names)) != len(names):
-        raise CompileError(
-            f"each apply() needs its own name; {names} repeat one")
-    if any(len(group) > 1 for group in join_applies.values()):
-        raise CompileError("a join takes one apply() returning pairs")
-    if gpus > 1 and any(apply.kind == "per_batch" for apply in applies):
-        return Refusal(
-            reasons=("per-batch apply() requires one GPU; "
-                     "use apply_table() or set gpus=1",),
-            constraint="per_batch_apply_needs_one_gpu",
-            needed=1, available=gpus, unit="gpus")
+            alias = self.operators.scans[0].alias
+            sink_inputs = (self.rows_src.get(alias, self.ids_src[alias]),)
+        columns = []
+        for c in self.plan.projection.columns:
+            columns.append(c.name if isinstance(c, Alias)
+                           else f"{c.alias}.{c.column}")
+            if isinstance(c, Alias) and getattr(c.expression, "probabilities", False):
+                columns.append(c.name + PROBABILITIES_SUFFIX)
+            if isinstance(c, Alias) and c.expression.kind == "extract":
+                columns.append(c.name + SPAN_SUFFIX)
+        score_ports = tuple(PortRef(node.node_id, "rows") for node in self.nodes
+                            if isinstance(node, AiScore)
+                            and any(node.spec.name == item.name
+                                    for item in self.projected_scores))
+        result_inputs = (*sink_inputs,
+                         *(port for port in score_ports if port not in sink_inputs),
+                         *self.label_ports)
+        self.nodes.extend(result_nodes(self.plan.result, result_inputs, tuple(columns)))
 
-    # ---- refusals first
-    weight_gpus = budgets.minimum_weight_gpus(model, device)
-    if weight_gpus > 1:
-        return Refusal(
-            reasons=(
-                f"the model needs {weight_gpus} GPUs of memory, "
-                f"but Quail loads one complete copy per GPU",
-            ),
-            constraint="weights_need_more_cards",
-            needed=weight_gpus, available=1, unit="cards")
-    workers = gpus
+    def _finish(self):
+        """Build the plan and bind its work estimator."""
+        stats = self.decisions.statistics.stats
+        statistics = self.decisions.statistics
+        stage_work = sum((record["work"] for record in self.decisions.join_records
+                          if not is_score(
+                              self.operators.joins[record["written_pos"]].predicate)),
+                         Work())
+        estimate = (speed_of_light(
+            sum(self.decisions.filter_work.values(), Work()) + stage_work,
+            self.model, self.device,
+            statistics.chunk).seconds + inference_seconds(self.nodes))
+        stage_works = {record["written_pos"]: record["work"]
+                       for record in self.decisions.join_records}
 
-    statistics = cached_statistics(
-        plan, {} if context is None else context.memo, model=model,
-        device=device, doc_tokens=doc_tokens, pair_fractions=pair_fractions,
-        scan_fractions=scan_fractions, context=context)
-    stats, chunk, pre = statistics.stats, statistics.chunk, statistics.pre
-    specs = statistics.specs
-    asks = statistics.asks
-    ask_filters = {alias: [filters[alias][position] for position in positions]
-                   for alias, positions in asks.items() if positions}
-    rule, source = (order, f"user: order={order!r}") if order else \
-        default_order_rule(operators.all_filters(), joins)
-    orders = choose_filter_orders(
-        plan, statistics, model=model, device=device, rule=rule,
-        context=context)
-    stop_keys = filter_stop_keys(plan)
+        estimator = partial(
+            node_estimates, filter_works=self.decisions.filter_work,
+            stage_works=stage_works,
+            live=self.decisions.live, stats=stats, pre=statistics.pre,
+            cap_pages=statistics.cap_pages,
+            model=self.model, device=self.device, chunk=statistics.chunk)
+        return PhysicalPlan(
+            model=self.model.name, device=self.device.name, workers=self.workers,
+            backend="quail", estimated_seconds=estimate,
+            nodes=tuple(self.nodes),
+            settings={
+                "chunk_tokens": statistics.chunk,
+                "arena_pages": list(statistics.arena_pages),
+                "admission_tokens": statistics.admission,
+                "order_rule": self.decisions.order_rule,
+                "order_source": self.decisions.order_source,
+                "search_seconds": estimate,
+                **({
+                    "retained_kv_tokens": self.scoring.capacity,
+                    "prefix_reuse": "fixed prompt and first document within each score",
+                    "survivor_assumption": "uniform independent selection",
+                    "estimated_fresh_tokens": self.scoring.work.tokens,
+                    "estimated_attention_pairs": self.scoring.work.pairs,
+                    "batching": "token_based_admission",
+                    "data_parallel_copies": self.workers,
+                    "score_normalization": {
+                        "reranker": "yes_no_softmax",
+                        "decision": "decision_head_softmax",
+                    }.get(self.model.role, "true_false_softmax"),
+                } if self.scoring is not None else {}),
+                **({"classify_placement": ("after joins" if self.after_joins
+                                           else "before joins")}
+                   if self.operators.labels.calls else {}),
+                **({"canvas_draws": self.context.canvas_draws}
+                   if self.operators.labels.calls and self.model.answer_canvas else {}),
+            },
+            estimator=estimator)
 
-    # ---- expected live counts after filters, and the filter work
-    live0 = live_after_filters(plan, statistics)
-    works = filter_works(plan, statistics, model, orders)
-    base_work = sum(works.values(), Work())
-
-    # ---- the stages in the chosen order: their work and expected tuples
-    seq = [(specs[position], anchor) for position, anchor in
-           choose_join_sequence(plan, statistics, orders, model=model,
-                                device=device, rule=rule)]
-    stage_work, stage_records = joinsearch.walk(
-        seq, live0, statistics.lengths, set(operators.all_filters()), pre,
-        model, device)
-    # a second group on the same anchor gets :2, a third :3
-    sequence_groups = retention.group_sequence(seq)
-    group_ids = []
-    join_ids = {}
-    seen_ids = {}
-    for group in sequence_groups:
-        anchor = group[0][1]
-        seen_ids[anchor] = seen_ids.get(anchor, 0) + 1
-        group_ids.append(f"ai_join:{anchor}" if seen_ids[anchor] == 1
-                         else f"ai_join:{anchor}:{seen_ids[anchor]}")
-
-    def unique_id(prefix, name):
+    def unique_id(self, prefix, name):
         key = f"{prefix}:{name}"
-        seen_ids[key] = seen_ids.get(key, 0) + 1
-        return key if seen_ids[key] == 1 else f"{key}:{seen_ids[key]}"
+        self.seen_ids[key] = self.seen_ids.get(key, 0) + 1
+        return key if self.seen_ids[key] == 1 else f"{key}:{self.seen_ids[key]}"
 
-    # a chain streams only into its alias's first use, and never through
-    # a barrier apply
-    barrier_aliases = {alias for alias, group in alias_applies.items()
-                       if any(apply.kind == "barrier" for apply in group)}
-    for group in sequence_groups:
-        anchor = group[0][1]
-        for spec, _ in group:
-            if any(apply.kind == "barrier"
-                   for apply in join_applies.get(spec["written_pos"], ())):
-                barrier_aliases.add(anchor)
-    chained = retention.chained_aliases(
-        sequence_groups, set(ask_filters), barrier_aliases, workers)
-
-    # ---- refusal checks on the predicted plan
-    anchors = {spec["written_pos"]: anchor for spec, anchor in seq}
-    for s in scans:
-        fq = max((question_tokens(p.prompt, model.canvas_tokens)
-                  for p in ask_filters.get(s.alias, ())), default=None)
-        if fq is None:
-            continue
-        need = pre + stats[s.alias].max_doc_tokens + fq
-        if need > chunk:
-            return Refusal(
-                reasons=(f"a document in {s.alias!r} needs {need} tokens "
-                         f"with its prompt, but the forward pass budget "
-                         f"is {chunk} tokens",),
-                constraint="suffix_over_chunk",
-                needed=need, available=chunk, unit="tokens")
-    for spec in specs:
-        if "cost" in spec:
-            continue
-        anchor = anchors[spec["written_pos"]]
-        need = join_input_tokens(
-            spec, anchor, {alias: stats[alias].max_doc_tokens
-                           for alias in spec["aliases"]}, pre)
-        if need > chunk:
-            return Refusal(
-                reasons=(f"one join pair anchored on {anchor!r} needs "
-                         f"{need} tokens, but the forward pass budget "
-                         f"is {chunk} tokens",),
-                constraint="suffix_over_chunk",
-                needed=need, available=chunk, unit="tokens")
-
-    # ---- build the dataflow graph; ids_src tracks each table's
-    # current producer node
-    nodes = []
-    ids_src = {}
-    rows_src = {}
-    scoring = ScoreLowering(context, nodes, projected_scores, chunk) if scored else None
-    for s in scans:
-        summary = summarize_alias(
-            doc_tokens[s.alias], model.sliding_window,
-            memo=context.memo if context is not None else None)
-        shard_ranges, loads = contiguous_shards(
-            doc_tokens[s.alias], workers, total=summary.total
-        )
-        sid = f"scan:{s.alias}"
-        nodes.append(PhysicalScan(
-            node_id=sid,
-            alias=s.alias, input_id=s.alias,
-            n_docs=len(doc_tokens[s.alias]),
-            total_tokens=summary.total,
-            shard_ranges=shard_ranges,
-            shard_token_loads=tuple(loads),
-            predicates=regular_predicates(s),
-            expected_docs=(float(stats[s.alias].n_docs)
-                           if s.predicates else None)))
-        ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
-    # the hash join reads the scans; survivors thin its pairs at the AI join
-    pairs_src = {}
-    for node in hash_join_nodes(joins, pair_fractions, ids_src.values()):
-        nodes.append(node)
-        pairs_src[node.written_pos] = node
-
-    # aliases whose filter chain runs in one pipeline with the
-    # classification or join after it
-    between = classified - after_joins
-    pipelined = chained | {
-        alias for alias in ask_filters if workers == 1 and alias in between}
-
-    def emit_filter(alias):
+    def emit_filter(self, alias):
+        stats = self.decisions.statistics.stats
+        orders = self.decisions.filter_orders
         n = stats[alias].n_docs
         surv = 1.0
         for rank, i in enumerate(orders[alias]):
-            p = filters[alias][i]
+            p = self.operators.filters[alias][i]
             fid = f"ai_filter:{alias}" if rank == 0 else f"ai_filter:{alias}:{i}"
-            nodes.append(AiFilter(
-                node_id=fid, inputs=input_ports((ids_src[alias],)), alias=alias,
+            self.nodes.append(AiFilter(
+                node_id=fid, inputs=input_ports((self.ids_src[alias],)), alias=alias,
                 written_pos=i,
-                question_tokens=question_tokens(p.prompt, model.canvas_tokens),
+                question_tokens=question_tokens(p.prompt, self.model.canvas_tokens),
                 preamble_tokens=p.prompt.preamble_tokens,
                 selectivity=p.selectivity, expected_docs=round(n * surv, 1),
-                arena_writes=len(orders[alias]) > 1 or alias in pipelined,
-                stop_key=stop_keys.get(alias, ())))
+                arena_writes=len(orders[alias]) > 1 or alias in self.pipelined,
+                stop_key=self.stop_keys.get(alias, ())))
             surv *= effective_selectivity(p.selectivity)
-            ids_src[alias] = PortRef(fid, f"ids:{alias}")
-        emit_applies(alias)
+            self.ids_src[alias] = PortRef(fid, f"ids:{alias}")
+        self.emit_applies(alias)
 
-    def emit_scores(alias):
+    def emit_scores(self, alias):
+        stats = self.decisions.statistics.stats
+        orders = self.decisions.filter_orders
         live = float(stats[alias].n_docs)
         for position in orders.get(alias, ()):
-            predicate = filters[alias][position]
-            source = rows_src.get(alias, ids_src[alias])
-            if predicate.prompt not in scoring.names:
-                source = scoring.score(
+            predicate = self.operators.filters[alias][position]
+            source = self.rows_src.get(alias, self.ids_src[alias])
+            if predicate.prompt not in self.scoring.names:
+                source = self.scoring.score(
                     predicate.prompt, f"__score_{alias}_{position}", (source,),
                     live, stats[alias].mean_doc_tokens)
-            source = scoring.comparison(predicate, source, (alias,), position)
-            rows_src[alias] = source
-            ids_src[alias] = PortRef(source.node_id, f"ids:{alias}")
+            source = self.scoring.comparison(predicate, source, (alias,), position)
+            self.rows_src[alias] = source
+            self.ids_src[alias] = PortRef(source.node_id, f"ids:{alias}")
             live *= effective_selectivity(predicate.selectivity)
-        for expression in projected_scores:
+        for expression in self.projected_scores:
             call = expression.expression
-            if call.aliases() != (alias,) or call.prompt in scoring.names:
+            if call.aliases() != (alias,) or call.prompt in self.scoring.names:
                 continue
-            rows_src[alias] = scoring.score(
+            self.rows_src[alias] = self.scoring.score(
                 call.prompt, expression.name,
-                (rows_src.get(alias, ids_src[alias]),), live,
+                (self.rows_src.get(alias, self.ids_src[alias]),), live,
                 stats[alias].mean_doc_tokens)
 
-    def emit_applies(alias):
-        for apply in alias_applies.get(alias, ()):
+    def emit_applies(self, alias):
+        for apply in self.alias_applies.get(alias, ()):
             aid = f"apply:{apply.function}"
-            nodes.append(Foreign(
+            self.nodes.append(Foreign(
                 node_id=aid,
-                inputs=input_ports((ids_src[alias],)),
+                inputs=input_ports((self.ids_src[alias],)),
                 function=apply.function, kind=apply.kind, ids=apply.ids,
                 columns=tuple((ref.alias, ref.column)
                               for ref in apply.columns),
                 aliases=(alias,)))
-            ids_src[alias] = PortRef(aid, f"ids:{alias}")
+            self.ids_src[alias] = PortRef(aid, f"ids:{alias}")
 
-    # documents expected after a table's model predicates, before its
-    # filters on labels
-    live_asked = {}
-    for alias, predicates in filters.items():
-        survival = 1.0
-        for predicate in predicates:
-            survival *= effective_selectivity(predicate.selectivity)
-        live_asked[alias] = float(stats[alias].n_docs) * survival
-    label_ports = []
-
-    def emit_classify(alias, live=None):
+    def emit_classify(self, alias, live=None):
         """Classify the alias's documents, then keep the accepted labels."""
-        calls = [call for call, owner in labels.calls
+        stats = self.decisions.statistics.stats
+        calls = [call for call, owner in self.operators.labels.calls
                  if owner == alias and len(call.aliases()) == 1]
-        if not calls or (alias in after_joins and live is None):
+        if not calls or (alias in self.after_joins and live is None):
             return
-        table = classify_builder(context, alias, "quail")
+        table = classify_builder(self.context, alias, "quail")
         if live is None:
-            live = live_asked.get(alias, float(stats[alias].n_docs))
+            live = self.live_asked.get(alias, float(stats[alias].n_docs))
         steps = [(test.call, test)
-                 for test in operators.label_filters.get(alias, ())]
-        steps.extend((call, None) for call in calls if call not in labels.tests)
+                 for test in self.operators.label_filters.get(alias, ())]
+        steps.extend((call, None) for call in calls
+                     if call not in self.operators.labels.tests)
         classified_calls = set()
         scores = None
         for call, test in steps:
             if call not in classified_calls:
-                spec, work = table.prepare(call, labels.names[call], live)
-                if scoring is not None:
-                    scoring.work += work
-                node = table.node(spec, scores or rows_src.get(alias, ids_src[alias]),
-                                  sum(isinstance(n, AiClassify) for n in nodes))
-                nodes.append(node)
+                spec, work = table.prepare(
+                    call, self.operators.labels.names[call], live)
+                if self.scoring is not None:
+                    self.scoring.work += work
+                node = table.node(
+                    spec, scores or self.rows_src.get(alias, self.ids_src[alias]),
+                                  sum(isinstance(n, AiClassify) for n in self.nodes))
+                self.nodes.append(node)
                 scores = PortRef(node.node_id, "rows")
-                ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
-                if call in labels.projected:
-                    label_ports.append(scores)
+                self.ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
+                if call in self.operators.labels.projected:
+                    self.label_ports.append(scores)
                 classified_calls.add(call)
             if test is not None:
                 lid = f"filter:{alias}:{test.position}"
-                nodes.append(Filter(
+                self.nodes.append(Filter(
                     node_id=lid, inputs=input_ports((scores,)),
-                    predicate=InList(labels.names[call], test.values),
+                    predicate=InList(self.operators.labels.names[call], test.values),
                     aliases=(alias,), selectivity=test.selectivity,
                     written_pos=test.position))
                 scores = PortRef(lid, "rows")
-                ids_src[alias] = PortRef(lid, f"ids:{alias}")
+                self.ids_src[alias] = PortRef(lid, f"ids:{alias}")
                 live *= effective_selectivity(test.selectivity)
         if scores is not None:
-            rows_src[alias] = scores
+            self.rows_src[alias] = scores
 
-    def emit_extract(alias, live=None):
+    def emit_extract(self, alias, live=None):
         """Copy the answers of the alias's documents, after its labels."""
-        calls = [node for node in extracts if node.alias == alias]
-        if not calls or (alias in extract_after and live is None):
+        stats = self.decisions.statistics.stats
+        calls = [node for node in self.operators.extracts if node.alias == alias]
+        if not calls or (alias in self.extract_after and live is None):
             return
         if live is None:
-            live = live_asked.get(alias, float(stats[alias].n_docs))
-            for test in operators.label_filters.get(alias, ()):
+            live = self.live_asked.get(alias, float(stats[alias].n_docs))
+            for test in self.operators.label_filters.get(alias, ()):
                 live *= effective_selectivity(test.selectivity)
         for index, logical_node in enumerate(calls):
             # the extractions of a table run in one pipeline
             # (quail.execution.pipelines): a document is read once
             # for all of them
             shared = index > 0
-            spec = extract_spec(context, logical_node.call,
+            spec = extract_spec(self.context, logical_node.call,
                                 logical_node.name, live, shared=shared)
             node = inference_node(
-                AiExtract, spec, (rows_src.get(alias, ids_src[alias]),),
-                index=sum(isinstance(n, AiExtract) for n in nodes),
-                backend="quail", model=model.name)
-            nodes.append(node)
+                AiExtract, spec, (self.rows_src.get(alias, self.ids_src[alias]),),
+                index=sum(isinstance(n, AiExtract) for n in self.nodes),
+                backend="quail", model=self.model.name)
+            self.nodes.append(node)
             scores = PortRef(node.node_id, "rows")
-            ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
-            rows_src[alias] = scores
-            label_ports.append(scores)
+            self.ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
+            self.rows_src[alias] = scores
+            self.label_ports.append(scores)
 
-    try:
-        for s in scans:
-            if scoring is not None:
-                emit_scores(s.alias)
-            elif s.alias in ask_filters:
-                emit_filter(s.alias)
-            else:
-                emit_applies(s.alias)
-            emit_classify(s.alias)
-            emit_extract(s.alias)
-    except ClassifyRefusedError as refused:
-        return refused.refusal()
-    except ScoreRefusedError as refused:
-        return refused.refusal
-
-    def emit_score_pair(prompt, position, fraction, pair_inputs):
+    def emit_score_pair(self, prompt, position, fraction, pair_inputs):
+        stats = self.decisions.statistics.stats
         aliases = tuple(dict.fromkeys(ref.alias for ref in prompt.args))
-        expected, prefixes = pair_counts(live0, aliases, fraction)
-        return scoring.score(
+        expected, prefixes = pair_counts(self.decisions.live, aliases, fraction)
+        return self.scoring.score(
             prompt, f"__score_join_{position}",
-            tuple(rows_src.get(a, ids_src[a]) for a in aliases) + pair_inputs,
+            tuple(self.rows_src.get(a, self.ids_src[a]) for a in aliases) + pair_inputs,
             expected, sum(stats[a].mean_doc_tokens for a in aliases),
             pair_fraction=fraction, prefix_groups=prefixes)
-
-    # group consecutive full stages on the same anchor; gates run
-    # alone; anchor switches become barriers
-    records = iter(stage_records)
-    groups = [[(spec, next(records)) for spec, _ in group]
-              for group in sequence_groups]
-    exec_idx = 0
-    pairs_edges = []     # every full stage's passing-pairs edge
-    out_aliases = []     # recombination's output order
-    score_pairs = None
-    for g, group in enumerate(groups):
-        anchor = sequence_groups[g][0][1]
-        if "cost" in group[0][0]:
-            try:
-                for spec, _ in group:
-                    position = spec["written_pos"]
-                    join = joins[position]
-                    pair_inputs = ()
-                    if position in pairs_src:
-                        producer = pairs_src[position]
-                        pair_inputs = (PortRef(producer.node_id, f"pairs:{position}"),)
-                    if score_pairs is None:
-                        score_pairs = emit_score_pair(
-                            join.prompt, position, spec["pair_fraction"], pair_inputs)
-                    score_pairs = scoring.comparison(
-                        join, score_pairs, spec["aliases"], position)
-            except ScoreRefusedError as refused:
-                return refused.refusal
-            continue
-        if g > 0:
-            ahead = [scan.alias for scan in scans]
-            bid = unique_id("barrier", anchor)
-            exchange_inputs = tuple(pairs_edges) + tuple(
-                ids_src[a] for a in ahead
-            )
-            nodes.append(Barrier(
-                node_id=bid,
-                inputs=input_ports(exchange_inputs),
-                next_anchor=anchor,
-                aliases=tuple(ahead)))
-            for a in ahead:
-                ids_src[a] = PortRef(bid, f"ids:{a}")
-        if workers > 1:
-            # anchors go to the GPU holding their KV, else balanced
-            xid = unique_id("exchange", anchor)
-            nodes.append(Exchange(
-                node_id=xid,
-                inputs=input_ports((ids_src[anchor],)),
-                anchor=anchor))
-            ids_src[anchor] = PortRef(xid, f"ids:{anchor}")
-        gid = group_ids[g]
-        for rank, (spec, record) in enumerate(group):
-            jid = gid if rank == 0 else f"{gid}:predicate:{spec['written_pos']}"
-            join_ids[spec["written_pos"]] = jid
-            pair_inputs = []
-            partners = [a for a in spec["aliases"] if a != anchor]
-            pairs_from = ""
-            if spec["written_pos"] in pairs_src:
-                producer = pairs_src[spec["written_pos"]]
-                pair_inputs.append(
-                    PortRef(producer.node_id, f"pairs:{spec['written_pos']}"))
-                pairs_from = producer.node_id
-            for apply in join_applies.get(spec["written_pos"], ()):
-                # the function's pairs reach the join on their own port
-                aid = f"apply:{apply.function}"
-                nodes.append(Foreign(
-                    node_id=aid,
-                    inputs=input_ports(tuple(
-                        ids_src[a] for a in apply.aliases)),
-                    function=apply.function, kind=apply.kind, ids="pairs",
-                    columns=tuple((ref.alias, ref.column)
-                                  for ref in apply.columns),
-                    aliases=tuple(apply.aliases),
-                    written_pos=spec["written_pos"]))
-                pair_inputs.append(PortRef(aid, f"pairs:{spec['written_pos']}"))
-                pairs_from = aid
-            nodes.append(AiJoin(
-                node_id=jid,
-                inputs=input_ports(tuple(ids_src[a] for a in [anchor, *partners])
-                                   + tuple(pair_inputs)),
-                written_pos=spec["written_pos"], exec_idx=exec_idx,
-                anchor=anchor, partners=tuple(partners),
-                semantics=spec["semantics"],
-                selectivity=spec["selectivity"],
-                expected_tuples=round(record["tuples"], 1),
-                anchor_frame_tokens=spec["frame_tokens"][anchor],
-                pair_tail_tokens=spec["tail_tokens"],
-                anchor_resident=record["resident"],
-                tuple_tokens=round(record["tokens"], 1),
-                pairs_from=pairs_from))
-            exec_idx += 1
-            ids_src[anchor] = PortRef(jid, f"ids:{anchor}")
-            if spec["semantics"] == "full":
-                pairs_edges.append(PortRef(
-                    jid, f"join_answers:{spec['written_pos']}"
-                ))
-                for a in [anchor] + partners:
-                    if a not in out_aliases:
-                        out_aliases.append(a)
-
-    # a classification of joined rows follows the join that keeps them,
-    # in the join's pipeline: each kept row's partner block, question,
-    # and label paths run over the anchor's resident KV
-    try:
-        for call, aliases in joined_calls(labels):
-            for g, group in enumerate(sequence_groups):
-                anchor = group[0][1]
-                stage = next((spec for spec, _ in group
-                              if set(spec["aliases"]) == set(aliases)), None)
-                if stage is not None:
-                    break
-            else:
-                raise AssertionError(
-                    "a classification of joined rows without its join")
-            partner = next(alias for alias in aliases if alias != anchor)
-            table = classify_builder(context, anchor, "quail")
-            join = joins[stage["written_pos"]]
-            pairs = (effective_selectivity(join.selectivity)
-                     * live0[anchor] * live0[partner])
-            spec, _ = table.classify_joined(
-                call, labels.names[call], partner, pairs,
-                stats[partner].mean_doc_tokens)
-            node = table.node(
-                spec, PortRef(join_ids[stage["written_pos"]],
-                              f"join_answers:{stage['written_pos']}"),
-                sum(isinstance(n, AiClassify) for n in nodes))
-            nodes.append(node)
-            if call in labels.projected:
-                label_ports.append(PortRef(node.node_id, "rows"))
-    except ClassifyRefusedError as refused:
-        return refused.refusal()
-
-    # classifications after the joins run over the documents the joins
-    # matched: a document with at least one true pair, expected as the
-    # join selectivity times the partners it met, at most every document
-    try:
-        for alias in sorted(after_joins | extract_after):
-            met = sum(
-                effective_selectivity(join.selectivity)
-                * sum(live0[argument.alias] for argument in join.prompt.args
-                      if argument.alias != alias)
-                for join in joins
-                if alias in {argument.alias for argument in join.prompt.args})
-            if alias in after_joins:
-                emit_classify(alias, live=live0[alias] * min(1.0, met))
-            if alias in extract_after:
-                emit_extract(alias, live=live0[alias] * min(1.0, met))
-    except ClassifyRefusedError as refused:
-        return refused.refusal()
-
-    try:
-        for expression in projected_scores:
-            call = expression.expression
-            if len(call.aliases()) == 2 and call.prompt not in scoring.names:
-                score_pairs = emit_score_pair(call.prompt, 0, 1.0, ())
-    except ScoreRefusedError as refused:
-        return refused.refusal
-
-    if score_pairs is not None:
-        sink_inputs = (score_pairs,)
-    elif len(pairs_edges) == 1 and len(seq) == 1 and not after_joins:
-        # one full join and nothing after it: its true pairs are the
-        # result rows, so no recombination is needed
-        sink_inputs = (pairs_edges[0],)
-    elif pairs_edges:
-        nodes.append(Recombine(
-            node_id="recombine",
-            inputs=input_ports(
-                tuple(pairs_edges)
-                + tuple(ids_src[a] for a in out_aliases)
-            ),
-            alias_order=tuple(out_aliases)))
-        sink_inputs = (PortRef("recombine", "tuples"),)
-    else:
-        alias = scans[0].alias
-        sink_inputs = (rows_src.get(alias, ids_src[alias]),)
-    columns = []
-    for c in plan.projection.columns:
-        columns.append(c.name if isinstance(c, Alias)
-                       else f"{c.alias}.{c.column}")
-        if isinstance(c, Alias) and getattr(c.expression, "probabilities", False):
-            columns.append(c.name + PROBABILITIES_SUFFIX)
-        if isinstance(c, Alias) and c.expression.kind == "extract":
-            columns.append(c.name + SPAN_SUFFIX)
-    score_ports = tuple(PortRef(node.node_id, "rows") for node in nodes
-                        if isinstance(node, AiScore)
-                        and any(node.spec.name == item.name
-                                for item in projected_scores))
-    result_inputs = (*sink_inputs,
-                     *(port for port in score_ports if port not in sink_inputs),
-                     *label_ports)
-    nodes.extend(result_nodes(plan.result, result_inputs, tuple(columns)))
-
-    stage_work = sum((record["work"] for record in stage_records
-                      if not is_score(joins[record["written_pos"]].predicate)), Work())
-    estimate = (speed_of_light(base_work + stage_work, model, device,
-                               chunk).seconds + inference_seconds(nodes))
-    stage_works = {record["written_pos"]: record["work"]
-                   for record in stage_records}
-
-    def estimator(graph):
-        return node_estimates(
-            graph, filter_works=works, stage_works=stage_works,
-            live=live0, stats=stats, pre=pre, cap_pages=statistics.cap_pages,
-            model=model, device=device, chunk=chunk)
-
-    return PhysicalPlan(
-        model=model.name, device=device.name, workers=workers,
-        backend="quail", estimated_seconds=estimate,
-        nodes=tuple(nodes),
-        settings={
-            "chunk_tokens": chunk,
-            "arena_pages": list(statistics.arena_pages),
-            "admission_tokens": statistics.admission,
-            "order_rule": rule,
-            "order_source": source,
-            "search_seconds": estimate,
-            **({
-                "retained_kv_tokens": scoring.capacity,
-                "prefix_reuse": "fixed prompt and first document within each score",
-                "survivor_assumption": "uniform independent selection",
-                "estimated_fresh_tokens": scoring.work.tokens,
-                "estimated_attention_pairs": scoring.work.pairs,
-                "batching": "token_based_admission",
-                "data_parallel_copies": workers,
-                "score_normalization": {
-                    "reranker": "yes_no_softmax",
-                    "decision": "decision_head_softmax",
-                }.get(model.role, "true_false_softmax"),
-            } if scoring is not None else {}),
-            **({"classify_placement": ("after joins" if after_joins
-                                       else "before joins")}
-               if labels.calls else {}),
-            **({"canvas_draws": context.canvas_draws}
-               if labels.calls and model.answer_canvas else {}),
-        },
-        estimator=estimator)
 
 
 def _pages(tokens: int) -> int:

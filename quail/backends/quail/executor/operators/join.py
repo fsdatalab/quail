@@ -83,8 +83,8 @@ class JoinPart(ExecutionPart):
         self.context = context
         self.canvas_tokens = len(state.loaded_model.pipeline.canvas_ids)
         self.attention = self.node.attention or None
-        self.settled = set()
-        self.final_rows = {}
+        self.settled = np.zeros(len(ids), dtype=bool)
+        self.final_rows = [None] * len(ids)
         self.readers = []
         lists_for = inputs.get("anchor_partners")
         self.stages = [
@@ -115,8 +115,9 @@ class JoinPart(ExecutionPart):
 
     def on_settled(self, anchor, survived, row):
         """Settle anchor KV using join answers after all readers finish."""
-        self.settled.add(anchor)
-        self.inputs["anchor_done"](anchor, self.final_rows.get(anchor, row))
+        self.settled[anchor] = True
+        self.inputs["anchor_done"](
+            anchor, row if self.final_rows[anchor] is None else self.final_rows[anchor])
 
     def finish(self, every) -> int:
         """Map predicate answers to reached anchors and count suffix work."""
@@ -125,8 +126,11 @@ class JoinPart(ExecutionPart):
             self.inputs["anchor_keys"], self.canvas_tokens)
         chain = self.inputs.get("chain")
         if chain is not None:
-            reached = sorted(set(every[0] if every else ()) | self.settled)
-            local_of = {position: local for local, position in enumerate(reached)}
+            if every:
+                self.settled[np.fromiter(every[0], dtype=np.int64)] = True
+            reached = np.flatnonzero(self.settled)
+            local_of = np.full(len(self.ids), -1, dtype=np.int32)
+            local_of[reached] = np.arange(len(reached), dtype=np.int32)
             self.answers = [
                 {local_of[position]: row for position, row in answers.items()}
                 for answers in every]
@@ -366,7 +370,7 @@ def prepare_join_inputs(node, inputs, context: ExecutionContext, chain=None,
         by_alias[port.split(":", 1)[1]] = list(value)
     if not state["joins_started"]:
         state["joins_started"] = True
-        arena = state["arena"]
+        arena = state["gpu"].arena
         retained = arena.retained_keys()
         state["kv_stats"].update(
             retained_after_filters=len(retained),
@@ -378,14 +382,14 @@ def prepare_join_inputs(node, inputs, context: ExecutionContext, chain=None,
             },
         )
     config = state["retention"]
-    apply_retention(state["arena"], config,
+    apply_retention(state["gpu"].arena, config,
                     config.get("before", {}).get(node.node_id, {}), by_alias)
     documents = {alias: select_documents(state["docs"][alias], by_alias[alias])
                  for member in nodes for alias in member.partners}
     prefixes = (DocumentPrefixes(state["pre"], state["docs"][node.anchor],
                                  by_alias[node.anchor])
                 if chain is None else chain["documents"])
-    prepared = join_inputs(nodes, documents, by_alias, prefixes, state["arena"],
+    prepared = join_inputs(nodes, documents, by_alias, prefixes, state["gpu"].arena,
                            config, port_pairs, chain=chain, report_answers=True)
     if chain is None:
         counts = prepared["kv_round"]

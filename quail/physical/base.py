@@ -47,12 +47,22 @@ class InputPort:
 
 
 @dataclass(frozen=True)
+class AnswerOutput:
+    """Model answer columns exposed for reporting, before later row operations."""
+
+    kind: str
+    name: str
+    columns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class OutputPort:
     """Named output produced by a physical node."""
 
     name: str
     value_type: ValueType
     schema: tuple[str, ...] = ()
+    answer: AnswerOutput | None = None
 
 
 def value_type_for_port(name: str) -> ValueType:

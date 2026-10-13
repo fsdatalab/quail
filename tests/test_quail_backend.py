@@ -144,12 +144,10 @@ class FakeArena:
 
 def graph_state(model_execution, docs):
     return {
-        "torch": fake_torch(),
-        "arena": FakeArena(),
-        "pipeline": SimpleNamespace(),
-        "model_execution": model_execution,
+        "gpu": SimpleNamespace(torch=fake_torch(), arena=FakeArena(),
+                               pipeline=SimpleNamespace(), execution=model_execution,
+                               spec=MODELS["qwen3-4b-fp8"]),
         "runtimes": built_in_registry().runtimes,
-        "model_spec": MODELS["qwen3-4b-fp8"],
         "device": DEVICES["h100-sxm"],
         "chunk_tokens": 8192,
         "docs": docs,
