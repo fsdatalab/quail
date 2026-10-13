@@ -84,6 +84,7 @@ required-version = "==0.12.13"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 
 [tool.ruff]
 line-length = 88
