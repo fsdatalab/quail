@@ -136,15 +136,23 @@ class KvRetention:
         }
         schedule.update(**coefficients(context.model, context.device),
                         cap_pages=statistics.cap_pages)
+        extracts = [(index, node.spec.alias) for index, node in enumerate(graph.nodes)
+                    if isinstance(node, AiExtract) and node.spec.shares_head]
         nodes = []
-        for node in graph.nodes:
+        for index, node in enumerate(graph.nodes):
             if isinstance(node, AiFilter):
-                keep = node.alias in schedule["initial"]
+                keep = (node.alias in schedule["initial"]
+                        or context.gpu_count > 1 and any(
+                            alias == node.alias and after > index
+                            for after, alias in extracts))
                 writes = node.arena_writes or keep
                 node = replace(node, keep_kv=keep, arena_writes=writes)
             elif isinstance(node, AiJoin):
                 node = replace(node, keep_anchor_kv=(
-                    node.anchor in schedule["after"][node.node_id]))
+                    node.anchor in schedule["after"][node.node_id]
+                    or context.gpu_count > 1 and any(
+                        alias == node.anchor and after > index
+                        for after, alias in extracts)))
             nodes.append(node)
         context.settings["retention"] = schedule
         return PhysicalGraph(tuple(nodes), graph.root)
@@ -302,7 +310,7 @@ class PrefixSharing:
             return None
         nodes = []
         changed = False
-        pipelines = build_pipelines(graph) if context.gpu_count == 1 else {}
+        pipelines = build_pipelines(graph)
         for node in graph.nodes:
             if isinstance(node, AiFilter) and not node.share_prefixes:
                 lengths = context.document_tokens.get(node.alias)
@@ -333,7 +341,7 @@ class PrefixSharing:
                         shared_tokens=page_aligned_shared_tokens(store),
                         total_tokens=sum(lengths), writes_pages=True):
                     pipeline = pipelines.get(node.node_id)
-                    resident = (pipeline is not None
+                    resident = (context.gpu_count == 1 and pipeline is not None
                                 and pipeline.members[0].node_id != node.node_id)
                     node = replace(node, spec=_shared_classify_spec(
                         node, context, store, resident=resident))
@@ -347,8 +355,11 @@ class PrefixSharing:
                         shared_tokens=page_aligned_shared_tokens(store),
                         total_tokens=sum(lengths), writes_pages=True):
                     pipeline = pipelines.get(node.node_id)
-                    resident = (pipeline is not None
-                                and pipeline.members[0].node_id != node.node_id)
+                    preceding = (() if pipeline is None else
+                                 pipeline.members[:pipeline.members.index(node)])
+                    resident = bool(preceding) and (
+                        context.gpu_count == 1
+                        or any(isinstance(member, AiExtract) for member in preceding))
                     node = replace(node, spec=_shared_extract_spec(
                         node, context, store, resident=resident))
                     changed = True
@@ -392,7 +403,7 @@ def _shared_extract_spec(node, context, store, *, resident=False):
         len(head), len(tail), chunk=chunk_budget(context.model, context.device),
         model=context.model, device=context.device, resident=resident,
         shared=page_tree(store).shared, max_answer_tokens=spec.max_answer_tokens,
-        draft_tokens=spec.draft_tokens)
+        draft_tokens=spec.draft_tokens, workers=context.gpu_count)
     return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
 
 

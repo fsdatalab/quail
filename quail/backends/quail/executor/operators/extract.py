@@ -130,7 +130,8 @@ def extract_stages(state: QueryExecutionState, nodes, inputs) -> tuple:
             f"not load")
     stages = ExtractionStages(state, specs, load_vocabulary(state), document_ids,
                            inputs["documents"][alias], texts,
-                           shared_head=inputs.get("pre"))
+                           shared_head=inputs.get("pre"),
+                           document_positions=inputs.get("document_positions"))
     return document_ids, stages
 
 

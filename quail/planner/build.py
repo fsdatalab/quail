@@ -297,16 +297,6 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 reasons=("AI.EXTRACT planning needs a planning context",),
                 constraint="unsupported_extract_query",
                 needed=1, available=0, unit="queries")
-        if scored:
-            return Refusal(
-                reasons=("AI.EXTRACT cannot be mixed with AI.SCORE",),
-                constraint="unsupported_extract_query",
-                needed=1, available=0, unit="queries")
-        if gpus > 1:
-            return Refusal(
-                reasons=("AI.EXTRACT runs on one GPU; set gpus=1",),
-                constraint="extract_needs_one_gpu",
-                needed=1, available=gpus, unit="gpus")
         refusal = extraction_refusal(context)
         if refusal is not None:
             return refusal
@@ -810,8 +800,14 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
             columns.append(c.name + PROBABILITIES_SUFFIX)
         if isinstance(c, Alias) and c.expression.kind == "extract":
             columns.append(c.name + SPAN_SUFFIX)
-    nodes.extend(result_nodes(
-        plan.result, tuple(sink_inputs) + tuple(label_ports), tuple(columns)))
+    score_ports = tuple(PortRef(node.node_id, "scores") for node in nodes
+                        if type(node) is AiScore
+                        and any(node.spec.name == item.name
+                                for item in projected_scores))
+    result_inputs = (*sink_inputs,
+                     *(port for port in score_ports if port not in sink_inputs),
+                     *label_ports)
+    nodes.extend(result_nodes(plan.result, result_inputs, tuple(columns)))
 
     stage_work = sum((record["work"] for record in stage_records
                       if not is_score(joins[record["written_pos"]].predicate)), Work())
@@ -975,7 +971,8 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         live, lengths, len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),
         model=context.model, device=context.device, resident=shared,
-        max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens)
+        max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens,
+        workers=context.gpu_count)
     return replace(spec, estimated_seconds=cost.seconds)
 
 

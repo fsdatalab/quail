@@ -41,13 +41,16 @@ class ExtractionStages:
             are the none token, then the stop tokens as one group.
         shared_head: The query's shared preamble, under which a filter
             writes the documents' KV; None when the query has none.
+        document_positions: Positions in the supplied documents and texts.
+            None uses document_ids.
 
     Raises:
         ValueError: The specs differ in their table, head, or decoding settings.
     """
 
     def __init__(self, state, specs, vocabulary: Vocabulary, document_ids,
-                 documents, texts, readout=None, shared_head=None):
+                 documents, texts, readout=None, shared_head=None,
+                 document_positions=None):
         self.specs = list(specs)
         first = self.specs[0]
         self.spec = first
@@ -65,15 +68,18 @@ class ExtractionStages:
         if any(len(tail) < 2 for tail in self.tails):
             raise ValueError("an extraction's tail ends in its cue after the question")
         self.vocabulary = vocabulary
+        positions = (document_ids if document_positions is None
+                     else document_positions)
         shown = [text.as_py() if hasattr(text, "as_py") else str(text)
-                 for text in (texts[document] for document in document_ids)]
+                 for text in (texts[position] for position in positions)]
         stored = [None if documents is None else documents[document]
-                  for document in document_ids]
+                  for document in positions]
         encoded = vocabulary.document_batch(shown, stored)
         self.docs = [self._prepare(index, document, text, tokens, prior)
                      for index, (document, text, tokens, prior) in enumerate(
                          zip(document_ids, shown, encoded, stored))]
-        self.document_indices = np.full(len(texts), -1, dtype=np.int64)
+        self.document_indices = np.full(max(document_ids, default=-1) + 1,
+                                        -1, dtype=np.int64)
         self.document_indices[document_ids] = np.arange(len(document_ids))
         self.prefixes = [doc.prefix for doc in self.docs]
         self.keys = [doc.key for doc in self.docs]

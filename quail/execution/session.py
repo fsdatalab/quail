@@ -1123,8 +1123,8 @@ class Query:
                             f"label column {name!r} belongs to {alias!r}, "
                             f"which is not in the result")
                     labeled = table.column(name).combine_chunks()
-                    if not pa.types.is_nested(labeled.type):
-                        labeled = labeled.cast(pa.string())
+                    if pa.types.is_dictionary(labeled.type):
+                        labeled = labeled.cast(labeled.type.value_type)
                     # a document whose answer names no label has no row
                     # in the table, and leaves the result
                     declaration = acero.Declaration(

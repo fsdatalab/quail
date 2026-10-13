@@ -17,6 +17,10 @@ from extract_fakes import (
 from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch
 
 from quail.backends.quail import QuailModelExecution
+from quail.backends.quail.distributed import (
+    DistributedQuailExecution,
+    execute_distributed_graph,
+)
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.extract.candidates import Stream
 from quail.backends.quail.executor.extract.decode import AnswerState, Decoder
@@ -29,6 +33,7 @@ from quail.backends.quail.executor.operators.extract import (
 from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.graph import execute_single_graph
+from quail.backends.quail.worker import _child_extract
 from quail.builtins import built_in_registry
 from quail.execution.tokens import TokenOffsets, TokenStore
 from quail.physical import (
@@ -38,6 +43,7 @@ from quail.physical import (
     PhysicalGraph,
     PortRef,
     Scan,
+    plan_envelope,
 )
 from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS
@@ -473,6 +479,79 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch):
     assert first.metrics.fresh_tokens == prefixes + fed[0]
     assert second.metrics.fresh_tokens == fed[1] > 0
     assert second.metrics.wall_s == 0.0 and first.metrics.wall_s > 0.0
+
+
+@pytest.mark.parametrize("workers", [2, 4])
+def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, workers):
+    import pickle
+
+    state, model, _, run_pipeline = _setup(monkeypatch, share_prefixes=True)
+    expected, _ = run_pipeline("ends", "starts")
+    spec, tables = make_spec()
+    nodes = [Scan(node_id="input:c", alias="c", input_id="c")]
+    for name in ("ends", "starts"):
+        previous = nodes[-1]
+        port = "ids:c" if isinstance(previous, Scan) else "scores"
+        nodes.append(AiExtract(
+            node_id=f"ai-extract:{name}", backend_name="quail", model="qwen3-4b-fp8",
+            inputs=input_ports((PortRef(previous.node_id, port),)),
+            spec=replace(spec, name=name, share_prefixes=True)))
+    graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "scores"))
+    registry = built_in_registry()
+    children = []
+    for _ in range(workers):
+        query = _state(model)
+        query.loaded_model.vocabulary = tables
+        children.append({"gpu": SimpleNamespace(
+            execution=SimpleNamespace(query=query), torch=query.torch,
+            arena=query.loaded_model.arena)})
+    payload = {
+        "model": "qwen3-4b-fp8", "chunk_tokens": state.chunk_tokens,
+        "true_ids": [1], "false_ids": [2], "pre_ids": [],
+        "docs": {"c": tables.document_batch(DOCS, [None] * len(DOCS))},
+        "texts": {"c": pa.array(DOCS)},
+        "physical_plan": plan_envelope(
+            backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
+            workers=workers, graph=graph, codecs=registry.codecs),
+    }
+    rounds = []
+
+    def round_fn(kind, subs):
+        if kind == "filters":
+            return [{"peak_gib": 0.0} for _ in subs]
+        assert kind == "extract"
+        subs = pickle.loads(pickle.dumps(subs))
+        rounds.append(subs)
+        for sub in subs:
+            supplied = sub["inputs"]
+            ids = supplied["document_ids"]
+            assert len(supplied["documents"]["c"]) == len(ids)
+            assert supplied["texts"]["c"].to_pylist() == [DOCS[i] for i in ids]
+        return [_child_extract(child, sub) for child, sub in zip(children, subs)]
+
+    result = execute_distributed_graph(
+        payload, graph, workers, round_fn, MODELS["qwen3-4b-fp8"],
+        DEVICES["h100-sxm"], registry.runtimes, registry)
+    assert len(rounds) == 1
+    for node in nodes[1:]:
+        actual = result["_outputs"][PortRef(node.node_id, "scores")]
+        assert actual.equals(expected[node.node_id].outputs["scores"])
+    assert result["fresh_tokens"] == sum(
+        item.metrics.fresh_tokens for item in expected.values())
+    assert result["evaluated_documents"] == 2 * len(DOCS)
+    assert result["backend_metrics"]["scores"][0]["none"] == 1
+
+    execution = DistributedQuailExecution(
+        payload, graph, workers, round_fn, MODELS["qwen3-4b-fp8"],
+        DEVICES["h100-sxm"], registry)
+    execution.started = True
+    execution._retained_placement([
+        {"retained": {"c": sub["inputs"]["document_ids"]}}
+        for sub in rounds[0]])
+    again = execution.execute(nodes[1], {"input": pa.table({"c": [2, 0]})})
+    assert again.outputs["scores"].equals(
+        expected[nodes[1].node_id].outputs["scores"].take(pa.array([2, 0])))
+    assert again.metrics.fresh_tokens < expected[nodes[1].node_id].metrics.fresh_tokens
 
 
 def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(

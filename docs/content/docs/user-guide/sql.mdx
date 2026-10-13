@@ -400,13 +400,13 @@ You get `end_date` and `end_date_span` for the first question, and
 
 ### Current limits
 
-- Use Qwen3 4B or Qwen3 32B with `gpus=1`. See
+- Use Qwen3 4B or Qwen3 32B. You can distribute documents across GPUs
+  with the session's `gpus` setting. See
   [Supported models and GPUs](/docs/user-guide/models).
 - Put each extraction directly in `SELECT` with an `AS` name. You cannot
   use it in a `WHERE` condition or inside another expression.
-- You can combine extraction with filters, joins, and classification.
+- You can combine extraction with filters, joins, classification, and scoring.
   Each extraction reads one document column.
-- You cannot combine `AI.EXTRACT` with `AI.SCORE` in one query.
 
 For the equivalent Python query, see
 [`ai_extract()`](/docs/user-guide/python-api#ai_extract).

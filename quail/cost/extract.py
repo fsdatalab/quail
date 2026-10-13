@@ -102,7 +102,7 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
 
 def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
              chunk: int, model, device, resident: bool = False,
-             shared=None, max_answer_tokens: int, draft_tokens: int,
+             shared=None, max_answer_tokens: int, draft_tokens: int, workers: int = 1,
              assumptions: ExtractAssumptions | None = None) -> ExtractCost:
     """Estimate the cost of one extraction over a table.
 
@@ -118,6 +118,7 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
         shared: Per-document borrowed prefix lengths, or None.
         max_answer_tokens: Answer limit from the extraction plan.
         draft_tokens: Source tokens proposed per round from the extraction plan.
+        workers: Model copies sharing the work, assuming balanced document costs.
         assumptions: Expected answer length, separate from execution limits.
 
     Returns:
@@ -142,5 +143,7 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
     scale = live / n
     total = work * scale
     passes = total.tokens / chunk
-    seconds = decoder_seconds(total, rows * scale, passes, model, device)
+    copies = max(1, min(workers, live))
+    seconds = decoder_seconds(total * (1 / copies), rows * scale / copies,
+                              passes / copies, model, device)
     return ExtractCost(seconds, passes, total, fed * scale, rows * scale)

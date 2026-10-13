@@ -7,11 +7,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import test_request_backends as request_tests
+import test_score as score_tests
 from fakes import letter_tokens
 
 import quail
+from quail.backends.quail.executor.operators.extract import extract_answer_table
 from quail.catalog import DocumentProvider
 from quail.execution.pipelines import build_pipelines
+from quail.execution.reranker import RerankerModelExecution
+from quail.execution.runner import NodeResult
 from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.logical import (
     CompileError,
@@ -294,6 +298,37 @@ def test_span_helpers_read_locate_and_widen_an_answer():
     assert line_span(LEASE, (14, 27)) == (0, 28)
     assert line_span(LEASE, (29, 36)) == (29, len(LEASE))
     assert line_span("one\n\nthree", (4, 4)) == (4, 4)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
+    execute = RerankerModelExecution.execute
+
+    def mixed(self, node, inputs):
+        if not isinstance(node, AiExtract):
+            return execute(self, node, inputs)
+        (source,) = inputs.values()
+        ids = source.column("c").to_pylist()
+        table = extract_answer_table(
+            node.spec, ids, ["March 3, 2027" if i == 0 else None for i in ids],
+            [(14, 27) if i == 0 else None for i in ids])
+        return NodeResult({"scores": table, "ids:c": ids})
+
+    monkeypatch.setattr(RerankerModelExecution, "execute", mixed)
+    query = session.sql(
+        "SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score, "
+        f"AI.EXTRACT(c.text, '{QUESTION}') AS ends FROM contracts c "
+        + ("WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.15"
+           if filtered else ""))
+    result = score_tests._finish(query, session, score_tests._RowReranker())
+    rows = result.collect()
+    assert rows.column("score").type == pa.float64()
+    expected = [
+        {"c.id": 1, "score": 0.1, "ends": "March 3, 2027",
+         "ends_span": {"start": 14, "end": 27}},
+        {"c.id": 2, "score": 0.2, "ends": None, "ends_span": None},
+    ]
+    assert rows.to_pylist() == (expected[1:] if filtered else expected)
 
 
 class _PhraseClient(request_tests._Client):
