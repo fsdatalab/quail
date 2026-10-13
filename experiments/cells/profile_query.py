@@ -110,13 +110,13 @@ class Timeline:
         import quail.backends.quail.executor.chunk as chunk
         import quail.backends.quail.executor.pack as pack
         import quail.backends.quail.executor.readout as readout
-        import quail.backends.quail.executor.stages as stages
+        import quail.backends.quail.executor.stage_executor as stage_executor
 
         self.torch = torch
         self.entries = []
         self.active = False
         self._wrap(chunk, "pack_chunk", "pack")
-        self._wrap(stages, "forward_chunk", "forward", gpu=True)
+        self._wrap(stage_executor, "forward_chunk", "forward", gpu=True)
         self._wrap(pack.JoinAdmission, "next_chunk", "next_chunk")
         for owner in (readout.AsyncLabelLogprobs, readout.AsyncAnswers,
                       readout.AsyncScores):

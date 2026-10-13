@@ -137,7 +137,7 @@ def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared, run):
 
 @pytest.mark.parametrize("mode", ["tree", "unified"])
 def test_warmup_runs_every_row_count_class(monkeypatch, mode):
-    from quail.backends.quail.executor import stages, warmup
+    from quail.backends.quail.executor import stage_executor, warmup
 
     cpu_staging(monkeypatch)
     arena = plain_arena(pages=256)
@@ -148,7 +148,7 @@ def test_warmup_runs_every_row_count_class(monkeypatch, mode):
         shapes.append((len(chunk.input_ids),
                        0 if reads is None else len(reads["rows"])))
 
-    monkeypatch.setattr(stages, "forward_chunk", forward)
+    monkeypatch.setattr(stage_executor, "forward_chunk", forward)
     warmup._warm_row_classes(torch, arena, None, mode)
     # the first chunk writes the cached documents' KV, each with a
     # one-token question so the chunk has answer rows

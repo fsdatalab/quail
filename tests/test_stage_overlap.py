@@ -4,7 +4,7 @@ import pytest
 from fakes import cpu_staging
 from kv_checker import Run, Setup, answer, chain, passthrough
 
-from quail.backends.quail.executor import stages as stages_mod
+from quail.backends.quail.executor.stage_executor import StageExecutor
 from quail.backends.quail.executor.stages import Stage, run_stages
 
 
@@ -28,7 +28,7 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
             expected[a, j] = [answers[hashed]]
     events = []
     executors = []
-    original = stages_mod._StageExecutor._run_one
+    original = StageExecutor._run_one
 
     def launch(self, groups):
         assert len(self.own) <= len(docs)
@@ -42,7 +42,7 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
             return True
         return keep
 
-    monkeypatch.setattr(stages_mod._StageExecutor, "_run_one", launch)
+    monkeypatch.setattr(StageExecutor, "_run_one", launch)
     readout = passthrough()
     stages = [Stage(suffixes=lambda _, suffix=suffix: [suffix], suffix_tokens=1,
                     frame=frame,
