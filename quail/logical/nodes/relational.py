@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 from typing import ClassVar
 
 from quail.logical.expressions import (
-    SPAN_SUFFIX,
     AggregateCall,
     Aggregation,
     Alias,
@@ -101,13 +100,11 @@ class Project:
                 raise CompileError(
                     f"the fields of {struct.name!r} read one document column")
         for name in extracted:
-            if "." in name and name not in members:
+            if name not in members:
                 raise CompileError(
                     f"the extraction {name!r} is a field of no struct column")
         others = [column_name(column) for column in self.columns
                   if column_name(column) not in members]
-        others += [name + SPAN_SUFFIX for name in extracted
-                   if name not in members]
         packed = [name for struct in self.structs
                   for name, _ in struct.packing()]
         if len(set(others + packed)) != len(others) + len(packed):

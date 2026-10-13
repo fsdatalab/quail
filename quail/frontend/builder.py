@@ -62,8 +62,7 @@ class Query:
         self._functions = {}         # name -> the Python function
         self._labels = {}            # name -> Alias of an AI.CLASSIFY call
         self._scores = {}            # name -> Alias of an AI.SCORE call
-        # name -> Alias of an AI.EXTRACT call, or an ExtractStruct and
-        # its fields' Aliases
+        # name -> an AI.EXTRACT's ExtractStruct and its fields' Aliases
         self._extracts = {}
         self._regular_predicates = {}  # alias -> [RegularPredicate]
         self._limit = None
@@ -211,48 +210,48 @@ class Query:
         self._labels[name] = Alias(call, name)
         return self
 
-    def ai_extract(self, c, question, *, name: str,
+    def ai_extract(self, c, questions, *, name: str,
                    trim: bool = True) -> "Query":
-        """Copy the words that answer a question from each document.
+        """Copy the words that answer each question from each document.
 
-        The result column ``name`` holds the copied words, or null when
-        the document does not answer the question. The column ``name``
-        plus "_span" holds the answer's character span in the document
-        as a (start, end) pair. Use select() to return the columns.
+        ``questions`` maps field names to questions. The result column
+        ``name`` is a struct with one field per question, holding the
+        copied words, or null when the document does not answer it. The
+        column ``name`` plus "_span" is a struct of the answers'
+        character spans in the document, each a (start, end) pair. Use
+        select() to return the columns.
 
-        For example, ``ai_extract("c.text", "When does the lease end?",
-        name="end")`` adds the columns ``end`` and ``end_span``.
-
-        A mapping from field names to questions asks every question of
-        each document and returns struct columns with one field per
-        question. For example, ``ai_extract("r.body", {"name": "What is
-        the patient's name?", "age": "How old is the patient?"},
-        name="patient")`` adds ``patient``, a struct of the fields
-        ``name`` and ``age``, and ``patient_span``, a struct of their
-        spans. Each field is its own extraction; the fields of one
-        document read the document's KV, written once.
+        For example, ``ai_extract("c.text", {"end": "When does the lease
+        end?", "signer": "Who signed the lease?"}, name="lease")`` adds
+        ``lease``, a struct of the fields ``end`` and ``signer``, and
+        ``lease_span``. Each field is its own extraction; the fields of
+        one document read the document's KV, written once.
 
         Args:
             c: The document column, as "alias.column" or a col().
-            question: The question the answer is copied for, or a
-                mapping from field names to questions.
+            questions: A mapping from field names to the questions their
+                answers are copied for.
             name: Result column name, without a dot.
-            trim: Whether the answer is the fewest words that answer the
-                question. With trim off, the answer is the whole lines
-                of the document that hold them, as the document's own
-                line breaks divide it.
+            trim: Whether each answer is the fewest words that answer
+                its question. With trim off, the answer is the whole
+                lines of the document that hold them, as the document's
+                own line breaks divide it.
 
         Returns:
             This query builder, with the extraction added.
 
         Raises:
-            CompileError: The name, column, fields, or question is
+            CompileError: The name, column, fields, or a question is
                 invalid, or a pending join has no AI predicate yet.
         """
         if self._pending_join is not None:
             raise CompileError(
                 "join() is waiting for the ai_filter over its pairs; "
                 "extract before joining")
+        if not isinstance(questions, Mapping):
+            raise CompileError(
+                "ai_extract takes a mapping from field names to questions, "
+                "such as {'end': 'When does the lease end?'}")
         if not name or "." in name:
             raise CompileError(
                 f"an extraction needs a column name without a dot, "
@@ -260,22 +259,17 @@ class Query:
         self._claim_name(name)
         self._claim_name(name + SPAN_SUFFIX)
         ref = self._resolve(col(c) if isinstance(c, str) else c)
-
-        def extraction(text):
-            bound = self._prompts.bind("extract", text, (ref,))
-            call = ModelCall(bound, "extract", question=text, trim=trim)
+        struct = ExtractStruct(name, tuple(questions))
+        struct.validate()
+        members = []
+        for field in struct.fields:
+            bound = self._prompts.bind("extract", questions[field], (ref,))
+            call = ModelCall(bound, "extract", question=questions[field],
+                             trim=trim)
             call.validate()
-            return call
-
-        if isinstance(question, Mapping):
-            struct = ExtractStruct(name, tuple(question))
-            struct.validate()
-            members = tuple(Alias(extraction(question[field]), struct.member(field))
-                            for field in struct.fields)
-            self._extracts[name] = (struct, members)
-        else:
-            self._extracts[name] = Alias(extraction(question), name)
+            members.append(Alias(call, struct.member(field)))
         self._note_doc_column(ref)
+        self._extracts[name] = (struct, tuple(members))
         return self
 
     def _claim_name(self, name: str) -> None:
@@ -650,8 +644,7 @@ class Query:
         structs = []
         aggregation = None
         if self._group or self._aggs or self._having:
-            if any(isinstance(self._extracts.get(c), tuple) for c in cols
-                   if isinstance(c, str)):
+            if any(c in self._extracts for c in cols if isinstance(c, str)):
                 raise CompileError(
                     "GROUP BY does not read AI.EXTRACT struct columns; "
                     "extract each field as its own column")
@@ -664,13 +657,9 @@ class Query:
                 columns.append(self._scores[c])
                 continue
             if isinstance(c, str) and c in self._extracts:
-                extraction = self._extracts[c]
-                if isinstance(extraction, Alias):
-                    columns.append(extraction)
-                else:
-                    struct, members = extraction
-                    structs.append(struct)
-                    columns.extend(members)
+                struct, members = self._extracts[c]
+                structs.append(struct)
+                columns.extend(members)
                 continue
             if isinstance(c, str) and c == "*":
                 for alias, provider in self._tables:
@@ -717,7 +706,7 @@ class Query:
         if aggregation is not None:
             named.update({a.name: a for a in aggregation.aggregates})
         for name, _, _ in self._order:
-            if name in self._extracts and not isinstance(self._extracts[name], Alias):
+            if name in self._extracts:
                 raise CompileError(
                     f"ORDER BY does not compare the AI.EXTRACT struct column "
                     f"{name!r}; extract the field as its own column")

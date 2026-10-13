@@ -341,34 +341,12 @@ class ExpressionBinder:
         model_call.validate()
         return model_call, options, aliases
 
-    def bind_ai_extract(self, node) -> ModelCall:
+    def bind_ai_extract(self, node, name: str) -> tuple:
         """Parse an AI.EXTRACT call and bind its document reference.
-
-        The call is ``AI.EXTRACT(column, 'question'[, {'trim': false}])``;
-        the one option is trim.
-
-        Args:
-            node: The AI_EXTRACT call.
-
-        Returns:
-            The extract ModelCall.
-
-        Raises:
-            CompileError: The column, question, or options are invalid.
-        """
-        ref, question, options = self._extract_arguments(node)
-        if isinstance(question, exp.Struct):
-            raise CompileError(
-                "an AI.EXTRACT over several fields is a SELECT column "
-                "with an AS name")
-        return self._extract_call(ref, str(question.this), options)
-
-    def bind_ai_extract_struct(self, node, name: str) -> tuple:
-        """Parse an AI.EXTRACT call over several fields.
 
         The call is ``AI.EXTRACT(column, {'field': 'question', ...}[,
         {'trim': false}])``. Each field is its own extraction, named
-        ``name.field``; the options apply to every field.
+        ``name.field``; the one option, trim, applies to every field.
 
         Args:
             node: The AI_EXTRACT call.
@@ -404,23 +382,23 @@ class ExpressionBinder:
         """Check an AI.EXTRACT call's arguments and resolve its column.
 
         Returns:
-            The column reference, the question literal or field object,
-            and the parsed options.
+            The column reference, the object of field questions, and the
+            parsed options.
         """
         args = list(node.expressions)
         if len(args) not in (2, 3):
             raise CompileError(
-                "AI.EXTRACT takes a document column, a question string or "
-                "an object of field questions, and at most one option object")
+                "AI.EXTRACT takes a document column, an object of field "
+                "questions, and at most one option object")
         if not isinstance(args[0], exp.Column):
             raise CompileError(
                 f"AI.EXTRACT's first argument is a document column, "
                 f"got {args[0].sql()}")
-        if not ((isinstance(args[1], exp.Literal) and args[1].is_string)
-                or isinstance(args[1], exp.Struct)):
+        if not isinstance(args[1], exp.Struct):
             raise CompileError(
-                f"AI.EXTRACT's second argument is the question as a string, "
-                f"or an object of field questions, got {args[1].sql()}")
+                f"AI.EXTRACT's second argument is an object of field "
+                f"questions such as {{'ends': 'When does the lease end?'}}, "
+                f"got {args[1].sql()}")
         ref = self.resolve_column(args[0])
         options = self.parse_extract_options(args[2] if len(args) == 3 else None)
         return ref, args[1], options
@@ -470,12 +448,10 @@ class ExpressionBinder:
         return out
 
     def bind_ai_value(self, node: exp.Expression) -> ModelCall:
-        """Bind a score, classification, or extraction to its model call."""
+        """Bind a score or classification to its model call."""
         if isinstance(node, exp.AIClassify):
             call, _, _ = self.bind_ai_classify(node)
             return call
-        if _is_call(node, "AI_EXTRACT"):
-            return self.bind_ai_extract(node)
         prompt, _, _ = self.bind_ai_call(node, "AI_SCORE", set())
         return ModelCall(prompt, "score")
 

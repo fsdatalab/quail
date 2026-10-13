@@ -323,12 +323,9 @@ def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list
         if _is_call(e, "AI_EXTRACT"):
             if not alias:
                 raise CompileError("AI.EXTRACT needs an AS name in SELECT")
-            if len(e.expressions) > 1 and isinstance(e.expressions[1], exp.Struct):
-                struct, members = b.bind_ai_extract_struct(e, alias)
-                structs.append(struct)
-                columns.extend(members)
-                continue
-            columns.append(Alias(b.bind_ai_extract(e), alias))
+            struct, members = b.bind_ai_extract(e, alias)
+            structs.append(struct)
+            columns.extend(members)
             continue
         if any(
             _is_call(call, "AI_SCORE") or _is_call(call, "AI_EXTRACT")

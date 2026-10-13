@@ -103,35 +103,16 @@ probability output, and limits on classifications of joined rows.
 
 ### ai_extract
 
-`ai_extract(c, question, *, name, trim=True)`
+`ai_extract(c, questions, *, name, trim=True)`
 
-Use `ai_extract()` to copy an answer from each document. Pass the document
-column as a string such as `"c.text"`, or use `col("c.text")`. Set `name`
-to the answer column you want, and include it in `select()`.
+Use `ai_extract()` to copy answers from each document. Pass the document
+column as a string such as `"c.text"`, or use `col("c.text")`. Pass a
+dictionary that maps each field name to its question. Set `name` to the
+struct column you want, and include it in `select()`.
 
 For example, imagine you registered a `contracts` table with an `id`
-column and the contract text in `text`. Ask when each lease ends:
-
-```python
-query = (
-    session.docs("contracts").alias("c")
-    .ai_extract("c.text", "When does the lease end?", name="ends")
-    .select("c.id", "ends")
-)
-rows = query.collect()
-```
-
-You get `c.id`, `ends`, and `ends_span`. Quail includes the span column
-automatically. It contains the answer's `start` and `end` character
-positions in the source, counting from zero with `end` excluded.
-If no answer is found, the answer and span are both null.
-
-Pass `trim=False` to return the complete source lines that contain the
-answer. You can call `ai_extract()` again with a different question and
-name, then include both names in `select()`.
-
-To get several answers as one struct column, pass a dictionary that
-maps each field name to its question:
+column and the contract text in `text`. Ask when each lease ends and
+who signed it:
 
 ```python
 query = (
@@ -140,10 +121,17 @@ query = (
                            "signer": "Who signed the lease?"}, name="lease")
     .select("c.id", "lease")
 )
+rows = query.collect()
 ```
 
 You get `c.id`, `lease`, and `lease_span`. `lease` has the fields
-`end_date` and `signer`; `lease_span` has their spans.
+`end_date` and `signer`. Quail includes the span column automatically:
+each of its fields holds the answer's `start` and `end` character
+positions in the source, counting from zero with `end` excluded. If no
+answer is found, the field and its span are both null.
+
+Pass `trim=False` to return the complete source lines that contain each
+answer.
 
 See [`AI.EXTRACT`](/docs/user-guide/sql#aiextract) for output examples
 and supported queries.

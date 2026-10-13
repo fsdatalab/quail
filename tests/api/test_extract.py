@@ -54,8 +54,8 @@ def session(tmp_path):
 
 def _ends(session, trim=True):
     return (session.docs("contracts").alias("c")
-            .ai_extract("c.text", QUESTION, name="ends", trim=trim)
-            .select("c.id", "ends"))
+            .ai_extract("c.text", {"ends": QUESTION}, name="lease", trim=trim)
+            .select("c.id", "lease"))
 
 
 def test_extract_prefix_sharing_is_planned_from_exact_document_tokens():
@@ -80,12 +80,12 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
     built = _ends(session)
     for dialect in ('snowflake', 'bq'):
         query = session.sql(
-            f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
+            f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
             f"FROM contracts c", dialect=dialect)
         assert query.logical == built.logical
     loose = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}', {{'trim': false}}) "
-        f"AS ends FROM contracts c")
+        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}, "
+        f"{{'trim': false}}) AS lease FROM contracts c")
     assert loose.logical == _ends(session, trim=False).logical
 
 
@@ -110,24 +110,25 @@ def test_extract_follows_the_filters_and_labels_of_its_table(session):
              .ai_classify(quail.prompt("{0}", quail.col("c.text")),
                           ["lease", "deed"], name="kind")
              .label_in("kind", ["lease"], selectivity=0.5)
-             .ai_extract("c.text", QUESTION, name="ends")
-             .select("c.id", "kind", "ends"))
+             .ai_extract("c.text", {"ends": QUESTION}, name="lease")
+             .select("c.id", "kind", "lease"))
     plan = query.plan()
     (node,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
     (test,) = [n for n in plan.nodes if isinstance(n, Filter)]
     assert node.inputs[0].source.node_id == test.node_id
     # half the documents pass the label filter
     assert node.spec.expected_inputs == pytest.approx(2 * 0.2 * 0.5)
-    assert plan.nodes[-1].columns == ("c.id", "kind", "ends", "ends_span")
+    assert plan.nodes[-1].columns == (
+        "c.id", "kind", "lease.ends", "lease.ends_span")
 
 
 def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
         session):
     query = (session.docs("contracts").alias("c")
-             .ai_extract("c.text", QUESTION, name="ends")
-             .ai_extract("c.text", "Who signs?", name="signer")
-             .ai_extract("c.text", "Where?", name="place")
-             .select("c.id", "ends", "signer", "place"))
+             .ai_extract("c.text", {"ends": QUESTION}, name="lease")
+             .ai_extract("c.text", {"signer": "Who signs?"}, name="signing")
+             .ai_extract("c.text", {"place": "Where?"}, name="venue")
+             .select("c.id", "lease", "signing", "venue"))
     plan = query.plan()
     extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
     pipelines = build_pipelines(plan.graph)
@@ -154,8 +155,8 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
     # and asks its question of the KV the filter wrote
     filtered = (session.docs("contracts").alias("c")
                 .ai_filter(quail.prompt("Is {0} a lease?", quail.col("c.text")))
-                .ai_extract("c.text", QUESTION, name="ends")
-                .select("c.id", "ends"))
+                .ai_extract("c.text", {"ends": QUESTION}, name="lease")
+                .select("c.id", "lease"))
     plan = filtered.plan()
     (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
     (ai_filter,) = [n for n in plan.nodes if isinstance(n, AiFilter)]
@@ -169,8 +170,8 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
     classified = (session.docs("contracts").alias("c")
                   .ai_classify(quail.prompt("Which kind is {0}?", quail.col("c.text")),
                                ["lease", "license"], name="kind")
-                  .ai_extract("c.text", QUESTION, name="ends")
-                  .select("c.id", "kind", "ends"))
+                  .ai_extract("c.text", {"ends": QUESTION}, name="lease")
+                  .select("c.id", "kind", "lease"))
     plan = classified.plan()
     (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
@@ -200,7 +201,8 @@ def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
     session.register("questions",
                      DocumentProvider.from_parquet(str(path), id_col="id"))
     query = session.sql(
-        f"SELECT c.id, q.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
+        f"SELECT c.id, q.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) "
+        f"AS lease "
         f"FROM contracts c JOIN questions q "
         f"ON AI_FILTER(PROMPT('Does {{0}} answer {{1}}?', c.text, q.ask))")
     assert extracted_above_joins(query.logical.root) == frozenset()
@@ -221,47 +223,47 @@ def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
     (before,) = [n for n in written.plan.nodes if isinstance(n, AiExtract)]
     assert before.spec.expected_inputs == 2
     assert node.spec.estimated_seconds < before.spec.estimated_seconds
-    assert plan.nodes[-1].columns == ("c.id", "q.id", "ends", "ends_span")
+    assert plan.nodes[-1].columns == (
+        "c.id", "q.id", "lease.ends", "lease.ends_span")
 
 
 def test_extract_errors_and_refusals(session):
     sql = session.sql
+    fields = f"{{'ends': '{QUESTION}'}}"
     for bad, message in (
-            (f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') FROM contracts c",
-             "AS name"),
             (f"SELECT c.id FROM contracts c WHERE AI.EXTRACT(c.text, "
-             f"'{QUESTION}') = 'x'", "not a predicate"),
+             f"{fields}) = 'x'", "not a predicate"),
             (f"SELECT c.id, AI.EXTRACT('{QUESTION}', c.text) AS x "
              f"FROM contracts c", "document column"),
-            ("SELECT c.id, AI.EXTRACT(c.text, c.id) AS x FROM contracts c",
-             "question as a string"),
+            (f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS x "
+             f"FROM contracts c", "object of field questions"),
             ("SELECT c.id, AI.EXTRACT(c.text) AS x FROM contracts c",
-             "a question string"),
-            (f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}', {{'trim': 1}}) "
+             "object of field questions"),
+            (f"SELECT c.id, AI.EXTRACT(c.text, {fields}, {{'trim': 1}}) "
              f"AS x FROM contracts c", "true or false"),
-            (f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}', {{'lines': 2}}) "
+            (f"SELECT c.id, AI.EXTRACT(c.text, {fields}, {{'lines': 2}}) "
              f"AS x FROM contracts c", "unknown AI.EXTRACT option"),
-            (f"SELECT c.id, UPPER(AI.EXTRACT(c.text, '{QUESTION}')) AS x "
-             f"FROM contracts c", "direct expressions"),
-            ("SELECT c.id, AI.EXTRACT(c.text, '') AS x FROM contracts c",
-             "at least one word")):
+            (f"SELECT c.id, UPPER(AI.EXTRACT(c.text, {fields})) AS x "
+             f"FROM contracts c", "direct expressions")):
         with pytest.raises(CompileError, match=message):
             sql(bad)
     builder = session.docs("contracts").alias("c")
+    with pytest.raises(CompileError, match="mapping from field names"):
+        builder.ai_extract("c.text", QUESTION, name="ends")
     with pytest.raises(CompileError, match="without a dot"):
-        builder.ai_extract("c.text", QUESTION, name="c.ends")
+        builder.ai_extract("c.text", {"ends": QUESTION}, name="c.ends")
     with pytest.raises(CompileError, match="already used"):
-        builder.ai_extract("c.text", QUESTION, name="c")
+        builder.ai_extract("c.text", {"ends": QUESTION}, name="c")
     with pytest.raises(CompileError, match="already used"):
-        (builder.ai_extract("c.text", QUESTION, name="ends")
+        (builder.ai_extract("c.text", {"ends": QUESTION}, name="lease")
          .ai_classify(quail.prompt("{0}", quail.col("c.text")), ["a", "b"],
-                      name="ends_span"))
+                      name="lease_span"))
     # the speed of light estimate prices an extraction as one question
     # per document, read once at the cue
     estimate = quail.speed_of_light_estimate(_ends(session), lambda *_: True)
     (stage,) = estimate.filter_stages
     assert (stage["operator"], stage["alias"], stage["name"]) == (
-        "AI.EXTRACT", "c", "ends")
+        "AI.EXTRACT", "c", "lease.ends")
     assert (stage["evaluated"], stage["passed"]) == (2, 2)
     assert estimate.extraction_evaluations == 2
     assert estimate.seconds > 0 and "extraction" in estimate.assumptions()
@@ -322,16 +324,17 @@ def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
     monkeypatch.setattr(RerankerModelExecution, "execute", mixed)
     query = session.sql(
         "SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score, "
-        f"AI.EXTRACT(c.text, '{QUESTION}') AS ends FROM contracts c "
+        f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease FROM contracts c "
         + ("WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.15"
            if filtered else ""))
     result = score_tests._finish(query, session, score_tests._RowReranker())
     rows = result.collect()
     assert rows.column("score").type == pa.float64()
     expected = [
-        {"c.id": 1, "score": 0.1, "ends": "March 3, 2027",
-         "ends_span": {"start": 14, "end": 27}},
-        {"c.id": 2, "score": 0.2, "ends": None, "ends_span": None},
+        {"c.id": 1, "score": 0.1, "lease": {"ends": "March 3, 2027"},
+         "lease_span": {"ends": {"start": 14, "end": 27}}},
+        {"c.id": 2, "score": 0.2, "lease": {"ends": None},
+         "lease_span": {"ends": None}},
     ]
     assert rows.to_pylist() == (expected[1:] if filtered else expected)
 
@@ -446,8 +449,8 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     session = request_tests._session(
         "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
     query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
-        f"FROM contracts c")
+        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
+        f"'term': 'How long is the term?'}}) AS lease FROM contracts c")
     boot = {"client": _PhraseClient(), "sampling_params": object(),
             "capacity": request_tests.CAPACITY}
     monkeypatch.setattr(
@@ -455,17 +458,21 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
         lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
     result = request_tests._run_stock_vllm(session, query)
     rows = result.collect()
-    assert rows.column_names == ["c.id", "ends", "ends_span"]
+    assert rows.column_names == ["c.id", "lease", "lease_span"]
     assert rows.column("c.id").to_pylist() == ["a", "b", "c", "d"]
-    assert rows.column("ends").to_pylist() == [
-        "March 3, 2027", None, "five years", "a phrase the document lacks"]
-    assert rows.column("ends_span").to_pylist() == [
-        {"start": 14, "end": 27}, None, {"start": 6, "end": 16}, None]
-    answers = result.answer_tables["extracts"]["ends"]
-    assert answers.column_names == ["c", "ends", "ends_span"]
+    # the fake client answers from the document, whatever the question
+    answers = ["March 3, 2027", None, "five years", "a phrase the document lacks"]
+    assert rows.column("lease").to_pylist() == [
+        {"ends": answer, "term": answer} for answer in answers]
+    spans = [{"start": 14, "end": 27}, None, {"start": 6, "end": 16}, None]
+    assert rows.column("lease_span").to_pylist() == [
+        {"ends": span, "term": span} for span in spans]
+    answers = result.answer_tables["extracts"]["lease.ends"]
+    assert answers.column_names == ["c", "lease.ends", "lease.ends_span"]
     assert answers.num_rows == 4
-    (step,) = result.report["backend_metrics"]["steps"]
-    assert step["kind"] == "extract" and step["requests"] == 4
+    steps = result.report["backend_metrics"]["steps"]
+    assert [(step["kind"], step["requests"]) for step in steps] == [
+        ("extract", 4), ("extract", 4)]
     session.close()
 
 
@@ -499,7 +506,7 @@ def _lease(session):
             .select("c.id", "lease"))
 
 
-def test_struct_extract_plans_one_extraction_per_field(session):
+def test_extract_plans_one_extraction_per_field(session):
     built = _lease(session)
     for dialect in ("snowflake", "bq"):
         assert session.sql(STRUCT_SQL, dialect=dialect).logical == built.logical
@@ -552,7 +559,7 @@ def _fake_struct_answers(monkeypatch):
 @pytest.mark.parametrize("suffix", [
     "", " ORDER BY c.id DESC LIMIT 1",
     " WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.05"])
-def test_struct_extract_returns_answer_and_span_structs(
+def test_extract_returns_answer_and_span_structs(
         session, monkeypatch, suffix):
     _fake_struct_answers(monkeypatch)
     result = score_tests._finish(session.sql(STRUCT_SQL + suffix), session,
@@ -574,29 +581,7 @@ def test_struct_extract_returns_answer_and_span_structs(
     assert rows.to_pylist() == (expected[1:] if "DESC" in suffix else expected)
 
 
-def test_stock_vllm_runs_a_struct_extraction(monkeypatch):
-    session = request_tests._session(
-        "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
-    query = session.sql(
-        "SELECT c.id, AI.EXTRACT(c.text, {'ends': '" + QUESTION + "', "
-        "'term': 'How long is the term?'}) AS lease FROM contracts c")
-    boot = {"client": _PhraseClient(), "sampling_params": object(),
-            "capacity": request_tests.CAPACITY}
-    monkeypatch.setattr(
-        "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
-    rows = request_tests._run_stock_vllm(session, query).collect()
-    assert rows.column_names == ["c.id", "lease", "lease_span"]
-    # the fake client answers from the document, whatever the question
-    answers = ["March 3, 2027", None, "five years", "a phrase the document lacks"]
-    assert rows.column("lease").to_pylist() == [
-        {"ends": answer, "term": answer} for answer in answers]
-    assert rows.column("lease_span").to_pylist()[2] == {
-        "ends": {"start": 6, "end": 16}, "term": {"start": 6, "end": 16}}
-    session.close()
-
-
-def test_struct_extract_errors(session):
+def test_extract_field_errors(session):
     for bad, message in (
             ("SELECT c.id, AI.EXTRACT(c.text, {'a': 'x?'}) FROM contracts c",
              "AS name"),
@@ -611,7 +596,7 @@ def test_struct_extract_errors(session):
             ("SELECT c.id, AI.EXTRACT(c.text, {'a': 'x?'}) AS c FROM contracts c",
              "also a table alias"),
             ("SELECT c.id, AI.EXTRACT(c.text, {'a': 'x?'}) AS x, "
-             "AI.EXTRACT(c.text, 'y?') AS x_span FROM contracts c", "unique"),
+             "AI.EXTRACT(c.text, {'b': 'y?'}) AS x_span FROM contracts c", "unique"),
             ("SELECT c.id, AI.EXTRACT(c.text, {'a': 'x?'}) AS x "
              "FROM contracts c ORDER BY x", "ORDER BY does not compare"),
             ("SELECT DISTINCT AI.EXTRACT(c.text, {'a': 'x?'}) AS x "

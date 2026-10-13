@@ -18,10 +18,11 @@ from quail.logical.nodes.join import _above_joins
 
 @dataclass(frozen=True)
 class SemanticExtract:
-    """One AI.EXTRACT call over its input rows, adding the answer columns.
+    """One AI.EXTRACT field over its input rows, adding the answer columns.
 
     Every input row passes through with the answer in the column named
-    ``name`` and its character span in the document, as a (start, end)
+    ``name``, which is ``struct.field`` for the ExtractStruct field it
+    fills, and its character span in the document, as a (start, end)
     pair, in the column ``name`` plus SPAN_SUFFIX. A row whose document
     does not answer the question gets nulls. The node starts on its
     table above the table's AI.IF SemanticFilter, classifications, and
@@ -67,10 +68,10 @@ class SemanticExtract:
         self.call.validate()
         if self.call.kind != "extract":
             raise CompileError("SemanticExtract needs an AI.EXTRACT call")
-        # a field of an ExtractStruct is named "struct.field"
-        if not all(self.name.split(".")) or self.name.count(".") > 1:
+        if self.name.count(".") != 1 or not all(self.name.split(".")):
             raise CompileError(
-                f"an extraction needs a column name without a dot, got {self.name!r}"
+                f"an extraction is named after its struct column and field, "
+                f"as 'struct.field', got {self.name!r}"
             )
         aliases = self.call.aliases()
         if len(aliases) != 1:
