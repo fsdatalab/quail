@@ -54,18 +54,30 @@ class FilterPart(ExecutionPart):
         self.node = node
         self.ids = ids
         self.canvas_tokens = canvas_tokens
+        self.frame_tokens = 0
         self.stages = filter_stages(
             [list(node.question_token_ids)],
             async_answers)
         self.document_done = filter_document_sink(node, ids)
         self.answers = {}
 
+    @staticmethod
+    def prepare_group(parts):
+        """Retain the common question preamble across consecutive filters."""
+        stages = filter_stages(
+            [part.node.question_token_ids for part in parts],
+            parts[0].stages[0].readout)
+        for index, (part, stage) in enumerate(zip(parts, stages)):
+            part.stages = [stage]
+            part.frame_tokens = len(stage.frame) if index == 0 else 0
+
     def finish(self, every) -> int | None:
         """Record filter answers and leave token accounting to the pipeline."""
         for stage in every:
             for document, row in stage.items():
                 self.answers.setdefault(document, []).append(int(row[0]))
-        return len(self.answers) * (len(self.node.question_token_ids)
+        return len(self.answers) * (len(self.stages[0].suffixes[0])
+                                    + self.frame_tokens
                                     + self.canvas_tokens)
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:

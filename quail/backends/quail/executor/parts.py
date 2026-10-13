@@ -1,6 +1,7 @@
 """Compose operator stages and collect their execution metrics."""
 
 import time
+from itertools import groupby
 
 import numpy as np
 
@@ -43,12 +44,14 @@ class ExecutionPart:
     """Operator work prepared for the shared document scheduler.
 
     Implementations prepare stages, finish their answers, and return node
-    results. combine groups consecutive nodes into one part. execute_group
+    results. combine groups consecutive nodes into one part. prepare_group
+    prepares stages across consecutive parts of the same type. execute_group
     optionally handles a run containing only that operator type.
     """
 
     combine = False
     execute_group = None
+    prepare_group = None
     gate = None
     document_done = None
     result_value = None
@@ -110,6 +113,9 @@ def gated_stages(parts) -> list:
     Raises:
         ValueError: A trailing condition has no following stage.
     """
+    for implementation, group in groupby(parts, type):
+        if implementation.prepare_group is not None:
+            implementation.prepare_group(list(group))
     stages = []
     pending = []
     for part in parts:

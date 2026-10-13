@@ -18,6 +18,8 @@ from fakes import fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.operators.filter import FilterPart
+from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
 from quail.execution.tokens import prefix_tree
 
@@ -335,10 +337,12 @@ def check_filter(docs, questions, setup):
             h = chain(doc + q + tail)
             answers[h] = answer(h)
     run = Run(setup, answers)
-    got, _, _ = loop.run_filter(
-        run.torch, run.arena, run.pipeline, passthrough(), docs, questions,
-        setup.budget, arena_writes=True,
-        arena_keys=[("d", i) for i in range(len(docs))],
+    parts = [FilterPart(SimpleNamespace(question_token_ids=q),
+                        list(range(len(docs))), passthrough(), len(tail))
+             for q in questions]
+    got, _, _ = run_stages(
+        run.torch, run.arena, run.pipeline, gated_stages(parts), docs,
+        setup.budget, anchor_keys=[("d", i) for i in range(len(docs))],
         attention_mode=setup.path, prefix_tree=run.tree(docs))
     for d, doc in enumerate(docs):
         want = []
@@ -346,7 +350,8 @@ def check_filter(docs, questions, setup):
             want.append(answers[chain(doc + q + tail)])
             if not want[-1]:
                 break
-        assert got[d] == want, f"document {d}"
+        assert [int(stage[d][0]) for stage in got if d in stage] == want, (
+            f"document {d}")
     assert not run.arena.accounting.owned
 
 
