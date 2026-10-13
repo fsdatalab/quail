@@ -205,20 +205,6 @@ def build_result_declaration(
     return declaration, schema
 
 
-def intersect_tables(left: pa.Table, right: pa.Table) -> pa.Table:
-    """Return rows present in both document-index relations."""
-    if set(left.schema.names) != set(right.schema.names):
-        raise ValueError("relation intersection requires the same aliases")
-    keys = left.schema.names
-    declaration, _ = _inner_join(
-        _table_source(left), left.schema,
-        _table_source(right), right.schema,
-        keys=keys,
-    )
-    table = declaration.to_table()
-    return table.select(keys).replace_schema_metadata(left.schema.metadata)
-
-
 def count_rows(declaration: acero.Declaration) -> int:
     """Count rows inside Acero without returning the rows to Python."""
     options = acero.AggregateNodeOptions(

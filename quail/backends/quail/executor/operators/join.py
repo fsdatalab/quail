@@ -7,13 +7,10 @@ import numpy as np
 
 from quail.backends.quail.executor.parts import (
     ExecutionPart,
-    execute_parts,
-    execution_prefix_tree,
     gpu_seconds,
     stage_spans,
 )
 from quail.backends.quail.executor.stages import Stage
-from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, join_settlement
 from quail.catalog.pairs import (
@@ -35,18 +32,6 @@ from quail.execution.runner import (
     NodeResult,
 )
 from quail.progress import answer_sink
-
-
-def execute_joins(state: QueryExecutionState, nodes, inputs) -> dict:
-    """Run consecutive join predicates through the document scheduler."""
-    state.gpu_timing = bool(inputs.get("gpu_timing", False))
-    part = JoinPart(state, nodes, inputs, inputs["anchor_ids"])
-    return execute_parts(
-        state, [part], inputs["prefixes"], inputs["anchor_keys"],
-        keep_kv=nodes[-1].keep_kv,
-        tree=execution_prefix_tree(nodes[0], inputs["prefixes"],
-                                   state.loaded_model.arena),
-        label=f"join ({len(nodes)} predicates)")
 
 
 class JoinPart(ExecutionPart):

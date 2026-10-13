@@ -279,16 +279,6 @@ def is_score(expression) -> bool:
     return model_call(expression).kind == "score"
 
 
-def is_label(expression) -> bool:
-    """Return whether the expression computes an AI.CLASSIFY label."""
-    return model_call(expression).kind == "label"
-
-
-def is_extract(expression) -> bool:
-    """Return whether the expression computes an AI.EXTRACT answer."""
-    return model_call(expression).kind == "extract"
-
-
 def has_score(plan) -> bool:
     """Return whether a logical plan computes an AI.SCORE value anywhere."""
     operators = plan.operators()

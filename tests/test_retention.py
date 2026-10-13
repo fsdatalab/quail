@@ -5,9 +5,10 @@ from fakes import bare_arena
 
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.retention import apply_retention, policy
+from quail.cost import work
 from quail.cost.joins import PricedJoin
 from quail.cost.retention import RetentionPolicy, coefficients
-from quail.cost.sol import prefix_recompute_seconds
+from quail.cost.sol import compute_seconds
 from quail.planner.retention import schedule
 from quail.progress import set_answer_sink
 from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_SXM, QWEN3_4B_FP8
@@ -96,4 +97,6 @@ def test_retention_costs_and_future_use():
         for length in (1, 16, 17, 1023, 1024, 1025, 24000):
             pages = -(-length // 16)
             assert retained.priority(('a', 0), length, pages)[0] == pytest.approx(
-                0.4 * prefix_recompute_seconds(length, model, H100_SXM) / pages)
+                0.4 * compute_seconds(
+                    work.scan(length, 0, window=model.sliding_window),
+                    model, H100_SXM) / pages)

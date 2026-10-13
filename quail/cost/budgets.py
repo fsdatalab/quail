@@ -158,19 +158,6 @@ def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
     return ridge * tot_p * model.w_bytes / denom
 
 
-def _projection_time(model: ModelSpec, device: DeviceSpec,
-                     chunk: int) -> float:
-    """Ideal seconds for all dense projections in one chunk, all layers."""
-    t = 0.0
-    for din, dout in _projection_shapes(model):
-        params = din * dout
-        flops = 2.0 * params * chunk
-        moved = (params * model.w_bytes
-                 + chunk * (din + dout) * ACT_BYTES)
-        t += max(flops / device.peak_flops, moved / device.hbm_bw)
-    return t * model.layers
-
-
 def _attention_time(model: ModelSpec, device: DeviceSpec,
                     chunk: int, context: int) -> float:
     """Ideal seconds for the attention kernels in one chunk, all layers."""

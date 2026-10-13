@@ -15,11 +15,6 @@ import numpy as np
 from quail.labels import decode_runs, fed_nodes, label_trie
 
 
-def trie_targets(trie) -> list[int]:
-    """Return every token id any trie node reads, sorted."""
-    return sorted({token for tokens in trie.values() for token in tokens})
-
-
 def match_label(text: str, labels) -> str | None:
     """Match the first answer line to a label.
 

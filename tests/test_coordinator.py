@@ -8,7 +8,6 @@ from quail.backends.quail.coordinator import (
     keyed_shards,
     merge_join_answers,
 )
-from quail.execution.types import join_answer_cells
 from quail.physical import AiFilter
 
 
@@ -124,8 +123,6 @@ def test_join_merge_and_partner_lists():
     ]
     merged = merge_join_answers([out["joins"][0] for out in outs])
     assert merged["anchor_partners"] == {0: [2], 1: [0, 1], 2: [1, 2]}
-    assert list(join_answer_cells(merged)) == [
-        (0, 2, 1), (1, 0, 0), (1, 1, 1), (2, 1, 1), (2, 2, 0)]
     # a pair stage ships each worker's anchors with their live partners only
     pairs = pa.table({"r": pa.array([0, 0, 2, 3, 5], pa.int32()),
                       "p": pa.array([0, 3, 1, 2, 3], pa.int32())})

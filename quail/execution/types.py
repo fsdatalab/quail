@@ -137,23 +137,6 @@ def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
     return filter_answer_table(node.alias, documents, positions, answers)
 
 
-def join_answer_cells(value: Mapping[str, Any]):
-    """Yield (anchor local index, partner member index, answer) triples.
-
-    rows[local] runs over the partner members the anchor streamed:
-    every member of partner_index, or the member indices listed in
-    anchor_partners[local] when the join ran over pairs.
-    """
-    members = value.get("anchor_partners") or {}
-    for raw_local, row in value["rows"].items():
-        local = int(raw_local)
-        streamed = members.get(local)
-        for position, answer in enumerate(row):
-            yield (local,
-                   position if streamed is None else int(streamed[position]),
-                   answer)
-
-
 def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     """Build the join answer table without visiting pairs in Python.
 

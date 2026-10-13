@@ -33,7 +33,7 @@ def test_model_weights_and_kv_memory_budgets():
     tokens = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM)
     assert tokens == 362_240     # 22,640 pages of 16 tokens
     assert tokens // 400 == 905
-    fp8 = budgets.arena_tokens(QWEN3_4B_FP8.with_kv_bytes(1.0), H100_SXM)
+    fp8 = budgets.arena_tokens(replace(QWEN3_4B_FP8, kv_bytes=1.0), H100_SXM)
     assert fp8 == pytest.approx(2 * tokens, rel=0.01)
     for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
         assert budgets.arena_tokens(model, RTX_PRO_6000_BLACKWELL_SERVER) \

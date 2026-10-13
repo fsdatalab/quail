@@ -511,9 +511,6 @@ EXTRACT_INSTRUCTION = (
 EXTRACT_FORMAT = "Answer in this format:"
 EXTRACT_PHRASE_FORMAT = 'Phrase: "<copied words>"'
 EXTRACT_PHRASE_CUE = 'Phrase: "'
-EXTRACT_NONE = "none"
-
-
 def render_extract_question(question: str) -> str:
     """Return the text after the document: question, instruction, and template."""
     lines = [EXTRACT_INSTRUCTION, EXTRACT_FORMAT, EXTRACT_PHRASE_FORMAT]

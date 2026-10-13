@@ -190,11 +190,6 @@ class ExecutionContext:
     workers: int = 1
     run_pipeline: Callable[..., Mapping[str, "NodeResult"]] | None = None
 
-    def execute_graph(self, graph: PhysicalGraph) -> RunResult:
-        """Execute a child graph with the same model state."""
-        return GenericRunner().run(graph, self)
-
-
 def _check_ports(node, result) -> None:
     expected = {output.name for output in node.outputs}
     missing = expected - set(result.outputs)
