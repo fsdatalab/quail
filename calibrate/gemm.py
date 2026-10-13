@@ -197,4 +197,5 @@ def main(device: str = "h100-sxm", model: str = "qwen3-4b-fp8",
     for name, run in summary["runs"].items():
         print(f"{name}: MAMF {json.dumps(run['mamf'])} "
               f"MSMF {json.dumps(run['msmf'])}", flush=True)
-    print(f"summary: {RESULTS / device / 'gemm.json'}", flush=True)
+    if not smoke:
+        print(f"summary: {RESULTS / device / 'gemm.json'}", flush=True)
