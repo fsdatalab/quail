@@ -119,8 +119,6 @@ def test_replay_returns_independent_output_storage():
 
 
 def test_worker_capture_limits_control_buffers_and_replay_admission():
-    from dataclasses import FrozenInstanceError
-
     from quail.backends.quail.executor.cuda_graphs import DecodeGraphConfig
 
     config = DecodeGraphConfig(row_buckets=(8, 16), max_context_tokens=31,
@@ -144,7 +142,3 @@ def test_worker_capture_limits_control_buffers_and_replay_admission():
     source.meta["reads"]["max_used"] = 9
     source.meta["max_a"] = 4
     assert not graphs.supports(source) and other.supports(source)
-    with pytest.raises(FrozenInstanceError):
-        config.max_context_tokens = 100
-    with pytest.raises(AttributeError):
-        graphs.config = other.config

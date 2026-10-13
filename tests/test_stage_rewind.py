@@ -7,8 +7,8 @@ from kv_checker import Run, Setup, answer, chain, passthrough
 from quail.backends.quail.executor.stages import Stage, run_stages
 
 DOCS = [[1, 2, 3, 4], [5, 6, 7], [8, 9, 10, 11, 12]]
-FIRST, SECOND = [70, 71], [72, 73]     # two questions' frames
-CUE, STEP = [41], [42]
+FIRST, SECOND = [70, 71], [72, 73, 74, 75]     # two questions' frames
+CUE, STEP = [41], [42, 43]
 
 
 def _question(frame, seen, index, readout):
@@ -56,5 +56,6 @@ def test_each_question_reads_its_frame_right_after_the_document(path, monkeypatc
         assert [out[j][d] for j in range(6)] == rows, f"document {d}"
     # each document packs its prefix once, two frames, and three
     # questions' cue and step
-    assert tokens == sum(len(doc) for doc in DOCS) + len(DOCS) * (4 + 6)
+    per_document = len(FIRST) + len(SECOND) + 3 * (len(CUE) + len(STEP))
+    assert tokens == sum(map(len, DOCS)) + len(DOCS) * per_document
     assert not run.arena.accounting.owned

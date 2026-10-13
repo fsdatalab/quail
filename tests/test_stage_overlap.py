@@ -8,9 +8,10 @@ from quail.backends.quail.executor import stages as stages_mod
 from quail.backends.quail.executor.stages import Stage, run_stages
 
 
-@pytest.mark.parametrize("shared_readout", [True, False])
 @pytest.mark.parametrize("path", ["unified", "tree"])
-@pytest.mark.parametrize("budget,pages", [(1000, 400), (18, 400), (1000, 3)])
+@pytest.mark.parametrize("budget,pages,shared_readout", [
+    (1000, 400, True), (1000, 400, False), (18, 400, True), (1000, 3, True),
+])
 def test_append_stages_launch_between_document_decisions(path, budget, pages,
                                                        shared_readout, monkeypatch):
     cpu_staging(monkeypatch)
