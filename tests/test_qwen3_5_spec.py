@@ -54,8 +54,11 @@ def test_only_attention_layers_keep_kv():
 
 
 def test_weights_match_the_plan():
-    # equation 21: 2 x (embedding + MLP + attention + Gated DeltaNet)
-    assert SPEC.W_mem == 8_411_152_384
+    # equation 21: 2 x (embedding + MLP + attention + Gated DeltaNet) is
+    # 8,411,152,384 bytes; vLLM's model memory after loading is 1.6
+    # percent above it, and the spec carries the measured figure
+    assert SPEC.W_mem == 8_545_764_864
+    assert SPEC.W_mem / 8_411_152_384 < 1.02
     assert SPEC.widest_projection == 18_432
     conv_weights = 24 * (2 * 16 * 128 + 32 * 128) * 4
     assert conv_weights == 786_432
@@ -116,8 +119,9 @@ def test_chunk_size_follows_the_plan():
 
     # equation 22: 2^31 - 1 over the widest projection, 18,432 columns
     assert budgets.kernel_index_cap(SPEC) == 116_508
-    # the memory bound before it, 412,529 tokens
-    assert budgets.chunk_memory_bound(SPEC, H100_SXM) == 412_529
+    # the memory bound before it: 412,529 tokens from the config's bytes,
+    # 411,707 from vLLM's measured model memory
+    assert budgets.chunk_memory_bound(SPEC, H100_SXM) == 411_707
     assert budgets.chunk_budget(SPEC, H100_SXM) == 116_508
 
 

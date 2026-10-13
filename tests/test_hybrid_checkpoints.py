@@ -3,6 +3,8 @@
 The numbers are the ones in the hybrid-model plan for Qwen3.5-4B on an H100.
 """
 
+from dataclasses import replace
+
 import pytest
 from fakes import bare_arena
 
@@ -15,6 +17,9 @@ from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_5_4B_BF16
 
 SPEC = QWEN3_5_4B_BF16
 CHUNK = 116_508
+# the plan's weights are 2 bytes x the config's tensors; the spec carries
+# vLLM's measured model memory, 1.6 percent higher
+PLAN = replace(SPEC, w_mem_bytes=8_411_152_384)
 
 
 def test_checkpoint_sizes():
@@ -28,24 +33,24 @@ def test_checkpoint_sizes():
 
 
 def test_pool_and_chunk_follow_the_plan():
-    assert budgets.chunk_budget(SPEC, H100_SXM) == CHUNK
-    assert budgets.checkpoint_pass_bytes(SPEC, 1_024, CHUNK) == 4_941 * 2**20
-    assert budgets.hybrid_pool_pages(SPEC, H100_SXM, CHUNK) == 68_060
+    assert budgets.chunk_budget(PLAN, H100_SXM) == CHUNK
+    assert budgets.checkpoint_pass_bytes(PLAN, 1_024, CHUNK) == 4_941 * 2**20
+    assert budgets.hybrid_pool_pages(PLAN, H100_SXM, CHUNK) == 68_060
 
 
 @pytest.mark.parametrize("tokens,slots", [(200, 611), (1_000, 422),
                                           (4_000, 195), (16_000, 61)])
 def test_slots_per_document_length(tokens, slots):
-    kv_pages, sliding = budgets.arena_pages(SPEC, H100_SXM, CHUNK, tokens)
+    kv_pages, sliding = budgets.arena_pages(PLAN, H100_SXM, CHUNK, tokens)
     assert sliding == 0
-    assert budgets.checkpoint_slots(SPEC, H100_SXM, CHUNK, kv_pages) == slots
+    assert budgets.checkpoint_slots(PLAN, H100_SXM, CHUNK, kv_pages) == slots
     # a document's retained cost fits the pool
     cost = -(-tokens // 16) + budgets.checkpoint_pages(SPEC)
     assert slots * cost <= 68_060 < (slots + 1) * cost
 
 
 def test_plan_example_splits_the_pool():
-    kv_pages, _ = budgets.arena_pages(SPEC, H100_SXM, CHUNK, 1_000)
+    kv_pages, _ = budgets.arena_pages(PLAN, H100_SXM, CHUNK, 1_000)
     assert kv_pages in (26_597, 26_598)
 
 
@@ -58,10 +63,17 @@ def test_models_without_gdn_layers_keep_their_pages():
 
 
 def test_arena_arguments_name_the_state_shapes():
-    args = checkpoint_arena_args(SPEC, H100_SXM, CHUNK, 26_598)
+    args = checkpoint_arena_args(PLAN, H100_SXM, CHUNK, 26_598)
     assert args["n_state_slots"] == 422
     assert args["gdn_state_shape"] == (24, 32, 128, 128)
     assert args["conv_state_shape"] == (24, 3, 8_192)
+
+
+def test_measured_weights_leave_a_slightly_smaller_pool():
+    # 134,612,480 bytes more weights than the plan: 0.4 percent fewer pages
+    assert budgets.hybrid_pool_pages(SPEC, H100_SXM, CHUNK) == 67_803
+    kv_pages, _ = budgets.arena_pages(SPEC, H100_SXM, CHUNK, 200)
+    assert budgets.checkpoint_slots(SPEC, H100_SXM, CHUNK, kv_pages) == 609
 
 
 def test_priority_divides_by_kv_and_checkpoint_pages():

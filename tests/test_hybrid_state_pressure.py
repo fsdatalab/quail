@@ -339,6 +339,60 @@ def _tree_run(slots, parents, children, monkeypatch, stages=1, frame=(),
          prefixes=docs)
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "the retry after a missing parent state keeps the borrowed pages, so "
+    "the child's whole-prefix writes land on the parent's pages with "
+    "the same values; known and left as is"))
+def test_a_borrower_that_computes_its_whole_prefix_borrows_no_pages(
+        monkeypatch):
+    # a fresh group writes KV from its start token on, so the pages it
+    # borrowed must end at that token; the retry after a missing parent
+    # state packs the whole prefix and must not keep the parent's pages
+    from quail.backends.quail.executor import stages as stages_mod
+
+    parent, child = ("d", 0), ("d", 1)
+    arena = _arena(6, pages=4_000)
+    arena.alloc(parent, 64)       # saved state covers 64 tokens, not 48
+    arena.accounting.alloc_slot(parent)
+    arena.record_checkpoint(parent, 64)
+    arena.retain(parent, 64)
+    prefixes = [[1] * 64, [1] * 48 + [2] * 16]
+    tree = SimpleNamespace(parent=[None, 0], shared=[0, 48], order=[0, 1],
+                           shared_tokens=48)
+    # let the borrow reach the planner, which finds no state to start from
+    monkeypatch.setattr(stages_mod._StageExecutor, "_state_borrow_check",
+                        lambda self, can_borrow: can_borrow)
+    packed, unborrowed = [], []
+    real_plan, real_pack = plan_phases, _pack
+
+    def counting_plan(arena, groups, stage):
+        try:
+            return real_plan(arena, groups, stage)
+        except chunk_mod.BorrowStateMissingError:
+            unborrowed.append(True)
+            raise
+
+    def checked_pack(torch, arena, specs, **options):
+        for spec in specs:
+            if spec.get("prefix") is not None:
+                packed.append((
+                    spec["key"], spec.get("start", 0),
+                    arena.accounting.borrowed_tokens(spec["key"])
+                    if spec["key"] in arena.accounting.borrowed else 0))
+        return real_pack(torch, arena, specs, **options)
+
+    monkeypatch.setitem(globals(), "plan_phases", counting_plan)
+    monkeypatch.setitem(globals(), "_pack", checked_pack)
+    stage = [Stage(suffixes=[[9, 9]], readout=_Readout(), single=True)]
+    _run(arena, [parent, child], stage, 1_000, monkeypatch,
+         prefix_tree=tree, prefixes=prefixes)
+    assert unborrowed, "the parent's state was meant to be missing"
+    # the retry packs the child from token 0 with nothing borrowed
+    key, start, borrowed = packed[-1]
+    assert key == child
+    assert borrowed <= start
+
+
 @pytest.mark.parametrize("slots", [3, 6, 10, 15, 30])
 @pytest.mark.parametrize("children", [2, 6])
 @pytest.mark.parametrize("stages,frame", [(1, ()), (1, (7, 7)), (2, (7, 7))])

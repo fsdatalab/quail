@@ -19,9 +19,11 @@ QWEN3_5_4B_BF16 = ModelSpec(
     hf_name="Qwen/Qwen3.5-4B",
     revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
     kv_bytes=2.0,
-    w_mem_bytes=8_411_152_384,    # derived from the config as 2 bytes
-    #                               x (projections + convolution +
-    #                               embedding); not yet measured as loaded
+    w_mem_bytes=8_545_764_864,    # vLLM's model memory after loading
+    #                               the text path, 1.6 percent above the
+    #                               8,411,152,384 bytes of the config's
+    #                               tensors; /results/ablations/
+    #                               qwen3.5-4b-bf16-vllm-limits-768.json
     vocab=248_320,
     tied_head=True,
     weight_precision="bf16",

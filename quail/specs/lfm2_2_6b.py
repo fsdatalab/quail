@@ -19,9 +19,11 @@ LFM2_2_6B_BF16 = ModelSpec(
     hf_name="LiquidAI/LFM2-2.6B",
     revision="36ed799f7024ef169ba92ffe184821835e15cc66",
     kv_bytes=2.0,
-    w_mem_bytes=5_138_544_640,    # 2 bytes x the hub's parameter count,
-    #                               which includes norms and the tied
-    #                               embedding; not yet measured as loaded
+    w_mem_bytes=5_154_951_680,    # vLLM's model memory after loading,
+    #                               0.3 percent above the 5,138,544,640
+    #                               bytes of 2 x the hub's parameter
+    #                               count; /results/ablations/
+    #                               lfm2-2.6b-bf16-vllm-limits-768.json
     vocab=65_536,
     tied_head=True,
     weight_precision="bf16",
