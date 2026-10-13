@@ -331,6 +331,20 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
         node.node_id for node in result.plan.topological_nodes()]
     assert restored.node_metrics == result.node_metrics
     assert restored.explain() == result.explain()
+    # a node's extra counters are saved beside the standard fields and
+    # return to its extension metrics when the report is loaded
+    report = dict(result.report)
+    report["node_metrics"] = {
+        node_id: {**metrics, "borrowed_prefix_tokens": 3}
+        for node_id, metrics in report["node_metrics"].items()}
+    counted = QueryResult.from_table(result.collect(), report=report)
+    counted.attach_executed_plan(registry.codecs)
+    assert all(metrics.extension == {"borrowed_prefix_tokens": 3}
+               for metrics in counted.node_metrics.values())
+    assert {node_id: metrics.wall_s
+            for node_id, metrics in counted.node_metrics.items()} == {
+        node_id: metrics.wall_s
+        for node_id, metrics in result.node_metrics.items()}
 
     # results are assembled from survivor indices and join tables
     true_join_tables = [

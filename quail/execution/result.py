@@ -417,7 +417,7 @@ class QueryResult:
         if encoded is not None:
             self.plan = decode_graph(encoded, codecs)
             self.node_metrics = {
-                node_id: NodeMetrics(**metrics)
+                node_id: NodeMetrics.from_scalars(metrics)
                 for node_id, metrics in self.report.get(
                     "node_metrics", {}).items()
             }

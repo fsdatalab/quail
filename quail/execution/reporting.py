@@ -1,22 +1,10 @@
 """Build execution reports and collect model answer relations."""
 
-from dataclasses import fields
-
 import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.execution.result import true_answer_rows
-from quail.execution.runner import NodeMetrics
 from quail.physical import AiJoin, Barrier, PortRef, ValueType
-
-
-def restore_node_metrics(metrics: dict) -> NodeMetrics:
-    """Rebuild a node's metrics from a report; extra numbers go to extension."""
-    names = {field.name for field in fields(NodeMetrics)} - {"extension"}
-    return NodeMetrics(
-        **{name: value for name, value in metrics.items() if name in names},
-        extension={name: value for name, value in metrics.items()
-                   if name not in names})
 
 
 def execution_report(plan, metrics, notes, coordinator_wall):

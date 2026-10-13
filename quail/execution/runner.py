@@ -59,6 +59,19 @@ class NodeMetrics:
     chunks: int = 0
     extension: Mapping[str, Any] = field(default_factory=dict)
 
+    @classmethod
+    def from_scalars(cls, metrics: Mapping[str, Any]) -> "NodeMetrics":
+        """Rebuild metrics saved by scalar_node_metrics.
+
+        A saved number that is not a standard field, such as a filter's
+        borrowed_prefix_tokens, returns to the extension mapping.
+        """
+        names = {field.name for field in fields(cls)} - {"extension"}
+        return cls(
+            **{name: value for name, value in metrics.items() if name in names},
+            extension={name: value for name, value in metrics.items()
+                       if name not in names})
+
     def __add__(self, other: "NodeMetrics") -> "NodeMetrics":
         return NodeMetrics(
             wall_s=self.wall_s + other.wall_s,

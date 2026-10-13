@@ -12,11 +12,7 @@ from quail.api.execute import execute_query
 from quail.catalog import inputs
 from quail.catalog.pairs import columns_key, estimate_pair_fraction
 from quail.execution.projection import projection_for
-from quail.execution.reporting import (
-    collect_answers,
-    execution_report,
-    restore_node_metrics,
-)
+from quail.execution.reporting import collect_answers, execution_report
 from quail.execution.result import QueryResult
 from quail.execution.runner import (
     ExecutionContext,
@@ -417,7 +413,7 @@ class Query:
             ),
             initial_outputs=response.outputs,
             initial_metrics={
-                node_id: restore_node_metrics(metrics)
+                node_id: NodeMetrics.from_scalars(metrics)
                 for node_id, metrics in out.get("node_metrics", {}).items()
             },
         )
