@@ -28,9 +28,9 @@ from quail.catalog.tokens import (
 from quail.progress import Progress, say
 
 # rows the planner samples to estimate selectivities and token lengths
-ESTIMATE_SAMPLE = 256
+ESTIMATE_SAMPLE = 1024
 # rows written per tokenization step, so progress stays responsive
-TOKENIZE_ROWS = 1_024
+TOKENIZE_ROWS = 2048
 
 
 class InputStore:

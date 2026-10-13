@@ -60,12 +60,6 @@ class RefusalError(RuntimeError):
             + " ".join(refusal.reasons))
 
 
-TOKENIZE_ROWS = 2048
-
-# documents tokenized to measure tokens per byte for a length estimate
-ESTIMATE_SAMPLE = 1024
-
-
 class PlanEditError(ValueError):
     """Raised by insert, remove, and move when an edit breaks a rule."""
 
