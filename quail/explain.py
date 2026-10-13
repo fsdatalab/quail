@@ -572,6 +572,46 @@ def rule_lines(logical_rules, physical_rules) -> list[str]:
             f"{names(physical_rules)}"]
 
 
+def architecture_lines(model_name: str) -> list[str]:
+    """Return the architecture, weight precision, and kernel path lines.
+
+    The gated delta net recurrence kernel is read from QUAIL_GDN_PREFILL
+    in this process, which is the worker's value when the worker was
+    started from the same shell.
+
+    Args:
+        model_name: A registered model name.
+
+    Returns:
+        Two lines, or none for a name that is not registered.
+    """
+    import os
+    from collections import Counter
+
+    from quail.specs import MODELS
+
+    spec = MODELS.get(model_name)
+    if spec is None:
+        return []
+    kinds = Counter(spec.layer_kinds)
+    layers = (", ".join(f"{count} {kind}" for kind, count in kinds.items())
+              if kinds else f"{spec.layers} layers")
+    gemm = ("fp8 GEMM (DeepGEMM)" if spec.weight_precision == "fp8"
+            else "bf16 GEMM (cuBLAS)")
+    paths = [f"linear layers: {gemm}"]
+    if "full_attention" in kinds or "sliding_attention" in kinds:
+        paths.append("attention: FlashAttention over paged KV")
+    if "gated_delta_net" in kinds:
+        requested = os.environ.get("QUAIL_GDN_PREFILL", "triton")
+        paths.append("gated_delta_net: Triton convolution, "
+                     f"recurrence={requested} (QUAIL_GDN_PREFILL)")
+    if "short_conv" in kinds:
+        paths.append("short_conv: Triton convolution")
+    return [f"architecture={spec.arch} ({layers}), "
+            f"weights={spec.weight_precision}",
+            "kernels: " + "; ".join(paths)]
+
+
 def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
             result=None, usd_per_hour: float | None = None,
             rules=None) -> str:
@@ -611,6 +651,8 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         if admission is not None:
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
+        lines.extend("  " + line for line in architecture_lines(
+            physical.model))
     lines.append("")
     lines.extend("  " + line for line in physical_tree(
         physical.graph, logical=logical, verbose=verbose,

@@ -26,6 +26,8 @@ def install_fake_torch(monkeypatch):
     torch.inference_mode = contextlib.nullcontext
     torch.cuda = SimpleNamespace(mem_get_info=lambda: (40 * 2**30, 80 * 2**30),
                                  current_blas_handle=lambda: 1,
+                                 memory_allocated=lambda: 8 * 2**30,
+                                 max_memory_allocated=lambda: 20 * 2**30,
                                  synchronize=lambda: None)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.nn", nn)
@@ -40,6 +42,8 @@ def booted(monkeypatch):
     for name in ("load_model", "build_pipeline", "AnswerRows", "KVArena",
                  "AsyncAnswers"):
         monkeypatch.setattr(worker, name, lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(worker, "KVArena", lambda *a, **k: SimpleNamespace(
+        k=[], v=[], gdn_state=None, conv_state=None))
     monkeypatch.setattr(worker, "warm_kernels",
                         lambda *a, **k: {"tier": "compiled"})
 
@@ -82,6 +86,9 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
         PAYLOAD, registry, object(), backend, runtime_state)
 
     assert response.metrics["boot_kind"] == "cold"
+    assert response.metrics["memory_bytes"] == {
+        "weights": 8 * 2**30, "kv": 0, "state": 0,
+        "other": 12 * 2**30, "peak": 20 * 2**30}
     assert gpu.prepared_boot is None
     assert len(boots) == 1
 

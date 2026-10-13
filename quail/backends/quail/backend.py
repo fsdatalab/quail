@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -164,6 +165,13 @@ class QuailBackend:
         if gpu_count not in {1, 2, 4, 8}:
             return SupportResult.reject(
                 "Quail requires 1, 2, 4, or 8 GPUs")
+        if (os.environ.get("QUAIL_GDN_PREFILL") == "flashinfer"
+                and "gated_delta_net" in model.layer_kinds
+                and device.name != "h100-sxm"):
+            return SupportResult.reject(
+                f"QUAIL_GDN_PREFILL=flashinfer needs a Hopper GPU, and "
+                f"device {device.name!r} is not one; use triton or auto "
+                f"for {model.name!r}")
         return SupportResult.accept()
 
     def plan(

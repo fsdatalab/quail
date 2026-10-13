@@ -78,6 +78,7 @@ class LoadedGpu:
                                 moe_backend=spec.moe_backend,
                                 text_only=spec.vision_tower)
         self.load_model_s = time.perf_counter() - t0
+        self.weights_bytes = int(torch.cuda.memory_allocated())
 
         # cuBLAS allocates its handle outside PyTorch's caching allocator.
         # At the warm-up peak the allocator holds every free byte, so
@@ -102,6 +103,7 @@ class LoadedGpu:
                              **checkpoint_arena_args(spec, device, budget,
                                                      full_pages))
         self.arena_s = time.perf_counter() - t0
+        self.pool_bytes = pool_bytes(self.arena)
 
         t0 = time.perf_counter()
         self.decision_head = None
@@ -209,6 +211,45 @@ def decision_offsets(spec, path) -> tuple[int, ...]:
             f"and the last row; layout {spec.prompt_layout!r} gives "
             f"{len(offsets)} rows")
     return offsets
+
+
+def pool_bytes(arena) -> dict:
+    """Return the bytes of an arena's KV pages and checkpoint state.
+
+    Args:
+        arena: A KVArena, or any object with the k, v, gdn_state and
+            conv_state tensors.
+
+    Returns:
+        {"kv": ..., "state": ...} in bytes. State is the Gated DeltaNet
+        recurrent state plus the convolution columns, or 0.
+    """
+    def size(tensor):
+        return 0 if tensor is None else int(
+            tensor.numel() * tensor.element_size())
+
+    return {
+        "kv": sum(size(t) for t in list(arena.k) + list(arena.v)),
+        "state": size(arena.gdn_state) + size(arena.conv_state),
+    }
+
+
+def memory_breakdown(weights_bytes: int, pools: dict, peak_bytes: int) -> dict:
+    """Split the peak allocated bytes into weights, KV, state, and the rest.
+
+    Args:
+        weights_bytes: Bytes allocated after the model loaded.
+        pools: The pool_bytes of the arena.
+        peak_bytes: The process's peak allocated bytes, which includes
+            kernel warm-up and every query run so far.
+
+    Returns:
+        The four numbers and the peak. "other" is the peak minus the
+        three pools: activations, temporary copies, and warm-up.
+    """
+    other = peak_bytes - weights_bytes - pools["kv"] - pools["state"]
+    return {"weights": weights_bytes, "kv": pools["kv"],
+            "state": pools["state"], "other": other, "peak": peak_bytes}
 
 
 def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
@@ -374,6 +415,10 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     report["boot_s"] = boot["boot_s"]
     report["boot_kind"] = boot["kind"]
     report["boot"] = boot
+    if hasattr(gpu, "pool_bytes"):
+        report["memory_bytes"] = memory_breakdown(
+            gpu.weights_bytes, gpu.pool_bytes,
+            int(gpu.torch.cuda.max_memory_allocated()))
     return PhysicalResponse(outputs, report)
 
 
