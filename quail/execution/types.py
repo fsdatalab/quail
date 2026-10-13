@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from itertools import chain
 from typing import Any
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -125,15 +126,15 @@ def _document_ids_table(port: OutputPort, value: Any) -> pa.Table:
 
 
 def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
-    documents = []
-    positions = []
-    answers = []
-    for document, row in value.items():
-        for answer in row:
-            documents.append(int(document))
-            positions.append(node.written_pos)
-            answers.append(bool(answer))
-    return filter_answer_table(node.alias, documents, positions, answers)
+    """One row per answer a document gave, repeating the document id."""
+    lengths = np.fromiter((len(row) for row in value.values()), dtype=np.int64,
+                          count=len(value))
+    documents = np.repeat(
+        np.fromiter(value.keys(), dtype=np.int64, count=len(value)), lengths)
+    answers = (np.concatenate([np.asarray(row, dtype=bool) for row in value.values()])
+               if len(value) else np.zeros(0, dtype=bool))
+    return filter_answer_table(
+        node.alias, documents, np.full(len(documents), node.written_pos), answers)
 
 
 def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:

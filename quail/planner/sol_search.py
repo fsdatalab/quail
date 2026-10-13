@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
-from quail.catalog.pairs import pair_table
+from quail.catalog.pairs import RowGroups, pair_table, partner_map
 from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan
@@ -117,7 +117,7 @@ class Search:
         # as prefixes; another alias of the column may reuse them
         self.computed_rows_by_column: dict[str, set[int]] = {}
         # joins without conditions are absent: every pair
-        self.allowed_pairs: dict[int, dict[str, dict[int, set[int]]]] = {}
+        self.allowed_pairs: dict[int, dict[str, RowGroups]] = {}
         for position, join in enumerate(self.joins):
             oriented = oriented_join_conditions(join)
             if oriented is None:
@@ -132,13 +132,9 @@ class Search:
                 for _, right in conditions
             ]
             pairs = pair_table(left_alias, left_keys, right_alias, right_keys)
-            by_side = {left_alias: {}, right_alias: {}}
-            for left_row, right_row in zip(
-                    pairs.column(left_alias).to_pylist(),
-                    pairs.column(right_alias).to_pylist()):
-                by_side[left_alias].setdefault(left_row, set()).add(right_row)
-                by_side[right_alias].setdefault(right_row, set()).add(left_row)
-            self.allowed_pairs[position] = by_side
+            self.allowed_pairs[position] = {
+                left_alias: partner_map(pairs, left_alias, right_alias),
+                right_alias: partner_map(pairs, right_alias, left_alias)}
 
     # ---- work counting --------------------------------------------
 
