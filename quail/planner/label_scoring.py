@@ -71,10 +71,8 @@ class ClassifyScoring(ClassifyStatistics):
         # together within the forward pass and KV budget
         need = len(head) + self.longest + len(tail) + max(suffixes)
         if need > self.budget:
-            raise ClassifyRefusedError(
-                f"a document in {self.alias!r} needs {need} tokens with its "
-                f"classification prompt, but the forward pass budget is "
-                f"{self.budget} tokens", need, self.budget)
+            raise ClassifyRefusedError.over_budget(
+                f"a document in {self.alias!r}", need, self.budget)
         return replace(
             spec, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), label_token_ids=labels,

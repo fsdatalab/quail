@@ -9,14 +9,10 @@ The names below are the planning interface a model backend uses.
 """
 
 from .api import plan_query, refine_plan
-from .build import (
-    balanced_shards,
-    build_physical_plan,
-    hash_join_nodes,
-    regular_predicates,
-)
+from .build import build_physical_plan, hash_join_nodes, regular_predicates
 from .filter_order import default_order_rule, order_filters_indexed
 from .plan import CorpusStats, EngineConfig, PhysicalPlan, Refusal
+from .shards import balanced_shards
 from .statistics import join_specs, preamble_tokens
 
 __all__ = [

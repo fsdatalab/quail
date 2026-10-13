@@ -17,7 +17,7 @@ from quail.catalog.tokens import (
     decode_token_documents,
     prefix_tree,
 )
-from quail.planner.build import contiguous_shards
+from quail.planner.shards import contiguous_shards
 from quail.planner.statistics import AliasStats, summarize_alias
 
 

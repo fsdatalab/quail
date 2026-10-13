@@ -125,7 +125,7 @@ def _five_filter_plan(catalog, sels):
 
 
 def test_gpu_copies_and_memory_refusals(catalog):
-    from quail.planner.build import contiguous_shards
+    from quail.planner.shards import contiguous_shards
 
     assert contiguous_shards([2, 2, 2], 2) == (((0, 1), (1, 3)), [2, 4])
     assert contiguous_shards([1, 0, 9], 2) == (((0, 1), (1, 3)), [1, 9])

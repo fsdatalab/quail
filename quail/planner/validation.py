@@ -170,6 +170,14 @@ class ClassifyRefusedError(Exception):
         super().__init__(reason)
         self.reason, self.needed, self.available = reason, needed, available
 
+    @classmethod
+    def over_budget(cls, what: str, need: int,
+                    budget: int) -> "ClassifyRefusedError":
+        """The error for a prompt longer than the forward pass budget."""
+        return cls(
+            f"{what} needs {need} tokens with its classification prompt, "
+            f"but the forward pass budget is {budget} tokens", need, budget)
+
     def refusal(self) -> Refusal:
         """Convert this exception to a planning Refusal."""
         return Refusal(reasons=(self.reason,), constraint="suffix_over_chunk",

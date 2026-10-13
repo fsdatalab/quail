@@ -43,6 +43,11 @@ def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
     return int(free // model.act_per_token) // CHUNK_SLACK
 
 
+def pages(tokens: int) -> int:
+    """Return the KV pages that hold tokens."""
+    return -(-tokens // PAGE_TOKENS)
+
+
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     """Effective chunk budget, floored at the compute knee.
 
