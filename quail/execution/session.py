@@ -744,15 +744,16 @@ class Query:
                 tuple(self.session.registry.logical_rules.values()),
                 context)
             rewritten = self.logical.operators()
+            backend = self.session.registry.backend(config.backend)
+            # an extension backend may leave the capability flags unset
+            reads_text = getattr(backend, "reads_document_text", False)
+            locates_answers = getattr(backend, "locates_answers_in_text", False)
             offset_aliases = {alias for extract in rewritten.extracts
                               for alias in extract.call.aliases()}
             for s in rewritten.scans:
                 columns = s.columns
-                with_offsets = (config.backend == "quail"
-                                and s.alias in offset_aliases)
-                if config.backend in {
-                    "stock_vllm", "pipelined_vllm", "dumb_vllm"
-                }:
+                with_offsets = locates_answers and s.alias in offset_aliases
+                if reads_text:
                     columns = tuple(dict.fromkeys((*columns, s.column)))
                 if s.alias not in self._estimated:
                     self._token_inputs[s.alias] = self.session.tokenize(

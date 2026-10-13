@@ -10,18 +10,21 @@ import pyarrow as pa
 import pytest
 
 import quail
-from quail.backends import pipelined_sglang_backend, stock_vllm_backend
 from quail.backends.base import BackendExecutionContext, GpuContext
-from quail.backends.request import RequestModelExecution
-from quail.backends.sglang import SGLangClient
-from quail.backends.vllm import VLLMEngine, sampling_kwargs
-from quail.builtins import built_in_registry
-from quail.physical import (
-    Project,
+from quail.baselines import (
     RequestClassifySpec,
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
+    pipelined_sglang_backend,
+    stock_vllm_backend,
+)
+from quail.baselines.request import RequestModelExecution
+from quail.baselines.sglang import SGLangClient
+from quail.baselines.vllm import VLLMEngine, sampling_kwargs
+from quail.builtins import built_in_registry
+from quail.physical import (
+    Project,
     decode_graph,
 )
 from quail.planner.plan import EngineConfig
@@ -90,7 +93,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
 
     boot = {"client": _Client(), "sampling_params": object(), "capacity": CAPACITY}
     monkeypatch.setattr(
-        "quail.backends.vllm.VLLMEngine.boot",
+        "quail.baselines.vllm.VLLMEngine.boot",
         lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
     session = _session(
         "stock_vllm",
@@ -290,7 +293,7 @@ def test_sglang_submission_and_cancellation():
 
 def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch):
     from quail.backends.quail.executor.models.diffusion_gemma import canvas_token_ids
-    from quail.backends.vllm import GigatokenVLLMTokenizer, diffusion_canvas
+    from quail.baselines.vllm import GigatokenVLLMTokenizer, diffusion_canvas
 
     engine = VLLMEngine()
     qwen = engine.llm_kwargs(QWEN3_4B_FP8)
@@ -480,7 +483,7 @@ def test_request_backends_decode_one_request_per_row_the_join_keeps():
 
 
 def test_match_label_takes_the_longest_label_the_answer_starts_with():
-    from quail.backends.request import match_label
+    from quail.baselines.request import match_label
 
     labels = ("cardiac", "cardiac disorders", "vascular disorders")
     assert match_label(" Cardiac disorders\nbecause", labels) == "cardiac disorders"

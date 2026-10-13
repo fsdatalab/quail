@@ -168,6 +168,8 @@ class QuailBackend:
 
     name = "quail"
     runtime_package = "vllm==0.26.0"
+    reads_document_text = False
+    locates_answers_in_text = True
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
         if device.name not in {"h100-sxm", "rtx-pro-6000-blackwell-server"}:

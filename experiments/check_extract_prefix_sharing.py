@@ -129,7 +129,7 @@ def compare(run: str, diagnose: bool = False):
         sources = {}
         for relative in ("quail/planner/physical_rules.py", "quail/cost/extract.py",
                          "quail/backends/quail/executor/operators/extract.py",
-                         "quail/backends/request.py", "quail/bench/quailb.py"):
+                         "quail/baselines/request.py", "quail/bench/quailb.py"):
             source = Path("/root") / relative
             sources[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
         summary["source_sha256"] = sources

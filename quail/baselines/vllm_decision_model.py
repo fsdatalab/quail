@@ -12,11 +12,12 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.pooler.abstract import Pooler
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
-from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
+from quail.backends.quail.executor.models.decision2_vllm import (
+    Decision2ForCausalLM,
+)
 from quail.backends.quail.executor.readout import DecisionHead
-from quail.backends.vllm_decision import TASK, pool_decision_rows
+from quail.baselines.vllm_decision import TASK, pool_decision_rows
 
 
 class DecisionPooler(Pooler):
@@ -42,22 +43,6 @@ class DecisionPooler(Pooler):
             torch.split(hidden_states, cursor.num_scheduled_tokens_cpu.tolist()),
             cursor.is_finished().tolist(), pooling_metadata.pooling_params,
             pooling_metadata.pooling_states)
-
-
-class Decision2ForCausalLM(Qwen3ForCausalLM):
-    """Qwen3 that loads a Decision 2.0 backbone's tensor names.
-
-    The backbone is saved as a bare Qwen3Model, without the `model.`
-    prefix Qwen3ForCausalLM's parameters carry.
-    """
-
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"": "model."})
-
-    def load_weights(self, weights):
-        loader = AutoWeightsLoader(
-            self, skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings
-                                 else None))
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class Qwen3DecisionModel(Decision2ForCausalLM, VllmModelForPooling):

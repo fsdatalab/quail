@@ -11,8 +11,9 @@ from __future__ import annotations
 import math
 import time
 
+from quail.backends.quail.executor.models.decision2 import register_backbone
+
 ARCHITECTURE = "Qwen3DecisionModel"
-BACKBONE_ARCHITECTURE = "Decision2ForCausalLM"
 TASK = "token_classify"
 OFFSETS_KEY = "decision_offsets"
 
@@ -21,10 +22,10 @@ def register() -> None:
     """Register the Decision 2.0 model classes with vLLM's model registry."""
     from vllm import ModelRegistry
 
-    for name in (ARCHITECTURE, BACKBONE_ARCHITECTURE):
-        if name not in ModelRegistry.get_supported_archs():
-            ModelRegistry.register_model(
-                name, f"quail.backends.vllm_decision_model:{name}")
+    register_backbone()
+    if ARCHITECTURE not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model(
+            ARCHITECTURE, f"quail.baselines.vllm_decision_model:{ARCHITECTURE}")
 
 
 def pooling_params(offsets, *, read_cache: bool = True):
@@ -190,7 +191,7 @@ class VLLMDecisionClient:
     def run_filter_chain(self, params, body_ids, question_ids, read_answer, *,
                          tag="q", body_texts=None, question_texts=None):
         """Pipeline filter stages through the engine's step loop."""
-        from quail.backends.request_scheduling import run_filter_chain
+        from quail.baselines.request_scheduling import run_filter_chain
 
         if body_texts is not None or question_texts is not None:
             raise ValueError("decision prompts are submitted as token ids")
@@ -217,7 +218,7 @@ def boot_decision(spec, llm_kwargs: dict) -> tuple[dict, dict]:
     from vllm import LLM
 
     from quail.backends.quail.executor.model import engine_args, resolve_model_path
-    from quail.backends.vllm import _capacity
+    from quail.baselines.vllm import _capacity
 
     register()
     path = resolve_model_path(spec.hf_name, spec.revision)

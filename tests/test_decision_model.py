@@ -15,7 +15,8 @@ import quail
 from quail.backends.quail.executor import model
 from quail.backends.quail.executor.readout import DecisionHead, DecisionRows
 from quail.backends.quail.executor.stages import Stage
-from quail.backends.request import RequestBackend
+from quail.baselines import RequestExecution
+from quail.baselines.request import RequestBackend
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (
     ColumnRef,
@@ -26,7 +27,7 @@ from quail.logical import (
     render_join_prompt_ids,
     render_join_prompt_text,
 )
-from quail.physical import AiClassify, AiFilter, AiJoin, AiScore, RequestExecution
+from quail.physical import AiClassify, AiFilter, AiJoin, AiScore
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import DECISION_2_KAI_0_6B_BF16, H100_SXM
 
@@ -402,7 +403,7 @@ class _PoolingState:
 
 def test_vllm_decision_pooler_reads_offsets_across_prefill_chunks():
     torch = pytest.importorskip("torch")
-    from quail.backends.vllm_decision import pool_decision_rows
+    from quail.baselines.vllm_decision import pool_decision_rows
 
     head = SimpleNamespace(scores=lambda options, last: options[..., 0]
                            * 100 + last[:, None, 0])
@@ -425,7 +426,7 @@ def test_vllm_decision_pooler_reads_offsets_across_prefill_chunks():
 
 
 def test_vllm_decision_client_reruns_a_request_without_its_rows():
-    from quail.backends import vllm_decision
+    from quail.baselines import vllm_decision
 
     def output(request_id, data):
         return SimpleNamespace(request_id=request_id, finished=True,

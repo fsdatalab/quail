@@ -12,7 +12,14 @@ from typing import Any, Mapping
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
-from quail.backends.request_scheduling import (
+from quail.baselines import (
+    RequestClassifySpec,
+    RequestExecution,
+    RequestExtractSpec,
+    RequestFilterSpec,
+    RequestJoinSpec,
+)
+from quail.baselines.request_scheduling import (
     canvas_answer,
     run_join_grouped,
     text_answer,
@@ -63,11 +70,6 @@ from quail.physical import (
     PortRef,
     Project,
     Recombine,
-    RequestClassifySpec,
-    RequestExecution,
-    RequestExtractSpec,
-    RequestFilterSpec,
-    RequestJoinSpec,
     Scan,
 )
 from quail.physical.base import input_ports
@@ -793,7 +795,7 @@ def _choose_documents(client, spec, bodies) -> dict:
         The same fields as _classify_documents; no answer is unmatched
         and none generates tokens.
     """
-    from quail.backends.vllm_decision import choice_index, pooling_params
+    from quail.baselines.vllm_decision import choice_index, pooling_params
 
     tail = _token_list(spec.tail_token_ids)
     prompts = [{"prompt_token_ids": body + tail} for body in bodies]
@@ -836,7 +838,7 @@ class RequestModelExecution:
             self.read_answer = partial(true_bit, true_ids=true_ids)
         self.decides = context.model.role == "decision"
         if self.decides:
-            from quail.backends.vllm_decision import decision_bit, pooling_params
+            from quail.baselines.vllm_decision import decision_bit, pooling_params
 
             self.sampling_params = pooling_params(settings["decision_offsets"])
             self.read_answer = decision_bit
@@ -1381,10 +1383,15 @@ class RequestBackend:
     engine: Any
     filter_submission: str
     join_submission: str = "anchor-major"
+    locates_answers_in_text = False
 
     @property
     def runtime_package(self) -> str:
         return self.engine.runtime_package
+
+    @property
+    def reads_document_text(self) -> bool:
+        return bool(getattr(self.engine, "reads_document_text", False))
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
         label = self.engine.label

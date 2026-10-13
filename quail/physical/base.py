@@ -159,6 +159,16 @@ class PhysicalNode:
         return self.attributes()
 
 
+def validate_integer_setting(name: str, value: int, minimum: int = 1) -> None:
+    """Validate an integer execution setting.
+
+    Raises:
+        ValueError: When value is not an int at least minimum.
+    """
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+
+
 class GraphValidationError(ValueError):
     """Raised when a physical graph is invalid."""
 

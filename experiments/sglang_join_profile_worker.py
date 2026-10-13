@@ -46,7 +46,7 @@ def profile_worker(directory, connection, input_detail=False):
         import sglang
         import torch
 
-        import quail.backends.request as request_module
+        import quail.baselines.request as request_module
         from quail.bench.process_isolation import run_backend_group
 
         original = request_module.run_join_grouped

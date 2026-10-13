@@ -293,7 +293,7 @@ class VLLMJudge:
     def __init__(self, repo: str = MODEL_REPO, revision: str = MODEL_REVISION):
         from vllm import LLM
 
-        from quail.backends.vllm import _capacity
+        from quail.baselines.vllm import _capacity
 
         started = time.perf_counter()
         self.llm = LLM(

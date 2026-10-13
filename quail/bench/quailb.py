@@ -25,11 +25,12 @@ import pyarrow.compute as pc
 
 import quail
 import quail_b as benchmark
+from quail.baselines import RequestExecution
 from quail.bench import substrait
 from quail.bench.results import write_json
 from quail.logical.expressions import SPAN_SUFFIX
 from quail.logical.prompts import bind_classify_prompt
-from quail.physical import AiClassify, AiExtract, AiScore, RequestExecution
+from quail.physical import AiClassify, AiExtract, AiScore
 from quail.planner.plan import Refusal
 from quail.progress import say
 from quail.specs import H100_USD_PER_HOUR, MODELS

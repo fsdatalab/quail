@@ -118,7 +118,7 @@ def stock_rows_main(out_path, every_layer=False):
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     from vllm import LLM, SamplingParams
 
-    from quail.backends.vllm import diffusion_canvas
+    from quail.baselines.vllm import diffusion_canvas
     from quail.specs import MODELS
 
     prompts = _prompt_ids()

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.backends.request_scheduling import canvas_answer, text_answer, true_bit
+from quail.baselines.request_scheduling import canvas_answer, text_answer, true_bit
 
 
 def _output(entries=None, *, tokens=(7,), text="TRUE"):

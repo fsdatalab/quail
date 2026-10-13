@@ -8,7 +8,7 @@ import pytest
 from quail.backends.quail.backend import QuailBackend
 from quail.backends.quail.executor.models import build_pipeline, supported_archs
 from quail.backends.quail.executor.models.qwen3 import Qwen3Pipeline
-from quail.backends.request import RequestBackend
+from quail.baselines.request import RequestBackend
 from quail.cost.budgets import tree_attention_allowed
 from quail.specs import (
     DECISION_2_KAI_0_6B_BF16,

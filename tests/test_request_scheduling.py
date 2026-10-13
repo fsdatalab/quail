@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.backends.request_scheduling import (
+from quail.baselines.request_scheduling import (
     run_filter_chain,
     run_filter_chain_async,
     run_join_grouped,

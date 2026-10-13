@@ -11,6 +11,10 @@ import test_score as score_tests
 from fakes import letter_tokens
 
 import quail
+from quail.baselines import (
+    RequestExecution,
+    RequestExtractSpec,
+)
 from quail.catalog import DocumentProvider
 from quail.execution.pipelines import build_pipelines
 from quail.execution.reranker import RerankerModelExecution
@@ -28,8 +32,6 @@ from quail.physical import (
     AiJoin,
     ExtractSpec,
     Filter,
-    RequestExecution,
-    RequestExtractSpec,
 )
 from quail.planner.plan import EngineConfig, Refusal
 
@@ -447,7 +449,7 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     boot = {"client": _PhraseClient(), "sampling_params": object(),
             "capacity": request_tests.CAPACITY}
     monkeypatch.setattr(
-        "quail.backends.vllm.VLLMEngine.boot",
+        "quail.baselines.vllm.VLLMEngine.boot",
         lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
     result = request_tests._run_stock_vllm(session, query)
     rows = result.collect()

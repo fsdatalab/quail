@@ -6,8 +6,8 @@ import os
 import time
 from contextlib import contextmanager
 
-from quail.backends.request import RequestBackend
-from quail.backends.request_scheduling import (
+from quail.baselines.request import RequestBackend
+from quail.baselines.request_scheduling import (
     MAX_BATCHED_TOKENS,
     MAX_SEQUENCES,
     run_filter_chain,
@@ -182,6 +182,8 @@ class VLLMEngine:
 
     kind = "vllm"
     label = "vLLM"
+    # prompts are rendered as text and tokenized by vLLM
+    reads_document_text = True
     runtime_package = "vllm==0.26.0"
     # a request can decode an answer as text
     scores_labels = True
@@ -215,7 +217,7 @@ class VLLMEngine:
     def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
         """Load the spec's model and return the engine state and boot record."""
         if spec.role == "decision":
-            from quail.backends.vllm_decision import boot_decision
+            from quail.baselines.vllm_decision import boot_decision
 
             return boot_decision(spec, self.llm_kwargs(spec))
         from vllm import LLM, SamplingParams
@@ -223,7 +225,7 @@ class VLLMEngine:
         from vllm.tokenizers import TokenizerRegistry
 
         registered = (
-            "quail.backends.vllm", "GigatokenVLLMTokenizer"
+            "quail.baselines.vllm", "GigatokenVLLMTokenizer"
         )
         if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
             TokenizerRegistry.register("gigatoken", *registered)

@@ -6,6 +6,7 @@ import pytest
 
 import quail
 from quail.backends.quail.prompts import join_request
+from quail.baselines import RequestExecution
 from quail.bench.quailb import (
     answer_oracle,
     build_query,
@@ -21,7 +22,7 @@ from quail.execution.result import answer_table
 from quail.execution.runner import NodeMetrics, NodeResult, RunResult
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical.prompts import render_join_prompt_text
-from quail.physical import AiFilter, AiJoin, RequestExecution, decode_graph
+from quail.physical import AiFilter, AiJoin, decode_graph
 from quail.physical import Scan as PhysicalScan
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import QWEN3_4B_FP8

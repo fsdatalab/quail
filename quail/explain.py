@@ -21,7 +21,6 @@ from quail.physical import (
     PortRef,
     Project,
     Recombine,
-    RequestExecution,
     Scan,
     Sort,
 )
@@ -462,25 +461,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             title += f": next_anchor={node.next_anchor}"
         elif isinstance(node, Recombine):
             title += ": " + ", ".join(node.alias_order)
-        elif isinstance(node, RequestExecution):
-            title += f": {node.backend_name}"
-            for spec in node.filters:
-                written = filters.get(spec.alias, ())
-                for position in spec.written_positions:
-                    predicate = (_short_prompt(written[position].prompt)
-                                 if position < len(written)
-                                 else f"predicate {position + 1}")
-                    details.append(f"Filter {spec.alias}: {predicate}")
-            for spec in node.joins:
-                predicate = (_short_prompt(joins[spec.written_pos].prompt)
-                             if spec.written_pos < len(joins)
-                             else f"predicate {spec.written_pos + 1}")
-                details.append(f"Join {spec.semantics}: {predicate}")
-            for spec in node.extracts:
-                details.append(
-                    f"Extract {spec.alias}: {spec.output} "
-                    f"question={spec.question!r}, "
-                    f"trim={'on' if spec.trim else 'off'}")
         else:
             title = node.type_name
             if not verbose:

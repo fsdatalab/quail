@@ -6,8 +6,8 @@ import asyncio
 import time
 import uuid
 
-from quail.backends.request import RequestBackend
-from quail.backends.request_scheduling import (
+from quail.baselines.request import RequestBackend
+from quail.baselines.request_scheduling import (
     MAX_BATCHED_TOKENS,
     MAX_SEQUENCES,
     run_filter_chain_async,

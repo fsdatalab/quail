@@ -15,6 +15,9 @@ from quail.backends.quail.executor.label_stages import label_requests
 from quail.backends.quail.executor.operators.classify import QuailClassifier
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs, answer_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
+from quail.baselines import (
+    RequestExecution,
+)
 from quail.bench.quailb import run_output
 from quail.catalog import DocumentProvider
 from quail.execution.labels import (
@@ -39,7 +42,6 @@ from quail.physical import (
     ClassifySpec,
     Filter,
     InList,
-    RequestExecution,
     decode_graph,
     encode_graph,
 )
