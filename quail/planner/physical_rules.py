@@ -8,7 +8,7 @@
   (letters, trie_tree, or trie_decode) whose estimated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
-  computing it again, in filters, joins, classifications, and scores
+  computing it again, in filters, joins, extractions, classifications, and scores
   of one table.
 - tree_attention: each join is annotated with the attention path the
   cost model prefers for its partners' reads of the anchor's KV.
@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
+from quail.cost.extract import estimate as extract_estimate
 from quail.cost.retention import coefficients
 from quail.cost.score import score_fixed_tokens
 from quail.execution.pipelines import build_pipelines
@@ -27,6 +28,7 @@ from quail.logical.prompts import classify_prompt_tokens
 from quail.physical import (
     Aggregate,
     AiClassify,
+    AiExtract,
     AiFilter,
     AiInference,
     AiJoin,
@@ -286,7 +288,8 @@ class PrefixSharing:
     on. The filter then writes pages even when it has one stage, since
     borrowed pages must exist. A join always writes its anchors' KV,
     so it fires for any join whose anchors share a whole page; a
-    classification writes its documents' KV the same way. A score of
+    classification or extraction writes its documents' KV the same way.
+    A score of
     one table is priced like a filter that writes no pages, since
     without sharing its documents follow one shared prompt head.
     """
@@ -335,6 +338,20 @@ class PrefixSharing:
                     node = replace(node, spec=_shared_classify_spec(
                         node, context, store, resident=resident))
                     changed = True
+            elif (isinstance(node, AiExtract) and node.spec is not None
+                  and not node.spec.share_prefixes):
+                lengths = context.document_tokens.get(node.spec.alias)
+                store = _token_store(lengths)
+                if store is not None and sharing_pays(
+                        context.model, context.device,
+                        shared_tokens=page_aligned_shared_tokens(store),
+                        total_tokens=sum(lengths), writes_pages=True):
+                    pipeline = pipelines.get(node.node_id)
+                    resident = (pipeline is not None
+                                and pipeline.members[0].node_id != node.node_id)
+                    node = replace(node, spec=_shared_extract_spec(
+                        node, context, store, resident=resident))
+                    changed = True
             elif (isinstance(node, AiScore) and node.spec is not None
                   and len(node.spec.aliases) == 1
                   and not node.spec.share_prefixes):
@@ -362,6 +379,20 @@ def _shared_classify_spec(node, context, store, *, resident=False):
     table = classify_scoring(context, node.spec.aliases[0],
                            shared=document_shared_tokens(store))
     return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
+
+
+def _shared_extract_spec(node, context, store, *, resident=False):
+    """Enable extraction prefix sharing and price the borrowed document KV."""
+    from quail.cost.budgets import chunk_budget
+
+    spec = node.spec
+    head, tail = spec.prompt_token_parts
+    cost = extract_estimate(
+        spec.expected_inputs, context.document_tokens[spec.alias],
+        len(head), len(tail), chunk=chunk_budget(context.model, context.device),
+        model=context.model, device=context.device, resident=resident,
+        shared=page_tree(store).shared)
+    return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
 
 
 def _shared_score_spec(spec, shared_tokens, lengths, canvas_tokens):

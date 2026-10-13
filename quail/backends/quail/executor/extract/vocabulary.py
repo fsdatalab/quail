@@ -8,7 +8,9 @@ tokens that close an answer.
 """
 
 import numpy as np
+import pyarrow as pa
 
+from quail.execution.tokens import GigatokenEncoder, TokenOffsets, TokenView
 from quail.progress import say
 
 
@@ -24,11 +26,15 @@ class Vocabulary:
     """One model's tokenizer and the vocabulary index its extractions read.
 
     Args:
-        tokenizer: A Hugging Face fast tokenizer, which returns the
-            character offsets of the tokens it produces.
+        tokenizer: A Gigatoken encoder or a tokenizer supplied by the caller.
     """
 
     def __init__(self, tokenizer):
+        self.encoder = tokenizer if isinstance(tokenizer, GigatokenEncoder) else None
+        self.offsets = (TokenOffsets(self.encoder.token_bytes())
+                        if self.encoder is not None else None)
+        if self.encoder is not None:
+            tokenizer = self.encoder.tokenizer.as_hf()
         self.tokenizer = tokenizer
         self.vocab = tokenizer.convert_ids_to_tokens(list(range(len(tokenizer))))
         # a document token may be written without its leading space
@@ -52,20 +58,22 @@ class Vocabulary:
                 key_ids[key] = kid
             key_of[index] = kid
         self.key_of = key_of
-        self._options = {}      # key id -> (its first tokens, their lengths)
-        self._fillers = {}      # (token, length) -> the rest of its word
+        self._options = [None] * len(self.keys)
+        self._fillers = [None] * len(self.vocab)
         self.quote_id = tokenizer.convert_tokens_to_ids('"')
         # a decoder closes the answer with any token that opens with the
         # quote, such as `".` or `",`: together they are the stop
         self.stop_ids = tuple(index for index, token in enumerate(self.vocab)
                               if token.startswith('"'))
-        self._stops = set(self.stop_ids)
+        self.is_stop = np.zeros(len(self.vocab), dtype=bool)
+        self.is_stop[list(self.stop_ids)] = True
         # a decoder may copy a token and close the quote in one token,
         # such as `."` or `)"`: the merged token of each token that has one
         index = {token: i for i, token in enumerate(self.vocab)}
-        self.merged = {index[token[:-1]]: i for token, i in index.items()
-                       if len(token) > 1 and token.endswith('"')
-                       and token[:-1] in index}
+        self.merged = np.full(len(self.vocab), -1, dtype=np.int64)
+        for token, i in index.items():
+            if len(token) > 1 and token.endswith('"') and token[:-1] in index:
+                self.merged[index[token[:-1]]] = i
         self.none_id = self.encode_ids("none")[0]
 
     def options(self, kid: int) -> tuple:
@@ -75,7 +83,7 @@ class Vocabulary:
         token spelling a prefix of an ASCII word, followed by the rest
         of the word. A token without a word begins itself alone.
         """
-        found = self._options.get(kid)
+        found = self._options[kid]
         if found is None:
             key = self.keys[kid]
             if isinstance(key, str) and key.isascii():
@@ -92,24 +100,54 @@ class Vocabulary:
 
     def filler(self, token: int, length: int) -> list:
         """Return the rest of a token's word after its first length characters."""
-        found = self._fillers.get((token, length))
+        text = self.vocab[token]
+        text = text[1:] if text.startswith("Ġ") else text
+        if length >= len(text):
+            return []
+        cached = self._fillers[token]
+        if cached is None:
+            cached = self._fillers[token] = [None] * len(text)
+        found = cached[length]
         if found is None:
-            text = self.vocab[token]
-            text = text[1:] if text.startswith("Ġ") else text
-            found = self.encode_ids(text[length:]) if length < len(text) else []
-            self._fillers[(token, length)] = found
+            found = cached[length] = self.encode_ids(text[length:])
         return found
+
+    def document_batch(self, texts, stored) -> list[TokenView]:
+        """Return document token views with source character ranges.
+
+        Stored views with offsets are reused. Other inputs are encoded
+        together through the same tokenizer used for continuations.
+        """
+        missing = [index for index, tokens in enumerate(stored)
+                   if not isinstance(tokens, TokenView)
+                   or tokens.character_offsets is None]
+        result = list(stored)
+        for index, (ids, offsets) in zip(
+                missing, self.encode_batch([texts[index] for index in missing])):
+            bounds = np.asarray(offsets, dtype=np.int64).reshape(-1)
+            result[index] = TokenView(
+                pa.array(ids, type=pa.int32()),
+                pa.FixedSizeListArray.from_arrays(pa.array(bounds), 2))
+        return result
 
     def encode(self, text: str) -> tuple:
         """Return the token ids of a text and each token's character range."""
-        enc = self.tokenizer(text, return_offsets_mapping=True,
-                             add_special_tokens=False)
-        return list(enc["input_ids"]), list(enc["offset_mapping"])
+        return self.encode_batch([text])[0]
 
     def encode_batch(self, texts: list) -> list:
         """Return (token ids, character ranges) of each text, encoded together."""
         if not texts:
             return []
+        if self.encoder is not None:
+            source = pa.array(texts, type=pa.large_string())
+            ids, boundaries = self.encoder.batch_numpy(texts)
+            tokens = pa.LargeListArray.from_arrays(boundaries, pa.array(ids))
+            offsets, exact = self.offsets.numpy(tokens, source)
+            if not exact.to_numpy(zero_copy_only=False).all():
+                raise ValueError(
+                    "AI.EXTRACT requires token bytes that preserve the source text")
+            return [(ids[start:end], offsets[start:end])
+                    for start, end in zip(boundaries[:-1], boundaries[1:])]
         backend = getattr(self.tokenizer, "backend_tokenizer", None)
         if backend is not None:
             return [(enc.ids, enc.offsets) for enc in backend.encode_batch(
@@ -127,12 +165,10 @@ def load_vocabulary(state) -> Vocabulary:
     """Return the loaded model's vocabulary index, loading its tokenizer once."""
     loaded = state.loaded_model
     if loaded.vocabulary is None:
-        from transformers import AutoTokenizer
-
         from quail.backends.quail.executor.model import resolve_model_path
 
         spec = loaded.model_spec
         path = resolve_model_path(spec.hf_name, spec.revision)
         say(f"loading the tokenizer of {spec.name} for AI.EXTRACT")
-        loaded.vocabulary = Vocabulary(AutoTokenizer.from_pretrained(path))
+        loaded.vocabulary = Vocabulary(GigatokenEncoder(path))
     return loaded.vocabulary

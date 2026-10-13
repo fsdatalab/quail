@@ -45,6 +45,8 @@ class DocumentTokens:
     ends: np.ndarray
     tokens: np.ndarray
     kids: np.ndarray
+    candidates: "CandidateIndex | None" = None
+    normalized: "SqueezedText | None" = None
 
     @classmethod
     def of(cls, vocabulary, prefix, tokens) -> "DocumentTokens":
@@ -53,6 +55,66 @@ class DocumentTokens:
         spans = np.array([span for _, span in tokens], dtype=np.int64).reshape(-1, 2)
         ids = np.asarray(prefix, dtype=np.int64)[positions]
         return cls(positions, spans[:, 0], spans[:, 1], ids, vocabulary.key_of[ids])
+
+
+class SqueezedText:
+    """A document with single spaces and a map to original character ends."""
+
+    def __init__(self, text: str):
+        self.text = re.sub(r"\s+", " ", text)
+        self.ends = np.arange(1, len(self.text) + 1, dtype=np.int64)
+        runs = list(re.finditer(r"\s{2,}", text))
+        if runs:
+            removed = np.array([run.end() - run.start() - 1 for run in runs])
+            starts = np.array([run.start() for run in runs])
+            positions = starts - (np.cumsum(removed) - removed)
+            shifts = np.zeros(len(self.text), dtype=np.int64)
+            shifts[positions] = removed
+            self.ends += np.cumsum(shifts)
+
+    def window(self, start: int, end: int) -> tuple:
+        """Return a normalized original-text interval and its character ends."""
+        if start >= end:
+            return "", self.ends[:0]
+        left = int(np.searchsorted(self.ends, start, side="right"))
+        right = int(np.searchsorted(self.ends, end - 1, side="right")) + 1
+        ends = self.ends[left:right]
+        if len(ends) and ends[-1] > end:
+            # A window may end inside a whitespace run.
+            ends = ends.copy()
+            ends[-1] = end
+        return self.text[left:right], ends
+
+
+@dataclass
+class CandidateIndex:
+    """The document's candidate starts, shared across extraction questions."""
+
+    kids: np.ndarray
+    anchor: np.ndarray
+    inverse: np.ndarray
+    token: np.ndarray
+    length: np.ndarray
+    segment: np.ndarray
+    offsets: np.ndarray
+    position_order: np.ndarray
+    position_offsets: np.ndarray
+
+    @classmethod
+    def of(cls, scan: DocumentTokens, vocabulary: Vocabulary) -> "CandidateIndex":
+        kids, first, inverse, occurrences = np.unique(
+            scan.kids, return_index=True, return_inverse=True, return_counts=True)
+        options = [vocabulary.options(int(kid)) for kid in kids]
+        counts = np.array([len(t) for t, _ in options], dtype=np.int64)
+        token = (np.concatenate([t for t, _ in options]) if options
+                 else np.empty(0, dtype=np.int64))
+        length = (np.concatenate([j for _, j in options]) if options
+                  else np.empty(0, dtype=np.int64))
+        return cls(kids, first, inverse, token, length,
+                   np.repeat(np.arange(len(kids)), counts),
+                   np.cumsum(counts) - counts,
+                   np.argsort(inverse, kind="stable"),
+                   np.concatenate(([0], np.cumsum(occurrences))))
 
 
 # characters a stream tokenizes ahead of its start at a time: room
@@ -72,6 +134,7 @@ class Stream:
     text: str           # the document
     exhausted: bool = False
     windows: int = 0    # windows tokenized so far
+    normalized: SqueezedText | None = None
 
     def extend(self, vocabulary: Vocabulary) -> None:
         """Tokenize the next window of the document past the stream's end.
@@ -79,27 +142,60 @@ class Stream:
         A window ends before a whitespace character, so no word is cut
         and the tokens are the whole text's.
         """
+        extend_streams([self], vocabulary)
+
+    def window(self) -> tuple:
+        """Return the next squeezed window and its document character ends."""
         start = self.ends[-1]
         cut = start + (STREAM_FIRST_WINDOW if not self.windows else STREAM_WINDOW)
         self.windows += 1
         if cut < len(self.text):
             boundary = re.compile(r"\s").search(self.text, cut)
             cut = len(self.text) if boundary is None else boundary.start()
-        window = self.text[start:cut]
-        rest, ends = squeezed(window)
+        cut = min(cut, len(self.text))
+        if self.normalized is None:
+            self.normalized = SqueezedText(self.text)
+        rest, ends = self.normalized.window(start, cut)
+        self.exhausted = cut == len(self.text)
         if not rest:
             self.exhausted = True
-            return
-        ids, offsets = vocabulary.encode(rest)
-        self.stream.extend(ids)
-        self.ends.extend(start + ends[b - 1] for _, b in offsets)
-        self.exhausted = start + len(window) >= len(self.text)
+        return rest, ends
+
+    def append_window(self, window, encoded) -> None:
+        """Append a tokenized window and its document character ends."""
+        _, ends = window
+        ids, offsets = encoded
+        if isinstance(ids, np.ndarray):
+            self.stream.extend(ids.tolist())
+            self.ends.extend(ends[offsets[:, 1] - 1].tolist())
+        else:
+            self.stream.extend(ids)
+            self.ends.extend(int(ends[b - 1]) for _, b in offsets)
 
     def next(self, at: int, vocabulary: Vocabulary):
         """Return the stream's token at index at, or None past its end."""
         while at >= len(self.stream) and not self.exhausted:
             self.extend(vocabulary)
         return self.stream[at] if at < len(self.stream) else None
+
+
+def extend_streams(streams: list, vocabulary: Vocabulary) -> None:
+    """Tokenize one window for each stream together, preserving character offsets."""
+    pending = []
+    for stream in streams:
+        window = stream.window()
+        if window[0]:
+            pending.append((stream, window))
+    encoded = vocabulary.encode_batch([window[0] for _, window in pending])
+    for (stream, window), tokens in zip(pending, encoded):
+        stream.append_window(window, tokens)
+
+
+def ensure_tokens(streams: list, at: int, vocabulary: Vocabulary) -> None:
+    """Tokenize windows together until each live stream reaches the requested token."""
+    while pending := [stream for stream in streams
+                      if at >= len(stream.stream) and not stream.exhausted]:
+        extend_streams(pending, vocabulary)
 
 
 @dataclass
@@ -138,9 +234,9 @@ class FirstTokens:
     def best_token(self) -> int:
         return int(self.token[int(np.argmax(self.lp))])
 
-    @property
-    def allowed(self) -> set:
-        return set(self.token[self.rated].tolist())
+    def allows(self, token: int) -> bool:
+        """Return whether the token can begin a rated document word."""
+        return bool(np.any(self.rated & (self.token == token)))
 
     def keys_of(self, token: int) -> np.ndarray:
         """Return the indices into kids of the keys the token begins."""
@@ -148,7 +244,13 @@ class FirstTokens:
 
     def positions_of(self, keys) -> np.ndarray:
         """Return the scan indices of the positions of those keys."""
-        return np.flatnonzero(np.isin(self.inverse, keys))
+        if len(keys) == 1:
+            index = self.scan.candidates
+            start, end = index.position_offsets[keys[0]:keys[0] + 2]
+            return index.position_order[start:end]
+        selected = np.zeros(len(self.kids), dtype=bool)
+        selected[keys] = True
+        return np.flatnonzero(selected[self.inverse])
 
     def __iter__(self):
         """Yield the prefix index of every rated position."""
@@ -177,7 +279,7 @@ def first_tokens(vocabulary: Vocabulary, lp, prefix, tokens,
 
     Args:
         vocabulary: The model's vocabulary index.
-        lp: The row's log probabilities by token id.
+        lp: The row's log probabilities indexed by token id.
         prefix: The document's prefix tokens.
         tokens: The document tokens, as document_tokens returns them,
             or None with scan.
@@ -186,27 +288,18 @@ def first_tokens(vocabulary: Vocabulary, lp, prefix, tokens,
     """
     if scan is None:
         scan = DocumentTokens.of(vocabulary, prefix, tokens)
-    kids, first, inverse = np.unique(scan.kids, return_index=True,
-                                     return_inverse=True)
-    options = [vocabulary.options(int(kid)) for kid in kids]
-    counts = np.array([len(t) for t, _ in options], dtype=np.int64)
-    option_token = np.concatenate([t for t, _ in options]) if options else \
-        np.zeros(0, dtype=np.int64)
-    option_length = np.concatenate([j for _, j in options]) if options else \
-        np.zeros(0, dtype=np.int64)
-    segment = np.repeat(np.arange(len(kids), dtype=np.int64), counts)
-    rated = np.full(len(vocabulary.vocab), NEG, dtype=np.float32)
-    rated[np.fromiter(lp.keys(), dtype=np.int64, count=len(lp))] = \
-        np.fromiter(lp.values(), dtype=np.float32, count=len(lp))
-    values = rated[option_token]
-    # per key, the likeliest option; the whole word wins a tie with a
-    # prefix of itself
-    order = np.lexsort((-option_length, -values, segment))
-    _, top = np.unique(segment[order], return_index=True)
-    best = order[top]
-    return FirstTokens(scan=scan, kids=kids, inverse=inverse,
-                  token=option_token[best], lp=values[best],
-                  length=option_length[best], anchor=first)
+    if scan.candidates is None:
+        scan.candidates = CandidateIndex.of(scan, vocabulary)
+    index = scan.candidates
+    values = lp[index.token]
+    maxima = np.maximum.reduceat(values, index.offsets)
+    # Vocabulary.options orders equal-score spellings longest first.
+    eligible = np.where(values == maxima[index.segment],
+                        np.arange(len(values)), len(values))
+    best = np.minimum.reduceat(eligible, index.offsets)
+    return FirstTokens(scan=scan, kids=index.kids, inverse=index.inverse,
+                       token=index.token[best], lp=values[best],
+                       length=index.length[best], anchor=index.anchor)
 
 
 def squeezed(text: str) -> tuple:
@@ -243,6 +336,8 @@ def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,
     to the document.
     """
     scan = starts.scan
+    if scan.normalized is None:
+        scan.normalized = SqueezedText(text)
     streams = []
     for k in starts.keys_of(first):
         filler = vocabulary.filler(int(scan.tokens[starts.anchor[k]]),
@@ -250,5 +345,6 @@ def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,
         for at in starts.positions_of([k]):
             end = int(scan.ends[at])
             streams.append(Stream(int(scan.starts[at]), [first, *filler],
-                                  [end] * (1 + len(filler)), text))
+                                  [end] * (1 + len(filler)), text,
+                                  normalized=scan.normalized))
     return streams

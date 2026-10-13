@@ -24,7 +24,8 @@ from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
 from quail.backends.quail.executor.stages import Stage
-from quail.cost.extract import ANSWER_MAX_TOKENS, DRAFT_TOKENS
+from quail.execution.tokens import chain_tokens
+from quail.extraction import ANSWER_MAX_TOKENS, DRAFT_TOKENS
 
 
 class ExtractionStages:
@@ -65,13 +66,14 @@ class ExtractionStages:
         self.vocabulary = vocabulary
         shown = [text.as_py() if hasattr(text, "as_py") else str(text)
                  for text in (texts[document] for document in document_ids)]
-        encoded = vocabulary.encode_batch(shown)
-        self.docs = [self._prepare(index, document, text, *ids,
-                                   None if documents is None
-                                   else documents[document])
-                     for index, (document, text, ids)
-                     in enumerate(zip(document_ids, shown, encoded))]
-        self.by_key = {doc.key: doc for doc in self.docs}
+        stored = [None if documents is None else documents[document]
+                  for document in document_ids]
+        encoded = vocabulary.document_batch(shown, stored)
+        self.docs = [self._prepare(index, document, text, tokens, prior)
+                     for index, (document, text, tokens, prior) in enumerate(
+                         zip(document_ids, shown, encoded, stored))]
+        self.document_indices = np.full(len(texts), -1, dtype=np.int64)
+        self.document_indices[document_ids] = np.arange(len(document_ids))
         self.prefixes = [doc.prefix for doc in self.docs]
         self.keys = [doc.key for doc in self.docs]
         self.readout = self._readout(state) if readout is None else readout
@@ -122,7 +124,7 @@ class ExtractionStages:
                                 [vocabulary.none_id, vocabulary.stop_ids],
                                 ragged=True)
 
-    def _prepare(self, index, document, text, ids, offsets, stored) -> Document:
+    def _prepare(self, index, document, text, ids, stored) -> Document:
         """Build a document's prefix: the head and its text.
 
         The key names the document under the extraction's head, so a
@@ -135,11 +137,15 @@ class ExtractionStages:
         key = (("extract", alias), int(document))
         shared = (self.head == self.shared_head if self.shared_head is not None
                   else not self.head)
-        if shared and stored is not None and [int(t) for t in stored] == ids:
+        tokens = ids.numpy()
+        same_tokens = stored is ids
+        if shared and stored is not None and not same_tokens:
+            prior = stored.numpy() if hasattr(stored, "numpy") else np.asarray(stored)
+            same_tokens = np.array_equal(prior, tokens)
+        if shared and stored is not None and same_tokens:
             key = (alias, int(document))
-        prefix = self.head + ids
-        bounds = np.asarray(offsets, dtype=np.int64).reshape(-1, 2)
-        tokens = np.asarray(ids, dtype=np.int64)
+        prefix = chain_tokens(self.head, ids)
+        bounds = ids.character_offsets
         scan = DocumentTokens(
             np.arange(len(ids), dtype=np.int64) + len(self.head),
             bounds[:, 0], bounds[:, 1], tokens, self.vocabulary.key_of[tokens])
@@ -162,13 +168,13 @@ class ExtractionStages:
 
     def _step_suffix(self, q, key):
         """Feed the chosen token, then the document's next tokens as a draft."""
-        answer = self.by_key[key].answers[q]
+        answer = self.docs[self.document_indices[key[1]]].answers[q]
         if answer.done:
             return Stage.SKIP
         return [self.decoder.draft(answer)]
 
     def _step_discard(self, q, key):
-        return self.by_key[key].answers[q].discard
+        return self.docs[self.document_indices[key[1]]].answers[q].discard
 
     def _step_decide(self, q, anchor, row):
         """Verify the round's draft by the row after each of its tokens."""

@@ -2,6 +2,7 @@
 
 import time
 
+import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail.executor.extract import (
@@ -12,6 +13,7 @@ from quail.backends.quail.executor.parts import (
     chunks,
     gpu_seconds,
     input_staging,
+    shared_prefix_tree,
     stage_spans,
 )
 from quail.backends.quail.executor.stages import run_stages
@@ -24,13 +26,17 @@ SPAN_TYPE = pa.struct([("start", pa.int32()), ("end", pa.int32())])
 
 def extract_answer_table(spec, document_ids, answers, spans) -> pa.Table:
     """Return one row per document: its id, its answer, and the answer's span."""
-    return pa.table({
-        spec.alias: pa.array([int(d) for d in document_ids], pa.int32()),
-        spec.name: pa.array(answers, pa.string()),
-        spec.span_name: pa.array(
-            [None if span is None else {"start": span[0], "end": span[1]}
-             for span in spans], SPAN_TYPE),
-    })
+    valid = np.fromiter((span is not None for span in spans), dtype=bool,
+                        count=len(spans))
+    bounds = np.zeros((len(spans), 2), dtype=np.int32)
+    bounds[valid] = np.asarray([span for span in spans if span is not None],
+                               dtype=np.int32).reshape(-1, 2)
+    span_array = pa.StructArray.from_arrays(
+        [pa.array(bounds[:, 0]), pa.array(bounds[:, 1])],
+        fields=list(SPAN_TYPE), mask=pa.array(~valid))
+    return pa.Table.from_arrays(
+        [pa.array(document_ids, pa.int32()), pa.array(answers, pa.string()),
+         span_array], names=[spec.alias, spec.name, spec.span_name])
 
 
 def execute_extract(state: QueryExecutionState, node, inputs) -> NodeResult:
@@ -79,11 +85,13 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
             arena.retain(key, len(stages.prefixes[anchor]))
 
     if document_ids:
+        tree = (shared_prefix_tree(nodes[0].spec.name, stages.prefixes, arena)
+                if nodes[0].spec.share_prefixes else None)
         _, spans, fresh = run_stages(
             state.torch, arena, state.loaded_model.pipeline,
             stages.stages, stages.prefixes, state.chunk_tokens,
             anchor_keys=stages.keys, on_settled=on_settled,
-            staging=input_staging(state), stats=stats,
+            staging=input_staging(state), prefix_tree=tree, stats=stats,
             label=f"extract {', '.join(node.spec.name for node in nodes)}",
             appended_tokens=stages.appended_tokens)
     stages.finish()

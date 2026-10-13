@@ -10,6 +10,26 @@ from quail.physical import AiClassify
 from quail.progress import logger
 
 
+def shared_prefix_tree(name, prefixes, arena):
+    """Build the prefix tree of an operator's document prefixes.
+
+    Args:
+        name: The operator's output name, for the log line.
+        prefixes: Token sequences, one per document.
+        arena: KVArena whose page size the shares round down to.
+
+    Returns:
+        The PrefixTree over prefixes.
+    """
+    started = time.perf_counter()
+    tree = prefix_tree(prefixes, arena.page_tokens)
+    logger.info(
+        "prefix sharing on %s: %s documents borrow %s tokens "
+        "(tree built in %.2f s)", name, len(prefixes),
+        tree.shared_tokens, time.perf_counter() - started)
+    return tree
+
+
 def input_staging(state: QueryExecutionState):
     """Return reusable transfer buffers with an empty fixed-token cache."""
     if state.loaded_model.input_staging is None:

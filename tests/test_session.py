@@ -29,6 +29,52 @@ from quail.planner.plan import EngineConfig
 CONFIG = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 
 
+def test_session_upgrades_and_reuses_offsets_without_invalidating_old_tokens():
+    calls = []
+
+    def encode(text):
+        calls.append(text)
+        return [ord(char) for char in text]
+
+    encode.token_bytes = lambda: {ord(char): char.encode() for char in "café東京"}
+    with quail.Session(CONFIG, tokenizer=encode) as session:
+        session.register("docs", quail.DocumentProvider.from_table(
+            pa.table({"id": [1, 2], "text": ["café", "東京"]}), id_col="id"))
+        previous = session.tokenize("docs", "text").tokens
+        assert not previous.has_offsets
+        calls.clear()
+        upgraded = session.tokenize("docs", "text", with_offsets=True).tokens
+        repeated = session.tokenize("docs", "text", with_offsets=True).tokens
+        assert upgraded is repeated and upgraded.has_offsets
+        assert not calls
+        assert list(previous[0]) == list(upgraded[0]) == encode("café")
+        assert upgraded[1].character_offsets.tolist() == [[0, 1], [1, 2]]
+
+
+def test_offset_tokenization_uses_gigatoken_without_transformers(monkeypatch):
+    from gigatoken import Tokenizer as Gigatoken
+    from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+
+    texts = ["café", "東京"]
+    native = Tokenizer(models.BPE())
+    native.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    native.train_from_iterator(texts, trainers.BpeTrainer(
+        vocab_size=300, initial_alphabet=pre_tokenizers.ByteLevel.alphabet()))
+    expected = native.encode_batch(texts)
+    fast = Gigatoken(native)
+    monkeypatch.setitem(sys.modules, "gigatoken",
+                        SimpleNamespace(Tokenizer=lambda source: fast))
+    monkeypatch.setitem(sys.modules, "transformers", None)
+    with quail.Session(CONFIG) as session:
+        session.register("docs", quail.DocumentProvider.from_table(
+            pa.table({"id": [1, 2], "text": texts}), id_col="id"))
+        scan = session.tokenize_async("docs", "text", with_offsets=True).result()
+        for index, encoding in enumerate(expected):
+            assert list(scan.tokens[index]) == encoding.ids
+            assert scan.tokens[index].character_offsets.tolist() == [
+                list(pair) for pair in encoding.offsets]
+
+
 def fake_tok(text):
     return text.split()
 

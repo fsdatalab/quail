@@ -20,6 +20,8 @@ from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
 import quail
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
+from quail.backends.quail.executor.extract.candidates import Stream
+from quail.backends.quail.executor.extract.decode import AnswerState, Decoder
 from quail.backends.quail.executor.extract.stages import ExtractionStages
 from quail.backends.quail.executor.extract.vocabulary import same_word
 from quail.backends.quail.executor.operators.extract import (
@@ -32,7 +34,6 @@ from quail.backends.quail.executor.state import LoadedModelState, QueryExecution
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
-from quail.cost.extract import ANSWER_MAX_TOKENS, DRAFT_TOKENS
 from quail.execution.execute import execute_query
 from quail.execution.runner import (
     ExecutionContext,
@@ -42,7 +43,9 @@ from quail.execution.runner import (
     compute_subgraph,
     scalar_node_metrics,
 )
+from quail.execution.tokens import TokenOffsets, TokenStore
 from quail.execution.types import PhysicalResponse, export_physical_outputs
+from quail.extraction import ANSWER_MAX_TOKENS, DRAFT_TOKENS
 from quail.physical import (
     AiExtract,
     AiFilter,
@@ -54,6 +57,53 @@ from quail.physical import (
 from quail.physical.base import input_ports
 from quail.planner.plan import EngineConfig
 from quail.specs import DEVICES, MODELS
+
+
+@pytest.mark.parametrize(("scores", "stop", "chosen", "done"), [
+    ([-1, -1, -9, -10], -8, 1, False),
+    ([-2, -1, -0.5, -10], -8, 1, True),
+    ([-2, -1, -9, -10], -1, None, True),
+    ([-2, -1, -9, -0.5], -8, None, True),
+])
+@pytest.mark.parametrize("tokens", [[1], [33, 1, 1]])
+def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
+        scores, stop, chosen, done, tokens):
+    merged = np.full(64, -1, dtype=np.int64)
+    merged[1] = 40
+    vocabulary = SimpleNamespace(vocab=range(64), merged=merged,
+                                 is_stop=np.zeros(64, dtype=bool), none_id=63)
+    vocabulary.is_stop[62] = True
+    decoder = Decoder(vocabulary, 4, 10, [True])
+    text = "abcdefghij"
+    streams = [Stream(at, [0, token], [at + 1, at + 2], text, exhausted=True)
+               for at, token in enumerate(tokens)]
+    if len(tokens) > 1:
+        streams.append(Stream(5, [0], [6], text, exhausted=True))
+    answer = AnswerState(written=[0], live=streams)
+    doc = SimpleNamespace(answers=[answer], text=text)
+    actual = decoder.choose(doc, 0, [-20, stop, 33, 1, 40, 50, *scores])
+    assert actual == (chosen if not done else None)
+    assert answer.done == done
+    assert answer.written == ([0, chosen] if chosen is not None else [0])
+    if chosen is not None:
+        assert [s.char for s in answer.live] == [
+            index for index, token in enumerate(tokens) if token == chosen]
+    if chosen is not None and done:
+        start = tokens.index(chosen)
+        assert answer.span == (start, start + 2)
+
+
+def test_readout_scores_reset_between_rows_and_keep_token_order():
+    _, vocabulary = make_spec()
+    decoder = Decoder(vocabulary, 4, 10, [True])
+    scores, none, stop = decoder.lp([-4, -5, 5, 2, 3, 4, -1, -1, -2, -3])
+    assert decoder.top == 5 and none == -4 and stop == -5
+    assert scores[5] == scores[2] == -1
+    reused, _, _ = decoder.lp([-6, -7, 6, 1, 0, 0, -0.5, -1, -20, -30])
+    assert reused is scores
+    assert decoder.top == 6
+    assert reused[5] == reused[2] == -np.inf
+    assert reused[0] == -30
 
 
 def test_writing_that_begins_outside_the_document_answers_none(monkeypatch):
@@ -279,7 +329,8 @@ DOCS = [LEASE, TERM, NOTHING]
 GOLD = ["March 3, 2027", "five years", None]
 
 
-def _setup(monkeypatch, trim=True, documents=None):
+def _setup(monkeypatch, trim=True, documents=None, token_documents=None,
+           share_prefixes=False, document_ids=None):
     """A state, its scripted model, and a node builder for one spec name."""
     spec, tables = make_spec(trim)
     documents = DOCS if documents is None else documents
@@ -289,7 +340,8 @@ def _setup(monkeypatch, trim=True, documents=None):
     monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     state = _state(model)
     state.loaded_model.vocabulary = tables
-    tokens = {"c": [tables.encode_ids(text) for text in documents]}
+    tokens = {"c": ([tables.encode_ids(text) for text in documents]
+                    if token_documents is None else token_documents)}
     stages_seen = {}
     original = ExtractionStages.__init__
 
@@ -304,9 +356,11 @@ def _setup(monkeypatch, trim=True, documents=None):
 
     def node(name):
         return AiExtract(node_id=f"ai-extract:{name}", backend_name="quail",
-                         model="qwen3-4b-fp8", spec=replace(spec, name=name))
+                         model="qwen3-4b-fp8", spec=replace(
+                             spec, name=name, share_prefixes=share_prefixes))
 
-    inputs = {"document_ids": list(range(len(documents))), "documents": tokens,
+    inputs = {"document_ids": (list(range(len(documents))) if document_ids is None
+                               else document_ids), "documents": tokens,
               "texts": {"c": documents}, "pre": [], "gpu_timing": False}
 
     def run(name="ends"):
@@ -321,6 +375,36 @@ def _setup(monkeypatch, trim=True, documents=None):
     return state, model, run, run_pipeline
 
 
+def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
+    documents = [LEASE, LEASE, NOTHING]
+    _, _, plain, _ = _setup(monkeypatch, documents=documents)
+    unshared, _ = plain()
+    _, model, shared, _ = _setup(
+        monkeypatch, documents=documents, share_prefixes=True)
+    result, stages = shared()
+    assert result.outputs["scores"].equals(unshared.outputs["scores"])
+    borrowed = result.metrics.extension["borrowed_prefix_tokens"]
+    assert borrowed > 0
+    assert result.metrics.fresh_tokens == unshared.metrics.fresh_tokens - borrowed
+    for doc in stages.docs:
+        rounds = [entry for entry in model.packed if entry[0] == doc.key]
+        if doc.answers[0].answer is not None:
+            assert len(rounds) > 1
+        assert model.reads[doc.key] <= 1
+        assert all(entry[2] > 0 for entry in rounds)
+
+
+
+@pytest.mark.parametrize("document_ids", [[2, 0], [1], []])
+def test_extraction_preserves_selected_document_order(monkeypatch, document_ids):
+    _, _, run, _ = _setup(monkeypatch, document_ids=document_ids)
+    result, _ = run()
+    table = result.outputs["scores"]
+    assert table.column("c").to_pylist() == document_ids
+    assert table.column("ends").to_pylist() == [GOLD[i] for i in document_ids]
+    assert table.column("ends_span").is_null().to_pylist() == [
+        GOLD[i] is None for i in document_ids]
+
 def _run(monkeypatch, trim=True, documents=None):
     _, model, run, _ = _setup(monkeypatch, trim, documents)
     result, stages = run()
@@ -329,6 +413,36 @@ def _run(monkeypatch, trim=True, documents=None):
 
 def tables_of(stages):
     return stages.vocabulary
+
+
+def test_extraction_reuses_arrow_tokens_and_offsets(monkeypatch, tmp_path):
+    _, vocabulary = make_spec()
+
+    offsets = TokenOffsets({index: text.encode() for index, text
+                            in enumerate(vocabulary.tokenizer.tokens)})
+
+    store = TokenStore.write(
+        str(tmp_path / "extract.arrow"), [pa.record_batch({"text": DOCS})],
+        document_column="text", tokenizer=vocabulary.encode_ids,
+        token_type=pa.int32(), offsets_encoder=offsets)
+    _, model, run, _ = _setup(monkeypatch, token_documents=store)
+    encode_batch = model.tables.encode_batch
+
+    def windows_only(texts):
+        assert all(text not in DOCS for text in texts)
+        return encode_batch(texts)
+
+    monkeypatch.setattr(model.tables, "encode_batch", windows_only)
+    result, stages = run()
+    assert result.outputs["scores"].column("ends").to_pylist() == GOLD
+    assert result.outputs["scores"].column("ends_span").to_pylist() == [
+        {"start": LEASE.index("March"),
+         "end": LEASE.index("March") + len(GOLD[0])},
+        {"start": 6, "end": 16}, None]
+    for index, doc in enumerate(stages.docs):
+        assert np.shares_memory(doc.scan.tokens, store[index].numpy())
+        assert np.shares_memory(doc.scan.starts, store[index].character_offsets)
+    store.close()
 
 
 def test_extractor_writes_the_answer_along_the_document(monkeypatch):

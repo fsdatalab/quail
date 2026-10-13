@@ -52,6 +52,26 @@ def _ends(session, trim=True):
             .select("c.id", "ends"))
 
 
+def test_extract_prefix_sharing_is_planned_from_exact_document_tokens():
+    with quail.Session(
+        EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+        tokenizer=letter_tokens,
+    ) as session:
+        shared = "The following agreement is made between the parties. " * 4
+        session.register("contracts", DocumentProvider.from_table(pa.table({
+            "id": [1, 2, 3],
+            "text": [shared + LEASE, shared + "No dates here.", "Unrelated."],
+        }), id_col="id"))
+        query = _ends(session)
+        query.plan()
+        query.wait_for_tokens()
+        plan = query.plan()
+        (node,) = [node for node in plan.nodes if isinstance(node, AiExtract)]
+        assert node.spec.share_prefixes
+        decoded = decode_graph(encode_graph(plan.graph, session.registry.codecs),
+                               session.registry.codecs)
+        assert decoded.node(node.node_id).spec.share_prefixes
+
 
 def test_sql_and_builder_extract_the_same_answer_columns(session):
     built = _ends(session)

@@ -9,6 +9,7 @@ The answer ends where the model would close the quote, or where its
 writing would leave the document.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -16,12 +17,13 @@ import numpy as np
 from quail.backends.quail.executor.extract.candidates import (
     NEG,
     DocumentTokens,
+    ensure_tokens,
     first_tokens,
     make_streams,
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.cost.extract import ANSWER_MAX_TOKENS, DRAFT_TOKENS
 from quail.execution.spans import line_span
+from quail.extraction import ANSWER_MAX_TOKENS, DRAFT_TOKENS
 
 CUE_TOP = 1024      # vocabulary entries read at the cue and each round
 
@@ -51,7 +53,7 @@ class Document:
 
     index: int
     text: str
-    prefix: list
+    prefix: Sequence
     scan: DocumentTokens
     key: tuple
     answers: list       # one AnswerState per question
@@ -74,6 +76,8 @@ class Decoder:
         self.k = k
         self.width = width
         self.trim = list(trim)
+        self.scores = np.full(len(vocabulary.vocab), NEG, dtype=np.float32)
+        self.previous_ids = np.empty(0, dtype=np.int64)
 
     def rows(self, row) -> np.ndarray:
         """Return a stage's answer as its rows of readout values."""
@@ -105,9 +109,12 @@ class Decoder:
         """Return a row's log probabilities by token id, and none's and the stop's."""
         values = np.asarray(values, dtype=np.float32).reshape(-1)
         k = self.k
-        lp = dict(zip(values[-2 * k:-k].astype(np.int64).tolist(),
-                      values[-k:].tolist()))
-        return lp, float(values[0]), float(values[1])
+        self.scores[self.previous_ids] = NEG
+        ids = values[-2 * k:-k].astype(np.int64)
+        self.scores[ids] = values[-k:]
+        self.previous_ids = ids
+        self.top = int(ids[np.argmax(self.scores[ids])])
+        return self.scores, float(values[0]), float(values[1])
 
     def verify(self, doc: Document, q: int, rows, fed) -> None:
         """Choose the answer's tokens from a round's rows, in order.
@@ -155,8 +162,8 @@ class Decoder:
             answer.none_lp = none_lp
             answer.best_lp = starts.best_lp
             answer.none_wins = (max(none_lp, stop_lp) > answer.best_lp
-                                or self.leaves(lp, starts.allowed, answer.best_lp,
-                                               stop_lp))
+                                or self.leaves(lp, starts.allows(self.top),
+                                               answer.best_lp, stop_lp))
             if answer.none_wins:
                 self.settle(doc, q)
                 return None
@@ -164,38 +171,63 @@ class Decoder:
             answer.live = make_streams(vocabulary, doc.text, starts, token)
         else:
             at = len(answer.written)
-            following = {token for token in (s.next(at, vocabulary)
-                                             for s in answer.live)
-                         if token is not None}
-            best = max(following, key=lambda t: lp.get(t, NEG), default=None)
-            best_lp = NEG if best is None else lp.get(best, NEG)
-            merged = {t: vocabulary.merged[t] for t in following
-                      if t in vocabulary.merged and vocabulary.merged[t] in lp}
-            joined = max(merged, key=lambda t: lp[merged[t]], default=None)
-            if joined is not None and lp[merged[joined]] > max(best_lp, stop_lp):
+            ensure_tokens(answer.live, at, vocabulary)
+            best, joined, joined_lp, allowed, next_tokens = self.continuations(
+                answer, at, lp)
+            best_lp = NEG if best is None else lp[best]
+            if joined is not None and joined_lp > max(best_lp, stop_lp):
                 answer.written.append(joined)
-                answer.live = [s for s in answer.live
-                               if s.next(at, vocabulary) == joined]
+                if next_tokens is not None:
+                    answer.live = [s for s, keep in zip(
+                        answer.live, next_tokens == joined) if keep]
                 self.settle(doc, q)
                 return None
             if (best is None or stop_lp >= best_lp
-                    or self.leaves(lp, following | set(merged.values()),
-                                   best_lp, stop_lp)):
+                    or self.leaves(lp, allowed, best_lp, stop_lp)):
                 self.settle(doc, q)
                 return None
             token = best
-            answer.live = [s for s in answer.live if s.next(at, vocabulary) == token]
+            if next_tokens is not None:
+                answer.live = [s for s, keep in zip(answer.live, next_tokens == token)
+                               if keep]
         answer.written.append(token)
         if len(answer.written) >= ANSWER_MAX_TOKENS:
             self.settle(doc, q)
         return token
 
-    def leaves(self, lp, allowed, best_lp, stop_lp) -> bool:
+    def continuations(self, answer: AnswerState, at: int, lp) -> tuple:
+        """Rate the next tokens and quote endings of the answer's live streams."""
+        merged_ids = self.vocabulary.merged
+        if len(answer.live) == 1:
+            stream = answer.live[0].stream
+            best = stream[at] if at < len(stream) else None
+            merged = int(merged_ids[best]) if best is not None else -1
+            joined_lp = lp[merged] if merged >= 0 else NEG
+            joined = best if joined_lp > NEG else None
+            allowed = self.top == best or self.top == merged
+            return best, joined, joined_lp, allowed, None
+        next_tokens = np.fromiter(
+            (s.stream[at] if at < len(s.stream) else -1 for s in answer.live),
+            dtype=np.int64, count=len(answer.live))
+        following = np.unique(next_tokens[next_tokens >= 0])
+        best = int(following[np.argmax(lp[following])]) if len(following) else None
+        merged = merged_ids[following]
+        valid = merged >= 0
+        originals, merged = following[valid], merged[valid]
+        rated = lp[merged] > NEG
+        originals, merged = originals[rated], merged[rated]
+        index = int(np.argmax(lp[merged])) if len(merged) else None
+        joined = int(originals[index]) if index is not None else None
+        joined_lp = lp[merged[index]] if index is not None else NEG
+        allowed = bool(np.any(following == self.top) or np.any(merged == self.top))
+        return best, joined, joined_lp, allowed, next_tokens
+
+    def leaves(self, lp, top_allowed: bool, best_lp, stop_lp) -> bool:
         """Return whether the model's likeliest token leaves the document."""
         vocabulary = self.vocabulary
-        top = max(lp, key=lp.get)
-        return (lp[top] > max(best_lp, stop_lp) and top not in allowed
-                and top not in vocabulary._stops and top != vocabulary.none_id)
+        top = self.top
+        return (lp[top] > max(best_lp, stop_lp) and not top_allowed
+                and not vocabulary.is_stop[top] and top != vocabulary.none_id)
 
     def settle(self, doc: Document, q: int) -> None:
         """Set the question's answer for the document: its span, or none.
