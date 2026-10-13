@@ -66,6 +66,7 @@ class Session:
             self._remote = RemoteConnection(endpoint, self.registry.codecs)
         elif tokenizer is None:
             _ = self.tokenizer
+            self.inputs.warm_tokenizer()
 
     @property
     def endpoint(self) -> str | None:

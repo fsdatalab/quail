@@ -130,3 +130,21 @@ def test_prefix_sharing_and_attention_path_are_decided_from_exact_tokens():
                  if n.type_name == "quail.ai_filter")
     assert sequence.share_prefixes and sequence.attention == "tree"
     session.close()
+
+
+def test_input_store_warms_its_background_tokenizer_thread():
+    import threading
+
+    from quail.catalog import Catalog, InputStore
+
+    threads = []
+
+    def tokenizer(text):
+        threads.append(threading.current_thread().name)
+        return list(text)
+
+    store = InputStore(Catalog(), tokenizer=lambda: tokenizer,
+                       tokenizer_name="fake")
+    store.warm_tokenizer().result()
+    assert threads and threads[0].startswith("quail-tokenize")
+    store.close()

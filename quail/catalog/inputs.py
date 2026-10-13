@@ -130,13 +130,25 @@ class InputStore:
             },
         )
 
-    def tokenize_async(self, provider_name: str, column: str,
-                       projected_columns=(), *, with_offsets=False) -> Future:
-        """Start tokenize() on a background thread and return its Future."""
+    def _background_executor(self) -> ThreadPoolExecutor:
         if self._background is None:
             self._background = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="quail-tokenize")
-        return self._background.submit(
+        return self._background
+
+    def warm_tokenizer(self) -> Future:
+        """Load the background thread's encoder before any column needs it.
+
+        The encoder keeps one instance per thread, and loading one takes
+        a few hundred milliseconds that would otherwise land in the first
+        query's input preparation.
+        """
+        return self._background_executor().submit(self.tokenizer, "")
+
+    def tokenize_async(self, provider_name: str, column: str,
+                       projected_columns=(), *, with_offsets=False) -> Future:
+        """Start tokenize() on a background thread and return its Future."""
+        return self._background_executor().submit(
             self.tokenize, provider_name, column, projected_columns,
             with_offsets=with_offsets)
 

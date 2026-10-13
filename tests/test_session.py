@@ -120,8 +120,8 @@ def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
             sources.append(source)
 
         def encode(self, text):
-            assert text == "hello"
-            return np.array([1, 2], dtype=np.uint32)
+            assert text in ("", "hello")
+            return np.array([1, 2], dtype=np.uint32)[:len(text)]
 
         def decode(self, ids):
             return b"hello"[:len(ids)]
@@ -130,7 +130,10 @@ def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
     with quail.Session(CONFIG) as session:
         token_ids = session.tokenizer("hello")
         piece = session.tokenizer.decode([1])
-    assert sources == ["Qwen/Qwen3-4B-FP8"]
+        # the session loads one encoder for the caller and warms one on
+        # the tokenization thread; the thread keeps its own instance
+        session.inputs.warm_tokenizer().result()
+    assert sources == ["Qwen/Qwen3-4B-FP8"] * 2
     assert token_ids == [1, 2]
     assert all(type(token_id) is int for token_id in token_ids)
     assert piece == b"h"
