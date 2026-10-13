@@ -3,20 +3,19 @@
 The estimate sums each document's work over every document, scales it
 to the live count, and prices the total with the component roofline
 at ideal packing, as quail/cost/classify.py does. The steps follow the
-executor (quail/backends/quail/executor/extract.py): the prompt with
+executor (quail/backends/quail/executor/extract/): the prompt with
 the document, then the answer, one chosen token and a configured draft of
 the document per round, every row read. The expected answer length is a
 cost assumption; the planner does not see the answer. The second and later
-extractions of
-a pipeline find the document resident and are priced without reading
-it.
+extractions of a pipeline reuse the document's KV. Each answer round reads
+the document, question, and previously accepted answer tokens from KV.
 """
 
 from dataclasses import dataclass
 
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.roofline import CostComponent, component_latencies
-from quail.cost.work import Work, ask, scan, stream
+from quail.cost.work import Work, ask, scan
 from quail.extraction import ExtractionConfig
 
 
@@ -103,8 +102,9 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     # every row; the last row read decides the closing quote
     round_tokens = 1 + config.draft_tokens
     rounds = assumptions.rounds(config)
-    if rounds:
-        work += stream(context, [round_tokens] * rounds, window=window)
+    for _ in range(rounds):
+        work += ask(context, round_tokens, window=window)
+        context += round_tokens
     fed += rounds * round_tokens
     rows += rounds * round_tokens
     return work, fed, rows

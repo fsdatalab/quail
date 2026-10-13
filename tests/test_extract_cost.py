@@ -5,7 +5,7 @@ from quail.cost.extract import (
     document_work,
     estimate,
 )
-from quail.cost.work import Work, ask, scan, stream
+from quail.cost.work import Work, ask, scan
 from quail.extraction import ExtractionConfig
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -24,18 +24,17 @@ def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     work, fed, rows = document_work(100, HEAD, TAIL)
     context = HEAD + 100 + TAIL
     config = ExtractionConfig()
-    rounds = [1 + config.draft_tokens] * ExtractAssumptions().rounds(config)
-    expected = scan(HEAD + 100, TAIL) + stream(context, rounds)
+    answer = 1 + config.draft_tokens
+    expected = scan(HEAD + 100, TAIL) + ask(context, answer)
     assert work == expected
-    answer = sum(rounds)
     assert fed == TAIL + answer
     assert rows == 1 + answer
     # resident KV turns the scan into a question over it
     resident, _, _ = document_work(100, HEAD, TAIL, resident=True)
-    assert resident == ask(HEAD + 100, TAIL) + stream(context, rounds)
+    assert resident == ask(HEAD + 100, TAIL) + ask(context, answer)
     assert resident.tokens < work.tokens
     shared, _, _ = document_work(100, HEAD, TAIL, shared=80)
-    assert shared == ask(80, HEAD + 100 + TAIL - 80) + stream(context, rounds)
+    assert shared == ask(80, HEAD + 100 + TAIL - 80) + ask(context, answer)
     assert shared.tokens == work.tokens - 80
     assert document_work(100, HEAD, TAIL, resident=True, shared=80)[0] == resident
 
@@ -75,13 +74,19 @@ def test_cost_uses_plan_limits_and_separate_answer_assumptions():
     config = ExtractionConfig(max_answer_tokens=8, draft_tokens=3)
     assumptions = ExtractAssumptions(answer_tokens=40)
     cost = _cost([100], config=config, assumptions=assumptions)
-    expected = scan(HEAD + 100, TAIL) + stream(HEAD + 100 + TAIL, [4, 4])
-    assert cost.work == expected
+    # Both rounds read KV. The second also reads the first round's four tokens.
+    assert cost.work.kv_read == 142 + 146
+    assert cost.work.pairs == 142 * 143 / 2 + 4 * 142 + 10 + 4 * 146 + 10
+    assert cost.work.tokens == 150
     assert cost.suffix_tokens == TAIL + 8
     assert cost.rows == 9
     shorter = _cost([100], config=config,
                     assumptions=ExtractAssumptions(answer_tokens=2))
-    assert shorter.work == scan(HEAD + 100, TAIL) + stream(HEAD + 100 + TAIL, [4])
+    assert shorter.work == scan(HEAD + 100, TAIL) + ask(HEAD + 100 + TAIL, 4)
     capped = _cost([100], config=ExtractionConfig(max_answer_tokens=1),
                    assumptions=assumptions)
     assert capped.work == scan(HEAD + 100, TAIL)
+    windowed, _, _ = document_work(
+        100, HEAD, TAIL, window=128, config=config, assumptions=assumptions)
+    assert windowed.sliding_kv_read == 2 * 127
+    assert windowed.sliding_pairs == 128 * 142 - 128 * 127 / 2 + 8 * 128

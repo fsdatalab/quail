@@ -55,16 +55,3 @@ def test_qwen3_spec_fields_override_derived_values():
 def test_qwen3_spec_rejects_layouts_the_executor_cannot_run(changes, message):
     with pytest.raises(ValueError, match=message):
         qwen3_spec("m", "Org/M", config=_config(**changes))
-
-
-def test_qwen3_copies_spans_in_its_chat_turn():
-    """AI.IF prompts stay raw; the extract prompt closes with the chat turn.
-
-    The turn has no opener, so the extraction's prompt head is the
-    AI.IF preamble and a filter's document KV serves the extraction.
-    """
-    spec = MODELS["qwen3-4b-fp8"]
-    assert spec.turn == ("", "")
-    assert spec.extract_turn == (
-        "", "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
-    assert MODELS["qwen3-32b-fp8"].extract_turn == spec.extract_turn

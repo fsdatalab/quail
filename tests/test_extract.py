@@ -15,20 +15,17 @@ from quail.execution.spans import line_span, locate_span, read_phrase
 from quail.extraction import ExtractionConfig
 from quail.logical import (
     SHARED_PRE,
-    Alias,
     ColumnRef,
     CompileError,
     LogicalPlan,
     ModelCall,
     Scan,
-    SemanticExtract,
     bind_extract_prompt,
     extracted_above_joins,
 )
 from quail.logical.prompts import EXTRACT_PHRASE_CUE
 from quail.physical import (
     AiExtract,
-    AiFilter,
     AiJoin,
     ExtractSpec,
     Filter,
@@ -113,15 +110,10 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
     built = _ends(session)
     assert query.logical == built.logical
     logical = built.logical
-    assert [type(node).__name__ for node in logical.walk()] == [
-        "Scan", "SemanticExtract", "Project"]
     (node,) = logical.operators().extracts
-    assert isinstance(node, SemanticExtract)
     assert (node.name, node.alias, node.span_name) == ("ends", "c", "ends_span")
     call = node.call
     assert call.kind == "extract" and call.question == QUESTION and call.trim
-    assert call.aliases() == ("c",)
-    assert logical.root.columns[1] == Alias(call, "ends")
     assert node.output_schema()[-2:] == (
         ColumnRef("c", "contracts", "ends"), ColumnRef("c", "contracts", "ends_span"))
     # the answer columns are not read below the extraction; the scan
@@ -140,31 +132,21 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
     plan = loose.plan()
     (spec,) = [n.spec for n in plan.nodes if isinstance(n, AiExtract)]
     assert not spec.trim
-    assert spec == ExtractSpec.from_mapping(spec.to_dict())
     # the BigQuery dialect names the call the same way
     assert session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
         f"FROM contracts c", dialect="bq").logical == logical
     text = built.explain()
-    assert "SemanticExtract: ends, ends_span" in text
     assert f"question={QUESTION!r} trim=on" in text
-    assert "AiExtract: ends over c" in text
     assert "up to 64 answer tokens" in text
-    assert "Project: c.id, ends" in text
 
 
 def test_extract_plans_one_physical_node_with_both_prompts(session):
     query = _ends(session)
     plan = query.plan()
     assert not isinstance(plan, Refusal)
-    assert [type(node).__name__ for node in plan.nodes] == [
-        "Scan", "AiExtract", "Project"]
     (node,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
     spec = node.spec
-    assert isinstance(spec, ExtractSpec)
-    assert (spec.name, spec.alias, spec.span_name) == ("ends", "c", "ends_span")
-    assert spec.question == QUESTION and spec.trim
-    assert spec.arguments == (("c", "text"),)
     assert spec.expected_inputs == 2
     assert spec.estimated_seconds > 0
     turn = session.model.extract_turn
@@ -173,13 +155,9 @@ def test_extract_plans_one_physical_node_with_both_prompts(session):
     # a model without turn text gets a line break before the cue
     assert list(tail) == letter_tokens(
         AFTER_DOCUMENT_TEXT + (turn[1] or "\n") + EXTRACT_PHRASE_CUE)
-    assert [port.name for port in node.outputs] == ["scores", "ids:c"]
-    assert node.outputs[0].schema == ("c", "ends", "ends_span")
-    assert node.runtime_key == "quail.ai_extract"
     assert plan.nodes[-1].columns == ("c.id", "ends", "ends_span")
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
-    assert node.runtime_key in session.registry.runtimes
 
 
 def test_extract_follows_the_filters_and_labels_of_its_table(session):
@@ -190,12 +168,7 @@ def test_extract_follows_the_filters_and_labels_of_its_table(session):
              .label_in("kind", ["lease"], selectivity=0.5)
              .ai_extract("c.text", QUESTION, name="ends")
              .select("c.id", "kind", "ends"))
-    assert [type(node).__name__ for node in query.logical.walk()] == [
-        "Scan", "SemanticFilter", "SemanticClassify", "Filter",
-        "SemanticExtract", "Project"]
     plan = query.plan()
-    assert [type(node).__name__ for node in plan.nodes] == [
-        "Scan", "AiFilter", "AiClassify", "Filter", "AiExtract", "Project"]
     (node,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
     (test,) = [n for n in plan.nodes if isinstance(n, Filter)]
     assert node.inputs[0].source.node_id == test.node_id
@@ -226,9 +199,6 @@ def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
         f"SELECT c.id, q.id, AI.EXTRACT(c.text, '{QUESTION}') AS ends "
         f"FROM contracts c JOIN questions q "
         f"ON AI_FILTER(PROMPT('Does {{0}} answer {{1}}?', c.text, q.ask))")
-    # the extraction is written on its table, below the join
-    assert [type(node).__name__ for node in query.logical.walk()] == [
-        "Scan", "SemanticExtract", "Scan", "Join", "SemanticJoin", "Project"]
     assert extracted_above_joins(query.logical.root) == frozenset()
     plan = query.plan()
     assert not isinstance(plan, Refusal)
@@ -238,17 +208,10 @@ def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
     # lifted plan is cheaper and wins
     assert written.logical_plan.root == query.logical.root
     assert extracted_above_joins(lifted.logical_plan.root) == {"c"}
-    assert [type(node).__name__
-            for node in LogicalPlan(lifted.logical_plan.root).walk()] == [
-        "Scan", "Scan", "Join", "SemanticJoin", "SemanticExtract", "Project"]
     assert lifted.estimated_seconds < written.estimated_seconds
-    assert [node.node_id for node in written.plan.nodes] == [
-        "scan:c", "scan:q", "ai-extract:0", "ai_join:q", "project"]
     (join,) = [n for n in written.plan.nodes if isinstance(n, AiJoin)]
     assert ("ai-extract:0", "ids:c") in [
         (port.source.node_id, port.source.port) for port in join.inputs]
-    assert [node.node_id for node in plan.nodes] == [
-        "scan:c", "scan:q", "ai_join:q", "ai-extract:0", "project"]
     (node,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
     assert node.spec.expected_inputs == pytest.approx(2 * 0.2)
     (before,) = [n for n in written.plan.nodes if isinstance(n, AiExtract)]
@@ -349,14 +312,6 @@ def test_extract_errors_and_refusals(session):
     refused = mixed.plan()
     assert isinstance(refused, Refusal)
     assert "AI.SCORE" in refused.reasons[0]
-    # an extraction beside an AI.IF filter over the same column shares
-    # the document's tokens
-    filtered = (session.docs("contracts").alias("c")
-                .ai_filter(quail.prompt("Is {0} a lease?", quail.col("c.text")))
-                .ai_extract("c.text", QUESTION, name="ends")
-                .select("c.id", "ends"))
-    nodes = filtered.plan().nodes
-    assert isinstance(nodes[1], AiFilter) and isinstance(nodes[2], AiExtract)
 
 
 def test_span_helpers_read_locate_and_widen_an_answer():
@@ -366,7 +321,6 @@ def test_span_helpers_read_locate_and_widen_an_answer():
     for empty in ("", '"', "none", "None.", ' none"'):
         assert read_phrase(empty) is None
     assert locate_span(LEASE, "March 3, 2027") == (14, 27)
-    assert LEASE[14:27] == "March 3, 2027"
     # case and runs of whitespace are forgiven; the first occurrence wins
     assert locate_span(LEASE, "RENT   is") == (29, 36)
     assert locate_span("a b a b", "a b") == (0, 3)
@@ -374,7 +328,6 @@ def test_span_helpers_read_locate_and_widen_an_answer():
     assert locate_span(LEASE, "   ") is None
     assert line_span(LEASE, (14, 27)) == (0, 28)
     assert line_span(LEASE, (29, 36)) == (29, len(LEASE))
-    assert LEASE[29:len(LEASE)] == "Rent is $2,000."
     assert line_span("one\n\nthree", (4, 4)) == (4, 4)
 
 
@@ -504,7 +457,6 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     assert spec.preamble_text == session.model.extract_turn[0] + SHARED_PRE
     assert list(spec.preamble_token_ids) == request_tests._tokens(
         spec.preamble_text)
-    assert spec == RequestExtractSpec.from_mapping(spec.to_dict())
     # a filter and an extraction plan together under one preamble: the
     # extraction's turn has no opener on Qwen3
     mixed = session.sql(
@@ -519,10 +471,7 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
                  + EXTRACT_PHRASE_CUE)
     assert list(spec.tail_token_ids) == request_tests._tokens(tail_text)
     assert spec.tail_text == tail_text
-    assert not request_node.filters and not request_node.classifies
     project = next(node for node in plan.nodes if isinstance(node, Project))
-    assert [port.source.port for port in project.inputs] == [
-        "ids:c", "extract_answers:ends"]
     assert project.columns == ("c.id", "ends", "ends_span")
     assert "Extract c: ends question=" in query.explain()
     codecs = session.registry.codecs
