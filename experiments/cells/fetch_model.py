@@ -10,7 +10,7 @@ Quail loader find it without another download.
 import modal
 
 try:
-    from quail.bench.images import cpu_image
+    from quail.deploy.images import cpu_image
     image = cpu_image()
 except ImportError:    # a container without the local quail package
     image = None

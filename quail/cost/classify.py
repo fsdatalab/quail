@@ -118,7 +118,7 @@ def _rounds_work(prefix, shared, frame_tokens: int, runs, resident: bool,
     return work + _canvas_work(rounds, canvas_rows)
 
 
-def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
+def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
                     live: float, lengths, shared, chunk: int,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0, runs=None,
@@ -129,7 +129,7 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
     Args:
         head_tokens: Number of prompt tokens before each document.
         frame_tokens: Number of prompt tokens written after each document.
-        chains: Request lengths in tokens, shared by all documents, in
+        suffixes: Request lengths in tokens, shared by all documents, in
             one round.
         live: Expected number of documents to classify.
         lengths: Document lengths in tokens.
@@ -141,7 +141,7 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
         canvas_rows: Number of answer canvas rows.
         runs: For a greedy decode, the tokens each label feeds in each
             of its rounds, with each label equally likely; it replaces
-            chains. A round reads one row.
+            suffixes. A round reads one row.
         answer_rows: Rows the readout processes per document. None reads
             the canvas rows or every request token in one round, and one
             row per decode round.
@@ -153,7 +153,7 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
         ideal packing.
     """
     n = len(lengths)
-    if live <= 0 or n == 0 or not (chains or runs):
+    if live <= 0 or n == 0 or not (suffixes or runs):
         return ClassifyCost(0.0, 0.0, Work(), 0.0, 0)
     window = model.sliding_window
     prefix = np.asarray(lengths, dtype=float) + head_tokens
@@ -172,9 +172,9 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
         rounds = max(map(len, runs))
     else:
         work = (_first_work(prefix, shared, frame_tokens, resident, window)
-                + _stream_work(prefix + frame_tokens, chains, window, canvas_rows))
-        suffix_tokens = float(sum(chains))
-        rows = float(canvas_rows or sum(chains))
+                + _stream_work(prefix + frame_tokens, suffixes, window, canvas_rows))
+        suffix_tokens = float(sum(suffixes))
+        rows = float(canvas_rows or sum(suffixes))
         rounds = 1
     if answer_rows is not None:
         rows = answer_rows
@@ -213,7 +213,7 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
     """
     canvas = model.answer_canvas
     canvas_rows = canvas.rows if canvas is not None else 0
-    chains = suffix_lengths(scoring, labels, canvas_rows, draws, starts)
+    suffixes = suffix_lengths(scoring, labels, canvas_rows, draws, starts)
     runs = answer_rows = None
     if scoring == DECODE_SCORING:
         # a document stops decoding at the choice that decides its label
@@ -223,8 +223,8 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
     # one-token labels are all read at the cue row from their target
     # rows of the head; longer labels normalize over the vocabulary
     targets = {token for ids in labels for token in ids}
-    return estimate_chains(
-        head_tokens, frame_tokens, chains, live=live, lengths=lengths,
+    return estimate_suffixes(
+        head_tokens, frame_tokens, suffixes, live=live, lengths=lengths,
         shared=shared, chunk=chunk, model=model, device=device,
         resident=resident,
         head_rows=len(targets) if all(len(ids) == 1 for ids in labels) else 0,

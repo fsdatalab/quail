@@ -19,7 +19,7 @@ import os
 import modal
 
 try:
-    from quail.bench.images import gpu_image
+    from quail.deploy.images import gpu_image
     image = gpu_image()
 except ImportError:    # a container without the local quail package
     image = None

@@ -13,61 +13,6 @@ from dataclasses import dataclass
 import numpy as np
 
 
-def orient(mean_left_tokens, mean_right_tokens):
-    """Which side anchors: the longer one.
-
-    Anchor tokens are paid once per document; partner tokens are paid
-    once per pair.
-    """
-    return "left" if mean_left_tokens >= mean_right_tokens else "right"
-
-
-def gate(answer_rows):
-    """Anchors that survive a conjunctive stage: any TRUE in the row.
-
-    answer_rows: dict anchor_index -> iterable of 0/1 answers.
-    Returns the sorted surviving anchor indices.
-    """
-    return sorted(a for a, row in answer_rows.items() if any(row))
-
-
-def matches(answer_rows):
-    """anchor_index -> sorted list of partner indices answered TRUE."""
-    return {a: sorted(i for i, v in enumerate(row) if v)
-            for a, row in answer_rows.items()}
-
-
-def assemble(ans1_rows, ans2_rows):
-    """Output triples from two pairwise join stages sharing one anchor.
-
-    ans1_rows: b -> row of 0/1 over A (stage 1, anchored on b).
-    ans2_rows: b -> row of 0/1 over C, present only for gated
-    survivors.
-    """
-    m1, m2 = matches(ans1_rows), matches(ans2_rows)
-    out = []
-    for b in sorted(ans2_rows):
-        for a in m1.get(b, ()):
-            for c in m2[b]:
-                out.append((a, b, c))
-    return sorted(out)
-
-
-def brute_force_triples(ans1_rows, ans2_rows):
-    """Nested-loop reference over recorded answers without gating."""
-    out = []
-    for b, row1 in sorted(ans1_rows.items()):
-        for a, v1 in enumerate(row1):
-            if v1:
-                for c, v2 in enumerate(ans2_rows[b]):
-                    if v2:
-                        out.append((a, b, c))
-    return sorted(out)
-
-
-# --------------------------------------------- continuous admission
-
-
 def pages_for(tokens: int, page_tokens: int) -> int:
     """Pages needed for `tokens` rows (suffix KV is never paged)."""
     return -(-tokens // page_tokens)
@@ -118,12 +63,6 @@ class Borrowing:
         self.skipped = set()       # documents that never run a chunk
         self.chosen = {}           # admitted borrower -> (parent, shared)
         self.borrowed_tokens = 0   # prefix tokens read from a parent
-
-    def add(self):
-        """A document streamed in after construction; it borrows nothing."""
-        self.tree_parent.append(None)
-        self.tree_shared.append(0)
-        return len(self.tree_parent) - 1
 
     def detach(self, doc):
         """The document's KV is already resident, so it borrows nothing."""
@@ -261,9 +200,9 @@ class JoinAdmission:
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
-    fresh anchors whose pages fit the free list. Pages are granted in
-    queue order; chunk room may be skipped. An anchor advances to its
-    next stage once its whole stream at the current stage is launched
+    fresh anchors whose pages fit the free list. Requests skipped for token
+    space take priority in the next chunk. Pages are granted in queue order.
+    An anchor advances to its next stage once its whole stream is launched
     and one partner has answered TRUE; the remaining answers fill in
     while the next stage runs. It drops out when every partner
     answered FALSE. An anchor with no partner at a stage settles
@@ -306,7 +245,7 @@ class JoinAdmission:
         self._page_cums = {}
         self._page_reserve = 0
         self.prefix = []
-        self.stages = [list(s) for s in stage_suffixes]
+        self.stages = [np.asarray(s, dtype=np.int64) for s in stage_suffixes]
         # frames: the rows a frame entry keeps in the anchor's KV;
         # frame_rows: the rows it packs, canvas included
         self.frames = (list(frame_tokens) if frame_tokens
@@ -328,13 +267,11 @@ class JoinAdmission:
         k = len(self.stages)
         self._cum = []
         for j, (lens, frame) in enumerate(zip(self.stages, self.frame_rows)):
-            cum = [0]
-            for t in lens:
-                cum.append(cum[-1] + t)
-            self._cum.append(cum)
-            if lens and frame + max(lens) > chunk_budget:
+            self._cum.append(np.concatenate(([0], np.cumsum(lens))))
+            longest = int(lens.max()) if len(lens) else 0
+            if len(lens) and frame + longest > chunk_budget:
                 raise ValueError(
-                    f"stage {j}: a {frame + max(lens)}-token partner "
+                    f"stage {j}: a {frame + longest}-token partner "
                     f"exceeds the {chunk_budget}-token chunk budget "
                     f"(suffixes are atomic)")
         self._extra = max(self.frame_rows)
@@ -435,18 +372,15 @@ class JoinAdmission:
         if lst is None:
             return None, None
         lengths = getattr(lst, "lengths", None)
-        lst = list(lst)
-        cum = [0]
-        if lengths is not None:
-            for n in lengths:
-                cum.append(cum[-1] + int(n))
-            return lst, cum
-        for i in lst:
-            if not 0 <= i < len(self.stages[j]):
+        lst = np.asarray(lst, dtype=np.int64)
+        if lengths is None:
+            invalid = (lst < 0) | (lst >= len(self.stages[j]))
+            if invalid.any():
+                i = lst[invalid][0]
                 raise ValueError(
                     f"anchor {a} stage {j}: partner {i} is out of range")
-            cum.append(cum[-1] + self.stages[j][i])
-        return lst, cum
+            lengths = self.stages[j][lst]
+        return lst, np.concatenate(([0], np.cumsum(lengths, dtype=np.int64)))
 
     def _cum_of(self, a, j):
         return self._cum[j] if self._lists[a][j] is None else self._cums[a][j]
@@ -529,8 +463,8 @@ class JoinAdmission:
             if lazy is not None:
                 largest = max([largest] + [
                     partner_pages(self.page_cost, self.page_tokens, prefix,
-                                  self.frames[j], max(self.stages[j]))
-                    for j in range(1, k) if self.stages[j]])
+                                  self.frames[j], int(self.stages[j].max()))
+                    for j in range(1, k) if len(self.stages[j])])
             needed = self.page_cost(prefix + self._extra) + largest
             if needed > self.arena_pages:
                 raise ValueError("anchor and one suffix exceed the KV arena")
@@ -573,31 +507,6 @@ class JoinAdmission:
         for event in events:
             self._settle_group(event.anchor, event.survived)
         return events
-
-    def buildable_tokens(self):
-        """Tokens the next chunk could pack, capped at the chunk budget.
-
-        Counts every placed anchor's remaining stream and every pending
-        anchor's first chunk. Chunk room, not pages: a page-blocked
-        anchor still counts.
-        """
-        total = 0
-        for a in self.ready:
-            j, i = self._stage[a], self._next[a]
-            cum = self._cum_of(a, j)
-            total += (self.frame_rows[j] if i == 0 else 0) + cum[-1] - cum[i]
-            if total >= self.chunk_budget:
-                return self.chunk_budget
-        for a in self.pending:
-            if self._stage[a] == _DONE:
-                continue
-            total += (self._carried[a] + self.frame_rows[0]
-                      + self._cum_of(a, 0)[-1])
-            if total >= self.chunk_budget:
-                return self.chunk_budget
-        return total
-
-    # ---- chunk building ------------------------------------------------
 
     def _first_cost(self, a, j, i):
         return self._suffix(a, j, i) + (self.frame_rows[j] if i == 0 else 0)
@@ -646,14 +555,17 @@ class JoinAdmission:
         room = self.chunk_budget
         groups = []
         continued = []
+        deferred = []
         temporary_pages = 0
         # 1) placed anchors: cut streams (front) and next-stage starts
         for _ in range(len(self.ready)):
+            if room == 0:
+                break
             a = self.ready.popleft()
             j, i = self._stage[a], self._next[a]
             if self._first_cost(a, j, i) > room:
-                self.ready.appendleft(a)    # FIFO; chunk nearly full
-                break
+                deferred.append(a)
+                continue
             end, tokens, pages = self._take(a, j, i, room, free_pages)
             if end == i:
                 self.blocked_pages = self._suffix_page_cost(a, j, i) - free_pages
@@ -731,6 +643,7 @@ class JoinAdmission:
                 continued.append(a)
         self.pending.extendleft(reversed(held))
         self.ready.extendleft(reversed(continued))
+        self.ready.extendleft(reversed(deferred))
         return groups
 
     # ---- gating --------------------------------------------------------

@@ -10,7 +10,7 @@ tokens that close an answer.
 import numpy as np
 import pyarrow as pa
 
-from quail.execution.tokens import GigatokenEncoder, TokenOffsets, TokenView
+from quail.catalog.tokens import GigatokenEncoder, TokenOffsets, TokenView
 from quail.progress import say
 
 

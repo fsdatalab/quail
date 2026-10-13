@@ -42,18 +42,6 @@ def unrounded_seconds(work: _workload.Work, model: ModelSpec, device: DeviceSpec
                for component in _latencies(work, model, device, passes))
 
 
-def prefix_recompute_seconds(prefix_tokens: int, model: ModelSpec,
-                             device: DeviceSpec) -> float:
-    """Return ideal compute time for one document prefix."""
-    if prefix_tokens < 0:
-        raise ValueError("prefix_tokens must be nonnegative")
-    return compute_seconds(
-        _workload.scan(prefix_tokens, 0, window=model.sliding_window),
-        model,
-        device,
-    )
-
-
 @dataclass(frozen=True)
 class SpeedOfLight:
     """The complete bound and its component breakdown."""

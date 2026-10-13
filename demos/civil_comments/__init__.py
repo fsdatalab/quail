@@ -331,6 +331,7 @@ def requested_input_tokens(
     from gigatoken import Tokenizer
 
     from quail.logical.prompts import bind_join_prompt, bind_prompt
+    from quail.planner.prompt_lowering import lower_prompt
     from quail.specs.diffusion_gemma_26b import DIFFUSION_GEMMA_26B_FP8
 
     class Ref:
@@ -339,18 +340,11 @@ def requested_input_tokens(
 
     tokenizer = Tokenizer(model_name).encode
     model = DIFFUSION_GEMMA_26B_FP8
-    filter_prompt = bind_prompt(
-        FILTER_PROMPT,
-        (Ref("c"),),
-        tokenizer,
-        turn=model.turn,
-    )
-    join_prompt = bind_join_prompt(
-        JOIN_PROMPT,
-        (Ref("c"), Ref("f")),
-        tokenizer,
-        turn=model.turn,
-    )
+    filter_prompt = lower_prompt(
+        bind_prompt(FILTER_PROMPT, (Ref("c"),), turn=model.turn), tokenizer)
+    join_prompt = lower_prompt(
+        bind_join_prompt(JOIN_PROMPT, (Ref("c"), Ref("f")), turn=model.turn),
+        tokenizer)
     texts = comments["text"].to_pylist()
     ids = comments["comment_id"].to_pylist()
     comment_lengths = np.asarray([len(tokenizer(text)) for text in texts])

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from quail.backends.quail.executor.arena import KVArena
@@ -49,3 +49,13 @@ class QueryExecutionState:
     # rows; None scores yes against no over answer_rows
     score_readout: Any = None
     gpu_timing: bool = False
+
+
+class GpuRuntime(Protocol):
+    """Loaded GPU resources used by graph execution and worker dispatch."""
+
+    torch: ModuleType
+    arena: KVArena
+    pipeline: ModelPipeline
+    spec: ModelSpec
+    execution: Any

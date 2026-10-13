@@ -30,7 +30,7 @@ import time
 import modal
 
 try:
-    from quail.bench.images import gpu_image
+    from quail.deploy.images import gpu_image
     image = gpu_image()
 except ImportError:    # a container without the local quail package
     image = None
@@ -171,13 +171,13 @@ def quail(model: str, backend: str = "flashinfer",
     from transformers import AutoTokenizer
 
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.loop import run_filter
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+    from quail.backends.quail.executor.stages import filter_stages, run_stages
     from quail.backends.quail.worker import checkpoint_arena_args
     from quail.cost import budgets
-    from quail.logical import true_false_ids
+    from quail.planner.prompt_lowering import true_false_ids
     from quail.specs import H100_SXM, MODELS
 
     spec = MODELS[model]
@@ -207,8 +207,8 @@ def quail(model: str, backend: str = "flashinfer",
                          add_special_tokens=False)["input_ids"]
 
     def stage(batch):
-        run_filter(torch, arena, pipeline, answers, batch, [question],
-                   budget, arena_writes=True, attention_mode="unified")
+        run_stages(torch, arena, pipeline, filter_stages([question], answers),
+                   batch, budget, attention_mode="unified")
         torch.cuda.synchronize()
         for key in arena.resident_keys():
             arena.free_key(key)
@@ -239,8 +239,8 @@ def vllm(model: str) -> dict:
     import torch
     from transformers import AutoTokenizer
 
-    from quail.backends.vllm import VLLMEngine
-    from quail.logical import true_false_ids
+    from quail.baselines.vllm import VLLMEngine
+    from quail.planner.prompt_lowering import true_false_ids
     from quail.specs import MODELS
 
     spec = MODELS[model]

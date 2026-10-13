@@ -4,7 +4,7 @@ import gzip
 import sys
 from bisect import bisect_right
 
-from experiments.sglang_profile_analysis import merge_intervals
+from experiments.trace_intervals import merge_intervals
 
 
 def aggregate_intervals(events, duration_us, gpu_intervals=()):

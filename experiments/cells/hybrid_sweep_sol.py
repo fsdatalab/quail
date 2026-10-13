@@ -21,7 +21,7 @@ import os
 import modal
 
 try:
-    from quail.bench.images import gpu_image
+    from quail.deploy.images import gpu_image
     image = gpu_image()
 except ImportError:    # a container without the local quail package
     image = None
@@ -40,7 +40,7 @@ def estimate(model: str, sf: float, query_ids: list[str],
 
     import quail
     import quail_b
-    from quail.bench.quailb import answer_oracle, build_query
+    from bench.quailb import answer_oracle, build_query
 
     directory = f"/results/quailb_data/sf{sf}"
     only = list(query_ids) or None

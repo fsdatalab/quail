@@ -1,10 +1,10 @@
 """Quail: a declarative query engine for AI_FILTER and AI_JOIN."""
 
+from quail.api import Query, RefusalError, Session
 from quail.catalog import DocumentProvider, ScanRequest, TableProvider
 from quail.execution.result import QueryResult
-from quail.execution.session import Query, RefusalError, Session
 from quail.extensions import ExtensionRegistry
-from quail.frontend.builder import col, prompt
+from quail.frontend.expressions import col, prompt
 from quail.frontend.sql import SQLDialect
 from quail.logical import (
     SHARED_PRE,
@@ -12,13 +12,13 @@ from quail.logical import (
     bind_join_prompt,
     bind_prompt,
     render_join_prompt_text,
-    true_false_ids,
 )
 from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
 from quail.planner.estimate import SpeedOfLightEstimate, speed_of_light_estimate
 from quail.planner.plan import EngineConfig
-from quail.server.client import QueryRun
-from quail.server.records import QueryFailedError, QueryStatus
+from quail.planner.prompt_lowering import lower_prompt, true_false_ids
+from quail.remote.client import QueryRun
+from quail.remote.records import QueryFailedError, QueryStatus
 
 __all__ = [
     "SHARED_PRE",
@@ -43,6 +43,7 @@ __all__ = [
     "bind_join_prompt",
     "bind_prompt",
     "col",
+    "lower_prompt",
     "prompt",
     "render_join_prompt_text",
     "speed_of_light_estimate",

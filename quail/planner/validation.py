@@ -1,6 +1,6 @@
 """Execution constraints checked during planning and graph construction."""
 
-from quail.execution.pipelines import build_pipelines
+from quail.cost.joins import PricedJoin, longest_join_input
 from quail.logical import (
     Alias,
     Apply,
@@ -11,6 +11,7 @@ from quail.logical import (
 )
 from quail.logical.prompts import prompt_aliases
 from quail.physical import AiClassify, AiJoin
+from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import Refusal
 
 
@@ -116,7 +117,7 @@ def joined_classification_refusal(graph, workers: int) -> Refusal | None:
         if pipeline is not None and any(
                 isinstance(member, AiJoin)
                 and any(port.source.node_id == member.node_id for port in node.inputs)
-                for member in pipeline.members):
+                for member in pipeline):
             continue
         return Refusal(
             reasons=(f"AI.CLASSIFY {node.spec.name!r} over a document pair "
@@ -169,31 +170,40 @@ class ClassifyRefusedError(Exception):
         super().__init__(reason)
         self.reason, self.needed, self.available = reason, needed, available
 
+    @classmethod
+    def over_budget(cls, what: str, need: int,
+                    budget: int) -> "ClassifyRefusedError":
+        """The error for a prompt longer than the forward pass budget."""
+        return cls(
+            f"{what} needs {need} tokens with its classification prompt, "
+            f"but the forward pass budget is {budget} tokens", need, budget)
+
     def refusal(self) -> Refusal:
         """Convert this exception to a planning Refusal."""
         return Refusal(reasons=(self.reason,), constraint="suffix_over_chunk",
                        needed=self.needed, available=self.available, unit="tokens")
 
 
-def anchor_candidates(spec: dict, honor_forced: bool = True) -> list:
+def anchor_candidates(spec: PricedJoin, honor_forced: bool = True) -> list:
     """Candidate anchors for one join.
 
     Gates keep their outer table, a forced full anchor is honored, a
     free full join offers every table.
     """
-    if spec["semantics"] != "full":
-        return [spec["anchor"]]
-    if honor_forced and not spec.get("anchor_free"):
-        return [spec["anchor"]]
-    return list(spec["aliases"])
+    if spec.semantics != "full":
+        return [spec.anchor]
+    if honor_forced and not spec.anchor_free:
+        return [spec.anchor]
+    return list(spec.aliases)
 
 
-def join_input_tokens(spec, anchor: str, maximum: dict, pre: int) -> int:
+def join_input_tokens(spec: PricedJoin, anchor: str, maximum: dict,
+                      pre: int) -> int:
     """Count tokens for the longest input under one join orientation."""
-    return (pre + maximum[anchor] + spec["frame_tokens"][anchor]
-            + spec["tail_tokens"]
-            + sum(spec["label_tokens"][partner] + maximum[partner]
-                  for partner in spec["aliases"] if partner != anchor))
+    return longest_join_input(
+        pre, maximum[anchor], spec.frame_tokens[anchor], spec.tail_tokens,
+        [(spec.label_tokens[partner], maximum[partner])
+         for partner in spec.aliases if partner != anchor])
 
 
 def score_input_tokens(spec, context) -> tuple[int, int]:

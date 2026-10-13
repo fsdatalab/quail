@@ -47,12 +47,22 @@ class InputPort:
 
 
 @dataclass(frozen=True)
+class AnswerOutput:
+    """Model answer columns exposed for reporting, before later row operations."""
+
+    kind: str
+    name: str
+    columns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class OutputPort:
     """Named output produced by a physical node."""
 
     name: str
     value_type: ValueType
     schema: tuple[str, ...] = ()
+    answer: AnswerOutput | None = None
 
 
 def value_type_for_port(name: str) -> ValueType:
@@ -94,6 +104,30 @@ class PhysicalNode:
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
     backend: ClassVar[str | None] = None
 
+    worker_pipelining: ClassVar[bool] = False
+
+    @property
+    def document_aliases(self) -> tuple[str, ...]:
+        """Return aliases this operator can process one document at a time."""
+        return ()
+
+    @property
+    def document_head(self) -> tuple[int, ...] | None:
+        """Return the document's prompt head, or None for the shared preamble."""
+        return None
+
+    def document_outputs(self, alias: str) -> tuple[str, ...]:
+        """Return outputs that can feed the next operator for a document."""
+        return (f"ids:{alias}",)
+
+    def can_follow(self, previous: "PhysicalNode", first: "PhysicalNode") -> bool:
+        """Return whether this operator can use the preceding document KV."""
+        return True
+
+    def can_precede(self, consumer: "PhysicalNode") -> bool:
+        """Return whether a consumer can run before other documents finish."""
+        return True
+
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         raise NotImplementedError
@@ -116,13 +150,19 @@ class PhysicalNode:
         """Return the same node with replacement inputs."""
         return replace(self, inputs=inputs)
 
-    def embedded_nodes(self) -> tuple["PhysicalNode", ...]:
-        """Return physical nodes stored inside this planning node."""
-        return ()
-
     def explain_fields(self) -> Mapping[str, Any]:
         """Return fields shown on one explain line."""
         return self.attributes()
+
+
+def validate_integer_setting(name: str, value: int, minimum: int = 1) -> None:
+    """Validate an integer execution setting.
+
+    Raises:
+        ValueError: When value is not an int at least minimum.
+    """
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
 
 
 class GraphValidationError(ValueError):
@@ -244,21 +284,5 @@ class PhysicalGraph:
         return tuple(ordered)
 
     def nodes_by_type(self, type_name: str) -> tuple[PhysicalNode, ...]:
-        """Return graph and embedded nodes with one registered type name."""
-        found = []
-
-        def visit(node: PhysicalNode) -> None:
-            if node.type_name == type_name:
-                found.append(node)
-            for child in node.embedded_nodes():
-                visit(child)
-
-        for node in self.nodes:
-            visit(node)
-        return tuple(found)
-
-    def explain(self, *, verbose: bool = False) -> str:
-        """Return an operator tree, optionally including internal fields."""
-        from quail.explain import physical_tree
-
-        return physical_tree(self, verbose=verbose)
+        """Return the graph's nodes with one registered type name."""
+        return tuple(node for node in self.nodes if node.type_name == type_name)

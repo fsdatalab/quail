@@ -1,6 +1,6 @@
 """Model and device spec structs for the planner."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Literal
 
 Precision = Literal["fp8", "bf16", "fp32"]
@@ -322,10 +322,6 @@ class ModelSpec:
     def intermediate(self) -> int:
         """MLP intermediate width; gate_up packs two of them."""
         return self.ffn_width // 2
-
-    def with_kv_bytes(self, kv_bytes: float) -> "ModelSpec":
-        return replace(self, kv_bytes=kv_bytes)
-
 
 @dataclass(frozen=True)
 class DeviceSpec:

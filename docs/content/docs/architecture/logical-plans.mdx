@@ -195,8 +195,11 @@ the category text `positive` in the result column.
 
 Quail tokenizes documents separately from fixed prompt text. The executor
 joins the token sequences without tokenizing the complete text again.
-This lets it reuse document tokens across queries. Bound prompts store
-fixed token IDs and counts for the planner and executor.
+This lets it reuse document tokens across queries. A bound prompt is
+text. The planner lowers it once per query with the session's
+tokenizer (`quail.planner.prompt_lowering.lower_prompt`), and the
+lowered prompt holds the fixed token IDs and counts the cost model and
+the executor read.
 
 For a score over one document, the input is:
 

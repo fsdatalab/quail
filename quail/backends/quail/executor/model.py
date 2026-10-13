@@ -54,8 +54,8 @@ def engine_args(path, architecture: str = "") -> dict:
     A Decision 2.0 package keeps its Qwen3 backbone in backbone/, in
     fp32 and without the `model.` tensor prefix; vLLM loads it as bf16
     through a class that maps the names, which the caller registers
-    with `vllm_decision.register()`. The tokenizer stays at the package
-    root.
+    with `decision2.register_backbone()`. The tokenizer stays at the
+    package root.
 
     Args:
         path: The local checkpoint directory.
@@ -64,7 +64,9 @@ def engine_args(path, architecture: str = "") -> dict:
     """
     if not is_decision2(path):
         return {"model": str(path)}
-    from quail.backends.vllm_decision import BACKBONE_ARCHITECTURE
+    from quail.backends.quail.executor.models.decision2 import (
+        BACKBONE_ARCHITECTURE,
+    )
 
     return {"model": str(Path(path) / "backbone"), "tokenizer": str(path),
             "dtype": "bfloat16",
@@ -216,9 +218,11 @@ def load_model(model_name: str, revision: str | None = None, *,
         os.environ["VLLM_TUNED_CONFIG_FOLDER"] = str(folder)
     model_path = resolve_model_path(model_name, revision)
     if is_decision2(model_path):
-        from quail.backends.vllm_decision import register
+        from quail.backends.quail.executor.models.decision2 import (
+            register_backbone,
+        )
 
-        register()
+        register_backbone()
     args = {"dtype": "auto", "enforce_eager": True} | engine_args(model_path)
     if max_batched_tokens is not None:
         args["max_num_batched_tokens"] = int(max_batched_tokens)
@@ -236,7 +240,7 @@ def load_model(model_name: str, revision: str | None = None, *,
     if answer_token_ids is None:
         from gigatoken import Tokenizer
 
-        from quail.logical import true_false_ids
+        from quail.planner.prompt_lowering import true_false_ids
 
         tokenizer = Tokenizer(model_path).as_hf()
         true_ids, false_ids = true_false_ids(tokenizer)
