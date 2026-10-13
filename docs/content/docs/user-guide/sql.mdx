@@ -383,14 +383,27 @@ For the same answer, `ends` contains `Lease ends on March 3, 2027.` and
 `ends_span` contains `{"start": 0, "end": 28}`. Line boundaries follow
 the line breaks in your source text.
 
-### Supported queries
+### Ask more than one question
+
+For the same `contracts` table, you can ask for both the lease end date
+and the person who signed it:
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.text, 'When does the lease end?') AS end_date,
+       AI.EXTRACT(c.text, 'Who signed the lease?') AS signer
+FROM contracts c
+```
+
+You get `end_date` and `end_date_span` for the first question, and
+`signer` and `signer_span` for the second question.
+
+### Current limits
 
 - Use Qwen3 4B or Qwen3 32B with `gpus=1`. See
   [Supported models and GPUs](/docs/user-guide/models).
 - Put each extraction directly in `SELECT` with an `AS` name. You cannot
   use it in a `WHERE` condition or inside another expression.
-- To ask several questions, add an `AI.EXTRACT` call with a different
-  answer name for each question.
 - You can combine extraction with filters, joins, and classification.
   Each extraction reads one document column.
 - You cannot combine `AI.EXTRACT` with `AI.SCORE` in one query.
