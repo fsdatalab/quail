@@ -1,6 +1,7 @@
 """Planning on length estimates while the token file is written."""
 
 import threading
+import time
 
 import pyarrow as pa
 from helpers.sessions import make_executor
@@ -98,6 +99,34 @@ def _table_session(bodies):
         tokenizer=str.split)
     session.register("docs", quail.DocumentProvider.from_table(table, id_col="id"))
     return session
+
+
+def test_exact_replanning_excludes_backend_startup_from_query_time(monkeypatch):
+    clock = time.perf_counter
+    elapsed_boot = 0.0
+
+    def prepare(plan, registry):
+        nonlocal elapsed_boot
+        elapsed_boot += 100.0
+
+    monkeypatch.setattr(time, "perf_counter", lambda: clock() + elapsed_boot)
+    monkeypatch.setattr(execution, "gpu_problem", lambda: None)
+    monkeypatch.setattr(execution, "_prepare_backend", prepare)
+    executor = make_executor(TRUTH)
+    monkeypatch.setattr(execution, "_execute_physical",
+                        lambda request, registry: executor(request))
+    with _session() as session:
+        query = session.sql(SQL)
+        query.plan()
+        for future in query._token_futures.values():
+            finished = threading.Event()
+            future.add_done_callback(lambda _, event=finished: event.set())
+            assert finished.wait(timeout=10)
+        result = query.run()
+        assert query._replanning_s > 0
+        assert result.report["worker_total_s"] >= elapsed_boot
+        assert (result.report["planning_s"]
+                <= result.report["input_ready_s"] < elapsed_boot)
 
 
 def test_prefix_sharing_and_attention_path_are_decided_from_exact_tokens():

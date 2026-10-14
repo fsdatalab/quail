@@ -78,7 +78,6 @@ class Query:
         self._planning_started_at = None
         self._planning_finished_at = None
         self._replanning_s = 0.0
-        self._replanning_finished_at = None
         self._scan_selectivities = {}
         self._pair_selectivities = {}
         self.token_wait_s = 0.0
@@ -210,15 +209,14 @@ class Query:
 
     @property
     def input_ready_s(self) -> float:
-        """Return time until planning and document tokenization finished."""
+        """Return planning and tokenization time, excluding backend startup."""
         if self._planning_started_at is None:
             return 0.0
         finished = [
             self._planning_finished_at or time.perf_counter(),
-            self._replanning_finished_at or 0.0,
             *self._token_finished_at.values(),
         ]
-        return max(finished) - self._planning_started_at
+        return max(finished) - self._planning_started_at + self._replanning_s
 
     def _pair_fractions(self, scans, joins) -> dict:
         """Estimated pairs over the cross product, per join with conditions."""
@@ -339,7 +337,6 @@ class Query:
                 self._plan = replace(self._plan, settings={
                     **self._plan.settings, "gpu_timing": True})
             self._replanning_s += time.perf_counter() - started
-            self._replanning_finished_at = time.perf_counter()
             self._estimated = ()
 
     def run(self, plan=None) -> QueryResult:
