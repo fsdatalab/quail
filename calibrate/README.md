@@ -1,213 +1,252 @@
-# calibrate
+# calibrate: GPU rates for the Quail cost model
 
-The `calibrate` package measures how fast a GPU does the work that
-Quail's cost model prices. It measures three rates:
+The `calibrate` package measures three rates of a GPU:
 
-- the fp8 matrix multiply (GEMM) rate, in [`gemm.py`](gemm.py);
-- the attention rate, in [`attention.py`](attention.py);
-- the memory bandwidth, also in [`attention.py`](attention.py).
+- the fp8 GEMM rate, with [`gemm.py`](gemm.py);
+- the attention rate, with [`attention.py`](attention.py);
+- the memory bandwidth, with [`attention.py`](attention.py).
 
-The package uses vendor libraries, not Quail's kernels. Thus the
-measured rates do not change when Quail's code changes.
+A GEMM is a matrix multiply. The Quail cost model uses these three
+rates to estimate the time of a query.
 
-The results go into the measured fields of `quail/specs/<device>.py`.
-[`to_spec.py`](to_spec.py) prints these fields from the saved results.
+The package uses vendor libraries (cuBLAS, FlashAttention 3, and
+FlashInfer). It does not use the Quail kernels. Changes to the Quail
+kernels do not change the measured rates.
 
-This package is not part of the `quail` wheel.
+[`to_spec.py`](to_spec.py) changes the results into the fields of
+`quail/specs/<device>.py`. This package is not in the `quail` wheel.
 
-## The GEMM measurement
+In this document, a "measurement" is one execution of `gemm.py` or
+`attention.py`.
 
-[`gemm.py`](gemm.py) measures the fastest fp8 GEMM rate that the GPU
-can keep at full power. The cost model uses this rate as
+## GEMM rate: gemm.py
+
+[`gemm.py`](gemm.py) finds the highest fp8 GEMM rate that the GPU
+holds at full power. The cost model uses this rate as
 `sustained_fp8_flops`.
 
-### The tool
+### Software that gemm.py uses
 
-`gemm.py` runs
-[mamf-finder](https://github.com/stas00/ml-engineering/blob/30ddd97054eb01035c0a5079a58f011df603b525/compute/accelerator/benchmarks/mamf-finder.py)
-by Stas Bekman. `gemm.py` does not change mamf-finder.
+`gemm.py` uses
+[mamf-finder](https://github.com/stas00/ml-engineering/blob/30ddd97054eb01035c0a5079a58f011df603b525/compute/accelerator/benchmarks/mamf-finder.py),
+a script by Stas Bekman:
 
-- `gemm.py` uses one fixed version of mamf-finder, at commit
-  `30ddd970`.
-- `gemm.py` downloads the file and checks its sha256 before it runs it.
-  If the sha256 is not correct, `gemm.py` stops.
-- mamf-finder calls `torch._scaled_mm` with one fp8 scale for each
-  tensor. PyTorch sends this call to cuBLAS.
+- `gemm.py` uses mamf-finder at commit `30ddd970` only.
+- `gemm.py` downloads mamf-finder and examines its sha256. If the
+  sha256 is incorrect, `gemm.py` stops.
+- `gemm.py` does not change mamf-finder.
 
-### The two rates
+mamf-finder calls `torch._scaled_mm` with one fp8 scale for each
+matrix. PyTorch sends this call to cuBLAS.
 
-mamf-finder gives two rates for each run:
+### MAMF and MSMF
 
-- **MAMF** (maximum achievable matmul FLOPS) is the fastest rate in a
-  short burst. The GPU starts each burst cool and at its top clock.
-- **MSMF** (maximum sustainable matmul FLOPS) is the fastest rate that
-  the GPU keeps for 2 s at full power. The GPU decreases its clock to
-  stay at its power limit, so MSMF is lower than MAMF.
+mamf-finder gives two rates:
 
-Quail uses MSMF. A query keeps the GPU at full power for seconds or
-minutes, not for one short burst.
+- **MAMF** (maximum achievable matmul FLOPS) is the highest rate in a
+  short burst. At the start of a burst, the GPU is cool and its clock
+  is at the maximum.
+- **MSMF** (maximum sustainable matmul FLOPS) is the highest rate that
+  the GPU holds for 2 s at full power.
 
-For example, on an H100 SXM, the vendor's fp8 specification is 1,979
-TFLOPS. The published MAMF is 1,550 TFLOPS. The published MSMF is
-1,358 TFLOPS.
+At full power, the GPU decreases its clock to stay below its power
+limit. For this reason, MSMF is lower than MAMF.
 
-### How mamf-finder measures one shape
+The cost model uses MSMF. A query holds the GPU at full power for
+seconds or minutes.
 
-A shape is the three sizes M, N, and K of one GEMM. For each shape,
-mamf-finder does these steps:
+For example, for the H100 SXM:
 
-1. For MAMF, it runs 10 bursts of 20 GEMMs. Before each burst, the GPU
-   stays idle for 0.25 s.
-2. It keeps only the GEMMs that ran at a clock of at least 0.97 times
-   the top clock.
-3. It takes the median of the 5 fastest GEMMs that it kept.
-4. For MSMF, it runs the GEMM until the clock stops decreasing.
-5. It then times the GEMM for 2 s, in 8 equal parts.
-6. It accepts the 2 s window only if two conditions are true:
-   - the second half is no more than 1% slower than the first half;
-   - the parts are within 10% of each other.
+| Rate | TFLOPS |
+|---|---|
+| Vendor specification, fp8 | 1,979 |
+| Published MAMF | 1,550 |
+| Published MSMF | 1,358 |
 
-The MAMF or MSMF of the GPU is the best rate of all the shapes.
+### Procedure that mamf-finder uses for one shape
 
-### The runs
+A GEMM multiplies an M × K matrix by a K × N matrix. The shape of the
+GEMM is M, N, and K. mamf-finder does these steps for each shape.
 
-`gemm.py` does these runs on the same GPU:
+To find the MAMF of the shape:
 
-| Run | Shapes | When |
+1. Run 10 bursts of 20 GEMMs. Before each burst, do not use the GPU
+   for 0.25 s.
+2. Discard each GEMM with a clock below 0.97 times the maximum clock.
+3. Find the 5 fastest GEMMs that remain.
+4. Use the median rate of these 5 GEMMs.
+
+To find the MSMF of the shape:
+
+1. Run the GEMM until the clock does not decrease.
+2. Measure the time of the GEMMs for 2 s. Divide the 2 s into 8
+   equal parts.
+3. Make sure that the result is steady. The result is steady if these
+   two conditions are true:
+   - The second half is not more than 1% slower than the first half.
+   - The difference between the fastest part and the slowest part is
+     not more than 10% of the median part.
+
+The MAMF of the GPU is the highest MAMF of all the shapes. The MSMF
+of the GPU is the highest MSMF of all the shapes.
+
+### Shapes that gemm.py measures
+
+`gemm.py` calls mamf-finder one or more times on the same GPU. Each
+call has a name:
+
+| Name | Shapes | Condition |
 |---|---|---|
-| `published_fp8` | The published MAMF and MSMF shapes of the GPU | The GPU has published rates in [`targets.py`](targets.py) |
-| `search` | The shape search of mamf-finder | The GPU has no published rates |
-| `qkv`, `o`, `gate_up`, `down` | The four projections of one model, with M from 16 to 131,072 tokens | You give `--model` |
+| `published_fp8` | The published MAMF shape and MSMF shape of the GPU | The GPU has published rates in [`targets.py`](targets.py) |
+| `search` | The shapes that mamf-finder selects | The GPU has no published rates |
+| `qkv`, `o`, `gate_up`, `down` | The four projections of one model; M is 16 to 131,072 tokens | You use `--model` |
 
-The `published_fp8` run lets you compare the GPU with the published
-rates. The projection runs are optional. The cost model does not need
-them.
+Use the `published_fp8` result to compare the GPU with the published
+rates. The cost model does not use the projection results.
 
-### Run the measurement
+### Measure the GEMM rate on a local GPU
 
-To run on a computer with the GPU, use this command:
+Do this procedure on a computer that has the GPU.
 
-```bash
-uv run python -m calibrate.gemm --device h100-sxm --root results/calibrate
-```
+1. Run this command:
 
-To run on Modal, use [`modal_app.py`](modal_app.py). Write the output
-to a log file:
+   ```bash
+   uv run python -m calibrate.gemm --device h100-sxm --root results/calibrate
+   ```
 
-```bash
-mkdir -p results/benchmark
-log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-gemm.log"
-uv run modal run --detach calibrate/modal_app.py::gemm \
-    --device h100-sxm --prediction "..." 2>&1 | tee "$log"
-```
+2. To also measure the projections of a model, add
+   `--model qwen3-4b-fp8`.
 
-The Modal run uses the NGC image `nvcr.io/nvidia/pytorch:26.04-py3`.
-The published H100 SXM rates come from this image. The Modal run
-writes to the `quail-results` volume, under `calibrate/`.
+### Measure the GEMM rate on Modal
 
-To also sweep the projections of a model, add `--model`, for example
-`--model qwen3-4b-fp8`.
+[`modal_app.py`](modal_app.py) does the same measurement on a Modal
+GPU. It uses the NGC image `nvcr.io/nvidia/pytorch:26.04-py3`. The
+published H100 SXM rates are from this image.
 
-### The output
+1. Run these commands:
 
-`--root` is the results directory. The run writes these files:
+   ```bash
+   mkdir -p results/benchmark
+   log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-gemm.log"
+   uv run modal run --detach calibrate/modal_app.py::gemm \
+       --device h100-sxm --prediction "..." 2>&1 | tee "$log"
+   ```
 
-- `<root>/<device>/gemm/<stamp>/<run>.txt`: the log of each
-  mamf-finder run;
-- `<root>/<device>/gemm/<stamp>/summary.json`: the summary, updated
-  after each run;
-- `<root>/<device>/gemm.json`: a copy of the last summary.
+2. Find the results on the `quail-results` volume, in `calibrate/`.
 
-Each new run replaces `gemm.json`. The logs of earlier runs stay in
-their own `<stamp>` directories.
+### Output files of gemm.py
 
-### Results on H100 SXM
+`--root` is the results directory. On Modal, the results directory is
+`calibrate/` on the `quail-results` volume.
 
-Each Modal run can get a different physical H100. These runs used the
-`published_fp8` shapes:
+| File | Contents |
+|---|---|
+| `<root>/<device>/gemm/<stamp>/<name>.txt` | The log of one mamf-finder call |
+| `<root>/<device>/gemm/<stamp>/summary.json` | The summary of the measurement, written after each call |
+| `<root>/<device>/gemm.json` | A copy of the summary of the last measurement |
 
-| Run | MSMF, TFLOPS | MAMF, TFLOPS | Results |
+Each measurement replaces `gemm.json`. The `<stamp>` directories of
+earlier measurements do not change.
+
+### GEMM results on H100 SXM
+
+On Modal, you cannot select the physical GPU. Each measurement can use
+a different H100. These measurements used the `published_fp8` shapes
+and the same software:
+
+| Date | MSMF, TFLOPS | MAMF, TFLOPS | Results directory |
 |---|---|---|---|
 | 2026-10-12 | 1,352 | 1,543 | `/results/ablations/gemm_ceilings/20261012T222632Z/` |
-| 2026-10-13, first | 1,429 | 1,629 | `/results/calibrate/h100-sxm/gemm/20261013T221653Z/` |
-| 2026-10-13, second | 1,315 | 1,500 | `/results/calibrate/h100-sxm/gemm/20261013T234156Z/` |
+| 2026-10-13 | 1,429 | 1,629 | `/results/calibrate/h100-sxm/gemm/20261013T221653Z/` |
+| 2026-10-13 | 1,315 | 1,500 | `/results/calibrate/h100-sxm/gemm/20261013T234156Z/` |
 
-The fastest MSMF is 8.7% higher than the slowest. The published rates
-show a difference of 2.7% between GPUs. The software was the same in
-all three runs.
+The highest MSMF is 8.7% more than the lowest MSMF. In the published
+results, the difference between GPUs is 2.7%.
 
-`quail/specs/h100_sxm.py` uses 1,352 TFLOPS. This rate is lower than
-the rate of the fastest GPU above. On that GPU, the speed of light
-(SoL) estimate can be slower than the real query. More runs on more
-GPUs will show the highest rate to use.
+`quail/specs/h100_sxm.py` uses 1,352 TFLOPS. The second GPU is faster
+than this rate. On that GPU, the speed-of-light (SoL) estimate can be
+longer than the measured query time. Then the estimate is not a lower
+bound. Measurements on more GPUs are necessary to find the correct
+rate.
 
-## The attention measurement
+## Attention rate and memory bandwidth: attention.py
 
-[`attention.py`](attention.py) times FlashAttention 3 and FlashInfer
-in bf16, at one head layout. A head layout is the number of query
-heads, the number of KV heads, and the head dimension. The device
-specification keeps one table of attention rates for each head layout.
+[`attention.py`](attention.py) measures FlashAttention 3 and FlashInfer
+in bf16, for one head layout. A head layout is three numbers: the
+query heads, the KV heads, and the head dimension. The device
+specification has one table of attention rates for each head layout.
 
-The measurement has three kinds of point:
+`attention.py` measures three types of point:
 
-- `packed`: causal attention on documents of equal length;
-- `cached`: query rows that read cached KV in pages;
-- `copy`: one 4 GB copy on the GPU, for the memory bandwidth.
+| Type | Work |
+|---|---|
+| `packed` | Causal attention on documents of equal length |
+| `cached` | Query rows that read cached KV in pages |
+| `copy` | One 4 GB copy on the GPU, for the memory bandwidth |
 
-The measurement times each point for 2 s at full power. It uses the
-same 2 s window and the same limits as MSMF.
-[`timing.py`](timing.py) contains this timing code.
+`attention.py` measures each point for 2 s at full power. The 2 s window and its limits
+are the same as for MSMF. [`timing.py`](timing.py) has this code.
 
-To run on a computer with the GPU, FlashAttention 3, and FlashInfer,
-use this command:
+### Measure the attention rate on a local GPU
 
-```bash
-uv run python -m calibrate.attention --device h100-sxm --heads 32,8,128 \
-    --root results/calibrate
-```
+Do this procedure on a computer that has the GPU, FlashAttention 3, and
+FlashInfer.
 
-To run on Modal, use this command:
+1. Run this command:
 
-```bash
-uv run modal run --detach calibrate/modal_app.py::attention \
-    --device h100-sxm --heads 32,8,128
-```
+   ```bash
+   uv run python -m calibrate.attention --device h100-sxm --heads 32,8,128 \
+       --root results/calibrate
+   ```
 
-Add `--smoke` for a short check. The smoke run measures one point of
-each kind for 0.5 s. It also compares both libraries with PyTorch.
+2. For a short test, add `--smoke`. The test measures one point of each
+   type for 0.5 s. It also compares the two libraries with PyTorch.
 
-## Make the device specification
+### Measure the attention rate on Modal
+
+1. Run this command:
+
+   ```bash
+   uv run modal run --detach calibrate/modal_app.py::attention \
+       --device h100-sxm --heads 32,8,128
+   ```
+
+2. For a short test, add `--smoke`.
+
+## Make the device specification: to_spec.py
 
 [`to_spec.py`](to_spec.py) reads the GEMM summary and the attention
-summary. It prints the fields for `quail/specs/<device>.py`:
+summary. It writes the fields for `quail/specs/<device>.py`:
 
-```bash
-uv run python -m calibrate.to_spec \
-    results/calibrate/h100-sxm/gemm.json \
-    results/calibrate/h100-sxm/attention_32_8_128.json
-```
+| Field | Value |
+|---|---|
+| `sustained_fp8_flops` | The highest MSMF of all the mamf-finder calls |
+| `sustained_hbm_bw` | The bandwidth of the copy |
+| `attention_rates` | The faster library at each point |
 
-- `sustained_fp8_flops` is the best MSMF of all the GEMM runs.
-- `sustained_hbm_bw` is the bandwidth of the copy.
-- The attention table uses the faster library at each point.
+`to_spec.py` also writes each point that was not steady.
 
-`to_spec.py` also prints each point that was not steady.
+1. If the summaries are on Modal, copy them from the volume:
 
-After a Modal run, first copy the summaries from the volume:
+   ```bash
+   modal volume get quail-results calibrate/h100-sxm/gemm.json .
+   modal volume get quail-results calibrate/h100-sxm/attention_32_8_128.json .
+   ```
 
-```bash
-modal volume get quail-results calibrate/h100-sxm/gemm.json .
-modal volume get quail-results calibrate/h100-sxm/attention_32_8_128.json .
-```
+2. Run `to_spec.py` with the two summaries:
+
+   ```bash
+   uv run python -m calibrate.to_spec gemm.json attention_32_8_128.json
+   ```
+
+3. Copy the output into `quail/specs/<device>.py`.
 
 ## Add a GPU
 
-Add a `Target` to [`targets.py`](targets.py). The `Target` gives:
-
-- the device name in `quail.specs`;
-- the Modal GPU type;
-- the FlashInfer architecture;
-- the published fp8 MAMF and MSMF, if they are available.
-
-If the GPU has no published rates, `gemm.py` runs the shape search of
-mamf-finder.
+1. Add a `Target` to [`targets.py`](targets.py). The `Target` has:
+   - the device name in `quail.specs`;
+   - the Modal GPU type;
+   - the FlashInfer architecture;
+   - the published fp8 MAMF and MSMF, if they are available.
+2. If the GPU has no published rates, set `published_fp8` to `None`.
+   Then `gemm.py` uses the shapes that mamf-finder selects.
