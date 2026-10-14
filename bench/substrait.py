@@ -49,9 +49,11 @@ def build_query(session, info: PlanInfo, selectivity=None,
             per_alias.setdefault(item.relation, []).append(item)
     prompts = {(item.relation, item.output): item.prompt
                for item in info.classifies}
-    # a label, score, or answer field is a named output of the builder
+    # a label, score, or answer struct is a named output of the builder
     named = {f"{item.relation}.{item.output}": item.output
-             for item in (*info.classifies, *info.scores, *info.extracts)}
+             for item in (*info.classifies, *info.scores)}
+    named.update({name: struct.name for struct in info.structs
+                  for name in struct.fields})
 
     def field(name: str) -> str:
         return named.get(name, name)
@@ -71,9 +73,16 @@ def build_query(session, info: PlanInfo, selectivity=None,
                     quail.prompt(item.prompt, document(alias)),
                     name=item.output)
             elif isinstance(item, Extract):
+                # a struct's fields are one call, made at its first field
+                struct = info.struct_of(item)
+                if struct.fields[0] != f"{alias}.{item.output}":
+                    continue
+                questions = {extract.output: extract.prompt
+                             for extract in info.extracts
+                             if info.struct_of(extract) == struct}
                 query = query.ai_extract(
                     f"{alias}.{info.relation(alias).text_column}",
-                    item.prompt, name=item.output)
+                    questions, name=struct.name)
             elif isinstance(item, Filter):
                 query = query.ai_filter(
                     quail.prompt(item.prompt, document(alias)),
@@ -141,4 +150,5 @@ def build_query(session, info: PlanInfo, selectivity=None,
             if step.offset:
                 query = query.offset(step.offset)
             query = query.limit(step.count)
-    return query.select(*(field(name) for name in info.select), order=order)
+    return query.select(*dict.fromkeys(field(name) for name in info.select),
+                        order=order)

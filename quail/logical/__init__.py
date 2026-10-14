@@ -16,6 +16,7 @@ from quail.logical.expressions import (
     Compare,
     CompileError,
     Equality,
+    ExtractStruct,
     FilterPredicate,
     HavingTest,
     InList,
@@ -27,6 +28,7 @@ from quail.logical.expressions import (
     has_score,
     is_score,
     model_call,
+    packed_columns,
 )
 from quail.logical.nodes import (
     Aggregate,
@@ -82,6 +84,7 @@ __all__ = [
     "CompileError",
     "DEFAULT_SELECTIVITY",
     "Equality",
+    "ExtractStruct",
     "Filter",
     "FilterPredicate",
     "HavingTest",
@@ -125,6 +128,7 @@ __all__ = [
     "label_text",
     "model_call",
     "oriented_join_conditions",
+    "packed_columns",
     "render_join_frame",
     "render_join_prompt_text",
     "render_join_question",

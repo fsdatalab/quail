@@ -46,7 +46,7 @@ from quail_b.queries import (
 )
 from quail_b.queries import queries as query_specs
 from quail_b.scoring import RunOutput, reference_answer
-from quail_b.substrait import Filter, InList, PlanInfo, output_name
+from quail_b.substrait import Filter, InList, PlanInfo
 
 # the fixed planner inputs, by prompt, and by prompt and accepted
 # labels for an IN-list filter; a predicate without an estimate here gets
@@ -183,20 +183,21 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         })
     extract_answers = {}
     for operator in info.extracts:
-        table = result.answer_tables["extracts"][operator.output]
+        name = _extract_name(info, operator)
+        table = result.answer_tables["extracts"][name]
         extract_answers[operator.id] = pa.table({
             operator.relation: id_column(
                 operator.relation, table.column(operator.relation)),
-            "answer": table.column(operator.output).cast(pa.string()),
+            "answer": table.column(name).cast(pa.string()),
         })
-    # quail-b checks that a plan selects ids, labels, scores, answers,
-    # and measures; a selected answer brings its span column, which the
-    # benchmark does not take
-    names = [output_name(name) for name in info.select]
+    # quail-b checks that a plan selects ids, labels, scores, answer
+    # structs, and measures; an answer struct brings its span struct,
+    # which the benchmark does not take
+    names = list(info.columns)
     started = time.perf_counter()
     rows = result.collect()
     collection_s = time.perf_counter() - started
-    spans = [f"{operator.output}{SPAN_SUFFIX}" for operator in info.extracts]
+    spans = [f"{struct.name}{SPAN_SUFFIX}" for struct in info.structs]
     rows = rows.drop_columns([name for name in rows.column_names
                               if name in spans])
     return RunOutput(
@@ -294,7 +295,7 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
     # inside the model's extract turn, which differs from the AI.IF
     # preamble on a model that answers AI.IF raw
     for operator in info.extracts:
-        head, tail = _extract_parts(query.plan(), operator.output)
+        head, tail = _extract_parts(query.plan(), _extract_name(info, operator))
         if not pieces["preamble"]:
             pieces["preamble"] = list(head)
         elif list(head) != pieces["preamble"]:
@@ -303,6 +304,11 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
             return None
         pieces["extracts"].append({"id": operator.id, "tail": list(tail)})
     return pieces
+
+
+def _extract_name(info: PlanInfo, operator) -> str:
+    """Return the name Quail gives an extraction: its struct, then its field."""
+    return f"{info.struct_of(operator).name}.{operator.output}"
 
 
 def _extract_parts(plan, output: str) -> tuple:

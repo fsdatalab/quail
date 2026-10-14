@@ -17,6 +17,7 @@ from quail.logical import (
     Alias,
     ColumnRef,
     CompileError,
+    ExtractStruct,
     HavingTest,
     SortKey,
     column_name,
@@ -66,11 +67,13 @@ def bind_order(
     b: ExpressionBinder,
     columns: tuple[ColumnRef | Alias, ...],
     aggregation: Aggregation | None = None,
+    structs: tuple[ExtractStruct, ...] = (),
 ) -> tuple[SortKey, ...]:
     """Bind each ORDER BY term to a projected name or a source column."""
     order = tree.args.get("order")
     if order is None:
         return ()
+    struct_names = {struct.name for struct in structs}
     named = {column.name: column for column in columns if isinstance(column, Alias)}
     if aggregation is not None:
         named.update(
@@ -84,6 +87,10 @@ def bind_order(
                 f"ORDER BY {target.sql()} is not a column; give an "
                 f"expression an AS name in SELECT and order by that name"
             )
+        if not target.table and target.name in struct_names:
+            raise CompileError(
+                f"ORDER BY does not compare the AI.EXTRACT struct column "
+                f"{target.name!r}; extract the field as its own column")
         if not target.table and target.name in named:
             expression = named[target.name]
         else:
@@ -113,6 +120,7 @@ class BoundSelect:
 
     columns: tuple[ColumnRef | Alias, ...]
     aggregation: Aggregation | None
+    structs: tuple[ExtractStruct, ...] = ()
 
 
 @dataclass
@@ -124,6 +132,7 @@ class SelectBinder:
     plain: list[str] = field(default_factory=list)
     output: list[str] = field(default_factory=list)
     aggregates: list[AggregateCall] = field(default_factory=list)
+    structs: list[ExtractStruct] = field(default_factory=list)
 
     def register_argument(self, node: exp.Expression, hidden: str) -> str:
         """Bind an aggregate's or key's expression to a projected column name.
@@ -184,7 +193,7 @@ class SelectBinder:
                     "an aggregate in SELECT is a direct COUNT, SUM, AVG, MIN, "
                     "or MAX call with an AS name"
                 )
-            selected = _compile_projection(b, [e])
+            selected = _compile_projection(b, [e], self.structs)
             for column in selected:
                 if column not in columns:
                     columns.append(column)
@@ -248,13 +257,18 @@ class SelectBinder:
     def bind(self, tree: exp.Select) -> BoundSelect:
         """Bind SELECT and its grouping clauses."""
         self.bind_projection(tree)
+        if self.structs and (self.aggregates or tree.args.get("group")
+                             or tree.args.get("having")):
+            raise CompileError(
+                "GROUP BY does not read AI.EXTRACT struct columns; extract "
+                "each field as its own column")
         keys = self.bind_group(tree)
         tests = self.bind_having(tree)
         if not self.aggregates and not keys and not tests:
             if len(self.output) != len(set(self.output)):
                 raise CompileError(
                     f"projection names must be unique, got {self.output}")
-            return BoundSelect(tuple(self.columns), None)
+            return BoundSelect(tuple(self.columns), None, tuple(self.structs))
         for name in self.plain:
             if name not in keys:
                 raise CompileError(
@@ -278,7 +292,7 @@ def _number(node):
     raise CompileError(f"HAVING compares with a number, got {node.sql()}")
 
 
-def _compile_projection(b: ExpressionBinder, expressions) -> list:
+def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list:
     columns = []
     for e in expressions:
         if isinstance(e, exp.Star):
@@ -309,7 +323,9 @@ def _compile_projection(b: ExpressionBinder, expressions) -> list:
         if _is_call(e, "AI_EXTRACT"):
             if not alias:
                 raise CompileError("AI.EXTRACT needs an AS name in SELECT")
-            columns.append(Alias(b.bind_ai_extract(e), alias))
+            struct, members = b.bind_ai_extract(e, alias)
+            structs.append(struct)
+            columns.extend(members)
             continue
         if any(
             _is_call(call, "AI_SCORE") or _is_call(call, "AI_EXTRACT")
