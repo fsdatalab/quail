@@ -18,7 +18,7 @@ from quail.catalog.tokens import (
     prefix_tree,
 )
 from quail.planner.graph.shards import contiguous_shards
-from quail.planner.statistics.query import AliasStats, summarize_alias
+from quail.planner.statistics.tables import AliasStats, summarize_alias
 
 
 def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypatch):

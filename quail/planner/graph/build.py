@@ -40,21 +40,15 @@ from quail.planner.graph import retention
 from quail.planner.graph.node_estimates import node_estimates
 from quail.planner.graph.results import result_nodes
 from quail.planner.graph.shards import contiguous_shards
-from quail.planner.operators.model_calls import (
-    ScoreLowering,
-    classify_builder,
-    extract_spec,
-    inference_node,
-)
+from quail.planner.operators.classify import classify_builder
+from quail.planner.operators.common import inference_node, question_tokens
+from quail.planner.operators.extract import extract_spec
+from quail.planner.operators.score import ScoreLowering
 from quail.planner.optimizer.physical import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal, inference_seconds
 from quail.planner.search.decisions import choose_plan, validate_query
-from quail.planner.statistics.query import (
-    filter_stop_keys,
-    pair_counts,
-    question_tokens,
-    summarize_alias,
-)
+from quail.planner.statistics.query import filter_stop_keys
+from quail.planner.statistics.tables import pair_counts, summarize_alias
 from quail.planner.validation import (
     ClassifyRefusedError,
     ScoreRefusedError,

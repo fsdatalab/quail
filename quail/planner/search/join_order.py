@@ -14,7 +14,7 @@ from quail.cost.joins import stage_work as join_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work
 from quail.planner.search.leftdeep import search_left_deep
-from quail.planner.statistics.query import AliasStats, alias_stats, cross_tuples, thin
+from quail.planner.statistics.tables import AliasStats, alias_stats, cross_tuples, thin
 from quail.planner.validation import anchor_candidates, join_input_tokens
 
 

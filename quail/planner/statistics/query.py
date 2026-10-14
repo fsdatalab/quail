@@ -7,241 +7,24 @@ The functions after it read the decisions the logical rules recorded
 on the plan's nodes: each table's filter order and the join sequence.
 """
 
-import math
-from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import partial
-from operator import mul
-
-import pyarrow as pa
-import pyarrow.compute as pc
 
 from quail.cost import budgets
-from quail.cost.filters import filter_cost, filter_sequence_work
-from quail.cost.joins import PricedJoin
 from quail.cost.retention import retention_pages
-from quail.cost.score import ScoreCost
-from quail.cost.work import Work, triangle
 from quail.logical import (
     LogicalPlan,
     SemanticFilter,
     classified_above_joins,
     effective_selectivity,
     is_score,
-    join_conditions,
     model_call,
 )
-from quail.logical.prompts import prompt_aliases
+from quail.planner.operators.common import preamble_tokens
+from quail.planner.operators.join import join_specs
 from quail.planner.plan import CorpusStats
-from quail.planner.prompt_lowering import LoweredPrompt, score_token_parts
-from quail.planner.search.filter_order import PredicateCost
+from quail.planner.statistics.memory import pool_split
+from quail.planner.statistics.tables import scale_alias, summarize_alias
 from quail.specs import DeviceSpec, ModelSpec
-
-
-@dataclass(frozen=True)
-class AliasStats:
-    """Length sums and counts below the attention window for one alias."""
-
-    count: int
-    total: int
-    squared: int
-    maximum: int
-    window: int = 0
-    short_counts: tuple[tuple[int, int], ...] = ()
-
-    @property
-    def mean(self) -> float:
-        return self.total / self.count if self.count else 0.0
-
-    @property
-    def variance(self) -> float:
-        if not self.count:
-            return 0.0
-        return (self.squared * self.count - self.total * self.total) / self.count**2
-
-    def window_pairs(self, offset: float) -> float:
-        """Sum sliding pairs for document lengths plus an offset."""
-        window = self.window
-        linear = window * (self.total + offset * self.count)
-        linear -= self.count * window * (window - 1) / 2
-        return linear + sum(
-            count * (triangle(length + offset)
-                     - window * (length + offset) + window * (window - 1) / 2)
-            for length, count in self.short_counts if length + offset < window)
-
-    def window_reads(self, offset: float) -> float:
-        """Sum retained prefix keys visible to the first suffix token."""
-        cap = self.window - 1
-        return self.count * cap - sum(
-            count * (cap - length - offset)
-            for length, count in self.short_counts if length + offset < cap)
-
-
-def summarize_alias(lengths, window: int = 0, *, memo=None) -> AliasStats:
-    """Summarize a length column, optionally reusing a query's cached summary."""
-    key = ("alias_stats", id(lengths), window)
-    if memo is not None and key in memo:
-        return memo[key][1]
-    values = getattr(lengths, "arrow_array", lengths)
-    if not isinstance(values, (pa.Array, pa.ChunkedArray)):
-        values = pa.array(values, type=pa.int64())
-    else:
-        values = values.cast(pa.int64())
-    short_counts = ()
-    if window:
-        counts = pc.value_counts(pc.filter(values, pc.less(values, window)))
-        short_counts = tuple(sorted(zip(
-            counts.field("values").to_pylist(), counts.field("counts").to_pylist())))
-    summary = AliasStats(
-        count=len(values),
-        total=pc.sum(values).as_py() or 0,
-        squared=pc.sum(pc.multiply(values, values)).as_py() or 0,
-        maximum=pc.max(values).as_py() or 0,
-        window=window,
-        short_counts=short_counts,
-    )
-    if memo is not None:
-        # Keep the source alive so another column cannot reuse its identity.
-        memo[key] = (lengths, summary)
-    return summary
-
-
-def scale_alias(stats: AliasStats, fraction: float) -> AliasStats:
-    """Return the summary of the fraction of the documents expected to remain."""
-    return AliasStats(
-        count=round(stats.count * fraction),
-        total=round(stats.total * fraction),
-        squared=round(stats.squared * fraction),
-        maximum=stats.maximum,
-        window=stats.window,
-        short_counts=tuple((length, round(count * fraction))
-                           for length, count in stats.short_counts),
-    )
-
-
-def alias_stats(lengths: dict, window: int = 0) -> dict[str, AliasStats]:
-    """Normalize raw length lists or accept summaries from a caller."""
-    return {
-        alias: (values if isinstance(values, AliasStats)
-                else summarize_alias(values, window))
-        for alias, values in lengths.items()
-    }
-
-
-def surviving_docs(n_docs: float, n_partners: float,
-                   tuple_selectivity) -> float:
-    """Expected distinct documents with at least one matching tuple."""
-    tuple_selectivity = effective_selectivity(tuple_selectivity)
-    return n_docs * (1.0 - (1.0 - tuple_selectivity)
-                     ** max(1.0, n_partners))
-
-
-def thin(live: dict, spec: PricedJoin) -> None:
-    """Update live document counts after one join's selectivity."""
-    sel = spec.selectivity
-    aliases = spec.aliases
-
-    def others(x):
-        out = 1.0
-        for a in aliases:
-            if a != x:
-                out *= live[a]
-        return out
-
-    if spec.semantics == "full":
-        new = {a: surviving_docs(live[a], others(a), sel)
-               for a in aliases}
-        live.update(new)
-    else:
-        anchor = spec.anchor
-        matched = surviving_docs(live[anchor], others(anchor), sel)
-        live[anchor] = (matched if spec.semantics == "exists"
-                        else live[anchor] - matched)
-
-
-def cross_tuples(spec: PricedJoin, live: dict) -> float:
-    """Expected tuples of one join.
-
-    The live cross product, or the fraction of it the join's equality
-    conditions keep.
-    """
-    tuples = 1.0
-    for a in spec.aliases:
-        tuples *= live[a]
-    return tuples * spec.pair_fraction
-
-
-def question_tokens(lowered: LoweredPrompt, canvas: int = 0) -> int:
-    """Token count of the prompt's per-evaluation tail.
-
-    canvas is the rows a diffusion model appends to every evaluation
-    to answer on; a decoder answers on the tail's last row.
-    """
-    if lowered.tail_tokens is None:
-        raise ValueError("a score prompt has no question tail")
-    return lowered.tail_tokens + canvas
-
-
-def preamble_tokens(lowered_prompts) -> int:
-    """Return the engine preamble's token count from any lowered prompt."""
-    for lowered in lowered_prompts:
-        if lowered.preamble_tokens is not None:
-            return lowered.preamble_tokens
-    return 0
-
-
-def _join_aliases(join) -> list:
-    """Return the join's table aliases in placeholder order."""
-    return [r.alias for r in join.prompt.args]
-
-
-def _label_counts(lowered: LoweredPrompt) -> dict:
-    """Return alias -> (block_label_tokens, anchor_frame_tokens)."""
-    return {a: (lt, nt) for a, lt, nt in lowered.labels}
-
-
-def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
-               context=None, chunk: int = 0) -> list[PricedJoin]:
-    """The joins as the cost model prices them, in written order.
-
-    pair_fractions maps a written position to the fraction of the
-    cross product its equality conditions keep; a join with
-    conditions but no entry is priced as the full cross product.
-    canvas is the rows a diffusion model appends to every pair.
-    """
-    pair_fractions = pair_fractions or {}
-    out = []
-    for i, j in enumerate(joins):
-        conditions = join_conditions(j)
-        fraction = pair_fractions.get(i, 1.0) if conditions else 1.0
-        if is_score(j.predicate):
-            parts, cost = score_statistics(j.prompt, context, chunk)
-            left, right = prompt_aliases(j.prompt)
-            head, middle, tail = map(len, parts)
-            out.append(PricedJoin(
-                written_pos=i, aliases=(left, right), anchor=left,
-                anchor_free=False, semantics=j.semantics,
-                selectivity=j.selectivity,
-                frame_tokens={left: head + middle, right: 0},
-                label_tokens={left: 0, right: 0}, tail_tokens=tail + canvas,
-                on=tuple((c.left.alias, c.left.column, c.right.alias,
-                          c.right.column) for c in conditions),
-                pair_fraction=fraction,
-                cost=ScoreJoinCost((left, right), cost, fraction)))
-            continue
-        lowered = context.lowered(j.prompt)
-        labels = _label_counts(lowered)
-        out.append(PricedJoin(
-            written_pos=i, aliases=tuple(_join_aliases(j)), anchor=j.anchor,
-            anchor_free=(j.anchor is None and j.semantics == "full"),
-            semantics=j.semantics, selectivity=j.selectivity,
-            frame_tokens={a: nt for a, (lt, nt) in labels.items()},
-            label_tokens={a: lt for a, (lt, nt) in labels.items()},
-            tail_tokens=question_tokens(lowered, canvas),
-            on=tuple((c.left.alias, c.left.column, c.right.alias,
-                      c.right.column) for c in conditions),
-            pair_fraction=fraction))
-    return out
 
 
 @dataclass(frozen=True)
@@ -392,204 +175,21 @@ def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
     return live
 
 
-def filter_alias_work(preds, stats, order, pre: int, lowered,
-                      canvas: int = 0, window: int = 0) -> Work:
-    """Prepare a filter sequence's counts and price its recorded order."""
-    predicates = [preds[index] for index in order]
-    return filter_sequence_work(
-        [question_tokens(lowered[predicate.prompt], canvas)
-         for predicate in predicates],
-        [effective_selectivity(predicate.selectivity) for predicate in predicates],
-        pre + stats.mean_doc_tokens, float(stats.n_docs), window)
 
 
-def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
-                 model: ModelSpec, orders: dict) -> dict:
-    """Return the expected Work of each table's filter sequence in run order.
-
-    Args:
-        plan: The logical plan.
-        statistics: The plan's statistics.
-        model: Model spec.
-        orders: alias -> written positions of its model predicates in
-            run order.
-    """
-    return {
-        alias: filter_alias_work(
-            predicates, statistics.stats[alias],
-            [i for i in orders.get(alias, []) if i in statistics.asks[alias]],
-            statistics.pre, statistics.lowered, model.canvas_tokens,
-            model.sliding_window)
-        for alias, predicates in plan.operators().filters.items()
-    }
 
 
-@dataclass(frozen=True)
-class ScoreJoinCost:
-    """Supply score work to join search at the given survivor counts."""
-
-    aliases: tuple[str, str]
-    cost: ScoreCost
-    pair_fraction: float
-
-    def work(self, live) -> Work:
-        expected, groups = pair_counts(live, self.aliases, self.pair_fraction)
-        return self.cost.estimate(expected, prefix_groups=groups)[0]
 
 
-def pair_counts(live, aliases, fraction) -> tuple[float, float]:
-    """Return expected pairs and first documents with at least one pair."""
-    left, right = aliases
-    touched = (1.0 if fraction >= 1 else
-               -math.expm1(live[right] * math.log1p(-fraction)))
-    return live[left] * live[right] * fraction, live[left] * touched
 
 
-def pool_split(model: ModelSpec, device: DeviceSpec, chunk: int,
-               summaries) -> tuple[int, int]:
-    """Return the query's KV pool split: (every-token pages, sliding pages).
-
-    The worker builds the arena to this split, and every operator's
-    cost reads its capacity from it. The pools are split for the
-    longest table's mean document length, before filters thin the
-    tables.
-
-    Args:
-        model: Model spec.
-        device: Device spec.
-        chunk: Chunk token budget.
-        summaries: The AliasStats of every table the query reads.
-    """
-    longest = max((summary.mean for summary in summaries), default=None)
-    return tuple(budgets.arena_pages(model, device, chunk, longest))
 
 
-def arena_capacity(context, chunk: int) -> int:
-    """Return the tokens of document KV the query's arena holds at once."""
-    window = context.model.sliding_window
-    full, _ = pool_split(context.model, context.device, chunk, (
-        summarize_alias(lengths, window, memo=context.memo)
-        for lengths in context.document_tokens.values()))
-    return full * budgets.PAGE_TOKENS
 
 
-def score_statistics(prompt, context, chunk, *, mean_tokens=None):
-    """Prepare a score's prompt tokens and numeric cost inputs once per query."""
-    key = ("score_prompt", prompt)
-    if key not in context.memo:
-        context.memo[key] = score_token_parts(prompt, context.model, context.tokenizer)
-    parts = context.memo[key]
-    aliases = prompt_aliases(prompt)
-    summaries = tuple(summarize_alias(
-        context.document_tokens[alias], context.model.sliding_window,
-        memo=context.memo) for alias in aliases)
-    if mean_tokens is None:
-        mean_tokens = sum(summary.mean for summary in summaries)
-    cost = ScoreCost(
-        token_lengths=tuple(map(len, parts)), summaries=summaries,
-        mean_tokens=mean_tokens, model=context.model, device=context.device,
-        chunk_tokens=chunk,
-        capacity=arena_capacity(context, chunk),
-        workers=context.gpu_count,
-        draws=context.canvas_draws if context.model.canvas_tokens
-        and len(aliases) == 1 else 1)
-    return parts, cost
 
 
-def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
-                         chunk_tokens, context=None,
-                         lower=None) -> tuple[PredicateCost, ...]:
-    """Prepare costs and reusable result identities for predicate ordering.
-
-    Args:
-        predicates: The model predicates of one table.
-        prefix_tokens: The preamble and mean document tokens.
-        model: Model spec.
-        device: Device spec.
-        chunk_tokens: The forward pass token budget.
-        context: The planning context; prices scores and lowers prompts.
-        lower: Lowers a prompt when there is no context.
-    """
-    lower = context.lowered if lower is None else lower
-    prepared = []
-    for predicate in predicates:
-        if is_score(predicate.expression):
-            _, cost = score_statistics(
-                predicate.prompt, context, chunk_tokens, mean_tokens=prefix_tokens)
-            first = later = cost.seconds
-            reuse_key = predicate.prompt
-        else:
-            q = question_tokens(lower(predicate.prompt), model.canvas_tokens)
-            first = partial(mul, filter_cost(
-                q, prefix_tokens, model, device, chunk_tokens, first=True))
-            later = partial(mul, filter_cost(
-                q, prefix_tokens, model, device, chunk_tokens, first=False))
-            reuse_key = None
-        prepared.append(PredicateCost(
-            effective_selectivity(predicate.selectivity), first, later, reuse_key))
-    return tuple(prepared)
 
 
-def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
-    """Gather document lengths and execution limits for one classification table.
-
-    Args:
-        context: The PlanningContext.
-        alias: The table's alias.
-        shared: Per document, the prefix tokens an earlier document
-            also has, when the plan shares prefixes; else empty.
-
-    Returns:
-        The table's document lengths, budgets, and model settings.
-    """
-    lengths = context.document_tokens[alias]
-    summary = summarize_alias(lengths, context.model.sliding_window, memo=context.memo)
-    if hasattr(lengths, "arrow_array"):
-        lengths = lengths.arrow_array.to_numpy()
-    chunk = budgets.chunk_budget(context.model, context.device)
-    capacity = arena_capacity(context, chunk)
-    return ClassifyStatistics(
-        alias=alias, mean=summary.mean,
-        longest=summary.maximum, budget=min(chunk, capacity),
-        chunk=chunk,
-        draws=context.canvas_draws if context.model.answer_canvas else 1,
-        model=context.model,
-        device=context.device,
-        capacity=capacity, lengths=lengths, shared=tuple(shared),
-        tree=(budgets.tree_attention_allowed(context.model)
-              and getattr(context, "attention", None) != "unified"))
 
 
-@dataclass(frozen=True)
-class ClassifyStatistics:
-    """Document lengths, model settings, and execution budgets for one table.
-
-    Attributes:
-        alias: Table alias in the query.
-        mean: Mean document length in tokens.
-        longest: Maximum document length in tokens.
-        budget: Smaller of the forward-pass token budget and KV capacity.
-        chunk: Maximum tokens per forward pass.
-        model: Model specification.
-        device: Device specification.
-        capacity: KV arena capacity in tokens.
-        draws: Maximum diffusion draws per document; one for causal models.
-        lengths: Document lengths in tokens.
-        shared: Shared prefix length per document, or an empty tuple.
-        tree: Whether the tree attention path, which trie_tree needs, is
-            available: an fp8 model without a canvas whose attention is not
-            forced to unified.
-    """
-
-    alias: str
-    mean: float
-    longest: int
-    budget: int
-    chunk: int
-    model: object
-    device: object
-    capacity: int = 0
-    draws: int = 1
-    lengths: Sequence = ()
-    shared: tuple = ()
-    tree: bool = False

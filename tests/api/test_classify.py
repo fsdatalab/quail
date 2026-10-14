@@ -648,7 +648,7 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
 
 def test_planner_prices_the_rules_and_takes_the_cheapest():
     from quail.cost import budgets
-    from quail.planner.operators.label_scoring import ClassifyScoring
+    from quail.planner.operators.classify import ClassifyScoring
     from quail.planner.validation import ClassifyRefusedError
 
     chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)

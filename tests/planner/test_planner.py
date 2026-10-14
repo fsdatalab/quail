@@ -33,15 +33,12 @@ from quail.physical import (
 from quail.physical.base import input_ports
 from quail.physical.pipelines import build_pipelines
 from quail.planner.api import refine_plan
+from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.rules.logical import built_in_logical_rules
 from quail.planner.rules.physical import built_in_physical_rules
 from quail.planner.search.filter_order import order_filters_indexed
-from quail.planner.statistics.query import (
-    AliasStats,
-    prepare_filter_costs,
-    summarize_alias,
-)
+from quail.planner.statistics.tables import AliasStats, summarize_alias
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 

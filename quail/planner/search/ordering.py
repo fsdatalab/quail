@@ -8,14 +8,10 @@ from __future__ import annotations
 
 from quail.cost.work import Work
 from quail.logical import LogicalPlan, SemanticFilter, model_call
+from quail.planner.operators.filter import filter_works, prepare_filter_costs
 from quail.planner.search import join_order as joinsearch
 from quail.planner.search.filter_order import order_filters_indexed
-from quail.planner.statistics.query import (
-    PlanStatistics,
-    filter_works,
-    live_after_filters,
-    prepare_filter_costs,
-)
+from quail.planner.statistics.query import PlanStatistics, live_after_filters
 
 
 def choose_filter_orders(plan: LogicalPlan, statistics: PlanStatistics, *,

@@ -38,11 +38,8 @@ from quail.physical.pipelines import build_pipelines
 from quail.planner.graph import retention
 from quail.planner.graph.kv import plan_kv_retention
 from quail.planner.sol.prefixes import document_shared_tokens, page_tree
-from quail.planner.statistics.query import (
-    cached_statistics,
-    live_after_filters,
-    summarize_alias,
-)
+from quail.planner.statistics.query import cached_statistics, live_after_filters
+from quail.planner.statistics.tables import summarize_alias
 
 
 class LimitPushdown:
@@ -182,7 +179,7 @@ class LabelScoring:
             raise ValueError(
                 "label_scoring needs the logical plan on the planning context "
                 "to score a classification without a scoring rule")
-        from quail.planner.operators.label_scoring import classify_scoring
+        from quail.planner.operators.classify import classify_scoring
 
         logical = context.logical_plan
         calls = {node.name: node.call for node in logical.operators().classifies}
@@ -324,7 +321,7 @@ class PrefixSharing:
 
 def _shared_classify_spec(node, context, store, *, resident=False):
     """Enable prefix sharing and update the classification cost estimate."""
-    from quail.planner.operators.label_scoring import classify_scoring
+    from quail.planner.operators.classify import classify_scoring
 
     table = classify_scoring(context, node.spec.aliases[0],
                            shared=document_shared_tokens(store))

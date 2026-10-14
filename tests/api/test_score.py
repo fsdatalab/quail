@@ -218,7 +218,7 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     from quail.cost.work import Work, ask, scan
     from quail.execution.metrics import NodeMetrics
     from quail.explain import run_summary
-    from quail.planner.statistics.query import summarize_alias
+    from quail.planner.statistics.tables import summarize_alias
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     for model, canvas in (("qwen3-4b-fp8", 0), ("diffusion-gemma-26b-a4b-fp8", 1)):
