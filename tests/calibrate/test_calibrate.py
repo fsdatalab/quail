@@ -1,20 +1,21 @@
 """CPU checks for the hardware calibration package."""
 
 import json
+from dataclasses import asdict
 
 import pytest
 
-from calibrate import gemm
-from calibrate.attention import AttentionSweep, parse_heads, summary_name
+from calibrate import gemm, timing
+from calibrate.attention import AttentionSweep, parse_heads
 from calibrate.gemm import ProjectionSweep, fetch_mamf_finder, mamf_runs, parse_log
-from calibrate.targets import TARGETS, gemm_shapes
+from calibrate.targets import TARGETS, call_sizes, gemm_shapes, head_layouts
 from calibrate.timing import Window, window_stats
 from calibrate.to_spec import (
     attention_rates,
+    load,
     spec_text,
     sustained_fp8_flops,
     sustained_hbm_bw,
-    unsteady_points,
 )
 from quail.specs import QWEN3_4B_FP8
 
@@ -68,8 +69,10 @@ def test_gemm_run_writes_under_the_given_root(tmp_path, monkeypatch):
     assert summary["runs"]["published_fp8"]["msmf"]["tflops"] == 722
     assert (root / "h100-sxm" / "gemm" / "20261013T000000Z"
             / "published_fp8.txt").exists()
-    assert json.loads((root / "h100-sxm" / "gemm.json").read_text()) == summary
-    assert len(saves) == 2
+    saved = root / "h100-sxm" / "gemm" / "20261013T000000Z" / "summary.json"
+    assert json.loads(saved.read_text()) == summary
+    assert not (root / "h100-sxm" / "gemm.json").exists()
+    assert len(saves) == 1
 
 
 def test_fetch_mamf_finder_rejects_a_wrong_file(tmp_path):
@@ -82,18 +85,34 @@ def test_model_shapes_match_qwen3_4b():
     assert gemm_shapes(QWEN3_4B_FP8) == {
         "qkv": (6144, 2560), "o": (2560, 4096),
         "gate_up": (19456, 2560), "down": (2560, 9728)}
-    assert summary_name((32, 8, 128)) == "attention_32_8_128.json"
     assert parse_heads("32,8,128") == (32, 8, 128)
 
 
-def test_sweep_has_copy_documents_and_cached_reads():
-    kinds = [point["kind"] for point in AttentionSweep().points()]
+def test_layouts_and_call_sizes_come_from_the_priced_models():
+    # DiffusionGemma has sliding layers, so the cost model never uses its rates
+    assert head_layouts() == [(16, 8, 128), (32, 8, 128), (64, 8, 128)]
+    chunk, kv = call_sizes((32, 8, 128), "h100-sxm")
+    assert chunk == 110376 and kv > 300_000
+    with pytest.raises(ValueError, match="no measured model"):
+        call_sizes((16, 8, 256), "h100-sxm")
+
+
+def test_sweep_sizes_calls_like_quail():
+    sweep = AttentionSweep(chunk_tokens=110376, kv_tokens=362240)
+    kinds = [point["kind"] for point in sweep.points()]
     assert kinds[0] == "copy"
-    assert kinds.count("packed") == 9 and kinds.count("cached") == 56
-    smoke = AttentionSweep.smoke()
-    assert [point["kind"] for point in smoke.points()] == \
-        ["copy", "packed", "cached", "cached"]
-    assert smoke.window.seconds == 0.5 and AttentionSweep().window == Window()
+    assert kinds.count("packed") == 9 + 2 and kinds.count("cached") == 28 + 2
+    # the chunk's rows bound short contexts, the KV arena bounds long ones
+    assert sweep.sequences({"query_rows": 1024, "context": 1024, "size": 1.0}) == 107
+    assert sweep.sequences({"query_rows": 16, "context": 32768, "size": 1.0}) == 11
+    assert sweep.sequences({"query_rows": 64, "context": 8192, "size": 0.5}) == 22
+    assert sweep.documents({"length": 128, "size": 1.0}) == 862
+    assert AttentionSweep(41943, 106368).documents({"length": 32768, "size": 1.0}) == 1
+    assert AttentionSweep.from_dict(json.loads(json.dumps(asdict(sweep)))) == sweep
+    smoke = AttentionSweep.smoke(110376, 362240)
+    assert [p["kind"] for p in smoke.points()] == ["copy", "packed", "cached",
+                                                   "packed", "cached"]
+    assert smoke.window.repeats == 1
 
 
 def test_window_is_steady_only_without_drop_or_spread():
@@ -102,60 +121,105 @@ def test_window_is_steady_only_without_drop_or_spread():
     subs = [696, 701, 656, 626, 686, 695, 666, 629]
     drop, spread, steady = window_stats(subs, Window())
     assert drop < 1.0
-    assert spread == pytest.approx(10.93, abs=0.01)
+    assert spread == pytest.approx(11.09, abs=0.01)
     assert not steady
     assert window_stats([195.0] * 8, Window()) == (0.0, 0.0, True)
-    assert window_stats(subs, Window(max_spread_pct=11.0))[2]
+    assert window_stats(subs, Window(max_spread_pct=12.0))[2]
+
+
+def test_measure_retries_until_enough_windows_are_steady(monkeypatch):
+    outcomes = iter([(100.0, False), (90.0, True), (95.0, True), (300.0, False),
+                     (92.0, True)])
+
+    def fake_window(*args):
+        tflops, steady = next(outcomes)
+        return {"tflops": tflops, "gbps": 0.0, "steady": steady}
+
+    monkeypatch.setattr(timing, "_call_seconds", lambda torch, run: 0.001)
+    monkeypatch.setattr(timing, "settle", lambda *args: {"settled": True})
+    monkeypatch.setattr(timing, "time_window", fake_window)
+
+    class FakeTorch:
+        int32 = None
+
+        @staticmethod
+        def empty(*args, **kwargs):
+            return None
+
+    result = timing.measure(FakeTorch, lambda: None, 1.0, 0.0, False, None, Window())
+    assert len(result["windows"]) == 5
+    assert result["steady"] and result["steady_windows"] == 3
+    assert result["tflops"] == 92.0
+    lonely = iter([(100.0, False)] * 6)
+    monkeypatch.setattr(timing, "time_window", lambda *a: dict(
+        zip(("tflops", "steady"), next(lonely)), gbps=0.0))
+    result = timing.measure(FakeTorch, lambda: None, 1.0, 0.0, False, None, Window())
+    assert not result["steady"] and len(result["windows"]) == 6
 
 
 def _measured(tflops, steady=True):
-    return {"tflops": tflops, "gbps": 0.0, "steady": steady,
-            "spread_pct": 11.0 if not steady else 1.0, "drop_pct": 0.1}
+    return {"tflops": tflops, "gbps": 0.0, "steady": steady}
 
 
-def _attention_summary():
-    rows = [{"kind": "copy", "copy": {"tflops": 0.0, "gbps": 3000.0,
+def _attention_summary(uuid, scale=1.0, check=False):
+    rows = [{"kind": "copy", "copy": {"tflops": 0.0, "gbps": 3000.0 * scale,
                                       "steady": True}}]
-    for length, fa3, fi in ((128, 100, 90), (512, 286, 301)):
-        rows.append({"kind": "packed", "length": length,
-                     "fa3": _measured(fa3), "flashinfer": _measured(fi)})
+    for length, fa3, fi in ((128, 100, 90), (512, 286, 301), (1024, 350, 340)):
+        rows.append({"kind": "packed", "length": length, "size": 1.0,
+                     "fa3": _measured(fa3 * scale),
+                     "flashinfer": _measured(fi * scale)})
+    rows.append({"kind": "packed", "length": 1024, "size": 0.5,
+                 "fa3": _measured(300 * scale), "flashinfer": _measured(1.0)})
     for q_rows in (16, 64):
         for context in (1024, 8192):
             rows.append({"kind": "cached", "query_rows": q_rows,
-                         "context": context, "pages": "private",
-                         "fa3": _measured(q_rows * 10 + context / 1024,
-                                          steady=q_rows == 16),
+                         "context": context, "size": 1.0,
+                         "fa3": _measured((q_rows * 10 + context / 1024) * scale),
                          "flashinfer": {"error": "RuntimeError: no kernel"}})
-            rows.append({"kind": "cached", "query_rows": q_rows,
-                         "context": context, "pages": "shared",
-                         "fa3": _measured(9999.0, steady=False)})
-    return {"stamp": "20261012T235536Z", "heads": [32, 8, 128],
-            "gpu": {"name": "NVIDIA H100 80GB HBM3"}, "points": rows}
+    return {"stamp": f"20261014T000000Z-{uuid}", "heads": [32, 8, 128],
+            "gpu": {"name": "NVIDIA H100 80GB HBM3", "uuid": uuid},
+            "sweep": {"chunk_tokens": 110376, "kv_tokens": 362240,
+                      "size_length": 1024, "size_read": [64, 8192]},
+            "check": check, "points": rows}
 
 
-def test_attention_rates_take_the_faster_library_on_private_pages():
-    rates = attention_rates(_attention_summary())
-    assert rates.causal_tokens == (128, 512)
-    assert rates.causal == (100e12, 301e12)
+def test_attention_rates_take_the_fastest_steady_gpu_and_library():
+    slow, fast = _attention_summary("a"), _attention_summary("b", scale=1.1)
+    rates = attention_rates([slow, fast])
+    assert rates.causal_tokens == (128, 512, 1024)
+    assert rates.causal == pytest.approx((110e12, 331.1e12, 385e12))
     assert rates.read_rows == (16, 64) and rates.read_contexts == (1024, 8192)
-    assert rates.read == ((161e12, 168e12), (641e12, 648e12))
-    assert sustained_hbm_bw(_attention_summary()) == 3000e9
-    broken = _attention_summary()
-    broken["points"][1]["fa3"] = {"error": "x"}
-    broken["points"][1]["flashinfer"] = {"error": "x"}
-    with pytest.raises(ValueError, match="no library measured"):
-        attention_rates(broken)
+    assert rates.read[0][0] == pytest.approx(161 * 1.1e12)
+    assert sustained_hbm_bw([slow, fast]) == pytest.approx(3300e9)
+    # an unsteady window on the fast GPU leaves the slow GPU's steady rate
+    fast["points"][1]["fa3"]["steady"] = False
+    fast["points"][1]["flashinfer"]["steady"] = False
+    assert attention_rates([slow, fast]).causal[0] == pytest.approx(100e12)
+    slow["points"][1]["fa3"]["steady"] = False
+    slow["points"][1]["flashinfer"]["steady"] = False
+    with pytest.raises(ValueError, match="no steady measurement"):
+        attention_rates([slow, fast])
 
 
-def test_spec_fields_use_the_best_msmf_and_flag_unsteady_points():
-    gemm = {"stamp": "20261012T222632Z", "runs": {
+def test_spec_text_combines_gpus_and_skips_smoke(tmp_path):
+    for name, summary in (("a", _attention_summary("a")),
+                          ("b", _attention_summary("b", scale=1.1)),
+                          ("s", _attention_summary("s", scale=9.0, check=True))):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "summary.json").write_text(json.dumps(summary))
+    gemm_runs = [{"stamp": "g0", "gpu": {"uuid": "a"}, "runs": {
         "published_fp8": {"msmf": {"tflops": 1352}},
-        "qkv": {"msmf": {"tflops": 1287}},
-        "search": {"msmf": None}}}
-    assert sustained_fp8_flops(gemm) == 1352e12
-    text = spec_text(gemm, _attention_summary())
-    assert "sustained_fp8_flops=1.352e+15" in text
+        "search": {"msmf": None}}},
+        {"stamp": "g1", "gpu": {"uuid": "b"}, "runs": {
+            "published_fp8": {"msmf": {"tflops": 1429}}}}]
+    for i, summary in enumerate(gemm_runs):
+        (tmp_path / f"g{i}").mkdir()
+        (tmp_path / f"g{i}" / "summary.json").write_text(json.dumps(summary))
+    gemm_summaries, attention = load([tmp_path])
+    assert len(gemm_summaries) == 2 and len(attention) == 2
+    assert sustained_fp8_flops(gemm_summaries) == 1429e12
+    text = spec_text(gemm_summaries, attention)
+    assert "sustained_fp8_flops=1.429e+15" in text
+    assert "over 2 GPUs" in text and "spread up to 9.1%" in text
     assert "attention_rates=(((32, 8, 128), ATTENTION_32_8_128),)" in text
-    unsteady = unsteady_points(_attention_summary())
-    assert len(unsteady) == 2
-    assert all("'query_rows': 64" in line for line in unsteady)
+    assert "('packed', 1024) at 0.5 of the call: 330 TFLOPS" in text

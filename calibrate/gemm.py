@@ -16,9 +16,9 @@ On a machine with the GPU:
 
     uv run python -m calibrate.gemm --device h100-sxm --root results/calibrate
 
-The mamf-finder logs go under <root>/<device>/gemm/<stamp>/ and the
-summary to <root>/<device>/gemm.json. calibrate.modal_app runs the same
-code on Modal.
+The mamf-finder logs and the summary go under
+<root>/<device>/gemm/<stamp>/. calibrate.modal_app runs the same code
+on Modal, on several GPUs at once.
 """
 
 from __future__ import annotations
@@ -122,8 +122,8 @@ def mamf_runs(published: dict | None, projections: ProjectionSweep | None,
 
 
 def gpu_info() -> dict:
-    """Return nvidia-smi's name, power limits, clocks, and driver for GPU 0."""
-    fields = ("name", "power.limit", "power.max_limit", "clocks.max.sm",
+    """Return nvidia-smi's name, UUID, power limits, clocks, and driver for GPU 0."""
+    fields = ("name", "uuid", "power.limit", "power.max_limit", "clocks.max.sm",
               "driver_version")
     row = subprocess.run(
         ["nvidia-smi", f"--query-gpu={','.join(fields)}",
@@ -168,7 +168,7 @@ def run(root: Path, device: str, stamp: str, published: dict | None,
         on_save: Called after each file is written.
 
     Returns:
-        The summary, also written to <root>/<device>/gemm.json.
+        The summary, also written to <root>/<device>/gemm/<stamp>/.
     """
     run_dir = root / device / "gemm" / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -192,8 +192,6 @@ def run(root: Path, device: str, stamp: str, published: dict | None,
               f"MSMF {json.dumps(parsed['msmf'])}", flush=True)
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
         on_save()
-    (root / device / "gemm.json").write_text(json.dumps(summary, indent=2))
-    on_save()
     return summary
 
 
@@ -223,11 +221,13 @@ def main(argv=None) -> None:
     parser.add_argument("--prediction", default="")
     args = parser.parse_args(argv)
     target = TARGETS.get(args.device)
-    run(args.root, args.device, utc_stamp(),
+    stamp = utc_stamp()
+    run(args.root, args.device, stamp,
         target and target.published_fp8,
         projection_sweep(args.model) if args.model else None,
         args.mamf_finder or fetch_mamf_finder(args.root), args.prediction)
-    print(f"summary: {args.root / args.device / 'gemm.json'}", flush=True)
+    print(f"summary: {args.root / args.device / 'gemm' / stamp / 'summary.json'}",
+          flush=True)
 
 
 if __name__ == "__main__":

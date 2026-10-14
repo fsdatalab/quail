@@ -119,9 +119,14 @@ Do this procedure on a computer that has the GPU.
 
 ### Measure the GEMM rate on Modal
 
-[`modal_app.py`](modal_app.py) does the same measurement on a Modal
-GPU. It uses the NGC image `nvcr.io/nvidia/pytorch:26.04-py3`. The
+[`modal_app.py`](modal_app.py) does the same measurement on Modal GPUs.
+It uses the NGC image `nvcr.io/nvidia/pytorch:26.04-py3`. The
 published H100 SXM rates are from this image.
+
+On Modal, you cannot select the physical GPU, and the GEMM rate is
+different on different GPUs. For this reason, measure on more than one GPU.
+`--gpus 5` starts 5 measurements at the same time. Each measurement is
+on its own GPU.
 
 1. Run these commands:
 
@@ -129,7 +134,7 @@ published H100 SXM rates are from this image.
    mkdir -p results/benchmark
    log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-gemm.log"
    uv run modal run --detach calibrate/modal_app.py::gemm \
-       --device h100-sxm --prediction "..." 2>&1 | tee "$log"
+       --device h100-sxm --gpus 5 --prediction "..." 2>&1 | tee "$log"
    ```
 
 2. Find the results on the `quail-results` volume, in `calibrate/`.
@@ -142,11 +147,7 @@ published H100 SXM rates are from this image.
 | File | Contents |
 |---|---|
 | `<root>/<device>/gemm/<stamp>/<name>.txt` | The log of one mamf-finder call |
-| `<root>/<device>/gemm/<stamp>/summary.json` | The summary of the measurement, written after each call |
-| `<root>/<device>/gemm.json` | A copy of the summary of the last measurement |
-
-Each measurement replaces `gemm.json`. The `<stamp>` directories of
-earlier measurements do not change.
+| `<root>/<device>/gemm/<stamp>/summary.json` | The summary of the measurement, with the GPU UUID, written after each call |
 
 ### GEMM results on H100 SXM
 
@@ -176,16 +177,61 @@ in bf16, for one head layout. A head layout is three numbers: the
 query heads, the KV heads, and the head dimension. The device
 specification has one table of attention rates for each head layout.
 
-`attention.py` measures three types of point:
+### Calls that attention.py measures
 
-| Type | Work |
+One call is the attention of one layer. Each call has the size of the
+calls that Quail makes:
+
+| Type | Call |
 |---|---|
-| `packed` | Causal attention on documents of equal length |
-| `cached` | Query rows that read cached KV in pages |
+| `packed` | Causal attention on one chunk of tokens. The chunk is divided into documents of one length. There is one point for each length, from 128 to 32,768 tokens. |
+| `cached` | Sequences whose query rows read KV that is in the cache. The query rows fill one chunk. The number of sequences is not more than the KV arena holds. There is one point for each (query rows, context) pair: 16 to 1,024 rows, 1,024 to 32,768 tokens of context. |
+| `size` | One `packed` point and one `cached` point, at 1/4 and 1/2 of the call size. These points show how the rate changes with the call size. |
 | `copy` | One 4 GB copy on the GPU, for the memory bandwidth |
 
-`attention.py` measures each point for 2 s at full power. The 2 s window and its limits
-are the same as for MSMF. [`timing.py`](timing.py) has this code.
+The chunk and the KV arena come from the Quail planner, for the models
+with the head layout ([`targets.py`](targets.py), `call_sizes`). If two
+models have the same layout, `attention.py` uses the larger chunk and
+the larger arena. A larger call does not have a lower rate, so the rate
+stays an upper bound for both models.
+
+| Head layout | Models | Chunk, tokens | KV arena, tokens |
+|---|---|---|---|
+| 16, 8, 128 | Qwen3 Reranker 0.6B, Decision-2.0-Kai 0.6B | 65,536 | 614,720 |
+| 32, 8, 128 | Qwen3 4B, Qwen3 Reranker 4B | 110,376 | 387,952 |
+| 64, 8, 128 | Qwen3 32B | 41,943 | 106,368 |
+
+DiffusionGemma 26B-A4B has sliding-window layers. The cost model does
+not use measured attention rates for it, so `attention.py` does not
+measure its layout.
+
+The inputs are random bf16 values. The time of a call is a function of
+the shapes, not of the values.
+
+### Procedure that attention.py uses for one point
+
+[`timing.py`](timing.py) has this code.
+
+1. Make the inputs.
+2. Call each library one time. This plans the call and compiles the
+   kernel, before the measurement starts.
+3. Do steps 3.1 to 3.4 for each library. Alternate which library is
+   first, from one point to the next.
+   1. Run the call until the clock does not decrease: 3 readings in a
+      row, 0.25 s apart, are not more than 5 MHz below the previous
+      reading. Run the call for 1 s minimum and 20 s maximum.
+   2. Run the call for 2 s. Record the time of each call with GPU
+      events. Before each call, write zeros to a 256 MB buffer. This
+      removes the data from the L2 cache. Do not record the time of
+      this step.
+   3. Examine the 2 s window as for MSMF. The window is steady if the
+      second half is not more than 1% slower than the first half, and
+      (fastest part − slowest part) ÷ median part of 8 parts is not
+      more than 10%.
+   4. Do steps 3.1 to 3.3 again until 3 windows are steady. Stop after
+      6 windows.
+4. The rate of the library is the median rate of its steady windows.
+   If fewer than 3 windows are steady, the rate is not steady.
 
 ### Measure the attention rate on a local GPU
 
@@ -200,43 +246,54 @@ FlashInfer.
    ```
 
 2. For a short test, add `--smoke`. The test measures one point of each
-   type for 0.5 s. It also compares the two libraries with PyTorch.
+   type in one 0.5 s window. It also compares the two libraries with
+   PyTorch.
 
 ### Measure the attention rate on Modal
 
-1. Run this command:
+`--heads all` measures each head layout in the table above. `--gpus 3`
+measures each layout on 3 GPUs at the same time.
+
+1. Run these commands:
 
    ```bash
+   mkdir -p results/benchmark
+   log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-attention.log"
    uv run modal run --detach calibrate/modal_app.py::attention \
-       --device h100-sxm --heads 32,8,128
+       --device h100-sxm --heads all --gpus 3 --prediction "..." 2>&1 | tee "$log"
    ```
 
 2. For a short test, add `--smoke`.
 
+The results go to `<root>/<device>/attention/<stamp>/summary.json`.
+
 ## Make the device specification: to_spec.py
 
-[`to_spec.py`](to_spec.py) reads the GEMM summary and the attention
-summary. It writes the fields for `quail/specs/<device>.py`:
+[`to_spec.py`](to_spec.py) reads the GEMM summaries and the attention
+summaries of all the GPUs. For each field, it uses the highest steady
+rate of all the GPUs. For this reason, the SoL estimate stays a lower bound on each
+GPU of the type.
 
 | Field | Value |
 |---|---|
 | `sustained_fp8_flops` | The highest MSMF of all the mamf-finder calls |
-| `sustained_hbm_bw` | The bandwidth of the copy |
-| `attention_rates` | The faster library at each point |
+| `sustained_hbm_bw` | The highest steady bandwidth of the copy |
+| `attention_rates` | One table for each head layout: at each point, the highest steady rate of the faster library |
 
-`to_spec.py` also writes each point that was not steady.
+If a point has no steady rate on any GPU, `to_spec.py` stops with an
+error. Measure that point again. `to_spec.py` does not use smoke
+results or the `size` points. It writes the `size` points as comments.
 
 1. If the summaries are on Modal, copy them from the volume:
 
    ```bash
-   modal volume get quail-results calibrate/h100-sxm/gemm.json .
-   modal volume get quail-results calibrate/h100-sxm/attention_32_8_128.json .
+   modal volume get quail-results calibrate/h100-sxm .
    ```
 
-2. Run `to_spec.py` with the two summaries:
+2. Run `to_spec.py` with the directory:
 
    ```bash
-   uv run python -m calibrate.to_spec gemm.json attention_32_8_128.json
+   uv run python -m calibrate.to_spec h100-sxm
    ```
 
 3. Copy the output into `quail/specs/<device>.py`.

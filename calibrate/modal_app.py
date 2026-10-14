@@ -1,14 +1,20 @@
 r"""Run calibrate's GEMM and attention measurements on Modal.
 
 Each measurement runs on the target's Modal GPU and writes to the
-quail-results volume under calibrate/:
+quail-results volume under calibrate/. --gpus N starts N containers at
+once, each on its own GPU, so to_spec can take the fastest GPU:
 
     mkdir -p results/benchmark
     log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-gemm.log"
     uv run modal run --detach calibrate/modal_app.py::gemm \
-        --device h100-sxm --prediction "..." 2>&1 | tee "$log"
+        --device h100-sxm --gpus 5 --prediction "..." 2>&1 | tee "$log"
     uv run modal run --detach calibrate/modal_app.py::attention \
-        --device h100-sxm --heads 32,8,128 --smoke 2>&1 | tee "$log"
+        --device h100-sxm --heads all --gpus 3 --prediction "..." 2>&1 | tee "$log"
+
+--heads all measures every head layout calibrate.targets.head_layouts()
+lists; "32,8,128;64,8,128" names layouts. --smoke times one point of
+each kind briefly. Modal picks the physical GPU; each summary records
+its UUID, and to_spec counts each GPU once.
 
 The GEMM image is the NGC image the published H100 SXM rows were
 measured with.
@@ -61,7 +67,7 @@ def measure_gemm(device: str, stamp: str, published: dict | None,
 
     Args:
         device: The quail.specs device name.
-        stamp: The UTC timestamp naming this run's directory.
+        stamp: Names this run's directory.
         published: The GPU's published fp8 rates and shapes, or None.
         projections: A ProjectionSweep's fields, or None.
         prediction: The prediction stated before the run.
@@ -72,29 +78,33 @@ def measure_gemm(device: str, stamp: str, published: dict | None,
                         on_save=results_vol.commit)
 
 
-@app.function(image=attention_image, gpu="H100!", timeout=2 * 3600,
+@app.function(image=attention_image, gpu="H100!", timeout=4 * 3600,
               volumes={str(VOLUME_DIR): results_vol})
-def measure_attention(device: str, stamp: str, heads: tuple, smoke: bool,
-                      prediction: str) -> dict:
+def measure_attention(device: str, stamp: str, heads: tuple, sweep: dict,
+                      check: bool, prediction: str) -> dict:
     """Run calibrate.attention on this container's GPU, committing each file.
 
     Args:
         device: The quail.specs device name.
-        stamp: The UTC timestamp naming this run's directory.
+        stamp: Names this run's directory.
         heads: (query heads, KV heads, head dimension).
-        smoke: Measure one point of each kind briefly and check correctness.
+        sweep: An AttentionSweep's fields.
+        check: Compare each library's output with torch's.
         prediction: The prediction stated before the run.
     """
-    return attention_run.run(ROOT, device, stamp, heads, smoke, prediction,
-                             on_save=results_vol.commit)
+    return attention_run.run(ROOT, device, stamp, heads,
+                             attention_run.AttentionSweep.from_dict(sweep),
+                             check, prediction, on_save=results_vol.commit)
 
 
 @app.local_entrypoint()
-def gemm(device: str = "h100-sxm", model: str = "", prediction: str = ""):
-    """Start the GEMM measurement on the device's GPU and print its headlines.
+def gemm(device: str = "h100-sxm", gpus: int = 1, model: str = "",
+         prediction: str = ""):
+    """Start the GEMM measurement on gpus GPUs and print each one's headlines.
 
     Args:
         device: The calibrate target, by quail.specs device name.
+        gpus: Containers to start, each on its own GPU.
         model: A quail.specs model name whose projections to sweep, or "".
         prediction: The prediction stated before the run.
     """
@@ -104,34 +114,57 @@ def gemm(device: str = "h100-sxm", model: str = "", prediction: str = ""):
     projections = model and asdict(gemm_run.projection_sweep(model))
     stamp = utc_stamp()
     print(f"prediction: {prediction or '(none stated)'}", flush=True)
-    call = measure_gemm.with_options(gpu=target.modal_gpu).spawn(
-        device, stamp, target.published_fp8, projections or None, prediction)
-    print(f"function call id: {call.object_id}", flush=True)
-    print(f"logs: {ROOT / device / 'gemm' / stamp}", flush=True)
-    for name, run in call.get()["runs"].items():
-        print(f"{name}: MAMF {run['mamf']} MSMF {run['msmf']}", flush=True)
-    print(f"summary: {ROOT / device / 'gemm.json'}", flush=True)
+    calls = {}
+    for i in range(gpus):
+        name = f"{stamp}-g{i}"
+        calls[name] = measure_gemm.with_options(gpu=target.modal_gpu).spawn(
+            device, name, target.published_fp8, projections or None, prediction)
+        print(f"{name}: function call id {calls[name].object_id}, "
+              f"summary {ROOT / device / 'gemm' / name / 'summary.json'}", flush=True)
+    for name, call in calls.items():
+        summary = call.get()
+        for run, result in summary["runs"].items():
+            print(f"{name} {summary['gpu'].get('uuid')} {run}: "
+                  f"MAMF {result['mamf']} MSMF {result['msmf']}", flush=True)
 
 
 @app.local_entrypoint()
-def attention(heads: str, device: str = "h100-sxm", smoke: bool = False,
-              prediction: str = ""):
-    """Start the attention measurement on the device's GPU and print each point.
+def attention(heads: str = "all", device: str = "h100-sxm", gpus: int = 1,
+              smoke: bool = False, prediction: str = ""):
+    """Start the attention measurement for each layout on gpus GPUs.
 
     Args:
-        heads: Query heads, KV heads, and head dimension, such as "32,8,128".
+        heads: "all", or layouts such as "32,8,128;64,8,128".
         device: The calibrate target, by quail.specs device name.
+        gpus: Containers to start per layout, each on its own GPU.
         smoke: Measure one point of each kind briefly and check correctness.
         prediction: The prediction stated before the run.
     """
+    from dataclasses import asdict
+
+    from calibrate.targets import call_sizes, head_layouts
+
     target = TARGETS[device]
+    layouts = (head_layouts() if heads == "all"
+               else [attention_run.parse_heads(h) for h in heads.split(";")])
     stamp = utc_stamp()
     print(f"prediction: {prediction or '(none stated)'}", flush=True)
-    call = measure_attention.with_options(
-        gpu=target.modal_gpu,
-        env={"FLASHINFER_CUDA_ARCH_LIST": target.flashinfer_arch},
-    ).spawn(device, stamp, attention_run.parse_heads(heads), smoke, prediction)
-    print(f"function call id: {call.object_id}", flush=True)
-    print(f"results: {ROOT / device / 'attention' / stamp}", flush=True)
-    for row in call.get()["points"]:
-        print(attention_run.point_line(row), flush=True)
+    calls = {}
+    for layout in layouts:
+        chunk, kv = call_sizes(layout, device)
+        sweep = (attention_run.AttentionSweep.smoke(chunk, kv) if smoke
+                 else attention_run.AttentionSweep(chunk, kv))
+        for i in range(gpus):
+            name = f"{stamp}-{'_'.join(map(str, layout))}-g{i}"
+            calls[name] = measure_attention.with_options(
+                gpu=target.modal_gpu,
+                env={"FLASHINFER_CUDA_ARCH_LIST": target.flashinfer_arch},
+            ).spawn(device, name, layout, asdict(sweep), smoke, prediction)
+            print(f"{name}: chunk {chunk}, KV {kv} tokens, function call id "
+                  f"{calls[name].object_id}, summary "
+                  f"{ROOT / device / 'attention' / name / 'summary.json'}", flush=True)
+    for name, call in calls.items():
+        summary = call.get()
+        print(f"{name} {summary['gpu'].get('uuid')}", flush=True)
+        for row in summary["points"]:
+            print(f"  {attention_run.point_line(row)}", flush=True)

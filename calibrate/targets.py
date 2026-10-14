@@ -1,4 +1,4 @@
-"""The GPUs calibrate runs on, and a model's projection shapes."""
+"""The GPUs calibrate runs on, and the model shapes and call sizes it measures."""
 
 from __future__ import annotations
 
@@ -56,3 +56,50 @@ def gemm_shapes(model) -> dict[str, tuple[int, int]]:
         "down": (model.hidden, model.intermediate),
     }
 
+
+
+def measured_models():
+    """Return the quail.specs models whose attention the cost model prices.
+
+    The cost model uses measured attention rates only for a model with
+    no sliding-window layers and one head layout on every layer.
+    """
+    from quail.specs import MODELS
+
+    return [m for m in MODELS.values() if not m.sliding_layer_set
+            and all(shape == (m.n_kv, m.d_head) for shape in m.kv_shapes)]
+
+
+def head_layouts() -> list[tuple[int, int, int]]:
+    """Return the distinct (query heads, KV heads, head dim) of measured_models()."""
+    return sorted({(m.n_q, m.n_kv, m.d_head) for m in measured_models()})
+
+
+def call_sizes(heads, device: str) -> tuple[int, int]:
+    """Return the largest Quail chunk and KV arena of the models with a layout.
+
+    Args:
+        heads: (query heads, KV heads, head dimension).
+        device: The quail.specs device name.
+
+    Returns:
+        (chunk tokens, KV arena tokens), each the largest over the
+        measured_models() with this layout on this device.
+
+    Raises:
+        ValueError: If no measured model has the layout.
+    """
+    from quail.cost import budgets
+    from quail.specs import DEVICES
+
+    spec = DEVICES[device]
+    sizes = []
+    for model in measured_models():
+        if (model.n_q, model.n_kv, model.d_head) != tuple(heads):
+            continue
+        chunk = budgets.chunk_budget(model, spec)
+        pages, _ = budgets.arena_pages(model, spec, chunk)
+        sizes.append((chunk, pages * budgets.PAGE_TOKENS))
+    if not sizes:
+        raise ValueError(f"no measured model has head layout {tuple(heads)}")
+    return max(c for c, _ in sizes), max(k for _, k in sizes)
