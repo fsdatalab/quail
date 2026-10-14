@@ -3,13 +3,14 @@
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
-from quail.logical import ColumnRef, LogicalPlan, Project, Scan
-from quail.planner.optimizer.logical import (
-    LogicalPlanningContext,
-    apply_logical_rules,
-)
+import pytest
 
-CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)
+from quail.logical import ColumnRef, LogicalPlan, Project, Scan
+from quail.planner.optimizer.context import PlanningContext
+from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
+from quail.planner.optimizer.tree_rewrites import logical_alternatives
+
+CONTEXT = PlanningContext(catalog=None, engine_config=None)
 
 
 @dataclass(frozen=True)
@@ -45,14 +46,14 @@ class TaggedInput:
         return {"tag": self.tag}
 
 
-class RenameTag:
+class RenameTag(LogicalRule):
     """Rename one tag value to another, one node at a time."""
 
     def __init__(self, old, new):
         self.name = f"rename_{old}_{new}"
         self.old, self.new = old, new
 
-    def rewrite(self, root, context):
+    def rewrites(self, root, context):
         def visit(node):
             children = tuple(visit(child) for child in node.children())
             if children != node.children():
@@ -62,7 +63,7 @@ class RenameTag:
             return node
 
         rewritten = visit(root)
-        return None if rewritten is root else rewritten
+        return [rewritten]
 
 
 def _tagged_plan(tag):
@@ -85,8 +86,9 @@ def test_custom_logical_node_rewrites_until_a_round_changes_nothing():
     for start, rules, tag, changed in REWRITES:
         case = f"{start} {rules}"
         plan = _tagged_plan(start)
-        optimized, applied = apply_logical_rules(
+        candidate, = logical_alternatives(
             plan, tuple(RenameTag(old, new) for old, new in rules), CONTEXT)
+        optimized, applied = candidate.plan, candidate.rules
 
         assert [node.type_name for node in optimized.walk()] == [
             "quail.scan", "test.tagged_input", "quail.logical_project"], case
@@ -100,15 +102,16 @@ def test_rules_that_never_settle_stop_at_the_pass_cap():
     # would repeat forever: a -> b -> c | c -> a | a -> b -> c | ...
     rules = (RenameTag("a", "b"), RenameTag("c", "a"), RenameTag("b", "c"))
 
-    optimized, changed = apply_logical_rules(
+    candidate, = logical_alternatives(
         _tagged_plan("a"), rules, CONTEXT, max_passes=3)
+    optimized, changed = candidate.plan, candidate.rules
 
     assert optimized.root.input.tag == "c"
     assert len(changed) == 5
 
 
 class RecordContext:
-    """Keep the context a session hands its logical rules."""
+    """Keep the context a session hands its optimizer rules."""
 
     name = "record_context"
 
@@ -120,16 +123,31 @@ class RecordContext:
         return None
 
 
-def test_session_rules_read_statistics_from_the_context():
+class RecordLogicalContext(RecordContext, LogicalRule):
+    def rewrites(self, root, context):
+        self.seen.append(context)
+        return [root]
+
+
+class RecordPhysicalContext(RecordContext, PhysicalRule):
+    pass
+
+
+@pytest.mark.parametrize("rule_type", [
+    RecordLogicalContext, RecordPhysicalContext])
+def test_session_rules_read_statistics_from_the_context(rule_type):
     import pyarrow as pa
 
     import quail
 
-    recorder = RecordContext()
+    recorder = rule_type()
     session = quail.Session(
         quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
         tokenizer=str.split)
-    session.registry.register_logical_rule(recorder)
+    register = (session.registry.register_logical_rule
+                if isinstance(recorder, LogicalRule)
+                else session.registry.register_physical_rule)
+    register(recorder)
     session.register("docs", quail.DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two three"]}),
         id_col="id"))
@@ -138,10 +156,10 @@ def test_session_rules_read_statistics_from_the_context():
     query.plan()
     query.wait_for_tokens()
 
-    # the rules ran before the physical planner, on document lengths
-    # estimated while the background thread tokenized the table
     assert len(recorder.seen) >= 1
     context = recorder.seen[0]
+    assert isinstance(context, PlanningContext)
+    assert context.logical_plan == query.logical
     assert context.catalog is session.catalog
     assert context.engine_config is session.config
     assert context.model is session.model
@@ -150,5 +168,56 @@ def test_session_rules_read_statistics_from_the_context():
     assert list(context.document_tokens["d"]) == [1, 2]
     assert context.tokenizer is session.tokenizer
     assert dict(context.pair_fractions) == {}
-    assert context.physical_context().document_tokens is context.document_tokens
     session.close()
+
+
+def test_logical_rule_can_propose_multiple_trees_without_replacing_original():
+    class RenameAlternatives(LogicalRule):
+        name = "rename_alternatives"
+
+        def rewrites(self, root, context):
+            if root.input.tag != "old":
+                return [root]
+            return [root, *(replace(root, input=replace(root.input, tag=tag))
+                            for tag in ("first", "second", "first"))]
+
+    plan = _tagged_plan("old")
+    rules = (RenameAlternatives(),)
+    candidates = logical_alternatives(plan, rules, CONTEXT)
+    assert [candidate.plan.root.input.tag for candidate in candidates] == [
+        "old", "first", "second"]
+    assert candidates[0].plan is plan
+    assert [candidate.rules for candidate in candidates] == [
+        (), ("rename_alternatives",), ("rename_alternatives",)]
+
+
+def test_later_rules_replace_every_branch_and_deduplicate_results():
+    class Branch(LogicalRule):
+        name = "branch"
+
+        def rewrites(self, root, context):
+            if root.input.tag != "old":
+                return [root]
+            return [replace(root, input=replace(root.input, tag=tag))
+                    for tag in ("first", "second")]
+
+    plan = _tagged_plan("old")
+    candidates = logical_alternatives(
+        plan, (Branch(), RenameTag("first", "done"), RenameTag("second", "done")),
+        CONTEXT)
+    assert len(candidates) == 1
+    assert candidates[0].plan.root.input.tag == "done"
+    assert candidates[0].rules == ("branch", "rename_first_done")
+    assert plan.root.input.tag == "old"
+
+
+@pytest.mark.parametrize("returned", [None, [], ()])
+def test_logical_rule_requires_a_nonempty_list(returned):
+    class InvalidRule(LogicalRule):
+        name = "invalid_rule"
+
+        def rewrites(self, root, context):
+            return returned
+
+    with pytest.raises(ValueError, match="invalid_rule.rewrites.*nonempty list"):
+        logical_alternatives(_tagged_plan("old"), (InvalidRule(),), CONTEXT)

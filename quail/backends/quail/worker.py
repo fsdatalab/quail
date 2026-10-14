@@ -12,7 +12,7 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.model import load_model, resolve_model_path
+from quail.backends.quail.executor.model_loading import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.operators.extract import execute_extractions
 from quail.backends.quail.executor.operators.join import join_inputs

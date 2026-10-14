@@ -33,7 +33,8 @@ from quail.physical import (
     encode_graph,
     plan_envelope,
 )
-from quail.planner.optimizer.physical import PhysicalCandidate, SupportResult
+from quail.planner.optimizer.candidates import PhysicalCandidate, SupportResult
+from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import EngineConfig, PhysicalPlan
 
 
@@ -129,7 +130,7 @@ class PreferredPlanner:
             context, count=2, estimate=-1.0, source="preferred planner"),)
 
 
-class KeepFirstDocument:
+class KeepFirstDocument(PhysicalRule):
     name = "keep_first_document"
 
     def rewrite(self, graph, context):
@@ -162,7 +163,7 @@ class TwoCandidatesBackend:
         )
 
 
-class RecordLogicalPlan:
+class RecordLogicalPlan(PhysicalRule):
     name = "record_logical_plan"
 
     def __init__(self):
@@ -192,11 +193,13 @@ def test_plan_query_keeps_the_cheapest_candidate_and_its_logical_plan(
     query = session.sql(
         "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
     plan = query.plan()
-    # on a tie the first candidate wins; the physical rules read the
-    # chosen candidate's logical plan
     assert plan.settings["planner_source"] == chosen
-    (seen,) = rule.seen
-    assert (seen is backend.alternative) == (chosen == "alternative")
+    written, alternative = rule.seen
+    assert query.logical is (written if chosen == "written" else alternative)
+    assert plan.logical_plan is query.logical
+    assert alternative is backend.alternative
+    assert [candidate["selected"] for candidate in plan.settings["candidates"]] == (
+        [True, False] if chosen == "written" else [False, True])
 
 
 def test_physical_extensions_plan_validate_and_execute(monkeypatch):

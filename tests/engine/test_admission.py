@@ -5,7 +5,7 @@ import random
 import pytest
 from helpers.fakes import expected_filter_rows
 
-from quail.backends.quail.executor.pack import (
+from quail.backends.quail.executor.admission import (
     DROP,
     SKIP,
     AdmissionReport,

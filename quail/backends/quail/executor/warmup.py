@@ -2,7 +2,7 @@
 
 import time
 
-from quail.backends.quail.executor.model import full_output_head
+from quail.backends.quail.executor.model_loading import full_output_head
 from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
 from quail.progress import Progress, logger, quiet
 

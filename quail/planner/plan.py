@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
+from quail.logical import LogicalPlan
 from quail.physical import (
     AiFilter,
     AiInference,
@@ -71,6 +72,7 @@ class PhysicalPlan:
     and, for a filter sequence a later join anchors on, the recompute it
     would pay if its KV were released instead of pinned. estimator
     recomputes them for an edited graph; it is not compared or shown.
+    logical_plan records the selected tree for query execution and explain.
     """
 
     model: str
@@ -84,6 +86,7 @@ class PhysicalPlan:
     estimates: Mapping[str, Mapping[str, float]] = field(
         default_factory=dict, repr=False)
     estimator: Any = field(default=None, repr=False, compare=False)
+    logical_plan: LogicalPlan | None = field(default=None, repr=False, compare=False)
     graph: PhysicalGraph = field(init=False, repr=False)
 
     def __post_init__(self) -> None:

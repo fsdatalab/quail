@@ -6,7 +6,7 @@ from itertools import groupby
 
 import numpy as np
 
-from quail.backends.quail.executor.pack import DROP, SKIP, JoinAdmission
+from quail.backends.quail.executor.admission import DROP, SKIP, JoinAdmission
 from quail.backends.quail.executor.readout_groups import ReadoutGroups
 from quail.backends.quail.executor.stages import (
     OwnRequests,

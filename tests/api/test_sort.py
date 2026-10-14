@@ -16,11 +16,9 @@ from quail.logical import Result, Scan, SemanticFilter
 from quail.physical import AiFilter, Project, Sort
 from quail.physical.base import input_ports
 from quail.planner import plan_query
-from quail.planner.optimizer.logical import (
-    LogicalPlanningContext,
-    apply_logical_rules,
-)
-from quail.planner.rules.logical import built_in_logical_rules
+from quail.planner.optimizer.context import PlanningContext
+from quail.planner.optimizer.tree_rewrites import logical_alternatives
+from quail.planner.rules import built_in_rules
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 
@@ -34,11 +32,12 @@ def catalog():
 
 
 def _optimize_with(catalog, logical, tokens):
-    """Run the built in logical rules with the catalog's id columns."""
-    context = LogicalPlanningContext(
-        catalog, None, model=QWEN3_4B_FP8, device=H100_SXM,
+    """Run the built in tree rewrites with the catalog's id columns."""
+    context = PlanningContext(
+        catalog=catalog, model=QWEN3_4B_FP8, device=H100_SXM,
         document_tokens=tokens, tokenizer=tok)
-    return apply_logical_rules(logical, built_in_logical_rules(), context)
+    candidate, = logical_alternatives(logical, built_in_rules(), context)
+    return candidate.plan, candidate.rules
 
 
 def _sort(**fields):
@@ -129,7 +128,7 @@ def test_distinct_is_dropped_when_every_tables_id_is_selected(catalog):
     tokens = {"r": [400] * 100}
     optimized, changed = _optimize_with(
         catalog, _filtered(catalog).distinct().limit(3).select("r.id"), tokens)
-    assert "distinct_elimination" in changed
+    assert "should_eliminate_distinct" in changed
     assert not isinstance(optimized.root, Result) or not optimized.root.distinct
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
                       registry=built_in_registry(),
@@ -140,15 +139,15 @@ def test_distinct_is_dropped_when_every_tables_id_is_selected(catalog):
     grouped = (_filtered(catalog).group_by("r.author").agg(n=count())
                .distinct().select("r.author", "n"))
     optimized, changed = _optimize_with(catalog, grouped, tokens)
-    assert "distinct_elimination" in changed and not optimized.root.distinct
+    assert "should_eliminate_distinct" in changed and not optimized.root.distinct
     # without the id the rows can repeat, so the DISTINCT stays
     optimized, changed = _optimize_with(
         catalog, _filtered(catalog).distinct().select("r.author"), tokens)
-    assert "distinct_elimination" not in changed and optimized.root.distinct
+    assert "should_eliminate_distinct" not in changed and optimized.root.distinct
     # without a catalog the rule cannot know the id columns
     optimized, changed = _optimize(
         _filtered(catalog).distinct().select("r.id"), tokens)
-    assert "distinct_elimination" not in changed and optimized.root.distinct
+    assert "should_eliminate_distinct" not in changed and optimized.root.distinct
 
 
 def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
@@ -156,7 +155,7 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
     logical = (_filtered(catalog).distinct().order_by("r.author").limit(2)
                .select("r.author"))
     optimized, changed = _optimize_with(catalog, logical, tokens)
-    assert "distinct_pushdown" in changed
+    assert "should_push_down_distinct" in changed
     node = next(node for node in optimized.walk()
                 if isinstance(node, SemanticFilter))
     assert node.stop_key == ("author",)
@@ -177,6 +176,6 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
             _filtered(catalog).distinct().select("r.id", "r.author"),
             _filtered(catalog).select("r.author")):
         optimized, changed = _optimize_with(catalog, logical, tokens)
-        assert "distinct_pushdown" not in changed
+        assert "should_push_down_distinct" not in changed
         assert all(not node.stop_key for node in optimized.walk()
                    if isinstance(node, SemanticFilter))

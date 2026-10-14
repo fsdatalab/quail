@@ -45,7 +45,7 @@ from quail.physical import (
 from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.prompt_lowering import lower_prompt
-from quail.planner.rules.logical import push_down_projection
+from quail.planner.rules.tree_transforms import push_down_projection
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 from quail_b.prompts import AGENT_PROGRESS, AGENT_PROGRESS_DESCRIPTIONS
 from quail_b.prompts import AGENT_PROGRESS_LABELS as STAGES
@@ -467,34 +467,33 @@ def _corpus(session, tmp_path, name, column, rows, words):
 
 
 def _candidates(session, query):
-    """Return the Quail backend's candidates for a planned query."""
-    from quail.planner.optimizer.physical import ModelRegion, PlanningContext
+    """Return the planner's refined candidates for a planned query."""
+    from quail.planner.optimize import search_candidates
+    from quail.planner.optimizer.context import PlanningContext
 
     query.plan()
     context = PlanningContext(
         model=session.model, device=session.device, gpu_count=1,
         document_tokens=query._doc_tokens, backend="quail",
         tokenizer=session.tokenizer)
-    return session.registry.backend("quail").plan(
-        ModelRegion(query.logical), context)
+    return search_candidates(query._logical_input, context, session.registry)
 
 
 def test_planner_places_and_scores_classifications(session, tmp_path):
     from quail.logical import classified_above_joins
-    from quail.planner.rules.logical import (
-        built_in_logical_rules,
-        lift_classifications,
+    from quail.planner.rules import built_in_rules
+    from quail.planner.rules.tree_transforms import (
+        lift_maps,
     )
-    from quail.planner.rules.physical import built_in_physical_rules
 
-    assert [rule.name for rule in built_in_logical_rules()] == [
-        "distinct_elimination", "distinct_pushdown", "projection_pushdown",
-        "filter_pushdown"]
-    assert [rule.name for rule in built_in_physical_rules()] == [
-        "limit_pushdown", "kv_retention", "label_scoring", "prefix_sharing",
-        "tree_attention"]
+    assert [rule.name for rule in built_in_rules()] == [
+        "should_eliminate_distinct", "should_push_down_distinct",
+        "should_push_down_projection",
+        "should_push_down_filters", "should_lift_maps",
+        "should_push_down_limit", "choose_classify_implementation", "should_retain_kv",
+        "should_share_prefixes", "choose_attention_algorithm"]
     plan = _topic(session).plan()
-    # label_scoring chose every classification's scoring rule
+    # choose_classify_implementation chose every classification's scoring rule
     assert all(node.spec.scoring for node in plan.nodes
                if isinstance(node, AiClassify))
     assert plan.settings["classify_placement"] == "before joins"
@@ -533,39 +532,38 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     assert plan.settings["search_seconds"] == plan.estimated_seconds
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
     assert (staged.exec_idx, staged.anchor) == (0, "r")
-    # the logical plan keeps the classification where it was written;
-    # the backend priced it there and above the join, and the lifted
-    # candidate was cheaper
-    assert classified_above_joins(after.logical.root) == frozenset()
+    assert classified_above_joins(after._logical_input.root) == frozenset()
+    assert classified_above_joins(after.logical.root) == {"r"}
     written_candidate, lifted_candidate = _candidates(session, after)
-    assert written_candidate.logical_plan.root == after.logical.root
+    assert classified_above_joins(written_candidate.logical_plan.root) == frozenset()
+    assert lifted_candidate.logical_plan == after.logical
     assert classified_above_joins(lifted_candidate.logical_plan.root) == {"r"}
     assert (lifted_candidate.estimated_seconds
             < written_candidate.estimated_seconds)
-    # a cost-based logical rule prices a plan the same way the backend
+    # a cost-based tree rewrite prices a plan the same way the backend
     # prices its candidates
     from quail.planner import pricing
-    from quail.planner.optimizer.logical import LogicalPlanningContext
+    from quail.planner.optimizer.context import PlanningContext
 
-    logical_context = LogicalPlanningContext(
-        session.catalog, session.config, model=session.model,
+    context = PlanningContext(
+        catalog=session.catalog, engine_config=session.config, model=session.model,
         device=session.device, document_tokens=after._doc_tokens,
         tokenizer=session.tokenizer)
     assert pricing.estimated_seconds(
-        lifted_candidate.logical_plan, logical_context) == (
+        lifted_candidate.logical_plan, context, session.registry) == (
         lifted_candidate.estimated_seconds)
     logical_text, physical_text = after.explain().split("physical:")
     assert "SemanticClassify: topic" in logical_text
     assert "AiClassify: topic over r" in physical_text
-    lifted = lift_classifications(written)
+    lifted = lift_maps(written)
     assert [type(node).__name__ for node in LogicalPlan(lifted).walk()] == [
         "Scan", "Scan", "Join", "SemanticJoin", "SemanticClassify",
         "Filter", "Project"]
     assert classified_above_joins(lifted) == {"r"}
     assert classified_above_joins(written) == frozenset()
-    assert lift_classifications(lifted) is None
+    assert lift_maps(lifted) is None
     # a query without a join gets one candidate
-    assert lift_classifications(_topic(session).logical.root) is None
+    assert lift_maps(_topic(session).logical.root) is None
     assert len(_candidates(session, _topic(session))) == 1
 
     # a filtered partner on a forced anchor stays classified before the

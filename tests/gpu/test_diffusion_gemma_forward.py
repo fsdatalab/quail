@@ -186,7 +186,7 @@ def quail(prompts, stock_layers):
     """
     from quail.backends.quail.executor.arena import KVArena
     from quail.backends.quail.executor.chunk import pack_chunk
-    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.cost.budgets import PAGE_TOKENS
     from quail.specs import MODELS

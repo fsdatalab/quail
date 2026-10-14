@@ -145,8 +145,8 @@ class ScoreLowering:
 
 def emit_scores(builder, alias):
     """Append the alias's score predicates and projected scores."""
-    stats = builder.decisions.statistics.stats
-    orders = builder.decisions.filter_orders
+    stats = builder.operator_order.statistics.stats
+    orders = builder.operator_order.filter_orders
     live = float(stats[alias].n_docs)
     for position in orders.get(alias, ()):
         predicate = builder.operators.filters[alias][position]
@@ -172,9 +172,9 @@ def emit_scores(builder, alias):
 
 def emit_score_pair(builder, prompt, position, fraction, pair_inputs):
     """Append the score of one pair prompt and return its rows port."""
-    stats = builder.decisions.statistics.stats
+    stats = builder.operator_order.statistics.stats
     aliases = tuple(dict.fromkeys(ref.alias for ref in prompt.args))
-    expected, prefixes = pair_counts(builder.decisions.live, aliases, fraction)
+    expected, prefixes = pair_counts(builder.operator_order.live, aliases, fraction)
     return builder.scoring.score(
         prompt, f"__score_join_{position}",
         tuple(builder.rows_src.get(a, builder.ids_src[a]) for a in aliases)

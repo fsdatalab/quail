@@ -22,7 +22,7 @@ class SemanticFilter:
     """Predicates over one table's documents, in written order.
 
     The physical planner chooses the order they run in. ``stop_key``
-    names columns of the filtered table once the distinct_pushdown rule
+    names columns of the filtered table once the should_push_down_distinct rule
     has found that the query asks only whether any document of each key
     value passes; the executor then skips a key's remaining documents
     once one survives.

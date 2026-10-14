@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
 from quail.physical import PhysicalNode
-from quail.planner.optimizer.physical import (
+from quail.planner.optimizer.candidates import (
     ModelRegion,
     PhysicalCandidate,
-    PlanningContext,
     SupportResult,
 )
+from quail.planner.optimizer.context import PlanningContext
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -73,7 +73,9 @@ class ModelBackend(Protocol):
         self,
         region: ModelRegion,
         context: PlanningContext,
-    ) -> Sequence[PhysicalCandidate]: ...
+    ) -> Sequence[PhysicalCandidate]:
+        """Lower one logical alternative; the planner applies optimizer rules."""
+        ...
 
     def start(self, context: GpuContext) -> ModelExecution: ...
 

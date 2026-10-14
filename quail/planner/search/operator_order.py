@@ -1,18 +1,102 @@
-"""Choose each table's filter order and the joins' stage order and anchors.
+"""Choose filter order, join order, and anchors using estimated cost."""
 
-Both choices are physical: they change how a plan runs, not what it
-returns. build_physical_plan makes them while it lowers a logical plan.
-"""
-
-from __future__ import annotations
+from dataclasses import dataclass
 
 from quail.cost.work import Work
-from quail.logical import LogicalPlan, SemanticFilter, model_call
+from quail.logical import (
+    LogicalPlan,
+    SemanticFilter,
+    model_call,
+)
+from quail.logical.plan import Operators
+from quail.planner.operators.common import question_tokens
 from quail.planner.operators.filter import filter_alias_work, prepare_filter_costs
+from quail.planner.plan import Refusal
 from quail.planner.search import join_order as joinsearch
-from quail.planner.search.filter_order import order_filters_indexed
-from quail.planner.search.statistics import PlanStatistics, live_after_filters
+from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
+from quail.planner.search.statistics import (
+    PlanStatistics,
+    cached_statistics,
+    live_after_filters,
+)
+from quail.planner.validation import join_input_tokens
 from quail.specs import ModelSpec
+
+
+@dataclass(frozen=True)
+class OperatorOrder:
+    """Operator order, input statistics, and work estimates for graph construction."""
+
+    operators: Operators
+    statistics: PlanStatistics
+    filter_orders: dict
+    join_sequence: list
+    join_steps: list
+    live: dict[str, float]
+    filter_work: dict[str, Work]
+    order_rule: str
+    order_source: str
+
+
+def choose_operator_order(plan, operators, model, device, doc_tokens, order,
+                pair_fractions, context, scan_fractions):
+    """Choose operator order and estimate work without constructing graph nodes."""
+    scans, filters, joins = operators.scans, operators.filters, operators.joins
+    statistics = cached_statistics(
+        plan, {} if context is None else context.memo, model=model,
+        device=device, doc_tokens=doc_tokens, pair_fractions=pair_fractions,
+        scan_fractions=scan_fractions, context=context)
+    stats, chunk, pre = statistics.stats, statistics.chunk, statistics.pre
+    specs = statistics.specs
+    asks = statistics.asks
+    ask_filters = {alias: [filters[alias][position] for position in positions]
+                   for alias, positions in asks.items() if positions}
+    rule, source = (order, f"user: order={order!r}") if order else \
+        default_order_rule(operators.all_filters(), joins)
+    orders = choose_filter_orders(
+        plan, statistics, model=model, device=device, rule=rule,
+        context=context)
+
+    live0 = live_after_filters(plan, statistics)
+    works = filter_works(plan, statistics, model, orders)
+
+    seq = [(specs[position], anchor) for position, anchor in
+           choose_join_sequence(plan, statistics, orders, model=model,
+                                device=device, rule=rule)]
+    _, join_steps = joinsearch.walk(
+        seq, live0, statistics.lengths, set(operators.all_filters()), pre,
+        model, device)
+    anchors = {spec.written_pos: anchor for spec, anchor in seq}
+    for s in scans:
+        fq = max((question_tokens(context.lowered(p.prompt), model.canvas_tokens)
+                  for p in ask_filters.get(s.alias, ())), default=None)
+        if fq is None:
+            continue
+        need = pre + stats[s.alias].max_doc_tokens + fq
+        if need > chunk:
+            return Refusal(
+                reasons=(f"a document in {s.alias!r} needs {need} tokens "
+                         f"with its prompt, but the forward pass budget "
+                         f"is {chunk} tokens",),
+                constraint="suffix_over_chunk",
+                needed=need, available=chunk, unit="tokens")
+    for spec in specs:
+        if spec.cost is not None:
+            continue
+        anchor = anchors[spec.written_pos]
+        need = join_input_tokens(
+            spec, anchor, {alias: stats[alias].max_doc_tokens
+                           for alias in spec.aliases}, pre)
+        if need > chunk:
+            return Refusal(
+                reasons=(f"one join pair anchored on {anchor!r} needs "
+                         f"{need} tokens, but the forward pass budget "
+                         f"is {chunk} tokens",),
+                constraint="suffix_over_chunk",
+                needed=need, available=chunk, unit="tokens")
+
+    return OperatorOrder(operators, statistics, orders, seq, join_steps,
+                         live0, works, rule, source)
 
 
 def filter_works(plan: LogicalPlan, statistics: PlanStatistics,

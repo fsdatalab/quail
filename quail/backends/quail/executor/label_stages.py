@@ -13,7 +13,7 @@ from typing import Callable
 
 import numpy as np
 
-from quail.backends.quail.executor.model import full_output_head
+from quail.backends.quail.executor.model_loading import full_output_head
 from quail.backends.quail.executor.readout import (
     AsyncDecisionChoices,
     AsyncLabelLogprobs,

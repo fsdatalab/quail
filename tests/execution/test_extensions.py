@@ -11,11 +11,12 @@ from quail.builtins import built_in_registry
 from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.runtimes import ScanRuntime
 from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
-from quail.planner.optimizer.physical import apply_physical_rules
+from quail.planner.optimizer.graph_refinement import rewrite_graph
+from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 
 
 @dataclass(frozen=True)
-class ChangeCount:
+class ChangeCount(PhysicalRule):
     name: str
     factor: int = 1
     offset: int = 0
@@ -45,14 +46,14 @@ def _count(registry):
         (Scan(node_id="input", alias="d", input_id="d", n_docs=1),),
         PortRef("input", "ids:d"),
     )
-    rewritten, _ = apply_physical_rules(
-        graph, tuple(registry.physical_rules.values()), None)
+    rewritten, _ = rewrite_graph(
+        graph, tuple(registry.rules.values()), None)
     return rewritten.nodes[0].n_docs
 
 
 def test_extension_order_nesting_and_rollback(monkeypatch):
     def register(registry):
-        assert "double" in registry.physical_rules
+        assert "double" in registry.rules
         registry.register_physical_rule(ChangeCount("add_three", offset=3))
 
     registry = (
@@ -79,8 +80,8 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
 
     outer = _module(monkeypatch, "test_outer_extension", register_outer)
     registry = built_in_registry().load_extension(outer)
-    built_in = list(built_in_registry().physical_rules)
-    assert [name for name in registry.physical_rules
+    built_in = list(built_in_registry().rules)
+    assert [name for name in registry.rules
             if name not in built_in] == ["before", "inner", "after"]
     assert registry.extension_modules == (outer.__name__, inner.__name__)
     assert calls == ["outer", "inner"]
@@ -95,15 +96,15 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
     module = _module(monkeypatch, "test_failed_extension", register)
     with pytest.raises(ValueError, match="duplicate physical_rule"):
         registry.load_extension(module)
-    built_in = list(built_in_registry().physical_rules)
-    assert [name for name in registry.physical_rules
+    built_in = list(built_in_registry().rules)
+    assert [name for name in registry.rules
             if name not in built_in] == ["existing"]
     assert registry.extension_modules == ()
 
     module.register_quail_extension = (
         lambda registry: registry.register_physical_rule(ChangeCount("added")))
     registry.load_extension(module)
-    assert [name for name in registry.physical_rules
+    assert [name for name in registry.rules
             if name not in built_in] == ["existing", "added"]
 
     def recursive(registry):
@@ -114,8 +115,48 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
     registry = built_in_registry()
     with pytest.raises(ValueError, match="duplicate extension module"):
         registry.load_extension(module)
-    assert list(registry.physical_rules) == built_in
+    assert list(registry.rules) == built_in
     assert not registry.extension_modules
+
+
+class KeepTree(LogicalRule):
+    def __init__(self, name):
+        self.name = name
+
+    def rewrites(self, root, context):
+        raise AssertionError("logical rules must not run on physical graphs")
+
+
+def test_rule_types_preserve_registration_order_within_each_stage():
+    registry = built_in_registry()
+    registry.register_physical_rule(ChangeCount("double", factor=2))
+    registry.register_logical_rule(KeepTree("keep_tree"))
+    registry.register_physical_rule(ChangeCount("add_three", offset=3))
+    registry.register_physical_rule(ChangeCount("double_again", factor=2))
+
+    assert list(registry.rules)[-4:] == [
+        "double", "keep_tree", "add_three", "double_again"]
+    assert list(registry.physical_rules)[-3:] == [
+        "double", "add_three", "double_again"]
+    assert list(registry.logical_rules)[-1:] == ["keep_tree"]
+    assert _count(registry) == 10
+
+    before = dict(registry.rules)
+    with pytest.raises(ValueError, match="duplicate optimizer rule"):
+        registry.register_logical_rule(KeepTree("double"))
+    assert dict(registry.rules) == before
+
+
+def test_rule_registration_validates_base_class():
+    registry = built_in_registry()
+    before = dict(registry.rules)
+    with pytest.raises(TypeError, match="needs a LogicalRule subclass"):
+        registry.register_logical_rule(ChangeCount("wrong_type"))
+    with pytest.raises(TypeError, match="needs a PhysicalRule subclass"):
+        registry.register_physical_rule(KeepTree("wrong_type"))
+    with pytest.raises(TypeError, match="needs a PhysicalRule subclass"):
+        registry.register_physical_rule(object())
+    assert dict(registry.rules) == before
 
 
 def test_node_registration_validation_and_execution():

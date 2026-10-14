@@ -183,16 +183,16 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
 
 
 def _candidates(session, query):
-    """Return the Quail backend's candidates for a planned query."""
-    from quail.planner.optimizer.physical import ModelRegion, PlanningContext
+    """Return the planner's refined candidates for a planned query."""
+    from quail.planner.optimize import search_candidates
+    from quail.planner.optimizer.context import PlanningContext
 
     query.plan()
     context = PlanningContext(
         model=session.model, device=session.device, gpu_count=1,
         document_tokens=query._doc_tokens, backend="quail",
         tokenizer=session.tokenizer)
-    return session.registry.backend("quail").plan(
-        ModelRegion(query.logical), context)
+    return search_candidates(query._logical_input, context, session.registry)
 
 
 def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
@@ -209,10 +209,11 @@ def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
     plan = query.plan()
     assert not isinstance(plan, Refusal)
     written, lifted = _candidates(session, query)
-    # the backend also offers the extraction after the join, over the
+    # The logical rule offers extraction after the join, over the
     # documents the join matched: a fifth of them by default, so the
     # lifted plan is cheaper and wins
-    assert written.logical_plan.root == query.logical.root
+    assert extracted_above_joins(written.logical_plan.root) == frozenset()
+    assert lifted.logical_plan == query.logical
     assert extracted_above_joins(lifted.logical_plan.root) == {"c"}
     assert lifted.estimated_seconds < written.estimated_seconds
     (join,) = [n for n in written.plan.nodes if isinstance(n, AiJoin)]

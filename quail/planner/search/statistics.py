@@ -1,9 +1,9 @@
-"""The numbers the cost-based rules and the physical planner read.
+"""The numbers the rules and the physical planner read.
 
 One PlanStatistics holds what the cost model knows about a logical
 plan before any decision: each table's document lengths, the model's
 token budgets, the preamble, and the joins as the search prices them.
-The functions after it read the decisions the logical rules recorded
+The functions after it read the decisions the tree rewrites recorded
 on the plan's nodes: each table's filter order and the join sequence.
 """
 
@@ -133,7 +133,7 @@ def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
                       context=None) -> PlanStatistics:
     """Return plan_statistics, computed once per memo and plan root.
 
-    Every logical rule and physical planner of one query that prices
+    Every tree rewrite and physical planner of one query that prices
     the same plan share one summary of each table's lengths.
     """
     key = ("statistics", plan.root)
@@ -146,7 +146,7 @@ def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
 
 
 def filter_stop_keys(plan: LogicalPlan) -> dict:
-    """Return alias -> the stop key the distinct_pushdown rule put on its filters."""
+    """Return each alias's DISTINCT stop key from its filters."""
     keys = {}
     for node in plan.walk():
         if isinstance(node, SemanticFilter) and node.stop_key:

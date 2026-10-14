@@ -22,13 +22,11 @@ from quail.logical import (
     SemanticJoin,
 )
 from quail.physical import Recombine
-from quail.planner.optimizer.logical import (
-    LogicalPlanningContext,
-    apply_logical_rules,
-)
+from quail.planner.optimizer.context import PlanningContext
+from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import EngineConfig
-from quail.planner.rules.logical import (
-    built_in_logical_rules,
+from quail.planner.rules import built_in_rules
+from quail.planner.rules.tree_transforms import (
     push_down_filters,
     push_down_projection,
 )
@@ -226,10 +224,11 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
     assert pushed.input.input.left == _stars_apply(joined.input.left)
     assert pushed.input.input.right == joined.input.right
     LogicalPlan(pushed).validate()
-    optimized, changed = apply_logical_rules(
-        LogicalPlan(above), built_in_logical_rules(),
-        LogicalPlanningContext(catalog, None))
-    assert changed == ("projection_pushdown", "filter_pushdown")
+    candidate, = logical_alternatives(
+        LogicalPlan(above), built_in_rules(),
+        PlanningContext(catalog=catalog))
+    optimized, changed = candidate.plan, candidate.rules
+    assert changed == ("should_push_down_projection", "should_push_down_filters")
     assert optimized.root == push_down_projection(pushed)
 
     # both front ends place the filter on its table, so the rule

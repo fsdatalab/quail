@@ -57,7 +57,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
 
 def emit_extract(builder, alias, live=None):
     """Copy the answers of the alias's documents, after its labels."""
-    stats = builder.decisions.statistics.stats
+    stats = builder.operator_order.statistics.stats
     calls = [node for node in builder.operators.extracts if node.alias == alias]
     if not calls or (alias in builder.extract_after and live is None):
         return

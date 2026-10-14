@@ -2,99 +2,104 @@
 title: Custom Rules
 ---
 
-Here we show how to implement and register a custom optimizer rule.
-The rule must preserve the query's meaning.
-For Quail's existing rules, see the [optimizer](/docs/architecture/optimizer).
+An optimizer rule changes a plan while preserving the query's result.
+Subclass `LogicalRule` for query trees or `PhysicalRule` for executable graphs.
+Both receive the same `PlanningContext`.
 
-## Choose the rule type
+## Logical rules
 
-- A *logical rule* changes the logical plan, such as which columns a
-  scan loads.
-- A *physical rule* changes the physical plan, such as an operator's
-  execution settings.
+Import `LogicalRule` from `quail.planner.optimizer.rules` and implement
+`rewrites(root, context)`. Return a nonempty list of equivalent query tree
+roots. The list replaces the input candidate:
 
-## Implement the rule
+| Return | Meaning |
+| --- | --- |
+| `[root]` | Keep the input unchanged. |
+| `[rewritten]` | Replace the input. |
+| `[root, rewritten]` | Keep both for cost comparison. |
 
-You can define a class with a `name` and a `rewrite()` method.
-`name` identifies the rule in the registry and plan explanations.
-Use a name that differs from those of registered rules.
+Include the input root explicitly to keep it. Do not modify input nodes.
+Each later rule runs on every returned candidate. The planner removes duplicate
+trees and compares costs after physical rules run. On a cost tie, it keeps the
+first candidate.
 
-For a logical rule, `rewrite(root, context)` receives the root node of
-the logical plan. Return a new root when you change the plan.
-Return `None` when no change is needed.
-
-The example below shows Quail's existing `ProjectionPushdown` rule.
-For example, imagine a `reviews` table with `id`, `body`, and `author`
-columns. A query returns `id` and uses `body` in a model filter.
-The rule tells the scan to retain `id` values for the result.
-Quail still tokenizes `body` for the filter. It does not need `author`.
+For example, imagine a query that extracts a date from each document and
+joins those documents with questions. Extraction can run before or after
+the join. This built-in rule proposes the second placement:
 
 ```python
-from quail.planner.rules.logical import push_down_projection
+from quail.planner.optimizer.rules import LogicalRule
+from quail.planner.rules.tree_transforms import lift_maps
 
 
-class ProjectionPushdown:
-    name = "projection_pushdown"
+class ShouldLiftMaps(LogicalRule):
+    name = "should_lift_maps"
 
-    def rewrite(self, root, context):
-        rewritten = push_down_projection(root)
-        return None if rewritten is root else rewritten
+    def rewrites(self, root, context):
+        rewritten = lift_maps(root)
+        return [root] if rewritten is None else [root, rewritten]
 ```
 
-The helper `push_down_projection()` updates the scans and returns the
-plan's root. It returns the original root when no change is needed.
-For your rule, implement the plan changes required by your operation.
-Return new nodes instead of changing existing nodes in place.
-See the [complete implementation](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/logical.py).
+The planner applies KV retention, prefix sharing, and the other physical
+rules to each placement before choosing one.
 
-For a physical rule, implement `rewrite(graph, context)`.
-Return a new `PhysicalGraph` when you change the plan, or `None` when
-no change is needed.
+## Physical rules
 
-Set `cost_based = True` on a rule that compares costs; `explain(verbose=True)`
-marks such rules. `quail.planner.pricing.estimated_seconds(plan, context)`
-prices a logical plan the way the planner does.
+Import `PhysicalRule` from `quail.planner.optimizer.rules` and implement
+`rewrite(graph, context)`. Return a replacement `PhysicalGraph`, or `None`
+to keep the graph. You can also update `context.settings` for this candidate.
+Do not modify the input nodes.
 
-The *planning context* provides the engine configuration and input
-statistics available to a rule. See
-[`LogicalPlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/logical.py)
-and
-[`PlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/physical.py)
-for their fields.
+A physical rule can compare implementation costs internally. For example,
+`should_share_prefixes` enables sharing when saved computation costs more
+than the extra KV writes. `should_retain_kv` sets up retention for compatible
+later operators without comparing on versus off.
 
-## Register the rule
+See the [physical rules](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/physical.py)
+for implementations.
 
-Create an [extension registry](/docs/extending#registration) with
-`ExtensionRegistry.with_built_ins()`. Create an instance of your rule class
-and register it with the method for its type:
+## Register a rule
 
-| Rule type | Registration method |
+Give each rule a unique `name`, shown in `explain()`. Use `should_...` for
+yes/no decisions and `choose_...` to select an implementation.
+
+Create a registry with `ExtensionRegistry.with_built_ins()` and register
+your rule with the method matching its base class:
+
+| Base class | Registration |
 | --- | --- |
-| Logical | `registry.register_logical_rule(rule)` |
-| Physical | `registry.register_physical_rule(rule)` |
+| `LogicalRule` | `registry.register_logical_rule(rule)` |
+| `PhysicalRule` | `registry.register_physical_rule(rule)` |
 
-Pass the registry to the session.
-`ProjectionPushdown` is already registered in Quail's default registry.
-The example shows its interface; you do not need to register it again.
+Pass the registry to the session. Quail already registers `ShouldLiftMaps`;
+do not register it again. Rules run in registration order within each step:
 
-### Rule execution order
+1. Apply logical `rewrites()` to every candidate in registration order. Remove
+   duplicate trees. Repeat until the roots stop changing, up to four passes.
+2. Build an executable graph for each tree.
+3. Apply physical `rewrite()` methods to each graph in registration order.
+4. Select the candidate with the lowest estimated time.
 
-- Your rules run after Quail's existing rules, in registration order.
-- For logical rules, one *pass* applies all rules once. Quail repeats
-  passes until a pass makes no changes, with a maximum of four passes.
-- Quail applies each physical rule once when it builds a physical plan.
-  It can apply physical rules again after tokenization.
+If initial planning used estimated token lengths, repeat the search when
+exact tokens are available. See [Optimizer](/docs/architecture/optimizer)
+for the built-in rule order.
 
-## Check the rule
+## Planning context
 
-Call `rewrite()` directly to test your rule without model inference.
-Check that:
+`PlanningContext` provides the model, device, tokenizer, catalog, token
+counts, and estimated fractions of rows kept by filters and joins.
+`context.logical_plan` is the current candidate's query tree.
 
-- The intended nodes and fields change.
-- The original plan remains unchanged.
-- The revised plan preserves the query's meaning.
-- A second call on the revised plan returns `None` if no further change
-  is needed.
+Each executable candidate has separate `settings`. Rules can reuse computed
+values through `memo`. Memo keys must include all inputs that affect the value.
+See [`optimizer/context.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/context.py)
+for the fields.
 
-See the [logical rule tests](https://github.com/fsdatalab/quail/blob/main/tests/frontend/test_logical_extensions.py)
-for examples of repeated calls and rule execution order.
+## Test a rule
+
+Call its methods without model inference. Check that the intended fields
+change, the input stays unchanged, and the result is equivalent. For an
+alternative, check which plan wins after physical rules run.
+
+See the [rule tests](https://github.com/fsdatalab/quail/blob/main/tests/frontend/test_logical_extensions.py)
+and [search tests](https://github.com/fsdatalab/quail/blob/main/tests/planner/test_search.py).

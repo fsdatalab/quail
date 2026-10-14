@@ -17,22 +17,19 @@ to write and register an extension rule.
 
 ## Planning process
 
-`Query.plan()` performs these steps:
-
-1. Get document lengths in tokens. If a column is not yet tokenized,
-   estimate its lengths using the tokens per byte of the first 1,024
-   documents.
-2. Run the logical rules in order. Repeat the sequence until a pass makes
-   no change, or four passes have run.
-3. Build the physical graph with `build_physical_plan`. Set the token
-   budget and KV capacity from the model and device specifications, and
-   choose classification placement, filter order, and join order.
-4. Run the physical rules once, in order.
-
-Tokenization can continue in the background while planning runs. Before
-execution, `refine_plan` applies the physical rules with exact token
-counts and sequences. It preserves the choices already made while
-building the plan and by rules such as `label_scoring` and `kv_retention`.
+1. **Prepare statistics.** Read token counts, or estimate document lengths
+   from the first 1,024 documents while tokenization runs in the background.
+2. **Rewrite candidates.** Each logical rule returns a list of viable query
+   trees. Projection pushdown replaces a tree; map placement keeps both
+   placements. Apply later rules to every candidate and remove duplicates.
+   Repeat until a pass makes no change, or four passes have run.
+3. **Compare plans.** Build each candidate and apply its execution settings,
+   including KV retention and prefix sharing. Choose the candidate with
+   the lowest estimated time. Keep the first candidate on a tie.
+4. **Update with exact tokens.** If the first search used estimated lengths,
+   repeat it after tokenization. Exact prefixes can change the chosen plan.
+   Explicitly edited physical plans preserve their edits and use `refine_plan`.
+5. **Execute.** Run the selected plan with its tokenized inputs.
 
 ## Cost estimates
 
@@ -105,23 +102,23 @@ built-in rules of the same kind, in registration order.
 
 | Rule | Kind | Decision | Uses cost estimates |
 | --- | --- | --- | --- |
-| `distinct_elimination` | Logical | Remove DISTINCT when the returned keys are unique. | No |
-| `distinct_pushdown` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
-| `projection_pushdown` | Logical | Load only columns the query uses. | No |
-| `filter_pushdown` | Logical | Move eligible CPU filters and Python functions before joins. | No |
-| `limit_pushdown` | Physical | Stop an eligible filter sequence after enough documents pass. | No |
-| `kv_retention` | Physical | Keep selected document KV for later operators. | Yes |
-| `label_scoring` | Physical | Choose a classification's label scoring method. | Yes |
-| `prefix_sharing` | Physical | Reuse KV between documents with a shared prefix. | Yes |
-| `tree_attention` | Physical | Choose unified or tree attention for filters and joins. | Yes |
+| `should_eliminate_distinct` | Logical | Remove DISTINCT when the returned keys are unique. | No |
+| `should_push_down_distinct` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
+| `should_push_down_projection` | Logical | Load only columns the query uses. | No |
+| `should_push_down_filters` | Logical | Move eligible CPU filters and Python functions before joins. | No |
+| `should_lift_maps` | Logical | Offer classification and extraction before and after joins. | Yes |
+| `should_push_down_limit` | Physical | Stop an eligible filter sequence after enough documents pass. | No |
+| `choose_classify_implementation` | Physical | Choose a classification's label scoring method. | Yes |
+| `should_retain_kv` | Physical | Keep selected document KV for later operators. | No |
+| `should_share_prefixes` | Physical | Reuse KV between documents with a shared prefix. | Yes |
+| `choose_attention_algorithm` | Physical | Choose unified or tree attention for filters and joins. | Yes |
 
 The implementations are in
 [`rules/logical.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/logical.py)
 and
 [`rules/physical.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/physical.py).
 
-Building the physical plan also makes three cost-based choices,
-described [below](#physical-plan-choices).
+The planner makes the cost-based choices described [below](#plan-choices).
 
 Each operator supplies its own prompt preparation, execution constraints,
 and costs. Score operators support both generative
@@ -130,18 +127,19 @@ model prompt. The executor reuses the first document's KV across its
 partners, so that document is the anchor.
 
 Call `explain(verbose=True)` to inspect physical settings, including
-`share_prefixes` and `attention`, and to list the rules with the
-cost-based ones marked.
+`share_prefixes` and `attention`, and to list logical and physical rules
+and candidate costs.
 
-## Physical plan choices
+## Plan choices
 
-`build_physical_plan` and the Quail backend make these choices while
-building the physical plan. They compare alternatives using estimated
-query work.
+The planner compares alternatives using estimated query work. Logical
+rules propose map placements. Physical construction chooses filter and
+join order for each candidate.
 
 ### Classification placement
 
-The Quail backend decides when to classify a table's documents.
+The `should_lift_maps` rule proposes when to classify a table's documents.
+It also proposes placements for extraction.
 A classification that reads one table's document can run before or after
 joins involving that table. This differs from classifying a joined pair,
 where the classification reads both documents.
@@ -157,8 +155,10 @@ negative reviews, and joins them with movie aspects. Classifying first
 can save join work if few reviews are negative. Joining first can save
 classification work if few reviews match an aspect.
 
-The backend compares the estimated query times. It keeps the written plan
-unless moving classifications after the joins has a lower estimate.
+The planner compares the estimated query times after applying physical
+rules to each candidate, including KV retention and prefix sharing.
+It keeps the written placement unless moving the maps after joins has a
+lower estimate.
 
 ### Filter order
 
@@ -236,9 +236,12 @@ how these limits affect batching.
 
 ### KV retention
 
-The `kv_retention` rule identifies document KV that later operators can
+The `should_retain_kv` rule identifies document KV that later operators can
 reuse. A filter can retain the KV of passing documents for a later join anchored on that
 table. A join can retain anchor KV for a later join with the same anchors.
+
+The planner rule does not compare retention on versus off. The executor
+uses estimated savings to decide which KV to keep.
 
 Retained KV has a memory limit. When pages run out, the executor removes
 the KV with the lowest estimated future savings per page. An operator
@@ -249,7 +252,7 @@ calculation and execution behavior.
 
 ### Label scoring
 
-The `label_scoring` rule compares supported classification methods and
+The `choose_classify_implementation` rule compares supported classification methods and
 chooses the one with the lowest estimated GPU time. It considers the
 model, label tokens, requested output, and whether earlier operators
 already provide document KV.
@@ -261,7 +264,7 @@ the methods select labels and their requirements.
 
 ### Prefix sharing
 
-The `prefix_sharing` rule enables [prefix sharing](/docs/architecture/kv#prefix-sharing)
+The `should_share_prefixes` rule enables [prefix sharing](/docs/architecture/kv#prefix-sharing)
 when the estimated compute savings exceed the additional KV write time:
 
 ```text
@@ -287,7 +290,7 @@ so the rule can make its final decision after tokenization finishes.
 
 ### Attention path
 
-The `tree_attention` rule chooses between the unified and tree attention
+The `choose_attention_algorithm` rule chooses between the unified and tree attention
 paths described in [Execution](/docs/architecture/execution#attention-paths).
 It compares their estimated time for requests that read the same prefix.
 For `r` requests, each with `q` new tokens and a shared prefix of `s` tokens,
