@@ -61,20 +61,21 @@ def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
 
 def test_measured_attention_rates_interpolate_and_fall_below_the_table():
     rates = H100_SXM.attention_rates_for(32, 8, 128)
-    assert H100_SXM.attention_rates_for(64, 8, 128) is None
+    assert H100_SXM.attention_rates_for(64, 8, 128) is not None
+    assert H100_SXM.attention_rates_for(16, 8, 256) is None
     assert RTX_PRO_6000_BLACKWELL_SERVER.attention_rates_for(32, 8, 128) is None
     # measured points, halfway in log length, and held past the longest
-    assert rates.causal_rate(1024) == 411.2e12
+    assert rates.causal_rate(1024) == 416.8e12
     assert rates.causal_rate((1024 * 2048) ** 0.5) == pytest.approx(
-        (411.2e12 + 506.1e12) / 2)
-    assert rates.causal_rate(10**6) == 667.6e12
+        (416.8e12 + 510.1e12) / 2)
+    assert rates.causal_rate(10**6) == 675.7e12
     # below the shortest document a call takes as long as at the
     # shortest, so the rate falls in proportion
-    assert rates.causal_rate(64) == pytest.approx(104.1e12 / 2)
-    assert rates.read_rate(64, 8192) == 496e12
-    assert rates.read_rate(8, 8192) == pytest.approx(195e12 / 2)
-    assert rates.read_rate(64, 100) == 412e12
-    assert rates.read_rate(4096, 10**6) == 578e12
+    assert rates.causal_rate(64) == pytest.approx(106.6e12 / 2)
+    assert rates.read_rate(64, 8192) == 497.7e12
+    assert rates.read_rate(8, 8192) == pytest.approx(188.4e12 / 2)
+    assert rates.read_rate(64, 100) == 415.3e12
+    assert rates.read_rate(4096, 10**6) == 585.7e12
 
 
 def test_attention_prices_at_measured_rates_for_the_measured_layout():
@@ -90,8 +91,9 @@ def test_attention_prices_at_measured_rates_for_the_measured_layout():
     # without a device, or without a table for the layout, the flops
     # price at the bf16 peak
     assert dense_decoder_components(work, QWEN3_4B_FP8, 1)[2].compute_seconds is None
+    no_table = RTX_PRO_6000_BLACKWELL_SERVER
     assert dense_decoder_components(
-        work, QWEN3_32B_FP8, 1, H100_SXM)[2].compute_seconds is None
+        work, QWEN3_32B_FP8, 1, no_table)[2].compute_seconds is None
 
 
 def test_reads_count_one_per_prefix_read_however_many_suffixes_stack():

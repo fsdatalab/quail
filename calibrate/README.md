@@ -151,24 +151,26 @@ on its own GPU.
 
 ### GEMM results on H100 SXM
 
-On Modal, you cannot select the physical GPU. Each measurement can use
-a different H100. These measurements used the `published_fp8` shapes
-and the same software:
+These measurements used the `published_fp8` shapes and the same
+software. Each row is a different physical H100.
 
-| Date | MSMF, TFLOPS | MAMF, TFLOPS | Results directory |
-|---|---|---|---|
-| 2026-10-12 | 1,352 | 1,543 | `/results/ablations/gemm_ceilings/20261012T222632Z/` |
-| 2026-10-13 | 1,429 | 1,629 | `/results/calibrate/h100-sxm/gemm/20261013T221653Z/` |
-| 2026-10-13 | 1,315 | 1,500 | `/results/calibrate/h100-sxm/gemm/20261013T234156Z/` |
+| Results directory under `/results/` | MSMF, TFLOPS | MAMF, TFLOPS |
+|---|---|---|
+| `ablations/gemm_ceilings/20261012T222632Z/` | 1,352 | 1,543 |
+| `calibrate/h100-sxm/gemm/20261013T221653Z/` | 1,429 | 1,629 |
+| `calibrate/h100-sxm/gemm/20261013T234156Z/` | 1,315 | 1,500 |
+| `calibrate/h100-sxm/gemm/20261014T173306Z-g0/` | 1,342 | 1,535 |
+| `calibrate/h100-sxm/gemm/20261014T173306Z-g1/` | 1,335 | 1,541 |
+| `calibrate/h100-sxm/gemm/20261014T173306Z-g2/` | 1,431 | 1,612 |
+| `calibrate/h100-sxm/gemm/20261014T173306Z-g3/` | 1,349 | 1,535 |
+| `calibrate/h100-sxm/gemm/20261014T173306Z-g4/` | 1,357 | 1,564 |
 
-The highest MSMF is 8.7% more than the lowest MSMF. In the published
-results, the difference between GPUs is 2.7%.
+The published MSMF is 1,358 TFLOPS. Six of the eight GPUs are between
+1,315 and 1,357 TFLOPS. Two GPUs are near 1,430 TFLOPS. The NVIDIA
+driver version does not show the difference.
 
-`quail/specs/h100_sxm.py` uses 1,352 TFLOPS. The second GPU is faster
-than this rate. On that GPU, the speed-of-light (SoL) estimate can be
-longer than the measured query time. Then the estimate is not a lower
-bound. Measurements on more GPUs are necessary to find the correct
-rate.
+`quail/specs/h100_sxm.py` uses the highest MSMF, 1,431 TFLOPS. With
+this rate, the SoL estimate is a lower bound on each GPU in the table.
 
 ## Attention rate and memory bandwidth: attention.py
 
