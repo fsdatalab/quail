@@ -448,6 +448,24 @@ def pair_counts(live, aliases, fraction) -> tuple[float, float]:
     return live[left] * live[right] * fraction, live[left] * touched
 
 
+def arena_mean_tokens(context) -> float | None:
+    """Return the mean document length the plan's KV pools are split for.
+
+    It is the longest table's mean, as in plan_statistics, so a cost
+    priced from the arena's capacity sees the pools the worker builds.
+    None when the context has no tables.
+    """
+    return max((summarize_alias(lengths, context.model.sliding_window,
+                                memo=context.memo).mean
+                for lengths in context.document_tokens.values()), default=None)
+
+
+def arena_capacity(context, chunk: int) -> int:
+    """Return the tokens of document KV the plan's arena holds at once."""
+    return budgets.arena_tokens(context.model, context.device, chunk,
+                                arena_mean_tokens(context))
+
+
 def score_statistics(prompt, context, chunk, *, mean_tokens=None):
     """Prepare a score's prompt tokens and numeric cost inputs once per query."""
     key = ("score_prompt", prompt)
@@ -464,7 +482,7 @@ def score_statistics(prompt, context, chunk, *, mean_tokens=None):
         token_lengths=tuple(map(len, parts)), summaries=summaries,
         mean_tokens=mean_tokens, model=context.model, device=context.device,
         chunk_tokens=chunk,
-        capacity=budgets.arena_tokens(context.model, context.device, chunk),
+        capacity=arena_capacity(context, chunk),
         workers=context.gpu_count,
         draws=context.canvas_draws if context.model.canvas_tokens
         and len(aliases) == 1 else 1)
@@ -522,7 +540,7 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
     if hasattr(lengths, "arrow_array"):
         lengths = lengths.arrow_array.to_numpy()
     chunk = budgets.chunk_budget(context.model, context.device)
-    capacity = budgets.arena_tokens(context.model, context.device, chunk)
+    capacity = arena_capacity(context, chunk)
     return ClassifyStatistics(
         alias=alias, mean=summary.mean,
         longest=summary.maximum, budget=min(chunk, capacity),

@@ -30,6 +30,7 @@ from quail.planner.prompt_lowering import (
 )
 from quail.planner.statistics import (
     ClassifyStatistics,
+    arena_capacity,
     classify_statistics,
     score_statistics,
 )
@@ -91,7 +92,7 @@ class ScoreLowering:
         self.nodes = nodes
         self.projected = projected
         self.chunk = chunk
-        self.capacity = budgets.arena_tokens(context.model, context.device, chunk)
+        self.capacity = arena_capacity(context, chunk)
         self.names = {}
         self.work = Work()
         self.index = 0
