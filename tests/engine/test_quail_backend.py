@@ -272,7 +272,7 @@ def test_foreign_runs_per_batch_or_once_as_a_barrier_and_are_checked(monkeypatch
 def test_predicate_nodes_keep_documents_and_join_frames_in_kv(monkeypatch):
     from dataclasses import replace
 
-    from quail.planner.kv import plan_kv_retention
+    from quail.planner.plan import plan_kv_retention
 
     graph = two_alias_graph(True, stages=2)
     graph = PhysicalGraph(tuple(

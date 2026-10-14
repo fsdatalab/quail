@@ -197,7 +197,7 @@ def test_time_falls_with_chunk_size_and_rises_with_label_choices():
 
 def test_kv_capacity_does_not_enter_the_estimate():
     from quail.cost import budgets
-    from quail.planner.label_scoring import ClassifyScoring
+    from quail.planner.operators.classify import ClassifyScoring
 
     chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
     tables = [ClassifyScoring(alias="d", mean=200.0, longest=300, budget=chunk,
@@ -275,3 +275,29 @@ def test_one_token_labels_read_only_their_target_rows():
     assert longer.seconds == pytest.approx(
         unrounded_seconds(work, QWEN3_4B_FP8, H100_SXM, CHUNK)
         + _readout_seconds(len(lengths), cost.passes))
+
+
+def test_classify_and_score_capacity_follow_the_plans_arena_split():
+    from types import SimpleNamespace
+
+    from quail.cost import budgets
+    from quail.planner.operators.classify import classify_statistics
+    from quail.planner.statistics.memory import arena_capacity
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
+
+    model = DIFFUSION_GEMMA_26B_FP8
+    chunk = budgets.chunk_budget(model, H100_SXM)
+    # documents four times the sliding window: the split gives the
+    # every-token pool more pages than the split for unknown lengths
+    context = SimpleNamespace(
+        document_tokens={"short": [300] * 8, "long": [4096] * 8}, model=model,
+        device=H100_SXM, canvas_draws=1, memo={})
+    planned = budgets.arena_tokens(model, H100_SXM, chunk, 4096)
+    assert planned > budgets.arena_tokens(model, H100_SXM, chunk)
+    # the longest table's mean, as plan_statistics splits the pools
+    assert arena_capacity(context, chunk) == planned
+    assert classify_statistics(context, "short").capacity == planned
+    # a model without sliding layers keeps one pool whatever the lengths
+    dense = SimpleNamespace(**{**vars(context), "model": QWEN3_4B_FP8, "memo": {}})
+    assert arena_capacity(dense, chunk) == budgets.arena_tokens(
+        QWEN3_4B_FP8, H100_SXM, chunk)

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
 from quail.physical import PhysicalNode
-from quail.planner.physical_optimizer import (
+from quail.planner.optimizer.physical import (
     ModelRegion,
     PhysicalCandidate,
     PlanningContext,

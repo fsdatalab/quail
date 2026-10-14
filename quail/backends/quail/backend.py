@@ -23,8 +23,7 @@ from quail.physical import (
     PhysicalNode,
 )
 from quail.planner import pricing
-from quail.planner.logical_rules import lift_classifications
-from quail.planner.physical_optimizer import (
+from quail.planner.optimizer.physical import (
     ModelRegion,
     PhysicalCandidate,
     PlanningContext,
@@ -32,6 +31,7 @@ from quail.planner.physical_optimizer import (
 )
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import answer_ids
+from quail.planner.rules.logical import lift_classifications
 from quail.planner.validation import has_label, joined_classification_refusal
 
 

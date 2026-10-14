@@ -12,12 +12,12 @@ from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan
 from quail.logical import oriented_join_conditions
-from quail.planner.filter_order import default_order_rule, order_filters_indexed
-from quail.planner.leftdeep import search_left_deep
-from quail.planner.live_rows import PairRelation, exact_live_rows
-from quail.planner.prefixes import document_shared_tokens
+from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
-from quail.planner.statistics import prepare_filter_costs
+from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
+from quail.planner.search.leftdeep import search_left_deep
+from quail.planner.search.live_rows import PairRelation, exact_live_rows
+from quail.planner.sol.prefixes import document_shared_tokens
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias

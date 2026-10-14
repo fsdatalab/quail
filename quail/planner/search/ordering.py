@@ -8,14 +8,32 @@ from __future__ import annotations
 
 from quail.cost.work import Work
 from quail.logical import LogicalPlan, SemanticFilter, model_call
-from quail.planner import join_order as joinsearch
-from quail.planner.filter_order import order_filters_indexed
-from quail.planner.statistics import (
-    PlanStatistics,
-    filter_works,
-    live_after_filters,
-    prepare_filter_costs,
-)
+from quail.planner.operators.filter import filter_alias_work, prepare_filter_costs
+from quail.planner.search import join_order as joinsearch
+from quail.planner.search.filter_order import order_filters_indexed
+from quail.planner.search.statistics import PlanStatistics, live_after_filters
+from quail.specs import ModelSpec
+
+
+def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
+                 model: ModelSpec, orders: dict) -> dict:
+    """Return the expected Work of each table's filter sequence in run order.
+
+    Args:
+        plan: The logical plan.
+        statistics: The plan's statistics.
+        model: Model spec.
+        orders: alias -> written positions of its model predicates in
+            run order.
+    """
+    return {
+        alias: filter_alias_work(
+            predicates, statistics.stats[alias],
+            [i for i in orders.get(alias, []) if i in statistics.asks[alias]],
+            statistics.pre, statistics.lowered, model.canvas_tokens,
+            model.sliding_window)
+        for alias, predicates in plan.operators().filters.items()
+    }
 
 
 def choose_filter_orders(plan: LogicalPlan, statistics: PlanStatistics, *,

@@ -43,9 +43,9 @@ from quail.physical import (
     encode_graph,
 )
 from quail.physical.pipelines import build_pipelines
-from quail.planner.logical_rules import push_down_projection
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.prompt_lowering import lower_prompt
+from quail.planner.rules.logical import push_down_projection
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 from quail_b.prompts import AGENT_PROGRESS, AGENT_PROGRESS_DESCRIPTIONS
 from quail_b.prompts import AGENT_PROGRESS_LABELS as STAGES
@@ -468,7 +468,7 @@ def _corpus(session, tmp_path, name, column, rows, words):
 
 def _candidates(session, query):
     """Return the Quail backend's candidates for a planned query."""
-    from quail.planner.physical_optimizer import ModelRegion, PlanningContext
+    from quail.planner.optimizer.physical import ModelRegion, PlanningContext
 
     query.plan()
     context = PlanningContext(
@@ -481,11 +481,11 @@ def _candidates(session, query):
 
 def test_planner_places_and_scores_classifications(session, tmp_path):
     from quail.logical import classified_above_joins
-    from quail.planner.logical_rules import (
+    from quail.planner.rules.logical import (
         built_in_logical_rules,
         lift_classifications,
     )
-    from quail.planner.physical_rules import built_in_physical_rules
+    from quail.planner.rules.physical import built_in_physical_rules
 
     assert [rule.name for rule in built_in_logical_rules()] == [
         "distinct_elimination", "distinct_pushdown", "projection_pushdown",
@@ -545,7 +545,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     # a cost-based logical rule prices a plan the same way the backend
     # prices its candidates
     from quail.planner import pricing
-    from quail.planner.logical_optimizer import LogicalPlanningContext
+    from quail.planner.optimizer.logical import LogicalPlanningContext
 
     logical_context = LogicalPlanningContext(
         session.catalog, session.config, model=session.model,
@@ -648,7 +648,7 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
 
 def test_planner_prices_the_rules_and_takes_the_cheapest():
     from quail.cost import budgets
-    from quail.planner.label_scoring import ClassifyScoring
+    from quail.planner.operators.classify import ClassifyScoring
     from quail.planner.validation import ClassifyRefusedError
 
     chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)

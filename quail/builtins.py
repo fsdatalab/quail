@@ -6,8 +6,8 @@ from quail.baselines import register_baselines
 from quail.execution.runtimes import built_in_runtimes
 from quail.extensions import ExtensionRegistry
 from quail.physical import built_in_codecs
-from quail.planner.logical_rules import built_in_logical_rules
-from quail.planner.physical_rules import built_in_physical_rules
+from quail.planner.rules.logical import built_in_logical_rules
+from quail.planner.rules.physical import built_in_physical_rules
 from quail.specs import DEVICES, MODELS
 
 
