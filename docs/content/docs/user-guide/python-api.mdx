@@ -105,14 +105,14 @@ probability output, and limits on classifications of joined rows.
 
 `ai_extract(c, questions, *, name, trim=True)`
 
-Extracts answers to questions from a document.
+`ai_extract()` returns answers that it copies from a document. Pass the
+document column as a string such as `"c.text"`, or use `col("c.text")`.
+Pass a dictionary that maps each field name to its question. Set `name`
+to the result column you want, and include it in `select()`.
 
-- `c`: the document column, such as `"c.text"`.
-- `questions`: a dictionary. Each key is a field name. Each value is a
-  question.
-- `name`: the name of the result column.
-- `trim`: set to `False` to return the whole line that holds each
-  answer.
+For example, imagine you registered a `contracts` table with an `id`
+column and the contract text in `text`. Return the end date and the
+signer of each lease:
 
 ```python
 query = (
@@ -123,9 +123,13 @@ query = (
 )
 ```
 
-The result has `lease`, a struct with one string field per question,
-and `lease_span`, the position of each answer. See
-[`AI.EXTRACT`](/docs/user-guide/sql#aiextract).
+You get `c.id`, `lease`, and `lease_span`. `lease` is a struct with one
+string field for each question. `lease_span` holds the position of each
+answer. Pass `trim=False` to return the whole line that contains each
+answer.
+
+See [`AI.EXTRACT`](/docs/user-guide/sql#aiextract) for output examples
+and supported queries.
 
 ### ai_score
 

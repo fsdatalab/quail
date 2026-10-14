@@ -331,58 +331,63 @@ For the scoring methods, see
 
 ## AI.EXTRACT
 
-Extracts answers to questions from a document.
-
-```sql
-AI.EXTRACT(document, questions[, options])
-```
-
-### Arguments
-
-| Argument | Description |
-| --- | --- |
-| `document` | A text column, such as `c.text`. |
-| `questions` | An object. Each key is a field name. Each value is a question. |
-| `options` | Optional. `{'trim': false}` returns the whole line that holds each answer. |
-
-### Returns
-
-A struct with one string field per question. A field is null when the
-document does not answer its question.
-
-Quail also returns a second struct, named with `_span` after the first.
-It holds the `start` and `end` character position of each answer.
-
-### Example
+`AI.EXTRACT` returns answers that it copies from a document. You give
+one question for each answer. For example, imagine a `contracts` table
+with contract text in `text`. Return the end date and the signer of
+each lease:
 
 ```sql
 SELECT c.id,
        AI.EXTRACT(c.text,
                   {'end_date': 'When does the lease end?',
                    'signer': 'Who signed the lease?'}) AS lease
-FROM contracts c
+FROM contracts c;
 ```
 
-For a contract with the text
-`Lease ends on March 3, 2027. Signed by Ana Ruiz.`:
+The result is a struct with one `STRING` field for each question. A
+field is null when the document does not answer its question. For a
+contract with the text `Lease ends on March 3, 2027. Signed by Ana Ruiz.`,
+`lease` is `{"end_date": "March 3, 2027", "signer": "Ana Ruiz"}`.
 
-| Column | Value |
-| --- | --- |
-| `lease` | `{"end_date": "March 3, 2027", "signer": "Ana Ruiz"}` |
-| `lease_span` | `{"end_date": {"start": 14, "end": 27}, "signer": {"start": 39, "end": 47}}` |
+An extraction in `SELECT` requires a column alias with `AS`. The call
+must be a separate item, rather than part of a larger expression.
 
-### Usage notes
+### Arguments
 
-- Name the result with `AS`.
-- To ask one question, use an object with one field.
-- Answers are copied from the document. In Python, `text[start:end]`
-  gives an answer from its span.
-- Each question is a separate extraction. On the Quail backend, the
-  questions about one document share its KV.
-- Supported on Qwen3 4B and Qwen3 32B. See
+`AI.EXTRACT(input, questions[, options])`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `input` | `STRING` column | The document to read. |
+| `questions` | Object | Field names and their questions. Use one field to ask one question. |
+| `options` | Object | Optional parameters listed below. |
+
+### Optional parameters
+
+Pass an object as the third argument, such as `{'trim': false}`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `trim` | `true` | When `true`, each answer is the fewest words that answer the question. When `false`, each answer is the whole line that contains it. |
+
+### Answer positions
+
+Quail also returns the position of each answer in a second struct. Its
+name is the alias followed by `_span`, and it has the same fields. Each
+field holds the `start` and `end` character positions of its answer.
+For the contract above, `lease_span` is
+`{"end_date": {"start": 14, "end": 27}, "signer": {"start": 39, "end": 47}}`.
+In Python, `text[start:end]` returns the answer.
+
+Each question is a separate extraction. On the Quail backend, the
+questions about one document read the same document KV.
+
+These limits apply:
+
+- Quail runs extractions on Qwen3 4B and Qwen3 32B. See
   [Supported models and GPUs](/docs/user-guide/models).
-- Not supported in `WHERE`, `ORDER BY`, `DISTINCT`, `GROUP BY`, or inside
-  another expression.
+- `WHERE`, `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result
+  of an extraction.
 
 For the Python form, see
 [`ai_extract()`](/docs/user-guide/python-api#ai_extract).
