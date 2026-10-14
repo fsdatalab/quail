@@ -105,14 +105,18 @@ probability output, and limits on classifications of joined rows.
 
 `ai_extract(c, questions, *, name, trim=True)`
 
-Use `ai_extract()` to copy answers from each document. Pass the document
-column as a string such as `"c.text"`, or use `col("c.text")`. Pass a
-dictionary that maps each field name to its question. Set `name` to the
-struct column you want, and include it in `select()`.
+`ai_extract()` copies the text that answers a question from each
+document.
 
-For example, imagine you registered a `contracts` table with an `id`
-column and the contract text in `text`. Ask when each lease ends and
-who signed it:
+- `c` is the document column, for example `"c.text"` or
+  `col("c.text")`.
+- `questions` is a dictionary. Each key is a field name. Each value is
+  a question.
+- `name` is the name of the answer column. Put this name in
+  `select()`.
+
+The `contracts` table has an `id` column and a `text` column. This
+query asks two questions about each contract:
 
 ```python
 query = (
@@ -124,17 +128,20 @@ query = (
 rows = query.collect()
 ```
 
-You get `c.id`, `lease`, and `lease_span`. `lease` has the fields
-`end_date` and `signer`. Quail includes the span column automatically:
-each of its fields holds the answer's `start` and `end` character
-positions in the source, counting from zero with `end` excluded. If no
-answer is found, the field and its span are both null.
+The result has the columns `c.id`, `lease`, and `lease_span`:
 
-Pass `trim=False` to return the complete source lines that contain each
-answer.
+- `lease` has the string fields `end_date` and `signer`.
+- `lease_span` has the same fields. Each field has the `start` and
+  `end` position of the answer. Positions start at zero. The character
+  at `end` is not part of the answer.
 
-See [`AI.EXTRACT`](/docs/user-guide/sql#aiextract) for output examples
-and supported queries.
+If the document does not answer a question, the field is null. The
+span of that field is also null.
+
+To get all of each line that contains the answer, set `trim=False`.
+
+For more examples and the limits, see
+[`AI.EXTRACT`](/docs/user-guide/sql#aiextract).
 
 ### ai_score
 

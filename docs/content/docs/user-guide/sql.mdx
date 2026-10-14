@@ -331,15 +331,24 @@ For the scoring methods, see
 
 ## AI.EXTRACT
 
-Use `AI.EXTRACT` to copy the text that answers each of your questions
-from each document. Pass an object that maps a field name to each
-question. You get a struct column with one field per question, and a
-second struct column with each answer's character positions in the
-source. If no answer is found, the field and its positions are null.
+`AI.EXTRACT` copies the text that answers a question from each
+document.
 
-For example, imagine you registered a `contracts` table with an `id`
-column and the contract text in `text`. Ask when each lease ends and
-who signed it:
+Put the questions in an object. Each key is a field name. Each value
+is a question.
+
+The result has two struct columns:
+
+- The answer column has one string field for each question.
+- The span column has the position of each answer in the document.
+
+If the document does not answer a question, the field is null. The
+span of that field is also null.
+
+### Example
+
+The `contracts` table has an `id` column and a `text` column. This
+query asks two questions about each contract:
 
 ```sql
 SELECT c.id,
@@ -351,9 +360,12 @@ SELECT c.id,
 FROM contracts c
 ```
 
-Give the struct a name with `AS`. Quail also returns a column with
-`_span` added to that name. If a contract reads
-`Lease ends on March 3, 2027. Signed by Ana Ruiz.`, you get:
+Use `AS` to name the answer column. The name of the span column is
+this name followed by `_span`.
+
+The text of one contract is
+`Lease ends on March 3, 2027. Signed by Ana Ruiz.` For this contract,
+the query returns these values:
 
 | Column | Value |
 | --- | --- |
@@ -361,11 +373,11 @@ Give the struct a name with `AS`. Quail also returns a column with
 | `lease_span` | `{"end_date": {"start": 14, "end": 27}, "signer": {"start": 39, "end": 47}}` |
 
 Each field of `lease` is a string. Each field of `lease_span` is a
-struct with integer `start` and `end` fields. Positions count
-characters from zero, with `end` excluded. You can recover an answer
-in Python with `text[start:end]`.
+struct with two integers, `start` and `end`. Positions are character
+positions that start at zero. The character at `end` is not part of
+the answer. In Python, `text[start:end]` is the answer.
 
-To ask one question, pass an object with one field, such as
+To ask one question, use an object with one field, for example
 `{'end_date': 'When does the lease end?'}`.
 
 ### Arguments
@@ -374,15 +386,15 @@ To ask one question, pass an object with one field, such as
 
 | Argument | Type | Description |
 | --- | --- | --- |
-| `input` | `STRING` column | The document to read. Pass a column reference such as `c.text`. |
-| `questions` | Object | Field names mapped to the questions you want answered, such as `{'end_date': 'When does the lease end?'}`. |
-| `options` | Object | Optional `trim` setting, described below. It applies to every field. |
+| `input` | `STRING` column | The document column, for example `c.text`. |
+| `questions` | Object | Field names and their questions, for example `{'end_date': 'When does the lease end?'}`. |
+| `options` | Object | Optional. The `trim` setting. It applies to all fields. |
 
-### Return the surrounding lines
+### Return full lines
 
-By default, Quail asks the model to copy the fewest words that answer
-each question. Set `trim` to `false` to return the complete source
-lines that contain each answer:
+By default, the model copies the fewest words that answer the
+question. To get all of each line that contains the answer, set
+`trim` to `false`:
 
 ```sql
 SELECT c.id,
@@ -391,33 +403,35 @@ SELECT c.id,
 FROM contracts c
 ```
 
-For the same contract, `lease.end_date` contains
+For the contract above, `lease.end_date` is
 `Lease ends on March 3, 2027. Signed by Ana Ruiz.` and
-`lease_span.end_date` contains `{"start": 0, "end": 48}`. Line
-boundaries follow the line breaks in your source text.
+`lease_span.end_date` is `{"start": 0, "end": 48}`. The line breaks in
+the document set the line boundaries.
 
 ### How Quail runs the questions
 
-Each field is its own extraction, named `lease.end_date` and
-`lease.signer` in `explain()`. On the Quail backend, the extractions of
-one table run as one pipeline: each document's KV is written once, and
-every later question reads it, so a later field costs only its question
-and answer tokens.
+Quail runs each field as a separate extraction. In `explain()`, the
+extractions are `lease.end_date` and `lease.signer`.
 
-### Current limits
+On the Quail backend, all extractions of one table run in one
+pipeline. Quail writes the KV of each document one time. Each later
+question reads this KV. Thus, a later field costs only the tokens of
+its question and its answer.
 
-- Use Qwen3 4B or Qwen3 32B. You can distribute documents across GPUs
-  with the session's `gpus` setting. See
-  [Supported models and GPUs](/docs/user-guide/models).
-- Put each extraction directly in `SELECT` with an `AS` name. You cannot
-  use it in a `WHERE` condition or inside another expression.
-- You can combine extraction with filters, joins, classification, and scoring.
-  Each extraction reads one document column.
-- The result columns cannot be used in `ORDER BY`, `DISTINCT`, or
-  `GROUP BY`.
-- Every field is a string, copied from the document.
+### Limits
 
-For the equivalent Python query, see
+- Use Qwen3 4B or Qwen3 32B. To use more than one GPU, set `gpus` in
+  the session. See [Supported models and GPUs](/docs/user-guide/models).
+- Put each extraction directly in `SELECT` with an `AS` name. Do not
+  use it in `WHERE` or in another expression.
+- You can use extractions together with filters, joins,
+  classifications, and scores. Each extraction reads one document
+  column.
+- Do not use the answer column or the span column in `ORDER BY`,
+  `DISTINCT`, or `GROUP BY`.
+- Each field is a string from the document.
+
+For the same query in Python, see
 [`ai_extract()`](/docs/user-guide/python-api#ai_extract).
 
 ## WHERE and ON
