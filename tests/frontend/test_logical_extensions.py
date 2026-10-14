@@ -7,7 +7,8 @@ import pytest
 
 from quail.logical import ColumnRef, LogicalPlan, Project, Scan
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import simplify_plan
+from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
+from quail.planner.optimizer.tree_rewrites import logical_alternatives, simplify_plan
 
 CONTEXT = PlanningContext(catalog=None, engine_config=None)
 
@@ -45,11 +46,8 @@ class TaggedInput:
         return {"tag": self.tag}
 
 
-class RenameTag:
+class RenameTag(LogicalRule):
     """Rename one tag value to another, one node at a time."""
-
-    target = "logical"
-    cost_based = False
 
     def __init__(self, old, new):
         self.name = f"rename_{old}_{new}"
@@ -113,9 +111,6 @@ def test_rules_that_never_settle_stop_at_the_pass_cap():
 class RecordContext:
     """Keep the context a session hands its optimizer rules."""
 
-    target = "logical"
-    cost_based = False
-
     name = "record_context"
 
     def __init__(self):
@@ -126,21 +121,37 @@ class RecordContext:
         return None
 
 
-@pytest.mark.parametrize("target", ["logical", "physical"])
-@pytest.mark.parametrize("cost_based", [False, True])
-def test_session_rules_read_statistics_from_the_context(target, cost_based):
+class RecordLogicalContext(RecordContext, LogicalRule):
+    pass
+
+
+class RecordAlternativeContext(RecordContext, LogicalRule):
+    def rewrite(self, root, context):
+        return None
+
+    def alternatives(self, root, context):
+        self.seen.append(context)
+        return ()
+
+
+class RecordPhysicalContext(RecordContext, PhysicalRule):
+    pass
+
+
+@pytest.mark.parametrize("rule_type", [
+    RecordLogicalContext, RecordAlternativeContext, RecordPhysicalContext])
+def test_session_rules_read_statistics_from_the_context(rule_type):
     import pyarrow as pa
 
     import quail
 
-    recorder = RecordContext()
-    recorder.cost_based = cost_based
-    recorder.target = target
+    recorder = rule_type()
     session = quail.Session(
         quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
         tokenizer=str.split)
-    register = (session.registry.register_cost_based_rule if cost_based
-                else session.registry.register_universal_rule)
+    register = (session.registry.register_logical_rule
+                if isinstance(recorder, LogicalRule)
+                else session.registry.register_physical_rule)
     register(recorder)
     session.register("docs", quail.DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two three"]}),
@@ -163,3 +174,24 @@ def test_session_rules_read_statistics_from_the_context(target, cost_based):
     assert context.tokenizer is session.tokenizer
     assert dict(context.pair_fractions) == {}
     session.close()
+
+
+def test_logical_rule_can_propose_multiple_trees_without_replacing_original():
+    class RenameAlternatives(LogicalRule):
+        name = "rename_alternatives"
+
+        def alternatives(self, root, context):
+            if root.input.tag != "old":
+                return ()
+            return tuple(replace(root, input=replace(root.input, tag=tag))
+                         for tag in ("first", "second", "first"))
+
+    plan = _tagged_plan("old")
+    rules = (RenameAlternatives(),)
+    assert simplify_plan(plan, rules, CONTEXT) == (plan, ())
+    candidates = logical_alternatives(plan, rules, CONTEXT)
+    assert [candidate.plan.root.input.tag for candidate in candidates] == [
+        "old", "first", "second"]
+    assert candidates[0].plan is plan
+    assert [candidate.rules for candidate in candidates] == [
+        (), ("rename_alternatives",), ("rename_alternatives",)]

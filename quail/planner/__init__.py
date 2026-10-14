@@ -1,6 +1,6 @@
 """The planner: every transformation of a plan.
 
-Universal and cost-based rules, candidate search, and executable
+Logical and physical rules, candidate search, and executable
 plan assembly from the cost model's numbers.
 
 No wall prediction. KV is always bf16.

@@ -6,9 +6,11 @@ The optimizer chooses how to execute a query. It converts a logical plan
 (the requested operations) into a physical plan (executable operators and
 settings).
 
-- **Universal rules** apply when their conditions hold, without comparing
-  plan costs.
-- **Cost-based rules** compare alternatives using estimated GPU time.
+- **Logical rules** change the query tree.
+- **Physical rules** change the executable graph and its settings.
+
+Logical rules run before physical rules. Either kind can involve a cost
+comparison. A logical alternative is priced after its physical rules run.
 
 See [Custom rules](/docs/extending/rules) to add a rule.
 
@@ -16,7 +18,7 @@ See [Custom rules](/docs/extending/rules) to add a rule.
 
 1. **Prepare statistics.** Read token counts, or estimate document lengths
    while tokenization runs in the background.
-2. **Simplify the query.** Apply universal tree rewrites, such as removing
+2. **Simplify the query.** Apply logical rewrites, such as removing
    unused columns.
 3. **Compare plans.** Consider placements such as extraction before or
    after joins. Build each candidate and apply its execution settings,
@@ -33,18 +35,18 @@ Use `explain(analyze=True)` to compare estimates with measured execution.
 
 | Rule | Category | Action |
 | --- | --- | --- |
-| `should_eliminate_distinct` | Universal | Remove DISTINCT when returned keys are unique. |
-| `should_push_down_distinct` | Universal | Stop eligible AI.IF filters after one document per key passes. |
-| `should_push_down_projection` | Universal | Load only columns the query uses. |
-| `should_push_down_filters` | Universal | Move eligible CPU filters before joins. |
-| `should_lift_maps` | Cost-based | Compare classification and extraction before and after joins. |
-| `should_push_down_limit` | Universal | Stop an eligible filter sequence after enough documents pass. |
-| `choose_classify_implementation` | Cost-based | Choose a classification implementation. |
-| `should_retain_kv` | Universal | Set up KV retention for compatible later operators. |
-| `should_share_prefixes` | Cost-based | Reuse shared prefixes when estimated savings exceed extra KV writes. |
-| `choose_attention_algorithm` | Cost-based | Choose unified or tree attention. |
+| `should_eliminate_distinct` | Logical | Remove DISTINCT when returned keys are unique. |
+| `should_push_down_distinct` | Logical | Stop eligible AI.IF filters after one document per key passes. |
+| `should_push_down_projection` | Logical | Load only columns the query uses. |
+| `should_push_down_filters` | Logical | Move eligible CPU filters before joins. |
+| `should_lift_maps` | Logical | Compare classification and extraction before and after joins. |
+| `should_push_down_limit` | Physical | Stop an eligible filter sequence after enough documents pass. |
+| `choose_classify_implementation` | Physical | Choose a classification implementation. |
+| `should_retain_kv` | Physical | Set up KV retention for compatible later operators. |
+| `should_share_prefixes` | Physical | Reuse shared prefixes when estimated savings exceed extra KV writes. |
+| `choose_attention_algorithm` | Physical | Choose unified or tree attention. |
 
-Graph rules run in registration order on every candidate. Classification
+Physical rules run in registration order on every candidate. Classification
 selection comes before KV retention, then prefix sharing, then attention
 selection. Each uses settings from the preceding rules.
 
@@ -89,7 +91,7 @@ label selection overhead. The optimizer includes that overhead in its
 plan costs. Report the supplied answers and KV assumptions with the
 estimate. Different answers can require different work.
 
-## Physical plan choices
+## Plan choices
 
 ### Classification placement
 
@@ -144,8 +146,8 @@ how these limits affect batching.
 ### KV retention
 
 The planner rule sets up retention when a later operator can reuse
-compatible document KV. It does not compare retention on versus off,
-so the rule is universal.
+compatible document KV. This physical rule does not compare retention
+on versus off.
 
 The executor uses a cost-based policy to decide which KV to keep:
 

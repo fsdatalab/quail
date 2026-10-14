@@ -645,7 +645,7 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     from quail.planner.optimizer.context import PlanningContext
     from quail.planner.optimizer.graph_refinement import apply_plan_rules
     from quail.planner.plan import PhysicalPlan
-    from quail.planner.rules.cost_based import ShouldSharePrefixes
+    from quail.planner.rules.physical import ShouldSharePrefixes
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     def graph(aliases, draws=1):

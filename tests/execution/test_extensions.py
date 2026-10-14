@@ -12,13 +12,11 @@ from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.runtimes import ScanRuntime
 from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
 from quail.planner.optimizer.graph_refinement import rewrite_graph
+from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 
 
 @dataclass(frozen=True)
-class ChangeCount:
-    target = "physical"
-    cost_based = False
-
+class ChangeCount(PhysicalRule):
     name: str
     factor: int = 1
     offset: int = 0
@@ -56,13 +54,13 @@ def _count(registry):
 def test_extension_order_nesting_and_rollback(monkeypatch):
     def register(registry):
         assert "double" in registry.rules
-        registry.register_universal_rule(ChangeCount("add_three", offset=3))
+        registry.register_physical_rule(ChangeCount("add_three", offset=3))
 
     registry = (
         built_in_registry()
-        .register_universal_rule(ChangeCount("double", factor=2))
+        .register_physical_rule(ChangeCount("double", factor=2))
         .load_extension(_module(monkeypatch, "test_order_extension", register))
-        .register_universal_rule(ChangeCount("double_again", factor=2))
+        .register_physical_rule(ChangeCount("double_again", factor=2))
     )
     assert _count(registry) == 10
 
@@ -70,15 +68,15 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
 
     def register_inner(registry):
         calls.append("inner")
-        registry.register_universal_rule(ChangeCount("inner"))
+        registry.register_physical_rule(ChangeCount("inner"))
 
     inner = _module(monkeypatch, "test_inner_extension", register_inner)
 
     def register_outer(registry):
         calls.append("outer")
-        registry.register_universal_rule(ChangeCount("before"))
+        registry.register_physical_rule(ChangeCount("before"))
         registry.load_extension(inner)
-        registry.register_universal_rule(ChangeCount("after"))
+        registry.register_physical_rule(ChangeCount("after"))
 
     outer = _module(monkeypatch, "test_outer_extension", register_outer)
     registry = built_in_registry().load_extension(outer)
@@ -89,14 +87,14 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
     assert calls == ["outer", "inner"]
 
     # a failed registration rolls the registry back
-    registry = built_in_registry().register_universal_rule(ChangeCount("existing"))
+    registry = built_in_registry().register_physical_rule(ChangeCount("existing"))
 
     def register(registry):
-        registry.register_universal_rule(ChangeCount("added"))
-        registry.register_universal_rule(ChangeCount("existing"))
+        registry.register_physical_rule(ChangeCount("added"))
+        registry.register_physical_rule(ChangeCount("existing"))
 
     module = _module(monkeypatch, "test_failed_extension", register)
-    with pytest.raises(ValueError, match="duplicate universal_rule"):
+    with pytest.raises(ValueError, match="duplicate physical_rule"):
         registry.load_extension(module)
     built_in = list(built_in_registry().rules)
     assert [name for name in registry.rules
@@ -104,13 +102,13 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
     assert registry.extension_modules == ()
 
     module.register_quail_extension = (
-        lambda registry: registry.register_universal_rule(ChangeCount("added")))
+        lambda registry: registry.register_physical_rule(ChangeCount("added")))
     registry.load_extension(module)
     assert [name for name in registry.rules
             if name not in built_in] == ["existing", "added"]
 
     def recursive(registry):
-        registry.register_universal_rule(ChangeCount("added"))
+        registry.register_physical_rule(ChangeCount("added"))
         registry.load_extension("test_recursive_extension")
 
     module = _module(monkeypatch, "test_recursive_extension", recursive)
@@ -121,40 +119,43 @@ def test_extension_order_nesting_and_rollback(monkeypatch):
     assert not registry.extension_modules
 
 
-class CostBasedChangeCount(ChangeCount):
-    cost_based = True
+class KeepTree(LogicalRule):
+    def __init__(self, name):
+        self.name = name
+
+    def rewrite(self, root, context):
+        raise AssertionError("logical rules must not run on physical graphs")
 
 
-def test_rule_categories_preserve_shared_registration_order():
+def test_rule_types_preserve_registration_order_within_each_stage():
     registry = built_in_registry()
-    registry.register_universal_rule(ChangeCount("double", factor=2))
-    registry.register_cost_based_rule(CostBasedChangeCount("add_three", offset=3))
-    registry.register_universal_rule(ChangeCount("double_again", factor=2))
+    registry.register_physical_rule(ChangeCount("double", factor=2))
+    registry.register_logical_rule(KeepTree("keep_tree"))
+    registry.register_physical_rule(ChangeCount("add_three", offset=3))
+    registry.register_physical_rule(ChangeCount("double_again", factor=2))
 
-    assert list(registry.rules)[-3:] == ["double", "add_three", "double_again"]
-    assert list(registry.universal_rules)[-2:] == ["double", "double_again"]
-    assert list(registry.cost_based_rules)[-1:] == ["add_three"]
+    assert list(registry.rules)[-4:] == [
+        "double", "keep_tree", "add_three", "double_again"]
+    assert list(registry.physical_rules)[-3:] == [
+        "double", "add_three", "double_again"]
+    assert list(registry.logical_rules)[-1:] == ["keep_tree"]
     assert _count(registry) == 10
 
     before = dict(registry.rules)
     with pytest.raises(ValueError, match="duplicate optimizer rule"):
-        registry.register_cost_based_rule(CostBasedChangeCount("double"))
+        registry.register_logical_rule(KeepTree("double"))
     assert dict(registry.rules) == before
 
 
-def test_rule_registration_validates_category_and_target():
+def test_rule_registration_validates_base_class():
     registry = built_in_registry()
     before = dict(registry.rules)
-    with pytest.raises(ValueError, match="needs cost_based=False"):
-        registry.register_universal_rule(CostBasedChangeCount("wrong_category"))
-    with pytest.raises(ValueError, match="needs cost_based=True"):
-        registry.register_cost_based_rule(ChangeCount("wrong_category"))
-
-    class InvalidTarget(ChangeCount):
-        target = "missing"
-
-    with pytest.raises(ValueError, match="rule target must be"):
-        registry.register_universal_rule(InvalidTarget("wrong_target"))
+    with pytest.raises(TypeError, match="needs a LogicalRule subclass"):
+        registry.register_logical_rule(ChangeCount("wrong_type"))
+    with pytest.raises(TypeError, match="needs a PhysicalRule subclass"):
+        registry.register_physical_rule(KeepTree("wrong_type"))
+    with pytest.raises(TypeError, match="needs a PhysicalRule subclass"):
+        registry.register_physical_rule(object())
     assert dict(registry.rules) == before
 
 

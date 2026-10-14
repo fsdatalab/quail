@@ -1,4 +1,4 @@
-"""Rules that propose alternatives or choose implementations by estimated cost."""
+"""Rules that change executable graphs."""
 
 from __future__ import annotations
 
@@ -6,37 +6,134 @@ from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
 from quail.cost.extract import estimate as extract_estimate
+from quail.cost.retention import coefficients
 from quail.cost.score import score_fixed_tokens
+from quail.physical import (
+    Aggregate as PhysicalAggregate,
+)
 from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
+    AiInference,
     AiJoin,
     AiScore,
+    Limit,
     PhysicalGraph,
+    Sort,
 )
 from quail.physical.pipelines import build_pipelines
+from quail.planner.graph import retention
 from quail.planner.operators.classify import classify_scoring
-from quail.planner.rules.tree_transforms import lift_maps
+from quail.planner.optimizer.rules import PhysicalRule
+from quail.planner.plan import plan_kv_retention
+from quail.planner.search.statistics import cached_statistics, live_after_filters
 from quail.planner.sol.prefixes import document_shared_tokens, page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
-class ShouldLiftMaps:
-    """Offer classification and extraction placement above joins on Quail."""
+class ShouldPushDownLimit(PhysicalRule):
+    """Let a LIMIT end the filter run once enough documents survived.
 
-    name = "should_lift_maps"
-    target = "logical"
-    cost_based = True
+    The rule puts the limit in the ``filter_limit`` setting, which the
+    executor reads to stop admitting documents once that many survived
+    the sequence's last stage. The pushdown keeps the first survivors to
+    finish, so it is sound only when those are the rows the query
+    returns: the graph ends in a Limit and has no Sort or PhysicalAggregate (an
+    ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
+    AiJoin (survivors are settled per join round), and no AiInference (a
+    score comparison after the sequence can drop survivors). Otherwise the
+    rule removes the setting.
+    """
 
-    def rewrite(self, root, context):
-        # Request backends do not implement map placement above joins.
-        if context.backend != "quail":
+    name = "should_push_down_limit"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None:
             return None
-        return lift_maps(root)
+        limit = next((node for node in graph.nodes
+                      if isinstance(node, Limit)), None)
+        blocked = any(isinstance(node, (Sort, PhysicalAggregate, AiJoin, AiInference))
+                      for node in graph.nodes)
+        if limit is None or blocked:
+            context.settings.pop("filter_limit", None)
+        else:
+            context.settings["filter_limit"] = limit.count
+        return None
 
 
-class ChooseClassifyImplementation:
+class ShouldRetainKv(PhysicalRule):
+    """Keep the KV that later operators read resident, within the page cap.
+
+    The schedule (quail.planner.graph.retention.schedule) records, at each
+    execution boundary, which aliases a later stage anchors on and how
+    likely each document is to survive to that use. The executor's
+    retention pool keeps their KV by that priority, up to the page cap.
+
+    - A filter sequence keeps its survivors' KV (keep_kv) when a later join
+      anchors on its table, unless the sequence streams into that join in
+      one pipeline on one GPU.
+    - A join keeps its anchor's KV (keep_kv) when a later group
+      anchors on the same table.
+    - A sequence writes KV pages only when a later stage, the next operator
+      of its pipeline, or the retention pool reads them.
+
+    The rule needs the logical plan on the context and fires only on a
+    plan without a ``retention`` setting, so a later pass keeps the
+    first schedule. It puts the schedule, the retention coefficients,
+    and the page cap in the ``retention`` setting.
+    """
+
+    name = "should_retain_kv"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None or context.logical_plan is None \
+                or "retention" in context.settings:
+            return None
+        logical = context.logical_plan
+        statistics = cached_statistics(
+            logical, context.memo, model=context.model, device=context.device,
+            doc_tokens=context.document_tokens,
+            pair_fractions=context.pair_fractions,
+            scan_fractions=context.scan_fractions, context=context)
+        joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
+        grouped = []
+        for node in joins:
+            if (not grouped or grouped[-1][-1].anchor != node.anchor
+                    or grouped[-1][-1].semantics != "full"
+                    or node.semantics != "full"):
+                grouped.append([])
+            grouped[-1].append(node)
+        groups = [[(statistics.specs[node.written_pos], node.anchor)
+                   for node in group] for group in grouped]
+        schedule = retention.schedule(
+            [predicate for group in groups for predicate in group],
+            live_after_filters(logical, statistics),
+            [group[0].node_id for group in grouped])
+        before, after = schedule["before"], schedule["after"]
+        schedule["before"] = {
+            node.node_id: before[group[0].node_id]
+            for group in grouped for node in group}
+        schedule["after"] = {
+            node.node_id: (after[group[0].node_id] if node is group[-1]
+                           else before[group[0].node_id])
+            for group in grouped for node in group}
+        paths = build_pipelines(graph, context.gpu_count)
+        streamed = {
+            node.alias for node in graph.nodes if isinstance(node, AiFilter)
+            and any(isinstance(member, AiJoin)
+                    for member in paths[node.node_id])}
+        schedule["initial"] = {
+            alias: use for alias, use in schedule["initial"].items()
+            if alias not in streamed}
+        schedule.update(**coefficients(context.model, context.device),
+                        cap_pages=statistics.cap_pages)
+        context.settings["retention"] = schedule
+        return plan_kv_retention(
+            graph, context.gpu_count, tuple(context.settings.get("pre_ids", ())))
+
+
+class ChooseClassifyImplementation(PhysicalRule):
     """Choose each classification's implementation by estimated time.
 
     Fires for every AiClassify whose spec has no scoring rule yet and
@@ -55,8 +152,6 @@ class ChooseClassifyImplementation:
     """
 
     name = "choose_classify_implementation"
-    target = "physical"
-    cost_based = True
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -133,7 +228,7 @@ def sharing_pays(model, device, *, shared_tokens: int, total_tokens: int,
     return saved > cost
 
 
-class ShouldSharePrefixes:
+class ShouldSharePrefixes(PhysicalRule):
     """Let documents borrow the KV pages of a document sharing their prefix.
 
     Fires for a filter whose documents share whole pages of prefix
@@ -148,8 +243,6 @@ class ShouldSharePrefixes:
     """
 
     name = "should_share_prefixes"
-    target = "physical"
-    cost_based = True
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -249,7 +342,7 @@ def _mean(values) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-class ChooseAttentionAlgorithm:
+class ChooseAttentionAlgorithm(PhysicalRule):
     """Annotate each join with the attention path the cost model prefers.
 
     A join stage has every partner of an anchor reading the anchor's
@@ -269,8 +362,6 @@ class ChooseAttentionAlgorithm:
     """
 
     name = "choose_attention_algorithm"
-    target = "physical"
-    cost_based = True
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:

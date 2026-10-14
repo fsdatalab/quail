@@ -1,4 +1,4 @@
-"""The numbers the cost-based rules and the physical planner read.
+"""The numbers the rules and the physical planner read.
 
 One PlanStatistics holds what the cost model knows about a logical
 plan before any decision: each table's document lengths, the model's

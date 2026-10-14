@@ -255,17 +255,15 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     assert _cell(physical, "Project: r.id") == ["25"]
     assert "KV: not stored" in physical
 
-    # verbose explain lists the rules in run order, marking the
-    # cost-based ones
     rules = built_in_rules()
     assert "rules" not in explain(logical, plan, rules=rules)
     text = explain(logical, plan, verbose=True, rules=rules)
-    assert ("  universal: should_eliminate_distinct, should_push_down_distinct, "
+    assert ("  logical: should_eliminate_distinct, should_push_down_distinct, "
             "should_push_down_projection, should_push_down_filters, "
-            "should_push_down_limit, "
-            "should_retain_kv") in text
-    assert ("  cost-based: should_lift_maps, choose_classify_implementation, "
-            "should_share_prefixes, choose_attention_algorithm") in text
+            "should_lift_maps") in text
+    assert ("  physical: should_push_down_limit, choose_classify_implementation, "
+            "should_retain_kv, should_share_prefixes, "
+            "choose_attention_algorithm") in text
     assert ("refine each graph in order: should_push_down_limit, "
             "choose_classify_implementation, should_retain_kv, should_share_prefixes, "
             "choose_attention_algorithm") in text
@@ -793,7 +791,7 @@ def _token_store(path, bodies):
 
 def test_prefix_sharing_and_attention_path_follow_the_token_store(
         catalog, tmp_path):
-    from quail.planner.rules.cost_based import (
+    from quail.planner.rules.physical import (
         page_aligned_shared_tokens,
         sharing_pays,
     )

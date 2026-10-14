@@ -3,95 +3,101 @@ title: Custom Rules
 ---
 
 An optimizer rule changes a plan while preserving the query's result.
-See [Optimizer](/docs/architecture/optimizer) for the built-in rules.
+Subclass `LogicalRule` for query trees or `PhysicalRule` for executable graphs.
+Both receive the same `PlanningContext`.
 
-## Define a rule
+## Logical rules
 
-Each rule has a name, a category, a target, and a `rewrite()` method.
+Import `LogicalRule` from `quail.planner.optimizer.rules` and override the
+method you need:
 
-| Field | Meaning |
-| --- | --- |
-| `name` | Unique name shown in `explain()`. Use `should_...` for yes/no decisions and `choose_...` to select an implementation. |
-| `cost_based` | `False` for a universal rule. `True` for a rule that compares alternatives by cost. |
-| `target` | `"logical"` for the query tree. `"physical"` for the executable graph. |
+| Method | Return | Planner behavior |
+| --- | --- | --- |
+| `rewrite(root, context)` | A replacement root, or `None`. | Replace the current tree without a cost comparison. |
+| `alternatives(root, context)` | A tuple of other roots, or `()`. | Keep the original too. Build and refine every candidate before comparing costs. |
 
-`rewrite(plan, context)` receives the tree root or graph named by `target`.
-Return a new root or graph when you change it. Return `None` otherwise.
-Do not modify the original nodes.
+The base class leaves the tree unchanged and proposes no alternatives.
+Do not modify the input nodes.
 
-For example, imagine a query that returns review IDs and filters on review
-text. The projection rule tells the scan to load IDs for the result and
-omit unused columns. The text is still tokenized for the filter.
+For example, imagine a query that extracts a date from each document and
+joins those documents with questions. Extraction can run before or after
+the join. This built-in rule proposes the second placement:
 
 ```python
-from quail.planner.rules.tree_transforms import push_down_projection
+from quail.planner.optimizer.rules import LogicalRule
+from quail.planner.rules.tree_transforms import lift_maps
 
 
-class ShouldPushDownProjection:
-    name = "should_push_down_projection"
-    target = "logical"
-    cost_based = False
+class ShouldLiftMaps(LogicalRule):
+    name = "should_lift_maps"
 
-    def rewrite(self, root, context):
-        rewritten = push_down_projection(root)
-        return None if rewritten is root else rewritten
+    def alternatives(self, root, context):
+        if context.backend != "quail":
+            return ()
+        rewritten = lift_maps(root)
+        return () if rewritten is None else (rewritten,)
 ```
 
-Quail already includes this rule. Use the example as a template for your rule.
+The planner applies KV retention, prefix sharing, and the other physical
+rules to each placement before choosing one.
 
-## Cost-based rules
+## Physical rules
 
-For a cost-based tree rule, return an alternative query tree. The planner keeps the
-original too, builds both executable plans, and compares their costs after
-applying execution settings such as prefix sharing.
+Import `PhysicalRule` from `quail.planner.optimizer.rules` and implement
+`rewrite(graph, context)`. Return a replacement `PhysicalGraph`, or `None`
+to keep the graph. You can also update `context.settings` for this candidate.
+Do not modify the input nodes.
 
-For a graph rewrite, compare the supported implementations and return the
-chosen graph. The planner includes its cost when comparing complete plans.
+A physical rule can compare implementation costs internally. For example,
+`should_share_prefixes` enables sharing when saved computation costs more
+than the extra KV writes. `should_retain_kv` sets up retention for compatible
+later operators without comparing on versus off.
 
-## Planning context
-
-All rules receive the same `PlanningContext` type. It provides:
-
-- The model, device, tokenizer, and session catalog.
-- Document token counts and estimated fractions of rows kept by filters and joins.
-- The logical plan for the current candidate.
-- `settings`, where graph rules add execution settings for that candidate.
-- `memo`, where rules can reuse computed values within one search.
-
-Each candidate has separate settings. Memo keys must include all inputs
-that affect the saved value. See the fields in
-[`optimizer/context.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/context.py).
+See the [physical rules](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/physical.py)
+for implementations.
 
 ## Register a rule
 
+Give each rule a unique `name`, shown in `explain()`. Use `should_...` for
+yes/no decisions and `choose_...` to select an implementation.
+
 Create a registry with `ExtensionRegistry.with_built_ins()` and register
-your rule:
+your rule with the method matching its base class:
 
-| Category | Method |
+| Base class | Registration |
 | --- | --- |
-| Universal | `registry.register_universal_rule(rule)` |
-| Cost-based | `registry.register_cost_based_rule(rule)` |
+| `LogicalRule` | `registry.register_logical_rule(rule)` |
+| `PhysicalRule` | `registry.register_physical_rule(rule)` |
 
-Pass the registry to the session. Rules share one registration order across
-both categories. `registry.rules` lists that order.
+Pass the registry to the session. Quail already registers `ShouldLiftMaps`;
+do not register it again. Rules run in registration order within each step:
 
-The planner:
-
-1. Applies universal tree rewrites until nothing changes, up to four passes.
-2. Collects cost-based tree alternatives, keeping the original and removing
+1. Apply logical `rewrite()` methods until nothing changes, up to four passes.
+2. Collect logical `alternatives()`, keeping the original and removing
    duplicates, up to four passes.
-3. Builds executable candidates and applies graph rules in registration order.
-4. Selects the candidate with the lowest estimated time.
+3. Build an executable graph for each tree and apply physical `rewrite()` methods.
+4. Select the candidate with the lowest estimated time.
 
-If initial planning used estimated token lengths, the planner repeats the
-search when exact tokens are available.
+If initial planning used estimated token lengths, repeat the search when
+exact tokens are available. See [Optimizer](/docs/architecture/optimizer)
+for the built-in rule order.
+
+## Planning context
+
+`PlanningContext` provides the model, device, tokenizer, catalog, token
+counts, and estimated fractions of rows kept by filters and joins.
+`context.logical_plan` is the current candidate's query tree.
+
+Each executable candidate has separate `settings`. Rules can reuse computed
+values through `memo`. Memo keys must include all inputs that affect the value.
+See [`optimizer/context.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/context.py)
+for the fields.
 
 ## Test a rule
 
-Call `rewrite()` without model inference. Check that the intended fields
-change, the original plan stays unchanged, and the result is equivalent.
-For a cost-based rule, check which plan wins after execution settings are
-applied.
+Call its methods without model inference. Check that the intended fields
+change, the input stays unchanged, and the result is equivalent. For an
+alternative, check which plan wins after physical rules run.
 
 See the [rule tests](https://github.com/fsdatalab/quail/blob/main/tests/frontend/test_logical_extensions.py)
 and [search tests](https://github.com/fsdatalab/quail/blob/main/tests/planner/test_search.py).

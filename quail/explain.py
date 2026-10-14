@@ -24,6 +24,7 @@ from quail.physical import (
     Sort,
 )
 from quail.physical.pipelines import build_pipelines
+from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 from quail.planner.plan import Refusal
 
 
@@ -544,12 +545,13 @@ def rule_lines(rules) -> list[str]:
 
     return [
         "optimizer rules:",
-        "  universal: " + names(rule for rule in rules if not rule.cost_based),
-        "  cost-based: " + names(rule for rule in rules if rule.cost_based),
-        "  search: simplify, retain cost-based tree alternatives, "
+        "  logical: " + names(rule for rule in rules if isinstance(rule, LogicalRule)),
+        "  physical: " + names(
+            rule for rule in rules if isinstance(rule, PhysicalRule)),
+        "  search: simplify, retain logical alternatives, "
         "then lower each alternative",
         "  refine each graph in order: " + names(
-            rule for rule in rules if rule.target == "physical"),
+            rule for rule in rules if isinstance(rule, PhysicalRule)),
         "  selection: lowest estimated cost after graph refinement",
     ]
 

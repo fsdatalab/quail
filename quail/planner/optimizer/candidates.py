@@ -52,7 +52,7 @@ class PhysicalCandidate:
             The planner refines backend estimates before selection.
         logical_plan: The logical plan the candidate lowers, when it
             differs from the region's, such as one with its
-            classifications moved above the joins. Rules targeting the graph
+            classifications moved above the joins. Physical rules
             read it before this candidate is compared with the others.
         rewrites: Alternative rules that produced this candidate.
     """
@@ -68,7 +68,7 @@ class PhysicalPlanner(Protocol):
     """Lower one logical alternative into physical candidates.
 
     The common planner refines each graph and compares the resulting
-    estimates. Implementations do not run cost-based tree rewrites.
+    estimates. Implementations do not run logical alternatives.
     """
 
     name: str

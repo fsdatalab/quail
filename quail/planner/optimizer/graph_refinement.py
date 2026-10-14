@@ -4,20 +4,20 @@ from dataclasses import replace
 
 from quail.physical.base import PhysicalGraph
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.rules import OptimizerRule
+from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import inference_seconds
 from quail.planner.validation import ClassifyRefusedError
 
 
 def rewrite_graph(
     graph: PhysicalGraph,
-    rules: tuple[OptimizerRule, ...],
+    rules: tuple[PhysicalRule, ...],
     context: PlanningContext,
 ) -> tuple[PhysicalGraph, tuple[str, ...]]:
     """Apply rules targeting executable graphs in registration order."""
     changed = []
     for rule in rules:
-        if rule.target != "physical":
+        if not isinstance(rule, PhysicalRule):
             continue
         replacement = rule.rewrite(graph, context)
         if replacement is not None and replacement != graph:
@@ -36,7 +36,7 @@ def apply_plan_rules(plan, rules, context):
 
     Args:
         plan: A PhysicalPlan.
-        rules: Registered rules in order; only graph targets apply.
+        rules: Physical rules in registration order.
         context: The PlanningContext.
 
     Returns:

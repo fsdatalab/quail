@@ -8,17 +8,17 @@ from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Any
 
 from quail.physical import NodeCodec, PhysicalNode
+from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 
 if TYPE_CHECKING:
     from quail.backends.base import ModelBackend
     from quail.execution.runner import ExecutionObserver, NodeRuntime
     from quail.planner.optimizer.candidates import PhysicalPlanner
-    from quail.planner.optimizer.rules import OptimizerRule
     from quail.specs import DeviceSpec, ModelSpec
 
 
 _KINDS = {
-    "universal_rule", "physical_planner", "cost_based_rule",
+    "logical_rule", "physical_planner", "physical_rule",
     "backend",
     "model", "device", "codec", "runtime", "observer", "function",
 }
@@ -47,24 +47,24 @@ class ExtensionRegistry:
         })
 
     @property
-    def universal_rules(self) -> Mapping[str, OptimizerRule]:
-        return self._values("universal_rule")
+    def logical_rules(self) -> Mapping[str, LogicalRule]:
+        return self._values("logical_rule")
 
     @property
     def physical_planners(self) -> Mapping[str, PhysicalPlanner]:
         return self._values("physical_planner")
 
     @property
-    def cost_based_rules(self) -> Mapping[str, OptimizerRule]:
-        return self._values("cost_based_rule")
+    def physical_rules(self) -> Mapping[str, PhysicalRule]:
+        return self._values("physical_rule")
 
     @property
-    def rules(self) -> Mapping[str, OptimizerRule]:
+    def rules(self) -> Mapping[str, LogicalRule | PhysicalRule]:
         """Return both rule categories in their shared registration order."""
         return MappingProxyType({
             name: value
             for (kind, name), value in self._registrations.items()
-            if kind in ("universal_rule", "cost_based_rule")
+            if kind in ("logical_rule", "physical_rule")
         })
 
     @property
@@ -176,23 +176,21 @@ class ExtensionRegistry:
             factory,
         )
 
-    def _register_rule(self, rule, name, *, cost_based):
+    def _register_rule(self, rule, name, *, kind, rule_type):
+        if not isinstance(rule, rule_type):
+            raise TypeError(f"{kind} needs a {rule_type.__name__} subclass")
         name = rule.name if name is None else name
-        kind = "cost_based_rule" if cost_based else "universal_rule"
         self._check_name(kind, name)
         if name in self.rules:
             raise ValueError(f"duplicate optimizer rule registration {name!r}")
-        if getattr(rule, "target", None) not in ("logical", "physical"):
-            raise ValueError("a rule target must be 'logical' or 'physical'")
-        if getattr(rule, "cost_based", None) is not cost_based:
-            raise ValueError(f"{kind} needs cost_based={cost_based}")
         return self._add(kind, name, rule)
 
-    def register_universal_rule(
-        self, rule: OptimizerRule, *, name: str | None = None,
+    def register_logical_rule(
+        self, rule: LogicalRule, *, name: str | None = None,
     ) -> ExtensionRegistry:
-        """Register a rule that applies without comparing costs."""
-        return self._register_rule(rule, name, cost_based=False)
+        """Register a rule that simplifies or proposes query trees."""
+        return self._register_rule(
+            rule, name, kind="logical_rule", rule_type=LogicalRule)
 
     def register_physical_planner(
         self, planner: PhysicalPlanner, *, name: str | None = None,
@@ -201,11 +199,12 @@ class ExtensionRegistry:
             "physical_planner", planner.name if name is None else name, planner,
         )
 
-    def register_cost_based_rule(
-        self, rule: OptimizerRule, *, name: str | None = None,
+    def register_physical_rule(
+        self, rule: PhysicalRule, *, name: str | None = None,
     ) -> ExtensionRegistry:
-        """Register a rule that proposes or prices alternatives."""
-        return self._register_rule(rule, name, cost_based=True)
+        """Register an executable graph rule in dependency order."""
+        return self._register_rule(
+            rule, name, kind="physical_rule", rule_type=PhysicalRule)
 
     def load_extension(self, module: str | ModuleType) -> ExtensionRegistry:
         """Call a module's register_quail_extension function once.

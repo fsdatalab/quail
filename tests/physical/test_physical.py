@@ -34,6 +34,7 @@ from quail.physical import (
     plan_envelope,
 )
 from quail.planner.optimizer.candidates import PhysicalCandidate, SupportResult
+from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import EngineConfig, PhysicalPlan
 
 
@@ -129,10 +130,7 @@ class PreferredPlanner:
             context, count=2, estimate=-1.0, source="preferred planner"),)
 
 
-class KeepFirstDocument:
-    target = "physical"
-    cost_based = False
-
+class KeepFirstDocument(PhysicalRule):
     name = "keep_first_document"
 
     def rewrite(self, graph, context):
@@ -165,10 +163,7 @@ class TwoCandidatesBackend:
         )
 
 
-class RecordLogicalPlan:
-    target = "physical"
-    cost_based = False
-
+class RecordLogicalPlan(PhysicalRule):
     name = "record_logical_plan"
 
     def __init__(self):
@@ -187,7 +182,7 @@ def test_plan_query_keeps_the_cheapest_candidate_and_its_logical_plan(
     backend = TwoCandidatesBackend(*estimates)
     registry.register_backend(backend)
     rule = RecordLogicalPlan()
-    registry.register_universal_rule(rule)
+    registry.register_physical_rule(rule)
     session = quail.Session(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",
                      device="h100-sxm"),
@@ -212,7 +207,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     planner = PreferredPlanner()
     registry.register_backend(backend)
     registry.register_physical_planner(planner)
-    registry.register_universal_rule(KeepFirstDocument())
+    registry.register_physical_rule(KeepFirstDocument())
     registry.register_node(FirstDocuments, runtime=FirstDocumentsRuntime())
     session = quail.Session(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",

@@ -138,7 +138,7 @@ class Query:
                 scan_fractions=scan_fractions)
             self.logical, changed = simplify_plan(
                 self.logical,
-                tuple(self.session.registry.rules.values()),
+                tuple(self.session.registry.logical_rules.values()),
                 context)
             rewritten = self.logical.operators()
             backend = self.session.registry.backend(config.backend)

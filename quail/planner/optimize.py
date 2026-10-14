@@ -97,8 +97,9 @@ def search_candidates(logical, context, registry) -> tuple[PhysicalCandidate, ..
     """Lower and refine every logical alternative before comparing costs."""
     backend = registry.backend(context.backend)
     planners = (backend, *registry.physical_planners.values())
-    rules = tuple(registry.rules.values())
-    alternatives = logical_alternatives(logical, rules, context)
+    rules = tuple(registry.physical_rules.values())
+    alternatives = logical_alternatives(
+        logical, tuple(registry.logical_rules.values()), context)
     candidates = []
     for alternative in alternatives:
         candidate_context = replace(
@@ -181,4 +182,4 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         pair_fractions=dict(pair_fractions or {}),
     )
     return apply_plan_rules(
-        plan, tuple(registry.rules.values()), context)
+        plan, tuple(registry.physical_rules.values()), context)

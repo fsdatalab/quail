@@ -14,6 +14,7 @@ from quail.physical import AiExtract, PhysicalGraph
 from quail.planner.optimize import search_candidates, search_plan
 from quail.planner.optimizer.candidates import ModelRegion
 from quail.planner.optimizer.context import PlanningContext
+from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.validation import ClassifyRefusedError
 
@@ -45,10 +46,7 @@ def context_for(query):
         tokenizer=query.session.tokenizer)
 
 
-class PlacementCost:
-    target = "physical"
-    cost_based = False
-
+class PlacementCost(PhysicalRule):
     name = "test_placement_cost"
 
     def __init__(self, *, refuse=False, exact=False):
@@ -81,7 +79,7 @@ def test_graph_refinement_can_reverse_placement_choice(query):
     original, lifted = search_candidates(query.logical, context, registry)
     assert lifted.estimated_seconds < original.estimated_seconds
     rule = PlacementCost()
-    registry.register_universal_rule(rule)
+    registry.register_physical_rule(rule)
     chosen = search_plan(query.logical, context, registry)
     assert rule.seen == [False, True]
     assert context.settings == {}
@@ -91,14 +89,14 @@ def test_graph_refinement_can_reverse_placement_choice(query):
     assert lifted["rewrites"] == ("should_lift_maps",)
     assert "test_seen" not in context.settings
     text = query.explain(verbose=True)
-    assert "cost-based: should_lift_maps" in text
-    assert "retain cost-based tree alternatives" in text
+    assert "should_lift_maps" in text.split("  physical:")[0]
+    assert "retain logical alternatives" in text
     assert "lowest estimated cost after graph refinement" in text
 
 
 def test_refused_candidate_does_not_hide_a_runnable_plan(query):
     context = context_for(query)
-    query.session.registry.register_universal_rule(PlacementCost(refuse=True))
+    query.session.registry.register_physical_rule(PlacementCost(refuse=True))
     plan = search_plan(query.logical, context, query.session.registry)
     assert not isinstance(plan, Refusal)
     original, lifted = plan.settings["candidates"]
@@ -138,23 +136,23 @@ def test_prefix_sharing_is_priced_for_every_placement(query):
             extract.spec.estimated_seconds)
 
 
-def test_cost_based_rules_retain_original_and_deduplicate(query):
+def test_logical_alternatives_retain_original_and_deduplicate(query):
     from quail.planner.optimizer.tree_rewrites import simplify_plan
-    from quail.planner.rules.cost_based import ShouldLiftMaps
+    from quail.planner.rules.logical import ShouldLiftMaps
 
     context = context_for(query)
     registry = query.session.registry
 
     class CheckCandidateContext(ShouldLiftMaps):
-        def rewrite(self, root, context):
+        def alternatives(self, root, context):
             assert context.logical_plan.root is root
             assert context.settings == {}
             context.settings["tree_rule_setting"] = True
-            return super().rewrite(root, context)
+            return super().alternatives(root, context)
 
-    registry.register_cost_based_rule(CheckCandidateContext(), name="duplicate_lift")
+    registry.register_logical_rule(CheckCandidateContext(), name="duplicate_lift")
     with pytest.raises(ValueError, match="duplicate"):
-        registry.register_cost_based_rule(ShouldLiftMaps())
+        registry.register_logical_rule(ShouldLiftMaps())
     simplified, changed = simplify_plan(
         query.logical, tuple(registry.rules.values()),
         context)
@@ -171,7 +169,7 @@ def test_cost_based_rules_retain_original_and_deduplicate(query):
 
 def test_exact_tokenization_reconsiders_placement(query):
     rule = PlacementCost(exact=True)
-    query.session.registry.register_universal_rule(rule)
+    query.session.registry.register_physical_rule(rule)
     first = query.plan()
     assert first.settings["candidates"][1]["selected"]
     request = query._prepare_physical()
@@ -189,3 +187,32 @@ def test_exact_tokenization_preserves_explicit_physical_edits(query):
     query._plan = edited
     query.wait_for_tokens()
     assert query.plan().settings["user_edit"] is True
+
+
+def test_logical_alternatives_finish_before_physical_rules(query):
+    context = context_for(query)
+    events = []
+
+    class RecordTrees(LogicalRule):
+        name = "record_trees"
+
+        def alternatives(self, root, context):
+            events.append("logical")
+            return ()
+
+    class RecordGraphs(PhysicalRule):
+        name = "record_graphs"
+
+        def rewrite(self, graph, context):
+            events.append("physical")
+            return None
+
+    registry = query.session.registry
+    registry.register_physical_rule(RecordGraphs())
+    registry.register_logical_rule(RecordTrees())
+    candidates = search_candidates(query.logical, context, registry)
+    assert len(candidates) == 2
+    first_physical = events.index("physical")
+    assert first_physical > 0
+    assert events[:first_physical] == ["logical"] * first_physical
+    assert events[first_physical:] == ["physical", "physical"]

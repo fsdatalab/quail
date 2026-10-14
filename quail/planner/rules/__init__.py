@@ -1,23 +1,23 @@
-"""Built in universal and cost-based rules in dependency order."""
+"""Built in logical and physical rules in execution order."""
 
-from quail.planner.rules.cost_based import (
-    ChooseAttentionAlgorithm,
-    ChooseClassifyImplementation,
-    ShouldLiftMaps,
-    ShouldSharePrefixes,
-)
-from quail.planner.rules.universal import (
+from quail.planner.rules.logical import (
     ShouldEliminateDistinct,
+    ShouldLiftMaps,
     ShouldPushDownDistinct,
     ShouldPushDownFilters,
-    ShouldPushDownLimit,
     ShouldPushDownProjection,
+)
+from quail.planner.rules.physical import (
+    ChooseAttentionAlgorithm,
+    ChooseClassifyImplementation,
+    ShouldPushDownLimit,
     ShouldRetainKv,
+    ShouldSharePrefixes,
 )
 
 
 def built_in_rules() -> tuple:
-    """Return rules in dependency order across both categories.
+    """Return logical rules followed by physical rules in dependency order.
 
     Classification implementation determines pipeline compatibility for
     KV retention. Prefix sharing prices the writes retention requires.
