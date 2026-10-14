@@ -11,9 +11,16 @@ class PageArena:
     the free list when its last holder frees it.
     """
 
-    def __init__(self, n_pages: int, page_tokens: int):
+    def __init__(self, n_pages: int, page_tokens: int, n_slots: int = 0):
         self.n_pages = n_pages
         self.page_tokens = page_tokens
+        self.n_slots = n_slots
+        self.free_slots = list(range(n_slots - 1, -1, -1))    # stack
+        self.slots = {}    # key -> the checkpoint slot it holds
+        self.slot_tokens = {}    # key -> tokens its checkpoint covers
+        self.ext_slots = {}    # key -> slot of the state past retained suffix
+        self.ext_tokens = {}    # key -> tokens that second checkpoint covers
+        self.share_slots = {}    # (key, tokens) -> slot of the state there
         self.free = list(range(n_pages - 1, -1, -1))    # stack
         self.owned = {}       # key -> list of page ids it alone writes
         self.borrowed = {}    # key -> leading page ids read from a parent
@@ -101,8 +108,68 @@ class PageArena:
                 freed += 1
         return freed
 
+    def alloc_slot(self, key):
+        """A checkpoint slot for a resident key, or None when none is free.
+
+        A key that already holds a slot keeps it.
+        """
+        if key not in self.owned:
+            raise KeyError(key)
+        if key in self.slots:
+            return self.slots[key]
+        if not self.free_slots:
+            return None
+        self.slots[key] = self.free_slots.pop()
+        return self.slots[key]
+
+    def alloc_extension(self, key):
+        """A second checkpoint slot for a resident key, or None when none is free.
+
+        Holds the state past tokens the key's KV retains beyond its
+        document, so the document-end checkpoint stays for a later
+        operator that asks at the document's length.
+        """
+        if key not in self.owned:
+            raise KeyError(key)
+        if key in self.ext_slots:
+            return self.ext_slots[key]
+        if not self.free_slots:
+            return None
+        self.ext_slots[key] = self.free_slots.pop()
+        return self.ext_slots[key]
+
+    def alloc_share(self, key, tokens: int):
+        """A slot for the key's state after `tokens` tokens, or None.
+
+        A borrower of the key's first `tokens` tokens starts from it.
+        The slot lives until the key is freed.
+        """
+        if key not in self.owned:
+            raise KeyError(key)
+        point = (key, tokens)
+        if point in self.share_slots:
+            return self.share_slots[point]
+        if not self.free_slots:
+            return None
+        self.share_slots[point] = self.free_slots.pop()
+        return self.share_slots[point]
+
+    def drop_extension(self, key) -> None:
+        """Free the key's second checkpoint slot, if it has one."""
+        slot = self.ext_slots.pop(key, None)
+        self.ext_tokens.pop(key, None)
+        if slot is not None:
+            self.free_slots.append(slot)
+
     def free_key(self, key) -> int:
-        """Drop a document's pages; returns the pages that went free."""
+        """Drop a document's pages and slots; returns the pages that went free."""
+        slot = self.slots.pop(key, None)
+        self.slot_tokens.pop(key, None)
+        self.drop_extension(key)
+        for point in [p for p in self.share_slots if p[0] == key]:
+            self.free_slots.append(self.share_slots.pop(point))
+        if slot is not None:
+            self.free_slots.append(slot)
         pages = self.owned.pop(key)
         borrowed = self.borrowed.pop(key)
         self.tokens.pop(key)

@@ -154,7 +154,9 @@ def retain_answer_head(torch, model, token_ids):
     if hasattr(model, "quail_answer_token_ids"):
         answer_weights(model, allowed)
         return
-    weight = model.lm_head.weight
+    # a checkpoint with a vision tower keeps its head in the language model
+    owner = model if hasattr(model, "lm_head") else model.language_model
+    weight = owner.lm_head.weight
     indices = torch.tensor(allowed, device=weight.device, dtype=torch.long)
     weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
     model.register_buffer("quail_answer_weights", weights, persistent=False)
@@ -164,7 +166,7 @@ def retain_answer_head(torch, model, token_ids):
     # memory; the model spec prices an untied head into the KV arena.
     model.quail_full_head = weight.detach().to(dtype=torch.bfloat16)
     # lm_head can be the same module as embed_tokens; drop only this reference.
-    model.lm_head = None
+    owner.lm_head = None
 
 
 def full_output_head(model):
@@ -189,13 +191,14 @@ def answer_weights(model, token_ids):
 
 def load_model(model_name: str, revision: str | None = None, *,
                answer_token_ids=None, max_batched_tokens=None,
-               moe_backend=None):
+               moe_backend=None, text_only=False):
     """Load model weights and retain the answer rows and the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
     fused MoE kernels size their scratch buffers from it; a dense model
     ignores it. moe_backend is passed through as vLLM's moe_backend
-    setting (see ModelSpec.moe_backend); None lets vLLM pick.
+    setting (see ModelSpec.moe_backend); None lets vLLM pick. text_only
+    takes no image or video input, for a checkpoint with a vision tower.
     """
     import os
     import tempfile
@@ -225,6 +228,8 @@ def load_model(model_name: str, revision: str | None = None, *,
         args["max_num_batched_tokens"] = int(max_batched_tokens)
     if moe_backend is not None:
         args["moe_backend"] = moe_backend
+    if text_only:
+        args["limit_mm_per_prompt"] = {"image": 0, "video": 0}
     config = EngineArgs(**args).create_engine_config()
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):

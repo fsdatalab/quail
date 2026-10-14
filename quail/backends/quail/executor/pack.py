@@ -293,6 +293,9 @@ class JoinAdmission:
         self._settled = []         # events for anchors that never ran
         self.in_flight = 0         # launched groups not yet reported
         self.blocked_pages = 0
+        # most anchors admitted and unfinished at once; a model that
+        # keeps a checkpoint per document sets it from its slot count
+        self.active_limit = None
         self.answers = [dict() for _ in range(k)]
         resident = dict(resident or {})
         anchor_partners = dict(anchor_partners or {})
@@ -578,7 +581,11 @@ class JoinAdmission:
         held = []
         blocked = False
         admitted = set()
+        active = (0 if self.active_limit is None
+                  else sum(1 for stage in self._stage if stage >= 0))
         while self.pending and room >= self._min_fresh:
+            if self.active_limit is not None and active >= self.active_limit:
+                break
             a = self.pending.popleft()
             if self._stage[a] == _DONE:
                 self._dead -= 1     # skipped by its group's survivor
@@ -625,6 +632,7 @@ class JoinAdmission:
             if not self._page_cost[a]:
                 self._zero_cost -= 1
             self._stage[a] = 0
+            active += 1
             admitted.add(a)
             if self.groups is not None:
                 group = self.groups[a]

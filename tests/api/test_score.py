@@ -257,7 +257,9 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
         for a, left in enumerate(lengths[0]):
             for b, right in enumerate(lengths[1]):
                 prefix = 3 + left + 4 if b and capacity == 100 else 3 if a or b else 0
-                expected += ask(prefix, 3 + left + 4 + right + 2 - prefix)
+                # the first pair computes its prompt from nothing resident
+                step = ask if prefix else scan
+                expected += step(prefix, 3 + left + 4 + right + 2 - prefix)
         work, _ = cost.estimate(6)
         assert vars(work) == pytest.approx(vars(expected))
         assert cost.estimate(0)[0] == Work()

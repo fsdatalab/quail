@@ -58,6 +58,10 @@ def _decode_outcome_work(lengths, runs, window=0, shared=None, resident=False):
         total["pairs"] += sum(fresh)
         contexts = [prompt + sum(fed[:round_]) for round_ in range(1, len(fed))]
         total["kv_read"] += kept + sum(contexts)
+        # one checkpoint read when the prefix is kept, one written when the
+        # document is computed, and one read for each later run
+        total["state_read"] += (1 if kept else 0) + len(contexts)
+        total["state_written"] += 0 if resident else 1
         if window:
             total["sliding_pairs"] += sum(min(i, window) for i in fresh)
             total["sliding_kv_read"] += sum(
@@ -80,7 +84,8 @@ def test_decode_feeds_one_run_per_choice():
 ])
 def test_expected_work_matches_every_label_assignment(lengths, labels, window,
                                                       shared, resident):
-    model = replace(QWEN3_4B_FP8, sliding_window=window, full_attention_period=2)
+    kinds = ("sliding_attention", "full_attention") * 18 if window else ()
+    model = replace(QWEN3_4B_FP8, sliding_window=window, layer_kinds=kinds)
     cost = _cost(lengths, labels, model=model, shared=shared or (),
                  resident=resident)
     runs = decode_round_tokens(labels)

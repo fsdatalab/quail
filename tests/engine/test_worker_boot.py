@@ -12,6 +12,7 @@ from quail.backends.quail import worker
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.worker import LoadedGpu
 from quail.builtins import built_in_registry
+from quail.specs import H100_SXM, MODELS
 
 
 def install_fake_torch(monkeypatch):
@@ -26,6 +27,9 @@ def install_fake_torch(monkeypatch):
     torch.inference_mode = contextlib.nullcontext
     torch.cuda = SimpleNamespace(mem_get_info=lambda: (40 * 2**30, 80 * 2**30),
                                  current_blas_handle=lambda: 1,
+                                 memory_allocated=lambda: 8 * 2**30,
+                                 max_memory_allocated=lambda: 20 * 2**30,
+                                 reset_peak_memory_stats=lambda: None,
                                  synchronize=lambda: None)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.nn", nn)
@@ -40,6 +44,8 @@ def booted(monkeypatch):
     for name in ("load_model", "build_pipeline", "AnswerRows", "KVArena",
                  "AsyncAnswers"):
         monkeypatch.setattr(worker, name, lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(worker, "KVArena", lambda *a, **k: SimpleNamespace(
+        k=[], v=[], gdn_state=None, conv_state=None))
     monkeypatch.setattr(worker, "warm_kernels",
                         lambda *a, **k: {"tier": "compiled"})
 
@@ -62,10 +68,13 @@ def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
     gpu.pipeline = SimpleNamespace(decode_graphs=SimpleNamespace(
         invalidate=lambda: calls.append("invalidate")))
     gpu.arena = SimpleNamespace(
-        n_pages=8, n_sliding_pages=0,
-        resize=lambda *a, **kw: calls.append("resize"))
+        n_pages=8, n_sliding_pages=0, k=[], v=[], gdn_state=None,
+        conv_state=None, resize=lambda *a, **kw: calls.append("resize"))
     gpu.model = gpu.F = None
     gpu.decision_head = None
+    # a dense model keeps no checkpoint slots, so resize gets no state pool
+    gpu.spec = MODELS["qwen3-4b-fp8"]
+    gpu.device = H100_SXM
     gpu.execution = SimpleNamespace(bind_query=lambda **kw: None)
     gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
     assert calls == ["resize"]
@@ -103,6 +112,9 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
         PAYLOAD, registry, object(), backend, runtime_state)
 
     assert response.metrics["boot_kind"] == "cold"
+    assert response.metrics["memory_bytes"] == {
+        "weights": 8 * 2**30, "kv": 0, "state": 0,
+        "other": 12 * 2**30, "peak": 20 * 2**30}
     assert gpu.prepared_boot is None
     assert len(boots) == 1
 
@@ -139,6 +151,7 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     assert runtime_state[("quail", "qwen3-4b-fp8")] is gpu
     resized = []
     gpu.arena = SimpleNamespace(
+        k=[], v=[], gdn_state=None, conv_state=None,
         resize=lambda *pages, **kw: resized.append((pages, kw)))
     gpu.bind_query([1], [2], 4096, arena_pages=(8, 2))
     assert resized == [((8, 2), {"free_resident": True})]

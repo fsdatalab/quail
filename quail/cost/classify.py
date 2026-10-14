@@ -9,7 +9,7 @@ order do not enter, just as they do not enter filter and join costs.
 """
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -80,7 +80,11 @@ def _first_work(prefix, shared, tail: int, resident: bool, window: int) -> Work:
     if resident:
         return ask(prefix, np.full_like(prefix, tail), window=window).total()
     fresh = prefix - shared + tail
-    return ask(shared, fresh, window=window).total()
+    work = ask(shared, fresh, window=window).total()
+    # a document with no shared prefix scans from nothing and writes a
+    # checkpoint; one that shares a prefix reads its parent's checkpoint
+    return replace(work, state_written=float(len(prefix)),
+                   state_read=float(np.sum(shared > 0)))
 
 
 def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:

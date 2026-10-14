@@ -12,7 +12,10 @@ from quail.backends.quail.executor.stages import (
     OwnRequests,
     PendingAnswers,
     _advance_stage,
+    checkpoint_slot_limit,
     frame_writes,
+    slots_per_document,
+    state_share_points,
 )
 from quail.progress import Progress, logger
 
@@ -39,8 +42,14 @@ def forward_chunk(pipeline, arena, chunk):
     try:
         graphs = getattr(pipeline, "decode_graphs", None)
         if graphs is not None:
-            return graphs.forward(chunk)
-        return pipeline.forward_chunk(chunk)
+            out = graphs.forward(chunk)
+        else:
+            out = pipeline.forward_chunk(chunk)
+        sample = getattr(arena, "sample_memory", None)
+        if sample is not None:
+            sample(getattr(chunk, "tokens", 0),
+                   len(getattr(chunk, "layout", ())))
+        return out
     finally:
         keys, chunk.temporary_keys = chunk.temporary_keys, ()
         for key in keys:
@@ -206,11 +215,49 @@ class StageExecutor:
         )
         self.borrowing = self.sched.borrowing
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
+        # a Gated DeltaNet layer starts a borrower from the parent's state
+        # at the shared point, so a parent writes one slot per point
+        self.share_points = [()] * len(self.keys)
+        spec = getattr(self.pipeline, "spec", None)
+        if (self.paged and getattr(spec, "state_layers", ())
+                and not getattr(self.arena, "n_state_slots", 0)):
+            raise ValueError(
+                "the arena has no checkpoint slots: the pool cannot hold "
+                "one document's state beside a chunk's KV, so a document "
+                "this long needs a smaller chunk or a larger pool")
+        if self.paged and getattr(self.arena, "n_state_slots", 0):
+            self._extends = (any(self.writes)
+                             or any(s.append for s in self.stages))
+            # a parent holds one slot per share length beside its own and
+            # its extension, and its borrowers need slots of their own, so
+            # a small pool keeps only the lengths that save the most
+            base = 1 + (1 if self._extends or len(self.stages) > 1 else 0)
+            room = max(0, (self.arena.n_state_slots - base) // 3)
+            self.share_points = state_share_points(
+                self.borrowing.tree_parent, self.borrowing.tree_shared,
+                limit=room)
+            self._share_width = max(map(len, self.share_points), default=0)
+            need = slots_per_document(len(self.stages), self._share_width,
+                                      self._extends)
+            if self.arena.n_state_slots < need:
+                raise ValueError(
+                    f"the arena has {self.arena.n_state_slots} checkpoint "
+                    f"slots and this query holds {need} per document in "
+                    f"flight; a document this long needs a smaller chunk "
+                    f"or a larger pool")
+            self.sched.active_limit = checkpoint_slot_limit(
+                self.arena.n_state_slots, len(self.stages),
+                self._share_width, frames=self._extends,
+                held=self.arena.slots_held(self.keys[a] for a in resident))
+            self.borrowing.can_borrow = self._state_borrow_check(
+                self.borrowing.can_borrow)
         # The admission detaches residents from borrowing: they pack no prefix.
         self.borrowers = self.borrowing.borrowers()
         self.lowest_borrow = lowest_borrows(self.borrowing)
         self.held = [self.keys[a] for a, n in enumerate(self.borrowers) if n]
 
+        self._held_parents = set()
+        self._unborrowed = set()    # borrowers rebuilt with their whole prefix
         self.spans = []
         self.tokens = 0
         self.pack_s = 0.0
@@ -298,6 +345,29 @@ class StageExecutor:
 
         return ask
 
+    def _state_borrow_check(self, can_borrow):
+        """Narrow can_borrow to borrows a parent's saved state can serve.
+
+        The borrower must start after the parent's own start and before
+        its own end, at a point the parent saves a state for or has
+        saved already.
+        """
+        def check(doc, parent, same_chunk):
+            shared = self.borrowing.tree_shared[doc]
+            if not shared < self.prefix_lengths[doc]:
+                return False
+            if not shared > self.borrowing.shared(parent):
+                return False
+            # the parent saves a state only at the lengths it kept
+            if (shared != self.prefix_lengths[parent]
+                    and shared not in self.share_points[parent]):
+                return False
+            if not same_chunk and self.arena.shared_state(
+                    self.keys[parent], shared) is None:
+                return False
+            return can_borrow(doc, parent, same_chunk)
+        return check
+
     def _merged(self, j, start, end):
         """Return whether the group packs its frame and suffix as one entry."""
         return self.stages[j].single and end - start == 1
@@ -321,16 +391,21 @@ class StageExecutor:
             if path and self.stages[j].discard is not None:
                 path = max(0, path - int(self.stages[j].discard(key)))
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
-                              if carried else (None, 0))
+                              if carried and a not in self._unborrowed
+                              else (None, 0))
             if self.paged:
-                fresh = not self.arena.is_resident(key)
                 got = self.arena.activate(
                     key, f, capacity_tokens=f + self.capacity_extra,
                     base_tokens=f,
                     borrow=(self.keys[parent], shared) if shared else None)
                 assert got is not None, \
                     "the admission placed a document the arena cannot hold"
-                if fresh and a < len(self.borrowers) and self.borrowers[a]:
+                # a retained parent is held too: a child planned in this
+                # chunk reads its state, and another group's slot request
+                # would otherwise evict it first
+                if (a not in self._held_parents and a < len(self.borrowers)
+                        and self.borrowers[a]):
+                    self._held_parents.add(a)
                     self.arena.hold(key, self.borrowers[a])
                     self.arena.keep_window(key, self.lowest_borrow[a])
             prefix = None
@@ -357,6 +432,11 @@ class StageExecutor:
             # under tree attention a borrowing document with one
             # suffix reads its parent's pages stacked with its siblings
             read_key = self.keys[parent] if shared and self.stages[j].single else None
+            carry = {}
+            if prefix is not None:
+                carry = dict(
+                    borrow_key=self.keys[parent] if shared else None,
+                    share_points=self.share_points[a])
             kept = int(sufs.lengths.sum()) if append else 0
             if append or (self.writes[j] and start == 0):
                 appended[a] = path + kept
@@ -369,14 +449,14 @@ class StageExecutor:
                         np.concatenate([self.frame_ids[j], sufs.ids]),
                         [len(frame) + int(sufs.lengths[0])]),
                     write_suffix_tokens=len(frame) + kept, single=True,
-                    read_all_rows=read_all, **own))
+                    read_all_rows=read_all, **carry, **own))
             elif self.writes[j] and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows; its own answer row means nothing
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f, suffixes=Suffixes(self.frame_ids[j], [len(frame)]),
-                    write_suffix_tokens=len(frame)))
+                    write_suffix_tokens=len(frame), **carry))
                 entries.append((j, 1))
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
@@ -390,7 +470,7 @@ class StageExecutor:
                     suffixes=sufs, read_all_rows=read_all,
                     write_suffix_tokens=kept,
                     single=self.stages[j].single and end - start == 1,
-                    paths=self.stages[j].paths, **own))
+                    paths=self.stages[j].paths, **carry, **own))
             entries.append((j, rows))
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,
@@ -477,22 +557,58 @@ class StageExecutor:
             if self.arena.is_resident(self.keys[a]):
                 self.arena.free_key(self.keys[a])
 
+    def _log_memory_event(self, kind, **detail):
+        log = getattr(self.arena, "log_event", None)
+        if log is not None:
+            reason = detail.get("reason", "")
+            if reason:
+                detail["reason"] = ("slots" if "checkpoint slot" in reason
+                                    else "pages" if "pages" in reason
+                                    else "rows")
+            log(kind, **detail)
+
     def _run_part(self, part):
         """Run one chunk of groups, halving it when its pages do not fit."""
-        from quail.backends.quail.executor.chunk import ArenaFullError
+        from quail.backends.quail.executor.chunk import (
+            ArenaFullError,
+            BorrowStateMissingError,
+        )
 
         try:
             self._run_one(part)
+        except BorrowStateMissingError as error:
+            # the parent's state is gone: the borrower computes its whole
+            # prefix, which the chunk packs in full
+            borrower = next(a for a, *_ in part if self.keys[a] == error.key)
+            self._unborrowed.add(borrower)
+            self._log_memory_event("unborrow", groups=len(part))
+            self._run_part(part)
         except ArenaFullError as error:
             # retained KV nothing here reads makes room first
             need = self.arena.page_cost(sum(self._entry_rows(*e) for e in part))
             if self.arena.evict_retained(need):
+                self._log_memory_event("evict_retry", groups=len(part))
                 logger.info("chunk of %d groups retried after evicting "
                             "retained KV", len(part))
                 self._run_part(part)
                 return
+            if len(part) < 2 and self.outstanding:
+                # reporting an earlier chunk settles documents, which
+                # frees their slots
+                self._log_memory_event("drain_retry", groups=len(part))
+                while self.outstanding:
+                    self._report_next()
+                self._run_part(part)
+                return
+            if len(part) < 2 and self.arena.drop_holds(self.held):
+                # parents held for queued children hold the slots: release
+                # them, and the children compute their whole prefixes
+                self._log_memory_event("drop_holds_retry", groups=len(part))
+                self._run_part(part)
+                return
             if len(part) < 2:
                 raise
+            self._log_memory_event("split", groups=len(part), reason=str(error))
             logger.info("chunk of %d groups split: %s", len(part), error)
             half = len(part) // 2
             self._run_part(part[:half])

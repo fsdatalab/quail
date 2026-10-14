@@ -138,8 +138,14 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
 
     report = graph_report(graph, result, wall, state["device"],
                           gpu_timing=state.get("gpu_timing", False))
-    report.update(kv_manager=kv_manager,
-                  peak_gib=round(torch.cuda.max_memory_allocated() / 2**30, 2))
+    report.update(
+        kv_manager=kv_manager,
+        memory_trace=list(getattr(arena, "memory_trace", ())),
+        memory_trace_started=started,
+        memory_events=[list(e) for e in getattr(arena, "events", ())],
+        memory_capacity={"pages": arena.n_pages,
+                         "slots": getattr(arena, "n_state_slots", 0)},
+        peak_gib=round(torch.cuda.max_memory_allocated() / 2**30, 2))
     return report
 
 

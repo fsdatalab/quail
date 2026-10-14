@@ -78,9 +78,11 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                 torch, arena, pipeline,
                 filter_stages([question], async_ans), [body], budget,
                 attention_mode=mode)
-        if not pipeline.canvas_ids:
+        if not pipeline.canvas_ids and getattr(
+                pipeline, "warm_row_classes", True):
             logger.debug("kernels: warming %s attention row classes", mode)
             _warm_row_classes(torch, arena, pipeline, mode)
+    join_chunk = join_chunk and getattr(pipeline, "warm_joins", True)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
         run_stages(

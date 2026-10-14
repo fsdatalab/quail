@@ -33,6 +33,8 @@ class ModelPipeline:
     needs_pages = False
     tree_attention = True
     gemm_warmup = True
+    warm_row_classes = True    # row-count classes keep one KV row per reader
+    warm_joins = True          # join and classification chunks borrow prefixes
     decode_graphs = None
 
     def forward_chunk(self, chunk):

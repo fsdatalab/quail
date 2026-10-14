@@ -38,7 +38,8 @@ def execution_report(plan, metrics, notes, coordinator_wall):
         node_metrics=out.get("node_metrics", {}),
         backend_metrics=out.get("backend_metrics"),
         remarks=list(notes))
-    for key in ("gpu_s", "chunks"):
+    for key in ("gpu_s", "chunks", "memory_trace", "memory_trace_started",
+                "memory_events", "memory_capacity", "memory_bytes"):
         if key in out:
             report[key] = out[key]
     for key in (

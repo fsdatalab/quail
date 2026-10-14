@@ -114,6 +114,13 @@ def diffusion_kwargs(spec) -> dict:
     return kwargs
 
 
+def text_only_kwargs(spec) -> dict:
+    """Turn off image and video inputs of a checkpoint with a vision tower."""
+    if not spec.vision_tower:
+        return {}
+    return {"limit_mm_per_prompt": {"image": 0, "video": 0}}
+
+
 def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
     """Set public sampling options for the model's answer format.
 
@@ -209,9 +216,11 @@ class VLLMEngine:
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
-                             else MAX_SEQUENCES),
+                             else min(MAX_SEQUENCES,
+                                      spec.max_num_seqs or MAX_SEQUENCES)),
         }
         kwargs.update(diffusion_kwargs(spec))
+        kwargs.update(text_only_kwargs(spec))
         return kwargs
 
     def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
@@ -233,6 +242,11 @@ class VLLMEngine:
         if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
             RENDERER_REGISTRY.register("gigatoken", *renderer)
 
+        if spec.vision_tower:
+            # the engine core of a multimodal architecture starts without
+            # the tokenizer registered above and fails building its
+            # structured-output manager
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         if spec.canvas_tokens == 1:
             # vLLM's engine core in its own process returns the canvas
             # row's logprobs unreliably under the step loop on long
@@ -289,7 +303,7 @@ class DefaultVLLMEngine(VLLMEngine):
     label = "vLLM with default settings"
 
     def llm_kwargs(self, spec) -> dict:
-        return diffusion_kwargs(spec)
+        return {**diffusion_kwargs(spec), **text_only_kwargs(spec)}
 
 
 def stock_vllm_backend() -> RequestBackend:

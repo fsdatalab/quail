@@ -4,6 +4,7 @@ Each image mounts the quail package and the bench package, which is
 not in the wheel, so the benchmark runner imports inside a container.
 """
 
+import os
 from importlib.metadata import version
 
 import modal
@@ -33,11 +34,18 @@ CACHE_ENV = {
 }
 
 
+# local variables copied into the image when set
+FORWARDED_ENV = ("QUAIL_GDN_PREFILL",)
+
+
 def _cuda_base() -> modal.Image:
+    # a run picks the Gated DeltaNet prefill kernel from its own shell
+    forwarded = {name: os.environ[name] for name in FORWARDED_ENV
+                 if name in os.environ}
     return (modal.Image.from_registry(CUDA_BASE, add_python="3.12")
             .entrypoint([])
             .apt_install("git")
-            .env(CACHE_ENV))
+            .env(CACHE_ENV | forwarded))
 
 
 def gpu_image(*local_dirs: tuple[str, str],
