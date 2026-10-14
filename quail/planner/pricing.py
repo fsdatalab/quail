@@ -1,14 +1,11 @@
 """Price logical alternatives through the planner's complete physical search."""
 
 from quail.planner.optimize import search_plan
-from quail.planner.optimizer.context import LogicalPlanningContext
 from quail.planner.plan import Refusal
 
 
 def physical_plan(logical, context, registry):
     """Return the cheapest refined physical candidate for a logical plan."""
-    if isinstance(context, LogicalPlanningContext):
-        context = context.physical_context(logical)
     return search_plan(logical, context, registry)
 
 

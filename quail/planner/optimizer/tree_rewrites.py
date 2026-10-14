@@ -1,8 +1,10 @@
 """Simplify query trees and retain cost-based alternatives."""
 
+from dataclasses import replace
+
 from quail.logical import LogicalPlan
 from quail.planner.optimizer.candidates import LogicalAlternative
-from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.rules import OptimizerRule
 
 # Rules that undo each other must not loop forever.
@@ -12,7 +14,7 @@ MAX_PASSES = 4
 def simplify_plan(
     plan: LogicalPlan,
     rules: tuple[OptimizerRule, ...],
-    context: LogicalPlanningContext,
+    context: PlanningContext,
     *,
     max_passes: int = MAX_PASSES,
 ) -> tuple[LogicalPlan, tuple[str, ...]]:
@@ -35,7 +37,8 @@ def simplify_plan(
         for rule in rules:
             if rule.target != "logical" or rule.cost_based:
                 continue
-            replacement = rule.rewrite(root, context)
+            replacement = rule.rewrite(
+                root, replace(context, logical_plan=LogicalPlan(root), settings={}))
             if replacement is not None and replacement != root:
                 root = replacement
                 changed.append(rule.name)
@@ -59,7 +62,9 @@ def logical_alternatives(plan, rules, context, *, max_passes=MAX_PASSES) -> tupl
             if rule.target != "logical" or not rule.cost_based:
                 continue
             for candidate in tuple(alternatives):
-                root = rule.rewrite(candidate.plan.root, context)
+                root = rule.rewrite(
+                    candidate.plan.root,
+                    replace(context, logical_plan=candidate.plan, settings={}))
                 if root is None or any(
                         root == other.plan.root for other in alternatives):
                     continue

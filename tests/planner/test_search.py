@@ -139,24 +139,34 @@ def test_prefix_sharing_is_priced_for_every_placement(query):
 
 
 def test_cost_based_rules_retain_original_and_deduplicate(query):
-    from quail.planner.optimizer.context import LogicalPlanningContext
     from quail.planner.optimizer.tree_rewrites import simplify_plan
     from quail.planner.rules.cost_based import ShouldLiftMaps
 
     context = context_for(query)
     registry = query.session.registry
-    registry.register_cost_based_rule(ShouldLiftMaps(), name="duplicate_lift")
+
+    class CheckCandidateContext(ShouldLiftMaps):
+        def rewrite(self, root, context):
+            assert context.logical_plan.root is root
+            assert context.settings == {}
+            context.settings["tree_rule_setting"] = True
+            return super().rewrite(root, context)
+
+    registry.register_cost_based_rule(CheckCandidateContext(), name="duplicate_lift")
     with pytest.raises(ValueError, match="duplicate"):
         registry.register_cost_based_rule(ShouldLiftMaps())
     simplified, changed = simplify_plan(
         query.logical, tuple(registry.rules.values()),
-        LogicalPlanningContext.from_physical(context))
+        context)
     assert simplified == query.logical
     assert "should_lift_maps" not in changed
     original, lifted = search_candidates(query.logical, context, registry)
     assert original.logical_plan == query.logical
     assert original.rewrites == ()
     assert lifted.rewrites == ("should_lift_maps",)
+    assert context.settings == {}
+    assert "tree_rule_setting" not in original.plan.settings
+    assert "tree_rule_setting" not in lifted.plan.settings
 
 
 def test_exact_tokenization_reconsiders_placement(query):

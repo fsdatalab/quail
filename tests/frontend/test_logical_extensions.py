@@ -6,10 +6,10 @@ from typing import ClassVar
 import pytest
 
 from quail.logical import ColumnRef, LogicalPlan, Project, Scan
-from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import simplify_plan
 
-CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)
+CONTEXT = PlanningContext(catalog=None, engine_config=None)
 
 
 @dataclass(frozen=True)
@@ -111,7 +111,7 @@ def test_rules_that_never_settle_stop_at_the_pass_cap():
 
 
 class RecordContext:
-    """Keep the context a session hands its tree rewrites."""
+    """Keep the context a session hands its optimizer rules."""
 
     target = "logical"
     cost_based = False
@@ -126,14 +126,16 @@ class RecordContext:
         return None
 
 
+@pytest.mark.parametrize("target", ["logical", "physical"])
 @pytest.mark.parametrize("cost_based", [False, True])
-def test_session_rules_read_statistics_from_the_context(cost_based):
+def test_session_rules_read_statistics_from_the_context(target, cost_based):
     import pyarrow as pa
 
     import quail
 
     recorder = RecordContext()
     recorder.cost_based = cost_based
+    recorder.target = target
     session = quail.Session(
         quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
         tokenizer=str.split)
@@ -148,10 +150,10 @@ def test_session_rules_read_statistics_from_the_context(cost_based):
     query.plan()
     query.wait_for_tokens()
 
-    # the rules ran before the physical planner, on document lengths
-    # estimated while the background thread tokenized the table
     assert len(recorder.seen) >= 1
     context = recorder.seen[0]
+    assert isinstance(context, PlanningContext)
+    assert context.logical_plan == query.logical
     assert context.catalog is session.catalog
     assert context.engine_config is session.config
     assert context.model is session.model
@@ -160,5 +162,4 @@ def test_session_rules_read_statistics_from_the_context(cost_based):
     assert list(context.document_tokens["d"]) == [1, 2]
     assert context.tokenizer is session.tokenizer
     assert dict(context.pair_fractions) == {}
-    assert context.physical_context().document_tokens is context.document_tokens
     session.close()

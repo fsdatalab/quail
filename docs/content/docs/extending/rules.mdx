@@ -2,34 +2,26 @@
 title: Custom Rules
 ---
 
-An optimizer rule changes a plan while preserving the query's meaning.
-For Quail's existing rules, see the [optimizer](/docs/architecture/optimizer).
+An optimizer rule changes a plan while preserving the query's result.
+See [Optimizer](/docs/architecture/optimizer) for the built-in rules.
 
-## Choose the category
+## Define a rule
 
-- A **universal rule** applies whenever its conditions hold, without
-  comparing costs. Set `cost_based = False`.
-- A **cost-based rule** proposes alternatives or chooses an implementation
-  using estimated cost. Set `cost_based = True`.
+Each rule has a name, a category, a target, and a `rewrite()` method.
 
-Each rule also declares its target. Set `target = "logical"` to rewrite
-query trees, or `target = "physical"` to rewrite executable graphs.
-The target tells the planner which representation the rule accepts.
-Both categories use the same `OptimizerRule` interface.
+| Field | Meaning |
+| --- | --- |
+| `name` | Unique name shown in `explain()`. Use `should_...` for yes/no decisions and `choose_...` to select an implementation. |
+| `cost_based` | `False` for a universal rule. `True` for a rule that compares alternatives by cost. |
+| `target` | `"logical"` for the query tree. `"physical"` for the executable graph. |
 
-## Implement the rule
+`rewrite(plan, context)` receives the tree root or graph named by `target`.
+Return a new root or graph when you change it. Return `None` otherwise.
+Do not modify the original nodes.
 
-Define a class with `name`, `target`, `cost_based`, and `rewrite()`.
-Use `should_...` for yes/no decisions and `choose_...` for choices among
-implementations. The name identifies the rule in the registry and explain.
-Use a name that differs from every registered rule, across both categories.
-Return new nodes instead of changing existing nodes in place.
-Return `None` when no change is needed.
-
-For example, imagine a `reviews` table with `id`, `body`, and `author`
-columns. A query returns `id` and uses `body` in a model filter.
-Projection pushdown tells the scan to retain `id` values for the result.
-Quail still tokenizes `body` for the filter. It does not need `author`.
+For example, imagine a query that returns review IDs and filters on review
+text. The projection rule tells the scan to load IDs for the result and
+omit unused columns. The text is still tokenized for the filter.
 
 ```python
 from quail.planner.rules.tree_transforms import push_down_projection
@@ -45,79 +37,61 @@ class ShouldPushDownProjection:
         return None if rewritten is root else rewritten
 ```
 
-The helper updates the scans and returns the plan's root. It returns the
-original root when no change is needed. See the
-[complete implementation](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/universal.py).
+Quail already includes this rule. Use the example as a template for your rule.
 
-For a query tree target, `rewrite(root, context)` returns a new root.
-For a cost-based tree rewrite, the planner retains the original,
-deduplicates equal roots, and lowers and refines every alternative before
-comparing costs. The rewrite proposes a placement; it does not call the
-planner recursively to price it. Check `context.backend` when a placement
-requires a particular engine's support, as `ShouldLiftMaps` does.
+## Cost-based rules
 
-For an executable graph target, `rewrite(graph, context)` returns a new
-`PhysicalGraph`. A cost-based graph rule compares the implementations it
-supports and returns its choice. The planner applies the change before
-comparing whole candidates. The current search is staged and does not
-enumerate all combinations of implementations and placements.
+For a cost-based tree rule, return an alternative query tree. The planner keeps the
+original too, builds both executable plans, and compares their costs after
+applying execution settings such as prefix sharing.
 
-The *planning context* provides the configuration and input statistics
-available to a rule. See
-`LogicalPlanningContext` and `PlanningContext` in
-[`optimizer/context.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/context.py)
-for their fields.
+For a graph rewrite, compare the supported implementations and return the
+chosen graph. The planner includes its cost when comparing complete plans.
 
-## Register the rule
+## Planning context
 
-Create an [extension registry](/docs/extending#registration) with
-`ExtensionRegistry.with_built_ins()`. Register an instance with the method
-for its category:
+All rules receive the same `PlanningContext` type. It provides:
 
-| Category | Registration method |
+- The model, device, tokenizer, and session catalog.
+- Document token counts and estimated fractions of rows kept by filters and joins.
+- The logical plan for the current candidate.
+- `settings`, where graph rules add execution settings for that candidate.
+- `memo`, where rules can reuse computed values within one search.
+
+Each candidate has separate settings. Memo keys must include all inputs
+that affect the saved value. See the fields in
+[`optimizer/context.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/context.py).
+
+## Register a rule
+
+Create a registry with `ExtensionRegistry.with_built_ins()` and register
+your rule:
+
+| Category | Method |
 | --- | --- |
 | Universal | `registry.register_universal_rule(rule)` |
 | Cost-based | `registry.register_cost_based_rule(rule)` |
 
-Pass the registry to the session. `ShouldPushDownProjection` is already
-registered in Quail's default registry. The example shows its interface;
-you do not need to register it again.
+Pass the registry to the session. Rules share one registration order across
+both categories. `registry.rules` lists that order.
 
-`registry.universal_rules` and `registry.cost_based_rules` expose each
-category. `registry.rules` contains both in one registration order.
-The registry checks the target and category when a rule is registered.
+The planner:
 
-### Execution order
+1. Applies universal tree rewrites until nothing changes, up to four passes.
+2. Collects cost-based tree alternatives, keeping the original and removing
+   duplicates, up to four passes.
+3. Builds executable candidates and applies graph rules in registration order.
+4. Selects the candidate with the lowest estimated time.
 
-- Universal tree rewrites simplify the query before search. A *pass*
-  applies all matching rules once. Quail repeats passes until nothing
-  changes, with a maximum of four passes.
-- Cost-based tree rewrites expand the known alternatives until no new
-  plan appears, with a maximum of four passes. The original stays first.
-- Both categories of graph rules run once on each candidate in their
-  shared registration order. Registration order preserves dependencies
-  across categories. Quail compares candidate costs after graph refinement.
-- Exact token sequences trigger the search again when initial planning
-  used estimated document lengths.
-- Rule settings belong to one candidate. The context memo is shared for
-  reusable statistics; memo keys must include all inputs that affect a value.
+If initial planning used estimated token lengths, the planner repeats the
+search when exact tokens are available.
 
-`explain(verbose=True)` lists both categories and the graph refinement
-order. The pricing helper
-`quail.planner.pricing.estimated_seconds(plan, context, registry)` uses the
-same search and registered rules.
+## Test a rule
 
-## Check the rule
+Call `rewrite()` without model inference. Check that the intended fields
+change, the original plan stays unchanged, and the result is equivalent.
+For a cost-based rule, check which plan wins after execution settings are
+applied.
 
-Call `rewrite()` directly to test your rule without model inference.
-Check that:
-
-- The intended nodes and fields change.
-- The original plan remains unchanged.
-- The revised plan preserves the query's meaning.
-- A second call returns `None` if no further change is needed.
-- Cost-based tree alternatives are compared after graph refinement.
-
-See the [tree rewrite tests](https://github.com/fsdatalab/quail/blob/main/tests/frontend/test_logical_extensions.py)
-and [search tests](https://github.com/fsdatalab/quail/blob/main/tests/planner/test_search.py)
-for examples.
+See the [rule tests](https://github.com/fsdatalab/quail/blob/main/tests/frontend/test_logical_extensions.py)
+and [search tests](https://github.com/fsdatalab/quail/blob/main/tests/planner/test_search.py).

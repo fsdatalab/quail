@@ -9,29 +9,20 @@ from quail.planner.prompt_lowering import LoweredPrompt, lower_prompt
 from quail.specs import DeviceSpec, ModelSpec
 
 
-def lowered_prompt(context, prompt) -> LoweredPrompt:
-    """Lower a prompt through a context's tokenizer, memoized on the context.
-
-    Raises:
-        ValueError: The context has no tokenizer.
-    """
-    key = ("lowered", prompt)
-    if key not in context.memo:
-        if context.tokenizer is None:
-            raise ValueError("planning needs a tokenizer to lower prompts")
-        context.memo[key] = lower_prompt(prompt, context.tokenizer)
-    return context.memo[key]
-
-
 @dataclass(frozen=True)
 class PlanningContext:
-    """Inputs available to physical planners."""
+    """Inputs shared by optimizer rules and backend planners.
 
-    model: ModelSpec
-    device: DeviceSpec
-    gpu_count: int
-    document_tokens: Mapping[str, Any]
-    backend: str
+    Tree rewrites that do not estimate costs may omit model and device.
+    Each candidate has its own settings. Memoized values are shared within
+    one search and must be keyed by all inputs that affect the result.
+    """
+
+    model: ModelSpec | None = None
+    device: DeviceSpec | None = None
+    gpu_count: int = 1
+    document_tokens: Mapping[str, Any] = field(default_factory=dict)
+    backend: str = "quail"
     order: str | None = None
     # the most noise draws a diffusion model averages per letters read
     # and per one-table AI.SCORE
@@ -60,78 +51,14 @@ class PlanningContext:
     memo: dict = field(default_factory=dict, compare=False, repr=False)
 
     def lowered(self, prompt) -> LoweredPrompt:
-        """Return the prompt lowered with the session tokenizer, once per query."""
-        return lowered_prompt(self, prompt)
+        """Return the tokenized prompt, reusing an earlier result when available.
 
-
-@dataclass(frozen=True)
-class LogicalPlanningContext:
-    """Session values and statistics available to rules that rewrite query trees.
-
-    Document token counts are exact when the column is tokenized, else
-    estimated from a sample. A cost-based rule prices a predicate
-    written without a selectivity with the default selectivity.
-
-    Attributes:
-        catalog: The session catalog.
-        engine_config: The session's EngineConfig.
-        model: Model spec; None when no cost-based rule will run.
-        device: Device spec; None when no cost-based rule will run.
-        gpu_count: GPU count; one model copy runs per GPU.
-        document_tokens: alias -> per-document token counts.
-        backend: Registered model backend name.
-        order: Stage order rule, 'by_cost' or 'as_written'; None picks
-            the default rule.
-        canvas_draws: Maximum diffusion draws per classification.
-        attention: An attention path forced for every filter and join.
-        tokenizer: Callable (text -> token list) for prompts.
-        pair_fractions: join written position -> the fraction of the
-            cross product its equality conditions keep.
-        scan_fractions: alias -> the fraction of its documents the
-            regular predicates are expected to keep.
-        memo: Results a rule computed for one plan root, so a later
-            pass or another rule pricing the same root reuses them.
-    """
-
-    catalog: Any
-    engine_config: Any
-    model: Any = None
-    device: Any = None
-    gpu_count: int = 1
-    document_tokens: Mapping[str, Any] = field(default_factory=dict)
-    backend: str = "quail"
-    order: str | None = None
-    canvas_draws: int = 4
-    attention: str | None = None
-    tokenizer: Callable[[str], Any] | None = None
-    pair_fractions: Mapping[int, float] = field(default_factory=dict)
-    scan_fractions: Mapping[str, float] = field(default_factory=dict)
-    memo: dict = field(default_factory=dict, compare=False, repr=False)
-
-    def lowered(self, prompt):
-        """Return the prompt lowered with the session tokenizer, once per query."""
-        return lowered_prompt(self, prompt)
-
-    def physical_context(self, logical_plan=None) -> PlanningContext:
-        """Return the physical planning context with the same inputs."""
-        return PlanningContext(
-            model=self.model, device=self.device, gpu_count=self.gpu_count,
-            document_tokens=self.document_tokens, backend=self.backend,
-            order=self.order, canvas_draws=self.canvas_draws,
-            attention=self.attention, tokenizer=self.tokenizer,
-            pair_fractions=dict(self.pair_fractions),
-            scan_fractions=dict(self.scan_fractions),
-            logical_plan=logical_plan, memo=self.memo,
-            catalog=self.catalog, engine_config=self.engine_config)
-
-    @classmethod
-    def from_physical(cls, context: PlanningContext) -> LogicalPlanningContext:
-        """Return a query tree context with the current search inputs."""
-        return cls(
-            catalog=context.catalog, engine_config=context.engine_config,
-            model=context.model, device=context.device, gpu_count=context.gpu_count,
-            document_tokens=context.document_tokens, backend=context.backend,
-            order=context.order, canvas_draws=context.canvas_draws,
-            attention=context.attention, tokenizer=context.tokenizer,
-            pair_fractions=context.pair_fractions,
-            scan_fractions=context.scan_fractions, memo=context.memo)
+        Raises:
+            ValueError: The context has no tokenizer.
+        """
+        key = ("lowered", prompt)
+        if key not in self.memo:
+            if self.tokenizer is None:
+                raise ValueError("planning needs a tokenizer to lower prompts")
+            self.memo[key] = lower_prompt(prompt, self.tokenizer)
+        return self.memo[key]

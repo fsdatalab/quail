@@ -26,7 +26,7 @@ from quail.logical import (
 )
 from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
-from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import simplify_plan
 from quail.planner.plan import Refusal, RefusalError
 from quail.planner.search.statistics import filter_stop_keys
@@ -126,8 +126,8 @@ class Query:
                 operators.scans, operators.joins)
             self._scan_selectivities = scan_fractions
             self._pair_selectivities = pair_fractions
-            context = LogicalPlanningContext(
-                self.session.catalog, config,
+            context = PlanningContext(
+                catalog=self.session.catalog, engine_config=config,
                 model=self.session.model, device=self.session.device,
                 gpu_count=config.gpus, document_tokens=self._doc_tokens,
                 backend=config.backend, order=self.order,

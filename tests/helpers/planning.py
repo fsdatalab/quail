@@ -2,7 +2,7 @@
 
 from quail.builtins import built_in_registry
 from quail.planner.optimize import plan_query
-from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import simplify_plan
 from quail.planner.rules import built_in_rules
 from quail.specs import H100_SXM, QWEN3_4B_FP8
@@ -22,8 +22,8 @@ def _optimize(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
     Returns:
         The optimized plan and the names of the rules that changed it.
     """
-    context = LogicalPlanningContext(
-        None, None, model=model, device=H100_SXM,
+    context = PlanningContext(
+        model=model, device=H100_SXM,
         gpu_count=kwargs.get("gpus", 1), document_tokens=doc_tokens,
         order=kwargs.get("order"), tokenizer=tok,
         pair_fractions=kwargs.get("pair_fractions") or {})

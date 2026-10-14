@@ -16,7 +16,7 @@ from quail.logical import Result, Scan, SemanticFilter
 from quail.physical import AiFilter, Project, Sort
 from quail.physical.base import input_ports
 from quail.planner import plan_query
-from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import simplify_plan
 from quail.planner.rules import built_in_rules
 from quail.specs import H100_SXM, QWEN3_4B_FP8
@@ -33,8 +33,8 @@ def catalog():
 
 def _optimize_with(catalog, logical, tokens):
     """Run the built in tree rewrites with the catalog's id columns."""
-    context = LogicalPlanningContext(
-        catalog, None, model=QWEN3_4B_FP8, device=H100_SXM,
+    context = PlanningContext(
+        catalog=catalog, model=QWEN3_4B_FP8, device=H100_SXM,
         document_tokens=tokens, tokenizer=tok)
     return simplify_plan(logical, built_in_rules(), context)
 

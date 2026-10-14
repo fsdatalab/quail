@@ -22,7 +22,7 @@ from quail.logical import (
     SemanticJoin,
 )
 from quail.physical import Recombine
-from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import simplify_plan
 from quail.planner.plan import EngineConfig
 from quail.planner.rules import built_in_rules
@@ -226,7 +226,7 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
     LogicalPlan(pushed).validate()
     optimized, changed = simplify_plan(
         LogicalPlan(above), built_in_rules(),
-        LogicalPlanningContext(catalog, None))
+        PlanningContext(catalog=catalog))
     assert changed == ("should_push_down_projection", "should_push_down_filters")
     assert optimized.root == push_down_projection(pushed)
 

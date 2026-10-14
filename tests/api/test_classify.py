@@ -542,14 +542,14 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     # a cost-based tree rewrite prices a plan the same way the backend
     # prices its candidates
     from quail.planner import pricing
-    from quail.planner.optimizer.context import LogicalPlanningContext
+    from quail.planner.optimizer.context import PlanningContext
 
-    logical_context = LogicalPlanningContext(
-        session.catalog, session.config, model=session.model,
+    context = PlanningContext(
+        catalog=session.catalog, engine_config=session.config, model=session.model,
         device=session.device, document_tokens=after._doc_tokens,
         tokenizer=session.tokenizer)
     assert pricing.estimated_seconds(
-        lifted_candidate.logical_plan, logical_context, session.registry) == (
+        lifted_candidate.logical_plan, context, session.registry) == (
         lifted_candidate.estimated_seconds)
     logical_text, physical_text = after.explain().split("physical:")
     assert "SemanticClassify: topic" in logical_text

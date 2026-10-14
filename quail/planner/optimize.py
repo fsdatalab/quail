@@ -4,7 +4,7 @@ from dataclasses import replace
 
 from quail.logical import LogicalPlan
 from quail.planner.optimizer.candidates import ModelRegion, PhysicalCandidate
-from quail.planner.optimizer.context import LogicalPlanningContext, PlanningContext
+from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.graph_refinement import apply_plan_rules
 from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import Refusal
@@ -98,9 +98,7 @@ def search_candidates(logical, context, registry) -> tuple[PhysicalCandidate, ..
     backend = registry.backend(context.backend)
     planners = (backend, *registry.physical_planners.values())
     rules = tuple(registry.rules.values())
-    alternatives = logical_alternatives(
-        logical, rules,
-        LogicalPlanningContext.from_physical(context))
+    alternatives = logical_alternatives(logical, rules, context)
     candidates = []
     for alternative in alternatives:
         candidate_context = replace(
