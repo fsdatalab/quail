@@ -7,12 +7,15 @@ from quail.cost.work import Work
 from quail.logical import CompileError, has_score
 from quail.logical.plan import Operators
 from quail.planner.operators.common import question_tokens
-from quail.planner.operators.filter import filter_works
 from quail.planner.plan import Refusal
 from quail.planner.search import join_order as joinsearch
 from quail.planner.search.filter_order import default_order_rule
-from quail.planner.search.ordering import choose_filter_orders, choose_join_sequence
-from quail.planner.statistics.query import (
+from quail.planner.search.ordering import (
+    choose_filter_orders,
+    choose_join_sequence,
+    filter_works,
+)
+from quail.planner.search.statistics import (
     PlanStatistics,
     cached_statistics,
     live_after_filters,

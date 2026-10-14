@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from quail.cost import budgets
 from quail.cost.score import ScoreCost
 from quail.cost.work import Work
+from quail.logical import effective_selectivity
 from quail.logical.prompts import (
     prompt_aliases,
     score_query_template,
@@ -140,3 +141,60 @@ class ScoreLowering:
             written_pos=position)
         self.nodes.append(node)
         return PortRef(node.node_id, "rows")
+
+
+def emit_scores(builder, alias):
+    """Append the alias's score predicates and projected scores."""
+    stats = builder.decisions.statistics.stats
+    orders = builder.decisions.filter_orders
+    live = float(stats[alias].n_docs)
+    for position in orders.get(alias, ()):
+        predicate = builder.operators.filters[alias][position]
+        source = builder.rows_src.get(alias, builder.ids_src[alias])
+        if predicate.prompt not in builder.scoring.names:
+            source = builder.scoring.score(
+                predicate.prompt, f"__score_{alias}_{position}", (source,),
+                live, stats[alias].mean_doc_tokens)
+        source = builder.scoring.comparison(predicate, source, (alias,), position)
+        builder.rows_src[alias] = source
+        builder.ids_src[alias] = PortRef(source.node_id, f"ids:{alias}")
+        live *= effective_selectivity(predicate.selectivity)
+    for expression in builder.projected_scores:
+        call = expression.expression
+        if call.aliases() != (alias,) or call.prompt in builder.scoring.names:
+            continue
+        builder.rows_src[alias] = builder.scoring.score(
+            call.prompt, expression.name,
+            (builder.rows_src.get(alias, builder.ids_src[alias]),), live,
+            stats[alias].mean_doc_tokens)
+
+
+
+def emit_score_pair(builder, prompt, position, fraction, pair_inputs):
+    """Append the score of one pair prompt and return its rows port."""
+    stats = builder.decisions.statistics.stats
+    aliases = tuple(dict.fromkeys(ref.alias for ref in prompt.args))
+    expected, prefixes = pair_counts(builder.decisions.live, aliases, fraction)
+    return builder.scoring.score(
+        prompt, f"__score_join_{position}",
+        tuple(builder.rows_src.get(a, builder.ids_src[a]) for a in aliases)
+        + pair_inputs,
+        expected, sum(stats[a].mean_doc_tokens for a in aliases),
+        pair_fraction=fraction, prefix_groups=prefixes)
+
+
+def emit_score_joins(builder, group):
+    """Append the scores and comparisons of one group of score joins."""
+    for spec, _ in group:
+        position = spec.written_pos
+        join = builder.operators.joins[position]
+        pair_inputs = ()
+        if position in builder.pairs_src:
+            producer = builder.pairs_src[position]
+            pair_inputs = (PortRef(producer.node_id,
+                                  f"pairs:{position}"),)
+        if builder.score_pairs is None:
+            builder.score_pairs = emit_score_pair(
+                builder, join.prompt, position, spec.pair_fraction, pair_inputs)
+        builder.score_pairs = builder.scoring.comparison(
+            join, builder.score_pairs, spec.aliases, position)

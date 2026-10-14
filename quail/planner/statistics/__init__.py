@@ -1,1 +1,1 @@
-"""The numbers a query's planning reads: table summaries, memory, plan statistics."""
+"""Table length summaries and the KV pool split every operator reads."""

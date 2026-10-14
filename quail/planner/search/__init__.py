@@ -1,1 +1,1 @@
-"""Cost-based choices: filter order, join order and anchors, survivors."""
+"""Cost-based choices from the plan statistics: filter order, join order, survivors."""

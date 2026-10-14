@@ -1,19 +1,7 @@
 """Choose predicate order from prepared costs, selectivities, and reuse keys."""
 
-from dataclasses import dataclass
-from typing import Callable, Hashable
 
 from quail.logical import DEFAULT_SELECTIVITY
-
-
-@dataclass(frozen=True)
-class PredicateCost:
-    """One predicate's costs and reusable result identity."""
-
-    selectivity: float
-    first: Callable[[float], float]
-    later: Callable[[float], float]
-    reuse_key: Hashable | None = None
 
 
 def default_order_rule(filters, joins) -> tuple[str, str]:

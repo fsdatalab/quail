@@ -6,6 +6,8 @@ from quail.logical import (
     join_conditions,
 )
 from quail.logical.prompts import prompt_aliases
+from quail.physical import AiJoin, Foreign, PortRef
+from quail.physical.base import input_ports
 from quail.planner.operators.common import question_tokens
 from quail.planner.operators.score import ScoreJoinCost, score_statistics
 from quail.planner.prompt_lowering import LoweredPrompt
@@ -63,3 +65,52 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
                       c.right.column) for c in conditions),
             pair_fraction=fraction))
     return out
+
+
+def emit_join(builder, spec, step, anchor, jid, exec_idx):
+    """Append one AI join stage and the functions that supply its pairs."""
+    pair_inputs = []
+    partners = [a for a in spec.aliases if a != anchor]
+    pairs_from = ""
+    if spec.written_pos in builder.pairs_src:
+        producer = builder.pairs_src[spec.written_pos]
+        pair_inputs.append(
+            PortRef(producer.node_id, f"pairs:{spec.written_pos}"))
+        pairs_from = producer.node_id
+    for apply in builder.join_applies.get(spec.written_pos, ()):
+        # the function's pairs reach the join on their own port
+        aid = f"apply:{apply.function}"
+        builder.nodes.append(Foreign(
+            node_id=aid,
+            inputs=input_ports(tuple(
+                builder.ids_src[a] for a in apply.aliases)),
+            function=apply.function, kind=apply.kind, ids="pairs",
+            columns=tuple((ref.alias, ref.column)
+                          for ref in apply.columns),
+            aliases=tuple(apply.aliases),
+            written_pos=spec.written_pos))
+        pair_inputs.append(PortRef(aid, f"pairs:{spec.written_pos}"))
+        pairs_from = aid
+    builder.nodes.append(AiJoin(
+        node_id=jid,
+        inputs=input_ports(tuple(
+            builder.ids_src[a] for a in [anchor, *partners])
+                           + tuple(pair_inputs)),
+        written_pos=spec.written_pos, exec_idx=exec_idx,
+        anchor=anchor, partners=tuple(partners),
+        semantics=spec.semantics,
+        selectivity=spec.selectivity,
+        expected_tuples=round(step.tuples, 1),
+        anchor_frame_tokens=spec.frame_tokens[anchor],
+        pair_tail_tokens=spec.tail_tokens,
+        anchor_resident=step.resident,
+        tuple_tokens=round(step.tokens, 1),
+        pairs_from=pairs_from))
+    builder.ids_src[anchor] = PortRef(jid, f"ids:{anchor}")
+    if spec.semantics == "full":
+        builder.pairs_edges.append(PortRef(
+            jid, f"join_answers:{spec.written_pos}"
+        ))
+        for a in [anchor] + partners:
+            if a not in builder.out_aliases:
+                builder.out_aliases.append(a)

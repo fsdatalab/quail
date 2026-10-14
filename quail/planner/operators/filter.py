@@ -1,20 +1,30 @@
 """AI.IF over one table: the cost and work of its filters."""
 
+from dataclasses import dataclass
 from functools import partial
 from operator import mul
+from typing import Callable, Hashable
 
 from quail.cost.filters import filter_cost, filter_sequence_work
 from quail.cost.work import Work
 from quail.logical import (
-    LogicalPlan,
     effective_selectivity,
     is_score,
 )
+from quail.physical import AiFilter, PortRef
+from quail.physical.base import input_ports
 from quail.planner.operators.common import question_tokens
 from quail.planner.operators.score import score_statistics
-from quail.planner.search.filter_order import PredicateCost
-from quail.planner.statistics.query import PlanStatistics
-from quail.specs import ModelSpec
+
+
+@dataclass(frozen=True)
+class PredicateCost:
+    """One predicate's costs and reusable result identity."""
+
+    selectivity: float
+    first: Callable[[float], float]
+    later: Callable[[float], float]
+    reuse_key: Hashable | None = None
 
 
 def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
@@ -62,22 +72,25 @@ def filter_alias_work(preds, stats, order, pre: int, lowered,
         pre + stats.mean_doc_tokens, float(stats.n_docs), window)
 
 
-def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
-                 model: ModelSpec, orders: dict) -> dict:
-    """Return the expected Work of each table's filter sequence in run order.
+def emit_filter(builder, alias):
+    """Append the alias's AI filters in their chosen order."""
+    stats = builder.decisions.statistics.stats
+    orders = builder.decisions.filter_orders
+    n = stats[alias].n_docs
+    surv = 1.0
+    for rank, i in enumerate(orders[alias]):
+        p = builder.operators.filters[alias][i]
+        fid = f"ai_filter:{alias}" if rank == 0 else f"ai_filter:{alias}:{i}"
+        builder.nodes.append(AiFilter(
+            node_id=fid, inputs=input_ports((builder.ids_src[alias],)), alias=alias,
+            written_pos=i,
+            question_tokens=question_tokens(
+                builder.context.lowered(p.prompt), builder.model.canvas_tokens),
+            preamble_tokens=builder.context.lowered(p.prompt).preamble_tokens,
+            selectivity=p.selectivity, expected_docs=round(n * surv, 1),
+            arena_writes=len(orders[alias]) > 1 or alias in builder.pipelined,
+            stop_key=builder.stop_keys.get(alias, ())))
+        surv *= effective_selectivity(p.selectivity)
+        builder.ids_src[alias] = PortRef(fid, f"ids:{alias}")
+    builder.emit_applies(alias)
 
-    Args:
-        plan: The logical plan.
-        statistics: The plan's statistics.
-        model: Model spec.
-        orders: alias -> written positions of its model predicates in
-            run order.
-    """
-    return {
-        alias: filter_alias_work(
-            predicates, statistics.stats[alias],
-            [i for i in orders.get(alias, []) if i in statistics.asks[alias]],
-            statistics.pre, statistics.lowered, model.canvas_tokens,
-            model.sliding_window)
-        for alias, predicates in plan.operators().filters.items()
-    }

@@ -14,10 +14,15 @@ from quail.labels import (
     decodable,
     word_starts,
 )
+from quail.logical import LabelWork, effective_selectivity
 from quail.physical import (
     AiClassify,
     ClassifySpec,
+    Filter,
+    InList,
+    PortRef,
 )
+from quail.physical.base import input_ports
 from quail.planner.operators.common import bind_inference, inference_node
 from quail.planner.prompt_lowering import (
     choice_token_parts,
@@ -446,3 +451,88 @@ class ClassifyBuilder(ClassifyStatistics):
             label_token_ids=blocks, scoring=DECISION_SCORING,
             join_layout=(tuple(note), tuple(partner_label)),
             frame_tokens=frame), estimated.work
+
+
+def emit_classify(builder, alias, live=None):
+    """Classify the alias's documents, then keep the accepted labels."""
+    stats = builder.decisions.statistics.stats
+    calls = [call for call, owner in builder.operators.labels.calls
+             if owner == alias and len(call.aliases()) == 1]
+    if not calls or (alias in builder.after_joins and live is None):
+        return
+    table = classify_builder(builder.context, alias, "quail")
+    if live is None:
+        live = builder.live_asked.get(alias, float(stats[alias].n_docs))
+    steps = [(test.call, test)
+             for test in builder.operators.label_filters.get(alias, ())]
+    steps.extend((call, None) for call in calls
+                 if call not in builder.operators.labels.tests)
+    classified_calls = set()
+    scores = None
+    for call, test in steps:
+        if call not in classified_calls:
+            spec, work = table.prepare(
+                call, builder.operators.labels.names[call], live)
+            if builder.scoring is not None:
+                builder.scoring.work += work
+            node = table.node(
+                spec, scores or builder.rows_src.get(alias, builder.ids_src[alias]),
+                              sum(isinstance(n, AiClassify) for n in builder.nodes))
+            builder.nodes.append(node)
+            scores = PortRef(node.node_id, "rows")
+            builder.ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
+            if call in builder.operators.labels.projected:
+                builder.label_ports.append(scores)
+            classified_calls.add(call)
+        if test is not None:
+            lid = f"filter:{alias}:{test.position}"
+            builder.nodes.append(Filter(
+                node_id=lid, inputs=input_ports((scores,)),
+                predicate=InList(builder.operators.labels.names[call], test.values),
+                aliases=(alias,), selectivity=test.selectivity,
+                written_pos=test.position))
+            scores = PortRef(lid, "rows")
+            builder.ids_src[alias] = PortRef(lid, f"ids:{alias}")
+            live *= effective_selectivity(test.selectivity)
+    if scores is not None:
+        builder.rows_src[alias] = scores
+
+
+
+def joined_calls(labels: LabelWork) -> list:
+    """Return classifications of document pairs and their table aliases."""
+    return [(call, call.aliases()) for call, _ in labels.calls
+            if len(call.aliases()) == 2]
+
+
+def emit_joined_classify(builder):
+    """Append the classifications of joined rows after their joins."""
+    stats = builder.decisions.statistics.stats
+    # a classification of joined rows follows the join that keeps them,
+    # in the join's pipeline: each kept row's partner block, question,
+    # and label paths run over the anchor's resident KV
+    for call, aliases in joined_calls(builder.operators.labels):
+        for g, group in enumerate(builder.sequence_groups):
+            anchor = group[0][1]
+            stage = next((spec for spec, _ in group
+                          if set(spec.aliases) == set(aliases)), None)
+            if stage is not None:
+                break
+        else:
+            raise AssertionError(
+                "a classification of joined rows without its join")
+        partner = next(alias for alias in aliases if alias != anchor)
+        table = classify_builder(builder.context, anchor, "quail")
+        join = builder.operators.joins[stage.written_pos]
+        pairs = (effective_selectivity(join.selectivity)
+                 * builder.decisions.live[anchor] * builder.decisions.live[partner])
+        spec, _ = table.classify_joined(
+            call, builder.operators.labels.names[call], partner, pairs,
+            stats[partner].mean_doc_tokens)
+        node = table.node(
+            spec, PortRef(builder.join_ids[stage.written_pos],
+                          f"join_answers:{stage.written_pos}"),
+            sum(isinstance(n, AiClassify) for n in builder.nodes))
+        builder.nodes.append(node)
+        if call in builder.operators.labels.projected:
+            builder.label_ports.append(PortRef(node.node_id, "rows"))
