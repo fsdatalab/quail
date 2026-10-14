@@ -162,7 +162,12 @@ class QuailBackend:
         if gpu_count not in {1, 2, 4, 8}:
             return SupportResult.reject(
                 "Quail requires 1, 2, 4, or 8 GPUs")
-        if (os.environ.get("QUAIL_GDN_PREFILL") == "flashinfer"
+        prefill = os.environ.get("QUAIL_GDN_PREFILL", "auto")
+        if prefill not in ("auto", "triton", "flashinfer"):
+            return SupportResult.reject(
+                f"QUAIL_GDN_PREFILL={prefill!r} is not triton, flashinfer, "
+                f"or auto")
+        if (prefill == "flashinfer"
                 and "gated_delta_net" in model.layer_kinds
                 and device.name != "h100-sxm"):
             return SupportResult.reject(
