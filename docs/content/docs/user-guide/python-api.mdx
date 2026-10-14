@@ -105,7 +105,8 @@ probability output, and limits on classifications of joined rows.
 
 `ai_extract(c, questions, *, name, trim=True)`
 
-`ai_extract()` returns answers that it copies from a document. Pass the
+`ai_extract()` returns the answer to each of your questions, copied
+from a document. Pass the
 document column as a string such as `"c.text"`, or use `col("c.text")`.
 Pass a dictionary that maps each field name to its question. Set `name`
 to the result column you want, and include it in `select()`.
