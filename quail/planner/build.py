@@ -500,7 +500,8 @@ class GraphBuilder:
         result_inputs = (*sink_inputs,
                          *(port for port in score_ports if port not in sink_inputs),
                          *self.label_ports)
-        self.nodes.extend(result_nodes(self.plan.result, result_inputs, tuple(columns)))
+        self.nodes.extend(result_nodes(self.plan.result, result_inputs, tuple(columns),
+                                       self.plan.projection.packing()))
 
     def _finish(self):
         """Build the plan and bind its work estimator."""

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
+from quail.logical.expressions import packed_columns
+
 from ..base import (
     ExecutionLocation,
     OutputPort,
@@ -75,24 +77,39 @@ class Recombine(PhysicalNode):
 
 @dataclass(frozen=True)
 class Project(PhysicalNode):
-    """Select the requested result columns."""
+    """Select the requested result columns.
+
+    Attributes:
+        columns: The selected columns, in order.
+        structs: (struct column, ((field, member column), ...)) pairs.
+            Each struct column takes the place of its first member and
+            holds one field per member; the members leave the result.
+    """
 
     columns: tuple[str, ...] = ()
+    structs: tuple = ()
 
     type_name: ClassVar[str] = "quail.project"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
     @property
+    def result_columns(self) -> tuple[str, ...]:
+        """Return the output column names, with struct members packed."""
+        return packed_columns(self.columns, self.structs)
+
+    @property
     def outputs(self) -> tuple[OutputPort, ...]:
         return (OutputPort(
             "rows",
             ValueType.ROWS,
-            schema=self.columns,
+            schema=self.result_columns,
         ),)
 
     def attributes(self) -> dict:
-        return {"columns": list(self.columns)}
+        return {"columns": list(self.columns),
+                "structs": [[name, [list(field) for field in fields]]
+                            for name, fields in self.structs]}
 
     @classmethod
     def from_attributes(cls, node_id, inputs, attributes):
@@ -100,6 +117,9 @@ class Project(PhysicalNode):
             node_id=node_id,
             inputs=inputs,
             columns=tuple(attributes["columns"]),
+            structs=tuple(
+                (name, tuple(tuple(field) for field in fields))
+                for name, fields in attributes.get("structs", ())),
         )
 
 
