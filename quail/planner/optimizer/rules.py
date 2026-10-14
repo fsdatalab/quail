@@ -9,22 +9,20 @@ if TYPE_CHECKING:
     from quail.planner.optimizer.context import PlanningContext
 
 
-class LogicalRule:
-    """Simplify a query tree or propose equivalent trees for cost comparison."""
+class LogicalRule(ABC):
+    """Return equivalent query trees to compare after physical planning."""
 
     name: str
 
-    def rewrite(
+    @abstractmethod
+    def rewrites(
         self, root: "LogicalNode", context: "PlanningContext",
-    ) -> "LogicalNode | None":
-        """Return a replacement root, or None to keep the input."""
-        return None
+    ) -> "list[LogicalNode]":
+        """Return candidate roots, including root if it should remain a candidate.
 
-    def alternatives(
-        self, root: "LogicalNode", context: "PlanningContext",
-    ) -> "tuple[LogicalNode, ...]":
-        """Return other roots to compare after applying physical rules."""
-        return ()
+        Return [root] for no change, [replacement] to replace it, or multiple
+        roots to compare. The list must not be empty.
+        """
 
 
 class PhysicalRule(ABC):

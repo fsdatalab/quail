@@ -90,3 +90,40 @@ def test_query_scans_provider_and_preserves_extension_objects(
     assert received.plan == response.plan
     assert received.node_metrics == response.node_metrics
     session.close()
+
+
+def test_tokenization_loads_columns_from_every_logical_candidate():
+    from dataclasses import replace
+
+    from quail.logical import Scan as LogicalScan
+    from quail.planner.optimizer.rules import LogicalRule
+
+    class ExtraColumn(LogicalRule):
+        name = "extra_column"
+
+        def rewrites(self, root, context):
+            def visit(node):
+                if isinstance(node, LogicalScan):
+                    return replace(node, columns=(*node.columns, "extra"))
+                return node.with_children(tuple(
+                    visit(child) for child in node.children()))
+
+            if any("extra" in scan.columns
+                   for scan in context.logical_plan.operators().scans):
+                return [root]
+            return [root, visit(root)]
+
+    session = quail.Session(
+        quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+        tokenizer=_tokens)
+    session.registry.register_logical_rule(ExtraColumn())
+    session.register("docs", quail.DocumentProvider.from_table(
+        pa.table({"id": ["a", "b"], "body": ["one", "two"], "extra": [1, 2]}),
+        id_col="id"))
+    query = session.sql(
+        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
+    stores = query.token_inputs()
+    assert stores["d"].column("extra").to_pylist() == [1, 2]
+    assert len(query.plan().settings["candidates"]) == 2
+    assert "extra" not in query.logical.operators().scans[0].columns
+    session.close()

@@ -3,7 +3,7 @@
 from quail.builtins import built_in_registry
 from quail.planner.optimize import plan_query
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import simplify_plan
+from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.rules import built_in_rules
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -27,12 +27,12 @@ def _optimize(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
         gpu_count=kwargs.get("gpus", 1), document_tokens=doc_tokens,
         order=kwargs.get("order"), tokenizer=tok,
         pair_fractions=kwargs.get("pair_fractions") or {})
-    return simplify_plan(logical, built_in_rules(), context)
+    candidate, = logical_alternatives(logical, built_in_rules(), context)
+    return candidate.plan, candidate.rules
 
 
 def _plan(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
     """Plan as a session would: the tree rewrites, then the physical planner."""
-    optimized, _ = _optimize(logical, doc_tokens, model, **kwargs)
-    return plan_query(optimized, model=model, device=H100_SXM,
+    return plan_query(logical, model=model, device=H100_SXM,
                       registry=built_in_registry(),
                       doc_tokens=doc_tokens, tokenizer=tok, **kwargs)

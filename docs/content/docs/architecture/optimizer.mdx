@@ -18,12 +18,12 @@ See [Custom rules](/docs/extending/rules) to add a rule.
 
 1. **Prepare statistics.** Read token counts, or estimate document lengths
    while tokenization runs in the background.
-2. **Simplify the query.** Apply logical rewrites, such as removing
-   unused columns.
-3. **Compare plans.** Consider placements such as extraction before or
-   after joins. Build each candidate and apply its execution settings,
+2. **Rewrite candidates.** Each logical rule returns a list of viable query
+   trees. Projection pushdown replaces a tree; map placement keeps both
+   placements. Apply later rules to every candidate and remove duplicates.
+3. **Compare plans.** Build each candidate and apply its execution settings,
    including KV retention and prefix sharing. Choose the candidate with
-   the lowest estimated time. Keep the original on a tie.
+   the lowest estimated time. Keep the first candidate on a tie.
 4. **Update with exact tokens.** If the first search used estimated lengths,
    repeat it after tokenization. Exact prefixes can change the chosen plan.
 5. **Execute.** Run the selected plan with its tokenized inputs.

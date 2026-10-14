@@ -123,7 +123,7 @@ class KeepTree(LogicalRule):
     def __init__(self, name):
         self.name = name
 
-    def rewrite(self, root, context):
+    def rewrites(self, root, context):
         raise AssertionError("logical rules must not run on physical graphs")
 
 

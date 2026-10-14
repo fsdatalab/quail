@@ -37,26 +37,26 @@ class ShouldEliminateDistinct(LogicalRule):
 
     name = "should_eliminate_distinct"
 
-    def rewrite(self, root, context):
+    def rewrites(self, root, context):
         if not isinstance(root, Result) or not root.distinct:
-            return None
+            return [root]
         if isinstance(root.input, Aggregate):
             # a group's keys name it once in the aggregate's output
-            return (replace(root, distinct=False)
+            return [replace(root, distinct=False)
                     if set(root.input.keys) <= set(root.input.output)
-                    else None)
+                    else root]
         if not isinstance(root.input, Project) or context.catalog is None:
-            return None
+            return [root]
         plan = LogicalPlan(root)
         if any(isinstance(node, Apply) for node in plan.walk()):
-            return None
+            return [root]
         returned = {(ref.alias, ref.column)
                     for ref in root.input.output_schema()}
         for scan in plan.operators().scans:
             id_column = context.catalog.get(scan.provider).id_col
             if (scan.alias, id_column) not in returned:
-                return None
-        return replace(root, distinct=False)
+                return [root]
+        return [replace(root, distinct=False)]
 
 
 class ShouldPushDownDistinct(LogicalRule):
@@ -73,17 +73,17 @@ class ShouldPushDownDistinct(LogicalRule):
 
     name = "should_push_down_distinct"
 
-    def rewrite(self, root, context):
+    def rewrites(self, root, context):
         if not isinstance(root, Result) or not root.distinct:
-            return None
+            return [root]
         if not isinstance(root.input, Project):
-            return None
+            return [root]
         alias = _filtered_alias(LogicalPlan(root).operators())
         if alias is None:
-            return None
+            return [root]
         key = _stop_key(root.input.columns, alias)
         if not key:
-            return None
+            return [root]
 
         def mark(node):
             if isinstance(node, SemanticFilter):
@@ -94,7 +94,7 @@ class ShouldPushDownDistinct(LogicalRule):
                 node.with_children(children))
 
         marked = mark(root)
-        return None if marked == root else marked
+        return [marked]
 
 
 class ShouldPushDownProjection(LogicalRule):
@@ -102,9 +102,9 @@ class ShouldPushDownProjection(LogicalRule):
 
     name = "should_push_down_projection"
 
-    def rewrite(self, root, context):
+    def rewrites(self, root, context):
         rewritten = push_down_projection(root)
-        return None if rewritten is root else rewritten
+        return [rewritten]
 
 
 class ShouldPushDownFilters(LogicalRule):
@@ -119,8 +119,9 @@ class ShouldPushDownFilters(LogicalRule):
 
     name = "should_push_down_filters"
 
-    def rewrite(self, root, context):
-        return push_down_filters(root)
+    def rewrites(self, root, context):
+        rewritten = push_down_filters(root)
+        return [root if rewritten is None else rewritten]
 
 
 class ShouldLiftMaps(LogicalRule):
@@ -128,9 +129,9 @@ class ShouldLiftMaps(LogicalRule):
 
     name = "should_lift_maps"
 
-    def alternatives(self, root, context):
+    def rewrites(self, root, context):
         # Request backends do not implement map placement above joins.
         if context.backend != "quail":
-            return ()
+            return [root]
         rewritten = lift_maps(root)
-        return () if rewritten is None else (rewritten,)
+        return [root] if rewritten is None else [root, rewritten]

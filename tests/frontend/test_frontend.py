@@ -32,7 +32,7 @@ from quail.logical import (
     split_frame,
 )
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import simplify_plan
+from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.rules import built_in_rules
 
@@ -311,8 +311,9 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
     assert pairs.on[0].left == ColumnRef("r", "reviews", "id")
     assert pairs.on[0].right == ColumnRef("p", "products", "asin")
     # the equality columns are loaded as values for the pair table
-    optimized, _ = simplify_plan(
+    candidate, = logical_alternatives(
         plan, built_in_rules(), PlanningContext(catalog=catalog))
+    optimized, _ = candidate.plan, candidate.rules
     scans = {node.alias: node for node in optimized.walk()
              if isinstance(node, Scan)}
     assert "id" in scans["r"].columns and "asin" in scans["p"].columns
@@ -475,8 +476,9 @@ def test_sql_and_builder_parse_order_by_offset_and_distinct(catalog):
              .select("r.id"))
     assert built == plan
     # the sort column is loaded by the scan although it is not returned
-    optimized, _ = simplify_plan(
+    candidate, = logical_alternatives(
         plan, built_in_rules(), PlanningContext(catalog=catalog))
+    optimized, _ = candidate.plan, candidate.rules
     scan = next(node for node in optimized.walk() if isinstance(node, Scan))
     assert "review" in scan.columns
 

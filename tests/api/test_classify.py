@@ -476,7 +476,7 @@ def _candidates(session, query):
         model=session.model, device=session.device, gpu_count=1,
         document_tokens=query._doc_tokens, backend="quail",
         tokenizer=session.tokenizer)
-    return search_candidates(query.logical, context, session.registry)
+    return search_candidates(query._logical_input, context, session.registry)
 
 
 def test_planner_places_and_scores_classifications(session, tmp_path):
@@ -532,10 +532,11 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     assert plan.settings["search_seconds"] == plan.estimated_seconds
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
     assert (staged.exec_idx, staged.anchor) == (0, "r")
-    # The query retains the original logical plan for later searches.
-    assert classified_above_joins(after.logical.root) == frozenset()
+    assert classified_above_joins(after._logical_input.root) == frozenset()
+    assert classified_above_joins(after.logical.root) == {"r"}
     written_candidate, lifted_candidate = _candidates(session, after)
-    assert written_candidate.logical_plan.root == after.logical.root
+    assert classified_above_joins(written_candidate.logical_plan.root) == frozenset()
+    assert lifted_candidate.logical_plan == after.logical
     assert classified_above_joins(lifted_candidate.logical_plan.root) == {"r"}
     assert (lifted_candidate.estimated_seconds
             < written_candidate.estimated_seconds)

@@ -195,7 +195,8 @@ def test_plan_query_keeps_the_cheapest_candidate_and_its_logical_plan(
     plan = query.plan()
     assert plan.settings["planner_source"] == chosen
     written, alternative = rule.seen
-    assert written is query.logical
+    assert query.logical is (written if chosen == "written" else alternative)
+    assert plan.logical_plan is query.logical
     assert alternative is backend.alternative
     assert [candidate["selected"] for candidate in plan.settings["candidates"]] == (
         [True, False] if chosen == "written" else [False, True])

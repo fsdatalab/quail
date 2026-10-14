@@ -76,28 +76,28 @@ class PlacementCost(PhysicalRule):
 def test_graph_refinement_can_reverse_placement_choice(query):
     context = context_for(query)
     registry = query.session.registry
-    original, lifted = search_candidates(query.logical, context, registry)
+    original, lifted = search_candidates(query._logical_input, context, registry)
     assert lifted.estimated_seconds < original.estimated_seconds
     rule = PlacementCost()
     registry.register_physical_rule(rule)
-    chosen = search_plan(query.logical, context, registry)
+    chosen = search_plan(query._logical_input, context, registry)
     assert rule.seen == [False, True]
     assert context.settings == {}
     original, lifted = chosen.settings["candidates"]
     assert original["selected"] and not lifted["selected"]
     assert original["estimated_seconds"] < lifted["estimated_seconds"]
-    assert lifted["rewrites"] == ("should_lift_maps",)
+    assert "should_lift_maps" in lifted["rewrites"]
     assert "test_seen" not in context.settings
     text = query.explain(verbose=True)
     assert "should_lift_maps" in text.split("  physical:")[0]
-    assert "retain logical alternatives" in text
+    assert "rewrite logical candidates" in text
     assert "lowest estimated cost after graph refinement" in text
 
 
 def test_refused_candidate_does_not_hide_a_runnable_plan(query):
     context = context_for(query)
     query.session.registry.register_physical_rule(PlacementCost(refuse=True))
-    plan = search_plan(query.logical, context, query.session.registry)
+    plan = search_plan(query._logical_input, context, query.session.registry)
     assert not isinstance(plan, Refusal)
     original, lifted = plan.settings["candidates"]
     assert original["selected"]
@@ -108,18 +108,19 @@ def test_refused_candidate_does_not_hide_a_runnable_plan(query):
 def test_backend_only_lowers_the_given_alternative(query):
     context = context_for(query)
     backend = query.session.registry.backend("quail")
-    (candidate,) = backend.plan(ModelRegion(query.logical), context)
-    assert candidate.logical_plan == query.logical
+    (candidate,) = backend.plan(ModelRegion(query._logical_input), context)
+    assert candidate.logical_plan == query._logical_input
     assert "retention" not in candidate.plan.settings
     assert "candidates" not in candidate.plan.settings
-    assert len(search_candidates(query.logical, context, query.session.registry)) == 2
+    assert len(search_candidates(
+        query._logical_input, context, query.session.registry)) == 2
 
 
 def test_prefix_sharing_is_priced_for_every_placement(query):
     query.token_inputs()
     context = context_for(query)
     registry = query.session.registry
-    candidates = search_candidates(query.logical, context, registry)
+    candidates = search_candidates(query._logical_input, context, registry)
     assert len(candidates) == 2
     for candidate in candidates:
         (raw,) = registry.backend("quail").plan(
@@ -137,31 +138,25 @@ def test_prefix_sharing_is_priced_for_every_placement(query):
 
 
 def test_logical_alternatives_retain_original_and_deduplicate(query):
-    from quail.planner.optimizer.tree_rewrites import simplify_plan
     from quail.planner.rules.logical import ShouldLiftMaps
 
     context = context_for(query)
     registry = query.session.registry
 
     class CheckCandidateContext(ShouldLiftMaps):
-        def alternatives(self, root, context):
+        def rewrites(self, root, context):
             assert context.logical_plan.root is root
             assert context.settings == {}
             context.settings["tree_rule_setting"] = True
-            return super().alternatives(root, context)
+            return super().rewrites(root, context)
 
     registry.register_logical_rule(CheckCandidateContext(), name="duplicate_lift")
     with pytest.raises(ValueError, match="duplicate"):
         registry.register_logical_rule(ShouldLiftMaps())
-    simplified, changed = simplify_plan(
-        query.logical, tuple(registry.rules.values()),
-        context)
-    assert simplified == query.logical
-    assert "should_lift_maps" not in changed
-    original, lifted = search_candidates(query.logical, context, registry)
-    assert original.logical_plan == query.logical
-    assert original.rewrites == ()
-    assert lifted.rewrites == ("should_lift_maps",)
+    original, lifted = search_candidates(query._logical_input, context, registry)
+    assert not extracted_above_joins(original.logical_plan.root)
+    assert "should_lift_maps" not in original.rewrites
+    assert "should_lift_maps" in lifted.rewrites
     assert context.settings == {}
     assert "tree_rule_setting" not in original.plan.settings
     assert "tree_rule_setting" not in lifted.plan.settings
@@ -172,9 +167,13 @@ def test_exact_tokenization_reconsiders_placement(query):
     query.session.registry.register_physical_rule(rule)
     first = query.plan()
     assert first.settings["candidates"][1]["selected"]
+    assert extracted_above_joins(query.logical.root)
+    assert query.logical is first.logical_plan
     request = query._prepare_physical()
     final = query.plan()
     assert final.settings["candidates"][0]["selected"]
+    assert not extracted_above_joins(query.logical.root)
+    assert query.logical is final.logical_plan
     assert request.plan["settings"]["candidates"] == final.settings["candidates"]
     assert rule.seen == [False, True, False, True]
     assert final.settings["test_seen"] is False
@@ -196,9 +195,9 @@ def test_logical_alternatives_finish_before_physical_rules(query):
     class RecordTrees(LogicalRule):
         name = "record_trees"
 
-        def alternatives(self, root, context):
+        def rewrites(self, root, context):
             events.append("logical")
-            return ()
+            return [root]
 
     class RecordGraphs(PhysicalRule):
         name = "record_graphs"
@@ -210,7 +209,7 @@ def test_logical_alternatives_finish_before_physical_rules(query):
     registry = query.session.registry
     registry.register_physical_rule(RecordGraphs())
     registry.register_logical_rule(RecordTrees())
-    candidates = search_candidates(query.logical, context, registry)
+    candidates = search_candidates(query._logical_input, context, registry)
     assert len(candidates) == 2
     first_physical = events.index("physical")
     assert first_physical > 0

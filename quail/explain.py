@@ -548,7 +548,7 @@ def rule_lines(rules) -> list[str]:
         "  logical: " + names(rule for rule in rules if isinstance(rule, LogicalRule)),
         "  physical: " + names(
             rule for rule in rules if isinstance(rule, PhysicalRule)),
-        "  search: simplify, retain logical alternatives, "
+        "  search: rewrite logical candidates, "
         "then lower each alternative",
         "  refine each graph in order: " + names(
             rule for rule in rules if isinstance(rule, PhysicalRule)),

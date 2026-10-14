@@ -27,7 +27,7 @@ from quail.logical import (
 from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import simplify_plan
+from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import Refusal, RefusalError
 from quail.planner.search.statistics import filter_stop_keys
 
@@ -66,6 +66,7 @@ class Query:
                  order: str | None = None):
         self.session = session
         self.logical = logical
+        self._logical_input = logical
         self.order = order
         self._plan = None
         self._searched_plan = None
@@ -136,18 +137,26 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions)
-            self.logical, changed = simplify_plan(
-                self.logical,
+            candidates = logical_alternatives(
+                self._logical_input,
                 tuple(self.session.registry.logical_rules.values()),
                 context)
-            rewritten = self.logical.operators()
+            self.logical = candidates[0].plan
+            scans = {}
+            offset_aliases = set()
+            for candidate in candidates:
+                operators = candidate.plan.operators()
+                offset_aliases.update(alias for extract in operators.extracts
+                                      for alias in extract.call.aliases())
+                for scan in operators.scans:
+                    previous = scans.get(scan.alias, scan)
+                    scans[scan.alias] = replace(scan, columns=tuple(dict.fromkeys(
+                        (*previous.columns, *scan.columns))))
             backend = self.session.registry.backend(config.backend)
             # an extension backend may leave the capability flags unset
             reads_text = getattr(backend, "reads_document_text", False)
             locates_answers = getattr(backend, "locates_answers_in_text", False)
-            offset_aliases = {alias for extract in rewritten.extracts
-                              for alias in extract.call.aliases()}
-            for s in rewritten.scans:
+            for s in scans.values():
                 columns = s.columns
                 with_offsets = locates_answers and s.alias in offset_aliases
                 if reads_text:
@@ -165,7 +174,7 @@ class Query:
                 future.add_done_callback(record_finished)
                 self._token_futures[s.alias] = future
             self._plan = plan_query(
-                self.logical, model=self.session.model,
+                self._logical_input, model=self.session.model,
                 device=self.session.device,
                 doc_tokens=self._doc_tokens,
                 gpus=config.gpus,
@@ -178,7 +187,9 @@ class Query:
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions,
                 memo=context.memo, catalog=self.session.catalog,
-                engine_config=config)
+                engine_config=config, logical_candidates=candidates)
+            if not isinstance(self._plan, Refusal):
+                self.logical = self._plan.logical_plan
             extra = {}
             if config.gpu_timing:
                 extra["gpu_timing"] = True
@@ -316,9 +327,11 @@ class Query:
                 pair_fractions=self._pair_selectivities)
             if self._plan is self._searched_plan:
                 self._plan = plan_query(
-                    self.logical, scan_fractions=self._scan_selectivities,
+                    self._logical_input, scan_fractions=self._scan_selectivities,
                     catalog=self.session.catalog, engine_config=self.session.config,
                     **options)
+                if not isinstance(self._plan, Refusal):
+                    self.logical = self._plan.logical_plan
             else:
                 # Explicit physical edits must survive exact tokenization.
                 self._plan = refine_plan(self._plan, **options)

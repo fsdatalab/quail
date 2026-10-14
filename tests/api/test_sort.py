@@ -17,7 +17,7 @@ from quail.physical import AiFilter, Project, Sort
 from quail.physical.base import input_ports
 from quail.planner import plan_query
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import simplify_plan
+from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.rules import built_in_rules
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -36,7 +36,8 @@ def _optimize_with(catalog, logical, tokens):
     context = PlanningContext(
         catalog=catalog, model=QWEN3_4B_FP8, device=H100_SXM,
         document_tokens=tokens, tokenizer=tok)
-    return simplify_plan(logical, built_in_rules(), context)
+    candidate, = logical_alternatives(logical, built_in_rules(), context)
+    return candidate.plan, candidate.rules
 
 
 def _sort(**fields):

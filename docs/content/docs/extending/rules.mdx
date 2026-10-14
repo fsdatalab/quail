@@ -8,16 +8,20 @@ Both receive the same `PlanningContext`.
 
 ## Logical rules
 
-Import `LogicalRule` from `quail.planner.optimizer.rules` and override the
-method you need:
+Import `LogicalRule` from `quail.planner.optimizer.rules` and implement
+`rewrites(root, context)`. Return a nonempty list of equivalent query tree
+roots. The list replaces the input candidate:
 
-| Method | Return | Planner behavior |
-| --- | --- | --- |
-| `rewrite(root, context)` | A replacement root, or `None`. | Replace the current tree without a cost comparison. |
-| `alternatives(root, context)` | A tuple of other roots, or `()`. | Keep the original too. Build and refine every candidate before comparing costs. |
+| Return | Meaning |
+| --- | --- |
+| `[root]` | Keep the input unchanged. |
+| `[rewritten]` | Replace the input. |
+| `[root, rewritten]` | Keep both for cost comparison. |
 
-The base class leaves the tree unchanged and proposes no alternatives.
-Do not modify the input nodes.
+Include the input root explicitly to keep it. Do not modify input nodes.
+Each later rule runs on every returned candidate. The planner removes duplicate
+trees and compares costs after physical rules run. On a cost tie, it keeps the
+first candidate.
 
 For example, imagine a query that extracts a date from each document and
 joins those documents with questions. Extraction can run before or after
@@ -31,11 +35,11 @@ from quail.planner.rules.tree_transforms import lift_maps
 class ShouldLiftMaps(LogicalRule):
     name = "should_lift_maps"
 
-    def alternatives(self, root, context):
+    def rewrites(self, root, context):
         if context.backend != "quail":
-            return ()
+            return [root]
         rewritten = lift_maps(root)
-        return () if rewritten is None else (rewritten,)
+        return [root] if rewritten is None else [root, rewritten]
 ```
 
 The planner applies KV retention, prefix sharing, and the other physical
@@ -72,10 +76,10 @@ your rule with the method matching its base class:
 Pass the registry to the session. Quail already registers `ShouldLiftMaps`;
 do not register it again. Rules run in registration order within each step:
 
-1. Apply logical `rewrite()` methods until nothing changes, up to four passes.
-2. Collect logical `alternatives()`, keeping the original and removing
-   duplicates, up to four passes.
-3. Build an executable graph for each tree and apply physical `rewrite()` methods.
+1. Apply logical `rewrites()` to every candidate in registration order. Remove
+   duplicate trees. Repeat until the roots stop changing, up to four passes.
+2. Build an executable graph for each tree.
+3. Apply physical `rewrite()` methods to each graph in registration order.
 4. Select the candidate with the lowest estimated time.
 
 If initial planning used estimated token lengths, repeat the search when

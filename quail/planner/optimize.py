@@ -18,11 +18,11 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                scan_fractions=None,
                canvas_draws: int = 4,
                attention: str | None = None, memo=None,
-               catalog=None, engine_config=None):
+               catalog=None, engine_config=None, logical_candidates=None):
     """Plan one query with the selected model backend.
 
     Args:
-        plan: The logical plan to plan, as the tree rewrites left it.
+        plan: The input logical plan.
         model: Model spec.
         device: Device spec.
         doc_tokens: Per document token counts for each table alias.
@@ -46,6 +46,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             as its statistics, for the physical planner to reuse.
         catalog: Catalog available to tree rewrites during search.
         engine_config: Session configuration available to tree rewrites.
+        logical_candidates: Already rewritten trees, or None to run logical rules.
 
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
@@ -90,16 +91,20 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         memo={} if memo is None else memo,
         catalog=catalog, engine_config=engine_config,
     )
-    return search_plan(plan, context, registry)
+    return search_plan(
+        plan, context, registry, logical_candidates=logical_candidates)
 
 
-def search_candidates(logical, context, registry) -> tuple[PhysicalCandidate, ...]:
+def search_candidates(
+    logical, context, registry, *, logical_candidates=None,
+) -> tuple[PhysicalCandidate, ...]:
     """Lower and refine every logical alternative before comparing costs."""
     backend = registry.backend(context.backend)
     planners = (backend, *registry.physical_planners.values())
     rules = tuple(registry.physical_rules.values())
-    alternatives = logical_alternatives(
+    alternatives = (logical_alternatives(
         logical, tuple(registry.logical_rules.values()), context)
+        if logical_candidates is None else logical_candidates)
     candidates = []
     for alternative in alternatives:
         candidate_context = replace(
@@ -130,15 +135,16 @@ def search_candidates(logical, context, registry) -> tuple[PhysicalCandidate, ..
     return tuple(candidates)
 
 
-def search_plan(logical, context, registry):
+def search_plan(logical, context, registry, *, logical_candidates=None):
     """Select the cheapest refined candidate and record the comparison."""
-    candidates = search_candidates(logical, context, registry)
+    candidates = search_candidates(
+        logical, context, registry, logical_candidates=logical_candidates)
     if not candidates:
         return Refusal(
             reasons=(f"backend {context.backend!r} could not produce a plan",),
             constraint="no_physical_plan",
             needed=1, available=0, unit="plans")
-    # Original alternatives come first, so min preserves them on a cost tie.
+    # Candidate order breaks cost ties; built-in rules return the original first.
     selected = min(range(len(candidates)),
                    key=lambda index: candidates[index].estimated_seconds)
     plan = candidates[selected].plan
@@ -152,7 +158,9 @@ def search_plan(logical, context, registry):
                     if isinstance(candidate.plan, Refusal) else None),
         "selected": index == selected,
     } for index, candidate in enumerate(candidates))
-    return replace(plan, settings={**plan.settings, "candidates": comparison})
+    return replace(
+        plan, logical_plan=candidates[selected].logical_plan,
+        settings={**plan.settings, "candidates": comparison})
 
 
 def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
