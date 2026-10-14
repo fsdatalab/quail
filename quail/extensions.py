@@ -12,13 +12,15 @@ from quail.physical import NodeCodec, PhysicalNode
 if TYPE_CHECKING:
     from quail.backends.base import ModelBackend
     from quail.execution.runner import ExecutionObserver, NodeRuntime
+    from quail.planner.optimizer.alternatives import LogicalAlternativeRule
     from quail.planner.optimizer.logical import LogicalOptimizerRule
     from quail.planner.optimizer.physical import PhysicalOptimizerRule, PhysicalPlanner
     from quail.specs import DeviceSpec, ModelSpec
 
 
 _KINDS = {
-    "logical_rule", "physical_planner", "physical_rule", "backend",
+    "logical_rule", "logical_alternative", "physical_planner", "physical_rule",
+    "backend",
     "model", "device", "codec", "runtime", "observer", "function",
 }
 
@@ -52,6 +54,10 @@ class ExtensionRegistry:
     @property
     def physical_planners(self) -> Mapping[str, PhysicalPlanner]:
         return self._values("physical_planner")
+
+    @property
+    def logical_alternatives(self) -> Mapping[str, LogicalAlternativeRule]:
+        return self._values("logical_alternative")
 
     @property
     def physical_rules(self) -> Mapping[str, PhysicalOptimizerRule]:
@@ -177,6 +183,13 @@ class ExtensionRegistry:
         return self._add(
             "physical_planner", planner.name if name is None else name, planner,
         )
+
+    def register_logical_alternative(
+        self, rule: LogicalAlternativeRule, *, name: str | None = None,
+    ) -> ExtensionRegistry:
+        """Register a rule that offers equivalent logical plans for search."""
+        return self._add(
+            "logical_alternative", rule.name if name is None else name, rule)
 
     def register_physical_rule(
         self, rule: PhysicalOptimizerRule, *, name: str | None = None,

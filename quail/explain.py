@@ -537,7 +537,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
     return "\n".join(lines)
 
 
-def rule_lines(logical_rules, physical_rules) -> list[str]:
+def rule_lines(logical_rules, physical_rules, alternative_rules=()) -> list[str]:
     """Return the optimizer rules in run order, each marked by kind.
 
     A rule is cost-based when its ``cost_based`` attribute is true and
@@ -548,11 +548,13 @@ def rule_lines(logical_rules, physical_rules) -> list[str]:
             rule.name + ("*" if getattr(rule, "cost_based", False) else "")
             for rule in rules) or "none"
 
-    return ["rules, in run order (* cost-based, others heuristic):",
+    return ["rules and search order (* compares costs):",
             f"  logical: {names(logical_rules)}",
+            f"  search alternatives: {names(alternative_rules)}",
             "  physical: building the plan (filter order*, join order and "
-            "anchors*, and on Quail classification placement*), then "
-            f"{names(physical_rules)}"]
+            "anchors*), then "
+            f"{names(physical_rules)} on every candidate",
+            "  selection: lowest estimated cost after physical rules"]
 
 
 def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
@@ -569,8 +571,8 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
             node shows its measured rows, time, and tokens next to the
             estimates, and the measured totals follow the tree.
         usd_per_hour: Price of one GPU, for the measured cost per query.
-        rules: The registered logical rules and physical rules, as a
-            pair of sequences, listed when verbose.
+        rules: Sequences of logical rules, physical rules, and optionally
+            logical alternative rules, listed when verbose.
     """
     lines = ["logical:"]
     lines.extend("  " + line for line in logical_tree(logical).splitlines())

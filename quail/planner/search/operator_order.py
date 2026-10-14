@@ -4,17 +4,19 @@ from dataclasses import dataclass
 
 from quail.cost import budgets
 from quail.cost.work import Work
-from quail.logical import CompileError, has_score
+from quail.logical import (
+    CompileError,
+    LogicalPlan,
+    SemanticFilter,
+    has_score,
+    model_call,
+)
 from quail.logical.plan import Operators
 from quail.planner.operators.common import question_tokens
+from quail.planner.operators.filter import filter_alias_work, prepare_filter_costs
 from quail.planner.plan import Refusal
 from quail.planner.search import join_order as joinsearch
-from quail.planner.search.filter_order import default_order_rule
-from quail.planner.search.ordering import (
-    choose_filter_orders,
-    choose_join_sequence,
-    filter_works,
-)
+from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.search.statistics import (
     PlanStatistics,
     cached_statistics,
@@ -26,10 +28,11 @@ from quail.planner.validation import (
     join_input_tokens,
     score_refusal,
 )
+from quail.specs import ModelSpec
 
 
 @dataclass(frozen=True)
-class PlanDecisions:
+class OperatorOrder:
     """Operator order, input statistics, and work estimates for graph construction."""
 
     operators: Operators
@@ -105,7 +108,7 @@ def validate_query(plan, operators, context, model, device, gpus):
     return None
 
 
-def choose_plan(plan, operators, model, device, doc_tokens, order,
+def choose_operator_order(plan, operators, model, device, doc_tokens, order,
                 pair_fractions, context, scan_fractions):
     """Choose operator order and estimate work without constructing graph nodes."""
     scans, filters, joins = operators.scans, operators.filters, operators.joins
@@ -162,5 +165,107 @@ def choose_plan(plan, operators, model, device, doc_tokens, order,
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
 
-    return PlanDecisions(operators, statistics, orders, seq, join_steps,
+    return OperatorOrder(operators, statistics, orders, seq, join_steps,
                          live0, works, rule, source)
+
+
+def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
+                 model: ModelSpec, orders: dict) -> dict:
+    """Return the expected Work of each table's filter sequence in run order.
+
+    Args:
+        plan: The logical plan.
+        statistics: The plan's statistics.
+        model: Model spec.
+        orders: alias -> written positions of its model predicates in
+            run order.
+    """
+    return {
+        alias: filter_alias_work(
+            predicates, statistics.stats[alias],
+            [i for i in orders.get(alias, []) if i in statistics.asks[alias]],
+            statistics.pre, statistics.lowered, model.canvas_tokens,
+            model.sliding_window)
+        for alias, predicates in plan.operators().filters.items()
+    }
+
+
+def choose_filter_orders(plan: LogicalPlan, statistics: PlanStatistics, *,
+                         model, device, rule: str, context=None) -> dict:
+    """Return alias -> written positions of its model predicates in run order.
+
+    Each SemanticFilter's predicates are ordered by order_filters_indexed:
+    every predicate is tried first, and later predicates are ranked by
+    cost per expected rejection. With rule "as_written", each filter
+    keeps its written order. A written position counts the alias's
+    predicates over every SemanticFilter, lowest node first, as
+    Operators lists them.
+
+    Args:
+        plan: The logical plan.
+        statistics: The plan's statistics.
+        model: Model spec.
+        device: Device spec.
+        rule: "by_cost" or "as_written".
+        context: The planning context, needed to price AI.SCORE
+            predicates.
+    """
+    counted = {}
+    orders = {}
+    for node in plan.walk():
+        if not isinstance(node, SemanticFilter):
+            continue
+        positions = []
+        for predicate in node.predicates:
+            (alias,) = model_call(predicate.expression).aliases()
+            positions.append((alias, counted.get(alias, 0)))
+            counted[alias] = counted.get(alias, 0) + 1
+        (alias,) = model_call(node.predicates[0].expression).aliases()
+        costs = prepare_filter_costs(
+            node.predicates,
+            prefix_tokens=(statistics.pre
+                           + statistics.stats[alias].mean_doc_tokens),
+            model=model, device=device, chunk_tokens=statistics.chunk,
+            context=context)
+        ordered = order_filters_indexed(
+            costs, rule, count=statistics.stats[alias].n_docs)
+        for index in ordered:
+            owner, position = positions[index]
+            orders.setdefault(owner, []).append(position)
+    return orders
+
+
+def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
+                         orders: dict, *, model, device, rule: str) -> list:
+    """Return [(written position, anchor)] for the joins in run order.
+
+    The left-deep search (join_order.search_joins) prices every
+    connected stage order with every anchor choice together, ranking
+    each by the whole query's estimated seconds with the filter sequences
+    in their chosen order. A written anchor is kept. With rule
+    "as_written", only the anchors are chosen. When no connected
+    left-deep order exists, the written order is priced.
+
+    Args:
+        plan: The logical plan.
+        statistics: The plan's statistics.
+        orders: alias -> written positions of its model predicates in
+            run order, from choose_filter_orders.
+        model: Model spec.
+        device: Device spec.
+        rule: "by_cost" or "as_written".
+    """
+    if not plan.operators().joins:
+        return []
+    base_work = sum(
+        filter_works(plan, statistics, model, orders).values(), Work())
+    live = live_after_filters(plan, statistics)
+    filtered = set(plan.operators().all_filters())
+    arguments = (statistics.specs, live, statistics.lengths, filtered,
+                 statistics.pre, statistics.chunk, model, device)
+    found = joinsearch.search_joins(
+        *arguments, base_work=base_work, fixed_order=rule == "as_written")
+    if found is None:
+        found = joinsearch.search_joins(
+            *arguments, base_work=base_work, fixed_order=True)
+    return list(found.seq)

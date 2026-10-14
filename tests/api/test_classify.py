@@ -467,16 +467,16 @@ def _corpus(session, tmp_path, name, column, rows, words):
 
 
 def _candidates(session, query):
-    """Return the Quail backend's candidates for a planned query."""
-    from quail.planner.optimizer.physical import ModelRegion, PlanningContext
+    """Return the planner's refined candidates for a planned query."""
+    from quail.planner.api import search_candidates
+    from quail.planner.optimizer.physical import PlanningContext
 
     query.plan()
     context = PlanningContext(
         model=session.model, device=session.device, gpu_count=1,
         document_tokens=query._doc_tokens, backend="quail",
         tokenizer=session.tokenizer)
-    return session.registry.backend("quail").plan(
-        ModelRegion(query.logical), context)
+    return search_candidates(query.logical, context, session.registry)
 
 
 def test_planner_places_and_scores_classifications(session, tmp_path):
@@ -491,7 +491,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
         "distinct_elimination", "distinct_pushdown", "projection_pushdown",
         "filter_pushdown"]
     assert [rule.name for rule in built_in_physical_rules()] == [
-        "limit_pushdown", "kv_retention", "choose_classify_implementation",
+        "limit_pushdown", "choose_classify_implementation", "kv_retention",
         "prefix_sharing", "tree_attention"]
     plan = _topic(session).plan()
     # choose_classify_implementation chose every classification's scoring rule
@@ -533,9 +533,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     assert plan.settings["search_seconds"] == plan.estimated_seconds
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
     assert (staged.exec_idx, staged.anchor) == (0, "r")
-    # the logical plan keeps the classification where it was written;
-    # the backend priced it there and above the join, and the lifted
-    # candidate was cheaper
+    # The query retains the original logical plan for later searches.
     assert classified_above_joins(after.logical.root) == frozenset()
     written_candidate, lifted_candidate = _candidates(session, after)
     assert written_candidate.logical_plan.root == after.logical.root
@@ -552,7 +550,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
         device=session.device, document_tokens=after._doc_tokens,
         tokenizer=session.tokenizer)
     assert pricing.estimated_seconds(
-        lifted_candidate.logical_plan, logical_context) == (
+        lifted_candidate.logical_plan, logical_context, session.registry) == (
         lifted_candidate.estimated_seconds)
     logical_text, physical_text = after.explain().split("physical:")
     assert "SemanticClassify: topic" in logical_text

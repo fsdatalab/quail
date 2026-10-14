@@ -67,6 +67,7 @@ class Query:
         self.logical = logical
         self.order = order
         self._plan = None
+        self._searched_plan = None
         self._doc_tokens = None
         self._token_inputs = None
         self._token_futures = {}
@@ -74,6 +75,10 @@ class Query:
         self._estimated = ()
         self._planning_started_at = None
         self._planning_finished_at = None
+        self._replanning_s = 0.0
+        self._replanning_finished_at = None
+        self._scan_selectivities = {}
+        self._pair_selectivities = {}
         self.token_wait_s = 0.0
 
     def token_inputs(self) -> dict:
@@ -118,6 +123,8 @@ class Query:
             scan_fractions = self._scan_fractions(operators.scans)
             pair_fractions = self._pair_fractions(
                 operators.scans, operators.joins)
+            self._scan_selectivities = scan_fractions
+            self._pair_selectivities = pair_fractions
             context = LogicalPlanningContext(
                 self.session.catalog, config,
                 model=self.session.model, device=self.session.device,
@@ -177,6 +184,7 @@ class Query:
                 self._plan = replace(self._plan, settings={
                     **self._plan.settings, **extra})
             self._planning_finished_at = time.perf_counter()
+            self._searched_plan = self._plan
         return self._plan
 
     @property
@@ -185,7 +193,7 @@ class Query:
         if self._planning_started_at is None:
             return 0.0
         finished = self._planning_finished_at or time.perf_counter()
-        return finished - self._planning_started_at
+        return finished - self._planning_started_at + self._replanning_s
 
     @property
     def input_ready_s(self) -> float:
@@ -194,6 +202,7 @@ class Query:
             return 0.0
         finished = [
             self._planning_finished_at or time.perf_counter(),
+            self._replanning_finished_at or 0.0,
             *self._token_finished_at.values(),
         ]
         return max(finished) - self._planning_started_at
@@ -255,6 +264,7 @@ class Query:
         result = None
         if analyze:
             result = self.run()
+            physical = self._plan
             # the root relation is lazy, so its row count is taken here
             rows = result.count()
             root = physical.graph.root.node_id
@@ -267,7 +277,8 @@ class Query:
         text = explain(self.logical, physical, verbose=verbose,
                        result=result,
                        rules=(tuple(registry.logical_rules.values()),
-                              tuple(registry.physical_rules.values())),
+                              tuple(registry.physical_rules.values()),
+                              tuple(registry.logical_alternatives.values())),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
         if self._estimated:
@@ -280,8 +291,8 @@ class Query:
     def wait_for_tokens(self) -> None:
         """Block until every background tokenization has finished.
 
-        A plan made on estimated lengths then gets the physical rules
-        that read the token stores applied with the exact inputs.
+        A plan made on estimated lengths is searched again with exact inputs,
+        so prefix sharing can change which logical alternative wins.
         """
         started = time.perf_counter()
         refine = bool(self._token_futures)
@@ -292,15 +303,30 @@ class Query:
             del self._token_futures[alias]
         self.token_wait_s += time.perf_counter() - started
         if refine and self._plan is not None:
-            self._plan = refine_plan(
-                self._plan, model=self.session.model,
+            started = time.perf_counter()
+            options = dict(
+                model=self.session.model,
                 device=self.session.device, doc_tokens=self._doc_tokens,
                 gpus=self.session.config.gpus, order=self.order,
                 canvas_draws=self.session.config.canvas_draws,
                 attention=self.session.config.attention,
                 backend=self.session.config.backend,
                 registry=self.session.registry,
-                tokenizer=self.session.tokenizer)
+                tokenizer=self.session.tokenizer,
+                pair_fractions=self._pair_selectivities)
+            if self._plan is self._searched_plan:
+                self._plan = plan_query(
+                    self.logical, scan_fractions=self._scan_selectivities,
+                    **options)
+            else:
+                # Explicit physical edits must survive exact tokenization.
+                self._plan = refine_plan(self._plan, **options)
+            if self.session.config.gpu_timing and not isinstance(self._plan, Refusal):
+                self._plan = replace(self._plan, settings={
+                    **self._plan.settings, "gpu_timing": True})
+            self._replanning_s += time.perf_counter() - started
+            self._replanning_finished_at = time.perf_counter()
+            self._estimated = ()
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.
@@ -332,10 +358,13 @@ class Query:
 
     def _prepare_physical(self):
         """Bind the query's tokenized inputs to its physical plan."""
+        self.plan()
+        self.wait_for_tokens()
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)
-        self.wait_for_tokens()
+        plan.graph.validate(runtime_keys=set(self.session.registry.runtimes))
+        plan.graph.validate_backend(plan.backend)
         inputs = {}
         logical_scans = {
             scan.alias: scan for scan in self.logical.operators().scans

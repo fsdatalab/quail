@@ -160,9 +160,8 @@ class ChooseClassifyImplementation:
     head. A classification of joined rows always uses letters and
     arrives chosen.
 
-    The rule adds the chosen rules' seconds to the ``search_seconds``
-    setting. It needs the logical plan on the context for the calls'
-    prompts.
+    The physical rule pass updates the plan cost from the chosen specs.
+    The rule needs the logical plan on the context for the calls' prompts.
     """
 
     name = "choose_classify_implementation"
@@ -195,10 +194,6 @@ class ChooseClassifyImplementation:
                 work = table.estimate_spec(chosen[node.node_id].spec, resident).work
                 context.settings["estimated_fresh_tokens"] += work.tokens
                 context.settings["estimated_attention_pairs"] += work.pairs
-        context.settings["search_seconds"] = (
-            context.settings.get("search_seconds", 0.0)
-            + sum(node.spec.estimated_seconds for node in chosen.values())
-            - sum(node.spec.estimated_seconds for node in pending))
         return PhysicalGraph(
             tuple(chosen.get(node.node_id, node) for node in graph.nodes),
             graph.root)
@@ -433,11 +428,13 @@ class TreeAttention:
 def built_in_physical_rules() -> tuple:
     """Return the physical rules registered with the built in registry.
 
-    In order: limit_pushdown, kv_retention, choose_classify_implementation,
-    prefix_sharing, and tree_attention. prefix_sharing follows
+    In order: limit_pushdown, choose_classify_implementation, kv_retention,
+    prefix_sharing, and tree_attention. Implementation selection precedes
+    kv_retention so pipeline compatibility uses the selected prompts.
+    prefix_sharing follows
     kv_retention because it weighs the page writes a sequence already
     makes, and tree_attention follows prefix_sharing because a filter's
     attention path depends on the prefixes it shares.
     """
-    return (LimitPushdown(), KvRetention(), ChooseClassifyImplementation(),
+    return (LimitPushdown(), ChooseClassifyImplementation(), KvRetention(),
             PrefixSharing(), TreeAttention())

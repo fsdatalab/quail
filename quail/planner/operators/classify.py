@@ -455,7 +455,7 @@ class ClassifyBuilder(ClassifyStatistics):
 
 def emit_classify(builder, alias, live=None):
     """Classify the alias's documents, then keep the accepted labels."""
-    stats = builder.decisions.statistics.stats
+    stats = builder.operator_order.statistics.stats
     calls = [call for call, owner in builder.operators.labels.calls
              if owner == alias and len(call.aliases()) == 1]
     if not calls or (alias in builder.after_joins and live is None):
@@ -507,7 +507,7 @@ def joined_calls(labels: LabelWork) -> list:
 
 def emit_joined_classify(builder):
     """Append the classifications of joined rows after their joins."""
-    stats = builder.decisions.statistics.stats
+    stats = builder.operator_order.statistics.stats
     # a classification of joined rows follows the join that keeps them,
     # in the join's pipeline: each kept row's partner block, question,
     # and label paths run over the anchor's resident KV
@@ -525,7 +525,8 @@ def emit_joined_classify(builder):
         table = classify_builder(builder.context, anchor, "quail")
         join = builder.operators.joins[stage.written_pos]
         pairs = (effective_selectivity(join.selectivity)
-                 * builder.decisions.live[anchor] * builder.decisions.live[partner])
+                 * builder.operator_order.live[anchor]
+                 * builder.operator_order.live[partner])
         spec, _ = table.classify_joined(
             call, builder.operators.labels.names[call], partner, pairs,
             stats[partner].mean_doc_tokens)

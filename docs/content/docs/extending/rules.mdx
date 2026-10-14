@@ -10,6 +10,8 @@ For Quail's existing rules, see the [optimizer](/docs/architecture/optimizer).
 
 - A *logical rule* changes the logical plan, such as which columns a
   scan loads.
+- A *logical alternative rule* offers equivalent logical plans for cost
+  comparison, retaining the original plan.
 - A *physical rule* changes the physical plan, such as an operator's
   execution settings.
 
@@ -51,9 +53,17 @@ For a physical rule, implement `rewrite(graph, context)`.
 Return a new `PhysicalGraph` when you change the plan, or `None` when
 no change is needed.
 
+For a logical alternative rule, implement `alternatives(root, context)`.
+Return a tuple of equivalent logical roots, or an empty tuple when none
+apply. The planner retains the original, deduplicates equal roots, and
+lowers and refines every alternative before selecting by cost. Check
+`context.backend` if the alternatives require a particular engine's
+lowering support, as the built-in `LiftMaps` rule does.
+
 Set `cost_based = True` on a rule that compares costs; `explain(verbose=True)`
-marks such rules. `quail.planner.pricing.estimated_seconds(plan, context)`
-prices a logical plan the way the planner does.
+marks such rules.
+`quail.planner.pricing.estimated_seconds(plan, context, registry)` runs the
+same complete search as the planner, including the registered physical rules.
 
 The *planning context* provides the engine configuration and input
 statistics available to a rule. See
@@ -71,6 +81,7 @@ and register it with the method for its type:
 | Rule type | Registration method |
 | --- | --- |
 | Logical | `registry.register_logical_rule(rule)` |
+| Logical alternative | `registry.register_logical_alternative(rule)` |
 | Physical | `registry.register_physical_rule(rule)` |
 
 Pass the registry to the session.
@@ -82,8 +93,12 @@ The example shows its interface; you do not need to register it again.
 - Your rules run after Quail's existing rules, in registration order.
 - For logical rules, one *pass* applies all rules once. Quail repeats
   passes until a pass makes no changes, with a maximum of four passes.
-- Quail applies each physical rule once when it builds a physical plan.
-  It can apply physical rules again after tokenization.
+- Logical alternative rules expand the known alternatives until no new
+  plan appears, with a maximum of four passes. The original stays first.
+- Quail applies each physical rule once to every candidate before comparing
+  costs. It repeats the search when exact token sequences become available.
+- Rule settings belong to one candidate. The context memo is shared for
+  reusable statistics; memo keys must include all inputs that affect a value.
 
 ## Check the rule
 

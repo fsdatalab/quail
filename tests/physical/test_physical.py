@@ -192,11 +192,12 @@ def test_plan_query_keeps_the_cheapest_candidate_and_its_logical_plan(
     query = session.sql(
         "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
     plan = query.plan()
-    # on a tie the first candidate wins; the physical rules read the
-    # chosen candidate's logical plan
     assert plan.settings["planner_source"] == chosen
-    (seen,) = rule.seen
-    assert (seen is backend.alternative) == (chosen == "alternative")
+    written, alternative = rule.seen
+    assert written is query.logical
+    assert alternative is backend.alternative
+    assert [candidate["selected"] for candidate in plan.settings["candidates"]] == (
+        [True, False] if chosen == "written" else [False, True])
 
 
 def test_physical_extensions_plan_validate_and_execute(monkeypatch):

@@ -267,7 +267,7 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     moves above the topmost join, under the root Project, in scan
     order. A classification or extraction of a table that no join
     reads stays. The map operators here are SemanticClassify and
-    SemanticExtract. The backend prices the rewritten plan alongside
+    SemanticExtract. The planner prices the rewritten plan alongside
     the original plan.
 
     Returns:
@@ -309,6 +309,24 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
                 spine = node.with_children((spine,))
     lifted = root.with_children((spine,))
     return None if lifted == root else lifted
+
+
+class LiftMaps:
+    """Offer classification and extraction placement above joins on Quail."""
+
+    name = "lift_maps"
+
+    def alternatives(self, root, context) -> tuple:
+        # Request backends do not implement map placement above joins.
+        if context.backend != "quail":
+            return ()
+        lifted = lift_maps(root)
+        return () if lifted is None else (lifted,)
+
+
+def built_in_logical_alternatives() -> tuple:
+    """Return the logical alternatives explored during physical plan search."""
+    return (LiftMaps(),)
 
 
 class DistinctElimination:
@@ -418,8 +436,8 @@ def built_in_logical_rules() -> tuple:
     and filter_pushdown. Every one is heuristic: it rewrites the plan
     without pricing it. The cost-based choices (where classifications
     and extractions run, filter order, join order and anchors) are made
-    in the physical phase (quail.planner.search.ordering and the Quail
-    backend's candidates).
+    during plan search, after the logical alternatives are lowered and
+    the physical rules have refined each candidate.
     """
     return (DistinctElimination(), DistinctPushdown(), ProjectionPushdown(),
             FilterPushdown())
