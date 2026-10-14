@@ -105,18 +105,14 @@ probability output, and limits on classifications of joined rows.
 
 `ai_extract(c, questions, *, name, trim=True)`
 
-`ai_extract()` copies the text that answers a question from each
-document.
+Extracts answers to questions from a document.
 
-- `c` is the document column, for example `"c.text"` or
-  `col("c.text")`.
-- `questions` is a dictionary. Each key is a field name. Each value is
-  a question.
-- `name` is the name of the answer column. Put this name in
-  `select()`.
-
-The `contracts` table has an `id` column and a `text` column. This
-query asks two questions about each contract:
+- `c`: the document column, such as `"c.text"`.
+- `questions`: a dictionary. Each key is a field name. Each value is a
+  question.
+- `name`: the name of the result column.
+- `trim`: set to `False` to return the whole line that holds each
+  answer.
 
 ```python
 query = (
@@ -125,22 +121,10 @@ query = (
                            "signer": "Who signed the lease?"}, name="lease")
     .select("c.id", "lease")
 )
-rows = query.collect()
 ```
 
-The result has the columns `c.id`, `lease`, and `lease_span`:
-
-- `lease` has the string fields `end_date` and `signer`.
-- `lease_span` has the same fields. Each field has the `start` and
-  `end` position of the answer. Positions start at zero. The character
-  at `end` is not part of the answer.
-
-If the document does not answer a question, the field is null. The
-span of that field is also null.
-
-To get all of each line that contains the answer, set `trim=False`.
-
-For more examples and the limits, see
+The result has `lease`, a struct with one string field per question,
+and `lease_span`, the position of each answer. See
 [`AI.EXTRACT`](/docs/user-guide/sql#aiextract).
 
 ### ai_score
