@@ -483,7 +483,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     from quail.logical import classified_above_joins
     from quail.planner.rules.logical import (
         built_in_logical_rules,
-        lift_classifications,
+        lift_maps,
     )
     from quail.planner.rules.physical import built_in_physical_rules
 
@@ -557,15 +557,15 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     logical_text, physical_text = after.explain().split("physical:")
     assert "SemanticClassify: topic" in logical_text
     assert "AiClassify: topic over r" in physical_text
-    lifted = lift_classifications(written)
+    lifted = lift_maps(written)
     assert [type(node).__name__ for node in LogicalPlan(lifted).walk()] == [
         "Scan", "Scan", "Join", "SemanticJoin", "SemanticClassify",
         "Filter", "Project"]
     assert classified_above_joins(lifted) == {"r"}
     assert classified_above_joins(written) == frozenset()
-    assert lift_classifications(lifted) is None
+    assert lift_maps(lifted) is None
     # a query without a join gets one candidate
-    assert lift_classifications(_topic(session).logical.root) is None
+    assert lift_maps(_topic(session).logical.root) is None
     assert len(_candidates(session, _topic(session))) == 1
 
     # a filtered partner on a forced anchor stays classified before the

@@ -26,8 +26,8 @@ class SemanticClassify:
     PROBABILITIES_SUFFIX, holds each label's probability. A call over
     one table starts on that table above its AI.IF SemanticFilter and
     below any join; when a join reads the table, the physical planner
-    also prices running it above the joins (lift_classifications). A
-    call over two tables sits above the SemanticJoin of the two. A
+    also prices running it above the joins (lift_maps). A call over
+    two tables sits above the SemanticJoin of the two. A
     Filter testing the label column sits above this node, and the root
     Project returns the column through an Alias of the same call.
     """

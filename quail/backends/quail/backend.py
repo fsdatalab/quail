@@ -31,7 +31,7 @@ from quail.planner.optimizer.physical import (
 )
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import answer_ids
-from quail.planner.rules.logical import lift_classifications
+from quail.planner.rules.logical import lift_maps
 from quail.planner.validation import has_label, joined_classification_refusal
 
 
@@ -187,9 +187,8 @@ class QuailBackend:
                 )
                 return (PhysicalCandidate(None, refusal, float("inf")),)
         candidates = [self._candidate(region, context)]
-        # classifying a joined table after its joins is the second
-        # candidate; on a tie the plan as written wins
-        lifted = lift_classifications(region.logical_plan.root)
+        # Keep the original candidate first so it wins a cost tie.
+        lifted = lift_maps(region.logical_plan.root)
         if lifted is not None:
             candidates.append(self._candidate(
                 ModelRegion(LogicalPlan(lifted)), context))

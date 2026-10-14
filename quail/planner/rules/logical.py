@@ -258,7 +258,7 @@ def _sequence_alias(node) -> str:
     return node.condition.column.alias
 
 
-def lift_classifications(root: LogicalNode) -> LogicalNode | None:
+def lift_maps(root: LogicalNode) -> LogicalNode | None:
     """Move every joined table's classifications and extractions above the joins.
 
     Each one-table SemanticClassify of a table that a SemanticJoin
@@ -266,13 +266,15 @@ def lift_classifications(root: LogicalNode) -> LogicalNode | None:
     SemanticExtract of such a table, leaves the table's sequence and
     moves above the topmost join, under the root Project, in scan
     order. A classification or extraction of a table that no join
-    reads stays.
+    reads stays. The map operators here are SemanticClassify and
+    SemanticExtract. The backend prices the rewritten plan alongside
+    the original plan.
 
     Returns:
-        The rewritten root, or None when no classification moved.
+        The rewritten root, or None when no classification or extraction moved.
     """
     if isinstance(root, (Result, Aggregate)):
-        rewritten = lift_classifications(root.input)
+        rewritten = lift_maps(root.input)
         return None if rewritten is None else root.with_children((rewritten,))
     joined = {alias for node in LogicalPlan(root).walk()
               if isinstance(node, SemanticJoin)
@@ -415,8 +417,9 @@ def built_in_logical_rules() -> tuple:
     In order: distinct_elimination, distinct_pushdown, projection_pushdown,
     and filter_pushdown. Every one is heuristic: it rewrites the plan
     without pricing it. The cost-based choices (where classifications
-    run, filter order, join order and anchors) are made in the physical
-    phase (quail.planner.search.ordering and the Quail backend's candidates).
+    and extractions run, filter order, join order and anchors) are made
+    in the physical phase (quail.planner.search.ordering and the Quail
+    backend's candidates).
     """
     return (DistinctElimination(), DistinctPushdown(), ProjectionPushdown(),
             FilterPushdown())
