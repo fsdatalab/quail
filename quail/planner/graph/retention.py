@@ -1,6 +1,6 @@
 """Planned anchor reuse at each execution boundary."""
 
-from quail.planner.statistics import thin
+from quail.planner.statistics.tables import thin
 
 
 def group_sequence(seq):

@@ -51,7 +51,7 @@ from quail.logical import (
     SemanticFilter,
     SemanticJoin,
 )
-from quail.planner.sol_search import (
+from quail.planner.sol.search import (
     CLASSIFY,
     EXTRACT,
     FILTER,

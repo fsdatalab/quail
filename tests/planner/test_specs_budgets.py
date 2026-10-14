@@ -11,7 +11,7 @@ from quail.cost.dense_decoder_cost import (
 )
 from quail.cost.joins import PricedJoin, stage_work
 from quail.cost.work import ask, scan, stream, triangle
-from quail.planner.statistics import summarize_alias
+from quail.planner.statistics.tables import summarize_alias
 from quail.specs import (
     H100_SXM,
     QWEN3_4B_FP8,

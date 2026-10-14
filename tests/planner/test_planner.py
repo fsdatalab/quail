@@ -33,11 +33,12 @@ from quail.physical import (
 from quail.physical.base import input_ports
 from quail.physical.pipelines import build_pipelines
 from quail.planner.api import refine_plan
-from quail.planner.filter_order import order_filters_indexed
-from quail.planner.logical_rules import built_in_logical_rules
-from quail.planner.physical_rules import built_in_physical_rules
+from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.plan import EngineConfig, Refusal
-from quail.planner.statistics import AliasStats, prepare_filter_costs, summarize_alias
+from quail.planner.rules.logical import built_in_logical_rules
+from quail.planner.rules.physical import built_in_physical_rules
+from quail.planner.search.filter_order import order_filters_indexed
+from quail.planner.statistics.tables import AliasStats, summarize_alias
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
@@ -93,7 +94,7 @@ def _five_filter_plan(catalog, sels):
 
 
 def test_gpu_copies_and_memory_refusals(catalog):
-    from quail.planner.shards import contiguous_shards
+    from quail.planner.graph.shards import contiguous_shards
 
     assert contiguous_shards([2, 2, 2], 2) == (((0, 1), (1, 3)), [2, 4])
     assert contiguous_shards([1, 0, 9], 2) == (((0, 1), (1, 3)), [1, 9])
@@ -428,7 +429,7 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
 
 def test_kv_retention_rule_schedules_the_kv_later_stages_read(
         catalog, monkeypatch):
-    import quail.planner.join_order as joinsearch
+    import quail.planner.search.join_order as joinsearch
 
     searches = []
     search_joins = joinsearch.search_joins
@@ -511,7 +512,7 @@ def _join_search_spec(position, aliases, anchor):
 
 
 def test_join_search_matches_enumeration_and_tracks_residency():
-    from quail.planner.join_order import (
+    from quail.planner.search.join_order import (
         anchor_fits,
         search_joins,
         walk,
@@ -789,7 +790,7 @@ def _token_store(path, bodies):
 
 def test_prefix_sharing_and_attention_path_follow_the_token_store(
         catalog, tmp_path):
-    from quail.planner.physical_rules import (
+    from quail.planner.rules.physical import (
         page_aligned_shared_tokens,
         sharing_pays,
     )

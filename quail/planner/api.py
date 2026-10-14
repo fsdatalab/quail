@@ -3,7 +3,7 @@
 from dataclasses import replace
 
 from quail.logical import LogicalPlan
-from quail.planner.physical_optimizer import (
+from quail.planner.optimizer.physical import (
     ModelRegion,
     PlanningContext,
     apply_physical_rules,

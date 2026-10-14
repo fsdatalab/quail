@@ -218,7 +218,7 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     from quail.cost.work import Work, ask, scan
     from quail.execution.metrics import NodeMetrics
     from quail.explain import run_summary
-    from quail.planner.statistics import summarize_alias
+    from quail.planner.statistics.tables import summarize_alias
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     for model, canvas in (("qwen3-4b-fp8", 0), ("diffusion-gemma-26b-a4b-fp8", 1)):
@@ -649,9 +649,9 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     from quail.physical import PhysicalGraph, PortRef, Scan, ScoreSpec
     from quail.physical.base import input_ports
     from quail.planner.api import apply_plan_rules
-    from quail.planner.physical_optimizer import PlanningContext
-    from quail.planner.physical_rules import PrefixSharing
+    from quail.planner.optimizer.physical import PlanningContext
     from quail.planner.plan import PhysicalPlan
+    from quail.planner.rules.physical import PrefixSharing
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     def graph(aliases, draws=1):
@@ -768,9 +768,12 @@ def test_score_refusals_name_oversized_documents_and_missing_scores(
         catalog, monkeypatch):
     from quail.cost import budgets
 
-    for budget, unit in (("chunk_budget", "tokens"), ("arena_tokens", "pages")):
+    # a 4-token chunk, then an arena of one 16-token page
+    for budget, value, unit in (("chunk_budget", 4, "tokens"),
+                                ("arena_pages", (1, 0), "pages")):
         with monkeypatch.context() as patch:
-            patch.setattr(budgets, budget, lambda model, device, *rest: 4)
+            patch.setattr(budgets, budget,
+                          lambda model, device, *rest, value=value: value)
             session = _session(catalog)
             query = session.sql(
                 "SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s "

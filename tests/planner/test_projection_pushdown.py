@@ -22,16 +22,16 @@ from quail.logical import (
     SemanticJoin,
 )
 from quail.physical import Recombine
-from quail.planner.logical_optimizer import (
+from quail.planner.optimizer.logical import (
     LogicalPlanningContext,
     apply_logical_rules,
 )
-from quail.planner.logical_rules import (
+from quail.planner.plan import EngineConfig
+from quail.planner.rules.logical import (
     built_in_logical_rules,
     push_down_filters,
     push_down_projection,
 )
-from quail.planner.plan import EngineConfig
 
 
 def _scans(plan):

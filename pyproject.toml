@@ -135,6 +135,22 @@ layers = [
 ]
 ignore_imports = ["quail.extensions -> quail.builtins"]
 
+[[tool.importlinter.contracts]]
+name = "Planner stages import downward only"
+type = "layers"
+layers = [
+    "quail.planner.pricing",
+    "quail.planner.rules",
+    "quail.planner.graph | quail.planner.sol",
+    "quail.planner.search",
+    "quail.planner.operators",
+    "quail.planner.statistics",
+    "quail.planner.api",
+    "quail.planner.optimizer",
+    "quail.planner.validation | quail.planner.prompt_lowering",
+    "quail.planner.plan",
+]
+
 [tool.vulture]
 paths = ["quail", "bench", "calibrate"]
 min_confidence = 70
