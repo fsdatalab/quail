@@ -4,8 +4,8 @@ from dataclasses import replace
 
 from quail.logical import has_score, shared_preamble
 from quail.physical import AiFilter, AiJoin
-from quail.planner.graph.build import build_physical_plan
-from quail.planner.optimizer.physical import PhysicalCandidate
+from quail.planner.graph.builder import build_physical_plan
+from quail.planner.optimizer.candidates import PhysicalCandidate
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import answer_ids
 from quail.planner.validation import has_label, joined_classification_refusal

@@ -1,7 +1,7 @@
 """Price logical alternatives through the planner's complete physical search."""
 
-from quail.planner.api import search_plan
-from quail.planner.optimizer.logical import LogicalPlanningContext
+from quail.planner.optimize import search_plan
+from quail.planner.optimizer.context import LogicalPlanningContext
 from quail.planner.plan import Refusal
 
 

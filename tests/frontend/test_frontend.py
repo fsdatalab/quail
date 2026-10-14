@@ -31,7 +31,8 @@ from quail.logical import (
     render_join_question,
     split_frame,
 )
-from quail.planner.optimizer.logical import LogicalPlanningContext, simplify_plan
+from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.tree_rewrites import simplify_plan
 from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.rules import built_in_rules
 

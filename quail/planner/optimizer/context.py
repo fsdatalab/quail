@@ -1,20 +1,67 @@
-"""Simplify query trees and retain cost-based alternatives."""
+"""Configuration, input statistics, and memoized prompts available during planning."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from quail.logical import LogicalPlan
-from quail.planner.optimizer.physical import (
-    PlanningContext,
-    lowered_prompt,
-)
-from quail.planner.optimizer.rules import OptimizerRule
+from quail.planner.prompt_lowering import LoweredPrompt, lower_prompt
+from quail.specs import DeviceSpec, ModelSpec
 
-# Rounds over the rule list before giving up on convergence. Two rules
-# that undo each other would otherwise loop forever.
-MAX_PASSES = 4
+
+def lowered_prompt(context, prompt) -> LoweredPrompt:
+    """Lower a prompt through a context's tokenizer, memoized on the context.
+
+    Raises:
+        ValueError: The context has no tokenizer.
+    """
+    key = ("lowered", prompt)
+    if key not in context.memo:
+        if context.tokenizer is None:
+            raise ValueError("planning needs a tokenizer to lower prompts")
+        context.memo[key] = lower_prompt(prompt, context.tokenizer)
+    return context.memo[key]
+
+
+@dataclass(frozen=True)
+class PlanningContext:
+    """Inputs available to physical planners."""
+
+    model: ModelSpec
+    device: DeviceSpec
+    gpu_count: int
+    document_tokens: Mapping[str, Any]
+    backend: str
+    order: str | None = None
+    # the most noise draws a diffusion model averages per letters read
+    # and per one-table AI.SCORE
+    canvas_draws: int = 4
+    # an attention path forced for every filter and join; None lets
+    # the planner choose per node
+    attention: str | None = None
+    tokenizer: Callable[[str], Any] | None = None
+    # join written position -> its equality pairs as a fraction of
+    # the cross product; joins without conditions are absent
+    pair_fractions: Mapping[int, float] = field(default_factory=dict)
+    # alias -> the fraction of its documents the regular predicates are
+    # expected to keep; aliases without tests are absent
+    scan_fractions: Mapping[str, float] = field(default_factory=dict)
+    # the logical plan the graph was planned from; None when the rules
+    # run again over a finished plan
+    logical_plan: Any = None
+    catalog: Any = None
+    engine_config: Any = None
+    # the plan's settings as the rules see them; a rule adds what the
+    # executor needs for its decision, such as the KV retention
+    # schedule, and the planner puts the result on the plan
+    settings: dict = field(default_factory=dict, compare=False, repr=False)
+    # results computed once per query, such as the plan's statistics,
+    # shared with the tree rewrites that planned it
+    memo: dict = field(default_factory=dict, compare=False, repr=False)
+
+    def lowered(self, prompt) -> LoweredPrompt:
+        """Return the prompt lowered with the session tokenizer, once per query."""
+        return lowered_prompt(self, prompt)
 
 
 @dataclass(frozen=True)
@@ -88,74 +135,3 @@ class LogicalPlanningContext:
             attention=context.attention, tokenizer=context.tokenizer,
             pair_fractions=context.pair_fractions,
             scan_fractions=context.scan_fractions, memo=context.memo)
-
-
-def simplify_plan(
-    plan: LogicalPlan,
-    rules: tuple[OptimizerRule, ...],
-    context: LogicalPlanningContext,
-    *,
-    max_passes: int = MAX_PASSES,
-) -> tuple[LogicalPlan, tuple[str, ...]]:
-    """Apply universal rules until no rule changes the plan.
-
-    Cost-based rules are deferred to search. Each round offers the current
-    plan to every universal rule in registration order. Rounds continue
-    until one round changes nothing, so a rewrite
-    that enables a later rule is not missed, or until `max_passes`
-    rounds have run.
-
-    Returns:
-        The rewritten plan and the name of each rule that changed it,
-        one entry per change, in the order the changes happened.
-    """
-    changed = []
-    root = plan.root
-    for _ in range(max_passes):
-        before = root
-        for rule in rules:
-            if rule.target != "logical" or rule.cost_based:
-                continue
-            replacement = rule.rewrite(root, context)
-            if replacement is not None and replacement != root:
-                root = replacement
-                changed.append(rule.name)
-        if root == before:
-            break
-    optimized = LogicalPlan(root)
-    optimized.validate()
-    return optimized, tuple(changed)
-
-
-@dataclass(frozen=True)
-class LogicalAlternative:
-    """A logical plan and the rules that produced it."""
-
-    plan: LogicalPlan
-    rules: tuple[str, ...] = ()
-
-
-def logical_alternatives(plan, rules, context, *, max_passes=MAX_PASSES) -> tuple:
-    """Apply cost-based tree rewrites, retaining the original first.
-
-    Equivalent roots are deduplicated. Rules run over every known alternative
-    for at most max_passes rounds, stopping when no new root is produced.
-    """
-    alternatives = [LogicalAlternative(plan)]
-    for _ in range(max_passes):
-        before = len(alternatives)
-        for rule in rules:
-            if rule.target != "logical" or not rule.cost_based:
-                continue
-            for candidate in tuple(alternatives):
-                root = rule.rewrite(candidate.plan.root, context)
-                if root is None or any(
-                        root == other.plan.root for other in alternatives):
-                    continue
-                rewritten = LogicalPlan(root)
-                rewritten.validate()
-                alternatives.append(LogicalAlternative(
-                    rewritten, (*candidate.rules, rule.name)))
-        if len(alternatives) == before:
-            break
-    return tuple(alternatives)

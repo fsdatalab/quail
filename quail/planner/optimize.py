@@ -3,15 +3,11 @@
 from dataclasses import replace
 
 from quail.logical import LogicalPlan
-from quail.planner.optimizer.logical import LogicalPlanningContext, logical_alternatives
-from quail.planner.optimizer.physical import (
-    ModelRegion,
-    PhysicalCandidate,
-    PlanningContext,
-    rewrite_graph,
-)
-from quail.planner.plan import Refusal, inference_seconds
-from quail.planner.validation import ClassifyRefusedError
+from quail.planner.optimizer.candidates import ModelRegion, PhysicalCandidate
+from quail.planner.optimizer.context import LogicalPlanningContext, PlanningContext
+from quail.planner.optimizer.graph_refinement import apply_plan_rules
+from quail.planner.optimizer.tree_rewrites import logical_alternatives
+from quail.planner.plan import Refusal
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -188,37 +184,3 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
     )
     return apply_plan_rules(
         plan, tuple(registry.rules.values()), context)
-
-
-def apply_plan_rules(plan, rules, context):
-    """Refine a plan by applying its registered rules in order.
-
-    The rules see the plan's settings on the context and may add to
-    them. Changes to inference estimates update both the plan total and
-    its search cost, and the node estimates are refreshed for explain.
-
-    Args:
-        plan: A PhysicalPlan.
-        rules: Registered rules in order; only graph targets apply.
-        context: The PlanningContext.
-
-    Returns:
-        The rewritten PhysicalPlan, or a Refusal when a classification
-        no rule can score refuses the plan.
-    """
-    context = replace(context, settings=dict(plan.settings))
-    try:
-        graph, changed = rewrite_graph(plan.graph, rules, context)
-    except ClassifyRefusedError as refused:
-        return refused.refusal()
-    if not changed and context.settings == dict(plan.settings):
-        return plan
-    difference = inference_seconds(graph.nodes) - inference_seconds(plan.nodes)
-    seconds = plan.estimated_seconds + difference
-    if "search_seconds" in plan.settings:
-        context.settings["search_seconds"] = (
-            plan.settings["search_seconds"] + difference)
-    return replace(
-        plan, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
-        settings=context.settings,
-        estimates=plan.estimator(graph) if plan.estimator else plan.estimates)

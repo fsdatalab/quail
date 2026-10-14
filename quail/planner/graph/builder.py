@@ -1,4 +1,4 @@
-"""Build the physical plan of a decided logical plan."""
+"""Build executable query graphs with operator order and execution settings."""
 
 from functools import partial
 
@@ -46,15 +46,16 @@ from quail.planner.operators.score import (
     emit_score_pair,
     emit_scores,
 )
-from quail.planner.optimizer.physical import PlanningContext
+from quail.planner.optimizer.context import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal, inference_seconds
-from quail.planner.search.operator_order import choose_operator_order, validate_query
+from quail.planner.search.operator_order import choose_operator_order
 from quail.planner.search.statistics import filter_stop_keys
 from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import (
     ClassifyRefusedError,
     ScoreRefusedError,
     score_projections,
+    validate_query,
 )
 from quail.specs import DeviceSpec, ModelSpec
 

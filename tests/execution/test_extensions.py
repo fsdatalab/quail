@@ -11,7 +11,7 @@ from quail.builtins import built_in_registry
 from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.runtimes import ScanRuntime
 from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
-from quail.planner.optimizer.physical import rewrite_graph
+from quail.planner.optimizer.graph_refinement import rewrite_graph
 
 
 @dataclass(frozen=True)

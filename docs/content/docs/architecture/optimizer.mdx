@@ -49,10 +49,10 @@ The query goes through these steps:
 The search is staged; it does not enumerate every combination of operator
 order, implementation, and KV policy.
 
-`planner/api.py` owns candidate generation, physical refinement, and
+`planner/optimize.py` owns candidate generation, physical refinement, and
 selection. `backends/quail/backend.py` provides the engine interface and
-delegates lowering to `backends/quail/planning.py`. It delegates model state
-and execution dispatch to `backends/quail/executor/execution.py`.
+delegates lowering to `backends/quail/lowering.py`. It delegates model state
+and execution dispatch to `backends/quail/executor/runtime.py`.
 
 `explain(verbose=True)` lists the registered rules and each candidate's
 refined cost, refusal if any, and whether it was selected.

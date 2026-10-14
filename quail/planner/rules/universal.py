@@ -27,7 +27,7 @@ from quail.physical import (
 from quail.physical.pipelines import build_pipelines
 from quail.planner.graph import retention
 from quail.planner.plan import plan_kv_retention
-from quail.planner.rules.rewrites import (
+from quail.planner.rules.tree_transforms import (
     _filtered_alias,
     _stop_key,
     push_down_filters,

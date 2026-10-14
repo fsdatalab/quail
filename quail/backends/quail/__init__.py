@@ -1,7 +1,7 @@
 """The Quail model backend: planning, node runtimes, and GPU execution."""
 
 from .backend import QuailBackend
-from .executor.execution import QuailModelExecution
+from .executor.runtime import QuailModelExecution
 from .graph import quail_runtimes
 
 __all__ = [

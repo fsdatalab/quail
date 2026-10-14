@@ -32,7 +32,7 @@ from quail.planner import (
     join_specs as logical_join_specs,
 )
 from quail.planner.operators.filter import prepare_filter_costs
-from quail.planner.optimizer.physical import PhysicalCandidate
+from quail.planner.optimizer.candidates import PhysicalCandidate
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planner.prompt_lowering import answer_row_offsets, true_false_token_ids
 from quail.planner.search.join_order import search_joins

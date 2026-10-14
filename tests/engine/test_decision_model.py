@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import quail
-from quail.backends.quail.executor import model
+from quail.backends.quail.executor import model_loading
 from quail.backends.quail.executor.readout import DecisionHead, DecisionRows
 from quail.backends.quail.executor.stages import Stage
 from quail.baselines.nodes import RequestExecution
@@ -279,14 +279,14 @@ def test_vllm_loads_a_decision2_backbone_in_place(tmp_path):
     package = tmp_path / "snapshot"
     (package / "backbone").mkdir(parents=True)
     (package / "config.json").write_text(json.dumps({"model_type": "decision2"}))
-    args = model.engine_args(package, "Qwen3DecisionModel")
+    args = model_loading.engine_args(package, "Qwen3DecisionModel")
     assert args == {"model": str(package / "backbone"), "tokenizer": str(package),
                     "dtype": "bfloat16",
                     "hf_overrides": {"architectures": ["Qwen3DecisionModel"]}}
     plain = tmp_path / "qwen3"
     plain.mkdir()
     (plain / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
-    assert model.engine_args(plain) == {"model": str(plain)}
+    assert model_loading.engine_args(plain) == {"model": str(plain)}
 
 
 def test_a_decision_classification_is_reestimated(session):

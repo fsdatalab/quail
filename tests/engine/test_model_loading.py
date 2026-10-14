@@ -9,8 +9,11 @@ import pytest
 from helpers.fakes import cpu_arena, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.executor import model
-from quail.backends.quail.executor.model import answer_weights, retain_answer_head
+from quail.backends.quail.executor import model_loading
+from quail.backends.quail.executor.model_loading import (
+    answer_weights,
+    retain_answer_head,
+)
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.builtins import built_in_registry
@@ -120,9 +123,9 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
 
 @pytest.fixture
 def clear_model_paths():
-    model.resolve_model_path.cache_clear()
+    model_loading.resolve_model_path.cache_clear()
     yield
-    model.resolve_model_path.cache_clear()
+    model_loading.resolve_model_path.cache_clear()
 
 
 def test_model_files_are_resolved_once_and_cached_before_children_start(
@@ -134,9 +137,9 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         return str(tmp_path / kwargs["revision"])
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", download)
-    first = model.resolve_model_path("Qwen/model", "revision-a")
-    assert model.resolve_model_path("Qwen/model", "revision-a") == first
-    assert model.resolve_model_path("Qwen/model", "revision-b") != first
+    first = model_loading.resolve_model_path("Qwen/model", "revision-a")
+    assert model_loading.resolve_model_path("Qwen/model", "revision-a") == first
+    assert model_loading.resolve_model_path("Qwen/model", "revision-b") != first
     assert [call["revision"] for call in calls] == ["revision-a", "revision-b"]
     assert all(call["repo_id"] == "Qwen/model" for call in calls)
     assert "*.safetensors" in calls[0]["allow_patterns"]

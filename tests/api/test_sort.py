@@ -16,10 +16,8 @@ from quail.logical import Result, Scan, SemanticFilter
 from quail.physical import AiFilter, Project, Sort
 from quail.physical.base import input_ports
 from quail.planner import plan_query
-from quail.planner.optimizer.logical import (
-    LogicalPlanningContext,
-    simplify_plan,
-)
+from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.tree_rewrites import simplify_plan
 from quail.planner.rules import built_in_rules
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 

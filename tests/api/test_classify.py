@@ -45,7 +45,7 @@ from quail.physical import (
 from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.prompt_lowering import lower_prompt
-from quail.planner.rules.rewrites import push_down_projection
+from quail.planner.rules.tree_transforms import push_down_projection
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 from quail_b.prompts import AGENT_PROGRESS, AGENT_PROGRESS_DESCRIPTIONS
 from quail_b.prompts import AGENT_PROGRESS_LABELS as STAGES
@@ -468,8 +468,8 @@ def _corpus(session, tmp_path, name, column, rows, words):
 
 def _candidates(session, query):
     """Return the planner's refined candidates for a planned query."""
-    from quail.planner.api import search_candidates
-    from quail.planner.optimizer.physical import PlanningContext
+    from quail.planner.optimize import search_candidates
+    from quail.planner.optimizer.context import PlanningContext
 
     query.plan()
     context = PlanningContext(
@@ -482,7 +482,7 @@ def _candidates(session, query):
 def test_planner_places_and_scores_classifications(session, tmp_path):
     from quail.logical import classified_above_joins
     from quail.planner.rules import built_in_rules
-    from quail.planner.rules.rewrites import (
+    from quail.planner.rules.tree_transforms import (
         lift_maps,
     )
 
@@ -541,7 +541,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     # a cost-based tree rewrite prices a plan the same way the backend
     # prices its candidates
     from quail.planner import pricing
-    from quail.planner.optimizer.logical import LogicalPlanningContext
+    from quail.planner.optimizer.context import LogicalPlanningContext
 
     logical_context = LogicalPlanningContext(
         session.catalog, session.config, model=session.model,

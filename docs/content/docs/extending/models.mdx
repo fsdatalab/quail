@@ -99,7 +99,7 @@ using `ModelSpec.arch`. Supporting another architecture requires both a
 compatible model loader and a forward pass that works with Quail's executor.
 
 1. Confirm that vLLM can load the checkpoint. Quail's
-   [loader](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py)
+   [loader](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model_loading.py)
    also expects the loaded model to expose an `lm_head` output layer.
 2. Define a `ModelSpec` with the model dimensions, KV shapes, weight
    format, and prompt format. The executor uses these values to allocate

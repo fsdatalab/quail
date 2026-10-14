@@ -17,7 +17,7 @@ from quail.physical import (
 )
 from quail.physical.pipelines import build_pipelines
 from quail.planner.operators.classify import classify_scoring
-from quail.planner.rules.rewrites import lift_maps
+from quail.planner.rules.tree_transforms import lift_maps
 from quail.planner.sol.prefixes import document_shared_tokens, page_tree
 from quail.planner.statistics.tables import summarize_alias
 

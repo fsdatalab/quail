@@ -6,10 +6,8 @@ from typing import ClassVar
 import pytest
 
 from quail.logical import ColumnRef, LogicalPlan, Project, Scan
-from quail.planner.optimizer.logical import (
-    LogicalPlanningContext,
-    simplify_plan,
-)
+from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.tree_rewrites import simplify_plan
 
 CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)
 

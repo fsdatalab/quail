@@ -1,11 +1,9 @@
 """Plan as a session would: the tree rewrites, then the physical planner."""
 
 from quail.builtins import built_in_registry
-from quail.planner.api import plan_query
-from quail.planner.optimizer.logical import (
-    LogicalPlanningContext,
-    simplify_plan,
-)
+from quail.planner.optimize import plan_query
+from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.tree_rewrites import simplify_plan
 from quail.planner.rules import built_in_rules
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 

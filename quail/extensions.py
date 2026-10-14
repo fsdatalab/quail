@@ -12,7 +12,7 @@ from quail.physical import NodeCodec, PhysicalNode
 if TYPE_CHECKING:
     from quail.backends.base import ModelBackend
     from quail.execution.runner import ExecutionObserver, NodeRuntime
-    from quail.planner.optimizer.physical import PhysicalPlanner
+    from quail.planner.optimizer.candidates import PhysicalPlanner
     from quail.planner.optimizer.rules import OptimizerRule
     from quail.specs import DeviceSpec, ModelSpec
 

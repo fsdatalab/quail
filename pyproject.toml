@@ -145,7 +145,7 @@ layers = [
     "quail.planner.search",
     "quail.planner.operators",
     "quail.planner.statistics",
-    "quail.planner.api",
+    "quail.planner.optimize",
     "quail.planner.optimizer",
     "quail.planner.validation | quail.planner.prompt_lowering",
     "quail.planner.plan",

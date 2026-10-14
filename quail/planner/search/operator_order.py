@@ -1,14 +1,11 @@
-"""Validate native queries and choose their cost-based operator order."""
+"""Choose filter order, join order, and anchors using estimated cost."""
 
 from dataclasses import dataclass
 
-from quail.cost import budgets
 from quail.cost.work import Work
 from quail.logical import (
-    CompileError,
     LogicalPlan,
     SemanticFilter,
-    has_score,
     model_call,
 )
 from quail.logical.plan import Operators
@@ -22,12 +19,7 @@ from quail.planner.search.statistics import (
     cached_statistics,
     live_after_filters,
 )
-from quail.planner.validation import (
-    classification_refusal,
-    extraction_refusal,
-    join_input_tokens,
-    score_refusal,
-)
+from quail.planner.validation import join_input_tokens
 from quail.specs import ModelSpec
 
 
@@ -44,68 +36,6 @@ class OperatorOrder:
     filter_work: dict[str, Work]
     order_rule: str
     order_source: str
-
-
-def validate_query(plan, operators, context, model, device, gpus):
-    """Return a refusal for unsupported inference or hardware requirements."""
-    labels, applies = operators.labels, operators.applies
-    scored = has_score(plan)
-    if scored:
-        refusal = score_refusal(plan, context)
-        if refusal is not None:
-            return refusal
-    if labels.calls:
-        if context is None:
-            return Refusal(
-                reasons=("AI.CLASSIFY planning needs a planning context",),
-                constraint="unsupported_classify_query",
-                needed=1, available=0, unit="queries")
-        if any(len(call.aliases()) not in (1, 2) for call, _ in labels.calls):
-            return Refusal(
-                reasons=("AI.CLASSIFY reads one document, or one from each "
-                         "side of a join",),
-                constraint="unsupported_classify_query",
-                needed=1, available=0, unit="queries")
-        refusal = classification_refusal(context)
-        if refusal is not None:
-            return refusal
-    extracts = operators.extracts
-    if extracts:
-        if context is None:
-            return Refusal(
-                reasons=("AI.EXTRACT planning needs a planning context",),
-                constraint="unsupported_extract_query",
-                needed=1, available=0, unit="queries")
-        refusal = extraction_refusal(context)
-        if refusal is not None:
-            return refusal
-    join_applies = {}
-    for apply in applies:
-        if apply.ids == "pairs":
-            join_applies.setdefault(apply.written_pos, []).append(apply)
-    names = [apply.function for apply in applies]
-    if len(set(names)) != len(names):
-        raise CompileError(
-            f"each apply() needs its own name; {names} repeat one")
-    if any(len(group) > 1 for group in join_applies.values()):
-        raise CompileError("a join takes one apply() returning pairs")
-    if gpus > 1 and any(apply.kind == "per_batch" for apply in applies):
-        return Refusal(
-            reasons=("per-batch apply() requires one GPU; "
-                     "use apply_table() or set gpus=1",),
-            constraint="per_batch_apply_needs_one_gpu",
-            needed=1, available=gpus, unit="gpus")
-
-    weight_gpus = budgets.minimum_weight_gpus(model, device)
-    if weight_gpus > 1:
-        return Refusal(
-            reasons=(
-                f"the model needs {weight_gpus} GPUs of memory, "
-                f"but Quail loads one complete copy per GPU",
-            ),
-            constraint="weights_need_more_cards",
-            needed=weight_gpus, available=1, unit="cards")
-    return None
 
 
 def choose_operator_order(plan, operators, model, device, doc_tokens, order,

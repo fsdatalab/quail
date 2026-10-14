@@ -33,7 +33,7 @@ from quail.physical import (
     encode_graph,
     plan_envelope,
 )
-from quail.planner.optimizer.physical import PhysicalCandidate, SupportResult
+from quail.planner.optimizer.candidates import PhysicalCandidate, SupportResult
 from quail.planner.plan import EngineConfig, PhysicalPlan
 
 

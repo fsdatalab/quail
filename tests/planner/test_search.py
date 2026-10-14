@@ -11,8 +11,9 @@ import quail
 from quail.catalog import DocumentProvider
 from quail.logical import extracted_above_joins
 from quail.physical import AiExtract, PhysicalGraph
-from quail.planner.api import search_candidates, search_plan
-from quail.planner.optimizer.physical import ModelRegion, PlanningContext
+from quail.planner.optimize import search_candidates, search_plan
+from quail.planner.optimizer.candidates import ModelRegion
+from quail.planner.optimizer.context import PlanningContext
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.validation import ClassifyRefusedError
 
@@ -138,10 +139,8 @@ def test_prefix_sharing_is_priced_for_every_placement(query):
 
 
 def test_cost_based_rules_retain_original_and_deduplicate(query):
-    from quail.planner.optimizer.logical import (
-        LogicalPlanningContext,
-        simplify_plan,
-    )
+    from quail.planner.optimizer.context import LogicalPlanningContext
+    from quail.planner.optimizer.tree_rewrites import simplify_plan
     from quail.planner.rules.cost_based import LiftMaps
 
     context = context_for(query)

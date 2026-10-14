@@ -26,7 +26,8 @@ from quail.logical import (
 )
 from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
-from quail.planner.optimizer.logical import LogicalPlanningContext, simplify_plan
+from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.tree_rewrites import simplify_plan
 from quail.planner.plan import Refusal, RefusalError
 from quail.planner.search.statistics import filter_stop_keys
 

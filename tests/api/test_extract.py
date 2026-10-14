@@ -184,8 +184,8 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
 
 def _candidates(session, query):
     """Return the planner's refined candidates for a planned query."""
-    from quail.planner.api import search_candidates
-    from quail.planner.optimizer.physical import PlanningContext
+    from quail.planner.optimize import search_candidates
+    from quail.planner.optimizer.context import PlanningContext
 
     query.plan()
     context = PlanningContext(

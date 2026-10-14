@@ -22,13 +22,11 @@ from quail.logical import (
     SemanticJoin,
 )
 from quail.physical import Recombine
-from quail.planner.optimizer.logical import (
-    LogicalPlanningContext,
-    simplify_plan,
-)
+from quail.planner.optimizer.context import LogicalPlanningContext
+from quail.planner.optimizer.tree_rewrites import simplify_plan
 from quail.planner.plan import EngineConfig
 from quail.planner.rules import built_in_rules
-from quail.planner.rules.rewrites import (
+from quail.planner.rules.tree_transforms import (
     push_down_filters,
     push_down_projection,
 )

@@ -32,8 +32,8 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.physical.pipelines import build_pipelines
-from quail.planner.api import refine_plan
 from quail.planner.operators.filter import prepare_filter_costs
+from quail.planner.optimize import refine_plan
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.rules import built_in_rules
 from quail.planner.search.filter_order import order_filters_indexed

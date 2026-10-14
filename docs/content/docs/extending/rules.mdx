@@ -31,7 +31,7 @@ Projection pushdown tells the scan to retain `id` values for the result.
 Quail still tokenizes `body` for the filter. It does not need `author`.
 
 ```python
-from quail.planner.rules.rewrites import push_down_projection
+from quail.planner.rules.tree_transforms import push_down_projection
 
 
 class ProjectionPushdown:
@@ -63,9 +63,8 @@ enumerate all combinations of implementations and placements.
 
 The *planning context* provides the configuration and input statistics
 available to a rule. See
-[`LogicalPlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/logical.py)
-and
-[`PlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/physical.py)
+`LogicalPlanningContext` and `PlanningContext` in
+[`optimizer/context.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/context.py)
 for their fields.
 
 ## Register the rule
