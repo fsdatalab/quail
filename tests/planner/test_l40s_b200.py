@@ -17,7 +17,13 @@ from quail.specs import (
     L40S,
     QWEN3_4B_FP8,
     QWEN3_32B_FP8,
+    modal_gpu_type,
 )
+
+
+def test_modal_gpu_type_appends_count_for_eight_l40s():
+    assert modal_gpu_type("l40s") == "L40S"
+    assert modal_gpu_type("l40s", 8) == "L40S:8"
 
 
 def _standin_filter_and_join(tmp_path):

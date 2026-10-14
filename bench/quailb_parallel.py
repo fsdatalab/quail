@@ -89,12 +89,12 @@ def _methods(csv: str) -> list[str]:
 def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
                 run_dir, ground_truth_collection, root=None,
                 attention=None, gpu_timing=False,
-                canvas_draws=None, device="h100-sxm") -> str:
+                canvas_draws=None, device="h100-sxm", gpus=1) -> str:
     """Run one query family's methods, one child process per group.
 
-    Every group runs on the one GPU of this container, in a fresh
-    process. The family's result, without the per-method suites, is
-    saved under `families/` in the run directory.
+    Every group runs on this container's GPUs, in a fresh process.
+    The family's result, without the per-method suites, is saved
+    under `families/` in the run directory.
     """
     from bench.process_isolation import run_backend_group_in_fresh_process
     from quail_b.queries import query_family_name
@@ -120,6 +120,7 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
             suite_name=f"{family}{result_name}",
             canvas_draws=canvas_draws,
             device=device,
+            gpus=gpus,
         )
         process_results.append(process_result)
         suites.update(process_result["suites"])
@@ -127,15 +128,15 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
         gpu_uuid for process_result in process_results
         for gpu_uuid in process_result["gpu_uuids"]
     }
-    if len(gpu_uuids) != 1:
+    if len(gpu_uuids) != gpus:
         raise RuntimeError(
-            "backend child processes did not see one physical GPU: "
-            f"{sorted(gpu_uuids)}")
+            f"backend child processes did not see {gpus} physical "
+            f"GPU(s): {sorted(gpu_uuids)}")
     result = {
         "query_family": family,
         "query_ids": list(query_ids),
         "ground_truth_collection": next(iter(suites.values()))["collection_id"],
-        "gpu": modal_gpu_type(device),
+        "gpu": modal_gpu_type(device, gpus),
         "gpu_uuids": sorted(gpu_uuids),
         "process_groups": [list(methods) for methods in process_groups],
         "process_cleanup": [
@@ -175,6 +176,7 @@ def run_query_family(
     label_root: str = "",
     canvas_draws: str = "",
     device: str = "h100-sxm",
+    gpus: int = 1,
 ) -> str:
     """Run one query family through the selected benchmark methods.
 
@@ -195,6 +197,7 @@ def run_query_family(
         canvas_draws: Comma-separated maximum diffusion draw counts. Empty
             keeps the default; multiple counts create separate Quail runs.
         device: Registered device name. Defaults to ``h100-sxm``.
+        gpus: Model copies, one per GPU. Defaults to 1.
 
     Returns:
         Path to the saved family result on the results volume.
@@ -218,6 +221,7 @@ def run_query_family(
             gpu_timing=gpu_timing,
             canvas_draws=canvas_draws or None,
             device=device,
+            gpus=gpus,
         )
     finally:
         results_vol.commit()
@@ -324,6 +328,7 @@ def run_all(
     label_root: str = "",
     canvas_draws: str = "",
     device: str = "h100-sxm",
+    gpus: int = 1,
 ):
     from quail_b import select_queries
 
@@ -345,6 +350,7 @@ def run_all(
         "attention": attention or None,
         "canvas_draws": canvas_draws or None,
         "device": device,
+        "gpus": gpus,
         "query_ids": list(query_ids),
         "summaries": {},
         "function_call_ids": {},
@@ -367,7 +373,7 @@ def run_all(
         for group, family_ids, result_name in _query_groups(query_ids):
             if include_quail or include_baselines or include_dumb_vllm:
                 family_call = run_query_family.with_options(
-                    gpu=modal_gpu_type(device),
+                    gpu=modal_gpu_type(device, gpus),
                 ).spawn(
                     model=model,
                     scale_factor=scale_factor,
@@ -384,6 +390,7 @@ def run_all(
                     label_root=label_root,
                     canvas_draws=canvas_draws,
                     device=device,
+                    gpus=gpus,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -550,6 +557,7 @@ def main(
     finish: str = "",
     canvas_draws: str = "",
     device: str = "h100-sxm",
+    gpus: int = 1,
 ):
     if finish:
         # finish an earlier run whose orchestrator died
@@ -579,6 +587,7 @@ def main(
         label_root=label_root,
         canvas_draws=canvas_draws,
         device=device,
+        gpus=gpus,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)
