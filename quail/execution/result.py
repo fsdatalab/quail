@@ -17,6 +17,20 @@ DEFAULT_BATCH_ROWS = 65_536
 
 
 @dataclass(frozen=True)
+class StructEntry:
+    """Projection entries a result packs into one struct column.
+
+    Attributes:
+        entries: The (alias, values) projection entry of each field.
+        fields: The Arrow field of each field, named as the struct
+            field.
+    """
+
+    entries: tuple
+    fields: tuple
+
+
+@dataclass(frozen=True)
 class IndexRelation:
     """A lazy Arrow relation over document index columns."""
 
@@ -249,6 +263,42 @@ def execute_stream(declaration: acero.Declaration, schema: pa.Schema,
     return pa.RecordBatchReader.from_batches(schema, batches())
 
 
+def projected_column(batch: pa.RecordBatch, alias, values) -> pa.Array:
+    """Return one result column for a batch of document index rows.
+
+    Args:
+        batch: The index rows.
+        alias: The index column that selects the values, the two ids
+            of a joined label, or None for a struct column.
+        values: The values by document index, None for a column the
+            batch carries, a joined label's lookup, or a StructEntry.
+    """
+    if isinstance(values, StructEntry):
+        return pa.StructArray.from_arrays(
+            [projected_column(batch, *entry) for entry in values.entries],
+            fields=list(values.fields))
+    if isinstance(alias, tuple):
+        # a label of joined rows, looked up by the row's ids
+        keys, table, order = values
+        positions = pc.index_in(
+            pair_keys(*(batch.column(batch.schema.get_field_index(name))
+                        for name in alias)),
+            value_set=keys)
+        labels = pc.take(
+            table.column(table.column_names[2]).combine_chunks().cast(pa.string()),
+            positions)
+        if order is not None:
+            labels = pa.DictionaryArray.from_arrays(
+                pc.index_in(labels, order).cast(pa.int32()), order)
+        return labels
+    column = batch.column(batch.schema.get_field_index(alias))
+    # a computed column such as a score is carried as is
+    selected = column if values is None else pc.take(values, column)
+    if isinstance(selected, pa.ChunkedArray):
+        selected = selected.combine_chunks()
+    return selected
+
+
 class QueryResult:
     """A lazy Arrow result backed by an Acero execution plan."""
 
@@ -340,35 +390,8 @@ class QueryResult:
                         yield batch.select([]).replace_schema_metadata(
                             self.schema.metadata)
                         continue
-                    arrays = []
-                    for alias, values in self._projection:
-                        if isinstance(alias, tuple):
-                            # a label of joined rows, looked up by the row's ids
-                            keys, table, order = values
-                            positions = pc.index_in(
-                                pair_keys(*(batch.column(
-                                    batch.schema.get_field_index(name))
-                                    for name in alias)),
-                                value_set=keys)
-                            labels = pc.take(
-                                table.column(table.column_names[2])
-                                .combine_chunks().cast(pa.string()), positions)
-                            if order is not None:
-                                labels = pa.DictionaryArray.from_arrays(
-                                    pc.index_in(labels, order).cast(pa.int32()),
-                                    order)
-                            arrays.append(labels)
-                            continue
-                        column = batch.column(
-                            batch.schema.get_field_index(alias))
-                        # a computed column such as a score is carried as is
-                        selected = (
-                            column if values is None
-                            else pc.take(values, column)
-                        )
-                        if isinstance(selected, pa.ChunkedArray):
-                            selected = selected.combine_chunks()
-                        arrays.append(selected)
+                    arrays = [projected_column(batch, alias, values)
+                              for alias, values in self._projection]
                     yield pa.RecordBatch.from_arrays(
                         arrays, schema=self.schema)
             finally:

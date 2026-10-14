@@ -345,9 +345,9 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
                 "ids:c": [0, 2],
                 "rows": pa.table({
                     "c": pa.array([0, 2], pa.int32()),
-                    "audit_rights": pa.array(["audit yearly", None],
-                                             pa.string()),
-                    "audit_rights_span": pa.array(
+                    "contract.audit_rights": pa.array(["audit yearly", None],
+                                                      pa.string()),
+                    "contract.audit_rights_span": pa.array(
                         [{"start": 0, "end": 12}, None],
                         pa.struct([("start", pa.int64()),
                                    ("end", pa.int64())])),
@@ -367,8 +367,10 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
         "c": ["ct0", "ct1", "ct2"], "answer": [True, False, True]}
     assert output.extract_answers["extract-1"].to_pydict() == {
         "c": ["ct0", "ct2"], "answer": ["audit yearly", None]}
+    # the answer comes back as a field of the plan's answer struct
     assert output.rows.to_pydict() == {
-        "c": ["ct0", "ct2"], "audit_rights": ["audit yearly", None]}
+        "c": ["ct0", "ct2"],
+        "contract": [{"audit_rights": "audit yearly"}, {"audit_rights": None}]}
     # the extraction's turn has no opener: its head is the AI.IF
     # preamble, so the query reports its pieces under one preamble
     assert not turn[0]
@@ -399,11 +401,11 @@ def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
             node for node in graph.nodes if isinstance(node, RequestExecution))
         return {model.node_id: NodeResult({
             "ids:c": [0, 1, 2],
-            "extract_answers:governing_law": pa.table({
+            "extract_answers:contract.governing_law": pa.table({
                 "c": pa.array([0, 1, 2], pa.int32()),
-                "governing_law": pa.array(["audit yearly", None, "will"],
-                                          pa.string()),
-                "governing_law_span": pa.array(
+                "contract.governing_law": pa.array(
+                    ["audit yearly", None, "will"], pa.string()),
+                "contract.governing_law_span": pa.array(
                     [{"start": 0, "end": 12}, None, {"start": 9, "end": 13}],
                     span_type),
             }),
@@ -419,7 +421,7 @@ def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
         turn = sess.model.extract_turn
     assert output.extract_answers["extract-1"].to_pydict() == {
         "c": ["ct0", "ct1", "ct2"], "answer": ["audit yearly", None, "will"]}
-    assert output.rows.column_names == ["c", "governing_law"]
+    assert output.rows.column_names == ["c", "contract"]
     # the request node carries the extraction's own head and tail
     assert pieces["preamble"] == _token_ids(turn[0] + quail.SHARED_PRE)
     assert [item["id"] for item in pieces["extracts"]] == ["extract-1"]

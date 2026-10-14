@@ -336,6 +336,7 @@ def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
         node_id="project",
         inputs=input_ports((sink_input, *label_ports)),
         columns=tuple(columns),
+        structs=region.logical_plan.projection.packing(),
     ))
     if region.logical_plan.result.limit is not None:
         nodes.append(Limit(
