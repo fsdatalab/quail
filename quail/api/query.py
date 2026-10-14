@@ -26,7 +26,7 @@ from quail.logical import (
 )
 from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
-from quail.planner.optimizer.logical import LogicalPlanningContext, apply_logical_rules
+from quail.planner.optimizer.logical import LogicalPlanningContext, simplify_plan
 from quail.planner.plan import Refusal, RefusalError
 from quail.planner.search.statistics import filter_stop_keys
 
@@ -96,7 +96,7 @@ class Query:
 
         Document lengths are exact for a tokenized column. For any other
         column they are estimated from a sample while a background thread
-        tokenizes it. The logical rules and the physical planner both read
+        tokenizes it. The tree rewrites and the physical planner both read
         these lengths.
 
         Returns:
@@ -135,9 +135,9 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions)
-            self.logical, changed = apply_logical_rules(
+            self.logical, changed = simplify_plan(
                 self.logical,
-                tuple(self.session.registry.logical_rules.values()),
+                tuple(self.session.registry.rules.values()),
                 context)
             rewritten = self.logical.operators()
             backend = self.session.registry.backend(config.backend)
@@ -176,7 +176,8 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions,
-                memo=context.memo)
+                memo=context.memo, catalog=self.session.catalog,
+                engine_config=config)
             extra = {}
             if config.gpu_timing:
                 extra["gpu_timing"] = True
@@ -276,9 +277,7 @@ class Query:
         registry = self.session.registry
         text = explain(self.logical, physical, verbose=verbose,
                        result=result,
-                       rules=(tuple(registry.logical_rules.values()),
-                              tuple(registry.physical_rules.values()),
-                              tuple(registry.logical_alternatives.values())),
+                       rules=tuple(registry.rules.values()),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
         if self._estimated:
@@ -317,6 +316,7 @@ class Query:
             if self._plan is self._searched_plan:
                 self._plan = plan_query(
                     self.logical, scan_fractions=self._scan_selectivities,
+                    catalog=self.session.catalog, engine_config=self.session.config,
                     **options)
             else:
                 # Explicit physical edits must survive exact tokenization.

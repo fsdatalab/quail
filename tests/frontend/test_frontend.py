@@ -31,9 +31,9 @@ from quail.logical import (
     render_join_question,
     split_frame,
 )
-from quail.planner.optimizer.logical import LogicalPlanningContext, apply_logical_rules
+from quail.planner.optimizer.logical import LogicalPlanningContext, simplify_plan
 from quail.planner.prompt_lowering import lower_prompt
-from quail.planner.rules.logical import built_in_logical_rules
+from quail.planner.rules import built_in_rules
 
 
 @pytest.fixture()
@@ -310,8 +310,8 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
     assert pairs.on[0].left == ColumnRef("r", "reviews", "id")
     assert pairs.on[0].right == ColumnRef("p", "products", "asin")
     # the equality columns are loaded as values for the pair table
-    optimized, _ = apply_logical_rules(
-        plan, built_in_logical_rules(), LogicalPlanningContext(catalog, None))
+    optimized, _ = simplify_plan(
+        plan, built_in_rules(), LogicalPlanningContext(catalog, None))
     scans = {node.alias: node for node in optimized.walk()
              if isinstance(node, Scan)}
     assert "id" in scans["r"].columns and "asin" in scans["p"].columns
@@ -474,8 +474,8 @@ def test_sql_and_builder_parse_order_by_offset_and_distinct(catalog):
              .select("r.id"))
     assert built == plan
     # the sort column is loaded by the scan although it is not returned
-    optimized, _ = apply_logical_rules(
-        plan, built_in_logical_rules(), LogicalPlanningContext(catalog, None))
+    optimized, _ = simplify_plan(
+        plan, built_in_rules(), LogicalPlanningContext(catalog, None))
     scan = next(node for node in optimized.walk() if isinstance(node, Scan))
     assert "review" in scan.columns
 

@@ -1,1 +1,1 @@
-"""The logical and physical optimizers that run the planner's rules."""
+"""Rule interfaces and application to query trees and executable graphs."""

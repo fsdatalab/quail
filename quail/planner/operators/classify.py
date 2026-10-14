@@ -311,7 +311,7 @@ class ClassifyBuilder(ClassifyStatistics):
 
         Returns:
             The specification and its work when the model requires a scoring
-            method. Otherwise, the choose_classify_implementation physical rule
+            method. Otherwise, the choose_classify_implementation rule
             chooses the method and fills in its work later.
         """
         lowered = self.lower(call.prompt)

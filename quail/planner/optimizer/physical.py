@@ -1,4 +1,4 @@
-"""Physical optimizer rules and the planner protocol."""
+"""Executable graph refinement and the planner protocol."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.physical.base import PhysicalGraph
+from quail.planner.optimizer.rules import OptimizerRule
 from quail.planner.prompt_lowering import LoweredPrompt, lower_prompt
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -73,12 +74,14 @@ class PlanningContext:
     # the logical plan the graph was planned from; None when the rules
     # run again over a finished plan
     logical_plan: Any = None
+    catalog: Any = None
+    engine_config: Any = None
     # the plan's settings as the rules see them; a rule adds what the
     # executor needs for its decision, such as the KV retention
     # schedule, and the planner puts the result on the plan
     settings: dict = field(default_factory=dict, compare=False, repr=False)
     # results computed once per query, such as the plan's statistics,
-    # shared with the logical rules that planned it
+    # shared with the tree rewrites that planned it
     memo: dict = field(default_factory=dict, compare=False, repr=False)
 
     def lowered(self, prompt) -> LoweredPrompt:
@@ -94,42 +97,26 @@ class PhysicalCandidate:
         graph: The plan's graph; None for a refusal.
         plan: A PhysicalPlan or a Refusal.
         estimated_seconds: The current cost estimate; infinite for a refusal.
-            Backend estimates are refined by physical rules before selection.
+            The planner refines backend estimates before selection.
         logical_plan: The logical plan the candidate lowers, when it
             differs from the region's, such as one with its
-            classifications moved above the joins. The physical rules
+            classifications moved above the joins. Rules targeting the graph
             read it before this candidate is compared with the others.
-        logical_rules: Alternative rules that produced this candidate.
+        rewrites: Alternative rules that produced this candidate.
     """
 
     graph: PhysicalGraph | None
     plan: Any
     estimated_seconds: float
     logical_plan: Any = None
-    logical_rules: tuple[str, ...] = ()
-
-
-class PhysicalOptimizerRule(Protocol):
-    """Rewrite a complete typed physical graph.
-
-    A rule may set ``cost_based = True`` when it prices the plans it
-    chooses between; explain lists every other rule as heuristic.
-    """
-
-    name: str
-
-    def rewrite(
-        self,
-        graph: PhysicalGraph,
-        context: PlanningContext,
-    ) -> PhysicalGraph | None: ...
+    rewrites: tuple[str, ...] = ()
 
 
 class PhysicalPlanner(Protocol):
     """Lower one logical alternative into physical candidates.
 
-    The common planner applies physical rules and compares the resulting
-    estimates. Implementations do not run logical alternative rules.
+    The common planner refines each graph and compares the resulting
+    estimates. Implementations do not run cost-based tree rewrites.
     """
 
     name: str
@@ -141,14 +128,16 @@ class PhysicalPlanner(Protocol):
     ) -> tuple[PhysicalCandidate, ...]: ...
 
 
-def apply_physical_rules(
+def rewrite_graph(
     graph: PhysicalGraph,
-    rules: tuple[PhysicalOptimizerRule, ...],
+    rules: tuple[OptimizerRule, ...],
     context: PlanningContext,
 ) -> tuple[PhysicalGraph, tuple[str, ...]]:
-    """Apply registered physical graph rules in order."""
+    """Apply rules targeting executable graphs in registration order."""
     changed = []
     for rule in rules:
+        if rule.target != "physical":
+            continue
         replacement = rule.rewrite(graph, context)
         if replacement is not None and replacement != graph:
             replacement.validate()

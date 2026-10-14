@@ -3,12 +3,12 @@
 from dataclasses import replace
 
 from quail.logical import LogicalPlan
-from quail.planner.optimizer.alternatives import logical_alternatives
+from quail.planner.optimizer.logical import LogicalPlanningContext, logical_alternatives
 from quail.planner.optimizer.physical import (
     ModelRegion,
     PhysicalCandidate,
     PlanningContext,
-    apply_physical_rules,
+    rewrite_graph,
 )
 from quail.planner.plan import Refusal, inference_seconds
 from quail.planner.validation import ClassifyRefusedError
@@ -21,11 +21,12 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                registry, tokenizer=None, pair_fractions=None,
                scan_fractions=None,
                canvas_draws: int = 4,
-               attention: str | None = None, memo=None):
+               attention: str | None = None, memo=None,
+               catalog=None, engine_config=None):
     """Plan one query with the selected model backend.
 
     Args:
-        plan: The logical plan to plan, as the logical rules left it.
+        plan: The logical plan to plan, as the tree rewrites left it.
         model: Model spec.
         device: Device spec.
         doc_tokens: Per document token counts for each table alias.
@@ -45,8 +46,10 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             regular predicates are expected to keep.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
-        memo: Results the logical rules computed for this plan, such
+        memo: Results the tree rewrites computed for this plan, such
             as its statistics, for the physical planner to reuse.
+        catalog: Catalog available to tree rewrites during search.
+        engine_config: Session configuration available to tree rewrites.
 
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
@@ -89,6 +92,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         scan_fractions=dict(scan_fractions or {}),
         logical_plan=plan,
         memo={} if memo is None else memo,
+        catalog=catalog, engine_config=engine_config,
     )
     return search_plan(plan, context, registry)
 
@@ -97,9 +101,10 @@ def search_candidates(logical, context, registry) -> tuple[PhysicalCandidate, ..
     """Lower and refine every logical alternative before comparing costs."""
     backend = registry.backend(context.backend)
     planners = (backend, *registry.physical_planners.values())
-    rules = tuple(registry.physical_rules.values())
+    rules = tuple(registry.rules.values())
     alternatives = logical_alternatives(
-        logical, tuple(registry.logical_alternatives.values()), context)
+        logical, rules,
+        LogicalPlanningContext.from_physical(context))
     candidates = []
     for alternative in alternatives:
         candidate_context = replace(
@@ -110,7 +115,7 @@ def search_candidates(logical, context, registry) -> tuple[PhysicalCandidate, ..
                 candidate = replace(
                     candidate,
                     logical_plan=candidate.logical_plan or alternative.plan,
-                    logical_rules=alternative.rules)
+                    rewrites=alternative.rules)
                 plan = candidate.plan
                 if not isinstance(plan, Refusal):
                     if plan.backend != context.backend:
@@ -145,7 +150,7 @@ def search_plan(logical, context, registry):
     if isinstance(plan, Refusal):
         return plan
     comparison = tuple({
-        "logical_rules": candidate.logical_rules,
+        "rewrites": candidate.rewrites,
         "estimated_seconds": (None if isinstance(candidate.plan, Refusal)
                               else candidate.estimated_seconds),
         "refusal": (candidate.plan.constraint
@@ -182,11 +187,11 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         pair_fractions=dict(pair_fractions or {}),
     )
     return apply_plan_rules(
-        plan, tuple(registry.physical_rules.values()), context)
+        plan, tuple(registry.rules.values()), context)
 
 
 def apply_plan_rules(plan, rules, context):
-    """Apply physical rules in order to a plan and return the result.
+    """Refine a plan by applying its registered rules in order.
 
     The rules see the plan's settings on the context and may add to
     them. Changes to inference estimates update both the plan total and
@@ -194,7 +199,7 @@ def apply_plan_rules(plan, rules, context):
 
     Args:
         plan: A PhysicalPlan.
-        rules: The physical rules, in the order to apply them.
+        rules: Registered rules in order; only graph targets apply.
         context: The PlanningContext.
 
     Returns:
@@ -203,7 +208,7 @@ def apply_plan_rules(plan, rules, context):
     """
     context = replace(context, settings=dict(plan.settings))
     try:
-        graph, changed = apply_physical_rules(plan.graph, rules, context)
+        graph, changed = rewrite_graph(plan.graph, rules, context)
     except ClassifyRefusedError as refused:
         return refused.refusal()
     if not changed and context.settings == dict(plan.settings):

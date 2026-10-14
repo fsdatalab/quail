@@ -63,13 +63,13 @@ too:
 | Path | Contents |
 | --- | --- |
 | `pricing.py` | Helpers that price a logical plan through the same search as the query planner. |
-| `rules/` | The built-in logical and physical optimizer rules. |
+| `rules/` | Universal and cost-based rules, with one dependency order. |
 | `graph/` | `GraphBuilder`, which turns the planner's decisions into a physical graph, plus shards, retention, and result operators. |
 | `sol/` | The speed-of-light estimate and its plan search. |
 | `search/` | `operator_order.py` assembles the chosen filter order, join order, and anchors. `filter_order.py` and `join_order.py` implement the searches. |
 | `operators/` | One module per AI operator (`filter`, `join`, `score`, `classify`, `extract`) with its statistics, cost, spec, and `emit_*` functions that add its plan nodes. |
 | `statistics/` | Table length summaries and `pool_split`, the KV pool split every operator reads. |
-| `api.py`, `optimizer/` | Logical alternatives, physical refinement of every candidate, and final selection. The optimizer modules define contexts, rule protocols, and rule application. |
+| `api.py`, `optimizer/` | Logical alternatives, physical refinement of every candidate, and final selection. The optimizer modules define contexts, the shared rule interface, and rule application. |
 | `validation.py`, `prompt_lowering.py`, `plan.py` | Refusals, prompt tokenization, and `PhysicalPlan`. |
 
 To add an AI operator, add a module under `operators/` and call its

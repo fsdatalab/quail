@@ -111,7 +111,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     its table runs after the table's AI.IF filters.
 
     The initial estimate includes filter and join work and any inference
-    costs already known. The planner then runs the physical rules to select
+    costs already known. The planner then runs the graph refinement rules to select
     classification implementations, KV retention, and prefix sharing before
     comparing this candidate with others.
 

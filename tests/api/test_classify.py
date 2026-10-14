@@ -45,7 +45,7 @@ from quail.physical import (
 from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.prompt_lowering import lower_prompt
-from quail.planner.rules.logical import push_down_projection
+from quail.planner.rules.rewrites import push_down_projection
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 from quail_b.prompts import AGENT_PROGRESS, AGENT_PROGRESS_DESCRIPTIONS
 from quail_b.prompts import AGENT_PROGRESS_LABELS as STAGES
@@ -481,16 +481,14 @@ def _candidates(session, query):
 
 def test_planner_places_and_scores_classifications(session, tmp_path):
     from quail.logical import classified_above_joins
-    from quail.planner.rules.logical import (
-        built_in_logical_rules,
+    from quail.planner.rules import built_in_rules
+    from quail.planner.rules.rewrites import (
         lift_maps,
     )
-    from quail.planner.rules.physical import built_in_physical_rules
 
-    assert [rule.name for rule in built_in_logical_rules()] == [
+    assert [rule.name for rule in built_in_rules()] == [
         "distinct_elimination", "distinct_pushdown", "projection_pushdown",
-        "filter_pushdown"]
-    assert [rule.name for rule in built_in_physical_rules()] == [
+        "filter_pushdown", "lift_maps",
         "limit_pushdown", "choose_classify_implementation", "kv_retention",
         "prefix_sharing", "tree_attention"]
     plan = _topic(session).plan()
@@ -540,7 +538,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     assert classified_above_joins(lifted_candidate.logical_plan.root) == {"r"}
     assert (lifted_candidate.estimated_seconds
             < written_candidate.estimated_seconds)
-    # a cost-based logical rule prices a plan the same way the backend
+    # a cost-based tree rewrite prices a plan the same way the backend
     # prices its candidates
     from quail.planner import pricing
     from quail.planner.optimizer.logical import LogicalPlanningContext

@@ -3,10 +3,12 @@
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
+import pytest
+
 from quail.logical import ColumnRef, LogicalPlan, Project, Scan
 from quail.planner.optimizer.logical import (
     LogicalPlanningContext,
-    apply_logical_rules,
+    simplify_plan,
 )
 
 CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)
@@ -48,6 +50,9 @@ class TaggedInput:
 class RenameTag:
     """Rename one tag value to another, one node at a time."""
 
+    target = "logical"
+    cost_based = False
+
     def __init__(self, old, new):
         self.name = f"rename_{old}_{new}"
         self.old, self.new = old, new
@@ -85,7 +90,7 @@ def test_custom_logical_node_rewrites_until_a_round_changes_nothing():
     for start, rules, tag, changed in REWRITES:
         case = f"{start} {rules}"
         plan = _tagged_plan(start)
-        optimized, applied = apply_logical_rules(
+        optimized, applied = simplify_plan(
             plan, tuple(RenameTag(old, new) for old, new in rules), CONTEXT)
 
         assert [node.type_name for node in optimized.walk()] == [
@@ -100,7 +105,7 @@ def test_rules_that_never_settle_stop_at_the_pass_cap():
     # would repeat forever: a -> b -> c | c -> a | a -> b -> c | ...
     rules = (RenameTag("a", "b"), RenameTag("c", "a"), RenameTag("b", "c"))
 
-    optimized, changed = apply_logical_rules(
+    optimized, changed = simplify_plan(
         _tagged_plan("a"), rules, CONTEXT, max_passes=3)
 
     assert optimized.root.input.tag == "c"
@@ -108,7 +113,10 @@ def test_rules_that_never_settle_stop_at_the_pass_cap():
 
 
 class RecordContext:
-    """Keep the context a session hands its logical rules."""
+    """Keep the context a session hands its tree rewrites."""
+
+    target = "logical"
+    cost_based = False
 
     name = "record_context"
 
@@ -120,16 +128,20 @@ class RecordContext:
         return None
 
 
-def test_session_rules_read_statistics_from_the_context():
+@pytest.mark.parametrize("cost_based", [False, True])
+def test_session_rules_read_statistics_from_the_context(cost_based):
     import pyarrow as pa
 
     import quail
 
     recorder = RecordContext()
+    recorder.cost_based = cost_based
     session = quail.Session(
         quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
         tokenizer=str.split)
-    session.registry.register_logical_rule(recorder)
+    register = (session.registry.register_cost_based_rule if cost_based
+                else session.registry.register_universal_rule)
+    register(recorder)
     session.register("docs", quail.DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two three"]}),
         id_col="id"))

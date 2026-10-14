@@ -2,71 +2,67 @@
 title: Custom Rules
 ---
 
-Here we show how to implement and register a custom optimizer rule.
-The rule must preserve the query's meaning.
+An optimizer rule changes a plan while preserving the query's meaning.
 For Quail's existing rules, see the [optimizer](/docs/architecture/optimizer).
 
-## Choose the rule type
+## Choose the category
 
-- A *logical rule* changes the logical plan, such as which columns a
-  scan loads.
-- A *logical alternative rule* offers equivalent logical plans for cost
-  comparison, retaining the original plan.
-- A *physical rule* changes the physical plan, such as an operator's
-  execution settings.
+- A **universal rule** applies whenever its conditions hold, without
+  comparing costs. Set `cost_based = False`.
+- A **cost-based rule** proposes alternatives or chooses an implementation
+  using estimated cost. Set `cost_based = True`.
+
+Each rule also declares its target. Set `target = "logical"` to rewrite
+query trees, or `target = "physical"` to rewrite executable graphs.
+The target tells the planner which representation the rule accepts.
+Both categories use the same `OptimizerRule` interface.
 
 ## Implement the rule
 
-You can define a class with a `name` and a `rewrite()` method.
-`name` identifies the rule in the registry and plan explanations.
-Use a name that differs from those of registered rules.
-
-For a logical rule, `rewrite(root, context)` receives the root node of
-the logical plan. Return a new root when you change the plan.
+Define a class with `name`, `target`, `cost_based`, and `rewrite()`.
+The name identifies the rule in the registry and plan explanations.
+Use a name that differs from every registered rule, across both categories.
+Return new nodes instead of changing existing nodes in place.
 Return `None` when no change is needed.
 
-The example below shows Quail's existing `ProjectionPushdown` rule.
 For example, imagine a `reviews` table with `id`, `body`, and `author`
 columns. A query returns `id` and uses `body` in a model filter.
-The rule tells the scan to retain `id` values for the result.
+Projection pushdown tells the scan to retain `id` values for the result.
 Quail still tokenizes `body` for the filter. It does not need `author`.
 
 ```python
-from quail.planner.rules.logical import push_down_projection
+from quail.planner.rules.rewrites import push_down_projection
 
 
 class ProjectionPushdown:
     name = "projection_pushdown"
+    target = "logical"
+    cost_based = False
 
     def rewrite(self, root, context):
         rewritten = push_down_projection(root)
         return None if rewritten is root else rewritten
 ```
 
-The helper `push_down_projection()` updates the scans and returns the
-plan's root. It returns the original root when no change is needed.
-For your rule, implement the plan changes required by your operation.
-Return new nodes instead of changing existing nodes in place.
-See the [complete implementation](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/logical.py).
+The helper updates the scans and returns the plan's root. It returns the
+original root when no change is needed. See the
+[complete implementation](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/universal.py).
 
-For a physical rule, implement `rewrite(graph, context)`.
-Return a new `PhysicalGraph` when you change the plan, or `None` when
-no change is needed.
+For a query tree target, `rewrite(root, context)` returns a new root.
+For a cost-based tree rewrite, the planner retains the original,
+deduplicates equal roots, and lowers and refines every alternative before
+comparing costs. The rewrite proposes a placement; it does not call the
+planner recursively to price it. Check `context.backend` when a placement
+requires a particular engine's support, as `LiftMaps` does.
 
-For a logical alternative rule, implement `alternatives(root, context)`.
-Return a tuple of equivalent logical roots, or an empty tuple when none
-apply. The planner retains the original, deduplicates equal roots, and
-lowers and refines every alternative before selecting by cost. Check
-`context.backend` if the alternatives require a particular engine's
-lowering support, as the built-in `LiftMaps` rule does.
+For an executable graph target, `rewrite(graph, context)` returns a new
+`PhysicalGraph`. A cost-based graph rule compares the implementations it
+supports and returns its choice. The planner applies the change before
+comparing whole candidates. The current search is staged and does not
+enumerate all combinations of implementations and placements.
 
-Set `cost_based = True` on a rule that compares costs; `explain(verbose=True)`
-marks such rules.
-`quail.planner.pricing.estimated_seconds(plan, context, registry)` runs the
-same complete search as the planner, including the registered physical rules.
-
-The *planning context* provides the engine configuration and input
-statistics available to a rule. See
+The *planning context* provides the configuration and input statistics
+available to a rule. See
 [`LogicalPlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/logical.py)
 and
 [`PlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/physical.py)
@@ -75,30 +71,41 @@ for their fields.
 ## Register the rule
 
 Create an [extension registry](/docs/extending#registration) with
-`ExtensionRegistry.with_built_ins()`. Create an instance of your rule class
-and register it with the method for its type:
+`ExtensionRegistry.with_built_ins()`. Register an instance with the method
+for its category:
 
-| Rule type | Registration method |
+| Category | Registration method |
 | --- | --- |
-| Logical | `registry.register_logical_rule(rule)` |
-| Logical alternative | `registry.register_logical_alternative(rule)` |
-| Physical | `registry.register_physical_rule(rule)` |
+| Universal | `registry.register_universal_rule(rule)` |
+| Cost-based | `registry.register_cost_based_rule(rule)` |
 
-Pass the registry to the session.
-`ProjectionPushdown` is already registered in Quail's default registry.
-The example shows its interface; you do not need to register it again.
+Pass the registry to the session. `ProjectionPushdown` is already
+registered in Quail's default registry. The example shows its interface;
+you do not need to register it again.
 
-### Rule execution order
+`registry.universal_rules` and `registry.cost_based_rules` expose each
+category. `registry.rules` contains both in one registration order.
+The registry checks the target and category when a rule is registered.
 
-- Your rules run after Quail's existing rules, in registration order.
-- For logical rules, one *pass* applies all rules once. Quail repeats
-  passes until a pass makes no changes, with a maximum of four passes.
-- Logical alternative rules expand the known alternatives until no new
+### Execution order
+
+- Universal tree rewrites simplify the query before search. A *pass*
+  applies all matching rules once. Quail repeats passes until nothing
+  changes, with a maximum of four passes.
+- Cost-based tree rewrites expand the known alternatives until no new
   plan appears, with a maximum of four passes. The original stays first.
-- Quail applies each physical rule once to every candidate before comparing
-  costs. It repeats the search when exact token sequences become available.
+- Both categories of graph rules run once on each candidate in their
+  shared registration order. Registration order preserves dependencies
+  across categories. Quail compares candidate costs after graph refinement.
+- Exact token sequences trigger the search again when initial planning
+  used estimated document lengths.
 - Rule settings belong to one candidate. The context memo is shared for
   reusable statistics; memo keys must include all inputs that affect a value.
+
+`explain(verbose=True)` lists both categories and the graph refinement
+order. The pricing helper
+`quail.planner.pricing.estimated_seconds(plan, context, registry)` uses the
+same search and registered rules.
 
 ## Check the rule
 
@@ -108,8 +115,9 @@ Check that:
 - The intended nodes and fields change.
 - The original plan remains unchanged.
 - The revised plan preserves the query's meaning.
-- A second call on the revised plan returns `None` if no further change
-  is needed.
+- A second call returns `None` if no further change is needed.
+- Cost-based tree alternatives are compared after graph refinement.
 
-See the [logical rule tests](https://github.com/fsdatalab/quail/blob/main/tests/frontend/test_logical_extensions.py)
-for examples of repeated calls and rule execution order.
+See the [tree rewrite tests](https://github.com/fsdatalab/quail/blob/main/tests/frontend/test_logical_extensions.py)
+and [search tests](https://github.com/fsdatalab/quail/blob/main/tests/planner/test_search.py)
+for examples.

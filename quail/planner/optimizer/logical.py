@@ -1,15 +1,16 @@
-"""Logical plan rewriting: whole-plan rules, run until nothing changes."""
+"""Simplify query trees and retain cost-based alternatives."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping
 
-from quail.logical import LogicalNode, LogicalPlan
+from quail.logical import LogicalPlan
 from quail.planner.optimizer.physical import (
     PlanningContext,
     lowered_prompt,
 )
+from quail.planner.optimizer.rules import OptimizerRule
 
 # Rounds over the rule list before giving up on convergence. Two rules
 # that undo each other would otherwise loop forever.
@@ -18,7 +19,7 @@ MAX_PASSES = 4
 
 @dataclass(frozen=True)
 class LogicalPlanningContext:
-    """Session values and statistics available to logical optimizer rules.
+    """Session values and statistics available to rules that rewrite query trees.
 
     Document token counts are exact when the column is tokenized, else
     estimated from a sample. A cost-based rule prices a predicate
@@ -73,43 +74,34 @@ class LogicalPlanningContext:
             attention=self.attention, tokenizer=self.tokenizer,
             pair_fractions=dict(self.pair_fractions),
             scan_fractions=dict(self.scan_fractions),
-            logical_plan=logical_plan, memo=self.memo)
+            logical_plan=logical_plan, memo=self.memo,
+            catalog=self.catalog, engine_config=self.engine_config)
+
+    @classmethod
+    def from_physical(cls, context: PlanningContext) -> LogicalPlanningContext:
+        """Return a query tree context with the current search inputs."""
+        return cls(
+            catalog=context.catalog, engine_config=context.engine_config,
+            model=context.model, device=context.device, gpu_count=context.gpu_count,
+            document_tokens=context.document_tokens, backend=context.backend,
+            order=context.order, canvas_draws=context.canvas_draws,
+            attention=context.attention, tokenizer=context.tokenizer,
+            pair_fractions=context.pair_fractions,
+            scan_fractions=context.scan_fractions, memo=context.memo)
 
 
-class LogicalOptimizerRule(Protocol):
-    """Rewrite a whole logical plan without changing query meaning.
-
-    A rule may set ``cost_based = True`` when it prices the plans it
-    chooses between; explain lists every other rule as heuristic. The
-    built in logical rules are all heuristic.
-
-    A rule walks the plan itself, in the direction its rewrite needs:
-    from the root toward the scans when it pushes information down,
-    from the scans toward the root when it simplifies a node once its
-    children are final. It returns the new root, or None when the plan
-    is unchanged.
-    """
-
-    name: str
-
-    def rewrite(
-        self,
-        root: LogicalNode,
-        context: LogicalPlanningContext,
-    ) -> LogicalNode | None: ...
-
-
-def apply_logical_rules(
+def simplify_plan(
     plan: LogicalPlan,
-    rules: tuple[LogicalOptimizerRule, ...],
+    rules: tuple[OptimizerRule, ...],
     context: LogicalPlanningContext,
     *,
     max_passes: int = MAX_PASSES,
 ) -> tuple[LogicalPlan, tuple[str, ...]]:
-    """Apply the rules in order, repeating until no rule changes the plan.
+    """Apply universal rules until no rule changes the plan.
 
-    Each round offers the current plan to every rule in registration
-    order. Rounds continue until one round changes nothing, so a rewrite
+    Cost-based rules are deferred to search. Each round offers the current
+    plan to every universal rule in registration order. Rounds continue
+    until one round changes nothing, so a rewrite
     that enables a later rule is not missed, or until `max_passes`
     rounds have run.
 
@@ -122,6 +114,8 @@ def apply_logical_rules(
     for _ in range(max_passes):
         before = root
         for rule in rules:
+            if rule.target != "logical" or rule.cost_based:
+                continue
             replacement = rule.rewrite(root, context)
             if replacement is not None and replacement != root:
                 root = replacement
@@ -131,3 +125,37 @@ def apply_logical_rules(
     optimized = LogicalPlan(root)
     optimized.validate()
     return optimized, tuple(changed)
+
+
+@dataclass(frozen=True)
+class LogicalAlternative:
+    """A logical plan and the rules that produced it."""
+
+    plan: LogicalPlan
+    rules: tuple[str, ...] = ()
+
+
+def logical_alternatives(plan, rules, context, *, max_passes=MAX_PASSES) -> tuple:
+    """Apply cost-based tree rewrites, retaining the original first.
+
+    Equivalent roots are deduplicated. Rules run over every known alternative
+    for at most max_passes rounds, stopping when no new root is produced.
+    """
+    alternatives = [LogicalAlternative(plan)]
+    for _ in range(max_passes):
+        before = len(alternatives)
+        for rule in rules:
+            if rule.target != "logical" or not rule.cost_based:
+                continue
+            for candidate in tuple(alternatives):
+                root = rule.rewrite(candidate.plan.root, context)
+                if root is None or any(
+                        root == other.plan.root for other in alternatives):
+                    continue
+                rewritten = LogicalPlan(root)
+                rewritten.validate()
+                alternatives.append(LogicalAlternative(
+                    rewritten, (*candidate.rules, rule.name)))
+        if len(alternatives) == before:
+            break
+    return tuple(alternatives)

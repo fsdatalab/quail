@@ -45,6 +45,9 @@ def context_for(query):
 
 
 class PlacementCost:
+    target = "physical"
+    cost_based = False
+
     name = "test_placement_cost"
 
     def __init__(self, *, refuse=False, exact=False):
@@ -71,29 +74,30 @@ class PlacementCost:
         ), graph.root)
 
 
-def test_physical_rules_can_reverse_placement_choice(query):
+def test_graph_refinement_can_reverse_placement_choice(query):
     context = context_for(query)
     registry = query.session.registry
     original, lifted = search_candidates(query.logical, context, registry)
     assert lifted.estimated_seconds < original.estimated_seconds
     rule = PlacementCost()
-    registry.register_physical_rule(rule)
+    registry.register_universal_rule(rule)
     chosen = search_plan(query.logical, context, registry)
     assert rule.seen == [False, True]
     assert context.settings == {}
     original, lifted = chosen.settings["candidates"]
     assert original["selected"] and not lifted["selected"]
     assert original["estimated_seconds"] < lifted["estimated_seconds"]
-    assert lifted["logical_rules"] == ("lift_maps",)
+    assert lifted["rewrites"] == ("lift_maps",)
     assert "test_seen" not in context.settings
     text = query.explain(verbose=True)
-    assert "search alternatives: lift_maps" in text
-    assert "lowest estimated cost after physical rules" in text
+    assert "cost-based: lift_maps" in text
+    assert "retain cost-based tree alternatives" in text
+    assert "lowest estimated cost after graph refinement" in text
 
 
 def test_refused_candidate_does_not_hide_a_runnable_plan(query):
     context = context_for(query)
-    query.session.registry.register_physical_rule(PlacementCost(refuse=True))
+    query.session.registry.register_universal_rule(PlacementCost(refuse=True))
     plan = search_plan(query.logical, context, query.session.registry)
     assert not isinstance(plan, Refusal)
     original, lifted = plan.settings["candidates"]
@@ -133,23 +137,32 @@ def test_prefix_sharing_is_priced_for_every_placement(query):
             extract.spec.estimated_seconds)
 
 
-def test_alternative_registration_deduplicates_equivalent_plans(query):
-    from quail.planner.rules.logical import LiftMaps
+def test_cost_based_rules_retain_original_and_deduplicate(query):
+    from quail.planner.optimizer.logical import (
+        LogicalPlanningContext,
+        simplify_plan,
+    )
+    from quail.planner.rules.cost_based import LiftMaps
 
     context = context_for(query)
     registry = query.session.registry
-    registry.register_logical_alternative(LiftMaps(), name="duplicate_lift")
+    registry.register_cost_based_rule(LiftMaps(), name="duplicate_lift")
     with pytest.raises(ValueError, match="duplicate"):
-        registry.register_logical_alternative(LiftMaps())
+        registry.register_cost_based_rule(LiftMaps())
+    simplified, changed = simplify_plan(
+        query.logical, tuple(registry.rules.values()),
+        LogicalPlanningContext.from_physical(context))
+    assert simplified == query.logical
+    assert "lift_maps" not in changed
     original, lifted = search_candidates(query.logical, context, registry)
     assert original.logical_plan == query.logical
-    assert original.logical_rules == ()
-    assert lifted.logical_rules == ("lift_maps",)
+    assert original.rewrites == ()
+    assert lifted.rewrites == ("lift_maps",)
 
 
 def test_exact_tokenization_reconsiders_placement(query):
     rule = PlacementCost(exact=True)
-    query.session.registry.register_physical_rule(rule)
+    query.session.registry.register_universal_rule(rule)
     first = query.plan()
     assert first.settings["candidates"][1]["selected"]
     request = query._prepare_physical()

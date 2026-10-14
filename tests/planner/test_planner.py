@@ -35,8 +35,7 @@ from quail.physical.pipelines import build_pipelines
 from quail.planner.api import refine_plan
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.plan import EngineConfig, Refusal
-from quail.planner.rules.logical import built_in_logical_rules
-from quail.planner.rules.physical import built_in_physical_rules
+from quail.planner.rules import built_in_rules
 from quail.planner.search.filter_order import order_filters_indexed
 from quail.planner.statistics.tables import AliasStats, summarize_alias
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
@@ -258,13 +257,17 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
 
     # verbose explain lists the rules in run order, marking the
     # cost-based ones
-    rules = (built_in_logical_rules(), built_in_physical_rules())
+    rules = built_in_rules()
     assert "rules" not in explain(logical, plan, rules=rules)
     text = explain(logical, plan, verbose=True, rules=rules)
-    assert ("  logical: distinct_elimination, distinct_pushdown, "
-            "projection_pushdown, filter_pushdown\n") in text
-    assert ("then limit_pushdown, choose_classify_implementation*, kv_retention, "
-            "prefix_sharing*, tree_attention* on every candidate") in text
+    assert ("  universal: distinct_elimination, distinct_pushdown, "
+            "projection_pushdown, filter_pushdown, limit_pushdown, "
+            "kv_retention") in text
+    assert ("  cost-based: lift_maps, choose_classify_implementation, "
+            "prefix_sharing, tree_attention") in text
+    assert ("refine each graph in order: limit_pushdown, "
+            "choose_classify_implementation, kv_retention, prefix_sharing, "
+            "tree_attention") in text
 
 
 def mask_pairs(prefix, suffix, window):
@@ -789,7 +792,7 @@ def _token_store(path, bodies):
 
 def test_prefix_sharing_and_attention_path_follow_the_token_store(
         catalog, tmp_path):
-    from quail.planner.rules.physical import (
+    from quail.planner.rules.cost_based import (
         page_aligned_shared_tokens,
         sharing_pays,
     )

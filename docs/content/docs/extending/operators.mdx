@@ -97,7 +97,7 @@ Register the node and runtime in each process that executes the plan.
 ## Add the operator to a plan
 
 Registration does not add the operator to queries.
-Implement a [physical rule or planner](/docs/extending/rules) that creates
+Implement a [rule targeting the graph](/docs/extending/rules) that creates
 node instances and connects them to the physical plan.
 Register the rule or planner in the same registry.
 

@@ -37,6 +37,9 @@ def test_query_scans_provider_and_preserves_extension_objects(
     lock = Lock()
 
     class CheckPlanning:
+        target = "physical"
+        cost_based = False
+
         name = "test.planning"
 
         def rewrite(self, graph, context):
@@ -72,7 +75,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
     monkeypatch.setattr(runtime, "_execute_physical", execute)
     monkeypatch.setattr(runtime, "_prepare_backend", lambda plan, registry: None)
 
-    session.registry.register_physical_rule(CheckPlanning())
+    session.registry.register_universal_rule(CheckPlanning())
     session.register("docs", quail.DocumentProvider.from_parquet(path, id_col="id"))
     response = session.sql(
         "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('keep {0}', d.body))"

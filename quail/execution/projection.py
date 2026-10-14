@@ -140,7 +140,7 @@ def projection_for(logical, token_inputs, documents):
                 raise CompileError(
                     f"projection column {name!r} was not loaded by the "
                     f"scan of {alias!r}; the projection_pushdown "
-                    f"logical rule is not registered")
+                    f"rule is not registered")
             values = store.column(column)
             projection.append((alias, values))
             fields.append(pa.field(

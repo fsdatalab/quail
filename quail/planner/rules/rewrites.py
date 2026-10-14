@@ -1,4 +1,4 @@
-"""Built in logical optimizer rules."""
+"""Query tree transformations used by optimizer rules."""
 
 from __future__ import annotations
 
@@ -111,17 +111,6 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     return descend(root, {})
 
 
-class ProjectionPushdown:
-    """Push the projected column set down to each Scan."""
-
-    name = "projection_pushdown"
-    cost_based = False
-
-    def rewrite(self, root, context):
-        rewritten = push_down_projection(root)
-        return None if rewritten is root else rewritten
-
-
 def _movable_filter_alias(node) -> str | None:
     """Return the table a cheap one-table filter reads, or None for other nodes.
 
@@ -219,23 +208,6 @@ def push_down_filters(root: LogicalNode) -> LogicalNode | None:
     return rewritten if moved else None
 
 
-class FilterPushdown:
-    """Push cheap one-table filters below the joins above their table.
-
-    Like Catalyst's PushDownPredicates, the move is unconditional: an
-    Apply returning ids and a Filter on a label column run no model, so
-    they thin a table before the joins read it. Both front ends already
-    place such filters on their table; the rule rewrites plans built
-    another way.
-    """
-
-    name = "filter_pushdown"
-    cost_based = False
-
-    def rewrite(self, root, context):
-        return push_down_filters(root)
-
-
 def _label_sequence(node) -> tuple:
     """Split a table's sequence at its classifications and extractions.
 
@@ -311,62 +283,6 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     return None if lifted == root else lifted
 
 
-class LiftMaps:
-    """Offer classification and extraction placement above joins on Quail."""
-
-    name = "lift_maps"
-
-    def alternatives(self, root, context) -> tuple:
-        # Request backends do not implement map placement above joins.
-        if context.backend != "quail":
-            return ()
-        lifted = lift_maps(root)
-        return () if lifted is None else (lifted,)
-
-
-def built_in_logical_alternatives() -> tuple:
-    """Return the logical alternatives explored during physical plan search."""
-    return (LiftMaps(),)
-
-
-class DistinctElimination:
-    """Clear a DISTINCT that cannot remove rows.
-
-    A filter returns each document at most once and a join pairs each
-    row pair once, so the result rows are unique when the projection
-    returns the id column of every scanned table. The id column is
-    taken as a key: nothing checks it, since that would read the
-    whole column, and a table that repeats an id gets the repeated
-    rows back. The rule reads the id columns from the catalog and
-    leaves a plan alone without one, or when an apply() supplies the
-    rows. A GROUP BY whose output returns every key is unique as well.
-    """
-
-    name = "distinct_elimination"
-    cost_based = False
-
-    def rewrite(self, root, context):
-        if not isinstance(root, Result) or not root.distinct:
-            return None
-        if isinstance(root.input, Aggregate):
-            # a group's keys name it once in the aggregate's output
-            return (replace(root, distinct=False)
-                    if set(root.input.keys) <= set(root.input.output)
-                    else None)
-        if not isinstance(root.input, Project) or context.catalog is None:
-            return None
-        plan = LogicalPlan(root)
-        if any(isinstance(node, Apply) for node in plan.walk()):
-            return None
-        returned = {(ref.alias, ref.column)
-                    for ref in root.input.output_schema()}
-        for scan in plan.operators().scans:
-            id_column = context.catalog.get(scan.provider).id_col
-            if (scan.alias, id_column) not in returned:
-                return None
-        return replace(root, distinct=False)
-
-
 def _filtered_alias(operators: Operators) -> str | None:
     """Return the one alias whose AI.IF predicates are the only model calls."""
     if (operators.joins or operators.classifies or operators.applies
@@ -388,56 +304,3 @@ def _stop_key(columns, alias) -> tuple[str, ...] | None:
         if column.column not in key:
             key.append(column.column)
     return tuple(key)
-
-
-class DistinctPushdown:
-    """Push a DISTINCT into a filter: stop a key once one document passes.
-
-    A DISTINCT over columns of one table asks only whether any document
-    of each key value passes. When that table's AI.IF predicates are
-    the plan's only model calls, the rule puts the key on its
-    SemanticFilter nodes. The executor then reads a key's documents one
-    at a time and skips the rest once one survives, so the answer
-    tables list only the documents it read. The result rows do not
-    change: each key value appears once either way.
-    """
-
-    name = "distinct_pushdown"
-    cost_based = False
-
-    def rewrite(self, root, context):
-        if not isinstance(root, Result) or not root.distinct:
-            return None
-        if not isinstance(root.input, Project):
-            return None
-        alias = _filtered_alias(LogicalPlan(root).operators())
-        if alias is None:
-            return None
-        key = _stop_key(root.input.columns, alias)
-        if not key:
-            return None
-
-        def mark(node):
-            if isinstance(node, SemanticFilter):
-                return node if node.stop_key == key else replace(
-                    node, stop_key=key)
-            children = tuple(mark(child) for child in node.children())
-            return node if children == node.children() else (
-                node.with_children(children))
-
-        marked = mark(root)
-        return None if marked == root else marked
-
-
-def built_in_logical_rules() -> tuple:
-    """Return the logical rules registered with the built in registry.
-
-    In order: distinct_elimination, distinct_pushdown, projection_pushdown,
-    and filter_pushdown. Every one is heuristic: it rewrites the plan
-    without pricing it. The cost-based choices (where classifications
-    and extractions run, filter order, join order and anchors) are made
-    during plan search, after the logical alternatives are lowered and
-    the physical rules have refined each candidate.
-    """
-    return (DistinctElimination(), DistinctPushdown(), ProjectionPushdown(),
-            FilterPushdown())
