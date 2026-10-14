@@ -36,8 +36,6 @@ class ShouldLiftMaps(LogicalRule):
     name = "should_lift_maps"
 
     def rewrites(self, root, context):
-        if context.backend != "quail":
-            return [root]
         rewritten = lift_maps(root)
         return [root] if rewritten is None else [root, rewritten]
 ```

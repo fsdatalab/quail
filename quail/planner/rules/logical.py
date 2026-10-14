@@ -125,13 +125,10 @@ class ShouldPushDownFilters(LogicalRule):
 
 
 class ShouldLiftMaps(LogicalRule):
-    """Offer classification and extraction placement above joins on Quail."""
+    """Offer classification and extraction placement above joins."""
 
     name = "should_lift_maps"
 
     def rewrites(self, root, context):
-        # Request backends do not implement map placement above joins.
-        if context.backend != "quail":
-            return [root]
         rewritten = lift_maps(root)
         return [root] if rewritten is None else [root, rewritten]
