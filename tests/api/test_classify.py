@@ -491,10 +491,10 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
         "distinct_elimination", "distinct_pushdown", "projection_pushdown",
         "filter_pushdown"]
     assert [rule.name for rule in built_in_physical_rules()] == [
-        "limit_pushdown", "kv_retention", "label_scoring", "prefix_sharing",
-        "tree_attention"]
+        "limit_pushdown", "kv_retention", "choose_classify_implementation",
+        "prefix_sharing", "tree_attention"]
     plan = _topic(session).plan()
-    # label_scoring chose every classification's scoring rule
+    # choose_classify_implementation chose every classification's scoring rule
     assert all(node.spec.scoring for node in plan.nodes
                if isinstance(node, AiClassify))
     assert plan.settings["classify_placement"] == "before joins"

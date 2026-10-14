@@ -301,7 +301,7 @@ class ClassifyBuilder(ClassifyStatistics):
         """Build a classification specification and work for a required method.
 
         The specification carries the prompt that names the labels; the
-        label_scoring rule picks the scoring rule, swaps in the
+        choose_classify_implementation rule picks the scoring rule, swaps in the
         lettered prompt when it picks letters, and fills the estimate.
 
         Args:
@@ -311,8 +311,8 @@ class ClassifyBuilder(ClassifyStatistics):
 
         Returns:
             The specification and its work when the model requires a scoring
-            method. Otherwise, the physical label_scoring rule chooses the
-            method and fills in its work later.
+            method. Otherwise, the choose_classify_implementation physical rule
+            chooses the method and fills in its work later.
         """
         lowered = self.lower(call.prompt)
         if self.model.role == "decision":

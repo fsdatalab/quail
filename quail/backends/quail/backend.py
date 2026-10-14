@@ -197,7 +197,7 @@ class QuailBackend:
     def _candidate(self, region, context) -> PhysicalCandidate:
         """Price one logical plan (quail.planner.pricing) as a candidate.
 
-        The candidate's estimate includes the label_scoring rule's
+        The candidate's estimate includes the choose_classify_implementation rule's
         choice, so candidates that place classifications differently
         compare on the scoring each would run.
         """

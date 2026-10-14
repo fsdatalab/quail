@@ -4,7 +4,7 @@
   the retention pool's page cap: a filter sequence keeps its survivors'
   KV for a join anchored on its table, and a join keeps its anchor's
   KV for a later group on the same anchor.
-- label_scoring: each classification gets the label scoring rule
+- choose_classify_implementation: each classification gets the label scoring rule
   (letters, trie_tree, or trie_decode) whose estimated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
@@ -146,8 +146,8 @@ class KvRetention:
             graph, context.gpu_count, tuple(context.settings.get("pre_ids", ())))
 
 
-class LabelScoring:
-    """Pick each classification's label scoring rule by estimated time.
+class ChooseClassifyImplementation:
+    """Choose each classification's implementation by estimated time.
 
     Fires for every AiClassify whose spec has no scoring rule yet and
     leaves chosen ones alone, so a later pass keeps the first choice.
@@ -165,7 +165,7 @@ class LabelScoring:
     prompts.
     """
 
-    name = "label_scoring"
+    name = "choose_classify_implementation"
     cost_based = True
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
@@ -178,7 +178,8 @@ class LabelScoring:
             return None
         if context.logical_plan is None:
             raise ValueError(
-                "label_scoring needs the logical plan on the planning context "
+                "choose_classify_implementation needs the logical plan "
+                "on the planning context "
                 "to score a classification without a scoring rule")
 
         logical = context.logical_plan
@@ -432,11 +433,11 @@ class TreeAttention:
 def built_in_physical_rules() -> tuple:
     """Return the physical rules registered with the built in registry.
 
-    In order: limit_pushdown, kv_retention, label_scoring,
+    In order: limit_pushdown, kv_retention, choose_classify_implementation,
     prefix_sharing, and tree_attention. prefix_sharing follows
     kv_retention because it weighs the page writes a sequence already
     makes, and tree_attention follows prefix_sharing because a filter's
     attention path depends on the prefixes it shares.
     """
-    return (LimitPushdown(), KvRetention(), LabelScoring(), PrefixSharing(),
-            TreeAttention())
+    return (LimitPushdown(), KvRetention(), ChooseClassifyImplementation(),
+            PrefixSharing(), TreeAttention())

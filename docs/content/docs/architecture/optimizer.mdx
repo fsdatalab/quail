@@ -32,7 +32,8 @@ to write and register an extension rule.
 Tokenization can continue in the background while planning runs. Before
 execution, `refine_plan` applies the physical rules with exact token
 counts and sequences. It preserves the choices already made while
-building the plan and by rules such as `label_scoring` and `kv_retention`.
+building the plan and by rules such as `choose_classify_implementation`
+and `kv_retention`.
 
 ## Cost estimates
 
@@ -111,7 +112,7 @@ built-in rules of the same kind, in registration order.
 | `filter_pushdown` | Logical | Move eligible CPU filters and Python functions before joins. | No |
 | `limit_pushdown` | Physical | Stop an eligible filter sequence after enough documents pass. | No |
 | `kv_retention` | Physical | Keep selected document KV for later operators. | Yes |
-| `label_scoring` | Physical | Choose a classification's label scoring method. | Yes |
+| `choose_classify_implementation` | Physical | Choose the cheapest supported classification implementation. | Yes |
 | `prefix_sharing` | Physical | Reuse KV between documents with a shared prefix. | Yes |
 | `tree_attention` | Physical | Choose unified or tree attention for filters and joins. | Yes |
 
@@ -249,8 +250,8 @@ calculation and execution behavior.
 
 ### Label scoring
 
-The `label_scoring` rule compares supported classification methods and
-chooses the one with the lowest estimated GPU time. It considers the
+The `choose_classify_implementation` rule compares supported classification
+implementations and chooses the one with the lowest estimated GPU time. It considers the
 model, label tokens, requested output, and whether earlier operators
 already provide document KV.
 

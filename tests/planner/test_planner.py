@@ -263,7 +263,7 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     text = explain(logical, plan, verbose=True, rules=rules)
     assert ("  logical: distinct_elimination, distinct_pushdown, "
             "projection_pushdown, filter_pushdown\n") in text
-    assert ("then limit_pushdown, kv_retention, label_scoring*, "
+    assert ("then limit_pushdown, kv_retention, choose_classify_implementation*, "
             "prefix_sharing*, tree_attention*") in text
 
 

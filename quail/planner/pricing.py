@@ -1,7 +1,7 @@
 """Price a logical plan by the estimated seconds of its physical plan.
 
 build_physical_plan builds the physical plan, choosing filter order and
-join order and anchors, and the label_scoring rule picks each
+join order and anchors, and the choose_classify_implementation rule picks each
 classification's scoring rule so its seconds are counted. The Quail
 backend prices its candidates this way, and a cost-based logical rule
 can compare plans with the same functions. Plans are memoized on the
@@ -18,7 +18,7 @@ from quail.planner.api import apply_plan_rules
 from quail.planner.graph.build import build_physical_plan
 from quail.planner.optimizer.logical import LogicalPlanningContext
 from quail.planner.plan import Refusal
-from quail.planner.rules.physical import LabelScoring
+from quail.planner.rules.physical import ChooseClassifyImplementation
 
 
 def physical_plan(logical: LogicalPlan, context):
@@ -46,7 +46,8 @@ def physical_plan(logical: LogicalPlan, context):
             order=context.order, pair_fractions=context.pair_fractions,
             context=context)
         if not isinstance(physical, Refusal):
-            physical = apply_plan_rules(physical, (LabelScoring(),), context)
+            physical = apply_plan_rules(
+                physical, (ChooseClassifyImplementation(),), context)
         context.memo[key] = physical
     return context.memo[key]
 

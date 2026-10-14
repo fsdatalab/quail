@@ -110,7 +110,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     runs after the joins, over the documents the joins matched. One on
     its table runs after the table's AI.IF filters.
 
-    The label_scoring physical rule picks each classification's scoring
+    The choose_classify_implementation physical rule picks each classification's scoring
     rule, and the kv_retention rule picks which KV stays resident. The
     estimate and ``search_seconds`` count only the filters, the joins,
     and the classifications of joined rows.
