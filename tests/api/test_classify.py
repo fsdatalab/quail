@@ -487,10 +487,11 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     )
 
     assert [rule.name for rule in built_in_rules()] == [
-        "distinct_elimination", "distinct_pushdown", "projection_pushdown",
-        "filter_pushdown", "lift_maps",
-        "limit_pushdown", "choose_classify_implementation", "kv_retention",
-        "prefix_sharing", "tree_attention"]
+        "should_eliminate_distinct", "should_push_down_distinct",
+        "should_push_down_projection",
+        "should_push_down_filters", "should_lift_maps",
+        "should_push_down_limit", "choose_classify_implementation", "should_retain_kv",
+        "should_share_prefixes", "choose_attention_algorithm"]
     plan = _topic(session).plan()
     # choose_classify_implementation chose every classification's scoring rule
     assert all(node.spec.scoring for node in plan.nodes

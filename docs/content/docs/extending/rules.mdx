@@ -20,7 +20,8 @@ Both categories use the same `OptimizerRule` interface.
 ## Implement the rule
 
 Define a class with `name`, `target`, `cost_based`, and `rewrite()`.
-The name identifies the rule in the registry and plan explanations.
+Use `should_...` for yes/no decisions and `choose_...` for choices among
+implementations. The name identifies the rule in the registry and explain.
 Use a name that differs from every registered rule, across both categories.
 Return new nodes instead of changing existing nodes in place.
 Return `None` when no change is needed.
@@ -34,8 +35,8 @@ Quail still tokenizes `body` for the filter. It does not need `author`.
 from quail.planner.rules.tree_transforms import push_down_projection
 
 
-class ProjectionPushdown:
-    name = "projection_pushdown"
+class ShouldPushDownProjection:
+    name = "should_push_down_projection"
     target = "logical"
     cost_based = False
 
@@ -53,7 +54,7 @@ For a cost-based tree rewrite, the planner retains the original,
 deduplicates equal roots, and lowers and refines every alternative before
 comparing costs. The rewrite proposes a placement; it does not call the
 planner recursively to price it. Check `context.backend` when a placement
-requires a particular engine's support, as `LiftMaps` does.
+requires a particular engine's support, as `ShouldLiftMaps` does.
 
 For an executable graph target, `rewrite(graph, context)` returns a new
 `PhysicalGraph`. A cost-based graph rule compares the implementations it
@@ -78,7 +79,7 @@ for its category:
 | Universal | `registry.register_universal_rule(rule)` |
 | Cost-based | `registry.register_cost_based_rule(rule)` |
 
-Pass the registry to the session. `ProjectionPushdown` is already
+Pass the registry to the session. `ShouldPushDownProjection` is already
 registered in Quail's default registry. The example shows its interface;
 you do not need to register it again.
 

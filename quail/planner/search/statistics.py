@@ -146,7 +146,7 @@ def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
 
 
 def filter_stop_keys(plan: LogicalPlan) -> dict:
-    """Return alias -> the stop key the distinct_pushdown rule put on its filters."""
+    """Return each alias's DISTINCT stop key from its filters."""
     keys = {}
     for node in plan.walk():
         if isinstance(node, SemanticFilter) and node.stop_key:

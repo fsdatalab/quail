@@ -26,7 +26,7 @@ class SemanticExtract:
     pair, in the column ``name`` plus SPAN_SUFFIX. A row whose document
     does not answer the question gets nulls. The node starts on its
     table above the table's AI.IF SemanticFilter, classifications, and
-    label filters, and below any join; the lift_maps rule moves it
+    label filters, and below any join; the should_lift_maps rule moves it
     above the joins of a joined table, so the extraction runs
     over the documents the joins matched. The root Project returns the
     columns through an Alias of the same call.

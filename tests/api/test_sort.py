@@ -127,7 +127,7 @@ def test_distinct_is_dropped_when_every_tables_id_is_selected(catalog):
     tokens = {"r": [400] * 100}
     optimized, changed = _optimize_with(
         catalog, _filtered(catalog).distinct().limit(3).select("r.id"), tokens)
-    assert "distinct_elimination" in changed
+    assert "should_eliminate_distinct" in changed
     assert not isinstance(optimized.root, Result) or not optimized.root.distinct
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
                       registry=built_in_registry(),
@@ -138,15 +138,15 @@ def test_distinct_is_dropped_when_every_tables_id_is_selected(catalog):
     grouped = (_filtered(catalog).group_by("r.author").agg(n=count())
                .distinct().select("r.author", "n"))
     optimized, changed = _optimize_with(catalog, grouped, tokens)
-    assert "distinct_elimination" in changed and not optimized.root.distinct
+    assert "should_eliminate_distinct" in changed and not optimized.root.distinct
     # without the id the rows can repeat, so the DISTINCT stays
     optimized, changed = _optimize_with(
         catalog, _filtered(catalog).distinct().select("r.author"), tokens)
-    assert "distinct_elimination" not in changed and optimized.root.distinct
+    assert "should_eliminate_distinct" not in changed and optimized.root.distinct
     # without a catalog the rule cannot know the id columns
     optimized, changed = _optimize(
         _filtered(catalog).distinct().select("r.id"), tokens)
-    assert "distinct_elimination" not in changed and optimized.root.distinct
+    assert "should_eliminate_distinct" not in changed and optimized.root.distinct
 
 
 def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
@@ -154,7 +154,7 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
     logical = (_filtered(catalog).distinct().order_by("r.author").limit(2)
                .select("r.author"))
     optimized, changed = _optimize_with(catalog, logical, tokens)
-    assert "distinct_pushdown" in changed
+    assert "should_push_down_distinct" in changed
     node = next(node for node in optimized.walk()
                 if isinstance(node, SemanticFilter))
     assert node.stop_key == ("author",)
@@ -175,6 +175,6 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
             _filtered(catalog).distinct().select("r.id", "r.author"),
             _filtered(catalog).select("r.author")):
         optimized, changed = _optimize_with(catalog, logical, tokens)
-        assert "distinct_pushdown" not in changed
+        assert "should_push_down_distinct" not in changed
         assert all(not node.stop_key for node in optimized.walk()
                    if isinstance(node, SemanticFilter))

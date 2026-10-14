@@ -22,10 +22,10 @@ from quail.planner.sol.prefixes import document_shared_tokens, page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
-class LiftMaps:
+class ShouldLiftMaps:
     """Offer classification and extraction placement above joins on Quail."""
 
-    name = "lift_maps"
+    name = "should_lift_maps"
     target = "logical"
     cost_based = True
 
@@ -133,7 +133,7 @@ def sharing_pays(model, device, *, shared_tokens: int, total_tokens: int,
     return saved > cost
 
 
-class PrefixSharing:
+class ShouldSharePrefixes:
     """Let documents borrow the KV pages of a document sharing their prefix.
 
     Fires for a filter whose documents share whole pages of prefix
@@ -147,7 +147,7 @@ class PrefixSharing:
     without sharing its documents follow one shared prompt head.
     """
 
-    name = "prefix_sharing"
+    name = "should_share_prefixes"
     target = "physical"
     cost_based = True
 
@@ -249,7 +249,7 @@ def _mean(values) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-class TreeAttention:
+class ChooseAttentionAlgorithm:
     """Annotate each join with the attention path the cost model prefers.
 
     A join stage has every partner of an anchor reading the anchor's
@@ -268,7 +268,7 @@ class TreeAttention:
     estimated lengths gets the path its exact tokens call for.
     """
 
-    name = "tree_attention"
+    name = "choose_attention_algorithm"
     target = "physical"
     cost_based = True
 

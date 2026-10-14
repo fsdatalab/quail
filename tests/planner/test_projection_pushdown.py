@@ -227,7 +227,7 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
     optimized, changed = simplify_plan(
         LogicalPlan(above), built_in_rules(),
         LogicalPlanningContext(catalog, None))
-    assert changed == ("projection_pushdown", "filter_pushdown")
+    assert changed == ("should_push_down_projection", "should_push_down_filters")
     assert optimized.root == push_down_projection(pushed)
 
     # both front ends place the filter on its table, so the rule

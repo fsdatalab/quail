@@ -88,10 +88,10 @@ def test_graph_refinement_can_reverse_placement_choice(query):
     original, lifted = chosen.settings["candidates"]
     assert original["selected"] and not lifted["selected"]
     assert original["estimated_seconds"] < lifted["estimated_seconds"]
-    assert lifted["rewrites"] == ("lift_maps",)
+    assert lifted["rewrites"] == ("should_lift_maps",)
     assert "test_seen" not in context.settings
     text = query.explain(verbose=True)
-    assert "cost-based: lift_maps" in text
+    assert "cost-based: should_lift_maps" in text
     assert "retain cost-based tree alternatives" in text
     assert "lowest estimated cost after graph refinement" in text
 
@@ -141,22 +141,22 @@ def test_prefix_sharing_is_priced_for_every_placement(query):
 def test_cost_based_rules_retain_original_and_deduplicate(query):
     from quail.planner.optimizer.context import LogicalPlanningContext
     from quail.planner.optimizer.tree_rewrites import simplify_plan
-    from quail.planner.rules.cost_based import LiftMaps
+    from quail.planner.rules.cost_based import ShouldLiftMaps
 
     context = context_for(query)
     registry = query.session.registry
-    registry.register_cost_based_rule(LiftMaps(), name="duplicate_lift")
+    registry.register_cost_based_rule(ShouldLiftMaps(), name="duplicate_lift")
     with pytest.raises(ValueError, match="duplicate"):
-        registry.register_cost_based_rule(LiftMaps())
+        registry.register_cost_based_rule(ShouldLiftMaps())
     simplified, changed = simplify_plan(
         query.logical, tuple(registry.rules.values()),
         LogicalPlanningContext.from_physical(context))
     assert simplified == query.logical
-    assert "lift_maps" not in changed
+    assert "should_lift_maps" not in changed
     original, lifted = search_candidates(query.logical, context, registry)
     assert original.logical_plan == query.logical
     assert original.rewrites == ()
-    assert lifted.rewrites == ("lift_maps",)
+    assert lifted.rewrites == ("should_lift_maps",)
 
 
 def test_exact_tokenization_reconsiders_placement(query):

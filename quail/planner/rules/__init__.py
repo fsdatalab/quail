@@ -1,18 +1,18 @@
 """Built in universal and cost-based rules in dependency order."""
 
 from quail.planner.rules.cost_based import (
+    ChooseAttentionAlgorithm,
     ChooseClassifyImplementation,
-    LiftMaps,
-    PrefixSharing,
-    TreeAttention,
+    ShouldLiftMaps,
+    ShouldSharePrefixes,
 )
 from quail.planner.rules.universal import (
-    DistinctElimination,
-    DistinctPushdown,
-    FilterPushdown,
-    KvRetention,
-    LimitPushdown,
-    ProjectionPushdown,
+    ShouldEliminateDistinct,
+    ShouldPushDownDistinct,
+    ShouldPushDownFilters,
+    ShouldPushDownLimit,
+    ShouldPushDownProjection,
+    ShouldRetainKv,
 )
 
 
@@ -24,8 +24,8 @@ def built_in_rules() -> tuple:
     Tree attention uses the selected shared prefixes.
     """
     return (
-        DistinctElimination(), DistinctPushdown(), ProjectionPushdown(),
-        FilterPushdown(), LiftMaps(), LimitPushdown(),
-        ChooseClassifyImplementation(), KvRetention(), PrefixSharing(),
-        TreeAttention(),
+        ShouldEliminateDistinct(), ShouldPushDownDistinct(), ShouldPushDownProjection(),
+        ShouldPushDownFilters(), ShouldLiftMaps(), ShouldPushDownLimit(),
+        ChooseClassifyImplementation(), ShouldRetainKv(), ShouldSharePrefixes(),
+        ChooseAttentionAlgorithm(),
     )

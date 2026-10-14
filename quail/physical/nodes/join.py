@@ -68,11 +68,11 @@ class AiJoin(PhysicalNode):
     frame_token_ids: tuple[int, ...] = ()
     label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()
     tail_token_ids: tuple[int, ...] = ()
-    # "unified" or "tree": the attention path the tree_attention rule
+    # "unified" or "tree": the attention path the choose_attention_algorithm rule
     # chose; empty leaves the model pipeline's default
     attention: str = ""
     # anchors borrow the KV pages of an anchor that shares their token
-    # prefix (the prefix_sharing rule)
+    # prefix (the should_share_prefixes rule)
     share_prefixes: bool = False
 
     type_name: ClassVar[str] = "quail.ai_join"

@@ -36,7 +36,7 @@ from quail.planner.rules.tree_transforms import (
 from quail.planner.search.statistics import cached_statistics, live_after_filters
 
 
-class DistinctElimination:
+class ShouldEliminateDistinct:
     """Clear a DISTINCT that cannot remove rows.
 
     A filter returns each document at most once and a join pairs each
@@ -49,7 +49,7 @@ class DistinctElimination:
     rows. A GROUP BY whose output returns every key is unique as well.
     """
 
-    name = "distinct_elimination"
+    name = "should_eliminate_distinct"
     target = "logical"
     cost_based = False
 
@@ -75,7 +75,7 @@ class DistinctElimination:
         return replace(root, distinct=False)
 
 
-class DistinctPushdown:
+class ShouldPushDownDistinct:
     """Push a DISTINCT into a filter: stop a key once one document passes.
 
     A DISTINCT over columns of one table asks only whether any document
@@ -87,7 +87,7 @@ class DistinctPushdown:
     change: each key value appears once either way.
     """
 
-    name = "distinct_pushdown"
+    name = "should_push_down_distinct"
     target = "logical"
     cost_based = False
 
@@ -115,10 +115,10 @@ class DistinctPushdown:
         return None if marked == root else marked
 
 
-class ProjectionPushdown:
+class ShouldPushDownProjection:
     """Push the projected column set down to each Scan."""
 
-    name = "projection_pushdown"
+    name = "should_push_down_projection"
     target = "logical"
     cost_based = False
 
@@ -127,7 +127,7 @@ class ProjectionPushdown:
         return None if rewritten is root else rewritten
 
 
-class FilterPushdown:
+class ShouldPushDownFilters:
     """Push cheap one-table filters below the joins above their table.
 
     Like Catalyst's PushDownPredicates, the move is unconditional: an
@@ -137,7 +137,7 @@ class FilterPushdown:
     another way.
     """
 
-    name = "filter_pushdown"
+    name = "should_push_down_filters"
     target = "logical"
     cost_based = False
 
@@ -145,7 +145,7 @@ class FilterPushdown:
         return push_down_filters(root)
 
 
-class LimitPushdown:
+class ShouldPushDownLimit:
     """Let a LIMIT end the filter run once enough documents survived.
 
     The rule puts the limit in the ``filter_limit`` setting, which the
@@ -159,7 +159,7 @@ class LimitPushdown:
     rule removes the setting.
     """
 
-    name = "limit_pushdown"
+    name = "should_push_down_limit"
     target = "physical"
     cost_based = False
 
@@ -177,7 +177,7 @@ class LimitPushdown:
         return None
 
 
-class KvRetention:
+class ShouldRetainKv:
     """Keep the KV that later operators read resident, within the page cap.
 
     The schedule (quail.planner.graph.retention.schedule) records, at each
@@ -199,7 +199,7 @@ class KvRetention:
     and the page cap in the ``retention`` setting.
     """
 
-    name = "kv_retention"
+    name = "should_retain_kv"
     target = "physical"
     cost_based = False
 
