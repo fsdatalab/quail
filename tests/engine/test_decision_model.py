@@ -290,7 +290,7 @@ def test_vllm_loads_a_decision2_backbone_in_place(tmp_path):
 
 
 def test_a_decision_classification_is_reestimated(session):
-    from quail.planner.label_scoring import ClassifyScoring
+    from quail.planner.operators.label_scoring import ClassifyScoring
 
     plan = session.sql(
         "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['x', 'y']) AS c "
@@ -461,7 +461,7 @@ def test_vllm_decision_client_reruns_a_request_without_its_rows():
 
 
 def test_classification_tree_scoring_follows_the_executor_gate():
-    from quail.planner.statistics import classify_statistics
+    from quail.planner.statistics.query import classify_statistics
     from quail.specs import MODELS
 
     def table(model):

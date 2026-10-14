@@ -2,11 +2,11 @@
 
 from quail.builtins import built_in_registry
 from quail.planner.api import plan_query
-from quail.planner.logical_optimizer import (
+from quail.planner.optimizer.logical import (
     LogicalPlanningContext,
     apply_logical_rules,
 )
-from quail.planner.logical_rules import built_in_logical_rules
+from quail.planner.rules.logical import built_in_logical_rules
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 

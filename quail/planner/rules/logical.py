@@ -416,7 +416,7 @@ def built_in_logical_rules() -> tuple:
     and filter_pushdown. Every one is heuristic: it rewrites the plan
     without pricing it. The cost-based choices (where classifications
     run, filter order, join order and anchors) are made in the physical
-    phase (quail.planner.ordering and the Quail backend's candidates).
+    phase (quail.planner.search.ordering and the Quail backend's candidates).
     """
     return (DistinctElimination(), DistinctPushdown(), ProjectionPushdown(),
             FilterPushdown())

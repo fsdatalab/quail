@@ -30,7 +30,7 @@ The rule tells the scan to retain `id` values for the result.
 Quail still tokenizes `body` for the filter. It does not need `author`.
 
 ```python
-from quail.planner.logical_rules import push_down_projection
+from quail.planner.rules.logical import push_down_projection
 
 
 class ProjectionPushdown:
@@ -45,7 +45,7 @@ The helper `push_down_projection()` updates the scans and returns the
 plan's root. It returns the original root when no change is needed.
 For your rule, implement the plan changes required by your operation.
 Return new nodes instead of changing existing nodes in place.
-See the [complete implementation](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py).
+See the [complete implementation](https://github.com/fsdatalab/quail/blob/main/quail/planner/rules/logical.py).
 
 For a physical rule, implement `rewrite(graph, context)`.
 Return a new `PhysicalGraph` when you change the plan, or `None` when
@@ -57,9 +57,9 @@ prices a logical plan the way the planner does.
 
 The *planning context* provides the engine configuration and input
 statistics available to a rule. See
-[`LogicalPlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)
+[`LogicalPlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/logical.py)
 and
-[`PlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_optimizer.py)
+[`PlanningContext`](https://github.com/fsdatalab/quail/blob/main/quail/planner/optimizer/physical.py)
 for their fields.
 
 ## Register the rule

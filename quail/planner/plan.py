@@ -18,7 +18,7 @@ from quail.physical import (
 )
 from quail.physical.codec import plan_envelope
 from quail.physical.pipelines import build_pipelines
-from quail.planner.kv import plan_kv_retention
+from quail.planner.graph.kv import plan_kv_retention
 from quail.specs import MODELS
 
 

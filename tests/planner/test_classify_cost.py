@@ -197,7 +197,7 @@ def test_time_falls_with_chunk_size_and_rises_with_label_choices():
 
 def test_kv_capacity_does_not_enter_the_estimate():
     from quail.cost import budgets
-    from quail.planner.label_scoring import ClassifyScoring
+    from quail.planner.operators.label_scoring import ClassifyScoring
 
     chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
     tables = [ClassifyScoring(alias="d", mean=200.0, longest=300, budget=chunk,
@@ -281,7 +281,7 @@ def test_classify_and_score_capacity_follow_the_plans_arena_split():
     from types import SimpleNamespace
 
     from quail.cost import budgets
-    from quail.planner.statistics import arena_capacity, classify_statistics
+    from quail.planner.statistics.query import arena_capacity, classify_statistics
     from quail.specs import DIFFUSION_GEMMA_26B_FP8
 
     model = DIFFUSION_GEMMA_26B_FP8

@@ -32,9 +32,9 @@ from quail.logical import (
     model_call,
 )
 from quail.logical.prompts import prompt_aliases
-from quail.planner.filter_order import PredicateCost
 from quail.planner.plan import CorpusStats
 from quail.planner.prompt_lowering import LoweredPrompt, score_token_parts
+from quail.planner.search.filter_order import PredicateCost
 from quail.specs import DeviceSpec, ModelSpec
 
 

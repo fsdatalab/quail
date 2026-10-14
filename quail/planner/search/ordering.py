@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from quail.cost.work import Work
 from quail.logical import LogicalPlan, SemanticFilter, model_call
-from quail.planner import join_order as joinsearch
-from quail.planner.filter_order import order_filters_indexed
-from quail.planner.statistics import (
+from quail.planner.search import join_order as joinsearch
+from quail.planner.search.filter_order import order_filters_indexed
+from quail.planner.statistics.query import (
     PlanStatistics,
     filter_works,
     live_after_filters,

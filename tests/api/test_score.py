@@ -218,7 +218,7 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     from quail.cost.work import Work, ask, scan
     from quail.execution.metrics import NodeMetrics
     from quail.explain import run_summary
-    from quail.planner.statistics import summarize_alias
+    from quail.planner.statistics.query import summarize_alias
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     for model, canvas in (("qwen3-4b-fp8", 0), ("diffusion-gemma-26b-a4b-fp8", 1)):
@@ -643,9 +643,9 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     from quail.physical import PhysicalGraph, PortRef, Scan, ScoreSpec
     from quail.physical.base import input_ports
     from quail.planner.api import apply_plan_rules
-    from quail.planner.physical_optimizer import PlanningContext
-    from quail.planner.physical_rules import PrefixSharing
+    from quail.planner.optimizer.physical import PlanningContext
     from quail.planner.plan import PhysicalPlan
+    from quail.planner.rules.physical import PrefixSharing
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     def graph(aliases, draws=1):

@@ -26,9 +26,9 @@ from quail.logical import (
 )
 from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
-from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
+from quail.planner.optimizer.logical import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import Refusal, RefusalError
-from quail.planner.statistics import filter_stop_keys
+from quail.planner.statistics.query import filter_stop_keys
 
 if TYPE_CHECKING:
     from quail.api.session import Session

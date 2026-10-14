@@ -36,20 +36,20 @@ from quail.physical import (
     Scan as PhysicalScan,
 )
 from quail.physical.base import input_ports
-from quail.planner import retention
-from quail.planner.decisions import choose_plan, validate_query
-from quail.planner.estimates import node_estimates
-from quail.planner.model_calls import (
+from quail.planner.graph import retention
+from quail.planner.graph.node_estimates import node_estimates
+from quail.planner.graph.results import result_nodes
+from quail.planner.graph.shards import contiguous_shards
+from quail.planner.operators.model_calls import (
     ScoreLowering,
     classify_builder,
     extract_spec,
     inference_node,
 )
-from quail.planner.physical_optimizer import PlanningContext
+from quail.planner.optimizer.physical import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal, inference_seconds
-from quail.planner.results import result_nodes
-from quail.planner.shards import contiguous_shards
-from quail.planner.statistics import (
+from quail.planner.search.decisions import choose_plan, validate_query
+from quail.planner.statistics.query import (
     filter_stop_keys,
     pair_counts,
     question_tokens,
@@ -115,7 +115,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
     The builder chooses each table's filter order and the joins' stage
-    order and anchors by cost (quail.planner.ordering), unless order
+    order and anchors by cost (quail.planner.search.ordering), unless order
     is "as_written". A one-table classification above a SemanticJoin
     runs after the joins, over the documents the joins matched. One on
     its table runs after the table's AI.IF filters.

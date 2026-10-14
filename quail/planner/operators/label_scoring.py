@@ -12,7 +12,7 @@ from quail.labels import (
 )
 from quail.physical import ClassifySpec
 from quail.planner.prompt_lowering import classify_prompt_tokens, lower_prompt
-from quail.planner.statistics import ClassifyStatistics, classify_statistics
+from quail.planner.statistics.query import ClassifyStatistics, classify_statistics
 from quail.planner.validation import ClassifyRefusedError
 
 

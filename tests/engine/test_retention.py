@@ -9,7 +9,7 @@ from quail.cost import work
 from quail.cost.joins import PricedJoin
 from quail.cost.retention import RetentionPolicy, coefficients
 from quail.cost.sol import compute_seconds
-from quail.planner.retention import schedule
+from quail.planner.graph.retention import schedule
 from quail.progress import set_answer_sink
 from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_SXM, QWEN3_4B_FP8
 

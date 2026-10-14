@@ -28,7 +28,7 @@ from quail.planner.prompt_lowering import (
     choice_token_parts,
     classify_prompt_tokens,
 )
-from quail.planner.statistics import (
+from quail.planner.statistics.query import (
     ClassifyStatistics,
     arena_capacity,
     classify_statistics,
