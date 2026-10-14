@@ -138,6 +138,8 @@ class LoadedGpu:
             self.arena.resize(*arena_pages, free_resident=True,
                               **{k: v for k, v in slots.items()
                                  if k == "n_state_slots"})
+            self.pool_bytes = pool_bytes(self.arena)
+        self.torch.cuda.reset_peak_memory_stats()
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
         if self.decision_head is not None:

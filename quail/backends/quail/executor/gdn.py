@@ -432,14 +432,14 @@ def gated_delta_reference(q, k, v, g, beta, state, lengths, scale):
 def gdn_prefill_backend():
     """Return "flashinfer" or "triton" for the chunked recurrence.
 
-    QUAIL_GDN_PREFILL is "triton" (default), "flashinfer", or "auto".
+    QUAIL_GDN_PREFILL is "auto" (default), "triton", or "flashinfer".
     "auto" picks FlashInfer on Hopper, as vLLM's layer does.
     """
     import os
 
     import torch
 
-    requested = os.environ.get("QUAIL_GDN_PREFILL", "triton")
+    requested = os.environ.get("QUAIL_GDN_PREFILL", "auto")
     if requested == "triton":
         return "triton"
     if requested not in ("flashinfer", "auto"):

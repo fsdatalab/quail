@@ -130,8 +130,8 @@ def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
     pages = checkpoint_pages(model)
     if not pages:
         return 0
-    return int((hybrid_pool_pages(model, device, chunk_tokens) - kv_pages)
-               // pages)
+    return max(0, int((hybrid_pool_pages(model, device, chunk_tokens)
+                       - kv_pages) // pages))
 
 
 def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,

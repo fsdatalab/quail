@@ -580,7 +580,7 @@ def architecture_lines(model_name: str) -> list[str]:
     if "full_attention" in kinds or "sliding_attention" in kinds:
         paths.append("attention: FlashAttention over paged KV")
     if "gated_delta_net" in kinds:
-        requested = os.environ.get("QUAIL_GDN_PREFILL", "triton")
+        requested = os.environ.get("QUAIL_GDN_PREFILL", "auto")
         paths.append("gated_delta_net: Triton convolution, "
                      f"recurrence={requested} (QUAIL_GDN_PREFILL)")
     if "short_conv" in kinds:
