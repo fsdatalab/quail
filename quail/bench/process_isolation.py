@@ -40,6 +40,7 @@ def run_backend_group(
     suite_name: str | None = None,
     canvas_draws: str | None = None,
     device: str = "h100-sxm",
+    gpus: int = 1,
 ) -> dict:
     """Run backend methods in one process, sharing a model when possible.
 
@@ -60,6 +61,7 @@ def run_backend_group(
             to keep the default. Each count runs its own Quail suite, named
             ``quail-draws<count>`` when there is more than one.
         device: Registered device name. Defaults to ``h100-sxm``.
+        gpus: Model copies, one per GPU. Defaults to 1.
 
     Returns:
         A dictionary containing the family, queries, collection ID, GPU IDs,
@@ -93,7 +95,7 @@ def run_backend_group(
             suite = run_suite(
                 query_ids, sf=sf,
                 config=EngineConfig(
-                    gpus=1,
+                    gpus=gpus,
                     model=model,
                     backend=method,
                     device=device,
