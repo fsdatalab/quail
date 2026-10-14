@@ -1,4 +1,4 @@
-from quail.planner.live_rows import PairRelation, exact_live_rows
+from quail.planner.search.live_rows import PairRelation, exact_live_rows
 
 PAIR_SETS = [
     ({("a", "b"): {(0, 0), (1, 1)}, ("b", "c"): {(0, 0)}}, (0,)),

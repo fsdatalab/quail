@@ -331,84 +331,65 @@ For the scoring methods, see
 
 ## AI.EXTRACT
 
-Use `AI.EXTRACT` to copy the text that answers your question from each
-document. You get the answer and its character positions in the source.
-If no answer is found, both values are null.
-
-For example, imagine you registered a `contracts` table with an `id`
-column and the contract text in `text`. Ask when each lease ends:
+`AI.EXTRACT` returns the answer to each of your questions, copied from
+a document. For example, imagine a `contracts` table
+with contract text in `text`. Return the end date and the signer of
+each lease:
 
 ```sql
 SELECT c.id,
-       AI.EXTRACT(c.text, 'When does the lease end?') AS ends
-FROM contracts c
+       AI.EXTRACT(c.text,
+                  {'end_date': 'When does the lease end?',
+                   'signer': 'Who signed the lease?'}) AS lease
+FROM contracts c;
 ```
 
-Give the answer a name with `AS`. Quail also returns a column with
-`_span` added to that name. If the model selects `March 3, 2027` from
-`Lease ends on March 3, 2027.`, you get:
+The result is a struct with one `STRING` field for each question. A
+field is null when the document does not answer its question. For a
+contract with the text `Lease ends on March 3, 2027. Signed by Ana Ruiz.`,
+`lease` is `{"end_date": "March 3, 2027", "signer": "Ana Ruiz"}`.
 
-| Column | Value |
-| --- | --- |
-| `ends` | `"March 3, 2027"` |
-| `ends_span` | `{"start": 14, "end": 27}` |
-
-`ends` is a string. `ends_span` is a struct with integer `start` and
-`end` fields. Positions count characters from zero, with `end` excluded.
-You can recover the answer in Python with `text[start:end]`.
+An extraction in `SELECT` requires a column alias with `AS`. The call
+must be a separate item, rather than part of a larger expression.
 
 ### Arguments
 
-`AI.EXTRACT(input, question[, options])`
+`AI.EXTRACT(input, questions[, options])`
 
 | Argument | Type | Description |
 | --- | --- | --- |
-| `input` | `STRING` column | The document to read. Pass a column reference such as `c.text`. |
-| `question` | String literal | The question you want to answer, such as `'When does the lease end?'`. |
-| `options` | Object | Optional `trim` setting, described below. |
+| `input` | `STRING` column | The document to read. |
+| `questions` | Object | Field names and their questions. Use one field to ask one question. |
+| `options` | Object | Optional parameters listed below. |
 
-### Return the surrounding lines
+### Optional parameters
 
-By default, Quail asks the model to copy the fewest words that answer
-your question. Set `trim` to `false` to return the complete source lines
-that contain the answer:
+Pass an object as the third argument, such as `{'trim': false}`.
 
-```sql
-SELECT c.id,
-       AI.EXTRACT(c.text, 'When does the lease end?', {'trim': false}) AS ends
-FROM contracts c
-```
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `trim` | `true` | When `true`, each answer is the fewest words that answer the question. When `false`, each answer is the whole line that contains it. |
 
-For the same answer, `ends` contains `Lease ends on March 3, 2027.` and
-`ends_span` contains `{"start": 0, "end": 28}`. Line boundaries follow
-the line breaks in your source text.
+### Answer positions
 
-### Ask more than one question
+Quail also returns the position of each answer in a second struct. Its
+name is the alias followed by `_span`, and it has the same fields. Each
+field holds the `start` and `end` character positions of its answer.
+For the contract above, `lease_span` is
+`{"end_date": {"start": 14, "end": 27}, "signer": {"start": 39, "end": 47}}`.
+In Python, `text[start:end]` returns the answer.
 
-For the same `contracts` table, you can ask for both the lease end date
-and the person who signed it:
+Each question is a separate extraction. On the Quail backend, the
+questions about one document read the same document KV.
 
-```sql
-SELECT c.id,
-       AI.EXTRACT(c.text, 'When does the lease end?') AS end_date,
-       AI.EXTRACT(c.text, 'Who signed the lease?') AS signer
-FROM contracts c
-```
+These limits apply:
 
-You get `end_date` and `end_date_span` for the first question, and
-`signer` and `signer_span` for the second question.
-
-### Current limits
-
-- Use Qwen3 4B or Qwen3 32B. You can distribute documents across GPUs
-  with the session's `gpus` setting. See
+- Quail runs extractions on Qwen3 4B and Qwen3 32B. See
   [Supported models and GPUs](/docs/user-guide/models).
-- Put each extraction directly in `SELECT` with an `AS` name. You cannot
-  use it in a `WHERE` condition or inside another expression.
-- You can combine extraction with filters, joins, classification, and scoring.
-  Each extraction reads one document column.
+- `WHERE`, `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result
+  of an extraction.
 
-For the equivalent Python query, see
+For the Python form, see
 [`ai_extract()`](/docs/user-guide/python-api#ai_extract).
 
 ## WHERE and ON

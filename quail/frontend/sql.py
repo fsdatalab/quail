@@ -117,9 +117,16 @@ def _reject_forbidden(tree) -> None:
 
 
 def _validate_query(
-    b: ExpressionBinder, joins: JoinBinder, columns: tuple[ColumnRef | Alias, ...]
+    b: ExpressionBinder, joins: JoinBinder, columns: tuple[ColumnRef | Alias, ...],
+    structs: tuple = (),
 ) -> None:
     """Validate output names and supported combinations of AI operators."""
+    for struct in structs:
+        if struct.name in dict(b.tables):
+            raise CompileError(
+                f"output name {struct.name!r} is also a table "
+                f"alias; pick another AS name"
+            )
     projected = tuple(column for column in columns if isinstance(column, Alias))
     projected_scores = tuple(
         column for column in projected if column.expression.kind == "score"
@@ -252,8 +259,8 @@ def compile_sql(
 
     selection = SelectBinder(b).bind(tree)
     columns, aggregation = selection.columns, selection.aggregation
-    order = bind_order(tree, b, columns, aggregation)
-    _validate_query(b, joins, columns)
+    order = bind_order(tree, b, columns, aggregation, selection.structs)
+    _validate_query(b, joins, columns, selection.structs)
     named, labels = _bind_label_names(b, columns)
     extracts = {}
     for column in columns:
@@ -292,4 +299,5 @@ def compile_sql(
         offset=offset,
         distinct=distinct,
         aggregation=aggregation,
+        structs=selection.structs,
     )

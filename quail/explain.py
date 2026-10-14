@@ -80,8 +80,10 @@ def logical_tree(logical):
         if isinstance(node, logical_nodes.Aggregate):
             title = f"Aggregate: {node.specification()}"
         elif isinstance(node, logical_nodes.Project):
-            columns = ", ".join(node.explain_fields()["columns"])
-            title = f"Project: {columns}"
+            fields = node.explain_fields()
+            title = f"Project: {', '.join(fields['columns'])}"
+            details = [f"{name} = struct({', '.join(members)})"
+                       for name, members in fields.get("structs", {}).items()]
         elif isinstance(node, logical_nodes.Scan):
             title = f"Scan {node.provider} as {node.alias}"
             columns = ", ".join(dict.fromkeys((node.column, *node.columns)))
@@ -353,7 +355,10 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 details.append("where " + " and ".join(
                     str(predicate) for predicate in source.predicates))
         elif isinstance(node, Project):
-            title += ": " + ", ".join(node.columns)
+            title += ": " + ", ".join(node.result_columns)
+            details.extend(
+                f"{name} = struct({', '.join(member for _, member in members)})"
+                for name, members in node.structs)
         elif isinstance(node, Limit):
             title += f": {node.count:,}"
         elif isinstance(node, Aggregate):

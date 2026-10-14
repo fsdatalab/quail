@@ -56,6 +56,25 @@ Each package imports only the packages below it in the list in
 `pyproject.toml` under `[tool.importlinter]`; `uv run lint-imports`
 checks that.
 
+`quail/planner/` has one subpackage per planning stage. The table runs
+from top to bottom, and `lint-imports` holds the planner to this order
+too:
+
+| Path | Contents |
+| --- | --- |
+| `pricing.py` | `estimated_seconds`, which plans a candidate and prices it. |
+| `rules/` | The built-in logical and physical optimizer rules. |
+| `graph/` | `GraphBuilder`, which turns the planner's decisions into a physical graph, plus shards, retention, and result operators. |
+| `sol/` | The speed-of-light estimate and its plan search. |
+| `search/` | `PlanStatistics` and the cost-based choices: filter order, join order, survivors. |
+| `operators/` | One module per AI operator (`filter`, `join`, `score`, `classify`, `extract`) with its statistics, cost, spec, and `emit_*` functions that add its plan nodes. |
+| `statistics/` | Table length summaries and `pool_split`, the KV pool split every operator reads. |
+| `api.py`, `optimizer/` | `plan_query`, planning contexts, rule protocols, and the loops that apply rules. |
+| `validation.py`, `prompt_lowering.py`, `plan.py` | Refusals, prompt tokenization, and `PhysicalPlan`. |
+
+To add an AI operator, add a module under `operators/` and call its
+`emit_*` function from `GraphBuilder` in `graph/build.py`.
+
 See [Architecture](/docs/architecture) for the query execution flow.
 See [Extending Quail](/docs/extending) for the extension interfaces.
 
