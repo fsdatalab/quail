@@ -315,6 +315,8 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
     lengths = {a: summarize_alias(t, model.sliding_window,
                                   memo=context.memo if context is not None else None)
                for a, t in doc_tokens.items()}
+    chunk = budgets.chunk_budget(model, device)
+    arena_split = pool_split(model, device, chunk, lengths.values())
     for alias, fraction in (scan_fractions or {}).items():
         if alias in lengths:
             lengths[alias] = scale_alias(lengths[alias], fraction)
@@ -326,11 +328,6 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
     for s in operators.scans:
         if s.alias not in stats:
             raise ValueError(f"no doc_tokens for alias {s.alias!r}")
-    chunk = budgets.chunk_budget(model, device)
-    # the longest documents bind the sliding-pool split
-    longest_mean = max(
-        (st.mean_doc_tokens for st in stats.values()), default=None)
-    arena_split = budgets.arena_pages(model, device, chunk, longest_mean)
     admission = arena_split[0] * budgets.PAGE_TOKENS
     return PlanStatistics(
         stats=stats, lengths=lengths, chunk=chunk,
@@ -448,22 +445,32 @@ def pair_counts(live, aliases, fraction) -> tuple[float, float]:
     return live[left] * live[right] * fraction, live[left] * touched
 
 
-def arena_mean_tokens(context) -> float | None:
-    """Return the mean document length the plan's KV pools are split for.
+def pool_split(model: ModelSpec, device: DeviceSpec, chunk: int,
+               summaries) -> tuple[int, int]:
+    """Return the query's KV pool split: (every-token pages, sliding pages).
 
-    It is the longest table's mean, as in plan_statistics, so a cost
-    priced from the arena's capacity sees the pools the worker builds.
-    None when the context has no tables.
+    The worker builds the arena to this split, and every operator's
+    cost reads its capacity from it. The pools are split for the
+    longest table's mean document length, before filters thin the
+    tables.
+
+    Args:
+        model: Model spec.
+        device: Device spec.
+        chunk: Chunk token budget.
+        summaries: The AliasStats of every table the query reads.
     """
-    return max((summarize_alias(lengths, context.model.sliding_window,
-                                memo=context.memo).mean
-                for lengths in context.document_tokens.values()), default=None)
+    longest = max((summary.mean for summary in summaries), default=None)
+    return tuple(budgets.arena_pages(model, device, chunk, longest))
 
 
 def arena_capacity(context, chunk: int) -> int:
-    """Return the tokens of document KV the plan's arena holds at once."""
-    return budgets.arena_tokens(context.model, context.device, chunk,
-                                arena_mean_tokens(context))
+    """Return the tokens of document KV the query's arena holds at once."""
+    window = context.model.sliding_window
+    full, _ = pool_split(context.model, context.device, chunk, (
+        summarize_alias(lengths, window, memo=context.memo)
+        for lengths in context.document_tokens.values()))
+    return full * budgets.PAGE_TOKENS
 
 
 def score_statistics(prompt, context, chunk, *, mean_tokens=None):

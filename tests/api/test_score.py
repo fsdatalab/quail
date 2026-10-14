@@ -762,9 +762,12 @@ def test_score_refusals_name_oversized_documents_and_missing_scores(
         catalog, monkeypatch):
     from quail.cost import budgets
 
-    for budget, unit in (("chunk_budget", "tokens"), ("arena_tokens", "pages")):
+    # a 4-token chunk, then an arena of one 16-token page
+    for budget, value, unit in (("chunk_budget", 4, "tokens"),
+                                ("arena_pages", (1, 0), "pages")):
         with monkeypatch.context() as patch:
-            patch.setattr(budgets, budget, lambda model, device, *rest: 4)
+            patch.setattr(budgets, budget,
+                          lambda model, device, *rest, value=value: value)
             session = _session(catalog)
             query = session.sql(
                 "SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s "
