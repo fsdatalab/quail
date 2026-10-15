@@ -15,7 +15,7 @@ def filter_cost(question_tokens: int, prefix_tokens: float, model: ModelSpec,
     return unrounded_seconds(work, model, device, chunk_tokens)
 
 
-def filter_chain_work(questions, selectivities, prefix_tokens: float,
+def filter_sequence_work(questions, selectivities, prefix_tokens: float,
                       count: float, window: int = 0) -> Work:
     """Return expected work for predicates in their chosen execution order."""
     total = Work()

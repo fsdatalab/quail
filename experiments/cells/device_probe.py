@@ -21,7 +21,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.images import gpu_image
+from quail.deploy.images import gpu_image
 
 PREDICTION_TEXT = (
     "L40S: capability (8, 9), mem_bytes near 48e9, DeepGEMM off, "

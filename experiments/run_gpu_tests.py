@@ -7,7 +7,7 @@ Prints pytest's output and fails when a test fails.
 
 import modal
 
-from quail.bench.images import gpu_image
+from quail.deploy.images import gpu_image
 
 image = gpu_image(("tests/gpu", "/root/tests/gpu"))
 

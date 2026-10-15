@@ -6,7 +6,7 @@ title: SQL reference
 
 AI-SQL extends standard SQL with operators that call a language model
 during query execution. You can filter rows, join tables, score documents,
-and assign labels using natural language instructions.
+assign labels, and extract answers using natural language instructions.
 
 For example, suppose you registered a `reviews` table with columns `id`
 and `body`. This query returns IDs of reviews that discuss the movie's
@@ -329,6 +329,69 @@ For labels computed before later filters, see
 For the scoring methods, see
 [Label scoring](/docs/architecture/execution#label-scoring).
 
+## AI.EXTRACT
+
+`AI.EXTRACT` returns the answer to each of your questions, copied from
+a document. For example, imagine a `contracts` table
+with contract text in `text`. Return the end date and the signer of
+each lease:
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.text,
+                  {'end_date': 'When does the lease end?',
+                   'signer': 'Who signed the lease?'}) AS lease
+FROM contracts c;
+```
+
+The result is a struct with one `STRING` field for each question. A
+field is null when the document does not answer its question. For a
+contract with the text `Lease ends on March 3, 2027. Signed by Ana Ruiz.`,
+`lease` is `{"end_date": "March 3, 2027", "signer": "Ana Ruiz"}`.
+
+An extraction in `SELECT` requires a column alias with `AS`. The call
+must be a separate item, rather than part of a larger expression.
+
+### Arguments
+
+`AI.EXTRACT(input, questions[, options])`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `input` | `STRING` column | The document to read. |
+| `questions` | Object | Field names and their questions. Use one field to ask one question. |
+| `options` | Object | Optional parameters listed below. |
+
+### Optional parameters
+
+Pass an object as the third argument, such as `{'trim': false}`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `trim` | `true` | When `true`, each answer is the fewest words that answer the question. When `false`, each answer is the whole line that contains it. |
+
+### Answer positions
+
+Quail also returns the position of each answer in a second struct. Its
+name is the alias followed by `_span`, and it has the same fields. Each
+field holds the `start` and `end` character positions of its answer.
+For the contract above, `lease_span` is
+`{"end_date": {"start": 14, "end": 27}, "signer": {"start": 39, "end": 47}}`.
+In Python, `text[start:end]` returns the answer.
+
+Each question is a separate extraction. On the Quail backend, the
+questions about one document read the same document KV.
+
+These limits apply:
+
+- Quail runs extractions on Qwen3 4B and Qwen3 32B. See
+  [Supported models and GPUs](/docs/user-guide/models).
+- `WHERE`, `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result
+  of an extraction.
+
+For the Python form, see
+[`ai_extract()`](/docs/user-guide/python-api#ai_extract).
+
 ## WHERE and ON
 
 `WHERE` keeps rows that satisfy the given conditions. `ON` specifies
@@ -471,6 +534,6 @@ rows that pass `WHERE`.
 - Queries with no AI operator
 - `JOIN` with only relational predicates (no AI operator)
 - Outer joins (`LEFT`, `RIGHT`, `FULL`)
-- `AI.EXTRACT` and `AI.MAP`
+- `AI.MAP`
 
 Using any of these raises `quail.logical.CompileError`.

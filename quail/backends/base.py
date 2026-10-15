@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
 from quail.physical import PhysicalNode
-from quail.planner.physical_optimizer import (
+from quail.planner.optimizer.candidates import (
     ModelRegion,
     PhysicalCandidate,
-    PlanningContext,
     SupportResult,
 )
+from quail.planner.optimizer.context import PlanningContext
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -48,9 +48,19 @@ class ModelExecution(Protocol):
 
 
 class ModelBackend(Protocol):
-    """Planner and execution factory for one model backend."""
+    """Planner and execution factory for one model backend.
+
+    Attributes:
+        name: The registered backend name.
+        reads_document_text: Whether the backend reads each scanned
+            document as text, so the scan carries its text column.
+        locates_answers_in_text: Whether the backend locates extracted
+            answers by character offsets, so tokenization keeps them.
+    """
 
     name: str
+    reads_document_text: bool
+    locates_answers_in_text: bool
 
     def supports(
         self,
@@ -63,7 +73,9 @@ class ModelBackend(Protocol):
         self,
         region: ModelRegion,
         context: PlanningContext,
-    ) -> Sequence[PhysicalCandidate]: ...
+    ) -> Sequence[PhysicalCandidate]:
+        """Lower one logical alternative; the planner applies optimizer rules."""
+        ...
 
     def start(self, context: GpuContext) -> ModelExecution: ...
 

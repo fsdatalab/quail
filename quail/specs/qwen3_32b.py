@@ -1,4 +1,5 @@
 from .base import ModelSpec
+from .qwen3 import EXTRACT_TURN_PREFIX, EXTRACT_TURN_SUFFIX
 
 QWEN3_32B_FP8 = ModelSpec(
     name="qwen3-32b-fp8",
@@ -20,4 +21,6 @@ QWEN3_32B_FP8 = ModelSpec(
     #                        for AI.CLASSIFY: about 5,900 KV tokens.
     vocab=151_936,
     tied_head=False,       # separate lm_head, kept for AI.CLASSIFY
+    extract_turn_prefix=EXTRACT_TURN_PREFIX,
+    extract_turn_suffix=EXTRACT_TURN_SUFFIX,
 )

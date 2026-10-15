@@ -17,8 +17,10 @@ from quail.logical import (
     Alias,
     ColumnRef,
     CompileError,
+    ExtractStruct,
     HavingTest,
     SortKey,
+    column_name,
 )
 
 
@@ -65,11 +67,13 @@ def bind_order(
     b: ExpressionBinder,
     columns: tuple[ColumnRef | Alias, ...],
     aggregation: Aggregation | None = None,
+    structs: tuple[ExtractStruct, ...] = (),
 ) -> tuple[SortKey, ...]:
     """Bind each ORDER BY term to a projected name or a source column."""
     order = tree.args.get("order")
     if order is None:
         return ()
+    struct_names = {struct.name for struct in structs}
     named = {column.name: column for column in columns if isinstance(column, Alias)}
     if aggregation is not None:
         named.update(
@@ -83,6 +87,10 @@ def bind_order(
                 f"ORDER BY {target.sql()} is not a column; give an "
                 f"expression an AS name in SELECT and order by that name"
             )
+        if not target.table and target.name in struct_names:
+            raise CompileError(
+                f"ORDER BY does not compare the AI.EXTRACT struct column "
+                f"{target.name!r}; extract the field as its own column")
         if not target.table and target.name in named:
             expression = named[target.name]
         else:
@@ -106,20 +114,13 @@ _AGGREGATE_CLASSES = {
 }
 
 
-def _column_name(column) -> str:
-    return (
-        f"{column.alias}.{column.column}"
-        if isinstance(column, ColumnRef)
-        else column.name
-    )
-
-
 @dataclass(frozen=True)
 class BoundSelect:
     """Columns needed before aggregation and the requested aggregate outputs."""
 
     columns: tuple[ColumnRef | Alias, ...]
     aggregation: Aggregation | None
+    structs: tuple[ExtractStruct, ...] = ()
 
 
 @dataclass
@@ -131,6 +132,7 @@ class SelectBinder:
     plain: list[str] = field(default_factory=list)
     output: list[str] = field(default_factory=list)
     aggregates: list[AggregateCall] = field(default_factory=list)
+    structs: list[ExtractStruct] = field(default_factory=list)
 
     def register_argument(self, node: exp.Expression, hidden: str) -> str:
         """Bind an aggregate's or key's expression to a projected column name.
@@ -146,7 +148,7 @@ class SelectBinder:
             ref = b.resolve_column(node)
             if ref not in columns:
                 columns.append(ref)
-            return _column_name(ref)
+            return column_name(ref)
         if not (_is_call(node, "AI_SCORE") or isinstance(node, exp.AIClassify)):
             raise CompileError(f"{node.sql()} is not a column or an AI expression")
         call = b.bind_ai_value(node)
@@ -191,12 +193,12 @@ class SelectBinder:
                     "an aggregate in SELECT is a direct COUNT, SUM, AVG, MIN, "
                     "or MAX call with an AS name"
                 )
-            selected = _compile_projection(b, [e])
+            selected = _compile_projection(b, [e], self.structs)
             for column in selected:
                 if column not in columns:
                     columns.append(column)
-            self.plain.extend(_column_name(column) for column in selected)
-            self.output.extend(_column_name(column) for column in selected)
+            self.plain.extend(column_name(column) for column in selected)
+            self.output.extend(column_name(column) for column in selected)
 
     def bind_group(self, tree: exp.Select) -> list[str]:
         """Resolve GROUP BY expressions and SELECT positions."""
@@ -255,13 +257,18 @@ class SelectBinder:
     def bind(self, tree: exp.Select) -> BoundSelect:
         """Bind SELECT and its grouping clauses."""
         self.bind_projection(tree)
+        if self.structs and (self.aggregates or tree.args.get("group")
+                             or tree.args.get("having")):
+            raise CompileError(
+                "GROUP BY does not read AI.EXTRACT struct columns; extract "
+                "each field as its own column")
         keys = self.bind_group(tree)
         tests = self.bind_having(tree)
         if not self.aggregates and not keys and not tests:
             if len(self.output) != len(set(self.output)):
                 raise CompileError(
                     f"projection names must be unique, got {self.output}")
-            return BoundSelect(tuple(self.columns), None)
+            return BoundSelect(tuple(self.columns), None, tuple(self.structs))
         for name in self.plain:
             if name not in keys:
                 raise CompileError(
@@ -285,7 +292,7 @@ def _number(node):
     raise CompileError(f"HAVING compares with a number, got {node.sql()}")
 
 
-def _compile_projection(b: ExpressionBinder, expressions) -> list:
+def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list:
     columns = []
     for e in expressions:
         if isinstance(e, exp.Star):
@@ -313,13 +320,21 @@ def _compile_projection(b: ExpressionBinder, expressions) -> list:
             call = b.bind_ai_value(e)
             columns.append(Alias(call, alias))
             continue
+        if _is_call(e, "AI_EXTRACT"):
+            if not alias:
+                raise CompileError("AI.EXTRACT needs an AS name in SELECT")
+            struct, members = b.bind_ai_extract(e, alias)
+            structs.append(struct)
+            columns.extend(members)
+            continue
         if any(
-            _is_call(call, "AI_SCORE") or isinstance(call, exp.AIClassify)
+            _is_call(call, "AI_SCORE") or _is_call(call, "AI_EXTRACT")
+            or isinstance(call, exp.AIClassify)
             for call in e.walk()
         ):
             raise CompileError(
-                "AI.SCORE and AI.CLASSIFY in SELECT must be direct "
-                "expressions with an AS name"
+                "AI.SCORE, AI.CLASSIFY, and AI.EXTRACT in SELECT must be "
+                "direct expressions with an AS name"
             )
         if not isinstance(e, exp.Column):
             raise CompileError(

@@ -22,6 +22,7 @@ from quail.logical.nodes import (
     Result,
     Scan,
     SemanticClassify,
+    SemanticExtract,
     SemanticFilter,
     SemanticJoin,
 )
@@ -128,7 +129,7 @@ class LogicalPlan:
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
         scans, filters, joins, applies, classifies = [], {}, [], [], []
-        tested, aliases = {}, []
+        extracts, tested, aliases = [], {}, []
         nodes = self.walk()
         for node in nodes:
             if isinstance(node, Scan):
@@ -150,6 +151,8 @@ class LogicalPlan:
                 applies.append(node)
             elif isinstance(node, SemanticClassify):
                 classifies.append(node)
+            elif isinstance(node, SemanticExtract):
+                extracts.append(node)
         calls = {
             (node.alias, node.name): node.call
             for node in classifies
@@ -189,6 +192,7 @@ class LogicalPlan:
             ),
             labels=_label_work(classifies, columns, label_filters),
             classifies=tuple(classifies),
+            extracts=tuple(extracts),
         )
 
 
@@ -197,9 +201,9 @@ class Operators:
     """The operators of one plan, in the order the plan was written.
 
     ``walk`` lists children before parents, so scans, joins, applies,
-    and classifications follow written order, each alias's AI.IF
-    predicates keep their order, and each alias's label filters keep
-    theirs.
+    classifications, and extractions follow written order, each
+    alias's AI.IF predicates keep their order, and each alias's label
+    filters keep theirs.
     """
 
     scans: tuple  # tuple[Scan, ...]
@@ -209,6 +213,7 @@ class Operators:
     labels: LabelWork
     projections: tuple = ()  # named model calls in SELECT order
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
+    extracts: tuple = ()  # tuple[SemanticExtract, ...]
     label_filters: dict = field(default_factory=dict)
     #                     alias -> tuple[LabelFilter, ...]
 

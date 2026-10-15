@@ -8,7 +8,7 @@ pyarrow. The HTTP application in ``quail.server.app`` needs the
 ``server`` installation extra.
 """
 
-from quail.server.records import (
+from quail.remote.records import (
     ACTIVE_STATES,
     STATES,
     TERMINAL_STATES,

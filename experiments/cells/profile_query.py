@@ -22,14 +22,14 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.images import gpu_image
-from quail.bench.quailb_parallel import (
+from bench.quailb_parallel import (
     DATA_DIR,
     VOLUMES,
     app,
     ensure_data,
     results_vol,
 )
+from quail.deploy.images import gpu_image
 
 PROFILE_DIR = "/results/ablations/profiles"
 # caching allocator counters: a retry flushes the cache after a failed
@@ -108,16 +108,16 @@ class Timeline:
 
     def __init__(self, torch):
         import quail.backends.quail.executor.chunk as chunk
-        import quail.backends.quail.executor.loop as loop
-        import quail.backends.quail.executor.pack as pack
         import quail.backends.quail.executor.readout as readout
+        import quail.backends.quail.executor.stage_executor as stage_executor
+        from quail.backends.quail.executor import admission
 
         self.torch = torch
         self.entries = []
         self.active = False
         self._wrap(chunk, "pack_chunk", "pack")
-        self._wrap(loop, "_forward", "forward", gpu=True)
-        self._wrap(pack.JoinAdmission, "next_chunk", "next_chunk")
+        self._wrap(stage_executor, "forward_chunk", "forward", gpu=True)
+        self._wrap(admission.JoinAdmission, "next_chunk", "next_chunk")
         for owner in (readout.AsyncLabelLogprobs, readout.AsyncAnswers,
                       readout.AsyncScores):
             self._wrap(owner, "submit", "submit", gpu=True)
@@ -300,7 +300,7 @@ def child(arguments: str) -> None:
 
     import quail
     import quail.backends.quail.graph as graph_module
-    from quail.bench.quailb import run_query
+    from bench.quailb import run_query
     from quail_b.benchmark import load_benchmark
 
     args = json.loads(arguments)

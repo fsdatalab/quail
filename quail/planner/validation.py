@@ -1,15 +1,20 @@
 """Execution constraints checked during planning and graph construction."""
 
-from quail.execution.pipelines import build_pipelines
+from quail.cost import budgets
+from quail.cost.joins import PricedJoin, longest_join_input
 from quail.logical import (
     Alias,
     Apply,
+    CompileError,
     SemanticClassify,
+    SemanticExtract,
     classified_above_joins,
+    has_score,
     is_score,
 )
 from quail.logical.prompts import prompt_aliases
 from quail.physical import AiClassify, AiJoin
+from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import Refusal
 
 
@@ -115,7 +120,7 @@ def joined_classification_refusal(graph, workers: int) -> Refusal | None:
         if pipeline is not None and any(
                 isinstance(member, AiJoin)
                 and any(port.source.node_id == member.node_id for port in node.inputs)
-                for member in pipeline.members):
+                for member in pipeline):
             continue
         return Refusal(
             reasons=(f"AI.CLASSIFY {node.spec.name!r} over a document pair "
@@ -131,6 +136,36 @@ def has_label(logical) -> bool:
     return any(isinstance(node, SemanticClassify) for node in logical.walk())
 
 
+def has_extract(logical) -> bool:
+    """Return whether a logical plan copies answers from documents."""
+    return any(isinstance(node, SemanticExtract) for node in logical.walk())
+
+
+def extraction_refusal(context) -> Refusal | None:
+    """Check whether the model supports extraction planning.
+
+    An extraction reads the model's next-token probabilities over the
+    document's own tokens, which a reranker, a decision model, and a
+    diffusion model with an answer canvas do not give.
+
+    Args:
+        context: Planning context with the tokenizer and model specification.
+
+    Returns:
+        A Refusal describing missing support, or None if planning can proceed.
+    """
+    model = context.model
+    if context.tokenizer is None:
+        reason = "AI.EXTRACT planning needs the model's tokenizer"
+    elif model.role in ("reranker", "decision") or model.canvas_tokens:
+        reason = (f"AI.EXTRACT reads next-token probabilities over the "
+                  f"document's tokens, which {model.name!r} does not give")
+    else:
+        return None
+    return Refusal(reasons=(reason,), constraint="unsupported_extract_query",
+                   needed=1, available=0, unit="queries")
+
+
 class ClassifyRefusedError(Exception):
     """A classification cannot run within the selected execution constraints."""
 
@@ -138,31 +173,40 @@ class ClassifyRefusedError(Exception):
         super().__init__(reason)
         self.reason, self.needed, self.available = reason, needed, available
 
+    @classmethod
+    def over_budget(cls, what: str, need: int,
+                    budget: int) -> "ClassifyRefusedError":
+        """The error for a prompt longer than the forward pass budget."""
+        return cls(
+            f"{what} needs {need} tokens with its classification prompt, "
+            f"but the forward pass budget is {budget} tokens", need, budget)
+
     def refusal(self) -> Refusal:
         """Convert this exception to a planning Refusal."""
         return Refusal(reasons=(self.reason,), constraint="suffix_over_chunk",
                        needed=self.needed, available=self.available, unit="tokens")
 
 
-def anchor_candidates(spec: dict, honor_forced: bool = True) -> list:
+def anchor_candidates(spec: PricedJoin, honor_forced: bool = True) -> list:
     """Candidate anchors for one join.
 
     Gates keep their outer table, a forced full anchor is honored, a
     free full join offers every table.
     """
-    if spec["semantics"] != "full":
-        return [spec["anchor"]]
-    if honor_forced and not spec.get("anchor_free"):
-        return [spec["anchor"]]
-    return list(spec["aliases"])
+    if spec.semantics != "full":
+        return [spec.anchor]
+    if honor_forced and not spec.anchor_free:
+        return [spec.anchor]
+    return list(spec.aliases)
 
 
-def join_input_tokens(spec, anchor: str, maximum: dict, pre: int) -> int:
+def join_input_tokens(spec: PricedJoin, anchor: str, maximum: dict,
+                      pre: int) -> int:
     """Count tokens for the longest input under one join orientation."""
-    return (pre + maximum[anchor] + spec["frame_tokens"][anchor]
-            + spec["tail_tokens"]
-            + sum(spec["label_tokens"][partner] + maximum[partner]
-                  for partner in spec["aliases"] if partner != anchor))
+    return longest_join_input(
+        pre, maximum[anchor], spec.frame_tokens[anchor], spec.tail_tokens,
+        [(spec.label_tokens[partner], maximum[partner])
+         for partner in spec.aliases if partner != anchor])
 
 
 def score_input_tokens(spec, context) -> tuple[int, int]:
@@ -180,3 +224,78 @@ def score_input_tokens(spec, context) -> tuple[int, int]:
         return len(parts[0]), longest[0] + len(parts[1]) + canvas
     prefix = len(parts[0]) + longest[0] + len(parts[1])
     return prefix, longest[1] + len(parts[2]) + canvas
+
+
+def validate_query(plan, operators, context, model, device, gpus):
+    """Return a refusal for unsupported inference or hardware requirements."""
+    labels, applies = operators.labels, operators.applies
+    scored = has_score(plan)
+    if scored:
+        refusal = score_refusal(plan, context)
+        if refusal is not None:
+            return refusal
+    if labels.calls:
+        if context is None:
+            return Refusal(
+                reasons=("AI.CLASSIFY planning needs a planning context",),
+                constraint="unsupported_classify_query",
+                needed=1, available=0, unit="queries")
+        if any(len(call.aliases()) not in (1, 2) for call, _ in labels.calls):
+            return Refusal(
+                reasons=("AI.CLASSIFY reads one document, or one from each "
+                         "side of a join",),
+                constraint="unsupported_classify_query",
+                needed=1, available=0, unit="queries")
+        refusal = classification_refusal(context)
+        if refusal is not None:
+            return refusal
+    extracts = operators.extracts
+    if extracts:
+        if context is None:
+            return Refusal(
+                reasons=("AI.EXTRACT planning needs a planning context",),
+                constraint="unsupported_extract_query",
+                needed=1, available=0, unit="queries")
+        refusal = extraction_refusal(context)
+        if refusal is not None:
+            return refusal
+    join_applies = {}
+    for apply in applies:
+        if apply.ids == "pairs":
+            join_applies.setdefault(apply.written_pos, []).append(apply)
+    names = [apply.function for apply in applies]
+    if len(set(names)) != len(names):
+        raise CompileError(
+            f"each apply() needs its own name; {names} repeat one")
+    if any(len(group) > 1 for group in join_applies.values()):
+        raise CompileError("a join takes one apply() returning pairs")
+    if gpus > 1 and any(apply.kind == "per_batch" for apply in applies):
+        return Refusal(
+            reasons=("per-batch apply() requires one GPU; "
+                     "use apply_table() or set gpus=1",),
+            constraint="per_batch_apply_needs_one_gpu",
+            needed=1, available=gpus, unit="gpus")
+
+    weight_gpus = budgets.minimum_weight_gpus(model, device)
+    if weight_gpus > 1:
+        return Refusal(
+            reasons=(
+                f"the model needs {weight_gpus} GPUs of memory, "
+                f"but Quail loads one complete copy per GPU",
+            ),
+            constraint="weights_need_more_cards",
+            needed=weight_gpus, available=1, unit="cards")
+    if not budgets.sliding_kv_fits(model, device):
+        chunk = budgets.chunk_budget(model, device)
+        free = budgets.arena_bytes(model, device, chunk)
+        floor = budgets.transient_sliding_pages(chunk, model.sliding_window)
+        needed = floor * model.kappa_sliding * budgets.PAGE_TOKENS
+        return Refusal(
+            reasons=(
+                f"{model.name} does not fit {device.name}: a "
+                f"{chunk}-token chunk's sliding KV exceeds leftover "
+                f"GPU memory",
+            ),
+            constraint="sliding_kv_needs_more_memory",
+            needed=needed, available=max(0.0, free), unit="bytes")
+    return None

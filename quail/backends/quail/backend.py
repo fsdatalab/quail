@@ -1,151 +1,19 @@
-"""Quail model backend."""
+"""Capabilities and entry points for the Quail engine."""
 
-from __future__ import annotations
-
-from collections.abc import Mapping
-from dataclasses import replace
 from typing import Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
-from quail.backends.quail.executor.operators.filter import execute_filter
-from quail.backends.quail.executor.operators.join import execute_join
-from quail.backends.quail.executor.pipeline import execute_pipeline
-from quail.backends.quail.executor.score import QuailScorer
-from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
+from quail.backends.quail.executor.runtime import QuailModelExecution
+from quail.backends.quail.lowering import plan_region
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
-from quail.execution.reranker import RerankerModelExecution
-from quail.logical import LogicalPlan, has_score, shared_preamble
-from quail.logical.prompts import answer_ids
-from quail.physical import AiFilter, AiJoin, AiScore, Barrier, PhysicalNode
-from quail.planner import pricing
-from quail.planner.logical_rules import lift_classifications
-from quail.planner.physical_optimizer import (
+from quail.planner.optimizer.candidates import (
     ModelRegion,
     PhysicalCandidate,
-    PlanningContext,
     SupportResult,
 )
-from quail.planner.plan import Refusal
-from quail.planner.validation import has_label, joined_classification_refusal
+from quail.planner.optimizer.context import PlanningContext
 from quail.specs import DEVICES
-
-
-class QuailModelExecution:
-    """Quail model state shared by model nodes on one GPU executor."""
-
-    def __init__(self, context: GpuContext):
-        self.context = context
-        self.loaded_model: LoadedModelState | None = None
-        self._query: QueryExecutionState | None = None
-        self._reranker: RerankerModelExecution | None = None
-
-    @property
-    def query(self) -> QueryExecutionState:
-        """Return the current query state.
-
-        Raises:
-            RuntimeError: No query has been bound to this executor.
-        """
-        if self._query is None:
-            raise RuntimeError("Quail model execution has no bound query")
-        return self._query
-
-    def bind_loaded_model(self, *, model, arena, pipeline,
-                          decision_head=None) -> None:
-        """Attach the loaded model and discard the previous model's caches."""
-        self.close()
-        self.loaded_model = LoadedModelState(
-            model=model, arena=arena, pipeline=pipeline,
-            model_spec=getattr(self.context, "model", None),
-            decision_head=decision_head)
-
-    def close(self) -> None:
-        """Drop every reference to the loaded model so its memory can go."""
-        self._reranker = None
-        self._query = None
-        self.loaded_model = None
-
-    def bind_query(self, *, torch, async_answers, answer_rows,
-                   chunk_tokens: int, async_scores=None) -> None:
-        """Attach state that is valid for the current query.
-
-        answer_rows are the retained output rows every readout scores
-        against; async_answers is the TRUE/FALSE readout over them.
-        async_scores is the AI.SCORE readout of a model that does not
-        score with answer rows, or None to score yes against no over
-        answer_rows.
-        """
-        loaded = self.loaded_model
-        if loaded is None:
-            raise RuntimeError("Quail model execution has no loaded model")
-        if loaded.input_staging is not None:
-            # Retain allocated transfer buffers, not the previous query's tokens.
-            loaded.input_staging.fixed_tokens.clear()
-        self._reranker = None
-        self._query = QueryExecutionState(
-            loaded_model=loaded,
-            torch=torch,
-            async_answers=async_answers,
-            answer_rows=answer_rows,
-            chunk_tokens=chunk_tokens,
-            score_readout=async_scores,
-        )
-
-    def execute(
-        self,
-        node: PhysicalNode,
-        inputs: Mapping[str, Any],
-    ) -> Any:
-        if isinstance(node, AiScore):
-            execution = self._reranker_execution(inputs["documents"])
-            self.query.gpu_timing = bool(inputs.get("gpu_timing", False))
-            if "score_rows" in inputs:
-                return execution.execute_rows(node, inputs["score_rows"])
-            return execution.execute(node, inputs["score_inputs"])
-        if not isinstance(node, (AiFilter, AiJoin)):
-            raise TypeError(
-                f"Quail cannot execute physical node {node.type_name!r}")
-        if isinstance(node, AiFilter):
-            return execute_filter(self.query, node, inputs)
-        return execute_join(self.query, node, inputs)
-
-    def _reranker_execution(self, documents) -> RerankerModelExecution:
-        """Return the reranker bound to this query's document tokens."""
-        execution = self._reranker
-        if execution is None or execution.documents is not documents:
-            execution = RerankerModelExecution(GpuContext(
-                gpu_index=self.context.gpu_index,
-                gpu_count=self.context.gpu_count,
-                model=self.context.model, device=self.context.device,
-                query_settings={
-                    "documents": documents,
-                    "reranker": QuailScorer(self.query),
-                },
-            ))
-            self._reranker = execution
-        return execution
-
-    def execute_pipeline(self, pipeline, inputs, context) -> dict:
-        """Execute a model pipeline with this executor's loaded state."""
-        return execute_pipeline(self.query, pipeline, inputs, context)
-
-
-def expected_join_nodes(plan) -> tuple[PhysicalNode, ...]:
-    """Return the join nodes selected from Quail's planning estimates."""
-    return tuple(
-        node for node in plan.nodes if isinstance(node, (AiJoin, Barrier))
-    )
-
-
-def expected_join_stages(plan) -> tuple:
-    """Return Quail's expected join stages in execution order."""
-    return tuple(
-        stage
-        for node in expected_join_nodes(plan)
-        if isinstance(node, AiJoin)
-        for stage in node.stages
-    )
 
 
 class QuailBackend:
@@ -153,6 +21,8 @@ class QuailBackend:
 
     name = "quail"
     runtime_package = "vllm==0.26.0"
+    reads_document_text = False
+    locates_answers_in_text = True
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
         if device.name not in DEVICES:
@@ -167,118 +37,12 @@ class QuailBackend:
                 "Quail requires 1, 2, 4, or 8 GPUs")
         return SupportResult.accept()
 
-    def plan(
-        self,
-        region: ModelRegion,
-        context: PlanningContext,
-    ) -> tuple[PhysicalCandidate, ...]:
-
-        if has_label(region.logical_plan):
-            if context.model.role == "reranker":
-                return (PhysicalCandidate(None, Refusal(
-                    reasons=("a reranker model cannot run AI.CLASSIFY",),
-                    constraint="reranker_only_scores", needed=1, available=0,
-                    unit="AI.CLASSIFY expressions"), float("inf")),)
-        scored = has_score(region.logical_plan)
-        if context.model.role == "reranker":
-            if not scored:
-                refusal = Refusal(
-                    reasons=("a reranker model can only be used with AI.SCORE",),
-                    constraint="reranker_only_scores",
-                    needed=1,
-                    available=0,
-                    unit="AI.SCORE expressions",
-                )
-                return (PhysicalCandidate(None, refusal, float("inf")),)
-        candidates = [self._candidate(region, context)]
-        # classifying a joined table after its joins is the second
-        # candidate; on a tie the plan as written wins
-        lifted = lift_classifications(region.logical_plan.root)
-        if lifted is not None:
-            candidates.append(self._candidate(
-                ModelRegion(LogicalPlan(lifted)), context))
-        return tuple(candidates)
-
-    def _candidate(self, region, context) -> PhysicalCandidate:
-        """Price one logical plan (quail.planner.pricing) as a candidate.
-
-        The candidate's estimate includes the label_scoring rule's
-        choice, so candidates that place classifications differently
-        compare on the scoring each would run.
-        """
-        logical = region.logical_plan
-        plan = pricing.physical_plan(logical, context)
-        if isinstance(plan, Refusal):
-            return PhysicalCandidate(None, plan, float("inf"), logical)
-        refusal = joined_classification_refusal(plan.graph, context.gpu_count)
-        if refusal is not None:
-            return PhysicalCandidate(None, refusal, float("inf"), logical)
-        plan = self._bind_runtime_data(plan, region, context)
-        return PhysicalCandidate(
-            plan.graph, plan, plan.estimated_seconds, logical)
+    def plan(self, region: ModelRegion,
+             context: PlanningContext) -> tuple[PhysicalCandidate, ...]:
+        return plan_region(region, context)
 
     def start(self, context: GpuContext) -> QuailModelExecution:
         return QuailModelExecution(context)
-
-    def _bind_runtime_data(self, plan, region, context):
-        """Put tokenized prompts and answer tokens in the physical plan."""
-        tokenizer = context.tokenizer
-        operators = region.logical_plan.operators()
-        filters, joins = operators.filters, operators.joins
-        encoded_nodes = []
-        for node in plan.nodes:
-            if isinstance(node, AiFilter):
-                predicates = filters[node.alias]
-                questions = tuple(
-                    tuple(predicates[stage.written_pos].prompt.tail_token_ids)
-                    for stage in node.stages
-                )
-                if any(not question for question in questions):
-                    raise ValueError("filter prompts have no token ids")
-                node = replace(node, question_token_ids=questions)
-            elif isinstance(node, AiJoin):
-                stages = []
-                for stage in node.stages:
-                    prompt = joins[stage.written_pos].prompt
-                    runtime_ids = {
-                        alias: (tuple(label), tuple(frame))
-                        for alias, label, frame in prompt.label_token_ids
-                    }
-                    stages.append(replace(
-                        stage,
-                        frame_token_ids=runtime_ids[stage.anchor][1],
-                        label_token_ids=tuple(
-                            (alias, runtime_ids[alias][0])
-                            for alias in stage.partners
-                        ),
-                        tail_token_ids=tuple(prompt.tail_token_ids),
-                    ))
-                node = replace(node, stages=tuple(stages))
-            encoded_nodes.append(node)
-
-        true_ids, false_ids = (
-            answer_ids(context.model, tokenizer) if tokenizer is not None
-            else ([], []))
-        prompts = operators.prompts
-        pre_ids = (
-            list(tokenizer(shared_preamble(context.model.turn_prefix,
-                                           context.model.prompt_layout)))
-            if tokenizer is not None else
-            list(prompts[0].preamble_token_ids) if prompts else []
-        )
-        return replace(
-            plan,
-            nodes=tuple(encoded_nodes),
-            root=plan.root,
-            settings={
-                **plan.settings,
-                "true_ids": true_ids,
-                "false_ids": false_ids,
-                **({"pre_ids": pre_ids} if any(
-                    isinstance(node, (AiFilter, AiJoin)) for node in plan.nodes
-                ) else {}),
-            },
-        )
 
     def prepare_request(self, context) -> None:
         """Boot the GPU for a request before its documents are ready."""

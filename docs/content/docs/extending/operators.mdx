@@ -61,7 +61,7 @@ In the example, `ScanRuntime` reads the prepared document IDs and returns
 them under the name declared by `Scan`:
 
 ```python
-from quail.execution.runner import NodeResult
+from quail.execution.metrics import NodeResult
 
 
 class ScanRuntime:
@@ -81,9 +81,9 @@ For your operator:
   Return a `NodeResult` with a value for each output port.
 
 See the complete implementations of
-[`Scan`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py)
+[`Scan`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes/scan.py)
 and
-[`ScanRuntime`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py).
+[`ScanRuntime`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runtimes/relational.py).
 
 ## Register the operator
 
@@ -97,7 +97,7 @@ Register the node and runtime in each process that executes the plan.
 ## Add the operator to a plan
 
 Registration does not add the operator to queries.
-Implement a [physical rule or planner](/docs/extending/rules) that creates
+Implement a [physical rule](/docs/extending/rules) that creates
 node instances and connects them to the physical plan.
 Register the rule or planner in the same registry.
 

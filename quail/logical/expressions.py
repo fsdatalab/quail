@@ -36,36 +36,55 @@ def column_name(column: ColumnRef | Alias) -> str:
 
 @dataclass(frozen=True)
 class Prompt:
-    """Bound prompt text and token layout for one LLM call.
+    """The text of one model call, laid out for a model's prompt format.
 
-    Token counts are filled when a tokenizer is available; None means the
-    planner must calculate them. A classification prompt keeps the text
-    before each label in label_prefix. Its optional lettered prompt names
-    each label with a distinct one-token letter for the letters rule.
+    The planner lowers the text to token ids with the session's
+    tokenizer; see quail.planner.prompt_lowering. A classification
+    prompt keeps the text before each label in label_prefix and what
+    rendered its label list, so lowering can render it again with one
+    letter per label.
+
+    Attributes:
+        template: The template as the query names the predicate.
+        args: Column references in placeholder order.
+        preamble: The text before the document.
+        tail: The text after the document, or after a join's last
+            partner, with the document placeholder.
+        frame: The text after the anchor document that every pair shares.
+        frame_text: The text whose token count is the frame's; empty
+            when the prompt has no frame.
+        kind: filter, join, label, extract, or score.
+        layout: The PROMPT_LAYOUTS name the text was built with.
+        tail_segments: The tail after the placeholder, one entry per
+            separately tokenized segment; empty means one segment.
+        label_texts: Per placeholder of a join or a classification of
+            joined rows, (alias, its label text, its frame text).
+        label_prefix: The text before a scored letter or label.
+        categories: A classification's labels, in query order.
+        descriptions: Their descriptions, in label order.
+        task_description: A classification's extra instructions.
+        turn: The model's chat text around the prompt.
+        source: The classification template as written.
+        letters: The letters naming the labels of a lettered prompt.
     """
 
     template: str
     args: tuple  # tuple[ColumnRef, ...] in placeholder order
     preamble: str
     tail: str
-    preamble_tokens: Optional[int] = None
-    tail_tokens: Optional[int] = None
     frame: str = ""
-    frame_tokens: Optional[int] = None
-    # join prompts only: (alias, label_tokens, anchor_frame_tokens)
-    # per placeholder, in order. Empty for filter prompts.
-    labels: tuple = ()
-    preamble_token_ids: tuple = ()
-    tail_token_ids: tuple = ()
-    label_token_ids: tuple = ()
-    # the PROMPT_LAYOUTS name the prompt text was built with
+    frame_text: str = ""
+    kind: str = "filter"
     layout: str = "ai-if"
-    # the text after a filter document or a join's last partner, one
-    # entry per separately tokenized segment; empty means one segment
     tail_segments: tuple = ()
+    label_texts: tuple = ()
     label_prefix: str = LABEL_PREFIX
+    categories: tuple = ()
+    descriptions: tuple = ()
+    task_description: str = ""
+    turn: tuple = ("", "")
+    source: str = ""
     letters: tuple = ()
-    lettered: Optional["Prompt"] = None
 
     type_name: ClassVar[str] = "quail.prompt"
 
@@ -76,7 +95,7 @@ DEFAULT_SELECTIVITY = 0.2
 SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 
 
-MODEL_CALL_KINDS = ("boolean", "score", "label")
+MODEL_CALL_KINDS = ("boolean", "score", "label", "extract")
 
 
 def effective_selectivity(selectivity: Optional[float]) -> float:
@@ -85,6 +104,9 @@ def effective_selectivity(selectivity: Optional[float]) -> float:
 
 
 PROBABILITIES_SUFFIX = "_probabilities"
+# an "extract" call's second result column: the answer's character
+# span in the document
+SPAN_SUFFIX = "_span"
 
 
 @dataclass(frozen=True)
@@ -105,6 +127,11 @@ class ModelCall:
     # probability, as the column named after the label column plus
     # PROBABILITIES_SUFFIX
     probabilities: bool = False
+    # an "extract" call only: the question the answer is copied for,
+    # and whether the answer is the copied words (trim) or the whole
+    # lines of the document that hold them
+    question: str = ""
+    trim: bool = True
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -117,11 +144,102 @@ class ModelCall:
             raise CompileError(
                 f"model call kind must be one of {MODEL_CALL_KINDS}, got {self.kind!r}"
             )
-        if self.kind != "label":
-            if self.labels or self.descriptions or self.probabilities:
-                raise CompileError("only an AI.CLASSIFY call has labels")
-            return
-        validate_labels(self.labels, self.descriptions)
+        if self.kind != "label" and (
+            self.labels or self.descriptions or self.probabilities
+        ):
+            raise CompileError("only an AI.CLASSIFY call has labels")
+        if self.kind != "extract" and (self.question or not self.trim):
+            raise CompileError("only an AI.EXTRACT call has a question")
+        if self.kind == "label":
+            validate_labels(self.labels, self.descriptions)
+        elif self.kind == "extract":
+            validate_question(self.question)
+
+
+def validate_question(question: str) -> None:
+    """Check an AI.EXTRACT question: text with at least one word.
+
+    Raises:
+        CompileError: The question is empty or not a string.
+    """
+    if not isinstance(question, str) or not question.strip():
+        raise CompileError("AI.EXTRACT needs a question with at least one word")
+
+
+@dataclass(frozen=True)
+class ExtractStruct:
+    """Several AI.EXTRACT fields of one table, returned as struct columns.
+
+    Each field is its own extraction, projected as an Alias named
+    ``name.field``. The result packs the fields' answers into the
+    struct column ``name`` and their spans into ``name`` plus
+    SPAN_SUFFIX, each with one struct field per extraction field.
+
+    Attributes:
+        name: The struct column's name.
+        fields: The field names, in written order.
+    """
+
+    name: str
+    fields: tuple[str, ...]
+
+    type_name: ClassVar[str] = "quail.extract_struct"
+
+    def member(self, field: str) -> str:
+        """Return the name of one field's extraction."""
+        return f"{self.name}.{field}"
+
+    @property
+    def members(self) -> tuple[str, ...]:
+        """Return the names of the fields' extractions, in field order."""
+        return tuple(self.member(field) for field in self.fields)
+
+    def packing(self) -> tuple:
+        """Return the answer and span struct columns as Project packs them.
+
+        Returns:
+            (struct column, ((field, member column), ...)) for the
+            answers, then for the spans.
+        """
+        return tuple(
+            (self.name + suffix,
+             tuple((field, self.member(field) + suffix) for field in self.fields))
+            for suffix in ("", SPAN_SUFFIX))
+
+    def validate(self) -> None:
+        if not self.name or "." in self.name:
+            raise CompileError(
+                f"an extraction needs a column name without a dot, "
+                f"got {self.name!r}")
+        if not self.fields:
+            raise CompileError(f"AI.EXTRACT {self.name!r} needs at least one field")
+        for field in self.fields:
+            if not isinstance(field, str) or not field or "." in field:
+                raise CompileError(
+                    f"an AI.EXTRACT field needs a name without a dot, "
+                    f"got {field!r}")
+        if len(set(self.fields)) != len(self.fields):
+            raise CompileError(
+                f"AI.EXTRACT {self.name!r} names a field twice: {list(self.fields)}")
+
+
+def packed_columns(columns, packing) -> tuple[str, ...]:
+    """Return result column names after packing members into struct columns.
+
+    Each struct column takes the place of its first member; its other
+    members leave the result.
+
+    Args:
+        columns: The column names before packing.
+        packing: (struct column, ((field, member column), ...)) pairs.
+    """
+    owner = {member: name for name, fields in packing for _, member in fields}
+    out = []
+    for column in columns:
+        name = owner.get(column, column)
+        if name not in out:
+            out.append(name)
+    return tuple(out)
 
 
 def validate_labels(labels: tuple, descriptions: tuple = ()) -> None:
@@ -237,11 +355,6 @@ def is_score(expression) -> bool:
     return model_call(expression).kind == "score"
 
 
-def is_label(expression) -> bool:
-    """Return whether the expression computes an AI.CLASSIFY label."""
-    return model_call(expression).kind == "label"
-
-
 def has_score(plan) -> bool:
     """Return whether a logical plan computes an AI.SCORE value anywhere."""
     operators = plan.operators()
@@ -274,6 +387,10 @@ def validate_predicate(expression) -> None:
             raise CompileError(
                 "an AI.CLASSIFY label is tested by a Filter on its "
                 "column, not by a SemanticFilter"
+            )
+        if expression.kind == "extract":
+            raise CompileError(
+                "an AI.EXTRACT answer is a result column, not a predicate"
             )
         return
     raise CompileError(
@@ -374,12 +491,15 @@ def _explain(expression) -> str:
             f"IN {list(expression.values)}"
         )
     if isinstance(expression, Alias):
-        if expression.expression.kind == "label":
-            # the SemanticClassify below computes the column
+        if expression.expression.kind in ("label", "extract"):
+            # the SemanticClassify or SemanticExtract below computes
+            # the column
             return expression.name
         return f"{_explain(expression.expression)} AS {expression.name}"
     if expression.kind == "label":
         return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"
+    if expression.kind == "extract":
+        return f"AI.EXTRACT({expression.prompt.template!r}, {expression.question!r})"
     function = "AI.SCORE" if expression.kind == "score" else "AI.IF"
     return f"{function}({expression.prompt.template!r})"
 
@@ -397,9 +517,7 @@ class SortKey:
     @property
     def name(self) -> str:
         """Return the result column name the key sorts on."""
-        if isinstance(self.expression, ColumnRef):
-            return f"{self.expression.alias}.{self.expression.column}"
-        return self.expression.name
+        return column_name(self.expression)
 
     def validate(self) -> None:
         if isinstance(self.expression, (Alias, AggregateCall)):

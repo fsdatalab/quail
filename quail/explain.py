@@ -4,11 +4,11 @@ from collections import Counter
 from collections.abc import Mapping
 
 from quail import logical as logical_nodes
-from quail.execution.pipelines import build_pipelines
 from quail.logical import DEFAULT_SELECTIVITY, LogicalPlan, effective_selectivity
 from quail.physical import (
     Aggregate,
     AiClassify,
+    AiExtract,
     AiFilter,
     AiJoin,
     Barrier,
@@ -20,10 +20,12 @@ from quail.physical import (
     PortRef,
     Project,
     Recombine,
-    RequestExecution,
     Scan,
     Sort,
 )
+from quail.physical.pipelines import build_pipelines
+from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
+from quail.planner.plan import Refusal
 
 
 def _number(value):
@@ -79,8 +81,10 @@ def logical_tree(logical):
         if isinstance(node, logical_nodes.Aggregate):
             title = f"Aggregate: {node.specification()}"
         elif isinstance(node, logical_nodes.Project):
-            columns = ", ".join(node.explain_fields()["columns"])
-            title = f"Project: {columns}"
+            fields = node.explain_fields()
+            title = f"Project: {', '.join(fields['columns'])}"
+            details = [f"{name} = struct({', '.join(members)})"
+                       for name, members in fields.get("structs", {}).items()]
         elif isinstance(node, logical_nodes.Scan):
             title = f"Scan {node.provider} as {node.alias}"
             columns = ", ".join(dict.fromkeys((node.column, *node.columns)))
@@ -110,6 +114,10 @@ def logical_tree(logical):
                 title += f", {node.name}{logical_nodes.PROBABILITIES_SUFFIX}"
             details = [f"{_prompt(node.call.prompt)} "
                        f"labels={list(node.call.labels)}"]
+        elif isinstance(node, logical_nodes.SemanticExtract):
+            title = f"SemanticExtract: {node.name}, {node.span_name}"
+            details = [f"question={node.call.question!r} "
+                       f"trim={'on' if node.call.trim else 'off'}"]
         elif isinstance(node, logical_nodes.Join):
             title = "Join"
             details = ([f"on {condition}" for condition in node.on]
@@ -169,12 +177,6 @@ def _short_prompt(prompt):
     if len(template) > PROMPT_CHARS:
         template = template[:PROMPT_CHARS] + "…"
     return f"PROMPT({template!r})"
-
-
-def _ordinal(n):
-    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(
-        n % 10, "th")
-    return f"{n}{suffix}"
 
 
 def _table(rows):
@@ -279,9 +281,8 @@ def _estimated_rows(graph):
                      else node.expected_docs)
         elif isinstance(node, AiFilter):
             value = inputs[0] if inputs else None
-            for stage in node.stages:
-                if value is not None:
-                    value *= effective_selectivity(stage.selectivity)
+            if value is not None:
+                value *= effective_selectivity(node.selectivity)
         elif isinstance(node, (Project, Limit, Sort, Exchange)) \
                 and len(inputs) == 1:
             value = inputs[0]
@@ -355,7 +356,10 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 details.append("where " + " and ".join(
                     str(predicate) for predicate in source.predicates))
         elif isinstance(node, Project):
-            title += ": " + ", ".join(node.columns)
+            title += ": " + ", ".join(node.result_columns)
+            details.extend(
+                f"{name} = struct({', '.join(member for _, member in members)})"
+                for name, members in node.structs)
         elif isinstance(node, Limit):
             title += f": {node.count:,}"
         elif isinstance(node, Aggregate):
@@ -386,7 +390,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         elif isinstance(node, AiFilter):
             title += f": {node.alias}"
             kv = []
-            if len(node.stages) > 1 and node.arena_writes:
+            if node.arena_writes:
                 kv.append("KV rewind=on")
             if node.keep_kv:
                 kv.append("retain KV for later joins")
@@ -398,19 +402,14 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                     f"(one document at a time, the rest skipped once "
                     f"one survives)")
             written = filters.get(node.alias, ())
-            order = [stage.written_pos for stage in node.stages]
-            reordered = order != sorted(order)
-            for index, stage in enumerate(node.stages, 1):
-                label = f"predicate {stage.written_pos + 1}"
-                if reordered:
-                    label = f"{_ordinal(index)}: {label}"
-                if stage.written_pos < len(written):
-                    label += "  " + _short_prompt(
-                        written[stage.written_pos].prompt)
-                predicates.append((label, stage_cells(
-                    stage.selectivity, stage.expected_docs,
-                    stages.get(("filter", node.alias, stage.written_pos)),
-                    "evaluated")))
+            label = f"predicate {node.written_pos + 1}"
+            if node.written_pos < len(written):
+                label += "  " + _short_prompt(
+                    written[node.written_pos].prompt)
+            predicates.append((label, stage_cells(
+                node.selectivity, node.expected_docs,
+                stages.get(("filter", node.alias, node.written_pos)),
+                "evaluated")))
         elif isinstance(node, AiClassify):
             spec = node.spec
             title += f": {spec.name} over {spec.aliases[0]}"
@@ -420,6 +419,12 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                            f"{sum(len(ids) for ids in spec.label_token_ids)}"
                            + (f", up to {spec.draws} noise draws"
                               if spec.draws > 1 else ""))
+        elif isinstance(node, AiExtract):
+            spec = node.spec
+            title += f": {spec.name} over {spec.alias}"
+            details.append(f"question={spec.question!r}, "
+                           f"trim={'on' if spec.trim else 'off'}, "
+                           f"up to {spec.max_answer_tokens} answer tokens")
         elif isinstance(node, Filter):
             title += f": {node.predicate.describe()}"
         elif isinstance(node, AiJoin):
@@ -427,23 +432,18 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             source = {"none": "not resident", "filter": "from filters",
                       "kept": "from an earlier join"}.get(
                           node.anchor_resident, node.anchor_resident)
-            keep = "yes" if node.keep_anchor_kv else "no"
+            keep = "yes" if node.keep_kv else "no"
             details.append(f"KV: anchor={source}, retain after join={keep}")
-            order = [stage.written_pos for stage in node.stages]
-            reordered = order != sorted(order)
-            for index, stage in enumerate(node.stages, 1):
-                label = (f"join {stage.written_pos + 1} {stage.semantics} "
-                         f"({stage.anchor}, {', '.join(stage.partners)})")
-                if stage.pairs_from:
-                    label += f" over pairs from {stage.pairs_from}"
-                if reordered:
-                    label = f"{_ordinal(index)}: {label}"
-                if stage.written_pos < len(joins):
-                    label += "  " + _short_prompt(
-                        joins[stage.written_pos].prompt)
-                predicates.append((label, stage_cells(
-                    stage.selectivity, stage.expected_tuples,
-                    stages.get(("join", stage.written_pos)), "tuples")))
+            label = (f"join {node.written_pos + 1} {node.semantics} "
+                     f"({node.anchor}, {', '.join(node.partners)})")
+            if node.pairs_from:
+                label += f" over pairs from {node.pairs_from}"
+            if node.written_pos < len(joins):
+                label += "  " + _short_prompt(
+                    joins[node.written_pos].prompt)
+            predicates.append((label, stage_cells(
+                node.selectivity, node.expected_tuples,
+                stages.get(("join", node.written_pos)), "tuples")))
         elif isinstance(node, HashJoin):
             title += ": " + " and ".join(
                 f"{node.left}.{left} = {node.right}.{right}"
@@ -462,20 +462,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             title += f": next_anchor={node.next_anchor}"
         elif isinstance(node, Recombine):
             title += ": " + ", ".join(node.alias_order)
-        elif isinstance(node, RequestExecution):
-            title += f": {node.backend_name}"
-            for spec in node.filters:
-                written = filters.get(spec.alias, ())
-                for position in spec.written_positions:
-                    predicate = (_short_prompt(written[position].prompt)
-                                 if position < len(written)
-                                 else f"predicate {position + 1}")
-                    details.append(f"Filter {spec.alias}: {predicate}")
-            for spec in node.joins:
-                predicate = (_short_prompt(joins[spec.written_pos].prompt)
-                             if spec.written_pos < len(joins)
-                             else f"predicate {spec.written_pos + 1}")
-                details.append(f"Join {spec.semantics}: {predicate}")
         else:
             title = node.type_name
             if not verbose:
@@ -515,7 +501,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 title += " (metrics unavailable)"
         if "release_recompute_tokens" in estimate:
             details.append(
-                "expected recompute at the join if the chain's KV is "
+                "expected recompute at the join if the sequence's KV is "
                 "released: "
                 f"{estimate['release_recompute_tokens']:,} tokens, "
                 f"{estimate['release_recompute_seconds']:.3f} s")
@@ -532,8 +518,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         children = dict.fromkeys(port.source.node_id for port in node.inputs)
         for child in children:
             visit(graph.node(child), depth + 1)
-        for child in node.embedded_nodes():
-            visit(child, depth + 1)
 
     visit(graph.node(graph.root.node_id), 0)
     for node in graph.topological_nodes():
@@ -542,11 +526,11 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
     lines = _table(rows)
     seen = set()
     for member_id, pipeline in build_pipelines(graph).items():
-        if id(pipeline) in seen or len(pipeline.members) < 2:
+        if id(pipeline) in seen or len(pipeline) < 2:
             continue
         seen.add(id(pipeline))
-        lines.append(f"Pipeline on {pipeline.alias}: "
-                     + " -> ".join(pipeline.node_ids)
+        lines.append(f"Pipeline on {pipeline[0].document_aliases[0]}: "
+                     + " -> ".join(member.node_id for member in pipeline)
                      + " (each document runs every operator with its KV "
                      "resident)")
     if used_default:
@@ -554,22 +538,22 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
     return "\n".join(lines)
 
 
-def rule_lines(logical_rules, physical_rules) -> list[str]:
-    """Return the optimizer rules in run order, each marked by kind.
+def rule_lines(rules) -> list[str]:
+    """Return rule categories and the order used during search."""
+    def names(selected):
+        return ", ".join(rule.name for rule in selected) or "none"
 
-    A rule is cost-based when its ``cost_based`` attribute is true and
-    heuristic otherwise.
-    """
-    def names(rules):
-        return ", ".join(
-            rule.name + ("*" if getattr(rule, "cost_based", False) else "")
-            for rule in rules) or "none"
-
-    return ["rules, in run order (* cost-based, others heuristic):",
-            f"  logical: {names(logical_rules)}",
-            "  physical: building the plan (filter order*, join order and "
-            "anchors*, and on Quail classification placement*), then "
-            f"{names(physical_rules)}"]
+    return [
+        "optimizer rules:",
+        "  logical: " + names(rule for rule in rules if isinstance(rule, LogicalRule)),
+        "  physical: " + names(
+            rule for rule in rules if isinstance(rule, PhysicalRule)),
+        "  search: rewrite logical candidates, "
+        "then lower each alternative",
+        "  refine each graph in order: " + names(
+            rule for rule in rules if isinstance(rule, PhysicalRule)),
+        "  selection: lowest estimated cost after graph refinement",
+    ]
 
 
 def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
@@ -586,11 +570,8 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
             node shows its measured rows, time, and tokens next to the
             estimates, and the measured totals follow the tree.
         usd_per_hour: Price of one GPU, for the measured cost per query.
-        rules: The registered logical rules and physical rules, as a
-            pair of sequences, listed when verbose.
+        rules: Registered rules in order, listed when verbose.
     """
-    from quail.planner.plan import Refusal
-
     lines = ["logical:"]
     lines.extend("  " + line for line in logical_tree(logical).splitlines())
     if isinstance(physical, Refusal):
@@ -638,5 +619,5 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
             lines.append("  KV dtype=bf16")
         if rules is not None:
             lines.append("")
-            lines.extend(rule_lines(*rules))
+            lines.extend(rule_lines(rules))
     return "\n".join(lines)

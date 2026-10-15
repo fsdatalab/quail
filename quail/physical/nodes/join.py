@@ -1,0 +1,286 @@
+"""The Barrier, AiJoin, Foreign, and HashJoin nodes."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import ClassVar
+
+from ..base import (
+    ExecutionLocation,
+    OutputPort,
+    PhysicalNode,
+    ValueType,
+)
+
+
+@dataclass(frozen=True)
+class Barrier(PhysicalNode):
+    """Move or repartition survivor ids between join steps."""
+
+    next_anchor: str = ""
+    aliases: tuple[str, ...] = ()
+
+    type_name: ClassVar[str] = "quail.barrier"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return tuple(
+            OutputPort(
+                f"ids:{alias}",
+                ValueType.DOCUMENT_IDS,
+                schema=(alias,),
+            )
+            for alias in self.aliases
+        )
+
+    def attributes(self) -> dict:
+        return {"next_anchor": self.next_anchor, "aliases": list(self.aliases)}
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            next_anchor=attributes["next_anchor"],
+            aliases=tuple(attributes["aliases"]),
+        )
+
+
+@dataclass(frozen=True)
+class AiJoin(PhysicalNode):
+    """Evaluate one join predicate using an anchor document."""
+
+    anchor: str = ""
+    anchor_resident: str = "none"
+    keep_kv: bool = False
+    written_pos: int = 0
+    exec_idx: int = 0
+    partners: tuple[str, ...] = ()
+    semantics: str = "full"
+    selectivity: float | None = None
+    expected_tuples: float = 0.0
+    anchor_frame_tokens: int = 0
+    pair_tail_tokens: int = 0
+    tuple_tokens: float = 0.0
+    pairs_from: str = ""
+    frame_token_ids: tuple[int, ...] = ()
+    label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    tail_token_ids: tuple[int, ...] = ()
+    # "unified" or "tree": the attention path the choose_attention_algorithm rule
+    # chose; empty leaves the model pipeline's default
+    attention: str = ""
+    # anchors borrow the KV pages of an anchor that shares their token
+    # prefix (the should_share_prefixes rule)
+    share_prefixes: bool = False
+
+    type_name: ClassVar[str] = "quail.ai_join"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+    backend: ClassVar[str] = "quail"
+
+    worker_pipelining: ClassVar[bool] = True
+
+    @property
+    def document_aliases(self) -> tuple[str, ...]:
+        return (self.anchor,)
+
+    def document_outputs(self, alias: str) -> tuple[str, ...]:
+        return (f"join_answers:{self.written_pos}", f"ids:{alias}")
+
+    def can_precede(self, consumer: PhysicalNode) -> bool:
+        # classify.py imports AiJoin, so AiClassify is imported at call time
+        from .classify import AiClassify
+
+        if isinstance(consumer, AiJoin):
+            return (self.anchor == consumer.anchor
+                    and self.semantics == consumer.semantics == "full")
+        return isinstance(consumer, AiClassify) and consumer.classifies_join(self)
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        outputs = [OutputPort(
+            f"ids:{self.anchor}",
+            ValueType.DOCUMENT_IDS,
+            schema=(self.anchor,),
+        )]
+        outputs.append(OutputPort(
+            f"join_answers:{self.written_pos}",
+            ValueType.JOIN_ANSWERS,
+            schema=(self.anchor, *self.partners, "answer"),
+        ))
+        return tuple(outputs)
+
+    def explain_fields(self) -> dict:
+        return {
+            "written_pos": self.written_pos,
+            "exec_idx": self.exec_idx,
+            "anchor": self.anchor,
+            "partners": list(self.partners),
+            "semantics": self.semantics,
+            "selectivity": self.selectivity,
+            "expected_tuples": self.expected_tuples,
+            "anchor_frame_tokens": self.anchor_frame_tokens,
+            "pair_tail_tokens": self.pair_tail_tokens,
+            "anchor_resident": self.anchor_resident,
+            "tuple_tokens": self.tuple_tokens,
+            "pairs_from": self.pairs_from,
+            "keep_kv": self.keep_kv,
+            "attention": self.attention,
+            "share_prefixes": self.share_prefixes,
+        }
+
+    def attributes(self) -> dict:
+        return {
+            **self.explain_fields(),
+            "frame_token_ids": list(self.frame_token_ids),
+            "label_token_ids": [[alias, list(tokens)]
+                                for alias, tokens in self.label_token_ids],
+            "tail_token_ids": list(self.tail_token_ids),
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, value):
+        return cls(
+            node_id=node_id, inputs=inputs,
+            keep_kv=bool(value["keep_kv"]),
+            attention=str(value["attention"]),
+            share_prefixes=bool(value["share_prefixes"]),
+            written_pos=int(value["written_pos"]),
+            exec_idx=int(value["exec_idx"]),
+            anchor=str(value["anchor"]),
+            partners=tuple(value["partners"]),
+            semantics=str(value["semantics"]),
+            selectivity=value["selectivity"],
+            expected_tuples=float(value["expected_tuples"]),
+            anchor_frame_tokens=int(value["anchor_frame_tokens"]),
+            pair_tail_tokens=int(value["pair_tail_tokens"]),
+            anchor_resident=str(value["anchor_resident"]),
+            tuple_tokens=float(value["tuple_tokens"]),
+            pairs_from=str(value.get("pairs_from", "")),
+            frame_token_ids=tuple(value.get("frame_token_ids", ())),
+            label_token_ids=tuple(
+                (alias, tuple(tokens))
+                for alias, tokens in value.get("label_token_ids", ())
+            ),
+            tail_token_ids=tuple(value.get("tail_token_ids", ())),
+        )
+
+
+@dataclass(frozen=True)
+class Foreign(PhysicalNode):
+    """Physical operator that calls a user function on document IDs or pairs.
+
+    Per-batch functions run as documents reach them in a pipeline, or once
+    over a materialized input. Barrier functions run once over all surviving
+    rows and end the preceding pipeline. The function may preserve or remove
+    input IDs, or return pairs of input IDs; it cannot create new IDs.
+    """
+
+    function: str = ""
+    kind: str = "per_batch"
+    ids: str = "drop"
+    columns: tuple[tuple[str, str], ...] = ()
+    aliases: tuple[str, ...] = ()
+    written_pos: int = -1
+
+    type_name: ClassVar[str] = "quail.foreign"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def document_aliases(self) -> tuple[str, ...]:
+        if self.kind != "per_batch":
+            return ()
+        return self.aliases if self.ids == "pairs" else self.aliases[:1]
+
+    def document_outputs(self, alias: str) -> tuple[str, ...]:
+        if self.ids == "pairs":
+            return (f"pairs:{self.written_pos}",)
+        return super().document_outputs(alias)
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        if self.ids == "pairs":
+            return (OutputPort(
+                f"pairs:{self.written_pos}", ValueType.PAIRS,
+                schema=tuple(self.aliases)),)
+        (alias,) = self.aliases
+        return (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
+                           schema=(alias,)),)
+
+    def attributes(self) -> dict:
+        return {
+            "function": self.function,
+            "kind": self.kind,
+            "ids": self.ids,
+            "columns": [list(column) for column in self.columns],
+            "aliases": list(self.aliases),
+            "written_pos": self.written_pos,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            function=str(attributes["function"]),
+            kind=str(attributes["kind"]),
+            ids=str(attributes["ids"]),
+            columns=tuple(
+                (str(alias), str(column))
+                for alias, column in attributes["columns"]
+            ),
+            aliases=tuple(attributes["aliases"]),
+            written_pos=int(attributes["written_pos"]),
+        )
+
+
+@dataclass(frozen=True)
+class HashJoin(PhysicalNode):
+    """Pair the rows of two tables whose key columns are equal.
+
+    ``on`` lists (left column, right column) pairs; a row pair is kept
+    when every listed pair of values is equal. The node reads the key
+    columns as values and writes the pairs the join at ``written_pos``
+    asks the model about. ``pair_fraction`` is the planner's estimate
+    of the pairs kept over the cross product.
+    """
+
+    left: str = ""
+    right: str = ""
+    on: tuple[tuple[str, str], ...] = ()
+    written_pos: int = -1
+    pair_fraction: float = 1.0
+
+    type_name: ClassVar[str] = "quail.hash_join"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort(f"pairs:{self.written_pos}", ValueType.PAIRS,
+                           schema=(self.left, self.right)),)
+
+    def attributes(self) -> dict:
+        return {
+            "left": self.left,
+            "right": self.right,
+            "on": [list(condition) for condition in self.on],
+            "written_pos": self.written_pos,
+            "pair_fraction": self.pair_fraction,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            left=str(attributes["left"]),
+            right=str(attributes["right"]),
+            on=tuple((str(left), str(right))
+                     for left, right in attributes["on"]),
+            written_pos=int(attributes["written_pos"]),
+            pair_fraction=float(attributes.get("pair_fraction", 1.0)),
+        )

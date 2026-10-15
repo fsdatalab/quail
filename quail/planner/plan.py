@@ -1,13 +1,13 @@
-"""Data structures produced by planning: PhysicalPlan and Refusal."""
+"""PhysicalPlan, Refusal, and the pass that sets document KV lifetimes."""
 
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
-from quail.execution.pipelines import build_pipelines
+from quail.logical import LogicalPlan
 from quail.physical import (
     AiFilter,
+    AiInference,
     AiJoin,
-    AiScore,
     Barrier,
     Exchange,
     Foreign,
@@ -18,13 +18,14 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.codec import plan_envelope
+from quail.physical.pipelines import build_pipelines
 from quail.specs import MODELS
 
 
-def score_seconds(nodes) -> float:
-    """Sum the score operators' estimated seconds in a physical graph."""
+def inference_seconds(nodes) -> float:
+    """Sum the inference operators' estimated seconds in a physical graph."""
     return sum(node.spec.estimated_seconds for node in nodes
-               if isinstance(node, AiScore) and node.spec is not None)
+               if isinstance(node, AiInference) and node.spec is not None)
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,17 @@ class Refusal:
     unit: str          # "cards" | "tokens" | "bytes"
 
 
+class RefusalError(RuntimeError):
+    """Raised when run() is called on a refused plan."""
+
+    def __init__(self, refusal: Refusal):
+        self.refusal = refusal
+        super().__init__(
+            f"{refusal.constraint}: needed {refusal.needed} "
+            f"{refusal.unit}, available {refusal.available}. "
+            + " ".join(refusal.reasons))
+
+
 class PlanEditError(ValueError):
     """Raised by insert, remove, and move when an edit breaks a rule."""
 
@@ -57,9 +69,10 @@ class PhysicalPlan:
     """A typed physical graph with its settings and estimates.
 
     estimates holds, per node id, the node's own estimated seconds
-    and, for a filter chain a later join anchors on, the recompute it
+    and, for a filter sequence a later join anchors on, the recompute it
     would pay if its KV were released instead of pinned. estimator
     recomputes them for an edited graph; it is not compared or shown.
+    logical_plan records the selected tree for query execution and explain.
     """
 
     model: str
@@ -73,6 +86,7 @@ class PhysicalPlan:
     estimates: Mapping[str, Mapping[str, float]] = field(
         default_factory=dict, repr=False)
     estimator: Any = field(default=None, repr=False, compare=False)
+    logical_plan: LogicalPlan | None = field(default=None, repr=False, compare=False)
     graph: PhysicalGraph = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -122,7 +136,9 @@ class PhysicalPlan:
         Raises:
             PlanEditError: The edited operator graph is invalid.
         """
-        nodes = _rederive_kv(tuple(nodes))
+        nodes = plan_kv_retention(
+            PhysicalGraph(tuple(nodes), self.graph.root), self.workers,
+            tuple(self.settings.get("pre_ids", ()))).nodes
         try:
             edited = replace(self, nodes=nodes, root=None, estimates={})
         except GraphValidationError as error:
@@ -131,13 +147,13 @@ class PhysicalPlan:
         if base is None:
             return edited
         scheduled = set(self.settings.get("retention", {}).get("initial", {}))
-        pipelines = build_pipelines(edited.graph)
+        pipelines = build_pipelines(edited.graph, self.workers)
         recompute = sum(
             edited.estimates.get(node.node_id, {}).get(
                 "release_recompute_seconds", 0.0)
             for node in edited.nodes
             if isinstance(node, AiFilter) and node.alias not in scheduled
-            and not isinstance(pipelines[node.node_id].sink, AiJoin))
+            and not isinstance(pipelines[node.node_id][-1], AiJoin))
         return replace(edited, estimated_seconds=base + recompute,
                        estimates=edited.estimates)
 
@@ -232,26 +248,6 @@ class PhysicalPlan:
             settings=self.settings,
         )
 
-def _rederive_kv(nodes: tuple) -> tuple:
-    """Set keep_kv and arena_writes on each filter whose alias anchors a join.
-
-    A filter whose pipeline does not end at that join, for example
-    because a Barrier sits between them, keeps its survivors' KV for it.
-    """
-    graph = PhysicalGraph(nodes, PortRef(nodes[-1].node_id,
-                                         nodes[-1].outputs[0].name))
-    joins = {node.anchor for node in nodes if isinstance(node, AiJoin)}
-    pipelines = build_pipelines(graph)
-    out = []
-    for node in nodes:
-        if not isinstance(node, AiFilter) or node.alias not in joins:
-            out.append(node)
-            continue
-        cut = not isinstance(pipelines[node.node_id].sink, AiJoin)
-        out.append(replace(node, keep_kv=cut, arena_writes=True))
-    return tuple(out)
-
-
 def resolve_model(name: str, models=None):
     """Return a ModelSpec by name, or a Refusal if unknown."""
     if models is None:
@@ -286,3 +282,47 @@ class EngineConfig:
     # one attention path, "tree" or "unified", forced for every filter
     # and join; None lets the planner choose per node
     attention: str | None = None
+
+
+def plan_kv_retention(graph: PhysicalGraph, workers: int = 1,
+                      shared_head: tuple[int, ...] = ()) -> PhysicalGraph:
+    """Set operators' KV retention from the next compatible document consumer.
+
+    KV between operators on one path stays active in the scheduler. It stays
+    available after the path finishes when the next path reads the same
+    documents under the same prompt head. Worker boundaries use the same
+    paths as execution.
+    """
+    def head(node):
+        return shared_head if node.document_head is None else node.document_head
+
+    paths = build_pipelines(graph, workers)
+    ordered = graph.topological_nodes()
+    starts = [node for node in ordered
+              if node.node_id in paths and paths[node.node_id][0] is node]
+    replacements = {}
+    for index, first in enumerate(starts):
+        members = paths[first.node_id]
+        alias = first.document_aliases[0]
+        following = next((later for later in starts[index + 1:]
+                          if later.document_aliases == (alias,)), None)
+        keep = (following is not None
+                and head(first) == head(following)
+                and (workers == 1 or first.worker_pipelining
+                     and following.worker_pipelining))
+        model_nodes = [node for node in members if node.backend is not None]
+        # Joins settle anchors after any classification of their surviving pairs.
+        settling = next((node for node in reversed(model_nodes)
+                         if isinstance(node, AiJoin)), model_nodes[-1])
+        for position, node in enumerate(model_nodes):
+            retain = bool(keep and node is settling)
+            if isinstance(node, AiJoin):
+                retain |= any(isinstance(later, AiJoin)
+                              for later in model_nodes[position + 1:])
+            fields = {"keep_kv": retain}
+            if isinstance(node, AiFilter):
+                fields["arena_writes"] = (node.arena_writes or retain
+                                          or position < len(model_nodes) - 1)
+            replacements[node.node_id] = replace(node, **fields)
+    return PhysicalGraph(tuple(replacements.get(node.node_id, node)
+                               for node in graph.nodes), graph.root)

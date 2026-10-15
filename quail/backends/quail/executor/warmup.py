@@ -2,8 +2,8 @@
 
 import time
 
-from quail.backends.quail.executor.loop import run_filter, run_join
-from quail.backends.quail.executor.model import full_output_head
+from quail.backends.quail.executor.model_loading import full_output_head
+from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
 from quail.progress import Progress, logger, quiet
 
 # ------------------------------------------------------------- warmup
@@ -63,9 +63,10 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
-        run_filter(torch, arena, pipeline, async_ans, warm_docs,
-                   [question], budget, arena_writes=True,
-                   attention_mode=mode)
+        run_stages(
+            torch, arena, pipeline,
+            filter_stages([question], async_ans), warm_docs, budget,
+            attention_mode=mode)
         # small chunks, one document each: the trailing-chunk shapes
         # of gated multi-stage runs (see ModelPipeline.warm_tokens)
         for t in pipeline.warm_tokens:
@@ -73,27 +74,33 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                 continue
             logger.debug("kernels: warming %s attention, %s tokens", mode, t)
             body = (doc * (t // len(doc) + 1))[:max(8, t - q_max)]
-            run_filter(torch, arena, pipeline, async_ans, [body],
-                       [question], budget, arena_writes=True,
-                       attention_mode=mode)
+            run_stages(
+                torch, arena, pipeline,
+                filter_stages([question], async_ans), [body], budget,
+                attention_mode=mode)
         if not pipeline.canvas_ids:
             logger.debug("kernels: warming %s attention row classes", mode)
             _warm_row_classes(torch, arena, pipeline, mode)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
-        run_join(torch, arena, pipeline, async_ans, warm_docs,
-                 [[question] * 8], budget)
+        run_stages(
+            torch, arena, pipeline,
+            [Stage(suffixes=[question] * 8, readout=async_ans)], warm_docs, budget)
     if join_chunk and trailing == 1:
         # a classification: the question as the frame after each
         # document, then many short suffixes of mixed lengths; a
         # decision model classifies with its own readout
         logger.debug("kernels: warming classification forward pass")
         labels = [question[:1 + i % 6] for i in range(26)]
-        run_join(torch, arena, pipeline, async_ans, warm_docs,
-                 [labels], budget, stage_frames=[question])
+        run_stages(
+            torch, arena, pipeline,
+            [Stage(suffixes=labels, readout=async_ans, frame=question)],
+            warm_docs, budget)
     logger.debug("kernels: warming filter without KV writes")
-    run_filter(torch, arena, pipeline, async_ans, warm_docs,
-               [question], budget, arena_writes=False)
+    run_stages(
+        torch, arena, pipeline,
+        filter_stages([question], async_ans), warm_docs, budget,
+        paged=False, default_attention="unified")
 
 
 def _warm_row_classes(torch, arena, pipeline, mode):
@@ -110,7 +117,7 @@ def _warm_row_classes(torch, arena, pipeline, mode):
         mode: The attention path, "tree" or "unified".
     """
     from quail.backends.quail.executor.chunk import pack_chunk
-    from quail.backends.quail.executor.loop import _forward
+    from quail.backends.quail.executor.stage_executor import forward_chunk
 
     cached = ROW_CLASS_CACHED
     readers = max(m for _, m in ROW_CLASSES)
@@ -123,7 +130,7 @@ def _warm_row_classes(torch, arena, pipeline, mode):
         # a forward pass ends in a norm over its answer rows, which
         # fails with a CUDA error when there are none: each document
         # takes a one-token question whose answer is not read
-        _forward(pipeline, arena, pack_chunk(
+        forward_chunk(pipeline, arena, pack_chunk(
             torch, arena, [dict(key=key, prefix=prefix, f=cached, suffixes=[[11]])
                            for key in keys], attention_mode=mode))
         for n, m in ROW_CLASSES:
@@ -136,7 +143,7 @@ def _warm_row_classes(torch, arena, pipeline, mode):
                 groups.append(dict(key=filler, prefix=prefix[:n - m],
                                    f=n - m, suffixes=[]))
             try:
-                _forward(pipeline, arena, pack_chunk(
+                forward_chunk(pipeline, arena, pack_chunk(
                     torch, arena, groups, attention_mode=mode))
             finally:
                 if arena.is_resident(filler):

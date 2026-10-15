@@ -1,0 +1,129 @@
+"""Tests for warmup marker path layout and identity stability."""
+
+import json
+import multiprocessing as mp
+from types import SimpleNamespace
+
+import pytest
+
+from quail.backends.quail.executor import warmup
+
+
+def _stub_torch():
+    return SimpleNamespace(
+        __version__="2.9.0", version=SimpleNamespace(cuda="13.0"),
+        cuda=SimpleNamespace(get_device_name=lambda: "NVIDIA H100",
+                             synchronize=lambda: None))
+
+
+def _concurrent_warmup(path, start, touch, compiles, results):
+    warmup._marker_path = lambda *args: path
+    warmup._marker_identity = lambda *args: {"version": 1}
+
+    def compile_once(*args):
+        with compiles.get_lock():
+            compiles.value += 1
+
+    def touch_together(*args):
+        # both cached workers must warm outside the compilation lock
+        touch.wait(timeout=10)
+
+    warmup.compile_kernels = compile_once
+    warmup.touch_kernels = touch_together
+    start.wait(timeout=10)
+    result = warmup.warm_kernels(_stub_torch(), None, None, None, 100,
+                                 model_name="model")
+    results.put(result["tier"])
+
+
+def test_concurrent_processes_compile_once_and_touch_in_parallel(tmp_path):
+    ctx = mp.get_context("spawn")
+    path = str(tmp_path / "warm.json")
+    start, touch = ctx.Barrier(3), ctx.Barrier(2)
+    compiles = ctx.Value("i", 0)
+    results = ctx.Queue()
+    workers = [ctx.Process(target=_concurrent_warmup,
+                           args=(path, start, touch, compiles, results))
+               for _ in range(3)]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=20)
+            assert worker.exitcode == 0
+        assert compiles.value == 1
+        assert sorted(results.get(timeout=2) for _ in workers) == [
+            "compile", "touch", "touch"]
+        assert json.loads((tmp_path / "warm.json").read_text()) == {"version": 1}
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=5)
+        results.close()
+
+
+def test_warmup_failure_writes_no_marker_and_touch_warms_the_join_chunk(
+        monkeypatch, tmp_path):
+    path = tmp_path / "warm.json"
+    monkeypatch.setattr(warmup, "_marker_path", lambda *args: str(path))
+    monkeypatch.setattr(warmup, "_marker_identity", lambda *args: {"version": 1})
+
+    def fail(*args):
+        raise RuntimeError("GPU failed")
+
+    for failure in ("compile", "synchronize"):
+        torch = _stub_torch()
+        monkeypatch.setattr(warmup, "compile_kernels",
+                            fail if failure == "compile" else lambda *args: None)
+        if failure == "synchronize":
+            torch.cuda.synchronize = fail
+        with pytest.raises(RuntimeError, match="GPU failed"):
+            warmup.warm_kernels(torch, None, None, None, 100, model_name="model")
+        assert not path.exists(), failure
+
+        torch.cuda.synchronize = lambda: None
+        monkeypatch.setattr(warmup, "compile_kernels", lambda *args: None)
+        assert warmup.warm_kernels(torch, None, None, None, 100,
+                                   model_name="model")["tier"] == "compile", failure
+        path.unlink()
+
+    calls = []
+    monkeypatch.setattr(warmup, "_forward_warm",
+                        lambda *args, **kwargs: calls.append(kwargs))
+    warmup.touch_kernels(None, None, None, None, 100)
+    assert calls == [{"join_chunk": True}]
+
+
+def test_forward_warm_runs_a_classification_chunk(monkeypatch):
+    from types import SimpleNamespace
+
+    joins = []
+    def run_stages(torch, arena, pipeline, stages, docs, budget, **kw):
+        joins.extend(stage for stage in stages if len(stage.suffixes) > 1)
+
+    monkeypatch.setattr(warmup, "run_stages", run_stages)
+    classes = []
+    monkeypatch.setattr(warmup, "_warm_row_classes",
+                        lambda torch, arena, pipeline, mode: classes.append(mode))
+    pipeline = SimpleNamespace(tree_attention=False, warm_tokens=(),
+                               canvas_ids=())
+    warmup._forward_warm(None, None, pipeline, None, 2048, join_chunk=True)
+    # the row-count classes run on each attention path the model has
+    assert classes == ["unified"]
+    (join, classify) = joins
+    assert len(join.suffixes) == 8 and join.frame == []
+    suffixes = classify.suffixes
+    question = list(range(10, 26))
+    # 26 suffixes of one to six tokens, after the question as the frame
+    assert len(suffixes) == 26 and {len(s) for s in suffixes} == set(range(1, 7))
+    assert all(s == question[:len(s)] for s in suffixes)
+    assert classify.frame == question
+
+    # a decision readout reads 31 trailing rows: the warmup question is
+    # that long, and the classification chunk is left out
+    joins.clear()
+    readout = SimpleNamespace(trailing_rows=31)
+    warmup._forward_warm(None, None, pipeline, readout, 2048, join_chunk=True)
+    (stage,) = joins
+    assert len(stage.suffixes[0]) == 31

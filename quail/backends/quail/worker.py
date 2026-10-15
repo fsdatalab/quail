@@ -5,14 +5,17 @@ per GPU, each with its own CUDA context and arena.
 """
 
 import gc
-import itertools
 import time
+from dataclasses import dataclass
+from typing import Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.model import load_model, resolve_model_path
+from quail.backends.quail.executor.model_loading import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
+from quail.backends.quail.executor.operators.extract import execute_extractions
+from quail.backends.quail.executor.operators.join import join_inputs
 from quail.backends.quail.executor.readout import (
     AnswerRows,
     AsyncAnswers,
@@ -20,21 +23,16 @@ from quail.backends.quail.executor.readout import (
     AsyncDecisionScores,
     DecisionHead,
 )
+from quail.backends.quail.executor.state import GpuRuntime
 from quail.backends.quail.executor.warmup import warm_kernels
-from quail.backends.quail.graph import (
-    _join_round_kv,
-    _tuple_suffix,
-    execute_single_graph,
-    partner_list_builder,
-    stage_partner_lists,
-)
-from quail.backends.quail.retention import apply_retention, retain_after_join
-from quail.cost import budgets
-from quail.execution.runner import ExecutionContext
-from quail.execution.tokens import (
+from quail.backends.quail.graph import execute_single_graph
+from quail.backends.quail.retention import apply_retention
+from quail.catalog.tokens import (
     DocumentPrefixes,
     decode_payload_documents,
 )
+from quail.cost import budgets
+from quail.execution.runner import ExecutionContext
 from quail.execution.types import PhysicalResponse
 from quail.physical import (
     AiFilter,
@@ -124,6 +122,11 @@ class LoadedGpu:
         survives in the arena between queries.
         """
         if arena_pages is not None:
+            graphs = getattr(self.pipeline, "decode_graphs", None)
+            if (graphs is not None and tuple(arena_pages)
+                    != (self.arena.n_pages, self.arena.n_sliding_pages)):
+                self.torch.cuda.synchronize()
+                graphs.invalidate()
             self.arena.resize(*arena_pages, free_resident=True)
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
@@ -149,18 +152,24 @@ class LoadedGpu:
         Returns:
             Tuple of (seconds spent warming, compilation tier).
         """
-        if self._warmed:
-            return 0.0, None
         t0 = time.perf_counter()
+        tier = None
         with self.torch.inference_mode():
-            warm = warm_kernels(self.torch, self.arena, self.pipeline,
-                                self.async_ans, self.chunk_tokens,
-                                model_name=self.spec.hf_name,
-                                model=self.model)
+            if not self._warmed:
+                warm = warm_kernels(self.torch, self.arena, self.pipeline,
+                                    self.async_ans, self.chunk_tokens,
+                                    model_name=self.spec.hf_name,
+                                    model=self.model)
+                tier = warm["tier"]
+            graphs = getattr(self.pipeline, "decode_graphs", None)
+            if graphs is not None and graphs.prepare():
+                tier = tier or "graphs"
+        if tier is None:
+            return 0.0, None
         self.torch.cuda.synchronize()
         warm_s = time.perf_counter() - t0
         self._warmed = True
-        return warm_s, warm["tier"]
+        return warm_s, tier
 
     def close(self):
         """Release GPU resources held by the execution context."""
@@ -173,7 +182,7 @@ def decision_offsets(spec, path) -> tuple[int, ...]:
     """The rows a decision readout reads, as distances before the last row."""
     from gigatoken import Tokenizer
 
-    from quail.logical import answer_row_offsets
+    from quail.planner.prompt_lowering import answer_row_offsets
 
     tokenizer = Tokenizer(path).as_hf()
     offsets = answer_row_offsets(
@@ -208,15 +217,19 @@ def quail_runtime_payload(request, graph) -> dict:
     """Build private Quail scheduler state from a standard request."""
     envelope = request.plan
     docs = {}
+    texts = {}
     for node in graph.nodes:
         if not isinstance(node, Scan):
             continue
         docs[node.alias] = request.inputs[node.input_id].documents
+        if request.inputs[node.input_id].texts is not None:
+            texts[node.alias] = request.inputs[node.input_id].texts
     return {
         "physical_plan": envelope,
         "model": envelope["model"],
         "workers": envelope["workers"],
         "docs": docs,
+        "texts": texts,
         "columns": request.column_tables(),
         **dict(envelope["settings"]),
     }
@@ -343,8 +356,7 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
             payload.get("arena_pages"))
     say("running the query")
 
-    state = _gpu_state(gpu)
-    report = execute_single(state, payload, registry, graph)
+    report = execute_single(gpu, payload, registry, graph)
     outputs = report.pop("_outputs")
     report.pop("filters", None)
     report.pop("joins", None)
@@ -354,25 +366,15 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     return PhysicalResponse(outputs, report)
 
 
-def _gpu_state(gpu):
-    """Build a state dict from a LoadedGpu for graph execution."""
-    return {
-        "torch": gpu.torch, "F": gpu.F,
-        "model_execution": gpu.execution,
-        "model": gpu.model, "arena": gpu.arena,
-        "pipeline": gpu.pipeline, "spec": gpu.spec,
-    }
-
-
-def execute_single(state, payload: dict, registry, graph) -> dict:
+def execute_single(gpu: GpuRuntime, payload: dict, registry, graph) -> dict:
     """Execute the typed Quail graph on one GPU."""
     runtime_state = {
-        **state,
+        "gpu": gpu,
         "docs": decode_payload_documents(payload["docs"]),
+        "texts": payload.get("texts", {}),
         "columns": payload.get("columns", {}),
         "functions": registry.functions,
         "runtimes": registry.runtimes,
-        "model_spec": state.get("spec") or state.get("model_spec"),
         "device": registry.device(payload["physical_plan"]["device"]),
         "chunk_tokens": payload["chunk_tokens"],
         "gpu_timing": payload.get("gpu_timing", False),
@@ -380,19 +382,23 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
     return execute_single_graph(runtime_state, payload, graph)
 
 
-# ------------------------------------------------- multi-GPU dispatch
-#
-# One executor per GPU, as its own child process. The parent is the
-# in-container coordinator: it splits the payload with
-# quail.backends.quail.coordinator, runs the filter round, merges
-# survivors, runs the join round, and merges the answers, with no
-# network hop between rounds.
+@dataclass
+class ChildState:
+    """GPU resources and query inputs owned by one worker process."""
+
+    gpu_index: int
+    gpu: LoadedGpu | None = None
+    registry: Any = None
+    model_path: str | None = None
+    runtime_context: ExecutionContext | None = None
+    score_documents: Any = None
+
 
 def _child_main(gpu_idx, conn):
     import os as _os
     _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
     set_gpu_index(gpu_idx)
-    state = {"gpu_index": gpu_idx, "gpu": None}
+    state = ChildState(gpu_idx)
     while True:
         try:
             kind, data = conn.recv()
@@ -402,23 +408,25 @@ def _child_main(gpu_idx, conn):
             break
         try:
             if kind == "boot":
-                state["registry"] = data["registry"]
-                state["model_path"] = data["model_path"]
+                state.registry = data["registry"]
+                state.model_path = data["model_path"]
                 conn.send(("ok", _child_boot(state, data)))
             elif kind == "filters":
                 conn.send(("ok", _child_filters(state, data)))
             elif kind == "scores":
-                gpu = state["gpu"]
+                gpu = state.gpu
                 inputs = data["inputs"]
                 if "documents" in inputs:
-                    state["score_documents"] = inputs["documents"]
-                inputs["documents"] = state["score_documents"]
+                    state.score_documents = inputs["documents"]
+                inputs["documents"] = state.score_documents
                 with gpu.torch.inference_mode():
                     result = gpu.execution.execute(data["node"], inputs)
                 gpu.torch.cuda.synchronize()
                 conn.send(("ok", result))
             elif kind == "joins":
                 conn.send(("ok", _child_joins(state, data)))
+            elif kind == "extract":
+                conn.send(("ok", _child_extract(state, data)))
         except Exception:
             import traceback
             conn.send(("err", traceback.format_exc()))
@@ -426,25 +434,25 @@ def _child_main(gpu_idx, conn):
 
 def _child_boot(state, sub):
     envelope = sub["physical_plan"]
-    registry = state["registry"]
+    registry = state.registry
     spec = registry.model(sub["model"])
     device = registry.device(envelope["device"])
     backend = registry.backend(envelope["backend"])
     t_boot = time.perf_counter()
-    gpu = state.get("gpu")
+    gpu = state.gpu
     if gpu is None:
         gpu = LoadedGpu(backend, GpuContext(
-            gpu_index=state["gpu_index"], gpu_count=sub["workers"],
+            gpu_index=state.gpu_index, gpu_count=sub["workers"],
             model=spec, device=device, query_settings={},
         ), sub["true_ids"] + sub["false_ids"],
-            model_path=state["model_path"])
-        state["gpu"] = gpu
+            model_path=state.model_path)
+        state.gpu = gpu
         cold = True
     else:
         cold = False
     gpu.bind_query(sub["true_ids"], sub["false_ids"],
                    sub["chunk_tokens"], sub.get("arena_pages"))
-    state["runtime_context"] = ExecutionContext(
+    state.runtime_context = ExecutionContext(
         runtimes=registry.runtimes, model_execution=gpu.execution,
     )
     warm_s, warm_tier = gpu.warm()
@@ -453,15 +461,24 @@ def _child_boot(state, sub):
     return boot
 
 
+def _execute_predicates(context, nodes, inputs):
+    """Dispatch one predicate or a pipeline of predicates on the worker."""
+    if len(nodes) == 1:
+        node = nodes[0]
+        return {node.node_id: context.runtimes[node.runtime_key].execute(
+            node, inputs, context)}
+    return context.model_execution.execute_predicates(nodes, inputs)
+
+
 def _child_filters(state, sub):
-    gpu = state.get("gpu")
-    torch = gpu.torch if gpu else state["torch"]
-    arena = gpu.arena if gpu else state["arena"]
+    gpu = state.gpu
+    torch = gpu.torch
+    arena = gpu.arena
     if sub.get("start_query", True):
         _reset_child_query(state)
         config = sub.get("retention", {})
         apply_retention(arena, config, config.get("initial", {}))
-    out = dict(filters={}, survivors={}, retained={}, fresh_tokens=0)
+    results = {}
     pre = sub.get("pre_ids") or []
     filter_limit = sub.get("filter_limit")
     t0 = time.perf_counter()
@@ -470,17 +487,19 @@ def _child_filters(state, sub):
         if node_id is not None:
             graph = decode_graph(
                 sub["physical_plan"]["graph"],
-                state["registry"].codecs,
+                state.registry.codecs,
             )
-            node = graph.node(node_id)
+            nodes = tuple(graph.node(member)
+                          for member in sub.get("node_ids", (node_id,)))
+            node = nodes[0]
             if not isinstance(node, AiFilter):
                 raise TypeError(
                     f"child filter received {node.type_name!r}")
             alias = node.alias
             index = sub["doc_index"][alias]
-            runtime_context = state["runtime_context"]
-            result = runtime_context.runtimes[node.runtime_key].execute(
-                node,
+            runtime_context = state.runtime_context
+            results = _execute_predicates(
+                runtime_context, nodes,
                 {
                     "documents": DocumentPrefixes(
                         pre,
@@ -490,46 +509,57 @@ def _child_filters(state, sub):
                     "document_ids": index,
                     "limit": filter_limit,
                     "stop_groups": sub.get("stop_groups"),
-                    "retain_survivors": node.keep_kv,
+                    "gpu_timing": sub.get("gpu_timing", False),
                 },
-                runtime_context,
             )
-            answers = result.outputs[f"filter_answers:{alias}"]
-            if node.keep_kv:
-                out["retained"][alias] = sorted(
-                    key[1] for key in arena.retained_keys()
-                    if key[0] == alias)
-            out["fresh_tokens"] += result.metrics.fresh_tokens
-            out["filters"][alias] = {
-                int(document): row for document, row in answers.items()
-            }
-            out["survivors"][alias] = list(
-                result.outputs[f"ids:{alias}"]
-            )
-    for alias, document in arena.retained_keys():
-        out["retained"].setdefault(alias, []).append(document)
-    out["retained"] = {alias: sorted(set(documents))
-                       for alias, documents in out["retained"].items()}
+    return _child_results(torch, arena, results, wall_started=t0)
+
+
+def _child_results(torch, arena, results, *, wall_started=None, **metrics):
+    """Collect worker outputs and measurements after GPU work completes."""
     torch.cuda.synchronize()
-    out["wall_s"] = round(time.perf_counter() - t0, 2)
-    out["peak_gib"] = round(
-        torch.cuda.max_memory_allocated() / 2**30, 2)
-    return out
+    retained = {}
+    for alias, document in arena.retained_keys():
+        if isinstance(alias, tuple) and alias[0] == "extract":
+            alias = alias[1]
+        retained.setdefault(alias, []).append(document)
+    return {
+        "results": results,
+        "retained": {alias: sorted(documents)
+                     for alias, documents in retained.items()},
+        "kv_totals": {
+            "evicted_keys": arena.evicted_keys,
+            "evicted_pages": arena.evicted_pages,
+            "evicted_prefix_tokens": arena.evicted_prefix_tokens,
+        },
+        "peak_gib": torch.cuda.max_memory_allocated() / 2**30,
+        **({"wall_s": round(time.perf_counter() - wall_started, 2)}
+           if wall_started is not None else {}),
+        **metrics,
+    }
+
+
+def _child_extract(state, sub):
+    """Extract answers on one worker and report its retained document KV."""
+    gpu = state.gpu
+    with gpu.torch.inference_mode():
+        results = execute_extractions(gpu.execution.query, sub["nodes"], sub["inputs"])
+    return _child_results(gpu.torch, gpu.arena, results)
 
 
 def _child_joins(state, sub):
-    gpu = state.get("gpu")
-    torch = gpu.torch if gpu else state["torch"]
-    arena = gpu.arena if gpu else state["arena"]
+    gpu = state.gpu
+    torch = gpu.torch
+    arena = gpu.arena
     if sub.get("start_query", False):
         _reset_child_query(state)
     pre = sub.get("pre_ids") or []
-    registry = state["registry"]
-    encoded_node = sub["physical_node"]
-    node = registry.codecs[encoded_node["type"]].decode(encoded_node)
+    registry = state.registry
+    nodes = tuple(registry.codecs[value["type"]].decode(value)
+                  for value in sub["physical_nodes"])
+    node = nodes[0]
     if not isinstance(node, AiJoin):
         raise TypeError(f"child join received {node.type_name!r}")
-    group = [stage.runtime_spec() for stage in node.stages]
     anchor_alias = node.anchor
     anchors_glob = list(sub["anchor_index"])
     anchor_docs = sub["anchor_docs"]
@@ -538,110 +568,26 @@ def _child_joins(state, sub):
     live[anchor_alias] = anchors_glob
     apply_retention(arena, config,
                     config.get("before", {}).get(node.node_id, {}), live)
-    retain_anchor = bool(sub.get("retain_anchor"))
-    out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():
-        stage_suffixes, tuple_globs = [], []
-        for j in group:
-            locals_ = [range(len(sub["partners"][p]["index"]))
-                       for p in j["partners"]]
-            combos = list(itertools.product(*locals_))
-            tuple_globs.append(
-                [[sub["partners"][p]["index"][c]
-                  for p, c in zip(j["partners"], combo)]
-                 for combo in combos])
-            part_docs = {p: sub["partners"][p]["docs"]
-                         for p in j["partners"]}
-            stage_suffixes.append(
-                [_tuple_suffix(j, part_docs, combo)
-                 for combo in combos])
-        # this GPU's anchors only
-        lists_for = partner_list_builder(
-            group, tuple_globs,
-            {int(position): {int(anchor): partners
-                             for anchor, partners in rows.items()}
-             for position, rows in sub.get("pairs", {}).items()})
         prefixes = DocumentPrefixes(pre, anchor_docs, range(len(anchor_docs)))
-        anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-        round_kv = _join_round_kv(anchor_keys, arena)
-
-        def anchor_done(a, row):
-            matched = any(row)
-            alive = (not matched if group[-1]["semantics"] == "anti"
-                     else matched)
-            if alive and retain_anchor:
-                retain_after_join(arena, anchor_keys[a], len(prefixes[a]), config,
-                                  config.get("after", {}).get(node.node_id, {}))
-            else:
-                arena.free_key(anchor_keys[a])
-
-        runtime_context = state["runtime_context"]
-        result = runtime_context.runtimes[node.runtime_key].execute(
-            node,
-            {
-                "prefixes": prefixes,
-                "stage_suffixes": stage_suffixes,
-                "stage_frames": [
-                    join.get("frame") or [] for join in group
-                ],
-                "anchor_keys": anchor_keys,
-                "anchor_done": anchor_done,
-                "chain": None,
-                "kv_round": round_kv,
-                "anchor_ids": anchors_glob,
-                "partner_indices": {
-                    stage.written_pos: tuples
-                    for stage, tuples in zip(node.stages, tuple_globs)
-                },
-                "anchor_partners": lists_for,
-                "group": group,
-            },
-            runtime_context,
-        )
-        ans = result.metrics.extension["answers"]
-        last = ans[-1] if ans else {}
-        for a, key in enumerate(anchor_keys):
-            if not arena.is_resident(key):
-                continue
-            matched = any(last.get(a, []))
-            alive = (not matched if group[-1]["semantics"] == "anti"
-                     else matched)
-            if alive and retain_anchor:
-                retain_after_join(arena, key, len(prefixes[a]), config,
-                                  config.get("after", {}).get(node.node_id, {}))
-            else:
-                arena.free_key(key)
-        tokens_total += result.metrics.fresh_tokens
-        partner_lists = stage_partner_lists(group, lists_for, anchors_glob)
-        for si, j in enumerate(group):
-            out_joins.append(dict(
-                rows={int(a): row for a, row in ans[si].items()},
-                anchor_index=anchors_glob,
-                partner_index=tuple_globs[si],
-                anchor_partners=partner_lists[si]))
+        prepared = join_inputs(
+            nodes, {alias: partner["docs"]
+                    for alias, partner in sub["partners"].items()},
+            live, prefixes, arena, config, sub.get("pairs", {}))
+        round_kv = prepared["kv_round"]
+        prepared["gpu_timing"] = sub.get("gpu_timing", False)
+        results = _execute_predicates(state.runtime_context, nodes, prepared)
     if sub.get("final_group"):
         for key in arena.resident_keys():
             arena.free_key(key)
-    torch.cuda.synchronize()
-    retained = {}
-    for alias, document in arena.retained_keys():
-        retained.setdefault(alias, []).append(document)
-    return dict(joins=out_joins, fresh_tokens=tokens_total,
-                retained={alias: sorted(documents)
-                          for alias, documents in retained.items()},
-                kv_round=round_kv,
-                kv_totals=dict(
-                    evicted_keys=arena.evicted_keys,
-                    evicted_pages=arena.evicted_pages,
-                    evicted_prefix_tokens=arena.evicted_prefix_tokens),
-                wall_s=round(time.perf_counter() - t0, 2))
+    return _child_results(torch, arena, results, wall_started=t0, kv_round=round_kv)
 
 
 def _reset_child_query(state):
     """Clear KV and counters before a child starts a new query."""
-    gpu = state.get("gpu")
-    arena = gpu.arena if gpu else state["arena"]
+    gpu = state.gpu
+    arena = gpu.arena
     for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()

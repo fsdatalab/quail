@@ -6,11 +6,28 @@ from collections.abc import Iterable
 from copy import copy
 from dataclasses import dataclass
 
+import numpy as np
 import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
 
+from quail.catalog.pairs import pair_keys
+
 DEFAULT_BATCH_ROWS = 65_536
+
+
+@dataclass(frozen=True)
+class StructEntry:
+    """Projection entries a result packs into one struct column.
+
+    Attributes:
+        entries: The (alias, values) projection entry of each field.
+        fields: The Arrow field of each field, named as the struct
+            field.
+    """
+
+    entries: tuple
+    fields: tuple
 
 
 @dataclass(frozen=True)
@@ -70,6 +87,35 @@ def answer_table(columns: dict[str, Iterable[int]],
               for field in schema if field.name != "answer"]
     arrays.append(pa.array(answers, type=pa.bool_()))
     return pa.Table.from_arrays(arrays, schema=schema)
+
+
+def filter_answer_table(alias, documents, positions, answers) -> pa.Table:
+    """Build filter answers with predicate positions and alias metadata."""
+    schema = pa.schema(
+        [pa.field(alias, pa.int32(), nullable=False),
+         pa.field("predicate", pa.int32(), nullable=False),
+         pa.field("answer", pa.bool_(), nullable=False)],
+        metadata={b"quail.kind": b"filter_answers",
+                  b"quail.alias": alias.encode("utf-8")})
+    return pa.Table.from_arrays(
+        [pa.array(documents, pa.int32()), pa.array(positions, pa.int32()),
+         pa.array(answers, pa.bool_())], schema=schema)
+
+
+def extract_answer_table(alias, name, span_name, document_ids, answers,
+                         spans) -> pa.Table:
+    """Build extraction answers and nullable character spans."""
+    valid = np.fromiter((span is not None for span in spans), dtype=bool,
+                        count=len(spans))
+    bounds = np.zeros((len(spans), 2), dtype=np.int32)
+    bounds[valid] = np.asarray([span for span in spans if span is not None],
+                               dtype=np.int32).reshape(-1, 2)
+    span_array = pa.StructArray.from_arrays(
+        [pa.array(bounds[:, 0]), pa.array(bounds[:, 1])],
+        names=["start", "end"], mask=pa.array(~valid))
+    return pa.Table.from_arrays(
+        [pa.array(document_ids, pa.int32()), pa.array(answers, pa.string()),
+         span_array], names=[alias, name, span_name])
 
 
 def true_answer_rows(table: pa.Table) -> pa.Table:
@@ -173,26 +219,6 @@ def build_result_declaration(
     return declaration, schema
 
 
-def intersect_tables(left: pa.Table, right: pa.Table) -> pa.Table:
-    """Return rows present in both document-index relations."""
-    if set(left.schema.names) != set(right.schema.names):
-        raise ValueError("relation intersection requires the same aliases")
-    keys = left.schema.names
-    declaration, _ = _inner_join(
-        _table_source(left), left.schema,
-        _table_source(right), right.schema,
-        keys=keys,
-    )
-    table = declaration.to_table()
-    return table.select(keys).replace_schema_metadata(left.schema.metadata)
-
-
-def intersect_indices(left: pa.Array, right: pa.Array) -> pa.Array:
-    """Return document indices present in both arrays."""
-    mask = pc.is_in(left, value_set=right)
-    return pc.filter(left, mask)
-
-
 def count_rows(declaration: acero.Declaration) -> int:
     """Count rows inside Acero without returning the rows to Python."""
     options = acero.AggregateNodeOptions(
@@ -235,6 +261,42 @@ def execute_stream(declaration: acero.Declaration, schema: pa.Schema,
             source.close()
 
     return pa.RecordBatchReader.from_batches(schema, batches())
+
+
+def projected_column(batch: pa.RecordBatch, alias, values) -> pa.Array:
+    """Return one result column for a batch of document index rows.
+
+    Args:
+        batch: The index rows.
+        alias: The index column that selects the values, the two ids
+            of a joined label, or None for a struct column.
+        values: The values by document index, None for a column the
+            batch carries, a joined label's lookup, or a StructEntry.
+    """
+    if isinstance(values, StructEntry):
+        return pa.StructArray.from_arrays(
+            [projected_column(batch, *entry) for entry in values.entries],
+            fields=list(values.fields))
+    if isinstance(alias, tuple):
+        # a label of joined rows, looked up by the row's ids
+        keys, table, order = values
+        positions = pc.index_in(
+            pair_keys(*(batch.column(batch.schema.get_field_index(name))
+                        for name in alias)),
+            value_set=keys)
+        labels = pc.take(
+            table.column(table.column_names[2]).combine_chunks().cast(pa.string()),
+            positions)
+        if order is not None:
+            labels = pa.DictionaryArray.from_arrays(
+                pc.index_in(labels, order).cast(pa.int32()), order)
+        return labels
+    column = batch.column(batch.schema.get_field_index(alias))
+    # a computed column such as a score is carried as is
+    selected = column if values is None else pc.take(values, column)
+    if isinstance(selected, pa.ChunkedArray):
+        selected = selected.combine_chunks()
+    return selected
 
 
 class QueryResult:
@@ -328,35 +390,8 @@ class QueryResult:
                         yield batch.select([]).replace_schema_metadata(
                             self.schema.metadata)
                         continue
-                    arrays = []
-                    for alias, values in self._projection:
-                        if isinstance(alias, tuple):
-                            # a label of joined rows, looked up by the row's ids
-                            keys, table, order = values
-                            positions = pc.index_in(
-                                _pair_keys(*(batch.column(
-                                    batch.schema.get_field_index(name))
-                                    for name in alias)),
-                                value_set=keys)
-                            labels = pc.take(
-                                table.column(table.column_names[2])
-                                .combine_chunks().cast(pa.string()), positions)
-                            if order is not None:
-                                labels = pa.DictionaryArray.from_arrays(
-                                    pc.index_in(labels, order).cast(pa.int32()),
-                                    order)
-                            arrays.append(labels)
-                            continue
-                        column = batch.column(
-                            batch.schema.get_field_index(alias))
-                        # a computed column such as a score is carried as is
-                        selected = (
-                            column if values is None
-                            else pc.take(values, column)
-                        )
-                        if isinstance(selected, pa.ChunkedArray):
-                            selected = selected.combine_chunks()
-                        arrays.append(selected)
+                    arrays = [projected_column(batch, alias, values)
+                              for alias, values in self._projection]
                     yield pa.RecordBatch.from_arrays(
                         arrays, schema=self.schema)
             finally:
@@ -384,14 +419,14 @@ class QueryResult:
 
     def attach_executed_plan(self, codecs) -> "QueryResult":
         """Decode the executed plan and node metrics from a saved report."""
-        from quail.execution.runner import NodeMetrics
+        from quail.execution.metrics import NodeMetrics
         from quail.physical import decode_graph
 
         encoded = self.report.get("executed_plan")
         if encoded is not None:
             self.plan = decode_graph(encoded, codecs)
             self.node_metrics = {
-                node_id: NodeMetrics(**metrics)
+                node_id: NodeMetrics.from_scalars(metrics)
                 for node_id, metrics in self.report.get(
                     "node_metrics", {}).items()
             }
@@ -451,10 +486,3 @@ class QueryResult:
 
     def __len__(self) -> int:
         return self.count()
-
-
-
-def _pair_keys(anchors, partners) -> pa.Array:
-    """Encode each anchor and partner index pair as one int64 key."""
-    return pc.add(pc.shift_left(pc.cast(anchors, pa.int64()), 32),
-                  pc.cast(partners, pa.int64()))

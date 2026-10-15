@@ -1,8 +1,10 @@
-"""Work counts for filters and joins at the model's attention window."""
+"""Token, attention, and KV work at the model's attention window."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,12 @@ class Work:
             self.sliding_kv_read * count,
         )
 
+    def total(self) -> "Work":
+        """Sum work over document arrays, leaving scalar counts unchanged."""
+        return Work(*(float(np.sum(value)) for value in (
+            self.tokens, self.pairs, self.kv_written, self.kv_read,
+            self.sliding_pairs, self.sliding_kv_read)))
+
     def dominates(self, other: "Work") -> bool:
         """Return whether every count is no larger than the other record."""
         return (
@@ -50,8 +58,9 @@ class Work:
 
 def triangle(n: float, window: int = 0) -> float:
     """Count causal attention pairs, including each token's own key."""
-    if window and n > window:
-        return window * n - window * (window - 1) / 2
+    if window:
+        visible = np.minimum(n, window)
+        return visible * n - visible * (visible - 1) / 2
     return n * (n + 1) / 2
 
 
@@ -71,7 +80,7 @@ def ask(prefix: float, suffix: float, *, window: int = 0) -> Work:
         kv_read=prefix,
         sliding_pairs=(triangle(prefix + suffix, window) - triangle(prefix, window)
                        if window else 0.0),
-        sliding_kv_read=min(prefix, window - 1) if window else 0.0,
+        sliding_kv_read=np.minimum(prefix, window - 1) if window else 0.0,
     )
 
 
@@ -90,5 +99,28 @@ def stream(prefix: float, suffixes, *, window: int = 0) -> Work:
         kv_written=tokens,
         kv_read=prefix,
         sliding_pairs=sliding_pairs,
-        sliding_kv_read=min(prefix, window - 1) if window else 0.0,
+        sliding_kv_read=np.minimum(prefix, window - 1) if window else 0.0,
     )
+
+
+def decode(prefix, rounds, *, window: int = 0) -> Work:
+    """Append accepted tokens over sequential rounds, rereading KV each round.
+
+    Args:
+        prefix: Context length, or an array of document context lengths.
+        rounds: Number of tokens fed in each fully accepted round.
+        window: Attention window, or 0 for full attention.
+
+    Returns:
+        Token, attention, and KV work over the rounds.
+    """
+    work = Work()
+    for tokens in rounds:
+        work += ask(prefix, tokens, window=window)
+        prefix = prefix + tokens
+    if np.ndim(prefix):
+        # Scalar suffix lengths apply once to each document in the array.
+        work = Work(work.tokens * np.ones_like(prefix), work.pairs,
+                    work.kv_written * np.ones_like(prefix), work.kv_read,
+                    work.sliding_pairs, work.sliding_kv_read)
+    return work
