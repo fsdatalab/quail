@@ -1,91 +1,69 @@
-# Device leftover: vLLM utilization and DiffusionGemma chunk
+# Device leftover: vLLM utilization
 
-Follow-up to #181. The ticket still wants stock/pipelined vLLM and
-DiffusionGemma on L40S. Two constants, set for H100 leftover, block
-that. This is not a public user API. The values should come from the
-device (and model), not a single literal.
+Follow-up to #181. vLLM stays at 0.91 unless a model spec asks for
+a reserve. DiffusionGemma on L40S is out of scope. This is not a
+public user API.
 
-Recorded behavior: `docs/content/docs/architecture/device-memory.mdx`.
+## DiffusionGemma on L40S
 
-## What is hard-coded
+Do not run it, and do not shrink its chunk to make the planner accept
+it.
 
+The 65,536-token cap does not fit L40S leftover. One chunk's sliding
+KV needs 13.63 GB, and 5.82 GB remains. The planner refuses with
+`sliding_kv_needs_more_memory`. A 32,768-token pack would fit that
+KV. That does not make the model run.
 
-| Constant                        | Where                                | Today                                            |
-| ------------------------------- | ------------------------------------ | ------------------------------------------------ |
-| `GPU_MEMORY_UTILIZATION = 0.91` | `quail/backends/vllm.py`             | Every device. Set in #79. vLLM's default is 0.9. |
-| `chunk_cap_tokens = 65_536`     | `quail/specs/diffusion_gemma_26b.py` | Every device. `chunk_budget` never exceeds it.   |
+Five of the thirty layers keep every token with 512-wide heads.
+FlashAttention 2 and 3 stop at 256. Quail sends those layers through
+FlashAttention 4 over paged KV. FlashAttention 4 does not run on an
+L40S. `flash_attention_version` selects FlashAttention 2 for compute
+capability 8.9. A run that planned at 32,768 still died in kernel
+warmup, after the weights had loaded:
 
+```
+AssertionError: paged KV not supported on SM 8.0
+```
 
-The 0.91 pool is weights + peak activations + KV. CUDA graphs and
+That run is `/results/benchmarks/quailb/20261015T120134Z-1aa1a30d`.
+The failure is the kernel, not the chunk. H100 and B200 stay at
+65,536. The SF 0.1 suite skips DiffusionGemma on L40S.
+
+## vLLM utilization
+
+vLLM's pool is weights, peak activations, and KV. CUDA graphs and
 EngineCore warmup (`logits.clone`, 1.16 GiB) allocate after it.
+`gpu_memory_utilization` in `quail/baselines/vllm.py` is 0.91 unless
+the model spec sets `vllm_reserve_bytes`. A reserve lowers the
+fraction to `min(0.91, 1 - reserve / device memory)`. It never raises
+the 0.91 pool. No `EngineConfig` field.
 
-On L40S (44.42 GiB visible) 0.91 left ~4 GiB. Qwen3 4B vLLM died with
-550 MiB free. On H100, 9% is ~7 GB and boots.
+Qwen3 4B sets a 6 GiB reserve. On an L40S that is 0.865. On H100
+(80 GB) and B200, 9% is already more than 6 GiB, so those stay at
+0.91. Other models leave the field at 0 and stay at 0.91 on every
+device. Qwen3 4B stock vLLM on L40S completed IMDB-1 at 0.865:
+`/results/benchmarks/quailb/20261015T131311Z-636400dd`. A fixed 0.91
+on that card left about 4 GiB, and the same model died with 550 MiB
+free.
 
-DiffusionGemma weights fit L40S (27.68 GB, one card). One 65,536-token
-chunk's sliding KV needs 13.63 GB; 5.82 GB remains. Planner refuses
-`sliding_kv_needs_more_memory`. H100 leftover 36.51 GB; B200 142.43 GB.
+## Checks
 
-## Plan
-
-Keep H100 and B200 at today's numbers. Derive L40S (and the next 48 GB
-card) from leftover bytes.
-
-### 1. vLLM utilization
-
-Add a leftover reserve, not a new magic fraction.
-
-- Name the extras: CUDA-graph capture + EngineCore warmup. Measure
-~6 GiB needed on L40S (covers the 1.16 GiB clone plus graphs).
-- `gpu_memory_utilization(device) = 1 - reserve / mem_bytes`, floored
-so the pool still holds weights. L40S → about 0.865. H100/B200 keep
-0.91 until they miss.
-- Put `reserve` on `DeviceSpec` (bytes, 0 means “use the 0.91 default”).
-`VLLMEngine.llm_kwargs` reads that. No `EngineConfig` field unless a
-cell must override for one run.
-- Do not change the shared 0.91 default for H100.
-
-
-
-### 2. DiffusionGemma chunk
-
-The cap is a model field but the fit is `(model, device)`.
-
-- `chunk_budget` already takes both. After `min(..., chunk_cap_tokens)`,
-clamp so `sliding_kv_fits` is true, or refuse if even the compute
-knee does not fit.
-- Largest L40S chunk that fits today is ~45,397 tokens. Use 32,768
-(needs 6.82 GB, leftover 11.72 GB). H100/B200 stay at 65,536.
-- Write the chosen chunk on the physical plan / suite metadata.
-- `moe_configs.py` only has H100 tiles at 32,768 and 65,536. If L40S
-uses 32,768, measure Ada tiles or fall back to vLLM defaults and say
-so.
-
-
-
-### 3. Checks
-
-- CPU: L40S DiffusionGemma plans IMDB-1 / FEV-1 (not a Refusal).
-`chunk_budget` is 32,768 on L40S and 65,536 on H100/B200.
-- CPU: vLLM `llm_kwargs` utilization is ~0.865 on L40S and 0.91 on
-H100.
-- GPU: Qwen3 4B stock + pipelined vLLM boots on L40S. One
-DiffusionGemma filter on L40S Quail. Cite volume paths.
-
-
+- CPU: a DiffusionGemma plan on L40S is a Refusal.
+- CPU: Qwen3 4B utilization is about 0.865 on L40S and 0.91 on H100
+  and B200. A model with no reserve is 0.91 on every device.
+- GPU: Qwen3 4B stock vLLM on L40S completed IMDB-1. Pipelined vLLM
+  on L40S is not run yet.
 
 ## Out of scope
 
-- Changing 0.91 or 65,536 on H100/B200.
+- DiffusionGemma on L40S, including a smaller chunk.
+- Changing the 65,536-token chunk cap on H100 or B200.
 - NVFP4.
 - Tensor-parallel weights.
-- A session/SQL knob for utilization or chunk. Bench cells can pass a
-spec override if needed.
-
-
+- A session or SQL knob for utilization.
 
 ## Acceptance
 
-L40S runs the #181 configs the ticket named: Quail + both vLLM on Qwen3
-4B, and Quail on DiffusionGemma, without shrinking H100/B200 packs or
-pools. Report L40S utilization and chunk next to the numbers.
+L40S runs Quail and both vLLM backends on Qwen3 4B. DiffusionGemma
+stays on H100 and B200. Report the L40S utilization next to the
+numbers.

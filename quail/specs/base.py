@@ -118,6 +118,7 @@ class ModelSpec:
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);
     #                                   None lets vLLM pick
+    vllm_reserve_bytes: float = 0.0    # bytes left outside vLLM's memory pool
     layer_kinds: tuple[LayerKind, ...] = ()    # one kind per layer; required
     #                                            when sliding_window is set;
     #                                            empty means every layer is

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -215,8 +216,11 @@ class RequestBackend:
             rollback.callback(release_models, context.runtime_state)
             engine = LoadedRequestEngine()
             context.runtime_state["engine"] = engine
-            engine.settings, boot = self.engine.boot(
-                model, allowed_ids, resources=engine.resources)
+            boot_call = self.engine.boot
+            kwargs = {"resources": engine.resources}
+            if "device" in inspect.signature(boot_call).parameters:
+                kwargs["device"] = context.registry.device(envelope["device"])
+            engine.settings, boot = boot_call(model, allowed_ids, **kwargs)
             rollback.pop_all()
         return engine, {**boot, "boot_s": round(time.perf_counter() - started, 2)}
 
