@@ -111,6 +111,9 @@ class ModelSpec:
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);
     #                                   None lets vLLM pick
+    vllm_reserve_bytes: float = 0.0    # bytes this model asks vLLM to
+    #                                   leave outside its pool. 0 keeps
+    #                                   the 0.91 utilization.
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""

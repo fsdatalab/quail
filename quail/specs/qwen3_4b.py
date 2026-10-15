@@ -21,4 +21,8 @@ QWEN3_4B_FP8 = ModelSpec(
     #                        nothing moves off the GPU at load
     extract_turn_prefix=EXTRACT_TURN_PREFIX,
     extract_turn_suffix=EXTRACT_TURN_SUFFIX,
+    # 0.91 left about 4 GiB on an L40S and this model died with 550 MiB
+    # free. 6 GiB covers CUDA-graph capture and EngineCore warmup.
+    # A larger card stays at 0.91, because 9% is already more than 6 GiB.
+    vllm_reserve_bytes=6 * 1024**3,
 )

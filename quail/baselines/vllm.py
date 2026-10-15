@@ -12,8 +12,41 @@ from quail.baselines.request_scheduling import (
     MAX_SEQUENCES,
     run_filter_sequence,
 )
+from quail.specs.base import DeviceSpec, ModelSpec
 
 GPU_MEMORY_UTILIZATION = 0.91
+# -1 tells vLLM 0.26 to keep the model's context length when the
+# leftover KV holds it, and otherwise the longest length that fits.
+MAX_MODEL_LEN = -1
+
+
+def gpu_memory_utilization(device: DeviceSpec | None,
+                           model: ModelSpec) -> float:
+    """Return the fraction of device memory vLLM may use.
+
+    The default is ``GPU_MEMORY_UTILIZATION``. A model that sets
+    ``vllm_reserve_bytes`` lowers the fraction so at least that many
+    bytes stay outside the pool.
+
+    Args:
+        device: The device the engine boots on. Required when the
+            model sets a reserve.
+        model: The model spec.
+
+    Returns:
+        The ``gpu_memory_utilization`` value for ``LLM``.
+
+    Raises:
+        ValueError: The model sets a reserve and ``device`` is missing.
+    """
+    if not model.vllm_reserve_bytes:
+        return GPU_MEMORY_UTILIZATION
+    if device is None:
+        raise ValueError("a vLLM reserve needs the device")
+    reserved = 1.0 - model.vllm_reserve_bytes / device.mem_bytes
+    return min(GPU_MEMORY_UTILIZATION, reserved)
+
+
 CUDA_GRAPH_CAPTURE_SIZE = 8_192
 # vLLM caps a diffusion model at 8 sequences per step whenever the
 # setting is 128 or more, sized for its 256-row canvas; one row needs
@@ -190,18 +223,27 @@ class VLLMEngine:
     # a decision model runs on the pooling runner
     roles = frozenset({"generative", "decision"})
 
-    def llm_kwargs(self, spec) -> dict:
+    def llm_kwargs(self, spec, device: DeviceSpec | None = None) -> dict:
         """Return the LLM constructor arguments beyond the model name.
 
         A spec with its own chunk cap (a mixture-of-experts model)
         batches at least that many tokens per step. A one-row-canvas
         diffusion model runs more sequences per step than vLLM's
-        default for its 256-row canvas.
+        default for its 256-row canvas. Utilization is 0.91 unless
+        the model spec sets a reserve. ``max_model_len`` is -1, so
+        vLLM uses the model's context length when leftover KV holds
+        it and otherwise the longest length that fits.
+
+        Args:
+            spec: The model spec.
+            device: The device the engine boots on.
         """
         batched = max(MAX_BATCHED_TOKENS, spec.chunk_cap_tokens)
+        utilization = gpu_memory_utilization(device, spec)
         kwargs = {
             "max_num_batched_tokens": batched,
-            "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
+            "max_model_len": MAX_MODEL_LEN,
+            "gpu_memory_utilization": utilization,
             "enable_prefix_caching": True,
             "disable_log_stats": True,
             "tokenizer_mode": "gigatoken",
@@ -214,12 +256,20 @@ class VLLMEngine:
         kwargs.update(diffusion_kwargs(spec))
         return kwargs
 
-    def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
-        """Load the spec's model and return the engine state and boot record."""
+    def boot(self, spec, allowed_ids: list[int],
+             device: DeviceSpec | None = None) -> tuple[dict, dict]:
+        """Load the spec's model and return the engine state and boot record.
+
+        Args:
+            spec: The model spec.
+            allowed_ids: Token ids the sampler may emit.
+            device: The device the engine boots on. Utilization uses
+                its reserve.
+        """
         if spec.role == "decision":
             from quail.baselines.vllm_decision import boot_decision
 
-            return boot_decision(spec, self.llm_kwargs(spec))
+            return boot_decision(spec, self.llm_kwargs(spec, device))
         from vllm import LLM, SamplingParams
         from vllm.renderers.registry import RENDERER_REGISTRY
         from vllm.tokenizers import TokenizerRegistry
@@ -242,7 +292,7 @@ class VLLMEngine:
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         started = time.perf_counter()
         with diffusion_canvas(spec) as canvas_ids:
-            llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
+            llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec, device))
         boot_s = time.perf_counter() - started
         sampling_params = SamplingParams(
             **sampling_kwargs(allowed_ids, spec.canvas_tokens))
@@ -288,7 +338,15 @@ class DefaultVLLMEngine(VLLMEngine):
     kind = "dumb_vllm"
     label = "vLLM with default settings"
 
-    def llm_kwargs(self, spec) -> dict:
+    def llm_kwargs(self, spec, device: DeviceSpec | None = None) -> dict:
+        """Return the canvas arguments. Other settings stay at vLLM's defaults.
+
+        Args:
+            spec: The model spec.
+            device: Accepted so boot can pass the device. Unused: this
+                engine does not set ``gpu_memory_utilization``.
+        """
+        del device
         return diffusion_kwargs(spec)
 
 

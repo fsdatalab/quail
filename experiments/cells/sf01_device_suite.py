@@ -1,8 +1,9 @@
 """One-GPU quail-b SF 0.1 suite for H100, L40S, and B200.
 
-Assumes leftover is device-aware (see ``docs/device-leftover-plan.md``):
-L40S runs stock and pipelined vLLM, and DiffusionGemma, on the same
-query list as H100 and B200. REL-AGENT is not in the issue list.
+L40S runs stock and pipelined vLLM on Qwen3. It does not run
+DiffusionGemma: the planner refuses it, and the 512-wide layers need
+FlashAttention 4, which does not run on L40S. See
+``docs/device-leftover-plan.md``. REL-AGENT is not in the issue list.
 
     uv run python experiments/cells/sf01_device_suite.py
     mkdir -p results/benchmark
@@ -26,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from quail.specs import DEVICES, QWEN3_32B_FP8
+from quail.specs import DEVICES, DIFFUSION_GEMMA_26B_FP8, QWEN3_32B_FP8
 
 SF = 0.1
 GPUS = 1
@@ -54,9 +55,9 @@ CONFIGS = ("quail", "stock_vllm", "pipelined_vllm")
 
 PREDICTION_TEXT = (
     "Compute-bound prefill. B200 at most 2.3x H100 (4.5 / 1.98 PFLOPS). "
-    "L40S at most 0.37x H100 (0.73 / 1.98); Ada mma.sync usually lower. "
-    "NVFP4 does not apply. L40S uses device leftover: vLLM utilization "
-    "and DiffusionGemma chunk from docs/device-leftover-plan.md."
+    "L40S at most 0.37x H100 (0.73 / 1.98). "
+    "Qwen3 4B reserves 6 GiB; other models stay at 0.91. "
+    "L40S does not run DiffusionGemma."
 )
 
 
@@ -84,11 +85,17 @@ def queries_for(model: str) -> tuple[str, ...]:
 
 
 def jobs(*, devices=RUN_DEVICES, models=(*FULL_MODELS, SHORT_MODEL)):
-    """Yield one spawn per (device, model)."""
+    """Yield one spawn per (device, model).
+
+    L40S skips DiffusionGemma. The planner refuses that pair.
+    """
     for device in devices:
         if device not in DEVICES:
             raise ValueError(f"unknown device {device!r}")
         for model in models:
+            if (device == "l40s"
+                    and model == DIFFUSION_GEMMA_26B_FP8.name):
+                continue
             note = "Quail plus stock and pipelined vLLM"
             if model == SHORT_MODEL:
                 w_gb = QWEN3_32B_FP8.w_mem_bytes / 1e9
