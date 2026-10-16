@@ -62,13 +62,36 @@ def document_index_schema(aliases: Iterable[str], kind: str) -> pa.Schema:
     )
 
 
+def rows_table(ids: dict[str, Iterable[int]], values: dict[str, pa.Array],
+               kind: str) -> pa.Table:
+    """Build an operator's rows: one id column per alias, then its values.
+
+    The id fields carry the shared relation schema, so an operator
+    after this one tells them from the value columns (id_aliases).
+
+    Args:
+        ids: Alias -> the document indices of each row.
+        values: Column name -> its values, one per row.
+        kind: The table's kind, in its schema metadata.
+    """
+    schema = document_index_schema(ids, kind)
+    arrays = [pa.array(ids[field.name], type=field.type) for field in schema]
+    for name, array in values.items():
+        schema = schema.append(pa.field(name, array.type))
+        arrays.append(array)
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
+def id_aliases(table: pa.Table) -> tuple[str, ...]:
+    """Return the aliases of a table's document id columns."""
+    return tuple(field.name for field in table.schema
+                 if (field.metadata or {}).get(b"quail.alias") is not None)
+
+
 def document_index_table(columns: dict[str, Iterable[int]],
                          kind: str) -> pa.Table:
     """Build a document-index table with the shared relation schema."""
-    schema = document_index_schema(columns, kind)
-    arrays = [pa.array(columns[field.name], type=field.type)
-              for field in schema]
-    return pa.Table.from_arrays(arrays, schema=schema)
+    return rows_table(columns, {}, kind)
 
 
 def answer_table(columns: dict[str, Iterable[int]],
@@ -113,9 +136,9 @@ def extract_answer_table(alias, name, span_name, document_ids, answers,
     span_array = pa.StructArray.from_arrays(
         [pa.array(bounds[:, 0]), pa.array(bounds[:, 1])],
         names=["start", "end"], mask=pa.array(~valid))
-    return pa.Table.from_arrays(
-        [pa.array(document_ids, pa.int32()), pa.array(answers, pa.string()),
-         span_array], names=[alias, name, span_name])
+    return rows_table({alias: document_ids},
+                      {name: pa.array(answers, pa.string()), span_name: span_array},
+                      "extract_answers")
 
 
 def true_answer_rows(table: pa.Table) -> pa.Table:

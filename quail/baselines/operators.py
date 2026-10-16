@@ -17,6 +17,7 @@ from quail.execution.result import (
     answer_table,
     extract_answer_table,
     filter_answer_table,
+    rows_table,
 )
 from quail.execution.spans import line_span, locate_span, read_phrase
 
@@ -236,10 +237,8 @@ def choose_documents(client, spec, bodies) -> dict:
 
 def classification_table(spec, columns, labels):
     """Build classified rows and remove rows without a matching label."""
-    table = pa.table({
-        **{alias: pa.array(values, pa.int32()) for alias, values in columns.items()},
-        spec.output: pa.array(labels, pa.string()),
-    })
+    table = rows_table(columns, {spec.output: pa.array(labels, pa.string())},
+                       "score_rows")
     return table.filter(table.column(spec.output).is_valid())
 
 

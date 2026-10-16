@@ -923,3 +923,17 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
             label=lambda prompt, a: "lease")
         assert [(stage["operator"], stage["evaluated"], stage["passed"])
                 for stage in estimate.filter_stages] == stages
+
+
+def test_an_extraction_table_names_its_alias_for_the_operators_after_it():
+    # a classification after the extraction carries its answers as
+    # prior columns and keeps one id column
+    from quail.backends.quail.reranker import attach_prior_columns
+
+    answers = extract_answer_table(
+        "c", "lease.ends", "lease.ends_span", [0, 2],
+        ["March 3, 2027", None], [(14, 27), None])
+    labels = pa.table({"c": pa.array([2, 0], pa.int32()), "kind": ["a", "b"]})
+    joined = attach_prior_columns(labels, {"c": answers})
+    assert joined.column_names == ["c", "kind", "lease.ends", "lease.ends_span"]
+    assert joined.column("lease.ends").to_pylist() == [None, "March 3, 2027"]

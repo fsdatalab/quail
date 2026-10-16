@@ -11,7 +11,13 @@ from pyarrow import compute as pc
 from quail.backends.base import GpuContext
 from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.result import DEFAULT_BATCH_ROWS, answer_table, filter_answer_table
+from quail.execution.result import (
+    DEFAULT_BATCH_ROWS,
+    answer_table,
+    filter_answer_table,
+    id_aliases,
+    rows_table,
+)
 from quail.logical import PROBABILITIES_SUFFIX
 from quail.physical import AiClassify, AiScore, ClassifySpec, Filter, ValueType
 from quail.progress import answer_sink
@@ -152,26 +158,15 @@ def probability_column(labels, probabilities) -> pa.MapArray:
 
 
 def _score_table(rows, aliases, name, scores, value_type=None) -> pa.Table:
-    arrays = {
-        alias: pa.array(rows[:, index], type=pa.int32())
-        for index, alias in enumerate(aliases)
-    }
-    arrays[name] = pa.array(scores, type=value_type or pa.float64())
-    return pa.table(arrays).replace_schema_metadata({
-        b"quail.kind": b"score_rows",
-        b"quail.aliases": ",".join(aliases).encode("utf-8"),
-    })
+    return rows_table(
+        {alias: rows[:, index] for index, alias in enumerate(aliases)},
+        {name: pa.array(scores, type=value_type or pa.float64())}, "score_rows")
 
 
 def _ids(value, alias: str) -> np.ndarray:
     if isinstance(value, pa.Table):
         value = value.column(alias)
     return id_positions(value)
-
-
-def _table_aliases(table: pa.Table) -> tuple[str, ...]:
-    metadata = table.schema.metadata or {}
-    return tuple(metadata.get(b"quail.aliases", b"").decode("utf-8").split(","))
 
 
 def _candidate_rows(node, inputs):
@@ -216,10 +211,8 @@ def attach_prior_columns(table: pa.Table, priors: Mapping[str, pa.Table]):
     table also holds, so the lookup by document index never misses.
     """
     for alias, prior in priors.items():
-        extra = [
-            name for name in prior.column_names
-            if name not in _table_aliases(prior)
-        ]
+        extra = [name for name in prior.column_names
+                 if name not in id_aliases(prior)]
         if not extra:
             continue
         positions = pc.index_in(
