@@ -106,7 +106,7 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
         # the policy's first-round choice for this document, with one stream
         policy = DraftPolicy(draft_tokens, max_answer_tokens, assumptions.answer_tokens)
         draft_tokens = policy.draft_length(
-            round_cost_per_token * (prefix + tail_tokens), 1, ambiguous=False)
+            round_cost_per_token * (prefix + tail_tokens), 1, live=1)
     if resident:
         work = ask(prefix, tail_tokens, window=window)
     elif shared:

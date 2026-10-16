@@ -1,24 +1,28 @@
 """The draft length of each extraction round, chosen from its cost and odds.
 
 A round feeds the chosen token and a draft of the document's next
-tokens, and pays one read of the document's KV however long the draft
-is. With one live stream a draft token is written when the answer
-still has a token to go, so the expected tokens a round writes follow
-the answer-length curve, and the policy picks the draft length that
-costs the least per written token. With several live streams the
-draft may follow the wrong one, so the round feeds the chosen token
-alone and the model's next token narrows the streams.
+tokens along one of the positions the answer so far fits, and pays one
+read of the document's KV however long the draft is. A draft token is
+written when the answer still has a token to go and the position
+followed is the answer's source. The first is the answer-length curve,
+learned from the answers that settle; the second is certain with one
+live position and is learned per count of live positions from the
+rounds that drafted. The policy picks the draft length that costs the
+least per written token.
 """
 
 import numpy as np
 
-# how many settled answers the planner's answer-length guess weighs
+# how many observations the seed of each curve weighs
 PRIOR_WEIGHT = 8
-# the draft fed while several document positions fit the answer, along
-# the first of them; the model's next token narrows the positions
-AMBIGUOUS_DRAFT = 0
 # the round's KV read in tokens, rounded to one of these for the tables
 RHO_BUCKETS = (0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)
+# the count of live positions, rounded to one of these for the tables
+LIVE_BUCKETS = (1, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000)
+
+
+def _bucket(buckets: tuple, value: float) -> int:
+    return int(np.argmin([abs(np.log1p(value) - np.log1p(b)) for b in buckets]))
 
 
 class DraftPolicy:
@@ -38,6 +42,10 @@ class DraftPolicy:
         self.q = 1.0 - 1.0 / max(1, expected_answer_tokens)
         self.lengths = np.zeros(max_answer_tokens + 1, dtype=np.int64)
         self.settled = 0
+        # drafted rounds and the ones whose first draft token was written,
+        # by the count of live positions
+        self.trials = np.zeros(len(LIVE_BUCKETS), dtype=np.int64)
+        self.accepts = np.zeros(len(LIVE_BUCKETS), dtype=np.int64)
         self._tables = {}
 
     def survival(self, written: int) -> np.ndarray:
@@ -55,29 +63,41 @@ class DraftPolicy:
         tail = curve[written:]
         return tail / tail[0] if tail[0] > 0 else np.ones_like(tail)
 
-    def draft_length(self, rho: float, written: int, ambiguous: bool) -> int:
+    def source_odds(self, live: int) -> float:
+        """Return P(the position followed is the answer's source) given live positions.
+
+        The seed is 1 / live, no position preferred, blended by count
+        with the drafted rounds seen at that many positions.
+        """
+        if live <= 1:
+            return 1.0
+        b = _bucket(LIVE_BUCKETS, live)
+        seed = PRIOR_WEIGHT / LIVE_BUCKETS[b]
+        return (seed + self.accepts[b]) / (PRIOR_WEIGHT + self.trials[b])
+
+    def draft_length(self, rho: float, written: int, live: int) -> int:
         """Return the draft length for a round.
 
         Args:
             rho: The round's KV read, in fed tokens.
             written: The answer's tokens so far.
-            ambiguous: Whether more than one live stream fits the answer;
-                such a round feeds AMBIGUOUS_DRAFT tokens at most.
+            live: How many document positions the answer so far fits.
         """
         room = min(self.cap, self.max_answer_tokens - written - 1)
         if room <= 0:
             return 0
-        if ambiguous:
-            return min(AMBIGUOUS_DRAFT, room)
-        bucket = int(np.argmin([abs(np.log1p(rho) - np.log1p(b)) for b in RHO_BUCKETS]))
-        key = (bucket, written, room)
+        key = (_bucket(RHO_BUCKETS, rho), written, room, _bucket(LIVE_BUCKETS, live))
         if key not in self._tables:
-            self._tables[key] = self._best(RHO_BUCKETS[bucket], written, room)
+            self._tables[key] = self._best(RHO_BUCKETS[key[0]], written, room,
+                                           self.source_odds(LIVE_BUCKETS[key[3]]))
         return self._tables[key]
 
-    def _best(self, rho: float, written: int, room: int) -> int:
+    def _best(self, rho: float, written: int, room: int, odds: float) -> int:
         gammas = np.arange(room + 1)
-        writes = np.cumsum(self.survival(written)[:room + 1])
+        survival = self.survival(written)[:room + 1]
+        # the chosen token, then each draft token while the answer goes
+        # on and the position followed is its source
+        writes = survival[0] + odds * np.cumsum(np.concatenate(([0.0], survival[1:])))
         cost = (1 + gammas + rho) / writes
         return int(gammas[int(np.argmin(cost))])
 
@@ -86,4 +106,17 @@ class DraftPolicy:
         self.lengths[min(length, self.max_answer_tokens)] += 1
         self.settled += 1
         if self.settled & (self.settled - 1) == 0:
+            self._tables.clear()
+
+    def observe(self, live: int, accepted: bool) -> None:
+        """Record whether a drafted round's first draft token was written.
+
+        Args:
+            live: How many document positions the answer fit when drafting.
+            accepted: Whether the model chose the first draft token.
+        """
+        b = _bucket(LIVE_BUCKETS, live)
+        self.trials[b] += 1
+        self.accepts[b] += accepted
+        if self.trials[b] & (self.trials[b] - 1) == 0:
             self._tables.clear()

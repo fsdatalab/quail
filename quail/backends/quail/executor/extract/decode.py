@@ -113,7 +113,7 @@ class Decoder:
         stream = min(answer.live, key=lambda s: s.char)
         length = self.spec.draft_tokens
         if self.policies is not None:
-            length = self.policies[q].draft_length(rho, at, len(answer.live) > 1)
+            length = self.policies[q].draft_length(rho, at, len(answer.live))
         draft = []
         for i in range(length):
             token = stream.next(at + i, self.vocabulary)
@@ -156,12 +156,16 @@ class Decoder:
         answer.steps += 1
         answer.discard = 0
         rows = np.asarray(rows)
+        # a draft along one of several live positions tells the policy
+        # whether that position was the answer's source
+        live = len(answer.live) if answer.written and len(fed) > 1 else 1
         if accepted is None:
             accepted = 0
             if answer.written and len(answer.live) == 1:
                 accepted = self.accepted(answer, rows, fed)
                 rows = rows[accepted:]
         if accepted:
+            self.observe(q, live, True)
             written = min(accepted, self.spec.max_answer_tokens - len(answer.written))
             answer.written.extend(fed[1:written + 1])
             if len(answer.written) >= self.spec.max_answer_tokens:
@@ -172,9 +176,15 @@ class Decoder:
             if answer.done:
                 return
             after = accepted + i + 1
+            if after == 1 and live > 1:
+                self.observe(q, live, token == fed[1])
             if after < len(fed) and token != fed[after]:
                 answer.discard = len(fed) - after
                 return
+
+    def observe(self, q: int, live: int, accepted: bool) -> None:
+        if self.policies is not None and live > 1:
+            self.policies[q].observe(live, accepted)
 
     def accepted(self, answer: AnswerState, rows: np.ndarray, fed) -> int:
         """Return how many leading rows write the draft token fed after them.
