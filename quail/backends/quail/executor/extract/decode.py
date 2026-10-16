@@ -23,7 +23,6 @@ from quail.backends.quail.executor.extract.candidates import (
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.cost.draft_policy import DraftPolicy
-from quail.execution.spans import line_span
 from quail.physical import ExtractSpec
 
 
@@ -67,24 +66,22 @@ class Decoder:
         k: How many likeliest tokens each readout row carries.
         width: The values in each readout row: none, the stop, then
             k ids and k log probabilities.
-        trim: Per question, whether the answer is the copied words or
-            the whole lines that hold them.
+        questions: How many questions the pipeline asks.
         spec: Extraction plan carrying the execution settings.
     """
 
-    def __init__(self, vocabulary: Vocabulary, k: int, width: int, trim,
+    def __init__(self, vocabulary: Vocabulary, k: int, width: int, questions: int,
                  spec: ExtractSpec):
         self.spec = spec
         self.vocabulary = vocabulary
         self.k = k
         self.width = width
-        self.trim = list(trim)
         self.scores = np.full(len(vocabulary.vocab), NEG, dtype=np.float32)
         self.previous_ids = np.empty(0, dtype=np.int64)
         # one answer-length curve per question under the adaptive policy
         self.policies = ([DraftPolicy(spec.draft_tokens, spec.max_answer_tokens,
                                       spec.expected_answer_tokens)
-                          for _ in self.trim]
+                          for _ in range(questions)]
                          if spec.draft_policy == "adaptive" else None)
 
     def rows(self, row) -> np.ndarray:
@@ -344,6 +341,4 @@ class Decoder:
             start += 1
         while end > start and text[end - 1].isspace():
             end -= 1
-        if not self.trim[q]:
-            start, end = line_span(text, (start, end))
         answer.answer, answer.span = text[start:end], (start, end)

@@ -51,7 +51,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         expected_inputs=live, estimated_seconds=0.0,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
-        question=call.question, trim=call.trim, shares_head=shares_head,
+        question=call.question, shares_head=shares_head,
         expected_answer_tokens=extract_cost.ExtractAssumptions().answer_tokens,
         round_cost_per_token=round_cost_per_token)
     cost = extract_cost.estimate(

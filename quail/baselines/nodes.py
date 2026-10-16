@@ -191,8 +191,7 @@ class RequestExtractSpec:
     The tail_token_ids follow the document and contain the question,
     the instruction, the answer template, and the phrase cue. The
     answer is the text the model writes up to the closing quote,
-    located in the document's text; with trim off, the whole lines
-    that hold it. The preamble precedes the document: the model's
+    located in the document's text. The preamble precedes the document: the model's
     extract turn and the document label, which differ from the
     request's shared preamble on a model that answers AI.IF raw.
     """
@@ -201,7 +200,6 @@ class RequestExtractSpec:
     output: str
     question: str
     tail_token_ids: tuple[Any, ...]
-    trim: bool = True
     # the tail's text, for an engine that tokenizes prompts itself
     tail_text: str = ""
     preamble_token_ids: tuple[Any, ...] = ()
@@ -223,7 +221,6 @@ class RequestExtractSpec:
             output=str(value["output"]),
             question=str(value["question"]),
             tail_token_ids=tuple(value["tail_token_ids"]),
-            trim=bool(value.get("trim", True)),
             tail_text=str(value.get("tail_text", "")),
             preamble_token_ids=tuple(value.get("preamble_token_ids", ())),
             preamble_text=str(value.get("preamble_text", "")),
@@ -237,7 +234,6 @@ class RequestExtractSpec:
             "output": self.output,
             "question": self.question,
             "tail_token_ids": list(self.tail_token_ids),
-            "trim": self.trim,
             "tail_text": self.tail_text,
             "preamble_token_ids": list(self.preamble_token_ids),
             "preamble_text": self.preamble_text,
@@ -359,8 +355,7 @@ class RequestExecution(PhysicalNode):
         for spec in self.classifies:
             fields[f"classify {spec.output}"] = list(spec.labels)
         for spec in self.extracts:
-            fields[f"extract {spec.output}"] = (
-                f"question={spec.question!r}, trim={'on' if spec.trim else 'off'}")
+            fields[f"extract {spec.output}"] = f"question={spec.question!r}"
         return fields
 
     @classmethod

@@ -16,7 +16,7 @@ from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
 from quail.execution.metrics import NodeResult
 from quail.execution.result import extract_answer_table
-from quail.execution.spans import line_span, locate_span, read_phrase
+from quail.execution.spans import locate_span, read_phrase
 from quail.logical import (
     CompileError,
     ExtractStruct,
@@ -52,9 +52,9 @@ def session(tmp_path):
     value.close()
 
 
-def _ends(session, trim=True):
+def _ends(session):
     return (session.docs("contracts").alias("c")
-            .ai_extract("c.text", {"ends": QUESTION}, name="lease", trim=trim)
+            .ai_extract("c.text", {"ends": QUESTION}, name="lease")
             .select("c.id", "lease"))
 
 
@@ -83,10 +83,6 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
             f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
             f"FROM contracts c", dialect=dialect)
         assert query.logical == built.logical
-    loose = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}, "
-        f"{{'trim': false}}) AS lease FROM contracts c")
-    assert loose.logical == _ends(session, trim=False).logical
 
 
 def test_planning_lowers_the_extraction_prompt_once(session, monkeypatch):
@@ -240,10 +236,8 @@ def test_extract_errors_and_refusals(session):
              f"FROM contracts c", "object of field questions"),
             ("SELECT c.id, AI.EXTRACT(c.text) AS x FROM contracts c",
              "object of field questions"),
-            (f"SELECT c.id, AI.EXTRACT(c.text, {fields}, {{'trim': 1}}) "
-             f"AS x FROM contracts c", "true or false"),
-            (f"SELECT c.id, AI.EXTRACT(c.text, {fields}, {{'lines': 2}}) "
-             f"AS x FROM contracts c", "unknown AI.EXTRACT option"),
+            (f"SELECT c.id, AI.EXTRACT(c.text, {fields}, {{'trim': false}}) "
+             f"AS x FROM contracts c", "takes a document column"),
             (f"SELECT c.id, UPPER(AI.EXTRACT(c.text, {fields})) AS x "
              f"FROM contracts c", "direct expressions")):
         with pytest.raises(CompileError, match=message):
@@ -302,9 +296,6 @@ def test_span_helpers_read_locate_and_widen_an_answer():
     assert locate_span("a b a b", "a b") == (0, 3)
     assert locate_span(LEASE, "April") is None
     assert locate_span(LEASE, "   ") is None
-    assert line_span(LEASE, (14, 27)) == (0, 28)
-    assert line_span(LEASE, (29, 36)) == (29, len(LEASE))
-    assert line_span("one\n\nthree", (4, 4)) == (4, 4)
 
 
 @pytest.mark.parametrize("filtered", [False, True])
@@ -394,9 +385,6 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
         RequestExtractSpec(max_answer_tokens=limit,
                            alias="c", output="ends", question=QUESTION,
                            tail_token_ids=(90,)),
-        RequestExtractSpec(max_answer_tokens=limit,
-                           alias="c", output="lines", question=QUESTION,
-                           tail_token_ids=(90,), trim=False),
     )
     node = RequestExecution(
         node_id="request-model", backend_name="stock_vllm", aliases=("c",),
@@ -405,22 +393,17 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     execution = request_tests._execution(
         documents, client=client, document_texts={"c": TEXTS})
     result = execution.execute(node, {"input:0": [0, 1, 2, 3]})
-    assert client.params == [(limit, ['"'])] * 2
-    trimmed = result.outputs["extract_answers:ends"].to_pydict()
-    assert trimmed == {
+    assert client.params == [(limit, ['"'])]
+    answers = result.outputs["extract_answers:ends"].to_pydict()
+    assert answers == {
         "c": [0, 1, 2, 3],
         "ends": ["March 3, 2027", None, "five years",
                  "a phrase the document lacks"],
         "ends_span": [{"start": 14, "end": 27}, None, {"start": 6, "end": 16},
                       None]}
-    whole = result.outputs["extract_answers:lines"].to_pydict()
-    assert whole["lines"] == ["Lease ends on March 3, 2027.", None,
-                              "Term: five years", "a phrase the document lacks"]
-    assert whole["lines_span"] == [{"start": 0, "end": 28}, None,
-                                   {"start": 0, "end": 16}, None]
     # an extraction keeps every document
     assert result.outputs["ids:c"].to_pylist() == [0, 1, 2, 3]
-    step, _ = result.metrics.extension["steps"]
+    step, = result.metrics.extension["steps"]
     assert (step["kind"], step["output"], step["n_in"], step["n_out"]) == (
         "extract", "ends", 4, 3)
     assert (step["requests"], step["unanswered"], step["unaligned"]) == (4, 1, 1)
@@ -431,8 +414,8 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
         2 + len(ids) for ids in documents["c"]) + (3 + 0 + 1 + 2)
     prompt_tokens = sum(2 + len(ids) for ids in documents["c"])
     assert step["prompt_tokens"] == prompt_tokens
-    assert result.metrics.extension["prompt_tokens"] == 2 * prompt_tokens
-    assert result.metrics.evaluated_documents == 8
+    assert result.metrics.extension["prompt_tokens"] == prompt_tokens
+    assert result.metrics.evaluated_documents == 4
     # an engine that takes text gets the preamble, the document, and
     # the tail's text, tokenized by the engine itself
     texted = _TextPhraseClient()

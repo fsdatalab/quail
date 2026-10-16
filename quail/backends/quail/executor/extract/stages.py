@@ -91,7 +91,7 @@ class ExtractionStages:
         self.keys = [doc.key for doc in self.docs]
         self.readout = self._readout(state) if readout is None else readout
         self.decoder = Decoder(vocabulary, self.readout.k, self.readout.width,
-                               [spec.trim for spec in self.specs], self.spec)
+                               len(self.specs), self.spec)
         self.stages = []
         for q, (spec, tail) in enumerate(zip(self.specs, self.tails)):
             self.stages.extend(self._question_stages(q, spec.name, tail))

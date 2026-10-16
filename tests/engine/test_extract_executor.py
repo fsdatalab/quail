@@ -61,7 +61,7 @@ def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
     vocabulary = SimpleNamespace(vocab=range(64), merged=merged,
                                  is_stop=np.zeros(64, dtype=bool), none_id=63)
     vocabulary.is_stop[62] = True
-    decoder = Decoder(vocabulary, 4, 10, [True], make_spec()[0])
+    decoder = Decoder(vocabulary, 4, 10, 1, make_spec()[0])
     text = "abcdefghij"
     streams = [Stream(at, [0, token], [at + 1, at + 2], text, exhausted=True)
                for at, token in enumerate(tokens)]
@@ -82,7 +82,7 @@ def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
 
 def test_readout_scores_reset_between_rows_and_keep_token_order():
     _, vocabulary = make_spec()
-    decoder = Decoder(vocabulary, 4, 10, [True], make_spec()[0])
+    decoder = Decoder(vocabulary, 4, 10, 1, make_spec()[0])
     scores, none, stop = decoder.lp([-4, -5, 5, 2, 3, 4, -1, -1, -2, -3])
     assert decoder.top == 5 and none == -4 and stop == -5
     assert scores[5] == scores[2] == -1
@@ -143,7 +143,7 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
     # days", and the model chooses " years" instead: the round ends
     # there, and the next round feeds " years" in the draft's place
     text = "five days or five years"
-    spec, tables = make_spec(True, text)
+    spec, tables = make_spec(text)
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
@@ -323,7 +323,7 @@ def _fake_readout(tables, k, verify=False):
     width = 2 + 2 * k
     value = SimpleNamespace(k=k, width=width, ragged=True, verifies=verify)
     value.dtype = np.dtype(object)
-    spec = replace(make_spec(True)[0], max_answer_tokens=10 ** 6)
+    spec = replace(make_spec()[0], max_answer_tokens=10 ** 6)
     decoder = Decoder(tables, k, width, [True], spec)
 
     def submit(rows, rows_per_answer=None, expected=None):
@@ -360,11 +360,11 @@ DOCS = [LEASE, TERM, NOTHING]
 GOLD = ["March 3, 2027", "five years", None]
 
 
-def _setup(monkeypatch, trim=True, documents=None, token_documents=None,
+def _setup(monkeypatch, documents=None, token_documents=None,
            share_prefixes=False, document_ids=None, gpu_timing=False,
            verify=False, policy="fixed"):
     """A state, its scripted model, and a node builder for one spec name."""
-    spec, tables = make_spec(trim)
+    spec, tables = make_spec()
     spec = replace(spec, draft_policy=policy, round_cost_per_token=0.05)
     documents = DOCS if documents is None else documents
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
@@ -447,8 +447,8 @@ def test_extraction_accepts_empty_input_and_sparse_document_ids(monkeypatch):
         doc.answers[0].discard = i + 1
         assert stages._step_discard(0, doc.key) == i + 1
 
-def _run(monkeypatch, trim=True, documents=None):
-    _, model, run, _ = _setup(monkeypatch, trim, documents)
+def _run(monkeypatch, documents=None):
+    _, model, run, _ = _setup(monkeypatch, documents)
     result, stages = run()
     return result, stages, model
 
@@ -683,21 +683,12 @@ def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
     assert not arena.resident_keys()
 
 
-def test_extractor_returns_whole_lines_with_trim_off(monkeypatch):
-    result, stages, _ = _run(monkeypatch, trim=False)
-    table = result.outputs["rows"].to_pydict()
-    line = LEASE.index("March 3, 2027 at noon.")
-    assert table["ends"] == ["March 3, 2027 at noon.", "Term: five years", None]
-    assert table["ends_span"][0] == {"start": line, "end": line + 22}
-    assert table["ends_span"][1] == {"start": 0, "end": len(TERM)}
-
-
 @pytest.mark.parametrize("limit,draft", [(5, 16), (3, 0), (1, 0)])
 def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
     # a model that never closes the quote keeps writing the document;
     # the answer ends at stages.spec.max_answer_tokens
     long = " ".join(["word"] * 200)
-    spec, tables = make_spec(True, long)
+    spec, tables = make_spec(long)
     spec = replace(spec, max_answer_tokens=limit, draft_tokens=draft)
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
@@ -746,7 +737,7 @@ def test_device_verification_matches_the_host_decoder():
 
     from quail.backends.quail.executor.readout import AsyncTopLogprobs
 
-    spec, tables = make_spec(True)
+    spec, tables = make_spec()
     spec = replace(spec, max_answer_tokens=1000)
     size = len(tables.vocab)
     generator = torch.Generator().manual_seed(3)

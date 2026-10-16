@@ -93,14 +93,14 @@ def make_vocabulary(*extra):
     return Vocabulary(tokenizer)
 
 
-def make_spec(trim=True, *extra):
+def make_spec(*extra):
     tables = make_vocabulary(*extra)
     return ExtractSpec(
         name="ends", aliases=("c",), query_template="{0}",
         arguments=(("c", "text"),), expected_inputs=3, estimated_seconds=0.0,
         prompt_token_parts=(tuple(tables.encode_ids(HEAD)),
                             tuple(tables.encode_ids(TAIL))),
-        question=QUESTION, trim=trim), tables
+        question=QUESTION), tables
 
 
 def squeezed(text: str) -> tuple:
