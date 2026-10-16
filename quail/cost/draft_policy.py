@@ -18,23 +18,21 @@ import numpy as np
 
 # how many observations the seed of each curve weighs
 PRIOR_WEIGHT = 8
-# the round's KV read in tokens, rounded to one of these for the tables
-RHO_BUCKETS = (0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)
-# the count of live positions, rounded to one of these for the tables
+# the source odds are learned per range of live positions, since a
+# count can be anything from 2 to the document's length: a round with
+# m live positions counts toward the range whose edge is nearest on a
+# log scale
 LIVE_BUCKETS = (1, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000)
-
-
-_RHO_LOGS = [math.log1p(b) for b in RHO_BUCKETS]
 _LIVE_LOGS = [math.log1p(b) for b in LIVE_BUCKETS]
 
 
-def _bucket(logs: list, value: float) -> int:
-    """Return the index of the bucket nearest value on a log scale."""
-    x = math.log1p(value)
-    i = bisect.bisect_left(logs, x)
-    if i == 0 or i == len(logs):
-        return min(i, len(logs) - 1)
-    return i if logs[i] - x < x - logs[i - 1] else i - 1
+def _bucket(live: int) -> int:
+    """Return the index of the live-position range nearest live on a log scale."""
+    x = math.log1p(live)
+    i = bisect.bisect_left(_LIVE_LOGS, x)
+    if i == 0 or i == len(_LIVE_LOGS):
+        return min(i, len(_LIVE_LOGS) - 1)
+    return i if _LIVE_LOGS[i] - x < x - _LIVE_LOGS[i - 1] else i - 1
 
 
 class DraftPolicy:
@@ -55,10 +53,10 @@ class DraftPolicy:
         self.lengths = np.zeros(max_answer_tokens + 1, dtype=np.int64)
         self.settled = 0
         # drafted rounds and the ones whose first draft token was written,
-        # by the count of live positions
+        # by range of live positions
         self.trials = np.zeros(len(LIVE_BUCKETS), dtype=np.int64)
         self.accepts = np.zeros(len(LIVE_BUCKETS), dtype=np.int64)
-        self._tables = {}
+        self._curve = None
 
     def survival(self, written: int) -> np.ndarray:
         """Return P(the answer has more than j tokens left), j = 0.., given written.
@@ -66,13 +64,13 @@ class DraftPolicy:
         The planner's geometric guess and the settled answers' lengths
         are blended by count, so the guess fades as answers settle.
         """
-        n = self.max_answer_tokens
-        j = np.arange(n + 1)
-        prior = PRIOR_WEIGHT * self.q ** j
-        # answers longer than j, from the histogram of settled lengths
-        longer = self.settled - np.cumsum(self.lengths)
-        curve = (prior + longer) / (PRIOR_WEIGHT + self.settled)
-        tail = curve[written:]
+        if self._curve is None:
+            j = np.arange(self.max_answer_tokens + 1)
+            prior = PRIOR_WEIGHT * self.q ** j
+            # answers longer than j, from the histogram of settled lengths
+            longer = self.settled - np.cumsum(self.lengths)
+            self._curve = (prior + longer) / (PRIOR_WEIGHT + self.settled)
+        tail = self._curve[written:]
         return tail / tail[0] if tail[0] > 0 else np.ones_like(tail)
 
     def source_odds(self, live: int) -> float:
@@ -83,7 +81,7 @@ class DraftPolicy:
         """
         if live <= 1:
             return 1.0
-        b = _bucket(_LIVE_LOGS, live)
+        b = _bucket(live)
         seed = PRIOR_WEIGHT / LIVE_BUCKETS[b]
         return (seed + self.accepts[b]) / (PRIOR_WEIGHT + self.trials[b])
 
@@ -98,27 +96,19 @@ class DraftPolicy:
         room = min(self.cap, self.max_answer_tokens - written - 1)
         if room <= 0:
             return 0
-        key = (_bucket(_RHO_LOGS, rho), written, room, _bucket(_LIVE_LOGS, live))
-        if key not in self._tables:
-            self._tables[key] = self._best(RHO_BUCKETS[key[0]], written, room,
-                                           self.source_odds(LIVE_BUCKETS[key[3]]))
-        return self._tables[key]
-
-    def _best(self, rho: float, written: int, room: int, odds: float) -> int:
         gammas = np.arange(room + 1)
         survival = self.survival(written)[:room + 1]
         # the chosen token, then each draft token while the answer goes
         # on and the position followed is its source
-        writes = survival[0] + odds * np.cumsum(np.concatenate(([0.0], survival[1:])))
-        cost = (1 + gammas + rho) / writes
-        return int(gammas[int(np.argmin(cost))])
+        writes = survival[0] + self.source_odds(live) * np.cumsum(
+            np.concatenate(([0.0], survival[1:])))
+        return int(gammas[int(np.argmin((1 + gammas + rho) / writes))])
 
     def settle(self, length: int) -> None:
-        """Record a settled answer's length; the curve picks it up at powers of two."""
+        """Record a settled answer's length."""
         self.lengths[min(length, self.max_answer_tokens)] += 1
         self.settled += 1
-        if self.settled & (self.settled - 1) == 0:
-            self._tables.clear()
+        self._curve = None
 
     def observe(self, live: int, accepted: bool) -> None:
         """Record whether a drafted round's first draft token was written.
@@ -127,8 +117,6 @@ class DraftPolicy:
             live: How many document positions the answer fit when drafting.
             accepted: Whether the model chose the first draft token.
         """
-        b = _bucket(_LIVE_LOGS, live)
+        b = _bucket(live)
         self.trials[b] += 1
         self.accepts[b] += accepted
-        if self.trials[b] & (self.trials[b] - 1) == 0:
-            self._tables = {k: v for k, v in self._tables.items() if k[3] != b}
