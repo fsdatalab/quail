@@ -12,13 +12,18 @@ saved to /results/ablations/extract_draft/.
 
     uv run modal run --detach experiments/cells/extract_draft.py::measure
         --query CUAD-3 --sf 1.0 --draft-tokens 16
+
+--sql with --table runs an ad hoc query over one benchmark table instead
+of a QUAIL-B query; the table's parquet must already be on the volume.
 """
 
 import json
 import sys
 import time
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 from bench.quailb_parallel import (
     DATA_DIR,
@@ -187,6 +192,28 @@ def _kernel_totals(profiler) -> list:
                   key=lambda row: -row[1])
 
 
+def _sql_runner(session, sql: str, table: str, sf: float):
+    """Return a run function for an ad hoc SQL query over one benchmark table."""
+    import pyarrow.parquet as pq
+
+    import quail
+
+    rows = pq.read_table(Path(DATA_DIR) / f"sf{sf}" / f"{table}.parquet")
+    session.register(table, quail.DocumentProvider.from_table(rows, id_col="id"))
+
+    def run():
+        started = time.perf_counter()
+        result = session.sql(sql).run()
+        result.collect()
+        wall_s = time.perf_counter() - started
+        extracts = result.answer_tables.get("extracts", {})
+        return SimpleNamespace(
+            measurements={**result.report, "wall_s": wall_s},
+            extract_answers={name: table for name, table in extracts.items()})
+
+    return run
+
+
 def child(arguments: str) -> None:
     """Run the query: timed, then profiled, then one logged run; print RESULT."""
     import torch
@@ -200,16 +227,20 @@ def child(arguments: str) -> None:
     passes = Passes(torch)
     rounds = Rounds()
     sf = args["sf"]
-    suite = load_benchmark([args["query_id"]], scale_factor=sf,
-                           data_dir=Path(DATA_DIR) / f"sf{sf}",
-                           collection_id=args["collection_id"] or None)
-    spec = suite.queries[0]
-    tables = {relation.table: suite.tables[relation.table]
-              for relation in spec.info.relations}
     config = quail.EngineConfig(gpus=1, model=args["model"], backend="quail",
                                 device="h100-sxm", gpu_timing=True)
     record = {**args, "runs": []}
     with quail.Session(config) as session:
+        if args.get("sql"):
+            run_once = _sql_runner(session, args["sql"], args["table"], sf)
+        else:
+            suite = load_benchmark([args["query_id"]], scale_factor=sf,
+                                   data_dir=Path(DATA_DIR) / f"sf{sf}",
+                                   collection_id=args["collection_id"] or None)
+            spec = suite.queries[0]
+            tables = {relation.table: suite.tables[relation.table]
+                      for relation in spec.info.relations}
+            run_once = partial(run_query, session, spec, tables)
         drafts = args.get("sweep") or [args["draft_tokens"]]
         modes = ([("timed", d) for _ in range(args["timed_runs"]) for d in drafts]
                  + [("kernels", args["draft_tokens"])] * args["kernel_runs"]
@@ -225,7 +256,7 @@ def child(arguments: str) -> None:
                 profiler.__enter__()
             else:
                 rounds.start()
-            output = run_query(session, spec, tables)
+            output = run_once()
             run = {"mode": mode, "draft_tokens": draft}
             if mode == "timed":
                 run["passes"] = passes.stop()
@@ -280,11 +311,17 @@ def measure_draft(arguments: str) -> str:
 @app.local_entrypoint()
 def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
             draft_tokens: int = 16, timed_runs: int = 2, kernel_runs: int = 0,
-            sweep: str = "", tag: str = "draft"):
-    data = ensure_data.spawn(sf, [query], "")
-    print(f"function call id: {data.object_id} (data)", flush=True)
-    collection = data.get()
+            sweep: str = "", sql: str = "", table: str = "", tag: str = "draft"):
+    collection = ""
+    if sql:
+        # an ad hoc query over a table ensure_data already wrote
+        query = table
+    else:
+        data = ensure_data.spawn(sf, [query], "")
+        print(f"function call id: {data.object_id} (data)", flush=True)
+        collection = data.get()
     arguments = json.dumps(dict(query_id=query, sf=sf, collection_id=collection,
+                                sql=sql, table=table,
                                 model=model, draft_tokens=draft_tokens,
                                 timed_runs=timed_runs, kernel_runs=kernel_runs,
                                 sweep=[int(d) for d in sweep.split(",") if d],
