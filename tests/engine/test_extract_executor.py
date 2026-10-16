@@ -61,7 +61,7 @@ def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
     vocabulary = SimpleNamespace(vocab=range(64), merged=merged,
                                  is_stop=np.zeros(64, dtype=bool), none_id=63)
     vocabulary.is_stop[62] = True
-    decoder = Decoder(vocabulary, 4, 10, [True], make_spec()[0])
+    decoder = Decoder(vocabulary, 4, 10, 1, make_spec()[0])
     text = "abcdefghij"
     streams = [Stream(at, [0, token], [at + 1, at + 2], text, exhausted=True)
                for at, token in enumerate(tokens)]
@@ -82,7 +82,7 @@ def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
 
 def test_readout_scores_reset_between_rows_and_keep_token_order():
     _, vocabulary = make_spec()
-    decoder = Decoder(vocabulary, 4, 10, [True], make_spec()[0])
+    decoder = Decoder(vocabulary, 4, 10, 1, make_spec()[0])
     scores, none, stop = decoder.lp([-4, -5, 5, 2, 3, 4, -1, -1, -2, -3])
     assert decoder.top == 5 and none == -4 and stop == -5
     assert scores[5] == scores[2] == -1
@@ -143,7 +143,7 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
     # days", and the model chooses " years" instead: the round ends
     # there, and the next round feeds " years" in the draft's place
     text = "five days or five years"
-    spec, tables = make_spec(True, text)
+    spec, tables = make_spec(text)
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
@@ -174,6 +174,34 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
     assert asked.steps == 3
     assert asked.fed_tokens == (len(tables.encode_ids(TAIL)) + len(fed[1][0])
                                 + len(fed[2][0]))
+
+def test_rows_with_one_live_stream_are_decided_together(monkeypatch):
+    # with one live stream, a round's rows are decided at once; the
+    # answers, steps, and fed tokens match choosing row by row
+    counts = []
+    accepted = Decoder.accepted
+
+    def counting(self, answer, rows, fed):
+        counts.append(accepted(self, answer, rows, fed))
+        return counts[-1]
+
+    def outcome(run):
+        result, stages = run()
+        return (result.outputs["rows"].column("ends").to_pylist(),
+                [(a.written, a.steps, a.fed_tokens, a.span)
+                 for doc in stages.docs for a in doc.answers])
+
+    monkeypatch.setattr(Decoder, "accepted", counting)
+    fast = outcome(_setup(monkeypatch)[2])
+    assert max(counts) > 0
+    # the adaptive policy changes draft lengths, not answers or spans
+    rows, states = outcome(_setup(monkeypatch, policy="adaptive")[2])
+    assert rows == fast[0]
+    assert [(w, span) for w, _, _, span in states] == [
+        (w, span) for w, _, _, span in fast[1]]
+    monkeypatch.setattr(Decoder, "accepted", lambda self, answer, rows, fed: 0)
+    assert outcome(_setup(monkeypatch)[2]) == fast
+
 
 class ScriptedModel:
     """Writes the gold answer: the lines that hold it, its tokens, then stops.
@@ -289,13 +317,14 @@ class ScriptedModel:
 
 
 def _fake_readout(tables, k):
+    """A readout over scripted rows."""
     width = 2 + 2 * k
     value = SimpleNamespace(k=k, width=width, ragged=True)
     value.dtype = np.dtype(object)
 
     def submit(rows, rows_per_answer=None):
-        return split_rows(np.asarray(rows, dtype=np.float32)[:, :width],
-                          rows_per_answer)
+        values = np.asarray(rows, dtype=np.float32)[:, :width]
+        return split_rows(values, rows_per_answer)
 
     value.submit, value.result = submit, lambda handle: handle
     return value
@@ -316,10 +345,12 @@ DOCS = [LEASE, TERM, NOTHING]
 GOLD = ["March 3, 2027", "five years", None]
 
 
-def _setup(monkeypatch, trim=True, documents=None, token_documents=None,
-           share_prefixes=False, document_ids=None, gpu_timing=False):
+def _setup(monkeypatch, documents=None, token_documents=None,
+           share_prefixes=False, document_ids=None, gpu_timing=False,
+           policy="fixed"):
     """A state, its scripted model, and a node builder for one spec name."""
-    spec, tables = make_spec(trim)
+    spec, tables = make_spec()
+    spec = replace(spec, draft_policy=policy, round_cost_per_token=0.05)
     documents = DOCS if documents is None else documents
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
@@ -401,8 +432,8 @@ def test_extraction_accepts_empty_input_and_sparse_document_ids(monkeypatch):
         doc.answers[0].discard = i + 1
         assert stages._step_discard(0, doc.key) == i + 1
 
-def _run(monkeypatch, trim=True, documents=None):
-    _, model, run, _ = _setup(monkeypatch, trim, documents)
+def _run(monkeypatch, documents=None):
+    _, model, run, _ = _setup(monkeypatch, documents)
     result, stages = run()
     return result, stages, model
 
@@ -637,21 +668,12 @@ def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
     assert not arena.resident_keys()
 
 
-def test_extractor_returns_whole_lines_with_trim_off(monkeypatch):
-    result, stages, _ = _run(monkeypatch, trim=False)
-    table = result.outputs["rows"].to_pydict()
-    line = LEASE.index("March 3, 2027 at noon.")
-    assert table["ends"] == ["March 3, 2027 at noon.", "Term: five years", None]
-    assert table["ends_span"][0] == {"start": line, "end": line + 22}
-    assert table["ends_span"][1] == {"start": 0, "end": len(TERM)}
-
-
 @pytest.mark.parametrize("limit,draft", [(5, 16), (3, 0), (1, 0)])
 def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
     # a model that never closes the quote keeps writing the document;
     # the answer ends at stages.spec.max_answer_tokens
     long = " ".join(["word"] * 200)
-    spec, tables = make_spec(True, long)
+    spec, tables = make_spec(long)
     spec = replace(spec, max_answer_tokens=limit, draft_tokens=draft)
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)

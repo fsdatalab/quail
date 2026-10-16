@@ -85,7 +85,7 @@ class ExtractionStages:
         self.keys = [doc.key for doc in self.docs]
         self.readout = self._readout(state) if readout is None else readout
         self.decoder = Decoder(vocabulary, self.readout.k, self.readout.width,
-                               [spec.trim for spec in self.specs], self.spec)
+                               len(self.specs), self.spec)
         self.stages = []
         for q, (spec, tail) in enumerate(zip(self.specs, self.tails)):
             self.stages.extend(self._question_stages(q, spec.name, tail))
@@ -155,8 +155,10 @@ class ExtractionStages:
         prefix = concat_tokens(self.head, ids)
         scan = DocumentTokens.from_tokens(
             self.vocabulary, tokens, ids.character_offsets, len(self.head))
+        # the round's KV read covers the prompt through the first tail
+        rho = self.spec.round_cost_per_token * (len(prefix) + len(self.tails[0]))
         return Document(index=index, text=text, prefix=prefix, scan=scan, key=key,
-                        answers=[AnswerState() for _ in self.specs])
+                        answers=[AnswerState() for _ in self.specs], rho=rho)
 
     # ---- the tail, then the answer, a round of tokens at a time ------------
 
@@ -169,29 +171,43 @@ class ExtractionStages:
         # only its cue token is fed
         same = q > 0 and self.tails[q] == self.tails[q - 1]
         answer.fed_tokens += 1 if same else len(self.tails[q])
-        self.decoder.verify(doc, q, self.decoder.rows(row), [])
+        self.decoder.verify(doc, q, self._rows(row), [])
         return True
+
+    def _rows(self, row):
+        """Return a readout's rows for one answer."""
+        # the admission hands over the document's one answer in a list
+        # or an object array
+        if isinstance(row, list) and len(row) == 1:
+            row = row[0]
+        elif isinstance(row, np.ndarray) and row.dtype == object and row.size == 1:
+            row = row.reshape(-1)[0]
+        return self.decoder.rows(row)
 
     def _step_suffix(self, q, key):
         """Feed the chosen token, then the document's next tokens as a draft."""
-        answer = self._answer(q, key)
+        doc = self._document(key)
+        answer = doc.answers[q]
         if answer.done:
             return Stage.SKIP
-        return [self.decoder.draft(answer)]
+        return [self.decoder.draft(answer, doc.rho, q)]
 
     def _step_discard(self, q, key):
         return self._answer(q, key).discard
 
-    def _answer(self, q, key):
+    def _document(self, key):
         position = np.searchsorted(self.document_ids, key[1], side="right") - 1
-        return self.docs[self.document_order[position]].answers[q]
+        return self.docs[self.document_order[position]]
+
+    def _answer(self, q, key):
+        return self._document(key).answers[q]
 
     def _step_decide(self, q, anchor, row):
         """Verify the round's draft by the row after each of its tokens."""
         doc = self.docs[anchor]
         answer = doc.answers[q]
         answer.fed_tokens += len(answer.fed)
-        self.decoder.verify(doc, q, self.decoder.rows(row), answer.fed)
+        self.decoder.verify(doc, q, self._rows(row), answer.fed)
         return True
 
     def finish(self) -> None:

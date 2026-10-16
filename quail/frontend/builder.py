@@ -210,8 +210,7 @@ class Query:
         self._labels[name] = Alias(call, name)
         return self
 
-    def ai_extract(self, c, questions, *, name: str,
-                   trim: bool = True) -> "Query":
+    def ai_extract(self, c, questions, *, name: str) -> "Query":
         """Copy the words that answer each question from each document.
 
         ``questions`` maps field names to questions. The result column
@@ -232,10 +231,6 @@ class Query:
             questions: A mapping from field names to the questions their
                 answers are copied for.
             name: Result column name, without a dot.
-            trim: Whether each answer is the fewest words that answer
-                its question. With trim off, the answer is the whole
-                lines of the document that hold them, as the document's
-                own line breaks divide it.
 
         Returns:
             This query builder, with the extraction added.
@@ -264,8 +259,7 @@ class Query:
         members = []
         for field in struct.fields:
             bound = self._prompts.bind("extract", questions[field], (ref,))
-            call = ModelCall(bound, "extract", question=questions[field],
-                             trim=trim)
+            call = ModelCall(bound, "extract", question=questions[field])
             call.validate()
             members.append(Alias(call, struct.member(field)))
         self._note_doc_column(ref)

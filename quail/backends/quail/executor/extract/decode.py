@@ -22,7 +22,7 @@ from quail.backends.quail.executor.extract.candidates import (
     make_streams,
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.execution.spans import line_span
+from quail.cost.draft_policy import DraftPolicy
 from quail.physical import ExtractSpec
 
 
@@ -55,6 +55,7 @@ class Document:
     scan: DocumentTokens
     key: tuple
     answers: list       # one AnswerState per question
+    rho: float = 0.0    # the document's KV read per round, in fed tokens
 
 
 class Decoder:
@@ -65,20 +66,23 @@ class Decoder:
         k: How many likeliest tokens each readout row carries.
         width: The values in each readout row: none, the stop, then
             k ids and k log probabilities.
-        trim: Per question, whether the answer is the copied words or
-            the whole lines that hold them.
+        questions: How many questions the pipeline asks.
         spec: Extraction plan carrying the execution settings.
     """
 
-    def __init__(self, vocabulary: Vocabulary, k: int, width: int, trim,
+    def __init__(self, vocabulary: Vocabulary, k: int, width: int, questions: int,
                  spec: ExtractSpec):
         self.spec = spec
         self.vocabulary = vocabulary
         self.k = k
         self.width = width
-        self.trim = list(trim)
         self.scores = np.full(len(vocabulary.vocab), NEG, dtype=np.float32)
         self.previous_ids = np.empty(0, dtype=np.int64)
+        # one answer-length curve per question under the adaptive policy
+        self.policies = ([DraftPolicy(spec.draft_tokens, spec.max_answer_tokens,
+                                      spec.expected_answer_tokens)
+                          for _ in range(questions)]
+                         if spec.draft_policy == "adaptive" else None)
 
     def rows(self, row) -> np.ndarray:
         """Return a stage's answer as its rows of readout values."""
@@ -87,18 +91,28 @@ class Decoder:
             values = np.asarray(values.reshape(-1)[0], dtype=np.float32)
         return values.reshape(-1, self.width)
 
-    def draft(self, answer: AnswerState) -> list:
+    def draft(self, answer: AnswerState, rho: float = 0.0, q: int = 0) -> list:
         """Return the tokens the next round feeds: the chosen token, then a draft.
 
         The draft is the document's next tokens along the first
         position the writing fits; the rows after them verify it, so a
         round writes as many tokens as the model would have chosen one
-        at a time.
+        at a time. Its length is the plan's, or under the adaptive
+        policy the length that costs the least per written token for
+        this document's KV read and the answer so far.
+
+        Args:
+            answer: The answer's state.
+            rho: The document's KV read per round, in fed tokens.
+            q: The question's index.
         """
         at = len(answer.written)
         stream = min(answer.live, key=lambda s: s.char)
+        length = self.spec.draft_tokens
+        if self.policies is not None:
+            length = self.policies[q].draft_length(rho, at, len(answer.live))
         draft = []
-        for i in range(self.spec.draft_tokens):
+        for i in range(length):
             token = stream.next(at + i, self.vocabulary)
             if token is None:
                 break
@@ -123,18 +137,88 @@ class Decoder:
         Row i follows token i of the round's fed tokens, so the token
         chosen from it is written and, when it is not the token fed
         next, the rest of the round is discarded: the next round feeds
-        the chosen token in its place.
+        the chosen token in its place. With one live stream the rows
+        that write the draft are decided together.
+
+        Args:
+            doc: The document.
+            q: The question's index.
+            rows: The readout rows of the round.
+            fed: The round's fed tokens.
         """
         answer = doc.answers[q]
         answer.steps += 1
         answer.discard = 0
+        rows = np.asarray(rows)
+        # a draft along one of several live positions tells the policy
+        # whether that position was the answer's source
+        live = len(answer.live) if answer.written and len(fed) > 1 else 1
+        accepted = 0
+        if answer.written and len(answer.live) == 1:
+            accepted = self.accepted(answer, rows, fed)
+            rows = rows[accepted:]
+        if accepted:
+            self.observe(q, live, True)
+            written = min(accepted, self.spec.max_answer_tokens - len(answer.written))
+            answer.written.extend(fed[1:written + 1])
+            if len(answer.written) >= self.spec.max_answer_tokens:
+                self.settle(doc, q)
+                return
         for i, values in enumerate(rows):
             token = self.choose(doc, q, values)
             if answer.done:
                 return
-            if i + 1 < len(fed) and token != fed[i + 1]:
-                answer.discard = len(fed) - (i + 1)
+            after = accepted + i + 1
+            if after == 1 and live > 1:
+                self.observe(q, live, token == fed[1])
+            if after < len(fed) and token != fed[after]:
+                answer.discard = len(fed) - after
                 return
+
+    def observe(self, q: int, live: int, accepted: bool) -> None:
+        if self.policies is not None and live > 1:
+            self.policies[q].observe(live, accepted)
+
+    def accepted(self, answer: AnswerState, rows: np.ndarray, fed) -> int:
+        """Return how many leading rows write the draft token fed after them.
+
+        With one live stream the draft is that stream's next tokens, so
+        a row writes the draft token exactly when choose() would: the
+        token beats the stop, closing the quote after it is not
+        preferred, and the model's likeliest token stays in the
+        document. Those tests read a few values per row, so every row
+        of the round is decided at once; the first row that fails, and
+        the rows after it, go through choose().
+        """
+        k = self.k
+        vocabulary = self.vocabulary
+        n = min(len(rows), len(fed) - 1,
+                self.spec.max_answer_tokens - len(answer.written))
+        if n <= 0:
+            return 0
+        values = rows[:n]
+        ids = values[:, -2 * k:-k].astype(np.int64)
+        lps = values[:, -k:]
+        draft = np.asarray(fed[1:n + 1], dtype=np.int64)
+        merged = vocabulary.merged[draft]
+        index = np.arange(n)
+
+        def lookup(tokens):
+            hit = ids == tokens[:, None]
+            found = lps[index, hit.argmax(axis=1)]
+            return np.where(hit.any(axis=1), found, NEG)
+
+        lp_draft = lookup(draft)
+        lp_merged = lookup(merged)
+        top_col = lps.argmax(axis=1)
+        top, lp_top = ids[index, top_col], lps[index, top_col]
+        stop = values[:, 1]
+        best = np.maximum(lp_draft, stop)
+        allowed = (top == draft) | (top == merged)
+        leaves = ((lp_top > best) & ~allowed & ~vocabulary.is_stop[top]
+                  & (top != vocabulary.none_id))
+        writes = (lp_draft > stop) & ~(lp_merged > best) & ~leaves
+        return int(np.argmin(writes)) if not writes.all() else n
 
     def choose(self, doc: Document, q: int, values):
         """Choose the answer's next token among the document's continuations.
@@ -244,6 +328,8 @@ class Decoder:
         if answer.none_wins or not answer.written or not answer.live:
             answer.answer, answer.span = None, None
             return
+        if self.policies is not None:
+            self.policies[q].settle(len(answer.written))
         stream = min(answer.live, key=lambda s: s.char)
         start, end = stream.char, stream.ends[len(answer.written) - 1]
         text = doc.text
@@ -251,6 +337,4 @@ class Decoder:
             start += 1
         while end > start and text[end - 1].isspace():
             end -= 1
-        if not self.trim[q]:
-            start, end = line_span(text, (start, end))
         answer.answer, answer.span = text[start:end], (start, end)

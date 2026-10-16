@@ -44,10 +44,3 @@ def locate_span(document: str, phrase: str) -> tuple[int, int] | None:
     pattern = r"\s+".join(re.escape(word) for word in words)
     match = re.search(pattern, document, re.IGNORECASE)
     return None if match is None else match.span()
-
-
-def line_span(document: str, span: tuple[int, int]) -> tuple[int, int]:
-    """Widen a span to the whole lines of the document that hold it."""
-    start = document.rfind("\n", 0, span[0]) + 1
-    end = document.find("\n", max(span[1], start))
-    return start, len(document) if end < 0 else end
