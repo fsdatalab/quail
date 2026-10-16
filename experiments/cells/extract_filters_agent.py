@@ -25,6 +25,7 @@ from quail_b.prompts import (
     AGENT_IMPLEMENTED_FIX,
     AGENT_PROGRESS,
     AGENT_PROGRESS_LABELS,
+    AGENT_RECOVERED,
 )
 
 app = modal.App("quail-milestone1")
@@ -93,10 +94,61 @@ COMMAND_REGEX_QUERY = f"""
       AND last_span.command.end > 1000
 """
 
+RAN_TESTS = (
+    "Judge strictly from the agent trace above whether the agent ran a "
+    "test suite or a test command at any point.\n\n{0}\n\nInstruction: "
+    "answer TRUE if the agent ran tests, FALSE otherwise."
+)
+
+# three asks, a classification with a label test, and two extractions
+# with four tests, all on one table: one pipeline of nine operators
+MANY_OPERATORS_QUERY = f"""
+    SELECT t.id,
+           AI.CLASSIFY(PROMPT('{_prompt(AGENT_PROGRESS)}', t.trace),
+                       ARRAY[{LABELS}]) AS progress,
+           AI.EXTRACT(t.trace, {{'edited': '{EDITED_FILE}'}}) AS edit,
+           AI.EXTRACT(t.trace, {{'command': '{LAST_COMMAND}',
+                                'error': '{ERROR_TEXT}'}}) AS last
+    FROM traces t
+    WHERE AI_FILTER(PROMPT('{_prompt(AGENT_IMPLEMENTED_FIX)}', t.trace),
+                    {{'selectivity': 0.3}})
+      AND AI_FILTER(PROMPT('{_prompt(AGENT_RECOVERED)}', t.trace),
+                    {{'selectivity': 0.3}})
+      AND AI_FILTER(PROMPT('{_prompt(RAN_TESTS)}', t.trace),
+                    {{'selectivity': 0.7}})
+      AND HINT(progress IN ({CHANGED}), {{'selectivity': 0.4}})
+      AND HINT(edit.edited LIKE '%.py', {{'selectivity': 0.6}})
+      AND HINT(last.command IS NOT NULL, {{'selectivity': 0.9}})
+      AND HINT(LENGTH(last.command) < 80, {{'selectivity': 0.8}})
+      AND HINT(last_span.error.start > 1000, {{'selectivity': 0.7}})
+"""
+
+# a join on a small table of issue kinds, with an extraction of the
+# anchor tested in WHERE
+ISSUE_KIND = ("Does the agent in DOCUMENT {0} work on the kind of issue "
+              "described in DOCUMENT {1}?")
+JOIN_WITH_ANSWER_TEST_QUERY = f"""
+    SELECT t.id, k.kind,
+           AI.EXTRACT(t.trace, {{'edited': '{EDITED_FILE}'}}) AS edit
+    FROM traces t
+    JOIN kinds k ON AI_FILTER(PROMPT('{ISSUE_KIND}', t.trace, k.kind),
+                              {{'selectivity': 0.3}})
+    WHERE HINT(edit.edited LIKE '%.py', {{'selectivity': 0.6}})
+"""
+
+KINDS = (
+    "a missing function, attribute, or import",
+    "a wrong result, value, or calculation",
+    "a crash, exception, or error message",
+    "a build, packaging, or test configuration problem",
+)
+
 QUERIES = {
     "fix_python_file": FIX_PYTHON_FILE_QUERY,
     "changed_code_with_error": CHANGED_CODE_WITH_ERROR_QUERY,
     "command_regex": COMMAND_REGEX_QUERY,
+    "many_operators": MANY_OPERATORS_QUERY,
+    "join_with_answer_test": JOIN_WITH_ANSWER_TEST_QUERY,
 }
 
 
@@ -106,6 +158,7 @@ QUERIES = {
 )
 def run_queries() -> None:
     """Run the queries and save each report to the results volume."""
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     docs = pq.read_table(CORPUS).slice(0, AGENT_DOCS)
@@ -115,6 +168,11 @@ def run_queries() -> None:
         gpus=1, model="qwen3-4b-fp8", backend="quail", device="h100-sxm"))
     session.register("traces", quail.DocumentProvider.from_parquet(
         subset, id_col="id"))
+    kinds = "/tmp/kinds.parquet"
+    pq.write_table(pa.table({"id": list(range(len(KINDS))),
+                             "kind": list(KINDS)}), kinds)
+    session.register("kinds", quail.DocumentProvider.from_parquet(
+        kinds, id_col="id"))
     run_id = uuid.uuid4().hex
     folder = Path("/results/extract-filters") / run_id
     folder.mkdir(parents=True, exist_ok=True)
@@ -135,7 +193,10 @@ def run_queries() -> None:
         print("node seconds:", json.dumps({
             node_id: round(metrics.wall_s, 2)
             for node_id, metrics in result.node_metrics.items()}), flush=True)
-        print("query seconds:", report.get("query_seconds"), flush=True)
+        print("seconds: model wall", round(report["model_wall_s"], 2),
+              "planning", round(report["planning_s"], 2),
+              "plan estimate", round(query.plan().estimated_seconds, 2),
+              flush=True)
     session.close()
     kernel_cache.commit()
 
