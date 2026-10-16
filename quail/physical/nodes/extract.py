@@ -21,7 +21,16 @@ class ExtractSpec(InferenceSpec):
     Attributes:
         question: The question the answer is copied for.
         max_answer_tokens: Maximum tokens in an extracted answer.
-        draft_tokens: Source tokens to verify after each chosen token.
+        draft_tokens: Source tokens to verify after each chosen token;
+            the most per round under the adaptive policy.
+        draft_policy: "fixed" feeds draft_tokens every round; "adaptive"
+            picks each round's draft length from the round's KV read
+            and the answer-length curve.
+        expected_answer_tokens: The planner's guess at the mean answer
+            length, the seed of the adaptive policy's answer-length curve.
+        round_cost_per_token: One document token's KV read per round,
+            in fed tokens of compute; the planner sets it from the
+            model and device.
         top_tokens: Vocabulary candidates returned by each GPU readout.
         first_window_chars: Source characters tokenized in the first window.
         window_chars: Source characters tokenized in later windows.
@@ -37,20 +46,29 @@ class ExtractSpec(InferenceSpec):
     shares_head: bool = False
     max_answer_tokens: int = 64
     draft_tokens: int = 16
+    draft_policy: str = "fixed"
+    expected_answer_tokens: int = 16
+    round_cost_per_token: float = 0.0
     top_tokens: int = 1024
     first_window_chars: int = 64
     window_chars: int = 512
 
     def __post_init__(self):
-        for name in ("max_answer_tokens", "draft_tokens", "top_tokens",
-                     "first_window_chars", "window_chars"):
+        for name in ("max_answer_tokens", "draft_tokens", "expected_answer_tokens",
+                     "top_tokens", "first_window_chars", "window_chars"):
             validate_integer_setting(name, getattr(self, name),
                                       minimum=0 if name == "draft_tokens" else 1)
+        if self.draft_policy not in ("fixed", "adaptive"):
+            raise ValueError("draft_policy is 'fixed' or 'adaptive'")
+        if not isinstance(self.round_cost_per_token, (int, float)) or (
+                self.round_cost_per_token < 0):
+            raise ValueError("round_cost_per_token is a nonnegative number")
 
     def same_decoding(self, other: "ExtractSpec") -> bool:
         """Return whether two extractions can use the same decoder."""
         return all(getattr(self, name) == getattr(other, name) for name in (
-            "max_answer_tokens", "draft_tokens", "top_tokens",
+            "max_answer_tokens", "draft_tokens", "draft_policy",
+            "expected_answer_tokens", "round_cost_per_token", "top_tokens",
             "first_window_chars", "window_chars"))
 
     @property
@@ -76,8 +94,9 @@ class ExtractSpec(InferenceSpec):
             trim=bool(value.get("trim", True)),
             shares_head=bool(value.get("shares_head", False)),
             **{name: value.get(name, getattr(cls, name))
-               for name in ("max_answer_tokens", "draft_tokens", "top_tokens",
-                            "first_window_chars", "window_chars")},
+               for name in ("max_answer_tokens", "draft_tokens", "draft_policy",
+                            "expected_answer_tokens", "round_cost_per_token",
+                            "top_tokens", "first_window_chars", "window_chars")},
         )
 
     def to_dict(self) -> dict:
@@ -88,6 +107,9 @@ class ExtractSpec(InferenceSpec):
             "shares_head": self.shares_head,
             "max_answer_tokens": self.max_answer_tokens,
             "draft_tokens": self.draft_tokens,
+            "draft_policy": self.draft_policy,
+            "expected_answer_tokens": self.expected_answer_tokens,
+            "round_cost_per_token": self.round_cost_per_token,
             "top_tokens": self.top_tokens,
             "first_window_chars": self.first_window_chars,
             "window_chars": self.window_chars,

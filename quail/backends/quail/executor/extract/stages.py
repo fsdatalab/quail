@@ -29,6 +29,10 @@ from quail.catalog.tokens import concat_tokens
 class ExtractionStages:
     """The stages of one pipeline's extractions and the answers they produce.
 
+    Rows are verified on the host unless device_verify is set, which
+    has the readout decide them; measured on an H100, the device path
+    gave the same answers and no change in query time.
+
     Args:
         state: The loaded model and current query state.
         specs: The ExtractSpecs, in order; they share a table and a
@@ -47,6 +51,8 @@ class ExtractionStages:
     Raises:
         ValueError: The specs differ in their table, head, or decoding settings.
     """
+
+    device_verify = False
 
     def __init__(self, state, specs, vocabulary: Vocabulary, document_ids,
                  documents, texts, readout=None, shared_head=None,
@@ -109,7 +115,8 @@ class ExtractionStages:
                   suffix_tokens=1 + self.spec.draft_tokens, frame=frame,
                   readout=self.readout, decide=partial(self._step_decide, q),
                   discard=partial(self._step_discard, q), read_all_rows=True,
-                  verify=partial(self._step_verifies, q),
+                  verify=(partial(self._step_verifies, q)
+                          if self.device_verify else None),
                   single=True, append=True, label=f"{name} round {t}")
             for t in range(1, self.spec.max_answer_tokens + 1))
         return stages
@@ -131,7 +138,8 @@ class ExtractionStages:
         return AsyncTopLogprobs(torch, torch.nn.functional, head,
                                 self.spec.top_tokens,
                                 [vocabulary.none_id, vocabulary.stop_ids],
-                                ragged=True, vocabulary=vocabulary)
+                                ragged=True,
+                                vocabulary=vocabulary if self.device_verify else None)
 
     def _prepare(self, index, document, text, ids, stored) -> Document:
         """Build a document's prefix: the head and its text.
@@ -156,8 +164,10 @@ class ExtractionStages:
         prefix = concat_tokens(self.head, ids)
         scan = DocumentTokens.from_tokens(
             self.vocabulary, tokens, ids.character_offsets, len(self.head))
+        # the round's KV read covers the prompt through the first tail
+        rho = self.spec.round_cost_per_token * (len(prefix) + len(self.tails[0]))
         return Document(index=index, text=text, prefix=prefix, scan=scan, key=key,
-                        answers=[AnswerState() for _ in self.specs])
+                        answers=[AnswerState() for _ in self.specs], rho=rho)
 
     # ---- the tail, then the answer, a round of tokens at a time ------------
 
@@ -197,17 +207,21 @@ class ExtractionStages:
 
     def _step_suffix(self, q, key):
         """Feed the chosen token, then the document's next tokens as a draft."""
-        answer = self._answer(q, key)
+        doc = self._document(key)
+        answer = doc.answers[q]
         if answer.done:
             return Stage.SKIP
-        return [self.decoder.draft(answer)]
+        return [self.decoder.draft(answer, doc.rho, q)]
 
     def _step_discard(self, q, key):
         return self._answer(q, key).discard
 
-    def _answer(self, q, key):
+    def _document(self, key):
         position = np.searchsorted(self.document_ids, key[1], side="right") - 1
-        return self.docs[self.document_order[position]].answers[q]
+        return self.docs[self.document_order[position]]
+
+    def _answer(self, q, key):
+        return self._document(key).answers[q]
 
     def _step_decide(self, q, anchor, row):
         """Verify the round's draft by the row after each of its tokens."""

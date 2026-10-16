@@ -43,8 +43,12 @@ LOGGED_TOKENS = 64
 image = gpu_image()
 
 
-def _set_draft(draft_tokens: int) -> dict:
-    """Plan every extraction with the draft length the returned dict holds."""
+def _set_draft(draft_tokens) -> dict:
+    """Plan every extraction with the draft setting the returned dict holds.
+
+    The setting is a draft length, or "adaptive" for the policy with
+    the plan's max_answer_tokens - 1 as its cap.
+    """
     import quail.planner.operators.extract as planned
     from quail.physical import ExtractSpec
 
@@ -54,7 +58,12 @@ def _set_draft(draft_tokens: int) -> dict:
     def bind_with_draft(cls, *args, **kwargs):
         spec = bind(cls, *args, **kwargs)
         if cls is ExtractSpec:
-            spec = replace(spec, draft_tokens=setting["draft_tokens"])
+            draft = setting["draft_tokens"]
+            if draft == "adaptive":
+                spec = replace(spec, draft_policy="adaptive",
+                               draft_tokens=spec.max_answer_tokens - 1)
+            else:
+                spec = replace(spec, draft_policy="fixed", draft_tokens=int(draft))
         return spec
 
     planned.bind_inference = bind_with_draft
@@ -81,8 +90,9 @@ class Passes:
         self.active = False
         self.entries = []
         self.host = dict.fromkeys(self.STEPS, 0.0)
+        self.gpu_steps = []
         self._wrap(chunk, "pack_chunk", "pack")
-        self._wrap(readout_groups.ReadoutGroups, "submit", "submit")
+        self._wrap(readout_groups.ReadoutGroups, "submit", "submit", gpu=True)
         self._wrap(stage_executor.StageExecutor, "_report_next", "decide")
         self._wrap(admission.JoinAdmission, "next_chunk", "next_chunk")
         forward = stage_executor.forward_chunk
@@ -107,23 +117,33 @@ class Passes:
 
         stage_executor.forward_chunk = timed
 
-    def _wrap(self, owner, name, step):
+    def _wrap(self, owner, name, step, gpu=False):
         original = getattr(owner, name)
         passes = self
+        torch = self.torch
 
         def timed(*args, **kwargs):
+            events = None
+            if gpu and passes.active:
+                events = (torch.cuda.Event(enable_timing=True),
+                          torch.cuda.Event(enable_timing=True))
+                events[0].record()
             began = time.perf_counter()
             try:
                 return original(*args, **kwargs)
             finally:
                 if passes.active:
                     passes.host[step] += time.perf_counter() - began
+                    if events is not None:
+                        events[1].record()
+                        passes.gpu_steps.append((step, *events))
 
         setattr(owner, name, timed)
 
     def start(self):
         self.entries = []
         self.host = dict.fromkeys(self.STEPS, 0.0)
+        self.gpu_steps = []
         self.torch.cuda.synchronize()
         self.started = time.perf_counter()
         self.active = True
@@ -135,8 +155,12 @@ class Passes:
         rows = [[round((began - self.started) * 1e3, 2),
                  round(start.elapsed_time(end), 3), *facts]
                 for began, start, end, facts in self.entries]
+        readout_s = sum(start.elapsed_time(end) for step, start, end in self.gpu_steps
+                        if step == "submit") / 1e3
         return {"window_s": round(window, 4),
                 "gpu_s": round(sum(row[1] for row in rows) / 1e3, 4),
+                # GPU seconds of the readouts, outside the forward passes
+                "readout_gpu_s": round(readout_s, 4),
                 "host_s": {step: round(value, 3) for step, value in self.host.items()},
                 # host start ms, GPU ms, tokens, answer rows, documents
                 # prefilled, resident KV tokens before the pass
@@ -373,7 +397,7 @@ def measure_draft(arguments: str) -> str:
 
 @app.local_entrypoint()
 def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
-            draft_tokens: int = 16, timed_runs: int = 2, kernel_runs: int = 0,
+            draft_tokens: str = "16", timed_runs: int = 2, kernel_runs: int = 0,
             host_runs: int = 0, sweep: str = "", sql: str = "", table: str = "",
             tag: str = "draft"):
     collection = ""
@@ -384,12 +408,14 @@ def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
         data = ensure_data.spawn(sf, [query], "")
         print(f"function call id: {data.object_id} (data)", flush=True)
         collection = data.get()
+    draft = draft_tokens if draft_tokens == "adaptive" else int(draft_tokens)
     arguments = json.dumps(dict(query_id=query, sf=sf, collection_id=collection,
                                 sql=sql, table=table,
-                                model=model, draft_tokens=draft_tokens,
+                                model=model, draft_tokens=draft,
                                 timed_runs=timed_runs, kernel_runs=kernel_runs,
                                 host_runs=host_runs,
-                                sweep=[int(d) for d in sweep.split(",") if d],
+                                sweep=[d if d == "adaptive" else int(d)
+                                       for d in sweep.split(",") if d],
                                 tag=tag))
     call = measure_draft.spawn(arguments)
     print(f"function call id: {call.object_id} (d={draft_tokens})", flush=True)

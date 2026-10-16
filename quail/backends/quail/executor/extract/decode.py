@@ -21,6 +21,7 @@ from quail.backends.quail.executor.extract.candidates import (
     first_tokens,
     make_streams,
 )
+from quail.backends.quail.executor.extract.policy import DraftPolicy
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.execution.spans import line_span
 from quail.physical import ExtractSpec
@@ -55,6 +56,7 @@ class Document:
     scan: DocumentTokens
     key: tuple
     answers: list       # one AnswerState per question
+    rho: float = 0.0    # the document's KV read per round, in fed tokens
 
 
 class Decoder:
@@ -79,6 +81,11 @@ class Decoder:
         self.trim = list(trim)
         self.scores = np.full(len(vocabulary.vocab), NEG, dtype=np.float32)
         self.previous_ids = np.empty(0, dtype=np.int64)
+        # one answer-length curve per question under the adaptive policy
+        self.policies = ([DraftPolicy(spec.draft_tokens, spec.max_answer_tokens,
+                                      spec.expected_answer_tokens)
+                          for _ in self.trim]
+                         if spec.draft_policy == "adaptive" else None)
 
     def rows(self, row) -> np.ndarray:
         """Return a stage's answer as its rows of readout values."""
@@ -87,18 +94,28 @@ class Decoder:
             values = np.asarray(values.reshape(-1)[0], dtype=np.float32)
         return values.reshape(-1, self.width)
 
-    def draft(self, answer: AnswerState) -> list:
+    def draft(self, answer: AnswerState, rho: float = 0.0, q: int = 0) -> list:
         """Return the tokens the next round feeds: the chosen token, then a draft.
 
         The draft is the document's next tokens along the first
         position the writing fits; the rows after them verify it, so a
         round writes as many tokens as the model would have chosen one
-        at a time.
+        at a time. Its length is the plan's, or under the adaptive
+        policy the length that costs the least per written token for
+        this document's KV read and the answer so far.
+
+        Args:
+            answer: The answer's state.
+            rho: The document's KV read per round, in fed tokens.
+            q: The question's index.
         """
         at = len(answer.written)
         stream = min(answer.live, key=lambda s: s.char)
+        length = self.spec.draft_tokens
+        if self.policies is not None:
+            length = self.policies[q].draft_length(rho, at, len(answer.live) > 1)
         draft = []
-        for i in range(self.spec.draft_tokens):
+        for i in range(length):
             token = stream.next(at + i, self.vocabulary)
             if token is None:
                 break
@@ -308,6 +325,8 @@ class Decoder:
         if answer.none_wins or not answer.written or not answer.live:
             answer.answer, answer.span = None, None
             return
+        if self.policies is not None:
+            self.policies[q].settle(len(answer.written))
         stream = min(answer.live, key=lambda s: s.char)
         start, end = stream.char, stream.ends[len(answer.written) - 1]
         text = doc.text

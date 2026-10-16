@@ -196,6 +196,11 @@ def test_rows_with_one_live_stream_are_decided_together(monkeypatch):
     assert max(counts) > 0
     # a verifying readout hands the decoder (accepted, kept rows)
     assert outcome(_setup(monkeypatch, verify=True)[2]) == fast
+    # the adaptive policy changes draft lengths, not answers or spans
+    rows, states = outcome(_setup(monkeypatch, policy="adaptive")[2])
+    assert rows == fast[0]
+    assert [(w, span) for w, _, _, span in states] == [
+        (w, span) for w, _, _, span in fast[1]]
     monkeypatch.setattr(Decoder, "accepted", lambda self, answer, rows, fed: 0)
     assert outcome(_setup(monkeypatch)[2]) == fast
 
@@ -357,9 +362,10 @@ GOLD = ["March 3, 2027", "five years", None]
 
 def _setup(monkeypatch, trim=True, documents=None, token_documents=None,
            share_prefixes=False, document_ids=None, gpu_timing=False,
-           verify=False):
+           verify=False, policy="fixed"):
     """A state, its scripted model, and a node builder for one spec name."""
     spec, tables = make_spec(trim)
+    spec = replace(spec, draft_policy=policy, round_cost_per_token=0.05)
     documents = DOCS if documents is None else documents
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)

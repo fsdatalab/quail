@@ -481,13 +481,19 @@ def test_extraction_settings_survive_plan_serialization(session):
     query = _ends(session)
     node = next(node for node in query.plan().nodes if isinstance(node, AiExtract))
     settings = dict(max_answer_tokens=7, draft_tokens=2, top_tokens=32,
-                    first_window_chars=16, window_chars=96)
+                    first_window_chars=16, window_chars=96,
+                    draft_policy="adaptive", expected_answer_tokens=9,
+                    round_cost_per_token=0.25)
     spec = replace(node.spec, **settings)
     assert ExtractSpec.from_mapping(spec.to_dict()) == spec
     legacy = spec.to_dict()
     for name in settings:
         legacy.pop(name)
-    assert ExtractSpec.from_mapping(legacy) == node.spec
+    # a plan without the settings takes their defaults; the planner had
+    # set the round's KV read from the model and device
+    assert ExtractSpec.from_mapping(legacy) == replace(
+        node.spec, round_cost_per_token=ExtractSpec.round_cost_per_token)
+    assert node.spec.round_cost_per_token > 0
     request = RequestExtractSpec(alias="c", output="ends", question=QUESTION,
                                  tail_token_ids=(1, 2), max_answer_tokens=7)
     assert RequestExtractSpec.from_mapping(request.to_dict()) == request
