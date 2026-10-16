@@ -231,7 +231,7 @@ def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
     else:
         if selectivity is not None:
             raise CompileError(
-                f"SELECTIVITY hints a test of a label or an answer; "
+                f"HINT estimates a test of a label or an answer; "
                 f"{term.sql()} tests a source column, applied at the scan")
         plain = bind_plain_test(b, test)
         b.regular_predicates.setdefault(plain.column.alias, []).append(plain)
@@ -243,7 +243,7 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
     where = tree.args.get("where")
     selected = ai_aliases(tree)
     for term in _conjuncts(where.this) if where else []:
-        term, hint = unwrap_hint(term)
+        term, hint = unwrap_hint(b, term)
         term = _name_select_labels(b, term, selected)
         if _bind_plain_term(b, term, selected, hint):
             continue

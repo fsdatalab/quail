@@ -558,8 +558,8 @@ class Query:
         ai_extract() runs right after the call that computes it, so the
         later operators read fewer documents; the model runs once for
         the test and the returned column. Such a test takes a
-        selectivity hint, ``col(...).like(...).hint(0.4)``, the
-        estimated fraction of documents it keeps; 0.2 without one.
+        selectivity hint, ``col(...).like(...).hint(selectivity=0.4)``,
+        the estimated fraction of documents it keeps; 0.2 without one.
 
         Args:
             tests: Comparisons of a ``col(...)`` with a literal, such as

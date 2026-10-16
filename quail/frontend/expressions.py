@@ -161,8 +161,8 @@ class PredicateSpec:
             comparison = f"not {self.comparison}"
         return PredicateSpec(self.col, comparison, self.value, self.selectivity)
 
-    def hint(self, selectivity: float) -> "PredicateSpec":
-        """``col(...).like(...).hint(0.4)``: the fraction of documents kept."""
+    def hint(self, *, selectivity: float) -> "PredicateSpec":
+        """``col(...).like(...).hint(selectivity=0.4)``: the fraction kept."""
         return PredicateSpec(self.col, self.comparison, self.value, selectivity)
 
     def __and__(self, other) -> "AndSpec":

@@ -90,24 +90,27 @@ def _operand(node) -> tuple[exp.Expression, str | None] | None:
     return None
 
 
-def unwrap_hint(term) -> tuple:
-    """Split ``SELECTIVITY(test, fraction)`` into the test and its hint.
+def unwrap_hint(b, term) -> tuple:
+    """Split ``HINT(test, {'selectivity': fraction})`` into the test and its hint.
+
+    Args:
+        b: The expression binder, which parses the option object.
+        term: The term.
 
     Returns:
         (term, selectivity), with None for a term without the hint.
 
     Raises:
-        CompileError: The hint's fraction is not a number.
+        CompileError: The hint has no option object, or an option other
+            than selectivity.
     """
-    if not (isinstance(term, exp.Anonymous)
-            and str(term.this).upper() == "SELECTIVITY"):
+    if not (isinstance(term, exp.Anonymous) and str(term.this).upper() == "HINT"):
         return term, None
     if len(term.expressions) != 2:
-        raise CompileError("SELECTIVITY takes a test and the fraction it keeps")
-    inner, fraction = term.expressions
-    if not isinstance(fraction, exp.Literal) or fraction.is_string:
-        raise CompileError("SELECTIVITY's fraction must be a number")
-    return inner, float(fraction.this)
+        raise CompileError(
+            "HINT takes a test and an option object like {'selectivity': 0.4}")
+    inner, options = term.expressions
+    return inner, b.parse_options(options, {"selectivity"}).get("selectivity")
 
 
 def parse_plain_test(term, dialect: str) -> PlainTest | None:

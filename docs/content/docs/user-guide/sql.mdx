@@ -396,8 +396,8 @@ mentions 2027:
 SELECT c.id,
        AI.EXTRACT(c.text, {'end_date': 'When does the lease end?'}) AS lease
 FROM contracts c
-WHERE SELECTIVITY(lease.end_date IS NOT NULL, 0.9)
-  AND SELECTIVITY(lease.end_date LIKE '%2027%', 0.4);
+WHERE HINT(lease.end_date IS NOT NULL, {'selectivity': 0.9})
+  AND HINT(lease.end_date LIKE '%2027%', {'selectivity': 0.4});
 ```
 
 A field is tested with the conditions of [WHERE and ON](#where-and-on):
@@ -407,11 +407,11 @@ by its `start` or `end`: `lease_span.end_date.start < 500` keeps the
 answers that begin in the first 500 characters. Repeating the call
 with the field works too: `AI.EXTRACT(...).end_date IS NOT NULL`.
 
-`SELECTIVITY(test, fraction)` estimates the fraction of documents a
-test on a label or an answer keeps, 0.2 without it; it does not change
-which pass. It wraps a test of an `AI.CLASSIFY` label the same way,
-`SELECTIVITY(sentiment IN ('negative', 'mixed'), 0.3)`, and then
-overrides the call's `selectivity` option.
+`HINT(test, {'selectivity': fraction})` estimates the fraction of
+documents a test on a label or an answer keeps, 0.2 without it; it
+does not change which pass. It wraps a test of an `AI.CLASSIFY` label
+the same way, `HINT(sentiment IN ('negative', 'mixed'), {'selectivity':
+0.3})`, and then overrides the call's `selectivity` option.
 
 The planner orders a table's `AI.IF` conditions, its classifications
 with their label tests, and its extractions with their answer tests
