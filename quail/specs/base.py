@@ -111,6 +111,9 @@ class ModelSpec:
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);
     #                                   None lets vLLM pick
+    vllm_reserve_bytes: float = 0.0    # bytes this model asks vLLM to
+    #                                   leave outside its pool. 0 keeps
+    #                                   the 0.91 utilization.
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""
@@ -226,6 +229,8 @@ class DeviceSpec:
     usd_per_hour: float = 0.0    # rental price of one device; 0 means
     #                              no price is known
     price_source: str = ""       # where usd_per_hour was read from
+    cuda_name: str = ""          # substring of torch.cuda.get_device_name
+    modal_gpu: str = ""          # Modal gpu= string, such as "H100!"
 
     @property
     def attn_flops(self) -> float:

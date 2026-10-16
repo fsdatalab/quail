@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +16,7 @@ from quail.execution.runtimes import ModelNodeRuntime
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.physical import Scan
 from quail.planner.optimizer.candidates import SupportResult
+from quail.specs import DEVICES
 
 
 def execute_request_graph(context, backend, engine_state, boot):
@@ -97,7 +99,7 @@ def request_runtimes() -> dict:
     return {RequestExecution.runtime_key: ModelNodeRuntime()}
 
 
-SUPPORTED_DEVICES = frozenset({"h100-sxm", "rtx-pro-6000-blackwell-server"})
+SUPPORTED_DEVICES = frozenset(DEVICES)
 
 
 def _warm_boot() -> dict:
@@ -174,7 +176,12 @@ class RequestBackend:
             allowed_ids = sorted(set(
                 envelope["settings"]["true_ids"]
             ) | set(envelope["settings"]["false_ids"]))
-            engine_state, boot = self.engine.boot(model, allowed_ids)
+            device = context.registry.device(envelope["device"])
+            boot_call = self.engine.boot
+            if "device" in inspect.signature(boot_call).parameters:
+                engine_state, boot = boot_call(model, allowed_ids, device)
+            else:
+                engine_state, boot = boot_call(model, allowed_ids)
             context.runtime_state[state_key] = engine_state
         else:
             boot = _warm_boot()

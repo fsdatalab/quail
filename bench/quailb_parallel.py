@@ -1,4 +1,4 @@
-"""Run Quail and vLLM on one physical H100 per query family.
+"""Run Quail and vLLM on one physical GPU per query family.
 
 Quail runs in a fresh child process. Stock vLLM and pipelined vLLM run
 in a second child process and share one loaded model. SGLang runs in a
@@ -6,7 +6,7 @@ separate container because its package version conflicts with vLLM.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
     uv run modal run --detach -m bench.quailb_parallel \
-      --model qwen3-4b-fp8 --sf 0.1 \
+      --model qwen3-4b-fp8 --sf 0.1 --device h100-sxm \
       2>&1 | tee "$run_log"
 
 The local entrypoint starts one remote function. Detached mode keeps that
@@ -22,6 +22,7 @@ import modal
 
 from bench.results import combine_measurements, write_json
 from quail.deploy.images import gpu_image, sglang_image
+from quail.specs import modal_gpu_type
 
 image = gpu_image()
 sglang_gpu_image = sglang_image()
@@ -88,12 +89,12 @@ def _methods(csv: str) -> list[str]:
 def _run_family(process_groups, result_name, model, sf, query_ids_csv,
                 run_dir, ground_truth_collection, root=None,
                 attention=None, gpu_timing=False,
-                canvas_draws=None) -> str:
+                canvas_draws=None, device="h100-sxm", gpus=1) -> str:
     """Run one query family's methods, one child process per group.
 
-    Every group runs on the one GPU of this container, in a fresh
-    process. The family's result, without the per-method suites, is
-    saved under `families/` in the run directory.
+    Every group runs on this container's GPUs, in a fresh process.
+    The family's result, without the per-method suites, is saved
+    under `families/` in the run directory.
     """
     from bench.process_isolation import run_backend_group_in_fresh_process
     from quail_b.queries import query_family_name
@@ -110,22 +111,23 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
             run_dir=run_dir, ground_truth_collection=ground_truth_collection,
             methods=methods, root=root,
             attention=attention, gpu_timing=gpu_timing,
-            suite_name=f"{family}{result_name}", canvas_draws=canvas_draws)
+            suite_name=f"{family}{result_name}", canvas_draws=canvas_draws,
+            device=device, gpus=gpus)
         process_results.append(process_result)
         suites.update(process_result["suites"])
     gpu_uuids = {
         gpu_uuid for process_result in process_results
         for gpu_uuid in process_result["gpu_uuids"]
     }
-    if len(gpu_uuids) != 1:
+    if len(gpu_uuids) != gpus:
         raise RuntimeError(
-            "backend child processes did not see one physical GPU: "
-            f"{sorted(gpu_uuids)}")
+            f"backend child processes did not see {gpus} physical "
+            f"GPU(s): {sorted(gpu_uuids)}")
     result = {
         "query_family": family,
         "query_ids": list(query_ids),
         "ground_truth_collection": next(iter(suites.values()))["collection_id"],
-        "gpu": "H100!",
+        "gpu": modal_gpu_type(device, gpus),
         "gpu_uuids": sorted(gpu_uuids),
         "process_groups": [list(methods) for methods in process_groups],
         "process_cleanup": [
@@ -143,7 +145,7 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
 
 @app.function(
     image=image,
-    gpu="H100!",
+    gpu=modal_gpu_type("h100-sxm"),
     memory=98304,
     timeout=36000,
     max_containers=8,
@@ -164,6 +166,8 @@ def run_query_family(
     gpu_timing: bool = False,
     label_root: str = "",
     canvas_draws: str = "",
+    device: str = "h100-sxm",
+    gpus: int = 1,
 ) -> str:
     """Run one query family through the selected benchmark methods.
 
@@ -183,6 +187,8 @@ def run_query_family(
         label_root: Optional local mirror of reference labels.
         canvas_draws: Comma-separated maximum diffusion draw counts. Empty
             keeps the default; multiple counts create separate Quail runs.
+        device: Registered device name. Defaults to ``h100-sxm``.
+        gpus: Model copies, one per GPU. Defaults to 1.
 
     Returns:
         Path to the saved family result on the results volume.
@@ -198,7 +204,8 @@ def run_query_family(
                            root=label_root or None,
                            attention=attention or None,
                            gpu_timing=gpu_timing,
-                           canvas_draws=canvas_draws or None)
+                           canvas_draws=canvas_draws or None,
+                           device=device, gpus=gpus)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -206,7 +213,7 @@ def run_query_family(
 
 @app.function(
     image=sglang_gpu_image,
-    gpu="H100!",
+    gpu=modal_gpu_type("h100-sxm"),
     memory=98304,
     timeout=36000,
     max_containers=8,
@@ -219,11 +226,13 @@ def run_sglang_query_family(
     run_dir: str,
     ground_truth_collection: str,
     result_name: str = "-sglang",
+    device: str = "h100-sxm",
 ) -> str:
     """Run one query family through the SGLang backend."""
     try:
         return _run_family([("pipelined_sglang",)], result_name, model, sf,
-                           query_ids_csv, run_dir, ground_truth_collection)
+                           query_ids_csv, run_dir, ground_truth_collection,
+                           device=device)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -301,6 +310,8 @@ def run_all(
     gpu_timing: bool = False,
     label_root: str = "",
     canvas_draws: str = "",
+    device: str = "h100-sxm",
+    gpus: int = 1,
 ):
     from quail_b import select_queries
 
@@ -320,6 +331,8 @@ def run_all(
         "sf": sf,
         "attention": attention or None,
         "canvas_draws": canvas_draws or None,
+        "device": device,
+        "gpus": gpus,
         "query_ids": list(query_ids),
         "summaries": {},
         "function_call_ids": {},
@@ -341,7 +354,9 @@ def run_all(
         call_ids = manifest["function_call_ids"]
         for group, family_ids, result_name in _query_groups(query_ids):
             if include_quail or include_baselines or include_dumb_vllm:
-                family_call = run_query_family.spawn(
+                family_call = run_query_family.with_options(
+                    gpu=modal_gpu_type(device, gpus),
+                ).spawn(
                     model=model,
                     sf=sf,
                     query_ids_csv=",".join(family_ids),
@@ -356,6 +371,8 @@ def run_all(
                     gpu_timing=gpu_timing,
                     label_root=label_root,
                     canvas_draws=canvas_draws,
+                    device=device,
+                    gpus=gpus,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -366,13 +383,16 @@ def run_all(
                 )
             if include_sglang:
                 sglang_result_name = f"{result_name}-sglang"
-                sglang_call = run_sglang_query_family.spawn(
+                sglang_call = run_sglang_query_family.with_options(
+                    gpu=modal_gpu_type(device),
+                ).spawn(
                     model=model,
                     sf=sf,
                     query_ids_csv=",".join(family_ids),
                     run_dir=run_dir,
                     ground_truth_collection=ground_truth_collection,
                     result_name=sglang_result_name,
+                    device=device,
                 )
                 sglang_calls.append((group, sglang_call))
                 call_ids[f"{group}:sglang"] = sglang_call.object_id
@@ -518,6 +538,8 @@ def main(
     label_root: str = "",
     finish: str = "",
     canvas_draws: str = "",
+    device: str = "h100-sxm",
+    gpus: int = 1,
 ):
     if finish:
         # finish an earlier run whose orchestrator died
@@ -546,6 +568,8 @@ def main(
         gpu_timing=gpu_timing,
         label_root=label_root,
         canvas_draws=canvas_draws,
+        device=device,
+        gpus=gpus,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)
