@@ -194,8 +194,6 @@ def test_rows_with_one_live_stream_are_decided_together(monkeypatch):
     monkeypatch.setattr(Decoder, "accepted", counting)
     fast = outcome(_setup(monkeypatch)[2])
     assert max(counts) > 0
-    # a verifying readout hands the decoder (accepted, kept rows)
-    assert outcome(_setup(monkeypatch, verify=True)[2]) == fast
     # the adaptive policy changes draft lengths, not answers or spans
     rows, states = outcome(_setup(monkeypatch, policy="adaptive")[2])
     assert rows == fast[0]
@@ -318,28 +316,15 @@ class ScriptedModel:
         return self._cue({}, -9.0, -0.5)
 
 
-def _fake_readout(tables, k, verify=False):
-    """A readout over scripted rows; with verify, it decides rows as the device does."""
+def _fake_readout(tables, k):
+    """A readout over scripted rows."""
     width = 2 + 2 * k
-    value = SimpleNamespace(k=k, width=width, ragged=True, verifies=verify)
+    value = SimpleNamespace(k=k, width=width, ragged=True)
     value.dtype = np.dtype(object)
-    spec = replace(make_spec()[0], max_answer_tokens=10 ** 6)
-    decoder = Decoder(tables, k, width, [True], spec)
 
-    def submit(rows, rows_per_answer=None, expected=None):
+    def submit(rows, rows_per_answer=None):
         values = np.asarray(rows, dtype=np.float32)[:, :width]
-        answers = split_rows(values, rows_per_answer)
-        if expected is None:
-            return answers
-        out = np.empty(len(answers), dtype=object)
-        row = 0
-        for index, own in enumerate(answers):
-            fed = [-1, *expected[row:row + len(own) - 1]]
-            state = AnswerState(written=[-1], live=[object()])
-            accepted = decoder.accepted(state, own, fed)
-            out[index] = (accepted, own[accepted:])
-            row += len(own)
-        return out
+        return split_rows(values, rows_per_answer)
 
     value.submit, value.result = submit, lambda handle: handle
     return value
@@ -362,14 +347,14 @@ GOLD = ["March 3, 2027", "five years", None]
 
 def _setup(monkeypatch, documents=None, token_documents=None,
            share_prefixes=False, document_ids=None, gpu_timing=False,
-           verify=False, policy="fixed"):
+           policy="fixed"):
     """A state, its scripted model, and a node builder for one spec name."""
     spec, tables = make_spec()
     spec = replace(spec, draft_policy=policy, round_cost_per_token=0.05)
     documents = DOCS if documents is None else documents
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
-    readout = _fake_readout(tables, 4, verify=verify)
+    readout = _fake_readout(tables, 4)
     monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     state = _state(model)
     state.loaded_model.vocabulary = tables
@@ -727,59 +712,3 @@ def test_top_logprob_readout_sums_a_group_of_extras():
     assert row[0] == pytest.approx(np.logaddexp(logprobs[0], logprobs[1]))
     assert row[1] == pytest.approx(logprobs[2])
     assert row[2:4] == [0.0, 1.0] and row[4:] == pytest.approx(logprobs[:2])
-
-
-def test_device_verification_matches_the_host_decoder():
-    # the readout decides each row against the token fed after it as
-    # Decoder.accepted does from the full values, and keeps the rows
-    # from the first it did not decide
-    import torch
-
-    from quail.backends.quail.executor.readout import AsyncTopLogprobs
-
-    spec, tables = make_spec()
-    spec = replace(spec, max_answer_tokens=1000)
-    size = len(tables.vocab)
-    generator = torch.Generator().manual_seed(3)
-    head = torch.randn(size, 16, generator=generator)
-    k = 6
-    readout = AsyncTopLogprobs(torch, torch.nn.functional, head, k,
-                               [tables.none_id, tables.stop_ids], ragged=True,
-                               vocabulary=tables)
-    decoder = Decoder(tables, k, readout.width, [True], spec)
-    rng = np.random.default_rng(3)
-    rows_per_answer = rng.integers(1, 9, size=40)
-    fed, expected, normed = [], [], []
-    stops = list(tables.stop_ids)
-    for count in rows_per_answer:
-        # as many fed tokens as rows: the token chosen before the round,
-        # then the draft; the last row has no token to verify
-        tokens = [int(t) for t in rng.integers(0, size, size=count)]
-        fed.append(tokens)
-        expected.extend(tokens[1:] + [-1])
-        for i in range(count):
-            row = torch.randn(16, generator=generator)
-            draw = rng.random()
-            if draw < 0.5 and i + 1 < count:    # the model prefers the fed token
-                row += 4 * head[tokens[i + 1]]
-            elif draw < 0.7:                    # it prefers closing the quote
-                row += 4 * head[stops[0]]
-            normed.append(row)
-    normed = torch.stack(normed)
-    expected = np.asarray(expected, dtype=np.int64)
-    values = readout.values(normed).numpy()
-    counts, kept = readout.verified(normed, rows_per_answer, expected)
-    counts, kept = counts.numpy(), kept.numpy()
-    row = kept_row = 0
-    accepted_rows = 0
-    for index, count in enumerate(rows_per_answer):
-        own = values[row:row + count]
-        answer = AnswerState(written=[fed[index][0]], live=[object()])
-        host = decoder.accepted(answer, own, fed[index])
-        assert counts[index].tolist() == [host, count - host]
-        np.testing.assert_allclose(kept[kept_row:kept_row + count - host],
-                                   own[host:], rtol=1e-5, atol=1e-5)
-        row += count
-        kept_row += count - host
-        accepted_rows += host
-    assert 0 < accepted_rows < len(expected)

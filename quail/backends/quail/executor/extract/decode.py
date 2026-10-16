@@ -131,23 +131,20 @@ class Decoder:
         self.top = int(ids[np.argmax(self.scores[ids])])
         return self.scores, float(values[0]), float(values[1])
 
-    def verify(self, doc: Document, q: int, rows, fed, accepted=None) -> None:
+    def verify(self, doc: Document, q: int, rows, fed) -> None:
         """Choose the answer's tokens from a round's rows, in order.
 
         Row i follows token i of the round's fed tokens, so the token
         chosen from it is written and, when it is not the token fed
         next, the rest of the round is discarded: the next round feeds
-        the chosen token in its place.
+        the chosen token in its place. With one live stream the rows
+        that write the draft are decided together.
 
         Args:
             doc: The document.
             q: The question's index.
-            rows: The readout rows: every row of the round when accepted
-                is None, else the rows from the first the readout did
-                not decide.
+            rows: The readout rows of the round.
             fed: The round's fed tokens.
-            accepted: How many leading rows the readout decided write
-                the token fed after them; None when it decided none.
         """
         answer = doc.answers[q]
         answer.steps += 1
@@ -156,11 +153,10 @@ class Decoder:
         # a draft along one of several live positions tells the policy
         # whether that position was the answer's source
         live = len(answer.live) if answer.written and len(fed) > 1 else 1
-        if accepted is None:
-            accepted = 0
-            if answer.written and len(answer.live) == 1:
-                accepted = self.accepted(answer, rows, fed)
-                rows = rows[accepted:]
+        accepted = 0
+        if answer.written and len(answer.live) == 1:
+            accepted = self.accepted(answer, rows, fed)
+            rows = rows[accepted:]
         if accepted:
             self.observe(q, live, True)
             written = min(accepted, self.spec.max_answer_tokens - len(answer.written))

@@ -49,22 +49,18 @@ class ReadoutGroups:
                 0, self.torch.from_numpy(index).to(normed.device, non_blocking=True))
         return [normed[r] for r in index]
 
-    def submit(self, normed, entries, rows_per_answer, expected=None):
+    def submit(self, normed, entries, rows_per_answer):
         """Submit answer rows to readouts and return handles by readout group.
 
         With one readout for every stage the whole chunk goes in one
         call, in group zero; otherwise each readout's stages' rows go to
-        it in one call, selected with one index. expected, the token
-        fed after each row or -1, goes to the readouts that verify.
+        it in one call, selected with one index.
         """
         if self.shared_readout:
             readout = self.readout_of[0]
             if rows_per_answer is None:
                 return [(0, readout.submit(normed))]
-            verified = ({"expected": expected} if expected is not None
-                        and getattr(readout, "verifies", False) else {})
-            return [(0, readout.submit(normed, rows_per_answer=rows_per_answer,
-                                       **verified))]
+            return [(0, readout.submit(normed, rows_per_answer=rows_per_answer))]
         spans = [[] for _ in self.readout_of]
         counts = [[] for _ in self.readout_of]
         boundaries = (None if rows_per_answer is None else np.cumsum(rows_per_answer))
@@ -89,11 +85,5 @@ class ReadoutGroups:
             else:
                 lengths = counts[key]
                 lengths = lengths[0] if len(lengths) == 1 else np.concatenate(lengths)
-                verified = {}
-                if expected is not None and getattr(readout, "verifies", False):
-                    index = np.concatenate([np.arange(start, end, dtype=np.int64)
-                                            for start, end in spans_key])
-                    verified = {"expected": expected[index]}
-                handles.append((key, readout.submit(
-                    selected, rows_per_answer=lengths, **verified)))
+                handles.append((key, readout.submit(selected, rows_per_answer=lengths)))
         return handles

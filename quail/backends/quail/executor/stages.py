@@ -75,12 +75,6 @@ class Stage:
             tokens, shared by its suffixes or supplied per suffix. None uses
             the pipeline's default canvas.
         canvas_rows: Number of rows in each canvas returned by canvas.
-        verify: Optional callback from document key to whether the
-            readout may decide the document's rows on the device, each
-            against the token fed after it, as a round of an extraction
-            whose draft follows one document position can be. Rows the
-            readout does not decide, and the last row of a request, are
-            read in full.
     """
 
     DROP = DROP
@@ -103,7 +97,6 @@ class Stage:
     canvas: Callable | None = None
     canvas_rows: int = 0
     suffix_tokens: int = 0
-    verify: Callable | None = None
 
     def __post_init__(self):
         if self.own_suffixes:

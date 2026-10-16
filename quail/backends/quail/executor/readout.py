@@ -238,17 +238,11 @@ class AsyncTopLogprobs(_HostReadout):
         ragged: Whether answers have several rows each: submit then
             takes rows_per_answer and result returns one (rows, width)
             array per answer, in an object array.
-        vocabulary: Optional extraction vocabulary (merged ids, stop
-            tokens, the none token). With it, submit takes expected,
-            the token fed after each row or -1, decides on the device
-            which leading rows of each answer write that token, and
-            reads in full only the rows from the first that does not;
-            result then returns (accepted rows, kept values) per answer.
     """
 
     BLOCK_ROWS = AsyncLabelLogprobs.BLOCK_ROWS
 
-    def __init__(self, torch, F, head, k, extras, ragged=False, vocabulary=None):
+    def __init__(self, torch, F, head, k, extras, ragged=False):
         super().__init__(torch)
         self.F = F
         self.head = head
@@ -263,15 +257,6 @@ class AsyncTopLogprobs(_HostReadout):
         self.ragged = ragged
         self.dtype = (np.dtype(object) if ragged
                       else np.dtype((np.float32, (self.width,))))
-        self.verifies = vocabulary is not None
-        if self.verifies:
-            device = head.device
-            self.merged = torch.as_tensor(vocabulary.merged, device=device)
-            self.is_stop = torch.as_tensor(vocabulary.is_stop, device=device)
-            self.stop_ids = torch.tensor(list(vocabulary.stop_ids), device=device,
-                                         dtype=torch.long)
-            self.none_id = int(vocabulary.none_id)
-            self.count_buffers = []
 
     def values(self, normed):
         """Compute each row's values from normalized hidden states."""
@@ -292,104 +277,13 @@ class AsyncTopLogprobs(_HostReadout):
             out[rows, n + self.k:] = top
         return out
 
-    def accepts(self, normed, expected):
-        """Return, per row, whether it writes the token fed after it.
-
-        The rule is Decoder.choose's for a round whose draft follows one
-        document position: the expected token is among the k likeliest,
-        beats the stop, closing the quote after it is not preferred, and
-        the likeliest token stays in the document. Rows with expected
-        -1 are never accepted.
-        """
-        torch = self.torch
-        k = self.k
-        accepted = torch.zeros(normed.shape[0], dtype=torch.bool,
-                               device=normed.device)
-        for start in range(0, normed.shape[0], self.BLOCK_ROWS):
-            block = normed[start:start + self.BLOCK_ROWS]
-            rows = slice(start, start + block.shape[0])
-            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
-            index = torch.arange(block.shape[0], device=normed.device)
-            token = expected[rows]
-            valid = token >= 0
-            token = token.clamp(min=0)
-            merged = self.merged[token]
-            lp_token = logits[index, token]
-            lp_merged = torch.where(merged >= 0, logits[index, merged.clamp(min=0)],
-                                    torch.full_like(lp_token, float("-inf")))
-            lp_top, top = logits.max(dim=1)
-            stop = torch.logsumexp(logits.index_select(1, self.stop_ids), dim=1)
-            within = (logits > lp_token[:, None]).sum(dim=1) < k
-            best = torch.maximum(lp_token, stop)
-            allowed = (top == token) | (top == merged)
-            leaves = ((lp_top > best) & ~allowed & ~self.is_stop[top]
-                      & (top != self.none_id))
-            accepted[rows] = (valid & within & (lp_token > stop)
-                              & ~(lp_merged > best) & ~leaves)
-        return accepted
-
-    def verified(self, normed, rows_per_answer, expected):
-        """Decide the rows on the device; return accepted counts and kept rows.
-
-        Returns:
-            Per answer, how many leading rows write the token fed after
-            them, and how many rows follow them; the full values of
-            those following rows, stacked in answer order.
-        """
-        torch = self.torch
-        device = normed.device
-
-        def upload(values):
-            # a pageable copy would wait for the forward pass to finish
-            host = torch.from_numpy(np.ascontiguousarray(values, dtype=np.int64))
-            if device.type == "cuda":
-                host = host.pin_memory()
-            return host.to(device, non_blocking=True)
-
-        counts = upload(rows_per_answer)
-        accepted = self.accepts(normed, upload(expected))
-        total = normed.shape[0]
-        ends = torch.cumsum(counts, dim=0)
-        starts = ends - counts
-        answer = torch.repeat_interleave(torch.arange(len(counts), device=device),
-                                         counts)
-        row = torch.arange(total, device=device)
-        # a request's last row has expected -1, so every answer has a
-        # first row the device did not decide
-        failing = torch.where(accepted, torch.full_like(row, total), row)
-        first = torch.full_like(counts, total).scatter_reduce(
-            0, answer, failing, reduce="amin")
-        first = torch.minimum(first, ends - 1)
-        kept = row >= first[answer]
-        # selecting the kept rows waits for the decision; the only wait here
-        values = self.values(normed[kept])
-        return torch.stack([first - starts, ends - first], dim=1), values
-
-    def submit(self, normed, rows_per_answer=None, expected=None):
-        if expected is None:
-            return (*self._copy(self.values(normed)), rows_per_answer, None)
-        counts, values = self.verified(normed, rows_per_answer, expected)
-        host = self.count_buffers.pop() if self.count_buffers else None
-        if host is None or host.shape[0] < counts.shape[0]:
-            host = self.torch.empty(counts.shape, dtype=counts.dtype, pin_memory=True)
-        # copied before the values, whose event then covers both
-        host[:counts.shape[0]].copy_(counts, non_blocking=True)
-        return (*self._copy(values), rows_per_answer, (host, counts.shape[0]))
+    def submit(self, normed, rows_per_answer=None):
+        return (*self._copy(self.values(normed)), rows_per_answer)
 
     def result(self, handle):
-        *transfer, rows_per_answer, counts = handle
+        *transfer, rows_per_answer = handle
         values = super().result(transfer)
-        if counts is None:
-            return split_rows(values, rows_per_answer) if self.ragged else values
-        host, n = counts
-        accepted, kept = host[:n].numpy().T.copy()
-        self.count_buffers.append(host)
-        out = np.empty(n, dtype=object)
-        row = 0
-        for index in range(n):
-            out[index] = (int(accepted[index]), values[row:row + int(kept[index])])
-            row += int(kept[index])
-        return out
+        return split_rows(values, rows_per_answer) if self.ragged else values
 
 
 def split_rows(values, rows_per_answer):
