@@ -62,7 +62,7 @@ def emit_extract(builder, alias, live=None):
     """Copy the answers of the alias's documents, after its labels.
 
     A Filter on an extraction's answer or span follows that extraction
-    and keeps the documents the next extraction reads, as a label
+    and drops the documents the next extraction would read, as a label
     filter does after its classification.
     """
     stats = builder.operator_order.statistics.stats
@@ -74,13 +74,13 @@ def emit_extract(builder, alias, live=None):
         for test in builder.operators.label_filters.get(alias, ()):
             live *= effective_selectivity(test.selectivity)
     tests = builder.operators.extract_filters.get(alias, ())
-    shared = False
-    for logical_node in calls:
-        # consecutive extractions of a table run in one pipeline
-        # (quail.physical.pipelines): a document is read once for
-        # all of them; a Filter between two ends the pipeline
+    for index, logical_node in enumerate(calls):
+        # the extractions of a table and the Filters on their answers
+        # run in one pipeline (quail.physical.pipelines): a document
+        # is read once for all of them, and a Filter drops it before
+        # the next question
         spec = extract_spec(builder.context, logical_node.call,
-                            logical_node.name, live, shared=shared)
+                            logical_node.name, live, shared=index > 0)
         node = inference_node(
             AiExtract, spec, (builder.rows_src.get(alias, builder.ids_src[alias]),),
             index=sum(isinstance(n, AiExtract) for n in builder.nodes),
@@ -88,7 +88,6 @@ def emit_extract(builder, alias, live=None):
         builder.nodes.append(node)
         scores = PortRef(node.node_id, "rows")
         builder.ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
-        shared = True
         for test in tests:
             if test.name != logical_node.name:
                 continue
@@ -102,7 +101,6 @@ def emit_extract(builder, alias, live=None):
             scores = PortRef(lid, "rows")
             builder.ids_src[alias] = PortRef(lid, f"ids:{alias}")
             live *= effective_selectivity(test.selectivity)
-            shared = False
         builder.rows_src[alias] = scores
         builder.label_ports.append(scores)
 

@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Mapping
 
 from ..base import PhysicalNode, validate_integer_setting
 from .classify import AiClassify
-from .filter import AiFilter
+from .filter import AiFilter, Filter
 from .inference import AiInference, InferenceSpec
 
 
@@ -130,6 +130,10 @@ class AiExtract(AiInference):
         if isinstance(previous, AiExtract):
             return (previous.spec.same_decoding(self.spec)
                     and previous.document_head == self.document_head)
+        if isinstance(previous, Filter) and isinstance(first, AiExtract):
+            # a test of an earlier extraction's answers; the KV the
+            # pipeline wrote stays
+            return first.document_head == self.document_head
         if not self.spec.shares_head:
             return False
         if isinstance(first, AiClassify):
@@ -139,7 +143,9 @@ class AiExtract(AiInference):
         return isinstance(first, AiFilter)
 
     def can_precede(self, consumer: PhysicalNode) -> bool:
-        return isinstance(consumer, AiExtract)
+        # a Filter on the answers gates the documents the next
+        # extraction reads
+        return isinstance(consumer, (AiExtract, Filter))
 
     def explain_fields(self) -> Mapping[str, Any]:
         return {

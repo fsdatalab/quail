@@ -4,6 +4,7 @@ import time
 from dataclasses import replace
 
 import numpy as np
+import pyarrow as pa
 
 from quail.backends.quail.executor.extract import (
     ExtractionStages,
@@ -131,7 +132,7 @@ class ExtractPart(ExecutionPart):
         Raises:
             ValueError: A document uses a different prompt or token sequence.
         """
-        first = parts[0].node
+        first = parts[0].node if parts else nodes[0]
         head = first.document_head
         part = cls(state, nodes, ids, {
             "documents": context.state["docs"],
@@ -165,6 +166,31 @@ class ExtractPart(ExecutionPart):
     @property
     def appended_tokens(self) -> int:
         return self.extraction.appended_tokens
+
+    @property
+    def tested_columns(self) -> tuple[str, ...]:
+        """The columns a Filter in the pipeline may test."""
+        return tuple(name for node in self.nodes
+                     for name in (node.spec.name, node.spec.span_name))
+
+    def tested_values(self, column: str, positions) -> pa.Array:
+        """Return the answers or spans settled so far at the positions.
+
+        Args:
+            column: An extraction's answer or span column.
+            positions: Positions among the part's documents.
+        """
+        q, span = next(
+            (q, column == node.spec.span_name) for q, node in enumerate(self.nodes)
+            if column in (node.spec.name, node.spec.span_name))
+        answers = [self.extraction.docs[position].answers[q] for position in positions]
+        if not span:
+            return pa.array([answer.answer for answer in answers], pa.string())
+        return pa.array(
+            [None if answer.span is None
+             else {"start": answer.span[0], "end": answer.span[1]}
+             for answer in answers],
+            pa.struct([("start", pa.int32()), ("end", pa.int32())]))
 
     def finish(self, every) -> int:
         """Settle every answer; return the tokens the questions fed."""

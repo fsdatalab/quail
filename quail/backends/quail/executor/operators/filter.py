@@ -1,7 +1,6 @@
 """Execute LLM filters and conditions on classification results."""
 
 import numpy as np
-import pyarrow as pa
 import pyarrow.compute as pc
 
 from quail.backends.quail.executor.parts import (
@@ -96,48 +95,56 @@ class FilterPart(SingleResultPart):
             pack_s=stats.get("pack_s", 0.0))
 
 
-class LabelGate(SingleResultPart):
-    """Pipeline condition that keeps documents with selected categories."""
+class ConditionGate(SingleResultPart):
+    """Pipeline condition that drops documents whose tested value fails.
+
+    The value is a label a ClassifyPart decoded or an answer or span
+    an ExtractPart copied, read as each document's settles; the
+    pipeline then skips the document's later stages and frees its KV.
+    """
 
     stages = ()
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
-        """Bind a label condition to its classification and input rows."""
-        from quail.backends.quail.executor.operators.classify import ClassifyPart
-
+        """Bind a condition to the part computing its column."""
         node = nodes[0]
-        labeled = next(part for part in reversed(parts)
-                       if isinstance(part, ClassifyPart)
-                       and part.node.spec.name == node.column)
-        source = next(part for part in parts
-                      if part.node.node_id == node.inputs[0].source.node_id)
-        return cls(node, labeled, source)
+        source_id = node.inputs[0].source.node_id
+        producer = next(part for part in reversed(parts)
+                        if node.column in getattr(part, "tested_columns", ()))
+        source = next(part for part in reversed(parts)
+                      if any(member.node_id == source_id
+                             for member in getattr(part, "nodes", (part.node,))))
+        return cls(node, producer, source)
 
-    def __init__(self, node, labeled, source):
+    def __init__(self, node, producer, source):
         self.node = node
-        self.labeled = labeled
-        self.source = source
+        self.producer = producer
+        self.source = source  # the part whose rows the Filter reads
         self.position = {document: index
-                         for index, document in enumerate(labeled.ids)}
+                         for index, document in enumerate(producer.ids)}
         self.accepted = {}
 
     def gate(self, key):
-        # labels settle as chunks finish, so each is tested as its
-        # document arrives; the labels are few, so each distinct one
-        # is evaluated once
-        label = self.labeled.plan.labels[self.position[key[1]]]
-        if label not in self.accepted:
-            self.accepted[label] = bool(accepted_rows(evaluate_predicate(
-                pa.array([label], pa.string()), self.node.predicate))[0].as_py())
-        return None if self.accepted[label] else Stage.DROP
+        # values settle as chunks finish, so each is tested as its
+        # document arrives; a repeated value, such as a label, is
+        # evaluated once
+        values = self.producer.tested_values(self.node.column,
+                                             [self.position[key[1]]])
+        value = values[0].as_py()
+        token = tuple(sorted(value.items())) if isinstance(value, dict) else value
+        if token not in self.accepted:
+            self.accepted[token] = bool(accepted_rows(
+                evaluate_predicate(values, self.node.predicate))[0].as_py())
+        return None if self.accepted[token] else Stage.DROP
 
     def finish(self, every):
         return None
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
+        source_id = self.node.inputs[0].source.node_id
         return filter_scores(self.node,
-                             self.source.result_value.outputs["rows"])
+                             self.source.results()[source_id].outputs["rows"])
 
 
 def filter_result(node, answers, tokens, document_ids,

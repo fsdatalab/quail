@@ -715,9 +715,14 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
         "lease.ends_span.start < 20", "length(lease.rent) < 20"]
     assert filters[0].inputs[0].source.node_id == extracts[0].node_id
     assert extracts[1].inputs[0].source.node_id == filters[2].node_id
-    # the three tests on the first field thin the second extraction
+    # the three tests on the first field thin the second extraction,
+    # which runs in the same pipeline over the resident KV
     assert extracts[1].spec.expected_inputs == pytest.approx(2 * 0.5 ** 3)
-    assert extracts[1].inputs[0].source.node_id == filters[2].node_id
+    assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
+    pipelines = build_pipelines(plan.graph)
+    assert [member.node_id for member in pipelines[extracts[0].node_id]] == [
+        extracts[0].node_id, filters[0].node_id, filters[1].node_id,
+        filters[2].node_id, extracts[1].node_id, filters[3].node_id]
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
     assert "Filter: lease.ends ilike '%march%'" in built.explain()

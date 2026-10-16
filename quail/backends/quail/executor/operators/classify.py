@@ -175,6 +175,16 @@ class ClassifyPart(ClassifyBatch):
     def results(self) -> dict:
         return {self.node.node_id: self.result_value}
 
+    @property
+    def tested_columns(self) -> tuple[str, ...]:
+        """The columns a Filter in the pipeline may test."""
+        return (self.node.spec.name,)
+
+    def tested_values(self, column: str, positions) -> pa.Array:
+        """Return the labels decoded so far of the documents at the positions."""
+        return pa.array([self.plan.labels[position] for position in positions],
+                        pa.string())
+
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         spec = self.node.spec
         plan = self.plan

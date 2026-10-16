@@ -690,3 +690,74 @@ def test_top_logprob_readout_sums_a_group_of_extras():
     assert row[0] == pytest.approx(np.logaddexp(logprobs[0], logprobs[1]))
     assert row[1] == pytest.approx(logprobs[2])
     assert row[2:4] == [0.0, 1.0] and row[4:] == pytest.approx(logprobs[:2])
+
+
+def test_a_filter_on_answers_drops_documents_before_the_next_question(
+        monkeypatch):
+    # the second question is asked of the documents whose first answer
+    # passed, over the KV the first question left; the dropped
+    # document is packed once and its KV freed
+    from quail.physical import Condition, Filter
+    from quail.physical.pipelines import build_pipelines
+
+    spec, tables = make_spec()
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
+    for index, text in enumerate(DOCS):
+        model.docs[("c", index)] = text
+        model.gold[("c", index)] = GOLD[index]
+    graph = PhysicalGraph((
+        Scan(node_id="input:c", alias="c", input_id="c"),
+        AiExtract(node_id="ai-extract:ends",
+                  inputs=input_ports((PortRef("input:c", "ids:c"),)),
+                  backend_name="quail", model="qwen3-4b-fp8", spec=spec),
+        Filter(node_id="filter:c:0",
+               inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
+               predicate=Condition("ends", "not like", "five%"),
+               aliases=("c",), written_pos=0),
+        AiExtract(node_id="ai-extract:starts",
+                  inputs=input_ports((PortRef("filter:c:0", "rows"),)),
+                  backend_name="quail", model="qwen3-4b-fp8",
+                  spec=replace(spec, name="starts")),
+        Filter(node_id="filter:c:1",
+               inputs=input_ports((PortRef("ai-extract:starts", "rows"),)),
+               predicate=Condition("starts_span", "<", 40, ("start",)),
+               aliases=("c",), written_pos=1),
+    ), PortRef("filter:c:1", "rows"))
+    assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
+            ] == ["ai-extract:ends", "filter:c:0", "ai-extract:starts", "filter:c:1"]
+    torch, arena = fake_torch(), cpu_arena(256)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    execution = QuailModelExecution(SimpleNamespace())
+    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.loaded_model.vocabulary = tables
+    execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+    execution.bind_query(torch=torch, answer_rows=object(), chunk_tokens=400,
+                         async_answers=object())
+    state = {"gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                                    execution=execution, spec=MODELS["qwen3-4b-fp8"]),
+             "runtimes": built_in_registry().runtimes,
+             "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
+             "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
+             "texts": {"c": list(DOCS)}}
+    report = execute_single_graph(
+        state, {"filter_limit": None, "pre_ids": [], "retention": {}}, graph)
+    outputs = report["_outputs"]
+    first = outputs[PortRef("ai-extract:ends", "rows")].to_pydict()
+    assert first["ends"] == ["March 3, 2027", "five years", None]
+    kept = outputs[PortRef("filter:c:0", "rows")].to_pydict()
+    assert kept["c"] == [0] and kept["ends"] == ["March 3, 2027"]
+    # the second question was asked of the survivor only
+    second = outputs[PortRef("ai-extract:starts", "rows")].to_pydict()
+    assert second == {"c": [0], "starts": ["March 3, 2027"],
+                      "starts_span": [first["ends_span"][0]]}
+    assert first["ends_span"][0] == {"start": 37, "end": 50}
+    assert outputs[PortRef("filter:c:1", "rows")].to_pydict()["c"] == [0]
+    assert outputs[PortRef("filter:c:1", "ids:c")].column("c").to_pylist() == [0]
+    assert dict(model.reads) == {("c", 0): 1, ("c", 1): 1, ("c", 2): 1}
+    metrics = report["node_metrics"]
+    assert metrics["ai-extract:starts"]["evaluated_documents"] == 1
+    assert metrics["filter:c:0"]["output_rows"] == 1
+    assert not arena.accounting.owned
