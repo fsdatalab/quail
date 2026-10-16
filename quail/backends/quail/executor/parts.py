@@ -166,19 +166,17 @@ def gated_stages(parts) -> list:
         implementation.prepare_group(list(group))
     stages = []
     pending = []
-    appended = 0
+    for part in parts[1:]:
+        if part.stages and not part.stages[0].rewind:
+            # an operator's first request follows the document, in
+            # place of whatever the operator before it appended, as
+            # the next question of an extraction does
+            part.stages = [replace(part.stages[0], rewind=True), *part.stages[1:]]
     for part in parts:
         if not part.stages:
             pending.append(part.gate)
             continue
         first = part.stages[0]
-        if appended and not first.rewind:
-            # the part before left its answer tokens after the
-            # document; this part's first request follows the
-            # document, as the next question of an extraction does
-            first = replace(first, rewind=True)
-            part.stages = [first, *part.stages[1:]]
-        appended = part.appended_tokens
         if pending:
             gates = list(pending)
             asked = first.requests

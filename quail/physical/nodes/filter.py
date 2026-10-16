@@ -85,6 +85,10 @@ class Filter(PhysicalNode):
     def document_outputs(self, alias: str) -> tuple[str, ...]:
         return ("rows", f"ids:{alias}")
 
+    def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
+        # a condition reads no KV: it gates the documents of any pipeline
+        return True
+
     @property
     def column(self) -> str:
         """Return the column tested by the predicate."""
@@ -166,11 +170,6 @@ class AiFilter(PhysicalNode):
     @property
     def document_aliases(self) -> tuple[str, ...]:
         return (self.alias,)
-
-    def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
-        # a filter continues any pipeline under the shared head,
-        # rewinding past what the operator before it appended
-        return first.document_head == self.document_head
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:

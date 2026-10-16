@@ -121,8 +121,13 @@ class PhysicalNode:
         return (f"ids:{alias}",)
 
     def can_follow(self, previous: "PhysicalNode", first: "PhysicalNode") -> bool:
-        """Return whether this operator can use the preceding document KV."""
-        return True
+        """Return whether this operator can use the preceding document KV.
+
+        It can when the pipeline shows the documents under this
+        operator's prompt head; the executor rewinds the KV past what
+        the operator before appended.
+        """
+        return first.document_head == self.document_head
 
     def can_precede(self, consumer: "PhysicalNode") -> bool:
         """Return whether a consumer can run before other documents finish."""

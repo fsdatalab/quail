@@ -189,6 +189,10 @@ class Foreign(PhysicalNode):
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
 
+    def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
+        # an apply reads no KV: it gates the documents of any pipeline
+        return True
+
     @property
     def document_aliases(self) -> tuple[str, ...]:
         if self.kind != "per_batch":
