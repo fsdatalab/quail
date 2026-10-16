@@ -51,11 +51,6 @@ class ColumnTest:
     selectivity: Optional[float]
     position: int
 
-    @property
-    def values(self) -> tuple:
-        """The labels a label filter keeps."""
-        return self.condition.value
-
 
 @dataclass(frozen=True)
 class LabelWork:

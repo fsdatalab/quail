@@ -19,7 +19,12 @@ from quail.planner.search.statistics import (
     cached_statistics,
     live_after_filters,
 )
-from quail.planner.search.table_steps import PlanPricing, resident_after, table_steps
+from quail.planner.search.table_steps import (
+    ASK,
+    PlanPricing,
+    resident_after,
+    table_steps,
+)
 from quail.planner.validation import join_input_tokens
 from quail.specs import ModelSpec
 
@@ -59,6 +64,12 @@ def choose_operator_order(plan, operators, model, device, doc_tokens, order,
         plan, statistics, model=model, device=device, rule=rule,
         context=context)
     steps = choose_step_orders(operators, statistics, rule=rule, context=context)
+    # the asks run in their order among the table's steps; the orders
+    # of score predicates, which the steps leave out, stay
+    for alias, table in steps.items():
+        asks = [step.key for step in table if step.kind == ASK]
+        if asks:
+            orders[alias] = asks
 
     live0 = live_after_filters(plan, statistics)
     works = filter_works(plan, statistics, model, orders)
@@ -175,8 +186,7 @@ def choose_step_orders(operators: Operators, statistics: PlanStatistics, *,
     The steps are ordered together by order_filters_indexed, each priced
     as resident or afresh by the step before it (table_steps). With
     rule "as_written", the asks keep their written order and the
-    classifications and extractions follow them. Without a planning
-    context, only the asks are ordered.
+    classifications and extractions follow them.
 
     Args:
         operators: The plan's operators.
@@ -184,8 +194,6 @@ def choose_step_orders(operators: Operators, statistics: PlanStatistics, *,
         rule: "by_cost" or "as_written".
         context: The planning context, which prices the steps.
     """
-    if context is None:
-        return {}
     orders = {}
     for scan in operators.scans:
         steps = table_steps(operators, scan.alias, statistics.asks.get(scan.alias, ()),

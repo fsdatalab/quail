@@ -400,13 +400,14 @@ class Search:
         for test in self.label_filters.get(alias, ()):
             if test.call != call:
                 continue
-            accepted = set(test.values)
+            accepted = set(test.condition.value)
             passed = [row for row in live
                       if self.label(call.prompt, {alias: row}) in accepted]
             stages.append(_stage(
                 LABEL_IN, alias, call.prompt.template, test.position,
                 0, test.selectivity, live, passed, Work(),
-                name=self.labels.names[call], accepted=list(test.values)))
+                name=self.labels.names[call],
+                accepted=list(test.condition.value)))
             live = passed
         return live, stage_work
 

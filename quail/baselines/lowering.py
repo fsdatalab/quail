@@ -86,7 +86,7 @@ def lower_classifications(context, operators,
                 tuple(context.tokenizer(label_text(label)))
                 for label in call.labels),
             tests=tuple(
-                (test.position, test.values)
+                (test.position, test.condition.value)
                 for test in operators.label_filters.get(alias, ())
                 if test.call == call),
             option_offsets=(_option_offsets(call.prompt, context.tokenizer)
