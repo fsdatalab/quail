@@ -167,8 +167,22 @@ def python_api_query(session):
     )
 
 
+# LIMIT stops the pipeline once five documents pass every test; the
+# whole-line answers come from trim off
+LIMITED_QUERY = f"""
+    SELECT t.id,
+           AI.EXTRACT(t.trace, {{'command': '{LAST_COMMAND}'}},
+                      {{'trim': false}}) AS last
+    FROM traces t
+    WHERE AI_FILTER(PROMPT('{_prompt(AGENT_RECOVERED)}', t.trace),
+                    {{'selectivity': 0.3}})
+      AND HINT(last.command LIKE '%python%', {{'selectivity': 0.5}})
+    LIMIT 5
+"""
+
 QUERIES = {
     "fix_python_file": (FIX_PYTHON_FILE_QUERY, None),
+    "limited": (LIMITED_QUERY, None),
     "changed_code_with_error": (CHANGED_CODE_WITH_ERROR_QUERY, None),
     "command_regex": (COMMAND_REGEX_QUERY, None),
     "many_operators": (MANY_OPERATORS_QUERY, None),
