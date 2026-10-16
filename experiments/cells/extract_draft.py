@@ -4,7 +4,8 @@ Runs one QUAIL-B extraction query in a fresh process with the plan's
 draft_tokens replaced. The timed runs record every forward pass: its
 tokens, answer rows, documents prefilled, resident KV tokens, and GPU
 milliseconds; --sweep alternates draft lengths between timed runs on
-one GPU. Optional profiled runs sum GPU time by kernel name. The logged
+one GPU. Optional profiled runs sum GPU time by kernel name
+(--kernel-runs) or host time by function (--host-runs). The logged
 run, which is not timed, records every round: the live streams, up to
 16 of their continuations, and what the round accepted, so other draft
 lengths and draft choices can be replayed on the CPU. The record is
@@ -17,7 +18,9 @@ saved to /results/ablations/extract_draft/.
 of a QUAIL-B query; the table's parquet must already be on the volume.
 """
 
+import cProfile
 import json
+import pstats
 import sys
 import time
 from dataclasses import replace
@@ -59,14 +62,29 @@ def _set_draft(draft_tokens: int) -> dict:
 
 
 class Passes:
-    """GPU time, tokens, rows, prefills, and resident KV of each forward pass."""
+    """GPU time, tokens, rows, prefills, and resident KV of each forward pass.
+
+    Also the host seconds spent in each executor step: packing a chunk,
+    launching the forward pass, submitting the readout, deciding
+    answers, and choosing the next chunk.
+    """
+
+    STEPS = ("pack", "forward", "submit", "decide", "next_chunk")
 
     def __init__(self, torch):
+        import quail.backends.quail.executor.chunk as chunk
+        import quail.backends.quail.executor.readout_groups as readout_groups
         import quail.backends.quail.executor.stage_executor as stage_executor
+        from quail.backends.quail.executor import admission
 
         self.torch = torch
         self.active = False
         self.entries = []
+        self.host = dict.fromkeys(self.STEPS, 0.0)
+        self._wrap(chunk, "pack_chunk", "pack")
+        self._wrap(readout_groups.ReadoutGroups, "submit", "submit")
+        self._wrap(stage_executor.StageExecutor, "_report_next", "decide")
+        self._wrap(admission.JoinAdmission, "next_chunk", "next_chunk")
         forward = stage_executor.forward_chunk
         passes = self
 
@@ -84,12 +102,28 @@ class Passes:
                 return forward(pipeline, arena, chunk)
             finally:
                 end.record()
+                passes.host["forward"] += time.perf_counter() - began
                 passes.entries.append((began, start, end, facts))
 
         stage_executor.forward_chunk = timed
 
+    def _wrap(self, owner, name, step):
+        original = getattr(owner, name)
+        passes = self
+
+        def timed(*args, **kwargs):
+            began = time.perf_counter()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                if passes.active:
+                    passes.host[step] += time.perf_counter() - began
+
+        setattr(owner, name, timed)
+
     def start(self):
         self.entries = []
+        self.host = dict.fromkeys(self.STEPS, 0.0)
         self.torch.cuda.synchronize()
         self.started = time.perf_counter()
         self.active = True
@@ -103,6 +137,7 @@ class Passes:
                 for began, start, end, facts in self.entries]
         return {"window_s": round(window, 4),
                 "gpu_s": round(sum(row[1] for row in rows) / 1e3, 4),
+                "host_s": {step: round(value, 3) for step, value in self.host.items()},
                 # host start ms, GPU ms, tokens, answer rows, documents
                 # prefilled, resident KV tokens before the pass
                 "passes": rows}
@@ -177,6 +212,20 @@ class Rounds:
                 "settled": self.settled}
 
 
+def _host_totals(profiler, top: int = 60) -> dict:
+    """Return the host functions with the most own time and the most total time."""
+    stats = pstats.Stats(profiler)
+
+    def ranked(key):
+        rows = sorted(stats.stats.items(), key=lambda item: -item[1][key])[:top]
+        # file:line(function), calls, own seconds, total seconds
+        return [[f"{path.split('/root/')[-1]}:{line}({name})", calls,
+                 round(own, 3), round(total, 3)]
+                for (path, line, name), (_, calls, own, total, _) in rows]
+
+    return {"by_own_s": ranked(2), "by_total_s": ranked(3)}
+
+
 def _kernel_totals(profiler) -> list:
     """Return [kernel name, GPU ms, launches], most GPU time first."""
     from torch.autograd import DeviceType
@@ -244,12 +293,17 @@ def child(arguments: str) -> None:
         drafts = args.get("sweep") or [args["draft_tokens"]]
         modes = ([("timed", d) for _ in range(args["timed_runs"]) for d in drafts]
                  + [("kernels", args["draft_tokens"])] * args["kernel_runs"]
+                 + [("host", args["draft_tokens"])] * args.get("host_runs", 0)
                  + [("logged", args["draft_tokens"])])
         for mode, draft in modes:
             setting["draft_tokens"] = draft
             profiler = None
             if mode == "timed":
+                before = torch.cuda.memory_stats()
                 passes.start()
+            elif mode == "host":
+                profiler = cProfile.Profile()
+                profiler.enable()
             elif mode == "kernels":
                 profiler = torch.profiler.profile(
                     activities=[torch.profiler.ProfilerActivity.CUDA])
@@ -260,6 +314,15 @@ def child(arguments: str) -> None:
             run = {"mode": mode, "draft_tokens": draft}
             if mode == "timed":
                 run["passes"] = passes.stop()
+                after = torch.cuda.memory_stats()
+                # a cudaMalloc retry flushes the cache and waits for every stream
+                run["allocator"] = {
+                    name: after.get(name, 0) - before.get(name, 0)
+                    for name in ("num_alloc_retries", "num_sync_all_streams",
+                                 "num_device_alloc", "num_device_free")}
+            elif mode == "host":
+                profiler.disable()
+                run["host"] = _host_totals(profiler)
             elif mode == "kernels":
                 torch.cuda.synchronize()
                 profiler.__exit__(None, None, None)
@@ -311,7 +374,8 @@ def measure_draft(arguments: str) -> str:
 @app.local_entrypoint()
 def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
             draft_tokens: int = 16, timed_runs: int = 2, kernel_runs: int = 0,
-            sweep: str = "", sql: str = "", table: str = "", tag: str = "draft"):
+            host_runs: int = 0, sweep: str = "", sql: str = "", table: str = "",
+            tag: str = "draft"):
     collection = ""
     if sql:
         # an ad hoc query over a table ensure_data already wrote
@@ -324,6 +388,7 @@ def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
                                 sql=sql, table=table,
                                 model=model, draft_tokens=draft_tokens,
                                 timed_runs=timed_runs, kernel_runs=kernel_runs,
+                                host_runs=host_runs,
                                 sweep=[int(d) for d in sweep.split(",") if d],
                                 tag=tag))
     call = measure_draft.spawn(arguments)

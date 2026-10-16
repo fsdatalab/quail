@@ -517,6 +517,12 @@ class StageExecutor:
             self.spans.append((by_stage, chunk.tokens, e0, e1))
         for key in chunk.fresh_keys:
             self.arena.trim_window(key)
+        # the earlier passes' readouts finished before this forward pass
+        # started, so their answers are decided while the GPU runs it;
+        # a readout of many rows launches enough kernels to fill the
+        # launch queue, and a host blocked there could not decide them
+        while self.outstanding:
+            self._report_next()
         handles = self.readouts.submit(normed, entries, chunk.rows_per_answer)
         self.outstanding.append(PendingAnswers(part, handles))
 
