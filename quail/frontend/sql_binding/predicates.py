@@ -90,6 +90,26 @@ def _operand(node) -> tuple[exp.Expression, str | None] | None:
     return None
 
 
+def unwrap_hint(term) -> tuple:
+    """Split ``SELECTIVITY(test, fraction)`` into the test and its hint.
+
+    Returns:
+        (term, selectivity), with None for a term without the hint.
+
+    Raises:
+        CompileError: The hint's fraction is not a number.
+    """
+    if not (isinstance(term, exp.Anonymous)
+            and str(term.this).upper() == "SELECTIVITY"):
+        return term, None
+    if len(term.expressions) != 2:
+        raise CompileError("SELECTIVITY takes a test and the fraction it keeps")
+    inner, fraction = term.expressions
+    if not isinstance(fraction, exp.Literal) or fraction.is_string:
+        raise CompileError("SELECTIVITY's fraction must be a number")
+    return inner, float(fraction.this)
+
+
 def parse_plain_test(term, dialect: str) -> PlainTest | None:
     """Parse one WHERE or ON term as a test of a column against literals.
 
@@ -216,8 +236,8 @@ def extract_test(b, test: PlainTest, selected: dict) -> tuple | None:
     or as the repeated call with ``.field``.
 
     Returns:
-        (alias, RegularPredicate, selectivity), or None when the test
-        reads no extraction.
+        (alias, RegularPredicate), or None when the test reads no
+        extraction.
 
     Raises:
         CompileError: The struct name is both a table alias and an AS
@@ -274,6 +294,4 @@ def extract_test(b, test: PlainTest, selected: dict) -> tuple | None:
         predicate.validate()
     else:
         predicate.validate_text_column()
-    options = b.parse_extract_options(
-        call.expressions[2] if len(call.expressions) == 3 else None)
-    return alias, predicate, options.get("selectivity")
+    return alias, predicate

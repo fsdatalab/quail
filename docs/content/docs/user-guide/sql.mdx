@@ -372,7 +372,6 @@ Pass an object as the third argument, such as `{'trim': false}`.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `trim` | `true` | When `true`, each answer is the fewest words that answer the question. When `false`, each answer is the whole line that contains it. |
-| `selectivity` | `0.2` | Estimated fraction of documents each `WHERE` test on the call's fields keeps. |
 
 ### Answer positions
 
@@ -395,11 +394,10 @@ mentions 2027:
 
 ```sql
 SELECT c.id,
-       AI.EXTRACT(c.text, {'end_date': 'When does the lease end?'},
-                  {'selectivity': 0.4}) AS lease
+       AI.EXTRACT(c.text, {'end_date': 'When does the lease end?'}) AS lease
 FROM contracts c
-WHERE lease.end_date IS NOT NULL
-  AND lease.end_date LIKE '%2027%';
+WHERE SELECTIVITY(lease.end_date IS NOT NULL, 0.9)
+  AND SELECTIVITY(lease.end_date LIKE '%2027%', 0.4);
 ```
 
 A field is tested with the conditions of [WHERE and ON](#where-and-on):
@@ -407,9 +405,13 @@ the comparisons, `IN`, `IS [NOT] NULL`, the text tests, and `LENGTH()`.
 A null answer fails every test but `IS NULL`. A span field is tested
 by its `start` or `end`: `lease_span.end_date.start < 500` keeps the
 answers that begin in the first 500 characters. Repeating the call
-with the field works too: `AI.EXTRACT(...).end_date IS NOT NULL`. The
-`selectivity` option estimates the fraction of documents the tests on
-the call keep; it does not change which pass.
+with the field works too: `AI.EXTRACT(...).end_date IS NOT NULL`.
+
+`SELECTIVITY(test, fraction)` estimates the fraction of documents a
+test on a label or an answer keeps, 0.2 without it; it does not change
+which pass. It wraps a test of an `AI.CLASSIFY` label the same way,
+`SELECTIVITY(sentiment IN ('negative', 'mixed'), 0.3)`, and then
+overrides the call's `selectivity` option.
 
 The planner orders a table's `AI.IF` conditions, its classifications
 with their label tests, and its extractions with their answer tests

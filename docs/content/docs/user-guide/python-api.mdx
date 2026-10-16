@@ -136,8 +136,8 @@ the extraction runs once for the test and the returned column:
 query = (
     session.docs("contracts").alias("c")
     .ai_extract("c.text", {"end_date": "When does the lease end?"}, name="lease")
-    .where(col("lease.end_date").is_not_null().hint(0.9),
-           col("lease.end_date").like("%2027%").hint(0.4))
+    .where(col("lease.end_date").is_not_null().hint(0.9)
+           & col("lease.end_date").like("%2027%").hint(0.4))
     .select("c.id", "lease")
 )
 ```
@@ -236,10 +236,10 @@ result = query.collect()
 
 ### where
 
-`where(*tests)`
+`where(test)`, also `filter(test)`
 
-Keep rows that satisfy all the given conditions. Use `col("name")` to
-refer to a column in a condition.
+Keep rows that satisfy the condition. Use `col("name")` to refer to a
+column, and `&` to combine conditions, as in PySpark.
 
 | Condition | Syntax |
 | --- | --- |
@@ -256,12 +256,11 @@ refer to a column in a condition.
 for nulls rather than comparing with `None`. `~` before a text test
 negates it.
 
-Several tests are combined with AND. A column can also be a label
-from `ai_classify()` (`col("sentiment").isin([...])`) or a field from
-`ai_extract()` (`col("lease.end_date").is_not_null()`). Such a test
-runs right after the call that computes the column, and
-`.hint(selectivity)` on the test estimates the fraction of documents
-it keeps, 0.2 without one.
+A column can also be a label from `ai_classify()`
+(`col("sentiment").isin([...])`) or a field from `ai_extract()`
+(`col("lease.end_date").is_not_null()`). Such a test runs right after
+the call that computes the column, and `.hint(selectivity)` on the
+test estimates the fraction of documents it keeps, 0.2 without one.
 
 E.g., the following query returns the IDs of reviews from 2024 with at
 least four stars that mention shipping:
@@ -269,7 +268,7 @@ least four stars that mention shipping:
 ```python
 query = (
     session.docs("reviews").alias("r")
-    .where(col("r.year") == 2024, col("r.stars") >= 4)
+    .where((col("r.year") == 2024) & (col("r.stars") >= 4))
     .ai_if(prompt('Does the review mention shipping?\n\n{0}', col("r.body")))
     .select("r.id")
 )

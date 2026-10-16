@@ -165,6 +165,28 @@ class PredicateSpec:
         """``col(...).like(...).hint(0.4)``: the fraction of documents kept."""
         return PredicateSpec(self.col, self.comparison, self.value, selectivity)
 
+    def __and__(self, other) -> "AndSpec":
+        return AndSpec((self,)) & other
+
+    def tests(self) -> tuple:
+        """The tests combined with AND: this one."""
+        return (self,)
+
+
+@dataclass(frozen=True)
+class AndSpec:
+    """Tests combined with AND: ``(col("a") > 1) & col("b").is_null()``."""
+    parts: tuple
+
+    def __and__(self, other) -> "AndSpec":
+        if not isinstance(other, (PredicateSpec, AndSpec)):
+            raise TypeError(f"& combines tests of columns, got {other!r}")
+        return AndSpec((*self.parts, *other.tests()))
+
+    def tests(self) -> tuple:
+        """The tests combined with AND, in written order."""
+        return self.parts
+
 
 @dataclass(frozen=True)
 class PromptSpec:

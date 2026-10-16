@@ -6,6 +6,7 @@ from typing import Optional
 from quail.catalog import Catalog
 from quail.frontend.expressions import (
     AggSpec,
+    AndSpec,
     ColSpec,
     EqualsSpec,
     HavingSpec,
@@ -550,7 +551,7 @@ class Query:
         return self
 
     def where(self, *tests) -> "Query":
-        """Keep the rows that pass every test of a column against literals.
+        """Keep the rows that pass the tests of columns against literals.
 
         A test of a source column runs at the scan, before any model
         call. A test of a label from ai_classify() or of an answer from
@@ -567,47 +568,60 @@ class Query:
                 ``col(...).like(...)``, ``col(...).ilike(...)``,
                 ``col(...).contains(...)``, ``col(...).startswith(...)``,
                 ``col(...).endswith(...)``, ``col(...).rlike(...)``, or
-                ``~`` before a text test, combined with AND.
+                ``~`` before a text test, combined with ``&``; several
+                arguments are combined the same way.
                 ``col("lease.end_date")`` names an extraction's field,
                 ``col("lease_span.end_date").field("start")`` its
                 span's start, and ``col(...).length()`` the number of
                 characters.
         """
-        for test in tests:
-            if not isinstance(test, PredicateSpec):
+        for group in tests:
+            if not isinstance(group, (PredicateSpec, AndSpec)):
                 raise CompileError(
-                    f"where() takes regular predicates such as col('r.year') > "
-                    f"2020, got {test!r}")
-            spec = test.col
-            if spec.alias is None and spec.column in self._labels:
-                if test.comparison not in ("=", "in"):
-                    raise CompileError(
-                        f"a label is tested with == or isin(), got {test.comparison}")
-                values = test.value if test.comparison == "in" else (test.value,)
-                self.label_in(spec.column, values, test.selectivity)
-                continue
-            extracted = self._extract_column(spec)
-            if extracted is not None:
-                predicate = RegularPredicate(
-                    extracted, test.comparison, test.value, spec.path, spec.function)
-                if spec.path:
-                    predicate.validate()
-                else:
-                    predicate.validate_text_column()
-                self._extract_filters.setdefault(extracted.alias, []).append(
-                    (predicate, test.selectivity))
-                continue
-            if spec.path:
-                raise CompileError(
-                    f"{spec.alias}.{spec.column} has no fields; only an "
-                    f"extraction's span does, such as "
-                    f"col('lease{SPAN_SUFFIX}.end_date').field('start')")
-            ref = self._resolve(spec)
-            predicate = RegularPredicate(ref, test.comparison, test.value,
-                                         function=spec.function)
-            predicate.validate()
-            self._regular_predicates.setdefault(ref.alias, []).append(predicate)
+                    f"where() takes tests such as col('r.year') > 2020, "
+                    f"combined with &, got {group!r}")
+            for test in group.tests():
+                self._where_test(test)
         return self
+
+    filter = where
+
+    def _where_test(self, test: PredicateSpec) -> None:
+        """Route one test to the scan, a label filter, or an answer filter."""
+        spec = test.col
+        if spec.alias is None and spec.column in self._labels:
+            if test.comparison not in ("=", "in"):
+                raise CompileError(
+                    f"a label is tested with == or isin(), got {test.comparison}")
+            values = test.value if test.comparison == "in" else (test.value,)
+            self.label_in(spec.column, values, test.selectivity)
+            return
+        extracted = self._extract_column(spec)
+        if extracted is not None:
+            predicate = RegularPredicate(
+                extracted, test.comparison, test.value, spec.path, spec.function)
+            if spec.path:
+                predicate.validate()
+            else:
+                predicate.validate_text_column()
+            self._extract_filters.setdefault(extracted.alias, []).append(
+                (predicate, test.selectivity))
+            return
+        if spec.path:
+            raise CompileError(
+                f"{spec.alias}.{spec.column} has no fields; only an "
+                f"extraction's span does, such as "
+                f"col('lease{SPAN_SUFFIX}.end_date').field('start')")
+        if test.selectivity is not None:
+            raise CompileError(
+                f"a hint estimates a test of a label or an answer; "
+                f"{spec.alias}.{spec.column} is a source column, tested at "
+                f"the scan")
+        ref = self._resolve(spec)
+        predicate = RegularPredicate(ref, test.comparison, test.value,
+                                     function=spec.function)
+        predicate.validate()
+        self._regular_predicates.setdefault(ref.alias, []).append(predicate)
 
     def _extract_column(self, spec: ColSpec) -> Optional[ColumnRef]:
         """Resolve a col() naming an extraction's answer or span, or None.

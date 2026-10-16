@@ -18,6 +18,7 @@ from quail.frontend.sql_binding.predicates import (
     bind_plain_test,
     extract_test,
     parse_plain_test,
+    unwrap_hint,
 )
 from quail.logical import (
     Alias,
@@ -200,12 +201,23 @@ def _name_select_labels(b: ExpressionBinder, term, selected: dict):
     return term
 
 
-def _bind_plain_term(b: ExpressionBinder, term, selected: dict) -> bool:
+def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
+                     selectivity: float | None) -> bool:
     """Bind a test of a source column or of an AI.EXTRACT field.
+
+    Args:
+        b: The binder.
+        term: The term.
+        selected: The AI calls in SELECT, by AS name.
+        selectivity: The term's SELECTIVITY hint, or None.
 
     Returns:
         Whether the term was a plain test; False leaves an AI term to
         its binder.
+
+    Raises:
+        CompileError: A test of a source column carries a hint; the
+            scan applies it before any model call, so it has no cost.
     """
     if _has_ai_call(term):
         return False
@@ -214,9 +226,13 @@ def _bind_plain_term(b: ExpressionBinder, term, selected: dict) -> bool:
         return False
     found = extract_test(b, test, selected)
     if found is not None:
-        alias, predicate, selectivity = found
+        alias, predicate = found
         b.extract_tests.setdefault(alias, []).append((predicate, selectivity))
     else:
+        if selectivity is not None:
+            raise CompileError(
+                f"SELECTIVITY hints a test of a label or an answer; "
+                f"{term.sql()} tests a source column, applied at the scan")
         plain = bind_plain_test(b, test)
         b.regular_predicates.setdefault(plain.column.alias, []).append(plain)
     return True
@@ -227,8 +243,9 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
     where = tree.args.get("where")
     selected = ai_aliases(tree)
     for term in _conjuncts(where.this) if where else []:
+        term, hint = unwrap_hint(term)
         term = _name_select_labels(b, term, selected)
-        if _bind_plain_term(b, term, selected):
+        if _bind_plain_term(b, term, selected, hint):
             continue
         anti = False
         node = term
@@ -258,7 +275,8 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
             if len(set(accepted)) != len(accepted):
                 raise CompileError("a filter on a label lists a label twice")
             b.label_tests.setdefault(aliases[0], []).append(
-                (call, tuple(accepted), options.get("selectivity"))
+                (call, tuple(accepted),
+                 options.get("selectivity") if hint is None else hint)
             )
             continue
         if any(isinstance(call, exp.AIClassify) for call in term.walk()):

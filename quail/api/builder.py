@@ -74,6 +74,8 @@ class BoundBuilder:
         self._inner.where(*tests)
         return self
 
+    filter = where
+
     def limit(self, n):
         self._inner.limit(n)
         return self

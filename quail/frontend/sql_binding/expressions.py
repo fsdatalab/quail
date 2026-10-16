@@ -328,7 +328,7 @@ class ExpressionBinder:
             node: SQLGlot Struct expression, or None for no options.
 
         Returns:
-            A dictionary with the supplied trim and selectivity values.
+            A dictionary with the supplied trim value.
 
         Raises:
             CompileError: The object is malformed, a key is unknown, or a
@@ -350,14 +350,10 @@ class ExpressionBinder:
                 if not isinstance(value, exp.Boolean):
                     raise CompileError(f"{key} is true or false")
                 out[key] = bool(value.this)
-            elif key == "selectivity":
-                if not (isinstance(value, exp.Literal) and not value.is_string):
-                    raise CompileError("selectivity must be a number")
-                out[key] = float(value.this)
             else:
                 raise CompileError(
-                    f"unknown AI.EXTRACT option {key!r}; the options are "
-                    f"trim and selectivity")
+                    f"unknown AI.EXTRACT option {key!r}; the one option is "
+                    f"trim")
         return out
 
     def bind_ai_value(self, node: exp.Expression) -> ModelCall:

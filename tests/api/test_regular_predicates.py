@@ -127,7 +127,7 @@ def test_sql_and_builder_bind_regular_predicates(session):
         with pytest.raises(CompileError, match=fragment):
             session.sql(f"SELECT r.id FROM reviews r WHERE {sql} AND "
                         f"AI_FILTER(PROMPT('q: {{0}}', r.review))")
-    with pytest.raises(CompileError, match="regular predicates"):
+    with pytest.raises(CompileError, match="takes tests"):
         session.docs("reviews").alias("r").where("r.stars > 3")
     # a plain test in ON restricts the joined table
     session.register("products", quail.DocumentProvider.from_table(pa.table({

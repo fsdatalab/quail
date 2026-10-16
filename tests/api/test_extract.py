@@ -675,19 +675,17 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     built = (session.docs("contracts").alias("c")
              .ai_extract("c.text", {"ends": QUESTION, "rent": "How much?"},
                          name="lease")
-             .where(quail.col("lease.ends").is_not_null().hint(0.5),
-                    quail.col("lease.ends").ilike("%march%").hint(0.5))
-             .where((quail.col("lease_span.ends").field("start") < 20).hint(0.5))
+             .where(quail.col("lease.ends").is_not_null().hint(0.5)
+                    & quail.col("lease.ends").ilike("%march%").hint(0.5))
+             .filter((quail.col("lease_span.ends").field("start") < 20).hint(0.5))
              .where((quail.col("lease.rent").length() < 20).hint(0.5))
              .select("c.id", "lease"))
+    tests = " AND ".join(f"SELECTIVITY({test}, 0.5)" for test in (
+        "lease.ends IS NOT NULL", "lease.ends ILIKE '%march%'",
+        "lease_span.ends.start < 20", "LENGTH(lease.rent) < 20"))
     written = sql(
         f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
-        f"'rent': 'How much?'}}, {{'selectivity': 0.5}}) AS lease "
-        f"FROM contracts c WHERE lease.ends IS NOT NULL "
-        f"AND lease.ends ILIKE '%march%' AND lease_span.ends.start < 20 "
-        f"AND LENGTH(lease.rent) < 20")
-    # the builder's hint is per test; SQL's option applies to every
-    # test of the call
+        f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE {tests}")
     assert written.logical == built.logical
     # each test follows its field's extraction; the span and length
     # tests use the same Filter node
@@ -807,6 +805,9 @@ def test_filters_on_answers_bind_in_both_dialects_and_refuse_bad_tests(session):
             (f"SELECT c.id, AI.EXTRACT(c.text, {fields}) AS c FROM contracts c "
              f"WHERE c.ends IS NOT NULL", "both a table alias"),
             (head + "WHERE c.text BETWEEN 'a' AND 'b'", "not supported"),
+            (head + "WHERE SELECTIVITY(c.id = 1, 0.5)", "tests a source column"),
+            (head + "WHERE SELECTIVITY(lease.ends IS NULL)", "takes a test"),
+            (head + "WHERE SELECTIVITY(lease.ends IS NULL, 'x')", "must be a number"),
             (head + "WHERE NOT c.text = 'a'", "NOT is supported as")):
         with pytest.raises(CompileError, match=message):
             sql(bad)
@@ -818,6 +819,10 @@ def test_filters_on_answers_bind_in_both_dialects_and_refuse_bad_tests(session):
         builder.where(quail.col("c.text").field("x") == "a")
     with pytest.raises(CompileError, match="does not return"):
         builder.where(quail.col("lease.ends").is_null()).select("c.id")
+    with pytest.raises(CompileError, match="source column"):
+        builder.where((quail.col("c.id") == 1).hint(0.5))
+    with pytest.raises(TypeError, match="combines tests"):
+        (quail.col("c.id") == 1) & 3
     # the speed of light estimate keeps the documents whose reference
     # answer passes, and does not price a span test
     tested = (session.docs("contracts").alias("c")

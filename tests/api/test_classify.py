@@ -1328,12 +1328,14 @@ def test_a_label_in_where_names_the_classification_by_its_as_name(session):
         f"WHERE {call} IN ('refund', 'shipping')")
     assert named.logical == repeated.logical
     equal = session.sql(
-        f"SELECT d.id, {call} AS topic FROM documents d WHERE topic = 'refund'")
+        f"SELECT d.id, {call} AS topic FROM documents d "
+        f"WHERE SELECTIVITY(topic = 'refund', 0.3)")
     assert str(equal.logical.root.input.condition) == "d.topic IN ('refund')"
+    assert equal.logical.root.input.selectivity == 0.3
     builder = (session.docs("documents").alias("d")
                .ai_classify(quail.prompt("What is {0} about?", quail.col("d.body")),
                             ["refund", "shipping", "praise"], name="topic")
-               .where(quail.col("topic") == "refund"))
+               .where((quail.col("topic") == "refund").hint(0.3)))
     assert builder.select("d.id", "topic").logical == equal.logical
     with pytest.raises(CompileError, match="== or isin"):
         builder.where(quail.col("topic").like("re%"))
