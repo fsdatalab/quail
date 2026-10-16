@@ -78,7 +78,7 @@ compute rates. Quail represents it with `DeviceSpec`.
 | `hbm_bw` | GPU memory bandwidth in bytes per second. |
 | `peak_flops` | Peak dense FP8 operations per second. |
 | `bf16_flops` | Peak dense BF16 operations per second. |
-| `sustained_fp8_flops` | Optional. The FP8 GEMM rate the GPU holds at its power limit, measured. The cost model prices dense projections at this rate when it is set, and at `peak_flops` otherwise. |
+| `sustained_fp8_flops` | Optional. The highest FP8 GEMM rate measured on the GPU (mamf-finder's MAMF). The cost model prices dense projections at this rate when it is set, and at `peak_flops` otherwise. |
 | `sustained_hbm_bw` | Optional. The device-to-device copy bandwidth, measured, in bytes per second. The cost model prices memory traffic at this rate when it is set, and at `hbm_bw` otherwise. |
 | `attention_rates` | Optional. Measured attention rates as `((query heads, KV heads, head dimension), AttentionRates)` entries. `AttentionRates` holds the causal rate by document length and the cached-read rate by query rows and context length, in operations per second. A model whose head layout has an entry prices attention from it; others use `bf16_flops`. |
 
@@ -121,9 +121,10 @@ modal volume get quail-results calibrate/h100-sxm .
 uv run python -m calibrate.to_spec h100-sxm
 ```
 
-The last command prints `sustained_fp8_flops`, `sustained_hbm_bw`, and
-one `AttentionRates` table per head layout, to paste into the
-specification. A new GPU needs an entry in `calibrate/targets.py` naming its
+The last command prints `sustained_fp8_flops`, to paste into the
+specification. With `--attention` it also prints the measured copy
+bandwidth and one `AttentionRates` table per head layout, as comments;
+the H100 specification does not use them yet. A new GPU needs an entry in `calibrate/targets.py` naming its
 Modal GPU type and FlashInfer architecture.
 
 Register a new specification with `registry.register_device(spec)`.

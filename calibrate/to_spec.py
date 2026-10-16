@@ -6,15 +6,14 @@ any number of GPUs. For example, after a Modal run:
     modal volume get quail-results calibrate/h100-sxm .
     uv run python -m calibrate.to_spec h100-sxm
 
-Each rate is the highest steady rate over the GPUs measured, so the
-speed-of-light estimate stays a lower bound on every GPU of the type:
+sustained_fp8_flops is the best MAMF of any mamf-finder run, so the
+speed-of-light estimate stays a lower bound on every GPU of the type.
 
-- sustained_fp8_flops is the best MSMF of any mamf-finder run.
-- sustained_hbm_bw is the best copy bandwidth.
-- each attention point is the faster library's rate.
-
-A point without a steady measurement on any GPU is an error; smoke
-summaries are skipped.
+With --attention it also prints, as comments, the best copy bandwidth
+and one attention table per head layout: at each point the faster
+library's highest steady rate over the GPUs. The device specifications
+do not use these yet. A point without a steady measurement on any GPU
+is an error; smoke summaries are skipped.
 """
 
 from __future__ import annotations
@@ -56,15 +55,15 @@ def gpu_id(summary: dict) -> str:
     return summary.get("gpu", {}).get("uuid") or summary["stamp"]
 
 
-def best_msmf(summary: dict) -> float:
-    """Return the best MSMF of one GEMM summary's runs, in TFLOPS."""
-    return max((run["msmf"]["tflops"] for run in summary["runs"].values()
-                if run.get("msmf")), default=0.0)
+def best_mamf(summary: dict) -> float:
+    """Return the best MAMF of one GEMM summary's runs, in TFLOPS."""
+    return max((run["mamf"]["tflops"] for run in summary["runs"].values()
+                if run.get("mamf")), default=0.0)
 
 
 def sustained_fp8_flops(gemm: list[dict]) -> float:
-    """Return the best MSMF over every GEMM summary, in FLOP/s."""
-    return max(best_msmf(s) for s in gemm) * 1e12
+    """Return the best MAMF over every GEMM summary, in FLOP/s."""
+    return max(best_mamf(s) for s in gemm) * 1e12
 
 
 def _key(row: dict) -> tuple:
@@ -201,21 +200,20 @@ def table_text(heads: tuple, summaries: list[dict]) -> str:
         f")\n")
 
 
-def spec_text(gemm: list[dict], attention: list[dict]) -> str:
-    """Return the DeviceSpec fields and one attention table per layout."""
-    layouts = by_layout(attention)
-    tables = "\n".join(table_text(heads, s) for heads, s in layouts.items())
-    entries = ", ".join(
-        f"(({', '.join(map(str, h))}), ATTENTION_{'_'.join(map(str, h))})"
-        for h in layouts)
-    msmf = ", ".join(f"{best_msmf(s):.0f}" for s in gemm)
-    return (
-        f"{tables}\n"
-        f"    sustained_fp8_flops={sustained_fp8_flops(gemm):.4g},"
-        f"  # best MSMF over {len({gpu_id(s) for s in gemm})} GPUs: {msmf}\n"
-        f"    sustained_hbm_bw={sustained_hbm_bw(attention):.4g},"
-        f"  # best 4 GB copy, held 2 s\n"
-        f"    attention_rates=({entries},),\n")
+def spec_text(gemm: list[dict]) -> str:
+    """Return the DeviceSpec's sustained_fp8_flops field."""
+    mamf = ", ".join(f"{best_mamf(s):.0f}" for s in gemm)
+    return (f"    sustained_fp8_flops={sustained_fp8_flops(gemm):.4g},"
+            f"  # best MAMF over {len({gpu_id(s) for s in gemm})} GPUs: {mamf}\n")
+
+
+def attention_text(attention: list[dict]) -> str:
+    """Return the copy bandwidth and one attention table per layout, commented."""
+    tables = "\n".join(table_text(heads, s)
+                       for heads, s in by_layout(attention).items())
+    lines = [f"sustained_hbm_bw={sustained_hbm_bw(attention):.4g}"
+             f"  # best 4 GB copy, held 2 s", "", *tables.splitlines()]
+    return "".join(f"# {line}\n" if line else "#\n" for line in lines)
 
 
 def main(argv=None) -> None:
@@ -223,9 +221,13 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("paths", nargs="+", type=Path,
                         help="summary.json files or directories holding them")
+    parser.add_argument("--attention", action="store_true",
+                        help="also print the measured copy and attention rates")
     args = parser.parse_args(argv)
     gemm, attention = load(args.paths)
-    print(spec_text(gemm, attention))
+    print(spec_text(gemm))
+    if args.attention:
+        print(attention_text(attention))
 
 
 if __name__ == "__main__":

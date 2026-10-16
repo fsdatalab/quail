@@ -6,8 +6,10 @@ The `calibrate` package measures three rates of a GPU:
 - the attention rate, with [`attention.py`](attention.py);
 - the memory bandwidth, with [`attention.py`](attention.py).
 
-A GEMM is a matrix multiply. The Quail cost model uses these three
-rates to estimate the time of a query.
+A GEMM is a matrix multiply. The Quail cost model uses only the GEMM
+rate. It uses the specification rates for attention and memory
+bandwidth. The attention rates change with the call size, the library,
+and the input data, so we do not use them yet.
 
 The package uses vendor libraries (cuBLAS, FlashAttention 3, and
 FlashInfer). It does not use the Quail kernels. Changes to the Quail
@@ -21,9 +23,8 @@ In this document, a "measurement" is one execution of `gemm.py` or
 
 ## GEMM rate: gemm.py
 
-[`gemm.py`](gemm.py) finds the highest fp8 GEMM rate that the GPU
-holds at full power. The cost model uses this rate as
-`sustained_fp8_flops`.
+[`gemm.py`](gemm.py) finds the highest fp8 GEMM rates of the GPU. The
+cost model uses the MAMF as `sustained_fp8_flops`.
 
 ### Software that gemm.py uses
 
@@ -52,8 +53,8 @@ mamf-finder gives two rates:
 At full power, the GPU decreases its clock to stay below its power
 limit. For this reason, MSMF is lower than MAMF.
 
-The cost model uses MSMF. A query holds the GPU at full power for
-seconds or minutes.
+The cost model uses MAMF. The SoL estimate must be a lower bound on
+the query time, so it uses the highest rate that a GEMM gets.
 
 For example, for the H100 SXM:
 
@@ -169,15 +170,17 @@ The published MSMF is 1,358 TFLOPS. Six of the eight GPUs are between
 1,315 and 1,357 TFLOPS. Two GPUs are near 1,430 TFLOPS. The NVIDIA
 driver version does not show the difference.
 
-`quail/specs/h100_sxm.py` uses the highest MSMF, 1,431 TFLOPS. With
+The MAMF is between 1,500 and 1,629 TFLOPS.
+`quail/specs/h100_sxm.py` uses the highest MAMF, 1,629 TFLOPS. With
 this rate, the SoL estimate is a lower bound on each GPU in the table.
 
 ## Attention rate and memory bandwidth: attention.py
 
 [`attention.py`](attention.py) measures FlashAttention 3 and FlashInfer
 in bf16, for one head layout. A head layout is three numbers: the
-query heads, the KV heads, and the head dimension. The device
-specification has one table of attention rates for each head layout.
+query heads, the KV heads, and the head dimension. `to_spec.py
+--attention` prints one table of attention rates for each head layout.
+The device specifications do not use these tables yet.
 
 ### Calls that attention.py measures
 
@@ -272,18 +275,19 @@ The results go to `<root>/<device>/attention/<stamp>/summary.json`.
 ## Make the device specification: to_spec.py
 
 [`to_spec.py`](to_spec.py) reads the GEMM summaries and the attention
-summaries of all the GPUs. For each field, it uses the highest steady
-rate of all the GPUs. For this reason, the SoL estimate stays a lower bound on each
-GPU of the type.
+summaries of all the GPUs. It uses the highest rate of all the GPUs.
+For this reason, the SoL estimate stays a lower bound on each GPU of
+the type.
 
-| Field | Value |
-|---|---|
-| `sustained_fp8_flops` | The highest MSMF of all the mamf-finder calls |
-| `sustained_hbm_bw` | The highest steady bandwidth of the copy |
-| `attention_rates` | One table for each head layout: at each point, the highest steady rate of the faster library |
+| Output | Value | In the device specification |
+|---|---|---|
+| `sustained_fp8_flops` | The highest MAMF of all the mamf-finder calls | Yes |
+| `sustained_hbm_bw` | The highest steady bandwidth of the copy, with `--attention` | No |
+| `attention_rates` | One table for each head layout, with `--attention`: at each point, the highest steady rate of the faster library | No |
 
-If a point has no steady rate on any GPU, `to_spec.py` stops with an
-error. Measure that point again. `to_spec.py` does not use smoke
+`to_spec.py` writes the outputs that are not in the specification as
+comments. If a point has no steady rate on any GPU, `to_spec.py
+--attention` stops with an error. Measure that point again. `to_spec.py` does not use smoke
 results or the `size` points. It writes the `size` points as comments.
 
 1. If the summaries are on Modal, copy them from the volume:

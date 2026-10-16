@@ -17,6 +17,7 @@ from quail.specs import (
     QWEN3_4B_FP8,
     QWEN3_32B_FP8,
     RTX_PRO_6000_BLACKWELL_SERVER,
+    AttentionRates,
 )
 
 
@@ -59,11 +60,28 @@ def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
         budgets.arena_pages(DIFFUSION_GEMMA_26B_FP8, small)
 
 
+# calibrate's 32/8/128 H100 table, which the H100 spec does not use
+RATES_32_8_128 = AttentionRates(
+    causal_tokens=(128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768),
+    causal=(106.6e12, 193.2e12, 301.9e12, 416.8e12, 510.1e12, 588.7e12,
+            635.5e12, 663.4e12, 675.7e12),
+    read_rows=(16, 32, 64, 128, 256, 512, 1024),
+    read_contexts=(1024, 4096, 8192, 32768),
+    read=((168.0e12, 185.6e12, 188.4e12, 163.3e12),
+          (309.9e12, 361.8e12, 372.5e12, 322.3e12),
+          (415.3e12, 484.4e12, 497.7e12, 421.9e12),
+          (441.7e12, 527.1e12, 530.0e12, 526.8e12),
+          (451.6e12, 542.8e12, 561.4e12, 537.8e12),
+          (492.1e12, 561.6e12, 578.7e12, 583.7e12),
+          (496.2e12, 567.9e12, 580.1e12, 585.7e12)),
+)
+MEASURED = replace(H100_SXM, attention_rates=(((32, 8, 128), RATES_32_8_128),))
+
+
 def test_measured_attention_rates_interpolate_and_fall_below_the_table():
-    rates = H100_SXM.attention_rates_for(32, 8, 128)
-    assert H100_SXM.attention_rates_for(64, 8, 128) is not None
-    assert H100_SXM.attention_rates_for(16, 8, 256) is None
-    assert RTX_PRO_6000_BLACKWELL_SERVER.attention_rates_for(32, 8, 128) is None
+    rates = MEASURED.attention_rates_for(32, 8, 128)
+    assert MEASURED.attention_rates_for(16, 8, 128) is None
+    assert H100_SXM.attention_rates_for(32, 8, 128) is None
     # measured points, halfway in log length, and held past the longest
     assert rates.causal_rate(1024) == 416.8e12
     assert rates.causal_rate((1024 * 2048) ** 0.5) == pytest.approx(
@@ -81,19 +99,19 @@ def test_measured_attention_rates_interpolate_and_fall_below_the_table():
 def test_attention_prices_at_measured_rates_for_the_measured_layout():
     work = scan(1024, 0) * 10 + ask(8192, 64) * 5
     full, _ = attention_pair_flops(QWEN3_4B_FP8)
-    rates = H100_SXM.attention_rates_for(32, 8, 128)
+    rates = RATES_32_8_128
     causal = 10 * triangle(1024) + 5 * triangle(64)
     length = 2 * causal / (10 * 1024 + 5 * 64) - 1
-    attention = dense_decoder_components(work, QWEN3_4B_FP8, 1, H100_SXM)[2]
+    attention = dense_decoder_components(work, QWEN3_4B_FP8, 1, MEASURED)[2]
     assert attention.compute_seconds == pytest.approx(
         full * causal / rates.causal_rate(length)
         + full * 5 * 64 * 8192 / rates.read_rate(64, 8192))
     # without a device, or without a table for the layout, the flops
     # price at the bf16 peak
     assert dense_decoder_components(work, QWEN3_4B_FP8, 1)[2].compute_seconds is None
-    no_table = RTX_PRO_6000_BLACKWELL_SERVER
-    assert dense_decoder_components(
-        work, QWEN3_32B_FP8, 1, no_table)[2].compute_seconds is None
+    for no_table in (H100_SXM, RTX_PRO_6000_BLACKWELL_SERVER):
+        assert dense_decoder_components(
+            work, QWEN3_32B_FP8, 1, no_table)[2].compute_seconds is None
 
 
 def test_reads_count_one_per_prefix_read_however_many_suffixes_stack():

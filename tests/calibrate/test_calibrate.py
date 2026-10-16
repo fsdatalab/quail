@@ -12,6 +12,7 @@ from calibrate.targets import TARGETS, call_sizes, gemm_shapes, head_layouts
 from calibrate.timing import Window, window_stats
 from calibrate.to_spec import (
     attention_rates,
+    attention_text,
     load,
     spec_text,
     sustained_fp8_flops,
@@ -208,18 +209,18 @@ def test_spec_text_combines_gpus_and_skips_smoke(tmp_path):
         (tmp_path / name).mkdir()
         (tmp_path / name / "summary.json").write_text(json.dumps(summary))
     gemm_runs = [{"stamp": "g0", "gpu": {"uuid": "a"}, "runs": {
-        "published_fp8": {"msmf": {"tflops": 1352}},
-        "search": {"msmf": None}}},
+        "published_fp8": {"mamf": {"tflops": 1543}},
+        "search": {"mamf": None}}},
         {"stamp": "g1", "gpu": {"uuid": "b"}, "runs": {
-            "published_fp8": {"msmf": {"tflops": 1429}}}}]
+            "published_fp8": {"mamf": {"tflops": 1629}}}}]
     for i, summary in enumerate(gemm_runs):
         (tmp_path / f"g{i}").mkdir()
         (tmp_path / f"g{i}" / "summary.json").write_text(json.dumps(summary))
     gemm_summaries, attention = load([tmp_path])
     assert len(gemm_summaries) == 2 and len(attention) == 2
-    assert sustained_fp8_flops(gemm_summaries) == 1429e12
-    text = spec_text(gemm_summaries, attention)
-    assert "sustained_fp8_flops=1.429e+15" in text
+    assert sustained_fp8_flops(gemm_summaries) == 1629e12
+    assert "sustained_fp8_flops=1.629e+15" in spec_text(gemm_summaries)
+    text = attention_text(attention)
     assert "over 2 GPUs" in text and "spread up to 9.1%" in text
-    assert "attention_rates=(((32, 8, 128), ATTENTION_32_8_128),)" in text
+    assert "# ATTENTION_32_8_128 = AttentionRates(" in text
     assert "('packed', 1024) at 0.5 of the call: 330 TFLOPS" in text
