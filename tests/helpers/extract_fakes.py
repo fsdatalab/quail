@@ -100,7 +100,7 @@ def make_spec(*extra):
         arguments=(("c", "text"),), expected_inputs=3, estimated_seconds=0.0,
         prompt_token_parts=(tuple(tables.encode_ids(HEAD)),
                             tuple(tables.encode_ids(TAIL))),
-        question=QUESTION), tables
+        question=QUESTION, draft_tokens=16, draft_policy="fixed"), tables
 
 
 def squeezed(text: str) -> tuple:

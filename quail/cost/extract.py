@@ -79,7 +79,7 @@ class ExtractCost:
 def document_work(length: int, head_tokens: int, tail_tokens: int, *,
                   window: int = 0, resident: bool = False,
                   shared: int = 0, max_answer_tokens: int, draft_tokens: int,
-                  draft_policy: str = "fixed", round_cost_per_token: float = 0.0,
+                  draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
                   assumptions: ExtractAssumptions | None = None,
                   ) -> tuple[Work, float, float]:
     """Return one document's work, its fed tokens, and its readout rows.
@@ -133,7 +133,7 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
 def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
              chunk: int, model, device, resident: bool = False,
              shared=None, max_answer_tokens: int, draft_tokens: int,
-             draft_policy: str = "fixed", round_cost_per_token: float = 0.0,
+             draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
              workers: int = 1,
              assumptions: ExtractAssumptions | None = None) -> ExtractCost:
     """Estimate the cost of one extraction over a table.

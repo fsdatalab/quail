@@ -18,7 +18,7 @@ CHUNK = 10000
 def _cost(lengths, **kwargs):
     options = dict(chunk=CHUNK, model=QWEN3_4B_FP8, device=H100_SXM,
                    max_answer_tokens=ExtractSpec.max_answer_tokens,
-                   draft_tokens=ExtractSpec.draft_tokens)
+                   draft_tokens=16, draft_policy="fixed")
     options.update(kwargs)
     live = options.pop("live", len(lengths))
     return estimate(live, lengths, HEAD, TAIL, **options)
@@ -27,7 +27,7 @@ def _cost(lengths, **kwargs):
 
 def _document(length, **kwargs):
     options = dict(max_answer_tokens=ExtractSpec.max_answer_tokens,
-                   draft_tokens=ExtractSpec.draft_tokens)
+                   draft_tokens=16, draft_policy="fixed")
     options.update(kwargs)
     return document_work(length, HEAD, TAIL, **options)
 
@@ -62,9 +62,8 @@ def test_expected_rounds_follow_the_answer_length_curve():
 def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     work, fed, rows = _document(100)
     context = HEAD + 100 + TAIL
-    round_tokens = 1 + ExtractSpec.draft_tokens
-    rounds = ExtractAssumptions().rounds(ExtractSpec.max_answer_tokens,
-                                         ExtractSpec.draft_tokens)
+    round_tokens = 1 + 16
+    rounds = ExtractAssumptions().rounds(ExtractSpec.max_answer_tokens, 16)
     answer = _rounds_work(context, round_tokens, rounds)
     assert work == scan(HEAD + 100, TAIL) + answer
     assert fed == pytest.approx(TAIL + rounds * round_tokens)
@@ -103,7 +102,7 @@ def test_cost_uses_plan_limits_and_separate_answer_assumptions():
     assert capped.work == scan(HEAD + 100, TAIL)
     windowed, _, _ = document_work(
         100, HEAD, TAIL, window=128, max_answer_tokens=8, draft_tokens=3,
-        assumptions=assumptions)
+        draft_policy="fixed", assumptions=assumptions)
     assert windowed.sliding_kv_read == pytest.approx(rounds * 127)
 
 
@@ -114,7 +113,7 @@ def test_adaptive_policy_drafts_longer_for_longer_documents():
     per_token = 0.02
     long, long_fed, _ = _document(8000, draft_tokens=63, draft_policy="adaptive",
                                   round_cost_per_token=per_token)
-    fixed, fixed_fed, _ = _document(8000, draft_tokens=4)
+    fixed, fixed_fed, _ = _document(8000, draft_tokens=4, draft_policy="fixed")
     assert long.kv_read < fixed.kv_read
     short, short_fed, _ = _document(400, draft_tokens=63, draft_policy="adaptive",
                                     round_cost_per_token=per_token)

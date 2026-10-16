@@ -23,10 +23,10 @@ class ExtractSpec(InferenceSpec):
         max_answer_tokens: Maximum tokens in an extracted answer.
         draft_tokens: Source tokens to verify after each chosen token;
             the most per round under the adaptive policy.
-        draft_policy: "fixed" feeds draft_tokens every round; "adaptive"
-            picks each round's draft length from the round's KV read
-            and the answer-length curve, and feeds none while several
-            document positions fit the answer.
+        draft_policy: "adaptive" picks each round's draft length from
+            the round's KV read, the answer-length curve, and the odds
+            that the position followed is the answer's source; "fixed"
+            feeds draft_tokens every round.
         expected_answer_tokens: The planner's guess at the mean answer
             length, the seed of the adaptive policy's answer-length curve.
         round_cost_per_token: One document token's KV read per round,
@@ -43,8 +43,8 @@ class ExtractSpec(InferenceSpec):
     question: str = ""
     shares_head: bool = False
     max_answer_tokens: int = 64
-    draft_tokens: int = 16
-    draft_policy: str = "fixed"
+    draft_tokens: int = 63
+    draft_policy: str = "adaptive"
     expected_answer_tokens: int = 16
     round_cost_per_token: float = 0.0
     top_tokens: int = 1024
