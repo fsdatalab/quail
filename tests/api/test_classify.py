@@ -737,16 +737,19 @@ def test_streamed_classifications_share_one_pipeline(session):
             split.plan().graph)[topic.node_id]) == (
         topic.node_id, "filter:d:0", "filter:d:1", kind.node_id)
 
+    # a later test on a label runs right after its classification, so
+    # the next classification reads fewer documents
     interleaved = _classify_then_filter(session, later_filters=(
         ("kind", ("complaint",)), ("topic", ("refund",))))
     assert tuple(
         member.node_id for member in build_pipelines(
             interleaved.plan().graph)[topic.node_id]) == (
-        topic.node_id, "filter:d:0", kind.node_id, "filter:d:1", "filter:d:2")
+        topic.node_id, "filter:d:0", "filter:d:2", kind.node_id, "filter:d:1")
     scorer = _Labels(["shipping", "praise"])
     result = _finish(interleaved, session, scorer)
     assert result.collect().num_rows == 0
-    assert scorer.calls == [("topic", [[0], [1]]), ("kind", [[0]])]
+    # the second test on topic drops the last document before kind
+    assert scorer.calls == [("topic", [[0], [1]])]
 
 
 def test_classify_refusals_and_builder_errors(session):

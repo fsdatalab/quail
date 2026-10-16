@@ -19,12 +19,22 @@ def default_order_rule(filters, joins) -> tuple[str, str]:
     return "by_cost", "default: by cost"
 
 
-def order_filters_indexed(predicates, rule: str, *, count: float = 1):
+def order_filters_indexed(predicates, rule: str, *, count: float = 1,
+                          resident=None):
     """Choose an order using costs at each expected survivor count.
 
     Try each first predicate, then rank remaining predicates by their
     cost per expected rejection. A computed reuse key costs no more model
     work. Written order breaks ties; as_written bypasses the search.
+
+    Args:
+        predicates: Each with first and later costs at a live count, a
+            selectivity, and a reuse key.
+        rule: "by_cost" or "as_written".
+        count: The documents the first predicate reads.
+        resident: resident(previous, predicate) -> whether the predicate
+            reads the KV the predicate before it left; None reads it
+            resident after any predicate.
     """
     indices = list(range(len(predicates)))
     if rule == "as_written" or len(indices) < 2:
@@ -38,6 +48,10 @@ def order_filters_indexed(predicates, rule: str, *, count: float = 1):
             costs[key] = (p.first if first else p.later)(live)
         return costs[key]
 
+    def fresh(previous, i) -> bool:
+        return resident is not None and not resident(
+            predicates[previous], predicates[i])
+
     candidates = []
     for first in indices:
         ordered = [first]
@@ -46,12 +60,13 @@ def order_filters_indexed(predicates, rule: str, *, count: float = 1):
         scored = ({predicates[first].reuse_key}
                   if predicates[first].reuse_key is not None else set())
         remaining = [i for i in indices if i != first]
+        previous = first
         while remaining:
             choices = []
             for i in remaining:
                 p = predicates[i]
                 seconds = (0.0 if p.reuse_key in scored else
-                           cost(i, live if live > 0 else 1.0, False))
+                           cost(i, live if live > 0 else 1.0, fresh(previous, i)))
                 rejected = 1.0 - p.selectivity
                 rank = (seconds / rejected if rejected > 0 else
                         0.0 if seconds == 0 else float("inf"))
@@ -59,6 +74,7 @@ def order_filters_indexed(predicates, rule: str, *, count: float = 1):
             _, selected, seconds = min(choices)
             total += seconds
             ordered.append(selected)
+            previous = selected
             live *= predicates[selected].selectivity
             if predicates[selected].reuse_key is not None:
                 scored.add(predicates[selected].reuse_key)

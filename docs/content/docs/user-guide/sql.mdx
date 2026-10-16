@@ -411,9 +411,15 @@ with the field works too: `AI.EXTRACT(...).end_date IS NOT NULL`. The
 `selectivity` option estimates the fraction of documents the tests on
 the call keep; it does not change which pass.
 
-The tests run after the table's `AI.IF` and `AI.CLASSIFY` conditions,
-so an extraction reads only the documents those kept, and a test on
-one field keeps the documents a later field is extracted from.
+The planner orders a table's `AI.IF` conditions, its classifications
+with their label tests, and its extractions with their answer tests
+together, by estimated cost per rejected document. An extraction costs
+more than an `AI.IF`, so it usually runs after the `AI.IF` and
+`AI.CLASSIFY` conditions, over the documents they kept; a test that
+rejects most documents can move its extraction first. A test on one
+field keeps the documents a later field is extracted from. Pass
+`order="as_written"` to `session.sql()` or `select()` to keep the
+written order.
 
 These limits apply:
 

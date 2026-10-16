@@ -72,23 +72,36 @@ def filter_alias_work(preds, stats, order, pre: int, lowered,
         pre + stats.mean_doc_tokens, float(stats.n_docs), window)
 
 
-def emit_filter(builder, alias):
-    """Append the alias's AI filters in their chosen order."""
+def emit_filter(builder, alias, positions=None, live=None, followed=False):
+    """Append a run of the alias's AI filters in their chosen order.
+
+    Args:
+        builder: The graph builder.
+        alias: The table.
+        positions: The written positions to emit, in run order; None
+            emits every ask in the chosen order.
+        live: The documents the run reads; None reads the table.
+        followed: Whether a classification or an extraction continues
+            the run's pipeline, so the filters write the documents' KV.
+    """
     stats = builder.operator_order.statistics.stats
     orders = builder.operator_order.filter_orders
-    n = stats[alias].n_docs
-    surv = 1.0
-    for rank, i in enumerate(orders[alias]):
+    if positions is None:
+        positions = orders[alias]
+    surv = stats[alias].n_docs if live is None else live
+    for i in positions:
         p = builder.operators.filters[alias][i]
-        fid = f"ai_filter:{alias}" if rank == 0 else f"ai_filter:{alias}:{i}"
+        fid = (f"ai_filter:{alias}" if i == orders[alias][0]
+               else f"ai_filter:{alias}:{i}")
         builder.nodes.append(AiFilter(
             node_id=fid, inputs=input_ports((builder.ids_src[alias],)), alias=alias,
             written_pos=i,
             question_tokens=question_tokens(
                 builder.context.lowered(p.prompt), builder.model.canvas_tokens),
             preamble_tokens=builder.context.lowered(p.prompt).preamble_tokens,
-            selectivity=p.selectivity, expected_docs=round(n * surv, 1),
-            arena_writes=len(orders[alias]) > 1 or alias in builder.pipelined,
+            selectivity=p.selectivity, expected_docs=round(surv, 1),
+            arena_writes=(len(orders[alias]) > 1 or followed
+                          or alias in builder.pipelined),
             stop_key=builder.stop_keys.get(alias, ())))
         surv *= effective_selectivity(p.selectivity)
         builder.ids_src[alias] = PortRef(fid, f"ids:{alias}")

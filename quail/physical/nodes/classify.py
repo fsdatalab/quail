@@ -117,6 +117,10 @@ class AiClassify(AiInference):
     def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
         if isinstance(previous, AiJoin):
             return self.classifies_join(previous)
+        if first.type_name == "quail.ai_extract":
+            # an extraction's pipeline holds extractions and their
+            # filters only
+            return False
         if isinstance(first, AiClassify):
             return (self.spec.partner is None
                     and self.document_head == first.document_head)

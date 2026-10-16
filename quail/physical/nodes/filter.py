@@ -167,6 +167,11 @@ class AiFilter(PhysicalNode):
     def document_aliases(self) -> tuple[str, ...]:
         return (self.alias,)
 
+    def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
+        # a filter continues a filter sequence only: after a
+        # classification or an extraction it reads the documents again
+        return isinstance(previous, AiFilter)
+
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         return (

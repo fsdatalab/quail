@@ -5,22 +5,28 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass
+from functools import partial
+from operator import mul
 from typing import Callable, Mapping
 
 import pyarrow as pa
 
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
 from quail.catalog.selection import accepted_rows, evaluate_predicate
+from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan
-from quail.logical import oriented_join_conditions
+from quail.logical import effective_selectivity, oriented_join_conditions
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.search.leftdeep import search_left_deep
 from quail.planner.search.live_rows import PairRelation, exact_live_rows
 from quail.planner.search.statistics import filter_stop_keys
+from quail.planner.search.table_steps import ASK, TableStep, resident_after
+from quail.planner.search.table_steps import CLASSIFY as CLASSIFY_STEP
+from quail.planner.search.table_steps import EXTRACT as EXTRACT_STEP
 from quail.planner.sol.prefixes import document_shared_tokens, subset_shared_tokens
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -270,12 +276,11 @@ class Search:
     def run_filters(self):
         """Apply each alias's filters and classifications with exact answers.
 
-        The AI.IF filters run first in the planner's order. Then each
-        classification runs once over the live documents, followed by
-        the label filters that test it, in written order; the
-        classifications no label filter tests follow. An alias whose
-        filters carry a stop key reads only each key's shortest
-        survivor, or every document of a key with none.
+        The AI.IF asks, the classifications with the label filters that
+        test them, and the extractions with the tests of their answers
+        run in the planner's order, by cost per rejected document. An
+        alias whose filters carry a stop key reads only each key's
+        shortest survivor, or every document of a key with none.
 
         Returns:
             (survivors by alias, work, stage records).
@@ -298,89 +303,128 @@ class Search:
                 continue
             tokens = self.aliases[alias].tokens
             mean_tokens = sum(tokens) / len(tokens) if tokens else 0
-            order = [asks[index] for index in order_filters_indexed(
-                prepare_filter_costs(
-                    [predicates[position] for position in asks],
-                    prefix_tokens=self.pre + mean_tokens,
-                    model=self.model, device=self.device,
-                    chunk_tokens=self.chunk_tokens, lower=self.lower),
-                rule)] if asks else []
+            steps = self.table_steps(alias, predicates, asks, calls, extracts,
+                                     self.pre + mean_tokens)
+            ordered = [steps[index] for index in order_filters_indexed(
+                steps, rule, count=len(survivors[alias]), resident=resident_after)]
             live = survivors[alias]
             reached = None
-            if order and alias in self.stop_groups:
+            if alias in self.stop_groups and all(
+                    step.kind == ASK for step in ordered):
+                order = [step.key for step in ordered]
                 reached = self.stop_key_rows(alias, live, order, predicates)
                 if self.credit_shared:
                     # a skipped document computes no prefix for another
                     self.aliases[alias].shared = subset_shared_tokens(
                         self.stores[alias], reached[0])
-            first = True
-            for index, written_pos in enumerate(order):
+            previous = None
+            for index, step in enumerate(ordered):
                 if reached is not None:
                     live = reached[index]
-                predicate = predicates[written_pos]
-                stage_work = self.question_work(
-                    alias, live, self.lower(predicate.prompt).tail_tokens, first)
-                first = False
+                # a step reads the documents afresh unless the step
+                # before it left their KV in the pipeline
+                first = previous is None or not resident_after(previous, step)
+                previous = step
+                if step.kind == ASK:
+                    live, stage_work = self.ask_stage(
+                        alias, predicates[step.key], step.key, live, first, stages)
+                elif step.kind == CLASSIFY_STEP:
+                    live, stage_work = self.classify_stage(
+                        alias, step.key, live, first, stages)
+                else:
+                    live, stage_work = self.extract_stage(
+                        alias, step.key, live, first, stages)
                 work = work + stage_work
-                passed = [
-                    row for row in live
-                    if self.answer(predicate.prompt, {alias: row})
-                ]
-                stages.append(_stage(
-                    FILTER, alias, predicate.prompt.template, written_pos,
-                    self.lower(predicate.prompt).tail_tokens, predicate.selectivity,
-                    live, passed, stage_work))
-                live = passed
-            steps = [(test.call, test)
-                     for test in self.label_filters.get(alias, ())]
-            steps.extend((call, None) for call in calls
-                         if call not in self.labels.tests)
-            classified = set()
-            for call, test in steps:
-                if call not in classified:
-                    stage_work = self.question_work(
-                        alias, live, self.lower(call.prompt).tail_tokens, first)
-                    first = False
-                    work = work + stage_work
-                    stages.append(_stage(
-                        CLASSIFY, alias, call.prompt.template, None,
-                        self.lower(call.prompt).tail_tokens, None, live, live,
-                        stage_work, name=self.labels.names[call]))
-                    classified.add(call)
-                if test is not None:
-                    accepted = set(test.values)
-                    passed = [
-                        row for row in live
-                        if self.label(call.prompt, {alias: row}) in accepted
-                    ]
-                    stages.append(_stage(
-                        LABEL_IN, alias, call.prompt.template, test.position,
-                        0, test.selectivity, live, passed, Work(),
-                        name=self.labels.names[call],
-                        accepted=list(test.values)))
-                    live = passed
-            # an extraction follows the labels; a test of its answers
-            # keeps the documents the next extraction reads
-            for node in extracts:
-                stage_work = self.question_work(
-                    alias, live, self.lower(node.call.prompt).tail_tokens, first)
-                first = False
-                work = work + stage_work
-                stages.append(_stage(
-                    EXTRACT, alias, node.call.prompt.template, None,
-                    self.lower(node.call.prompt).tail_tokens, None, live, live,
-                    stage_work, name=node.name))
-                for test in self.extract_filters.get(alias, ()):
-                    if test.name != node.name:
-                        continue
-                    passed = self.answer_survivors(node, test.condition, live)
-                    stages.append(_stage(
-                        ANSWER_TEST, alias, node.call.prompt.template,
-                        test.position, 0, test.selectivity, live, passed, Work(),
-                        name=node.name, condition=str(test.condition)))
-                    live = passed
             survivors[alias] = live
         return survivors, work, stages
+
+    def table_steps(self, alias, predicates, asks, calls, extracts,
+                    prefix_tokens) -> list:
+        """Return the alias's steps, priced as the estimate prices a question.
+
+        Every step is one question of its tail over the live documents;
+        a step's selectivity is the product of its tests' hints.
+        """
+        costs = prepare_filter_costs(
+            [predicates[position] for position in asks],
+            prefix_tokens=prefix_tokens, model=self.model, device=self.device,
+            chunk_tokens=self.chunk_tokens, lower=self.lower)
+        steps = [TableStep(ASK, position, cost.selectivity, cost.first,
+                           cost.later, cost.reuse_key)
+                 for position, cost in zip(asks, costs)]
+
+        def priced(kind, key, prompt, selectivities):
+            tail = self.lower(prompt).tail_tokens
+            survival = 1.0
+            for selectivity in selectivities:
+                survival *= effective_selectivity(selectivity)
+            first, later = (partial(mul, filter_cost(
+                tail, prefix_tokens, self.model, self.device, self.chunk_tokens,
+                first=fresh)) for fresh in (True, False))
+            return TableStep(kind, key, survival, first, later)
+
+        for call in calls:
+            steps.append(priced(
+                CLASSIFY_STEP, call, call.prompt,
+                [test.selectivity for test in self.label_filters.get(alias, ())
+                 if test.call == call]))
+        for node in extracts:
+            steps.append(priced(
+                EXTRACT_STEP, node, node.call.prompt,
+                [test.selectivity for test in self.extract_filters.get(alias, ())
+                 if test.name == node.name]))
+        return steps
+
+    def ask_stage(self, alias, predicate, written_pos, live, first, stages):
+        """Run one AI.IF over the live rows; return the survivors and work."""
+        stage_work = self.question_work(
+            alias, live, self.lower(predicate.prompt).tail_tokens, first)
+        passed = [row for row in live if self.answer(predicate.prompt, {alias: row})]
+        stages.append(_stage(
+            FILTER, alias, predicate.prompt.template, written_pos,
+            self.lower(predicate.prompt).tail_tokens, predicate.selectivity,
+            live, passed, stage_work))
+        return passed, stage_work
+
+    def classify_stage(self, alias, call, live, first, stages):
+        """Classify the live rows, then apply the label filters testing the call."""
+        stage_work = self.question_work(
+            alias, live, self.lower(call.prompt).tail_tokens, first)
+        stages.append(_stage(
+            CLASSIFY, alias, call.prompt.template, None,
+            self.lower(call.prompt).tail_tokens, None, live, live,
+            stage_work, name=self.labels.names[call]))
+        for test in self.label_filters.get(alias, ()):
+            if test.call != call:
+                continue
+            accepted = set(test.values)
+            passed = [row for row in live
+                      if self.label(call.prompt, {alias: row}) in accepted]
+            stages.append(_stage(
+                LABEL_IN, alias, call.prompt.template, test.position,
+                0, test.selectivity, live, passed, Work(),
+                name=self.labels.names[call], accepted=list(test.values)))
+            live = passed
+        return live, stage_work
+
+    def extract_stage(self, alias, node, live, first, stages):
+        """Extract from the live rows, then apply the tests of the answers."""
+        stage_work = self.question_work(
+            alias, live, self.lower(node.call.prompt).tail_tokens, first)
+        stages.append(_stage(
+            EXTRACT, alias, node.call.prompt.template, None,
+            self.lower(node.call.prompt).tail_tokens, None, live, live,
+            stage_work, name=node.name))
+        for test in self.extract_filters.get(alias, ()):
+            if test.name != node.name:
+                continue
+            passed = self.answer_survivors(node, test.condition, live)
+            stages.append(_stage(
+                ANSWER_TEST, alias, node.call.prompt.template,
+                test.position, 0, test.selectivity, live, passed, Work(),
+                name=node.name, condition=str(test.condition)))
+            live = passed
+        return live, stage_work
 
     def answer_survivors(self, node, condition, live) -> list:
         """Return the live rows whose reference answer passes the condition."""

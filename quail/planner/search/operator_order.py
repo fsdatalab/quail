@@ -19,6 +19,7 @@ from quail.planner.search.statistics import (
     cached_statistics,
     live_after_filters,
 )
+from quail.planner.search.table_steps import resident_after, table_steps
 from quail.planner.validation import join_input_tokens
 from quail.specs import ModelSpec
 
@@ -30,6 +31,7 @@ class OperatorOrder:
     operators: Operators
     statistics: PlanStatistics
     filter_orders: dict
+    step_orders: dict  # alias -> its TableSteps in run order
     join_sequence: list
     join_steps: list
     live: dict[str, float]
@@ -56,6 +58,7 @@ def choose_operator_order(plan, operators, model, device, doc_tokens, order,
     orders = choose_filter_orders(
         plan, statistics, model=model, device=device, rule=rule,
         context=context)
+    steps = choose_step_orders(operators, statistics, rule=rule, context=context)
 
     live0 = live_after_filters(plan, statistics)
     works = filter_works(plan, statistics, model, orders)
@@ -95,7 +98,7 @@ def choose_operator_order(plan, operators, model, device, doc_tokens, order,
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
 
-    return OperatorOrder(operators, statistics, orders, seq, join_steps,
+    return OperatorOrder(operators, statistics, orders, steps, seq, join_steps,
                          live0, works, rule, source)
 
 
@@ -162,6 +165,37 @@ def choose_filter_orders(plan: LogicalPlan, statistics: PlanStatistics, *,
         for index in ordered:
             owner, position = positions[index]
             orders.setdefault(owner, []).append(position)
+    return orders
+
+
+def choose_step_orders(operators: Operators, statistics: PlanStatistics, *,
+                       rule: str, context) -> dict:
+    """Return alias -> its asks, classifications, and extractions in run order.
+
+    The steps are ordered together by order_filters_indexed, each priced
+    as resident or afresh by the step before it (table_steps). With
+    rule "as_written", the asks keep their written order and the
+    classifications and extractions follow them. Without a planning
+    context, only the asks are ordered.
+
+    Args:
+        operators: The plan's operators.
+        statistics: The plan's statistics.
+        rule: "by_cost" or "as_written".
+        context: The planning context, which prices the steps.
+    """
+    if context is None:
+        return {}
+    orders = {}
+    for scan in operators.scans:
+        steps = table_steps(operators, scan.alias, context=context,
+                            statistics=statistics)
+        if not steps:
+            continue
+        ordered = order_filters_indexed(
+            steps, rule, count=statistics.stats[scan.alias].n_docs,
+            resident=resident_after)
+        orders[scan.alias] = [steps[index] for index in ordered]
     return orders
 
 

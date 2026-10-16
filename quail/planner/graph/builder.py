@@ -1,6 +1,7 @@
 """Build executable query graphs with operator order and execution settings."""
 
 from functools import partial
+from itertools import groupby
 
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work
@@ -50,6 +51,7 @@ from quail.planner.optimizer.context import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal, inference_seconds
 from quail.planner.search.operator_order import choose_operator_order
 from quail.planner.search.statistics import filter_stop_keys
+from quail.planner.search.table_steps import ASK, CLASSIFY, EXTRACT
 from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import (
     ClassifyRefusedError,
@@ -278,16 +280,37 @@ class GraphBuilder:
             for s in self.operators.scans:
                 if self.scoring is not None:
                     emit_scores(self, s.alias)
-                elif s.alias in self.ask_filters:
-                    emit_filter(self, s.alias)
+                    emit_classify(self, s.alias)
+                    emit_extract(self, s.alias)
                 else:
-                    self.emit_applies(s.alias)
-                emit_classify(self, s.alias)
-                emit_extract(self, s.alias)
+                    self._emit_steps(s.alias)
         except ClassifyRefusedError as refused:
             return refused.refusal()
         except ScoreRefusedError as refused:
             return refused.refusal
+
+    def _emit_steps(self, alias):
+        """Emit a table's asks, classifications, and extractions in run order.
+
+        Consecutive steps of one kind are emitted together. A
+        classification or extraction the planner lifted above the joins
+        is emitted after them instead.
+        """
+        steps = self.operator_order.step_orders.get(alias, [])
+        if not any(step.kind == ASK for step in steps):
+            self.emit_applies(alias)
+        live = float(self.operator_order.statistics.stats[alias].n_docs)
+        for kind, run in groupby(steps, key=lambda step: step.kind):
+            run = list(run)
+            if kind == ASK:
+                emit_filter(self, alias, [step.key for step in run], live=live,
+                            followed=run[-1] is not steps[-1])
+            elif kind == CLASSIFY and alias not in self.after_joins:
+                emit_classify(self, alias, live=live, calls=[step.key for step in run])
+            elif kind == EXTRACT and alias not in self.extract_after:
+                emit_extract(self, alias, live=live, names=[step.key for step in run])
+            for step in run:
+                live *= step.selectivity
 
     def _emit_joins(self):
         """Create joins and the exchanges between anchor groups."""

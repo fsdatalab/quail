@@ -58,15 +58,26 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
     return replace(spec, estimated_seconds=cost.seconds)
 
 
-def emit_extract(builder, alias, live=None):
-    """Copy the answers of the alias's documents, after its labels.
+def emit_extract(builder, alias, live=None, names=None):
+    """Copy the answers of the alias's documents.
 
     A Filter on an extraction's answer or span follows that extraction
     and drops the documents the next extraction would read, as a label
     filter does after its classification.
+
+    Args:
+        builder: The graph builder.
+        alias: The table.
+        live: The documents the extractions read; None reads those the
+            table's asks and label filters keep.
+        names: The extractions to emit, in run order; None emits every
+            extraction of the alias in written order.
     """
     stats = builder.operator_order.statistics.stats
-    calls = [node for node in builder.operators.extracts if node.alias == alias]
+    calls = [node for node in builder.operators.extracts if node.alias == alias
+             and (names is None or node.name in names)]
+    if names is not None:
+        calls.sort(key=lambda node: names.index(node.name))
     if not calls or (alias in builder.extract_after and live is None):
         return
     if live is None:
