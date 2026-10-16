@@ -145,6 +145,28 @@ KINDS = (
 
 # name -> (SQL, order rule); the nine-operator query runs in its written
 # order as well, to measure what the cost-based order saves
+def python_api_query(session):
+    """The same shape as MANY_OPERATORS_QUERY, built with the Python API."""
+    col, prompt = quail.col, quail.prompt
+    return (
+        session.docs("traces").alias("t")
+        .ai_filter(prompt(AGENT_IMPLEMENTED_FIX, col("t.trace")), selectivity=0.3)
+        .ai_classify(prompt(AGENT_PROGRESS, col("t.trace")),
+                     list(AGENT_PROGRESS_LABELS), name="progress")
+        .where(col("progress").isin(list(AGENT_PROGRESS_LABELS[2:]))
+               .hint(selectivity=0.4))
+        .ai_extract("t.trace", {"edited": EDITED_FILE, "command": LAST_COMMAND,
+                                "error": ERROR_TEXT}, name="last")
+        # the middle field is tested, the others only returned
+        .where(col("last.command").is_not_null().hint(selectivity=0.9)
+               & ~col("last.command").like("%str_replace%").hint(selectivity=0.8)
+               & col("last.command").rlike("(python|pytest|git).*")
+               .hint(selectivity=0.5)
+               & (col("last_span.command").field("end") > 1000))
+        .select("t.id", "progress", "last")
+    )
+
+
 QUERIES = {
     "fix_python_file": (FIX_PYTHON_FILE_QUERY, None),
     "changed_code_with_error": (CHANGED_CODE_WITH_ERROR_QUERY, None),
@@ -181,8 +203,10 @@ def run_queries() -> None:
     folder = Path("/results/extract-filters") / run_id
     folder.mkdir(parents=True, exist_ok=True)
     print(f"run id: {run_id}", flush=True)
-    for name, (text, order) in QUERIES.items():
-        query = session.sql(text, order=order)
+    queries = {**{name: session.sql(text, order=order)
+                  for name, (text, order) in QUERIES.items()},
+               "python_api": python_api_query(session)}
+    for name, query in queries.items():
         print(f"== {name}\n{query.explain()}", flush=True)
         result = query.run()
         rows = result.to_rows()
