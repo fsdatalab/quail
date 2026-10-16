@@ -1,6 +1,6 @@
 """Tests for the adaptive draft-length policy."""
 
-from quail.backends.quail.executor.extract.policy import DraftPolicy
+from quail.cost.draft_policy import DraftPolicy
 
 
 def test_draft_length_grows_with_the_kv_read_and_shrinks_when_ambiguous():

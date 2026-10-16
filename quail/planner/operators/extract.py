@@ -59,7 +59,8 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         chunk=budgets.chunk_budget(context.model, context.device),
         model=context.model, device=context.device, resident=shared,
         max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens,
-        workers=context.gpu_count)
+        draft_policy=spec.draft_policy,
+        round_cost_per_token=spec.round_cost_per_token, workers=context.gpu_count)
     return replace(spec, estimated_seconds=cost.seconds)
 
 

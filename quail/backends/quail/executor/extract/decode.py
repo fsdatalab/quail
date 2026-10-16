@@ -21,8 +21,8 @@ from quail.backends.quail.executor.extract.candidates import (
     first_tokens,
     make_streams,
 )
-from quail.backends.quail.executor.extract.policy import DraftPolicy
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
+from quail.cost.draft_policy import DraftPolicy
 from quail.execution.spans import line_span
 from quail.physical import ExtractSpec
 

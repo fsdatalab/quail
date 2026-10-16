@@ -318,7 +318,8 @@ def _shared_extract_spec(node, context, store, *, resident=False):
         len(head), len(tail), chunk=chunk_budget(context.model, context.device),
         model=context.model, device=context.device, resident=resident,
         shared=page_tree(store).shared, max_answer_tokens=spec.max_answer_tokens,
-        draft_tokens=spec.draft_tokens, workers=context.gpu_count)
+        draft_tokens=spec.draft_tokens, draft_policy=spec.draft_policy,
+        round_cost_per_token=spec.round_cost_per_token, workers=context.gpu_count)
     return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
 
 
