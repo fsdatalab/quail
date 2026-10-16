@@ -11,6 +11,9 @@ rounds that drafted. The policy picks the draft length that costs the
 least per written token.
 """
 
+import bisect
+import math
+
 import numpy as np
 
 # how many observations the seed of each curve weighs
@@ -21,8 +24,17 @@ RHO_BUCKETS = (0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)
 LIVE_BUCKETS = (1, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000)
 
 
-def _bucket(buckets: tuple, value: float) -> int:
-    return int(np.argmin([abs(np.log1p(value) - np.log1p(b)) for b in buckets]))
+_RHO_LOGS = [math.log1p(b) for b in RHO_BUCKETS]
+_LIVE_LOGS = [math.log1p(b) for b in LIVE_BUCKETS]
+
+
+def _bucket(logs: list, value: float) -> int:
+    """Return the index of the bucket nearest value on a log scale."""
+    x = math.log1p(value)
+    i = bisect.bisect_left(logs, x)
+    if i == 0 or i == len(logs):
+        return min(i, len(logs) - 1)
+    return i if logs[i] - x < x - logs[i - 1] else i - 1
 
 
 class DraftPolicy:
@@ -71,7 +83,7 @@ class DraftPolicy:
         """
         if live <= 1:
             return 1.0
-        b = _bucket(LIVE_BUCKETS, live)
+        b = _bucket(_LIVE_LOGS, live)
         seed = PRIOR_WEIGHT / LIVE_BUCKETS[b]
         return (seed + self.accepts[b]) / (PRIOR_WEIGHT + self.trials[b])
 
@@ -86,7 +98,7 @@ class DraftPolicy:
         room = min(self.cap, self.max_answer_tokens - written - 1)
         if room <= 0:
             return 0
-        key = (_bucket(RHO_BUCKETS, rho), written, room, _bucket(LIVE_BUCKETS, live))
+        key = (_bucket(_RHO_LOGS, rho), written, room, _bucket(_LIVE_LOGS, live))
         if key not in self._tables:
             self._tables[key] = self._best(RHO_BUCKETS[key[0]], written, room,
                                            self.source_odds(LIVE_BUCKETS[key[3]]))
@@ -115,8 +127,8 @@ class DraftPolicy:
             live: How many document positions the answer fit when drafting.
             accepted: Whether the model chose the first draft token.
         """
-        b = _bucket(LIVE_BUCKETS, live)
+        b = _bucket(_LIVE_LOGS, live)
         self.trials[b] += 1
         self.accepts[b] += accepted
         if self.trials[b] & (self.trials[b] - 1) == 0:
-            self._tables.clear()
+            self._tables = {k: v for k, v in self._tables.items() if k[3] != b}
