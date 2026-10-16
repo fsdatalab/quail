@@ -3,7 +3,8 @@
 Runs one QUAIL-B extraction query in a fresh process with the plan's
 draft_tokens replaced. The timed runs record every forward pass: its
 tokens, answer rows, documents prefilled, resident KV tokens, and GPU
-milliseconds. The logged run, which is not timed, records every round:
+milliseconds. Optional profiled runs sum GPU time by kernel name. The
+logged run, which is not timed, records every round:
 the live streams, up to 16 of their continuations, and what the round
 accepted, so other draft lengths and draft choices can be replayed on
 the CPU. The record is saved to /results/ablations/extract_draft/.
@@ -168,8 +169,23 @@ class Rounds:
                 "settled": self.settled}
 
 
+def _kernel_totals(profiler) -> list:
+    """Return [kernel name, GPU ms, launches], most GPU time first."""
+    from torch.autograd import DeviceType
+
+    totals = {}
+    for event in profiler.events():
+        if event.device_type == DeviceType.CUDA:
+            ms, count = totals.get(event.name, (0.0, 0))
+            totals[event.name] = (ms + event.time_range.elapsed_us() / 1e3,
+                                  count + 1)
+    return sorted(([name, round(ms, 3), count]
+                   for name, (ms, count) in totals.items()),
+                  key=lambda row: -row[1])
+
+
 def child(arguments: str) -> None:
-    """Run the query: timed runs, then one logged run; print one RESULT line."""
+    """Run the query: timed, then profiled, then one logged run; print RESULT."""
     import torch
 
     import quail
@@ -191,15 +207,26 @@ def child(arguments: str) -> None:
                                 device="h100-sxm", gpu_timing=True)
     record = {**args, "runs": []}
     with quail.Session(config) as session:
-        for mode in ["timed"] * args["timed_runs"] + ["logged"]:
+        modes = (["timed"] * args["timed_runs"] + ["kernels"] * args["kernel_runs"]
+                 + ["logged"])
+        for mode in modes:
+            profiler = None
             if mode == "timed":
                 passes.start()
+            elif mode == "kernels":
+                profiler = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CUDA])
+                profiler.__enter__()
             else:
                 rounds.start()
             output = run_query(session, spec, tables)
             run = {"mode": mode}
             if mode == "timed":
                 run["passes"] = passes.stop()
+            elif mode == "kernels":
+                torch.cuda.synchronize()
+                profiler.__exit__(None, None, None)
+                run["kernels"] = _kernel_totals(profiler)
             else:
                 run["rounds"] = rounds.stop()
             measures = output.measurements
@@ -246,13 +273,15 @@ def measure_draft(arguments: str) -> str:
 
 @app.local_entrypoint()
 def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
-            draft_tokens: int = 16, timed_runs: int = 2, tag: str = "draft"):
+            draft_tokens: int = 16, timed_runs: int = 2, kernel_runs: int = 0,
+            tag: str = "draft"):
     data = ensure_data.spawn(sf, [query], "")
     print(f"function call id: {data.object_id} (data)", flush=True)
     collection = data.get()
     arguments = json.dumps(dict(query_id=query, sf=sf, collection_id=collection,
                                 model=model, draft_tokens=draft_tokens,
-                                timed_runs=timed_runs, tag=tag))
+                                timed_runs=timed_runs, kernel_runs=kernel_runs,
+                                tag=tag))
     call = measure_draft.spawn(arguments)
     print(f"function call id: {call.object_id} (d={draft_tokens})", flush=True)
     print(f"saved to {call.get()}", flush=True)
