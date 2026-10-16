@@ -265,13 +265,30 @@ def _kernel_totals(profiler) -> list:
                   key=lambda row: -row[1])
 
 
-def _sql_runner(session, sql: str, table: str, sf: float):
-    """Return a run function for an ad hoc SQL query over one benchmark table."""
+def _sql_runner(session, sql: str, table: str, sf: float, limit: int = 0,
+                nfc: bool = False):
+    """Return a run function for an ad hoc SQL query over one benchmark table.
+
+    limit keeps the table's first rows, for a sample of a large table.
+    nfc normalizes the text column to NFC: AI.EXTRACT refuses a text
+    whose tokens do not reproduce its bytes, as happens with characters
+    the tokenizer normalizes, such as U+037E in some SEC filings.
+    """
+    import unicodedata
+
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     import quail
 
     rows = pq.read_table(Path(DATA_DIR) / f"sf{sf}" / f"{table}.parquet")
+    if limit:
+        rows = rows.slice(0, limit)
+    if nfc:
+        column = rows.schema.get_field_index("text")
+        texts = [unicodedata.normalize("NFC", text)
+                 for text in rows.column("text").to_pylist()]
+        rows = rows.set_column(column, "text", pa.array(texts, type=pa.string()))
     session.register(table, quail.DocumentProvider.from_table(rows, id_col="id"))
 
     def run():
@@ -305,7 +322,8 @@ def child(arguments: str) -> None:
     record = {**args, "runs": []}
     with quail.Session(config) as session:
         if args.get("sql"):
-            run_once = _sql_runner(session, args["sql"], args["table"], sf)
+            run_once = _sql_runner(session, args["sql"], args["table"], sf,
+                                   args.get("limit", 0), args.get("nfc", False))
         else:
             suite = load_benchmark([args["query_id"]], scale_factor=sf,
                                    data_dir=Path(DATA_DIR) / f"sf{sf}",
@@ -399,7 +417,7 @@ def measure_draft(arguments: str) -> str:
 def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
             draft_tokens: str = "16", timed_runs: int = 2, kernel_runs: int = 0,
             host_runs: int = 0, sweep: str = "", sql: str = "", table: str = "",
-            tag: str = "draft"):
+            limit: int = 0, nfc: bool = False, tag: str = "draft"):
     collection = ""
     if sql:
         # an ad hoc query over a table ensure_data already wrote
@@ -410,7 +428,7 @@ def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
         collection = data.get()
     draft = draft_tokens if draft_tokens == "adaptive" else int(draft_tokens)
     arguments = json.dumps(dict(query_id=query, sf=sf, collection_id=collection,
-                                sql=sql, table=table,
+                                sql=sql, table=table, limit=limit, nfc=nfc,
                                 model=model, draft_tokens=draft,
                                 timed_runs=timed_runs, kernel_runs=kernel_runs,
                                 host_runs=host_runs,
