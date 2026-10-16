@@ -38,7 +38,7 @@ volumes = {
     "/root/.cache/kernels": kernel_cache,
 }
 
-AGENT_DOCS = 64
+AGENT_DOCS = 128
 CORPUS = "/results/quailb_data/sf0.1/agent_traces.parquet"
 
 EDITED_FILE = "Which file did the agent edit last?"
