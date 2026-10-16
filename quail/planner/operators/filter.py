@@ -78,7 +78,7 @@ def emit_filter(builder, alias, positions, live, followed=False):
         fid = (f"ai_filter:{alias}" if i == orders[alias][0]
                else f"ai_filter:{alias}:{i}")
         builder.nodes.append(AiFilter(
-            node_id=fid, inputs=input_ports((builder.ids_src[alias],)), alias=alias,
+            node_id=fid, inputs=input_ports((builder.ids_of(alias),)), alias=alias,
             written_pos=i,
             question_tokens=question_tokens(
                 builder.context.lowered(p.prompt), builder.model.canvas_tokens),
@@ -88,6 +88,6 @@ def emit_filter(builder, alias, positions, live, followed=False):
                           or alias in builder.pipelined),
             stop_key=builder.stop_keys.get(alias, ())))
         surv *= effective_selectivity(p.selectivity)
-        builder.ids_src[alias] = PortRef(fid, f"ids:{alias}")
+        builder.source[alias] = PortRef(fid, f"ids:{alias}")
     builder.emit_applies(alias)
 

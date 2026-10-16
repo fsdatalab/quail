@@ -29,6 +29,7 @@ from quail.physical import (
     AiJoin,
     ExtractSpec,
     Filter,
+    PortRef,
     Project,
     decode_graph,
     encode_graph,
@@ -900,6 +901,10 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
     # rejecting nearly every document puts it first
     assert order(usual) == ["ai-classify:0", "ai-extract:0", "ai_filter:c"]
     assert order(selective) == ["ai-extract:0", "ai-classify:0", "ai_filter:c"]
+    # the result reads the documents the last step keeps, whatever
+    # kind of step it is
+    for plan in (usual, selective):
+        assert plan.nodes[-1].inputs[0].source == PortRef("ai_filter:c", "ids:c")
     (extract,) = [n for n in selective.nodes if isinstance(n, AiExtract)]
     (classify,) = [n for n in selective.nodes if isinstance(n, AiClassify)]
     (ask,) = [n for n in selective.nodes if isinstance(n, AiFilter)]

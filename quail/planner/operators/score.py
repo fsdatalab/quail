@@ -155,14 +155,13 @@ def emit_scores(builder, alias, positions, live):
     stats = builder.operator_order.statistics.stats
     for position in positions:
         predicate = builder.operators.filters[alias][position]
-        source = builder.rows_src.get(alias, builder.ids_src[alias])
+        source = builder.source[alias]
         if predicate.prompt not in builder.scoring.names:
             source = builder.scoring.score(
                 predicate.prompt, f"__score_{alias}_{position}", (source,),
                 live, stats[alias].mean_doc_tokens)
         source = builder.scoring.comparison(predicate, source, (alias,), position)
-        builder.rows_src[alias] = source
-        builder.ids_src[alias] = PortRef(source.node_id, f"ids:{alias}")
+        builder.source[alias] = source
         live *= effective_selectivity(predicate.selectivity)
 
 
@@ -173,9 +172,8 @@ def emit_projected_scores(builder, alias, live):
         call = expression.expression
         if call.aliases() != (alias,) or call.prompt in builder.scoring.names:
             continue
-        builder.rows_src[alias] = builder.scoring.score(
-            call.prompt, expression.name,
-            (builder.rows_src.get(alias, builder.ids_src[alias]),), live,
+        builder.source[alias] = builder.scoring.score(
+            call.prompt, expression.name, (builder.source[alias],), live,
             stats[alias].mean_doc_tokens)
 
 
@@ -187,7 +185,7 @@ def emit_score_pair(builder, prompt, position, fraction, pair_inputs):
     expected, prefixes = pair_counts(builder.operator_order.live, aliases, fraction)
     return builder.scoring.score(
         prompt, f"__score_join_{position}",
-        tuple(builder.rows_src.get(a, builder.ids_src[a]) for a in aliases)
+        tuple(builder.source[a] for a in aliases)
         + pair_inputs,
         expected, sum(stats[a].mean_doc_tokens for a in aliases),
         pair_fraction=fraction, prefix_groups=prefixes)

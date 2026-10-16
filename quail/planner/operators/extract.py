@@ -79,12 +79,12 @@ def emit_extract(builder, alias, live, names):
         spec = extract_spec(builder.context, logical_node.call,
                             logical_node.name, live, shared=index > 0)
         node = inference_node(
-            AiExtract, spec, (builder.rows_src.get(alias, builder.ids_src[alias]),),
+            AiExtract, spec, (builder.source[alias],),
             index=sum(isinstance(n, AiExtract) for n in builder.nodes),
             backend="quail", model=builder.model.name)
         builder.nodes.append(node)
         scores = PortRef(node.node_id, "rows")
-        builder.ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
+        builder.source[alias] = scores
         for test in tests:
             if test.name != logical_node.name:
                 continue
@@ -94,8 +94,7 @@ def emit_extract(builder, alias, live, names):
                 predicate=test.condition, aliases=(alias,),
                 selectivity=test.selectivity, written_pos=test.position))
             scores = PortRef(lid, "rows")
-            builder.ids_src[alias] = PortRef(lid, f"ids:{alias}")
+            builder.source[alias] = scores
             live *= effective_selectivity(test.selectivity)
-        builder.rows_src[alias] = scores
         builder.label_ports.append(scores)
 

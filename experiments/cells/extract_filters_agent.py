@@ -143,12 +143,15 @@ KINDS = (
     "a build, packaging, or test configuration problem",
 )
 
+# name -> (SQL, order rule); the nine-operator query runs in its written
+# order as well, to measure what the cost-based order saves
 QUERIES = {
-    "fix_python_file": FIX_PYTHON_FILE_QUERY,
-    "changed_code_with_error": CHANGED_CODE_WITH_ERROR_QUERY,
-    "command_regex": COMMAND_REGEX_QUERY,
-    "many_operators": MANY_OPERATORS_QUERY,
-    "join_with_answer_test": JOIN_WITH_ANSWER_TEST_QUERY,
+    "fix_python_file": (FIX_PYTHON_FILE_QUERY, None),
+    "changed_code_with_error": (CHANGED_CODE_WITH_ERROR_QUERY, None),
+    "command_regex": (COMMAND_REGEX_QUERY, None),
+    "many_operators": (MANY_OPERATORS_QUERY, None),
+    "many_operators_as_written": (MANY_OPERATORS_QUERY, "as_written"),
+    "join_with_answer_test": (JOIN_WITH_ANSWER_TEST_QUERY, None),
 }
 
 
@@ -165,7 +168,8 @@ def run_queries() -> None:
     subset = "/tmp/agent_traces.parquet"
     pq.write_table(docs, subset)
     session = quail.Session(EngineConfig(
-        gpus=1, model="qwen3-4b-fp8", backend="quail", device="h100-sxm"))
+        gpus=1, model="qwen3-4b-fp8", backend="quail", device="h100-sxm",
+        gpu_timing=True))
     session.register("traces", quail.DocumentProvider.from_parquet(
         subset, id_col="id"))
     kinds = "/tmp/kinds.parquet"
@@ -177,8 +181,8 @@ def run_queries() -> None:
     folder = Path("/results/extract-filters") / run_id
     folder.mkdir(parents=True, exist_ok=True)
     print(f"run id: {run_id}", flush=True)
-    for name, text in QUERIES.items():
-        query = session.sql(text)
+    for name, (text, order) in QUERIES.items():
+        query = session.sql(text, order=order)
         print(f"== {name}\n{query.explain()}", flush=True)
         result = query.run()
         rows = result.to_rows()
@@ -193,6 +197,10 @@ def run_queries() -> None:
         print("node seconds:", json.dumps({
             node_id: round(metrics.wall_s, 2)
             for node_id, metrics in result.node_metrics.items()}), flush=True)
+        print("node gpu seconds, chunks, fresh tokens:", json.dumps({
+            node_id: (round(metrics.gpu_s, 2), metrics.chunks, metrics.fresh_tokens)
+            for node_id, metrics in result.node_metrics.items()
+            if metrics.chunks}), flush=True)
         print("seconds: model wall", round(report["model_wall_s"], 2),
               "planning", round(report["planning_s"], 2),
               "plan estimate", round(query.plan().estimated_seconds, 2),

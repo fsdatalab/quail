@@ -222,8 +222,9 @@ class GraphBuilder:
             self.sequence_groups, set(self.ask_filters), barrier_aliases, self.workers)
 
         self.nodes = []
-        self.ids_src = {}
-        self.rows_src = {}
+        # alias -> the output of its latest operator: the rows when
+        # the operator has them, else the document ids
+        self.source = {}
         self.scoring = (ScoreLowering(self.context, self.nodes,
                                      self.projected_scores, statistics.chunk)
                         if has_score(self.plan) else None)
@@ -249,11 +250,11 @@ class GraphBuilder:
                 predicates=regular_predicates(s),
                 expected_docs=(float(stats[s.alias].n_docs)
                                if s.predicates else None)))
-            self.ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
+            self.source[s.alias] = PortRef(sid, f"ids:{s.alias}")
         # the hash join reads the scans; survivors thin its pairs at the AI join
         self.pairs_src = {}
         for node in hash_join_nodes(self.operators.joins, self.pair_fractions,
-                                    self.ids_src.values()):
+                                    self.source.values()):
             self.nodes.append(node)
             self.pairs_src[node.written_pos] = node
 
@@ -344,7 +345,7 @@ class GraphBuilder:
                 ahead = [scan.alias for scan in self.operators.scans]
                 bid = self.unique_id("barrier", anchor)
                 exchange_inputs = tuple(self.pairs_edges) + tuple(
-                    self.ids_src[a] for a in ahead
+                    self.ids_of(a) for a in ahead
                 )
                 self.nodes.append(Barrier(
                     node_id=bid,
@@ -352,15 +353,15 @@ class GraphBuilder:
                     next_anchor=anchor,
                     aliases=tuple(ahead)))
                 for a in ahead:
-                    self.ids_src[a] = PortRef(bid, f"ids:{a}")
+                    self.source[a] = PortRef(bid, f"ids:{a}")
             if self.workers > 1:
                 # anchors go to the GPU holding their KV, else balanced
                 xid = self.unique_id("exchange", anchor)
                 self.nodes.append(Exchange(
                     node_id=xid,
-                    inputs=input_ports((self.ids_src[anchor],)),
+                    inputs=input_ports((self.ids_of(anchor),)),
                     anchor=anchor))
-                self.ids_src[anchor] = PortRef(xid, f"ids:{anchor}")
+                self.source[anchor] = PortRef(xid, f"ids:{anchor}")
             gid = self.group_ids[g]
             for rank, (spec, step) in enumerate(group):
                 jid = gid if rank == 0 else f"{gid}:predicate:{spec.written_pos}"
@@ -419,13 +420,13 @@ class GraphBuilder:
                 node_id="recombine",
                 inputs=input_ports(
                     tuple(self.pairs_edges)
-                    + tuple(self.ids_src[a] for a in self.out_aliases)
+                    + tuple(self.ids_of(a) for a in self.out_aliases)
                 ),
                 alias_order=tuple(self.out_aliases)))
             sink_inputs = (PortRef("recombine", "tuples"),)
         else:
             alias = self.operators.scans[0].alias
-            sink_inputs = (self.rows_src.get(alias, self.ids_src[alias]),)
+            sink_inputs = (self.source[alias],)
         columns = []
         for c in self.plan.projection.columns:
             columns.append(c.name if isinstance(c, Alias)
@@ -498,6 +499,21 @@ class GraphBuilder:
             },
             estimator=estimator)
 
+    def ids_of(self, alias: str) -> PortRef:
+        """Return the ids of the alias's documents after its latest operator.
+
+        An operator without an ids output keeps every document it
+        reads, so the ids are the nearest earlier operator's.
+        """
+        port = self.source[alias]
+        while f"ids:{alias}" not in {
+                output.name for output in self._node(port.node_id).outputs}:
+            port = self._node(port.node_id).inputs[0].source
+        return PortRef(port.node_id, f"ids:{alias}")
+
+    def _node(self, node_id: str):
+        return next(node for node in self.nodes if node.node_id == node_id)
+
     def unique_id(self, prefix, name):
         key = f"{prefix}:{name}"
         self.seen_ids[key] = self.seen_ids.get(key, 0) + 1
@@ -508,9 +524,9 @@ class GraphBuilder:
             aid = f"apply:{apply.function}"
             self.nodes.append(Foreign(
                 node_id=aid,
-                inputs=input_ports((self.ids_src[alias],)),
+                inputs=input_ports((self.ids_of(alias),)),
                 function=apply.function, kind=apply.kind, ids=apply.ids,
                 columns=tuple((ref.alias, ref.column)
                               for ref in apply.columns),
                 aliases=(alias,)))
-            self.ids_src[alias] = PortRef(aid, f"ids:{alias}")
+            self.source[alias] = PortRef(aid, f"ids:{alias}")

@@ -83,7 +83,7 @@ def emit_join(builder, spec, step, anchor, jid, exec_idx):
         builder.nodes.append(Foreign(
             node_id=aid,
             inputs=input_ports(tuple(
-                builder.ids_src[a] for a in apply.aliases)),
+                builder.ids_of(a) for a in apply.aliases)),
             function=apply.function, kind=apply.kind, ids="pairs",
             columns=tuple((ref.alias, ref.column)
                           for ref in apply.columns),
@@ -94,7 +94,7 @@ def emit_join(builder, spec, step, anchor, jid, exec_idx):
     builder.nodes.append(AiJoin(
         node_id=jid,
         inputs=input_ports(tuple(
-            builder.ids_src[a] for a in [anchor, *partners])
+            builder.ids_of(a) for a in [anchor, *partners])
                            + tuple(pair_inputs)),
         written_pos=spec.written_pos, exec_idx=exec_idx,
         anchor=anchor, partners=tuple(partners),
@@ -106,7 +106,7 @@ def emit_join(builder, spec, step, anchor, jid, exec_idx):
         anchor_resident=step.resident,
         tuple_tokens=round(step.tokens, 1),
         pairs_from=pairs_from))
-    builder.ids_src[anchor] = PortRef(jid, f"ids:{anchor}")
+    builder.source[anchor] = PortRef(jid, f"ids:{anchor}")
     if spec.semantics == "full":
         builder.pairs_edges.append(PortRef(
             jid, f"join_answers:{spec.written_pos}"

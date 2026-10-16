@@ -485,11 +485,11 @@ def emit_classify(builder, alias, live, calls):
             if builder.scoring is not None:
                 builder.scoring.work += work
             node = table.node(
-                spec, scores or builder.rows_src.get(alias, builder.ids_src[alias]),
+                spec, scores or builder.source[alias],
                               sum(isinstance(n, AiClassify) for n in builder.nodes))
             builder.nodes.append(node)
             scores = PortRef(node.node_id, "rows")
-            builder.ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
+            builder.source[alias] = scores
             if call in builder.operators.labels.projected:
                 builder.label_ports.append(scores)
             classified_calls.add(call)
@@ -500,10 +500,8 @@ def emit_classify(builder, alias, live, calls):
                 predicate=test.condition, aliases=(alias,),
                 selectivity=test.selectivity, written_pos=test.position))
             scores = PortRef(lid, "rows")
-            builder.ids_src[alias] = PortRef(lid, f"ids:{alias}")
+            builder.source[alias] = scores
             live *= effective_selectivity(test.selectivity)
-    if scores is not None:
-        builder.rows_src[alias] = scores
 
 
 
