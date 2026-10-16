@@ -176,8 +176,8 @@ class Rounds:
                      for s in kept]])
             return fed
 
-        def logged_verify(decoder, doc, q, rows, fed):
-            verify(decoder, doc, q, rows, fed)
+        def logged_verify(decoder, doc, q, rows, fed, accepted=None):
+            verify(decoder, doc, q, rows, fed, accepted)
             if rounds.active:
                 answer = doc.answers[q]
                 rounds.verified.append([doc.index, q, len(fed), answer.discard,

@@ -228,6 +228,7 @@ class StageExecutor:
         self.finished = 0
 
         self.readouts = ReadoutGroups(self.torch, self.stages)
+        self.verifying = any(stage.verify is not None for stage in self.stages)
 
     def _stop_width(self, stop_groups, budget) -> int:
         """Anchors of one stop key group in flight at once.
@@ -308,6 +309,7 @@ class StageExecutor:
 
         specs = []
         entries = []
+        expected = []
         appended = {}
         for a, j, start, end, carried in chunk_groups:
             key = self.keys[a]
@@ -360,6 +362,14 @@ class StageExecutor:
             kept = int(sufs.lengths.sum()) if append else 0
             if append or (self.writes[j] and start == 0):
                 appended[a] = path + kept
+            # the token fed after each row the readout may decide on the
+            # device; -1 for a request's last row and for undecided rows
+            verify = self.stages[j].verify
+            if read_all and verify is not None and verify(key):
+                tokens = np.append(sufs.ids[1:], -1)
+                tokens[sufs.offsets[1:] - 1] = -1
+            else:
+                tokens = np.full(rows, -1, dtype=np.int64)
             if self.writes[j] and start == 0 and self._merged(j, start, end):
                 # the frame and the one suffix are one entry; the
                 # frame's rows are scattered into KV after the document
@@ -378,6 +388,7 @@ class StageExecutor:
                     f=f, suffixes=Suffixes(self.frame_ids[j], [len(frame)]),
                     write_suffix_tokens=len(frame)))
                 entries.append((j, 1))
+                expected.append(np.full(1, -1, dtype=np.int64))
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
@@ -392,11 +403,14 @@ class StageExecutor:
                     single=self.stages[j].single and end - start == 1,
                     paths=self.stages[j].paths, **own))
             entries.append((j, rows))
+            expected.append(tokens)
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,
             staging=self.staging, canvas=self.canvas, answer_row=self.answer_row)
         for a, tokens in appended.items():
             self.appended[a] = tokens
+        if self.verifying:
+            chunk.expected = np.concatenate(expected)
         return chunk, entries
 
     def _settle(self, settlement):
@@ -523,7 +537,9 @@ class StageExecutor:
         # launch queue, and a host blocked there could not decide them
         while self.outstanding:
             self._report_next()
-        handles = self.readouts.submit(normed, entries, chunk.rows_per_answer)
+        handles = self.readouts.submit(
+            normed, entries, chunk.rows_per_answer,
+            expected=getattr(chunk, "expected", None))
         self.outstanding.append(PendingAnswers(part, handles))
 
     def run(self):

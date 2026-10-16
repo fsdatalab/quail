@@ -117,31 +117,46 @@ class Decoder:
         self.top = int(ids[np.argmax(self.scores[ids])])
         return self.scores, float(values[0]), float(values[1])
 
-    def verify(self, doc: Document, q: int, rows, fed) -> None:
+    def verify(self, doc: Document, q: int, rows, fed, accepted=None) -> None:
         """Choose the answer's tokens from a round's rows, in order.
 
         Row i follows token i of the round's fed tokens, so the token
         chosen from it is written and, when it is not the token fed
         next, the rest of the round is discarded: the next round feeds
         the chosen token in its place.
+
+        Args:
+            doc: The document.
+            q: The question's index.
+            rows: The readout rows: every row of the round when accepted
+                is None, else the rows from the first the readout did
+                not decide.
+            fed: The round's fed tokens.
+            accepted: How many leading rows the readout decided write
+                the token fed after them; None when it decided none.
         """
         answer = doc.answers[q]
         answer.steps += 1
         answer.discard = 0
         rows = np.asarray(rows)
-        start = 0
-        if answer.written and len(answer.live) == 1:
-            start = self.accepted(answer, rows, fed)
-            answer.written.extend(fed[1:start + 1])
+        if accepted is None:
+            accepted = 0
+            if answer.written and len(answer.live) == 1:
+                accepted = self.accepted(answer, rows, fed)
+                rows = rows[accepted:]
+        if accepted:
+            written = min(accepted, self.spec.max_answer_tokens - len(answer.written))
+            answer.written.extend(fed[1:written + 1])
             if len(answer.written) >= self.spec.max_answer_tokens:
                 self.settle(doc, q)
                 return
-        for i in range(start, len(rows)):
-            token = self.choose(doc, q, rows[i])
+        for i, values in enumerate(rows):
+            token = self.choose(doc, q, values)
             if answer.done:
                 return
-            if i + 1 < len(fed) and token != fed[i + 1]:
-                answer.discard = len(fed) - (i + 1)
+            after = accepted + i + 1
+            if after < len(fed) and token != fed[after]:
+                answer.discard = len(fed) - after
                 return
 
     def accepted(self, answer: AnswerState, rows: np.ndarray, fed) -> int:

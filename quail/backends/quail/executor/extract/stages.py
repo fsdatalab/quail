@@ -109,6 +109,7 @@ class ExtractionStages:
                   suffix_tokens=1 + self.spec.draft_tokens, frame=frame,
                   readout=self.readout, decide=partial(self._step_decide, q),
                   discard=partial(self._step_discard, q), read_all_rows=True,
+                  verify=partial(self._step_verifies, q),
                   single=True, append=True, label=f"{name} round {t}")
             for t in range(1, self.spec.max_answer_tokens + 1))
         return stages
@@ -130,7 +131,7 @@ class ExtractionStages:
         return AsyncTopLogprobs(torch, torch.nn.functional, head,
                                 self.spec.top_tokens,
                                 [vocabulary.none_id, vocabulary.stop_ids],
-                                ragged=True)
+                                ragged=True, vocabulary=vocabulary)
 
     def _prepare(self, index, document, text, ids, stored) -> Document:
         """Build a document's prefix: the head and its text.
@@ -169,8 +170,30 @@ class ExtractionStages:
         # only its cue token is fed
         same = q > 0 and self.tails[q] == self.tails[q - 1]
         answer.fed_tokens += 1 if same else len(self.tails[q])
-        self.decoder.verify(doc, q, self.decoder.rows(row), [])
+        rows, accepted = self._rows(row)
+        self.decoder.verify(doc, q, rows, [], accepted)
         return True
+
+    def _rows(self, row):
+        """Return a readout's rows for one answer, with the count it verified.
+
+        A verifying readout returns (accepted, kept rows); another
+        returns every row, and the decoder verifies them itself.
+        """
+        # the admission hands over the document's one answer in a list
+        # or an object array
+        if isinstance(row, list) and len(row) == 1:
+            row = row[0]
+        elif isinstance(row, np.ndarray) and row.dtype == object and row.size == 1:
+            row = row.reshape(-1)[0]
+        if isinstance(row, tuple):
+            accepted, rows = row
+            return self.decoder.rows(rows), accepted
+        return self.decoder.rows(row), None
+
+    def _step_verifies(self, q, key) -> bool:
+        """Whether the round's draft follows one document position."""
+        return len(self._answer(q, key).live) == 1
 
     def _step_suffix(self, q, key):
         """Feed the chosen token, then the document's next tokens as a draft."""
@@ -191,7 +214,8 @@ class ExtractionStages:
         doc = self.docs[anchor]
         answer = doc.answers[q]
         answer.fed_tokens += len(answer.fed)
-        self.decoder.verify(doc, q, self.decoder.rows(row), answer.fed)
+        rows, accepted = self._rows(row)
+        self.decoder.verify(doc, q, rows, answer.fed, accepted)
         return True
 
     def finish(self) -> None:
