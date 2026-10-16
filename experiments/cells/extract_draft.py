@@ -3,11 +3,12 @@
 Runs one QUAIL-B extraction query in a fresh process with the plan's
 draft_tokens replaced. The timed runs record every forward pass: its
 tokens, answer rows, documents prefilled, resident KV tokens, and GPU
-milliseconds. Optional profiled runs sum GPU time by kernel name. The
-logged run, which is not timed, records every round:
-the live streams, up to 16 of their continuations, and what the round
-accepted, so other draft lengths and draft choices can be replayed on
-the CPU. The record is saved to /results/ablations/extract_draft/.
+milliseconds; --sweep alternates draft lengths between timed runs on
+one GPU. Optional profiled runs sum GPU time by kernel name. The logged
+run, which is not timed, records every round: the live streams, up to
+16 of their continuations, and what the round accepted, so other draft
+lengths and draft choices can be replayed on the CPU. The record is
+saved to /results/ablations/extract_draft/.
 
     uv run modal run --detach experiments/cells/extract_draft.py::measure
         --query CUAD-3 --sf 1.0 --draft-tokens 16
@@ -34,20 +35,22 @@ LOGGED_TOKENS = 64
 image = gpu_image()
 
 
-def _set_draft(draft_tokens: int) -> None:
-    """Plan every extraction with the given draft length."""
+def _set_draft(draft_tokens: int) -> dict:
+    """Plan every extraction with the draft length the returned dict holds."""
     import quail.planner.operators.extract as planned
     from quail.physical import ExtractSpec
 
     bind = planned.bind_inference
+    setting = {"draft_tokens": draft_tokens}
 
     def bind_with_draft(cls, *args, **kwargs):
         spec = bind(cls, *args, **kwargs)
         if cls is ExtractSpec:
-            spec = replace(spec, draft_tokens=draft_tokens)
+            spec = replace(spec, draft_tokens=setting["draft_tokens"])
         return spec
 
     planned.bind_inference = bind_with_draft
+    return setting
 
 
 class Passes:
@@ -193,7 +196,7 @@ def child(arguments: str) -> None:
     from quail_b.benchmark import load_benchmark
 
     args = json.loads(arguments)
-    _set_draft(args["draft_tokens"])
+    setting = _set_draft(args["draft_tokens"])
     passes = Passes(torch)
     rounds = Rounds()
     sf = args["sf"]
@@ -207,9 +210,12 @@ def child(arguments: str) -> None:
                                 device="h100-sxm", gpu_timing=True)
     record = {**args, "runs": []}
     with quail.Session(config) as session:
-        modes = (["timed"] * args["timed_runs"] + ["kernels"] * args["kernel_runs"]
-                 + ["logged"])
-        for mode in modes:
+        drafts = args.get("sweep") or [args["draft_tokens"]]
+        modes = ([("timed", d) for _ in range(args["timed_runs"]) for d in drafts]
+                 + [("kernels", args["draft_tokens"])] * args["kernel_runs"]
+                 + [("logged", args["draft_tokens"])])
+        for mode, draft in modes:
+            setting["draft_tokens"] = draft
             profiler = None
             if mode == "timed":
                 passes.start()
@@ -220,7 +226,7 @@ def child(arguments: str) -> None:
             else:
                 rounds.start()
             output = run_query(session, spec, tables)
-            run = {"mode": mode}
+            run = {"mode": mode, "draft_tokens": draft}
             if mode == "timed":
                 run["passes"] = passes.stop()
             elif mode == "kernels":
@@ -274,13 +280,14 @@ def measure_draft(arguments: str) -> str:
 @app.local_entrypoint()
 def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
             draft_tokens: int = 16, timed_runs: int = 2, kernel_runs: int = 0,
-            tag: str = "draft"):
+            sweep: str = "", tag: str = "draft"):
     data = ensure_data.spawn(sf, [query], "")
     print(f"function call id: {data.object_id} (data)", flush=True)
     collection = data.get()
     arguments = json.dumps(dict(query_id=query, sf=sf, collection_id=collection,
                                 model=model, draft_tokens=draft_tokens,
                                 timed_runs=timed_runs, kernel_runs=kernel_runs,
+                                sweep=[int(d) for d in sweep.split(",") if d],
                                 tag=tag))
     call = measure_draft.spawn(arguments)
     print(f"function call id: {call.object_id} (d={draft_tokens})", flush=True)
