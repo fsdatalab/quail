@@ -1407,6 +1407,31 @@ at stage j > 1 (survivor suffix):
     no document tokens are recomputed
 ```
 
+### 4.8 Extraction rounds and the draft policy
+
+An AI.EXTRACT answer is copied from the document one round at a time.
+A round is one forward pass over the document's KV with a few fed
+tokens: the token the model chose last round, then a draft of the
+document's next tokens after the position the answer so far matches.
+Readout rows after each fed token verify the draft, so a round writes
+as many tokens as the model would have chosen one at a time.
+
+The draft length is chosen per document and round
+(`quail/cost/draft_policy.py`, from `Decoder.draft`). The round costs
+`1 + γ + ρ` fed-token equivalents, with ρ the document's KV read per
+round in fed tokens, set by the planner from the model's KV bytes per
+token, the device bandwidth, and the token price. A draft of γ is
+expected to write `1 + a(m) × Σ surv(j)` tokens, where `surv(j)` is the
+answer-length curve, seeded geometric with mean `expected_answer_tokens`
+and learned from settled answers, and `a(m)` is the chance the position
+followed is the answer's source when m positions match, seeded `1/m`
+and learned from drafted rounds. The round feeds the γ with the least
+cost per written token. The plan's `draft_policy` "fixed" feeds
+`draft_tokens` every round instead.
+
+The sweep and traces behind the default are in
+[2026-10-16-extract-draft-policy.md](2026-10-16-extract-draft-policy.md).
+
 ## 5. Joins
 
 ### Packed joins
