@@ -1,4 +1,4 @@
-"""Filter predicates and the Filter and AiFilter nodes."""
+"""The Filter condition and the Filter and AiFilter nodes."""
 
 from __future__ import annotations
 
@@ -14,69 +14,62 @@ from ..base import (
 
 
 @dataclass(frozen=True)
-class InList:
-    """The predicate ``column IN (values)`` over a label column."""
+class Condition:
+    """The predicate ``column <comparison> value`` over a result column.
+
+    The fields are those of quail.logical.RegularPredicate with the
+    column named as the rows table names it; the executor evaluates
+    both with quail.catalog.selection.evaluate_predicate.
+    """
 
     column: str
-    values: tuple[str, ...]
-
-    def accepts(self, value) -> bool:
-        """Return whether the value is one of the accepted labels."""
-        return value in self.values
-
-    def to_dict(self) -> dict:
-        return {"kind": "in_list", "column": self.column,
-                "values": list(self.values)}
-
-    def describe(self) -> str:
-        return f"{self.column} IN {list(self.values)}"
-
-
-@dataclass(frozen=True)
-class Comparison:
-    """The predicate ``column <op> value`` over a score column."""
-
-    column: str
-    op: str
-    value: float
-
-    def accepts(self, value) -> bool:
-        """Return whether the value satisfies the score comparison."""
-        import operator
-
-        compare = {"<": operator.lt, "<=": operator.le,
-                   ">": operator.gt, ">=": operator.ge}[self.op]
-        return bool(compare(value, self.value))
+    comparison: str
+    value: Any = None
+    path: tuple[str, ...] = ()
+    function: str | None = None
 
     def to_dict(self) -> dict:
-        return {"kind": "comparison", "column": self.column, "op": self.op,
-                "value": self.value}
+        return {"column": self.column, "comparison": self.comparison,
+                "value": list(self.value) if isinstance(self.value, tuple)
+                else self.value, "path": list(self.path),
+                "function": self.function}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "Condition":
+        """Decode a condition from its serialized mapping."""
+        literal = value["value"]
+        return cls(str(value["column"]), str(value["comparison"]),
+                   tuple(literal) if isinstance(literal, list) else literal,
+                   tuple(str(field) for field in value.get("path", ())),
+                   value.get("function"))
+
+    @classmethod
+    def from_predicate(cls, column: str, predicate) -> "Condition":
+        """Build the condition a logical RegularPredicate applies."""
+        return cls(column, predicate.comparison, predicate.value,
+                   tuple(predicate.path), predicate.function)
 
     def describe(self) -> str:
-        return f"{self.column} {self.op} {self.value}"
-
-
-def predicate_from_mapping(value: Mapping[str, Any]) -> "InList | Comparison":
-    """Decode a filter predicate from its serialized mapping."""
-    if value["kind"] == "in_list":
-        return InList(str(value["column"]),
-                      tuple(str(item) for item in value["values"]))
-    if value["kind"] == "comparison":
-        return Comparison(str(value["column"]), str(value["op"]),
-                          float(value["value"]))
-    raise ValueError(f"unknown filter predicate {value['kind']!r}")
+        name = ".".join((self.column, *self.path))
+        name = f"{self.function}({name})" if self.function else name
+        if self.comparison == "in":
+            return f"{name} IN {list(self.value)}"
+        if self.comparison.startswith("is"):
+            return f"{name} {self.comparison.upper()}"
+        return f"{name} {self.comparison} {self.value!r}"
 
 
 @dataclass(frozen=True)
 class Filter(PhysicalNode):
-    """Physical operator that keeps rows matching a score or label condition.
+    """Physical operator that keeps the rows whose condition holds.
 
-    InList tests a label produced by AI.CLASSIFY. Comparison tests a score
-    produced by AI.SCORE. Single-document filters also return the kept
-    document IDs; filters over joined pairs return join answers.
+    The condition tests a label AI.CLASSIFY produced, a score AI.SCORE
+    produced, or an answer or span AI.EXTRACT produced. Single-document
+    filters also return the kept document IDs; filters over joined
+    pairs return join answers.
     """
 
-    predicate: InList | Comparison | None = None
+    predicate: Condition | None = None
     aliases: tuple[str, ...] = ()
     selectivity: float | None = None
     written_pos: int = 0
@@ -133,7 +126,7 @@ class Filter(PhysicalNode):
         return cls(
             node_id=node_id,
             inputs=inputs,
-            predicate=predicate_from_mapping(attributes["predicate"]),
+            predicate=Condition.from_dict(attributes["predicate"]),
             aliases=tuple(attributes["aliases"]),
             selectivity=attributes["selectivity"],
             written_pos=int(attributes["written_pos"]),

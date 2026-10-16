@@ -12,7 +12,7 @@ from quail.logical.prompts import (
 )
 from quail.physical import (
     AiScore,
-    Comparison,
+    Condition,
     Filter,
     PortRef,
     ScoreSpec,
@@ -135,8 +135,8 @@ class ScoreLowering:
         node = Filter(
             node_id=f"filter:{alias}:{position}",
             inputs=input_ports((source,)),
-            predicate=Comparison(self.names[predicate.prompt],
-                                 expression.comparison, expression.threshold),
+            predicate=Condition(self.names[predicate.prompt],
+                                expression.comparison, expression.threshold),
             aliases=tuple(aliases), selectivity=predicate.selectivity,
             written_pos=position)
         self.nodes.append(node)

@@ -251,7 +251,7 @@ def compile_sql(
     distinct = _parse_distinct(tree)
 
     b = ExpressionBinder(catalog, prompts or PromptBinder(
-        turn=turn, layout=layout))
+        turn=turn, layout=layout), dialect=dialect.value)
 
     joins = JoinBinder(b)
     joins.bind_tables(tree)
@@ -283,6 +283,7 @@ def compile_sql(
                 for call, accepted, selectivity in b.label_tests.get(alias, ())
             ),
             extracts=tuple(extracts.get(alias, ())),
+            extract_filters=tuple(b.extract_tests.get(alias, ())),
         )
     for join in b.joins:
         logical.add_join(join)

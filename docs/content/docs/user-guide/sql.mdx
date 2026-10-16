@@ -299,6 +299,9 @@ WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body)
 - A category that is not in the list matches no rows.
 - Quail evaluates the repeated classification once and uses its label
   in both `SELECT` and `WHERE`.
+- `WHERE` can name the label by its `AS` name instead of repeating the
+  call: `WHERE sentiment IN ('negative', 'mixed')`. The name must not
+  also be a column of a table in the query.
 
 #### Classify joined rows
 
@@ -369,6 +372,7 @@ Pass an object as the third argument, such as `{'trim': false}`.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `trim` | `true` | When `true`, each answer is the fewest words that answer the question. When `false`, each answer is the whole line that contains it. |
+| `selectivity` | `0.2` | Estimated fraction of documents each `WHERE` test on the call's fields keeps. |
 
 ### Answer positions
 
@@ -382,12 +386,42 @@ In Python, `text[start:end]` returns the answer.
 Each question is a separate extraction. On the Quail backend, the
 questions about one document read the same document KV.
 
+### Filter on answers
+
+`WHERE` can test a field of an extraction named in `SELECT`. Quail
+extracts once, keeps the documents whose answer passes, and returns the
+answer. For example, keep the leases whose end date was found and
+mentions 2027:
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.text, {'end_date': 'When does the lease end?'},
+                  {'selectivity': 0.4}) AS lease
+FROM contracts c
+WHERE lease.end_date IS NOT NULL
+  AND lease.end_date LIKE '%2027%';
+```
+
+A field is tested with the conditions of [WHERE and ON](#where-and-on):
+the comparisons, `IN`, `IS [NOT] NULL`, the text tests, and `LENGTH()`.
+A null answer fails every test but `IS NULL`. A span field is tested
+by its `start` or `end`: `lease_span.end_date.start < 500` keeps the
+answers that begin in the first 500 characters. Repeating the call
+with the field works too: `AI.EXTRACT(...).end_date IS NOT NULL`. The
+`selectivity` option estimates the fraction of documents the tests on
+the call keep; it does not change which pass.
+
+The tests run after the table's `AI.IF` and `AI.CLASSIFY` conditions,
+so an extraction reads only the documents those kept, and a test on
+one field keeps the documents a later field is extracted from.
+
 These limits apply:
 
 - Quail runs extractions on Qwen3 4B and Qwen3 32B. See
   [Supported models and GPUs](/docs/user-guide/models).
-- `WHERE`, `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result
-  of an extraction.
+- Filters on answers run on the Quail backend only.
+- `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result of an
+  extraction.
 
 For the Python form, see
 [`ai_extract()`](/docs/user-guide/python-api#ai_extract).
@@ -403,10 +437,17 @@ which rows to join. Both support the following conditions on table columns:
 | Match a value in a list | `IN (...)` |
 | Keep null values | `IS NULL` |
 | Keep non-null values | `IS NOT NULL` |
+| Match a pattern | `LIKE`, `ILIKE` (`%` matches any text, `_` one character) |
+| Find text | Snowflake `CONTAINS`, `STARTSWITH`, `ENDSWITH`; BigQuery `CONTAINS_SUBSTR` (ignores case), `STARTS_WITH`, `ENDS_WITH` |
+| Match a regular expression | Snowflake `REGEXP_LIKE`, `RLIKE` (the whole value); BigQuery `REGEXP_CONTAINS` (anywhere) |
+| Test the length | `LENGTH(column)` compared with a number |
 
 Values can be numbers, strings, or booleans. `IN` requires a non-empty
-list of constant values. Combine conditions with `AND`.
-Comparisons exclude null values. Use `IS NULL` to keep them.
+list of constant values. Combine conditions with `AND`. `NOT` before a
+text test negates it. Comparisons exclude null values. Use `IS NULL`
+to keep them. The same conditions test a label or an extraction field
+named in `SELECT`; see [AI.CLASSIFY](#aiclassify) and
+[Filter on answers](#filter-on-answers).
 
 E.g., the following SQL query returns the IDs of reviews from 2024 with
 at least four stars that mention shipping:
@@ -530,7 +571,7 @@ rows that pass `WHERE`.
 - Window functions, `QUALIFY`
 - `UNION`, `EXCEPT`, `INTERSECT`
 - `OR` between conditions
-- `BETWEEN`, `LIKE`, and arithmetic in column comparisons
+- `BETWEEN` and arithmetic in column comparisons
 - Queries with no AI operator
 - `JOIN` with only relational predicates (no AI operator)
 - Outer joins (`LEFT`, `RIGHT`, `FULL`)

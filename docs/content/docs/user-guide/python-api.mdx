@@ -129,6 +129,22 @@ string field for each question. `lease_span` holds the position of each
 answer. Pass `trim=False` to return the whole line that contains each
 answer.
 
+Test a field with `where()` to keep the documents whose answer passes;
+the extraction runs once for the test and the returned column:
+
+```python
+query = (
+    session.docs("contracts").alias("c")
+    .ai_extract("c.text", {"end_date": "When does the lease end?"}, name="lease")
+    .where(col("lease.end_date").is_not_null(),
+           col("lease.end_date").like("%2027%"), selectivity=0.4)
+    .select("c.id", "lease")
+)
+```
+
+`col("lease_span.end_date").field("start") < 500` tests where the
+answer begins.
+
 See [`AI.EXTRACT`](/docs/user-guide/sql#aiextract) for output examples
 and supported queries.
 
@@ -220,7 +236,7 @@ result = query.collect()
 
 ### where
 
-`where(*tests)`
+`where(*tests, selectivity=None)`
 
 Keep rows that satisfy all the given conditions. Use `col("name")` to
 refer to a column in a condition.
@@ -231,9 +247,20 @@ refer to a column in a condition.
 | Match a value in a collection | `col(...).isin(values)` |
 | Keep null values | `col(...).is_null()` |
 | Keep non-null values | `col(...).is_not_null()` |
+| Match a pattern | `col(...).like(pattern)`, `col(...).ilike(pattern)` |
+| Find text | `col(...).contains(text, ignore_case=False)`, `col(...).startswith(text)`, `col(...).endswith(text)` |
+| Match a regular expression | `col(...).rlike(pattern)` |
+| Test the length | `col(...).length() < 40` |
 
 `isin()` takes a non-empty iterable of values. Use `is_null()` to test
-for nulls rather than comparing with `None`.
+for nulls rather than comparing with `None`. `~` before a text test
+negates it.
+
+A column can also be a label from `ai_classify()` (`col("sentiment")
+.isin([...])`) or a field from `ai_extract()` (`col("lease.end_date")
+.is_not_null()`). Such a test runs right after the call that computes
+the column, and `selectivity` estimates the fraction of documents it
+keeps.
 
 E.g., the following query returns the IDs of reviews from 2024 with at
 least four stars that mention shipping:
@@ -248,9 +275,9 @@ query = (
 result = query.collect()
 ```
 
-Quail applies `where()` before AI operators even if it appears later
-in the builder chain. To compare columns from different tables, use
-[`join()`](#join).
+Quail applies a `where()` on a source column before AI operators even
+if it appears later in the builder chain. To compare columns from
+different tables, use [`join()`](#join).
 
 ### limit
 

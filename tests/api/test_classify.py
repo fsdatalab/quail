@@ -37,8 +37,8 @@ from quail.physical import (
     AiClassify,
     AiJoin,
     ClassifySpec,
+    Condition,
     Filter,
-    InList,
     decode_graph,
     encode_graph,
 )
@@ -299,7 +299,7 @@ def test_classify_plans_filters_and_returns_labels(session):
     # a tokenizer without decode marks no word start
     assert classify.spec.label_word_starts == tuple(
         (False,) * len(ids) for ids in classify.spec.label_token_ids)
-    assert test.predicate == InList("topic", ("refund", "shipping"))
+    assert test.predicate == Condition("topic", "in", ("refund", "shipping"))
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
 
@@ -381,7 +381,7 @@ def test_sql_classifies_and_tests_labels(session):
         .label_in("topic", ["refund", "shipping"]).select("d.id", "topic"))
     assert query.logical == built.logical
     (test,) = [n for n in query.plan().nodes if isinstance(n, Filter)]
-    assert test.predicate == InList("topic", ("refund", "shipping"))
+    assert test.predicate == Condition("topic", "in", ("refund", "shipping"))
     # a filter on the label alone, with a selectivity option
     filtered = session.sql(
         f"SELECT d.id FROM documents d WHERE {call[:-1]}, "
@@ -414,8 +414,8 @@ def test_frontends_place_classifications_on_their_table(session):
                      "SemanticClassify", "Filter", "Project"]
     topic, kind = plan.operators().classifies
     assert (topic.name, topic.alias, kind.name) == ("topic", "d", "kind")
-    assert plan.root.input.condition == quail.logical.InList(
-        ColumnRef("d", "documents", "kind"), ("complaint",))
+    assert plan.root.input.condition == quail.logical.RegularPredicate(
+        ColumnRef("d", "documents", "kind"), "in", ("complaint",))
     assert plan.operators().labels.tests == {topic.call: [0], kind.call: [1]}
     # projection pushdown reaches the scan through the classifications
     assert push_down_projection(plan.root) is plan.root
@@ -449,7 +449,7 @@ def test_frontends_place_classifications_on_their_table(session):
     assert unused.logical.operators().classifies == ()
     text = _topic(session).explain()
     assert "SemanticClassify: topic" in text
-    assert ("Filter: d.topic IN ['refund', 'shipping'] (selectivity=50%)"
+    assert ("Filter: d.topic IN ('refund', 'shipping') (selectivity=50%)"
             in text.split("SemanticClassify")[0])
     assert "Project: d.id, topic" in text
     assert "AiClassify: topic over d" in text
@@ -757,7 +757,7 @@ def test_classify_refusals_and_builder_errors(session):
         quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
         name="x").label_in("x", ["c"]).select("d.id"))
     (test,) = [n for n in none.plan().nodes if isinstance(n, Filter)]
-    assert test.predicate == InList("x", ("c",))
+    assert test.predicate == Condition("x", "in", ("c",))
     with pytest.raises(CompileError, match="differ ignoring case"):
         session.docs("documents").alias("d").ai_classify(
             quail.prompt("{0}", quail.col("d.body")), ["a", "A"], name="x")
@@ -1309,3 +1309,29 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
     # the cue and the canvas after the prompt and the frame, once
     assert batch.suffix_tokens == 2 * (1 + 4)
     assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 5)
+
+
+def test_a_label_in_where_names_the_classification_by_its_as_name(session):
+    call = ("AI.CLASSIFY(PROMPT('What is {0} about?', d.body), "
+            "ARRAY['refund', 'shipping', 'praise'])")
+    named = session.sql(
+        f"SELECT d.id, {call} AS topic FROM documents d "
+        f"WHERE topic IN ('refund', 'shipping')")
+    repeated = session.sql(
+        f"SELECT d.id, {call} AS topic FROM documents d "
+        f"WHERE {call} IN ('refund', 'shipping')")
+    assert named.logical == repeated.logical
+    equal = session.sql(
+        f"SELECT d.id, {call} AS topic FROM documents d WHERE topic = 'refund'")
+    assert str(equal.logical.root.input.condition) == "d.topic IN ('refund')"
+    builder = (session.docs("documents").alias("d")
+               .ai_classify(quail.prompt("What is {0} about?", quail.col("d.body")),
+                            ["refund", "shipping", "praise"], name="topic")
+               .where(quail.col("topic") == "refund"))
+    assert builder.select("d.id", "topic").logical == equal.logical
+    with pytest.raises(CompileError, match="== or isin"):
+        builder.where(quail.col("topic").like("re%"))
+    # a name that is also a column of a table in scope is ambiguous
+    with pytest.raises(CompileError, match="both a column"):
+        session.sql(f"SELECT d.id, {call} AS body FROM documents d "
+                    f"WHERE body = 'refund'")

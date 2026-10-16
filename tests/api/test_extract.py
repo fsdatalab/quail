@@ -30,6 +30,8 @@ from quail.physical import (
     ExtractSpec,
     Filter,
     Project,
+    decode_graph,
+    encode_graph,
 )
 from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import EngineConfig, Refusal
@@ -615,3 +617,230 @@ def test_extract_field_errors(session):
         (session.docs("contracts").alias("c")
          .ai_extract("c.text", FIELDS, name="lease")
          .order_by("lease").select("c.id", "lease"))
+
+
+def _answers_executor(answers):
+    """Build a fake executor whose extractions return the given answers.
+
+    Args:
+        answers: Document position -> the answer text or None, for
+            every question.
+    """
+    def execute(request):
+        from helpers.fakes import graph_state
+
+        from quail.backends.quail.graph import execute_single_graph
+        from quail.builtins import built_in_registry
+        from quail.execution.metrics import NodeMetrics, NodeResult
+        from quail.execution.types import PhysicalResponse
+        from quail.physical import Scan
+
+        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
+        docs = {node.alias: request.inputs[node.input_id].documents
+                for node in graph.nodes if isinstance(node, Scan)}
+        texts = {node.alias: request.inputs[node.input_id].texts
+                 for node in graph.nodes if isinstance(node, Scan)}
+
+        class Answers:
+            def execute(self, node, inputs):
+                spec = node.spec
+                ids = [int(i) for i in inputs["document_ids"]]
+                table = extract_answer_table(
+                    spec.alias, spec.name, spec.span_name, ids,
+                    [answers[i] for i in ids],
+                    [None if answers[i] is None
+                     else locate_span(str(texts[spec.alias][i]), answers[i])
+                     for i in ids])
+                return NodeResult(
+                    {"rows": table, f"ids:{spec.alias}": ids},
+                    NodeMetrics(input_rows=len(ids), output_rows=len(ids),
+                                evaluated_documents=len(ids)))
+
+        state = graph_state(Answers(), docs)
+        state["texts"] = texts
+        report = execute_single_graph(
+            state, {"filter_limit": None, "pre_ids": []}, graph)
+        outputs = report.pop("_outputs")
+        return PhysicalResponse(outputs, {
+            **report, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 12})
+
+    return execute
+
+
+def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
+    from quail.api.execute import execute_query
+    from quail.logical import Filter as LogicalFilter
+
+    sql = session.sql
+    built = (session.docs("contracts").alias("c")
+             .ai_extract("c.text", {"ends": QUESTION, "rent": "How much?"},
+                         name="lease")
+             .where(quail.col("lease.ends").is_not_null(),
+                    quail.col("lease.ends").ilike("%march%"), selectivity=0.5)
+             .where(quail.col("lease_span.ends").field("start") < 20,
+                    selectivity=0.5)
+             .where(quail.col("lease.rent").length() < 20, selectivity=0.5)
+             .select("c.id", "lease"))
+    written = sql(
+        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
+        f"'rent': 'How much?'}}, {{'selectivity': 0.5}}) AS lease "
+        f"FROM contracts c WHERE lease.ends IS NOT NULL "
+        f"AND lease.ends ILIKE '%march%' AND lease_span.ends.start < 20 "
+        f"AND LENGTH(lease.rent) < 20")
+    # the builder's selectivity applies to each where(); SQL's option
+    # to every test of the call
+    assert written.logical == built.logical
+    # each test follows its field's extraction; the span and length
+    # tests use the same Filter node
+    kinds = [type(node).__name__ for node in built.logical.walk()]
+    assert kinds == ["Scan", "SemanticExtract", "Filter", "Filter", "Filter",
+                     "SemanticExtract", "Filter", "Project"]
+    tests = [node for node in built.logical.walk()
+             if isinstance(node, LogicalFilter)]
+    assert [str(node.condition) for node in tests] == [
+        "c.lease.ends IS NOT NULL", "c.lease.ends ilike '%march%'",
+        "c.lease.ends_span.start < 20", "length(c.lease.rent) < 20"]
+    assert [node.selectivity for node in tests] == [0.5, 0.5, 0.5, 0.5]
+    operators = built.logical.operators()
+    assert [(test.name, test.position)
+            for test in operators.extract_filters["c"]] == [
+        ("lease.ends", 0), ("lease.ends", 1), ("lease.ends", 2),
+        ("lease.rent", 3)]
+    plan = built.plan()
+    assert not isinstance(plan, Refusal)
+    extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    filters = [n for n in plan.nodes if isinstance(n, Filter)]
+    assert [node.predicate.describe() for node in filters] == [
+        "lease.ends IS NOT NULL", "lease.ends ilike '%march%'",
+        "lease.ends_span.start < 20", "length(lease.rent) < 20"]
+    assert filters[0].inputs[0].source.node_id == extracts[0].node_id
+    assert extracts[1].inputs[0].source.node_id == filters[2].node_id
+    # the three tests on the first field thin the second extraction
+    assert extracts[1].spec.expected_inputs == pytest.approx(2 * 0.5 ** 3)
+    assert extracts[1].inputs[0].source.node_id == filters[2].node_id
+    codecs = session.registry.codecs
+    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
+    assert "Filter: lease.ends ilike '%march%'" in built.explain()
+
+    # one document answers; its answer passes the tests
+    result = execute_query(built, physical_executor=_answers_executor(
+        {0: "March 3, 2027", 1: None}))
+    rows = result.collect()
+    assert rows.column("c.id").to_pylist() == [1]
+    assert rows.column("lease").to_pylist() == [
+        {"ends": "March 3, 2027", "rent": "March 3, 2027"}]
+    answers = result.answer_tables["extracts"]["lease.ends"]
+    assert answers.column("lease.ends").to_pylist() == ["March 3, 2027", None]
+    # the second question was asked of the survivor only
+    assert result.answer_tables["extracts"]["lease.rent"].num_rows == 1
+    passed = result.answer_tables["filters"]
+    assert passed[("c", 0)].column("answer").to_pylist() == [True, False]
+    assert passed[("c", 2)].column("answer").to_pylist() == [True]
+    # a negated text test drops the null answer as SQL does
+    negated = (session.docs("contracts").alias("c")
+               .ai_extract("c.text", {"ends": QUESTION}, name="lease")
+               .where(~quail.col("lease.ends").like("March%"))
+               .select("c.id", "lease"))
+    assert str(negated.logical.root.input.condition) == (
+        "c.lease.ends not like 'March%'")
+    result = execute_query(negated, physical_executor=_answers_executor(
+        {0: "March 3, 2027", 1: None}))
+    assert result.collect().num_rows == 0
+
+
+def test_filters_on_answers_bind_in_both_dialects_and_refuse_bad_tests(session):
+    sql = session.sql
+    fields = f"{{'ends': '{QUESTION}'}}"
+    head = f"SELECT c.id, AI.EXTRACT(c.text, {fields}) AS lease FROM contracts c "
+    # the repeated call names the field; BigQuery's text functions
+    # and Snowflake's parse to the same tests, but for case and anchors
+    repeated = sql(head + f"WHERE AI.EXTRACT(c.text, {fields}).ends "
+                   f"NOT LIKE 'x%'")
+    assert str(repeated.logical.root.input.condition) == (
+        "c.lease.ends not like 'x%'")
+    bq = sql(head + "WHERE REGEXP_CONTAINS(lease.ends, '20..') AND "
+             "CONTAINS_SUBSTR(lease.ends, 'MARCH') AND STARTS_WITH(lease.ends, 'M') "
+             "AND NOT ENDS_WITH(lease.ends, '.') AND lease.ends NOT LIKE 'x%'",
+             dialect="bq")
+    snowflake = sql(head + "WHERE REGEXP_LIKE(lease.ends, '20..') AND "
+                    "CONTAINS(lease.ends, 'MARCH') AND STARTSWITH(lease.ends, 'M') "
+                    "AND NOT ENDSWITH(lease.ends, '.') AND lease.ends RLIKE 'M.*'")
+    conditions = [str(test.condition)
+                  for test in bq.logical.operators().extract_filters["c"]]
+    assert conditions == [
+        "c.lease.ends regex '20..'", "c.lease.ends icontains 'MARCH'",
+        "c.lease.ends starts with 'M'", "c.lease.ends not ends with '.'",
+        "c.lease.ends not like 'x%'"]
+    conditions = [str(test.condition)
+                  for test in snowflake.logical.operators().extract_filters["c"]]
+    assert conditions == [
+        "c.lease.ends regex '^(?:20..)$'", "c.lease.ends contains 'MARCH'",
+        "c.lease.ends starts with 'M'", "c.lease.ends not ends with '.'",
+        "c.lease.ends regex '^(?:M.*)$'"]
+    # the answer tests of a joined table ride with its extraction when
+    # the planner lifts it above the joins
+    session.register("questions", DocumentProvider.from_table(
+        pa.table({"id": [1], "ask": ["end dates"]}), id_col="id"))
+    joined = sql(
+        f"SELECT c.id, q.id, AI.EXTRACT(c.text, {fields}) AS lease "
+        f"FROM contracts c JOIN questions q "
+        f"ON AI_FILTER(PROMPT('Does {{0}} answer {{1}}?', c.text, q.ask)) "
+        f"WHERE lease.ends IS NOT NULL")
+    plan = joined.plan()
+    assert not isinstance(plan, Refusal)
+    assert extracted_above_joins(joined.logical.root) == {"c"}
+    (test,) = [n for n in plan.nodes if isinstance(n, Filter)]
+    (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    assert test.inputs[0].source.node_id == extract.node_id
+    for bad, message in (
+            (head + "WHERE lease.ends = 3", "compares it with a string"),
+            (head + "WHERE lease.ends LIKE 3", "compares with a string"),
+            (head + "WHERE lease.signer IS NOT NULL", "no field 'signer'"),
+            (head + "WHERE lease_span.ends < 3", "test its start or end"),
+            (head + "WHERE lease.ends.start < 3", "field under an answer"),
+            (head + "WHERE AI.EXTRACT(c.text, {'other': 'q?'}).other IS NULL",
+             "not returned by SELECT"),
+            (f"SELECT c.id, AI.EXTRACT(c.text, {fields}) AS c FROM contracts c "
+             f"WHERE c.ends IS NOT NULL", "both a table alias"),
+            (head + "WHERE c.text BETWEEN 'a' AND 'b'", "not supported"),
+            (head + "WHERE NOT c.text = 'a'", "NOT is supported as")):
+        with pytest.raises(CompileError, match=message):
+            sql(bad)
+    builder = (session.docs("contracts").alias("c")
+               .ai_extract("c.text", {"ends": QUESTION}, name="lease"))
+    with pytest.raises(CompileError, match="no field 'signer'"):
+        builder.where(quail.col("lease.signer").is_null())
+    with pytest.raises(CompileError, match="has no fields"):
+        builder.where(quail.col("c.text").field("x") == "a")
+    with pytest.raises(CompileError, match="does not return"):
+        builder.where(quail.col("lease.ends").is_null()).select("c.id")
+    # the speed of light estimate keeps the documents whose reference
+    # answer passes, and does not price a span test
+    tested = (session.docs("contracts").alias("c")
+              .ai_extract("c.text", {"ends": QUESTION}, name="lease")
+              .where(quail.col("lease.ends").is_not_null())
+              .select("c.id", "lease"))
+    reference = {0: "March 3, 2027", 1: None}
+    estimate = quail.speed_of_light_estimate(
+        tested, lambda prompt, assignment: reference[assignment["c"]])
+    extract, test = estimate.filter_stages
+    assert (test["operator"], test["evaluated"], test["passed"],
+            test["condition"]) == ("ANSWER TEST", 2, 1, "c.lease.ends IS NOT NULL")
+    spanned = (session.docs("contracts").alias("c")
+               .ai_extract("c.text", {"ends": QUESTION}, name="lease")
+               .where(quail.col("lease_span.ends").field("start") < 3)
+               .select("c.id", "lease"))
+    with pytest.raises(NotImplementedError, match="span"):
+        quail.speed_of_light_estimate(spanned, lambda *_: None)
+    # stock vLLM returns answers but not the filter
+    stock = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
+                                       backend="stock_vllm"),
+                          tokenizer=letter_tokens)
+    stock.register("contracts", session.catalog.get("contracts"))
+    refused = (stock.docs("contracts").alias("c")
+               .ai_extract("c.text", {"ends": QUESTION}, name="lease")
+               .where(quail.col("lease.ends").is_not_null())
+               .select("c.id", "lease")).plan()
+    assert isinstance(refused, Refusal)
+    assert refused.constraint == "extract_filter_needs_quail_backend"
+    stock.close()

@@ -6,8 +6,21 @@ from typing import Optional
 
 @dataclass(frozen=True, eq=False)
 class ColSpec:
+    """A column reference, with the struct fields and function read on it.
+
+    Attributes:
+        alias: The table alias or result struct, or None when unqualified.
+        column: The column or struct field name.
+        path: Struct fields read under the column, such as ``("start",)``
+            of an extraction's span.
+        function: A function applied to the values before a test, such
+            as ``"length"``.
+    """
+
     alias: Optional[str]
     column: str
+    path: tuple = ()
+    function: Optional[str] = None
 
     def __eq__(self, other):
         """``col("c.url") == col("e.url")`` is a join condition.
@@ -42,6 +55,35 @@ class ColSpec:
     def is_not_null(self) -> "PredicateSpec":
         return PredicateSpec(self, "is not null")
 
+    def like(self, pattern: str) -> "PredicateSpec":
+        """SQL LIKE: ``%`` matches any text and ``_`` one character."""
+        return PredicateSpec(self, "like", pattern)
+
+    def ilike(self, pattern: str) -> "PredicateSpec":
+        """LIKE ignoring case."""
+        return PredicateSpec(self, "ilike", pattern)
+
+    def contains(self, text: str, ignore_case: bool = False) -> "PredicateSpec":
+        return PredicateSpec(self, "icontains" if ignore_case else "contains", text)
+
+    def startswith(self, text: str) -> "PredicateSpec":
+        return PredicateSpec(self, "starts with", text)
+
+    def endswith(self, text: str) -> "PredicateSpec":
+        return PredicateSpec(self, "ends with", text)
+
+    def rlike(self, pattern: str) -> "PredicateSpec":
+        """Whether a regular expression (RE2 syntax) matches anywhere."""
+        return PredicateSpec(self, "regex", pattern)
+
+    def field(self, name: str) -> "ColSpec":
+        """Read a field of a struct column, such as a span's ``start``."""
+        return ColSpec(self.alias, self.column, (*self.path, name), self.function)
+
+    def length(self) -> "ColSpec":
+        """The number of characters of each value."""
+        return ColSpec(self.alias, self.column, self.path, "length")
+
     def asc(self) -> "SortSpec":
         return SortSpec(self)
 
@@ -55,7 +97,7 @@ class ColSpec:
         return SortSpec(self, nulls="last")
 
     def __hash__(self):
-        return hash((self.alias, self.column))
+        return hash((self.alias, self.column, self.path, self.function))
 
 
 @dataclass(frozen=True)
@@ -99,6 +141,15 @@ class PredicateSpec:
     col: ColSpec
     comparison: str
     value: object = None
+
+    def __invert__(self) -> "PredicateSpec":
+        """``~col(...).like(...)``: the negated text test."""
+        if self.comparison.startswith("not "):
+            return PredicateSpec(self.col, self.comparison[4:], self.value)
+        if self.comparison in ("is null", "is not null"):
+            flipped = "is not null" if self.comparison == "is null" else "is null"
+            return PredicateSpec(self.col, flipped)
+        return PredicateSpec(self.col, f"not {self.comparison}", self.value)
 
 
 @dataclass(frozen=True)

@@ -27,7 +27,6 @@ from quail.logical import (
     ExtractStruct,
     FilterPredicate,
     HavingTest,
-    InList,
     JoinSpec,
     LogicalPlan,
     LogicalPlanBuilder,
@@ -65,6 +64,8 @@ class Query:
         # name -> an AI.EXTRACT's ExtractStruct and its fields' Aliases
         self._extracts = {}
         self._regular_predicates = {}  # alias -> [RegularPredicate]
+        # alias -> [(RegularPredicate on an answer or span, selectivity)]
+        self._extract_filters = {}
         self._limit = None
         self._order = []             # (column or name, descending, nulls_first)
         self._offset = 0
@@ -307,7 +308,8 @@ class Query:
                 f"{name!r} classifies pairs of {call.aliases()}")
         (alias,) = call.aliases()
         labels = tuple(labels)
-        InList(ColumnRef(alias, self._scope()[alias], name), labels).validate()
+        RegularPredicate(ColumnRef(alias, self._scope()[alias], name), "in",
+                         labels).validate()
         self._label_filters.setdefault(alias, []).append(
             (name, labels, selectivity))
         return self
@@ -461,6 +463,8 @@ class Query:
                 self._label_filters.setdefault(a, []).extend(tests)
             for a, preds in other._regular_predicates.items():
                 self._regular_predicates.setdefault(a, []).extend(preds)
+            for a, tests in other._extract_filters.items():
+                self._extract_filters.setdefault(a, []).extend(tests)
             for a, applies in other._applies.items():
                 self._applies.setdefault(a, []).extend(applies)
             for name, fn in other._functions.items():
@@ -545,24 +549,98 @@ class Query:
                                     anchor=anchor))
         return self
 
-    def where(self, *tests) -> "Query":
-        """Keep the documents that pass regular predicates, before any model call.
+    def where(self, *tests, selectivity: Optional[float] = None) -> "Query":
+        """Keep the rows that pass tests of a column against literals.
+
+        A test of a source column runs at the scan, before any model
+        call. A test of a label from ai_classify() or of an answer from
+        ai_extract() runs right after the call that computes it, so the
+        later operators read fewer documents; the model runs once for
+        the test and the returned column.
 
         Args:
             tests: Comparisons of a ``col(...)`` with a literal, such as
-                ``col("r.year") > 2020``, or ``col(...).isin([...])``,
-                ``col(...).is_null()``, or ``col(...).is_not_null()``.
+                ``col("r.year") > 2020``, ``col(...).isin([...])``,
+                ``col(...).is_null()``, ``col(...).is_not_null()``,
+                ``col(...).like(...)``, ``col(...).ilike(...)``,
+                ``col(...).contains(...)``, ``col(...).startswith(...)``,
+                ``col(...).endswith(...)``, ``col(...).rlike(...)``, or
+                ``~`` before a text test. ``col("lease.end_date")``
+                names an extraction's field, ``col("lease_span.end_date")
+                .field("start")`` its span's start, and
+                ``col(...).length()`` the number of characters.
+            selectivity: Estimated fraction of documents each test on a
+                label or an answer keeps. None uses 0.2.
         """
         for test in tests:
             if not isinstance(test, PredicateSpec):
                 raise CompileError(
                     f"where() takes regular predicates such as col('r.year') > "
                     f"2020, got {test!r}")
-            ref = self._resolve(test.col)
-            predicate = RegularPredicate(ref, test.comparison, test.value)
+            spec = test.col
+            if spec.alias is None and spec.column in self._labels:
+                if test.comparison not in ("=", "in"):
+                    raise CompileError(
+                        f"a label is tested with == or isin(), got {test.comparison}")
+                values = test.value if test.comparison == "in" else (test.value,)
+                self.label_in(spec.column, values, selectivity)
+                continue
+            extracted = self._extract_column(spec)
+            if extracted is not None:
+                predicate = RegularPredicate(
+                    extracted, test.comparison, test.value, spec.path, spec.function)
+                if spec.path:
+                    predicate.validate()
+                else:
+                    predicate.validate_text_column()
+                self._extract_filters.setdefault(extracted.alias, []).append(
+                    (predicate, selectivity))
+                continue
+            if spec.path:
+                raise CompileError(
+                    f"{spec.alias}.{spec.column} has no fields; only an "
+                    f"extraction's span does, such as "
+                    f"col('lease{SPAN_SUFFIX}.end_date').field('start')")
+            ref = self._resolve(spec)
+            predicate = RegularPredicate(ref, test.comparison, test.value,
+                                         function=spec.function)
             predicate.validate()
             self._regular_predicates.setdefault(ref.alias, []).append(predicate)
         return self
+
+    def _extract_column(self, spec: ColSpec) -> Optional[ColumnRef]:
+        """Resolve a col() naming an extraction's answer or span, or None.
+
+        Raises:
+            CompileError: The name is both a table alias and an
+                extraction's name, or the field or span part is unknown.
+        """
+        if spec.alias is None:
+            return None
+        name, span = spec.alias, spec.alias.endswith(SPAN_SUFFIX)
+        if span:
+            name = name[:-len(SPAN_SUFFIX)]
+        if name not in self._extracts:
+            return None
+        if spec.alias in self._scope():
+            raise CompileError(
+                f"{spec.alias!r} is both a table alias and an extraction's "
+                f"name; rename one")
+        struct, members = self._extracts[name]
+        if spec.column not in struct.fields:
+            raise CompileError(
+                f"ai_extract {name!r} has no field {spec.column!r}; its "
+                f"fields are {list(struct.fields)}")
+        if span and tuple(spec.path) not in (("start",), ("end",)):
+            raise CompileError(
+                f"{spec.alias}.{spec.column} is a span; test its start or "
+                f"end with .field('start') or .field('end')")
+        if not span and spec.path:
+            raise CompileError(f"{spec.alias}.{spec.column} has no fields")
+        member = next(m for m in members if m.name == struct.member(spec.column))
+        (alias,) = member.expression.aliases()
+        column = struct.member(spec.column) + (SPAN_SUFFIX if span else "")
+        return ColumnRef(alias, self._scope()[alias], column)
 
     def limit(self, n: int) -> "Query":
         if not isinstance(n, int) or n <= 0:
@@ -695,6 +773,7 @@ class Query:
                 extracts=tuple((column.expression, column.name)
                                for column in extracted
                                if column.expression.aliases() == (alias,)),
+                extract_filters=tuple(self._extract_filters.get(alias, ())),
             )
         for join in self._joins:
             logical.add_join(join)

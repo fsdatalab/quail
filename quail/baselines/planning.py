@@ -190,6 +190,12 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
                          f"{context.model.name!r}",),
                 constraint="extract_needs_quail_backend",
                 needed=1, available=0, unit="backends")
+        if refusal is None and region.logical_plan.operators().extract_filters:
+            refusal = Refusal(
+                reasons=(f"a filter on an AI.EXTRACT answer runs on the "
+                         f"Quail backend only, not {backend_name}",),
+                constraint="extract_filter_needs_quail_backend",
+                needed=1, available=0, unit="backends")
         if refusal is not None:
             return refusal
     if any(isinstance(column, Alias)

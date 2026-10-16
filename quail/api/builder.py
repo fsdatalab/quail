@@ -70,8 +70,8 @@ class BoundBuilder:
                             anchor=anchor, semantics=semantics)
         return self
 
-    def where(self, *tests):
-        self._inner.where(*tests)
+    def where(self, *tests, selectivity=None):
+        self._inner.where(*tests, selectivity=selectivity)
         return self
 
     def limit(self, n):

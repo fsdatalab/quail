@@ -29,8 +29,8 @@ from quail.physical import (
     AiJoin,
     AiScore,
     ClassifySpec,
+    Condition,
     Filter,
-    InList,
     PhysicalGraph,
     PortRef,
     Scan,
@@ -134,12 +134,12 @@ def fused_graph(*, classify_only=False):
         Filter(
             node_id="label:r",
             inputs=input_ports((PortRef("classify:r", "rows"),)),
-            predicate=InList("topic", ("a",)), aliases=("r",),
+            predicate=Condition("topic", "in", ("a",)), aliases=("r",),
             selectivity=0.5, written_pos=1),
         Filter(
             node_id="label:again",
             inputs=input_ports((PortRef("label:r", "rows"),)),
-            predicate=InList("topic", ("a",)), aliases=("r",),
+            predicate=Condition("topic", "in", ("a",)), aliases=("r",),
             selectivity=1.0, written_pos=2),
         AiClassify(
             node_id="classify:kind",
@@ -217,7 +217,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         nodes.append(Filter(
             node_id="label:r",
             inputs=input_ports((PortRef("classify:r", "rows"),)),
-            predicate=InList("topic", ("b",)), aliases=("r",),
+            predicate=Condition("topic", "in", ("b",)), aliases=("r",),
             selectivity=0.5, written_pos=1))
         root = PortRef("label:r", "ids:r")
     if shape == "joined":
@@ -226,7 +226,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
             Filter(
                 node_id="label:r",
                 inputs=input_ports((PortRef("classify:r", "rows"),)),
-                predicate=InList("topic", ("a",)), aliases=("r",),
+                predicate=Condition("topic", "in", ("a",)), aliases=("r",),
                 selectivity=0.5, written_pos=1),
             AiJoin(
                 node_id="group:0", anchor="r", anchor_resident="filter",

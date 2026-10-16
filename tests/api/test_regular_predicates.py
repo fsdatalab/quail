@@ -5,7 +5,7 @@ import pytest
 from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
-from quail.execution.selection import evaluate_predicate, selected_rows
+from quail.catalog.selection import evaluate_predicate, selected_rows
 from quail.frontend.expressions import col, prompt
 from quail.logical import ColumnRef, CompileError, RegularPredicate, Scan
 
@@ -227,3 +227,42 @@ def test_regular_predicates_reach_score_scans_and_may_read_the_text(session):
              .where(col("r.review") == "review 3 " + "pad " * 20)
              .select("r.id"))
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r3",)]
+
+
+def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
+    names = pa.chunked_array([["Acme Corp", None, "acme inc"], ["Beta"]])
+    name = ColumnRef("r", "reviews", "name")
+
+    def passes(comparison, value=None, path=(), function=None):
+        return evaluate_predicate(
+            names, RegularPredicate(name, comparison, value, path, function)
+        ).to_pylist()
+
+    assert passes("like", "Acme%") == [True, None, False, False]
+    assert passes("ilike", "%ACME%") == [True, None, True, False]
+    assert passes("not ilike", "%ACME%") == [False, None, False, True]
+    assert passes("contains", "inc") == [False, None, True, False]
+    assert passes("icontains", "CORP") == [True, None, False, False]
+    assert passes("starts with", "B") == [False, None, False, True]
+    assert passes("ends with", "c") == [False, None, True, False]
+    assert passes("regex", r"\binc\b") == [False, None, True, False]
+    assert passes("regex", "^(?:acme)$") == [False, None, False, False]
+    assert passes("<", 5, function="length") == [False, None, False, True]
+    assert passes("=", "Beta") == [False, None, False, True]
+    spans = pa.chunked_array([pa.StructArray.from_arrays(
+        [pa.array([14, 0]), pa.array([27, 3])], names=["start", "end"],
+        mask=pa.array([False, True]))])
+    predicate = RegularPredicate(name, "<", 20, ("start",))
+    assert evaluate_predicate(spans, predicate).to_pylist() == [True, None]
+    # a text test needs a string; a path needs a struct
+    with pytest.raises(CompileError, match="compares with a string"):
+        RegularPredicate(name, "like", 3).validate()
+    with pytest.raises(CompileError, match="unsupported column function"):
+        RegularPredicate(name, "<", 3, function="upper").validate()
+    with pytest.raises(CompileError, match="cannot be evaluated"):
+        evaluate_predicate(names, RegularPredicate(name, "<", 3, ("start",)))
+    # source columns take the same tests, at the scan
+    reviews = ColumnRef("r", "reviews", "review")
+    assert selected_rows({"review": names, "name": names}, (
+        RegularPredicate(reviews, "ilike", "%acme%"),
+        RegularPredicate(name, ">", 5, function="length"))).to_pylist() == [0, 2]

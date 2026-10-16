@@ -32,7 +32,7 @@ class ScanRuntime:
 
 def _tested_documents(node, context) -> pa.Array:
     """Return the positions of the documents that pass a scan's regular predicates."""
-    from quail.execution.selection import selected_rows
+    from quail.catalog.selection import selected_rows
     from quail.logical import ColumnRef, RegularPredicate
 
     columns = context.sources.get(columns_key(node.alias))

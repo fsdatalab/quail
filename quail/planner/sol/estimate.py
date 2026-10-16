@@ -38,6 +38,7 @@ from quail.cost import budgets
 from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work
 from quail.logical import (
+    SPAN_SUFFIX,
     Aggregate,
     Filter,
     Join,
@@ -51,6 +52,7 @@ from quail.logical import (
     SemanticJoin,
 )
 from quail.planner.sol.search import (
+    ANSWER_TEST,
     CLASSIFY,
     EXTRACT,
     FILTER,
@@ -240,6 +242,13 @@ def _refuse_unpriced(logical) -> None:
                     f"the speed of light estimate does not price the "
                     f"{type(expression).__name__} filter on {alias!r}; "
                     f"it prices AI.IF and label filters")
+    for tests in operators.extract_filters.values():
+        for test in tests:
+            if test.condition.column.column.endswith(SPAN_SUFFIX):
+                raise NotImplementedError(
+                    f"the speed of light estimate does not price the test "
+                    f"{test.condition} of an answer's span; the answer "
+                    f"oracle gives the answer's text only")
     for join in operators.joins:
         if not (isinstance(join.predicate, ModelCall)
                 and join.predicate.kind == "boolean"):
@@ -323,7 +332,7 @@ def speed_of_light_estimate(
                     credit_shared_prefixes)
     survivors, filter_work, filter_stages = search.run_filters()
     resident = frozenset(stage["alias"] for stage in filter_stages
-                         if stage["operator"] != LABEL_IN)
+                         if stage["operator"] not in (LABEL_IN, ANSWER_TEST))
     base_rows = {alias: tuple(rows) for alias, rows in survivors.items()}
     best, result = search.search_joins_sol(base_rows, resident, filter_work)
     return SpeedOfLightEstimate(

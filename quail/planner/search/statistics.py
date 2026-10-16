@@ -16,6 +16,7 @@ from quail.logical import (
     SemanticFilter,
     classified_above_joins,
     effective_selectivity,
+    extracted_above_joins,
     is_score,
     model_call,
 )
@@ -158,18 +159,22 @@ def filter_stop_keys(plan: LogicalPlan) -> dict:
 def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
     """Return the expected live documents per alias after its filters run.
 
-    A filter on a label of a table classified after the joins thins
-    nothing before them.
+    A filter on a label or an answer of a table classified or
+    extracted after the joins thins nothing before them.
     """
-    after_joins = classified_above_joins(plan.root)
+    classified_after = classified_above_joins(plan.root)
+    extracted_after = extracted_above_joins(plan.root)
     operators = plan.operators()
     live = {a: float(st.n_docs) for a, st in statistics.stats.items()}
     for alias in operators.all_filters():
         survival = 1.0
         for predicate in operators.filters.get(alias, ()):
             survival *= effective_selectivity(predicate.selectivity)
-        if alias not in after_joins:
+        if alias not in classified_after:
             for test in operators.label_filters.get(alias, ()):
+                survival *= effective_selectivity(test.selectivity)
+        if alias not in extracted_after:
+            for test in operators.extract_filters.get(alias, ()):
                 survival *= effective_selectivity(test.selectivity)
         live[alias] *= survival
     return live

@@ -18,8 +18,8 @@ from quail.logical import LabelWork, effective_selectivity
 from quail.physical import (
     AiClassify,
     ClassifySpec,
+    Condition,
     Filter,
-    InList,
     PortRef,
 )
 from quail.physical.base import input_ports
@@ -488,7 +488,8 @@ def emit_classify(builder, alias, live=None):
             lid = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
                 node_id=lid, inputs=input_ports((scores,)),
-                predicate=InList(builder.operators.labels.names[call], test.values),
+                predicate=Condition(builder.operators.labels.names[call], "in",
+                                    test.values),
                 aliases=(alias,), selectivity=test.selectivity,
                 written_pos=test.position))
             scores = PortRef(lid, "rows")

@@ -10,9 +10,12 @@ from quail.logical.prompts import (
 )
 from quail.physical import (
     AiExtract,
+    Condition,
     ExtractSpec,
+    Filter,
     PortRef,
 )
+from quail.physical.base import input_ports
 from quail.planner.operators.common import bind_inference, inference_node
 
 
@@ -56,7 +59,12 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
 
 
 def emit_extract(builder, alias, live=None):
-    """Copy the answers of the alias's documents, after its labels."""
+    """Copy the answers of the alias's documents, after its labels.
+
+    A Filter on an extraction's answer or span follows that extraction
+    and keeps the documents the next extraction reads, as a label
+    filter does after its classification.
+    """
     stats = builder.operator_order.statistics.stats
     calls = [node for node in builder.operators.extracts if node.alias == alias]
     if not calls or (alias in builder.extract_after and live is None):
@@ -65,11 +73,12 @@ def emit_extract(builder, alias, live=None):
         live = builder.live_asked.get(alias, float(stats[alias].n_docs))
         for test in builder.operators.label_filters.get(alias, ()):
             live *= effective_selectivity(test.selectivity)
-    for index, logical_node in enumerate(calls):
-        # the extractions of a table run in one pipeline
-        # (quail.physical.pipelines): a document is read once
-        # for all of them
-        shared = index > 0
+    tests = builder.operators.extract_filters.get(alias, ())
+    shared = False
+    for logical_node in calls:
+        # consecutive extractions of a table run in one pipeline
+        # (quail.physical.pipelines): a document is read once for
+        # all of them; a Filter between two ends the pipeline
         spec = extract_spec(builder.context, logical_node.call,
                             logical_node.name, live, shared=shared)
         node = inference_node(
@@ -79,6 +88,21 @@ def emit_extract(builder, alias, live=None):
         builder.nodes.append(node)
         scores = PortRef(node.node_id, "rows")
         builder.ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
+        shared = True
+        for test in tests:
+            if test.name != logical_node.name:
+                continue
+            lid = f"filter:{alias}:{test.position}"
+            builder.nodes.append(Filter(
+                node_id=lid, inputs=input_ports((scores,)),
+                predicate=Condition.from_predicate(
+                    test.condition.column.column, test.condition),
+                aliases=(alias,), selectivity=test.selectivity,
+                written_pos=test.position))
+            scores = PortRef(lid, "rows")
+            builder.ids_src[alias] = PortRef(lid, f"ids:{alias}")
+            live *= effective_selectivity(test.selectivity)
+            shared = False
         builder.rows_src[alias] = scores
         builder.label_ports.append(scores)
 

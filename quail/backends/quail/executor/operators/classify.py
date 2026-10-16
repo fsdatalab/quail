@@ -23,8 +23,8 @@ from quail.backends.quail.reranker import (
     probability_column,
     scored_batch,
 )
+from quail.catalog.selection import document_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.selection import document_positions
 from quail.logical import PROBABILITIES_SUFFIX
 from quail.physical import ValueType
 from quail.progress import answer_sink

@@ -307,24 +307,6 @@ class Compare:
 
 
 @dataclass(frozen=True)
-class InList:
-    """A column's value is one of the listed values, as SQL IN."""
-
-    column: ColumnRef
-    values: tuple  # tuple[str, ...]
-
-    type_name: ClassVar[str] = "quail.in_list"
-
-    def validate(self) -> None:
-        # only a repeated value is an error; a value the column never
-        # holds matches no row
-        if len(set(self.values)) != len(self.values):
-            raise CompileError(
-                f"{self.column.alias}.{self.column.column} IN lists a value twice"
-            )
-
-
-@dataclass(frozen=True)
 class Alias:
     """A model call returned as a named result column."""
 
@@ -414,52 +396,6 @@ class FilterPredicate:
         return model_call(self.expression).prompt
 
 
-COLUMN_COMPARISONS = ("=", "<>", "<", "<=", ">", ">=", "in", "is null", "is not null")
-
-
-@dataclass(frozen=True)
-class RegularPredicate:
-    """A test of one source column against literals, decided without the model.
-
-    ``value`` is the literal compared with, a tuple of literals for
-    ``in``, and None for the null tests.
-    """
-
-    column: ColumnRef
-    comparison: str
-    value: Any = None
-
-    type_name: ClassVar[str] = "quail.regular_predicate"
-
-    def aliases(self) -> tuple[str, ...]:
-        return (self.column.alias,)
-
-    def validate(self) -> None:
-        if not isinstance(self.column, ColumnRef):
-            raise CompileError("a column predicate tests a column reference")
-        if self.comparison not in COLUMN_COMPARISONS:
-            raise CompileError(
-                f"unsupported column comparison {self.comparison!r}; "
-                f"supported: {', '.join(COLUMN_COMPARISONS)}"
-            )
-        if self.comparison == "in":
-            if not isinstance(self.value, tuple) or not self.value:
-                raise CompileError("IN needs a non-empty list of literals")
-        elif self.comparison.startswith("is"):
-            if self.value is not None:
-                raise CompileError("a null test takes no value")
-        elif self.value is None or isinstance(self.value, (tuple, list)):
-            raise CompileError(f"{self.comparison} compares with one literal")
-
-    def __str__(self) -> str:
-        name = f"{self.column.alias}.{self.column.column}"
-        if self.comparison == "in":
-            return f"{name} IN ({', '.join(repr(v) for v in self.value)})"
-        if self.comparison.startswith("is"):
-            return f"{name} {self.comparison.upper()}"
-        return f"{name} {self.comparison} {self.value!r}"
-
-
 @dataclass(frozen=True)
 class Equality:
     """One ordinary join condition: two columns of two tables are equal."""
@@ -484,11 +420,6 @@ def _explain(expression) -> str:
         return (
             f"{_explain(expression.call)} {expression.comparison} "
             f"{expression.threshold}"
-        )
-    if isinstance(expression, InList):
-        return (
-            f"{expression.column.alias}.{expression.column.column} "
-            f"IN {list(expression.values)}"
         )
     if isinstance(expression, Alias):
         if expression.expression.kind in ("label", "extract"):

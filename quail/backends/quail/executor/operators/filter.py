@@ -1,6 +1,7 @@
 """Execute LLM filters and conditions on classification results."""
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.compute as pc
 
 from quail.backends.quail.executor.parts import (
@@ -11,6 +12,7 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.reranker import filter_scores
+from quail.catalog.selection import accepted_rows, evaluate_predicate
 from quail.catalog.tokens import (
     DocumentKeys,
     DocumentPrefixes,
@@ -116,13 +118,19 @@ class LabelGate(SingleResultPart):
         self.node = node
         self.labeled = labeled
         self.source = source
-        self.predicate = node.predicate
         self.position = {document: index
                          for index, document in enumerate(labeled.ids)}
+        self.accepted = {}
 
     def gate(self, key):
+        # labels settle as chunks finish, so each is tested as its
+        # document arrives; the labels are few, so each distinct one
+        # is evaluated once
         label = self.labeled.plan.labels[self.position[key[1]]]
-        return None if self.predicate.accepts(label) else Stage.DROP
+        if label not in self.accepted:
+            self.accepted[label] = bool(accepted_rows(evaluate_predicate(
+                pa.array([label], pa.string()), self.node.predicate))[0].as_py())
+        return None if self.accepted[label] else Stage.DROP
 
     def finish(self, every):
         return None

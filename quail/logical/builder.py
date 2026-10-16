@@ -10,7 +10,6 @@ from quail.logical.expressions import (
     ColumnRef,
     CompileError,
     FilterPredicate,
-    InList,
     ModelCall,
     Prompt,
     model_call,
@@ -31,6 +30,7 @@ from quail.logical.nodes import (
 from quail.logical.plan import (
     LogicalPlan,
 )
+from quail.logical.predicates import RegularPredicate
 
 
 @dataclass(frozen=True)
@@ -71,6 +71,7 @@ class LogicalPlanBuilder:
         label_filters: tuple = (),
         regular_predicates: tuple = (),
         extracts: tuple = (),
+        extract_filters: tuple = (),
     ) -> None:
         """Add one table with its filters, applies, classifications, and extractions.
 
@@ -90,10 +91,14 @@ class LogicalPlanBuilder:
                 classification's label column, in written order.
             extracts: (call, name) per extraction, in order. They sit
                 above the classifications and label filters.
+            extract_filters: (RegularPredicate, selectivity) per Filter
+                on an extraction's answer or span column, in written
+                order. Each sits right above the extraction it tests.
 
         Raises:
-            CompileError: The alias is taken, or a label filter names a
-                column no classification in labels computes.
+            CompileError: The alias is taken, a label filter names a
+                column no classification in labels computes, or an
+                extraction filter names a column no extraction computes.
         """
         if alias in self._nodes:
             raise CompileError(f"duplicate table alias {alias!r}")
@@ -127,15 +132,25 @@ class LogicalPlanBuilder:
                 classified.append(calls[name])
             node = Filter(
                 node,
-                InList(ColumnRef(alias, provider, name), tuple(values)),
+                RegularPredicate(ColumnRef(alias, provider, name), "in", tuple(values)),
                 selectivity,
             )
         for call, name in labels:
             if call not in classified:
                 node = SemanticClassify(node, call, name)
                 classified.append(call)
+        tests = list(extract_filters)
         for call, name in extracts:
-            node = SemanticExtract(node, call, name)
+            extraction = SemanticExtract(node, call, name)
+            node = extraction
+            for predicate, selectivity in extract_filters:
+                if predicate.column.column in (name, extraction.span_name):
+                    node = Filter(node, predicate, selectivity)
+                    tests.remove((predicate, selectivity))
+        if tests:
+            raise CompileError(
+                f"the filter {tests[0][0]} tests an extraction the query "
+                f"does not return")
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:

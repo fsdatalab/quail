@@ -7,7 +7,10 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
+import pyarrow as pa
+
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
+from quail.catalog.selection import accepted_rows, evaluate_predicate
 from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan
@@ -22,8 +25,9 @@ from quail.planner.sol.prefixes import document_shared_tokens, subset_shared_tok
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
-# in the prompt to a row index of that alias's corpus table
-AnswerOracle = Callable[[object, Mapping[str, int]], bool]
+# in the prompt to a row index of that alias's corpus table; for an
+# AI.EXTRACT prompt, the reference answer text, or None for no answer
+AnswerOracle = Callable[[object, Mapping[str, int]], object]
 # label(prompt, assignment) -> str, the reference label of an
 # AI.CLASSIFY prompt for one row assignment
 LabelOracle = Callable[[object, Mapping[str, int]], str]
@@ -33,6 +37,7 @@ FILTER = "AI.IF"
 CLASSIFY = "AI.CLASSIFY"
 EXTRACT = "AI.EXTRACT"
 LABEL_IN = "IN"
+ANSWER_TEST = "ANSWER TEST"
 
 
 @dataclass
@@ -80,6 +85,7 @@ class Search:
         self.labels = operators.labels
         self.label_filters = operators.label_filters
         self.extracts = operators.extracts
+        self.extract_filters = operators.extract_filters
         if self.labels.calls and label is None:
             raise ValueError(
                 "the query classifies documents; pass label=(prompt, "
@@ -353,7 +359,8 @@ class Search:
                         name=self.labels.names[call],
                         accepted=list(test.values)))
                     live = passed
-            # an extraction follows the labels; it keeps every document
+            # an extraction follows the labels; a test of its answers
+            # keeps the documents the next extraction reads
             for node in extracts:
                 stage_work = self.question_work(
                     alias, live, self.lower(node.call.prompt).tail_tokens, first)
@@ -363,8 +370,25 @@ class Search:
                     EXTRACT, alias, node.call.prompt.template, None,
                     self.lower(node.call.prompt).tail_tokens, None, live, live,
                     stage_work, name=node.name))
+                for test in self.extract_filters.get(alias, ()):
+                    if test.name != node.name:
+                        continue
+                    passed = self.answer_survivors(node, test.condition, live)
+                    stages.append(_stage(
+                        ANSWER_TEST, alias, node.call.prompt.template,
+                        test.position, 0, test.selectivity, live, passed, Work(),
+                        name=node.name, condition=str(test.condition)))
+                    live = passed
             survivors[alias] = live
         return survivors, work, stages
+
+    def answer_survivors(self, node, condition, live) -> list:
+        """Return the live rows whose reference answer passes the condition."""
+        answers = pa.array(
+            [self.answer(node.call.prompt, {node.alias: row}) for row in live],
+            pa.string())
+        kept = accepted_rows(evaluate_predicate(answers, condition))
+        return [row for row, keep in zip(live, kept.to_pylist()) if keep]
 
     # ---- joins -----------------------------------------------------
 

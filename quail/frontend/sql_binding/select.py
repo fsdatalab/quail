@@ -5,12 +5,11 @@ from dataclasses import dataclass, field
 from sqlglot import exp
 
 from quail.frontend.sql_binding.expressions import (
-    _FLIPPED,
-    _PLAIN_COMPARISONS,
     ExpressionBinder,
     _conjuncts,
     _is_call,
 )
+from quail.frontend.sql_binding.predicates import _FLIPPED, _PLAIN_COMPARISONS
 from quail.logical import (
     AggregateCall,
     Aggregation,

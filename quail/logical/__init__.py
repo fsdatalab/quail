@@ -19,9 +19,7 @@ from quail.logical.expressions import (
     ExtractStruct,
     FilterPredicate,
     HavingTest,
-    InList,
     ModelCall,
-    RegularPredicate,
     SortKey,
     column_name,
     effective_selectivity,
@@ -55,6 +53,10 @@ from quail.logical.plan import (
     join_outer_input,
     oriented_join_conditions,
 )
+from quail.logical.predicates import (
+    COLUMN_COMPARISONS,
+    RegularPredicate,
+)
 from quail.logical.prompts import (
     ANSWER_CUE,
     SHARED_PRE,
@@ -82,13 +84,13 @@ __all__ = [
     "ColumnRef",
     "Compare",
     "CompileError",
+    "COLUMN_COMPARISONS",
     "DEFAULT_SELECTIVITY",
     "Equality",
     "ExtractStruct",
     "Filter",
     "FilterPredicate",
     "HavingTest",
-    "InList",
     "Join",
     "JoinSpec",
     "LabelWork",
