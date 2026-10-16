@@ -17,7 +17,8 @@ from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.search.leftdeep import search_left_deep
 from quail.planner.search.live_rows import PairRelation, exact_live_rows
-from quail.planner.sol.prefixes import document_shared_tokens
+from quail.planner.search.statistics import filter_stop_keys
+from quail.planner.sol.prefixes import document_shared_tokens, subset_shared_tokens
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
@@ -113,6 +114,13 @@ class Search:
                 tokens=tokens,
                 shared=shared,
             )
+        self.stores = stores
+        # alias -> each row's stop key value, for the aliases whose
+        # filters stop a key at its first survivor
+        self.stop_groups: dict[str, list[tuple]] = {}
+        for alias, key in filter_stop_keys(query.logical).items():
+            columns = [stores[alias].column(name).to_pylist() for name in key]
+            self.stop_groups[alias] = list(zip(*columns))
         # column -> rows every filtered alias of that column computed
         # as prefixes; another alias of the column may reuse them
         self.computed_rows_by_column: dict[str, set[int]] = {}
@@ -222,13 +230,46 @@ class Search:
 
     # ---- filters and classifications --------------------------------
 
+    def stop_key_rows(self, alias, live, order, predicates) -> list[list[int]]:
+        """Return per stage the rows read when each key stops at a survivor.
+
+        A key with a row that survives every stage reads only its
+        survivor with the fewest tokens: no execution of the stop key
+        reads less. A key with no survivor reads each row until the
+        first stage it fails.
+        """
+        tokens = self.aliases[alias].tokens
+        groups: dict[tuple, list[int]] = {}
+        for row in live:
+            groups.setdefault(self.stop_groups[alias][row], []).append(row)
+        reached: list[list[int]] = [[] for _ in order]
+        for rows in groups.values():
+            survivors = [
+                row for row in rows
+                if all(self.answer(predicates[written_pos].prompt, {alias: row})
+                       for written_pos in order)]
+            if survivors:
+                shortest = min(survivors, key=lambda row: tokens[row])
+                for stage in reached:
+                    stage.append(shortest)
+                continue
+            for row in rows:
+                for index, written_pos in enumerate(order):
+                    reached[index].append(row)
+                    if not self.answer(predicates[written_pos].prompt,
+                                       {alias: row}):
+                        break
+        return [sorted(rows) for rows in reached]
+
     def run_filters(self):
         """Apply each alias's filters and classifications with exact answers.
 
         The AI.IF filters run first in the planner's order. Then each
         classification runs once over the live documents, followed by
         the label filters that test it, in written order; the
-        classifications no label filter tests follow.
+        classifications no label filter tests follow. An alias whose
+        filters carry a stop key reads only each key's shortest
+        survivor, or every document of a key with none.
 
         Returns:
             (survivors by alias, work, stage records).
@@ -259,8 +300,17 @@ class Search:
                     chunk_tokens=self.chunk_tokens, lower=self.lower),
                 rule)] if asks else []
             live = survivors[alias]
+            reached = None
+            if order and alias in self.stop_groups:
+                reached = self.stop_key_rows(alias, live, order, predicates)
+                if self.credit_shared:
+                    # a skipped document computes no prefix for another
+                    self.aliases[alias].shared = subset_shared_tokens(
+                        self.stores[alias], reached[0])
             first = True
-            for written_pos in order:
+            for index, written_pos in enumerate(order):
+                if reached is not None:
+                    live = reached[index]
                 predicate = predicates[written_pos]
                 stage_work = self.question_work(
                     alias, live, self.lower(predicate.prompt).tail_tokens, first)
