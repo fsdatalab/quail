@@ -761,3 +761,78 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
     assert metrics["ai-extract:starts"]["evaluated_documents"] == 1
     assert metrics["filter:c:0"]["output_rows"] == 1
     assert not arena.accounting.owned
+
+
+def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
+        monkeypatch):
+    # the filter's question follows the document in KV, in place of
+    # the answer the extraction wrote; the document is packed once
+    from quail.physical import Condition, Filter
+    from quail.physical.pipelines import build_pipelines
+
+    spec, tables = make_spec()
+    head = list(spec.prompt_token_parts[0])
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
+    for index, text in enumerate(DOCS):
+        model.docs[("c", index)] = text
+        model.gold[("c", index)] = GOLD[index]
+        model.filter_truth[("c", index)] = index != 1
+    question = tables.encode_ids(" question")
+    graph = PhysicalGraph((
+        Scan(node_id="input:c", alias="c", input_id="c"),
+        AiExtract(node_id="ai-extract:ends",
+                  inputs=input_ports((PortRef("input:c", "ids:c"),)),
+                  backend_name="quail", model="qwen3-4b-fp8",
+                  spec=replace(spec, shares_head=True)),
+        Filter(node_id="filter:c:1",
+               inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
+               predicate=Condition("ends", "is not null"),
+               aliases=("c",), written_pos=1),
+        AiFilter(
+            node_id="ai_filter:c",
+            inputs=input_ports((PortRef("filter:c:1", "ids:c"),)),
+            alias="c", arena_writes=True, question_token_ids=tuple(question),
+            written_pos=0, question_tokens=len(question), preamble_tokens=len(head),
+            selectivity=0.7, expected_docs=2.0),
+    ), PortRef("ai_filter:c", "ids:c"))
+    assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
+            ] == ["ai-extract:ends", "filter:c:1", "ai_filter:c"]
+    torch, arena = fake_torch(), cpu_arena(256)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    execution = QuailModelExecution(SimpleNamespace())
+    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.loaded_model.vocabulary = tables
+    execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+    execution.bind_query(
+        torch=torch, answer_rows=object(), chunk_tokens=400,
+        async_answers=SimpleNamespace(
+            submit=lambda rows: [float(np.asarray(r).ravel()[0]) for r in rows],
+            result=lambda v: v, dtype=None))
+    state = {"gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                                    execution=execution, spec=MODELS["qwen3-4b-fp8"]),
+             "runtimes": built_in_registry().runtimes,
+             "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
+             "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
+             "texts": {"c": list(DOCS)}}
+    report = execute_single_graph(
+        state, {"filter_limit": None, "pre_ids": head, "retention": {}}, graph)
+    outputs = report["_outputs"]
+    assert outputs[PortRef("ai-extract:ends", "rows")].to_pydict()["ends"] == [
+        "March 3, 2027", "five years", None]
+    # the test drops the third document; the filter asks the other two
+    # and keeps the first
+    assert outputs[PortRef("filter:c:1", "ids:c")].column("c").to_pylist() == [0, 1]
+    assert outputs[PortRef("ai_filter:c", "ids:c")].column("c").to_pylist() == [0]
+    assert dict(model.reads) == {("c", 0): 1, ("c", 1): 1, ("c", 2): 1}
+    # the filter's question was fed right after the document, in place
+    # of the extraction's cue and answer
+    fed = [(key, suffix, f) for key, suffix, kept, _, f in model.packed
+           if suffix == question]
+    assert [(key, f) for key, _, f in fed] == [
+        (("c", index), len(head) + len(state["docs"]["c"][index]))
+        for index in (0, 1)]
+    assert report["node_metrics"]["ai_filter:c"]["evaluated_documents"] == 2
+    assert not arena.accounting.owned

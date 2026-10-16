@@ -32,6 +32,9 @@ class ClassifySpec(InferenceSpec):
         frame_tokens: For the decision_choice rule, the tokens of the
             prompt tail before the first option block; the option
             blocks and the closing line follow.
+        shares_head: Whether the prompt's head is the query's shared
+            preamble, so the documents' KV is the one the table's
+            other operators read.
     """
 
     pair_fraction: float = 1.0
@@ -43,6 +46,7 @@ class ClassifySpec(InferenceSpec):
     probabilities: bool = False
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     frame_tokens: int = 0
+    shares_head: bool = False
 
     @property
     def anchor(self) -> str:
@@ -73,6 +77,7 @@ class ClassifySpec(InferenceSpec):
                 tuple(int(token) for token in part)
                 for part in value["join_layout"])),
             frame_tokens=int(value.get("frame_tokens", 0)),
+            shares_head=bool(value.get("shares_head", False)),
         )
 
     def to_dict(self) -> dict:
@@ -88,6 +93,7 @@ class ClassifySpec(InferenceSpec):
             "join_layout": (None if self.join_layout is None
                             else [list(part) for part in self.join_layout]),
             "frame_tokens": self.frame_tokens,
+            "shares_head": self.shares_head,
         }
 
 
@@ -114,17 +120,18 @@ class AiClassify(AiInference):
     def document_outputs(self, alias: str) -> tuple[str, ...]:
         return ("rows", f"ids:{alias}")
 
+    @property
+    def document_head(self) -> tuple[int, ...] | None:
+        return (None if self.spec and self.spec.shares_head
+                else super().document_head)
+
     def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
         if isinstance(previous, AiJoin):
             return self.classifies_join(previous)
-        if first.type_name == "quail.ai_extract":
-            # an extraction's pipeline holds extractions and their
-            # filters only
-            return False
-        if isinstance(first, AiClassify):
-            return (self.spec.partner is None
-                    and self.document_head == first.document_head)
-        return self.spec.partner is None
+        # a classification of documents continues any pipeline that
+        # shows them under its head
+        return (self.spec.partner is None
+                and self.document_head == first.document_head)
 
     def classifies_join(self, join: "AiJoin") -> bool:
         """Return whether this classification reads the join's surviving pairs."""

@@ -3,6 +3,7 @@
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from itertools import groupby
 from typing import Any, ClassVar
 
@@ -165,11 +166,19 @@ def gated_stages(parts) -> list:
         implementation.prepare_group(list(group))
     stages = []
     pending = []
+    appended = 0
     for part in parts:
         if not part.stages:
             pending.append(part.gate)
             continue
         first = part.stages[0]
+        if appended and not first.rewind:
+            # the part before left its answer tokens after the
+            # document; this part's first request follows the
+            # document, as the next question of an extraction does
+            first = replace(first, rewind=True)
+            part.stages = [first, *part.stages[1:]]
+        appended = part.appended_tokens
         if pending:
             gates = list(pending)
             asked = first.requests

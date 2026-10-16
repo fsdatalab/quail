@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
 
 from ..base import PhysicalNode, validate_integer_setting
-from .classify import AiClassify
-from .filter import AiFilter, Filter
 from .inference import AiInference, InferenceSpec
 
 
@@ -127,25 +125,17 @@ class AiExtract(AiInference):
         return ("rows", f"ids:{alias}")
 
     def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
-        if isinstance(previous, AiExtract):
-            return (previous.spec.same_decoding(self.spec)
-                    and previous.document_head == self.document_head)
-        if isinstance(previous, Filter) and isinstance(first, AiExtract):
-            # a test of an earlier extraction's answers; the KV the
-            # pipeline wrote stays
-            return first.document_head == self.document_head
-        if not self.spec.shares_head:
+        # an extraction continues any pipeline that shows the documents
+        # under its head; consecutive extractions share one decoder
+        if isinstance(previous, AiExtract) and not previous.spec.same_decoding(
+                self.spec):
             return False
-        if isinstance(first, AiClassify):
-            return (first.spec.partner is None
-                    and first.spec.prompt_token_parts[0]
-                    == self.spec.prompt_token_parts[0])
-        return isinstance(first, AiFilter)
+        return first.document_head == self.document_head
 
     def can_precede(self, consumer: PhysicalNode) -> bool:
-        # a Filter on the answers gates the documents the next
-        # extraction reads
-        return isinstance(consumer, (AiExtract, Filter))
+        # the next operator rewinds the KV past the answer; a Filter on
+        # the answers gates the documents it reads
+        return True
 
     def explain_fields(self) -> Mapping[str, Any]:
         return {

@@ -5,9 +5,6 @@ from dataclasses import replace
 from quail.cost import budgets
 from quail.cost import extract as extract_cost
 from quail.logical import effective_selectivity
-from quail.logical.prompts import (
-    shared_preamble,
-)
 from quail.physical import (
     AiExtract,
     Condition,
@@ -16,7 +13,11 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.base import input_ports
-from quail.planner.operators.common import bind_inference, inference_node
+from quail.planner.operators.common import (
+    bind_inference,
+    inference_node,
+    shares_query_head,
+)
 
 
 def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
@@ -36,11 +37,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
             before this one.
     """
     prompt = context.lowered(call.prompt)
-    # under the query's shared preamble, the prompt's document KV is
-    # the one a filter writes
-    shares_head = tuple(prompt.preamble_token_ids) == tuple(
-        context.tokenizer(shared_preamble(
-            context.model.turn_prefix, context.model.prompt_layout)))
+    shares_head = shares_query_head(context, prompt)
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
     spec = bind_inference(

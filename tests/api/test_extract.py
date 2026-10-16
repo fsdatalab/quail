@@ -866,42 +866,45 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
                        selectivity=selectivity)
                 .select("c.id", "kind", "lease", order=order))
 
-    def kinds(plan):
-        return [type(node).__name__ for node in plan.nodes
+    def order(plan):
+        return [node.node_id for node in plan.nodes
                 if type(node).__name__ in ("AiFilter", "AiClassify", "AiExtract")]
 
-    # an extraction costs more than an ask, so with a usual test it
-    # runs last, in one pipeline over the KV the ask wrote
-    usual = query(0.5).plan()
-    assert kinds(usual) == ["AiFilter", "AiClassify", "AiExtract"]
-    (extract,) = [n for n in usual.nodes if isinstance(n, AiExtract)]
-    assert len(build_pipelines(usual.graph)[extract.node_id]) == 5
-    # a test that rejects nearly every document goes first; the
-    # classification and the ask then read the few survivors afresh,
-    # each in its own pipeline, which the estimate prices
-    selective = query(0.05).plan()
-    assert kinds(selective) == ["AiExtract", "AiClassify", "AiFilter"]
+    # the steps run as one pipeline whatever their order: each reads
+    # the KV the step before it left, rewound past its answer
+    usual, selective = query(0.5).plan(), query(0.05).plan()
+    for plan in (usual, selective):
+        (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
+        pipeline = build_pipelines(plan.graph)[extract.node_id]
+        assert len(pipeline) == 5 and sorted(
+            member.node_id for member in pipeline) == sorted(
+            node.node_id for node in plan.nodes
+            if type(node).__name__ not in ("Scan", "Project"))
+    # the ask rejects a tenth, the label test a fifth; an extraction
+    # test rejecting half ranks the extraction before the ask, and one
+    # rejecting nearly every document puts it first
+    assert order(usual) == ["ai-classify:0", "ai-extract:0", "ai_filter:c"]
+    assert order(selective) == ["ai-extract:0", "ai-classify:0", "ai_filter:c"]
     (extract,) = [n for n in selective.nodes if isinstance(n, AiExtract)]
     (classify,) = [n for n in selective.nodes if isinstance(n, AiClassify)]
     (ask,) = [n for n in selective.nodes if isinstance(n, AiFilter)]
     assert extract.spec.expected_inputs == 2
     assert classify.spec.expected_inputs == pytest.approx(2 * 0.05)
     assert ask.expected_docs == pytest.approx(2 * 0.05 * 0.8, abs=0.05)
-    pipelines = build_pipelines(selective.graph)
-    assert [m.node_id for m in pipelines[extract.node_id]] == [
-        extract.node_id, "filter:c:2"]
-    assert [m.node_id for m in pipelines[classify.node_id]] == [
-        classify.node_id, "filter:c:1"]
-    assert [m.node_id for m in pipelines[ask.node_id]] == [ask.node_id]
+    # the later steps are priced over the resident KV
+    assert classify.spec.estimated_seconds < extract.spec.estimated_seconds
     written = query(0.05, order="as_written").plan()
-    assert kinds(written) == ["AiFilter", "AiClassify", "AiExtract"]
-    # the speed of light estimate runs the same order
+    assert order(written) == ["ai_filter:c", "ai-classify:0", "ai-extract:0"]
+    # the speed of light estimate runs the same orders
     reference = {0: "March 3, 2027", 1: None}
-    estimate = quail.speed_of_light_estimate(
-        query(0.05),
-        lambda prompt, a: reference[a["c"]] if prompt.kind == "extract" else True,
-        label=lambda prompt, a: "lease")
-    assert [(stage["operator"], stage["evaluated"], stage["passed"])
-            for stage in estimate.filter_stages] == [
-        ("AI.EXTRACT", 2, 2), ("ANSWER TEST", 2, 1), ("AI.CLASSIFY", 1, 1),
-        ("IN", 1, 1), ("AI.IF", 1, 1)]
+    for selectivity, stages in ((0.5, [
+            ("AI.CLASSIFY", 2, 2), ("IN", 2, 2), ("AI.EXTRACT", 2, 2),
+            ("ANSWER TEST", 2, 1), ("AI.IF", 1, 1)]), (0.05, [
+            ("AI.EXTRACT", 2, 2), ("ANSWER TEST", 2, 1), ("AI.CLASSIFY", 1, 1),
+            ("IN", 1, 1), ("AI.IF", 1, 1)])):
+        estimate = quail.speed_of_light_estimate(
+            query(selectivity),
+            lambda prompt, a: reference[a["c"]] if prompt.kind == "extract" else True,
+            label=lambda prompt, a: "lease")
+        assert [(stage["operator"], stage["evaluated"], stage["passed"])
+                for stage in estimate.filter_stages] == stages

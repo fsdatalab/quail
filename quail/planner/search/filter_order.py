@@ -52,8 +52,14 @@ def order_filters_indexed(predicates, rule: str, *, count: float = 1,
         return resident is not None and not resident(
             predicates[previous], predicates[i])
 
+    # a predicate that rejects nothing never starts a sequence: every
+    # later predicate would read as many documents, at the same price;
+    # such predicates keep their written order among themselves
+    starters = [i for i in indices if predicates[i].selectivity < 1]
+    if not starters:
+        return indices
     candidates = []
-    for first in indices:
+    for first in starters:
         ordered = [first]
         total = cost(first, count, True)
         live = count * predicates[first].selectivity

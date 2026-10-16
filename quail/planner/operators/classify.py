@@ -14,7 +14,7 @@ from quail.labels import (
     decodable,
     word_starts,
 )
-from quail.logical import LabelWork, effective_selectivity
+from quail.logical import LabelWork, effective_selectivity, shared_preamble
 from quail.physical import (
     AiClassify,
     ClassifySpec,
@@ -285,8 +285,11 @@ class ClassifyScoring(ClassifyStatistics):
 def classify_builder(context, alias, backend_name):
     """Prepare the inputs for constructing classification operators."""
     stats = classify_statistics(context, alias)
-    return ClassifyBuilder(**vars(stats), tokenizer=context.tokenizer,
-                           lower=context.lowered, backend_name=backend_name)
+    return ClassifyBuilder(
+        **vars(stats), tokenizer=context.tokenizer, lower=context.lowered,
+        backend_name=backend_name,
+        query_head=tuple(context.tokenizer(shared_preamble(
+            context.model.turn_prefix, context.model.prompt_layout))))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -296,6 +299,7 @@ class ClassifyBuilder(ClassifyStatistics):
     tokenizer: object
     lower: object
     backend_name: str
+    query_head: tuple = ()  # the token ids of the query's shared head
 
     def prepare(self, call, name, live) -> tuple[ClassifySpec, Work]:
         """Build a classification specification and work for a required method.
@@ -315,9 +319,11 @@ class ClassifyBuilder(ClassifyStatistics):
             chooses the method and fills in its work later.
         """
         lowered = self.lower(call.prompt)
+        shares_head = tuple(lowered.preamble_token_ids) == tuple(self.query_head)
         if self.model.role == "decision":
-            return self._choice_spec(call, name, live, (self.alias,),
-                                     tuple(lowered.preamble_token_ids))
+            spec, work = self._choice_spec(call, name, live, (self.alias,),
+                                           tuple(lowered.preamble_token_ids))
+            return replace(spec, shares_head=shares_head), work
         head, tail, labels = classify_prompt_tokens(
             lowered, call.labels, self.tokenizer)
         return bind_inference(
@@ -329,6 +335,7 @@ class ClassifyBuilder(ClassifyStatistics):
             label_word_starts=word_starts(
                 labels, getattr(self.tokenizer, "decode", None)),
             scoring="", probabilities=call.probabilities,
+            shares_head=shares_head,
         ), Work()
 
     def node(self, spec, input_port, index, *ports) -> AiClassify:

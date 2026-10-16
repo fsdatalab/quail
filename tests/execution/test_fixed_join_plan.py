@@ -340,20 +340,21 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
                      quail.col("e.text")), selectivity=0.5)
                  .select("c.id", "e.id", "topic"))
         plan = query.plan()
+        # the label test rejects half the claims and the filter a tenth,
+        # so the classification goes first; the classification, the
+        # filter on its label, and the sequence run as one pipeline,
+        # and the join joins it only when it anchors on the claims
         assert [type(node).__name__ for node in plan.nodes] == [
-            "Scan", "Scan", "AiFilter", "AiClassify", "Filter", "AiJoin",
+            "Scan", "Scan", "AiClassify", "Filter", "AiFilter", "AiJoin",
             "Project"]
-        # the sequence, the classification, and the filter on its label run as
-        # one pipeline; the join joins it only when it anchors on the
-        # claims
-        test, join, project = plan.nodes[4], plan.nodes[5], plan.nodes[6]
+        test, ask, join, project = plan.nodes[3:7]
         members = tuple(
-            member.node_id for member in build_pipelines(plan.graph)["ai_filter:c"])
-        assert members == (("ai_filter:c", "ai-classify:0", test.node_id)
+            member.node_id for member in build_pipelines(plan.graph)["ai-classify:0"])
+        assert members == (("ai-classify:0", test.node_id, ask.node_id)
                            + ((join.node_id,) if join.anchor == "c" else ()))
         (claims_port,) = [port.source for port in join.inputs
                           if port.source.port == "ids:c"]
-        assert claims_port == PortRef(test.node_id, "ids:c")
+        assert claims_port == PortRef(ask.node_id, "ids:c")
         assert [port.source.port for port in project.inputs] == [
             "join_answers:0", "rows"]
         codecs = session.registry.codecs
@@ -362,8 +363,9 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         result = execute_query(query, physical_executor=execute)
         assert result.collect().to_pylist() == [
             {"c.id": "c0", "e.id": "e0", "topic": "science"}]
+        # the classification ran first, over every claim
         labels = result.answer_tables["classifies"]["topic"]
-        assert labels.column("topic").to_pylist() == ["science", "sport"]
+        assert labels.column("topic").to_pylist() == ["science", "sport", "science"]
 
 
 def test_a_classification_of_joined_rows_follows_its_join(monkeypatch):

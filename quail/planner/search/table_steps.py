@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 from quail.logical import effective_selectivity
 from quail.planner.operators.classify import classify_builder, classify_scoring
+from quail.planner.operators.common import shares_query_head
 from quail.planner.operators.extract import extract_spec
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.validation import ClassifyRefusedError
@@ -36,6 +37,8 @@ class TableStep:
         first: Seconds at a live count, the documents read afresh.
         later: Seconds at a live count, the documents' KV resident.
         reuse_key: Identity of a result an earlier step computed, or None.
+        head: The prompt head the step shows the document under: None
+            for the query's shared head, else its token ids.
     """
 
     kind: str
@@ -44,21 +47,17 @@ class TableStep:
     first: Callable[[float], float]
     later: Callable[[float], float]
     reuse_key: Any = None
+    head: Any = None
 
 
 def resident_after(previous: TableStep, step: TableStep) -> bool:
     """Return whether a step reads the KV the step before it left.
 
-    An ask or a classification leaves the document under the query's
-    shared head, which a later ask, classification, or extraction
-    continues. An extraction's answer and its tests stay in the
-    extraction pipeline, which only another extraction continues.
+    The steps under one head run in one pipeline: each rewinds the KV
+    past what the step before it appended and asks its question
+    (the can_follow rules of the physical nodes).
     """
-    if previous.kind == EXTRACT:
-        return step.kind == EXTRACT
-    if step.kind == ASK:
-        return previous.kind == ASK
-    return True
+    return previous.head == step.head
 
 
 def table_steps(operators, alias: str, *, context, statistics) -> list[TableStep]:
@@ -93,7 +92,8 @@ def table_steps(operators, alias: str, *, context, statistics) -> list[TableStep
         steps.append(TableStep(
             CLASSIFY, call, _survival(tests.get(call, ())),
             partial(_classify_seconds, context, alias, call, name, False),
-            partial(_classify_seconds, context, alias, call, name, True)))
+            partial(_classify_seconds, context, alias, call, name, True),
+            head=_head(context, call.prompt)))
     tests = {}
     for test in operators.extract_filters.get(alias, ()):
         tests.setdefault(test.name, []).append(test.selectivity)
@@ -103,8 +103,16 @@ def table_steps(operators, alias: str, *, context, statistics) -> list[TableStep
         steps.append(TableStep(
             EXTRACT, node.name, _survival(tests.get(node.name, ())),
             partial(_extract_seconds, context, node, False),
-            partial(_extract_seconds, context, node, True)))
+            partial(_extract_seconds, context, node, True),
+            head=_head(context, node.call.prompt)))
     return steps
+
+
+def _head(context, prompt):
+    """Return a prompt's head: None under the query's shared head."""
+    lowered = context.lowered(prompt)
+    return (None if shares_query_head(context, lowered)
+            else tuple(lowered.preamble_token_ids))
 
 
 def _survival(selectivities) -> float:

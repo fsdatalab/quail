@@ -118,7 +118,8 @@ def fused_graph(*, classify_only=False):
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=14, estimated_seconds=0.0,
         prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
-        label_token_ids=LABEL_IDS, scoring="letters", share_prefixes=True)
+        label_token_ids=LABEL_IDS, scoring="letters", share_prefixes=True,
+        shares_head=True)
     nodes = [
         Scan(node_id="input:r", alias="r", input_id="r"),
         Scan(node_id="input:p", alias="p", input_id="p"),
@@ -191,7 +192,8 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         expected_inputs=4, estimated_seconds=0.0,
         prompt_token_parts=(head, (91, 92, 93)), labels=("a", "b"),
         label_token_ids=((1,), (2,)), scoring="letters",
-        draws=4 if shape == "draws" else 1, probabilities=shape == "draws")
+        draws=4 if shape == "draws" else 1, probabilities=shape == "draws",
+        shares_head=not first)
     nodes = [Scan(node_id="input:r", alias="r", input_id="r")]
     if not first:
         nodes.append(AiFilter(
@@ -685,3 +687,99 @@ def test_a_join_writes_its_first_partner_label_with_the_frame():
     docs = {"p": [[PARTNER]], "q": [[PARTNER + 1, PARTNER + 1]]}
     pair = list(spec["frame"]) + list(_tuple_suffix(spec, docs, (0, 0)))
     assert pair == [1, 2, 3, 4, PARTNER, 5, PARTNER + 1, PARTNER + 1, 9]
+
+
+def test_a_filter_after_a_classification_asks_over_the_resident_kv(monkeypatch):
+    # the second filter's question follows the document in KV, after
+    # the label test; the next classification reads the survivors
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    n_docs = 14
+    docs = {"r": [[DOC + d] * (10 + 2 * d) for d in range(n_docs)]}
+    filter_truth = [[d % 3 != 0, d % 4 != 0] for d in range(n_docs)]
+    label_truth = [d % 2 for d in range(n_docs)]
+    model = LabelingModel(filter_truth, {}, label_truth)
+    torch = fake_torch()
+    arena = cpu_arena(64)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    execution = QuailModelExecution(SimpleNamespace(
+        model=MODELS["qwen3-4b-fp8"], gpu_index=0, gpu_count=1,
+        device=DEVICES["h100-sxm"]))
+    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.bind_query(
+        torch=torch,
+        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
+                                      dtype=None),
+        answer_rows=object(), chunk_tokens=120)
+
+    def submit(rows, rows_per_answer=None):
+        # a frame entry's one row is not read and carries no log
+        # probabilities
+        padded = np.full((len(rows), 1, len(TARGETS)), np.nan, np.float32)
+        for answer, row in enumerate(rows):
+            padded[answer, 0] = (row if hasattr(row, "shape")
+                                 else np.zeros(len(TARGETS)))
+        return padded
+
+    execution.loaded_model.label_readout = SimpleNamespace(
+        targets=np.asarray(TARGETS), rows=1,
+        dtype=np.dtype((np.float32, (1, len(TARGETS)))), submit=submit,
+        result=lambda rows: rows)
+    graph = fused_graph(classify_only=True)
+    nodes = [node for node in graph.nodes if node.node_id != "classify:kind"]
+    nodes.insert(0, Scan(node_id="input:r", alias="r", input_id="r"))
+    nodes = list(dict.fromkeys(nodes))
+    spec = next(node for node in nodes if node.node_id == "classify:r").spec
+    nodes = [
+        node for node in nodes if node.node_id in ("input:r", "label:r")
+        or isinstance(node, AiClassify)]
+    nodes = [
+        nodes[0],
+        AiFilter(
+            node_id="filter:r", inputs=input_ports((PortRef("input:r", "ids:r"),)),
+            alias="r", arena_writes=True, question_token_ids=(QUESTION,),
+            written_pos=0, question_tokens=1, preamble_tokens=0,
+            selectivity=0.8, expected_docs=14 * 0.8),
+        replace(nodes[1], inputs=input_ports((PortRef("filter:r", "ids:r"),))),
+        nodes[2],
+        AiFilter(
+            node_id="filter:again",
+            inputs=input_ports((PortRef("label:r", "ids:r"),)),
+            alias="r", arena_writes=True, question_token_ids=(QUESTION + 1,),
+            written_pos=2, question_tokens=1, preamble_tokens=0,
+            selectivity=0.8, expected_docs=4.0),
+        AiClassify(
+            node_id="classify:kind",
+            inputs=input_ports((PortRef("filter:again", "ids:r"),)),
+            backend_name="quail", model="qwen3-4b-fp8",
+            spec=replace(spec, name="kind", labels=("b", "a"),
+                         prompt_token_parts=((), (CLASSIFY_FRAME + 1, CUE)))),
+    ]
+    graph = PhysicalGraph(tuple(nodes), PortRef("classify:kind", "rows"))
+    from quail.physical.pipelines import build_pipelines
+
+    assert [member.node_id for member in build_pipelines(graph)["filter:r"]] == [
+        "filter:r", "classify:r", "label:r", "filter:again", "classify:kind"]
+    state = {
+        "gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                               execution=execution, spec=MODELS["qwen3-4b-fp8"]),
+        "runtimes": built_in_registry().runtimes, "device": DEVICES["h100-sxm"],
+        "chunk_tokens": 120, "docs": docs,
+    }
+    result = execute_single_graph(state, SETTINGS, graph)
+    outputs, metrics = result["_outputs"], result["node_metrics"]
+    passed = [d for d in range(n_docs) if filter_truth[d][0]]
+    accepted = [d for d in passed if label_truth[d] == 0]
+    asked_again = [d for d in accepted if filter_truth[d][1]]
+    assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() == accepted
+    assert outputs[PortRef("filter:again", "ids:r")].column("r").to_pylist() \
+        == asked_again
+    assert outputs[PortRef("classify:kind", "rows")].column("r").to_pylist() \
+        == asked_again
+    # the second filter fed one question token per accepted document
+    # over its resident KV, and every document was packed once
+    assert metrics["filter:again"]["fresh_tokens"] == len(accepted)
+    assert metrics["filter:again"]["evaluated_documents"] == len(accepted)
+    prefills = [entry["key"][1] for chunk in model.launched for entry in chunk
+                if entry["prefix"] is not None]
+    assert sorted(prefills) == list(range(n_docs))
+    assert not arena.accounting.owned
