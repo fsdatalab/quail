@@ -164,7 +164,8 @@ def test_one_token_labels_decode_as_a_merged_letters_request():
 
 
 def test_smaller_chunks_pay_more_weight_reads_without_changing_work():
-    device = replace(H100_SXM, peak_flops=float("inf"), bf16_flops=float("inf"))
+    device = replace(H100_SXM, peak_flops=float("inf"), bf16_flops=float("inf"),
+                     sustained_fp8_flops=float("inf"))
     large = _cost((10, 20, 30), device=device)
     small = _cost((10, 20, 30), device=device, chunk=40)
     assert asdict(small.work) == pytest.approx(asdict(large.work))

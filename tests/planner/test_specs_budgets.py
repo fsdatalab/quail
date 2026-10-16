@@ -50,3 +50,10 @@ def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
     small = replace(H100_SXM, mem_bytes=40e9)
     with pytest.raises(ValueError, match="one chunk's sliding KV"):
         budgets.arena_pages(DIFFUSION_GEMMA_26B_FP8, small)
+
+
+def test_gemms_price_at_the_measured_rate_when_known():
+    assert H100_SXM.gemm_flops == H100_SXM.sustained_fp8_flops == 1.629e15
+    assert H100_SXM.arithmetic_bandwidth("fp8") == 1.629e15
+    rtx = RTX_PRO_6000_BLACKWELL_SERVER
+    assert rtx.gemm_flops == rtx.peak_flops

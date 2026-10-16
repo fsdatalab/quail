@@ -147,7 +147,7 @@ def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
 
     That is where they cross the roofline ridge.
     """
-    ridge = device.peak_flops / device.hbm_bw
+    ridge = device.gemm_flops / device.hbm_bw
     tot_p = tot_io = 0.0
     for din, dout in _projection_shapes(model):
         tot_p += din * dout

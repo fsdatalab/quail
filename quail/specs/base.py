@@ -226,6 +226,14 @@ class DeviceSpec:
     usd_per_hour: float = 0.0    # rental price of one device; 0 means
     #                              no price is known
     price_source: str = ""       # where usd_per_hour was read from
+    sustained_fp8_flops: float = 0.0    # highest fp8 GEMM rate measured
+    #                                     (mamf-finder's MAMF); 0 means
+    #                                     none was measured
+
+    @property
+    def gemm_flops(self) -> float:
+        """Return the fp8 GEMM rate: measured when known, else the peak."""
+        return self.sustained_fp8_flops or self.peak_flops
 
     @property
     def attn_flops(self) -> float:
@@ -235,7 +243,7 @@ class DeviceSpec:
     def arithmetic_bandwidth(self, precision: Precision) -> float:
         """Return arithmetic throughput for one component precision."""
         if precision == "fp8":
-            return self.peak_flops
+            return self.gemm_flops
         if precision == "bf16":
             return self.attn_flops
         if precision == "fp32" and self.fp32_flops:
