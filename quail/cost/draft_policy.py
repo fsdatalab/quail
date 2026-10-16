@@ -4,16 +4,14 @@ A round feeds the chosen token and a draft of the document's next
 tokens, and pays one read of the document's KV however long the draft
 is. With one live stream a draft token is written when the answer
 still has a token to go, so the expected tokens a round writes follow
-the answer-length curve; with several live streams the draft may
-follow the wrong one, and each token is accepted with a constant
-chance. The policy picks the draft length that costs the least per
-written token, round by round.
+the answer-length curve, and the policy picks the draft length that
+costs the least per written token. With several live streams the
+draft may follow the wrong one, so the round feeds the chosen token
+alone and the model's next token narrows the streams.
 """
 
 import numpy as np
 
-# live streams past the first: the chance each draft token is accepted
-ALPHA_AMBIGUOUS = 0.5
 # how many settled answers the planner's answer-length guess weighs
 PRIOR_WEIGHT = 8
 # the round's KV read in tokens, rounded to one of these for the tables
@@ -60,25 +58,21 @@ class DraftPolicy:
         Args:
             rho: The round's KV read, in fed tokens.
             written: The answer's tokens so far.
-            ambiguous: Whether more than one live stream fits the answer.
+            ambiguous: Whether more than one live stream fits the answer;
+                such a round feeds no draft.
         """
         room = min(self.cap, self.max_answer_tokens - written - 1)
-        if room <= 0:
+        if ambiguous or room <= 0:
             return 0
         bucket = int(np.argmin([abs(np.log1p(rho) - np.log1p(b)) for b in RHO_BUCKETS]))
-        key = (bucket, ambiguous, written if not ambiguous else 0, room)
+        key = (bucket, written, room)
         if key not in self._tables:
-            self._tables[key] = self._best(RHO_BUCKETS[bucket], written,
-                                           ambiguous, room)
+            self._tables[key] = self._best(RHO_BUCKETS[bucket], written, room)
         return self._tables[key]
 
-    def _best(self, rho: float, written: int, ambiguous: bool, room: int) -> int:
+    def _best(self, rho: float, written: int, room: int) -> int:
         gammas = np.arange(room + 1)
-        if ambiguous:
-            a = ALPHA_AMBIGUOUS
-            writes = (1 - a ** (gammas + 1)) / (1 - a)
-        else:
-            writes = np.cumsum(self.survival(written)[:room + 1])
+        writes = np.cumsum(self.survival(written)[:room + 1])
         cost = (1 + gammas + rho) / writes
         return int(gammas[int(np.argmin(cost))])
 

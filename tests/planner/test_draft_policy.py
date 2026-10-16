@@ -3,15 +3,13 @@
 from quail.cost.draft_policy import DraftPolicy
 
 
-def test_draft_length_grows_with_the_kv_read_and_shrinks_when_ambiguous():
+def test_draft_length_grows_with_the_kv_read_and_is_zero_when_ambiguous():
     policy = DraftPolicy(cap=63, max_answer_tokens=64, expected_answer_tokens=16)
     one_match = [policy.draft_length(rho, 1, ambiguous=False)
                  for rho in (0, 5, 50, 500)]
     assert one_match == sorted(one_match) and one_match[0] < one_match[-1]
-    ambiguous = [policy.draft_length(rho, 1, ambiguous=True) for rho in (0, 5, 50, 500)]
-    assert ambiguous == sorted(ambiguous)
-    assert all(a <= o for a, o in zip(ambiguous, one_match))
-    assert 1 <= ambiguous[1] <= 4
+    assert all(policy.draft_length(rho, 1, ambiguous=True) == 0
+               for rho in (0, 5, 50, 500))
 
 
 def test_draft_length_respects_the_cap_and_the_answer_limit():

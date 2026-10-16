@@ -25,7 +25,8 @@ class ExtractSpec(InferenceSpec):
             the most per round under the adaptive policy.
         draft_policy: "fixed" feeds draft_tokens every round; "adaptive"
             picks each round's draft length from the round's KV read
-            and the answer-length curve.
+            and the answer-length curve, and feeds none while several
+            document positions fit the answer.
         expected_answer_tokens: The planner's guess at the mean answer
             length, the seed of the adaptive policy's answer-length curve.
         round_cost_per_token: One document token's KV read per round,
