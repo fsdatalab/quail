@@ -317,7 +317,9 @@ def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
         if not isinstance(node, AiExtract):
             return execute(self, node, inputs)
         (source,) = inputs.values()
-        ids = source.column("c").to_pylist()
+        # the extraction reads the scan's ids, or the rows of the score
+        # predicate before it
+        ids = (source.column("c") if hasattr(source, "column") else source).to_pylist()
         table = extract_answer_table(
             node.spec.alias, node.spec.name, node.spec.span_name,
             ids, ["March 3, 2027" if i == 0 else None for i in ids],

@@ -5,7 +5,7 @@ import pytest
 from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
-from quail.catalog.selection import evaluate_predicate, selected_rows
+from quail.catalog.selection import selected_rows
 from quail.frontend.expressions import col, prompt
 from quail.logical import ColumnRef, CompileError, RegularPredicate, Scan
 
@@ -18,11 +18,11 @@ def _predicate(comparison, value=None):
 
 def test_predicates_evaluate_with_nulls_rejected():
     stars = pa.chunked_array([[3, None, 4], [5, 1]])
-    assert evaluate_predicate(stars, _predicate(">=", 4)).to_pylist() == [
+    assert _predicate(">=", 4).evaluate(stars).to_pylist() == [
         False, None, True, True, False]
-    assert evaluate_predicate(stars, _predicate("in", (1, 3))).to_pylist() == [
+    assert _predicate("in", (1, 3)).evaluate(stars).to_pylist() == [
         True, False, False, False, True]
-    assert evaluate_predicate(stars, _predicate("is null")).to_pylist() == [
+    assert _predicate("is null").evaluate(stars).to_pylist() == [
         False, True, False, False, False]
     assert selected_rows({"stars": stars}, (
         _predicate("is not null"), _predicate("<>", 4))).to_pylist() == [0, 3, 4]
@@ -30,7 +30,7 @@ def test_predicates_evaluate_with_nulls_rejected():
     assert selected_rows({"stars": stars}, (_predicate(">", 3.5),)
                          ).to_pylist() == [2, 3]
     with pytest.raises(CompileError, match="cannot be evaluated"):
-        evaluate_predicate(stars, _predicate("=", "five"))
+        _predicate("=", "five").evaluate(stars)
 
 
 @pytest.fixture()
@@ -234,9 +234,8 @@ def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
     name = ColumnRef("r", "reviews", "name")
 
     def passes(comparison, value=None, path=(), function=None):
-        return evaluate_predicate(
-            names, RegularPredicate(name, comparison, value, path, function)
-        ).to_pylist()
+        predicate = RegularPredicate(name, comparison, value, path, function)
+        return predicate.evaluate(names).to_pylist()
 
     assert passes("like", "Acme%") == [True, None, False, False]
     assert passes("ilike", "%ACME%") == [True, None, True, False]
@@ -253,14 +252,14 @@ def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
         [pa.array([14, 0]), pa.array([27, 3])], names=["start", "end"],
         mask=pa.array([False, True]))])
     predicate = RegularPredicate(name, "<", 20, ("start",))
-    assert evaluate_predicate(spans, predicate).to_pylist() == [True, None]
+    assert predicate.evaluate(spans).to_pylist() == [True, None]
     # a text test needs a string; a path needs a struct
     with pytest.raises(CompileError, match="compares with a string"):
         RegularPredicate(name, "like", 3).validate()
     with pytest.raises(CompileError, match="unsupported column function"):
         RegularPredicate(name, "<", 3, function="upper").validate()
     with pytest.raises(CompileError, match="cannot be evaluated"):
-        evaluate_predicate(names, RegularPredicate(name, "<", 3, ("start",)))
+        RegularPredicate(name, "<", 3, ("start",)).evaluate(names)
     # source columns take the same tests, at the scan
     reviews = ColumnRef("r", "reviews", "review")
     assert selected_rows({"review": names, "name": names}, (

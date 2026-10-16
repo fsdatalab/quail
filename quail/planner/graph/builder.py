@@ -43,13 +43,14 @@ from quail.planner.operators.filter import emit_filter
 from quail.planner.operators.join import emit_join
 from quail.planner.operators.score import (
     ScoreLowering,
+    emit_projected_scores,
     emit_score_joins,
     emit_score_pair,
     emit_scores,
 )
 from quail.planner.optimizer.context import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal, inference_seconds
-from quail.planner.search.operator_order import choose_operator_order
+from quail.planner.search.operator_order import choose_operator_order, resident_asks
 from quail.planner.search.statistics import filter_stop_keys
 from quail.planner.search.table_steps import ASK, CLASSIFY, EXTRACT
 from quail.planner.statistics.tables import summarize_alias
@@ -266,51 +267,59 @@ class GraphBuilder:
     def _emit_documents(self):
         """Create inference nodes over individual tables."""
         stats = self.operator_order.statistics.stats
-        # documents expected after a table's model predicates, before its
-        # filters on labels
-        self.live_asked = {}
-        for alias, predicates in self.operators.filters.items():
-            survival = 1.0
-            for predicate in predicates:
-                survival *= effective_selectivity(predicate.selectivity)
-            self.live_asked[alias] = float(stats[alias].n_docs) * survival
         self.label_ports = []
-
         try:
             for s in self.operators.scans:
-                if self.scoring is not None:
-                    emit_scores(self, s.alias)
-                    emit_classify(self, s.alias)
-                    emit_extract(self, s.alias)
-                else:
-                    self._emit_steps(s.alias)
+                # a classification or extraction the planner lifted
+                # above the joins is emitted after them
+                kinds = {ASK}
+                if s.alias not in self.after_joins:
+                    kinds.add(CLASSIFY)
+                if s.alias not in self.extract_after:
+                    kinds.add(EXTRACT)
+                self._emit_steps(s.alias, float(stats[s.alias].n_docs), kinds)
         except ClassifyRefusedError as refused:
             return refused.refusal()
         except ScoreRefusedError as refused:
             return refused.refusal
 
-    def _emit_steps(self, alias):
-        """Emit a table's asks, classifications, and extractions in run order.
+    def _emit_steps(self, alias, live, kinds):
+        """Emit the given kinds of a table's steps in run order.
 
-        Consecutive steps of one kind are emitted together. A
-        classification or extraction the planner lifted above the joins
-        is emitted after them instead.
+        Consecutive steps of one kind are emitted together, each run
+        over the documents the steps before it keep.
+
+        Args:
+            alias: The table.
+            live: The documents the first step reads.
+            kinds: The step kinds to emit: ASK, CLASSIFY, EXTRACT.
         """
-        steps = self.operator_order.step_orders.get(alias, [])
-        if not any(step.kind == ASK for step in steps):
+        steps = [step for step in self.operator_order.step_orders.get(alias, ())
+                 if step.kind in kinds]
+        if ASK in kinds and not any(step.kind == ASK for step in steps):
             self.emit_applies(alias)
-        live = float(self.operator_order.statistics.stats[alias].n_docs)
+        # the scores SELECT returns follow the score predicates, before
+        # the classifications and extractions read the rows
+        scores_pending = ASK in kinds and self.scoring is not None
         for kind, run in groupby(steps, key=lambda step: step.kind):
             run = list(run)
-            if kind == ASK:
-                emit_filter(self, alias, [step.key for step in run], live=live,
+            positions = [step.key for step in run]
+            if kind != ASK and scores_pending:
+                emit_projected_scores(self, alias, live)
+                scores_pending = False
+            if kind == ASK and self.scoring is not None:
+                emit_scores(self, alias, positions, live)
+            elif kind == ASK:
+                emit_filter(self, alias, positions, live,
                             followed=run[-1] is not steps[-1])
-            elif kind == CLASSIFY and alias not in self.after_joins:
-                emit_classify(self, alias, live=live, calls=[step.key for step in run])
-            elif kind == EXTRACT and alias not in self.extract_after:
-                emit_extract(self, alias, live=live, names=[step.key for step in run])
+            elif kind == CLASSIFY:
+                emit_classify(self, alias, live, positions)
+            else:
+                emit_extract(self, alias, live, positions)
             for step in run:
                 live *= step.selectivity
+        if scores_pending:
+            emit_projected_scores(self, alias, live)
 
     def _emit_joins(self):
         """Create joins and the exchanges between anchor groups."""
@@ -378,14 +387,13 @@ class GraphBuilder:
                           if argument.alias != alias)
                     for join in self.operators.joins
                     if alias in {argument.alias for argument in join.prompt.args})
+                kinds = set()
                 if alias in self.after_joins:
-                    emit_classify(
-                        self, alias,
-                        live=self.operator_order.live[alias] * min(1.0, met))
+                    kinds.add(CLASSIFY)
                 if alias in self.extract_after:
-                    emit_extract(
-                        self, alias,
-                        live=self.operator_order.live[alias] * min(1.0, met))
+                    kinds.add(EXTRACT)
+                self._emit_steps(alias, self.operator_order.live[alias] * min(1.0, met),
+                                 kinds)
         except ClassifyRefusedError as refused:
             return refused.refusal()
 
@@ -456,7 +464,8 @@ class GraphBuilder:
             stage_works=stage_works,
             live=self.operator_order.live, stats=stats, pre=statistics.pre,
             cap_pages=statistics.cap_pages,
-            model=self.model, device=self.device, chunk=statistics.chunk)
+            model=self.model, device=self.device, chunk=statistics.chunk,
+            resident_asks=resident_asks(self.operator_order.step_orders))
         return PhysicalPlan(
             model=self.model.name, device=self.device.name, workers=self.workers,
             backend="quail", estimated_seconds=estimate,

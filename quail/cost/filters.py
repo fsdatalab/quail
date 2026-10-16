@@ -1,7 +1,7 @@
 """Costs of boolean filters over prepared prompt token counts."""
 
 from quail.cost.sol import unrounded_seconds
-from quail.cost.work import Work, ask, scan
+from quail.cost.work import ask, scan
 from quail.specs import DeviceSpec, ModelSpec
 
 
@@ -13,14 +13,3 @@ def filter_cost(question_tokens: int, prefix_tokens: float, model: ModelSpec,
                      question_tokens,
                      window=model.sliding_window)
     return unrounded_seconds(work, model, device, chunk_tokens)
-
-
-def filter_sequence_work(questions, selectivities, prefix_tokens: float,
-                      count: float, window: int = 0) -> Work:
-    """Return expected work for predicates in their chosen execution order."""
-    total = Work()
-    for index, (question, selectivity) in enumerate(zip(questions, selectivities)):
-        operation = scan if index == 0 else ask
-        total = total + operation(prefix_tokens, question, window=window) * count
-        count *= selectivity
-    return total

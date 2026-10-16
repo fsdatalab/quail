@@ -1,15 +1,18 @@
 """Column predicates: a column tested against literals, decided without the model.
 
 A column predicate tests a source column at the scan, or a column a
-classification or an extraction computed, in a Filter. The planner
-and the executor evaluate every comparison with one Arrow compute
-function (quail.catalog.selection).
+classification or an extraction computed, in a Filter. It evaluates
+itself over Arrow values with one compute function per comparison.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, ClassVar, Optional
+
+import pyarrow as pa
+from pyarrow import compute as pc
 
 from quail.logical.expressions import ColumnRef, CompileError
 
@@ -21,6 +24,20 @@ COLUMN_COMPARISONS = (
     *TEXT_COMPARISONS, *(f"not {comparison}" for comparison in TEXT_COMPARISONS))
 # functions applied to the column's values before the comparison
 COLUMN_FUNCTIONS = ("length",)
+
+_COMPARE = {
+    "=": pc.equal, "<>": pc.not_equal,
+    "<": pc.less, "<=": pc.less_equal,
+    ">": pc.greater, ">=": pc.greater_equal,
+    "like": pc.match_like,
+    "ilike": partial(pc.match_like, ignore_case=True),
+    "contains": pc.match_substring,
+    "icontains": partial(pc.match_substring, ignore_case=True),
+    "starts with": pc.starts_with,
+    "ends with": pc.ends_with,
+    "regex": pc.match_substring_regex,
+}
+_FUNCTIONS = {"length": pc.utf8_length}
 
 
 @dataclass(frozen=True)
@@ -95,6 +112,48 @@ class RegularPredicate:
                 isinstance(v, (str, bool)) for v in values):
             raise CompileError(f"{self.name} compares with a number")
 
+    def evaluate(self, values) -> pa.ChunkedArray:
+        """Return a boolean array of the rows the predicate accepts.
+
+        A null compared with a literal is neither accepted nor rejected
+        and comes back null; accepts() treats it as rejected.
+
+        Args:
+            values: The column's values, an Arrow array or chunked array.
+
+        Raises:
+            CompileError: The literal cannot be compared with the
+                column's values, such as a string against a number
+                column.
+        """
+        try:
+            for field in self.path:
+                values = pc.struct_field(values, field)
+            if self.function is not None:
+                values = _FUNCTIONS[self.function](values)
+            comparison = self.comparison.removeprefix("not ")
+            if comparison == "is null":
+                mask = pc.is_null(values)
+            elif comparison == "is not null":
+                mask = pc.is_valid(values)
+            elif comparison == "in":
+                mask = pc.is_in(values, value_set=pa.array(
+                    list(self.value), values.type))
+            elif isinstance(self.value, str):
+                mask = _COMPARE[comparison](values, self.value)
+            else:
+                mask = _COMPARE[comparison](values, pa.scalar(self.value, values.type))
+            return pc.invert(mask) if comparison != self.comparison else mask
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError,
+                pa.ArrowTypeError, TypeError, ValueError, OverflowError) as error:
+            raise CompileError(
+                f"{self} cannot be evaluated on a column of type "
+                f"{values.type}: {error}") from error
+
+    def accepts(self, values) -> pa.Array:
+        """Return the rows the predicate accepts, with every null rejected."""
+        return accepted_rows(self.evaluate(values))
+
     def to_dict(self) -> dict:
         return {"column": vars(self.column), "comparison": self.comparison,
                 "value": (list(self.value) if isinstance(self.value, tuple)
@@ -122,3 +181,9 @@ class RegularPredicate:
         if self.comparison.startswith("is"):
             return f"{self.name} {self.comparison.upper()}"
         return f"{self.name} {self.comparison} {self.value!r}"
+
+
+def accepted_rows(mask) -> pa.Array:
+    """Return a predicate's mask with every null rejected, as one array."""
+    mask = pc.fill_null(mask, False)
+    return mask.combine_chunks() if isinstance(mask, pa.ChunkedArray) else mask

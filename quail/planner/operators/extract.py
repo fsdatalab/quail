@@ -54,7 +54,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
     return replace(spec, estimated_seconds=cost.seconds)
 
 
-def emit_extract(builder, alias, live=None, names=None):
+def emit_extract(builder, alias, live, names):
     """Copy the answers of the alias's documents.
 
     A Filter on an extraction's answer or span follows that extraction
@@ -64,22 +64,12 @@ def emit_extract(builder, alias, live=None, names=None):
     Args:
         builder: The graph builder.
         alias: The table.
-        live: The documents the extractions read; None reads those the
-            table's asks and label filters keep.
-        names: The extractions to emit, in run order; None emits every
-            extraction of the alias in written order.
+        live: The documents the extractions read.
+        names: The extractions to emit, in run order.
     """
-    stats = builder.operator_order.statistics.stats
-    calls = [node for node in builder.operators.extracts if node.alias == alias
-             and (names is None or node.name in names)]
-    if names is not None:
-        calls.sort(key=lambda node: names.index(node.name))
-    if not calls or (alias in builder.extract_after and live is None):
-        return
-    if live is None:
-        live = builder.live_asked.get(alias, float(stats[alias].n_docs))
-        for test in builder.operators.label_filters.get(alias, ()):
-            live *= effective_selectivity(test.selectivity)
+    extracts = {node.name: node for node in builder.operators.extracts
+                if node.alias == alias}
+    calls = [extracts[name] for name in names]
     tests = builder.operators.extract_filters.get(alias, ())
     for index, logical_node in enumerate(calls):
         # the extractions of a table and the Filters on their answers

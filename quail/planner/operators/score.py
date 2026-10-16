@@ -143,12 +143,17 @@ class ScoreLowering:
         return PortRef(node.node_id, "rows")
 
 
-def emit_scores(builder, alias):
-    """Append the alias's score predicates and projected scores."""
+def emit_scores(builder, alias, positions, live):
+    """Append a run of the alias's score predicates in their chosen order.
+
+    Args:
+        builder: The graph builder.
+        alias: The table.
+        positions: The written positions to emit, in run order.
+        live: The documents the run reads.
+    """
     stats = builder.operator_order.statistics.stats
-    orders = builder.operator_order.filter_orders
-    live = float(stats[alias].n_docs)
-    for position in orders.get(alias, ()):
+    for position in positions:
         predicate = builder.operators.filters[alias][position]
         source = builder.rows_src.get(alias, builder.ids_src[alias])
         if predicate.prompt not in builder.scoring.names:
@@ -159,6 +164,11 @@ def emit_scores(builder, alias):
         builder.rows_src[alias] = source
         builder.ids_src[alias] = PortRef(source.node_id, f"ids:{alias}")
         live *= effective_selectivity(predicate.selectivity)
+
+
+def emit_projected_scores(builder, alias, live):
+    """Append the alias's scores returned in SELECT, over the live documents."""
+    stats = builder.operator_order.statistics.stats
     for expression in builder.projected_scores:
         call = expression.expression
         if call.aliases() != (alias,) or call.prompt in builder.scoring.names:

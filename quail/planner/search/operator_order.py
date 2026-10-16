@@ -2,15 +2,12 @@
 
 from dataclasses import dataclass
 
-from quail.cost.work import Work
+from quail.cost.work import Work, ask, scan
 from quail.logical import (
     LogicalPlan,
-    SemanticFilter,
-    model_call,
 )
 from quail.logical.plan import Operators
 from quail.planner.operators.common import question_tokens
-from quail.planner.operators.filter import filter_alias_work, prepare_filter_costs
 from quail.planner.plan import Refusal
 from quail.planner.search import join_order as joinsearch
 from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
@@ -60,22 +57,15 @@ def choose_operator_order(plan, operators, model, device, doc_tokens, order,
                    for alias, positions in asks.items() if positions}
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(operators.all_filters(), joins)
-    orders = choose_filter_orders(
-        plan, statistics, model=model, device=device, rule=rule,
-        context=context)
     steps = choose_step_orders(operators, statistics, rule=rule, context=context)
-    # the asks run in their order among the table's steps; the orders
-    # of score predicates, which the steps leave out, stay
-    for alias, table in steps.items():
-        asks = [step.key for step in table if step.kind == ASK]
-        if asks:
-            orders[alias] = asks
+    orders = {alias: [step.key for step in table if step.kind == ASK]
+              for alias, table in steps.items()}
 
     live0 = live_after_filters(plan, statistics)
-    works = filter_works(plan, statistics, model, orders)
+    works = filter_works(plan, statistics, model, steps)
 
     seq = [(specs[position], anchor) for position, anchor in
-           choose_join_sequence(plan, statistics, orders, model=model,
+           choose_join_sequence(plan, statistics, steps, model=model,
                                 device=device, rule=rule)]
     _, join_steps = joinsearch.walk(
         seq, live0, statistics.lengths, set(operators.all_filters()), pre,
@@ -114,79 +104,53 @@ def choose_operator_order(plan, operators, model, device, doc_tokens, order,
 
 
 def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
-                 model: ModelSpec, orders: dict) -> dict:
-    """Return the expected Work of each table's filter sequence in run order.
+                 model: ModelSpec, step_orders: dict) -> dict:
+    """Return the expected Work of each table's AI.IF asks in run order.
+
+    An ask reads the documents afresh when it starts the table's
+    sequence or follows a step that leaves no KV for it, and the
+    resident KV otherwise; it reads the documents the steps before it
+    keep. The classifications and extractions among the steps carry
+    their own estimates; a score predicate is priced by its AiScore.
 
     Args:
         plan: The logical plan.
         statistics: The plan's statistics.
         model: Model spec.
-        orders: alias -> written positions of its model predicates in
-            run order.
+        step_orders: alias -> its TableSteps in run order.
     """
-    return {
-        alias: filter_alias_work(
-            predicates, statistics.stats[alias],
-            [i for i in orders.get(alias, []) if i in statistics.asks[alias]],
-            statistics.pre, statistics.lowered, model.canvas_tokens,
-            model.sliding_window)
-        for alias, predicates in plan.operators().filters.items()
-    }
-
-
-def choose_filter_orders(plan: LogicalPlan, statistics: PlanStatistics, *,
-                         model, device, rule: str, context=None) -> dict:
-    """Return alias -> written positions of its model predicates in run order.
-
-    Each SemanticFilter's predicates are ordered by order_filters_indexed:
-    every predicate is tried first, and later predicates are ranked by
-    cost per expected rejection. With rule "as_written", each filter
-    keeps its written order. A written position counts the alias's
-    predicates over every SemanticFilter, lowest node first, as
-    Operators lists them.
-
-    Args:
-        plan: The logical plan.
-        statistics: The plan's statistics.
-        model: Model spec.
-        device: Device spec.
-        rule: "by_cost" or "as_written".
-        context: The planning context, needed to price AI.SCORE
-            predicates.
-    """
-    counted = {}
-    orders = {}
-    for node in plan.walk():
-        if not isinstance(node, SemanticFilter):
-            continue
-        positions = []
-        for predicate in node.predicates:
-            (alias,) = model_call(predicate.expression).aliases()
-            positions.append((alias, counted.get(alias, 0)))
-            counted[alias] = counted.get(alias, 0) + 1
-        (alias,) = model_call(node.predicates[0].expression).aliases()
-        costs = prepare_filter_costs(
-            node.predicates,
-            prefix_tokens=(statistics.pre
-                           + statistics.stats[alias].mean_doc_tokens),
-            model=model, device=device, chunk_tokens=statistics.chunk,
-            context=context)
-        ordered = order_filters_indexed(
-            costs, rule, count=statistics.stats[alias].n_docs)
-        for index in ordered:
-            owner, position = positions[index]
-            orders.setdefault(owner, []).append(position)
-    return orders
+    works = {}
+    for alias, predicates in plan.operators().filters.items():
+        stats = statistics.stats[alias]
+        prefix = statistics.pre + stats.mean_doc_tokens
+        count, total, previous = float(stats.n_docs), Work(), None
+        for step in step_orders.get(alias, ()):
+            if step.kind == ASK and step.key in statistics.asks[alias]:
+                question = question_tokens(
+                    statistics.lowered[predicates[step.key].prompt],
+                    model.canvas_tokens)
+                operation = (ask if previous is not None
+                             and resident_after(previous, step) else scan)
+                total = total + operation(
+                    prefix, question, window=model.sliding_window) * count
+            count *= step.selectivity
+            previous = step
+        works[alias] = total
+    return works
 
 
 def choose_step_orders(operators: Operators, statistics: PlanStatistics, *,
                        rule: str, context) -> dict:
-    """Return alias -> its asks, classifications, and extractions in run order.
+    """Return alias -> its predicates, classifications, and extractions in run order.
 
-    The steps are ordered together by order_filters_indexed, each priced
-    as resident or afresh by the step before it (table_steps). With
-    rule "as_written", the asks keep their written order and the
-    classifications and extractions follow them.
+    The steps are ordered together by order_filters_indexed: every
+    step is tried first, and later steps are ranked by cost per
+    expected rejection, each priced as resident or afresh by the step
+    before it (table_steps). With rule "as_written", the predicates
+    keep their written order and the classifications and extractions
+    follow them. A predicate's written position counts the alias's
+    predicates over every SemanticFilter, lowest node first, as
+    Operators lists them.
 
     Args:
         operators: The plan's operators.
@@ -195,20 +159,21 @@ def choose_step_orders(operators: Operators, statistics: PlanStatistics, *,
         context: The planning context, which prices the steps.
     """
     orders = {}
-    for scan in operators.scans:
-        steps = table_steps(operators, scan.alias, statistics.asks.get(scan.alias, ()),
-                            PlanPricing(context, statistics, scan.alias))
+    for table in operators.scans:
+        positions = range(len(operators.filters.get(table.alias, ())))
+        steps = table_steps(operators, table.alias, positions,
+                            PlanPricing(context, statistics, table.alias))
         if not steps:
             continue
         ordered = order_filters_indexed(
-            steps, rule, count=statistics.stats[scan.alias].n_docs,
+            steps, rule, count=statistics.stats[table.alias].n_docs,
             resident=resident_after)
-        orders[scan.alias] = [steps[index] for index in ordered]
+        orders[table.alias] = [steps[index] for index in ordered]
     return orders
 
 
 def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
-                         orders: dict, *, model, device, rule: str) -> list:
+                         step_orders: dict, *, model, device, rule: str) -> list:
     """Return [(written position, anchor)] for the joins in run order.
 
     The left-deep search (join_order.search_joins) prices every
@@ -221,8 +186,8 @@ def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
     Args:
         plan: The logical plan.
         statistics: The plan's statistics.
-        orders: alias -> written positions of its model predicates in
-            run order, from choose_filter_orders.
+        step_orders: alias -> its TableSteps in run order, from
+            choose_step_orders.
         model: Model spec.
         device: Device spec.
         rule: "by_cost" or "as_written".
@@ -230,7 +195,7 @@ def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
     if not plan.operators().joins:
         return []
     base_work = sum(
-        filter_works(plan, statistics, model, orders).values(), Work())
+        filter_works(plan, statistics, model, step_orders).values(), Work())
     live = live_after_filters(plan, statistics)
     filtered = set(plan.operators().all_filters())
     arguments = (statistics.specs, live, statistics.lengths, filtered,
@@ -241,3 +206,17 @@ def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
         found = joinsearch.search_joins(
             *arguments, base_work=base_work, fixed_order=True)
     return list(found.seq)
+
+
+def resident_asks(step_orders: dict) -> frozenset:
+    """Return the aliases whose first ask reads KV a step before it left."""
+    resident = set()
+    for alias, steps in step_orders.items():
+        previous = None
+        for step in steps:
+            if step.kind == ASK:
+                if previous is not None and resident_after(previous, step):
+                    resident.add(alias)
+                break
+            previous = step
+    return frozenset(resident)

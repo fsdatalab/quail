@@ -11,7 +11,6 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.reranker import filter_scores
-from quail.catalog.selection import accepted_rows, evaluate_predicate
 from quail.catalog.tokens import (
     DocumentKeys,
     DocumentPrefixes,
@@ -134,8 +133,7 @@ class ConditionGate(SingleResultPart):
         value = values[0].as_py()
         token = tuple(sorted(value.items())) if isinstance(value, dict) else value
         if token not in self.accepted:
-            self.accepted[token] = bool(accepted_rows(
-                evaluate_predicate(values, self.node.predicate))[0].as_py())
+            self.accepted[token] = bool(self.node.predicate.accepts(values)[0].as_py())
         return None if self.accepted[token] else Stage.DROP
 
     def finish(self, every):

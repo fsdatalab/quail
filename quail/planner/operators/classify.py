@@ -459,26 +459,16 @@ class ClassifyBuilder(ClassifyStatistics):
             frame_tokens=frame), estimated.work
 
 
-def emit_classify(builder, alias, live=None, calls=None):
+def emit_classify(builder, alias, live, calls):
     """Classify the alias's documents, then keep the accepted labels.
 
     Args:
         builder: The graph builder.
         alias: The table.
-        live: The documents the classifications read; None reads those
-            the table's asks keep.
-        calls: The classifications to emit, in run order; None emits
-            every one-table classification of the alias in written order.
+        live: The documents the classifications read.
+        calls: The classifications to emit, in run order.
     """
-    stats = builder.operator_order.statistics.stats
-    if calls is None:
-        calls = [call for call, owner in builder.operators.labels.calls
-                 if owner == alias and len(call.aliases()) == 1]
-    if not calls or (alias in builder.after_joins and live is None):
-        return
     table = classify_builder(builder.context, alias, "quail")
-    if live is None:
-        live = builder.live_asked.get(alias, float(stats[alias].n_docs))
     steps = []
     for call in calls:
         steps.extend((test.call, test)

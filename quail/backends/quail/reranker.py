@@ -9,7 +9,6 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.backends.base import GpuContext
-from quail.catalog.selection import accepted_rows, evaluate_predicate
 from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import DEFAULT_BATCH_ROWS, answer_table, filter_answer_table
@@ -443,8 +442,7 @@ class FilterRuntime:
 
 def filter_scores(node, table) -> NodeResult:
     """Apply a filter to a table of scores or labels."""
-    answers = accepted_rows(
-        evaluate_predicate(table.column(node.column), node.predicate))
+    answers = node.predicate.accepts(table.column(node.column))
     filtered = table.filter(answers)
     if len(node.aliases) == 1:
         answer_name = f"filter_answers:{node.aliases[0]}"

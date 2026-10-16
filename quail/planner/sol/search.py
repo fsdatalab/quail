@@ -12,7 +12,6 @@ from typing import Callable, Mapping
 import pyarrow as pa
 
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
-from quail.catalog.selection import accepted_rows, evaluate_predicate
 from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import speed_of_light
@@ -435,7 +434,7 @@ class Search:
         answers = pa.array(
             [self.answer(node.call.prompt, {node.alias: row}) for row in live],
             pa.string())
-        kept = accepted_rows(evaluate_predicate(answers, condition))
+        kept = condition.accepts(answers)
         return [row for row, keep in zip(live, kept.to_pylist()) if keep]
 
     # ---- joins -----------------------------------------------------

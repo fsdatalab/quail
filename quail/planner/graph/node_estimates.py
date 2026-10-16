@@ -7,7 +7,7 @@ from quail.physical import AiExtract, AiFilter, AiJoin
 
 
 def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
-                   cap_pages, model, device, chunk) -> dict:
+                   cap_pages, model, device, chunk, resident_asks=frozenset()) -> dict:
     """Price each node's own work, and each sequence's recompute if released.
 
     Returns node id -> {"seconds", and for a filter sequence a later join
@@ -17,6 +17,8 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
     packing shares forward passes across them. The recompute figure
     is the expected survivors past the retention pool cap times their
     prefix cost: what the join pays if the sequence's KV is not pinned.
+    A table in resident_asks had a step before its first filter leave
+    the documents' KV, so that filter is priced as a question alone.
     """
     anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
     out = {}
@@ -26,7 +28,8 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
     for node in graph.nodes:
         entry = {}
         if isinstance(node, AiFilter) and node.alias in filter_works:
-            operation = ask if node.alias in priced_filters else scan
+            operation = (ask if node.alias in priced_filters
+                         or node.alias in resident_asks else scan)
             priced_filters.add(node.alias)
             work = operation(pre + stats[node.alias].mean_doc_tokens,
                              node.question_tokens, window=model.sliding_window)
