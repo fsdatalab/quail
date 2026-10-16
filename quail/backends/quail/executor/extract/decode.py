@@ -128,13 +128,62 @@ class Decoder:
         answer = doc.answers[q]
         answer.steps += 1
         answer.discard = 0
-        for i, values in enumerate(rows):
-            token = self.choose(doc, q, values)
+        rows = np.asarray(rows)
+        start = 0
+        if answer.written and len(answer.live) == 1:
+            start = self.accepted(answer, rows, fed)
+            answer.written.extend(fed[1:start + 1])
+            if len(answer.written) >= self.spec.max_answer_tokens:
+                self.settle(doc, q)
+                return
+        for i in range(start, len(rows)):
+            token = self.choose(doc, q, rows[i])
             if answer.done:
                 return
             if i + 1 < len(fed) and token != fed[i + 1]:
                 answer.discard = len(fed) - (i + 1)
                 return
+
+    def accepted(self, answer: AnswerState, rows: np.ndarray, fed) -> int:
+        """Return how many leading rows write the draft token fed after them.
+
+        With one live stream the draft is that stream's next tokens, so
+        a row writes the draft token exactly when choose() would: the
+        token beats the stop, closing the quote after it is not
+        preferred, and the model's likeliest token stays in the
+        document. Those tests read a few values per row, so every row
+        of the round is decided at once; the first row that fails, and
+        the rows after it, go through choose().
+        """
+        k = self.k
+        vocabulary = self.vocabulary
+        n = min(len(rows), len(fed) - 1,
+                self.spec.max_answer_tokens - len(answer.written))
+        if n <= 0:
+            return 0
+        values = rows[:n]
+        ids = values[:, -2 * k:-k].astype(np.int64)
+        lps = values[:, -k:]
+        draft = np.asarray(fed[1:n + 1], dtype=np.int64)
+        merged = vocabulary.merged[draft]
+        index = np.arange(n)
+
+        def lookup(tokens):
+            hit = ids == tokens[:, None]
+            found = lps[index, hit.argmax(axis=1)]
+            return np.where(hit.any(axis=1), found, NEG)
+
+        lp_draft = lookup(draft)
+        lp_merged = lookup(merged)
+        top_col = lps.argmax(axis=1)
+        top, lp_top = ids[index, top_col], lps[index, top_col]
+        stop = values[:, 1]
+        best = np.maximum(lp_draft, stop)
+        allowed = (top == draft) | (top == merged)
+        leaves = ((lp_top > best) & ~allowed & ~vocabulary.is_stop[top]
+                  & (top != vocabulary.none_id))
+        writes = (lp_draft > stop) & ~(lp_merged > best) & ~leaves
+        return int(np.argmin(writes)) if not writes.all() else n
 
     def choose(self, doc: Document, q: int, values):
         """Choose the answer's next token among the document's continuations.

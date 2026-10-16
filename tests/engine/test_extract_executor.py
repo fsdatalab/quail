@@ -175,6 +175,29 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
     assert asked.fed_tokens == (len(tables.encode_ids(TAIL)) + len(fed[1][0])
                                 + len(fed[2][0]))
 
+def test_rows_with_one_live_stream_are_decided_together(monkeypatch):
+    # with one live stream, a round's rows are decided at once; the
+    # answers, steps, and fed tokens match choosing row by row
+    counts = []
+    accepted = Decoder.accepted
+
+    def counting(self, answer, rows, fed):
+        counts.append(accepted(self, answer, rows, fed))
+        return counts[-1]
+
+    def outcome(run):
+        result, stages = run()
+        return (result.outputs["rows"].column("ends").to_pylist(),
+                [(a.written, a.steps, a.fed_tokens, a.span)
+                 for doc in stages.docs for a in doc.answers])
+
+    monkeypatch.setattr(Decoder, "accepted", counting)
+    fast = outcome(_setup(monkeypatch)[2])
+    assert max(counts) > 0
+    monkeypatch.setattr(Decoder, "accepted", lambda self, answer, rows, fed: 0)
+    assert outcome(_setup(monkeypatch)[2]) == fast
+
+
 class ScriptedModel:
     """Writes the gold answer: the lines that hold it, its tokens, then stops.
 
