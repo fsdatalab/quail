@@ -90,8 +90,6 @@ def bind_runtime_data(plan, region, context):
             **plan.settings,
             "true_ids": true_ids,
             "false_ids": false_ids,
-            **({"pre_ids": pre_ids} if any(
-                isinstance(node, (AiFilter, AiJoin)) for node in plan.nodes
-            ) else {}),
+            "pre_ids": pre_ids,
         },
     )

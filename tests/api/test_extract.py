@@ -133,6 +133,11 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
              .select("c.id", "lease", "signing", "venue"))
     plan = query.plan()
     extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
+    # the extractions show the documents under the query's shared
+    # head, which the executor keys their KV by, so the plan carries it
+    # without a filter or a join
+    assert extracts[0].document_head is None
+    assert list(extracts[0].spec.prompt_token_parts[0]) == plan.settings["pre_ids"]
     pipelines = build_pipelines(plan.graph)
     # the three run as one pipeline: the later ones read the KV the
     # first leaves and are priced without reading the document
