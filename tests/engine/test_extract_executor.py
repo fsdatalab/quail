@@ -35,6 +35,7 @@ from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_extract
 from quail.builtins import built_in_registry
 from quail.catalog.tokens import TokenOffsets, TokenStore
+from quail.logical import ColumnRef, RegularPredicate
 from quail.physical import (
     AiExtract,
     AiFilter,
@@ -697,7 +698,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
     # the second question is asked of the documents whose first answer
     # passed, over the KV the first question left; the dropped
     # document is packed once and its KV freed
-    from quail.physical import Condition, Filter
+    from quail.physical import Filter
     from quail.physical.pipelines import build_pipelines
 
     spec, tables = make_spec()
@@ -715,7 +716,8 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                   backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         Filter(node_id="filter:c:0",
                inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
-               predicate=Condition("ends", "not like", "five%"),
+               predicate=RegularPredicate(
+                   ColumnRef("c", "contracts", "ends"), "not like", "five%"),
                aliases=("c",), written_pos=0),
         AiExtract(node_id="ai-extract:starts",
                   inputs=input_ports((PortRef("filter:c:0", "rows"),)),
@@ -723,7 +725,8 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                   spec=replace(spec, name="starts")),
         Filter(node_id="filter:c:1",
                inputs=input_ports((PortRef("ai-extract:starts", "rows"),)),
-               predicate=Condition("starts_span", "<", 40, ("start",)),
+               predicate=RegularPredicate(
+                   ColumnRef("c", "contracts", "starts_span"), "<", 40, ("start",)),
                aliases=("c",), written_pos=1),
     ), PortRef("filter:c:1", "rows"))
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
@@ -767,7 +770,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
         monkeypatch):
     # the filter's question follows the document in KV, in place of
     # the answer the extraction wrote; the document is packed once
-    from quail.physical import Condition, Filter
+    from quail.physical import Filter
     from quail.physical.pipelines import build_pipelines
 
     spec, tables = make_spec()
@@ -789,7 +792,8 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
                   spec=replace(spec, shares_head=True)),
         Filter(node_id="filter:c:1",
                inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
-               predicate=Condition("ends", "is not null"),
+               predicate=RegularPredicate(
+                   ColumnRef("c", "contracts", "ends"), "is not null"),
                aliases=("c",), written_pos=1),
         AiFilter(
             node_id="ai_filter:c",

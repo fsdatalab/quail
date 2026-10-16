@@ -5,14 +5,13 @@ from dataclasses import dataclass
 from quail.cost import budgets
 from quail.cost.score import ScoreCost
 from quail.cost.work import Work
-from quail.logical import effective_selectivity
+from quail.logical import ColumnRef, RegularPredicate, effective_selectivity
 from quail.logical.prompts import (
     prompt_aliases,
     score_query_template,
 )
 from quail.physical import (
     AiScore,
-    Condition,
     Filter,
     PortRef,
     ScoreSpec,
@@ -135,8 +134,9 @@ class ScoreLowering:
         node = Filter(
             node_id=f"filter:{alias}:{position}",
             inputs=input_ports((source,)),
-            predicate=Condition(self.names[predicate.prompt],
-                                expression.comparison, expression.threshold),
+            predicate=RegularPredicate(
+                ColumnRef(alias, "", self.names[predicate.prompt]),
+                expression.comparison, expression.threshold),
             aliases=tuple(aliases), selectivity=predicate.selectivity,
             written_pos=position)
         self.nodes.append(node)

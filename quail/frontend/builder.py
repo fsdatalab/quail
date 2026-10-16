@@ -549,14 +549,16 @@ class Query:
                                     anchor=anchor))
         return self
 
-    def where(self, *tests, selectivity: Optional[float] = None) -> "Query":
-        """Keep the rows that pass tests of a column against literals.
+    def where(self, *tests) -> "Query":
+        """Keep the rows that pass every test of a column against literals.
 
         A test of a source column runs at the scan, before any model
         call. A test of a label from ai_classify() or of an answer from
         ai_extract() runs right after the call that computes it, so the
         later operators read fewer documents; the model runs once for
-        the test and the returned column.
+        the test and the returned column. Such a test takes a
+        selectivity hint, ``col(...).like(...).hint(0.4)``, the
+        estimated fraction of documents it keeps; 0.2 without one.
 
         Args:
             tests: Comparisons of a ``col(...)`` with a literal, such as
@@ -565,12 +567,11 @@ class Query:
                 ``col(...).like(...)``, ``col(...).ilike(...)``,
                 ``col(...).contains(...)``, ``col(...).startswith(...)``,
                 ``col(...).endswith(...)``, ``col(...).rlike(...)``, or
-                ``~`` before a text test. ``col("lease.end_date")``
-                names an extraction's field, ``col("lease_span.end_date")
-                .field("start")`` its span's start, and
-                ``col(...).length()`` the number of characters.
-            selectivity: Estimated fraction of documents each test on a
-                label or an answer keeps. None uses 0.2.
+                ``~`` before a text test, combined with AND.
+                ``col("lease.end_date")`` names an extraction's field,
+                ``col("lease_span.end_date").field("start")`` its
+                span's start, and ``col(...).length()`` the number of
+                characters.
         """
         for test in tests:
             if not isinstance(test, PredicateSpec):
@@ -583,7 +584,7 @@ class Query:
                     raise CompileError(
                         f"a label is tested with == or isin(), got {test.comparison}")
                 values = test.value if test.comparison == "in" else (test.value,)
-                self.label_in(spec.column, values, selectivity)
+                self.label_in(spec.column, values, test.selectivity)
                 continue
             extracted = self._extract_column(spec)
             if extracted is not None:
@@ -594,7 +595,7 @@ class Query:
                 else:
                     predicate.validate_text_column()
                 self._extract_filters.setdefault(extracted.alias, []).append(
-                    (predicate, selectivity))
+                    (predicate, test.selectivity))
                 continue
             if spec.path:
                 raise CompileError(

@@ -137,19 +137,33 @@ class EqualsSpec:
 
 @dataclass(frozen=True)
 class PredicateSpec:
-    """An unresolved regular predicate for ``where()``."""
+    """An unresolved regular predicate for ``where()``.
+
+    Attributes:
+        col: The tested column.
+        comparison: One of quail.logical.COLUMN_COMPARISONS.
+        value: The literal or literals compared with.
+        selectivity: Estimated fraction of documents the test keeps,
+            for a test on a label or an answer; None uses 0.2.
+    """
     col: ColSpec
     comparison: str
     value: object = None
+    selectivity: Optional[float] = None
 
     def __invert__(self) -> "PredicateSpec":
         """``~col(...).like(...)``: the negated text test."""
         if self.comparison.startswith("not "):
-            return PredicateSpec(self.col, self.comparison[4:], self.value)
-        if self.comparison in ("is null", "is not null"):
-            flipped = "is not null" if self.comparison == "is null" else "is null"
-            return PredicateSpec(self.col, flipped)
-        return PredicateSpec(self.col, f"not {self.comparison}", self.value)
+            comparison = self.comparison[4:]
+        elif self.comparison in ("is null", "is not null"):
+            comparison = "is not null" if self.comparison == "is null" else "is null"
+        else:
+            comparison = f"not {self.comparison}"
+        return PredicateSpec(self.col, comparison, self.value, self.selectivity)
+
+    def hint(self, selectivity: float) -> "PredicateSpec":
+        """``col(...).like(...).hint(0.4)``: the fraction of documents kept."""
+        return PredicateSpec(self.col, self.comparison, self.value, selectivity)
 
 
 @dataclass(frozen=True)

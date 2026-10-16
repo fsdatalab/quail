@@ -17,16 +17,19 @@ from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan
-from quail.logical import effective_selectivity, oriented_join_conditions
+from quail.logical import oriented_join_conditions
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.search.leftdeep import search_left_deep
 from quail.planner.search.live_rows import PairRelation, exact_live_rows
 from quail.planner.search.statistics import filter_stop_keys
-from quail.planner.search.table_steps import ASK, TableStep, resident_after
+from quail.planner.search.table_steps import (
+    ASK,
+    resident_after,
+    table_steps,
+)
 from quail.planner.search.table_steps import CLASSIFY as CLASSIFY_STEP
-from quail.planner.search.table_steps import EXTRACT as EXTRACT_STEP
 from quail.planner.sol.prefixes import document_shared_tokens, subset_shared_tokens
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -44,6 +47,41 @@ CLASSIFY = "AI.CLASSIFY"
 EXTRACT = "AI.EXTRACT"
 LABEL_IN = "IN"
 ANSWER_TEST = "ANSWER TEST"
+
+
+class _EstimatePricing:
+    """Price a table's steps as the estimate prices a question.
+
+    Every step is one question of its tail over the live documents,
+    under the query's shared head.
+    """
+
+    def __init__(self, search, prefix_tokens: float):
+        self.search = search
+        self.prefix_tokens = prefix_tokens
+
+    def asks(self, predicates) -> tuple:
+        search = self.search
+        return prepare_filter_costs(
+            predicates, prefix_tokens=self.prefix_tokens, model=search.model,
+            device=search.device, chunk_tokens=search.chunk_tokens,
+            lower=search.lower)
+
+    def _question(self, prompt) -> tuple:
+        search = self.search
+        tail = search.lower(prompt).tail_tokens
+        return tuple(partial(mul, filter_cost(
+            tail, self.prefix_tokens, search.model, search.device,
+            search.chunk_tokens, first=fresh)) for fresh in (True, False))
+
+    def classify(self, call, name: str) -> tuple:
+        return self._question(call.prompt)
+
+    def extract(self, node) -> tuple:
+        return self._question(node.call.prompt)
+
+    def head(self, prompt):
+        return None
 
 
 @dataclass
@@ -85,6 +123,7 @@ class Search:
         self.window = model.sliding_window
         stores = query.token_inputs()
         operators = query.logical.operators()
+        self.logical_operators = operators
         self.scans, self.filters, self.joins = (
             operators.scans, operators.filters, operators.joins
         )
@@ -303,8 +342,8 @@ class Search:
                 continue
             tokens = self.aliases[alias].tokens
             mean_tokens = sum(tokens) / len(tokens) if tokens else 0
-            steps = self.table_steps(alias, predicates, asks, calls, extracts,
-                                     self.pre + mean_tokens)
+            steps = table_steps(self.logical_operators, alias, asks,
+                                _EstimatePricing(self, self.pre + mean_tokens))
             ordered = [steps[index] for index in order_filters_indexed(
                 steps, rule, count=len(survivors[alias]), resident=resident_after)]
             live = survivors[alias]
@@ -332,48 +371,12 @@ class Search:
                     live, stage_work = self.classify_stage(
                         alias, step.key, live, first, stages)
                 else:
+                    node = next(node for node in extracts if node.name == step.key)
                     live, stage_work = self.extract_stage(
-                        alias, step.key, live, first, stages)
+                        alias, node, live, first, stages)
                 work = work + stage_work
             survivors[alias] = live
         return survivors, work, stages
-
-    def table_steps(self, alias, predicates, asks, calls, extracts,
-                    prefix_tokens) -> list:
-        """Return the alias's steps, priced as the estimate prices a question.
-
-        Every step is one question of its tail over the live documents;
-        a step's selectivity is the product of its tests' hints.
-        """
-        costs = prepare_filter_costs(
-            [predicates[position] for position in asks],
-            prefix_tokens=prefix_tokens, model=self.model, device=self.device,
-            chunk_tokens=self.chunk_tokens, lower=self.lower)
-        steps = [TableStep(ASK, position, cost.selectivity, cost.first,
-                           cost.later, cost.reuse_key)
-                 for position, cost in zip(asks, costs)]
-
-        def priced(kind, key, prompt, selectivities):
-            tail = self.lower(prompt).tail_tokens
-            survival = 1.0
-            for selectivity in selectivities:
-                survival *= effective_selectivity(selectivity)
-            first, later = (partial(mul, filter_cost(
-                tail, prefix_tokens, self.model, self.device, self.chunk_tokens,
-                first=fresh)) for fresh in (True, False))
-            return TableStep(kind, key, survival, first, later)
-
-        for call in calls:
-            steps.append(priced(
-                CLASSIFY_STEP, call, call.prompt,
-                [test.selectivity for test in self.label_filters.get(alias, ())
-                 if test.call == call]))
-        for node in extracts:
-            steps.append(priced(
-                EXTRACT_STEP, node, node.call.prompt,
-                [test.selectivity for test in self.extract_filters.get(alias, ())
-                 if test.name == node.name]))
-        return steps
 
     def ask_stage(self, alias, predicate, written_pos, live, first, stages):
         """Run one AI.IF over the live rows; return the survivors and work."""

@@ -426,7 +426,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                            f"trim={'on' if spec.trim else 'off'}, "
                            f"up to {spec.max_answer_tokens} answer tokens")
         elif isinstance(node, Filter):
-            title += f": {node.predicate.describe()}"
+            title += f": {node.predicate}"
         elif isinstance(node, AiJoin):
             title += f": anchor={node.anchor}"
             source = {"none": "not resident", "filter": "from filters",

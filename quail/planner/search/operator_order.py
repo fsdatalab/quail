@@ -19,7 +19,7 @@ from quail.planner.search.statistics import (
     cached_statistics,
     live_after_filters,
 )
-from quail.planner.search.table_steps import resident_after, table_steps
+from quail.planner.search.table_steps import PlanPricing, resident_after, table_steps
 from quail.planner.validation import join_input_tokens
 from quail.specs import ModelSpec
 
@@ -188,8 +188,8 @@ def choose_step_orders(operators: Operators, statistics: PlanStatistics, *,
         return {}
     orders = {}
     for scan in operators.scans:
-        steps = table_steps(operators, scan.alias, context=context,
-                            statistics=statistics)
+        steps = table_steps(operators, scan.alias, statistics.asks.get(scan.alias, ()),
+                            PlanPricing(context, statistics, scan.alias))
         if not steps:
             continue
         ordered = order_filters_indexed(

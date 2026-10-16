@@ -95,6 +95,21 @@ class RegularPredicate:
                 isinstance(v, (str, bool)) for v in values):
             raise CompileError(f"{self.name} compares with a number")
 
+    def to_dict(self) -> dict:
+        return {"column": vars(self.column), "comparison": self.comparison,
+                "value": (list(self.value) if isinstance(self.value, tuple)
+                          else self.value),
+                "path": list(self.path), "function": self.function}
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "RegularPredicate":
+        """Decode a predicate from its serialized mapping."""
+        literal = value["value"]
+        return cls(ColumnRef(**value["column"]), str(value["comparison"]),
+                   tuple(literal) if isinstance(literal, list) else literal,
+                   tuple(str(field) for field in value.get("path", ())),
+                   value.get("function"))
+
     @property
     def name(self) -> str:
         """The tested column as written, with its path and function."""

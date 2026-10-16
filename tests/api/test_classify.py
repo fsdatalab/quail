@@ -29,6 +29,7 @@ from quail.logical import (
     ColumnRef,
     CompileError,
     LogicalPlan,
+    RegularPredicate,
     Scan,
     bind_classify_prompt,
 )
@@ -37,7 +38,6 @@ from quail.physical import (
     AiClassify,
     AiJoin,
     ClassifySpec,
-    Condition,
     Filter,
     decode_graph,
     encode_graph,
@@ -299,7 +299,8 @@ def test_classify_plans_filters_and_returns_labels(session):
     # a tokenizer without decode marks no word start
     assert classify.spec.label_word_starts == tuple(
         (False,) * len(ids) for ids in classify.spec.label_token_ids)
-    assert test.predicate == Condition("topic", "in", ("refund", "shipping"))
+    assert test.predicate == RegularPredicate(
+        ColumnRef("d", "documents", "topic"), "in", ("refund", "shipping"))
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
 
@@ -381,7 +382,8 @@ def test_sql_classifies_and_tests_labels(session):
         .label_in("topic", ["refund", "shipping"]).select("d.id", "topic"))
     assert query.logical == built.logical
     (test,) = [n for n in query.plan().nodes if isinstance(n, Filter)]
-    assert test.predicate == Condition("topic", "in", ("refund", "shipping"))
+    assert test.predicate == RegularPredicate(
+        ColumnRef("d", "documents", "topic"), "in", ("refund", "shipping"))
     # a filter on the label alone, with a selectivity option
     filtered = session.sql(
         f"SELECT d.id FROM documents d WHERE {call[:-1]}, "
@@ -454,7 +456,7 @@ def test_frontends_place_classifications_on_their_table(session):
     assert "Project: d.id, topic" in text
     assert "AiClassify: topic over d" in text
     assert "rule=trie_decode, labels=3" in text
-    assert "Filter: topic IN ['refund', 'shipping']" in text
+    assert "Filter: d.topic IN ('refund', 'shipping')" in text
 
 
 def _corpus(session, tmp_path, name, column, rows, words):
@@ -760,7 +762,8 @@ def test_classify_refusals_and_builder_errors(session):
         quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
         name="x").label_in("x", ["c"]).select("d.id"))
     (test,) = [n for n in none.plan().nodes if isinstance(n, Filter)]
-    assert test.predicate == Condition("x", "in", ("c",))
+    assert test.predicate == RegularPredicate(
+        ColumnRef("d", "documents", "x"), "in", ("c",))
     with pytest.raises(CompileError, match="differ ignoring case"):
         session.docs("documents").alias("d").ai_classify(
             quail.prompt("{0}", quail.col("d.body")), ["a", "A"], name="x")

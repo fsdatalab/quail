@@ -23,13 +23,13 @@ from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.operators.join import _tuple_suffix
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
+from quail.logical import ColumnRef, RegularPredicate
 from quail.physical import (
     AiClassify,
     AiFilter,
     AiJoin,
     AiScore,
     ClassifySpec,
-    Condition,
     Filter,
     PhysicalGraph,
     PortRef,
@@ -135,12 +135,16 @@ def fused_graph(*, classify_only=False):
         Filter(
             node_id="label:r",
             inputs=input_ports((PortRef("classify:r", "rows"),)),
-            predicate=Condition("topic", "in", ("a",)), aliases=("r",),
+            predicate=RegularPredicate(
+                ColumnRef("r", "reviews", "topic"), "in", ("a",)),
+            aliases=("r",),
             selectivity=0.5, written_pos=1),
         Filter(
             node_id="label:again",
             inputs=input_ports((PortRef("label:r", "rows"),)),
-            predicate=Condition("topic", "in", ("a",)), aliases=("r",),
+            predicate=RegularPredicate(
+                ColumnRef("r", "reviews", "topic"), "in", ("a",)),
+            aliases=("r",),
             selectivity=1.0, written_pos=2),
         AiClassify(
             node_id="classify:kind",
@@ -219,7 +223,9 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         nodes.append(Filter(
             node_id="label:r",
             inputs=input_ports((PortRef("classify:r", "rows"),)),
-            predicate=Condition("topic", "in", ("b",)), aliases=("r",),
+            predicate=RegularPredicate(
+                ColumnRef("r", "reviews", "topic"), "in", ("b",)),
+            aliases=("r",),
             selectivity=0.5, written_pos=1))
         root = PortRef("label:r", "ids:r")
     if shape == "joined":
@@ -228,7 +234,9 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
             Filter(
                 node_id="label:r",
                 inputs=input_ports((PortRef("classify:r", "rows"),)),
-                predicate=Condition("topic", "in", ("a",)), aliases=("r",),
+                predicate=RegularPredicate(
+                ColumnRef("r", "reviews", "topic"), "in", ("a",)),
+            aliases=("r",),
                 selectivity=0.5, written_pos=1),
             AiJoin(
                 node_id="group:0", anchor="r", anchor_resident="filter",

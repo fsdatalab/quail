@@ -28,12 +28,11 @@ from quail.execution.runner import (
     compute_subgraph,
 )
 from quail.frontend.sql import compile_sql
-from quail.logical import CompileError, SemanticJoin
+from quail.logical import ColumnRef, CompileError, RegularPredicate, SemanticJoin
 from quail.physical import (
     AiClassify,
     AiScore,
     ClassifySpec,
-    Condition,
     Filter,
     decode_graph,
     encode_graph,
@@ -179,7 +178,8 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
     score_filter = next(
         node for node in physical.nodes if isinstance(node, Filter)
     )
-    assert score_filter.predicate == Condition("score", ">=", 0.7)
+    assert score_filter.predicate == RegularPredicate(
+        ColumnRef("d", "", "score"), ">=", 0.7)
     graph = physical.graph
     decoded = decode_graph(
         encode_graph(graph, session.registry.codecs),
@@ -280,7 +280,8 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
 
 
 def test_score_filters_compare_values_and_keep_pair_answers(catalog):
-    node = Filter(node_id="filter", predicate=Condition("score", ">", 0.5),
+    node = Filter(node_id="filter",
+                  predicate=RegularPredicate(ColumnRef("r", "", "score"), ">", 0.5),
                   aliases=("q", "d"), written_pos=0)
     table = pa.table({
         "q": pa.array([0, 0, 1, 1], pa.int32()),
@@ -390,7 +391,7 @@ def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
             assert sum(type(node) is AiScore for node in physical.nodes) == 1
             if "IN" in predicate:
                 assert any(isinstance(node, Filter)
-                           and node.predicate == Condition("topic", "in", ("praise",))
+                           and node.predicate.value == ("praise",)
                            for node in physical.nodes)
             decoded = decode_graph(
                 encode_graph(physical.graph, session.registry.codecs),

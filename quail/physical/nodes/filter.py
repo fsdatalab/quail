@@ -1,9 +1,11 @@
-"""The Filter condition and the Filter and AiFilter nodes."""
+"""The Filter and AiFilter nodes."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
+
+from quail.logical import RegularPredicate
 
 from ..base import (
     ExecutionLocation,
@@ -14,62 +16,17 @@ from ..base import (
 
 
 @dataclass(frozen=True)
-class Condition:
-    """The predicate ``column <comparison> value`` over a result column.
-
-    The fields are those of quail.logical.RegularPredicate with the
-    column named as the rows table names it; the executor evaluates
-    both with quail.catalog.selection.evaluate_predicate.
-    """
-
-    column: str
-    comparison: str
-    value: Any = None
-    path: tuple[str, ...] = ()
-    function: str | None = None
-
-    def to_dict(self) -> dict:
-        return {"column": self.column, "comparison": self.comparison,
-                "value": list(self.value) if isinstance(self.value, tuple)
-                else self.value, "path": list(self.path),
-                "function": self.function}
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "Condition":
-        """Decode a condition from its serialized mapping."""
-        literal = value["value"]
-        return cls(str(value["column"]), str(value["comparison"]),
-                   tuple(literal) if isinstance(literal, list) else literal,
-                   tuple(str(field) for field in value.get("path", ())),
-                   value.get("function"))
-
-    @classmethod
-    def from_predicate(cls, column: str, predicate) -> "Condition":
-        """Build the condition a logical RegularPredicate applies."""
-        return cls(column, predicate.comparison, predicate.value,
-                   tuple(predicate.path), predicate.function)
-
-    def describe(self) -> str:
-        name = ".".join((self.column, *self.path))
-        name = f"{self.function}({name})" if self.function else name
-        if self.comparison == "in":
-            return f"{name} IN {list(self.value)}"
-        if self.comparison.startswith("is"):
-            return f"{name} {self.comparison.upper()}"
-        return f"{name} {self.comparison} {self.value!r}"
-
-
-@dataclass(frozen=True)
 class Filter(PhysicalNode):
-    """Physical operator that keeps the rows whose condition holds.
+    """Physical operator that keeps the rows whose predicate holds.
 
-    The condition tests a label AI.CLASSIFY produced, a score AI.SCORE
-    produced, or an answer or span AI.EXTRACT produced. Single-document
-    filters also return the kept document IDs; filters over joined
-    pairs return join answers.
+    The predicate is the logical plan's RegularPredicate over a label
+    AI.CLASSIFY produced, a score AI.SCORE produced, or an answer or
+    span AI.EXTRACT produced; its column names the rows table's
+    column. Single-document filters also return the kept document IDs;
+    filters over joined pairs return join answers.
     """
 
-    predicate: Condition | None = None
+    predicate: RegularPredicate | None = None
     aliases: tuple[str, ...] = ()
     selectivity: float | None = None
     written_pos: int = 0
@@ -92,7 +49,7 @@ class Filter(PhysicalNode):
     @property
     def column(self) -> str:
         """Return the column tested by the predicate."""
-        return self.predicate.column
+        return self.predicate.column.column
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
@@ -120,7 +77,7 @@ class Filter(PhysicalNode):
 
     def explain_fields(self) -> Mapping[str, Any]:
         return {
-            "predicate": self.predicate.describe(),
+            "predicate": str(self.predicate),
             "selectivity": self.selectivity,
             "aliases": list(self.aliases),
         }
@@ -130,7 +87,7 @@ class Filter(PhysicalNode):
         return cls(
             node_id=node_id,
             inputs=inputs,
-            predicate=Condition.from_dict(attributes["predicate"]),
+            predicate=RegularPredicate.from_dict(attributes["predicate"]),
             aliases=tuple(attributes["aliases"]),
             selectivity=attributes["selectivity"],
             written_pos=int(attributes["written_pos"]),

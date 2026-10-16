@@ -18,7 +18,6 @@ from quail.logical import LabelWork, effective_selectivity, shared_preamble
 from quail.physical import (
     AiClassify,
     ClassifySpec,
-    Condition,
     Filter,
     PortRef,
 )
@@ -508,10 +507,8 @@ def emit_classify(builder, alias, live=None, calls=None):
             lid = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
                 node_id=lid, inputs=input_ports((scores,)),
-                predicate=Condition(builder.operators.labels.names[call], "in",
-                                    test.values),
-                aliases=(alias,), selectivity=test.selectivity,
-                written_pos=test.position))
+                predicate=test.condition, aliases=(alias,),
+                selectivity=test.selectivity, written_pos=test.position))
             scores = PortRef(lid, "rows")
             builder.ids_src[alias] = PortRef(lid, f"ids:{alias}")
             live *= effective_selectivity(test.selectivity)

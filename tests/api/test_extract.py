@@ -675,11 +675,10 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     built = (session.docs("contracts").alias("c")
              .ai_extract("c.text", {"ends": QUESTION, "rent": "How much?"},
                          name="lease")
-             .where(quail.col("lease.ends").is_not_null(),
-                    quail.col("lease.ends").ilike("%march%"), selectivity=0.5)
-             .where(quail.col("lease_span.ends").field("start") < 20,
-                    selectivity=0.5)
-             .where(quail.col("lease.rent").length() < 20, selectivity=0.5)
+             .where(quail.col("lease.ends").is_not_null().hint(0.5),
+                    quail.col("lease.ends").ilike("%march%").hint(0.5))
+             .where((quail.col("lease_span.ends").field("start") < 20).hint(0.5))
+             .where((quail.col("lease.rent").length() < 20).hint(0.5))
              .select("c.id", "lease"))
     written = sql(
         f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
@@ -687,8 +686,8 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
         f"FROM contracts c WHERE lease.ends IS NOT NULL "
         f"AND lease.ends ILIKE '%march%' AND lease_span.ends.start < 20 "
         f"AND LENGTH(lease.rent) < 20")
-    # the builder's selectivity applies to each where(); SQL's option
-    # to every test of the call
+    # the builder's hint is per test; SQL's option applies to every
+    # test of the call
     assert written.logical == built.logical
     # each test follows its field's extraction; the span and length
     # tests use the same Filter node
@@ -710,9 +709,9 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     assert not isinstance(plan, Refusal)
     extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
     filters = [n for n in plan.nodes if isinstance(n, Filter)]
-    assert [node.predicate.describe() for node in filters] == [
-        "lease.ends IS NOT NULL", "lease.ends ilike '%march%'",
-        "lease.ends_span.start < 20", "length(lease.rent) < 20"]
+    assert [str(node.predicate) for node in filters] == [
+        "c.lease.ends IS NOT NULL", "c.lease.ends ilike '%march%'",
+        "c.lease.ends_span.start < 20", "length(c.lease.rent) < 20"]
     assert filters[0].inputs[0].source.node_id == extracts[0].node_id
     assert extracts[1].inputs[0].source.node_id == filters[2].node_id
     # the three tests on the first field thin the second extraction,
@@ -725,7 +724,7 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
         filters[2].node_id, extracts[1].node_id, filters[3].node_id]
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
-    assert "Filter: lease.ends ilike '%march%'" in built.explain()
+    assert "Filter: c.lease.ends ilike '%march%'" in built.explain()
 
     # one document answers; its answer passes the tests
     result = execute_query(built, physical_executor=_answers_executor(
@@ -860,10 +859,9 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
                            selectivity=0.9)
                 .ai_classify(quail.prompt("Kind of {0}?", quail.col("c.text")),
                              ["lease", "deed"], name="kind")
-                .where(quail.col("kind") == "lease", selectivity=0.8)
+                .where((quail.col("kind") == "lease").hint(0.8))
                 .ai_extract("c.text", {"ends": QUESTION}, name="lease")
-                .where(quail.col("lease.ends").is_not_null(),
-                       selectivity=selectivity)
+                .where(quail.col("lease.ends").is_not_null().hint(selectivity))
                 .select("c.id", "kind", "lease", order=order))
 
     def order(plan):

@@ -2,7 +2,7 @@
 
 from .classify import AiClassify, ClassifySpec
 from .extract import AiExtract, ExtractSpec
-from .filter import AiFilter, Condition, Filter
+from .filter import AiFilter, Filter
 from .inference import AiInference, AiScore, InferenceSpec, ScoreSpec
 from .join import AiJoin, Barrier, Foreign, HashJoin
 from .relational import Aggregate, Exchange, Limit, Project, Recombine, Sort
@@ -18,7 +18,6 @@ __all__ = [
     "AiScore",
     "Barrier",
     "ClassifySpec",
-    "Condition",
     "Exchange",
     "ExtractSpec",
     "Filter",

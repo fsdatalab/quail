@@ -30,39 +30,31 @@ from quail.logical.predicates import RegularPredicate
 
 
 @dataclass(frozen=True)
-class LabelFilter:
-    """A Filter on a one-table classification's label, as the planner reads it.
+class ColumnTest:
+    """A Filter on a column a classification or an extraction computes.
 
     Attributes:
-        call: The classification that computes the label.
-        values: The labels the Filter keeps.
-        selectivity: The Filter's selectivity hint, or None.
-        position: Its written position among the table's filters,
-            counted after the table's AI.IF predicates.
-    """
-
-    call: "ModelCall"
-    values: tuple
-    selectivity: Optional[float]
-    position: int
-
-
-@dataclass(frozen=True)
-class ExtractFilter:
-    """A Filter on an extraction's answer or span column, as the planner reads it.
-
-    Attributes:
-        name: The extraction's name, as the SemanticExtract names it.
+        name: The label column, or the extraction whose answer or
+            span the Filter tests, as the SemanticClassify or
+            SemanticExtract names it.
+        call: The model call that computes the column.
         condition: The RegularPredicate the Filter applies.
         selectivity: The Filter's selectivity hint, or None.
         position: Its written position among the table's filters,
-            counted after the table's AI.IF predicates and label filters.
+            counted after the table's AI.IF predicates, with the label
+            filters before the answer filters.
     """
 
     name: str
+    call: "ModelCall"
     condition: RegularPredicate
     selectivity: Optional[float]
     position: int
+
+    @property
+    def values(self) -> tuple:
+        """The labels a label filter keeps."""
+        return self.condition.value
 
 
 @dataclass(frozen=True)
@@ -183,9 +175,10 @@ class LogicalPlan:
                       if (alias, node.condition.column.column) in calls]
             if labels:
                 label_filters[alias] = tuple(
-                    LabelFilter(
+                    ColumnTest(
+                        name=node.condition.column.column,
                         call=calls[(alias, node.condition.column.column)],
-                        values=node.condition.value,
+                        condition=node.condition,
                         selectivity=node.selectivity,
                         position=len(filters.get(alias, ())) + index,
                     )
@@ -193,8 +186,9 @@ class LogicalPlan:
             answers = [node for node in tested.get(alias, ()) if node not in labels]
             if answers:
                 extract_filters[alias] = tuple(
-                    ExtractFilter(
-                        name=_extraction_name(node.condition.column.column, extracts),
+                    ColumnTest(
+                        name=_extraction(node.condition.column.column, extracts).name,
+                        call=_extraction(node.condition.column.column, extracts).call,
                         condition=node.condition,
                         selectivity=node.selectivity,
                         position=len(filters.get(alias, ())) + len(labels) + index,
@@ -245,12 +239,12 @@ class Operators:
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
     extracts: tuple = ()  # tuple[SemanticExtract, ...]
     label_filters: dict = field(default_factory=dict)
-    #                     alias -> tuple[LabelFilter, ...]
+    #                     alias -> tuple[ColumnTest, ...] on labels
     extract_filters: dict = field(default_factory=dict)
-    #                     alias -> tuple[ExtractFilter, ...]
+    #                     alias -> tuple[ColumnTest, ...] on answers
 
     def all_filters(self) -> dict:
-        """Return alias -> its AI.IF predicates, LabelFilters, then ExtractFilters."""
+        """Return alias -> its AI.IF predicates, then its ColumnTests."""
         aliases = list(dict.fromkeys(
             (*self.filters, *self.label_filters, *self.extract_filters)))
         return {
@@ -280,10 +274,9 @@ class Operators:
         )
 
 
-def _extraction_name(column: str, extracts) -> str:
-    """Return the name of the extraction computing an answer or span column."""
-    return next(node.name for node in extracts
-                if column in (node.name, node.span_name))
+def _extraction(column: str, extracts):
+    """Return the SemanticExtract computing an answer or span column."""
+    return next(node for node in extracts if column in (node.name, node.span_name))
 
 
 def join_outer_input(join: "SemanticJoin") -> "LogicalNode":

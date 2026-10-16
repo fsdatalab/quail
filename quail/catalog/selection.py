@@ -37,7 +37,7 @@ def evaluate_predicate(values, predicate) -> pa.ChunkedArray:
     Args:
         values: The column's values.
         predicate: A quail.logical.RegularPredicate or a
-            quail.physical.Condition: its comparison, value, path, and
+            physical Filter: its comparison, value, path, and
             function.
 
     Raises:

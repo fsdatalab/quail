@@ -136,8 +136,8 @@ the extraction runs once for the test and the returned column:
 query = (
     session.docs("contracts").alias("c")
     .ai_extract("c.text", {"end_date": "When does the lease end?"}, name="lease")
-    .where(col("lease.end_date").is_not_null(),
-           col("lease.end_date").like("%2027%"), selectivity=0.4)
+    .where(col("lease.end_date").is_not_null().hint(0.9),
+           col("lease.end_date").like("%2027%").hint(0.4))
     .select("c.id", "lease")
 )
 ```
@@ -236,7 +236,7 @@ result = query.collect()
 
 ### where
 
-`where(*tests, selectivity=None)`
+`where(*tests)`
 
 Keep rows that satisfy all the given conditions. Use `col("name")` to
 refer to a column in a condition.
@@ -256,11 +256,12 @@ refer to a column in a condition.
 for nulls rather than comparing with `None`. `~` before a text test
 negates it.
 
-A column can also be a label from `ai_classify()` (`col("sentiment")
-.isin([...])`) or a field from `ai_extract()` (`col("lease.end_date")
-.is_not_null()`). Such a test runs right after the call that computes
-the column, and `selectivity` estimates the fraction of documents it
-keeps.
+Several tests are combined with AND. A column can also be a label
+from `ai_classify()` (`col("sentiment").isin([...])`) or a field from
+`ai_extract()` (`col("lease.end_date").is_not_null()`). Such a test
+runs right after the call that computes the column, and
+`.hint(selectivity)` on the test estimates the fraction of documents
+it keeps, 0.2 without one.
 
 E.g., the following query returns the IDs of reviews from 2024 with at
 least four stars that mention shipping:

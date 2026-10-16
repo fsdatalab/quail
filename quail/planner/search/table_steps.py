@@ -60,25 +60,59 @@ def resident_after(previous: TableStep, step: TableStep) -> bool:
     return previous.head == step.head
 
 
-def table_steps(operators, alias: str, *, context, statistics) -> list[TableStep]:
+class PlanPricing:
+    """Price a table's steps with the node estimators of the physical planner.
+
+    Args:
+        context: The planning context, with the model, device, and
+            tokenizer.
+        statistics: The plan's PlanStatistics.
+        alias: The table.
+    """
+
+    def __init__(self, context, statistics, alias: str):
+        self.context = context
+        self.statistics = statistics
+        self.alias = alias
+
+    def asks(self, predicates) -> tuple:
+        """Return the PredicateCosts of the table's AI.IF predicates."""
+        stats = self.statistics.stats[self.alias]
+        return prepare_filter_costs(
+            predicates, prefix_tokens=self.statistics.pre + stats.mean_doc_tokens,
+            model=self.context.model, device=self.context.device,
+            chunk_tokens=self.statistics.chunk, context=self.context)
+
+    def classify(self, call, name: str) -> tuple:
+        """Return a classification's (first, later) costs at a live count."""
+        return tuple(partial(_classify_seconds, self.context, self.alias, call,
+                             name, resident) for resident in (False, True))
+
+    def extract(self, node) -> tuple:
+        """Return an extraction's (first, later) costs at a live count."""
+        return tuple(partial(_extract_seconds, self.context, node, resident)
+                     for resident in (False, True))
+
+    def head(self, prompt):
+        """Return a prompt's head: None under the query's shared head."""
+        lowered = self.context.lowered(prompt)
+        return (None if shares_query_head(self.context, lowered)
+                else tuple(lowered.preamble_token_ids))
+
+
+def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
     """Return a table's steps in written order, priced.
 
     Args:
         operators: The plan's Operators.
         alias: The table.
-        context: The planning context, with the model, device, and
-            tokenizer.
-        statistics: The plan's PlanStatistics.
+        asks: The written positions of the table's AI.IF predicates.
+        pricing: Prices the steps: asks(predicates), classify(call,
+            name), extract(node), and head(prompt), as PlanPricing does.
     """
-    stats = statistics.stats[alias]
     steps = []
     predicates = operators.filters.get(alias, ())
-    asks = statistics.asks.get(alias, ())
-    costs = prepare_filter_costs(
-        [predicates[position] for position in asks],
-        prefix_tokens=statistics.pre + stats.mean_doc_tokens,
-        model=context.model, device=context.device,
-        chunk_tokens=statistics.chunk, context=context)
+    costs = pricing.asks([predicates[position] for position in asks])
     for position, cost in zip(asks, costs):
         steps.append(TableStep(ASK, position, cost.selectivity, cost.first,
                                cost.later, cost.reuse_key))
@@ -88,31 +122,19 @@ def table_steps(operators, alias: str, *, context, statistics) -> list[TableStep
     for call, owner in operators.labels.calls:
         if owner != alias or len(call.aliases()) != 1:
             continue
-        name = operators.labels.names[call]
-        steps.append(TableStep(
-            CLASSIFY, call, _survival(tests.get(call, ())),
-            partial(_classify_seconds, context, alias, call, name, False),
-            partial(_classify_seconds, context, alias, call, name, True),
-            head=_head(context, call.prompt)))
+        first, later = pricing.classify(call, operators.labels.names[call])
+        steps.append(TableStep(CLASSIFY, call, _survival(tests.get(call, ())),
+                               first, later, head=pricing.head(call.prompt)))
     tests = {}
     for test in operators.extract_filters.get(alias, ()):
         tests.setdefault(test.name, []).append(test.selectivity)
     for node in operators.extracts:
         if node.alias != alias:
             continue
-        steps.append(TableStep(
-            EXTRACT, node.name, _survival(tests.get(node.name, ())),
-            partial(_extract_seconds, context, node, False),
-            partial(_extract_seconds, context, node, True),
-            head=_head(context, node.call.prompt)))
+        first, later = pricing.extract(node)
+        steps.append(TableStep(EXTRACT, node.name, _survival(tests.get(node.name, ())),
+                               first, later, head=pricing.head(node.call.prompt)))
     return steps
-
-
-def _head(context, prompt):
-    """Return a prompt's head: None under the query's shared head."""
-    lowered = context.lowered(prompt)
-    return (None if shares_query_head(context, lowered)
-            else tuple(lowered.preamble_token_ids))
 
 
 def _survival(selectivities) -> float:
