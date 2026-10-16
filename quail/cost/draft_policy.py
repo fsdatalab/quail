@@ -14,6 +14,9 @@ import numpy as np
 
 # how many settled answers the planner's answer-length guess weighs
 PRIOR_WEIGHT = 8
+# the draft fed while several document positions fit the answer, along
+# the first of them; the model's next token narrows the positions
+AMBIGUOUS_DRAFT = 0
 # the round's KV read in tokens, rounded to one of these for the tables
 RHO_BUCKETS = (0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)
 
@@ -59,11 +62,13 @@ class DraftPolicy:
             rho: The round's KV read, in fed tokens.
             written: The answer's tokens so far.
             ambiguous: Whether more than one live stream fits the answer;
-                such a round feeds no draft.
+                such a round feeds AMBIGUOUS_DRAFT tokens at most.
         """
         room = min(self.cap, self.max_answer_tokens - written - 1)
-        if ambiguous or room <= 0:
+        if room <= 0:
             return 0
+        if ambiguous:
+            return min(AMBIGUOUS_DRAFT, room)
         bucket = int(np.argmin([abs(np.log1p(rho) - np.log1p(b)) for b in RHO_BUCKETS]))
         key = (bucket, written, room)
         if key not in self._tables:

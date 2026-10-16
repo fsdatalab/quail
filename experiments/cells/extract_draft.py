@@ -310,6 +310,7 @@ def child(arguments: str) -> None:
 
     import quail
     from bench.quailb import run_query
+    from quail.cost import draft_policy
     from quail_b.benchmark import load_benchmark
 
     args = json.loads(arguments)
@@ -333,12 +334,18 @@ def child(arguments: str) -> None:
                       for relation in spec.info.relations}
             run_once = partial(run_query, session, spec, tables)
         drafts = args.get("sweep") or [args["draft_tokens"]]
-        modes = ([("timed", d) for _ in range(args["timed_runs"]) for d in drafts]
-                 + [("kernels", args["draft_tokens"])] * args["kernel_runs"]
-                 + [("host", args["draft_tokens"])] * args.get("host_runs", 0)
-                 + [("logged", args["draft_tokens"])])
-        for mode, draft in modes:
+        # the ambiguous-round drafts to alternate between timed runs
+        ambiguous = args.get("ambiguous_drafts") or [draft_policy.AMBIGUOUS_DRAFT]
+        modes = ([("timed", d, n) for _ in range(args["timed_runs"])
+                  for d in drafts for n in ambiguous]
+                 + [("kernels", args["draft_tokens"], ambiguous[0])]
+                 * args["kernel_runs"]
+                 + [("host", args["draft_tokens"], ambiguous[0])]
+                 * args.get("host_runs", 0)
+                 + [("logged", args["draft_tokens"], ambiguous[0])])
+        for mode, draft, ambiguous_draft in modes:
             setting["draft_tokens"] = draft
+            draft_policy.AMBIGUOUS_DRAFT = ambiguous_draft
             profiler = None
             if mode == "timed":
                 before = torch.cuda.memory_stats()
@@ -353,7 +360,8 @@ def child(arguments: str) -> None:
             else:
                 rounds.start()
             output = run_once()
-            run = {"mode": mode, "draft_tokens": draft}
+            run = {"mode": mode, "draft_tokens": draft,
+                   "ambiguous_draft": ambiguous_draft}
             if mode == "timed":
                 run["passes"] = passes.stop()
                 after = torch.cuda.memory_stats()
@@ -391,7 +399,7 @@ def child(arguments: str) -> None:
     print(f"RESULT {path}", flush=True)
 
 
-@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+@app.function(image=image, gpu="H100!", memory=98304, timeout=4 * 3600,
               volumes=VOLUMES)
 def measure_draft(arguments: str) -> str:
     """Run child() in a fresh process and return the saved record's path."""
@@ -417,7 +425,8 @@ def measure_draft(arguments: str) -> str:
 def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
             draft_tokens: str = "16", timed_runs: int = 2, kernel_runs: int = 0,
             host_runs: int = 0, sweep: str = "", sql: str = "", table: str = "",
-            limit: int = 0, nfc: bool = False, tag: str = "draft"):
+            limit: int = 0, nfc: bool = False, ambiguous_drafts: str = "",
+            tag: str = "draft"):
     collection = ""
     if sql:
         # an ad hoc query over a table ensure_data already wrote
@@ -429,6 +438,8 @@ def measure(query: str = "CUAD-3", sf: float = 1.0, model: str = "qwen3-4b-fp8",
     draft = draft_tokens if draft_tokens == "adaptive" else int(draft_tokens)
     arguments = json.dumps(dict(query_id=query, sf=sf, collection_id=collection,
                                 sql=sql, table=table, limit=limit, nfc=nfc,
+                                ambiguous_drafts=[int(n) for n in
+                                                  ambiguous_drafts.split(",") if n],
                                 model=model, draft_tokens=draft,
                                 timed_runs=timed_runs, kernel_runs=kernel_runs,
                                 host_runs=host_runs,
