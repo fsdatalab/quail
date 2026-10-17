@@ -135,6 +135,45 @@ how they release and explain changes.
 - Do not create Modal app names. Attach GPU cells to
   `quail-milestone1` and the worker to `quail-engine`; caches and warm
   state belong to those apps.
+- To check a change, run these 13 queries at scale factor 0.1, with
+  Quail alone. Do not run the full suite; it is slow. Together they
+  cover each AI operator alone, chained with the others, and followed
+  by relational operators:
+  - `IMDB-1`: one filter.
+  - `IMDB-2`: one join.
+  - `IMDB-4`: two filters, then a join.
+  - `FEV-9`: four filters and a chain of three joins.
+  - `IMDB-11`: classify.
+  - `AGENT-5`: three classifies over the same rows.
+  - `IMDB-15`: a classify, a join, then another classify.
+  - `CUAD-1`: extract, one span per row.
+  - `CUAD-4`: extract, several spans per row.
+  - `CUAD-10`: three extracts over the same rows.
+  - `CUAD-15`: a filter, an extract, then sort and limit.
+  - `CUAD-11`: classify, then aggregate.
+  - `SALES-5`: a relational filter, a score, then top 25.
+
+  `bench.quailb_parallel` runs each query family on its own H100, so
+  this set uses five H100s: IMDB, FEV, AGENT, CUAD, and SALES. If a
+  change touches one operator, run only the queries that use it.
+
+  For example:
+
+      queries=IMDB-1,IMDB-2,IMDB-4,FEV-9,IMDB-11,AGENT-5,IMDB-15
+      queries=$queries,CUAD-1,CUAD-4,CUAD-10,CUAD-15,CUAD-11,SALES-5
+      uv run modal run --detach -m bench.quailb_parallel \
+        --model qwen3-4b-fp8 --sf 0.1 --query "$queries" \
+        --no-include-baselines --no-include-sglang \
+        2>&1 | tee "$run_log"
+
+  Run more queries, or a larger scale factor, only when the change
+  targets them or the user asks.
+- Do not run stock vLLM, pipelined vLLM, or SGLang by default.
+  `bench.quailb_parallel` runs them unless told not to, so pass
+  `--no-include-baselines --no-include-sglang`. Run a baseline only
+  for an experiment whose point is to compare Quail with it, or when
+  the user asks. Reuse saved baseline results when the queries, scale
+  factor, and model have not changed.
 - Tee every Modal run to a file; the CLI drops old log lines.
 - Do not save Modal return values to local JSON. Print the function
   call id (`fc-...`) into the tee file, and fetch the result later
