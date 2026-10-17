@@ -74,6 +74,39 @@ def _sequences(spec, tokenizer, question=QUESTION):
     return pairs
 
 
+def _run_filter(torch, arena, pipeline, answers, documents, questions, budget,
+                document_done=None):
+    """Run Boolean filter stages over the documents; return bits per document."""
+    from quail.backends.quail.executor.stages import filter_stages, run_stages
+
+    stages = filter_stages(questions, answers)
+    last = len(stages) - 1
+    arena.retention_cap_pages = max(
+        0, arena.n_pages - arena.pages_needed(2 * budget))
+
+    def on_settled(document, survived, row):
+        if arena.is_resident(document):
+            arena.free_key(document)
+
+    def on_chunk(transitions):
+        finished = [(document, stage, passed)
+                    for document, stage, passed in transitions
+                    if not passed or stage == last]
+        if finished:
+            document_done(finished)
+
+    stage_answers, _, _ = run_stages(
+        torch, arena, pipeline, stages, documents, budget,
+        anchor_keys=list(range(len(documents))), on_settled=on_settled,
+        attention_mode="unified", default_attention="unified",
+        on_chunk=on_chunk if document_done is not None else None)
+    bits = {}
+    for stage in stage_answers:
+        for document, row in stage.items():
+            bits.setdefault(document, []).append(int(row[0]))
+    return bits
+
+
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=VOLUMES)
 def reference(model: str) -> dict:
@@ -83,7 +116,7 @@ def reference(model: str) -> dict:
     from transformers import AutoTokenizer
 
     from quail.baselines.vllm import VLLMEngine
-    from quail.logical import true_false_ids
+    from quail.planner.prompt_lowering import true_false_ids
     from quail.specs import MODELS
 
     spec = MODELS[model]
@@ -140,7 +173,6 @@ def quail(model: str) -> dict:
     from transformers import AutoTokenizer
 
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.loop import run_filter
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
@@ -189,19 +221,18 @@ def quail(model: str) -> dict:
     with torch.inference_mode():
         for document, question in pairs:
             answers = Recording()
-            bits, _, _ = run_filter(
+            bits = _run_filter(
                 torch, arena, pipeline, answers, [document], [question],
-                BUDGET, arena_writes=True, attention_mode="unified")
+                BUDGET)
             record["alone"].append(answers.differences[-1])
             record["alone_bits"].append(int(bits[0][0]))
             for key in arena.resident_keys():
                 arena.free_key(key)
         answers = Recording()
         order = []
-        bits, _, _ = run_filter(
+        bits = _run_filter(
             torch, arena, pipeline, answers, [d for d, _ in pairs],
-            [pairs[0][1]], BUDGET, arena_writes=True,
-            attention_mode="unified",
+            [pairs[0][1]], BUDGET,
             document_done=lambda done: order.extend(p for p, _, _ in done))
         record["batched_bits"] = [int(bits[i][0]) for i in range(len(pairs))]
         record["batched_differences"] = answers.differences
@@ -214,19 +245,17 @@ def quail(model: str) -> dict:
         record["chain"] = []
         for (document, first), (_, other) in zip(pairs, second):
             answers = Recording()
-            run_filter(torch, arena, pipeline, answers, [document],
-                       [first, other], BUDGET, arena_writes=True,
-                       attention_mode="unified")
+            _run_filter(torch, arena, pipeline, answers, [document],
+                        [first, other], BUDGET)
             record["chain"].append(answers.differences)
             for key in arena.resident_keys():
                 arena.free_key(key)
         # every document through both stages in one run
         answers = Recording()
         order = []
-        bits, _, _ = run_filter(
+        bits = _run_filter(
             torch, arena, pipeline, answers, [d for d, _ in pairs],
-            [pairs[0][1], second[0][1]], BUDGET, arena_writes=True,
-            attention_mode="unified",
+            [pairs[0][1], second[0][1]], BUDGET,
             document_done=lambda done: order.extend(p for p, _, _ in done))
         record["chain_batched_answers"] = [
             [int(a) for a in bits[i]] for i in range(len(pairs))]

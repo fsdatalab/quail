@@ -8,7 +8,10 @@ import pytest
 from helpers.fakes import bare_arena
 
 from quail.backends.quail.executor.arena import KVArena, PageArena
-from quail.backends.quail.executor.chunk import BorrowStateMissingError
+from quail.backends.quail.executor.chunk import (
+    ArenaFullError,
+    BorrowStateMissingError,
+)
 from quail.backends.quail.executor.gdn import plan_phases
 
 
@@ -113,6 +116,22 @@ def test_freeing_a_parent_frees_its_shared_slots(torch_stub):
     assert len(arena.accounting.free_slots) == 1
     arena.accounting.free_key("p")
     assert len(arena.accounting.free_slots) == 4
+
+
+def test_a_later_group_does_not_evict_a_parent_an_earlier_group_reads(
+        torch_stub):
+    arena = arena_with_slots(slots=3)
+    resident(arena, "p")
+    plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
+    shared = arena.shared_state("p", 32)
+    arena.accounting.retain("p")
+    resident(arena, "c", "d")
+    groups = [group("c", 64, 0, 32, start=32, borrow_key="p"),
+              group("d", 48, 34, 82)]
+    with pytest.raises(ArenaFullError):
+        plan_phases(arena, groups, stage)
+    assert arena.shared_state("p", 32) == shared
+    assert not arena._reading
 
 
 # ---- edge cases -------------------------------------------------------

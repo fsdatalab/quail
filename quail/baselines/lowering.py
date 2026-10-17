@@ -162,7 +162,9 @@ def lower_extractions(context, extracts) -> list[RequestExtractSpec]:
             tail_text=re.sub(r"\{\d+\}", "", node.call.prompt.tail),
             preamble_token_ids=tuple(
                 context.lowered(node.call.prompt).preamble_token_ids),
-            preamble_text=node.call.prompt.preamble))
+            # vLLM adds the model's beginning-of-text token itself
+            preamble_text=without_bos(node.call.prompt.preamble,
+                                      context.model.bos_text)))
     return extract_specs
 
 

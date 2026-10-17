@@ -54,6 +54,7 @@ def bare_arena(arena, pages):
     arena._base = {}
     arena._sliding_start = {}
     arena._holds = {}
+    arena._reading = {}
     arena._deferred = set()
     arena._window_floor = {}
     arena._trimmed = set()

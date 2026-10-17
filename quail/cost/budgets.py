@@ -109,6 +109,11 @@ def checkpoint_pass_bytes(model: ModelSpec, questions: int,
             + buffers * MIB)
 
 
+def execution_pages(chunk_tokens: int) -> int:
+    """KV pages kept free for two chunks of execution."""
+    return 2 * -(-chunk_tokens // PAGE_TOKENS)
+
+
 def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec,
                       chunk_tokens: int) -> int:
     """Pages a hybrid model shares between retained KV and checkpoints.
@@ -121,25 +126,27 @@ def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec,
             - checkpoint_pass_bytes(model, CHECKPOINT_PASS_QUESTIONS,
                                   chunk_tokens))
     page_bytes = model.kappa * PAGE_TOKENS
-    return int(free // page_bytes) - 2 * -(-chunk_tokens // PAGE_TOKENS)
+    return int(free // page_bytes) - execution_pages(chunk_tokens)
 
 
 def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
                      kv_pages: int) -> int:
-    """Checkpoints the pool holds beside `kv_pages` of KV; 0 without them."""
+    """Checkpoints the pool holds beside an arena of `kv_pages`; 0 without them."""
     pages = checkpoint_pages(model)
     if not pages:
         return 0
+    retained = kv_pages - execution_pages(chunk_tokens)
     return max(0, int((hybrid_pool_pages(model, device, chunk_tokens)
-                       - kv_pages) // pages))
+                       - retained) // pages))
 
 
 def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
                        mean_doc_tokens: float | None) -> int:
-    """KV pages left once the pool holds one checkpoint per retained document.
+    """Arena KV pages: two chunks of execution plus the retained KV.
 
     A retained document of `l` tokens costs ceil(l / 16) KV pages plus
-    its checkpoint, so the pool holds floor(pool / that) documents.
+    its checkpoint, so the pool holds floor(pool / that) documents, and
+    the KV the checkpoints leave is retained KV.
     """
     mean = CHECKPOINT_DEFAULT_DOC_TOKENS if mean_doc_tokens is None else max(
         1.0, mean_doc_tokens)
@@ -153,7 +160,7 @@ def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
         raise ValueError(
             f"the pool holds no checkpoint of {ckpt:.1f} pages beside a "
             f"document of {mean:.0f} tokens")
-    return kv_pages
+    return kv_pages + execution_pages(chunk_tokens)
 
 
 def arena_pages(model: ModelSpec, device: DeviceSpec,

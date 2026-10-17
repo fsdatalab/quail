@@ -12,7 +12,7 @@ from quail.backends.quail.executor.arena import KVArena, PageArena
 from quail.backends.quail.retention import policy
 from quail.backends.quail.worker import checkpoint_arena_args
 from quail.cost import budgets
-from quail.cost.retention import RetentionPolicy, coefficients
+from quail.cost.retention import RetentionPolicy, coefficients, retention_pages
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_5_4B_BF16
 
 SPEC = QWEN3_5_4B_BF16
@@ -51,7 +51,7 @@ def test_slots_per_document_length(tokens, slots):
 
 def test_plan_example_splits_the_pool():
     kv_pages, _ = budgets.arena_pages(PLAN, H100_SXM, CHUNK, 1_000)
-    assert kv_pages in (26_597, 26_598)
+    assert kv_pages - budgets.execution_pages(CHUNK) in (26_597, 26_598)
 
 
 def test_models_without_gdn_layers_keep_their_pages():
@@ -63,10 +63,20 @@ def test_models_without_gdn_layers_keep_their_pages():
 
 
 def test_arena_arguments_name_the_state_shapes():
-    args = checkpoint_arena_args(PLAN, H100_SXM, CHUNK, 26_598)
+    args = checkpoint_arena_args(
+        PLAN, H100_SXM, CHUNK, 26_598 + budgets.execution_pages(CHUNK))
     assert args["n_state_slots"] == 422
     assert args["gdn_state_shape"] == (24, 32, 128, 128)
     assert args["conv_state_shape"] == (24, 3, 8_192)
+
+
+def test_arena_keeps_two_chunks_beyond_the_retained_cap():
+    kv_pages, _ = budgets.arena_pages(SPEC, H100_SXM, CHUNK, 1_000)
+    cap = retention_pages(kv_pages * 16, CHUNK, 16)
+    slots = budgets.checkpoint_slots(SPEC, H100_SXM, CHUNK, kv_pages)
+    assert cap + slots * budgets.checkpoint_pages(SPEC) <= (
+        budgets.hybrid_pool_pages(SPEC, H100_SXM, CHUNK))
+    assert cap == kv_pages - budgets.execution_pages(CHUNK)
 
 
 def test_measured_weights_leave_a_slightly_smaller_pool():

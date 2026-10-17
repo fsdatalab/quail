@@ -110,6 +110,7 @@ class KVArena:
         self._base = {}       # key -> tokens the window is anchored below
         self._sliding_start = {}  # key -> logical row of its first sliding page
         self._holds = {}      # key -> queued keys that will borrow from it
+        self._reading = {}    # key -> groups of the planned chunk reading it
         self._deferred = set()    # held keys freed by their operator
         self._window_floor = {}   # key -> lowest sliding row a borrower reads
         self._trimmed = set()     # keys past their own pass's trim_window
@@ -442,11 +443,13 @@ class KVArena:
     def _evict_until(self, satisfied) -> tuple:
         """Evict retained prefixes in priority order until satisfied() holds.
 
-        A held key is never evicted: a queued borrower will read it.
+        A held key is never evicted: a queued borrower will read it. Nor
+        is a key the chunk being planned reads.
         """
         keys = []
+        keep = set(self._holds) | set(self._reading)
         while not satisfied():
-            victim = self.accounting.pop_retained_victim(keep=self._holds)
+            victim = self.accounting.pop_retained_victim(keep=keep)
             if victim is None:
                 break
             keys.append(victim[0])
@@ -556,6 +559,18 @@ class KVArena:
             self.free_key(key)
         else:
             self._lift_floor(key)
+
+    def read_state(self, keys) -> None:
+        """Keep each key's slots while the chunk being planned reads them."""
+        for key in keys:
+            self._reading[key] = self._reading.get(key, 0) + 1
+
+    def done_reading(self, keys) -> None:
+        """Undo read_state for the same keys."""
+        for key in keys:
+            self._reading[key] -= 1
+            if not self._reading[key]:
+                del self._reading[key]
 
     def drop_holds(self, keys=None) -> bool:
         """Release every hold on the keys (all keys by default).

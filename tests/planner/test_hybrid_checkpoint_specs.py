@@ -231,3 +231,24 @@ def test_models_without_a_beginning_of_text_token_keep_their_prefix():
     for spec in (QWEN3_4B_FP8, QWEN3_5_4B_BF16):
         assert spec.bos_text == ""
         assert without_bos(spec.turn_prefix, spec.bos_text) == spec.turn_prefix
+
+
+def test_extract_preamble_text_drops_the_beginning_of_text_token():
+    from types import SimpleNamespace
+
+    from quail.baselines.lowering import lower_extractions
+
+    bos = LFM2_2_6B_BF16.bos_text
+    prompt = SimpleNamespace(preamble=bos + "<|im_start|>user\n", tail="{0}?")
+    node = SimpleNamespace(
+        alias="d", name="out",
+        call=SimpleNamespace(question="q", prompt=prompt, trim=False))
+    context = SimpleNamespace(
+        model=LFM2_2_6B_BF16,
+        lowered=lambda _: SimpleNamespace(
+            tail_token_ids=[1], preamble_token_ids=[2]))
+
+    (spec,) = lower_extractions(context, [node])
+
+    assert spec.preamble_text == "<|im_start|>user\n"
+    assert spec.preamble_token_ids == (2,)

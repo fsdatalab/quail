@@ -3,7 +3,7 @@
 A join writes each anchor document and a frame into KV (and, on a hybrid
 model, into a checkpoint that the frame extends), then streams every
 partner after it. This cell sends a few anchors of different lengths
-and a handful of partners through run_join, and sends the same
+and a handful of partners through run_stages, and sends the same
 concatenated prompt of every (anchor, partner) pair through stock vLLM.
 The reference records each pair's TRUE minus FALSE logprob. Quail
 records the same difference and its answer bit.
@@ -77,6 +77,18 @@ def _pieces(spec, tokenizer):
     return anchors, frame, suffixes
 
 
+def _run_join(torch, arena, pipeline, answers, anchors, suffixes, frame, budget):
+    """Run one join stage of partner suffixes; return answer rows per anchor."""
+    from quail.backends.quail.executor.stages import Stage, run_stages
+
+    stages = [Stage(suffixes=suffixes, readout=answers, frame=frame)]
+    stage_answers, _, _ = run_stages(
+        torch, arena, pipeline, stages, anchors, budget,
+        on_settled=lambda anchor, survived, row: None,
+        attention_mode="unified", label="join (1 stage)")
+    return stage_answers[0]
+
+
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=VOLUMES)
 def reference(model: str) -> dict:
@@ -132,13 +144,12 @@ def reference(model: str) -> dict:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=VOLUMES)
 def quail(model: str) -> dict:
-    """Quail's TRUE minus FALSE logit for every pair, through run_join."""
+    """Quail's TRUE minus FALSE logit for every pair, through run_stages."""
     import torch
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.loop import run_join
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
@@ -188,21 +199,19 @@ def quail(model: str) -> dict:
         # each anchor alone, then every anchor in one run
         for anchor in anchors:
             answers = Recording()
-            out, _, _ = run_join(
-                torch, arena, pipeline, answers, [anchor], [suffixes],
-                BUDGET, stage_frames=[frame], attention_mode="unified")
+            out = _run_join(torch, arena, pipeline, answers, [anchor],
+                            suffixes, frame, BUDGET)
             record["alone"].append(sorted(answers.differences))
             record["alone_bits"].append(
-                [int(b) for b in out[0][0]])
+                [int(b) for b in out[0]])
             for key in arena.resident_keys():
                 arena.free_key(key)
         answers = Recording()
-        out, _, _ = run_join(
-            torch, arena, pipeline, answers, anchors, [suffixes],
-            BUDGET, stage_frames=[frame], attention_mode="unified")
+        out = _run_join(torch, arena, pipeline, answers, anchors,
+                        suffixes, frame, BUDGET)
         record["together"] = sorted(answers.differences)
         record["together_bits"] = [
-            [int(b) for b in out[0][i]] for i in range(len(anchors))]
+            [int(b) for b in out[i]] for i in range(len(anchors))]
         for key in arena.resident_keys():
             arena.free_key(key)
     torch.cuda.synchronize()

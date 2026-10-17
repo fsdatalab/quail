@@ -99,6 +99,12 @@ def plan_phases(arena, groups, stage):
         ArenaFullError: Every checkpoint slot belongs to a pinned key.
     """
     undo = []
+    # a later group's slot allocation must not evict a parent that an
+    # earlier group reads, or the two would share one slot
+    parents = [group["borrow_key"] for group in groups
+               if group["fresh"] and group["start"]
+               and group.get("borrow_key") is not None]
+    arena.read_state(parents)
     try:
         return _plan_phases(arena, groups, stage, undo)
     except Exception:
@@ -126,6 +132,8 @@ def plan_phases(arena, groups, stage):
                 if slot is not None:
                     accounting.free_slots.append(slot)
         raise
+    finally:
+        arena.done_reading(parents)
 
 
 def _plan_phases(arena, groups, stage, undo):
