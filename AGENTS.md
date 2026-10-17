@@ -137,19 +137,32 @@ how they release and explain changes.
   state belong to those apps.
 - To check a change, run Quail alone on a small set of queries at
   scale factor 0.1, not the full suite. The full suite is slow. Use
-  these six, which together cover the main plan shapes:
+  these 13, which cover each AI operator alone, chained with the
+  others, and followed by relational operators:
   - `IMDB-1`: one filter.
   - `IMDB-2`: one join.
   - `IMDB-4`: two filters, then a join.
   - `FEV-9`: four filters and a chain of three joins.
-  - `BIO-5`: classify.
-  - `CUAD-1`: extract.
+  - `IMDB-11`: classify.
+  - `AGENT-5`: three classifies over the same rows.
+  - `IMDB-15`: a classify, a join, then another classify.
+  - `CUAD-1`: extract, one span per row.
+  - `CUAD-4`: extract, several spans per row.
+  - `CUAD-10`: three extracts over the same rows.
+  - `CUAD-15`: a filter, an extract, then sort and limit.
+  - `CUAD-11`: classify, then aggregate.
+  - `SALES-5`: a relational filter, a score, then top 25.
+
+  `bench.quailb_parallel` runs each query family on its own H100, so
+  this set uses five H100s: IMDB, FEV, AGENT, CUAD, and SALES. If a
+  change touches one operator, run only its rows.
 
   For example:
 
+      queries=IMDB-1,IMDB-2,IMDB-4,FEV-9,IMDB-11,AGENT-5,IMDB-15
+      queries=$queries,CUAD-1,CUAD-4,CUAD-10,CUAD-15,CUAD-11,SALES-5
       uv run modal run --detach -m bench.quailb_parallel \
-        --model qwen3-4b-fp8 --sf 0.1 \
-        --query IMDB-1,IMDB-2,IMDB-4,FEV-9,BIO-5,CUAD-1 \
+        --model qwen3-4b-fp8 --sf 0.1 --query "$queries" \
         --no-include-baselines --no-include-sglang \
         2>&1 | tee "$run_log"
 
