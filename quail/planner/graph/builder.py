@@ -51,7 +51,7 @@ from quail.planner.optimizer.context import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal
 from quail.planner.search.operator_order import choose_operator_order, resident_asks
 from quail.planner.search.statistics import filter_stop_keys
-from quail.planner.search.table_steps import ASK, CLASSIFY, EXTRACT
+from quail.planner.search.table_steps import ASK, CLASSIFY, EXTRACT, resident_after
 from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import (
     ClassifyRefusedError,
@@ -314,9 +314,11 @@ class GraphBuilder:
         # the scores SELECT returns follow the score predicates, before
         # the classifications and extractions read the rows
         scores_pending = ASK in kinds and self.scoring is not None
+        previous = None
         for kind, run in groupby(steps, key=lambda step: step.kind):
             run = list(run)
             positions = [step.key for step in run]
+            resident = previous is not None and resident_after(previous, run[0])
             if kind != ASK and scores_pending:
                 frontier = emit_projected_scores(self, alias, live, frontier)
                 scores_pending = False
@@ -329,10 +331,12 @@ class GraphBuilder:
                 frontier, ports = emit_classify(self, alias, live, positions, frontier)
                 label_ports += ports
             else:
-                frontier, ports = emit_extract(self, alias, live, positions, frontier)
+                frontier, ports = emit_extract(self, alias, live, positions, frontier,
+                                               resident=resident)
                 label_ports += ports
             for step in run:
                 live *= step.selectivity
+            previous = run[-1]
         if scores_pending:
             frontier = emit_projected_scores(self, alias, live, frontier)
         return frontier, label_ports

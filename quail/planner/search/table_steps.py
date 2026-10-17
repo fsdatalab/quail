@@ -36,8 +36,7 @@ class TableStep:
         first: Seconds at a live count, the documents read afresh.
         later: Seconds at a live count, the documents' KV resident.
         reuse_key: Identity of a result an earlier step computed, or None.
-        head: The prompt head the step shows the document under: None
-            for the query's shared head, else its token ids.
+        head: The token ids the step shows the document under.
     """
 
     kind: str
@@ -112,7 +111,8 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
     costs = pricing.asks([predicates[position] for position in asks])
     for position, cost in zip(asks, costs):
         steps.append(TableStep(ASK, position, cost.selectivity, cost.first,
-                               cost.later, cost.reuse_key))
+                               cost.later, cost.reuse_key,
+                               head=pricing.head(predicates[position].prompt)))
     tests = {}
     for test in operators.label_filters.get(alias, ()):
         tests.setdefault(test.call, []).append(test.selectivity)

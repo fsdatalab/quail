@@ -910,6 +910,27 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
     assert ask.expected_docs == pytest.approx(2 * 0.05 * 0.8, abs=0.05)
     # the later steps are priced over the resident KV
     assert classify.spec.estimated_seconds < extract.spec.estimated_seconds
+    # the ask, the classification, and the extraction show the
+    # documents under one head, so each step reads the KV the one
+    # before it leaves
+    from quail.planner.optimizer.context import PlanningContext
+    from quail.planner.search.statistics import cached_statistics
+    from quail.planner.search.table_steps import PlanPricing, table_steps
+
+    priced = query(0.5)
+    priced.plan()
+    context = PlanningContext(
+        model=session.model, device=session.device, gpu_count=1,
+        document_tokens=priced._doc_tokens, backend="quail",
+        tokenizer=session.tokenizer)
+    operators = priced.logical.operators()
+    statistics = cached_statistics(
+        priced.logical, {}, model=session.model, device=session.device,
+        doc_tokens=priced._doc_tokens, context=context)
+    steps = table_steps(operators, "c", range(1),
+                        PlanPricing(context, statistics, "c"))
+    assert [step.kind for step in steps] == ["ask", "classify", "extract"]
+    assert len({step.head for step in steps}) == 1 and steps[0].head
     written = query(0.05, order="as_written").plan()
     assert order(written) == ["ai_filter:c", "ai-classify:0", "ai-extract:0"]
     # the speed of light estimate runs the same orders

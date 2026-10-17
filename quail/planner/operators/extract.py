@@ -53,7 +53,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
     return replace(spec, estimated_seconds=cost.seconds)
 
 
-def emit_extract(builder, alias, live, names, frontier) -> tuple:
+def emit_extract(builder, alias, live, names, frontier, resident=False) -> tuple:
     """Copy the answers of the alias's documents.
 
     A Filter on an extraction's answer or span follows that extraction
@@ -66,6 +66,8 @@ def emit_extract(builder, alias, live, names, frontier) -> tuple:
         live: The documents the extractions read.
         names: The extractions to emit, in run order.
         frontier: Where the documents stand before the extractions.
+        resident: Whether the step before the run left the documents'
+            KV for the first extraction to read.
 
     Returns:
         Where the documents stand after them, and the rows ports of
@@ -82,7 +84,7 @@ def emit_extract(builder, alias, live, names, frontier) -> tuple:
         # is read once for all of them, and a Filter drops it before
         # the next question
         spec = extract_spec(builder.context, logical_node.call,
-                            logical_node.name, live, shared=index > 0)
+                            logical_node.name, live, shared=resident or index > 0)
         node = inference_node(
             AiExtract, spec, (frontier.source,),
             index=sum(isinstance(n, AiExtract) for n in builder.nodes),
