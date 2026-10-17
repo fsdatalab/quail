@@ -7,7 +7,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from helpers.fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
-from helpers.rerankers import _finish
+from helpers.oracle import Oracle, finish
 
 import quail
 from bench.quailb import run_output
@@ -16,7 +16,6 @@ from quail.backends.quail.executor.label_stages import label_requests
 from quail.backends.quail.executor.operators.classify import QuailClassifier
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs, answer_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
-from quail.backends.quail.reranker import RerankerBatch
 from quail.baselines.nodes import RequestExecution
 from quail.catalog import DocumentProvider
 from quail.execution.labels import (
@@ -269,24 +268,11 @@ def _topic(session, *, accepted=("refund", "shipping")):
     return query.select("d.id", "topic")
 
 
-class _Labels:
-    def __init__(self, labels):
-        self.labels = labels
-        self.calls = []
-
-    def score(self, spec, rows, documents):
-        assert isinstance(spec, ClassifySpec)
-        self.calls.append((spec.name, rows.tolist()))
-        values = np.asarray([
-            spec.labels[0] if spec.name == "kind" else self.labels[row[0]]
-            for row in rows], dtype=object)
-        probabilities = np.asarray([
-            [np.nan] * len(spec.labels) if value is None
-            else [0.8 if label == value else 0.1 for label in spec.labels]
-            for value in values]) if spec.probabilities else None
-        return RerankerBatch(values, fresh_tokens=len(rows), cached_tokens=0,
-                             suffix_tokens=3 * len(rows),
-                             probabilities=probabilities)
+def _labels(labels):
+    """An oracle labeling document i with labels[i]; a "kind" gets its first label."""
+    return Oracle(labels=lambda spec, ids: (spec.labels[0] if spec.name == "kind"
+                                            else labels[ids[0]]),
+                  probabilities=True)
 
 
 def test_classify_plans_filters_and_returns_labels(session):
@@ -304,7 +290,7 @@ def test_classify_plans_filters_and_returns_labels(session):
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
 
-    result = _finish(query, session, _Labels(["refund", "praise"]))
+    result = finish(query, _labels(["refund", "praise"]))
     rows = result.collect()
     assert rows.column("topic").to_pylist() == ["refund"]
     labels = result.answer_tables["classifies"]["topic"]
@@ -315,18 +301,18 @@ def test_classify_plans_filters_and_returns_labels(session):
 
     # a projected label with no filter classifies every document
     plain = _topic(session, accepted=())
-    result = _finish(plain, session, _Labels(["praise", "shipping"]))
+    result = finish(plain, _labels(["praise", "shipping"]))
     assert result.collect().column("topic").to_pylist() == [
         "praise", "shipping"]
 
     # a document whose decoded answer names no label leaves the run
-    result = _finish(plain, session, _Labels(["praise", None]))
+    result = finish(plain, _labels(["praise", None]))
     assert result.collect().column("topic").to_pylist() == ["praise"]
     labels = result.answer_tables["classifies"]["topic"]
     assert labels.column("topic").to_pylist() == ["praise"]
     assert result.report["node_metrics"]["ai-classify:0"]["output_rows"] == 1
 
-    result = _finish(query, session, _Labels([None, "refund"]))
+    result = finish(query, _labels([None, "refund"]))
     assert result.collect().column("topic").to_pylist() == ["refund"]
     (answers,) = result.answer_tables["filters"].values()
     assert answers.column("answer").to_pylist() == [True]
@@ -348,8 +334,7 @@ def test_classify_plans_filters_and_returns_labels(session):
     assert classify.spec.probabilities
     assert classify.spec.scoring != "trie_decode"
     assert plan.nodes[-1].columns == ("d.id", "topic", "topic_probabilities")
-    rows = _finish(probable, session,
-                   _Labels(["praise", "shipping"])).collect()
+    rows = finish(probable, _labels(["praise", "shipping"])).collect()
     assert rows.column("topic_probabilities").to_pylist() == [
         [("refund", 0.1), ("shipping", 0.1), ("praise", 0.8)],
         [("refund", 0.1), ("shipping", 0.8), ("praise", 0.1)]]
@@ -722,8 +707,8 @@ def test_streamed_classifications_share_one_pipeline(session):
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
     assert kind.spec.estimated_seconds < topic.spec.estimated_seconds
 
-    scorer = _Labels(["refund", "praise"])
-    result = _finish(query, session, scorer)
+    scorer = _labels(["refund", "praise"])
+    result = finish(query, scorer)
     assert result.collect().to_pydict() == {
         "d.id": [7], "topic": ["refund"], "kind": ["complaint"]}
     labels = result.answer_tables["classifies"]
@@ -746,8 +731,8 @@ def test_streamed_classifications_share_one_pipeline(session):
         member.node_id for member in build_pipelines(
             interleaved.plan().graph)[topic.node_id]) == (
         topic.node_id, "filter:d:0", "filter:d:2", kind.node_id, "filter:d:1")
-    scorer = _Labels(["shipping", "praise"])
-    result = _finish(interleaved, session, scorer)
+    scorer = _labels(["shipping", "praise"])
+    result = finish(interleaved, scorer)
     assert result.collect().num_rows == 0
     # the second test on topic drops the last document before kind
     assert scorer.calls == [("topic", [[0], [1]])]

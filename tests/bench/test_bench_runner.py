@@ -3,6 +3,7 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from helpers.oracle import Oracle, oracle_executor
 
 import quail
 from bench.quailb import (
@@ -14,7 +15,6 @@ from bench.quailb import (
     run_output,
 )
 from quail.api.execute import execute_query
-from quail.backends.quail.prompts import join_request
 from quail.baselines.nodes import RequestExecution
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
@@ -22,8 +22,7 @@ from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.result import answer_table
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical.prompts import render_join_prompt_text
-from quail.physical import AiFilter, AiJoin, decode_graph
-from quail.physical import Scan as PhysicalScan
+from quail.physical import decode_graph
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import QWEN3_4B_FP8
 from quail_b.labels import GroundTruthCollection, PredicateLabels
@@ -130,47 +129,27 @@ def _query(sess):
             .select("r.id", "a.id"))
 
 
+_REPORT = {"wall_s": 2.0, "boot_s": 3.0, "boot_kind": "cold", "boot": {},
+           "fresh_tokens": 2000, "peak_gib": 1.0}
+
+
 def _execute(query, nodes, **metrics):
+    """Run a query on a request backend whose node results nodes() plants."""
     def execute(request):
         graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
         outputs = export_physical_outputs(
             graph, RunResult(None, nodes(graph, request), NodeMetrics()))
-        return PhysicalResponse(outputs, {
-            "wall_s": 2.0, "boot_s": 3.0, "boot_kind": "cold", "boot": {},
-            "fresh_tokens": 2000, "peak_gib": 1.0, **metrics})
+        return PhysicalResponse(outputs, {**_REPORT, **metrics})
 
     return execute_query(query, physical_executor=execute)
 
 
 def _run(query, join_answers):
-    def nodes(graph, request):
-        filtered = next(node for node in graph.nodes if isinstance(node, AiFilter))
-        anchored = next(node for node in graph.nodes if isinstance(node, AiJoin))
-        join = join_request(anchored)
-        return {
-            **{node.node_id: NodeResult({f"rows:{node.alias}": range(
-                len(request.inputs[node.input_id].documents))})
-               for node in graph.nodes if isinstance(node, PhysicalScan)},
-            filtered.node_id: NodeResult({
-                "rows:r": [0],
-                "filter_answers:r": {0: [1], 1: [0]},
-            }),
-            anchored.node_id: NodeResult({
-                "rows:r": [0] if any(join_answers) else [],
-                "join_answers:0": {
-                    "rows": {0: join_answers},
-                    "anchor_index": [0],
-                    "partner_index": [[0], [1]],
-                    "anchor": "r",
-                    "partners": ["a"],
-                    "semantics": "full",
-                    "selectivity": join["selectivity"],
-                    "written_position": 0,
-                },
-            }),
-        }
-
-    return _execute(query, nodes, store=None)
+    """Run the review query: r0 passes the filter; join_answers[a] is pair (r0, a)."""
+    return execute_query(query, physical_executor=oracle_executor(Oracle(
+        filters=lambda alias, document, position: document == 0,
+        joins=lambda node, assignment: join_answers[assignment["a"]]),
+        **_REPORT, store=None))
 
 
 def _run_request_backend(query, join_answers):
@@ -252,20 +231,10 @@ def test_relational_plans_build_and_run(tmp_path):
         assert "stop per key: trajectory_id" in query.explain()
 
         # the fixes: s0, s1 (A), s2, s4 (B), s5 (C): A and B twice
-        def nodes(graph, request):
-            filtered = next(node for node in graph.nodes
-                            if isinstance(node, AiFilter))
-            answers = {0: [1], 1: [1], 2: [1], 3: [0], 4: [1], 5: [1]}
-            return {
-                **{node.node_id: NodeResult({f"rows:{node.alias}": range(
-                    len(request.inputs[node.input_id].documents))})
-                   for node in graph.nodes if isinstance(node, PhysicalScan)},
-                filtered.node_id: NodeResult({
-                    "rows:t": [0, 1, 2, 4, 5], "filter_answers:t": answers}),
-            }
-
+        oracle = Oracle(filters=lambda alias, document, position: document != 3)
         query = build_query(sess, get_query("REL-AGENT-6"))
-        result = _execute(query, nodes, store=None)
+        result = execute_query(query, physical_executor=oracle_executor(
+            oracle, **_REPORT, store=None))
         output = run_output(result, get_query("REL-AGENT-6").info,
                             {"agent_traces": TRACES})
     assert output.rows.to_pydict() == {
@@ -276,27 +245,18 @@ def test_relational_plans_build_and_run(tmp_path):
 
 
 def test_a_score_query_reports_every_scored_document_and_its_pieces(tmp_path):
-    from quail.physical import AiScore
 
     spec = get_query("REL-AGENT-4")
     scores = [0.9, 0.1, 0.8, 0.2, 0.7, 0.3]
 
-    def nodes(graph, request):
-        scored = next(node for node in graph.nodes if isinstance(node, AiScore))
-        return {
-            **{node.node_id: NodeResult({f"rows:{node.alias}": range(
-                len(request.inputs[node.input_id].documents))})
-               for node in graph.nodes if isinstance(node, PhysicalScan)},
-            scored.node_id: NodeResult({"rows:t": pa.table({
-                "t": pa.array(range(6), pa.int32()),
-                "recovered_score": pa.array(scores, pa.float32())})}),
-        }
+    oracle = Oracle(scores=lambda spec, ids: scores[ids[0]])
 
     with _session(tmp_path) as sess:
         sess.register("agent_traces", DocumentProvider.from_table(
             TRACES, id_col="id"))
         query = build_query(sess, spec)
-        result = _execute(query, nodes, store=None)
+        result = execute_query(query, physical_executor=oracle_executor(
+            oracle, **_REPORT, store=None))
         output = run_output(result, spec.info, {"agent_traces": TRACES})
         output.prompt_pieces = prompt_pieces(query, spec.info, {})
     # the rows keep the fetch; the answers keep every scored document
@@ -325,40 +285,19 @@ CONTRACTS = pa.table({
 
 
 def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
-    from quail.physical import AiExtract
 
     spec = get_query("CUAD-7")
 
-    def nodes(graph, request):
-        filtered = next(node for node in graph.nodes if isinstance(node, AiFilter))
-        extracted = next(node for node in graph.nodes
-                         if isinstance(node, AiExtract))
-        return {
-            **{node.node_id: NodeResult({f"rows:{node.alias}": range(
-                len(request.inputs[node.input_id].documents))})
-               for node in graph.nodes if isinstance(node, PhysicalScan)},
-            filtered.node_id: NodeResult({
-                "rows:c": [0, 2],
-                "filter_answers:c": {0: [1], 1: [0], 2: [1]},
-            }),
-            extracted.node_id: NodeResult({
-                "rows:c": pa.table({
-                    "c": pa.array([0, 2], pa.int32()),
-                    "contract.audit_rights": pa.array(["audit yearly", None],
-                                                      pa.string()),
-                    "contract.audit_rights_span": pa.array(
-                        [{"start": 0, "end": 12}, None],
-                        pa.struct([("start", pa.int64()),
-                                   ("end", pa.int64())])),
-                }),
-            }),
-        }
+    oracle = Oracle(
+        filters=lambda alias, document, position: document != 1,
+        answers=lambda spec, document: "audit yearly" if document == 0 else None)
 
     with _session(tmp_path) as sess:
         sess.register("contracts", DocumentProvider.from_table(
             CONTRACTS, id_col="id"))
         query = build_query(sess, spec)
-        result = _execute(query, nodes, store=None)
+        result = execute_query(query, physical_executor=oracle_executor(
+            oracle, **_REPORT, store=None))
         output = run_output(result, spec.info, {"contracts": CONTRACTS})
         output.prompt_pieces = prompt_pieces(query, spec.info, {})
         turn = sess.model.extract_turn

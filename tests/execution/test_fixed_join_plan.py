@@ -1,21 +1,18 @@
 """Fixed join execution, filter retention, and answer reconstruction."""
 
-import numpy as np
 import pyarrow as pa
 import pytest
 from helpers.fakes import graph_state, letter_tokens
+from helpers.oracle import Oracle
 
 import quail
 from bench import quailb
 from quail.api.execute import execute_query
 from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.reranker import score_rows
-from quail.execution.ids import id_positions
-from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.metrics import NodeMetrics
 from quail.execution.types import PhysicalResponse
 from quail.logical.expressions import CompileError
 from quail.physical import (
-    AiClassify,
     AiFilter,
     AiJoin,
     Barrier,
@@ -58,136 +55,35 @@ def register_fever(session):
             table, id_col="id"))
 
 
-class FixedFeverAnswers:
-    # the label a classification gives claims c0, c1, c2
-    labels = ("science", "sport", "science")
+# the label a classification gives claims c0, c1, c2
+FEVER_LABELS = ("science", "sport", "science")
+# the stance a classification gives each (claim, evidence) pair
+FEVER_STANCES = {(0, 0): "supports", (1, 1): "refutes", (2, 0): "supports"}
 
-    def __init__(self, state, capacity, empty):
-        self.state = state
-        self.capacity = capacity
-        self.empty = empty
 
-    def _answers(self, document_ids):
-        answers = {local: [document < 2 and not self.empty]
-                   for local, document in enumerate(document_ids)}
-        expected_rows = [document for local, document in enumerate(document_ids)
-                if all(answers[local])]
-        return answers, expected_rows
+def _fever_label(spec, ids):
+    if len(ids) == 1:
+        return FEVER_LABELS[ids[0]]
+    # the stances are keyed (claim, evidence) whichever the anchor
+    return FEVER_STANCES.get(ids if spec.anchor.startswith("c") else ids[::-1])
 
-    def _label_table(self, node, ids):
-        # a document whose answer names no label has no row, as the
-        # classify node drops it
-        labeled = [int(document) for document in ids
-                   if self.labels[int(document)] is not None]
-        rows = np.asarray([[document] for document in labeled],
-                          dtype=np.int32).reshape(-1, 1)
-        table = score_rows(
-            rows, node.spec.aliases, node.spec.name,
-            [self.labels[document] for document in labeled], pa.string())
-        return labeled, table
 
-    # the stance a classification gives each (claim, evidence) pair
-    stances = {(0, 0): "supports", (1, 1): "refutes", (2, 0): "supports"}
+def _fever_join(node, assignment):
+    claim = next(value for alias, value in assignment.items() if alias.startswith("c"))
+    evidence = next(value for alias, value in assignment.items()
+                    if alias.startswith("e"))
+    passing = ({(1, 0), (2, 0), (0, 2)} if node.written_position == 1
+               else {(0, 0), (1, 1), (2, 0), (1, 2)})
+    return (claim, evidence) in passing
 
-    def execute_predicates(self, nodes, inputs):
-        results = {}
-        expected_rows = set(range(len(inputs["anchor_ids"])))
-        partners = inputs.get("anchor_partners")
-        for index, node in enumerate(nodes):
-            value = self.execute(node, {
-                **inputs, "_live": expected_rows,
-                "anchor_partners": (None if partners is None else
-                                    lambda key, stage, j=index: partners(key, j))})
-            results[node.node_id] = value
-            rows = value.metrics.extension["answers"][0]
-            expected_rows = {local for local, row in rows.items() if any(row)}
-        return results
 
-    def execute(self, node, inputs):
-        if isinstance(node, AiClassify) and node.spec.partner is not None:
-            # the join's true pairs, labeled from the table above; a
-            # pair without a stance gets no row
-            (answers,) = inputs["score_inputs"].values()
-            pairs = []
-            for local, row in answers["rows"].items():
-                anchor = answers["anchor_index"][local]
-                members = (answers["anchor_partners"] or {}).get(local)
-                for position, bit in enumerate(row):
-                    if not bit:
-                        continue
-                    member = position if members is None else members[position]
-                    (partner,) = answers["partner_index"][member]
-                    pairs.append((int(anchor), int(partner)))
-            # the stances are keyed (claim, evidence) whichever the anchor
-            claim_first = node.spec.anchor.startswith("c")
-            labeled = [pair for pair in pairs
-                       if (pair if claim_first else pair[::-1]) in self.stances]
-            rows = np.asarray(labeled, dtype=np.int32).reshape(-1, 2)
-            table = score_rows(
-                rows, node.spec.aliases, node.spec.name,
-                [self.stances[pair if claim_first else pair[::-1]]
-                 for pair in labeled], pa.string())
-            return NodeResult({node.rows_port: table}, NodeMetrics(
-                input_rows=len(pairs), output_rows=len(labeled)))
-        if isinstance(node, AiClassify):
-            (alias,) = node.spec.aliases
-            (ids,) = inputs["score_inputs"].values()
-            labeled, table = self._label_table(node, id_positions(ids))
-            return NodeResult(
-                {f"rows:{alias}": table},
-                NodeMetrics(input_rows=len(ids), output_rows=len(ids)))
-        if isinstance(node, AiFilter):
-            document_ids = list(inputs["document_ids"])
-            answers, expected_rows = self._answers(document_ids)
-            if node.keep_kv:
-                for document in expected_rows[:self.capacity]:
-                    self.state["gpu"].arena.retain((node.alias, document), 16)
-            return NodeResult({
-                f"rows:{node.alias}": expected_rows,
-                f"filter_answers:{node.alias}": {
-                    document_ids[local]: row for local, row in answers.items()
-                },
-            })
-
-        outputs = {}
-        anchor_ids = inputs["anchor_ids"]
-        expected_rows = set(inputs.get("_live", range(len(anchor_ids))))
-        lists_for = inputs.get("anchor_partners")
-        aliases = (node.anchor, *node.partners)
-        claim = next(alias for alias in aliases if alias.startswith("c"))
-        evidence = next(alias for alias in aliases if alias.startswith("e"))
-        passing = ({(1, 0), (2, 0), (0, 2)} if node.written_position == 1
-                   else {(0, 0), (1, 1), (2, 0), (1, 2)})
-        partners = inputs["partner_indices"][node.written_position]
-        # a stage over pairs asks each anchor about its own members
-        members = {} if lists_for and node.pairs_from else None
-        rows = {}
-        for local in sorted(expected_rows):
-            mine = (range(len(partners)) if members is None
-                    else lists_for(anchor_ids[local], 0))
-            if members is not None:
-                members[local] = list(mine)
-            rows[local] = []
-            for member in mine:
-                assignment = dict(zip(
-                    aliases, (anchor_ids[local], *partners[member])))
-                rows[local].append((assignment[claim], assignment[evidence])
-                                   in passing)
-        expected_rows = {local for local, row in rows.items() if any(row)}
-        outputs[f"join_answers:{node.written_position}"] = {
-            "rows": rows, "anchor_index": anchor_ids,
-            "partner_index": partners, "anchor_partners": members,
-            "anchor": node.anchor,
-            "partners": list(node.partners), "semantics": node.semantics,
-            "selectivity": node.selectivity, "written_position": node.written_position,
-        }
-        outputs[f"rows:{node.anchor}"] = [
-            anchor_ids[local] for local in sorted(expected_rows)
-        ]
-        return NodeResult(outputs, NodeMetrics(
-            gpu_s=0.02, peak_gpu_bytes=128,
-            extension={"answers": [rows], "pack_s": 0.125,
-                       "borrowed_prefix_tokens": 16}))
+def fever_oracle(capacity, empty):
+    """The oracle answering FEVER: c0 and c1 pass every filter unless empty."""
+    return Oracle(
+        filters=lambda alias, document, position: document < 2 and not empty,
+        joins=_fever_join, labels=_fever_label, retain=capacity,
+        join_metrics=NodeMetrics(gpu_s=0.02, peak_gpu_bytes=128, extension={
+            "pack_s": 0.125, "borrowed_prefix_tokens": 16}))
 
 
 def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
@@ -199,9 +95,9 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     def child(documents):
-        state = graph_state(None, documents)
-        model = FixedFeverAnswers(state, capacity=1, empty=False)
-        state["gpu"].execution = model
+        model = fever_oracle(capacity=1, empty=False)
+        state = graph_state(model, documents)
+        model.arena = state["gpu"].arena
         return worker.ChildState(
             gpu_index=0, gpu=state["gpu"], registry=session.registry,
             runtime_context=ExecutionContext(
@@ -213,8 +109,9 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
                 for node in graph.nodes if isinstance(node, Scan)}
         extra = check(request, graph) if check else {}
         if gpus == 1:
-            state = graph_state(None, documents)
-            state["gpu"].execution = FixedFeverAnswers(state, capacity, empty)
+            model = fever_oracle(capacity, empty)
+            state = graph_state(model, documents)
+            model.arena = state["gpu"].arena
             state.update(extra, functions=session.registry.functions)
             report = execute_single_graph(state, request.plan["settings"], graph)
             assert not state["gpu"].arena.accounting.owned

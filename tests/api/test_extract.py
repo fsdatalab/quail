@@ -7,14 +7,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from helpers import baselines as request_tests
-from helpers import rerankers as score_tests
 from helpers.fakes import letter_tokens
+from helpers.oracle import Oracle, finish, oracle_executor
 
 import quail
-from quail.backends.quail.reranker import RerankerModelExecution
 from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
-from quail.execution.metrics import NodeResult
 from quail.execution.rows import Rows, extraction_rows
 from quail.execution.spans import locate_span, read_phrase
 from quail.logical import (
@@ -305,28 +303,14 @@ def test_span_helpers_read_locate_and_widen_an_answer():
 
 @pytest.mark.parametrize("filtered", [False, True])
 def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
-    execute = RerankerModelExecution.execute
-
-    def mixed(self, node, inputs):
-        if not isinstance(node, AiExtract):
-            return execute(self, node, inputs)
-        (source,) = inputs.values()
-        # the extraction reads the scan's ids, or the rows of the score
-        # predicate before it
-        ids = (source.ids["c"] if isinstance(source, Rows) else source).to_pylist()
-        table = extraction_rows(
-            node.spec.alias, node.spec.name, node.spec.span_name,
-            ids, ["March 3, 2027" if i == 0 else None for i in ids],
-            [(14, 27) if i == 0 else None for i in ids])
-        return NodeResult({"rows:c": table})
-
-    monkeypatch.setattr(RerankerModelExecution, "execute", mixed)
+    oracle = Oracle(answers=lambda spec, document: (
+        "March 3, 2027" if document == 0 else None))
     query = session.sql(
         "SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score, "
         f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease FROM contracts c "
         + ("WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.15"
            if filtered else ""))
-    result = score_tests._finish(query, session, score_tests._RowReranker())
+    result = finish(query, oracle)
     rows = result.collect()
     assert rows.column("score").type == pa.float64()
     expected = [
@@ -531,25 +515,10 @@ def test_extract_plans_one_extraction_per_field(session):
     assert "lease = struct(lease.ends, lease.rent)" in built.explain()
 
 
-def _fake_struct_answers(monkeypatch):
-    execute = RerankerModelExecution.execute
+def _struct_answers():
     answers = {"lease.ends": ["March 3, 2027", None],
                "lease.rent": ["$2,000", None]}
-
-    def answer(self, node, inputs):
-        if not isinstance(node, AiExtract):
-            return execute(self, node, inputs)
-        (source,) = inputs.values()
-        ids = (source.ids["c"] if isinstance(source, Rows) else source).to_pylist()
-        found = answers[node.spec.name]
-        spans = {"lease.ends": (14, 27), "lease.rent": (37, 43)}
-        table = extraction_rows(
-            node.spec.alias, node.spec.name, node.spec.span_name, ids,
-            [found[i] for i in ids],
-            [spans[node.spec.name] if found[i] else None for i in ids])
-        return NodeResult({"rows:c": table})
-
-    monkeypatch.setattr(RerankerModelExecution, "execute", answer)
+    return Oracle(answers=lambda spec, document: answers[spec.name][document])
 
 
 @pytest.mark.parametrize("suffix", [
@@ -557,9 +526,7 @@ def _fake_struct_answers(monkeypatch):
     " WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.05"])
 def test_extract_returns_answer_and_span_structs(
         session, monkeypatch, suffix):
-    _fake_struct_answers(monkeypatch)
-    result = score_tests._finish(session.sql(STRUCT_SQL + suffix), session,
-                                 score_tests._RowReranker())
+    result = finish(session.sql(STRUCT_SQL + suffix), _struct_answers())
     rows = result.collect()
     assert rows.column_names == ["c.id", "lease", "lease_span"]
     span = pa.struct([("start", pa.int32()), ("end", pa.int32())])
@@ -613,51 +580,8 @@ def test_extract_field_errors(session):
 
 
 def _answers_executor(answers):
-    """Build a fake executor whose extractions return the given answers.
-
-    Args:
-        answers: Document position -> the answer text or None, for
-            every question.
-    """
-    def execute(request):
-        from helpers.fakes import graph_state
-
-        from quail.backends.quail.graph import execute_single_graph
-        from quail.builtins import built_in_registry
-        from quail.execution.metrics import NodeMetrics, NodeResult
-        from quail.execution.types import PhysicalResponse
-        from quail.physical import Scan
-
-        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
-        documents = {node.alias: request.inputs[node.input_id].documents
-                for node in graph.nodes if isinstance(node, Scan)}
-        texts = {node.alias: request.inputs[node.input_id].texts
-                 for node in graph.nodes if isinstance(node, Scan)}
-
-        class Answers:
-            def execute(self, node, inputs):
-                spec = node.spec
-                ids = [int(i) for i in inputs["document_ids"]]
-                table = extraction_rows(
-                    spec.alias, spec.name, spec.span_name, ids,
-                    [answers[i] for i in ids],
-                    [None if answers[i] is None
-                     else locate_span(str(texts[spec.alias][i]), answers[i])
-                     for i in ids])
-                return NodeResult(
-                    {f"rows:{spec.alias}": table},
-                    NodeMetrics(input_rows=len(ids), output_rows=len(ids),
-                                evaluated_documents=len(ids)))
-
-        state = graph_state(Answers(), documents)
-        state["texts"] = texts
-        report = execute_single_graph(
-            state, {"filter_limit": None}, graph)
-        outputs = report.pop("_outputs")
-        return PhysicalResponse(outputs, {
-            **report, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 12})
-
-    return execute
+    """A physical executor whose extractions answer answers[document]."""
+    return oracle_executor(Oracle(answers=answers), fresh_tokens=12)
 
 
 def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):

@@ -8,7 +8,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from helpers.fakes import letter_tokens
-from helpers.rerankers import _finish, _RowReranker, _run_graph
+from helpers.oracle import Oracle, finish
+from helpers.rerankers import _run_graph
 
 import quail
 from quail.backends.quail.executor.stages import Stage
@@ -33,7 +34,6 @@ from quail.logical import ColumnRef, CompileError, RegularPredicate, SemanticJoi
 from quail.physical import (
     AiClassify,
     AiScore,
-    ClassifySpec,
     Filter,
     decode_graph,
     encode_graph,
@@ -307,7 +307,7 @@ def test_score_filters_compare_values_and_keep_pair_answers(catalog):
         "FROM queries q CROSS JOIN documents d "
         "WHERE AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15"
     )
-    result = _finish(query, session, _RowReranker())
+    result = finish(query, Oracle())
     assert result.collect().to_pylist() == [
         {"q.id": 1, "d.id": 2, "s1": 0.2, "s2": 0.2},
         {"q.id": 2, "d.id": 2, "s1": 0.2, "s2": 0.3},
@@ -322,12 +322,12 @@ def test_score_filters_compare_values_and_keep_pair_answers(catalog):
     physical = query.plan()
     assert sum(isinstance(node, AiScore) for node in physical.nodes) == 1
     assert sum(isinstance(node, Filter) for node in physical.nodes) == 2
-    reranker = _RowReranker()
-    result = _finish(query, session, reranker)
+    oracle = Oracle()
+    result = finish(query, oracle)
     assert result.collect().to_pylist() == [{"d.id": 2, "s": 0.2}]
     assert result.schema.field("s").type == pa.float64()
     assert result.report["estimated_seconds"] > 0
-    assert reranker.calls == 1
+    assert len(oracle.calls) == 1
     session.close()
 
 
@@ -362,12 +362,8 @@ def test_score_join_runs_on_its_legal_anchor(catalog):
 
 
 def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
-    class MixedOutputs(_RowReranker):
-        def score(self, spec, rows, documents):
-            if isinstance(spec, ClassifySpec):
-                labels = [spec.labels[int(row[0]) % 2] for row in rows]
-                return RerankerBatch(labels, fresh_tokens=len(rows), cached_tokens=0)
-            return super().score(spec, rows, documents)
+    def mixed():
+        return Oracle(labels=lambda spec, ids: spec.labels[ids[0] % 2])
 
     session = _session(catalog, model="qwen3-4b-fp8", tokenizer=letter_tokens)
     score = "AI.SCORE(PROMPT('Refund? {0}', d.body))"
@@ -395,7 +391,7 @@ def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
                 encode_graph(physical.graph, session.registry.codecs),
                 session.registry.codecs)
             assert decoded == physical.graph
-            result = _finish(query, session, MixedOutputs())
+            result = finish(query, mixed())
             rows = result.collect()
             assert list(zip(rows.column("d.id").to_pylist(),
                             rows.column("topic").to_pylist())) == expected
@@ -408,21 +404,9 @@ def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
         f"SELECT q.id, d.id, {label} AS topic, "
         "AI.SCORE(PROMPT('Relevance {0} {1}', q.text, d.body)) AS relevance "
         "FROM queries q CROSS JOIN documents d")
-    assert _finish(query, session, MixedOutputs()).collect().column(
+    assert finish(query, mixed()).collect().column(
         "topic").to_pylist() == ["refund", "praise", "refund", "praise"]
     session.close()
-
-
-class _StreamingReranker(_RowReranker):
-    """Reports each row's score while scoring, one row at a time."""
-
-    streams_answers = True
-
-    def score(self, spec, rows, documents, on_answers=None):
-        batch = super().score(spec, rows, documents)
-        for position, value in enumerate(batch.scores):
-            on_answers(np.array([position]), [value])
-        return batch
 
 
 def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
@@ -434,13 +418,13 @@ def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
     set_answer_sink(streamed.append)
     try:
         graph, model, _ = _run_graph(
-            session, query, query._prepare_physical(), _RowReranker())
+            session, query, query._prepare_physical(), Oracle())
         score_node = next(
             node for node in graph.nodes if isinstance(node, AiScore))
         inputs = {port.name: np.arange(2, dtype=np.int32)
                   for port in score_node.inputs}
         # a reranker that reports while scoring streams each answer once
-        model.reranker = _StreamingReranker()
+        model.reranker = Oracle(streams=True)
         result = score_in_batches(
             score_node, inputs,
             lambda node, batches: [model.execute_rows(node, b) for b in batches],
