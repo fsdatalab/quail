@@ -659,8 +659,8 @@ def test_foreign_node_placement_and_pipelines():
                 per_batch.graph)[sequence.node_id]) == (
             sequence.node_id, foreign.node_id, join.node_id)
         assert isinstance(foreign, Foreign) and foreign.kind == "per_batch"
-        assert foreign.inputs[0].source == PortRef("ai_filter:c", "ids:c")
-        assert PortRef("apply:keep_even", "ids:c") in {
+        assert foreign.inputs[0].source == PortRef("ai_filter:c", "rows:c")
+        assert PortRef("apply:keep_even", "rows:c") in {
             port.source for port in join.inputs}
         assert "keep_even" in session.registry.functions
         text = physical_tree(per_batch.graph)
@@ -705,7 +705,7 @@ def test_foreign_node_placement_and_pipelines():
     orphan = PhysicalGraph(
         tuple(node for node in graph.nodes if node.node_id != "group:0")
         + (graph.node("group:0").with_inputs(input_ports(
-            (PortRef("input:r", "ids:r"), PortRef("input:p", "ids:p")))),),
+            (PortRef("input:r", "rows:r"), PortRef("input:p", "rows:p")))),),
         graph.root)
     assert sequences(orphan) == [("filter:r",), ("group:0",)]
 

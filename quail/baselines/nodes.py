@@ -272,8 +272,8 @@ class RequestExecution(PhysicalNode):
     def outputs(self) -> tuple[OutputPort, ...]:
         outputs = [
             OutputPort(
-                f"ids:{alias}",
-                ValueType.DOCUMENT_IDS,
+                f"rows:{alias}",
+                ValueType.ROWS,
                 schema=(alias,),
             )
             for alias in self.aliases

@@ -142,6 +142,19 @@ def as_table(value):
     return value.table() if isinstance(value, Rows) else value
 
 
+def rows_of(value, alias: str) -> Rows:
+    """Return a port's value as rows: itself, or the ids of one table."""
+    return value if isinstance(value, Rows) else Rows({alias: value})
+
+
+def survivor_rows(source, alias: str, ids) -> Rows:
+    """Return the rows of the ids, with the source's columns when it has them."""
+    if isinstance(source, Rows) and source.column_names:
+        positions = pc.index_in(pa.array(ids), value_set=source.ids[alias])
+        return source.take(positions)
+    return Rows({alias: ids})
+
+
 def _empty(length: int) -> pa.Table:
     """A table of the length with no columns."""
     return pa.table({"_": pa.nulls(length)}).drop_columns(["_"])

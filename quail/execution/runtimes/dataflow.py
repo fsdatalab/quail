@@ -14,6 +14,7 @@ from quail.execution.result import (
     build_result_declaration,
     true_answer_rows,
 )
+from quail.execution.rows import Rows, as_table
 from quail.physical import (
     Barrier,
     Exchange,
@@ -33,7 +34,7 @@ class ExchangeRuntime:
             raise TypeError(type(node).__name__)
         if len(inputs) != 1:
             raise ValueError("Exchange takes one survivor input")
-        return NodeResult({f"ids:{node.anchor}": next(iter(inputs.values()))})
+        return NodeResult({f"rows:{node.anchor}": next(iter(inputs.values()))})
 
 
 class BarrierRuntime:
@@ -48,7 +49,7 @@ class BarrierRuntime:
         tables = []
         for port in node.inputs:
             value = inputs[port.name]
-            if port.value_type is ValueType.DOCUMENT_IDS:
+            if port.value_type is ValueType.ROWS:
                 alias = port.source.port.split(":", 1)[1]
                 survivors[alias] = document_ids(value)
             elif port.value_type is ValueType.JOIN_ANSWERS:
@@ -66,7 +67,7 @@ class BarrierRuntime:
                     ids = survivors[alias]
                     survivors[alias] = pc.filter(ids, pc.is_in(
                         ids, value_set=pc.unique(table[alias]).cast(ids.type)))
-        return NodeResult({f"ids:{alias}": survivors[alias]
+        return NodeResult({f"rows:{alias}": Rows({alias: survivors[alias]})
                            for alias in node.aliases})
 
 
@@ -186,7 +187,7 @@ def foreign_ids(node, inputs) -> dict:
     """Return the input IDs for a Foreign node, indexed by table alias."""
     values = {}
     for port in node.inputs:
-        if port.source.port.startswith("ids:"):
+        if port.source.port.startswith("rows:"):
             values[port.source.port.split(":", 1)[1]] = inputs[port.name]
     return values
 
@@ -196,7 +197,8 @@ def foreign_outputs(node, result) -> dict:
     if node.ids == "pairs":
         return {f"pairs:{node.written_position}":
                 pair_ids_table(*node.aliases, result)}
-    return {f"ids:{node.aliases[0]}": document_ids(result)}
+    (alias,) = node.aliases
+    return {f"rows:{alias}": Rows({alias: document_ids(result)})}
 
 
 class ForeignRuntime:
@@ -224,19 +226,15 @@ class RecombineRuntime:
             answer_tables = []
             survivors = {}
             for input_port in node.inputs:
-                value = inputs[input_port.name]
+                value = as_table(inputs[input_port.name])
                 if not isinstance(value, pa.Table):
                     raise TypeError(
                         "Recombine inputs must be Arrow tables"
                     )
                 if input_port.value_type is ValueType.JOIN_ANSWERS:
                     answer_tables.append(true_answer_rows(value))
-                elif input_port.value_type is ValueType.DOCUMENT_IDS:
-                    if len(value.column_names) != 1:
-                        raise ValueError(
-                            "a survivor relation needs one alias column"
-                        )
-                    alias = value.column_names[0]
+                elif input_port.value_type is ValueType.ROWS:
+                    alias = input_port.source.port.split(":", 1)[1]
                     survivors[alias] = value.column(alias).combine_chunks()
                 else:
                     raise TypeError(
@@ -279,7 +277,7 @@ class HashJoinRuntime:
         for alias, names in ((node.left, [left for left, _ in node.on]),
                              (node.right, [right for _, right in node.on])):
             port = next(port for port in node.inputs
-                        if port.source.port == f"ids:{alias}")
+                        if port.source.port == f"rows:{alias}")
             table = alias_table(alias, inputs[port.name],
                                 context.sources.get(columns_key(alias)), names)
             sides[alias] = (table.column(alias),

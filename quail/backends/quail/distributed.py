@@ -15,7 +15,7 @@ from quail.backends.quail.prompts import join_request
 from quail.backends.quail.reranker import score_in_batches
 from quail.catalog.pairs import columns_key
 from quail.catalog.tokens import select_documents
-from quail.execution.ids import document_ids, id_positions
+from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
 from quail.execution.runner import (
@@ -172,10 +172,10 @@ class DistributedQuailExecution:
         results = {}
         for index, node in enumerate(nodes):
             parts = [output["results"][node.node_id] for output in outputs]
-            table = Rows.concat([part.outputs["rows"] for part in parts])
+            table = Rows.concat([part.outputs[node.rows_port] for part in parts])
             metrics = sum((part.metrics for part in parts), NodeMetrics())
             results[node.node_id] = NodeResult(
-                {"rows": table.take(order), f"ids:{alias}": document_ids(ids)},
+                {node.rows_port: table.take(order)},
                 replace(metrics, wall_s=wall if index == 0 else 0.0))
         return results
 
@@ -257,11 +257,11 @@ class DistributedQuailExecution:
                     for document, row in part.outputs[
                         f"filter_answers:{node.alias}"].items()}
             survivors = np.sort(np.concatenate([
-                id_positions(part.outputs[f"ids:{node.alias}"]) for part in parts]))
+                id_positions(part.outputs[f"rows:{node.alias}"]) for part in parts]))
             if j == len(nodes) - 1 and not self.joins:
                 survivors = survivors[:self.payload.get("filter_limit")]
             results[member.node_id] = NodeResult(
-                {f"ids:{node.alias}": document_ids(survivors),
+                {f"rows:{node.alias}": Rows({node.alias: survivors}),
                  f"filter_answers:{node.alias}": rows},
                 replace(sum((part.metrics for part in parts), NodeMetrics()),
                         wall_s=wall if j == 0 else 0.0))
@@ -321,10 +321,10 @@ class DistributedQuailExecution:
                 ]
             )
             survivors = np.sort(np.concatenate([
-                id_positions(part.outputs[f"ids:{member.anchor}"]) for part in parts]))
+                id_positions(part.outputs[f"rows:{member.anchor}"]) for part in parts]))
             metrics = sum((part.metrics for part in parts), NodeMetrics())
             results[member.node_id] = NodeResult(
-                {f"ids:{member.anchor}": document_ids(survivors),
+                {f"rows:{member.anchor}": Rows({member.anchor: survivors}),
                  f"join_answers:{member.written_position}": output},
                 replace(metrics, wall_s=wall if j == 0 else 0.0,
                         extension={**metrics.extension, "joins": [output]}))

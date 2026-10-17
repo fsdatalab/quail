@@ -10,6 +10,7 @@ from bench import quailb
 from quail.api.execute import execute_query
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.reranker import score_rows
+from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.types import PhysicalResponse
 from quail.logical.expressions import CompileError
@@ -126,14 +127,14 @@ class FixedFeverAnswers:
                 rows, node.spec.aliases, node.spec.name,
                 [self.stances[pair if claim_first else pair[::-1]]
                  for pair in labeled], pa.string())
-            return NodeResult({"rows": table}, NodeMetrics(
+            return NodeResult({node.rows_port: table}, NodeMetrics(
                 input_rows=len(pairs), output_rows=len(labeled)))
         if isinstance(node, AiClassify):
-            (ids,) = inputs["score_inputs"].values()
             (alias,) = node.spec.aliases
-            labeled, table = self._label_table(node, ids)
+            (ids,) = inputs["score_inputs"].values()
+            labeled, table = self._label_table(node, id_positions(ids))
             return NodeResult(
-                {"rows": table, f"ids:{alias}": labeled},
+                {f"rows:{alias}": table},
                 NodeMetrics(input_rows=len(ids), output_rows=len(ids)))
         if isinstance(node, AiFilter):
             document_ids = list(inputs["document_ids"])
@@ -142,7 +143,7 @@ class FixedFeverAnswers:
                 for document in expected_rows[:self.capacity]:
                     self.state["gpu"].arena.retain((node.alias, document), 16)
             return NodeResult({
-                f"ids:{node.alias}": expected_rows,
+                f"rows:{node.alias}": expected_rows,
                 f"filter_answers:{node.alias}": {
                     document_ids[local]: row for local, row in answers.items()
                 },
@@ -180,7 +181,7 @@ class FixedFeverAnswers:
             "partners": list(node.partners), "semantics": node.semantics,
             "selectivity": node.selectivity, "written_position": node.written_position,
         }
-        outputs[f"ids:{node.anchor}"] = [
+        outputs[f"rows:{node.anchor}"] = [
             anchor_ids[local] for local in sorted(expected_rows)
         ]
         return NodeResult(outputs, NodeMetrics(
@@ -324,7 +325,7 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
             "Scan", "AiFilter", "AiClassify", "Project"]
         classify = plan.nodes[2]
         assert classify.inputs[0].source == PortRef(plan.nodes[1].node_id,
-                                                    "ids:c")
+                                                    "rows:c")
         execute = fever_executor(session, monkeypatch, 1, capacity=10)
         rows = execute_query(query, physical_executor=execute).collect()
         assert rows.to_pylist() == [{"c.id": "c0", "topic": "science"},
@@ -355,10 +356,10 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         assert members == (("ai-classify:0", test.node_id, ask.node_id)
                            + ((join.node_id,) if join.anchor == "c" else ()))
         (claims_port,) = [port.source for port in join.inputs
-                          if port.source.port == "ids:c"]
-        assert claims_port == PortRef(ask.node_id, "ids:c")
+                          if port.source.port == "rows:c"]
+        assert claims_port == PortRef(ask.node_id, "rows:c")
         assert [port.source.port for port in project.inputs] == [
-            "join_answers:0", "rows"]
+            "join_answers:0", "rows:c"]
         codecs = session.registry.codecs
         assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
         execute = fever_executor(session, monkeypatch, 1, capacity=10)

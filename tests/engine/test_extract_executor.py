@@ -110,7 +110,7 @@ def test_writing_that_begins_outside_the_document_answers_none(monkeypatch):
 
     model._cue_row = straying
     result, stages = run()
-    assert result.outputs["rows"].column("ends").to_pylist() == [
+    assert result.outputs["rows:c"].column("ends").to_pylist() == [
         None, "five years", None]
     assert stages.documents[0].answers[0].none_wins
 
@@ -134,7 +134,7 @@ def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
 
     model._answer_row = straying
     result, stages = run()
-    assert result.outputs["rows"].column("ends").to_pylist() == [
+    assert result.outputs["rows:c"].column("ends").to_pylist() == [
         "March", "five years", None]
     assert not stages.documents[0].answers[0].none_wins
 
@@ -188,7 +188,7 @@ def test_rows_with_one_live_stream_are_decided_together(monkeypatch):
 
     def outcome(run):
         result, stages = run()
-        return (result.outputs["rows"].column("ends").to_pylist(),
+        return (result.outputs["rows:c"].column("ends").to_pylist(),
                 [(a.written, a.steps, a.fed_tokens, a.span)
                  for document in stages.documents for a in document.answers])
 
@@ -402,7 +402,7 @@ def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
     _, model, shared, _ = _setup(
         monkeypatch, documents=documents, share_prefixes=True)
     result, stages = shared()
-    assert result.outputs["rows"].table().equals(unshared.outputs["rows"].table())
+    assert result.outputs["rows:c"].table().equals(unshared.outputs["rows:c"].table())
     borrowed = result.metrics.extension["borrowed_prefix_tokens"]
     assert borrowed > 0
     assert result.metrics.fresh_tokens == unshared.metrics.fresh_tokens - borrowed
@@ -419,7 +419,7 @@ def test_extraction_accepts_empty_input_and_sparse_document_ids(monkeypatch):
     document_ids = []
     state, _, run, _ = _setup(monkeypatch, document_ids=document_ids)
     result, _ = run()
-    table = result.outputs["rows"]
+    table = result.outputs["rows:c"]
     assert table.ids["c"].to_pylist() == document_ids
     assert table.column("ends").to_pylist() == [GOLD[i] for i in document_ids]
     assert table.column("ends_span").is_null().to_pylist() == [
@@ -458,8 +458,8 @@ def test_extraction_reuses_arrow_tokens_and_offsets(monkeypatch, tmp_path):
 
     monkeypatch.setattr(model.tables, "encode_batch", windows_only)
     result, stages = run()
-    assert result.outputs["rows"].column("ends").to_pylist() == GOLD
-    assert result.outputs["rows"].column("ends_span").to_pylist() == [
+    assert result.outputs["rows:c"].column("ends").to_pylist() == GOLD
+    assert result.outputs["rows:c"].column("ends_span").to_pylist() == [
         {"start": LEASE.index("March"),
          "end": LEASE.index("March") + len(GOLD[0])},
         {"start": 6, "end": 16}, None]
@@ -484,10 +484,10 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch, gpu_tim
                         lambda: timing_calls.append("sync"))
     results, stages = run_pipeline("ends", "starts")
     first, second = results["ai-extract:ends"], results["ai-extract:starts"]
-    assert second.outputs["rows"].column("starts").to_pylist() == \
-        first.outputs["rows"].column("ends").to_pylist()
-    assert second.outputs["rows"].column("starts_span").to_pylist() == \
-        first.outputs["rows"].column("ends_span").to_pylist()
+    assert second.outputs["rows:c"].column("starts").to_pylist() == \
+        first.outputs["rows:c"].column("ends").to_pylist()
+    assert second.outputs["rows:c"].column("starts_span").to_pylist() == \
+        first.outputs["rows:c"].column("ends_span").to_pylist()
     assert dict(model.reads) == {document.key: 1 for document in stages.documents}
     # the documents are read once: the second extraction is charged
     # only the tokens fed after them
@@ -513,7 +513,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
     nodes = [Scan(node_id="input:c", alias="c", input_id="c")]
     for name in ("ends", "starts"):
         previous = nodes[-1]
-        port = "ids:c" if isinstance(previous, Scan) else "rows"
+        port = "rows:c"
         nodes.append(AiExtract(
             node_id=f"ai-extract:{name}", backend_name="quail", model="qwen3-4b-fp8",
             inputs=input_ports((PortRef(previous.node_id, port),)),
@@ -557,8 +557,8 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
         DEVICES["h100-sxm"], registry.runtimes, registry)
     assert len(rounds) == 1
     for node in nodes[1:]:
-        actual = result["_outputs"][PortRef(node.node_id, "rows")]
-        assert actual.equals(expected[node.node_id].outputs["rows"].table())
+        actual = result["_outputs"][PortRef(node.node_id, "rows:c")]
+        assert actual.equals(expected[node.node_id].outputs["rows:c"].table())
     assert result["fresh_tokens"] == sum(
         item.metrics.fresh_tokens for item in expected.values())
     assert result["evaluated_documents"] == 2 * len(DOCS)
@@ -572,8 +572,8 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
         {"retained": {"c": sub["inputs"]["document_ids"]}}
         for sub in rounds[0]])
     again = execution.execute(nodes[1], {"input": pa.table({"c": [2, 0]})})
-    assert again.outputs["rows"].table().equals(
-        expected[nodes[1].node_id].outputs["rows"].take(pa.array([2, 0])).table())
+    assert again.outputs["rows:c"].table().equals(
+        expected[nodes[1].node_id].outputs["rows:c"].take(pa.array([2, 0])).table())
     assert again.metrics.fresh_tokens < expected[nodes[1].node_id].metrics.fresh_tokens
 
 
@@ -599,7 +599,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
             Scan(node_id="input:c", alias="c", input_id="c"),
             AiFilter(
                 node_id="ai_filter:c",
-                inputs=input_ports((PortRef("input:c", "ids:c"),)),
+                inputs=input_ports((PortRef("input:c", "rows:c"),)),
                 alias="c",
                 arena_writes=True,
                 question_token_ids=tuple(question),
@@ -612,20 +612,20 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
             ),
             AiExtract(
                 node_id="ai-extract:ends",
-                inputs=input_ports((PortRef("ai_filter:c", "ids:c"),)),
+                inputs=input_ports((PortRef("ai_filter:c", "rows:c"),)),
                 backend_name="quail",
                 model="qwen3-4b-fp8",
                 spec=plain,
             ),
             AiExtract(
                 node_id="ai-extract:starts",
-                inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
+                inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
                 backend_name="quail",
                 model="qwen3-4b-fp8",
                 spec=replace(plain, name="starts"),
             ),
         ),
-        PortRef("ai-extract:starts", "rows"),
+        PortRef("ai-extract:starts", "rows:c"),
     )
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
@@ -647,7 +647,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
              "texts": {"c": list(DOCS)}, "gpu_timing": True}
     report = execute_single_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
-    table = report["_outputs"][PortRef("ai-extract:ends", "rows")].to_pydict()
+    table = report["_outputs"][PortRef("ai-extract:ends", "rows:c")].to_pydict()
     assert table["c"] == [0, 1]
     assert table["ends"] == ["March 3, 2027", "five years"]
     # every document was packed once: the extraction's tail followed
@@ -658,7 +658,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
     assert metrics["ai-extract:ends"]["fresh_tokens"] < documents
     assert metrics["ai_filter:c"]["fresh_tokens"] >= documents
     assert metrics["ai-extract:ends"]["evaluated_documents"] == 2
-    later = report["_outputs"][PortRef("ai-extract:starts", "rows")].to_pydict()
+    later = report["_outputs"][PortRef("ai-extract:starts", "rows:c")].to_pydict()
     assert later["starts"] == table["ends"]
     assert later["starts_span"] == table["ends_span"]
     assert metrics["ai-extract:ends"]["gpu_s"] > 0
@@ -679,8 +679,8 @@ def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
     assert [document.key for document in again.documents] == [
         document.key for document in stages.documents
     ]
-    assert second.outputs["rows"].column("starts").to_pylist() == \
-        first.outputs["rows"].column("ends").to_pylist()
+    assert second.outputs["rows:c"].column("starts").to_pylist() == \
+        first.outputs["rows:c"].column("ends").to_pylist()
     # the second extraction feeds no document: only its tail, lines,
     # cue, and spans are fresh
     prefixes = sum(len(document.prefix) for document in stages.documents)
@@ -754,23 +754,23 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
     graph = PhysicalGraph((
         Scan(node_id="input:c", alias="c", input_id="c"),
         AiExtract(node_id="ai-extract:ends",
-                  inputs=input_ports((PortRef("input:c", "ids:c"),)),
+                  inputs=input_ports((PortRef("input:c", "rows:c"),)),
                   backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         Filter(node_id="filter:c:0",
-               inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
+               inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
                predicate=RegularPredicate(
                    ColumnRef("c", "contracts", "ends"), "not like", "five%"),
                aliases=("c",), written_position=0),
         AiExtract(node_id="ai-extract:starts",
-                  inputs=input_ports((PortRef("filter:c:0", "rows"),)),
+                  inputs=input_ports((PortRef("filter:c:0", "rows:c"),)),
                   backend_name="quail", model="qwen3-4b-fp8",
                   spec=replace(spec, name="starts")),
         Filter(node_id="filter:c:1",
-               inputs=input_ports((PortRef("ai-extract:starts", "rows"),)),
+               inputs=input_ports((PortRef("ai-extract:starts", "rows:c"),)),
                predicate=RegularPredicate(
                    ColumnRef("c", "contracts", "starts_span"), "<", 40, ("start",)),
                aliases=("c",), written_position=1),
-    ), PortRef("filter:c:1", "rows"))
+    ), PortRef("filter:c:1", "rows:c"))
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
             ] == ["ai-extract:ends", "filter:c:0", "ai-extract:starts", "filter:c:1"]
     torch, arena = fake_torch(), cpu_arena(256)
@@ -790,17 +790,17 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
     report = execute_single_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
     outputs = report["_outputs"]
-    first = outputs[PortRef("ai-extract:ends", "rows")].to_pydict()
+    first = outputs[PortRef("ai-extract:ends", "rows:c")].to_pydict()
     assert first["ends"] == ["March 3, 2027", "five years", None]
-    kept = outputs[PortRef("filter:c:0", "rows")].to_pydict()
+    kept = outputs[PortRef("filter:c:0", "rows:c")].to_pydict()
     assert kept["c"] == [0] and kept["ends"] == ["March 3, 2027"]
     # the second question was asked of the survivor only
-    second = outputs[PortRef("ai-extract:starts", "rows")].to_pydict()
+    second = outputs[PortRef("ai-extract:starts", "rows:c")].to_pydict()
     assert second == {"c": [0], "starts": ["March 3, 2027"],
                       "starts_span": [first["ends_span"][0]]}
     assert first["ends_span"][0] == {"start": 37, "end": 50}
-    assert outputs[PortRef("filter:c:1", "rows")].to_pydict()["c"] == [0]
-    assert outputs[PortRef("filter:c:1", "ids:c")].column("c").to_pylist() == [0]
+    assert outputs[PortRef("filter:c:1", "rows:c")].to_pydict()["c"] == [0]
+    assert outputs[PortRef("filter:c:1", "rows:c")].column("c").to_pylist() == [0]
     assert dict(model.reads) == {("c", 0): 1, ("c", 1): 1, ("c", 2): 1}
     metrics = report["node_metrics"]
     assert metrics["ai-extract:starts"]["evaluated_documents"] == 1
@@ -831,14 +831,14 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
             Scan(node_id="input:c", alias="c", input_id="c"),
             AiExtract(
                 node_id="ai-extract:ends",
-                inputs=input_ports((PortRef("input:c", "ids:c"),)),
+                inputs=input_ports((PortRef("input:c", "rows:c"),)),
                 backend_name="quail",
                 model="qwen3-4b-fp8",
                 spec=spec,
             ),
             Filter(
                 node_id="filter:c:1",
-                inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
+                inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
                 predicate=RegularPredicate(
                     ColumnRef("c", "contracts", "ends"), "is not null"
                 ),
@@ -847,7 +847,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
             ),
             AiFilter(
                 node_id="ai_filter:c",
-                inputs=input_ports((PortRef("filter:c:1", "ids:c"),)),
+                inputs=input_ports((PortRef("filter:c:1", "rows:c"),)),
                 alias="c",
                 arena_writes=True,
                 question_token_ids=tuple(question),
@@ -859,7 +859,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
                 expected_rows=2.0,
             ),
         ),
-        PortRef("ai_filter:c", "ids:c"),
+        PortRef("ai_filter:c", "rows:c"),
     )
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
             ] == ["ai-extract:ends", "filter:c:1", "ai_filter:c"]
@@ -883,12 +883,12 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
     report = execute_single_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
     outputs = report["_outputs"]
-    assert outputs[PortRef("ai-extract:ends", "rows")].to_pydict()["ends"] == [
+    assert outputs[PortRef("ai-extract:ends", "rows:c")].to_pydict()["ends"] == [
         "March 3, 2027", "five years", None]
     # the test drops the third document; the filter asks the other two
     # and keeps the first
-    assert outputs[PortRef("filter:c:1", "ids:c")].column("c").to_pylist() == [0, 1]
-    assert outputs[PortRef("ai_filter:c", "ids:c")].column("c").to_pylist() == [0]
+    assert outputs[PortRef("filter:c:1", "rows:c")].column("c").to_pylist() == [0, 1]
+    assert outputs[PortRef("ai_filter:c", "rows:c")].column("c").to_pylist() == [0]
     assert dict(model.reads) == {("c", 0): 1, ("c", 1): 1, ("c", 2): 1}
     # the filter's question was fed right after the document, in place
     # of the extraction's cue and answer
@@ -920,14 +920,14 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
     graph = PhysicalGraph((
         Scan(node_id="input:c", alias="c", input_id="c"),
         AiExtract(node_id="ai-extract:ends",
-                  inputs=input_ports((PortRef("input:c", "ids:c"),)),
+                  inputs=input_ports((PortRef("input:c", "rows:c"),)),
                   backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         Filter(node_id="filter:c:0",
-               inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
+               inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
                predicate=RegularPredicate(
                    ColumnRef("c", "contracts", "ends"), "is not null"),
                aliases=("c",), written_position=0),
-    ), PortRef("filter:c:0", "rows"))
+    ), PortRef("filter:c:0", "rows:c"))
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
@@ -948,7 +948,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
     report = execute_single_graph(
         state, {"filter_limit": 1, "retention": {}}, graph)
     outputs = report["_outputs"]
-    kept = outputs[PortRef("filter:c:0", "rows")].to_pydict()
+    kept = outputs[PortRef("filter:c:0", "rows:c")].to_pydict()
     # the documents in flight when the first passed finish; the
     # queued ones are never read
     assert kept["c"][0] == 0 and kept["ends"][0] == "March 3, 2027"

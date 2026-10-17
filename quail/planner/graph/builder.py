@@ -39,7 +39,6 @@ from quail.planner.operators.classify import (
 from quail.planner.operators.extract import emit_extract
 from quail.planner.operators.filter import emit_filter
 from quail.planner.operators.join import emit_join
-from quail.planner.operators.ports import Ports
 from quail.planner.operators.score import (
     ScoreLowering,
     emit_projected_scores,
@@ -189,17 +188,17 @@ class GraphBuilder:
         output of the operator before it.
         """
         self._prepare()
-        ports_by_alias = self._emit_scans()
+        port_by_alias = self._emit_scans()
         try:
-            ports_by_alias, row_ports = self._emit_documents(ports_by_alias)
-            ports_by_alias, joins = self._emit_joins(ports_by_alias)
-            row_ports += self._emit_join_answers(ports_by_alias, joins)
-            score_pairs = self._emit_pair_scores(ports_by_alias, joins)
+            port_by_alias, row_ports = self._emit_documents(port_by_alias)
+            port_by_alias, joins = self._emit_joins(port_by_alias)
+            row_ports += self._emit_join_answers(port_by_alias, joins)
+            score_pairs = self._emit_pair_scores(port_by_alias, joins)
         except ClassifyRefusedError as refused:
             return refused.refusal()
         except ScoreRefusedError as refused:
             return refused.refusal
-        self._emit_result(ports_by_alias, row_ports, joins, score_pairs)
+        self._emit_result(port_by_alias, row_ports, joins, score_pairs)
         return self._finish()
 
     def _prepare(self):
@@ -237,7 +236,7 @@ class GraphBuilder:
     def _emit_scans(self) -> dict:
         """Create the scans and equality joins; return where each table starts."""
         stats = self.operator_order.statistics.stats
-        ports_by_alias = {}
+        port_by_alias = {}
         for s in self.operators.scans:
             summary = summarize_alias(
                 self.document_tokens[s.alias], self.model.sliding_window,
@@ -256,11 +255,11 @@ class GraphBuilder:
                 predicates=regular_predicates(s),
                 expected_rows=(float(stats[s.alias].num_documents)
                                if s.predicates else None)))
-            ports_by_alias[s.alias] = Ports(PortRef(scan_id, f"ids:{s.alias}"))
+            port_by_alias[s.alias] = PortRef(scan_id, f"rows:{s.alias}")
         # the hash join reads the scans; survivors thin its pairs at the AI join
         self.pairs_src = {}
         for node in hash_join_nodes(self.operators.joins, self.pair_fractions,
-                                    [ports.ids for ports in ports_by_alias.values()]):
+                                    list(port_by_alias.values())):
             self.nodes.append(node)
             self.pairs_src[node.written_position] = node
 
@@ -270,13 +269,13 @@ class GraphBuilder:
         self.pipelined = self.streamed | {
             alias for alias in self.ask_filters
             if self.gpus == 1 and alias in between}
-        return ports_by_alias
+        return port_by_alias
 
-    def _emit_documents(self, ports_by_alias: dict) -> tuple:
+    def _emit_documents(self, port_by_alias: dict) -> tuple:
         """Create the inference nodes over each table before its joins."""
         stats = self.operator_order.statistics.stats
         row_ports = []
-        ports_by_alias = dict(ports_by_alias)
+        port_by_alias = dict(port_by_alias)
         for s in self.operators.scans:
             # a classification or extraction the planner lifted
             # above the joins is emitted after them
@@ -285,16 +284,16 @@ class GraphBuilder:
                 kinds.add(CLASSIFY)
             if s.alias not in self.extract_after:
                 kinds.add(EXTRACT)
-            ports_by_alias[s.alias], rows = self._emit_steps(
+            port_by_alias[s.alias], rows = self._emit_steps(
                 s.alias,
                 float(stats[s.alias].num_documents),
                 kinds,
-                ports_by_alias[s.alias],
+                port_by_alias[s.alias],
             )
             row_ports += rows
-        return ports_by_alias, row_ports
+        return port_by_alias, row_ports
 
-    def _emit_steps(self, alias, expected_rows, kinds, ports) -> tuple:
+    def _emit_steps(self, alias, expected_rows, kinds, port) -> tuple:
         """Emit the given kinds of a table's steps in run order.
 
         Consecutive steps of one kind are emitted together, each run
@@ -304,7 +303,7 @@ class GraphBuilder:
             alias: The table.
             expected_rows: The documents the first step reads.
             kinds: The step kinds to emit: ASK, CLASSIFY, EXTRACT.
-            ports: Where the documents stand before the steps.
+            port: The port the documents stand at before the steps.
 
         Returns:
             Where the documents stand after the steps, and the rows
@@ -313,7 +312,7 @@ class GraphBuilder:
         steps = [step for step in self.operator_order.step_orders.get(alias, ())
                  if step.kind in kinds]
         if ASK in kinds and not any(step.kind == ASK for step in steps):
-            ports = self.emit_applies(alias, ports)
+            port = self.emit_applies(alias, port)
         row_ports = []
         # the scores SELECT returns follow the score predicates, before
         # the classifications and extractions read the rows
@@ -324,30 +323,30 @@ class GraphBuilder:
             positions = [step.key for step in run]
             resident = previous is not None and resident_after(previous, run[0])
             if kind != ASK and scores_pending:
-                ports = emit_projected_scores(self, alias, expected_rows, ports)
+                port = emit_projected_scores(self, alias, expected_rows, port)
                 scores_pending = False
             if kind == ASK and self.scoring is not None:
-                ports = emit_scores(self, alias, positions, expected_rows, ports)
+                port = emit_scores(self, alias, positions, expected_rows, port)
             elif kind == ASK:
-                ports = emit_filter(self, alias, positions, expected_rows, ports,
+                port = emit_filter(self, alias, positions, expected_rows, port,
                                        followed=run[-1] is not steps[-1])
             elif kind == CLASSIFY:
-                ports, rows = emit_classify(
-                    self, alias, expected_rows, positions, ports
+                port, rows = emit_classify(
+                    self, alias, expected_rows, positions, port
                 )
                 row_ports += rows
             else:
-                ports, rows = emit_extract(self, alias, expected_rows, positions, ports,
+                port, rows = emit_extract(self, alias, expected_rows, positions, port,
                                            resident=resident)
                 row_ports += rows
             for step in run:
                 expected_rows *= step.selectivity
             previous = run[-1]
         if scores_pending:
-            ports = emit_projected_scores(self, alias, expected_rows, ports)
-        return ports, row_ports
+            port = emit_projected_scores(self, alias, expected_rows, port)
+        return port, row_ports
 
-    def _emit_joins(self, ports_by_alias: dict) -> tuple:
+    def _emit_joins(self, port_by_alias: dict) -> tuple:
         """Create the joins and the exchanges between anchor groups.
 
         Returns:
@@ -359,14 +358,14 @@ class GraphBuilder:
         steps = iter(self.operator_order.join_steps)
         groups = [[(spec, next(steps)) for spec, _ in group]
                   for group in self.sequence_groups]
-        ports_by_alias = dict(ports_by_alias)
+        port_by_alias = dict(port_by_alias)
         joins = JoinPorts()
         exec_index = 0
         for g, group in enumerate(groups):
             anchor = self.sequence_groups[g][0][1]
             if group[0][0].cost is not None:
                 joins.score_pairs = emit_score_joins(
-                    self, group, ports_by_alias, joins.score_pairs)
+                    self, group, port_by_alias, joins.score_pairs)
                 continue
             if g > 0:
                 ahead = [scan.alias for scan in self.operators.scans]
@@ -374,38 +373,38 @@ class GraphBuilder:
                 self.nodes.append(Barrier(
                     node_id=barrier_id,
                     inputs=input_ports(tuple(joins.answers)
-                                       + tuple(ports_by_alias[a].ids for a in ahead)),
+                                       + tuple(port_by_alias[a] for a in ahead)),
                     next_anchor=anchor,
                     aliases=tuple(ahead)))
                 for a in ahead:
-                    ports_by_alias[a] = Ports(PortRef(barrier_id, f"ids:{a}"))
+                    port_by_alias[a] = PortRef(barrier_id, f"rows:{a}")
             if self.gpus > 1:
                 # anchors go to the GPU holding their KV, else balanced
                 exchange_id = self.unique_id("exchange", anchor)
                 self.nodes.append(
                     Exchange(
                         node_id=exchange_id,
-                        inputs=input_ports((ports_by_alias[anchor].ids,)),
+                        inputs=input_ports((port_by_alias[anchor],)),
                         anchor=anchor,
                     )
                 )
-                ports_by_alias[anchor] = Ports(PortRef(exchange_id, f"ids:{anchor}"))
+                port_by_alias[anchor] = PortRef(exchange_id, f"rows:{anchor}")
             group_id = self.group_ids[g]
             for rank, (spec, step) in enumerate(group):
                 join_id = (group_id if rank == 0
                            else f"{group_id}:predicate:{spec.written_position}")
                 joins.node_ids[spec.written_position] = join_id
-                ports_by_alias[anchor], answers = emit_join(
-                    self, spec, step, anchor, join_id, exec_index, ports_by_alias)
+                port_by_alias[anchor], answers = emit_join(
+                    self, spec, step, anchor, join_id, exec_index, port_by_alias)
                 if answers is not None:
                     joins.answers.append(answers)
                     for a in spec.aliases:
                         if a not in joins.aliases:
                             joins.aliases.append(a)
                 exec_index += 1
-        return ports_by_alias, joins
+        return port_by_alias, joins
 
-    def _emit_join_answers(self, ports_by_alias: dict, joins) -> list:
+    def _emit_join_answers(self, port_by_alias: dict, joins) -> list:
         """Create the classifications and extractions that follow the joins.
 
         Returns:
@@ -428,23 +427,23 @@ class GraphBuilder:
                 kinds.add(CLASSIFY)
             if alias in self.extract_after:
                 kinds.add(EXTRACT)
-            ports_by_alias[alias], rows = self._emit_steps(
+            port_by_alias[alias], rows = self._emit_steps(
                 alias, self.operator_order.expected_rows[alias] * min(1.0, met), kinds,
-                ports_by_alias[alias])
+                port_by_alias[alias])
             row_ports += rows
         return row_ports
 
-    def _emit_pair_scores(self, ports_by_alias: dict, joins) -> PortRef | None:
+    def _emit_pair_scores(self, port_by_alias: dict, joins) -> PortRef | None:
         """Create the pair scores SELECT returns; return their rows port."""
         score_pairs = joins.score_pairs
         for expression in self.projected_scores:
             call = expression.expression
             if len(call.aliases()) == 2 and call.prompt not in self.scoring.names:
                 score_pairs = emit_score_pair(self, call.prompt, 0, 1.0, (),
-                                              ports_by_alias)
+                                              port_by_alias)
         return score_pairs
 
-    def _emit_result(self, ports_by_alias, row_ports, joins, score_pairs):
+    def _emit_result(self, port_by_alias, row_ports, joins, score_pairs):
         """Connect result operators to surviving rows and answers."""
         if score_pairs is not None:
             sink_inputs = (score_pairs,)
@@ -459,13 +458,13 @@ class GraphBuilder:
                 node_id="recombine",
                 inputs=input_ports(
                     tuple(joins.answers)
-                    + tuple(ports_by_alias[a].ids for a in joins.aliases)
+                    + tuple(port_by_alias[a] for a in joins.aliases)
                 ),
                 alias_order=tuple(joins.aliases)))
             sink_inputs = (PortRef("recombine", "tuples"),)
         else:
             alias = self.operators.scans[0].alias
-            sink_inputs = (ports_by_alias[alias].source,)
+            sink_inputs = (port_by_alias[alias],)
         columns = []
         for c in self.plan.projection.columns:
             columns.append(c.name if isinstance(c, Alias)
@@ -474,7 +473,7 @@ class GraphBuilder:
                 columns.append(c.name + PROBABILITIES_SUFFIX)
             if isinstance(c, Alias) and c.expression.kind == "extract":
                 columns.append(c.name + SPAN_SUFFIX)
-        score_ports = tuple(PortRef(node.node_id, "rows") for node in self.nodes
+        score_ports = tuple(PortRef(node.node_id, node.rows_port) for node in self.nodes
                             if isinstance(node, AiScore)
                             and any(node.spec.name == item.name
                                     for item in self.projected_scores))
@@ -533,19 +532,19 @@ class GraphBuilder:
         self.seen_ids[key] = self.seen_ids.get(key, 0) + 1
         return key if self.seen_ids[key] == 1 else f"{key}:{self.seen_ids[key]}"
 
-    def emit_applies(self, alias, ports) -> Ports:
-        """Append the alias's apply() functions; return where its documents stand."""
+    def emit_applies(self, alias, port) -> PortRef:
+        """Append the alias's apply() functions; return the port its rows leave on."""
         for apply in self.alias_applies.get(alias, ()):
             apply_id = f"apply:{apply.function}"
             self.nodes.append(Foreign(
                 node_id=apply_id,
-                inputs=input_ports((ports.ids,)),
+                inputs=input_ports((port,)),
                 function=apply.function, kind=apply.kind, ids=apply.ids,
                 columns=tuple((ref.alias, ref.column)
                               for ref in apply.columns),
                 aliases=(alias,)))
-            ports = Ports(PortRef(apply_id, f"ids:{alias}"))
-        return ports
+            port = PortRef(apply_id, f"rows:{alias}")
+        return port
 
 
 @dataclass

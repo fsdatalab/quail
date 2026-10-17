@@ -103,16 +103,12 @@ class AiClassify(AiInference):
 
     answer_kind: ClassVar[str] = "classifies"
     spec_type: ClassVar[type[InferenceSpec]] = ClassifySpec
-    document_ids: ClassVar[bool] = True
     type_name: ClassVar[str] = "quail.ai_classify"
     runtime_key: ClassVar[str] = type_name
 
     @property
     def document_aliases(self) -> tuple[str, ...]:
         return () if self.spec is None else (self.spec.anchor,)
-
-    def document_outputs(self, alias: str) -> tuple[str, ...]:
-        return ("rows", f"ids:{alias}")
 
     def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
         if isinstance(previous, AiJoin):

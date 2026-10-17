@@ -118,7 +118,6 @@ class AiExtract(AiInference):
 
     answer_kind: ClassVar[str] = "extracts"
     spec_type: ClassVar[type[InferenceSpec]] = ExtractSpec
-    document_ids: ClassVar[bool] = True
     type_name: ClassVar[str] = "quail.ai_extract"
     runtime_key: ClassVar[str] = type_name
 
@@ -127,9 +126,6 @@ class AiExtract(AiInference):
     @property
     def document_aliases(self) -> tuple[str, ...]:
         return () if self.spec is None else (self.spec.alias,)
-
-    def document_outputs(self, alias: str) -> tuple[str, ...]:
-        return ("rows", f"ids:{alias}")
 
     def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
         # an extraction continues any pipeline that shows the documents

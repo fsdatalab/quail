@@ -3,6 +3,7 @@
 import pyarrow as pa
 from pyarrow import compute as pc
 
+from quail.execution.ids import document_ids
 from quail.execution.result import true_answer_rows
 from quail.execution.rows import Rows, as_table
 from quail.physical import AiJoin, Barrier, PortRef, ValueType
@@ -135,19 +136,13 @@ def collect_answers(logical, plan, outputs, documents):
 
     for node in plan.graph.topological_nodes():
         for output in node.outputs:
-            if output.value_type is not ValueType.DOCUMENT_IDS:
+            if not output.name.startswith("rows:"):
                 continue
             ref = PortRef(node.node_id, output.name)
             if ref not in outputs:
                 continue
-            table = outputs[ref]
-            if len(table.column_names) != 1:
-                raise ValueError(
-                    "a document id relation needs one alias column"
-                )
-            alias = table.column_names[0]
-            survivors[alias] = (
-                table.column(alias).combine_chunks().cast(pa.int32()))
+            alias = output.name.split(":", 1)[1]
+            survivors[alias] = document_ids(as_table(outputs[ref]).column(alias))
 
     for alias, relations in filter_relations.items():
         table = relations[0] if len(relations) == 1 else \

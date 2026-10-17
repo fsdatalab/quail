@@ -51,7 +51,7 @@ class Scan(PhysicalNode):
 
     @property
     def outputs(self):
-        return (OutputPort(f"ids:{self.alias}", ValueType.DOCUMENT_IDS,
+        return (OutputPort(f"rows:{self.alias}", ValueType.ROWS,
                            schema=(self.alias,)),)
 ```
 
@@ -67,7 +67,7 @@ from quail.execution.metrics import NodeResult
 class ScanRuntime:
     def execute(self, node, inputs, context):
         value = context.sources[node.input_id]
-        return NodeResult({f"ids:{node.alias}": value})
+        return NodeResult({f"rows:{node.alias}": value})
 ```
 
 For your operator:

@@ -20,7 +20,7 @@ class ApplyGate(SingleResultPart):
         node = nodes[0]
         values = {}
         for port in node.inputs:
-            if not port.source.port.startswith("ids:"):
+            if not port.source.port.startswith("rows:"):
                 continue
             port_alias = port.source.port.split(":", 1)[1]
             values[port_alias] = (

@@ -455,7 +455,7 @@ def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
         "aliases": ["d"], "rows": [0, 1], "scores": [0.1, 0.2]}
     assert [(entry["rows"], entry["scores"]) for entry in streamed[1:]] == [
         ([0], [0.1]), ([1], [0.2])]
-    assert result.outputs["rows"].ids["d"].to_pylist() == [0, 1]
+    assert result.outputs["rows:d"].ids["d"].to_pylist() == [0, 1]
 
     rows = ScoreRows((np.arange(100_000), np.arange(100_000)), product=True)
     assert len(rows) == 10_000_000_000
@@ -656,10 +656,10 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
                            input_id=alias) for alias in aliases)
         score = AiScore(
             node_id="score", backend_name="quail", model="qwen3-4b-fp8",
-            inputs=input_ports(tuple(PortRef(f"input:{alias}", f"ids:{alias}")
+            inputs=input_ports(tuple(PortRef(f"input:{alias}", f"rows:{alias}")
                                      for alias in aliases)),
             spec=spec)
-        return PhysicalGraph(nodes + (score,), PortRef("score", "rows"))
+        return PhysicalGraph(nodes + (score,), PortRef("score", score.rows_port))
 
     def scored(rewritten):
         return next(node for node in rewritten.nodes

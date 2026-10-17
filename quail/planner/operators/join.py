@@ -9,7 +9,6 @@ from quail.logical.prompts import prompt_aliases
 from quail.physical import AiJoin, Foreign, PortRef
 from quail.physical.base import input_ports
 from quail.planner.operators.common import question_tokens
-from quail.planner.operators.ports import Ports
 from quail.planner.operators.score import ScoreJoinCost, score_statistics
 from quail.planner.prompt_lowering import LoweredPrompt
 
@@ -69,7 +68,7 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
 
 
 def emit_join(
-    builder, spec, step, anchor, join_id, exec_index, ports_by_alias
+    builder, spec, step, anchor, join_id, exec_index, port_by_alias
 ) -> tuple:
     """Append one AI join stage and the functions that supply its pairs.
 
@@ -80,7 +79,7 @@ def emit_join(
         anchor: The anchor alias.
         join_id: The AiJoin node id.
         exec_index: The join's position in execution order.
-        ports_by_alias: alias -> the ports its documents stand at.
+        port_by_alias: alias -> the port its documents stand at.
 
     Returns:
         The anchor's ports after the join, and the port of the pairs a
@@ -100,7 +99,7 @@ def emit_join(
         builder.nodes.append(Foreign(
             node_id=apply_id,
             inputs=input_ports(tuple(
-                ports_by_alias[a].ids for a in apply.aliases)),
+                port_by_alias[a] for a in apply.aliases)),
             function=apply.function, kind=apply.kind, ids="pairs",
             columns=tuple((ref.alias, ref.column)
                           for ref in apply.columns),
@@ -111,7 +110,7 @@ def emit_join(
     builder.nodes.append(AiJoin(
         node_id=join_id,
         inputs=input_ports(tuple(
-            ports_by_alias[a].ids for a in [anchor, *partners])
+            port_by_alias[a] for a in [anchor, *partners])
                            + tuple(pair_inputs)),
         written_position=spec.written_position, exec_index=exec_index,
         anchor=anchor, partners=tuple(partners),
@@ -125,6 +124,6 @@ def emit_join(
         anchor_resident=step.resident,
         tuple_tokens=round(step.tokens, 1),
         pairs_from=pairs_from))
-    return (Ports(PortRef(join_id, f"ids:{anchor}")),
+    return (PortRef(join_id, f"rows:{anchor}"),
             PortRef(join_id, f"join_answers:{spec.written_position}")
             if spec.semantics == "full" else None)

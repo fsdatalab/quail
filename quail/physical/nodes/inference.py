@@ -94,7 +94,6 @@ class AiInference(PhysicalNode):
 
     answer_kind: ClassVar[str] = "scores"
     spec_type: ClassVar[type[InferenceSpec]] = InferenceSpec
-    document_ids: ClassVar[bool] = False
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
 
     @property
@@ -113,15 +112,16 @@ class AiInference(PhysicalNode):
             return ()
         columns = (self.spec.output_columns if self.answer_kind == "extracts"
                    else (*self.spec.aliases, self.spec.name))
-        ports = (OutputPort("rows", ValueType.ROWS,
-                            schema=self.spec.output_columns,
-                            answer=AnswerOutput(self.answer_kind, self.spec.name,
-                                                columns)),)
-        if self.document_ids and len(self.spec.aliases) == 1:
-            (alias,) = self.spec.aliases
-            ports += (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
-                                 schema=(alias,)),)
-        return ports
+        return (OutputPort(self.rows_port, ValueType.ROWS,
+                           schema=self.spec.output_columns,
+                           answer=AnswerOutput(self.answer_kind, self.spec.name,
+                                               columns)),)
+
+    @property
+    def rows_port(self) -> str:
+        """The output carrying the rows: per alias for one table, rows for pairs."""
+        aliases = () if self.spec is None else self.spec.aliases
+        return f"rows:{aliases[0]}" if len(aliases) == 1 else "rows"
 
     def attributes(self) -> dict:
         return {

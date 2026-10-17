@@ -97,7 +97,7 @@ def plan_request_backend(
             expected_rows=float(summary.num_documents) if scan.predicates else None,
         )
         nodes.append(node)
-        input_refs.append(PortRef(node.node_id, f"ids:{scan.alias}"))
+        input_refs.append(PortRef(node.node_id, f"rows:{scan.alias}"))
 
     for node in hash_join_nodes(joins, context.pair_fractions, input_refs):
         nodes.append(node)
@@ -325,7 +325,7 @@ def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
             PortRef(request_node.node_id, f"join_answers:{spec.written_position}")
             for spec in full_joins
         ) + tuple(
-            PortRef(request_node.node_id, f"ids:{alias}")
+            PortRef(request_node.node_id, f"rows:{alias}")
             for alias in result_aliases
         )
         nodes.append(Recombine(
@@ -335,7 +335,7 @@ def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
         ))
         sink_input = PortRef("recombine", "tuples")
     else:
-        sink_input = PortRef(request_node.node_id, f"ids:{aliases[0]}")
+        sink_input = PortRef(request_node.node_id, f"rows:{aliases[0]}")
 
     label_ports = tuple(
         PortRef(request_node.node_id, f"label_answers:{name}")

@@ -23,7 +23,7 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
 
     alias = first.document_aliases[0]
     anchor_port = next((port.name for port in first.inputs
-                        if port.source.port == f"ids:{alias}"), None)
+                        if port.source.port == f"rows:{alias}"), None)
     source = (inputs[first.node_id][anchor_port] if anchor_port is not None
               else next(iter(inputs[first.node_id].values())))
     ids = id_positions(source.ids[alias] if isinstance(source, Rows) else source)

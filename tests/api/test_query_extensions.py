@@ -61,7 +61,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
         ]
         filter_node = next(node for node in graph.nodes if isinstance(node, AiFilter))
         run = RunResult(None, {filter_node.node_id: NodeResult({
-            "ids:d": [0],
+            "rows:d": [0],
             "filter_answers:d": {0: [True], 1: [False]},
         })}, NodeMetrics())
         return PhysicalResponse(

@@ -26,8 +26,9 @@ from quail.catalog.tokens import (
     concat_tokens,
     select_documents,
 )
-from quail.execution.ids import document_ids, id_positions
+from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.rows import Rows
 from quail.execution.runner import ExecutionContext
 from quail.progress import answer_sink
 
@@ -145,7 +146,7 @@ class JoinPart(ExecutionPart):
             if member.semantics == "anti":
                 candidates = np.asarray(
                     anchor_ids if j == 0 else id_positions(results[
-                        nodes[j - 1].node_id].outputs[f"ids:{node.anchor}"]),
+                        nodes[j - 1].node_id].outputs[f"rows:{node.anchor}"]),
                     dtype=np.int64)
                 survivors = candidates[~np.isin(candidates, matched)]
             answer = {
@@ -161,7 +162,7 @@ class JoinPart(ExecutionPart):
             }
             own_spans = stage_spans(spans, offset + j, offset + j + 1)
             results[member.node_id] = NodeResult(
-                outputs={f"ids:{member.anchor}": document_ids(survivors),
+                outputs={f"rows:{member.anchor}": Rows({member.anchor: survivors}),
                          f"join_answers:{member.written_position}": answer},
                 metrics=NodeMetrics(
                     input_rows=len(anchor_ids) if j == 0 else len(reached_ids),
@@ -351,7 +352,7 @@ def prepare_join_inputs(node, inputs, context: ExecutionContext, upstream=None,
         if port.startswith("pairs:"):
             port_pairs[int(port.split(":", 1)[1])] = value
             continue
-        if not port.startswith("ids:"):
+        if not port.startswith("rows:"):
             continue
         # the suffix and partner builders index these as Python ints
         by_alias[port.split(":", 1)[1]] = id_positions(value).tolist()

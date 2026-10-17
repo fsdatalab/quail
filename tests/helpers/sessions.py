@@ -54,7 +54,7 @@ def make_executor(filter_truth, join_truth=None):
                             (position, len(row) - 1, bool(row[-1]))
                             for position, row in enumerate(rows.values())])
                     return NodeResult({
-                        f"ids:{node.alias}": survivors,
+                        f"rows:{node.alias}": survivors,
                         f"filter_answers:{node.alias}": rows,
                     }, NodeMetrics(input_rows=len(rows),
                                    output_rows=len(survivors),
@@ -75,7 +75,7 @@ def make_executor(filter_truth, join_truth=None):
                     "written_position": node.written_position,
                 }
                 passing = {anchors[i] for i, row in rows.items() if any(row)}
-                outputs[f"ids:{node.anchor}"] = [a for a in anchors
+                outputs[f"rows:{node.anchor}"] = [a for a in anchors
                     if (a not in passing if node.semantics == "anti"
                         else a in passing)]
                 # the real loop reports each anchor's last-stage row as
@@ -85,7 +85,7 @@ def make_executor(filter_truth, join_truth=None):
                         inputs["anchor_done"](i, row)
                 return NodeResult(outputs, NodeMetrics(
                     input_rows=len(anchors),
-                    output_rows=len(outputs[f"ids:{node.anchor}"]),
+                    output_rows=len(outputs[f"rows:{node.anchor}"]),
                     evaluated_document_pairs=sum(
                         len(row) for row in rows.values())))
 

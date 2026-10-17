@@ -161,15 +161,15 @@ def test_filter_and_join_answers_and_suffix_major_fallback():
         filtered = execution.execute(FILTER_NODE, {})
         assert filtered.outputs["filter_answers:d"].to_pydict() == {
             "d": [0, 1], "predicate": [0, 0], "answer": [True, False]}, model.name
-        assert filtered.outputs["ids:d"].to_pylist() == [0], model.name
+        assert filtered.outputs["rows:d"].ids["d"].to_pylist() == [0], model.name
         assert filtered.metrics.evaluated_documents == 2, model.name
 
         joined = execution.execute(_join_node(), {})
         assert joined.outputs["join_answers:0"].to_pydict() == {
             "r": [0, 0, 1, 1], "p": [0, 1, 0, 1],
             "answer": [True, True, False, False]}, model.name
-        assert joined.outputs["ids:r"].to_pylist() == [0], model.name
-        assert joined.outputs["ids:p"].to_pylist() == [0, 1], model.name
+        assert joined.outputs["rows:r"].ids["r"].to_pylist() == [0], model.name
+        assert joined.outputs["rows:p"].ids["p"].to_pylist() == [0, 1], model.name
         assert joined.metrics.evaluated_document_pairs == 4, model.name
 
     class RecordingClient(_Client):
@@ -354,7 +354,7 @@ def test_request_backends_classify_with_one_decode_request_per_document():
     result = execution.execute(node, {})
     assert result.outputs["label_answers:kind"].to_pydict() == {
         "d": [0, 1], "kind": ["a", "b"]}
-    assert result.outputs["ids:d"].to_pylist() == [1]
+    assert result.outputs["rows:d"].ids["d"].to_pylist() == [1]
     assert result.outputs["label_in_answers:kind"].to_pydict() == {
         "d": [0, 1], "predicate": [0, 0], "answer": [False, True]}
     assert result.metrics.extension["requests"] == 2
@@ -381,7 +381,7 @@ def test_request_backends_classify_with_one_decode_request_per_document():
     assert not request_node.filters
     project = next(node for node in plan.nodes if isinstance(node, Project))
     assert [port.source.port for port in project.inputs] == [
-        "ids:d", "label_answers:kind"]
+        "rows:d", "label_answers:kind"]
     assert project.columns == ("d.id", "kind")
     session.close()
 
@@ -421,7 +421,7 @@ def test_request_backends_decode_one_request_per_row_the_join_keeps():
     assert client.prompts == [(3, 10, 70, 71, 20, 90), (3, 10, 70, 71, 21, 90)]
     assert result.outputs["label_answers:kind"].to_pydict() == {
         "r": [0, 0], "p": [0, 1], "kind": ["a", "b"]}
-    assert result.outputs["ids:r"].to_pylist() == [0]
+    assert result.outputs["rows:r"].ids["r"].to_pylist() == [0]
     join_step, classify_step = result.metrics.extension["steps"]
     assert join_step["kind"] == "join"
     assert (classify_step["alias"], classify_step["partner"]) == ("r", "p")

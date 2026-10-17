@@ -32,8 +32,8 @@ class Exchange(PhysicalNode):
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         return (OutputPort(
-            f"ids:{self.anchor}",
-            ValueType.DOCUMENT_IDS,
+            f"rows:{self.anchor}",
+            ValueType.ROWS,
             schema=(self.anchor,),
         ),)
 

@@ -28,8 +28,8 @@ class Barrier(PhysicalNode):
     def outputs(self) -> tuple[OutputPort, ...]:
         return tuple(
             OutputPort(
-                f"ids:{alias}",
-                ValueType.DOCUMENT_IDS,
+                f"rows:{alias}",
+                ValueType.ROWS,
                 schema=(alias,),
             )
             for alias in self.aliases
@@ -89,7 +89,7 @@ class AiJoin(PhysicalNode):
         return (self.anchor,)
 
     def document_outputs(self, alias: str) -> tuple[str, ...]:
-        return (f"join_answers:{self.written_position}", f"ids:{alias}")
+        return (f"join_answers:{self.written_position}", f"rows:{alias}")
 
     def can_precede(self, consumer: PhysicalNode) -> bool:
         # classify.py imports AiJoin, so AiClassify is imported at call time
@@ -103,8 +103,8 @@ class AiJoin(PhysicalNode):
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         outputs = [OutputPort(
-            f"ids:{self.anchor}",
-            ValueType.DOCUMENT_IDS,
+            f"rows:{self.anchor}",
+            ValueType.ROWS,
             schema=(self.anchor,),
         )]
         outputs.append(OutputPort(
@@ -215,7 +215,7 @@ class Foreign(PhysicalNode):
                 f"pairs:{self.written_position}", ValueType.PAIRS,
                 schema=tuple(self.aliases)),)
         (alias,) = self.aliases
-        return (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
+        return (OutputPort(f"rows:{alias}", ValueType.ROWS,
                            schema=(alias,)),)
 
     def attributes(self) -> dict:

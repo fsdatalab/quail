@@ -18,7 +18,6 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.planner.operators.common import bind_inference, inference_node
-from quail.planner.operators.ports import Ports
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import score_token_parts
 from quail.planner.statistics.memory import arena_capacity
@@ -126,7 +125,7 @@ class ScoreLowering:
         self.nodes.append(node)
         self.names[prompt] = name
         self.work += work
-        return PortRef(node.node_id, "rows")
+        return PortRef(node.node_id, node.rows_port)
 
     def comparison(self, predicate, source, aliases, position) -> PortRef:
         alias = aliases[0] if len(aliases) == 1 else "join"
@@ -141,10 +140,10 @@ class ScoreLowering:
             aliases=tuple(aliases), selectivity=predicate.selectivity,
             written_position=position)
         self.nodes.append(node)
-        return PortRef(node.node_id, "rows")
+        return PortRef(node.node_id, node.rows_port)
 
 
-def emit_scores(builder, alias, positions, expected_rows, ports) -> Ports:
+def emit_scores(builder, alias, positions, expected_rows, port) -> PortRef:
     """Append a run of the alias's score predicates in their chosen order.
 
     Args:
@@ -152,7 +151,7 @@ def emit_scores(builder, alias, positions, expected_rows, ports) -> Ports:
         alias: The table.
         positions: The written positions to emit, in run order.
         expected_rows: The documents the run reads.
-        ports: Where the documents stand before the run.
+        port: The port the documents stand at before the run.
 
     Returns:
         Where the documents stand after the run: the last comparison's
@@ -161,18 +160,17 @@ def emit_scores(builder, alias, positions, expected_rows, ports) -> Ports:
     stats = builder.operator_order.statistics.stats
     for position in positions:
         predicate = builder.operators.filters[alias][position]
-        source = ports.source
+        source = port
         if predicate.prompt not in builder.scoring.names:
             source = builder.scoring.score(
                 predicate.prompt, f"__score_{alias}_{position}", (source,),
                 expected_rows, stats[alias].mean_document_tokens)
-        rows = builder.scoring.comparison(predicate, source, (alias,), position)
-        ports = Ports(PortRef(rows.node_id, f"ids:{alias}"), rows)
+        port = builder.scoring.comparison(predicate, source, (alias,), position)
         expected_rows *= effective_selectivity(predicate.selectivity)
-    return ports
+    return port
 
 
-def emit_projected_scores(builder, alias, expected_rows, ports) -> Ports:
+def emit_projected_scores(builder, alias, expected_rows, port) -> PortRef:
     """Append the alias's scores returned in SELECT, over the live documents.
 
     A score keeps every document it reads, so the documents' ids stay
@@ -183,24 +181,23 @@ def emit_projected_scores(builder, alias, expected_rows, ports) -> Ports:
         call = expression.expression
         if call.aliases() != (alias,) or call.prompt in builder.scoring.names:
             continue
-        rows = builder.scoring.score(
-            call.prompt, expression.name, (ports.source,), expected_rows,
+        port = builder.scoring.score(
+            call.prompt, expression.name, (port,), expected_rows,
             stats[alias].mean_document_tokens)
-        ports = Ports(ports.ids, rows)
-    return ports
+    return port
 
 
 def emit_score_pair(builder, prompt, position, pair_fraction, pair_inputs,
-                    ports_by_alias) -> PortRef:
+                    port_by_alias) -> PortRef:
     """Append the score of one pair prompt and return its rows port.
 
     Args:
         builder: The graph builder.
         prompt: The pair prompt.
         position: The join's written position.
-        pair_fraction: The pair_fraction of the cross product the pairs keep.
+        pair_fraction: The fraction of the cross product the pairs keep.
         pair_inputs: The ports supplying the pairs, if any.
-        ports_by_alias: alias -> where its documents stand.
+        port_by_alias: alias -> the port its documents stand at.
     """
     stats = builder.operator_order.statistics.stats
     aliases = tuple(dict.fromkeys(ref.alias for ref in prompt.args))
@@ -209,18 +206,18 @@ def emit_score_pair(builder, prompt, position, pair_fraction, pair_inputs,
     )
     return builder.scoring.score(
         prompt, f"__score_join_{position}",
-        tuple(ports_by_alias[a].source for a in aliases) + pair_inputs,
+        tuple(port_by_alias[a] for a in aliases) + pair_inputs,
         expected, sum(stats[a].mean_document_tokens for a in aliases),
         pair_fraction=pair_fraction, prefix_groups=prefixes)
 
 
-def emit_score_joins(builder, group, ports_by_alias, score_pairs) -> PortRef:
+def emit_score_joins(builder, group, port_by_alias, score_pairs) -> PortRef:
     """Append the scores and comparisons of one group of score joins.
 
     Args:
         builder: The graph builder.
         group: The group's (PricedJoin, step) pairs.
-        ports_by_alias: alias -> where its documents stand.
+        port_by_alias: alias -> the port its documents stand at.
         score_pairs: The rows of the pairs scored so far, or None.
 
     Returns:
@@ -236,7 +233,7 @@ def emit_score_joins(builder, group, ports_by_alias, score_pairs) -> PortRef:
         if score_pairs is None:
             score_pairs = emit_score_pair(
                 builder, join.prompt, position, spec.pair_fraction, pair_inputs,
-                ports_by_alias)
+                port_by_alias)
         score_pairs = builder.scoring.comparison(
             join, score_pairs, spec.aliases, position)
     return score_pairs

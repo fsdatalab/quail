@@ -56,8 +56,8 @@ class Scan(PhysicalNode):
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         return (OutputPort(
-            f"ids:{self.alias}",
-            ValueType.DOCUMENT_IDS,
+            f"rows:{self.alias}",
+            ValueType.ROWS,
             schema=(self.alias,),
         ),)
 

@@ -13,9 +13,8 @@ import pyarrow.compute as pc
 
 from quail.catalog.pairs import COLUMNS_PREFIX
 from quail.catalog.tokens import decode_token_documents
-from quail.execution.ids import document_ids
 from quail.execution.result import filter_answer_table
-from quail.execution.rows import Rows
+from quail.execution.rows import Rows, rows_of
 from quail.physical import (
     AiFilter,
     OutputPort,
@@ -115,17 +114,6 @@ class PhysicalResponse:
                 from error
 
 
-def _document_ids_table(port: OutputPort, value: Any) -> pa.Table:
-    alias = port.schema[0]
-    schema = pa.schema(
-        [pa.field(alias, pa.int32(), nullable=False)],
-        metadata={
-            b"quail.kind": b"document_ids",
-        },
-    )
-    return pa.Table.from_arrays([document_ids(value)], schema=schema)
-
-
 def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
     """One row per answer a document gave, repeating the document id."""
     lengths = np.fromiter((len(row) for row in value.values()), dtype=np.int64,
@@ -192,8 +180,8 @@ def _output_table(node, port: OutputPort, value: Any) -> pa.Table:
         return value.table()
     if isinstance(value, pa.Table):
         return value
-    if port.value_type is ValueType.DOCUMENT_IDS:
-        return _document_ids_table(port, value)
+    if port.name.startswith("rows:"):
+        return rows_of(value, port.name.split(":", 1)[1]).table()
     if port.value_type is ValueType.FILTER_ANSWERS:
         if not isinstance(node, AiFilter):
             raise TypeError("filter answer output needs a AiFilter node")

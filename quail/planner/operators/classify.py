@@ -23,7 +23,6 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.planner.operators.common import bind_inference, inference_node
-from quail.planner.operators.ports import Ports
 from quail.planner.prompt_lowering import (
     choice_token_parts,
     classify_prompt_tokens,
@@ -333,10 +332,10 @@ class ClassifyBuilder(ClassifyStatistics):
             scoring="", probabilities=call.probabilities,
         ), Work()
 
-    def node(self, spec, input_port, index, *ports) -> AiClassify:
+    def node(self, spec, input_port, index, *port) -> AiClassify:
         """Build the physical node for one classification."""
         return inference_node(
-            AiClassify, spec, (input_port, *ports), index=index,
+            AiClassify, spec, (input_port, *port), index=index,
             backend=self.backend_name, model=self.model.name)
 
     def classify_joined(self, call, name, partner, expected_rows, partner_tokens):
@@ -465,7 +464,7 @@ class ClassifyBuilder(ClassifyStatistics):
             frame_tokens=frame), estimated.work
 
 
-def emit_classify(builder, alias, expected_rows, calls, ports) -> tuple:
+def emit_classify(builder, alias, expected_rows, calls, port) -> tuple:
     """Classify the alias's documents, then keep the accepted labels.
 
     Args:
@@ -473,7 +472,7 @@ def emit_classify(builder, alias, expected_rows, calls, ports) -> tuple:
         alias: The table.
         expected_rows: The documents the classifications read.
         calls: The classifications to emit, in run order.
-        ports: Where the documents stand before the classifications.
+        port: The port the documents stand at before the classifications.
 
     Returns:
         Where the documents stand after them, and the rows ports of
@@ -496,25 +495,21 @@ def emit_classify(builder, alias, expected_rows, calls, ports) -> tuple:
             if builder.scoring is not None:
                 builder.scoring.work += work
             node = table.node(
-                spec, ports.source,
-                sum(isinstance(n, AiClassify) for n in builder.nodes))
+                spec, port, sum(isinstance(n, AiClassify) for n in builder.nodes))
             builder.nodes.append(node)
-            ports = Ports(PortRef(node.node_id, f"ids:{alias}"),
-                                PortRef(node.node_id, "rows"))
+            port = PortRef(node.node_id, node.rows_port)
             if call in builder.operators.labels.projected:
-                row_ports.append(ports.rows)
+                row_ports.append(port)
             classified_calls.add(call)
         if test is not None:
             filter_id = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
-                node_id=filter_id, inputs=input_ports((ports.rows,)),
+                node_id=filter_id, inputs=input_ports((port,)),
                 predicate=test.condition, aliases=(alias,),
                 selectivity=test.selectivity, written_position=test.position))
-            ports = Ports(
-                PortRef(filter_id, f"ids:{alias}"), PortRef(filter_id, "rows")
-            )
+            port = PortRef(filter_id, f"rows:{alias}")
             expected_rows *= effective_selectivity(test.selectivity)
-    return ports, row_ports
+    return port, row_ports
 
 
 def joined_calls(labels: LabelWork) -> list:
@@ -563,5 +558,5 @@ def emit_joined_classify(builder, join_ids) -> list:
             sum(isinstance(n, AiClassify) for n in builder.nodes))
         builder.nodes.append(node)
         if call in builder.operators.labels.projected:
-            row_ports.append(PortRef(node.node_id, "rows"))
+            row_ports.append(PortRef(node.node_id, node.rows_port))
     return row_ports

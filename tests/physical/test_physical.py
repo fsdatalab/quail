@@ -42,7 +42,7 @@ def test_barrier_preserves_survivor_order_and_duplicates():
     from quail.physical.base import input_ports
 
     node = Barrier(node_id="barrier", aliases=("a", "b"), inputs=input_ports((
-        PortRef("scan:a", "ids:a"), PortRef("scan:b", "ids:b"),
+        PortRef("scan:a", "rows:a"), PortRef("scan:b", "rows:b"),
         PortRef("join", "join_answers:0"))))
     for arrow in (False, True):
         for keep in (False, True):
@@ -52,7 +52,8 @@ def test_barrier_preserves_survivor_order_and_duplicates():
             inputs["input:2"] = pa.table({"a": [1, 3, 2, 9], "b": [7, 8, 7, 8],
                                           "answer": [keep, keep, False, keep]})
             outputs = BarrierRuntime().execute(node, inputs, None).outputs
-            values = [outputs[f"ids:{alias}"].to_pylist() for alias in node.aliases]
+            values = [outputs[f"rows:{alias}"].ids[alias].to_pylist()
+                      for alias in node.aliases]
             assert values == ([[3, 1, 3], [8, 7]] if keep else [[], []])
 
 
@@ -67,7 +68,7 @@ class FirstDocuments(PhysicalNode):
 
     @property
     def outputs(self):
-        return (OutputPort(f"ids:{self.alias}", ValueType.DOCUMENT_IDS,
+        return (OutputPort(f"rows:{self.alias}", ValueType.ROWS,
                            schema=(self.alias,)),)
 
     def attributes(self):
@@ -82,13 +83,13 @@ class FirstDocuments(PhysicalNode):
 class FirstDocumentsRuntime:
     def execute(self, node, inputs, context):
         documents = next(iter(inputs.values()))
-        return NodeResult({f"ids:{node.alias}": documents[:node.count]})
+        return NodeResult({f"rows:{node.alias}": documents[:node.count]})
 
 
 def local_plan(context, *, count, estimate, source):
     def ids_from(node_id):
-        return (InputPort("input:0", ValueType.DOCUMENT_IDS,
-                          PortRef(node_id, "ids:d"), schema=("d",)),)
+        return (InputPort("input:0", ValueType.ROWS,
+                          PortRef(node_id, "rows:d"), schema=("d",)),)
 
     scan = Scan(node_id="input:d", alias="d", input_id="d",
                 num_documents=len(context.document_tokens["d"]))
@@ -235,7 +236,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     registry = built_in_registry()
     scan = Scan(node_id="input:d", alias="d", input_id="d", num_documents=1,
                 shard_ranges=((0, 1),), shard_token_loads=(1,))
-    plan = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
+    plan = PhysicalGraph((scan,), PortRef("input:d", "rows:d"))
     encoded = encode_graph(plan, registry.codecs)
     missing = copy.deepcopy(encoded)
     del missing["nodes"][0]["attributes"]["shard_ranges"]
@@ -262,7 +263,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     monkeypatch.setitem(sys.modules, module.__name__, module)
     registry = built_in_registry()
     scan = Scan(node_id="input:d", alias="d", input_id="d", num_documents=2)
-    graph = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
+    graph = PhysicalGraph((scan,), PortRef("input:d", "rows:d"))
     request = PhysicalRequest(
         plan_envelope(backend=ExampleBackend.name, model="qwen3-4b-fp8",
                       device="h100-sxm", gpus=1, graph=graph,
@@ -282,14 +283,14 @@ def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
     source = Scan(node_id="input:d", alias="d", num_documents=100)
     first = FirstDocuments(
         node_id="first", alias="d", count=5,
-        inputs=input_ports((PortRef(source.node_id, "ids:d"),)))
+        inputs=input_ports((PortRef(source.node_id, "rows:d"),)))
     second = FirstDocuments(
         node_id="second", alias="d", count=10,
-        inputs=input_ports((PortRef(source.node_id, "ids:d"),)))
+        inputs=input_ports((PortRef(source.node_id, "rows:d"),)))
     project = Project(
         node_id="project", columns=("d.id",),
-        inputs=input_ports((PortRef(first.node_id, "ids:d"),
-                            PortRef(second.node_id, "ids:d"))))
+        inputs=input_ports((PortRef(first.node_id, "rows:d"),
+                            PortRef(second.node_id, "rows:d"))))
     graph = PhysicalGraph((source, first, second, project),
                           PortRef(project.node_id, "rows"))
     text = physical_tree(graph)
@@ -300,10 +301,10 @@ def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
     assert "count=5" in text and "count=10" in text
     assert "test.first_documents" in text
     assert "input:d" not in text
-    assert "input:d[ids:d]" in physical_tree(graph, verbose=True)
+    assert "input:d[rows:d]" in physical_tree(graph, verbose=True)
 
     node = Scan(node_id="input:d", alias="d", num_documents=100)
-    graph = PhysicalGraph((node,), PortRef(node.node_id, "ids:d"))
+    graph = PhysicalGraph((node,), PortRef(node.node_id, "rows:d"))
     assert "metrics unavailable" in physical_tree(graph, metrics={})
     measured = {node.node_id: NodeMetrics(output_rows=42, wall_s=1.25,
                                          fresh_tokens=200)}

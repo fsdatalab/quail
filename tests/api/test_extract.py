@@ -218,7 +218,7 @@ def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
     assert extracted_above_joins(lifted.logical_plan.root) == {"c"}
     assert lifted.estimated_seconds < written.estimated_seconds
     (join,) = [n for n in written.plan.nodes if isinstance(n, AiJoin)]
-    assert ("ai-extract:0", "ids:c") in [
+    assert ("ai-extract:0", "rows:c") in [
         (port.source.node_id, port.source.port) for port in join.inputs]
     (node,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
     assert node.spec.expected_rows == pytest.approx(2 * 0.2)
@@ -318,7 +318,7 @@ def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
             node.spec.alias, node.spec.name, node.spec.span_name,
             ids, ["March 3, 2027" if i == 0 else None for i in ids],
             [(14, 27) if i == 0 else None for i in ids])
-        return NodeResult({"rows": table, "ids:c": ids})
+        return NodeResult({"rows:c": table})
 
     monkeypatch.setattr(RerankerModelExecution, "execute", mixed)
     query = session.sql(
@@ -409,7 +409,7 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
         "ends_span": [{"start": 14, "end": 27}, None, {"start": 6, "end": 16},
                       None]}
     # an extraction keeps every document
-    assert result.outputs["ids:c"].to_pylist() == [0, 1, 2, 3]
+    assert result.outputs["rows:c"].ids["c"].to_pylist() == [0, 1, 2, 3]
     step, = result.metrics.extension["steps"]
     assert (step["kind"], step["output"], step["num_in"], step["num_out"]) == (
         "extract", "ends", 4, 3)
@@ -547,7 +547,7 @@ def _fake_struct_answers(monkeypatch):
             node.spec.alias, node.spec.name, node.spec.span_name, ids,
             [found[i] for i in ids],
             [spans[node.spec.name] if found[i] else None for i in ids])
-        return NodeResult({"rows": table, "ids:c": ids})
+        return NodeResult({"rows:c": table})
 
     monkeypatch.setattr(RerankerModelExecution, "execute", answer)
 
@@ -645,7 +645,7 @@ def _answers_executor(answers):
                      else locate_span(str(texts[spec.alias][i]), answers[i])
                      for i in ids])
                 return NodeResult(
-                    {"rows": table, f"ids:{spec.alias}": ids},
+                    {f"rows:{spec.alias}": table},
                     NodeMetrics(input_rows=len(ids), output_rows=len(ids),
                                 evaluated_documents=len(ids)))
 
@@ -889,7 +889,7 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
     # the result reads the documents the last step keeps, whatever
     # kind of step it is
     for plan in (usual, selective):
-        assert plan.nodes[-1].inputs[0].source == PortRef("ai_filter:c", "ids:c")
+        assert plan.nodes[-1].inputs[0].source == PortRef("ai_filter:c", "rows:c")
     (extract,) = [n for n in selective.nodes if isinstance(n, AiExtract)]
     (classify,) = [n for n in selective.nodes if isinstance(n, AiClassify)]
     (ask,) = [n for n in selective.nodes if isinstance(n, AiFilter)]

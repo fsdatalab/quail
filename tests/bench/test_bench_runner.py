@@ -148,15 +148,15 @@ def _run(query, join_answers):
         anchored = next(node for node in graph.nodes if isinstance(node, AiJoin))
         join = join_request(anchored)
         return {
-            **{node.node_id: NodeResult({f"ids:{node.alias}": range(
+            **{node.node_id: NodeResult({f"rows:{node.alias}": range(
                 len(request.inputs[node.input_id].documents))})
                for node in graph.nodes if isinstance(node, PhysicalScan)},
             filtered.node_id: NodeResult({
-                "ids:r": [0],
+                "rows:r": [0],
                 "filter_answers:r": {0: [1], 1: [0]},
             }),
             anchored.node_id: NodeResult({
-                "ids:r": [0] if any(join_answers) else [],
+                "rows:r": [0] if any(join_answers) else [],
                 "join_answers:0": {
                     "rows": {0: join_answers},
                     "anchor_index": [0],
@@ -196,8 +196,8 @@ def _run_request_backend(query, join_answers):
             index for index, answer in enumerate(join_answers) if answer
         ]
         return {model.node_id: NodeResult({
-            "ids:r": [0] if true_aspects else [],
-            "ids:a": true_aspects,
+            "rows:r": [0] if true_aspects else [],
+            "rows:a": true_aspects,
             "filter_answers:r": filter_table,
             "join_answers:0": join_table,
         })}
@@ -257,11 +257,11 @@ def test_relational_plans_build_and_run(tmp_path):
                             if isinstance(node, AiFilter))
             answers = {0: [1], 1: [1], 2: [1], 3: [0], 4: [1], 5: [1]}
             return {
-                **{node.node_id: NodeResult({f"ids:{node.alias}": range(
+                **{node.node_id: NodeResult({f"rows:{node.alias}": range(
                     len(request.inputs[node.input_id].documents))})
                    for node in graph.nodes if isinstance(node, PhysicalScan)},
                 filtered.node_id: NodeResult({
-                    "ids:t": [0, 1, 2, 4, 5], "filter_answers:t": answers}),
+                    "rows:t": [0, 1, 2, 4, 5], "filter_answers:t": answers}),
             }
 
         query = build_query(sess, get_query("REL-AGENT-6"))
@@ -284,10 +284,10 @@ def test_a_score_query_reports_every_scored_document_and_its_pieces(tmp_path):
     def nodes(graph, request):
         scored = next(node for node in graph.nodes if isinstance(node, AiScore))
         return {
-            **{node.node_id: NodeResult({f"ids:{node.alias}": range(
+            **{node.node_id: NodeResult({f"rows:{node.alias}": range(
                 len(request.inputs[node.input_id].documents))})
                for node in graph.nodes if isinstance(node, PhysicalScan)},
-            scored.node_id: NodeResult({"rows": pa.table({
+            scored.node_id: NodeResult({"rows:t": pa.table({
                 "t": pa.array(range(6), pa.int32()),
                 "recovered_score": pa.array(scores, pa.float32())})}),
         }
@@ -334,16 +334,15 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
         extracted = next(node for node in graph.nodes
                          if isinstance(node, AiExtract))
         return {
-            **{node.node_id: NodeResult({f"ids:{node.alias}": range(
+            **{node.node_id: NodeResult({f"rows:{node.alias}": range(
                 len(request.inputs[node.input_id].documents))})
                for node in graph.nodes if isinstance(node, PhysicalScan)},
             filtered.node_id: NodeResult({
-                "ids:c": [0, 2],
+                "rows:c": [0, 2],
                 "filter_answers:c": {0: [1], 1: [0], 2: [1]},
             }),
             extracted.node_id: NodeResult({
-                "ids:c": [0, 2],
-                "rows": pa.table({
+                "rows:c": pa.table({
                     "c": pa.array([0, 2], pa.int32()),
                     "contract.audit_rights": pa.array(["audit yearly", None],
                                                       pa.string()),
@@ -400,7 +399,7 @@ def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
         model = next(
             node for node in graph.nodes if isinstance(node, RequestExecution))
         return {model.node_id: NodeResult({
-            "ids:c": [0, 1, 2],
+            "rows:c": [0, 1, 2],
             "extract_answers:contract.governing_law": pa.table({
                 "c": pa.array([0, 1, 2], pa.int32()),
                 "contract.governing_law": pa.array(

@@ -17,7 +17,6 @@ from quail.planner.operators.common import (
     bind_inference,
     inference_node,
 )
-from quail.planner.operators.ports import Ports
 
 
 def extract_spec(context, call, name, expected_rows, resident=False) -> ExtractSpec:
@@ -70,7 +69,7 @@ def extract_spec(context, call, name, expected_rows, resident=False) -> ExtractS
     return replace(spec, estimated_seconds=cost.seconds)
 
 
-def emit_extract(builder, alias, expected_rows, names, ports, resident=False) -> tuple:
+def emit_extract(builder, alias, expected_rows, names, port, resident=False) -> tuple:
     """Copy the answers of the alias's documents.
 
     A Filter on an extraction's answer or span follows that extraction
@@ -82,7 +81,7 @@ def emit_extract(builder, alias, expected_rows, names, ports, resident=False) ->
         alias: The table.
         expected_rows: The documents the extractions read.
         names: The extractions to emit, in run order.
-        ports: Where the documents stand before the extractions.
+        port: The port the documents stand at before the extractions.
         resident: Whether the step before the run left the documents'
             KV for the first extraction to read.
 
@@ -108,23 +107,21 @@ def emit_extract(builder, alias, expected_rows, names, ports, resident=False) ->
             resident=resident or index > 0,
         )
         node = inference_node(
-            AiExtract, spec, (ports.source,),
+            AiExtract, spec, (port,),
             index=sum(isinstance(n, AiExtract) for n in builder.nodes),
             backend="quail", model=builder.model.name)
         builder.nodes.append(node)
-        ports = Ports(PortRef(node.node_id, f"ids:{alias}"),
-                            PortRef(node.node_id, "rows"))
+        port = PortRef(node.node_id, node.rows_port)
         for test in tests:
             if test.name != logical_node.name:
                 continue
             filter_id = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
-                node_id=filter_id, inputs=input_ports((ports.rows,)),
+                node_id=filter_id, inputs=input_ports((port,)),
                 predicate=test.condition, aliases=(alias,),
                 selectivity=test.selectivity, written_position=test.position))
-            ports = Ports(PortRef(filter_id, f"ids:{alias}"),
-                          PortRef(filter_id, "rows"))
+            port = PortRef(filter_id, f"rows:{alias}")
             expected_rows *= effective_selectivity(test.selectivity)
-        row_ports.append(ports.rows)
-    return ports, row_ports
+        row_ports.append(port)
+    return port, row_ports
 

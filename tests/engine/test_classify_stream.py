@@ -123,38 +123,38 @@ def fused_graph(*, classify_only=False):
         Scan(node_id="input:r", alias="r", input_id="r"),
         Scan(node_id="input:p", alias="p", input_id="p"),
         AiFilter(
-            node_id="filter:r", inputs=input_ports((PortRef("input:r", "ids:r"),)),
+            node_id="filter:r", inputs=input_ports((PortRef("input:r", "rows:r"),)),
             alias="r", arena_writes=True, question_token_ids=(QUESTION,),
             written_position=0, question_tokens=1, preamble_tokens=0,
             selectivity=0.8, expected_rows=14 * 0.8),
         AiClassify(
             node_id="classify:r",
-            inputs=input_ports((PortRef("filter:r", "ids:r"),)),
+            inputs=input_ports((PortRef("filter:r", "rows:r"),)),
             backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         Filter(
             node_id="label:r",
-            inputs=input_ports((PortRef("classify:r", "rows"),)),
+            inputs=input_ports((PortRef("classify:r", "rows:r"),)),
             predicate=RegularPredicate(
                 ColumnRef("r", "reviews", "topic"), "in", ("a",)),
             aliases=("r",),
             selectivity=0.5, written_position=1),
         Filter(
             node_id="label:again",
-            inputs=input_ports((PortRef("label:r", "rows"),)),
+            inputs=input_ports((PortRef("label:r", "rows:r"),)),
             predicate=RegularPredicate(
                 ColumnRef("r", "reviews", "topic"), "in", ("a",)),
             aliases=("r",),
             selectivity=1.0, written_position=2),
         AiClassify(
             node_id="classify:kind",
-            inputs=input_ports((PortRef("label:again", "rows"),)),
+            inputs=input_ports((PortRef("label:again", "rows:r"),)),
             backend_name="quail", model="qwen3-4b-fp8",
             spec=replace(spec, name="kind", labels=("b", "a"),
                          prompt_token_parts=((), (CLASSIFY_FRAME + 1, CUE)))),
         AiJoin(
             node_id="group:0", anchor="r", anchor_resident="filter",
-            inputs=input_ports((PortRef("classify:kind", "ids:r"),
-                                PortRef("input:p", "ids:p"))),
+            inputs=input_ports((PortRef("classify:kind", "rows:r"),
+                                PortRef("input:p", "rows:p"))),
             written_position=2, exec_index=0, partners=("p",), semantics="full",
             selectivity=0.5, expected_rows=1, anchor_frame_tokens=1,
             pair_tail_tokens=0, tuple_tokens=0, pairs_from="",
@@ -163,10 +163,10 @@ def fused_graph(*, classify_only=False):
     if classify_only:
         nodes = [node for node in nodes if node.node_id not in (
             "input:p", "filter:r", "group:0")]
-        nodes = [replace(node, inputs=input_ports((PortRef("input:r", "ids:r"),)))
+        nodes = [replace(node, inputs=input_ports((PortRef("input:r", "rows:r"),)))
                  if node.node_id == "classify:r" else node for node in nodes]
-        return PhysicalGraph(tuple(nodes), PortRef("classify:kind", "rows"))
-    return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
+        return PhysicalGraph(tuple(nodes), PortRef("classify:kind", "rows:r"))
+    return PhysicalGraph(tuple(nodes), PortRef("group:0", "rows:r"))
 
 
 @pytest.mark.parametrize("shape", ["filter", "joined", "classify_first",
@@ -199,13 +199,13 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
     nodes = [Scan(node_id="input:r", alias="r", input_id="r")]
     if not first:
         nodes.append(AiFilter(
-            node_id="filter:r", inputs=input_ports((PortRef("input:r", "ids:r"),)),
+            node_id="filter:r", inputs=input_ports((PortRef("input:r", "rows:r"),)),
             alias="r", arena_writes=True, question_token_ids=(QUESTION,),
             written_position=0, question_tokens=1, preamble_tokens=0,
             selectivity=0.8, expected_rows=4 * 0.8))
     if shape == "score_first":
         nodes.append(AiScore(
-            node_id="score:r", inputs=input_ports((PortRef("input:r", "ids:r"),)),
+            node_id="score:r", inputs=input_ports((PortRef("input:r", "rows:r"),)),
             backend_name="quail", model="diffusion-gemma-26b-a4b-fp8",
             spec=ScoreSpec(name="score", aliases=("r",), query_template="",
                            arguments=(), expected_rows=4, estimated_seconds=0)))
@@ -213,40 +213,40 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         node_id="classify:r",
         inputs=input_ports((PortRef(
             "score:r" if shape == "score_first" else "input:r" if first else "filter:r",
-            "rows" if shape == "score_first" else "ids:r"),)),
+            "rows:r"),)),
         backend_name="quail", model="diffusion-gemma-26b-a4b-fp8",
         spec=spec))
-    root = PortRef("classify:r", "rows")
+    root = PortRef("classify:r", "rows:r")
     if first:
         nodes.append(Filter(
             node_id="label:r",
-            inputs=input_ports((PortRef("classify:r", "rows"),)),
+            inputs=input_ports((PortRef("classify:r", "rows:r"),)),
             predicate=RegularPredicate(
                 ColumnRef("r", "reviews", "topic"), "in", ("b",)),
             aliases=("r",),
             selectivity=0.5, written_position=1))
-        root = PortRef("label:r", "ids:r")
+        root = PortRef("label:r", "rows:r")
     if shape == "joined":
         nodes += [
             Scan(node_id="input:p", alias="p", input_id="p"),
             Filter(
                 node_id="label:r",
-                inputs=input_ports((PortRef("classify:r", "rows"),)),
+                inputs=input_ports((PortRef("classify:r", "rows:r"),)),
                 predicate=RegularPredicate(
                 ColumnRef("r", "reviews", "topic"), "in", ("a",)),
             aliases=("r",),
                 selectivity=0.5, written_position=1),
             AiJoin(
                 node_id="group:0", anchor="r", anchor_resident="filter",
-                inputs=input_ports((PortRef("label:r", "ids:r"),
-                                    PortRef("input:p", "ids:p"))),
+                inputs=input_ports((PortRef("label:r", "rows:r"),
+                                    PortRef("input:p", "rows:p"))),
                 written_position=2, exec_index=0, partners=("p",), semantics="full",
                 selectivity=0.5, expected_rows=1, anchor_frame_tokens=1,
                 pair_tail_tokens=0, tuple_tokens=0, pairs_from="",
                 frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
                 tail_token_ids=()),
         ]
-        root = PortRef("group:0", "ids:r")
+        root = PortRef("group:0", "rows:r")
     graph = PhysicalGraph(tuple(nodes), root)
     pipelines = {tuple(
         member.node_id for member in pipeline)
@@ -373,7 +373,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         def with_score(node, inputs):
             if node.node_id == "score:r":
                 rows = np.arange(4, dtype=np.int32).reshape(-1, 1)
-                return NodeResult({"rows": score_rows(
+                return NodeResult({"rows:r": score_rows(
                     rows, ("r",), "score", [0.1, 0.2, 0.3, 0.4])})
             return execute(node, inputs)
 
@@ -382,17 +382,17 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
     assert not arena.accounting.owned
     outputs = result["_outputs"]
     metrics = result["node_metrics"]
-    labels = outputs[PortRef("classify:r", "rows")]
+    labels = outputs[PortRef("classify:r", "rows:r")]
     if first:
         assert labels.column("topic").to_pylist() == ["a", "a", "b", "b"]
         assert outputs[root].column("r").to_pylist() == [2, 3]
         if shape == "score_first":
             assert labels.column("score").to_pylist() == [0.1, 0.2, 0.3, 0.4]
-            filtered = outputs[PortRef("label:r", "rows")]
+            filtered = outputs[PortRef("label:r", "rows:r")]
             assert filtered.column("score").to_pylist() == [0.3, 0.4]
         assert prefixes == {d: list(head) + documents["r"][d] for d in range(4)}
         return
-    assert outputs[PortRef("filter:r", "ids:r")].column("r").to_pylist() \
+    assert outputs[PortRef("filter:r", "rows:r")].column("r").to_pylist() \
         == [0, 2, 3]
     assert labels.column("r").to_pylist() == [0, 2, 3]
     if shape == "draws":
@@ -430,9 +430,9 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
     if shape == "joined":
         # the filter keeps document 0, whose partner suffixes
         # ran over its resident KV after its read
-        assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() \
+        assert outputs[PortRef("label:r", "rows:r")].column("r").to_pylist() \
             == [0]
-        joined_ids = outputs[PortRef("group:0", "ids:r")]
+        joined_ids = outputs[PortRef("group:0", "rows:r")]
         assert joined_ids.column("r").to_pylist() == [0]
         assert metrics["group:0"]["fresh_tokens"] == 2 + 2 * 2
 
@@ -507,16 +507,16 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     matched = [d for d in accepted if any(join_truth[("r", d)])]
     outputs = result["_outputs"]
     metrics = result["node_metrics"]
-    labels = outputs[PortRef("classify:r", "rows")]
+    labels = outputs[PortRef("classify:r", "rows:r")]
     assert labels.column("r").to_pylist() == passed
     assert labels.column("topic").to_pylist() == [
         ("a", "b")[label_truth[d]] for d in passed]
-    assert outputs[PortRef("classify:r", "ids:r")].column("r").to_pylist() \
+    assert outputs[PortRef("classify:r", "rows:r")].column("r").to_pylist() \
         == passed
-    assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() \
+    assert outputs[PortRef("label:r", "rows:r")].column("r").to_pylist() \
         == accepted
     assert metrics["label:again"]["input_rows"] == len(accepted)
-    later = outputs[PortRef("classify:kind", "rows")]
+    later = outputs[PortRef("classify:kind", "rows:r")]
     assert later.to_pydict() == {
         "r": accepted, "kind": ["b"] * len(accepted),
         "topic": ["a"] * len(accepted)}
@@ -524,7 +524,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     if classify_only:
         assert metrics["classify:r"]["fresh_tokens"] == prefill + 2 * num_documents
     else:
-        assert outputs[PortRef("group:0", "ids:r")].column("r").to_pylist() \
+        assert outputs[PortRef("group:0", "rows:r")].column("r").to_pylist() \
             == matched
         assert metrics["filter:r"]["fresh_tokens"] == prefill + num_documents
         assert metrics["classify:r"]["fresh_tokens"] == 2 * len(passed)
@@ -558,8 +558,8 @@ def joined_graph(two_joins=False):
         Scan(node_id="input:p", alias="p", input_id="p"),
         AiJoin(
             node_id="group:0", anchor="r", anchor_resident="fresh",
-            inputs=input_ports((PortRef("input:r", "ids:r"),
-                                PortRef("input:p", "ids:p"))),
+            inputs=input_ports((PortRef("input:r", "rows:r"),
+                                PortRef("input:p", "rows:p"))),
             written_position=2, exec_index=0, partners=("p",), semantics="full",
             selectivity=0.5, expected_rows=3, anchor_frame_tokens=1,
             pair_tail_tokens=0, tuple_tokens=0, pairs_from="",
@@ -574,8 +574,8 @@ def joined_graph(two_joins=False):
         join = nodes[3]
         nodes.insert(4, replace(
             join, node_id="group:1", written_position=3, exec_index=1, partners=("q",),
-            inputs=input_ports((PortRef("group:0", "ids:r"),
-                                PortRef("input:q", "ids:q"))),
+            inputs=input_ports((PortRef("group:0", "rows:r"),
+                                PortRef("input:q", "rows:q"))),
             frame_token_ids=(FRAME + 1,), label_token_ids=(("q", ()),)))
     return PhysicalGraph(tuple(nodes), PortRef("classify:rp", "rows"))
 
@@ -656,7 +656,7 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     assert not arena.accounting.owned
     outputs = result["_outputs"]
     metrics = result["node_metrics"]
-    assert outputs[PortRef("group:0", "ids:r")].column("r").to_pylist() \
+    assert outputs[PortRef("group:0", "rows:r")].column("r").to_pylist() \
         == [0, 1]
     labels = outputs[PortRef("classify:rp", "rows")]
     assert labels.column("r").to_pylist() == [0, 0, 1]
@@ -739,26 +739,26 @@ def test_a_filter_after_a_classification_asks_over_the_resident_kv(monkeypatch):
     nodes = [
         nodes[0],
         AiFilter(
-            node_id="filter:r", inputs=input_ports((PortRef("input:r", "ids:r"),)),
+            node_id="filter:r", inputs=input_ports((PortRef("input:r", "rows:r"),)),
             alias="r", arena_writes=True, question_token_ids=(QUESTION,),
             written_position=0, question_tokens=1, preamble_tokens=0,
             selectivity=0.8, expected_rows=14 * 0.8),
-        replace(nodes[1], inputs=input_ports((PortRef("filter:r", "ids:r"),))),
+        replace(nodes[1], inputs=input_ports((PortRef("filter:r", "rows:r"),))),
         nodes[2],
         AiFilter(
             node_id="filter:again",
-            inputs=input_ports((PortRef("label:r", "ids:r"),)),
+            inputs=input_ports((PortRef("label:r", "rows:r"),)),
             alias="r", arena_writes=True, question_token_ids=(QUESTION + 1,),
             written_position=2, question_tokens=1, preamble_tokens=0,
             selectivity=0.8, expected_rows=4.0),
         AiClassify(
             node_id="classify:kind",
-            inputs=input_ports((PortRef("filter:again", "ids:r"),)),
+            inputs=input_ports((PortRef("filter:again", "rows:r"),)),
             backend_name="quail", model="qwen3-4b-fp8",
             spec=replace(spec, name="kind", labels=("b", "a"),
                          prompt_token_parts=((), (CLASSIFY_FRAME + 1, CUE)))),
     ]
-    graph = PhysicalGraph(tuple(nodes), PortRef("classify:kind", "rows"))
+    graph = PhysicalGraph(tuple(nodes), PortRef("classify:kind", "rows:r"))
     from quail.physical.pipelines import build_pipelines
 
     assert [member.node_id for member in build_pipelines(graph)["filter:r"]] == [
@@ -774,10 +774,10 @@ def test_a_filter_after_a_classification_asks_over_the_resident_kv(monkeypatch):
     passed = [d for d in range(num_documents) if filter_truth[d][0]]
     accepted = [d for d in passed if label_truth[d] == 0]
     asked_again = [d for d in accepted if filter_truth[d][1]]
-    assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() == accepted
-    assert outputs[PortRef("filter:again", "ids:r")].column("r").to_pylist() \
+    assert outputs[PortRef("label:r", "rows:r")].column("r").to_pylist() == accepted
+    assert outputs[PortRef("filter:again", "rows:r")].column("r").to_pylist() \
         == asked_again
-    assert outputs[PortRef("classify:kind", "rows")].column("r").to_pylist() \
+    assert outputs[PortRef("classify:kind", "rows:r")].column("r").to_pylist() \
         == asked_again
     # the second filter fed one question token per accepted document
     # over its resident KV, and every document was packed once

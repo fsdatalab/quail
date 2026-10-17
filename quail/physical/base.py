@@ -18,7 +18,6 @@ class ExecutionLocation(str, Enum):
 class ValueType(str, Enum):
     """Value passed between physical node ports."""
 
-    DOCUMENT_IDS = "document_ids"
     FILTER_ANSWERS = "filter_answers"
     JOIN_ANSWERS = "join_answers"
     LABEL_ANSWERS = "label_answers"
@@ -67,8 +66,8 @@ class OutputPort:
 
 def value_type_for_port(name: str) -> ValueType:
     """Return the built in value type for a port name."""
-    if name.startswith("ids:"):
-        return ValueType.DOCUMENT_IDS
+    if name == "rows" or name.startswith("rows:"):
+        return ValueType.ROWS
     if name.startswith("filter_answers:"):
         return ValueType.FILTER_ANSWERS
     if name.startswith("join_answers:"):
@@ -118,7 +117,7 @@ class PhysicalNode:
 
     def document_outputs(self, alias: str) -> tuple[str, ...]:
         """Return outputs that can feed the next operator for a document."""
-        return (f"ids:{alias}",)
+        return (f"rows:{alias}",)
 
     def can_follow(self, previous: "PhysicalNode", first: "PhysicalNode") -> bool:
         """Return whether this operator can use the preceding document KV.

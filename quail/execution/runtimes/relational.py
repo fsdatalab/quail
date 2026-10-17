@@ -10,7 +10,7 @@ from quail.catalog.pairs import columns_key
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
-from quail.execution.rows import as_table
+from quail.execution.rows import Rows, as_table
 from quail.physical import Aggregate, Limit, Project, Scan, Sort
 
 
@@ -27,7 +27,7 @@ class ScanRuntime:
         value = document_ids(
             _tested_documents(node, context) if node.predicates
             else context.sources[node.input_id])
-        return NodeResult({f"ids:{node.alias}": value},
+        return NodeResult({f"rows:{node.alias}": Rows({node.alias: value})},
                           NodeMetrics(output_rows=len(value)))
 
 

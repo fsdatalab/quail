@@ -32,11 +32,11 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     from quail.physical import plan_envelope
 
     filtered = AiFilter(
-        node_id="filter:d", inputs=input_ports((PortRef("input:d", "ids:d"),)),
+        node_id="filter:d", inputs=input_ports((PortRef("input:d", "rows:d"),)),
         alias="d", question_token_ids=(9,), written_position=0, question_tokens=1,
         preamble_tokens=1, selectivity=None, expected_rows=4)
     graph = PhysicalGraph((Scan(node_id="input:d", alias="d", input_id="d"),
-                           filtered), PortRef("filter:d", "ids:d"))
+                           filtered), PortRef("filter:d", "rows:d"))
 
     def round_fn(kind, subs):
         assert kind == "filters"
@@ -46,7 +46,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
             from quail.execution.metrics import NodeMetrics, NodeResult
 
             result = NodeResult({
-                "ids:d": [index for index in indices if index % 2 == 0],
+                "rows:d": [index for index in indices if index % 2 == 0],
                 "filter_answers:d": {index: [index % 2 == 0] for index in indices}},
                 NodeMetrics(fresh_tokens=len(indices)))
             outputs.append({
@@ -90,7 +90,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     result = execution.execute(filtered, {
         "documents": [[1]], "document_ids": [10]})
     assert not arena.owned
-    assert result.outputs["ids:d"].to_pylist() == [10]
+    assert result.outputs["rows:d"].ids["d"].to_pylist() == [10]
 
 
 def _key_columns(r_keys, p_keys):
@@ -145,7 +145,7 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
         # anchors whose pairs all answered FALSE are gone
         kept = [d for d in survivors
                 if any(join_truth[("r", d)][i] for i in allowed[d])]
-        root = result["_outputs"][PortRef("group:0", "ids:r")]
+        root = result["_outputs"][PortRef("group:0", "rows:r")]
         assert sorted(root.column("r").to_pylist()) == kept
 
     # GPU timing sums the chunk events only when asked
@@ -229,7 +229,7 @@ def test_foreign_runs_per_batch_or_once_as_a_barrier_and_are_checked(monkeypatch
     foreign = result["node_metrics"]["apply:keep_even"]
     assert foreign["input_rows"] == len(survivors)
     assert foreign["output_rows"] == len(kept)
-    assert result["_outputs"][PortRef("apply:keep_even", "ids:r")].column(
+    assert result["_outputs"][PortRef("apply:keep_even", "rows:r")].column(
         "r").to_pylist() == kept
     assert result["node_metrics"]["group:0"]["kv_hits"] == len(kept)
 
@@ -282,10 +282,10 @@ def test_predicate_nodes_keep_documents_and_join_frames_in_kv(monkeypatch):
     first_join = graph.nodes[-1]
     second_join = replace(
         first_join, node_id="join:second", written_position=1, exec_index=1,
-        inputs=input_ports((PortRef(first_join.node_id, "ids:r"),
-                            PortRef("input:p", "ids:p"))))
+        inputs=input_ports((PortRef(first_join.node_id, "rows:r"),
+                            PortRef("input:p", "rows:p"))))
     graph = PhysicalGraph((*graph.nodes, second_join),
-                          PortRef(second_join.node_id, "ids:r"))
+                          PortRef(second_join.node_id, "rows:r"))
     graph = plan_kv_retention(graph)
     result, model, filters, joins = run_graph_on_arena(
         monkeypatch, graph, stages=2, shared_prefix=16)

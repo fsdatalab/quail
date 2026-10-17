@@ -18,6 +18,7 @@ from quail.catalog.tokens import (
 from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.rows import Rows
 from quail.progress import answer_sink
 
 
@@ -141,9 +142,9 @@ class ConditionGate(SingleResultPart):
         return None
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
-        source_id = self.node.inputs[0].source.node_id
+        source = self.node.inputs[0].source
         return filter_scores(self.node,
-                             self.source.results()[source_id].outputs["rows"])
+                             self.source.results()[source.node_id].outputs[source.port])
 
 
 def filter_result(node, answers, tokens, document_ids,
@@ -172,7 +173,7 @@ def filter_result(node, answers, tokens, document_ids,
     global_answers = dict(zip(positions[local].tolist(), answers.values()))
     return NodeResult(
         outputs={
-            f"ids:{node.alias}": survivors,
+            f"rows:{node.alias}": Rows({node.alias: survivors}),
             f"filter_answers:{node.alias}": global_answers,
         },
         metrics=NodeMetrics(

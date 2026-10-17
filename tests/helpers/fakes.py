@@ -220,7 +220,7 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
     """
     nodes = [Scan(node_id="input:r", alias="r", input_id="r"),
              Scan(node_id="input:p", alias="p", input_id="p")]
-    anchor_src = PortRef("input:r", "ids:r")
+    anchor_src = PortRef("input:r", "rows:r")
     if filtered:
         for index in range(stages):
             node_id = "filter:r" if index == 0 else f"filter:r:{index}"
@@ -230,26 +230,26 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
                 question_tokens=1, preamble_tokens=0,
                 selectivity=0.8 - 0.1 * index, expected_rows=14 * 0.8 ** index,
                 question_token_ids=(QUESTION + index,)))
-            anchor_src = PortRef(node_id, "ids:r")
+            anchor_src = PortRef(node_id, "rows:r")
     if filtered and not pipelined:
         nodes.append(Barrier(node_id="barrier:r",
                              inputs=input_ports((anchor_src,)),
                              next_anchor="r", aliases=("r",)))
-        anchor_src = PortRef("barrier:r", "ids:r")
+        anchor_src = PortRef("barrier:r", "rows:r")
     join_inputs = []
     pairs_from = ""
     if hash_join:
         nodes.append(HashJoin(
             node_id="hash_join:r-p",
-            inputs=input_ports((PortRef("input:r", "ids:r"),
-                                PortRef("input:p", "ids:p"))),
+            inputs=input_ports((PortRef("input:r", "rows:r"),
+                                PortRef("input:p", "rows:p"))),
             left="r", right="p", on=(("key", "key"),), written_position=0))
         join_inputs.append(PortRef("hash_join:r-p", "pairs:0"))
         pairs_from = "hash_join:r-p"
     if foreign and foreign[1] == "pairs":
         nodes.append(Foreign(
             node_id="apply:same_key",
-            inputs=input_ports((anchor_src, PortRef("input:p", "ids:p"))),
+            inputs=input_ports((anchor_src, PortRef("input:p", "rows:p"))),
             function="same_key", kind=foreign[0], ids="pairs",
             columns=(("r", "key"), ("p", "key")), aliases=("r", "p"),
             written_position=0))
@@ -261,17 +261,17 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
             inputs=input_ports((anchor_src,)),
             function="keep_even", kind=foreign[0], ids=foreign[1],
             columns=(), aliases=("r",)))
-        anchor_src = PortRef("apply:keep_even", "ids:r")
+        anchor_src = PortRef("apply:keep_even", "rows:r")
     resident = "filter" if filtered and pipelined else "none"
     nodes.append(AiJoin(
         node_id="group:0", anchor="r", anchor_resident=resident, keep_kv=keep_kv,
-        inputs=input_ports((anchor_src, PortRef("input:p", "ids:p"),
+        inputs=input_ports((anchor_src, PortRef("input:p", "rows:p"),
                             *join_inputs)),
         written_position=0, exec_index=0, partners=("p",), semantics=semantics,
         selectivity=0.5, expected_rows=1, anchor_frame_tokens=1,
         pair_tail_tokens=0, tuple_tokens=0, pairs_from=pairs_from,
         frame_token_ids=(FRAME,), label_token_ids=(("p", ()),), tail_token_ids=()))
-    return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
+    return PhysicalGraph(tuple(nodes), PortRef("group:0", "rows:r"))
 
 
 def run_graph_on_arena(monkeypatch, graph, *, num_documents=14, num_partners=4,

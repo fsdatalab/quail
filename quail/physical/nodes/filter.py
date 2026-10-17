@@ -39,8 +39,10 @@ class Filter(PhysicalNode):
     def document_aliases(self) -> tuple[str, ...]:
         return self.aliases if len(self.aliases) == 1 else ()
 
-    def document_outputs(self, alias: str) -> tuple[str, ...]:
-        return ("rows", f"ids:{alias}")
+    @property
+    def rows_port(self) -> str:
+        """The output carrying the rows that pass: per alias for one table."""
+        return f"rows:{self.aliases[0]}" if len(self.aliases) == 1 else "rows"
 
     def can_follow(self, previous: PhysicalNode, first: PhysicalNode) -> bool:
         # a condition reads no KV: it gates the documents of any pipeline
@@ -56,10 +58,8 @@ class Filter(PhysicalNode):
         if len(self.aliases) == 1:
             (alias,) = self.aliases
             return (
-                OutputPort("rows", ValueType.ROWS),
+                OutputPort(f"rows:{alias}", ValueType.ROWS),
                 OutputPort(f"filter_answers:{alias}", ValueType.FILTER_ANSWERS),
-                OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
-                           schema=(alias,)),
             )
         return (
             OutputPort("rows", ValueType.ROWS),
@@ -134,8 +134,8 @@ class AiFilter(PhysicalNode):
     def outputs(self) -> tuple[OutputPort, ...]:
         return (
             OutputPort(
-                f"ids:{self.alias}",
-                ValueType.DOCUMENT_IDS,
+                f"rows:{self.alias}",
+                ValueType.ROWS,
                 schema=(self.alias,),
             ),
             OutputPort(

@@ -16,7 +16,7 @@ from quail.execution.result import (
     answer_table,
     filter_answer_table,
 )
-from quail.execution.rows import Rows
+from quail.execution.rows import Rows, rows_of
 from quail.logical import PROBABILITIES_SUFFIX
 from quail.physical import AiClassify, AiScore, ClassifySpec, Filter, ValueType
 from quail.progress import answer_sink
@@ -180,14 +180,13 @@ def _candidate_rows(node, inputs):
             pairs = value
             continue
         if port.value_type is ValueType.ROWS:
+            if port.source.port.startswith("rows:"):
+                value = rows_of(value, port.source.port.split(":", 1)[1])
             for alias in spec.aliases:
                 if alias in value.ids:
                     by_alias[alias] = id_positions(value.ids[alias])
                     priors[alias] = value
             continue
-        if port.source.port.startswith("ids:"):
-            alias = port.source.port.split(":", 1)[1]
-            by_alias[alias] = _ids(value, alias)
 
     if len(spec.aliases) == 1:
         return ScoreRows((by_alias[spec.aliases[0]],)), priors
@@ -230,12 +229,8 @@ def scored_batch(node, rows, values) -> dict:
 
 
 def classify_outputs(node, rows: Rows) -> dict:
-    """Return the label rows and, for one alias, the labeled document IDs."""
-    outputs = {"rows": rows}
-    if len(node.spec.aliases) == 1:
-        (alias,) = node.spec.aliases
-        outputs[f"ids:{alias}"] = rows.ids[alias]
-    return outputs
+    """Return the label rows on the node's rows port."""
+    return {node.rows_port: rows}
 
 
 def score_in_batches(node, inputs, score_batches, shards: int = 1,
@@ -284,21 +279,21 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         ]
         results = score_batches(node, [batch for _, batch in batches])
         for (where, batch), result in zip(batches, results):
-            scored.append(result.outputs["rows"])
+            scored.append(result.outputs[node.rows_port])
             positions.append(where)
             metrics += result.metrics
             sink = answer_sink()
             if sink is not None and not streamed and len(batch):
                 sink(scored_batch(
                     node, batch,
-                    result.outputs["rows"].column(node.spec.name).to_pylist()))
+                    result.outputs[node.rows_port].column(node.spec.name).to_pylist()))
     rows = Rows.concat(scored)
     order = np.concatenate(positions)
     if len(order) and np.any(np.diff(order) < 0):
         rows = rows.take(np.argsort(order, kind="stable"))
     for alias, prior in priors.items():
         rows = rows.joined(prior, alias)
-    outputs = {"rows": rows}
+    outputs = {node.rows_port: rows}
     if isinstance(node.spec, ClassifySpec):
         # a document whose decoded answer names no label leaves the query
         rows = rows.filter(pc.is_valid(rows.column(node.spec.name)))
@@ -364,7 +359,7 @@ class RerankerModelExecution:
                     if batch.probabilities is None else batch.probabilities))
         count = len(rows)
         return NodeResult(
-            {"rows": scored},
+            {node.rows_port: scored},
             NodeMetrics(
                 wall_s=time.perf_counter() - started,
                 input_rows=count,
@@ -435,9 +430,7 @@ def filter_scores(node, rows: Rows) -> NodeResult:
                 "threshold": node.predicate.value,
             },
         )
-    outputs = {"rows": filtered, answer_name: answer_relation}
-    if len(node.aliases) == 1:
-        outputs[f"ids:{node.aliases[0]}"] = filtered.ids[node.aliases[0]]
+    outputs = {node.rows_port: filtered, answer_name: answer_relation}
     return NodeResult(
         outputs,
         NodeMetrics(input_rows=rows.num_rows, output_rows=filtered.num_rows),

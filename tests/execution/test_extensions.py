@@ -44,7 +44,7 @@ def _module(monkeypatch, name, register):
 def _count(registry):
     graph = PhysicalGraph(
         (Scan(node_id="input", alias="d", input_id="d", num_documents=1),),
-        PortRef("input", "ids:d"),
+        PortRef("input", "rows:d"),
     )
     rewritten, _ = rewrite_graph(
         graph, tuple(registry.rules.values()), None)
@@ -178,10 +178,10 @@ def test_node_registration_validation_and_execution():
     assert codec.decode(codec.encode(node)) == node
     assert isinstance(registry.runtimes[node.runtime_key], ScanRuntime)
     result = GenericRunner().run(
-        PhysicalGraph((node,), PortRef("custom", "ids:d")),
+        PhysicalGraph((node,), PortRef("custom", "rows:d")),
         ExecutionContext(runtimes=registry.runtimes, sources={"d": [3, 7]}),
     )
-    assert result.value.to_pylist() == [3, 7]
+    assert result.value.ids["d"].to_pylist() == [3, 7]
 
     registry = built_in_registry()
     with pytest.raises(ValueError, match="codec must describe"):
