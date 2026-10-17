@@ -155,7 +155,7 @@ how they release and explain changes.
 
   `bench.quailb_parallel` runs each query family on its own H100, so
   this set uses five H100s: IMDB, FEV, AGENT, CUAD, and SALES. If a
-  change touches one operator, run only its rows.
+  change touches one operator, run only the queries that use it.
 
   For example:
 
