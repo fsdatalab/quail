@@ -6,7 +6,6 @@ from typing import Any, Mapping
 from quail.logical import LogicalPlan
 from quail.physical import (
     AiFilter,
-    AiInference,
     AiJoin,
     Barrier,
     Exchange,
@@ -20,18 +19,6 @@ from quail.physical import (
 from quail.physical.codec import plan_envelope
 from quail.physical.pipelines import build_pipelines
 from quail.specs import MODELS
-
-
-def inference_seconds(nodes) -> float:
-    """Sum the inference operators' estimated seconds in a physical graph."""
-    return sum(node.spec.estimated_seconds for node in nodes
-               if isinstance(node, AiInference) and node.spec is not None)
-
-
-def model_seconds(nodes) -> float:
-    """Sum every model-reading node's own estimated seconds in a graph."""
-    return inference_seconds(nodes) + sum(
-        node.estimated_seconds for node in nodes if isinstance(node, AiFilter))
 
 
 @dataclass(frozen=True)
@@ -76,8 +63,9 @@ class PhysicalPlan:
 
     estimates holds, per node id, the node's own estimated seconds
     and, for a filter sequence a later join anchors on, the recompute it
-    would pay if its KV were released instead of pinned. estimator
-    recomputes them for an edited graph; it is not compared or shown.
+    would pay if its KV were released instead of pinned. estimator, a
+    PlanPricer, recomputes them and the plan's seconds for an edited
+    graph; it is not compared or shown.
     logical_plan records the selected tree for query execution and explain.
     """
 
@@ -148,8 +136,7 @@ class PhysicalPlan:
             edited = replace(self, nodes=nodes, root=None, estimates={})
         except GraphValidationError as error:
             raise PlanEditError(str(error)) from error
-        base = self.settings.get("search_seconds")
-        if base is None:
+        if self.estimator is None:
             return edited
         scheduled = set(self.settings.get("retention", {}).get("initial", {}))
         pipelines = build_pipelines(edited.graph, self.workers)
@@ -159,8 +146,8 @@ class PhysicalPlan:
             for node in edited.nodes
             if isinstance(node, AiFilter) and node.alias not in scheduled
             and not isinstance(pipelines[node.node_id][-1], AiJoin))
-        return replace(edited, estimated_seconds=base + recompute,
-                       estimates=edited.estimates)
+        seconds = self.estimator.seconds(edited.graph) + recompute
+        return replace(edited, estimated_seconds=seconds, estimates=edited.estimates)
 
     def insert(self, node: PhysicalNode, *, between: tuple) -> "PhysicalPlan":
         """Put node on the edge from producer to consumer.

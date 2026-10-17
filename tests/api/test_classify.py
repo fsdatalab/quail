@@ -531,7 +531,6 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     assert classify.spec.scoring == "trie_tree"
     assert classify.spec.expected_inputs == pytest.approx(1.8)
     assert round(plan.estimated_seconds, 3) == 0.062
-    assert plan.settings["search_seconds"] == plan.estimated_seconds
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
     assert (staged.exec_idx, staged.anchor) == (0, "r")
     assert classified_above_joins(after._logical_input.root) == frozenset()

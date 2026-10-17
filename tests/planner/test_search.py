@@ -131,9 +131,8 @@ def test_prefix_sharing_is_priced_for_every_placement(query):
         assert extract.spec.share_prefixes
         assert "retention" in candidate.plan.settings
         assert candidate.estimated_seconds < raw.estimated_seconds
-        assert candidate.plan.settings["search_seconds"] == pytest.approx(
-            candidate.estimated_seconds)
-        assert candidate.plan.estimates[extract.node_id]["seconds"] == (
+        # the sharing extraction is priced over its fresh tokens
+        assert candidate.plan.estimates[extract.node_id]["seconds"] < (
             extract.spec.estimated_seconds)
 
 

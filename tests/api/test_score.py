@@ -642,6 +642,7 @@ def _shared_store(path, bodies):
 def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     from quail.physical import PhysicalGraph, PortRef, Scan, ScoreSpec
     from quail.physical.base import input_ports
+    from quail.planner.graph.pricing import PlanPricer
     from quail.planner.optimizer.context import PlanningContext
     from quail.planner.optimizer.graph_refinement import apply_plan_rules
     from quail.planner.plan import PhysicalPlan
@@ -677,25 +678,32 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
                               document_tokens={"d": store.lengths,
                                                "e": plain.lengths},
                               backend="quail")
-    spec = scored(ShouldSharePrefixes().rewrite(graph(("d",)), context))
-    assert spec.share_prefixes
-    # 19 x 400 of 20 x (401 + 2) tokens are borrowed
-    assert spec.estimated_seconds == pytest.approx(10.0 * (1 - 19 * 400 / 8060))
+    def pricer(context):
+        return PlanPricer(context=context, statistics=SimpleNamespace(
+            chunk=1000, stats={}, cap_pages=0), stage_works={}, live={})
+
+    rewritten = ShouldSharePrefixes().rewrite(graph(("d",)), context)
+    spec = scored(rewritten)
+    # the rule turns sharing on; the pricer prices the score over its
+    # fresh tokens: 19 x 400 of 20 x (401 + 2) tokens are borrowed
+    assert spec.share_prefixes and spec.estimated_seconds == 10.0
+    assert pricer(context)(rewritten)["score"]["seconds"] == pytest.approx(
+        10.0 * (1 - 19 * 400 / 8060))
     # the plan's total moves by the score's change
     unshared = graph(("d",))
     plan = apply_plan_rules(
         PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", workers=2,
-                     estimated_seconds=12.0, nodes=unshared.nodes,
-                     root=unshared.root),
+                     nodes=unshared.nodes, root=unshared.root,
+                     estimator=pricer(context)),
         (ShouldSharePrefixes(),), context)
-    assert plan.estimated_seconds == pytest.approx(
-        12.0 - 10.0 + spec.estimated_seconds)
+    assert plan.estimated_seconds == pytest.approx(10.0 * (1 - 19 * 400 / 8060))
     # a 256-token canvas and four draws add 2 + 256 + 3 x 257 = 1,029
     # tokens per document that sharing does not save
     canvas = replace(context, model=replace(QWEN3_4B_FP8, canvas_tokens=256))
-    spec = scored(ShouldSharePrefixes().rewrite(graph(("d",), draws=4), canvas))
-    assert spec.estimated_seconds == pytest.approx(
+    rewritten = ShouldSharePrefixes().rewrite(graph(("d",), draws=4), canvas)
+    assert pricer(canvas)(rewritten)["score"]["seconds"] == pytest.approx(
         10.0 * (1 - 19 * 400 / (8020 + 20 * 1029)))
+    spec = scored(rewritten)
     assert ScoreSpec.from_mapping(spec.to_dict()) == spec
     # documents with nothing in common share nothing
     assert ShouldSharePrefixes().rewrite(graph(("e",)), context) is None

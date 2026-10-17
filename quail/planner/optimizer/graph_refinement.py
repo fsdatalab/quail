@@ -5,7 +5,6 @@ from dataclasses import replace
 from quail.physical.base import PhysicalGraph
 from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.rules import PhysicalRule
-from quail.planner.plan import model_seconds
 from quail.planner.validation import ClassifyRefusedError
 
 
@@ -31,8 +30,7 @@ def apply_plan_rules(plan, rules, context):
     """Refine a plan by applying its registered rules in order.
 
     The rules see the plan's settings on the context and may add to
-    them. Changes to inference estimates update both the plan total and
-    its search cost, and the node estimates are refreshed for explain.
+    them. The plan and its nodes are priced again after the rewrite.
 
     Args:
         plan: A PhysicalPlan.
@@ -50,12 +48,10 @@ def apply_plan_rules(plan, rules, context):
         return refused.refusal()
     if not changed and context.settings == dict(plan.settings):
         return plan
-    difference = model_seconds(graph.nodes) - model_seconds(plan.nodes)
-    seconds = plan.estimated_seconds + difference
-    if "search_seconds" in plan.settings:
-        context.settings["search_seconds"] = (
-            plan.settings["search_seconds"] + difference)
+    pricer = plan.estimator
     return replace(
-        plan, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
+        plan, nodes=graph.nodes, root=graph.root,
+        estimated_seconds=(pricer.seconds(graph) if pricer
+                           else plan.estimated_seconds),
         settings=context.settings,
-        estimates=plan.estimator(graph) if plan.estimator else plan.estimates)
+        estimates=pricer(graph) if pricer else plan.estimates)

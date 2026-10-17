@@ -5,9 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
-from quail.cost.extract import estimate as extract_estimate
 from quail.cost.retention import coefficients
-from quail.cost.score import score_fixed_tokens
 from quail.physical import (
     Aggregate as PhysicalAggregate,
 )
@@ -27,7 +25,7 @@ from quail.planner.operators.classify import classify_scoring
 from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import plan_kv_retention
 from quail.planner.search.statistics import cached_statistics, live_after_filters
-from quail.planner.sol.prefixes import document_shared_tokens, page_tree
+from quail.planner.sol.prefixes import page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
@@ -250,7 +248,6 @@ class ShouldSharePrefixes(PhysicalRule):
             return None
         nodes = []
         changed = False
-        pipelines = build_pipelines(graph, context.gpu_count)
         summaries = {
             alias: summarize_alias(lengths, context.model.sliding_window,
                                    memo=context.memo)
@@ -280,94 +277,18 @@ class ShouldSharePrefixes(PhysicalRule):
                     total_tokens=summaries[alias].total, writes_pages=writes_pages):
                 nodes.append(node)
                 continue
+            # the plan's pricer prices a sharing node over its fresh tokens
             if isinstance(node, AiFilter):
-                pipeline = pipelines.get(node.node_id)
-                if pipeline is None or pipeline[0].node_id == node.node_id:
-                    # the first filter of its pipeline reads the
-                    # documents, borrowing their shared prefix
-                    node = replace(node, estimated_seconds=_shared_filter_seconds(
-                        node, context, store))
                 node = replace(node, share_prefixes=True, arena_writes=True)
             elif isinstance(node, AiJoin):
                 node = replace(node, share_prefixes=True)
-            elif isinstance(node, AiScore):
-                node = replace(node, spec=_shared_score_spec(
-                    node.spec, shared, summaries[alias], context.model.canvas_tokens))
             else:
-                pipeline = pipelines.get(node.node_id)
-                resident = pipeline is not None and pipeline[0].node_id != node.node_id
-                prepare = (_shared_classify_spec if isinstance(node, AiClassify)
-                           else _shared_extract_spec)
-                node = replace(node, spec=prepare(
-                    node, context, store, resident=resident))
+                node = replace(node, spec=replace(node.spec, share_prefixes=True))
             nodes.append(node)
             changed = True
         if not changed:
             return None
         return PhysicalGraph(tuple(nodes), graph.root)
-
-
-def _shared_classify_spec(node, context, store, *, resident=False):
-    """Enable prefix sharing and update the classification cost estimate."""
-    table = classify_scoring(context, node.spec.aliases[0],
-                           shared=document_shared_tokens(store))
-    return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
-
-
-def _shared_extract_spec(node, context, store, *, resident=False):
-    """Enable extraction prefix sharing and price the borrowed document KV."""
-    from quail.cost.budgets import chunk_budget
-
-    spec = node.spec
-    head, tail = spec.prompt_token_parts
-    cost = extract_estimate(
-        spec.expected_inputs, context.document_tokens[spec.alias],
-        len(head), len(tail), chunk=chunk_budget(context.model, context.device),
-        model=context.model, device=context.device, resident=resident,
-        shared=page_tree(store).shared, max_answer_tokens=spec.max_answer_tokens,
-        draft_tokens=spec.draft_tokens, workers=context.gpu_count)
-    return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
-
-
-def _shared_filter_seconds(node, context, store) -> float:
-    """Price a filter's scan of its documents with their borrowed prefixes.
-
-    Each document computes its own tokens past the prefix it borrows
-    and the question, as the node estimates price it without sharing.
-    """
-    from quail.cost.budgets import chunk_budget
-    from quail.cost.sol import speed_of_light
-    from quail.cost.work import Work, ask, scan
-
-    window = context.model.sliding_window
-    lengths = context.document_tokens[node.alias]
-    work = Work()
-    for length, borrowed in zip(lengths, page_tree(store).shared):
-        prefix = node.preamble_tokens + int(length)
-        work += (ask(borrowed, prefix + node.question_tokens - borrowed, window=window)
-                 if borrowed else scan(prefix, node.question_tokens, window=window))
-    work = work * (node.expected_docs / len(lengths))
-    return speed_of_light(work, context.model, context.device,
-                          chunk_budget(context.model, context.device)).seconds
-
-
-def _shared_score_spec(spec, shared_tokens, summary, canvas_tokens):
-    """Enable prefix sharing and scale the score's estimate by its fresh tokens.
-
-    Assumes time is proportional to the tokens the score computes, and
-    that the scored documents borrow the same share of their tokens as
-    the whole table.
-    """
-    fixed = score_fixed_tokens(tuple(map(len, spec.prompt_token_parts)),
-                               canvas_tokens, spec.draws)
-    fresh = _fresh_fraction(shared_tokens, summary.total + summary.count * fixed)
-    return replace(spec, share_prefixes=True,
-                   estimated_seconds=spec.estimated_seconds * fresh)
-
-
-def _fresh_fraction(shared_tokens: int, total_tokens: float) -> float:
-    """The share of a table's tokens its documents compute when they borrow."""
-    return max(0.0, 1.0 - shared_tokens / total_tokens) if total_tokens else 1.0
 
 
 def _mean(values) -> float:

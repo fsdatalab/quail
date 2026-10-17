@@ -1,11 +1,8 @@
 """Build executable query graphs with operator order and execution settings."""
 
 from dataclasses import replace
-from functools import partial
 from itertools import groupby
 
-from quail.cost.sol import speed_of_light
-from quail.cost.work import Work
 from quail.logical import (
     PROBABILITIES_SUFFIX,
     SPAN_SUFFIX,
@@ -19,7 +16,6 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.physical import (
-    AiFilter,
     AiScore,
     Barrier,
     Exchange,
@@ -33,7 +29,7 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.planner.graph import retention
-from quail.planner.graph.node_estimates import node_estimates
+from quail.planner.graph.pricing import PlanPricer
 from quail.planner.graph.results import result_nodes
 from quail.planner.graph.shards import contiguous_shards
 from quail.planner.operators.classify import (
@@ -51,7 +47,7 @@ from quail.planner.operators.score import (
     emit_scores,
 )
 from quail.planner.optimizer.context import PlanningContext
-from quail.planner.plan import PhysicalPlan, Refusal, inference_seconds
+from quail.planner.plan import PhysicalPlan, Refusal
 from quail.planner.search.operator_order import choose_operator_order, resident_asks
 from quail.planner.search.statistics import filter_stop_keys
 from quail.planner.search.table_steps import ASK, CLASSIFY, EXTRACT
@@ -448,38 +444,26 @@ class GraphBuilder:
                                        self.plan.projection.packing()))
 
     def _finish(self):
-        """Build the plan and bind its work estimator."""
-        stats = self.operator_order.statistics.stats
+        """Build the plan and bind its pricer."""
         statistics = self.operator_order.statistics
-        stage_work = sum((step.work for step in self.operator_order.join_steps
-                          if not is_score(
-                              self.operators.joins[step.written_pos].predicate)),
-                         Work())
-        estimate = (speed_of_light(
-            sum(self.operator_order.filter_work.values(), Work()) + stage_work,
-            self.model, self.device,
-            statistics.chunk).seconds + inference_seconds(self.nodes))
+        # a score join's work is in its AiScore's estimate
         stage_works = {step.written_pos: step.work
-                       for step in self.operator_order.join_steps}
-
-        estimator = partial(
-            node_estimates, filter_works=self.operator_order.filter_work,
-            stage_works=stage_works,
-            live=self.operator_order.live, stats=stats, pre=statistics.pre,
-            cap_pages=statistics.cap_pages,
-            model=self.model, device=self.device, chunk=statistics.chunk,
+                       for step in self.operator_order.join_steps
+                       if not is_score(
+                           self.operators.joins[step.written_pos].predicate)}
+        pricer = PlanPricer(
+            context=self.context, statistics=statistics, stage_works=stage_works,
+            live=self.operator_order.live,
             resident_asks=resident_asks(self.operator_order.step_orders))
         plan = PhysicalPlan(
             model=self.model.name, device=self.device.name, workers=self.workers,
-            backend="quail", estimated_seconds=estimate,
-            nodes=tuple(self.nodes),
+            backend="quail", nodes=tuple(self.nodes),
             settings={
                 "chunk_tokens": statistics.chunk,
                 "arena_pages": list(statistics.arena_pages),
                 "admission_tokens": statistics.admission,
                 "order_rule": self.operator_order.order_rule,
                 "order_source": self.operator_order.order_source,
-                "search_seconds": estimate,
                 **({
                     "retained_kv_tokens": self.scoring.capacity,
                     "prefix_reuse": "fixed prompt and first document within each score",
@@ -499,14 +483,8 @@ class GraphBuilder:
                 **({"canvas_draws": self.context.canvas_draws}
                    if self.operators.labels.calls and self.model.answer_canvas else {}),
             },
-            estimator=estimator)
-        # each filter carries its own price, as the inference nodes do,
-        # so a rule that changes what it computes can reprice it
-        estimates = estimator(plan.graph)
-        return replace(plan, nodes=tuple(
-            replace(node, estimated_seconds=estimates[node.node_id]["seconds"])
-            if isinstance(node, AiFilter) and "seconds" in estimates[node.node_id]
-            else node for node in plan.nodes))
+            estimator=pricer)
+        return replace(plan, estimated_seconds=pricer.seconds(plan.graph))
 
     def ids_of(self, alias: str) -> PortRef:
         """Return the ids of the alias's documents after its latest operator.
