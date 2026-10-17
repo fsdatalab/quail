@@ -253,9 +253,8 @@ class ExpressionBinder:
     def bind_ai_extract(self, node, name: str) -> tuple:
         """Parse an AI.EXTRACT call and bind its document reference.
 
-        The call is ``AI.EXTRACT(column, {'field': 'question', ...}[,
-        {'trim': false}])``. Each field is its own extraction, named
-        ``name.field``; the one option, trim, applies to every field.
+        The call is ``AI.EXTRACT(column, {'field': 'question', ...})``.
+        Each field is its own extraction, named ``name.field``.
 
         Args:
             node: The AI_EXTRACT call.
@@ -266,9 +265,9 @@ class ExpressionBinder:
             written order.
 
         Raises:
-            CompileError: The column, fields, or options are invalid.
+            CompileError: The column or fields are invalid.
         """
-        ref, fields, options = self._extract_arguments(node)
+        ref, fields = self._extract_arguments(node)
         questions = {}
         for prop in fields.expressions:
             if not isinstance(prop, exp.PropertyEQ):
@@ -284,21 +283,20 @@ class ExpressionBinder:
         struct = ExtractStruct(name, tuple(questions))
         struct.validate()
         return struct, tuple(
-            Alias(self._extract_call(ref, question, options), struct.member(field))
+            Alias(self._extract_call(ref, question), struct.member(field))
             for field, question in questions.items())
 
     def _extract_arguments(self, node) -> tuple:
         """Check an AI.EXTRACT call's arguments and resolve its column.
 
         Returns:
-            The column reference, the object of field questions, and the
-            parsed options.
+            The column reference and the object of field questions.
         """
         args = list(node.expressions)
-        if len(args) not in (2, 3):
+        if len(args) != 2:
             raise CompileError(
-                "AI.EXTRACT takes a document column, an object of field "
-                "questions, and at most one option object")
+                "AI.EXTRACT takes a document column and an object of field "
+                "questions")
         if not isinstance(args[0], exp.Column):
             raise CompileError(
                 f"AI.EXTRACT's first argument is a document column, "
@@ -309,52 +307,15 @@ class ExpressionBinder:
                 f"questions such as {{'ends': 'When does the lease end?'}}, "
                 f"got {args[1].sql()}")
         ref = self.resolve_column(args[0])
-        options = self.parse_extract_options(args[2] if len(args) == 3 else None)
-        return ref, args[1], options
+        return ref, args[1]
 
-    def _extract_call(self, ref, question: str, options: dict) -> ModelCall:
+    def _extract_call(self, ref, question: str) -> ModelCall:
         """Bind one extraction's prompt over the document column."""
         prompt = self.prompts.bind("extract", question, (ref,))
         self.note_doc_column(ref)
-        call = ModelCall(prompt, "extract", question=question,
-                         trim=options.get("trim", True))
+        call = ModelCall(prompt, "extract", question=question)
         call.validate()
         return call
-
-    def parse_extract_options(self, node) -> dict:
-        """Validate and extract the options for AI.EXTRACT.
-
-        Args:
-            node: SQLGlot Struct expression, or None for no options.
-
-        Returns:
-            A dictionary with the supplied trim value.
-
-        Raises:
-            CompileError: The object is malformed, a key is unknown, or a
-                value has the wrong type.
-        """
-        if node is None:
-            return {}
-        if not isinstance(node, exp.Struct):
-            raise CompileError(
-                f"AI.EXTRACT's options are an object like "
-                f"{{'trim': false}}, got {node.sql()}")
-        out = {}
-        for prop in node.expressions:
-            if not isinstance(prop, exp.PropertyEQ):
-                raise CompileError(f"malformed option {prop.sql()}")
-            key = str(prop.this.name).lower()
-            value = prop.expression
-            if key == "trim":
-                if not isinstance(value, exp.Boolean):
-                    raise CompileError(f"{key} is true or false")
-                out[key] = bool(value.this)
-            else:
-                raise CompileError(
-                    f"unknown AI.EXTRACT option {key!r}; the one option is "
-                    f"trim")
-        return out
 
     def bind_ai_value(self, node: exp.Expression) -> ModelCall:
         """Bind a score or classification to its model call."""

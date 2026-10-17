@@ -357,21 +357,12 @@ must be a separate item, rather than part of a larger expression.
 
 ### Arguments
 
-`AI.EXTRACT(input, questions[, options])`
+`AI.EXTRACT(input, questions)`
 
 | Argument | Type | Description |
 | --- | --- | --- |
 | `input` | `STRING` column | The document to read. |
 | `questions` | Object | Field names and their questions. Use one field to ask one question. |
-| `options` | Object | Optional parameters listed below. |
-
-### Optional parameters
-
-Pass an object as the third argument, such as `{'trim': false}`.
-
-| Parameter | Default | Meaning |
-| --- | --- | --- |
-| `trim` | `true` | When `true`, each answer is the fewest words that answer the question. When `false`, each answer is the whole line that contains it. |
 
 ### Answer positions
 

@@ -166,7 +166,9 @@ class PlanPricer:
                     len(tail), chunk=self.statistics.chunk, model=context.model,
                     device=context.device, resident=resident, shared=borrowed,
                     max_answer_tokens=spec.max_answer_tokens,
-                    draft_tokens=spec.draft_tokens, workers=context.gpu_count).seconds
+                    draft_tokens=spec.draft_tokens, draft_policy=spec.draft_policy,
+                    round_cost_per_token=spec.round_cost_per_token,
+                    workers=context.gpu_count).seconds
 
             return _ratio(seconds(shared), seconds(None))
         if isinstance(node, AiClassify):

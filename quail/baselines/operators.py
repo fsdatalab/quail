@@ -19,7 +19,7 @@ from quail.execution.result import (
     filter_answer_table,
 )
 from quail.execution.rows import Rows
-from quail.execution.spans import line_span, locate_span, read_phrase
+from quail.execution.spans import locate_span, read_phrase
 
 
 def token_list(values) -> list[int]:
@@ -246,7 +246,7 @@ def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
 
     Generation stops at the quote that closes the phrase. An answer
     the document holds is returned as the document's own text at its
-    span, widened to whole lines when trim is off; "none" gives nulls;
+    span; "none" gives nulls;
     an answer the document does not hold is returned as written, with
     a null span.
 
@@ -281,8 +281,6 @@ def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
             unanswered += 1
         elif span is None:
             unaligned += 1
-        elif not spec.trim:
-            span = line_span(document, span)
         answers.append(phrase if span is None else document[span[0]:span[1]])
         spans.append(span)
     return {

@@ -167,12 +167,10 @@ def python_api_query(session):
     )
 
 
-# LIMIT stops the pipeline once five documents pass every test; the
-# whole-line answers come from trim off
+# LIMIT stops the pipeline once five documents pass every test
 LIMITED_QUERY = f"""
     SELECT t.id,
-           AI.EXTRACT(t.trace, {{'command': '{LAST_COMMAND}'}},
-                      {{'trim': false}}) AS last
+           AI.EXTRACT(t.trace, {{'command': '{LAST_COMMAND}'}}) AS last
     FROM traces t
     WHERE AI_FILTER(PROMPT('{_prompt(AGENT_RECOVERED)}', t.trace),
                     {{'selectivity': 0.3}})

@@ -127,11 +127,8 @@ class ModelCall:
     # probability, as the column named after the label column plus
     # PROBABILITIES_SUFFIX
     probabilities: bool = False
-    # an "extract" call only: the question the answer is copied for,
-    # and whether the answer is the copied words (trim) or the whole
-    # lines of the document that hold them
+    # an "extract" call only: the question the answer is copied for
     question: str = ""
-    trim: bool = True
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -148,7 +145,7 @@ class ModelCall:
             self.labels or self.descriptions or self.probabilities
         ):
             raise CompileError("only an AI.CLASSIFY call has labels")
-        if self.kind != "extract" and (self.question or not self.trim):
+        if self.kind != "extract" and self.question:
             raise CompileError("only an AI.EXTRACT call has a question")
         if self.kind == "label":
             validate_labels(self.labels, self.descriptions)

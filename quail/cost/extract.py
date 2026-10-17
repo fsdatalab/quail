@@ -4,26 +4,32 @@ The estimate sums each document's work over every document, scales it
 to the live count, and prices the total with the component roofline
 at ideal packing, as quail/cost/classify.py does. The steps follow the
 executor (quail/backends/quail/executor/extract/): the prompt with
-the document, then the answer, one chosen token and a configured draft of
-the document per round, every row read. The expected answer length is a
-cost assumption; the planner does not see the answer. The second and later
-extractions of a pipeline reuse the document's KV. Each answer round reads
-the document, question, and previously accepted answer tokens from KV.
+the document, then the answer, one chosen token and a draft of the
+document per round, every row read. The answer length is a cost
+assumption: answers are taken as geometric with the assumed mean, and
+a document's rounds are the expected number under that curve. Drafts
+are taken as accepted while the answer continues. The second and later
+extractions of a pipeline reuse the document's KV. Each answer round
+reads the document, question, and previously accepted answer tokens
+from KV.
 """
 
 from dataclasses import dataclass
 from itertools import repeat
 
 from quail.cost.dense_decoder_cost import decoder_seconds
+from quail.cost.draft_policy import DraftPolicy
 from quail.cost.work import Work, ask, decode, scan
 
 
 @dataclass(frozen=True)
 class ExtractAssumptions:
-    """Expected answer length used only for extraction cost estimates.
+    """The answer-length curve the extraction cost estimate assumes.
 
-    The default assumes 16 tokens and fully accepted drafts. Actual answer
-    lengths and rejected drafts are not available during planning.
+    Answers are geometric with mean answer_tokens: the chance an answer
+    has more than j tokens after its first is (1 - 1/answer_tokens)**j.
+    The executor's adaptive draft policy starts from the same curve.
+    Actual answer lengths are not available during planning.
     """
 
     answer_tokens: int = 16
@@ -32,13 +38,23 @@ class ExtractAssumptions:
         if type(self.answer_tokens) is not int or self.answer_tokens < 0:
             raise ValueError("answer_tokens must be a nonnegative integer")
 
-    def rounds(self, max_answer_tokens: int, draft_tokens: int) -> int:
-        """Return expected rounds, limited by the configured answer length."""
-        tokens = min(self.answer_tokens, max_answer_tokens)
-        if tokens == max_answer_tokens:
-            # The first token comes from the cue; the cap needs no stop read.
-            tokens -= 1
-        return -(-tokens // (1 + draft_tokens))
+    def survival(self, tokens: int) -> float:
+        """Return the chance an answer has more than tokens tokens after its first."""
+        if self.answer_tokens == 0:
+            return 0.0
+        return (1 - 1 / self.answer_tokens) ** tokens
+
+    def rounds(self, max_answer_tokens: int, draft_tokens: int) -> float:
+        """Return the expected rounds an answer takes, limited by the answer limit.
+
+        The cue chooses the first token. Round r, counting from zero,
+        runs when the answer has more than r (1 + draft_tokens) tokens
+        after it; at the limit no stop is read, so the limit minus one
+        token bounds the rounds.
+        """
+        per_round = 1 + draft_tokens
+        most = -(-(max_answer_tokens - 1) // per_round)
+        return float(sum(self.survival(r * per_round) for r in range(most)))
 
 
 @dataclass(frozen=True)
@@ -63,6 +79,7 @@ class ExtractCost:
 def document_work(length: int, head_tokens: int, tail_tokens: int, *,
                   window: int = 0, resident: bool = False,
                   shared: int = 0, max_answer_tokens: int, draft_tokens: int,
+                  draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
                   assumptions: ExtractAssumptions | None = None,
                   ) -> tuple[Work, float, float]:
     """Return one document's work, its fed tokens, and its readout rows.
@@ -76,11 +93,20 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
             it is for the second and later extractions of a pipeline.
         shared: Prefix tokens borrowed from an earlier document.
         max_answer_tokens: Answer limit from the extraction plan.
-        draft_tokens: Source tokens proposed per round from the extraction plan.
+        draft_tokens: Source tokens proposed per round from the extraction
+            plan; the cap under the adaptive policy.
+        draft_policy: "fixed" or "adaptive", from the extraction plan.
+        round_cost_per_token: One document token's KV read per round, in
+            fed tokens, from the extraction plan.
         assumptions: Expected answer length, separate from execution limits.
     """
     assumptions = ExtractAssumptions() if assumptions is None else assumptions
     prefix = head_tokens + length
+    if draft_policy == "adaptive":
+        # the policy's first-round choice for this document, with one stream
+        policy = DraftPolicy(draft_tokens, max_answer_tokens, assumptions.answer_tokens)
+        draft_tokens = policy.draft_length(
+            round_cost_per_token * (prefix + tail_tokens), 1, live=1)
     if resident:
         work = ask(prefix, tail_tokens, window=window)
     elif shared:
@@ -94,7 +120,11 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     # every row; the last row read decides the closing quote
     round_tokens = 1 + draft_tokens
     rounds = assumptions.rounds(max_answer_tokens, draft_tokens)
-    work += decode(context, repeat(round_tokens, rounds), window=window)
+    whole = int(rounds)
+    work += decode(context, repeat(round_tokens, whole), window=window)
+    if rounds > whole:
+        work += ask(context + whole * round_tokens, round_tokens,
+                    window=window) * (rounds - whole)
     fed += rounds * round_tokens
     rows += rounds * round_tokens
     return work, fed, rows
@@ -102,7 +132,9 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
 
 def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
              chunk: int, model, device, resident: bool = False,
-             shared=None, max_answer_tokens: int, draft_tokens: int, workers: int = 1,
+             shared=None, max_answer_tokens: int, draft_tokens: int,
+             draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
+             workers: int = 1,
              assumptions: ExtractAssumptions | None = None) -> ExtractCost:
     """Estimate the cost of one extraction over a table.
 
@@ -117,7 +149,11 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
         resident: Whether the documents' KV is already available.
         shared: Per-document borrowed prefix lengths, or None.
         max_answer_tokens: Answer limit from the extraction plan.
-        draft_tokens: Source tokens proposed per round from the extraction plan.
+        draft_tokens: Source tokens proposed per round from the extraction
+            plan; the cap under the adaptive policy.
+        draft_policy: "fixed" or "adaptive", from the extraction plan.
+        round_cost_per_token: One document token's KV read per round, in
+            fed tokens, from the extraction plan.
         workers: Model copies sharing the work, assuming balanced document costs.
         assumptions: Expected answer length, separate from execution limits.
 
@@ -136,6 +172,7 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
             window=model.sliding_window, resident=resident,
             shared=0 if shared is None else int(shared[index]),
             max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
+            draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
             assumptions=assumptions)
         work += own
         fed += own_fed
