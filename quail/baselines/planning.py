@@ -31,11 +31,12 @@ from quail.planner import (
 from quail.planner import (
     join_specs as logical_join_specs,
 )
-from quail.planner.join_order import search_joins
-from quail.planner.physical_optimizer import PhysicalCandidate
+from quail.planner.operators.filter import prepare_filter_costs
+from quail.planner.optimizer.physical import PhysicalCandidate
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planner.prompt_lowering import answer_row_offsets, true_false_token_ids
-from quail.planner.statistics import prepare_filter_costs, summarize_alias
+from quail.planner.search.join_order import search_joins
+from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import extraction_refusal, has_extract, has_label
 
 
@@ -336,6 +337,7 @@ def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
         node_id="project",
         inputs=input_ports((sink_input, *label_ports)),
         columns=tuple(columns),
+        structs=region.logical_plan.projection.packing(),
     ))
     if region.logical_plan.result.limit is not None:
         nodes.append(Limit(

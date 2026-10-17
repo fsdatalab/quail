@@ -6,7 +6,12 @@ from pyarrow import acero
 from pyarrow import compute as pc
 
 from quail.catalog.pairs import pair_keys
-from quail.execution.result import IndexRelation, QueryResult, true_answer_rows
+from quail.execution.result import (
+    IndexRelation,
+    QueryResult,
+    StructEntry,
+    true_answer_rows,
+)
 from quail.logical import (
     Alias,
     CompileError,
@@ -148,8 +153,11 @@ def projection_for(logical, token_inputs, documents):
                     b"quail.column": column.encode("utf-8"),
                 },
             ))
+        if node.structs:
+            projection, fields = pack_structs(
+                node.columns, node.structs, projection, fields)
         return QueryResult(
-            columns=list(node.columns),
+            columns=list(node.result_columns),
             declaration=declaration,
             document_index_schema=relation.schema,
             output_schema=pa.schema(
@@ -164,3 +172,41 @@ def projection_for(logical, token_inputs, documents):
         )
 
     return project
+
+
+def pack_structs(columns, structs, projection, fields) -> tuple[list, list]:
+    """Pack member columns into struct columns.
+
+    Each struct column takes the place of its first member and holds
+    one field per member; the members leave the result.
+
+    Args:
+        columns: The projected column names, one per projection entry.
+        structs: (struct column, ((field, member column), ...)) pairs.
+        projection: The (alias, values) entry of each column.
+        fields: The Arrow field of each column.
+
+    Returns:
+        The packed projection entries and fields.
+    """
+    entries = dict(zip(columns, zip(projection, fields)))
+    owner = {member: name for name, members in structs for _, member in members}
+    packed = {}
+    for name, members in structs:
+        parts = [entries[member] for _, member in members]
+        struct_fields = tuple(pa.field(field, part.type)
+                              for (field, _), (_, part) in zip(members, parts))
+        packed[name] = (
+            (None, StructEntry(tuple(entry for entry, _ in parts), struct_fields)),
+            pa.field(name, pa.struct(struct_fields), nullable=True,
+                     metadata=parts[0][1].metadata))
+    out_projection, out_fields = [], []
+    for column, entry in zip(columns, zip(projection, fields)):
+        name = owner.get(column)
+        if name is not None:
+            if name not in packed:
+                continue
+            entry = packed.pop(name)
+        out_projection.append(entry[0])
+        out_fields.append(entry[1])
+    return out_projection, out_fields

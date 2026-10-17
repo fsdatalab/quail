@@ -166,6 +166,82 @@ def validate_question(question: str) -> None:
         raise CompileError("AI.EXTRACT needs a question with at least one word")
 
 
+@dataclass(frozen=True)
+class ExtractStruct:
+    """Several AI.EXTRACT fields of one table, returned as struct columns.
+
+    Each field is its own extraction, projected as an Alias named
+    ``name.field``. The result packs the fields' answers into the
+    struct column ``name`` and their spans into ``name`` plus
+    SPAN_SUFFIX, each with one struct field per extraction field.
+
+    Attributes:
+        name: The struct column's name.
+        fields: The field names, in written order.
+    """
+
+    name: str
+    fields: tuple[str, ...]
+
+    type_name: ClassVar[str] = "quail.extract_struct"
+
+    def member(self, field: str) -> str:
+        """Return the name of one field's extraction."""
+        return f"{self.name}.{field}"
+
+    @property
+    def members(self) -> tuple[str, ...]:
+        """Return the names of the fields' extractions, in field order."""
+        return tuple(self.member(field) for field in self.fields)
+
+    def packing(self) -> tuple:
+        """Return the answer and span struct columns as Project packs them.
+
+        Returns:
+            (struct column, ((field, member column), ...)) for the
+            answers, then for the spans.
+        """
+        return tuple(
+            (self.name + suffix,
+             tuple((field, self.member(field) + suffix) for field in self.fields))
+            for suffix in ("", SPAN_SUFFIX))
+
+    def validate(self) -> None:
+        if not self.name or "." in self.name:
+            raise CompileError(
+                f"an extraction needs a column name without a dot, "
+                f"got {self.name!r}")
+        if not self.fields:
+            raise CompileError(f"AI.EXTRACT {self.name!r} needs at least one field")
+        for field in self.fields:
+            if not isinstance(field, str) or not field or "." in field:
+                raise CompileError(
+                    f"an AI.EXTRACT field needs a name without a dot, "
+                    f"got {field!r}")
+        if len(set(self.fields)) != len(self.fields):
+            raise CompileError(
+                f"AI.EXTRACT {self.name!r} names a field twice: {list(self.fields)}")
+
+
+def packed_columns(columns, packing) -> tuple[str, ...]:
+    """Return result column names after packing members into struct columns.
+
+    Each struct column takes the place of its first member; its other
+    members leave the result.
+
+    Args:
+        columns: The column names before packing.
+        packing: (struct column, ((field, member column), ...)) pairs.
+    """
+    owner = {member: name for name, fields in packing for _, member in fields}
+    out = []
+    for column in columns:
+        name = owner.get(column, column)
+        if name not in out:
+            out.append(name)
+    return tuple(out)
+
+
 def validate_labels(labels: tuple, descriptions: tuple = ()) -> None:
     """Check an AI.CLASSIFY label list and its descriptions.
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.logical import LogicalNode, LogicalPlan
-from quail.planner.physical_optimizer import (
+from quail.planner.optimizer.physical import (
     PlanningContext,
     lowered_prompt,
 )

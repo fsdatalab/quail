@@ -2,7 +2,7 @@
 
 The speed of light estimate asks, for every join subset its search
 visits, which rows occur in at least one satisfying assignment. The
-left deep search itself lives in quail.planner.leftdeep.
+left deep search itself lives in quail.planner.search.leftdeep.
 """
 
 from __future__ import annotations

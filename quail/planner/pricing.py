@@ -15,10 +15,10 @@ from dataclasses import replace
 
 from quail.logical import LogicalPlan
 from quail.planner.api import apply_plan_rules
-from quail.planner.build import build_physical_plan
-from quail.planner.logical_optimizer import LogicalPlanningContext
-from quail.planner.physical_rules import LabelScoring
+from quail.planner.graph.build import build_physical_plan
+from quail.planner.optimizer.logical import LogicalPlanningContext
 from quail.planner.plan import Refusal
+from quail.planner.rules.physical import LabelScoring
 
 
 def physical_plan(logical: LogicalPlan, context):

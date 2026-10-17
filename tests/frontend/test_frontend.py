@@ -31,9 +31,9 @@ from quail.logical import (
     render_join_question,
     split_frame,
 )
-from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
-from quail.planner.logical_rules import built_in_logical_rules
+from quail.planner.optimizer.logical import LogicalPlanningContext, apply_logical_rules
 from quail.planner.prompt_lowering import lower_prompt
+from quail.planner.rules.logical import built_in_logical_rules
 
 
 @pytest.fixture()

@@ -2,12 +2,13 @@
 
 from quail.logical import Aggregate as LogicalAggregate
 from quail.logical import Result as LogicalResult
+from quail.logical import packed_columns
 from quail.physical import Aggregate, Limit, PortRef, Project, Sort
 from quail.physical.base import input_ports
 
 
 def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
-                 columns: tuple[str, ...]) -> tuple:
+                 columns: tuple[str, ...], structs: tuple = ()) -> tuple:
     """Return the Project, Aggregate, and Sort or Limit that end a plan.
 
     A sort key over a source column the projection does not return is
@@ -20,6 +21,8 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
         root: The result modifiers above a projection or aggregation.
         inputs: The ports the projection reads, the relation first.
         columns: The result column names, in the projection's order.
+        structs: The struct columns the Project packs, as
+            Project.structs names them.
     """
     # with an aggregation the sort keys name its outputs, not inputs
     hidden = () if isinstance(root.input, LogicalAggregate) else tuple(dict.fromkeys(
@@ -28,9 +31,10 @@ def result_nodes(root: LogicalResult, inputs: tuple[PortRef, ...],
         node_id="project",
         inputs=input_ports(tuple(inputs)),
         columns=tuple(columns) + hidden,
+        structs=tuple(structs),
     )]
     rows = (PortRef("project", "rows"),)
-    result = tuple(columns)
+    result = packed_columns(columns, structs)
     if isinstance(root.input, LogicalAggregate):
         aggregation = root.input
         nodes.append(Aggregate(
