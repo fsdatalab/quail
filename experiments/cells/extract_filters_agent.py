@@ -188,6 +188,8 @@ QUERIES = {
     "many_operators": (MANY_OPERATORS_QUERY, None),
     "many_operators_as_written": (MANY_OPERATORS_QUERY, "as_written"),
     "join_with_answer_test": (JOIN_WITH_ANSWER_TEST_QUERY, None),
+    # the first query again, after the session is warm
+    "fix_python_file_again": (FIX_PYTHON_FILE_QUERY, None),
 }
 
 
