@@ -468,7 +468,7 @@ def emit_classify(builder, alias, live, calls, ports) -> tuple:
         Where the documents stand after them, and the rows ports of
         the labels SELECT returns.
     """
-    label_ports = []
+    row_ports = []
     table = classify_builder(builder.context, alias, "quail")
     steps = []
     for call in calls:
@@ -491,7 +491,7 @@ def emit_classify(builder, alias, live, calls, ports) -> tuple:
             ports = Ports(PortRef(node.node_id, f"ids:{alias}"),
                                 PortRef(node.node_id, "rows"))
             if call in builder.operators.labels.projected:
-                label_ports.append(ports.rows)
+                row_ports.append(ports.rows)
             classified_calls.add(call)
         if test is not None:
             lid = f"filter:{alias}:{test.position}"
@@ -501,7 +501,7 @@ def emit_classify(builder, alias, live, calls, ports) -> tuple:
                 selectivity=test.selectivity, written_pos=test.position))
             ports = Ports(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
             live *= effective_selectivity(test.selectivity)
-    return ports, label_ports
+    return ports, row_ports
 
 
 def joined_calls(labels: LabelWork) -> list:
@@ -521,7 +521,7 @@ def emit_joined_classify(builder, join_ids) -> list:
         The rows ports of the labels SELECT returns.
     """
     stats = builder.operator_order.statistics.stats
-    label_ports = []
+    row_ports = []
     # a classification of joined rows follows the join that keeps them,
     # in the join's pipeline: each kept row's partner block, question,
     # and label paths run over the anchor's resident KV
@@ -550,5 +550,5 @@ def emit_joined_classify(builder, join_ids) -> list:
             sum(isinstance(n, AiClassify) for n in builder.nodes))
         builder.nodes.append(node)
         if call in builder.operators.labels.projected:
-            label_ports.append(PortRef(node.node_id, "rows"))
-    return label_ports
+            row_ports.append(PortRef(node.node_id, "rows"))
+    return row_ports

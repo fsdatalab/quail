@@ -86,12 +86,12 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
     for q, node in enumerate(nodes):
         spec = node.spec
         answers, answer_spans = stages.answers(q, kept)
-        table = extraction_rows(spec.alias, spec.name, spec.span_name,
+        answers = extraction_rows(spec.alias, spec.name, spec.span_name,
                                 document_ids, answers, answer_spans)
         first = q == 0
         gpu_s, timed = own(q)
         results[node.node_id] = NodeResult(
-            {"rows": table, f"ids:{spec.alias}": arrow_ids(document_ids)},
+            {"rows": answers, f"ids:{spec.alias}": arrow_ids(document_ids)},
             NodeMetrics(
                 input_rows=len(document_ids), output_rows=len(document_ids),
                 evaluated_documents=len(document_ids),

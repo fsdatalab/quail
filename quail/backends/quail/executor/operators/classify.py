@@ -72,7 +72,7 @@ class QuailClassifier:
         Args:
             spec: Classification specification.
             rows: Document IDs to classify, in input order.
-            documents: Tokenized documents indexed by table alias and document ID.
+            documents: Tokenized documents indexed by scored alias and document ID.
             on_answers: Optional callable(row positions, labels) run with each
                 chunk's newly labeled rows.
 
@@ -160,7 +160,7 @@ class ClassifyPart(ClassifyBatch):
                  prior_tables=()):
         self.node = node
         self.ids = ids
-        self.priors = priors      # (part, port) of each label table read
+        self.priors = priors      # (part, port) of each label scored read
         self.prior_tables = prior_tables
         self.kept = kept          # KeptPairs, for joined rows
         sink = answer_sink()
@@ -191,13 +191,13 @@ class ClassifyPart(ClassifyBatch):
             rows = np.asarray(
                 [[self.ids[anchor], plan.partners.ids[partner]]
                  for anchor, partner in pairs], dtype=np.int32).reshape(-1, 2)
-            table = score_rows(rows, spec.aliases, spec.name,
+            scored = score_rows(rows, spec.aliases, spec.name,
                                [plan.pair_labels[pair] for pair in pairs],
                                pa.string())
             sink = answer_sink()
             if sink is not None and len(rows):
-                sink(scored_batch(self.node, rows, table))
-            return NodeResult(classify_outputs(self.node, table), NodeMetrics(
+                sink(scored_batch(self.node, rows, scored))
+            return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
                 input_rows=len(pairs), output_rows=len(pairs),
                 evaluated_document_pairs=len(pairs), fresh_tokens=tokens,
                 gpu_s=gpu_s, chunks=chunks,
@@ -209,19 +209,19 @@ class ClassifyPart(ClassifyBatch):
                    if label is not None]
         rows = np.asarray([[self.ids[index]] for index in labeled],
                           dtype=np.int32).reshape(-1, 1)
-        table = score_rows(rows, spec.aliases, spec.name,
+        scored = score_rows(rows, spec.aliases, spec.name,
                            [plan.labels[index] for index in labeled],
                            pa.string())
         if plan.probabilities is not None:
-            table = table.with_column(
+            scored = scored.with_column(
                 spec.name + PROBABILITIES_SUFFIX,
                 probability_column(spec.labels, plan.probabilities[labeled]))
         # the labels the parts before it gave these documents, as a
         # classify node on its own carries them from its scores input
         for prior in (*self.prior_tables, *(part.result_value.outputs[port]
                                              for part, port in self.priors)):
-            table = table.joined(prior, spec.aliases[0])
-        return NodeResult(classify_outputs(self.node, table), NodeMetrics(
+            scored = scored.joined(prior, spec.aliases[0])
+        return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),
             evaluated_documents=self.reached, fresh_tokens=tokens,
             gpu_s=gpu_s, chunks=chunks,

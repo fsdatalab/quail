@@ -20,7 +20,7 @@ from quail.planner.operators.common import (
 from quail.planner.operators.ports import Ports
 
 
-def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
+def extract_spec(context, call, name, live, resident=False) -> ExtractSpec:
     """Build an extraction's specification and price it.
 
     The specification carries the token ids of the prompt around the
@@ -33,8 +33,8 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         call: Logical AI.EXTRACT call.
         name: Result column name.
         live: Expected number of documents to extract from.
-        shared: Whether an extraction of the same table runs right
-            before this one.
+        resident: Whether the documents' KV is already read, by a
+            step of the same pipeline before this one.
     """
     prompt = context.lowered(call.prompt)
     (ref,) = call.prompt.args
@@ -55,7 +55,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
     cost = extract_cost.estimate(
         live, lengths, len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),
-        model=context.model, device=context.device, resident=shared,
+        model=context.model, device=context.device, resident=resident,
         max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens,
         draft_policy=spec.draft_policy,
         round_cost_per_token=spec.round_cost_per_token, workers=context.gpu_count)
@@ -86,14 +86,14 @@ def emit_extract(builder, alias, live, names, ports, resident=False) -> tuple:
                 if node.alias == alias}
     calls = [extracts[name] for name in names]
     tests = builder.operators.extract_filters.get(alias, ())
-    answer_ports = []
+    row_ports = []
     for index, logical_node in enumerate(calls):
         # the extractions of a table and the Filters on their answers
         # run in one pipeline (quail.physical.pipelines): a document
         # is read once for all of them, and a Filter drops it before
         # the next question
         spec = extract_spec(builder.context, logical_node.call,
-                            logical_node.name, live, shared=resident or index > 0)
+                            logical_node.name, live, resident=resident or index > 0)
         node = inference_node(
             AiExtract, spec, (ports.source,),
             index=sum(isinstance(n, AiExtract) for n in builder.nodes),
@@ -111,6 +111,6 @@ def emit_extract(builder, alias, live, names, ports, resident=False) -> tuple:
                 selectivity=test.selectivity, written_pos=test.position))
             ports = Ports(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
             live *= effective_selectivity(test.selectivity)
-        answer_ports.append(ports.rows)
-    return ports, answer_ports
+        row_ports.append(ports.rows)
+    return ports, row_ports
 

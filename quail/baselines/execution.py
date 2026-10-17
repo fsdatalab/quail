@@ -227,12 +227,12 @@ class RequestModelExecution:
                     for document in document_ids])
             # a document whose answer names no label has no label row
             # and leaves the query
-            table = classification_rows(
+            labels = classification_rows(
                 spec, {spec.alias: document_ids}, result["labels"])
-            outputs[f"label_answers:{spec.output}"] = table
-            labeled = list(zip(table.ids[spec.alias].to_pylist(),
-                               table.column(spec.output).to_pylist()))
-            survivors[spec.alias] = table.ids[spec.alias].to_pylist()
+            outputs[f"label_answers:{spec.output}"] = labels
+            labeled = list(zip(labels.ids[spec.alias].to_pylist(),
+                               labels.column(spec.output).to_pylist()))
+            survivors[spec.alias] = labels.ids[spec.alias].to_pylist()
             test_answers = {}
             for index, (position, accepted) in enumerate(spec.tests):
                 kept = set(accepted)
@@ -424,17 +424,17 @@ class RequestModelExecution:
                     + note + partner_label
                     + token_list(self.documents[spec.partner][partner])
                     for anchor, partner in pairs])
-            table = classification_rows(
+            labels = classification_rows(
                 spec, {spec.alias: kept.column(spec.alias),
                        spec.partner: kept.column(spec.partner)}, result["labels"])
-            outputs[f"label_answers:{spec.output}"] = table
+            outputs[f"label_answers:{spec.output}"] = labels
             steps.append(request_step(result,
                 kind="classify",
                 alias=spec.alias,
                 partner=spec.partner,
                 output=spec.output,
                 n_in=len(pairs),
-                n_out=table.num_rows,
+                n_out=labels.num_rows,
                 unmatched=result["unmatched"],
             ))
 

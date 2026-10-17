@@ -265,7 +265,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     rows, priors = _candidate_rows(node, inputs)
     parts = rows.shard(shards) if shards > 1 else [rows]
     width = len(node.spec.aliases)
-    tables = []
+    scored = []
     positions = []
     metrics = NodeMetrics()
     # a product's pairs are built per batch: the whole product may not
@@ -284,7 +284,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         ]
         results = score_batches(node, [batch for _, batch in batches])
         for (where, batch), result in zip(batches, results):
-            tables.append(result.outputs["rows"])
+            scored.append(result.outputs["rows"])
             positions.append(where)
             metrics += result.metrics
             sink = answer_sink()
@@ -292,18 +292,18 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
                 sink(scored_batch(
                     node, batch,
                     result.outputs["rows"].column(node.spec.name).to_pylist()))
-    table = Rows.concat(tables)
+    rows = Rows.concat(scored)
     order = np.concatenate(positions)
     if len(order) and np.any(np.diff(order) < 0):
-        table = table.take(np.argsort(order, kind="stable"))
+        rows = rows.take(np.argsort(order, kind="stable"))
     for alias, prior in priors.items():
-        table = table.joined(prior, alias)
-    outputs = {"rows": table}
+        rows = rows.joined(prior, alias)
+    outputs = {"rows": rows}
     if isinstance(node.spec, ClassifySpec):
         # a document whose decoded answer names no label leaves the query
-        table = table.filter(pc.is_valid(table.column(node.spec.name)))
-        metrics = replace(metrics, output_rows=table.num_rows)
-        outputs = classify_outputs(node, table)
+        rows = rows.filter(pc.is_valid(rows.column(node.spec.name)))
+        metrics = replace(metrics, output_rows=rows.num_rows)
+        outputs = classify_outputs(node, rows)
     return NodeResult(outputs, replace(
         metrics, wall_s=time.perf_counter() - started,
         extension={**metrics.extension, "output": node.spec.name,
@@ -354,17 +354,17 @@ class RerankerModelExecution:
         )
         if sink is not None and len(rows) and not streams:
             sink(scored_batch(node, rows, batch.scores))
-        table = score_rows(rows, spec.aliases, spec.name, batch.scores,
+        scored = score_rows(rows, spec.aliases, spec.name, batch.scores,
                            _value_type(spec))
         if isinstance(spec, ClassifySpec) and spec.probabilities:
-            table = table.with_column(
+            scored = scored.with_column(
                 spec.name + PROBABILITIES_SUFFIX, probability_column(
                     spec.labels,
                     np.full((len(rows), len(spec.labels)), np.nan)
                     if batch.probabilities is None else batch.probabilities))
         count = len(rows)
         return NodeResult(
-            {"rows": table},
+            {"rows": scored},
             NodeMetrics(
                 wall_s=time.perf_counter() - started,
                 input_rows=count,
@@ -408,8 +408,8 @@ class FilterRuntime:
             raise TypeError(type(node).__name__)
         if len(inputs) != 1:
             raise ValueError("Filter needs one score or label input")
-        table = next(iter(inputs.values()))
-        return filter_scores(node, table)
+        rows = next(iter(inputs.values()))
+        return filter_scores(node, rows)
 
 
 def filter_scores(node, rows: Rows) -> NodeResult:

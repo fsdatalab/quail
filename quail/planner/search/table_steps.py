@@ -162,5 +162,5 @@ def _classify_seconds(context, alias, call, name, resident, live) -> float:
 def _extract_seconds(context, node, resident, live) -> float:
     """Price an extraction at a live count."""
     return extract_spec(context, node.call, node.name, live,
-                        shared=resident).estimated_seconds
+                        resident=resident).estimated_seconds
 

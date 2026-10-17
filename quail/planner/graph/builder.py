@@ -191,15 +191,15 @@ class GraphBuilder:
         self._prepare()
         ports_by_alias = self._emit_scans()
         try:
-            ports_by_alias, label_ports = self._emit_documents(ports_by_alias)
+            ports_by_alias, row_ports = self._emit_documents(ports_by_alias)
             ports_by_alias, joins = self._emit_joins(ports_by_alias)
-            label_ports += self._emit_join_answers(ports_by_alias, joins)
+            row_ports += self._emit_join_answers(ports_by_alias, joins)
             score_pairs = self._emit_pair_scores(ports_by_alias, joins)
         except ClassifyRefusedError as refused:
             return refused.refusal()
         except ScoreRefusedError as refused:
             return refused.refusal
-        self._emit_result(ports_by_alias, label_ports, joins, score_pairs)
+        self._emit_result(ports_by_alias, row_ports, joins, score_pairs)
         return self._finish()
 
     def _prepare(self):
@@ -275,7 +275,7 @@ class GraphBuilder:
     def _emit_documents(self, ports_by_alias: dict) -> tuple:
         """Create the inference nodes over each table before its joins."""
         stats = self.operator_order.statistics.stats
-        label_ports = []
+        row_ports = []
         ports_by_alias = dict(ports_by_alias)
         for s in self.operators.scans:
             # a classification or extraction the planner lifted
@@ -287,8 +287,8 @@ class GraphBuilder:
                 kinds.add(EXTRACT)
             ports_by_alias[s.alias], rows = self._emit_steps(
                 s.alias, float(stats[s.alias].n_docs), kinds, ports_by_alias[s.alias])
-            label_ports += rows
-        return ports_by_alias, label_ports
+            row_ports += rows
+        return ports_by_alias, row_ports
 
     def _emit_steps(self, alias, live, kinds, ports) -> tuple:
         """Emit the given kinds of a table's steps in run order.
@@ -310,7 +310,7 @@ class GraphBuilder:
                  if step.kind in kinds]
         if ASK in kinds and not any(step.kind == ASK for step in steps):
             ports = self.emit_applies(alias, ports)
-        label_ports = []
+        row_ports = []
         # the scores SELECT returns follow the score predicates, before
         # the classifications and extractions read the rows
         scores_pending = ASK in kinds and self.scoring is not None
@@ -329,17 +329,17 @@ class GraphBuilder:
                                        followed=run[-1] is not steps[-1])
             elif kind == CLASSIFY:
                 ports, rows = emit_classify(self, alias, live, positions, ports)
-                label_ports += rows
+                row_ports += rows
             else:
                 ports, rows = emit_extract(self, alias, live, positions, ports,
                                            resident=resident)
-                label_ports += rows
+                row_ports += rows
             for step in run:
                 live *= step.selectivity
             previous = run[-1]
         if scores_pending:
             ports = emit_projected_scores(self, alias, live, ports)
-        return ports, label_ports
+        return ports, row_ports
 
     def _emit_joins(self, ports_by_alias: dict) -> tuple:
         """Create the joins and the exchanges between anchor groups.
@@ -359,8 +359,8 @@ class GraphBuilder:
         for g, group in enumerate(groups):
             anchor = self.sequence_groups[g][0][1]
             if group[0][0].cost is not None:
-                joins.scored_pairs = emit_score_joins(
-                    self, group, ports_by_alias, joins.scored_pairs)
+                joins.score_pairs = emit_score_joins(
+                    self, group, ports_by_alias, joins.score_pairs)
                 continue
             if g > 0:
                 ahead = [scan.alias for scan in self.operators.scans]
@@ -401,7 +401,7 @@ class GraphBuilder:
         Returns:
             The rows ports of the labels and answers SELECT returns.
         """
-        label_ports = emit_joined_classify(self, joins.node_ids)
+        row_ports = emit_joined_classify(self, joins.node_ids)
         # classifications after the joins run over the documents the joins
         # matched: a document with at least one true pair, expected as the
         # join selectivity times the partners it met, at most every document
@@ -421,12 +421,12 @@ class GraphBuilder:
             ports_by_alias[alias], rows = self._emit_steps(
                 alias, self.operator_order.live[alias] * min(1.0, met), kinds,
                 ports_by_alias[alias])
-            label_ports += rows
-        return label_ports
+            row_ports += rows
+        return row_ports
 
     def _emit_pair_scores(self, ports_by_alias: dict, joins) -> PortRef | None:
         """Create the pair scores SELECT returns; return their rows port."""
-        score_pairs = joins.scored_pairs
+        score_pairs = joins.score_pairs
         for expression in self.projected_scores:
             call = expression.expression
             if len(call.aliases()) == 2 and call.prompt not in self.scoring.names:
@@ -434,7 +434,7 @@ class GraphBuilder:
                                               ports_by_alias)
         return score_pairs
 
-    def _emit_result(self, ports_by_alias, label_ports, joins, score_pairs):
+    def _emit_result(self, ports_by_alias, row_ports, joins, score_pairs):
         """Connect result operators to surviving rows and answers."""
         if score_pairs is not None:
             sink_inputs = (score_pairs,)
@@ -470,7 +470,7 @@ class GraphBuilder:
                                     for item in self.projected_scores))
         result_inputs = (*sink_inputs,
                          *(port for port in score_ports if port not in sink_inputs),
-                         *label_ports)
+                         *row_ports)
         self.nodes.extend(result_nodes(self.plan.result, result_inputs, tuple(columns),
                                        self.plan.projection.packing()))
 
@@ -546,10 +546,10 @@ class JoinPorts:
         node_ids: Join written position -> its AiJoin node id.
         answers: Every full stage's port of passing pairs.
         aliases: The recombination's output order.
-        scored_pairs: The rows of the pairs the score joins keep, or None.
+        score_pairs: The rows of the pairs the score joins keep, or None.
     """
 
     node_ids: dict = field(default_factory=dict)
     answers: list = field(default_factory=list)
     aliases: list = field(default_factory=list)
-    scored_pairs: PortRef | None = None
+    score_pairs: PortRef | None = None
