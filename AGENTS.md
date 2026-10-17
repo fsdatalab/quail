@@ -137,18 +137,19 @@ how they release and explain changes.
   state belong to those apps.
 - To check a change, run Quail alone on a small set of queries at
   scale factor 0.1, not the full suite. The full suite is slow. Use
-  these five, which together cover the main plan shapes:
+  these six, which together cover the main plan shapes:
   - `IMDB-1`: one filter.
   - `IMDB-2`: one join.
   - `IMDB-4`: two filters, then a join.
   - `FEV-9`: four filters and a chain of three joins.
   - `BIO-5`: classify.
+  - `CUAD-1`: extract.
 
   For example:
 
       uv run modal run --detach -m bench.quailb_parallel \
         --model qwen3-4b-fp8 --sf 0.1 \
-        --query IMDB-1,IMDB-2,IMDB-4,FEV-9,BIO-5 \
+        --query IMDB-1,IMDB-2,IMDB-4,FEV-9,BIO-5,CUAD-1 \
         --no-include-baselines --no-include-sglang \
         2>&1 | tee "$run_log"
 
