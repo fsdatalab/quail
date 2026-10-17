@@ -402,7 +402,7 @@ def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
     _, model, shared, _ = _setup(
         monkeypatch, documents=documents, share_prefixes=True)
     result, stages = shared()
-    assert result.outputs["rows"].equals(unshared.outputs["rows"])
+    assert result.outputs["rows"].table().equals(unshared.outputs["rows"].table())
     borrowed = result.metrics.extension["borrowed_prefix_tokens"]
     assert borrowed > 0
     assert result.metrics.fresh_tokens == unshared.metrics.fresh_tokens - borrowed
@@ -572,8 +572,8 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
         {"retained": {"c": sub["inputs"]["document_ids"]}}
         for sub in rounds[0]])
     again = execution.execute(nodes[1], {"input": pa.table({"c": [2, 0]})})
-    assert again.outputs["rows"].equals(
-        expected[nodes[1].node_id].outputs["rows"].take(pa.array([2, 0])))
+    assert again.outputs["rows"].table().equals(
+        expected[nodes[1].node_id].outputs["rows"].take(pa.array([2, 0])).table())
     assert again.metrics.fresh_tokens < expected[nodes[1].node_id].metrics.fresh_tokens
 
 
@@ -600,7 +600,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
             node_id="ai_filter:c", inputs=input_ports((PortRef("input:c", "ids:c"),)),
             alias="c", arena_writes=True, question_token_ids=tuple(question),
             written_pos=0, question_tokens=len(question), preamble_tokens=len(head),
-            head_token_ids=tuple(head),
+            document_head=tuple(head),
             selectivity=0.7, expected_docs=2.0),
         AiExtract(node_id="ai-extract:ends",
                   inputs=input_ports((PortRef("ai_filter:c", "ids:c"),)),
@@ -823,7 +823,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
             inputs=input_ports((PortRef("filter:c:1", "ids:c"),)),
             alias="c", arena_writes=True, question_token_ids=tuple(question),
             written_pos=0, question_tokens=len(question), preamble_tokens=len(head),
-            head_token_ids=tuple(head),
+            document_head=tuple(head),
             selectivity=0.7, expected_docs=2.0),
     ), PortRef("ai_filter:c", "ids:c"))
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]

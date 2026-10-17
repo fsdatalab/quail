@@ -29,7 +29,10 @@ from quail.planner.search.table_steps import (
     table_steps,
 )
 from quail.planner.search.table_steps import CLASSIFY as CLASSIFY_STEP
-from quail.planner.sol.prefixes import document_shared_tokens, subset_shared_tokens
+from quail.planner.statistics.prefixes import (
+    document_shared_tokens,
+    subset_shared_tokens,
+)
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
@@ -79,7 +82,7 @@ class _EstimatePricing:
     def extract(self, node) -> tuple:
         return self._question(node.call.prompt)
 
-    def head(self, prompt):
+    def document_head(self, prompt):
         return None
 
 

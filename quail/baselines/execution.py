@@ -15,7 +15,6 @@ from quail.baselines.operators import (
     classification_rows,
     classify_documents,
     extract_documents,
-    extraction_rows,
     filter_answers,
     join_answers,
     operator_at_a_time_filter,
@@ -32,6 +31,7 @@ from quail.baselines.request_scheduling import (
 )
 from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.rows import extraction_rows
 from quail.physical import PhysicalNode
 
 
@@ -460,7 +460,8 @@ class RequestModelExecution:
                 body_texts=([preamble_text + text for text in document_texts]
                             if self.submit_text else None))
             outputs[f"extract_answers:{spec.output}"] = extraction_rows(
-                spec, document_ids, result["answers"], result["spans"])
+                spec.alias, spec.output, spec.span_output, document_ids,
+                result["answers"], result["spans"])
             steps.append(request_step(result,
                 kind="extract",
                 alias=spec.alias,

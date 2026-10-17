@@ -25,7 +25,7 @@ from quail.planner.operators.classify import classify_scoring
 from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import plan_kv_retention
 from quail.planner.search.statistics import cached_statistics, live_after_filters
-from quail.planner.sol.prefixes import page_tree
+from quail.planner.statistics.prefixes import page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 

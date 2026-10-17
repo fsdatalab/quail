@@ -13,11 +13,11 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.base import input_ports
-from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import (
     bind_inference,
     inference_node,
 )
+from quail.planner.operators.ports import Ports
 
 
 def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
@@ -62,7 +62,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
     return replace(spec, estimated_seconds=cost.seconds)
 
 
-def emit_extract(builder, alias, live, names, frontier, resident=False) -> tuple:
+def emit_extract(builder, alias, live, names, ports, resident=False) -> tuple:
     """Copy the answers of the alias's documents.
 
     A Filter on an extraction's answer or span follows that extraction
@@ -74,7 +74,7 @@ def emit_extract(builder, alias, live, names, frontier, resident=False) -> tuple
         alias: The table.
         live: The documents the extractions read.
         names: The extractions to emit, in run order.
-        frontier: Where the documents stand before the extractions.
+        ports: Where the documents stand before the extractions.
         resident: Whether the step before the run left the documents'
             KV for the first extraction to read.
 
@@ -95,22 +95,22 @@ def emit_extract(builder, alias, live, names, frontier, resident=False) -> tuple
         spec = extract_spec(builder.context, logical_node.call,
                             logical_node.name, live, shared=resident or index > 0)
         node = inference_node(
-            AiExtract, spec, (frontier.source,),
+            AiExtract, spec, (ports.source,),
             index=sum(isinstance(n, AiExtract) for n in builder.nodes),
             backend="quail", model=builder.model.name)
         builder.nodes.append(node)
-        frontier = Frontier(PortRef(node.node_id, f"ids:{alias}"),
+        ports = Ports(PortRef(node.node_id, f"ids:{alias}"),
                             PortRef(node.node_id, "rows"))
         for test in tests:
             if test.name != logical_node.name:
                 continue
             lid = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
-                node_id=lid, inputs=input_ports((frontier.rows,)),
+                node_id=lid, inputs=input_ports((ports.rows,)),
                 predicate=test.condition, aliases=(alias,),
                 selectivity=test.selectivity, written_pos=test.position))
-            frontier = Frontier(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
+            ports = Ports(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
             live *= effective_selectivity(test.selectivity)
-        answer_ports.append(frontier.rows)
-    return frontier, answer_ports
+        answer_ports.append(ports.rows)
+    return ports, answer_ports
 

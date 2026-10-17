@@ -97,7 +97,7 @@ class PhysicalPlan:
         object.__setattr__(self, "root", graph.root)
         object.__setattr__(self, "graph", graph)
         if self.estimator is not None and not self.estimates:
-            object.__setattr__(self, "estimates", self.estimator(graph))
+            object.__setattr__(self, "estimates", self.estimator(graph)[1])
 
 
     def _edge(self, producer: str, consumer: str) -> tuple:
@@ -146,8 +146,9 @@ class PhysicalPlan:
             for node in edited.nodes
             if isinstance(node, AiFilter) and node.alias not in scheduled
             and not isinstance(pipelines[node.node_id][-1], AiJoin))
-        seconds = self.estimator.seconds(edited.graph) + recompute
-        return replace(edited, estimated_seconds=seconds, estimates=edited.estimates)
+        seconds, estimates = self.estimator(edited.graph)
+        return replace(edited, estimated_seconds=seconds + recompute,
+                       estimates=estimates)
 
     def insert(self, node: PhysicalNode, *, between: tuple) -> "PhysicalPlan":
         """Put node on the edge from producer to consumer.

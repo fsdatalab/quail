@@ -15,8 +15,7 @@ from quail.backends.quail.reranker import RerankerModelExecution
 from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
 from quail.execution.metrics import NodeResult
-from quail.execution.result import extract_answers
-from quail.execution.rows import Rows
+from quail.execution.rows import Rows, extraction_rows
 from quail.execution.spans import locate_span, read_phrase
 from quail.logical import (
     CompileError,
@@ -315,7 +314,7 @@ def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
         # the extraction reads the scan's ids, or the rows of the score
         # predicate before it
         ids = (source.ids["c"] if isinstance(source, Rows) else source).to_pylist()
-        table = extract_answers(
+        table = extraction_rows(
             node.spec.alias, node.spec.name, node.spec.span_name,
             ids, ["March 3, 2027" if i == 0 else None for i in ids],
             [(14, 27) if i == 0 else None for i in ids])
@@ -544,7 +543,7 @@ def _fake_struct_answers(monkeypatch):
         ids = (source.ids["c"] if isinstance(source, Rows) else source).to_pylist()
         found = answers[node.spec.name]
         spans = {"lease.ends": (14, 27), "lease.rent": (37, 43)}
-        table = extract_answers(
+        table = extraction_rows(
             node.spec.alias, node.spec.name, node.spec.span_name, ids,
             [found[i] for i in ids],
             [spans[node.spec.name] if found[i] else None for i in ids])
@@ -639,7 +638,7 @@ def _answers_executor(answers):
             def execute(self, node, inputs):
                 spec = node.spec
                 ids = [int(i) for i in inputs["document_ids"]]
-                table = extract_answers(
+                table = extraction_rows(
                     spec.alias, spec.name, spec.span_name, ids,
                     [answers[i] for i in ids],
                     [None if answers[i] is None
@@ -919,7 +918,8 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
     steps = table_steps(operators, "c", range(1),
                         PlanPricing(context, statistics, "c"))
     assert [step.kind for step in steps] == ["ask", "classify", "extract"]
-    assert len({step.head for step in steps}) == 1 and steps[0].head
+    assert len({step.document_head for step in steps}) == 1
+    assert steps[0].document_head
     written = query(0.05, order="as_written").plan()
     assert order(written) == ["ai_filter:c", "ai-classify:0", "ai-extract:0"]
     # the speed of light estimate runs the same orders
@@ -940,7 +940,7 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
 def test_rows_carry_their_ids_apart_from_their_values():
     # a classification after an extraction carries its answers as
     # value columns; the ids stay the ids
-    answers = extract_answers(
+    answers = extraction_rows(
         "c", "lease.ends", "lease.ends_span", [0, 2],
         ["March 3, 2027", None], [(14, 27), None])
     labels = Rows({"c": [2, 0]}, pa.table({"kind": ["a", "b"]}))

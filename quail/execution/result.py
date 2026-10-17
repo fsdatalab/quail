@@ -6,7 +6,6 @@ from collections.abc import Iterable
 from copy import copy
 from dataclasses import dataclass
 
-import numpy as np
 import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
@@ -100,26 +99,6 @@ def filter_answer_table(alias, documents, positions, answers) -> pa.Table:
     return pa.Table.from_arrays(
         [pa.array(documents, pa.int32()), pa.array(positions, pa.int32()),
          pa.array(answers, pa.bool_())], schema=schema)
-
-
-def extract_answers(alias, name, span_name, document_ids, answers, spans):
-    """Build the rows of an extraction: its answers and nullable character spans.
-
-    Returns:
-        Rows of the alias with the answer and span columns.
-    """
-    from quail.execution.rows import Rows
-
-    valid = np.fromiter((span is not None for span in spans), dtype=bool,
-                        count=len(spans))
-    bounds = np.zeros((len(spans), 2), dtype=np.int32)
-    bounds[valid] = np.asarray([span for span in spans if span is not None],
-                               dtype=np.int32).reshape(-1, 2)
-    span_array = pa.StructArray.from_arrays(
-        [pa.array(bounds[:, 0]), pa.array(bounds[:, 1])],
-        names=["start", "end"], mask=pa.array(~valid))
-    return Rows({alias: document_ids},
-                pa.table({name: pa.array(answers, pa.string()), span_name: span_array}))
 
 
 def true_answer_rows(table: pa.Table) -> pa.Table:

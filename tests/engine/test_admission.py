@@ -557,7 +557,7 @@ def test_next_stage_settlement_preserves_the_answered_stage_decision(
     assert sched.done() and sched.survivors == 0
 
 
-def test_a_limit_paces_admission_by_the_expected_survival():
+def test_a_limit_paces_admission_by_the_parts_survival():
     # a limit of two survivors at a survival of a half: four anchors
     # in flight are expected to reach it, so the fifth waits; a drop
     # settles one and lets the next in

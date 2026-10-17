@@ -16,7 +16,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from quail.execution.ids import document_ids
-from quail.execution.result import document_index_schema
+from quail.execution.result import document_index_table
 
 
 @dataclass(frozen=True)
@@ -96,33 +96,21 @@ class Rows:
             rows = rows.with_column(name, pc.take(prior.column(name), positions))
         return rows
 
-    def table(self, kind: str = "rows") -> pa.Table:
+    def table(self) -> pa.Table:
         """Return the rows as one table: the id columns, then the values.
 
         The id fields carry the document index schema the result
         assembly joins on.
         """
-        schema = document_index_schema(self.ids, kind)
-        arrays = [self.ids[name] for name in schema.names]
+        table = document_index_table(self.ids, "rows")
         for name in self.values.column_names:
-            schema = schema.append(self.values.schema.field(name))
-            arrays.append(self.values.column(name))
-        return pa.Table.from_arrays(arrays, schema=schema)
-
-    def equals(self, other: Rows) -> bool:
-        """Return whether the rows hold the same ids and values, in order."""
-        return self.table().equals(other.table())
+            table = table.append_column(self.values.schema.field(name),
+                                        self.values.column(name))
+        return table
 
     def to_pydict(self) -> dict:
         """Return the ids and values as Python lists, ids first."""
         return self.table().to_pydict()
-
-    @classmethod
-    def from_table(cls, table: pa.Table, aliases: Iterable[str]) -> Rows:
-        """Split a table into the rows: the named columns are the ids."""
-        aliases = tuple(aliases)
-        return cls({alias: table.column(alias) for alias in aliases},
-                   table.drop_columns(list(aliases)))
 
     @classmethod
     def concat(cls, parts: Iterable[Rows]) -> Rows:
@@ -133,6 +121,25 @@ class Rows:
         return cls({alias: pa.concat_arrays([part.ids[alias] for part in parts])
                     for alias in parts[0].aliases},
                    pa.concat_tables([part.values for part in parts]))
+
+
+def extraction_rows(alias, name, span_name, document_ids, answers, spans) -> Rows:
+    """Build the rows of an extraction: its answers and nullable character spans."""
+    valid = np.fromiter((span is not None for span in spans), dtype=bool,
+                        count=len(spans))
+    bounds = np.zeros((len(spans), 2), dtype=np.int32)
+    bounds[valid] = np.asarray([span for span in spans if span is not None],
+                               dtype=np.int32).reshape(-1, 2)
+    span_array = pa.StructArray.from_arrays(
+        [pa.array(bounds[:, 0]), pa.array(bounds[:, 1])],
+        names=["start", "end"], mask=pa.array(~valid))
+    return Rows({alias: document_ids},
+                pa.table({name: pa.array(answers, pa.string()), span_name: span_array}))
+
+
+def as_table(value):
+    """Return rows as their table, and any other value as it is."""
+    return value.table() if isinstance(value, Rows) else value
 
 
 def _empty(length: int) -> pa.Table:

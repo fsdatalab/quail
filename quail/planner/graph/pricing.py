@@ -26,7 +26,7 @@ from quail.physical import (
 )
 from quail.physical.pipelines import build_pipelines
 from quail.planner.operators.classify import classify_scoring
-from quail.planner.sol.prefixes import document_shared_tokens, page_tree
+from quail.planner.statistics.prefixes import document_shared_tokens, page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
@@ -58,19 +58,20 @@ class PlanPricer:
     live: dict
     resident_asks: frozenset = frozenset()
 
-    def __call__(self, graph: PhysicalGraph) -> dict:
-        """Return node id -> its explain entry: seconds, and recompute figures."""
-        return {node_id: entry for node_id, (_, entry) in self._priced(graph).items()}
+    def __call__(self, graph: PhysicalGraph) -> tuple[float, dict]:
+        """Price a graph: its seconds, and node id -> its explain entry.
 
-    def seconds(self, graph: PhysicalGraph) -> float:
-        """Return the plan's estimated seconds."""
-        work, seconds = Work(), 0.0
-        for price, _ in self._priced(graph).values():
+        An entry holds the node's seconds and, for the last filter of
+        a table a join anchors on, what releasing its KV would cost.
+        """
+        work, seconds, entries = Work(), 0.0, {}
+        for node_id, (price, entry) in self._priced(graph).items():
+            entries[node_id] = entry
             if price.work is not None:
                 work += price.work
             else:
                 seconds += price.seconds
-        return self._seconds(work) + seconds
+        return self._seconds(work) + seconds, entries
 
     def _priced(self, graph) -> dict:
         pipelines = build_pipelines(graph, self.context.gpu_count)
@@ -170,14 +171,16 @@ class PlanPricer:
                     round_cost_per_token=spec.round_cost_per_token,
                     workers=context.gpu_count).seconds
 
-            return _ratio(seconds(shared), seconds(None))
+            whole = seconds(None)
+            return seconds(shared) / whole if whole else 1.0
         if isinstance(node, AiClassify):
             def seconds(borrowed):
                 return classify_scoring(context, alias, shared=borrowed).estimate_spec(
                     spec, resident).seconds
 
-            return _ratio(seconds(document_shared_tokens(self._store(alias))),
-                          seconds(()))
+            whole = seconds(())
+            return (seconds(document_shared_tokens(self._store(alias))) / whole
+                    if whole else 1.0)
         # a score's time is taken as proportional to the tokens it
         # computes, its documents borrowing the table's share of theirs
         summary = summarize_alias(context.document_tokens[alias],
@@ -198,6 +201,3 @@ class PlanPricer:
             return None
         return page_tree(store).shared
 
-
-def _ratio(part: float, whole: float) -> float:
-    return part / whole if whole else 1.0

@@ -108,7 +108,7 @@ class AiFilter(PhysicalNode):
     expected_docs: float = 0.0
     question_token_ids: tuple[Any, ...] = ()
     # the token ids the documents are shown under, before the document
-    head_token_ids: tuple[int, ...] = ()
+    document_head: tuple[int, ...] = ()
     # documents borrow the KV pages of a document that shares their
     # token prefix (the should_share_prefixes rule)
     share_prefixes: bool = False
@@ -129,10 +129,6 @@ class AiFilter(PhysicalNode):
     @property
     def document_aliases(self) -> tuple[str, ...]:
         return (self.alias,)
-
-    @property
-    def document_head(self) -> tuple[int, ...]:
-        return self.head_token_ids
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
@@ -160,7 +156,7 @@ class AiFilter(PhysicalNode):
             "selectivity": self.selectivity,
             "expected_docs": self.expected_docs,
             "question_token_ids": list(self.question_token_ids),
-            "head_token_ids": list(self.head_token_ids),
+            "document_head": list(self.document_head),
             "share_prefixes": self.share_prefixes,
             "attention": self.attention,
             "stop_key": list(self.stop_key),
@@ -169,7 +165,7 @@ class AiFilter(PhysicalNode):
     def explain_fields(self) -> Mapping[str, Any]:
         value = self.attributes()
         value.pop("question_token_ids")
-        value.pop("head_token_ids")
+        value.pop("document_head")
         return value
 
     @classmethod
@@ -186,7 +182,7 @@ class AiFilter(PhysicalNode):
             selectivity=attributes["selectivity"],
             expected_docs=float(attributes["expected_docs"]),
             question_token_ids=tuple(attributes["question_token_ids"]),
-            head_token_ids=tuple(attributes.get("head_token_ids", ())),
+            document_head=tuple(attributes.get("document_head", ())),
             share_prefixes=bool(attributes.get("share_prefixes", False)),
             attention=str(attributes.get("attention", "")),
             stop_key=tuple(str(column)

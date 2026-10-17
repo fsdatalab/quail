@@ -22,8 +22,8 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.base import input_ports
-from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import bind_inference, inference_node
+from quail.planner.operators.ports import Ports
 from quail.planner.prompt_lowering import (
     choice_token_parts,
     classify_prompt_tokens,
@@ -454,7 +454,7 @@ class ClassifyBuilder(ClassifyStatistics):
             frame_tokens=frame), estimated.work
 
 
-def emit_classify(builder, alias, live, calls, frontier) -> tuple:
+def emit_classify(builder, alias, live, calls, ports) -> tuple:
     """Classify the alias's documents, then keep the accepted labels.
 
     Args:
@@ -462,7 +462,7 @@ def emit_classify(builder, alias, live, calls, frontier) -> tuple:
         alias: The table.
         live: The documents the classifications read.
         calls: The classifications to emit, in run order.
-        frontier: Where the documents stand before the classifications.
+        ports: Where the documents stand before the classifications.
 
     Returns:
         Where the documents stand after them, and the rows ports of
@@ -485,23 +485,23 @@ def emit_classify(builder, alias, live, calls, frontier) -> tuple:
             if builder.scoring is not None:
                 builder.scoring.work += work
             node = table.node(
-                spec, frontier.source,
+                spec, ports.source,
                 sum(isinstance(n, AiClassify) for n in builder.nodes))
             builder.nodes.append(node)
-            frontier = Frontier(PortRef(node.node_id, f"ids:{alias}"),
+            ports = Ports(PortRef(node.node_id, f"ids:{alias}"),
                                 PortRef(node.node_id, "rows"))
             if call in builder.operators.labels.projected:
-                label_ports.append(frontier.rows)
+                label_ports.append(ports.rows)
             classified_calls.add(call)
         if test is not None:
             lid = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
-                node_id=lid, inputs=input_ports((frontier.rows,)),
+                node_id=lid, inputs=input_ports((ports.rows,)),
                 predicate=test.condition, aliases=(alias,),
                 selectivity=test.selectivity, written_pos=test.position))
-            frontier = Frontier(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
+            ports = Ports(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
             live *= effective_selectivity(test.selectivity)
-    return frontier, label_ports
+    return ports, label_ports
 
 
 def joined_calls(labels: LabelWork) -> list:

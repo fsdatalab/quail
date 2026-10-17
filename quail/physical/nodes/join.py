@@ -69,7 +69,7 @@ class AiJoin(PhysicalNode):
     label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()
     tail_token_ids: tuple[int, ...] = ()
     # the token ids the anchors are shown under, before the document
-    head_token_ids: tuple[int, ...] = ()
+    document_head: tuple[int, ...] = ()
     # "unified" or "tree": the attention path the choose_attention_algorithm rule
     # chose; empty leaves the model pipeline's default
     attention: str = ""
@@ -87,10 +87,6 @@ class AiJoin(PhysicalNode):
     @property
     def document_aliases(self) -> tuple[str, ...]:
         return (self.anchor,)
-
-    @property
-    def document_head(self) -> tuple[int, ...]:
-        return self.head_token_ids
 
     def document_outputs(self, alias: str) -> tuple[str, ...]:
         return (f"join_answers:{self.written_pos}", f"ids:{alias}")
@@ -144,7 +140,7 @@ class AiJoin(PhysicalNode):
             "label_token_ids": [[alias, list(tokens)]
                                 for alias, tokens in self.label_token_ids],
             "tail_token_ids": list(self.tail_token_ids),
-            "head_token_ids": list(self.head_token_ids),
+            "document_head": list(self.document_head),
         }
 
     @classmethod
@@ -172,7 +168,7 @@ class AiJoin(PhysicalNode):
                 for alias, tokens in value.get("label_token_ids", ())
             ),
             tail_token_ids=tuple(value.get("tail_token_ids", ())),
-            head_token_ids=tuple(value.get("head_token_ids", ())),
+            document_head=tuple(value.get("document_head", ())),
         )
 
 

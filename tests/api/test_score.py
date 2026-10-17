@@ -685,7 +685,7 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     # the rule turns sharing on; the pricer prices the score over its
     # fresh tokens: 19 x 400 of 20 x (401 + 2) tokens are borrowed
     assert spec.share_prefixes and spec.estimated_seconds == 10.0
-    assert pricer(context)(rewritten)["score"]["seconds"] == pytest.approx(
+    assert pricer(context)(rewritten)[1]["score"]["seconds"] == pytest.approx(
         10.0 * (1 - 19 * 400 / 8060))
     # the plan's total moves by the score's change
     unshared = graph(("d",))
@@ -699,7 +699,7 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     # tokens per document that sharing does not save
     canvas = replace(context, model=replace(QWEN3_4B_FP8, canvas_tokens=256))
     rewritten = ShouldSharePrefixes().rewrite(graph(("d",), draws=4), canvas)
-    assert pricer(canvas)(rewritten)["score"]["seconds"] == pytest.approx(
+    assert pricer(canvas)(rewritten)[1]["score"]["seconds"] == pytest.approx(
         10.0 * (1 - 19 * 400 / (8020 + 20 * 1029)))
     spec = scored(rewritten)
     assert ScoreSpec.from_mapping(spec.to_dict()) == spec

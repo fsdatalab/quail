@@ -147,7 +147,7 @@ def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
         attention_mode=next((part.attention for part in parts if part.attention),
                             attention),
         staging=input_staging(state), label=label, limit=limit,
-        survival=expected_survival(parts),
+        survival=survival(parts),
         stop_groups=stop_groups, paged=paged,
         on_chunk=transition_reporter(parts), on_answers=on_answers,
         appended_tokens=max(part.appended_tokens for part in parts) or None)
@@ -266,16 +266,16 @@ def complete_parts(parts, every, spans, tokens, stats):
             low)
 
 
-def expected_survival(parts) -> float:
+def survival(parts) -> float:
     """The fraction of documents expected to pass every part, by selectivity."""
-    survival = 1.0
+    fraction = 1.0
     for part in parts:
         nodes = getattr(part, "nodes", None) or (
             (part.node,) if hasattr(part, "node") else ())
         for node in nodes:
             if hasattr(node, "selectivity"):
-                survival *= effective_selectivity(node.selectivity)
-    return survival
+                fraction *= effective_selectivity(node.selectivity)
+    return fraction
 
 
 def execution_prefix_tree(node, documents, arena):

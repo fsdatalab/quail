@@ -48,10 +48,8 @@ def apply_plan_rules(plan, rules, context):
         return refused.refusal()
     if not changed and context.settings == dict(plan.settings):
         return plan
-    pricer = plan.estimator
-    return replace(
-        plan, nodes=graph.nodes, root=graph.root,
-        estimated_seconds=(pricer.seconds(graph) if pricer
-                           else plan.estimated_seconds),
-        settings=context.settings,
-        estimates=pricer(graph) if pricer else plan.estimates)
+    seconds, estimates = (plan.estimator(graph) if plan.estimator
+                          else (plan.estimated_seconds, plan.estimates))
+    return replace(plan, nodes=graph.nodes, root=graph.root,
+                   estimated_seconds=seconds, settings=context.settings,
+                   estimates=estimates)

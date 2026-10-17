@@ -20,8 +20,7 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.result import extract_answers
-from quail.execution.rows import Rows
+from quail.execution.rows import Rows, extraction_rows
 from quail.physical import AiExtract
 
 
@@ -87,7 +86,7 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
     for q, node in enumerate(nodes):
         spec = node.spec
         answers, answer_spans = stages.answers(q, kept)
-        table = extract_answers(spec.alias, spec.name, spec.span_name,
+        table = extraction_rows(spec.alias, spec.name, spec.span_name,
                                 document_ids, answers, answer_spans)
         first = q == 0
         gpu_s, timed = own(q)
@@ -136,7 +135,7 @@ class ExtractPart(ExecutionPart):
         part = cls(state, nodes, ids, {
             "documents": context.state["docs"],
             "texts": context.state.get("texts", {}),
-            "head": first.document_head})
+            "pipeline_head": first.document_head})
         alias = part.node.spec.alias
         for doc, document in zip(part.extraction.docs, part.ids):
             if doc.key != (alias, document):
@@ -158,7 +157,7 @@ class ExtractPart(ExecutionPart):
         self.extraction = ExtractionStages(
             state, [node.spec for node in nodes], load_vocabulary(state), self.ids,
             inputs["documents"][alias], texts,
-            pipeline_head=inputs.get("head", self.node.document_head),
+            pipeline_head=inputs.get("pipeline_head", self.node.document_head),
             document_positions=inputs.get("document_positions"))
         self.stages = self.extraction.stages
         self._results = {}

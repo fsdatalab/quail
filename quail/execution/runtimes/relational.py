@@ -10,7 +10,7 @@ from quail.catalog.pairs import columns_key
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
-from quail.execution.rows import Rows
+from quail.execution.rows import as_table
 from quail.physical import Aggregate, Limit, Project, Scan, Sort
 
 
@@ -72,8 +72,8 @@ class ProjectRuntime:
         if not inputs:
             raise ValueError("Project needs one input")
         first, *rest = node.inputs
-        value = _as_table(inputs[first.name])
-        labels = {port.name: _as_table(inputs[port.name]) for port in rest}
+        value = as_table(inputs[first.name])
+        labels = {port.name: as_table(inputs[port.name]) for port in rest}
         if context.project is not None:
             value = (context.project(node, value, labels) if labels
                      else context.project(node, value))
@@ -137,15 +137,9 @@ _HAVING_COMPARE = {
 }
 
 
-def _as_table(value):
-    """Rows as their table; any other value as it is."""
-    return value.table() if isinstance(value, Rows) else value
-
-
 def _rows_table(value) -> pa.Table:
     """Return a node's rows input as one Arrow table."""
-    if isinstance(value, Rows):
-        return value.table()
+    value = as_table(value)
     if isinstance(value, QueryResult):
         return value.collect()
     if isinstance(value, pa.RecordBatch):

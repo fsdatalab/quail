@@ -1,4 +1,4 @@
-"""Where a table's documents stand after an operator: the value lowering passes on."""
+"""The ports an operator leaves for the operator after it."""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ from quail.physical import PortRef
 
 
 @dataclass(frozen=True)
-class Frontier:
+class Ports:
     """The output of a table's latest operator, as the next operator reads it.
 
-    Each operator over a table takes the frontier before it and returns
-    the one after it, so an operator's input is always the output of
+    Each operator over a table takes the ports before it and returns
+    the ones after it, so an operator's input is always the output of
     the operator before it.
 
     Attributes:

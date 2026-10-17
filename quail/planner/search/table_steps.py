@@ -36,7 +36,7 @@ class TableStep:
         first: Seconds at a live count, the documents read afresh.
         later: Seconds at a live count, the documents' KV resident.
         reuse_key: Identity of a result an earlier step computed, or None.
-        head: The token ids the step shows the document under.
+        document_head: The token ids the step shows the document under.
     """
 
     kind: str
@@ -45,7 +45,7 @@ class TableStep:
     first: Callable[[float], float]
     later: Callable[[float], float]
     reuse_key: Any = None
-    head: Any = None
+    document_head: Any = None
 
 
 def resident_after(previous: TableStep, step: TableStep) -> bool:
@@ -55,7 +55,7 @@ def resident_after(previous: TableStep, step: TableStep) -> bool:
     past what the step before it appended and asks its question
     (the can_follow rules of the physical nodes).
     """
-    return previous.head == step.head
+    return previous.document_head == step.document_head
 
 
 class PlanPricing:
@@ -91,7 +91,7 @@ class PlanPricing:
         return tuple(partial(_extract_seconds, self.context, node, resident)
                      for resident in (False, True))
 
-    def head(self, prompt):
+    def document_head(self, prompt):
         """Return the token ids a prompt shows the document under."""
         return tuple(self.context.lowered(prompt).preamble_token_ids)
 
@@ -104,7 +104,8 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
         alias: The table.
         asks: The written positions of the table's AI.IF predicates.
         pricing: Prices the steps: asks(predicates), classify(call,
-            name), extract(node), and head(prompt), as PlanPricing does.
+            name), extract(node), and document_head(prompt), as
+            PlanPricing does.
     """
     steps = []
     predicates = operators.filters.get(alias, ())
@@ -112,7 +113,8 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
     for position, cost in zip(asks, costs):
         steps.append(TableStep(ASK, position, cost.selectivity, cost.first,
                                cost.later, cost.reuse_key,
-                               head=pricing.head(predicates[position].prompt)))
+                               document_head=pricing.document_head(
+                                   predicates[position].prompt)))
     tests = {}
     for test in operators.label_filters.get(alias, ()):
         tests.setdefault(test.call, []).append(test.selectivity)
@@ -121,7 +123,8 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
             continue
         first, later = pricing.classify(call, operators.labels.names[call])
         steps.append(TableStep(CLASSIFY, call, _survival(tests.get(call, ())),
-                               first, later, head=pricing.head(call.prompt)))
+                               first, later,
+                               document_head=pricing.document_head(call.prompt)))
     tests = {}
     for test in operators.extract_filters.get(alias, ()):
         tests.setdefault(test.name, []).append(test.selectivity)
@@ -130,7 +133,8 @@ def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:
             continue
         first, later = pricing.extract(node)
         steps.append(TableStep(EXTRACT, node.name, _survival(tests.get(node.name, ())),
-                               first, later, head=pricing.head(node.call.prompt)))
+                               first, later,
+                               document_head=pricing.document_head(node.call.prompt)))
     return steps
 
 

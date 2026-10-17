@@ -15,7 +15,6 @@ from quail.catalog.pairs import (
 from quail.execution.labels import match_label
 from quail.execution.result import (
     answer_table,
-    extract_answers,
     filter_answer_table,
 )
 from quail.execution.rows import Rows
@@ -292,12 +291,6 @@ def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
         "unanswered": unanswered,
         "unaligned": unaligned,
     }
-
-
-def extraction_rows(spec, document_ids, answers, spans) -> Rows:
-    """Return each document's answer and character span."""
-    return extract_answers(spec.alias, spec.output, spec.span_output,
-                           document_ids, answers, spans)
 
 
 def allowed_members_by_anchor(anchor, partners, anchor_ids, members, pairs) -> list:
