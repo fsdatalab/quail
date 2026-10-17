@@ -26,29 +26,29 @@ def _common_payload(payload: dict) -> dict:
     }
 
 
-def begin_query_payloads(payload: dict, k: int) -> list[dict]:
+def begin_query_payloads(payload: dict, gpus: int) -> list[dict]:
     """Build one empty query start payload per GPU executor."""
     outputs = []
-    for worker in range(k):
+    for worker in range(gpus):
         sub = _common_payload(payload)
         sub["physical_plan"] = payload["physical_plan"]
         sub.update(
-            docs={},
-            doc_index={},
+            documents={},
+            document_index={},
             node_id=None,
             worker=worker,
-            workers=k,
+            gpus=gpus,
         )
         outputs.append(sub)
     return outputs
 
 
 def filter_node_payloads(payload: dict, node, shards: dict,
-                         k: int, *, has_joins: bool) -> list[dict]:
+                         gpus: int, *, has_joins: bool) -> list[dict]:
     """Build one typed filter node payload per GPU executor."""
     outputs = []
-    tokens = payload["docs"][node.alias]
-    for worker in range(k):
+    tokens = payload["documents"][node.alias]
+    for worker in range(gpus):
         shard = shards[node.alias][worker]
         indices = shard if isinstance(shard, range) else list(shard)
         sub = _common_payload(payload)
@@ -57,120 +57,120 @@ def filter_node_payloads(payload: dict, node, shards: dict,
             None if has_joins else payload.get("filter_limit")
         )
         sub.update(
-            docs={node.alias: select_documents(tokens, indices)},
-            doc_index={node.alias: indices},
+            documents={node.alias: select_documents(tokens, indices)},
+            document_index={node.alias: indices},
             stop_groups=stop_groups(
                 node, payload.get("columns", {}).get(node.alias), indices),
             node_id=node.node_id,
             worker=worker,
-            workers=k,
+            gpus=gpus,
         )
         outputs.append(sub)
     return outputs
 
 
-def keyed_shards(groups, doc_tokens, k: int) -> tuple:
+def keyed_shards(groups, document_tokens, gpus: int) -> tuple:
     """Shard documents by stop key group, balanced by token count.
 
     Every document of a group lands on one worker, so the worker's
     per-key stop sees the whole group.
     """
     tokens = {}
-    for group, length in zip(groups, doc_tokens):
+    for group, length in zip(groups, document_tokens):
         tokens[group] = tokens.get(group, 0) + length
     ordered = list(tokens)
-    shards, _ = balanced_shards([tokens[group] for group in ordered], k)
+    shards, _ = balanced_shards([tokens[group] for group in ordered], gpus)
     placed = {ordered[index]: worker
               for worker, shard in enumerate(shards) for index in shard}
-    out = [[] for _ in range(k)]
+    out = [[] for _ in range(gpus)]
     for document, group in enumerate(groups):
         out[placed[group]].append(document)
     return tuple(tuple(shard) for shard in out)
 
 
-def join_group_payloads(payload: dict, k: int, survivors: dict,
-                        group: list, prior_shards: dict | None = None,
+def join_group_payloads(payload: dict, gpus: int, survivors: dict,
+                        joins: list, prior_shards: dict | None = None,
                         *, filtered_aliases: set[str] | None = None,
                         shards: dict | None = None,
                         pair_tables: dict | None = None) -> list:
-    """Build per-worker sub-payloads for one anchor group's join round.
+    """Build per-worker sub-payloads for one anchor joins's join round.
 
     Anchors follow the shards their KV already sits on - the shards of
-    an earlier group that kept the anchor's KV (prior_shards), else
+    an earlier joins that kept the anchor's KV (prior_shards), else
     their filter shards - otherwise they are re-sharded over the live
     set. Partners are replicated to all workers.
     """
-    if not group:
+    if not joins:
         return []
 
-    anchor_alias = group[0]["anchor"]
+    anchor_alias = joins[0]["anchor"]
 
     def surv(alias):
         # an alias with no filters survives whole
         if alias in survivors:
             return list(survivors[alias])
-        return list(range(len(payload["docs"][alias])))
+        return list(range(len(payload["documents"][alias])))
 
-    live = surv(anchor_alias)
+    expected_rows = surv(anchor_alias)
     shards = shards if shards is not None else payload.get("shards") or {}
     filtered_aliases = (filtered_aliases if filtered_aliases is not None
                         else set(payload.get("filters", ())))
-    alive = set(live)
+    alive = set(expected_rows)
     if prior_shards and anchor_alias in prior_shards:
         anchor_shards = [[g for g in shard if g in alive]
                          for shard in prior_shards[anchor_alias]]
         placed = {g for shard in anchor_shards for g in shard}
-        missing = [g for g in live if g not in placed]
+        missing = [g for g in expected_rows if g not in placed]
         if missing:
-            toks = payload["docs"][anchor_alias]
-            idx_shards, _ = balanced_shards(
-                [len(toks[g]) for g in missing], k)
-            for worker, shard in enumerate(idx_shards):
+            tokens = payload["documents"][anchor_alias]
+            index_shards, _ = balanced_shards(
+                [len(tokens[g]) for g in missing], gpus)
+            for worker, shard in enumerate(index_shards):
                 anchor_shards[worker].extend(missing[i] for i in shard)
     elif anchor_alias in filtered_aliases and anchor_alias in shards:
         anchor_shards = [[g for g in shard if g in alive]
                          for shard in shards[anchor_alias]]
     else:
-        toks = payload["docs"][anchor_alias]
-        idx_shards, _ = balanced_shards([len(toks[g]) for g in live],
-                                        k)
-        anchor_shards = [[live[i] for i in s] for s in idx_shards]
-    partner_aliases = sorted({p for j in group for p in j["partners"]})
+        tokens = payload["documents"][anchor_alias]
+        index_shards, _ = balanced_shards([len(tokens[g]) for g in expected_rows],
+                                        gpus)
+        anchor_shards = [[expected_rows[i] for i in s] for s in index_shards]
+    partner_aliases = sorted({p for j in joins for p in j["partners"]})
     partners = {}
     for alias in partner_aliases:
         indices = surv(alias)
         partners[alias] = {
             "index": indices,
-            "docs": select_documents(payload["docs"][alias], indices),
+            "documents": select_documents(payload["documents"][alias], indices),
         }
     # a pair stage ships each worker its anchors' live partner rows
     pair_rows = {}
-    for j in group:
+    for j in joins:
         if not runs_over_pairs(j):
             continue
         partner = pair_partner(anchor_alias, j["partners"])
-        table = (pair_tables or {}).get(j["written_pos"])
+        table = (pair_tables or {}).get(j["written_position"])
         if table is None:
-            raise ValueError(f"join {j['written_pos']} received no pair table")
-        pair_rows[j["written_pos"]] = table.filter(pc.is_in(
+            raise ValueError(f"join {j['written_position']} received no pair table")
+        pair_rows[j["written_position"]] = table.filter(pc.is_in(
             table[partner], value_set=pa.array(partners[partner]["index"],
                                                type=table[partner].type)))
     subs = []
-    for w in range(k):
+    for w in range(gpus):
         sub = _common_payload(payload)
         sub["physical_plan"] = payload["physical_plan"]
-        sub.update(joins=group,
+        sub.update(joins=joins,
                    anchor_alias=anchor_alias,
                    anchor_index=list(anchor_shards[w]),
-                   anchor_docs=select_documents(
-                       payload["docs"][anchor_alias], anchor_shards[w]
+                   anchor_documents=select_documents(
+                       payload["documents"][anchor_alias], anchor_shards[w]
                    ),
                    partners=partners,
                    pairs={position: table.filter(pc.is_in(
                        table[anchor_alias], value_set=pa.array(
                            anchor_shards[w], type=table[anchor_alias].type)))
                           for position, table in pair_rows.items()},
-                   worker=w, workers=k)
+                   worker=w, gpus=gpus)
         subs.append(sub)
     return subs
 

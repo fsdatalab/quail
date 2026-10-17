@@ -91,14 +91,14 @@ def local_plan(context, *, count, estimate, source):
                           PortRef(node_id, "ids:d"), schema=("d",)),)
 
     scan = Scan(node_id="input:d", alias="d", input_id="d",
-                n_docs=len(context.document_tokens["d"]))
+                num_documents=len(context.document_tokens["d"]))
     filtered = FirstDocuments(
         node_id="filter:d", inputs=ids_from("input:d"), alias="d", count=count)
     project = Project(
         node_id="project", inputs=ids_from("filter:d"), columns=("d.id",))
     plan = PhysicalPlan(
         model=context.model.name, device=context.device.name,
-        workers=context.gpu_count, backend="local_filter",
+        gpus=context.gpus, backend="local_filter",
         estimated_seconds=estimate, nodes=(scan, filtered, project),
         settings={"planner_source": source})
     return PhysicalCandidate(plan.graph, plan, estimate)
@@ -110,7 +110,7 @@ class LocalFilterBackend:
     def __init__(self):
         self.called = False
 
-    def supports(self, model, device, gpu_count):
+    def supports(self, model, device, gpus):
         return SupportResult.accept()
 
     def plan(self, region, context):
@@ -149,7 +149,7 @@ class TwoCandidatesBackend:
         self.estimates = (written, alternative)
         self.alternative = None
 
-    def supports(self, model, device, gpu_count):
+    def supports(self, model, device, gpus):
         return SupportResult.accept()
 
     def plan(self, region, context):
@@ -187,11 +187,11 @@ def test_plan_query_keeps_the_cheapest_candidate_and_its_logical_plan(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",
                      device="h100-sxm"),
         tokenizer=str.split, registry=registry)
-    session.register("docs", DocumentProvider.from_table(
+    session.register("documents", DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
         id_col="id", identity="two-candidate-docs"))
     query = session.sql(
-        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
+        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
     plan = query.plan()
     assert plan.settings["planner_source"] == chosen
     written, alternative = rule.seen
@@ -216,11 +216,11 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
         tokenizer=str.split,
         registry=registry,
     )
-    session.register("docs", DocumentProvider.from_table(
+    session.register("documents", DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
         id_col="id", identity="local-filter-docs"))
     query = session.sql(
-        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
+        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
     plan = query.plan()
     envelope = plan.to_envelope(registry.codecs)
 
@@ -233,7 +233,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
 
     registry = built_in_registry()
-    scan = Scan(node_id="input:d", alias="d", input_id="d", n_docs=1,
+    scan = Scan(node_id="input:d", alias="d", input_id="d", num_documents=1,
                 shard_ranges=((0, 1),), shard_token_loads=(1,))
     plan = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
     encoded = encode_graph(plan, registry.codecs)
@@ -261,11 +261,11 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     module.register_quail_extension = register
     monkeypatch.setitem(sys.modules, module.__name__, module)
     registry = built_in_registry()
-    scan = Scan(node_id="input:d", alias="d", input_id="d", n_docs=2)
+    scan = Scan(node_id="input:d", alias="d", input_id="d", num_documents=2)
     graph = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
     request = PhysicalRequest(
         plan_envelope(backend=ExampleBackend.name, model="qwen3-4b-fp8",
-                      device="h100-sxm", workers=1, graph=graph,
+                      device="h100-sxm", gpus=1, graph=graph,
                       codecs=registry.codecs),
         {"d": document_input(pa.array([[1], [2]]))},
     )
@@ -279,7 +279,7 @@ def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
     from quail.explain import physical_tree
     from quail.physical.base import input_ports
 
-    source = Scan(node_id="input:d", alias="d", n_docs=100)
+    source = Scan(node_id="input:d", alias="d", num_documents=100)
     first = FirstDocuments(
         node_id="first", alias="d", count=5,
         inputs=input_ports((PortRef(source.node_id, "ids:d"),)))
@@ -302,7 +302,7 @@ def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
     assert "input:d" not in text
     assert "input:d[ids:d]" in physical_tree(graph, verbose=True)
 
-    node = Scan(node_id="input:d", alias="d", n_docs=100)
+    node = Scan(node_id="input:d", alias="d", num_documents=100)
     graph = PhysicalGraph((node,), PortRef(node.node_id, "ids:d"))
     assert "metrics unavailable" in physical_tree(graph, metrics={})
     measured = {node.node_id: NodeMetrics(output_rows=42, wall_s=1.25,

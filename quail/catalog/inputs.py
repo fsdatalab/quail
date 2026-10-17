@@ -52,7 +52,7 @@ class InputStore:
         self._token_stores = {}
         self._replaced_token_stores = []
         self._column_stores = {}
-        self._store_count = 0
+        self.num_stores = 0
         self._token_directory = None
         self._corpus_tokenizers = {}
         self._length_estimates = {}
@@ -200,14 +200,14 @@ class InputStore:
         if key in self._length_estimates:
             return self._length_estimates[key]
         started = time.perf_counter()
-        row_count = provider.statistics().row_count
+        num_rows = provider.statistics().num_rows
         sample = self.sample_columns(provider_name, (column,))[column].to_pylist()
         # Defer fast-tokenizer initialization to the background tokenization pass.
-        tok = self.tokenizer
-        sample_lengths = [max(1, len(tok(text))) for text in sample]
-        if row_count is not None:
+        tokenizer = self.tokenizer
+        sample_lengths = [max(1, len(tokenizer(text))) for text in sample]
+        if num_rows is not None:
             lengths = [sample_lengths[index % len(sample_lengths)]
-                       for index in range(row_count)] if sample_lengths else []
+                       for index in range(num_rows)] if sample_lengths else []
         else:
             sample_tokens = sum(sample_lengths)
             sample_bytes = sum(len(text.encode("utf-8")) for text in sample)
@@ -231,19 +231,19 @@ class InputStore:
         """Cache the session tokenizer and token type for one column."""
         key = (self.catalog.get(provider_name).content_identity(), column)
         if key not in self._corpus_tokenizers:
-            tok = self.tokenizer
+            tokenizer = self.tokenizer
             self.notes.append(
                 f"{provider_name}.{column}: tokenizer: {self.tokenizer_name}"
             )
             first_token = next(
-                (token for text in texts for token in tok(text)), None
+                (token for text in texts for token in tokenizer(text)), None
             )
             token_type = (
                 pa.int32()
                 if first_token is None or isinstance(first_token, Integral)
                 else pa.string()
             )
-            self._corpus_tokenizers[key] = (tok, token_type)
+            self._corpus_tokenizers[key] = (tokenizer, token_type)
         return self._corpus_tokenizers[key]
 
     def _store_path(self) -> str:
@@ -251,10 +251,10 @@ class InputStore:
             self._token_directory = TemporaryDirectory(
                 prefix="quail-tokens-"
             )
-        self._store_count += 1
+        self.num_stores += 1
         return str(
             Path(self._token_directory.name)
-            / f"input-{self._store_count}.arrow"
+            / f"input-{self.num_stores}.arrow"
         )
 
     def _pick_tokenizer(self, reader, provider_name: str, column: str):
@@ -270,9 +270,9 @@ class InputStore:
             texts = batch.column(batch.schema.get_field_index(column))
             needed = 25 - len(text_sample)
             text_sample.extend(texts.slice(0, needed).to_pylist())
-        tok, token_type = self._corpus_tokenizer(
+        tokenizer, token_type = self._corpus_tokenizer(
             provider_name, column, text_sample)
-        return buffered, tok, token_type
+        return buffered, tokenizer, token_type
 
     def _load(self, provider_name: str, column: str | None,
               value_columns: tuple[str, ...], *, offsets_encoder=None) -> None:
@@ -301,18 +301,21 @@ class InputStore:
                 existing = self._token_stores.get((identity, column))
                 existing_tokens = existing.arrow_array if existing is not None else None
                 if existing_tokens is None:
-                    buffered, tok, token_type = self._pick_tokenizer(
+                    buffered, tokenizer, token_type = self._pick_tokenizer(
                         reader, provider_name, column)
                     batches = chain(buffered, reader)
                 else:
-                    tok, token_type = self.tokenizer, existing_tokens.type.value_type
+                    tokenizer, token_type = (
+                        self.tokenizer,
+                        existing_tokens.type.value_type,
+                    )
                 if offsets_encoder is not None:
                     self.notes.append(f"{provider_name}.{column}: tokenizer: "
                                       f"{self.tokenizer_name} with character offsets")
                 token_writer = TokenStoreWriter(
                     self._store_path(),
                     document_column=column,
-                    tokenizer=tok,
+                    tokenizer=tokenizer,
                     token_type=token_type,
                     offsets_encoder=offsets_encoder,
                     existing_tokens=existing_tokens,

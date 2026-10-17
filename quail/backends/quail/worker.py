@@ -86,15 +86,15 @@ class LoadedGpu:
 
         t0 = time.perf_counter()
         full_pages, sliding_pages = budgets.arena_pages(spec, device, budget)
-        self.arena = KVArena(n_layers=spec.layers,
-                             n_pages=full_pages,
+        self.arena = KVArena(num_layers=spec.layers,
+                             num_pages=full_pages,
                              page_tokens=budgets.PAGE_TOKENS,
-                             n_kv=spec.n_kv, d_head=spec.d_head,
+                             num_kv_heads=spec.num_kv_heads, d_head=spec.d_head,
                              dtype=torch.bfloat16,
                              layer_kv=spec.kv_shapes,
                              sliding_layers=spec.sliding_layer_set,
                              sliding_window=spec.sliding_window,
-                             n_sliding_pages=sliding_pages)
+                             num_sliding_pages=sliding_pages)
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -124,7 +124,7 @@ class LoadedGpu:
         if arena_pages is not None:
             graphs = getattr(self.pipeline, "decode_graphs", None)
             if (graphs is not None and tuple(arena_pages)
-                    != (self.arena.n_pages, self.arena.n_sliding_pages)):
+                    != (self.arena.num_pages, self.arena.num_sliding_pages)):
                 self.torch.cuda.synchronize()
                 graphs.invalidate()
             self.arena.resize(*arena_pages, free_resident=True)
@@ -216,19 +216,19 @@ def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
 def quail_runtime_payload(request, graph) -> dict:
     """Build private Quail scheduler state from a standard request."""
     envelope = request.plan
-    docs = {}
+    documents = {}
     texts = {}
     for node in graph.nodes:
         if not isinstance(node, Scan):
             continue
-        docs[node.alias] = request.inputs[node.input_id].documents
+        documents[node.alias] = request.inputs[node.input_id].documents
         if request.inputs[node.input_id].texts is not None:
             texts[node.alias] = request.inputs[node.input_id].texts
     return {
         "physical_plan": envelope,
         "model": envelope["model"],
-        "workers": envelope["workers"],
-        "docs": docs,
+        "gpus": envelope["gpus"],
+        "documents": documents,
         "texts": texts,
         "columns": request.column_tables(),
         **dict(envelope["settings"]),
@@ -239,7 +239,7 @@ def _single_gpu_context(registry, envelope):
     """Build the GPU context for the single-GPU boot path."""
     return GpuContext(
         gpu_index=0,
-        gpu_count=envelope["workers"],
+        gpus=envelope["gpus"],
         model=registry.model(envelope["model"]),
         device=registry.device(envelope["device"]),
         query_settings={},
@@ -273,7 +273,7 @@ def _boot_for_query(runtime_state, backend, gpu_context,
 
 def prepare_quail_request(context) -> None:
     """Boot one GPU from the plan alone; the documents can arrive later."""
-    if context.gpu_count != 1:
+    if context.gpus != 1:
         return
     envelope = context.request.plan
     settings = dict(envelope["settings"])
@@ -289,7 +289,7 @@ def prepare_quail_request(context) -> None:
 def execute_quail_request(context):
     """Run one Quail request from a backend execution context."""
     payload = quail_runtime_payload(context.request, context.graph)
-    if context.gpu_count == 1:
+    if context.gpus == 1:
         backend = context.registry.backend(context.request.plan["backend"])
         return execute_quail_payload(
             payload, context.registry, context.graph, backend,
@@ -370,7 +370,7 @@ def execute_single(gpu: GpuRuntime, payload: dict, registry, graph) -> dict:
     """Execute the typed Quail graph on one GPU."""
     runtime_state = {
         "gpu": gpu,
-        "docs": decode_payload_documents(payload["docs"]),
+        "documents": decode_payload_documents(payload["documents"]),
         "texts": payload.get("texts", {}),
         "columns": payload.get("columns", {}),
         "functions": registry.functions,
@@ -394,11 +394,11 @@ class ChildState:
     score_documents: Any = None
 
 
-def _child_main(gpu_idx, conn):
+def _child_main(gpu_index, conn):
     import os as _os
-    _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-    set_gpu_index(gpu_idx)
-    state = ChildState(gpu_idx)
+    _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+    set_gpu_index(gpu_index)
+    state = ChildState(gpu_index)
     while True:
         try:
             kind, data = conn.recv()
@@ -442,7 +442,7 @@ def _child_boot(state, sub):
     gpu = state.gpu
     if gpu is None:
         gpu = LoadedGpu(backend, GpuContext(
-            gpu_index=state.gpu_index, gpu_count=sub["workers"],
+            gpu_index=state.gpu_index, gpus=sub["gpus"],
             model=spec, device=device, query_settings={},
         ), sub["true_ids"] + sub["false_ids"],
             model_path=state.model_path)
@@ -495,15 +495,15 @@ def _child_filters(state, sub):
                 raise TypeError(
                     f"child filter received {node.type_name!r}")
             alias = node.alias
-            index = sub["doc_index"][alias]
+            index = sub["document_index"][alias]
             runtime_context = state.runtime_context
             results = _execute_predicates(
                 runtime_context, nodes,
                 {
                     "documents": DocumentPrefixes(
                         node.document_head,
-                        sub["docs"][alias],
-                        range(len(sub["docs"][alias])),
+                        sub["documents"][alias],
+                        range(len(sub["documents"][alias])),
                     ),
                     "document_ids": index,
                     "limit": filter_limit,
@@ -560,20 +560,22 @@ def _child_joins(state, sub):
         raise TypeError(f"child join received {node.type_name!r}")
     anchor_alias = node.anchor
     anchors_glob = list(sub["anchor_index"])
-    anchor_docs = sub["anchor_docs"]
+    anchor_documents = sub["anchor_documents"]
     config = sub.get("retention", {})
-    live = {alias: partner["index"] for alias, partner in sub["partners"].items()}
-    live[anchor_alias] = anchors_glob
+    expected_rows = {
+        alias: partner["index"] for alias, partner in sub["partners"].items()
+    }
+    expected_rows[anchor_alias] = anchors_glob
     apply_retention(arena, config,
-                    config.get("before", {}).get(node.node_id, {}), live)
+                    config.get("before", {}).get(node.node_id, {}), expected_rows)
     t0 = time.perf_counter()
     with torch.inference_mode():
-        prefixes = DocumentPrefixes(node.document_head, anchor_docs,
-                                    range(len(anchor_docs)))
+        prefixes = DocumentPrefixes(node.document_head, anchor_documents,
+                                    range(len(anchor_documents)))
         prepared = join_inputs(
-            nodes, {alias: partner["docs"]
+            nodes, {alias: partner["documents"]
                     for alias, partner in sub["partners"].items()},
-            live, prefixes, arena, config, sub.get("pairs", {}))
+            expected_rows, prefixes, arena, config, sub.get("pairs", {}))
         round_kv = prepared["kv_round"]
         prepared["gpu_timing"] = sub.get("gpu_timing", False)
         results = _execute_predicates(state.runtime_context, nodes, prepared)
@@ -621,25 +623,25 @@ def _round(kind, subs):
 def execute_quail_multi(payload, registry, graph):
     """Execute the typed Quail graph across GPU child processes."""
     payload = dict(payload)
-    payload["docs"] = decode_payload_documents(payload["docs"])
-    gpu_count = payload["workers"]
+    payload["documents"] = decode_payload_documents(payload["documents"])
+    gpus = payload["gpus"]
     spec = registry.model(payload["model"])
     started = time.perf_counter()
     model_path = resolve_model_path(spec.hf_name, spec.revision)
     model_files_s = time.perf_counter() - started
-    _ensure_children(gpu_count)
+    _ensure_children(gpus)
     setup = {key: payload[key] for key in (
-        "model", "physical_plan", "workers", "chunk_tokens", "true_ids", "false_ids",
+        "model", "physical_plan", "gpus", "chunk_tokens", "true_ids", "false_ids",
     )}
     setup["arena_pages"] = payload.get("arena_pages")
     setup.update(registry=registry, model_path=model_path)
-    boots = _round("boot", [setup] * gpu_count)
+    boots = _round("boot", [setup] * gpus)
     boot_s = round(time.perf_counter() - started, 2)
-    say(f"all {gpu_count} GPUs ready; running the query")
+    say(f"all {gpus} GPUs ready; running the query")
     report = execute_distributed_graph(
         payload,
         graph,
-        gpu_count,
+        gpus,
         _round,
         spec,
         registry.device(payload["physical_plan"]["device"]),

@@ -55,7 +55,7 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
             if nodes[0].spec.share_prefixes else None)
     results = execute_parts(
         state, [part], stages.prefixes, stages.keys,
-        keep_kv=nodes[-1].keep_kv, tree=tree,
+        keep_kv=nodes[-1].keep_kv, prefix_tree=tree,
         label=f"extract {', '.join(node.spec.name for node in nodes)}")
     first = nodes[0].node_id
     results[first] = replace(results[first], metrics=replace(
@@ -121,7 +121,7 @@ class ExtractPart(ExecutionPart):
         ids = (value.ids[node.spec.alias].to_numpy() if isinstance(value, Rows)
                else np.asarray(value, dtype=np.int64))
         return {"document_ids": ids,
-                "documents": context.state["docs"],
+                "documents": context.state["documents"],
                 "texts": context.state.get("texts", {})}
 
     @classmethod
@@ -133,15 +133,15 @@ class ExtractPart(ExecutionPart):
         """
         first = parts[0].node if parts else nodes[0]
         part = cls(state, nodes, ids, {
-            "documents": context.state["docs"],
+            "documents": context.state["documents"],
             "texts": context.state.get("texts", {}),
             "pipeline_head": first.document_head})
         alias = part.node.spec.alias
-        for doc, document in zip(part.extraction.docs, part.ids):
-            if doc.key != (alias, document):
+        for document, document_id in zip(part.extraction.documents, part.ids):
+            if document.key != (alias, document_id):
                 raise ValueError(
                     f"AI.EXTRACT {part.node.spec.name!r} shows document "
-                    f"{document} of {alias!r} unlike the pipeline before it")
+                    f"{document_id} of {alias!r} unlike the pipeline before it")
         return part
 
     def __init__(self, state, nodes, ids, inputs):
@@ -182,7 +182,9 @@ class ExtractPart(ExecutionPart):
         q, span = next(
             (q, column == node.spec.span_name) for q, node in enumerate(self.nodes)
             if column in (node.spec.name, node.spec.span_name))
-        answers = [self.extraction.docs[position].answers[q] for position in positions]
+        answers = [
+            self.extraction.documents[position].answers[q] for position in positions
+        ]
         if not span:
             return pa.array([answer.answer for answer in answers], pa.string())
         return pa.array(
@@ -197,7 +199,7 @@ class ExtractPart(ExecutionPart):
         self.counts = [self.extraction.counts(q) for q in range(len(self.nodes))]
         return sum(count["suffix_tokens"] for count in self.counts)
 
-    def complete(self, tokens, spans, stats, offset):
+    def complete(self, fresh, spans, stats, offset):
         """Build each question's answer table and attribute its GPU work."""
         per_question = len(self.stages) // len(self.nodes)
 
@@ -207,7 +209,7 @@ class ExtractPart(ExecutionPart):
             return gpu_seconds(selected), len(selected)
 
         self._results = extraction_results(
-            self.nodes, self.extraction, self.ids, fresh=tokens, counts=self.counts,
+            self.nodes, self.extraction, self.ids, fresh=fresh, counts=self.counts,
             own=own, stats=stats, kept=self.extraction.asked())
         self.result_value = self._results[self.node.node_id]
 

@@ -142,7 +142,7 @@ class ClassifyScoring(ClassifyStatistics):
                 lettered_prompt, lettered_prompt.letters, self.tokenizer)
             lettered = (len(letter_head), len(letter_tail) - 1, letter_ids)
         scoring, estimated = self.choose(
-            spec.expected_inputs, len(head), len(tail) - 1, labels, resident,
+            spec.expected_rows, len(head), len(tail) - 1, labels, resident,
             lettered, probabilities=spec.probabilities, starts=starts)
         if scoring == LETTERS_SCORING:
             head, tail, labels = letter_head, letter_tail, letter_ids
@@ -172,13 +172,13 @@ class ClassifyScoring(ClassifyStatistics):
         canvas = self.model.answer_canvas
         return canvas.rows if canvas is not None else 0
 
-    def estimate(self, scoring, live, head_tokens, frame_tokens, labels,
+    def estimate(self, scoring, expected_rows, head_tokens, frame_tokens, labels,
                  resident, starts=()) -> classify_cost.ClassifyCost:
         """Estimate one scoring rule using this table's lengths and budgets.
 
         Args:
             scoring: Label scoring rule name.
-            live: Expected number of documents to classify.
+            expected_rows: Expected number of documents to classify.
             head_tokens: Number of prompt tokens before each document.
             frame_tokens: Number of prompt tokens written after each document.
             labels: Token sequence for each label.
@@ -189,7 +189,7 @@ class ClassifyScoring(ClassifyStatistics):
             Estimated execution time, work, and token counts.
         """
         return classify_cost.estimate(
-            scoring, live, head_tokens, frame_tokens, labels,
+            scoring, expected_rows, head_tokens, frame_tokens, labels,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=resident,
             draws=self.draws, starts=starts)
@@ -206,12 +206,12 @@ class ClassifyScoring(ClassifyStatistics):
         if spec.scoring == DECISION_SCORING:
             return classify_cost.estimate_suffixes(
                 len(head), spec.frame_tokens, [len(tail) - spec.frame_tokens],
-                live=spec.expected_inputs, lengths=self.lengths,
+                expected_rows=spec.expected_rows, lengths=self.lengths,
                 shared=self.shared, chunk=self.chunk, model=self.model,
                 device=self.device, resident=resident,
                 answer_rows=len(spec.label_token_ids) + 1)
         return self.estimate(
-            spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
+            spec.scoring, spec.expected_rows, len(head), len(tail) - 1,
             spec.label_token_ids, resident, spec.label_word_starts)
 
     def reestimate(self, spec: ClassifySpec, *, resident=False) -> ClassifySpec:
@@ -227,7 +227,7 @@ class ClassifyScoring(ClassifyStatistics):
         return replace(spec,
                        estimated_seconds=self.estimate_spec(spec, resident).seconds)
 
-    def choose(self, live, head_tokens, frame_tokens, labels, resident,
+    def choose(self, expected_rows, head_tokens, frame_tokens, labels, resident,
                lettered=None, probabilities=False, starts=()
                ) -> tuple[str, classify_cost.ClassifyCost]:
         """Choose the supported scoring rule with the lowest estimated time.
@@ -240,7 +240,7 @@ class ClassifyScoring(ClassifyStatistics):
         candidate.
 
         Args:
-            live: Expected number of documents to classify.
+            expected_rows: Expected number of documents to classify.
             head_tokens: Number of prompt tokens before the document.
             frame_tokens: Number of prompt tokens after the document, excluding
                 the final answer cue token.
@@ -274,8 +274,9 @@ class ClassifyScoring(ClassifyStatistics):
             head, frame, ids, flags = (
                 (head_tokens, frame_tokens, labels, starts)
                 if scoring != LETTERS_SCORING else (*lettered, ()))
-            estimated = self.estimate(scoring, live, head, frame, ids, resident,
-                                      flags)
+            estimated = self.estimate(
+                scoring, expected_rows, head, frame, ids, resident, flags
+            )
             key = (estimated.seconds, estimated.suffix_tokens)
             if best is None or key < best[0]:
                 best = (key, scoring, estimated)
@@ -298,7 +299,7 @@ class ClassifyBuilder(ClassifyStatistics):
     lower: object
     backend_name: str
 
-    def prepare(self, call, name, live) -> tuple[ClassifySpec, Work]:
+    def prepare(self, call, name, expected_rows) -> tuple[ClassifySpec, Work]:
         """Build a classification specification and work for a required method.
 
         The specification carries the prompt that names the labels; the
@@ -308,7 +309,7 @@ class ClassifyBuilder(ClassifyStatistics):
         Args:
             call: Logical AI.CLASSIFY call.
             name: Result column name.
-            live: Expected number of documents to classify.
+            expected_rows: Expected number of documents to classify.
 
         Returns:
             The specification and its work when the model requires a scoring
@@ -317,13 +318,13 @@ class ClassifyBuilder(ClassifyStatistics):
         """
         lowered = self.lower(call.prompt)
         if self.model.role == "decision":
-            return self._choice_spec(call, name, live, (self.alias,),
+            return self._choice_spec(call, name, expected_rows, (self.alias,),
                                      tuple(lowered.preamble_token_ids))
         head, tail, labels = classify_prompt_tokens(
             lowered, call.labels, self.tokenizer)
         return bind_inference(
             ClassifySpec, call.prompt, name=name, aliases=(self.alias,),
-            expected_inputs=live, estimated_seconds=0.0,
+            expected_rows=expected_rows, estimated_seconds=0.0,
             prompt_token_parts=(head, tail),
             labels=tuple(call.labels),
             label_token_ids=labels,
@@ -338,8 +339,8 @@ class ClassifyBuilder(ClassifyStatistics):
             AiClassify, spec, (input_port, *ports), index=index,
             backend=self.backend_name, model=self.model.name)
 
-    def classify_joined(self, call, name, partner, pairs, partner_tokens):
-        """Build a classification specification for joined document pairs.
+    def classify_joined(self, call, name, partner, expected_rows, partner_tokens):
+        """Build a classification specification for joined document expected_rows.
 
         Pair classification uses letters and reuses the anchor document's KV.
 
@@ -347,7 +348,7 @@ class ClassifyBuilder(ClassifyStatistics):
             call: Logical AI.CLASSIFY call referring to both documents.
             name: Result column name.
             partner: Partner table alias.
-            pairs: Expected number of joined pairs to classify.
+            expected_rows: Expected number of joined expected_rows to classify.
             partner_tokens: Mean partner document length in tokens.
 
         Returns:
@@ -362,7 +363,7 @@ class ClassifyBuilder(ClassifyStatistics):
                 f"a classification of joined rows returns its label only; "
                 f"{name!r} asks for the labels' probabilities", 1, 0)
         if self.model.role == "decision":
-            return self._joined_choice_spec(call, name, partner, pairs,
+            return self._joined_choice_spec(call, name, partner, expected_rows,
                                             partner_tokens)
         prompt = self.lower(call.prompt).lettered
         if prompt is None:
@@ -381,7 +382,8 @@ class ClassifyBuilder(ClassifyStatistics):
             for length in classify_cost.suffix_lengths(LETTERS_SCORING, labels)
         ]
         estimated = classify_cost.estimate_suffixes(
-            len(head), len(note) + len(partner_label), suffixes, live=pairs,
+            len(head), len(note) + len(partner_label), suffixes,
+            expected_rows=expected_rows,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=True,
             canvas_rows=self.model.canvas_tokens,
@@ -392,13 +394,13 @@ class ClassifyBuilder(ClassifyStatistics):
                 f"a row of {self.alias!r} x {partner!r}", need, self.budget)
         return bind_inference(
             ClassifySpec, call.prompt, name=name, aliases=(self.alias, partner),
-            expected_inputs=pairs, estimated_seconds=estimated.seconds,
+            expected_rows=expected_rows, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=labels, scoring=LETTERS_SCORING,
             join_layout=(tuple(note), tuple(partner_label)),
         ), estimated.work
 
-    def _choice_spec(self, call, name, live, aliases, head):
+    def _choice_spec(self, call, name, expected_rows, aliases, head):
         """Build a decision_choice specification for one document per row.
 
         Each document takes the question as its frame, then one request
@@ -412,18 +414,26 @@ class ClassifyBuilder(ClassifyStatistics):
             raise ClassifyRefusedError.over_budget(
                 f"a document in {self.alias!r}", need, self.budget)
         estimated = classify_cost.estimate_suffixes(
-            len(head), frame, [request], live=live, lengths=self.lengths,
-            shared=self.shared, chunk=self.chunk, model=self.model,
-            device=self.device, answer_rows=len(blocks) + 1)
+            len(head),
+            frame,
+            [request],
+            expected_rows=expected_rows,
+            lengths=self.lengths,
+            shared=self.shared,
+            chunk=self.chunk,
+            model=self.model,
+            device=self.device,
+            answer_rows=len(blocks) + 1,
+        )
         return bind_inference(
             ClassifySpec, call.prompt, name=name, aliases=aliases,
-            expected_inputs=live, estimated_seconds=estimated.seconds,
+            expected_rows=expected_rows, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=blocks, scoring=DECISION_SCORING,
             probabilities=call.probabilities, frame_tokens=frame), estimated.work
 
-    def _joined_choice_spec(self, call, name, partner, pairs, partner_tokens):
-        """Build a decision_choice specification for joined document pairs.
+    def _joined_choice_spec(self, call, name, partner, expected_rows, partner_tokens):
+        """Build a decision_choice specification for joined document expected_rows.
 
         The anchor's KV ends in its note and the partner's label; each
         pair's request is the partner document, the question, every
@@ -437,7 +447,8 @@ class ClassifyBuilder(ClassifyStatistics):
         note, partner_label = parts[self.alias][1], parts[partner][0]
         request = int(round(partner_tokens)) + len(tail)
         estimated = classify_cost.estimate_suffixes(
-            len(head), len(note) + len(partner_label), [request], live=pairs,
+            len(head), len(note) + len(partner_label), [request],
+            expected_rows=expected_rows,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=True,
             answer_rows=len(blocks) + 1)
@@ -447,20 +458,20 @@ class ClassifyBuilder(ClassifyStatistics):
                 f"a row of {self.alias!r} x {partner!r}", need, self.budget)
         return bind_inference(
             ClassifySpec, call.prompt, name=name, aliases=(self.alias, partner),
-            expected_inputs=pairs, estimated_seconds=estimated.seconds,
+            expected_rows=expected_rows, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=blocks, scoring=DECISION_SCORING,
             join_layout=(tuple(note), tuple(partner_label)),
             frame_tokens=frame), estimated.work
 
 
-def emit_classify(builder, alias, live, calls, ports) -> tuple:
+def emit_classify(builder, alias, expected_rows, calls, ports) -> tuple:
     """Classify the alias's documents, then keep the accepted labels.
 
     Args:
         builder: The graph builder.
         alias: The table.
-        live: The documents the classifications read.
+        expected_rows: The documents the classifications read.
         calls: The classifications to emit, in run order.
         ports: Where the documents stand before the classifications.
 
@@ -481,7 +492,7 @@ def emit_classify(builder, alias, live, calls, ports) -> tuple:
     for call, test in steps:
         if call not in classified_calls:
             spec, work = table.prepare(
-                call, builder.operators.labels.names[call], live)
+                call, builder.operators.labels.names[call], expected_rows)
             if builder.scoring is not None:
                 builder.scoring.work += work
             node = table.node(
@@ -494,13 +505,15 @@ def emit_classify(builder, alias, live, calls, ports) -> tuple:
                 row_ports.append(ports.rows)
             classified_calls.add(call)
         if test is not None:
-            lid = f"filter:{alias}:{test.position}"
+            filter_id = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
-                node_id=lid, inputs=input_ports((ports.rows,)),
+                node_id=filter_id, inputs=input_ports((ports.rows,)),
                 predicate=test.condition, aliases=(alias,),
-                selectivity=test.selectivity, written_pos=test.position))
-            ports = Ports(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
-            live *= effective_selectivity(test.selectivity)
+                selectivity=test.selectivity, written_position=test.position))
+            ports = Ports(
+                PortRef(filter_id, f"ids:{alias}"), PortRef(filter_id, "rows")
+            )
+            expected_rows *= effective_selectivity(test.selectivity)
     return ports, row_ports
 
 
@@ -537,16 +550,16 @@ def emit_joined_classify(builder, join_ids) -> list:
                 "a classification of joined rows without its join")
         partner = next(alias for alias in aliases if alias != anchor)
         table = classify_builder(builder.context, anchor, "quail")
-        join = builder.operators.joins[stage.written_pos]
+        join = builder.operators.joins[stage.written_position]
         pairs = (effective_selectivity(join.selectivity)
-                 * builder.operator_order.live[anchor]
-                 * builder.operator_order.live[partner])
+                 * builder.operator_order.expected_rows[anchor]
+                 * builder.operator_order.expected_rows[partner])
         spec, _ = table.classify_joined(
             call, builder.operators.labels.names[call], partner, pairs,
-            stats[partner].mean_doc_tokens)
+            stats[partner].mean_document_tokens)
         node = table.node(
-            spec, PortRef(join_ids[stage.written_pos],
-                          f"join_answers:{stage.written_pos}"),
+            spec, PortRef(join_ids[stage.written_position],
+                          f"join_answers:{stage.written_position}"),
             sum(isinstance(n, AiClassify) for n in builder.nodes))
         builder.nodes.append(node)
         if call in builder.operators.labels.projected:

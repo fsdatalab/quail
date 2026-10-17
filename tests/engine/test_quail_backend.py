@@ -33,8 +33,8 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
 
     filtered = AiFilter(
         node_id="filter:d", inputs=input_ports((PortRef("input:d", "ids:d"),)),
-        alias="d", question_token_ids=(9,), written_pos=0, question_tokens=1,
-        preamble_tokens=1, selectivity=None, expected_docs=4)
+        alias="d", question_token_ids=(9,), written_position=0, question_tokens=1,
+        preamble_tokens=1, selectivity=None, expected_rows=4)
     graph = PhysicalGraph((Scan(node_id="input:d", alias="d", input_id="d"),
                            filtered), PortRef("filter:d", "ids:d"))
 
@@ -42,7 +42,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
         assert kind == "filters"
         outputs = []
         for sub in subs:
-            indices = sub["doc_index"]["d"]
+            indices = sub["document_index"]["d"]
             from quail.execution.metrics import NodeMetrics, NodeResult
 
             result = NodeResult({
@@ -60,12 +60,12 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": 8192, "true_ids": [1],
         "false_ids": [2], "filter_limit": None,
-        "order_rule": "by_cost", "docs": {"d": [[1], [2], [3], [4]]},
+        "order_rule": "by_cost", "documents": {"d": [[1], [2], [3], [4]]},
         "joins": [], "filters": {}, "filter_arena_writes": {},
         "shards": {"d": ((0, 2), (1, 3))},
         "physical_plan": plan_envelope(
             backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
-            workers=2, graph=graph, codecs=registry.codecs),
+            gpus=2, graph=graph, codecs=registry.codecs),
     }
     result = execute_distributed_graph(
         payload, graph, 2, round_fn, MODELS["qwen3-4b-fp8"],
@@ -281,7 +281,7 @@ def test_predicate_nodes_keep_documents_and_join_frames_in_kv(monkeypatch):
         for node in graph.nodes), graph.root)
     first_join = graph.nodes[-1]
     second_join = replace(
-        first_join, node_id="join:second", written_pos=1, exec_idx=1,
+        first_join, node_id="join:second", written_position=1, exec_index=1,
         inputs=input_ports((PortRef(first_join.node_id, "ids:r"),
                             PortRef("input:p", "ids:p"))))
     graph = PhysicalGraph((*graph.nodes, second_join),

@@ -59,7 +59,7 @@ def _execute_physical(request, registry):
         request=request,
         graph=graph,
         registry=registry,
-        gpu_count=request.gpu_count,
+        gpus=request.gpus,
         runtime_state=_BACKEND_STATE,
     ))
     if not isinstance(response, PhysicalResponse):
@@ -99,7 +99,7 @@ def execute_query(query, physical_executor=None, plan=None,
         raise RefusalError(plan)
     plan.graph.validate(runtime_keys=set(query.session.registry.runtimes))
     plan.graph.validate_backend(plan.backend)
-    if plan.workers > 8:
+    if plan.gpus > 8:
         raise NotImplementedError("query execution supports at most 8 GPUs")
     if physical_executor is None:
         # Backend startup must not wait for background tokenization.
@@ -148,6 +148,6 @@ def _prepare_backend(plan, registry) -> None:
         request=PhysicalRequest(envelope, {}),
         graph=plan.graph,
         registry=registry,
-        gpu_count=plan.workers,
+        gpus=plan.gpus,
         runtime_state=_BACKEND_STATE,
     ))

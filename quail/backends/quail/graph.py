@@ -85,10 +85,10 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     arena.reset_stats()
     retention = payload.get("retention", {})
     apply_retention(arena, retention, retention.get("initial", {}))
-    docs = state["docs"]
+    documents = state["documents"]
     sources = {
-        alias: range(len(documents))
-        for alias, documents in docs.items()
+        alias: range(len(tokens))
+        for alias, tokens in documents.items()
     }
     for alias, table in state.get("columns", {}).items():
         sources[columns_key(alias)] = table
@@ -142,7 +142,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     return report
 
 
-def graph_report(graph, result, wall, device, *, workers=1, gpu_timing=False):
+def graph_report(graph, result, wall, device, *, gpus=1, gpu_timing=False):
     """Collect graph outputs, execution metrics, and GPU cost."""
     filters, joins = model_answers(graph, result)
     report = {
@@ -156,7 +156,7 @@ def graph_report(graph, result, wall, device, *, workers=1, gpu_timing=False):
         "evaluated_document_pairs": result.metrics.evaluated_document_pairs,
         "usd_per_query": (
             None if device.usd_per_hour is None
-            else wall / 3600 * workers * device.usd_per_hour
+            else wall / 3600 * gpus * device.usd_per_hour
         ),
         "backend_metrics": {"inferences": [
             dict(value.metrics.extension)
@@ -187,7 +187,7 @@ def throughput(graph, metrics, seconds: float) -> dict:
                 metrics.evaluated_document_pairs / seconds,
         }
     documents = sum(
-        node.n_docs for node in graph.nodes if isinstance(node, Scan)
+        node.num_documents for node in graph.nodes if isinstance(node, Scan)
     )
     return {"documents_per_second": documents / seconds}
 
@@ -204,7 +204,7 @@ def model_answers(graph, result) -> tuple[dict, list]:
                 combined.setdefault(document, []).extend(answers)
         elif isinstance(node, AiJoin):
             joins.append(result.nodes[node.node_id].outputs[
-                f"join_answers:{node.written_pos}"])
+                f"join_answers:{node.written_position}"])
     return filters, joins
 
 

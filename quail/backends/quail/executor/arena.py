@@ -52,38 +52,38 @@ class KVArena:
     ratio, so a count that fits admits in both pools.
     """
 
-    def __init__(self, n_layers: int, n_pages: int, page_tokens: int,
-                 n_kv: int, d_head: int, dtype=None, device="cuda",
+    def __init__(self, num_layers: int, num_pages: int, page_tokens: int,
+                 num_kv_heads: int, d_head: int, dtype=None, device="cuda",
                  layer_kv=None, sliding_layers=(), sliding_window=0,
-                 n_sliding_pages=0):
+                 num_sliding_pages=0):
         import torch
         self.torch = torch
         self.dtype = dtype or torch.bfloat16
         self.device = device
         self.pinned = str(device).startswith("cuda")
-        shapes = ([(n_kv, d_head)] * n_layers if layer_kv is None
+        shapes = ([(num_kv_heads, d_head)] * num_layers if layer_kv is None
                   else [tuple(shape) for shape in layer_kv])
-        if len(shapes) != n_layers:
+        if len(shapes) != num_layers:
             raise ValueError(
                 f"layer_kv names {len(shapes)} layers, the arena has "
-                f"{n_layers}")
+                f"{num_layers}")
         self.shapes = shapes
         self.sliding_layers = (frozenset(sliding_layers) if sliding_window
                                else frozenset())
         self.window = sliding_window if self.sliding_layers else 0
-        if self.sliding_layers and n_sliding_pages <= 0:
+        if self.sliding_layers and num_sliding_pages <= 0:
             raise ValueError("sliding layers need a sliding pool")
-        self._build(n_pages, page_tokens, n_sliding_pages)
+        self._build(num_pages, page_tokens, num_sliding_pages)
         self.reset_stats()
 
-    def _build(self, n_pages, page_tokens, n_sliding_pages):
+    def _build(self, num_pages, page_tokens, num_sliding_pages):
         torch = self.torch
-        self.accounting = PageArena(n_pages, page_tokens)
-        self.sliding = (PageArena(n_sliding_pages, page_tokens)
+        self.accounting = PageArena(num_pages, page_tokens)
+        self.sliding = (PageArena(num_sliding_pages, page_tokens)
                         if self.sliding_layers else None)
         self.k, self.v = [], []
         for layer, (heads, dim) in enumerate(self.shapes):
-            pages = n_sliding_pages if layer in self.sliding_layers else n_pages
+            pages = num_sliding_pages if layer in self.sliding_layers else num_pages
             shape = (pages * page_tokens, heads, dim)
             self.k.append(torch.empty(shape, dtype=self.dtype, device=self.device))
             self.v.append(torch.empty(shape, dtype=self.dtype, device=self.device))
@@ -99,7 +99,7 @@ class KVArena:
         self._window_floor = {}   # key -> lowest sliding row a borrower reads
         self._trimmed = set()     # keys past their own pass's trim_window
 
-    def resize(self, n_pages: int, n_sliding_pages: int = 0, *,
+    def resize(self, num_pages: int, num_sliding_pages: int = 0, *,
                free_resident: bool = False) -> None:
         """Rebuild both pools at new sizes.
 
@@ -112,11 +112,11 @@ class KVArena:
                 self.free_key(key)
         if self.accounting.owned:
             raise RuntimeError("the arena holds keys; free them before resizing")
-        if (n_pages, n_sliding_pages) == (self.n_pages, self.n_sliding_pages):
+        if (num_pages, num_sliding_pages) == (self.num_pages, self.num_sliding_pages):
             return
         page_tokens = self.page_tokens
         self.k = self.v = None
-        self._build(n_pages, page_tokens, n_sliding_pages)
+        self._build(num_pages, page_tokens, num_sliding_pages)
 
     def reset_stats(self):
         self.evicted_keys = 0
@@ -465,12 +465,12 @@ class KVArena:
         return self.accounting.page_tokens
 
     @property
-    def n_pages(self) -> int:
-        return self.accounting.n_pages
+    def num_pages(self) -> int:
+        return self.accounting.num_pages
 
     @property
-    def n_sliding_pages(self) -> int:
-        return 0 if self.sliding is None else self.sliding.n_pages
+    def num_sliding_pages(self) -> int:
+        return 0 if self.sliding is None else self.sliding.num_pages
 
     @property
     def free_pages(self) -> int:
@@ -478,8 +478,8 @@ class KVArena:
         free = self.accounting.free_pages
         if self.sliding is None:
             return free
-        return min(free, self.sliding.free_pages * self.accounting.n_pages
-                   // self.sliding.n_pages)
+        return min(free, self.sliding.free_pages * self.accounting.num_pages
+                   // self.sliding.num_pages)
 
     def page_cost(self, tokens: int, base_tokens: int | None = None) -> int:
         """Pages a key of `tokens` rows takes, in every-token pages.
@@ -521,8 +521,8 @@ class KVArena:
 
     def _as_every_token_pages(self, sliding_pages: int) -> int:
         """Sliding pages converted at the pools' size ratio, rounded up."""
-        return -(-sliding_pages * self.accounting.n_pages
-                 // self.sliding.n_pages)
+        return -(-sliding_pages * self.accounting.num_pages
+                 // self.sliding.num_pages)
 
     @property
     def retained_pages(self) -> int:
@@ -592,8 +592,8 @@ class KVArena:
 
     def paged_kv(self, layer: int):
         """Pools as (n_pages, page_tokens, n_kv, d_head) for paged attention."""
-        n_kv, d = self.k[layer].shape[-2], self.k[layer].shape[-1]
-        shape = (-1, self.page_tokens, n_kv, d)
+        num_kv_heads, d = self.k[layer].shape[-2], self.k[layer].shape[-1]
+        shape = (-1, self.page_tokens, num_kv_heads, d)
         return self.k[layer].view(shape), self.v[layer].view(shape)
 
     def block_table(self, keys, pad_to=None):

@@ -43,13 +43,17 @@ def test_session_upgrades_and_reuses_offsets_without_invalidating_old_tokens():
 
     encode.token_bytes = lambda: {ord(char): char.encode() for char in "café東京"}
     with quail.Session(CONFIG, tokenizer=encode) as session:
-        session.register("docs", quail.DocumentProvider.from_table(
+        session.register("documents", quail.DocumentProvider.from_table(
             pa.table({"id": [1, 2], "text": ["café", "東京"]}), id_col="id"))
-        previous = session.inputs.tokenize("docs", "text").tokens
+        previous = session.inputs.tokenize("documents", "text").tokens
         assert not previous.has_offsets
         calls.clear()
-        upgraded = session.inputs.tokenize("docs", "text", with_offsets=True).tokens
-        repeated = session.inputs.tokenize("docs", "text", with_offsets=True).tokens
+        upgraded = session.inputs.tokenize(
+            "documents", "text", with_offsets=True
+        ).tokens
+        repeated = session.inputs.tokenize(
+            "documents", "text", with_offsets=True
+        ).tokens
         assert upgraded is repeated and upgraded.has_offsets
         assert not calls
         assert list(previous[0]) == list(upgraded[0]) == encode("café")
@@ -71,9 +75,14 @@ def test_offset_tokenization_uses_gigatoken_without_transformers(monkeypatch):
                         SimpleNamespace(Tokenizer=lambda source: fast))
     monkeypatch.setitem(sys.modules, "transformers", None)
     with quail.Session(CONFIG) as session:
-        session.register("docs", quail.DocumentProvider.from_table(
-            pa.table({"id": [1, 2], "text": texts}), id_col="id"))
-        scan = session.inputs.tokenize_async("docs", "text", with_offsets=True).result()
+        session.register(
+            "documents",
+            quail.DocumentProvider.from_table(
+                pa.table({"id": [1, 2], "text": texts}), id_col="id"
+            ),
+        )
+        scan = session.inputs.tokenize_async(
+            "documents", "text", with_offsets=True).result()
         for index, encoding in enumerate(expected):
             assert list(scan.tokens[index]) == encoding.ids
             assert scan.tokens[index].character_offsets.tolist() == [
@@ -187,7 +196,7 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     assert re.search(rf"(?:1st: )?predicate {first[1]}\s+6\s+6\s+50%\s+66\.7%$",
                      explained, re.M)
     stages = [s for s in result.report["stages"] if s["op"] == "filter"]
-    assert [s["written_pos"] for s in stages] == [int(first[1]) - 1,
+    assert [s["written_position"] for s in stages] == [int(first[1]) - 1,
                                                 int(second[1]) - 1]
 
 
@@ -379,7 +388,7 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
     from quail.backends.quail.executor.operators.join import partner_list_builder
 
     streamed = {}
-    group = [dict(anchor="a", partners=["b"], written_pos=j, pairs_from="pairs")
+    group = [dict(anchor="a", partners=["b"], written_position=j, pairs_from="pairs")
              for j in range(2)]
     lookup = partner_list_builder(
         group, [[[7], [1], [7], [3]]] * 2, {0: grouped, 1: streamed})
@@ -414,8 +423,8 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
         assert paired_stage.pairs_from == "hash_join:c-e"
         assert not cross_stage.pairs_from
         assert "hash_join:c-e" not in {node.node_id for node in cross_plan.nodes}
-        assert paired_stage.expected_tuples == round(
-            cross_stage.expected_tuples * 5 / 12, 1)
+        assert paired_stage.expected_rows == round(
+            cross_stage.expected_rows * 5 / 12, 1)
         assert paired_plan.estimated_seconds < cross_plan.estimated_seconds
         assert "HashJoin" in paired.explain() and "c.url = e.url" in paired.explain()
         # the request carries the key columns, not the pairs

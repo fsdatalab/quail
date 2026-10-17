@@ -55,8 +55,8 @@ class QuailScorer:
             return self._shared(spec, rows, documents, on_answers)
         if len(spec.aliases) == 1:
             prefixes = [parts[0]]
-            suffixes = [concat_tokens(documents[spec.aliases[0]][doc], parts[1])
-                        for doc in rows[:, 0]]
+            suffixes = [concat_tokens(documents[spec.aliases[0]][document_id], parts[1])
+                        for document_id in rows[:, 0]]
             partners = None
             order = np.arange(len(rows))
             offsets = np.array([0, len(rows)])
@@ -65,10 +65,10 @@ class QuailScorer:
             left, right = spec.aliases
             anchors, anchor_index = np.unique(rows[:, 0], return_inverse=True)
             candidates, candidate_index = np.unique(rows[:, 1], return_inverse=True)
-            prefixes = [concat_tokens(parts[0], documents[left][doc], parts[1])
-                        for doc in anchors]
-            suffixes = [concat_tokens(documents[right][doc], parts[2])
-                        for doc in candidates]
+            prefixes = [concat_tokens(parts[0], documents[left][document_id], parts[1])
+                        for document_id in anchors]
+            suffixes = [concat_tokens(documents[right][document_id], parts[2])
+                        for document_id in candidates]
             order = np.argsort(anchor_index, kind="stable")
             offsets = np.concatenate(([0], np.cumsum(np.bincount(anchor_index))))
             partners = [candidate_index[order[start:end]]
@@ -94,12 +94,12 @@ class QuailScorer:
 
         return self._execute(spec, batch, prefixes, on_answers=report)
 
-    def _execute(self, spec, batch, prefixes, *, tree=None, on_answers=None):
+    def _execute(self, spec, batch, prefixes, *, prefix_tree=None, on_answers=None):
         """Execute prepared scores and collect common timing and token metrics."""
         return execute_parts(
             self.state, [batch], prefixes,
             [("score", spec.name, index) for index in range(len(prefixes))],
-            keep_kv=False, tree=tree, label=f"score {spec.name}",
+            keep_kv=False, prefix_tree=prefix_tree, label=f"score {spec.name}",
             on_answers=on_answers)[spec.name]
 
     def _scores(self) -> AsyncScores:
@@ -140,21 +140,21 @@ class QuailScorer:
         head, tail = spec.prompt_token_parts
         if not tail:
             raise ValueError("AI.SCORE needs a question after the document")
-        docs = rows[:, 0]
-        scores = np.full(len(docs), np.nan, dtype=np.float32)
+        document_ids = rows[:, 0]
+        scores = np.full(len(document_ids), np.nan, dtype=np.float32)
 
         def keep(anchor, row):
             scores[anchor] = float(row[0])
             return True
 
-        prefixes = DocumentPrefixes(head, documents[alias], docs)
+        prefixes = DocumentPrefixes(head, documents[alias], document_ids)
         stages = [Stage(suffixes=[[tail[-1]]], readout=self._scores(),
                         frame=list(tail[:-1]), decide=keep, single=True,
                         label=f"score {spec.name}")]
-        total = sum(len(head) + len(documents[alias][doc]) + len(tail)
-                    for doc in docs)
+        total = sum(len(head) + len(documents[alias][document_id]) + len(tail)
+                    for document_id in document_ids)
         batch = ScoreBatch(spec.name, stages, scores, lambda: total, on_answers)
-        return self._execute(spec, batch, prefixes, tree=shared_prefix_tree(
+        return self._execute(spec, batch, prefixes, prefix_tree=shared_prefix_tree(
             spec.name, prefixes, state.loaded_model.arena))
 
     def _drawn(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
@@ -178,15 +178,15 @@ class QuailScorer:
         vocab = state.loaded_model.model_spec.vocab
         (alias,) = spec.aliases
         head, tail = spec.prompt_token_parts
-        docs = rows[:, 0]
+        document_ids = rows[:, 0]
         width = len(pipeline.canvas_ids)
         more = spec.draws - 1
-        scores = np.full(len(docs), np.nan, dtype=np.float32)
-        first = np.zeros(len(docs), dtype=np.float64)
+        scores = np.full(len(document_ids), np.nan, dtype=np.float32)
+        first = np.zeros(len(document_ids), dtype=np.float64)
         extended = [0]
 
         def canvas(anchor, draw):
-            rng = np.random.default_rng((CANVAS_SEED, int(docs[anchor]), draw))
+            rng = np.random.default_rng((CANVAS_SEED, int(document_ids[anchor]), draw))
             return rng.integers(0, vocab, width)
 
         def settle(anchor, row):
@@ -217,15 +217,17 @@ class QuailScorer:
                       [canvas(anchor, draw) for draw in range(1, spec.draws)]),
                   canvas_rows=width),
         ]
-        prefixes = DocumentPrefixes(head, documents[alias], docs)
+        prefixes = DocumentPrefixes(head, documents[alias], document_ids)
         tree = (shared_prefix_tree(spec.name, prefixes, state.loaded_model.arena)
                 if spec.share_prefixes else None)
         read = len(cue) + width
-        base = (sum(len(head) + len(documents[alias][doc]) for doc in docs)
-                + len(docs) * (len(tail) - 1 + read))
+        base = sum(
+            len(head) + len(documents[alias][document_id])
+            for document_id in document_ids
+        ) + len(document_ids) * (len(tail) - 1 + read)
         batch = ScoreBatch(spec.name, stages, scores,
                            lambda: base + extended[0] * more * read, on_answers)
-        return self._execute(spec, batch, prefixes, tree=tree)
+        return self._execute(spec, batch, prefixes, prefix_tree=tree)
 
 
 class ScoreBatch(SingleResultPart):
@@ -234,7 +236,7 @@ class ScoreBatch(SingleResultPart):
     @staticmethod
     def model_inputs(node, inputs, context, sequence=None, nodes=None):
         # scored through the reranker readout over the documents
-        return {"score_inputs": inputs, "documents": context.state["docs"]}
+        return {"score_inputs": inputs, "documents": context.state["documents"]}
 
     def __init__(self, name, stages, scores, total_tokens, on_answers):
         self.name = name

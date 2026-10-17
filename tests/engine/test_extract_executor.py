@@ -67,14 +67,14 @@ def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
     streams = [Stream(at, [0, token], [at + 1, at + 2], text, exhausted=True)
                for at, token in enumerate(tokens)]
     streams.append(Stream(5, [0], [6], text, exhausted=True))
-    answer = AnswerState(written=[0], live=streams)
-    doc = SimpleNamespace(answers=[answer], text=text)
-    actual = decoder.choose(doc, 0, [-20, stop, 33, 1, 40, 50, *scores])
+    answer = AnswerState(written=[0], streams=streams)
+    document = SimpleNamespace(answers=[answer], text=text)
+    actual = decoder.choose(document, 0, [-20, stop, 33, 1, 40, 50, *scores])
     assert actual == (chosen if not done else None)
     assert answer.done == done
     assert answer.written == ([0, chosen] if chosen is not None else [0])
     if chosen is not None:
-        assert [s.char for s in answer.live] == [
+        assert [s.char for s in answer.streams] == [
             index for index, token in enumerate(tokens) if token == chosen]
     if chosen is not None and done:
         start = tokens.index(chosen)
@@ -112,7 +112,7 @@ def test_writing_that_begins_outside_the_document_answers_none(monkeypatch):
     result, stages = run()
     assert result.outputs["rows"].column("ends").to_pylist() == [
         None, "five years", None]
-    assert stages.docs[0].answers[0].none_wins
+    assert stages.documents[0].answers[0].none_wins
 
 
 def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
@@ -136,7 +136,7 @@ def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
     result, stages = run()
     assert result.outputs["rows"].column("ends").to_pylist() == [
         "March", "five years", None]
-    assert not stages.docs[0].answers[0].none_wins
+    assert not stages.documents[0].answers[0].none_wins
 
 
 def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
@@ -153,8 +153,8 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
     state.loaded_model.vocabulary = tables
     stages = ExtractionStages(state, [spec], tables, [0],
                            [tables.encode_ids(text)], [text])
-    key = stages.docs[0].key
-    model.docs[key] = text
+    key = stages.documents[0].key
+    model.documents[key] = text
     model.gold[key] = "five years"
     from quail.backends.quail.executor.stages import run_stages
 
@@ -163,7 +163,7 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
                state.chunk_tokens, anchor_keys=stages.keys,
                appended_tokens=stages.appended_tokens)
     stages.finish()
-    asked = stages.docs[0].answers[0]
+    asked = stages.documents[0].answers[0]
     assert asked.answer == "five years" and asked.span == (13, 23)
     assert asked.written == tables.encode_ids("five years")
     five, days, years = (tables.encode_ids(w)[0] for w in ("five", " days", " years"))
@@ -190,7 +190,7 @@ def test_rows_with_one_live_stream_are_decided_together(monkeypatch):
         result, stages = run()
         return (result.outputs["rows"].column("ends").to_pylist(),
                 [(a.written, a.steps, a.fed_tokens, a.span)
-                 for doc in stages.docs for a in doc.answers])
+                 for document in stages.documents for a in document.answers])
 
     monkeypatch.setattr(Decoder, "accepted", counting)
     fast = outcome(_setup(monkeypatch)[2])
@@ -213,9 +213,9 @@ class ScriptedModel:
     and closes the quote once the whole answer is written.
     """
 
-    def __init__(self, tables, docs, gold, k):
+    def __init__(self, tables, documents, gold, k):
         self.tables = tables
-        self.docs = docs            # key -> text
+        self.documents = documents            # key -> text
         self.gold = gold            # key -> gold answer text, or None
         self.k = k
         self.filter_truth = {}      # key -> a filter question's answer
@@ -366,9 +366,9 @@ def _setup(monkeypatch, documents=None, token_documents=None,
 
     def init(self, *args, **kwargs):
         original(self, *args, **kwargs)
-        for doc in self.docs:
-            model.docs[doc.key] = doc.text
-            model.gold[doc.key] = GOLD[documents.index(doc.text)]
+        for document in self.documents:
+            model.documents[document.key] = document.text
+            model.gold[document.key] = GOLD[documents.index(document.text)]
         stages_seen["stages"] = self
 
     monkeypatch.setattr(ExtractionStages, "__init__", init)
@@ -406,11 +406,11 @@ def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
     borrowed = result.metrics.extension["borrowed_prefix_tokens"]
     assert borrowed > 0
     assert result.metrics.fresh_tokens == unshared.metrics.fresh_tokens - borrowed
-    for doc in stages.docs:
-        rounds = [entry for entry in model.packed if entry[0] == doc.key]
-        if doc.answers[0].answer is not None:
+    for document in stages.documents:
+        rounds = [entry for entry in model.packed if entry[0] == document.key]
+        if document.answers[0].answer is not None:
             assert len(rounds) > 1
-        assert model.reads[doc.key] <= 1
+        assert model.reads[document.key] <= 1
         assert all(entry[2] > 0 for entry in rounds)
 
 
@@ -429,9 +429,9 @@ def test_extraction_accepts_empty_input_and_sparse_document_ids(monkeypatch):
         state, [spec], vocabulary, [10_000_000, 2], None, DOCS,
         document_positions=[0, 1])
     assert stages.document_ids.nbytes + stages.document_order.nbytes == 32
-    for i, doc in enumerate(stages.docs):
-        doc.answers[0].discard = i + 1
-        assert stages._step_discard(0, doc.key) == i + 1
+    for i, document in enumerate(stages.documents):
+        document.answers[0].discard = i + 1
+        assert stages._step_discard(0, document.key) == i + 1
 
 def _run(monkeypatch, documents=None):
     _, model, run, _ = _setup(monkeypatch, documents)
@@ -463,9 +463,9 @@ def test_extraction_reuses_arrow_tokens_and_offsets(monkeypatch, tmp_path):
         {"start": LEASE.index("March"),
          "end": LEASE.index("March") + len(GOLD[0])},
         {"start": 6, "end": 16}, None]
-    for index, doc in enumerate(stages.docs):
-        assert np.shares_memory(doc.scan.tokens, store[index].numpy())
-        assert np.shares_memory(doc.scan.starts, store[index].character_offsets)
+    for index, document in enumerate(stages.documents):
+        assert np.shares_memory(document.scan.tokens, store[index].numpy())
+        assert np.shares_memory(document.scan.starts, store[index].character_offsets)
     store.close()
 
 
@@ -488,10 +488,10 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch, gpu_tim
         first.outputs["rows"].column("ends").to_pylist()
     assert second.outputs["rows"].column("starts_span").to_pylist() == \
         first.outputs["rows"].column("ends_span").to_pylist()
-    assert dict(model.reads) == {doc.key: 1 for doc in stages.docs}
+    assert dict(model.reads) == {document.key: 1 for document in stages.documents}
     # the documents are read once: the second extraction is charged
     # only the tokens fed after them
-    prefixes = sum(len(doc.prefix) for doc in stages.docs)
+    prefixes = sum(len(document.prefix) for document in stages.documents)
     fed = [stages.counts(q)["suffix_tokens"] for q in range(2)]
     assert first.metrics.fresh_tokens == prefixes + fed[0]
     assert second.metrics.fresh_tokens == fed[1] > 0
@@ -503,8 +503,8 @@ def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch, gpu_tim
         assert timing_calls == []
 
 
-@pytest.mark.parametrize("workers", [2, 4])
-def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, workers):
+@pytest.mark.parametrize("gpus", [2, 4])
+def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
     import pickle
 
     state, model, _, run_pipeline = _setup(monkeypatch, share_prefixes=True)
@@ -522,7 +522,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
     graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "rows"))
     registry = built_in_registry()
     children = []
-    for _ in range(workers):
+    for _ in range(gpus):
         query = _state(model)
         query.loaded_model.vocabulary = tables
         children.append(ChildState(gpu_index=0, gpu=SimpleNamespace(
@@ -531,11 +531,11 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": state.chunk_tokens,
         "true_ids": [1], "false_ids": [2],
-        "docs": {"c": tables.document_batch(DOCS, [None] * len(DOCS))},
+        "documents": {"c": tables.document_batch(DOCS, [None] * len(DOCS))},
         "texts": {"c": pa.array(DOCS)},
         "physical_plan": plan_envelope(
             backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
-            workers=workers, graph=graph, codecs=registry.codecs),
+            gpus=gpus, graph=graph, codecs=registry.codecs),
     }
     rounds = []
 
@@ -553,7 +553,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
         return [_child_extract(child, sub) for child, sub in zip(children, subs)]
 
     result = execute_distributed_graph(
-        payload, graph, workers, round_fn, MODELS["qwen3-4b-fp8"],
+        payload, graph, gpus, round_fn, MODELS["qwen3-4b-fp8"],
         DEVICES["h100-sxm"], registry.runtimes, registry)
     assert len(rounds) == 1
     for node in nodes[1:]:
@@ -565,7 +565,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
     assert result["backend_metrics"]["inferences"][0]["none"] == 1
 
     execution = DistributedQuailExecution(
-        payload, graph, workers, round_fn, MODELS["qwen3-4b-fp8"],
+        payload, graph, gpus, round_fn, MODELS["qwen3-4b-fp8"],
         DEVICES["h100-sxm"], registry)
     execution.started = True
     execution._retained_placement([
@@ -590,26 +590,43 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
     readout = _fake_readout(tables, 4)
     monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     for index, text in enumerate(DOCS):
-        model.docs[("c", index)] = text
+        model.documents[("c", index)] = text
         model.gold[("c", index)] = GOLD[index]
         model.filter_truth[("c", index)] = index != 2
     question = tables.encode_ids(" question")
-    graph = PhysicalGraph((
-        Scan(node_id="input:c", alias="c", input_id="c"),
-        AiFilter(
-            node_id="ai_filter:c", inputs=input_ports((PortRef("input:c", "ids:c"),)),
-            alias="c", arena_writes=True, question_token_ids=tuple(question),
-            written_pos=0, question_tokens=len(question), preamble_tokens=len(head),
-            document_head=tuple(head),
-            selectivity=0.7, expected_docs=2.0),
-        AiExtract(node_id="ai-extract:ends",
-                  inputs=input_ports((PortRef("ai_filter:c", "ids:c"),)),
-                  backend_name="quail", model="qwen3-4b-fp8", spec=plain),
-        AiExtract(node_id="ai-extract:starts",
-                  inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
-                  backend_name="quail", model="qwen3-4b-fp8",
-                  spec=replace(plain, name="starts")),
-    ), PortRef("ai-extract:starts", "rows"))
+    graph = PhysicalGraph(
+        (
+            Scan(node_id="input:c", alias="c", input_id="c"),
+            AiFilter(
+                node_id="ai_filter:c",
+                inputs=input_ports((PortRef("input:c", "ids:c"),)),
+                alias="c",
+                arena_writes=True,
+                question_token_ids=tuple(question),
+                written_position=0,
+                question_tokens=len(question),
+                preamble_tokens=len(head),
+                document_head=tuple(head),
+                selectivity=0.7,
+                expected_rows=2.0,
+            ),
+            AiExtract(
+                node_id="ai-extract:ends",
+                inputs=input_ports((PortRef("ai_filter:c", "ids:c"),)),
+                backend_name="quail",
+                model="qwen3-4b-fp8",
+                spec=plain,
+            ),
+            AiExtract(
+                node_id="ai-extract:starts",
+                inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
+                backend_name="quail",
+                model="qwen3-4b-fp8",
+                spec=replace(plain, name="starts"),
+            ),
+        ),
+        PortRef("ai-extract:starts", "rows"),
+    )
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
@@ -626,7 +643,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"],
              "chunk_tokens": 400,
-             "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
+             "documents": {"c": [tables.encode_ids(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}, "gpu_timing": True}
     report = execute_single_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
@@ -637,7 +654,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
     # the filter's question over the resident KV
     assert dict(model.reads) == {("c", 0): 1, ("c", 1): 1, ("c", 2): 1}
     metrics = report["node_metrics"]
-    documents = sum(len(head) + len(tokens) for tokens in state["docs"]["c"])
+    documents = sum(len(head) + len(tokens) for tokens in state["documents"]["c"])
     assert metrics["ai-extract:ends"]["fresh_tokens"] < documents
     assert metrics["ai_filter:c"]["fresh_tokens"] >= documents
     assert metrics["ai-extract:ends"]["evaluated_documents"] == 2
@@ -654,17 +671,19 @@ def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
     first, stages = run("ends", keep_kv=True)
     arena = state.loaded_model.arena
     # every document's KV stays resident after the extraction
-    assert all(arena.is_resident(doc.key) for doc in stages.docs)
-    assert all(arena.prefix_tokens(doc.key) == len(doc.prefix)
-               for doc in stages.docs)
+    assert all(arena.is_resident(document.key) for document in stages.documents)
+    assert all(arena.prefix_tokens(document.key) == len(document.prefix)
+               for document in stages.documents)
     model.kv = {}
     second, again = run("starts")
-    assert [doc.key for doc in again.docs] == [doc.key for doc in stages.docs]
+    assert [document.key for document in again.documents] == [
+        document.key for document in stages.documents
+    ]
     assert second.outputs["rows"].column("starts").to_pylist() == \
         first.outputs["rows"].column("ends").to_pylist()
     # the second extraction feeds no document: only its tail, lines,
     # cue, and spans are fresh
-    prefixes = sum(len(doc.prefix) for doc in stages.docs)
+    prefixes = sum(len(document.prefix) for document in stages.documents)
     assert first.metrics.fresh_tokens > prefixes
     assert second.metrics.fresh_tokens == first.metrics.fresh_tokens - prefixes
     assert not arena.resident_keys()
@@ -685,15 +704,15 @@ def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
     state.loaded_model.vocabulary = tables
     stages = ExtractionStages(state, [spec], tables, [0],
                            [tables.encode_ids(long)], [long])
-    model.docs[stages.docs[0].key] = long
-    model.gold[stages.docs[0].key] = long
+    model.documents[stages.documents[0].key] = long
+    model.gold[stages.documents[0].key] = long
     from quail.backends.quail.executor.stages import run_stages
 
     run_stages(state.torch, state.loaded_model.arena,
                state.loaded_model.pipeline, stages.stages, stages.prefixes,
                state.chunk_tokens, anchor_keys=stages.keys)
     stages.finish()
-    asked = stages.docs[0].answers[0]
+    asked = stages.documents[0].answers[0]
     assert asked.done and len(asked.written) == stages.spec.max_answer_tokens
     assert asked.answer == " ".join(["word"] * stages.spec.max_answer_tokens)
     assert all(len(suffix) <= 1 + draft
@@ -730,7 +749,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
     readout = _fake_readout(tables, 4)
     monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     for index, text in enumerate(DOCS):
-        model.docs[("c", index)] = text
+        model.documents[("c", index)] = text
         model.gold[("c", index)] = GOLD[index]
     graph = PhysicalGraph((
         Scan(node_id="input:c", alias="c", input_id="c"),
@@ -741,7 +760,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
                predicate=RegularPredicate(
                    ColumnRef("c", "contracts", "ends"), "not like", "five%"),
-               aliases=("c",), written_pos=0),
+               aliases=("c",), written_position=0),
         AiExtract(node_id="ai-extract:starts",
                   inputs=input_ports((PortRef("filter:c:0", "rows"),)),
                   backend_name="quail", model="qwen3-4b-fp8",
@@ -750,7 +769,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                inputs=input_ports((PortRef("ai-extract:starts", "rows"),)),
                predicate=RegularPredicate(
                    ColumnRef("c", "contracts", "starts_span"), "<", 40, ("start",)),
-               aliases=("c",), written_pos=1),
+               aliases=("c",), written_position=1),
     ), PortRef("filter:c:1", "rows"))
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
             ] == ["ai-extract:ends", "filter:c:0", "ai-extract:starts", "filter:c:1"]
@@ -766,7 +785,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                                     execution=execution, spec=MODELS["qwen3-4b-fp8"]),
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
-             "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
+             "documents": {"c": [tables.encode_ids(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}}
     report = execute_single_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
@@ -803,29 +822,45 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
     readout = _fake_readout(tables, 4)
     monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     for index, text in enumerate(DOCS):
-        model.docs[("c", index)] = text
+        model.documents[("c", index)] = text
         model.gold[("c", index)] = GOLD[index]
         model.filter_truth[("c", index)] = index != 1
     question = tables.encode_ids(" question")
-    graph = PhysicalGraph((
-        Scan(node_id="input:c", alias="c", input_id="c"),
-        AiExtract(node_id="ai-extract:ends",
-                  inputs=input_ports((PortRef("input:c", "ids:c"),)),
-                  backend_name="quail", model="qwen3-4b-fp8",
-                  spec=spec),
-        Filter(node_id="filter:c:1",
-               inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
-               predicate=RegularPredicate(
-                   ColumnRef("c", "contracts", "ends"), "is not null"),
-               aliases=("c",), written_pos=1),
-        AiFilter(
-            node_id="ai_filter:c",
-            inputs=input_ports((PortRef("filter:c:1", "ids:c"),)),
-            alias="c", arena_writes=True, question_token_ids=tuple(question),
-            written_pos=0, question_tokens=len(question), preamble_tokens=len(head),
-            document_head=tuple(head),
-            selectivity=0.7, expected_docs=2.0),
-    ), PortRef("ai_filter:c", "ids:c"))
+    graph = PhysicalGraph(
+        (
+            Scan(node_id="input:c", alias="c", input_id="c"),
+            AiExtract(
+                node_id="ai-extract:ends",
+                inputs=input_ports((PortRef("input:c", "ids:c"),)),
+                backend_name="quail",
+                model="qwen3-4b-fp8",
+                spec=spec,
+            ),
+            Filter(
+                node_id="filter:c:1",
+                inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
+                predicate=RegularPredicate(
+                    ColumnRef("c", "contracts", "ends"), "is not null"
+                ),
+                aliases=("c",),
+                written_position=1,
+            ),
+            AiFilter(
+                node_id="ai_filter:c",
+                inputs=input_ports((PortRef("filter:c:1", "ids:c"),)),
+                alias="c",
+                arena_writes=True,
+                question_token_ids=tuple(question),
+                written_position=0,
+                question_tokens=len(question),
+                preamble_tokens=len(head),
+                document_head=tuple(head),
+                selectivity=0.7,
+                expected_rows=2.0,
+            ),
+        ),
+        PortRef("ai_filter:c", "ids:c"),
+    )
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
             ] == ["ai-extract:ends", "filter:c:1", "ai_filter:c"]
     torch, arena = fake_torch(), cpu_arena(256)
@@ -843,7 +878,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
                                     execution=execution, spec=MODELS["qwen3-4b-fp8"]),
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
-             "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
+             "documents": {"c": [tables.encode_ids(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}}
     report = execute_single_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
@@ -860,7 +895,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
     fed = [(key, suffix, f) for key, suffix, kept, _, f in model.packed
            if suffix == question]
     assert [(key, f) for key, _, f in fed] == [
-        (("c", index), len(head) + len(state["docs"]["c"][index]))
+        (("c", index), len(head) + len(state["documents"]["c"][index]))
         for index in (0, 1)]
     assert report["node_metrics"]["ai_filter:c"]["evaluated_documents"] == 2
     assert not arena.accounting.owned
@@ -878,9 +913,9 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
     monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
     # twelve documents, four of each kind, so some are still queued
     # when the first one passes
-    docs, gold = DOCS * 4, GOLD * 4
-    for index, text in enumerate(docs):
-        model.docs[("c", index)] = text
+    texts, gold = DOCS * 4, GOLD * 4
+    for index, text in enumerate(texts):
+        model.documents[("c", index)] = text
         model.gold[("c", index)] = gold[index]
     graph = PhysicalGraph((
         Scan(node_id="input:c", alias="c", input_id="c"),
@@ -891,7 +926,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
                inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
                predicate=RegularPredicate(
                    ColumnRef("c", "contracts", "ends"), "is not null"),
-               aliases=("c",), written_pos=0),
+               aliases=("c",), written_position=0),
     ), PortRef("filter:c:0", "rows"))
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
@@ -899,7 +934,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.loaded_model.vocabulary = tables
     execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
-    documents = [tables.encode_ids(text) for text in docs]
+    documents = [tables.encode_ids(text) for text in texts]
     # a chunk holds about one document and its question
     chunk = max(len(document) for document in documents) + len(
         spec.prompt_token_parts[0]) + len(spec.prompt_token_parts[1]) + 8
@@ -909,7 +944,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
                                     execution=execution, spec=MODELS["qwen3-4b-fp8"]),
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"], "chunk_tokens": chunk,
-             "docs": {"c": documents}, "texts": {"c": list(docs)}}
+             "documents": {"c": documents}, "texts": {"c": list(texts)}}
     report = execute_single_graph(
         state, {"filter_limit": 1, "retention": {}}, graph)
     outputs = report["_outputs"]
@@ -917,6 +952,6 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
     # the documents in flight when the first passed finish; the
     # queued ones are never read
     assert kept["c"][0] == 0 and kept["ends"][0] == "March 3, 2027"
-    assert 1 <= len(kept["c"]) < len(docs)
-    assert sum(model.reads.values()) < len(docs)
+    assert 1 <= len(kept["c"]) < len(texts)
+    assert sum(model.reads.values()) < len(texts)
     assert not arena.accounting.owned

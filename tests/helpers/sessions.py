@@ -35,7 +35,7 @@ def make_executor(filter_truth, join_truth=None):
         from quail.physical import AiFilter, Scan, decode_graph
 
         graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
-        docs = {
+        documents = {
             node.alias: request.inputs[node.input_id].documents
             for node in graph.nodes if isinstance(node, Scan)
         }
@@ -62,17 +62,17 @@ def make_executor(filter_truth, join_truth=None):
                                    fresh_tokens=10 * len(rows)))
                 anchors = list(inputs["anchor_ids"])
                 outputs = {}
-                partners = inputs["partner_indices"][node.written_pos]
+                partners = inputs["partner_indices"][node.written_position]
                 rule = join_truth[(node.anchor, *node.partners)]
                 rows = {i: [rule(a, *pair) for pair in partners]
                         for i, a in enumerate(anchors)}
-                outputs[f"join_answers:{node.written_pos}"] = {
+                outputs[f"join_answers:{node.written_position}"] = {
                     "rows": rows, "anchor_index": anchors,
                     "partner_index": partners, "anchor": node.anchor,
                     "partners": list(node.partners),
                     "semantics": node.semantics,
                     "selectivity": node.selectivity,
-                    "written_pos": node.written_pos,
+                    "written_position": node.written_position,
                 }
                 passing = {anchors[i] for i, row in rows.items() if any(row)}
                 outputs[f"ids:{node.anchor}"] = [a for a in anchors
@@ -89,7 +89,7 @@ def make_executor(filter_truth, join_truth=None):
                     evaluated_document_pairs=sum(
                         len(row) for row in rows.values())))
 
-        state = graph_state(FixedAnswers(), docs)
+        state = graph_state(FixedAnswers(), documents)
         if getattr(request, "relations", None):
             state["columns"] = request.column_tables()
         report = execute_single_graph(state, {

@@ -23,7 +23,7 @@ class ChangeCount(PhysicalRule):
 
     def rewrite(self, graph, context):
         return PhysicalGraph(tuple(
-            replace(node, n_docs=node.n_docs * self.factor + self.offset)
+            replace(node, num_documents=node.num_documents * self.factor + self.offset)
             for node in graph.nodes
         ), graph.root)
 
@@ -43,12 +43,12 @@ def _module(monkeypatch, name, register):
 
 def _count(registry):
     graph = PhysicalGraph(
-        (Scan(node_id="input", alias="d", input_id="d", n_docs=1),),
+        (Scan(node_id="input", alias="d", input_id="d", num_documents=1),),
         PortRef("input", "ids:d"),
     )
     rewritten, _ = rewrite_graph(
         graph, tuple(registry.rules.values()), None)
-    return rewritten.nodes[0].n_docs
+    return rewritten.nodes[0].num_documents
 
 
 def test_extension_order_nesting_and_rollback(monkeypatch):
@@ -173,7 +173,7 @@ def test_node_registration_validation_and_execution():
         assert dict(registry.runtimes) == runtimes
 
     registry = built_in_registry().register_node(CustomInput, runtime=ScanRuntime())
-    node = CustomInput(node_id="custom", alias="d", input_id="d", n_docs=2)
+    node = CustomInput(node_id="custom", alias="d", input_id="d", num_documents=2)
     codec = registry.codecs[node.type_name]
     assert codec.decode(codec.encode(node)) == node
     assert isinstance(registry.runtimes[node.runtime_key], ScanRuntime)

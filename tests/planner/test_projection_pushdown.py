@@ -141,7 +141,7 @@ class _UnstableProvider:
 
     def statistics(self):
         from quail.catalog import TableStatistics
-        return TableStatistics(row_count=3)
+        return TableStatistics(num_rows=3)
 
     def scan(self, request):
         self.scans += 1
@@ -156,13 +156,13 @@ class _UnstableProvider:
 
 def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
     session = _session(tmp_path)
-    session.register("docs", _UnstableProvider())
-    session.inputs.tokenize("docs", "body", ("id",))
+    session.register("documents", _UnstableProvider())
+    session.inputs.tokenize("documents", "body", ("id",))
 
     with pytest.raises(RuntimeError, match="stable order"):
-        session.inputs.tokenize("docs", "body", ("stars",))
+        session.inputs.tokenize("documents", "body", ("stars",))
     with pytest.raises(RuntimeError, match="stable order"):
-        session.inputs.tokenize("docs", "body", ("stars",))
+        session.inputs.tokenize("documents", "body", ("stars",))
 
     assert ("unstable", "stars") not in session.inputs._column_stores
     assert len(list(Path(session.inputs._token_directory.name).iterdir())) == 2
@@ -263,6 +263,6 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
     assert push_down_filters(above) is None
     pairs = replace(joined, input=Apply(
         joined.input, function="pairs", kind="barrier", ids="pairs",
-        columns=(), aliases=("r", "p"), written_pos=0))
+        columns=(), aliases=("r", "p"), written_position=0))
     above = replace(labelled.root, input=_stars_apply(pairs))
     assert push_down_filters(above) is None

@@ -15,12 +15,12 @@ def payload():
     return dict(
         model="qwen3-4b-fp8", chunk_tokens=1000,
         true_ids=[1], false_ids=[2], filter_limit=None,
-        docs={"r": [[i] * (10 + i) for i in range(6)],
+        documents={"r": [[i] * (10 + i) for i in range(6)],
               "p": [[i] * 5 for i in range(4)]},
         filters={"r": [[7, 7]]}, filter_arena_writes={"r": True}, physical_plan={},
         joins=[dict(anchor="r", partners=["p"], semantics="full",
                     labels={"p": [2]}, frame=[8], tail=[3])],
-        workers=2,
+        gpus=2,
         shards={"r": ((0, 2, 4), (1, 3, 5)), "p": ((0, 1), (2, 3))})
 
 
@@ -37,9 +37,9 @@ def test_filter_and_join_rounds_split_and_place_documents():
         p, filter_node(), p["shards"], 2, has_joins=True))
     subs = filter_node_payloads(p, filter_node(), p["shards"], 2, has_joins=False)
     assert all(s["filter_limit"] == 3 for s in subs)
-    assert [sub["doc_index"]["r"] for sub in subs] == [[0, 2, 4], [1, 3, 5]]
-    assert subs[1]["docs"]["r"][0] == [1] * 11
-    assert "p" not in subs[0]["docs"]
+    assert [sub["document_index"]["r"] for sub in subs] == [[0, 2, 4], [1, 3, 5]]
+    assert subs[1]["documents"]["r"][0] == [1] * 11
+    assert "p" not in subs[0]["documents"]
 
     # an anchor that ran no filter round has no KV to stay near: its scan
     # shard is ignored and shards balance over the live documents
@@ -53,7 +53,7 @@ def test_filter_and_join_rounds_split_and_place_documents():
     # two full stages sharing one anchor: every worker gets both stages
     # and every partner table of either stage
     p = payload()
-    p["docs"]["m"] = [[9] * 3 for _ in range(3)]
+    p["documents"]["m"] = [[9] * 3 for _ in range(3)]
     p["joins"].append(dict(anchor="r", partners=["m"],
                            semantics="full", labels={"m": [4]},
                            frame=[8], tail=[3]))
@@ -127,7 +127,7 @@ def test_join_merge_and_partner_lists():
     pairs = pa.table({"r": pa.array([0, 0, 2, 3, 5], pa.int32()),
                       "p": pa.array([0, 3, 1, 2, 3], pa.int32())})
     p = payload()
-    group = [dict(p["joins"][0], written_pos=0, pairs_from="hash_join:r-p")]
+    group = [dict(p["joins"][0], written_position=0, pairs_from="hash_join:r-p")]
     subs = join_group_payloads(p, 2, {"r": [0, 2, 3, 5], "p": [1, 3]},
                                group, pair_tables={0: pairs})
     assert [sub["anchor_index"] for sub in subs] == [[0, 2], [3, 5]]

@@ -58,6 +58,11 @@ def _tick(timing, key, t0):
     return time.perf_counter()
 
 
+def _concatenate(parts):
+    """Join int64 arrays, or give an empty one when there is nothing to join."""
+    return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+
+
 def _staged(torch, data, dtype, pinned=True):
     """Copy host data to the device.
 
@@ -275,9 +280,6 @@ class _PoolBuilder:
             self.tail_dst.append(temp.rows[:remainder].numpy())
 
     def build(self, arena, stage, torch, staging, index):
-        def concatenate(parts):
-            return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
-
         tag = "" if index == 0 else "_sliding"
         if staging is None:
             table = arena.block_table_rows(self.page_rows)
@@ -289,11 +291,11 @@ class _PoolBuilder:
             table = stage(f"block_table{tag}", block_table, torch.int32).view(
                 len(self.page_rows), width)
         return dict(
-            src=stage(f"unified_src{tag}", concatenate(self.src), torch.int64),
-            dst=stage(f"unified_dst{tag}", concatenate(self.dst), torch.int64),
-            tail_src=(stage(f"tail_src{tag}", concatenate(self.tail_src),
+            src=stage(f"unified_src{tag}", _concatenate(self.src), torch.int64),
+            dst=stage(f"unified_dst{tag}", _concatenate(self.dst), torch.int64),
+            tail_src=(stage(f"tail_src{tag}", _concatenate(self.tail_src),
                             torch.int64) if self.tail_src else None),
-            tail_dst=(stage(f"tail_dst{tag}", concatenate(self.tail_dst),
+            tail_dst=(stage(f"tail_dst{tag}", _concatenate(self.tail_dst),
                             torch.int64) if self.tail_dst else None),
             used=stage(f"unified_lengths{tag}", self.lengths, torch.int32),
             table=table,
@@ -344,9 +346,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             return staging.copy(name, values, dtype)
         return _staged(torch, values, dtype, pinned)
 
-    def concatenate(parts):
-        return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
-
     if attention_mode not in ATTENTION_PATHS:
         raise ValueError(
             f"attention_mode must be one of {ATTENTION_PATHS}, "
@@ -366,8 +365,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     canvas_starts = []    # per group, the first row of each canvas
     canvas_sizes = []     # per group, the rows of each canvas
     canvas_seq = []       # its sequence in the unified paged call
-    id_parts, token_count = [], 0
-    pos, finals = [], []
+    id_parts, num_tokens = [], 0
+    position, finals = [], []
     cu_a = [np.zeros(1, dtype=np.int64)]
     rows_per_answer = []
     multi_row = False
@@ -388,7 +387,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         key = g["key"]
         start = g.get("start", 0)
         paged = arena.is_resident(key)
-        row0 = token_count
+        row0 = num_tokens
         sufs = g["suffixes"]
         if not isinstance(sufs, Suffixes):
             sufs = Suffixes.of(sufs)
@@ -415,21 +414,21 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     f"group {key!r}: a borrowed prefix needs arena pages")
             prefix_len = len(g["prefix"])
             id_parts.append(g["prefix"])
-            token_count += prefix_len
-            pos.append(np.arange(start, start + prefix_len, dtype=np.int64))
+            num_tokens += prefix_len
+            position.append(np.arange(start, start + prefix_len, dtype=np.int64))
             if (paged or not n) and not stacked and not whole:
-                cu_a.append(np.array([token_count], dtype=np.int64))
+                cu_a.append(np.array([num_tokens], dtype=np.int64))
             if borrowing and not stacked:
-                reader_rows.append(np.arange(row0, token_count, dtype=np.int64))
+                reader_rows.append(np.arange(row0, num_tokens, dtype=np.int64))
                 cu_q.append(cu_q[-1] + prefix_len)
                 read_keys.append(key)
                 read_used.append(start)
                 max_q = max(max_q, prefix_len)
             if paged and tree_path:
-                kv_writes.append((key, row0, token_count, start))
+                kv_writes.append((key, row0, num_tokens, start))
                 fresh_keys.append(key)
-        prefix_end = token_count
-        s_row0 = token_count
+        prefix_end = num_tokens
+        s_row0 = num_tokens
         # with a canvas, read_all_rows reads every canvas row instead
         # of the suffix's own rows
         read_all = bool(g.get("read_all_rows"))
@@ -517,7 +516,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             starts = np.array([start for _, start, _ in paths])
             path_ends = s_row0 + np.cumsum(lengths)
             path_row0 = path_ends - lengths
-            pos.append(f + np.repeat(starts, lengths)
+            position.append(f + np.repeat(starts, lengths)
                        + (np.arange(total, dtype=np.int64)
                           - np.repeat(path_row0 - s_row0, lengths)))
             cu_a.append(path_ends)
@@ -534,11 +533,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 node_k.append(keys)
                 node_cu_q.append(node_cu_q[-1] + int(lengths[index]))
                 node_cu_k.append(node_cu_k[-1] + len(keys))
-            token_count += total
+            num_tokens += total
         elif n:
-            pos.append(f + within)
+            position.append(f + within)
             cu_a.append(s_row0 + ends)
-            token_count += total
+            num_tokens += total
             wst = g.get("write_suffix_tokens", 0)
             if wst and paged and tree_path:
                 # the shared question preamble joins the kept KV right
@@ -546,13 +545,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 # after a kept document's f rows
                 dest = start + prefix_len if fresh else f
                 kv_writes.append((key, s_row0, s_row0 + wst, dest))
-        s_count = token_count - s_row0
+        num_s = num_tokens - s_row0
         layout.append((key, n))
         if stacked:
             # every row of the group reads the parent's pages up to
             # start; siblings packed back to back share that read
-            count = token_count - row0
-            reader_rows.append(np.arange(row0, token_count, dtype=np.int64))
+            count = num_tokens - row0
+            reader_rows.append(np.arange(row0, num_tokens, dtype=np.int64))
             read_key = g["read_key"]
             if read_keys and read_keys[-1] == read_key \
                     and read_used[-1] == start:
@@ -563,17 +562,17 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 read_keys.append(read_key)
                 read_used.append(start)
                 max_q = max(max_q, count)
-        elif s_count and f and paged and tree_path and not whole:
-            reader_rows.append(np.arange(s_row0, token_count, dtype=np.int64))
-            cu_q.append(cu_q[-1] + s_count)
+        elif num_s and f and paged and tree_path and not whole:
+            reader_rows.append(np.arange(s_row0, num_tokens, dtype=np.int64))
+            cu_q.append(cu_q[-1] + num_s)
             read_keys.append(key)
             read_used.append(f)
-            max_q = max(max_q, s_count)
+            max_q = max(max_q, num_s)
         if attention_mode == "unified":
             if paged:
                 unified_groups.append(dict(
                     key=key, fresh=fresh, f=f, row0=row0, start=start,
-                    prefix_end=prefix_end, row1=token_count,
+                    prefix_end=prefix_end, row1=num_tokens,
                     suffix_spans=(s_row0 + begins, s_row0 + ends),
                     canvas=bool(n and width),
                     keeps=bool(g.get("write_suffix_tokens"))))
@@ -591,7 +590,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         rows = np.concatenate(reader_rows)
         # row -> its index in call B's output, -1 for rows that read
         # nothing resident; the fused merge kernel's map
-        source = np.full(token_count, -1, dtype=np.int32)
+        source = np.full(num_tokens, -1, dtype=np.int32)
         source[rows] = np.arange(len(rows), dtype=np.int32)
         reads = dict(
             rows=_staged(torch, rows, torch.int64, pinned),
@@ -667,15 +666,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                         canvas_seq.append(len(cu_q) - 2)
                     continue
 
-                prefix_count = spec["prefix_end"] - r0
-                if prefix_count:
+                num_prefix_tokens = spec["prefix_end"] - r0
+                if num_prefix_tokens:
                     for pool, view in zip(pools, views):
                         pool.scatter_direct(view, r0, spec["prefix_end"],
                                             spec["start"])
                         pool.add_sequence(
                             view.pages[:arena.pages_needed(f - view.start)],
                             f - view.start)
-                    cu_q.append(cu_q[-1] + prefix_count)
+                    cu_q.append(cu_q[-1] + num_prefix_tokens)
 
                 for s0, s1 in zip(begins.tolist(), ends.tolist()):
                     suffix_tokens = s1 - s0
@@ -781,10 +780,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)
     out = Chunk(
         input_ids=_staged_token_parts(
-            torch, id_parts, token_count, pinned, staging),
-        positions=stage("positions", concatenate(pos), torch.int64),
-        final_indices=stage("finals", concatenate(finals), torch.int64),
-        meta=meta, attention_mode=attention_mode, tokens=token_count,
+            torch, id_parts, num_tokens, pinned, staging),
+        positions=stage("positions", _concatenate(position), torch.int64),
+        final_indices=stage("finals", _concatenate(finals), torch.int64),
+        meta=meta, attention_mode=attention_mode, tokens=num_tokens,
         layout=layout, temporary_keys=tuple(temporary_keys),
         fresh_keys=tuple(fresh_keys),
         rows_per_answer=(np.concatenate(rows_per_answer) if multi_row else None))

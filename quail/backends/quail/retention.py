@@ -21,7 +21,7 @@ def apply_retention(arena, config, uses, survivors=None):
         if alias not in uses or (alias in alive and document not in alive[alias]):
             arena.free_key(key)
     arena.configure_retention(
-        policy(config, uses), min(config["cap_pages"], arena.n_pages))
+        policy(config, uses), min(config["cap_pages"], arena.num_pages))
     arena.evict_retained(max(0, arena.retained_pages - arena.retention_cap_pages))
 
 

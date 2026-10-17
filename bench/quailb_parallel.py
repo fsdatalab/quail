@@ -42,12 +42,12 @@ DATA_DIR = "/results/quailb_data"
 
 
 @app.function(image=image, timeout=1200, volumes=VOLUMES)
-def ensure_data(sf: float, query_ids: list[str], collection_id: str,
+def ensure_data(scale_factor: float, query_ids: list[str], collection_id: str,
                 label_root: str = ""):
     """Prepare query tables and resolve the reference label collection.
 
     Args:
-        sf: Dataset scale factor.
+        scale_factor: Dataset scale factor.
         query_ids: Query IDs whose tables are required.
         collection_id: Reference collection ID, or empty to use the default.
         label_root: Optional local mirror of published reference labels.
@@ -64,7 +64,7 @@ def ensure_data(sf: float, query_ids: list[str], collection_id: str,
         relation.table for query_id in query_ids
         for relation in benchmark.get_query(query_id).info.relations
     }
-    directory = Path(DATA_DIR) / f"sf{sf}"
+    directory = Path(DATA_DIR) / f"sf{scale_factor}"
     directory.mkdir(parents=True, exist_ok=True)
     for name in sorted(names):
         path = directory / f"{name}.parquet"
@@ -72,9 +72,9 @@ def ensure_data(sf: float, query_ids: list[str], collection_id: str,
         if (path.exists() and set(CORPUS_COLUMNS[name])
                 <= set(pq.read_schema(path).names)):
             continue
-        pq.write_table(benchmark.load_table(name, scale_factor=sf), path)
+        pq.write_table(benchmark.load_table(name, scale_factor=scale_factor), path)
     suite = benchmark.load_benchmark(
-        query_ids, scale_factor=sf, data_dir=directory,
+        query_ids, scale_factor=scale_factor, data_dir=directory,
         collection_id=collection_id or None, root=label_root or None)
     results_vol.commit()
     return suite.ground_truth.collection_id
@@ -85,7 +85,7 @@ def _methods(csv: str) -> list[str]:
     return [item.strip() for item in csv.split(",") if item.strip()]
 
 
-def _run_family(process_groups, result_name, model, sf, query_ids_csv,
+def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
                 run_dir, ground_truth_collection, root=None,
                 attention=None, gpu_timing=False,
                 canvas_draws=None) -> str:
@@ -106,11 +106,19 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
     suites = {}
     for methods in process_groups:
         process_result = run_backend_group_in_fresh_process(
-            data_dir=DATA_DIR, model=model, sf=sf, query_ids=query_ids,
-            run_dir=run_dir, ground_truth_collection=ground_truth_collection,
-            methods=methods, root=root,
-            attention=attention, gpu_timing=gpu_timing,
-            suite_name=f"{family}{result_name}", canvas_draws=canvas_draws)
+            data_dir=DATA_DIR,
+            model=model,
+            scale_factor=scale_factor,
+            query_ids=query_ids,
+            run_dir=run_dir,
+            ground_truth_collection=ground_truth_collection,
+            methods=methods,
+            root=root,
+            attention=attention,
+            gpu_timing=gpu_timing,
+            suite_name=f"{family}{result_name}",
+            canvas_draws=canvas_draws,
+        )
         process_results.append(process_result)
         suites.update(process_result["suites"])
     gpu_uuids = {
@@ -151,7 +159,7 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
 )
 def run_query_family(
     model: str,
-    sf: float,
+    scale_factor: float,
     query_ids_csv: str,
     run_dir: str,
     ground_truth_collection: str,
@@ -169,7 +177,7 @@ def run_query_family(
 
     Args:
         model: Model name.
-        sf: Dataset scale factor.
+        scale_factor: Dataset scale factor.
         query_ids_csv: Comma-separated query IDs in one family.
         run_dir: Directory for this benchmark run.
         ground_truth_collection: Reference label collection ID.
@@ -193,12 +201,19 @@ def run_query_family(
     if include_dumb_vllm:
         process_groups.append(("dumb_vllm",))
     try:
-        return _run_family(process_groups, result_name, model, sf, query_ids_csv,
-                           run_dir, ground_truth_collection,
-                           root=label_root or None,
-                           attention=attention or None,
-                           gpu_timing=gpu_timing,
-                           canvas_draws=canvas_draws or None)
+        return _run_family(
+            process_groups,
+            result_name,
+            model,
+            scale_factor,
+            query_ids_csv,
+            run_dir,
+            ground_truth_collection,
+            root=label_root or None,
+            attention=attention or None,
+            gpu_timing=gpu_timing,
+            canvas_draws=canvas_draws or None,
+        )
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -214,7 +229,7 @@ def run_query_family(
 )
 def run_sglang_query_family(
     model: str,
-    sf: float,
+    scale_factor: float,
     query_ids_csv: str,
     run_dir: str,
     ground_truth_collection: str,
@@ -222,7 +237,7 @@ def run_sglang_query_family(
 ) -> str:
     """Run one query family through the SGLang backend."""
     try:
-        return _run_family([("pipelined_sglang",)], result_name, model, sf,
+        return _run_family([("pipelined_sglang",)], result_name, model, scale_factor,
                            query_ids_csv, run_dir, ground_truth_collection)
     finally:
         results_vol.commit()
@@ -289,7 +304,7 @@ def _query_groups(query_ids) -> list[tuple[str, tuple[str, ...], str]]:
 def run_all(
     run_dir: str,
     model: str = "qwen3-4b-fp8",
-    sf: float = 0.1,
+    scale_factor: float = 0.1,
     query: str = "",
     ground_truth_collection: str = "",
     include_baselines: bool = True,
@@ -305,7 +320,8 @@ def run_all(
     from quail_b import select_queries
 
     only = [item.strip() for item in query.split(",")] if query else None
-    query_ids = tuple(spec.id for spec in select_queries(only, scale_factor=sf))
+    query_ids = tuple(spec.id for spec in select_queries(
+        only, scale_factor=scale_factor))
     # not resolve(): /results is a mount inside the container
     directory = Path(run_dir)
     if not directory.is_relative_to("/results") or directory == Path("/results"):
@@ -317,7 +333,7 @@ def run_all(
         "status": "running",
         "started_at": started.isoformat(),
         "model": model,
-        "sf": sf,
+        "sf": scale_factor,
         "attention": attention or None,
         "canvas_draws": canvas_draws or None,
         "query_ids": list(query_ids),
@@ -329,7 +345,7 @@ def run_all(
     results_vol.commit()
 
     try:
-        data_call = ensure_data.spawn(sf, query_ids, ground_truth_collection,
+        data_call = ensure_data.spawn(scale_factor, query_ids, ground_truth_collection,
                                       label_root)
         manifest["function_call_ids"]["data"] = data_call.object_id
         print(f"function call id: {data_call.object_id} (data)", flush=True)
@@ -343,7 +359,7 @@ def run_all(
             if include_quail or include_baselines or include_dumb_vllm:
                 family_call = run_query_family.spawn(
                     model=model,
-                    sf=sf,
+                    scale_factor=scale_factor,
                     query_ids_csv=",".join(family_ids),
                     run_dir=run_dir,
                     ground_truth_collection=ground_truth_collection,
@@ -368,7 +384,7 @@ def run_all(
                 sglang_result_name = f"{result_name}-sglang"
                 sglang_call = run_sglang_query_family.spawn(
                     model=model,
-                    sf=sf,
+                    scale_factor=scale_factor,
                     query_ids_csv=",".join(family_ids),
                     run_dir=run_dir,
                     ground_truth_collection=ground_truth_collection,
@@ -505,7 +521,7 @@ def finish_run(run_dir: str) -> str:
 def main(
     output_dir: str = "/results/benchmarks/quailb",
     model: str = "qwen3-4b-fp8",
-    sf: float = 0.1,
+    scale_factor: float = 0.1,
     query: str = "",
     ground_truth_collection: str = "",
     include_baselines: bool = True,
@@ -534,7 +550,7 @@ def main(
     call = run_all.spawn(
         run_dir=run_dir,
         model=model,
-        sf=sf,
+        scale_factor=scale_factor,
         query=query,
         ground_truth_collection=ground_truth_collection,
         include_baselines=include_baselines,

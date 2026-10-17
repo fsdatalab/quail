@@ -49,7 +49,7 @@ def catalog(tmp_path):
     return cat
 
 
-def tok(text):
+def tokenizer(text):
     return text.split()
 
 
@@ -158,7 +158,7 @@ def test_prompt_layout_and_predicate_order(catalog):
     args = (ColumnRef("a", "reviews", "review"),
             ColumnRef("b", "threads", "thread"))
     p = bind_join_prompt("Does {0} praise {1}?", args)
-    lowered = lower_prompt(p, tok)
+    lowered = lower_prompt(p, tokenizer)
     assert p.template == "Does {0} praise {1}?"
     assert p.preamble == SHARED_PRE
     # the static question is in the anchor frame; only the answer cue
@@ -167,11 +167,11 @@ def test_prompt_layout_and_predicate_order(catalog):
                        "Evaluate TRUE or FALSE for the following "
                        "question: Does {0} praise {1}?")
     assert p.tail == ANSWER_CUE
-    assert lowered.tail_tokens == len(tok(p.tail))
+    assert lowered.tail_tokens == len(tokenizer(p.tail))
     assert join_label(1) == "\n\nDOCUMENT {1}:\n"
     assert [a for a, _, _ in lowered.labels] == ["a", "b"]
-    assert lowered.labels[1][1] == len(tok(join_label(1)))
-    assert lowered.labels[0][2] == len(tok(render_join_frame(p.template, 0)))
+    assert lowered.labels[1][1] == len(tokenizer(join_label(1)))
+    assert lowered.labels[0][2] == len(tokenizer(render_join_frame(p.template, 0)))
     assert render_join_question(p.template) == p.frame
 
     plan = compile_sql("""
@@ -205,9 +205,9 @@ def test_prompt_layout_and_predicate_order(catalog):
                 "This review is negative:" + ANSWER_CUE)
     assert pred.prompt.preamble == SHARED_PRE
     assert pred.prompt.tail == "{0}\n\n" + question
-    lowered = lower_prompt(pred.prompt, tok)
-    assert lowered.preamble_tokens == len(tok(SHARED_PRE))
-    assert lowered.tail_tokens == len(tok(question))
+    lowered = lower_prompt(pred.prompt, tokenizer)
+    assert lowered.preamble_tokens == len(tokenizer(SHARED_PRE))
+    assert lowered.tail_tokens == len(tokenizer(question))
 
 
 TWO_ONS = """
@@ -517,7 +517,7 @@ def test_builder_places_apply_nodes_in_the_logical_tree():
     join = plan.root.input
     assert isinstance(join, SemanticJoin)
     (pairs,) = join_applies(join)
-    assert (pairs.function, pairs.kind, pairs.ids, pairs.written_pos) == (
+    assert (pairs.function, pairs.kind, pairs.ids, pairs.written_position) == (
         "same_key", "barrier", "pairs", 0)
     assert pairs.aliases == ("c", "e")
     assert isinstance(pairs.input, Join)

@@ -67,7 +67,7 @@ def test_greedy_decoder_follows_the_likeliest_child_to_a_label():
     # the cue's request, then the run from token 1 to the next choice
     assert decoder.suffixes == [[93], [1]]
     # round 0 feeds the cue, request 0, for both documents
-    assert [decoder.requests(doc) for doc in range(2)] == [[0], [0]]
+    assert [decoder.requests(document) for document in range(2)] == [[0], [0]]
     assert decoder.tokens == 2
     # document 0 follows token 1, document 1 takes the one-token label 4
     decoder.update(0, np.array([-1.0, -9.0, -9.0, -3.0]))
@@ -158,7 +158,7 @@ def test_label_readout_is_log_softmax_over_the_whole_vocabulary(monkeypatch):
 def test_classifier_decodes_one_choice_per_round(monkeypatch):
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=3, estimated_seconds=0.0,
+        expected_rows=3, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
         label_token_ids=IDS, scoring="trie_decode")
     requests = label_requests(spec)
@@ -475,8 +475,8 @@ def _candidates(session, query):
 
     query.plan()
     context = PlanningContext(
-        model=session.model, device=session.device, gpu_count=1,
-        document_tokens=query._doc_tokens, backend="quail",
+        model=session.model, device=session.device, gpus=1,
+        document_tokens=query._document_tokens, backend="quail",
         tokenizer=session.tokenizer)
     return search_candidates(query._logical_input, context, session.registry)
 
@@ -529,10 +529,10 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.inputs[0].source.node_id == "ai_join:r"
     assert classify.spec.scoring == "trie_tree"
-    assert classify.spec.expected_inputs == pytest.approx(1.8)
+    assert classify.spec.expected_rows == pytest.approx(1.8)
     assert round(plan.estimated_seconds, 3) == 0.062
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
-    assert (staged.exec_idx, staged.anchor) == (0, "r")
+    assert (staged.exec_index, staged.anchor) == (0, "r")
     assert classified_above_joins(after._logical_input.root) == frozenset()
     assert classified_above_joins(after.logical.root) == {"r"}
     written_candidate, lifted_candidate = _candidates(session, after)
@@ -548,7 +548,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
 
     context = PlanningContext(
         catalog=session.catalog, engine_config=session.config, model=session.model,
-        device=session.device, document_tokens=after._doc_tokens,
+        device=session.device, document_tokens=after._document_tokens,
         tokenizer=session.tokenizer)
     assert pricing.estimated_seconds(
         lifted_candidate.logical_plan, context, session.registry) == (
@@ -580,7 +580,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
         "scan:r", "scan:a", "ai_filter:r", "ai-classify:0", "filter:r:1",
         "ai_join:a", "project"]
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    assert (classify.spec.scoring, classify.spec.expected_inputs) == (
+    assert (classify.spec.scoring, classify.spec.expected_rows) == (
         "trie_tree", 30.0)
     assert round(plan.estimated_seconds, 3) == 0.410
     written_candidate, lifted_candidate = _candidates(session, before)
@@ -895,7 +895,7 @@ def test_trie_paths_cover_every_node_once_and_gather_ancestors():
         label_trie([(1,), ()])
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=1, estimated_seconds=0.0,
+        expected_rows=1, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 93)), labels=("a", "b", "c", "d"),
         label_token_ids=labels, scoring="trie_tree")
     requests = label_requests(spec)
@@ -1072,7 +1072,7 @@ def test_classifier_scores_the_packed_trie(monkeypatch, worded):
     paths = trie_paths(labels, read)
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=2, estimated_seconds=0.0,
+        expected_rows=2, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 93)), labels=("a", "b", "c", "d"),
         label_token_ids=labels, scoring="trie_tree",
         label_word_starts=starts if worded else ())
@@ -1255,7 +1255,7 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
     settings = AnswerCanvas(rows=4, turn_close_id=6, pad_id=0)
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=2, estimated_seconds=0.0,
+        expected_rows=2, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
         label_token_ids=((1,), (2,)), scoring="letters")
     vocab = 8

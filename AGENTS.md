@@ -36,6 +36,7 @@ CI runs these on every pull request. Run them before pushing:
 
     uv run ruff check quail bench tests experiments tools
     uv run python tools/check_long_strings.py
+    uv run python tools/check_names.py
     uv run vulture
     uv run lint-imports
     uv run pytest -q

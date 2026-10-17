@@ -103,13 +103,13 @@ def collect_answers(logical, plan, outputs, documents):
                 alias.decode("utf-8"), []
             ).append(table)
         elif value_type is ValueType.JOIN_ANSWERS:
-            written_pos = metadata.get(b"quail.written_pos")
-            if written_pos is None:
+            written_position = metadata.get(b"quail.written_position")
+            if written_position is None:
                 raise ValueError(
                     "a join answer relation needs "
-                    "quail.written_pos metadata"
+                    "quail.written_position metadata"
                 )
-            position = int(written_pos.decode("ascii"))
+            position = int(written_position.decode("ascii"))
             if position in join_relations:
                 raise ValueError(
                     f"duplicate join answer relation {position}"
@@ -154,22 +154,24 @@ def collect_answers(logical, plan, outputs, documents):
             pa.concat_tables(relations)
         # predicates in the order their first answers appear
         predicate_order = [
-            int(pos) for pos in pc.unique(table.column("predicate")).to_pylist()]
+            int(position)
+            for position in pc.unique(table.column("predicate")).to_pylist()
+        ]
         predicate_order.extend(
             position for position in range(len(logical_filters[alias]))
             if position not in predicate_order
         )
-        for index, written_pos in enumerate(predicate_order):
-            mask = pc.equal(table.column("predicate"), written_pos)
+        for index, written_position in enumerate(predicate_order):
+            mask = pc.equal(table.column("predicate"), written_position)
             stage_table = table.filter(mask)
             evaluated = stage_table.num_rows
             passed = pc.sum(stage_table.column("answer")).as_py() or 0
-            answer_tables["filters"][(alias, written_pos)] = stage_table
+            answer_tables["filters"][(alias, written_position)] = stage_table
             report["stages"].append(dict(
                 op="filter", alias=alias, stage=index,
-                written_pos=written_pos,
+                written_position=written_position,
                 provided_selectivity=(
-                    logical_filters[alias][written_pos].selectivity
+                    logical_filters[alias][written_position].selectivity
                 ),
                 observed_selectivity=round(
                     passed / max(1, evaluated), 4
@@ -188,12 +190,12 @@ def collect_answers(logical, plan, outputs, documents):
         position for position in sorted(join_relations)
         if position not in expected_order
     )
-    for written_pos in expected_order:
-        if written_pos not in join_relations:
+    for written_position in expected_order:
+        if written_position not in join_relations:
             continue
-        table = join_relations[written_pos]
+        table = join_relations[written_position]
         metadata = table.schema.metadata or {}
-        logical_join = logical_joins[written_pos]
+        logical_join = logical_joins[written_position]
         logical_aliases = [
             argument.alias for argument in logical_join.prompt.args
         ]
@@ -217,9 +219,9 @@ def collect_answers(logical, plan, outputs, documents):
                 f"{sorted(missing_columns)}"
             )
         answers = table.column("answer")
-        answer_tables["joins"][written_pos] = table
+        answer_tables["joins"][written_position] = table
         report["stages"].append(dict(
-            op="join", written_pos=written_pos, anchor=anchor,
+            op="join", written_position=written_position, anchor=anchor,
             partners=partners,
             semantics=semantics,
             provided_selectivity=logical_join.selectivity,
@@ -229,5 +231,5 @@ def collect_answers(logical, plan, outputs, documents):
             tuples=len(answers),
         ))
         if semantics == "full":
-            true_join_tables[written_pos] = true_answer_rows(table)
+            true_join_tables[written_position] = true_answer_rows(table)
     return answer_tables, survivors, true_join_tables, report["stages"]

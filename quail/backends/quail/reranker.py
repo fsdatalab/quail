@@ -397,7 +397,7 @@ def _filter_answer_table(node: Filter, rows: Rows, answers) -> pa.Table:
     alias = node.aliases[0]
     return filter_answer_table(
         alias, rows.ids[alias],
-        np.full(rows.num_rows, node.written_pos, dtype=np.int32), answers)
+        np.full(rows.num_rows, node.written_position, dtype=np.int32), answers)
 
 
 class FilterRuntime:
@@ -421,13 +421,13 @@ def filter_scores(node, rows: Rows) -> NodeResult:
         answer_relation = _filter_answer_table(node, rows, answers)
     else:
         left, right = node.aliases
-        answer_name = f"join_answers:{node.written_pos}"
+        answer_name = f"join_answers:{node.written_position}"
         answer_relation = answer_table(
             {left: rows.ids[left], right: rows.ids[right]},
             answers,
             "join_answers",
             metadata={
-                "written_pos": node.written_pos,
+                "written_position": node.written_position,
                 "anchor": left,
                 "partners": right,
                 "semantics": "full",

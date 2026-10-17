@@ -20,7 +20,7 @@ class PlanningContext:
 
     model: ModelSpec | None = None
     device: DeviceSpec | None = None
-    gpu_count: int = 1
+    gpus: int = 1
     document_tokens: Mapping[str, Any] = field(default_factory=dict)
     backend: str = "quail"
     order: str | None = None

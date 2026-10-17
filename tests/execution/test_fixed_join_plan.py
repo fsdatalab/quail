@@ -69,9 +69,9 @@ class FixedFeverAnswers:
     def _answers(self, document_ids):
         answers = {local: [document < 2 and not self.empty]
                    for local, document in enumerate(document_ids)}
-        live = [document for local, document in enumerate(document_ids)
+        expected_rows = [document for local, document in enumerate(document_ids)
                 if all(answers[local])]
-        return answers, live
+        return answers, expected_rows
 
     def _label_table(self, node, ids):
         # a document whose answer names no label has no row, as the
@@ -90,16 +90,16 @@ class FixedFeverAnswers:
 
     def execute_predicates(self, nodes, inputs):
         results = {}
-        live = set(range(len(inputs["anchor_ids"])))
+        expected_rows = set(range(len(inputs["anchor_ids"])))
         partners = inputs.get("anchor_partners")
         for index, node in enumerate(nodes):
             value = self.execute(node, {
-                **inputs, "_live": live,
+                **inputs, "_live": expected_rows,
                 "anchor_partners": (None if partners is None else
                                     lambda key, stage, j=index: partners(key, j))})
             results[node.node_id] = value
             rows = value.metrics.extension["answers"][0]
-            live = {local for local, row in rows.items() if any(row)}
+            expected_rows = {local for local, row in rows.items() if any(row)}
         return results
 
     def execute(self, node, inputs):
@@ -137,12 +137,12 @@ class FixedFeverAnswers:
                 NodeMetrics(input_rows=len(ids), output_rows=len(ids)))
         if isinstance(node, AiFilter):
             document_ids = list(inputs["document_ids"])
-            answers, live = self._answers(document_ids)
+            answers, expected_rows = self._answers(document_ids)
             if node.keep_kv:
-                for document in live[:self.capacity]:
+                for document in expected_rows[:self.capacity]:
                     self.state["gpu"].arena.retain((node.alias, document), 16)
             return NodeResult({
-                f"ids:{node.alias}": live,
+                f"ids:{node.alias}": expected_rows,
                 f"filter_answers:{node.alias}": {
                     document_ids[local]: row for local, row in answers.items()
                 },
@@ -150,18 +150,18 @@ class FixedFeverAnswers:
 
         outputs = {}
         anchor_ids = inputs["anchor_ids"]
-        live = set(inputs.get("_live", range(len(anchor_ids))))
+        expected_rows = set(inputs.get("_live", range(len(anchor_ids))))
         lists_for = inputs.get("anchor_partners")
         aliases = (node.anchor, *node.partners)
         claim = next(alias for alias in aliases if alias.startswith("c"))
         evidence = next(alias for alias in aliases if alias.startswith("e"))
-        passing = ({(1, 0), (2, 0), (0, 2)} if node.written_pos == 1
+        passing = ({(1, 0), (2, 0), (0, 2)} if node.written_position == 1
                    else {(0, 0), (1, 1), (2, 0), (1, 2)})
-        partners = inputs["partner_indices"][node.written_pos]
+        partners = inputs["partner_indices"][node.written_position]
         # a stage over pairs asks each anchor about its own members
         members = {} if lists_for and node.pairs_from else None
         rows = {}
-        for local in sorted(live):
+        for local in sorted(expected_rows):
             mine = (range(len(partners)) if members is None
                     else lists_for(anchor_ids[local], 0))
             if members is not None:
@@ -172,15 +172,17 @@ class FixedFeverAnswers:
                     aliases, (anchor_ids[local], *partners[member])))
                 rows[local].append((assignment[claim], assignment[evidence])
                                    in passing)
-        live = {local for local, row in rows.items() if any(row)}
-        outputs[f"join_answers:{node.written_pos}"] = {
+        expected_rows = {local for local, row in rows.items() if any(row)}
+        outputs[f"join_answers:{node.written_position}"] = {
             "rows": rows, "anchor_index": anchor_ids,
             "partner_index": partners, "anchor_partners": members,
             "anchor": node.anchor,
             "partners": list(node.partners), "semantics": node.semantics,
-            "selectivity": node.selectivity, "written_pos": node.written_pos,
+            "selectivity": node.selectivity, "written_position": node.written_position,
         }
-        outputs[f"ids:{node.anchor}"] = [anchor_ids[local] for local in sorted(live)]
+        outputs[f"ids:{node.anchor}"] = [
+            anchor_ids[local] for local in sorted(expected_rows)
+        ]
         return NodeResult(outputs, NodeMetrics(
             gpu_s=0.02, peak_gpu_bytes=128,
             extension={"answers": [rows], "pack_s": 0.125,
@@ -195,8 +197,8 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
     from quail.execution.runner import ExecutionContext
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
-    def child(docs):
-        state = graph_state(None, docs)
+    def child(documents):
+        state = graph_state(None, documents)
         model = FixedFeverAnswers(state, capacity=1, empty=False)
         state["gpu"].execution = model
         return worker.ChildState(
@@ -206,17 +208,17 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
 
     def execute(request):
         graph = decode_graph(request.plan["graph"], session.registry.codecs)
-        docs = {node.alias: request.inputs[node.input_id].documents
+        documents = {node.alias: request.inputs[node.input_id].documents
                 for node in graph.nodes if isinstance(node, Scan)}
         extra = check(request, graph) if check else {}
         if gpus == 1:
-            state = graph_state(None, docs)
+            state = graph_state(None, documents)
             state["gpu"].execution = FixedFeverAnswers(state, capacity, empty)
             state.update(extra, functions=session.registry.functions)
             report = execute_single_graph(state, request.plan["settings"], graph)
             assert not state["gpu"].arena.accounting.owned
             return PhysicalResponse(report.pop("_outputs"), report)
-        children = [child(docs), child(docs)]
+        children = [child(documents), child(documents)]
 
         def round_fn(kind, subs):
             function = (worker._child_filters if kind == "filters"
@@ -226,7 +228,7 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
         monkeypatch.setattr(worker, "_child_boot", lambda state, sub: None)
         report = execute_distributed_graph(
             {**request.plan["settings"], "model": "qwen3-4b-fp8",
-             "docs": docs, **extra, "physical_plan": request.plan},
+             "documents": documents, **extra, "physical_plan": request.plan},
             graph, 2, round_fn, QWEN3_4B_FP8, H100_SXM,
             session.registry.runtimes, session.registry,
         )

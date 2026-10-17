@@ -29,7 +29,7 @@ class Filter(PhysicalNode):
     predicate: RegularPredicate | None = None
     aliases: tuple[str, ...] = ()
     selectivity: float | None = None
-    written_pos: int = 0
+    written_position: int = 0
 
     type_name: ClassVar[str] = "quail.filter"
     runtime_key: ClassVar[str] = type_name
@@ -63,7 +63,7 @@ class Filter(PhysicalNode):
             )
         return (
             OutputPort("rows", ValueType.ROWS),
-            OutputPort(f"join_answers:{self.written_pos}",
+            OutputPort(f"join_answers:{self.written_position}",
                        ValueType.JOIN_ANSWERS),
         )
 
@@ -72,7 +72,7 @@ class Filter(PhysicalNode):
             "predicate": self.predicate.to_dict(),
             "aliases": list(self.aliases),
             "selectivity": self.selectivity,
-            "written_pos": self.written_pos,
+            "written_position": self.written_position,
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -90,7 +90,7 @@ class Filter(PhysicalNode):
             predicate=RegularPredicate.from_dict(attributes["predicate"]),
             aliases=tuple(attributes["aliases"]),
             selectivity=attributes["selectivity"],
-            written_pos=int(attributes["written_pos"]),
+            written_position=int(attributes["written_position"]),
         )
 
 
@@ -101,11 +101,11 @@ class AiFilter(PhysicalNode):
     alias: str = ""
     arena_writes: bool = False
     keep_kv: bool = False
-    written_pos: int = 0
+    written_position: int = 0
     question_tokens: int = 0
     preamble_tokens: int = 0
     selectivity: float | None = None
-    expected_docs: float = 0.0
+    expected_rows: float = 0.0
     question_token_ids: tuple[Any, ...] = ()
     # the token ids the documents are shown under, before the document
     document_head: tuple[int, ...] = ()
@@ -150,11 +150,11 @@ class AiFilter(PhysicalNode):
             "alias": self.alias,
             "arena_writes": self.arena_writes,
             "keep_kv": self.keep_kv,
-            "written_pos": self.written_pos,
+            "written_position": self.written_position,
             "question_tokens": self.question_tokens,
             "preamble_tokens": self.preamble_tokens,
             "selectivity": self.selectivity,
-            "expected_docs": self.expected_docs,
+            "expected_rows": self.expected_rows,
             "question_token_ids": list(self.question_token_ids),
             "document_head": list(self.document_head),
             "share_prefixes": self.share_prefixes,
@@ -176,11 +176,11 @@ class AiFilter(PhysicalNode):
             alias=attributes["alias"],
             arena_writes=bool(attributes["arena_writes"]),
             keep_kv=bool(attributes["keep_kv"]),
-            written_pos=int(attributes["written_pos"]),
+            written_position=int(attributes["written_position"]),
             question_tokens=int(attributes["question_tokens"]),
             preamble_tokens=int(attributes["preamble_tokens"]),
             selectivity=attributes["selectivity"],
-            expected_docs=float(attributes["expected_docs"]),
+            expected_rows=float(attributes["expected_rows"]),
             question_token_ids=tuple(attributes["question_token_ids"]),
             document_head=tuple(attributes.get("document_head", ())),
             share_prefixes=bool(attributes.get("share_prefixes", False)),

@@ -115,13 +115,13 @@ class ServerClient:
                                                    body=body))
 
     def status(self, query_id: str, *, after: int | None = None,
-               wait: float = 0.0) -> QueryStatus:
+               poll_s: float = 0.0) -> QueryStatus:
         query = ""
-        if after is not None and wait > 0:
+        if after is not None and poll_s > 0:
             query = "?" + urllib.parse.urlencode(
-                {"after": after, "wait": f"{wait:g}"})
+                {"after": after, "wait": f"{poll_s:g}"})
         data = self._request("GET", f"/v1/queries/{query_id}{query}",
-                             timeout=self.timeout_s + wait)
+                             timeout=self.timeout_s + poll_s)
         return QueryStatus.from_dict(data)
 
     def cancel(self, query_id: str) -> QueryStatus:
@@ -217,7 +217,7 @@ class QueryRun:
         yield status
         while not status.done:
             newer = self._client.status(self.id, after=status.revision,
-                                        wait=poll_s)
+                                        poll_s=poll_s)
             if newer.revision > status.revision:
                 status = newer
                 yield status

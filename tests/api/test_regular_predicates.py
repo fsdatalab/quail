@@ -76,7 +76,7 @@ def test_regular_predicates_select_documents_before_the_model(session):
         "AND r.stars IS NOT NULL")
     plan = query.plan()
     scan = next(node for node in plan.nodes if type(node).__name__ == "Scan")
-    assert (scan.n_docs, scan.expected_docs) == (6, 3.0)
+    assert (scan.num_documents, scan.expected_rows) == (6, 3.0)
     assert scan.predicates == (
         ("stars", ">=", 3), ("lang", "in", ("en", "fr")),
         ("stars", "is not null", None))
@@ -87,7 +87,7 @@ def test_regular_predicates_select_documents_before_the_model(session):
     stage = next(s for s in result.report["stages"] if s["op"] == "filter")
     assert stage["evaluated"] == 3
     # answer tables and survivors hold positions in the registered table
-    answers = result.answer_tables["filters"][("r", stage["written_pos"])]
+    answers = result.answer_tables["filters"][("r", stage["written_position"])]
     assert answers.column("r").to_pylist() == [0, 2, 4]
     assert result.survivor_indices["r"].to_pylist() == [0]
 
@@ -193,7 +193,7 @@ def test_two_joins_on_one_table_sample_each_key_column(session):
     """)
     plan = query.plan()
     assert not isinstance(plan, Refusal)
-    fractions = {node.written_pos: node.pair_fraction for node in plan.nodes
+    fractions = {node.written_position: node.pair_fraction for node in plan.nodes
                  if isinstance(node, HashJoin)}
     # stars 5, 2, 4, null, 3, 5 against prices 5, 2: three of twelve;
     # langs en x4, fr, de against en, fr: five of twelve
@@ -210,7 +210,7 @@ def test_regular_predicates_reach_score_scans_and_may_read_the_text(session):
     plan = scored.plan()
     scan = next(node for node in plan.nodes if isinstance(node, PhysicalScan))
     assert scan.predicates == (("stars", ">=", 4),)
-    assert (scan.n_docs, scan.expected_docs) == (6, 3.0)
+    assert (scan.num_documents, scan.expected_rows) == (6, 3.0)
     # a test on the document column keeps the text as a value column
     text = "review 2 " + "pad " * 20
     query = (session.docs("reviews").alias("r")

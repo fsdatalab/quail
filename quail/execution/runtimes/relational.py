@@ -48,10 +48,10 @@ def _tested_documents(node, context) -> pa.Array:
     return selected_rows(values, predicates)
 
 
-def _row_count(value) -> int | None:
+def _num_rows(value) -> int | None:
     """Rows of a table or sequence, or None when counting would run a plan."""
     if isinstance(value, QueryResult):
-        return value.known_count()
+        return value.known_num_rows()
     if hasattr(value, "num_rows"):
         return int(value.num_rows)
     if hasattr(value, "__len__"):
@@ -79,9 +79,9 @@ class ProjectRuntime:
                      else context.project(node, value))
         # a projection keeps its rows; a lazy result's count is the
         # input's until the result runs
-        rows = _row_count(inputs[first.name]) or 0
+        rows = _num_rows(inputs[first.name]) or 0
         return NodeResult({"rows": value}, NodeMetrics(
-            input_rows=rows, output_rows=_row_count(value) or rows))
+            input_rows=rows, output_rows=_num_rows(value) or rows))
 
 
 class LimitRuntime:
@@ -94,7 +94,7 @@ class LimitRuntime:
             raise ValueError("Limit needs one input")
         value = next(iter(inputs.values()))
 
-        rows = _row_count(value) or 0
+        rows = _num_rows(value) or 0
         if isinstance(value, QueryResult):
             value = value.with_limit(node.count)
         elif hasattr(value, "slice"):
@@ -102,7 +102,7 @@ class LimitRuntime:
         else:
             value = value[:node.count]
         return NodeResult({"rows": value}, NodeMetrics(
-            input_rows=rows, output_rows=_row_count(value) or 0))
+            input_rows=rows, output_rows=_num_rows(value) or 0))
 
 
 def _comparable(column, clause: str):

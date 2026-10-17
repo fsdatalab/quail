@@ -24,7 +24,10 @@ from quail.planner.graph import retention
 from quail.planner.operators.classify import classify_scoring
 from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import plan_kv_retention
-from quail.planner.search.statistics import cached_statistics, live_after_filters
+from quail.planner.search.statistics import (
+    cached_statistics,
+    expected_rows_after_filters,
+)
 from quail.planner.statistics.prefixes import page_tree
 from quail.planner.statistics.tables import summarize_alias
 
@@ -51,7 +54,7 @@ class ShouldPushDownLimit(PhysicalRule):
         limit = next((node for node in graph.nodes
                       if isinstance(node, Limit)), None)
         pipelines = {id(members) for members
-                     in build_pipelines(graph, context.gpu_count).values()}
+                     in build_pipelines(graph, context.gpus).values()}
         blocked = len(pipelines) > 1 or any(
             isinstance(node, (Sort, PhysicalAggregate, AiJoin))
             for node in graph.nodes)
@@ -93,7 +96,7 @@ class ShouldRetainKv(PhysicalRule):
         logical = context.logical_plan
         statistics = cached_statistics(
             logical, context.memo, model=context.model, device=context.device,
-            doc_tokens=context.document_tokens,
+            document_tokens=context.document_tokens,
             pair_fractions=context.pair_fractions,
             scan_fractions=context.scan_fractions, context=context)
         joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
@@ -104,11 +107,11 @@ class ShouldRetainKv(PhysicalRule):
                     or node.semantics != "full"):
                 grouped.append([])
             grouped[-1].append(node)
-        groups = [[(statistics.specs[node.written_pos], node.anchor)
+        groups = [[(statistics.specs[node.written_position], node.anchor)
                    for node in group] for group in grouped]
         schedule = retention.schedule(
             [predicate for group in groups for predicate in group],
-            live_after_filters(logical, statistics),
+            expected_rows_after_filters(logical, statistics),
             [group[0].node_id for group in grouped])
         before, after = schedule["before"], schedule["after"]
         schedule["before"] = {
@@ -118,7 +121,7 @@ class ShouldRetainKv(PhysicalRule):
             node.node_id: (after[group[0].node_id] if node is group[-1]
                            else before[group[0].node_id])
             for group in grouped for node in group}
-        paths = build_pipelines(graph, context.gpu_count)
+        paths = build_pipelines(graph, context.gpus)
         streamed = {
             node.alias for node in graph.nodes if isinstance(node, AiFilter)
             and any(isinstance(member, AiJoin)
@@ -129,7 +132,7 @@ class ShouldRetainKv(PhysicalRule):
         schedule.update(**coefficients(context.model, context.device),
                         cap_pages=statistics.cap_pages)
         context.settings["retention"] = schedule
-        return plan_kv_retention(graph, context.gpu_count)
+        return plan_kv_retention(graph, context.gpus)
 
 
 class ChooseClassifyImplementation(PhysicalRule):
@@ -168,7 +171,7 @@ class ChooseClassifyImplementation(PhysicalRule):
 
         logical = context.logical_plan
         calls = {node.name: node.call for node in logical.operators().classifies}
-        paths = build_pipelines(graph, context.gpu_count)
+        paths = build_pipelines(graph, context.gpus)
         chosen = {}
         for node in pending:
             table = classify_scoring(context, node.spec.anchor)
@@ -343,7 +346,7 @@ class ChooseAttentionAlgorithm(PhysicalRule):
                 path = "unified"
                 if tree_available:
                     stage = node
-                    readers = (stage.expected_tuples / len(lengths)
+                    readers = (stage.expected_rows / len(lengths)
                                if len(lengths) else 1.0)
                     # a partner's rows: its document and the question tail
                     rows = stage.pair_tail_tokens + sum(

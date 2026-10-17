@@ -46,11 +46,11 @@ def booted(monkeypatch):
 
 ENVELOPE = {
     "backend": "quail", "model": "qwen3-4b-fp8", "device": "h100-sxm",
-    "workers": 1,
+    "gpus": 1,
     "settings": {"chunk_tokens": 8192, "true_ids": [1], "false_ids": [2]},
 }
-PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "workers": 1,
-           "docs": {}, **ENVELOPE["settings"]}
+PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "gpus": 1,
+           "documents": {}, **ENVELOPE["settings"]}
 
 
 def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
@@ -62,7 +62,7 @@ def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
     gpu.pipeline = SimpleNamespace(decode_graphs=SimpleNamespace(
         invalidate=lambda: calls.append("invalidate")))
     gpu.arena = SimpleNamespace(
-        n_pages=8, n_sliding_pages=0,
+        num_pages=8, num_sliding_pages=0,
         resize=lambda *a, **kw: calls.append("resize"))
     gpu.model = gpu.F = None
     gpu.decision_head = None
@@ -91,7 +91,7 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
                         lambda *a, **k: {"_outputs": {}, "wall_s": 1.0})
 
     worker.prepare_quail_request(SimpleNamespace(
-        gpu_count=1, registry=registry, runtime_state=runtime_state,
+        gpus=1, registry=registry, runtime_state=runtime_state,
         request=SimpleNamespace(plan=ENVELOPE),
     ))
 

@@ -165,7 +165,7 @@ def _run(query, join_answers):
                     "partners": ["a"],
                     "semantics": "full",
                     "selectivity": join["selectivity"],
-                    "written_pos": 0,
+                    "written_position": 0,
                 },
             }),
         }
@@ -190,7 +190,7 @@ def _run_request_backend(query, join_answers):
             [bool(answer) for answer in join_answers],
             "join_answers",
             metadata={"anchor": "r", "partners": "a", "semantics": "full",
-                      "written_pos": 0},
+                      "written_position": 0},
         )
         true_aspects = [
             index for index, answer in enumerate(join_answers) if answer

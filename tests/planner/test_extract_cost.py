@@ -20,8 +20,8 @@ def _cost(lengths, **kwargs):
                    max_answer_tokens=ExtractSpec.max_answer_tokens,
                    draft_tokens=16, draft_policy="fixed")
     options.update(kwargs)
-    live = options.pop("live", len(lengths))
-    return estimate(live, lengths, HEAD, TAIL, **options)
+    expected_rows = options.pop("expected_rows", len(lengths))
+    return estimate(expected_rows, lengths, HEAD, TAIL, **options)
 
 
 
@@ -80,10 +80,10 @@ def test_a_document_scans_once_then_writes_its_answer_in_rounds():
 
 def test_parallel_estimate_preserves_work_and_limits_used_workers():
     one = _cost([100, 100])
-    two = _cost([100, 100], workers=2)
+    two = _cost([100, 100], gpus=2)
     assert two.work == one.work
     assert two.seconds == pytest.approx(one.seconds / 2)
-    assert _cost([100], workers=8).seconds == _cost([100]).seconds
+    assert _cost([100], gpus=8).seconds == _cost([100]).seconds
 
 
 def test_cost_uses_plan_limits_and_separate_answer_assumptions():

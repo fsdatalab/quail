@@ -62,7 +62,7 @@ volumes = {
 )
 def run_query():
     tmp = tempfile.mkdtemp()
-    flags = make_filter_parquet(f"{tmp}/docs.parquet", n_docs=40)
+    flags = make_filter_parquet(f"{tmp}/docs.parquet", num_documents=40)
     registry = quail.ExtensionRegistry.with_built_ins().register_observer(
         RowTrace)
     session = quail.Session(
@@ -74,7 +74,7 @@ def run_query():
         ),
         registry=registry,
     )
-    session.register("docs", quail.DocumentProvider.from_parquet(
+    session.register("documents", quail.DocumentProvider.from_parquet(
         f"{tmp}/docs.parquet", id_col="id"))
     q1_text = FILTER_Q.replace("{j}", "1")
     query = session.sql(f"""

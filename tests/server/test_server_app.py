@@ -100,7 +100,7 @@ def test_uploads_are_checked_and_saved_once(make_client):
     assert client.head(f"/v1/inputs/{content_id}").status_code == 200
     server = client.app.state.server
     assert not list(server.inputs_dir.glob("*.tmp"))
-    assert server.store.get_input(content_id).byte_count == len(payload)
+    assert server.store.get_input(content_id).num_bytes == len(payload)
 
 
 def test_capabilities_submission_validation_client_ids_and_hf_inputs(

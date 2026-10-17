@@ -72,8 +72,8 @@ class Checkpoint:
         ``force`` copies any new write now, ignoring the progress timer.
         """
         with self._lock:
-            count = self.store.write_count
-            durable = self.store.durable_write_count
+            count = self.store.num_writes
+            durable = self.store.num_durable_writes
             if count == self._seen or self.store.closed:
                 return False
             progress_only = durable == self._seen_durable

@@ -9,11 +9,11 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     # Attention runs with softmax scale 1.0. 25 layers slide over a
     # 1024-token window with 256-wide heads; every sixth layer keeps
     # every token with 512-wide heads and two KV heads.
-    n_q=16,
-    n_kv=8,
+    num_q_heads=16,
+    num_kv_heads=8,
     d_head=256,
     full_attention_period=6,
-    full_n_kv=2,
+    full_num_kv_heads=2,
     full_d_head=512,
     sliding_window=1024,
     # a dense MLP 2112 wide beside 128 experts 704 wide, eight active

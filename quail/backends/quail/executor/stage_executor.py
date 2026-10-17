@@ -17,14 +17,14 @@ from quail.backends.quail.executor.stages import (
 from quail.progress import Progress, logger
 
 
-def attention_path(pipeline, requested, default="unified") -> str:
+def attention_path(pipeline, requested, default_attention="unified") -> str:
     """The path a filter stream or join runs: the plan's request where the model has it.
 
-    None asks for the default. A model without tree attention, and a
+    None asks for the default_attention. A model without tree attention, and a
     canvas model (whose rows the tree path does not pack), run unified.
     """
     if requested is None:
-        requested = default
+        requested = default_attention
     if requested == "tree" and pipeline.tree_attention and not pipeline.canvas_ids:
         return "tree"
     return "unified"
@@ -56,8 +56,8 @@ def borrow_check(arena, keys, borrowing):
     chunk or earlier, has the pages it has: it may have trimmed its
     window in an earlier query.
     """
-    def can_borrow(doc, parent, same_chunk):
-        shared = borrowing.tree_shared[doc]
+    def can_borrow(document, parent, same_chunk):
+        shared = borrowing.tree_shared[document]
         if not same_chunk or arena.is_resident(keys[parent]):
             return arena.can_borrow(keys[parent], shared)
         return arena.origin(borrowing.shared(parent)) <= arena.origin(shared)
@@ -67,9 +67,9 @@ def borrow_check(arena, keys, borrowing):
 def lowest_borrows(borrowing):
     """Per document, the fewest tokens any of its borrowers shares."""
     lowest = {}
-    for doc, parent in enumerate(borrowing.tree_parent):
+    for document, parent in enumerate(borrowing.tree_parent):
         if parent is not None:
-            shared = borrowing.tree_shared[doc]
+            shared = borrowing.tree_shared[document]
             lowest[parent] = min(lowest.get(parent, shared), shared)
     return lowest
 
@@ -132,7 +132,7 @@ class StageExecutor:
         if any(stage.paths is not None for stage in self.stages):
             attention_mode = "tree"
         self.mode = attention_path(
-            self.pipeline, attention_mode, default=default_attention)
+            self.pipeline, attention_mode, default_attention=default_attention)
         self.canvas = tuple(self.pipeline.canvas_ids)
         self.answer_row = self.pipeline.canvas_answer_row
         self.canvas_rows = [len(self.canvas) if stage.canvas is None
@@ -185,7 +185,7 @@ class StageExecutor:
             [s.lengths + rows
              for s, rows in zip(self.suffixes, self.canvas_rows)],
             budget,
-            self.arena.n_pages if self.paged else 1 << 62,
+            self.arena.num_pages if self.paged else 1 << 62,
             self.arena.page_tokens,
             frame_tokens=[len(f) for f in self.frames], resident=resident,
             anchor_partners={a: self._requests_of(a, key)
@@ -221,7 +221,7 @@ class StageExecutor:
             self.label = " > ".join(stage.label or f"stage {j}"
                                    for j, stage in enumerate(self.stages))
         self.counting_answers = count_answers
-        total = (sum(self.sched.partner_count(a, j) for a in range(len(self.prefixes))
+        total = (sum(self.sched.num_partners(a, j) for a in range(len(self.prefixes))
                      for j in range(k))
                  if self.counting_answers else len(self.prefixes))
         self.progress = Progress(self.label, total=total, unit=unit)
@@ -421,23 +421,23 @@ class StageExecutor:
             entry.values = self.readouts.results(entry.handles)
             entry.positions = np.zeros(len(self.readouts), dtype=np.int64)
         groups = entry.groups[entry.at:entry.at + entry.step]
-        values, pos = entry.values, entry.positions
+        values, position = entry.values, entry.positions
         transitions = []
         for a, j, start, end, _ in groups:
             key = self.readouts.group_key[j]
             if self.writes[j] and start == 0 and not self._merged(j, start, end):
-                pos[key] += 1        # the frame entry's answer means nothing
-            cnt = end - start
-            rows = values[key][pos[key]:pos[key] + cnt]
+                position[key] += 1        # the frame entry's answer means nothing
+            count = end - start
+            rows = values[key][position[key]:position[key] + count]
             result = self.sched.report(a, j, start, end, rows)
-            if self.stages[j].own_suffixes and end == self.sched.partner_count(a, j):
+            if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
                 del self.own[(j, a)]
             if self.on_answers is not None:
                 self.on_answers(a, j, start, end, rows)
             for settlement in result.settlements:
                 self._event(settlement)
             transitions.extend(result.transitions)
-            pos[key] += cnt
+            position[key] += count
         entry.at += len(groups)
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)

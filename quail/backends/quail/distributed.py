@@ -41,22 +41,22 @@ class DistributedQuailExecution:
     # the children keep the document tokens after the first score round
     score_documents_sent = False
 
-    def __init__(self, payload, graph, gpu_count, round_fn,
+    def __init__(self, payload, graph, gpus, round_fn,
                  model_spec, device, registry):
 
         self.payload = payload
         self.graph = graph
-        self.gpu_count = gpu_count
+        self.gpus = gpus
         self.round_fn = round_fn
         self.model_spec = model_spec
         self.device = device
         self.registry = registry
-        self.docs = payload["docs"]
+        self.documents = payload["documents"]
         self.shards = {
             node.alias: node.shards
             for node in graph.nodes
             if isinstance(node, Scan)
-            and len(node.shards) == gpu_count
+            and len(node.shards) == gpus
         }
         self.filter_aliases = {
             node.alias
@@ -65,24 +65,24 @@ class DistributedQuailExecution:
         if self.filter_aliases - set(self.shards):
             for alias in self.filter_aliases - set(self.shards):
                 shards, _ = balanced_shards(
-                    [len(document) for document in self.docs[alias]],
-                    gpu_count,
+                    [len(document) for document in self.documents[alias]],
+                    gpus,
                 )
                 self.shards[alias] = shards
         # a per-key stop needs a key's documents on one worker
         for node in graph.nodes:
-            if isinstance(node, AiFilter) and node.stop_key and gpu_count > 1:
-                documents = self.docs[node.alias]
+            if isinstance(node, AiFilter) and node.stop_key and gpus > 1:
+                documents = self.documents[node.alias]
                 self.shards[node.alias] = coordinator.keyed_shards(
                     stop_groups(node, payload.get("columns", {}).get(
                         node.alias), range(len(documents))),
-                    [len(document) for document in documents], gpu_count)
+                    [len(document) for document in documents], gpus)
         self.joins = tuple(node for node in graph.nodes if isinstance(node, AiJoin))
         self.joins_started = False
         self.retained: dict[str, set[int]] = {}
         self.prior_shards: dict[str, list[list[int]]] = {}
         self.started = False
-        self.child_totals = [None] * gpu_count
+        self.child_totals = [None] * gpus
         self.peak_gib = 0.0
         self.kv_stats = {
             "retained_after_filters": 0,
@@ -107,32 +107,32 @@ class DistributedQuailExecution:
         raise TypeError(
             f"distributed Quail cannot execute {node.type_name!r}")
 
-    def execute_pipeline(self, pipeline, inputs, context):
+    def execute_pipeline(self, nodes, inputs, context):
         """Run compatible predicates or extraction questions together on each worker."""
-        first = pipeline[0]
+        first = nodes[0]
         if isinstance(first, AiFilter):
-            return self._execute_filters(pipeline, inputs[first.node_id])
+            return self._execute_filters(nodes, inputs[first.node_id])
         if isinstance(first, AiJoin):
             prepared = prepare_distributed_inputs(
-                first, inputs, context, nodes=pipeline)
-            return self._execute_joins(pipeline, prepared)
-        return self._execute_extractions(pipeline, inputs[first.node_id])
+                first, inputs, context, nodes=nodes)
+            return self._execute_joins(nodes, prepared)
+        return self._execute_extractions(nodes, inputs[first.node_id])
 
     def _extraction_positions(self, alias, ids):
         """Keep documents on their previous worker, partitioning unplaced rows."""
-        owners = np.full(len(self.docs[alias]), -1, dtype=np.int32)
+        owners = np.full(len(self.documents[alias]), -1, dtype=np.int32)
         for worker, shard in enumerate(self.shards.get(alias, ())):
             owners[np.asarray(shard, dtype=np.int64)] = worker
         for worker, shard in enumerate(self.prior_shards.get(alias, ())):
             owners[np.asarray(shard, dtype=np.int64)] = worker
         missing = ids[owners[ids] < 0]
         shards, _ = balanced_shards(
-            [len(self.docs[alias][document]) for document in missing],
-            self.gpu_count)
+            [len(self.documents[alias][document]) for document in missing],
+            self.gpus)
         for worker, shard in enumerate(shards):
             owners[missing[np.asarray(shard, dtype=np.int64)]] = worker
         return [np.flatnonzero(owners[ids] == worker)
-                for worker in range(self.gpu_count)]
+                for worker in range(self.gpus)]
 
     def _execute_extractions(self, nodes, inputs):
         if not self.started:
@@ -147,13 +147,20 @@ class DistributedQuailExecution:
         subs = []
         for part in positions:
             documents = ids[part]
-            subs.append({"nodes": nodes, "inputs": {
-                "document_ids": documents,
-                "document_positions": range(len(documents)),
-                "documents": {alias: select_documents(self.docs[alias], documents)},
-                "texts": {alias: texts.take(pa.array(documents))},
-                "gpu_timing": self.payload.get("gpu_timing", False),
-            }})
+            subs.append(
+                {
+                    "nodes": nodes,
+                    "inputs": {
+                        "document_ids": documents,
+                        "document_positions": range(len(documents)),
+                        "documents": {
+                            alias: select_documents(self.documents[alias], documents)
+                        },
+                        "texts": {alias: texts.take(pa.array(documents))},
+                        "gpu_timing": self.payload.get("gpu_timing", False),
+                    },
+                }
+            )
         started = time.perf_counter()
         outputs = self.round_fn("extract", subs)
         wall = time.perf_counter() - started
@@ -174,7 +181,7 @@ class DistributedQuailExecution:
 
     def _execute_score(self, node, inputs):
         return score_in_batches(
-            node, inputs, self._score_round, shards=self.gpu_count
+            node, inputs, self._score_round, shards=self.gpus
         )
 
     def _score_round(self, node, batches):
@@ -185,8 +192,8 @@ class DistributedQuailExecution:
                 for batch in batches]
         if not self.score_documents_sent:
             documents = {
-                alias: select_documents(docs, range(len(docs)))
-                for alias, docs in self.docs.items()
+                alias: select_documents(documents, range(len(documents)))
+                for alias, documents in self.documents.items()
             }
             for sub in subs:
                 sub["inputs"]["documents"] = documents
@@ -196,7 +203,7 @@ class DistributedQuailExecution:
     def begin(self):
         """Start a query that has no filter node."""
         subs = coordinator.begin_query_payloads(
-            self.payload, self.gpu_count
+            self.payload, self.gpus
         )
         for sub in subs:
             sub["start_query"] = True
@@ -214,21 +221,21 @@ class DistributedQuailExecution:
         node = nodes[0]
 
         # the worker payloads are pickled, so ids cross as Python ints
-        live_ids = id_positions(next(iter(inputs.values()))).tolist()
+        survivor_ids = id_positions(next(iter(inputs.values()))).tolist()
         shards = self.shards
-        complete = len(live_ids) == len(self.docs[node.alias])
+        complete = len(survivor_ids) == len(self.documents[node.alias])
         if node.alias in shards and not complete:
-            live = set(live_ids)
+            survivors = set(survivor_ids)
             shards = dict(shards)
             shards[node.alias] = tuple(
-                tuple(document for document in shard if document in live)
+                tuple(document for document in shard if document in survivors)
                 for shard in shards[node.alias]
             )
         subs = coordinator.filter_node_payloads(
             self.payload,
             node,
             shards,
-            self.gpu_count,
+            self.gpus,
             has_joins=bool(self.joins),
         )
         for sub in subs:
@@ -272,7 +279,7 @@ class DistributedQuailExecution:
             self.joins_started = True
         subs = coordinator.join_group_payloads(
             self._runtime_payload(),
-            self.gpu_count,
+            self.gpus,
             survivors,
             group,
             prior_shards=self.prior_shards,
@@ -307,14 +314,18 @@ class DistributedQuailExecution:
         results = {}
         for j, member in enumerate(nodes):
             parts = [item["results"][member.node_id] for item in outputs]
-            output = coordinator.merge_join_answers([
-                part.outputs[f"join_answers:{member.written_pos}"] for part in parts])
+            output = coordinator.merge_join_answers(
+                [
+                    part.outputs[f"join_answers:{member.written_position}"]
+                    for part in parts
+                ]
+            )
             survivors = np.sort(np.concatenate([
                 id_positions(part.outputs[f"ids:{member.anchor}"]) for part in parts]))
             metrics = sum((part.metrics for part in parts), NodeMetrics())
             results[member.node_id] = NodeResult(
                 {f"ids:{member.anchor}": document_ids(survivors),
-                 f"join_answers:{member.written_pos}": output},
+                 f"join_answers:{member.written_position}": output},
                 replace(metrics, wall_s=wall if j == 0 else 0.0,
                         extension={**metrics.extension, "joins": [output]}))
         self._retained_placement(outputs)
@@ -327,7 +338,7 @@ class DistributedQuailExecution:
             for alias, documents in output.get("retained", {}).items():
                 self.retained.setdefault(alias, set()).update(documents)
                 placement.setdefault(
-                    alias, [[] for _ in range(self.gpu_count)]
+                    alias, [[] for _ in range(self.gpus)]
                 )
                 placement[alias][worker] = list(documents)
         self.prior_shards = placement
@@ -337,7 +348,7 @@ class DistributedQuailExecution:
 
         heads = {node.alias: len(node.document_head)
                  for node in self.graph.nodes if isinstance(node, AiFilter)}
-        lengths = [heads.get(alias, 0) + len(self.docs[alias][document])
+        lengths = [heads.get(alias, 0) + len(self.documents[alias][document])
                    for alias, documents in self.retained.items()
                    for document in documents]
         self.kv_stats.update(
@@ -387,16 +398,16 @@ def prepare_distributed_inputs(node, inputs, context, nodes=None):
     return inputs
 
 
-def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
+def execute_distributed_graph(payload, graph: PhysicalGraph, gpus: int,
                               round_fn, model_spec, device, runtimes,
                               registry) -> dict:
     """Execute one typed Quail graph across GPU child processes."""
     execution = DistributedQuailExecution(
-        payload, graph, gpu_count, round_fn, model_spec, device, registry
+        payload, graph, gpus, round_fn, model_spec, device, registry
     )
     sources = {
         alias: range(len(documents))
-        for alias, documents in payload["docs"].items()
+        for alias, documents in payload["documents"].items()
     }
     for alias, table in payload.get("columns", {}).items():
         sources[columns_key(alias)] = table
@@ -407,7 +418,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         model_inputs=prepare_distributed_inputs,
         state={"distributed_execution": execution},
         functions=registry.functions,
-        workers=execution.gpu_count,
+        gpus=execution.gpus,
         run_pipeline=execution.execute_pipeline,
     )
     started = time.perf_counter()
@@ -416,6 +427,6 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
     result = GenericRunner().run(compute_subgraph(graph), context)
     elapsed = time.perf_counter() - started
     report = execution.report()
-    report.update(graph_report(graph, result, elapsed, device, workers=gpu_count,
+    report.update(graph_report(graph, result, elapsed, device, gpus=gpus,
                                gpu_timing=payload.get("gpu_timing", False)))
     return report

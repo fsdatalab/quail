@@ -94,9 +94,9 @@ def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypa
 
 
 def test_prefix_tree_borrows_whole_pages_and_siblings_share_one_parent():
-    docs = [list(range(40)), list(range(50)), list(range(32)) + [99] * 20,
+    documents = [list(range(40)), list(range(50)), list(range(32)) + [99] * 20,
             [7] * 20, [7] * 10]
-    tree = prefix_tree(docs, 16)
+    tree = prefix_tree(documents, 16)
     # sorted order: 0..39, 0..49, 0..31+99s, [7]*10, [7]*20
     assert tree.order == [0, 1, 2, 4, 3]
     # doc 1 shares 40 with doc 0; doc 2 shares 32 with doc 1, pages
@@ -105,9 +105,9 @@ def test_prefix_tree_borrows_whole_pages_and_siblings_share_one_parent():
     assert tree.parent == [None, 0, 0, None, None]
     assert tree.shared == [0, 32, 32, 0, 0]
     assert tree.shared_tokens == 64
-    groups = tree.reader_groups([len(doc) for doc in docs])
+    groups = tree.reader_groups([len(document) for document in documents])
     assert [values.tolist() for values in groups] == [[32], [2], [38]]
-    assert tree.reader_groups([len(doc) for doc in docs]) is groups
+    assert tree.reader_groups([len(document) for document in documents]) is groups
     parents_first = {index: position for position, index in enumerate(tree.order)}
     assert all(parent is None or parents_first[parent] < parents_first[index]
                for index, parent in enumerate(tree.parent))
@@ -118,17 +118,17 @@ def test_prefix_tree_borrows_whole_pages_and_siblings_share_one_parent():
     assert tree.shared == [0, 0, 0]
 
     header = list(range(64))
-    docs = [header + [1] * 8, header + [2] * 8, header + [3] * 8,
+    documents = [header + [1] * 8, header + [2] * 8, header + [3] * 8,
             header + [3] * 8 + [4] * 40, header + [5] * 8]
-    tree = prefix_tree(docs, 16)
+    tree = prefix_tree(documents, 16)
     # every record borrows the header from the first; doc 3 reads its
     # 64 shared tokens from doc 0 too, as doc 2 owns none of them
     assert tree.parent == [None, 0, 0, 0, 0]
     assert tree.shared == [0, 64, 64, 64, 64]
     # a longer shared run makes a deeper node
-    docs = [header + [1] * 32, header + [1] * 32 + [2] * 8,
+    documents = [header + [1] * 32, header + [1] * 32 + [2] * 8,
             header + [1] * 32 + [3] * 8]
-    tree = prefix_tree(docs, 16)
+    tree = prefix_tree(documents, 16)
     assert tree.parent == [None, 0, 0]
     assert tree.shared == [0, 96, 96]
     left = [7] * 4096 + [8, 9]

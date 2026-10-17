@@ -205,29 +205,29 @@ def measured_stages(report) -> dict:
         report: An execution report (QueryResult.report).
 
     Returns:
-        ("filter", alias, written_pos) and ("join", written_pos) keys
+        ("filter", alias, written_position) and ("join", written_position) keys
         mapped to the stage dicts of report["stages"]. Stages saved
-        before written_pos was recorded are left out.
+        before written_position was recorded are left out.
     """
     stages = {}
     for stage in (report or {}).get("stages", ()):
-        written_pos = stage.get("written_pos")
-        if written_pos is None:
+        written_position = stage.get("written_position")
+        if written_position is None:
             continue
         if stage.get("op") == "filter":
-            stages[("filter", stage["alias"], written_pos)] = stage
+            stages[("filter", stage["alias"], written_position)] = stage
         elif stage.get("op") == "join":
-            stages[("join", written_pos)] = stage
+            stages[("join", written_position)] = stage
     return stages
 
 
-def run_summary(report, graph, workers, usd_per_hour=None) -> list:
+def run_summary(report, graph, gpus, usd_per_hour=None) -> list:
     """Return the measured totals of one run as labeled lines.
 
     Args:
         report: The execution report (QueryResult.report).
         graph: The executed physical graph, for the input document count.
-        workers: GPUs the query ran on.
+        gpus: GPUs the query ran on.
         usd_per_hour: Price of one GPU, for the cost per query.
     """
     wall = report.get("wall_s")
@@ -242,7 +242,7 @@ def run_summary(report, graph, workers, usd_per_hour=None) -> list:
     if not pairs:
         # a score over document pairs has no join stage records
         pairs = report.get("evaluated_document_pairs") or 0
-    documents = sum(node.n_docs for node in graph.nodes
+    documents = sum(node.num_documents for node in graph.nodes
                     if isinstance(node, Scan))
     if wall > 0 and pairs:
         items.append(("throughput", f"{_number(pairs / wall)} document "
@@ -255,8 +255,8 @@ def run_summary(report, graph, workers, usd_per_hour=None) -> list:
         tokens += f", {report['cached_tokens']:,} read from KV"
     items.append(("tokens", tokens))
     if usd_per_hour is not None:
-        cost = wall / 3600 * workers * usd_per_hour
-        items.append(("GPU cost", f"${cost:.4f} per query ({workers} GPU at "
+        cost = wall / 3600 * gpus * usd_per_hour
+        items.append(("GPU cost", f"${cost:.4f} per query ({gpus} GPU at "
                       f"${usd_per_hour:.4f}/hour, startup excluded)"))
     width = max(len(label) for label, _ in items)
     return [f"{label.ljust(width)}   {value}" for label, value in items]
@@ -276,8 +276,8 @@ def _estimated_rows(graph):
         inputs = [rows.get(port.source) for port in node.inputs]
         value = None
         if isinstance(node, Scan):
-            value = (node.n_docs if node.expected_docs is None
-                     else node.expected_docs)
+            value = (node.num_documents if node.expected_rows is None
+                     else node.expected_rows)
         elif isinstance(node, AiFilter):
             value = inputs[0] if inputs else None
             if value is not None:
@@ -348,9 +348,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             source = scans.get(node.alias)
             title = (f"Scan {source.provider} as {node.alias}" if source else
                      f"Scan: {node.alias}")
-            mean = node.total_tokens / node.n_docs if node.n_docs else 0
+            mean = node.total_tokens / node.num_documents if node.num_documents else 0
             details.append(f"tokens={node.total_tokens:,}, "
-                           f"mean_doc_tokens={_number(mean)}")
+                           f"mean_document_tokens={_number(mean)}")
             if source is not None and source.predicates:
                 details.append("where " + " and ".join(
                     str(predicate) for predicate in source.predicates))
@@ -401,13 +401,13 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                     f"(one document at a time, the rest skipped once "
                     f"one survives)")
             written = filters.get(node.alias, ())
-            label = f"predicate {node.written_pos + 1}"
-            if node.written_pos < len(written):
+            label = f"predicate {node.written_position + 1}"
+            if node.written_position < len(written):
                 label += "  " + _short_prompt(
-                    written[node.written_pos].prompt)
+                    written[node.written_position].prompt)
             predicates.append((label, stage_cells(
-                node.selectivity, node.expected_docs,
-                stages.get(("filter", node.alias, node.written_pos)),
+                node.selectivity, node.expected_rows,
+                stages.get(("filter", node.alias, node.written_position)),
                 "evaluated")))
         elif isinstance(node, AiClassify):
             spec = node.spec
@@ -432,16 +432,16 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                           node.anchor_resident, node.anchor_resident)
             keep = "yes" if node.keep_kv else "no"
             details.append(f"KV: anchor={source}, retain after join={keep}")
-            label = (f"join {node.written_pos + 1} {node.semantics} "
+            label = (f"join {node.written_position + 1} {node.semantics} "
                      f"({node.anchor}, {', '.join(node.partners)})")
             if node.pairs_from:
                 label += f" over pairs from {node.pairs_from}"
-            if node.written_pos < len(joins):
+            if node.written_position < len(joins):
                 label += "  " + _short_prompt(
-                    joins[node.written_pos].prompt)
+                    joins[node.written_position].prompt)
             predicates.append((label, stage_cells(
-                node.selectivity, node.expected_tuples,
-                stages.get(("join", node.written_pos)), "tuples")))
+                node.selectivity, node.expected_rows,
+                stages.get(("join", node.written_position)), "tuples")))
         elif isinstance(node, HashJoin):
             title += ": " + " and ".join(
                 f"{node.left}.{left} = {node.right}.{right}"
@@ -580,7 +580,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         return "\n".join(lines)
     lines.append("")
     lines.append(f"physical: backend={physical.backend}, "
-                 f"model={physical.model}, workers={physical.workers}")
+                 f"model={physical.model}, gpus={physical.gpus}")
     if physical.backend == "quail":
         chunk = physical.settings.get("chunk_tokens")
         admission = physical.settings.get("admission_tokens")
@@ -606,7 +606,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         lines.append("")
         lines.append("run:")
         lines.extend("  " + line for line in run_summary(
-            result.report, physical.graph, physical.workers, usd_per_hour))
+            result.report, physical.graph, physical.gpus, usd_per_hour))
     if verbose:
         lines.append("")
         lines.append("settings:")

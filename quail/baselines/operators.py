@@ -65,8 +65,8 @@ def operator_at_a_time_filter(client, sampling_params, bodies, questions,
         active = next_active
         stages.append({
             "stage": stage_index,
-            "n_in": len(evaluated),
-            "n_out": len(active),
+            "num_in": len(evaluated),
+            "num_out": len(active),
         })
     return {
         "wall_s": time.perf_counter() - started,
@@ -112,8 +112,8 @@ def pipelined_filter(client, sampling_params, bodies, questions, read_answer,
         ]
         stages.append({
             "stage": stage - 1,
-            "n_in": len(evaluated),
-            "n_out": sum(
+            "num_in": len(evaluated),
+            "num_out": sum(
                 bool(result["answers"][(document, stage)])
                 for document in evaluated
             ),
@@ -315,7 +315,7 @@ def join_answers(spec, rows, answers, anchor, partners) -> pa.Table:
             "anchor": anchor,
             "partners": ",".join(partners),
             "semantics": spec.semantics,
-            "written_pos": spec.written_pos,
+            "written_position": spec.written_position,
             **(
                 {"selectivity": spec.selectivity}
                 if spec.selectivity is not None else {}

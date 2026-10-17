@@ -103,15 +103,15 @@ def alias_stats(lengths: dict, window: int = 0) -> dict[str, AliasStats]:
     }
 
 
-def surviving_docs(n_docs: float, n_partners: float,
+def surviving_documents(num_documents: float, num_partners: float,
                    tuple_selectivity) -> float:
     """Expected distinct documents with at least one matching tuple."""
     tuple_selectivity = effective_selectivity(tuple_selectivity)
-    return n_docs * (1.0 - (1.0 - tuple_selectivity)
-                     ** max(1.0, n_partners))
+    return num_documents * (1.0 - (1.0 - tuple_selectivity)
+                     ** max(1.0, num_partners))
 
 
-def thin(live: dict, spec: PricedJoin) -> None:
+def thin(expected_rows: dict, spec: PricedJoin) -> None:
     """Update live document counts after one join's selectivity."""
     sel = spec.selectivity
     aliases = spec.aliases
@@ -120,21 +120,21 @@ def thin(live: dict, spec: PricedJoin) -> None:
         out = 1.0
         for a in aliases:
             if a != x:
-                out *= live[a]
+                out *= expected_rows[a]
         return out
 
     if spec.semantics == "full":
-        new = {a: surviving_docs(live[a], others(a), sel)
+        new = {a: surviving_documents(expected_rows[a], others(a), sel)
                for a in aliases}
-        live.update(new)
+        expected_rows.update(new)
     else:
         anchor = spec.anchor
-        matched = surviving_docs(live[anchor], others(anchor), sel)
-        live[anchor] = (matched if spec.semantics == "exists"
-                        else live[anchor] - matched)
+        matched = surviving_documents(expected_rows[anchor], others(anchor), sel)
+        expected_rows[anchor] = (matched if spec.semantics == "exists"
+                        else expected_rows[anchor] - matched)
 
 
-def cross_tuples(spec: PricedJoin, live: dict) -> float:
+def cross_tuples(spec: PricedJoin, expected_rows: dict) -> float:
     """Expected tuples of one join.
 
     The live cross product, or the fraction of it the join's equality
@@ -142,13 +142,15 @@ def cross_tuples(spec: PricedJoin, live: dict) -> float:
     """
     tuples = 1.0
     for a in spec.aliases:
-        tuples *= live[a]
+        tuples *= expected_rows[a]
     return tuples * spec.pair_fraction
 
 
-def pair_counts(live, aliases, fraction) -> tuple[float, float]:
+def pair_counts(expected_rows, aliases, fraction) -> tuple[float, float]:
     """Return expected pairs and first documents with at least one pair."""
     left, right = aliases
     touched = (1.0 if fraction >= 1 else
-               -math.expm1(live[right] * math.log1p(-fraction)))
-    return live[left] * live[right] * fraction, live[left] * touched
+               -math.expm1(expected_rows[right] * math.log1p(-fraction)))
+    return expected_rows[left] * expected_rows[right] * fraction, expected_rows[
+        left
+    ] * touched

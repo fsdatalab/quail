@@ -226,9 +226,9 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
             node_id = "filter:r" if index == 0 else f"filter:r:{index}"
             nodes.append(AiFilter(
                 node_id=node_id, inputs=input_ports((anchor_src,)), alias="r",
-                arena_writes=True, keep_kv=not pipelined, written_pos=index,
+                arena_writes=True, keep_kv=not pipelined, written_position=index,
                 question_tokens=1, preamble_tokens=0,
-                selectivity=0.8 - 0.1 * index, expected_docs=14 * 0.8 ** index,
+                selectivity=0.8 - 0.1 * index, expected_rows=14 * 0.8 ** index,
                 question_token_ids=(QUESTION + index,)))
             anchor_src = PortRef(node_id, "ids:r")
     if filtered and not pipelined:
@@ -243,7 +243,7 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
             node_id="hash_join:r-p",
             inputs=input_ports((PortRef("input:r", "ids:r"),
                                 PortRef("input:p", "ids:p"))),
-            left="r", right="p", on=(("key", "key"),), written_pos=0))
+            left="r", right="p", on=(("key", "key"),), written_position=0))
         join_inputs.append(PortRef("hash_join:r-p", "pairs:0"))
         pairs_from = "hash_join:r-p"
     if foreign and foreign[1] == "pairs":
@@ -252,7 +252,7 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
             inputs=input_ports((anchor_src, PortRef("input:p", "ids:p"))),
             function="same_key", kind=foreign[0], ids="pairs",
             columns=(("r", "key"), ("p", "key")), aliases=("r", "p"),
-            written_pos=0))
+            written_position=0))
         join_inputs.append(PortRef("apply:same_key", "pairs:0"))
         pairs_from = "apply:same_key"
     elif foreign:
@@ -267,14 +267,14 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
         node_id="group:0", anchor="r", anchor_resident=resident, keep_kv=keep_kv,
         inputs=input_ports((anchor_src, PortRef("input:p", "ids:p"),
                             *join_inputs)),
-        written_pos=0, exec_idx=0, partners=("p",), semantics=semantics,
-        selectivity=0.5, expected_tuples=1, anchor_frame_tokens=1,
+        written_position=0, exec_index=0, partners=("p",), semantics=semantics,
+        selectivity=0.5, expected_rows=1, anchor_frame_tokens=1,
         pair_tail_tokens=0, tuple_tokens=0, pairs_from=pairs_from,
         frame_token_ids=(FRAME,), label_token_ids=(("p", ()),), tail_token_ids=()))
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
-def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
+def run_graph_on_arena(monkeypatch, graph, *, num_documents=14, num_partners=4,
                        seed=5, pages=64, stages=1, partner_tokens=20,
                        streamed_anchors=True, shared_prefix=0, **extra):
     """Run a graph over random documents through the real graph runtime.
@@ -285,15 +285,17 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
     """
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     rng = random.Random(seed)
-    docs = {
+    documents = {
         "r": [[DOC - 1] * shared_prefix + [DOC + d] * rng.randrange(10, 40)
-              for d in range(n_docs)],
-        "p": [[PARTNER + i] * partner_tokens for i in range(n_partners)],
+              for d in range(num_documents)],
+        "p": [[PARTNER + i] * partner_tokens for i in range(num_partners)],
     }
     filter_truth = [[1 if rng.random() < p else 0
-                     for p in (0.8, 0.7)[:stages]] for _ in range(n_docs)]
-    join_truth = {("r", d): [1 if rng.random() < 0.5 else 0
-                             for _ in range(n_partners)] for d in range(n_docs)}
+                     for p in (0.8, 0.7)[:stages]] for _ in range(num_documents)]
+    join_truth = {
+        ("r", d): [1 if rng.random() < 0.5 else 0 for _ in range(num_partners)]
+        for d in range(num_documents)
+    }
     model = FakeModel(filter_truth, join_truth, streamed_anchors)
     torch = fake_torch()
     arena = cpu_arena(pages)
@@ -312,7 +314,7 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
                                execution=execution, spec=MODELS["qwen3-4b-fp8"]),
         "runtimes": built_in_registry().runtimes,
         "device": DEVICES["h100-sxm"],
-        "chunk_tokens": 120, "docs": docs, **extra,
+        "chunk_tokens": 120, "documents": documents, **extra,
     }
     result = execute_single_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
@@ -346,7 +348,7 @@ def same_key(tables):
 
 
 class FakeArena:
-    n_pages = 100
+    num_pages = 100
     page_tokens = 16
     retention_cap_pages = None
     evicted_keys = evicted_pages = evicted_prefix_tokens = 0
@@ -395,7 +397,7 @@ class FakeArena:
         pass
 
 
-def graph_state(model_execution, docs):
+def graph_state(model_execution, documents):
     return {
         "gpu": SimpleNamespace(torch=fake_torch(), arena=FakeArena(),
                                pipeline=SimpleNamespace(), execution=model_execution,
@@ -403,12 +405,19 @@ def graph_state(model_execution, docs):
         "runtimes": built_in_registry().runtimes,
         "device": DEVICES["h100-sxm"],
         "chunk_tokens": 8192,
-        "docs": docs,
+        "documents": documents,
     }
 
 
 def plain_arena(pages=64):
     import torch
 
-    return KVArena(n_layers=1, n_pages=pages, page_tokens=16, n_kv=1, d_head=2,
-                   dtype=torch.float32, device="cpu")
+    return KVArena(
+        num_layers=1,
+        num_pages=pages,
+        page_tokens=16,
+        num_kv_heads=1,
+        d_head=2,
+        dtype=torch.float32,
+        device="cpu",
+    )

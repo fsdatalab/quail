@@ -23,13 +23,13 @@ from quail.specs import MODELS
 
 @dataclass(frozen=True)
 class CorpusStats:
-    n_docs: int
+    num_documents: int
     total_tokens: int
-    max_doc_tokens: int
+    max_document_tokens: int
 
     @property
-    def mean_doc_tokens(self) -> float:
-        return self.total_tokens / max(1, self.n_docs)
+    def mean_document_tokens(self) -> float:
+        return self.total_tokens / max(1, self.num_documents)
 
 @dataclass(frozen=True)
 class Refusal:
@@ -71,7 +71,7 @@ class PhysicalPlan:
 
     model: str
     device: str
-    workers: int
+    gpus: int
     backend: str = "quail"
     estimated_seconds: float = 0.0
     nodes: tuple = ()          # typed nodes in topological order
@@ -131,7 +131,7 @@ class PhysicalPlan:
             PlanEditError: The edited operator graph is invalid.
         """
         nodes = plan_kv_retention(
-            PhysicalGraph(tuple(nodes), self.graph.root), self.workers).nodes
+            PhysicalGraph(tuple(nodes), self.graph.root), self.gpus).nodes
         try:
             edited = replace(self, nodes=nodes, root=None, estimates={})
         except GraphValidationError as error:
@@ -139,7 +139,7 @@ class PhysicalPlan:
         if self.estimator is None:
             return edited
         scheduled = set(self.settings.get("retention", {}).get("initial", {}))
-        pipelines = build_pipelines(edited.graph, self.workers)
+        pipelines = build_pipelines(edited.graph, self.gpus)
         recompute = sum(
             edited.estimates.get(node.node_id, {}).get(
                 "release_recompute_seconds", 0.0)
@@ -235,7 +235,7 @@ class PhysicalPlan:
             backend=self.backend,
             model=self.model,
             device=self.device,
-            workers=self.workers,
+            gpus=self.gpus,
             graph=self.graph,
             codecs=codecs,
             settings=self.settings,
@@ -277,7 +277,7 @@ class EngineConfig:
     attention: str | None = None
 
 
-def plan_kv_retention(graph: PhysicalGraph, workers: int = 1) -> PhysicalGraph:
+def plan_kv_retention(graph: PhysicalGraph, gpus: int = 1) -> PhysicalGraph:
     """Set operators' KV retention from the next compatible document consumer.
 
     KV between operators on one path stays active in the scheduler. It stays
@@ -285,7 +285,7 @@ def plan_kv_retention(graph: PhysicalGraph, workers: int = 1) -> PhysicalGraph:
     documents under the same prompt head. Worker boundaries use the same
     paths as execution.
     """
-    paths = build_pipelines(graph, workers)
+    paths = build_pipelines(graph, gpus)
     ordered = graph.topological_nodes()
     starts = [node for node in ordered
               if node.node_id in paths and paths[node.node_id][0] is node]
@@ -297,7 +297,7 @@ def plan_kv_retention(graph: PhysicalGraph, workers: int = 1) -> PhysicalGraph:
                           if later.document_aliases == (alias,)), None)
         keep = (following is not None
                 and first.document_head == following.document_head
-                and (workers == 1 or first.worker_pipelining
+                and (gpus == 1 or first.worker_pipelining
                      and following.worker_pipelining))
         model_nodes = [node for node in members if node.backend is not None]
         # Joins settle anchors after any classification of their surviving pairs.

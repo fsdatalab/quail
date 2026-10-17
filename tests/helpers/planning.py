@@ -12,11 +12,11 @@ def node_kinds(plan):
     return [type(node).__name__ for node in plan.nodes]
 
 
-def tok(text):
+def tokenizer(text):
     return text.split()
 
 
-def _optimize(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
+def _optimize(logical, document_tokens, model=QWEN3_4B_FP8, **kwargs):
     """Run the built in tree rewrites as a session would.
 
     Returns:
@@ -24,15 +24,15 @@ def _optimize(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
     """
     context = PlanningContext(
         model=model, device=H100_SXM,
-        gpu_count=kwargs.get("gpus", 1), document_tokens=doc_tokens,
-        order=kwargs.get("order"), tokenizer=tok,
+        gpus=kwargs.get("gpus", 1), document_tokens=document_tokens,
+        order=kwargs.get("order"), tokenizer=tokenizer,
         pair_fractions=kwargs.get("pair_fractions") or {})
     candidate, = logical_alternatives(logical, built_in_rules(), context)
     return candidate.plan, candidate.rules
 
 
-def _plan(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
+def _plan(logical, document_tokens, model=QWEN3_4B_FP8, **kwargs):
     """Plan as a session would: the tree rewrites, then the physical planner."""
     return plan_query(logical, model=model, device=H100_SXM,
                       registry=built_in_registry(),
-                      doc_tokens=doc_tokens, tokenizer=tok, **kwargs)
+                      document_tokens=document_tokens, tokenizer=tokenizer, **kwargs)

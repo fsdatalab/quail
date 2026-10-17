@@ -207,7 +207,7 @@ class LogicalPlanBuilder:
                 )
         if join.on:
             root = replace(root, on=tuple(join.on))
-        written_pos = self._joins
+        written_position = self._joins
         self._joins += 1
         for function, kind, columns in join.applies:
             aliases = tuple(dict.fromkeys(ref.alias for ref in join.prompt.args))
@@ -218,7 +218,7 @@ class LogicalPlanBuilder:
                 ids="pairs",
                 columns=tuple(columns),
                 aliases=aliases,
-                written_pos=written_pos,
+                written_position=written_position,
             )
         self._root = SemanticJoin(
             input=root,

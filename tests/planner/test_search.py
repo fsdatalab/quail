@@ -41,8 +41,8 @@ def query(tmp_path):
 def context_for(query):
     query.plan()
     return PlanningContext(
-        model=query.session.model, device=query.session.device, gpu_count=1,
-        document_tokens=query._doc_tokens, backend="quail",
+        model=query.session.model, device=query.session.device, gpus=1,
+        document_tokens=query._document_tokens, backend="quail",
         tokenizer=query.session.tokenizer)
 
 

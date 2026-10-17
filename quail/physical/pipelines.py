@@ -4,13 +4,13 @@ from quail.physical import AiClassify, AiJoin, PhysicalGraph, PhysicalNode
 
 
 def build_pipelines(
-    graph: PhysicalGraph, workers: int = 1, completed: tuple[str, ...] = (),
+    graph: PhysicalGraph, gpus: int = 1, completed: tuple[str, ...] = (),
 ) -> dict[str, tuple[PhysicalNode, ...]]:
     """Group compatible per-document operators into pipelines.
 
     Args:
         graph: Physical operator graph.
-        workers: Number of model workers.
+        gpus: Number of model workers.
         completed: Nodes whose outputs are already available.
 
     Returns:
@@ -50,7 +50,7 @@ def build_pipelines(
                 if (not node.can_precede(consumer)
                         or not consumer.can_follow(node, first)):
                     continue
-                if workers > 1 and (not node.worker_pipelining
+                if gpus > 1 and (not node.worker_pipelining
                                     or type(consumer) is not type(node)):
                     continue
                 if takes(consumer, alias) and consumer not in following:
@@ -88,9 +88,9 @@ def build_pipelines(
             members.extend(after)
             followed.update(consumer.node_id for consumer in after)
         joins = [member for member in members if isinstance(member, AiJoin)]
-        for join in joins if workers == 1 else ():
+        for join in joins if gpus == 1 else ():
             candidates = [consumer for consumer in consumers.get(
-                (join.node_id, f"join_answers:{join.written_pos}"), ())
+                (join.node_id, f"join_answers:{join.written_position}"), ())
                 if isinstance(consumer, AiClassify) and consumer.classifies_join(join)]
             if len(candidates) == 1 and candidates[0].node_id not in followed:
                 members.append(candidates[0])

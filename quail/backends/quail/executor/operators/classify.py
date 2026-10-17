@@ -92,7 +92,7 @@ class QuailClassifier:
         plan.seeds = rows
         part = ClassifyBatch(plan, on_answers, sum(map(len, prefixes)))
         return execute_parts(
-            state, [part], prefixes, keys, keep_kv=False, tree=tree,
+            state, [part], prefixes, keys, keep_kv=False, prefix_tree=tree,
             label=f"classify {spec.name}")[spec.name]
 
 def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
@@ -122,8 +122,8 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
     partner_ids = [int(entry[0]) if isinstance(entry, (tuple, list))
                    else int(entry)
                    for entry in join_inputs["partner_indices"][
-                       stage.written_pos]]
-    documents = context.state["docs"][spec.partner]
+                       stage.written_position]]
+    documents = context.state["documents"][spec.partner]
     kept = KeptPairs(join.index(stage))
     partners = JoinPartners(
         ids=partner_ids,
@@ -141,7 +141,7 @@ class ClassifyPart(ClassifyBatch):
     @staticmethod
     def model_inputs(node, inputs, context, sequence=None, nodes=None):
         # scored through the reranker readout over the documents
-        return {"score_inputs": inputs, "documents": context.state["docs"]}
+        return {"score_inputs": inputs, "documents": context.state["documents"]}
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):

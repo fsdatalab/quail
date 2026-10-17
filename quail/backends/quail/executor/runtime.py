@@ -101,7 +101,7 @@ class QuailModelExecution:
         if execution is None or execution.documents is not documents:
             execution = RerankerModelExecution(GpuContext(
                 gpu_index=self.context.gpu_index,
-                gpu_count=self.context.gpu_count,
+                gpus=self.context.gpus,
                 model=self.context.model, device=self.context.device,
                 query_settings={
                     "documents": documents,

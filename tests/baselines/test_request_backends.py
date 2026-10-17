@@ -35,7 +35,7 @@ DOCS = {"id": ["a", "b"], "body": ["one", "two"]}
 
 
 def _filter_query(session):
-    return (session.docs("docs").alias("d")
+    return (session.docs("documents").alias("d")
             .ai_filter(quail.prompt("useful {0}", quail.col("d.body")))
             .select("d.id"))
 
@@ -47,7 +47,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     }
 
     for backend_name in ("stock_vllm", "pipelined_vllm", "pipelined_sglang"):
-        session = _session(backend_name, docs=DOCS)
+        session = _session(backend_name, documents=DOCS)
         plan = _filter_query(session).plan()
         request_node = next(
             node for node in plan.nodes if isinstance(node, RequestExecution))
@@ -70,7 +70,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
         lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
     session = _session(
         "stock_vllm",
-        docs={**DOCS, "key": ["k1", "k2"]},
+        documents={**DOCS, "key": ["k1", "k2"]},
         notes={"id": ["x", "y", "z"], "text": ["p", "q", "r"],
                "key": ["k2", "k1", "k3"]},
     )
@@ -79,7 +79,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     assert result.report["backend_metrics"]["requests"] == 2
     assert result.count() == 0
     query = (
-        session.docs("docs").alias("d")
+        session.docs("documents").alias("d")
         .join(session.docs("notes").alias("n"),
               on=[quail.col("d.key") == quail.col("n.key")])
         .ai_filter(quail.prompt("{0} matches {1}", quail.col("d.body"),
@@ -95,7 +95,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     # aliases before the label column; the join kept no pair here
     boot["client"] = _JoinedClient()
     query = (
-        session.docs("docs").alias("d")
+        session.docs("documents").alias("d")
         .join(session.docs("notes").alias("n"),
               on=[quail.col("d.key") == quail.col("n.key")])
         .ai_filter(quail.prompt("{0} matches {1}", quail.col("d.body"),
@@ -139,7 +139,7 @@ def _join_node(backend_name="stock_vllm"):
         node_id="request-model", backend_name=backend_name, aliases=("r", "p"),
         preamble_token_ids=(3,),
         joins=(RequestJoinSpec(
-            written_pos=0, aliases=("r", "p"), outer_aliases=("r",),
+            written_position=0, aliases=("r", "p"), outer_aliases=("r",),
             anchor="r", semantics="full", selectivity=0.5,
             label_token_ids=(("r", (40,)), ("p", (41,))),
             frame_token_ids=(("r", (30,)), ("p", (31,))),
@@ -359,15 +359,15 @@ def test_request_backends_classify_with_one_decode_request_per_document():
         "d": [0, 1], "predicate": [0, 0], "answer": [False, True]}
     assert result.metrics.extension["requests"] == 2
     (step,) = result.metrics.extension["steps"]
-    assert (step["kind"], step["n_in"], step["n_out"]) == ("classify", 2, 1)
+    assert (step["kind"], step["num_in"], step["num_out"]) == ("classify", 2, 1)
     assert (step["generated_tokens"], step["unmatched"]) == (4, 0)
     # two 3-token prompts, and each answer's first token fed back
     assert result.metrics.fresh_tokens == 2 * 3 + 2 * (2 - 1)
     assert step["prompt_tokens"] == 6
     assert result.metrics.extension["prompt_tokens"] == 6
 
-    session = _session("stock_vllm", docs=DOCS)
-    query = (session.docs("docs").alias("d")
+    session = _session("stock_vllm", documents=DOCS)
+    query = (session.docs("documents").alias("d")
              .ai_classify(quail.prompt("kind of {0}", quail.col("d.body")),
                           ["a", "b", "c"], name="kind")
              .label_in("kind", ["b"])
@@ -408,7 +408,7 @@ def test_request_backends_decode_one_request_per_row_the_join_keeps():
     spec = RequestClassifySpec(
         alias="r", output="kind", tail_token_ids=(90,),
         labels=("a", "b", "c"), label_token_ids=((60, 62), (61, 62), (60, 63)),
-        partner="p", join_layout_token_ids=((70,), (71,)), join_written_pos=0)
+        partner="p", join_layout_token_ids=((70,), (71,)), join_written_position=0)
     node = replace(_join_node(), classifies=(spec,))
     client = _JoinedClient()
     execution = _execution({"r": [[10], [11]], "p": [[20], [21]]}, client=client)
@@ -425,7 +425,7 @@ def test_request_backends_decode_one_request_per_row_the_join_keeps():
     join_step, classify_step = result.metrics.extension["steps"]
     assert join_step["kind"] == "join"
     assert (classify_step["alias"], classify_step["partner"]) == ("r", "p")
-    assert (classify_step["n_in"], classify_step["n_out"]) == (2, 2)
+    assert (classify_step["num_in"], classify_step["num_out"]) == (2, 2)
     assert result.metrics.evaluated_document_pairs == 4 + 2
 
 
@@ -469,8 +469,8 @@ def test_request_planner_checks_map_placement(backend_name, operation):
     from quail.planner.plan import Refusal
     from quail.planner.rules.logical import ShouldLiftMaps
 
-    with _session(backend_name, docs=DOCS, partners=DOCS) as session:
-        documents = session.docs("docs").alias("d")
+    with _session(backend_name, documents=DOCS, partners=DOCS) as session:
+        documents = session.docs("documents").alias("d")
         if operation == "classify":
             documents = documents.ai_classify(
                 quail.prompt("kind of {0}", quail.col("d.body")),
@@ -495,7 +495,7 @@ def test_request_planner_checks_map_placement(backend_name, operation):
         assert written["selected"] and written["refusal"] is None
         context = PlanningContext(
             model=session.model, device=session.device,
-            document_tokens=query._doc_tokens, tokenizer=session.tokenizer,
+            document_tokens=query._document_tokens, tokenizer=session.tokenizer,
             backend=backend_name)
         candidate, = session.registry.backend(backend_name).plan(
             ModelRegion(LogicalPlan(lifted)), context)

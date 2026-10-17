@@ -40,7 +40,7 @@ def execute_request_graph(context, backend, engine_state, boot):
     settings = dict(envelope["settings"])
     model_execution = backend.start(GpuContext(
         gpu_index=0,
-        gpu_count=1,
+        gpus=1,
         model=context.registry.model(envelope["model"]),
         device=context.registry.device(envelope["device"]),
         query_settings={
@@ -134,7 +134,7 @@ class RequestBackend:
     def reads_document_text(self) -> bool:
         return bool(getattr(self.engine, "reads_document_text", False))
 
-    def supports(self, model, device, gpu_count: int) -> SupportResult:
+    def supports(self, model, device, gpus: int) -> SupportResult:
         label = self.engine.label
         roles = getattr(self.engine, "roles", frozenset({"generative"}))
         if model.role not in roles:
@@ -146,7 +146,7 @@ class RequestBackend:
             return SupportResult.reject(
                 f"{label} does not support device {device.name!r}"
             )
-        if gpu_count != 1:
+        if gpus != 1:
             return SupportResult.reject(
                 f"the {label} request backends use one model copy on one GPU"
             )

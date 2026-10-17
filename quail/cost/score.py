@@ -60,10 +60,10 @@ class ScoreCost:
     device: DeviceSpec
     chunk_tokens: int
     capacity: int
-    workers: int
+    gpus: int
     draws: int
 
-    def estimate(self, expected_inputs, *, prefix_groups=None) -> tuple[Work, float]:
+    def estimate(self, expected_rows, *, prefix_groups=None) -> tuple[Work, float]:
         """Return model work and seconds for the expected inputs."""
         summaries = self.summaries
         canvas = self.model.canvas_tokens
@@ -74,28 +74,28 @@ class ScoreCost:
         shared = self.token_lengths[0]
         prefix = float(shared)
         prefix_variance = 0.0
-        groups = min(float(self.workers), expected_inputs)
+        groups = min(float(self.gpus), expected_rows)
         capacity = self.capacity
         if len(summaries) == 2:
             prefix += summaries[0].mean + self.token_lengths[1]
             prefix_variance = summaries[0].variance
             groups = min(
-                expected_inputs,
+                expected_rows,
                 summaries[0].count if prefix_groups is None else prefix_groups,
             )
             longest = sum(summary.maximum for summary in summaries) + fixed_tokens
             if longest > capacity:
                 prefix = float(shared)
                 prefix_variance = 0.0
-                groups = min(float(self.workers), expected_inputs)
+                groups = min(float(self.gpus), expected_rows)
         work = score_work(
-            expected_inputs, self.mean_tokens, fixed_tokens,
+            expected_rows, self.mean_tokens, fixed_tokens,
             variance=sum(summary.variance for summary in summaries),
             prefix_tokens=prefix, prefix_variance=prefix_variance,
-            groups=groups, shared_tokens=shared, copies=self.workers,
+            groups=groups, shared_tokens=shared, copies=self.gpus,
         )
         estimate = speed_of_light(
-            work * (1 / max(1, min(self.workers, expected_inputs))),
+            work * (1 / max(1, min(self.gpus, expected_rows))),
             self.model, self.device, self.chunk_tokens,
         ).seconds
         return work, estimate

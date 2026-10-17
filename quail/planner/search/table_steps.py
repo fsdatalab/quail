@@ -77,7 +77,7 @@ class PlanPricing:
         """Return the PredicateCosts of the table's AI.IF predicates."""
         stats = self.statistics.stats[self.alias]
         return prepare_filter_costs(
-            predicates, prefix_tokens=self.statistics.pre + stats.mean_doc_tokens,
+            predicates, mean_tokens=self.statistics.pre + stats.mean_document_tokens,
             model=self.context.model, device=self.context.device,
             chunk_tokens=self.statistics.chunk, context=self.context)
 
@@ -145,22 +145,24 @@ def _survival(selectivities) -> float:
     return survival
 
 
-def _classify_seconds(context, alias, call, name, resident, live) -> float:
+def _classify_seconds(context, alias, call, name, resident, expected_rows) -> float:
     """Price a classification at a live count with its cheapest scoring rule."""
-    spec, _ = classify_builder(context, alias, "quail").prepare(call, name, live)
+    spec, _ = classify_builder(context, alias, "quail").prepare(
+        call, name, expected_rows
+    )
     if spec.estimated_seconds:
         return spec.estimated_seconds
     try:
         chosen = classify_scoring(context, alias).choose_scoring(
-            replace(spec, expected_inputs=live), call, resident)
+            replace(spec, expected_rows=expected_rows), call, resident)
     except ClassifyRefusedError:
         # the refusal is raised again when the node is built
         return float("inf")
     return chosen.estimated_seconds
 
 
-def _extract_seconds(context, node, resident, live) -> float:
+def _extract_seconds(context, node, resident, expected_rows) -> float:
     """Price an extraction at a live count."""
-    return extract_spec(context, node.call, node.name, live,
+    return extract_spec(context, node.call, node.name, expected_rows,
                         resident=resident).estimated_seconds
 

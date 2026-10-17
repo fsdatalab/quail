@@ -200,9 +200,9 @@ def run_queries() -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    docs = pq.read_table(CORPUS).slice(0, AGENT_DOCS)
+    documents = pq.read_table(CORPUS).slice(0, AGENT_DOCS)
     subset = "/tmp/agent_traces.parquet"
-    pq.write_table(docs, subset)
+    pq.write_table(documents, subset)
     session = quail.Session(EngineConfig(
         gpus=1, model="qwen3-4b-fp8", backend="quail", device="h100-sxm",
         gpu_timing=True))
@@ -229,7 +229,7 @@ def run_queries() -> None:
         report["rows"] = [list(row) for row in rows]
         (folder / f"{name}.json").write_text(json.dumps(report, default=str))
         results_vol.commit()
-        print(f"{name}: {len(rows)} rows of {docs.num_rows}", flush=True)
+        print(f"{name}: {len(rows)} rows of {documents.num_rows}", flush=True)
         for row in rows[:5]:
             print("  ", row, flush=True)
         print("node seconds:", json.dumps({

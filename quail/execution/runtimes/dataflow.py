@@ -194,7 +194,7 @@ def foreign_ids(node, inputs) -> dict:
 def foreign_outputs(node, result) -> dict:
     """Build a Foreign node's output ports from its function result."""
     if node.ids == "pairs":
-        return {f"pairs:{node.written_pos}":
+        return {f"pairs:{node.written_position}":
                 pair_ids_table(*node.aliases, result)}
     return {f"ids:{node.aliases[0]}": document_ids(result)}
 
@@ -291,7 +291,7 @@ class HashJoinRuntime:
             alias: pc.take(sides[alias][0], positions.column(alias))
             for alias in (node.left, node.right)})
         return NodeResult(
-            {f"pairs:{node.written_pos}": pairs},
+            {f"pairs:{node.written_position}": pairs},
             NodeMetrics(
                 input_rows=sum(len(ids) for ids, _ in sides.values()),
                 output_rows=pairs.num_rows))

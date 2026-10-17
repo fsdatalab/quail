@@ -7,8 +7,8 @@ QWEN3_32B_FP8 = ModelSpec(
     #                         (Qwen3-32B non-embedding param count)
     layers=64,
     hidden=5120,
-    n_q=64,
-    n_kv=8,
+    num_q_heads=64,
+    num_kv_heads=8,
     d_head=128,
     ffn_width=51200,       # gate_up output: 2 x 25600 intermediate
     w_bytes=1.0,           # fp8 weights

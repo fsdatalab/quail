@@ -21,7 +21,7 @@ class PairRelation:
     pairs: frozenset[tuple[int, int]]
 
 
-def exact_live_rows(
+def exact_survivors(
     base_rows: Mapping[str, Sequence[int]],
     relations: Sequence[PairRelation],
 ) -> dict[str, tuple[int, ...]]:
@@ -60,10 +60,12 @@ def exact_live_rows(
             if relation.left in component and relation.right in component
         ]
         if len(component_relations) <= len(component) - 1:
-            live = _forest_live_rows(base_rows, component_relations, component)
+            expected_rows = _forest_live_rows(base_rows, component_relations, component)
         else:
-            live = _cyclic_live_rows(base_rows, component_relations, component)
-        output.update({alias: tuple(sorted(rows)) for alias, rows in live.items()})
+            expected_rows = _cyclic_live_rows(base_rows, component_relations, component)
+        output.update(
+            {alias: tuple(sorted(rows)) for alias, rows in expected_rows.items()}
+        )
     return output
 
 
@@ -102,7 +104,7 @@ def _forest_live_rows(
     relations: Sequence[PairRelation],
     aliases: set[str],
 ) -> dict[str, set[int]]:
-    live = {alias: set(base_rows[alias]) for alias in aliases}
+    expected_rows = {alias: set(base_rows[alias]) for alias in aliases}
     adjacency = {
         (relation.left, relation.right): _adjacency(relation)
         for relation in relations
@@ -116,21 +118,21 @@ def _forest_live_rows(
             ]
             left = {
                 row
-                for row in live[relation.left]
-                if left_to_right.get(row, set()) & live[relation.right]
+                for row in expected_rows[relation.left]
+                if left_to_right.get(row, set()) & expected_rows[relation.right]
             }
             right = {
                 row
-                for row in live[relation.right]
-                if right_to_left.get(row, set()) & live[relation.left]
+                for row in expected_rows[relation.right]
+                if right_to_left.get(row, set()) & expected_rows[relation.left]
             }
-            if left != live[relation.left]:
-                live[relation.left] = left
+            if left != expected_rows[relation.left]:
+                expected_rows[relation.left] = left
                 changed = True
-            if right != live[relation.right]:
-                live[relation.right] = right
+            if right != expected_rows[relation.right]:
+                expected_rows[relation.right] = right
                 changed = True
-    return live
+    return expected_rows
 
 
 def _cyclic_live_rows(

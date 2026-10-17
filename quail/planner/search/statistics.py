@@ -66,7 +66,7 @@ def ask_positions(filters) -> dict:
 
 
 def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
-                    device: DeviceSpec, doc_tokens: dict,
+                    device: DeviceSpec, document_tokens: dict,
                     pair_fractions=None, scan_fractions=None,
                     context=None) -> PlanStatistics:
     """Gather the statistics of one logical plan.
@@ -75,7 +75,7 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
         plan: The logical plan.
         model: Model spec.
         device: Device spec.
-        doc_tokens: alias -> per-document token counts, of every
+        document_tokens: alias -> per-document token counts, of every
             document in the table.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
@@ -98,20 +98,20 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
         *operators.prompts, *(node.call.prompt for node in operators.extracts))}
     lengths = {a: summarize_alias(t, model.sliding_window,
                                   memo=context.memo if context is not None else None)
-               for a, t in doc_tokens.items()}
+               for a, t in document_tokens.items()}
     chunk = budgets.chunk_budget(model, device)
     arena_split = pool_split(model, device, chunk, lengths.values())
     for alias, fraction in (scan_fractions or {}).items():
         if alias in lengths:
             lengths[alias] = scale_alias(lengths[alias], fraction)
     stats = {
-        a: CorpusStats(n_docs=s.count, total_tokens=s.total,
-                       max_doc_tokens=s.maximum)
+        a: CorpusStats(num_documents=s.count, total_tokens=s.total,
+                       max_document_tokens=s.maximum)
         for a, s in lengths.items()
     }
     for s in operators.scans:
         if s.alias not in stats:
-            raise ValueError(f"no doc_tokens for alias {s.alias!r}")
+            raise ValueError(f"no document_tokens for alias {s.alias!r}")
     admission = arena_split[0] * budgets.PAGE_TOKENS
     return PlanStatistics(
         stats=stats, lengths=lengths, chunk=chunk,
@@ -129,7 +129,7 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
 
 
 def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
-                      device: DeviceSpec, doc_tokens: dict,
+                      device: DeviceSpec, document_tokens: dict,
                       pair_fractions=None, scan_fractions=None,
                       context=None) -> PlanStatistics:
     """Return plan_statistics, computed once per memo and plan root.
@@ -140,7 +140,7 @@ def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
     key = ("statistics", plan.root)
     if key not in memo:
         memo[key] = plan_statistics(
-            plan, model=model, device=device, doc_tokens=doc_tokens,
+            plan, model=model, device=device, document_tokens=document_tokens,
             pair_fractions=pair_fractions, scan_fractions=scan_fractions,
             context=context)
     return memo[key]
@@ -156,7 +156,7 @@ def filter_stop_keys(plan: LogicalPlan) -> dict:
     return keys
 
 
-def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
+def expected_rows_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
     """Return the expected live documents per alias after its filters run.
 
     A filter on a label or an answer of a table classified or
@@ -165,7 +165,7 @@ def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
     classified_after = classified_above_joins(plan.root)
     extracted_after = extracted_above_joins(plan.root)
     operators = plan.operators()
-    live = {a: float(st.n_docs) for a, st in statistics.stats.items()}
+    expected_rows = {a: float(st.num_documents) for a, st in statistics.stats.items()}
     for alias in operators.all_filters():
         survival = 1.0
         for predicate in operators.filters.get(alias, ()):
@@ -176,8 +176,8 @@ def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
         if alias not in extracted_after:
             for test in operators.extract_filters.get(alias, ()):
                 survival *= effective_selectivity(test.selectivity)
-        live[alias] *= survival
-    return live
+        expected_rows[alias] *= survival
+    return expected_rows
 
 
 

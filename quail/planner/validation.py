@@ -101,18 +101,18 @@ def classification_refusal(context) -> Refusal | None:
                    needed=1, available=0, unit="queries")
 
 
-def joined_classification_refusal(graph, workers: int) -> Refusal | None:
+def joined_classification_refusal(graph, gpus: int) -> Refusal | None:
     """Check that each pair classification can run in its join's pipeline.
 
     Args:
         graph: Physical operator graph.
-        workers: Number of model workers.
+        gpus: Number of model workers.
 
     Returns:
         A Refusal if a pair classification cannot share its source join's
         pipeline on one worker, or None if every pair classification can run.
     """
-    pipelines = build_pipelines(graph) if workers == 1 else {}
+    pipelines = build_pipelines(graph) if gpus == 1 else {}
     for node in graph.nodes:
         if not isinstance(node, AiClassify) or node.spec.partner is None:
             continue
@@ -262,7 +262,7 @@ def validate_query(plan, operators, context, model, device, gpus):
     join_applies = {}
     for apply in applies:
         if apply.ids == "pairs":
-            join_applies.setdefault(apply.written_pos, []).append(apply)
+            join_applies.setdefault(apply.written_position, []).append(apply)
     names = [apply.function for apply in applies]
     if len(set(names)) != len(names):
         raise CompileError(

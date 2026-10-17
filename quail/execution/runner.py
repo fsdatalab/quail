@@ -58,7 +58,7 @@ class ExecutionContext:
     state: dict[str, Any] = field(default_factory=dict)
     observers: tuple[ExecutionObserver, ...] = ()
     functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
-    workers: int = 1
+    gpus: int = 1
     run_pipeline: Callable[..., Mapping[str, "NodeResult"]] | None = None
 
 def _check_ports(node, result) -> None:
@@ -106,11 +106,11 @@ class GenericRunner:
                 observer.after_node(node, result)
 
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
-        pipelines = (build_pipelines(graph, context.workers, completed)
+        pipelines = (build_pipelines(graph, context.gpus, completed)
                      if context.run_pipeline else {})
         for node in graph.topological_nodes():
             pipeline = pipelines.get(node.node_id)
-            if pipeline is not None and (context.workers == 1
+            if pipeline is not None and (context.gpus == 1
                                          or pipeline[0].worker_pipelining):
                 if node is not pipeline[-1]:
                     continue

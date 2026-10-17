@@ -33,12 +33,12 @@ def plan_region(region, context) -> tuple[PhysicalCandidate, ...]:
     logical = region.logical_plan
     plan = build_physical_plan(
         logical, model=context.model, device=context.device,
-        doc_tokens=context.document_tokens, gpus=context.gpu_count,
+        document_tokens=context.document_tokens, gpus=context.gpus,
         order=context.order, pair_fractions=context.pair_fractions,
         context=context)
     if isinstance(plan, Refusal):
         return (PhysicalCandidate(None, plan, float("inf"), logical),)
-    refusal = joined_classification_refusal(plan.graph, context.gpu_count)
+    refusal = joined_classification_refusal(plan.graph, context.gpus)
     if refusal is not None:
         return (PhysicalCandidate(None, refusal, float("inf"), logical),)
     plan = bind_runtime_data(plan, region, context)
@@ -55,12 +55,12 @@ def bind_runtime_data(plan, region, context):
         if isinstance(node, AiFilter):
             predicates = filters[node.alias]
             question = tuple(context.lowered(
-                predicates[node.written_pos].prompt).tail_token_ids)
+                predicates[node.written_position].prompt).tail_token_ids)
             if not question:
                 raise ValueError("filter prompts have no token ids")
             node = replace(node, question_token_ids=question)
         elif isinstance(node, AiJoin):
-            prompt = context.lowered(joins[node.written_pos].prompt)
+            prompt = context.lowered(joins[node.written_position].prompt)
             runtime_ids = {
                 alias: (tuple(label), tuple(frame))
                 for alias, label, frame in prompt.label_token_ids

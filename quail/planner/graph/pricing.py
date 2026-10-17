@@ -47,7 +47,7 @@ class PlanPricer:
             document tokens.
         statistics: The plan's PlanStatistics.
         stage_works: Join written position -> the Work its stage does.
-        live: alias -> documents expected after its filters.
+        expected_rows: alias -> documents expected after its filters.
         resident_asks: Aliases whose first ask reads KV a step before
             it left.
     """
@@ -55,7 +55,7 @@ class PlanPricer:
     context: object
     statistics: object
     stage_works: dict
-    live: dict
+    expected_rows: dict
     resident_asks: frozenset = frozenset()
 
     def __call__(self, graph: PhysicalGraph) -> tuple[float, dict]:
@@ -74,7 +74,7 @@ class PlanPricer:
         return self._seconds(work) + seconds, entries
 
     def _priced(self, graph) -> dict:
-        pipelines = build_pipelines(graph, self.context.gpu_count)
+        pipelines = build_pipelines(graph, self.context.gpus)
         anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
         last_filters = {node.alias: node.node_id for node in graph.nodes
                         if isinstance(node, AiFilter)}
@@ -93,7 +93,9 @@ class PlanPricer:
                 if node.alias in anchored and last_filters[node.alias] == node.node_id:
                     entry.update(self._release_recompute(node))
             elif isinstance(node, AiJoin):
-                price = NodePrice(work=self.stage_works.get(node.written_pos, Work()))
+                price = NodePrice(
+                    work=self.stage_works.get(node.written_position, Work())
+                )
                 entry["seconds"] = self._seconds(price.work)
             elif isinstance(node, (AiScore, AiClassify, AiExtract)) \
                     and node.spec is not None:
@@ -114,27 +116,30 @@ class PlanPricer:
         question = node.question_tokens
         mean_prefix = self._mean_prefix(node)
         if resident:
-            return ask(mean_prefix, question, window=window) * node.expected_docs
+            return ask(mean_prefix, question, window=window) * node.expected_rows
         shared = self._shared(node, node.alias)
         if shared is None:
-            return scan(mean_prefix, question, window=window) * node.expected_docs
+            return scan(mean_prefix, question, window=window) * node.expected_rows
         lengths = self.context.document_tokens[node.alias]
         work = Work()
-        for length, borrowed in zip(lengths, shared):
+        for length, shared in zip(lengths, shared):
             prefix = node.preamble_tokens + int(length)
-            work += (ask(borrowed, prefix + question - borrowed, window=window)
-                     if borrowed else scan(prefix, question, window=window))
-        return work * (node.expected_docs / len(lengths))
+            work += (ask(shared, prefix + question - shared, window=window)
+                     if shared else scan(prefix, question, window=window))
+        return work * (node.expected_rows / len(lengths))
 
     def _mean_prefix(self, node: AiFilter) -> float:
-        return node.preamble_tokens + self.statistics.stats[node.alias].mean_doc_tokens
+        return (
+            node.preamble_tokens
+            + self.statistics.stats[node.alias].mean_document_tokens
+        )
 
     def _release_recompute(self, node: AiFilter) -> dict:
         """What a later join pays if the sequence's KV is released, not pinned."""
         prefix = self._mean_prefix(node)
         pages = budgets.pages(prefix)
         fits = self.statistics.cap_pages // max(1, pages)
-        excess = max(0.0, self.live.get(node.alias, 0.0) - fits)
+        excess = max(0.0, self.expected_rows.get(node.alias, 0.0) - fits)
         return {
             "release_recompute_tokens": round(excess * prefix),
             "release_recompute_seconds": self._seconds(
@@ -161,21 +166,21 @@ class PlanPricer:
         if isinstance(node, AiExtract):
             head, tail = spec.prompt_token_parts
 
-            def seconds(borrowed):
+            def seconds(shared):
                 return extract_estimate(
-                    spec.expected_inputs, context.document_tokens[alias], len(head),
+                    spec.expected_rows, context.document_tokens[alias], len(head),
                     len(tail), chunk=self.statistics.chunk, model=context.model,
-                    device=context.device, resident=resident, shared=borrowed,
+                    device=context.device, resident=resident, shared=shared,
                     max_answer_tokens=spec.max_answer_tokens,
                     draft_tokens=spec.draft_tokens, draft_policy=spec.draft_policy,
                     round_cost_per_token=spec.round_cost_per_token,
-                    workers=context.gpu_count).seconds
+                    gpus=context.gpus).seconds
 
             whole = seconds(None)
             return seconds(shared) / whole if whole else 1.0
         if isinstance(node, AiClassify):
-            def seconds(borrowed):
-                return classify_scoring(context, alias, shared=borrowed).estimate_spec(
+            def seconds(shared):
+                return classify_scoring(context, alias, shared=shared).estimate_spec(
                     spec, resident).seconds
 
             whole = seconds(())

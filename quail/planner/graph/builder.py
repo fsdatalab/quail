@@ -89,7 +89,7 @@ def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
         nodes.append(HashJoin(
             node_id=f"hash_join:{left}-{right}",
             inputs=input_ports((by_alias[left], by_alias[right])),
-            left=left, right=right, on=on, written_pos=position,
+            left=left, right=right, on=on, written_position=position,
             pair_fraction=pair_fractions.get(position, 1.0)))
     return nodes
 
@@ -101,7 +101,7 @@ def regular_predicates(scan) -> tuple:
 
 
 def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
-                        device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
+                        device: DeviceSpec, document_tokens: dict, gpus: int = 1,
                         order: str | None = None, pair_fractions=None,
                         context: PlanningContext | None = None,
                         scan_fractions=None):
@@ -122,7 +122,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         plan: The logical plan to compile.
         model: Model spec.
         device: Device spec.
-        doc_tokens: alias -> list of per-document token counts.
+        document_tokens: alias -> list of per-document token counts.
         gpus: GPU count; one model copy runs per GPU.
         order: Stage order rule, 'by_cost' or 'as_written'; None picks
             the default rule. Reported in the plan's settings.
@@ -143,24 +143,24 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     if scan_fractions is None and context is not None:
         scan_fractions = context.scan_fractions
     operator_order = choose_operator_order(
-        plan, operators, model, device, doc_tokens, order,
+        plan, operators, model, device, document_tokens, order,
         pair_fractions, context, scan_fractions)
     if isinstance(operator_order, Refusal):
         return operator_order
-    return GraphBuilder(plan, model, device, doc_tokens, gpus, context,
+    return GraphBuilder(plan, model, device, document_tokens, gpus, context,
                         pair_fractions, operator_order).build()
 
 
 class GraphBuilder:
     """Construct native physical nodes in the selected operator order."""
 
-    def __init__(self, plan, model, device, doc_tokens, workers, context,
+    def __init__(self, plan, model, device, document_tokens, gpus, context,
                  pair_fractions, operator_order):
         self.plan = plan
         self.model = model
         self.device = device
-        self.doc_tokens = doc_tokens
-        self.workers = workers
+        self.document_tokens = document_tokens
+        self.gpus = gpus
         self.context = context
         self.pair_fractions = pair_fractions
         self.operator_order = operator_order
@@ -173,7 +173,7 @@ class GraphBuilder:
         self.join_applies = {}
         for apply in self.operators.applies:
             if apply.ids == "pairs":
-                self.join_applies.setdefault(apply.written_pos, []).append(apply)
+                self.join_applies.setdefault(apply.written_position, []).append(apply)
             else:
                 self.alias_applies.setdefault(apply.aliases[0], []).append(apply)
         self.ask_filters = {
@@ -224,10 +224,10 @@ class GraphBuilder:
             anchor = group[0][1]
             for spec, _ in group:
                 if any(apply.kind == "barrier"
-                       for apply in self.join_applies.get(spec.written_pos, ())):
+                       for apply in self.join_applies.get(spec.written_position, ())):
                     barrier_aliases.add(anchor)
         self.streamed = retention.streamed_aliases(
-            self.sequence_groups, set(self.ask_filters), barrier_aliases, self.workers)
+            self.sequence_groups, set(self.ask_filters), barrier_aliases, self.gpus)
 
         self.nodes = []
         self.scoring = (ScoreLowering(self.context, self.nodes,
@@ -240,36 +240,36 @@ class GraphBuilder:
         ports_by_alias = {}
         for s in self.operators.scans:
             summary = summarize_alias(
-                self.doc_tokens[s.alias], self.model.sliding_window,
+                self.document_tokens[s.alias], self.model.sliding_window,
                 memo=self.context.memo if self.context is not None else None)
             shard_ranges, loads = contiguous_shards(
-                self.doc_tokens[s.alias], self.workers, total=summary.total
+                self.document_tokens[s.alias], self.gpus, total=summary.total
             )
-            sid = f"scan:{s.alias}"
+            scan_id = f"scan:{s.alias}"
             self.nodes.append(PhysicalScan(
-                node_id=sid,
+                node_id=scan_id,
                 alias=s.alias, input_id=s.alias,
-                n_docs=len(self.doc_tokens[s.alias]),
+                num_documents=len(self.document_tokens[s.alias]),
                 total_tokens=summary.total,
                 shard_ranges=shard_ranges,
                 shard_token_loads=tuple(loads),
                 predicates=regular_predicates(s),
-                expected_docs=(float(stats[s.alias].n_docs)
+                expected_rows=(float(stats[s.alias].num_documents)
                                if s.predicates else None)))
-            ports_by_alias[s.alias] = Ports(PortRef(sid, f"ids:{s.alias}"))
+            ports_by_alias[s.alias] = Ports(PortRef(scan_id, f"ids:{s.alias}"))
         # the hash join reads the scans; survivors thin its pairs at the AI join
         self.pairs_src = {}
         for node in hash_join_nodes(self.operators.joins, self.pair_fractions,
                                     [ports.ids for ports in ports_by_alias.values()]):
             self.nodes.append(node)
-            self.pairs_src[node.written_pos] = node
+            self.pairs_src[node.written_position] = node
 
         # aliases whose filter sequence runs in one pipeline with the
         # classification or join after it
         between = self.classified - self.after_joins
         self.pipelined = self.streamed | {
             alias for alias in self.ask_filters
-            if self.workers == 1 and alias in between}
+            if self.gpus == 1 and alias in between}
         return ports_by_alias
 
     def _emit_documents(self, ports_by_alias: dict) -> tuple:
@@ -286,11 +286,15 @@ class GraphBuilder:
             if s.alias not in self.extract_after:
                 kinds.add(EXTRACT)
             ports_by_alias[s.alias], rows = self._emit_steps(
-                s.alias, float(stats[s.alias].n_docs), kinds, ports_by_alias[s.alias])
+                s.alias,
+                float(stats[s.alias].num_documents),
+                kinds,
+                ports_by_alias[s.alias],
+            )
             row_ports += rows
         return ports_by_alias, row_ports
 
-    def _emit_steps(self, alias, live, kinds, ports) -> tuple:
+    def _emit_steps(self, alias, expected_rows, kinds, ports) -> tuple:
         """Emit the given kinds of a table's steps in run order.
 
         Consecutive steps of one kind are emitted together, each run
@@ -298,7 +302,7 @@ class GraphBuilder:
 
         Args:
             alias: The table.
-            live: The documents the first step reads.
+            expected_rows: The documents the first step reads.
             kinds: The step kinds to emit: ASK, CLASSIFY, EXTRACT.
             ports: Where the documents stand before the steps.
 
@@ -320,25 +324,27 @@ class GraphBuilder:
             positions = [step.key for step in run]
             resident = previous is not None and resident_after(previous, run[0])
             if kind != ASK and scores_pending:
-                ports = emit_projected_scores(self, alias, live, ports)
+                ports = emit_projected_scores(self, alias, expected_rows, ports)
                 scores_pending = False
             if kind == ASK and self.scoring is not None:
-                ports = emit_scores(self, alias, positions, live, ports)
+                ports = emit_scores(self, alias, positions, expected_rows, ports)
             elif kind == ASK:
-                ports = emit_filter(self, alias, positions, live, ports,
+                ports = emit_filter(self, alias, positions, expected_rows, ports,
                                        followed=run[-1] is not steps[-1])
             elif kind == CLASSIFY:
-                ports, rows = emit_classify(self, alias, live, positions, ports)
+                ports, rows = emit_classify(
+                    self, alias, expected_rows, positions, ports
+                )
                 row_ports += rows
             else:
-                ports, rows = emit_extract(self, alias, live, positions, ports,
+                ports, rows = emit_extract(self, alias, expected_rows, positions, ports,
                                            resident=resident)
                 row_ports += rows
             for step in run:
-                live *= step.selectivity
+                expected_rows *= step.selectivity
             previous = run[-1]
         if scores_pending:
-            ports = emit_projected_scores(self, alias, live, ports)
+            ports = emit_projected_scores(self, alias, expected_rows, ports)
         return ports, row_ports
 
     def _emit_joins(self, ports_by_alias: dict) -> tuple:
@@ -355,7 +361,7 @@ class GraphBuilder:
                   for group in self.sequence_groups]
         ports_by_alias = dict(ports_by_alias)
         joins = JoinPorts()
-        exec_idx = 0
+        exec_index = 0
         for g, group in enumerate(groups):
             anchor = self.sequence_groups[g][0][1]
             if group[0][0].cost is not None:
@@ -364,35 +370,39 @@ class GraphBuilder:
                 continue
             if g > 0:
                 ahead = [scan.alias for scan in self.operators.scans]
-                bid = self.unique_id("barrier", anchor)
+                barrier_id = self.unique_id("barrier", anchor)
                 self.nodes.append(Barrier(
-                    node_id=bid,
+                    node_id=barrier_id,
                     inputs=input_ports(tuple(joins.answers)
                                        + tuple(ports_by_alias[a].ids for a in ahead)),
                     next_anchor=anchor,
                     aliases=tuple(ahead)))
                 for a in ahead:
-                    ports_by_alias[a] = Ports(PortRef(bid, f"ids:{a}"))
-            if self.workers > 1:
+                    ports_by_alias[a] = Ports(PortRef(barrier_id, f"ids:{a}"))
+            if self.gpus > 1:
                 # anchors go to the GPU holding their KV, else balanced
-                xid = self.unique_id("exchange", anchor)
-                self.nodes.append(Exchange(
-                    node_id=xid,
-                    inputs=input_ports((ports_by_alias[anchor].ids,)),
-                    anchor=anchor))
-                ports_by_alias[anchor] = Ports(PortRef(xid, f"ids:{anchor}"))
-            gid = self.group_ids[g]
+                exchange_id = self.unique_id("exchange", anchor)
+                self.nodes.append(
+                    Exchange(
+                        node_id=exchange_id,
+                        inputs=input_ports((ports_by_alias[anchor].ids,)),
+                        anchor=anchor,
+                    )
+                )
+                ports_by_alias[anchor] = Ports(PortRef(exchange_id, f"ids:{anchor}"))
+            group_id = self.group_ids[g]
             for rank, (spec, step) in enumerate(group):
-                jid = gid if rank == 0 else f"{gid}:predicate:{spec.written_pos}"
-                joins.node_ids[spec.written_pos] = jid
+                join_id = (group_id if rank == 0
+                           else f"{group_id}:predicate:{spec.written_position}")
+                joins.node_ids[spec.written_position] = join_id
                 ports_by_alias[anchor], answers = emit_join(
-                    self, spec, step, anchor, jid, exec_idx, ports_by_alias)
+                    self, spec, step, anchor, join_id, exec_index, ports_by_alias)
                 if answers is not None:
                     joins.answers.append(answers)
                     for a in spec.aliases:
                         if a not in joins.aliases:
                             joins.aliases.append(a)
-                exec_idx += 1
+                exec_index += 1
         return ports_by_alias, joins
 
     def _emit_join_answers(self, ports_by_alias: dict, joins) -> list:
@@ -408,7 +418,7 @@ class GraphBuilder:
         for alias in sorted(self.after_joins | self.extract_after):
             met = sum(
                 effective_selectivity(join.selectivity)
-                * sum(self.operator_order.live[argument.alias]
+                * sum(self.operator_order.expected_rows[argument.alias]
                       for argument in join.prompt.args
                       if argument.alias != alias)
                 for join in self.operators.joins
@@ -419,7 +429,7 @@ class GraphBuilder:
             if alias in self.extract_after:
                 kinds.add(EXTRACT)
             ports_by_alias[alias], rows = self._emit_steps(
-                alias, self.operator_order.live[alias] * min(1.0, met), kinds,
+                alias, self.operator_order.expected_rows[alias] * min(1.0, met), kinds,
                 ports_by_alias[alias])
             row_ports += rows
         return row_ports
@@ -478,16 +488,16 @@ class GraphBuilder:
         """Build the plan and bind its pricer."""
         statistics = self.operator_order.statistics
         # a score join's work is in its AiScore's estimate
-        stage_works = {step.written_pos: step.work
+        stage_works = {step.written_position: step.work
                        for step in self.operator_order.join_steps
                        if not is_score(
-                           self.operators.joins[step.written_pos].predicate)}
+                           self.operators.joins[step.written_position].predicate)}
         pricer = PlanPricer(
             context=self.context, statistics=statistics, stage_works=stage_works,
-            live=self.operator_order.live,
+            expected_rows=self.operator_order.expected_rows,
             resident_asks=resident_asks(self.operator_order.step_orders))
         plan = PhysicalPlan(
-            model=self.model.name, device=self.device.name, workers=self.workers,
+            model=self.model.name, device=self.device.name, gpus=self.gpus,
             backend="quail", nodes=tuple(self.nodes),
             settings={
                 "chunk_tokens": statistics.chunk,
@@ -502,7 +512,7 @@ class GraphBuilder:
                     "estimated_fresh_tokens": self.scoring.work.tokens,
                     "estimated_attention_pairs": self.scoring.work.pairs,
                     "batching": "token_based_admission",
-                    "data_parallel_copies": self.workers,
+                    "data_parallel_copies": self.gpus,
                     "score_normalization": {
                         "reranker": "yes_no_softmax",
                         "decision": "decision_head_softmax",
@@ -526,15 +536,15 @@ class GraphBuilder:
     def emit_applies(self, alias, ports) -> Ports:
         """Append the alias's apply() functions; return where its documents stand."""
         for apply in self.alias_applies.get(alias, ()):
-            aid = f"apply:{apply.function}"
+            apply_id = f"apply:{apply.function}"
             self.nodes.append(Foreign(
-                node_id=aid,
+                node_id=apply_id,
                 inputs=input_ports((ports.ids,)),
                 function=apply.function, kind=apply.kind, ids=apply.ids,
                 columns=tuple((ref.alias, ref.column)
                               for ref in apply.columns),
                 aliases=(alias,)))
-            ports = Ports(PortRef(aid, f"ids:{alias}"))
+            ports = Ports(PortRef(apply_id, f"ids:{alias}"))
         return ports
 
 

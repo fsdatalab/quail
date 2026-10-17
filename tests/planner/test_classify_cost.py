@@ -25,8 +25,8 @@ def _cost(lengths, labels=LABELS, scoring="trie_decode", **kwargs):
     options = dict(lengths=lengths, shared=(), chunk=CHUNK,
                    model=QWEN3_4B_FP8, device=H100_SXM)
     options.update(kwargs)
-    live = options.pop("live", len(lengths))
-    return estimate(scoring, live, HEAD, FRAME, labels, **options)
+    expected_rows = options.pop("expected_rows", len(lengths))
+    return estimate(scoring, expected_rows, HEAD, FRAME, labels, **options)
 
 
 def _head_bytes():
@@ -211,15 +211,17 @@ def test_kv_capacity_does_not_enter_the_estimate():
         assert first == second
 
 
-@pytest.mark.parametrize("live", [0, 0.25, 1.8, 7])
-def test_the_estimate_is_linear_in_the_expected_document_count(live):
-    cost = _cost((10,), live=live)
+@pytest.mark.parametrize("expected_rows", [0, 0.25, 1.8, 7])
+def test_the_estimate_is_linear_in_the_expected_document_count(expected_rows):
+    cost = _cost((10,), expected_rows=expected_rows)
     single = _cost((10,))
-    assert cost.rounds == (2 if live else 0)
+    assert cost.rounds == (2 if expected_rows else 0)
     assert asdict(cost.work) == pytest.approx(
-        {key: value * live for key, value in asdict(single.work).items()})
+        {key: value * expected_rows for key, value in asdict(single.work).items()})
     for name in ("seconds", "passes", "suffix_tokens"):
-        assert getattr(cost, name) == pytest.approx(getattr(single, name) * live)
+        assert getattr(cost, name) == pytest.approx(
+            getattr(single, name) * expected_rows
+        )
 
 
 def _decision_readout_seconds(model, rows, passes):
@@ -234,9 +236,19 @@ def test_decision_models_read_option_rows_through_their_head(resident):
     model = DECISION_2_KAI_0_6B_BF16
     assert model.decision_head_dim == 256
     lengths, options = (10, 20, 30), 26
-    cost = estimate_suffixes(HEAD, FRAME, [50], live=len(lengths), lengths=lengths,
-                           shared=(), chunk=CHUNK, model=model, device=H100_SXM,
-                           resident=resident, answer_rows=options + 1)
+    cost = estimate_suffixes(
+        HEAD,
+        FRAME,
+        [50],
+        expected_rows=len(lengths),
+        lengths=lengths,
+        shared=(),
+        chunk=CHUNK,
+        model=model,
+        device=H100_SXM,
+        resident=resident,
+        answer_rows=options + 1,
+    )
     work = Work()
     for length in lengths:
         prefix = HEAD + length
@@ -253,8 +265,8 @@ def test_decision_models_read_option_rows_through_their_head(resident):
     assert cost.seconds < unrounded_seconds(work, model, H100_SXM, CHUNK) + vocabulary
     without_rate = replace(H100_SXM, fp32_flops=0.0)
     with pytest.raises(ValueError, match="fp32"):
-        estimate_suffixes(HEAD, FRAME, [50], live=3, lengths=lengths, shared=(),
-                        chunk=CHUNK, model=model, device=without_rate,
+        estimate_suffixes(HEAD, FRAME, [50], expected_rows=3, lengths=lengths,
+                        shared=(), chunk=CHUNK, model=model, device=without_rate,
                         answer_rows=options + 1)
 
 

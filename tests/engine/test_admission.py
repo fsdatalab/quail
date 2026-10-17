@@ -199,7 +199,7 @@ def test_ready_requests_fill_remaining_tokens_without_starving_skipped_requests(
 
 def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
                  pages=64, cap=None, order=(0, 1, 2), attention_mode=None,
-                 docs=None, tree=None, stop_groups=None):
+                 documents=None, tree=None, stop_groups=None):
     """Run a one-question filter over three documents.
 
     By default, document 1 shares its first 32 tokens with document 0.
@@ -227,19 +227,19 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
     arena = cpu_arena(pages)
     if cap is not None:
         arena.retention_cap_pages = cap
-    if docs is None:
-        docs = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 32, [DOC + 2] * 64]
+    if documents is None:
+        documents = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 32, [DOC + 2] * 64]
     if tree is None:
         tree = PrefixTree(order=list(order), parent=[None, 0, None],
                           shared=[0, 32, 0])
     stats = {}
     from quail.backends.quail.executor.parts import settle_documents
 
-    keys = [("r", d) for d in range(len(docs))]
+    keys = [("r", d) for d in range(len(documents))]
     got, _, tokens = run_stages(
         fake_torch(), arena, pipeline, filter_stages([[QUESTION]], answers),
-        docs, budget, anchor_keys=keys, prefix_tree=tree, limit=limit,
-        on_settled=settle_documents(arena, keys, docs, bool(retain), budget),
+        documents, budget, anchor_keys=keys, prefix_tree=tree, limit=limit,
+        on_settled=settle_documents(arena, keys, documents, bool(retain), budget),
         attention_mode=attention_mode, stats=stats, stop_groups=stop_groups,
         default_attention="unified")
     got = {document: list(row) for document, row in got[0].items()}
@@ -265,13 +265,13 @@ def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
     # attention: the siblings follow their parent in one run, each
     # naming it as the read key, and the other root comes at its place
     # in tree order
-    docs = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 8, [DOC + 2] * 64,
+    documents = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 8, [DOC + 2] * 64,
             [DOC] * 32 + [DOC + 3] * 8]
     tree = PrefixTree(order=[0, 1, 3, 2], parent=[None, 0, None, 0],
                       shared=[0, 32, 0, 32])
     got, tokens, borrowed, arena = _tree_filter(
         monkeypatch, truth={0: [1], 1: [1], 2: [1], 3: [1]}, budget=500,
-        docs=docs, tree=tree, attention_mode="tree")
+        documents=documents, tree=tree, attention_mode="tree")
     assert got == {0: [1], 1: [1], 2: [1], 3: [1]}
     assert tokens == 64 + 8 + 8 + 64 + 4
     assert borrowed == 64
@@ -281,14 +281,14 @@ def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
 
     # a child that is itself a parent packs after its own parent even
     # when its document index is smaller
-    docs = [[DOC] * 48 + [DOC + 1] * 16, [DOC] * 48 + [DOC + 1] * 16 + [5] * 8,
+    documents = [[DOC] * 48 + [DOC + 1] * 16, [DOC] * 48 + [DOC + 1] * 16 + [5] * 8,
             [DOC] * 48]
     tree = PrefixTree(order=[2, 0, 1], parent=[2, 0, None],
                       shared=[48, 64, 0])
     packed.clear()
     got, tokens, borrowed, arena = _tree_filter(
         monkeypatch, truth={0: [1], 1: [1], 2: [1]}, budget=500,
-        docs=docs, tree=tree, attention_mode="tree")
+        documents=documents, tree=tree, attention_mode="tree")
     assert packed == [[(("r", 2), 0, None), (("r", 0), 48, ("r", 2)),
                        (("r", 1), 64, ("r", 0))]]
     assert tokens == 48 + 16 + 8 + 3

@@ -15,12 +15,12 @@ from quail.backends.quail.executor.stages import Stage, run_stages
 def test_append_stages_launch_between_document_decisions(path, budget, pages,
                                                        shared_readout, monkeypatch):
     cpu_staging(monkeypatch)
-    docs = [[a + 1, 20, 21, 22] for a in range(8)]
+    documents = [[a + 1, 20, 21, 22] for a in range(8)]
     frame = [70, 71]
     suffixes = [[40], [50], [51], [52]]
     answers, expected = {}, {}
-    for a, doc in enumerate(docs):
-        context = doc + frame
+    for a, document in enumerate(documents):
+        context = document + frame
         for j, suffix in enumerate(suffixes):
             context += suffix
             hashed = chain(context)
@@ -31,7 +31,7 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
     original = StageExecutor._run_one
 
     def launch(self, groups):
-        assert len(self.own) <= len(docs)
+        assert len(self.own) <= len(documents)
         executors[:] = [self]
         events.append(("launch", tuple(groups)))
         return original(self, groups)
@@ -52,11 +52,13 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
     setup = Setup(path=path, budget=budget, pages=pages)
     run = Run(setup, answers)
     out, _, tokens = run_stages(
-        run.torch, run.arena, run.pipeline, stages, docs, budget,
-        anchor_keys=[("d", a) for a in range(len(docs))], attention_mode=path)
+        run.torch, run.arena, run.pipeline, stages, documents, budget,
+        anchor_keys=[("d", a) for a in range(len(documents))], attention_mode=path)
     for (a, j), want in expected.items():
         assert out[j][a] == want
-    assert tokens == sum(map(len, docs)) + len(docs) * (len(frame) + len(suffixes))
+    assert tokens == sum(map(len, documents)) + len(documents) * (
+        len(frame) + len(suffixes)
+    )
     assert not run.arena.accounting.owned
     assert not executors[0].own
     first_round = next(i for i, event in enumerate(events)
@@ -70,5 +72,5 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
     elif pages == 400:
         decided = [event[2] for event in events[:first_round]
                    if event[0:2] == ("decide", 0)]
-        assert len(decided) == len(docs) // 2
+        assert len(decided) == len(documents) // 2
         assert {a for a, *_ in events[first_round][1]} == set(decided)

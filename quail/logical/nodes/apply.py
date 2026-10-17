@@ -28,7 +28,7 @@ class Apply:
     over, ``barrier`` once over every survivor. ``ids`` says what it
     returns: ``preserve`` every input id, ``drop`` a subset of them,
     ``pairs`` a relation of (left alias, right alias) rows for the join
-    at ``written_pos``. A function never invents an id.
+    at ``written_position``. A function never invents an id.
     """
 
     input: LogicalNode
@@ -37,7 +37,7 @@ class Apply:
     ids: str
     columns: tuple  # tuple[ColumnRef, ...]
     aliases: tuple  # the alias, or the join's two aliases
-    written_pos: Optional[int] = None
+    written_position: Optional[int] = None
 
     type_name: ClassVar[str] = "quail.apply"
 

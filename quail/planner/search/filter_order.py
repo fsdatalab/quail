@@ -41,11 +41,11 @@ def order_filters_indexed(predicates, rule: str, *, count: float = 1,
         return indices
     costs = {}
 
-    def cost(i, live, first):
-        key = (i, live, first)
+    def cost(i, expected_rows, first):
+        key = (i, expected_rows, first)
         if key not in costs:
             p = predicates[i]
-            costs[key] = (p.first if first else p.later)(live)
+            costs[key] = (p.first if first else p.later)(expected_rows)
         return costs[key]
 
     def fresh(previous, i) -> bool:
@@ -62,7 +62,7 @@ def order_filters_indexed(predicates, rule: str, *, count: float = 1,
     for first in starters:
         ordered = [first]
         total = cost(first, count, True)
-        live = count * predicates[first].selectivity
+        expected_rows = count * predicates[first].selectivity
         scored = ({predicates[first].reuse_key}
                   if predicates[first].reuse_key is not None else set())
         remaining = [i for i in indices if i != first]
@@ -71,17 +71,24 @@ def order_filters_indexed(predicates, rule: str, *, count: float = 1,
             choices = []
             for i in remaining:
                 p = predicates[i]
-                seconds = (0.0 if p.reuse_key in scored else
-                           cost(i, live if live > 0 else 1.0, fresh(previous, i)))
+                seconds = (
+                    0.0
+                    if p.reuse_key in scored
+                    else cost(
+                        i,
+                        expected_rows if expected_rows > 0 else 1.0,
+                        fresh(previous, i),
+                    )
+                )
                 rejected = 1.0 - p.selectivity
                 rank = (seconds / rejected if rejected > 0 else
                         0.0 if seconds == 0 else float("inf"))
-                choices.append((rank, i, seconds if live > 0 else 0.0))
+                choices.append((rank, i, seconds if expected_rows > 0 else 0.0))
             _, selected, seconds = min(choices)
             total += seconds
             ordered.append(selected)
             previous = selected
-            live *= predicates[selected].selectivity
+            expected_rows *= predicates[selected].selectivity
             if predicates[selected].reuse_key is not None:
                 scored.add(predicates[selected].reuse_key)
             remaining.remove(selected)

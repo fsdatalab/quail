@@ -55,12 +55,12 @@ class AiJoin(PhysicalNode):
     anchor: str = ""
     anchor_resident: str = "none"
     keep_kv: bool = False
-    written_pos: int = 0
-    exec_idx: int = 0
+    written_position: int = 0
+    exec_index: int = 0
     partners: tuple[str, ...] = ()
     semantics: str = "full"
     selectivity: float | None = None
-    expected_tuples: float = 0.0
+    expected_rows: float = 0.0
     anchor_frame_tokens: int = 0
     pair_tail_tokens: int = 0
     tuple_tokens: float = 0.0
@@ -89,7 +89,7 @@ class AiJoin(PhysicalNode):
         return (self.anchor,)
 
     def document_outputs(self, alias: str) -> tuple[str, ...]:
-        return (f"join_answers:{self.written_pos}", f"ids:{alias}")
+        return (f"join_answers:{self.written_position}", f"ids:{alias}")
 
     def can_precede(self, consumer: PhysicalNode) -> bool:
         # classify.py imports AiJoin, so AiClassify is imported at call time
@@ -108,7 +108,7 @@ class AiJoin(PhysicalNode):
             schema=(self.anchor,),
         )]
         outputs.append(OutputPort(
-            f"join_answers:{self.written_pos}",
+            f"join_answers:{self.written_position}",
             ValueType.JOIN_ANSWERS,
             schema=(self.anchor, *self.partners, "answer"),
         ))
@@ -116,13 +116,13 @@ class AiJoin(PhysicalNode):
 
     def explain_fields(self) -> dict:
         return {
-            "written_pos": self.written_pos,
-            "exec_idx": self.exec_idx,
+            "written_position": self.written_position,
+            "exec_index": self.exec_index,
             "anchor": self.anchor,
             "partners": list(self.partners),
             "semantics": self.semantics,
             "selectivity": self.selectivity,
-            "expected_tuples": self.expected_tuples,
+            "expected_rows": self.expected_rows,
             "anchor_frame_tokens": self.anchor_frame_tokens,
             "pair_tail_tokens": self.pair_tail_tokens,
             "anchor_resident": self.anchor_resident,
@@ -150,13 +150,13 @@ class AiJoin(PhysicalNode):
             keep_kv=bool(value["keep_kv"]),
             attention=str(value["attention"]),
             share_prefixes=bool(value["share_prefixes"]),
-            written_pos=int(value["written_pos"]),
-            exec_idx=int(value["exec_idx"]),
+            written_position=int(value["written_position"]),
+            exec_index=int(value["exec_index"]),
             anchor=str(value["anchor"]),
             partners=tuple(value["partners"]),
             semantics=str(value["semantics"]),
             selectivity=value["selectivity"],
-            expected_tuples=float(value["expected_tuples"]),
+            expected_rows=float(value["expected_rows"]),
             anchor_frame_tokens=int(value["anchor_frame_tokens"]),
             pair_tail_tokens=int(value["pair_tail_tokens"]),
             anchor_resident=str(value["anchor_resident"]),
@@ -187,7 +187,7 @@ class Foreign(PhysicalNode):
     ids: str = "drop"
     columns: tuple[tuple[str, str], ...] = ()
     aliases: tuple[str, ...] = ()
-    written_pos: int = -1
+    written_position: int = -1
 
     type_name: ClassVar[str] = "quail.foreign"
     runtime_key: ClassVar[str] = type_name
@@ -205,14 +205,14 @@ class Foreign(PhysicalNode):
 
     def document_outputs(self, alias: str) -> tuple[str, ...]:
         if self.ids == "pairs":
-            return (f"pairs:{self.written_pos}",)
+            return (f"pairs:{self.written_position}",)
         return super().document_outputs(alias)
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         if self.ids == "pairs":
             return (OutputPort(
-                f"pairs:{self.written_pos}", ValueType.PAIRS,
+                f"pairs:{self.written_position}", ValueType.PAIRS,
                 schema=tuple(self.aliases)),)
         (alias,) = self.aliases
         return (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
@@ -225,7 +225,7 @@ class Foreign(PhysicalNode):
             "ids": self.ids,
             "columns": [list(column) for column in self.columns],
             "aliases": list(self.aliases),
-            "written_pos": self.written_pos,
+            "written_position": self.written_position,
         }
 
     @classmethod
@@ -241,7 +241,7 @@ class Foreign(PhysicalNode):
                 for alias, column in attributes["columns"]
             ),
             aliases=tuple(attributes["aliases"]),
-            written_pos=int(attributes["written_pos"]),
+            written_position=int(attributes["written_position"]),
         )
 
 
@@ -251,7 +251,7 @@ class HashJoin(PhysicalNode):
 
     ``on`` lists (left column, right column) pairs; a row pair is kept
     when every listed pair of values is equal. The node reads the key
-    columns as values and writes the pairs the join at ``written_pos``
+    columns as values and writes the pairs the join at ``written_position``
     asks the model about. ``pair_fraction`` is the planner's estimate
     of the pairs kept over the cross product.
     """
@@ -259,7 +259,7 @@ class HashJoin(PhysicalNode):
     left: str = ""
     right: str = ""
     on: tuple[tuple[str, str], ...] = ()
-    written_pos: int = -1
+    written_position: int = -1
     pair_fraction: float = 1.0
 
     type_name: ClassVar[str] = "quail.hash_join"
@@ -268,7 +268,7 @@ class HashJoin(PhysicalNode):
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
-        return (OutputPort(f"pairs:{self.written_pos}", ValueType.PAIRS,
+        return (OutputPort(f"pairs:{self.written_position}", ValueType.PAIRS,
                            schema=(self.left, self.right)),)
 
     def attributes(self) -> dict:
@@ -276,7 +276,7 @@ class HashJoin(PhysicalNode):
             "left": self.left,
             "right": self.right,
             "on": [list(condition) for condition in self.on],
-            "written_pos": self.written_pos,
+            "written_position": self.written_position,
             "pair_fraction": self.pair_fraction,
         }
 
@@ -289,6 +289,6 @@ class HashJoin(PhysicalNode):
             right=str(attributes["right"]),
             on=tuple((str(left), str(right))
                      for left, right in attributes["on"]),
-            written_pos=int(attributes["written_pos"]),
+            written_position=int(attributes["written_position"]),
             pair_fraction=float(attributes.get("pair_fraction", 1.0)),
         )

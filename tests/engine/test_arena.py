@@ -8,7 +8,7 @@ from quail.backends.quail.executor.pages import PageArena
 
 
 def test_allocation_retention_rewind_and_pinning():
-    a = PageArena(n_pages=10, page_tokens=16)
+    a = PageArena(num_pages=10, page_tokens=16)
     pages = a.alloc("d0", 40)      # 3 pages
     assert len(pages) == 3
     assert a.free_pages == 7
@@ -25,28 +25,28 @@ def test_allocation_retention_rewind_and_pinning():
         a.alloc("d", 5)
 
     rng = random.Random(5)
-    a = PageArena(n_pages=64, page_tokens=16)
-    live = {}
+    a = PageArena(num_pages=64, page_tokens=16)
+    expected_rows = {}
     for step in range(500):
-        if live and rng.random() < 0.45:
-            key = rng.choice(sorted(live))
+        if expected_rows and rng.random() < 0.45:
+            key = rng.choice(sorted(expected_rows))
             a.free_key(key)
-            del live[key]
+            del expected_rows[key]
         else:
             key = f"d{step}"
             got = a.alloc(key, rng.randrange(1, 200))
             if got is not None:
-                live[key] = got
-        held = [p for pages in live.values() for p in pages]
+                expected_rows[key] = got
+        held = [p for pages in expected_rows.values() for p in pages]
         assert len(held) == len(set(held)), "page double-owned"
         assert len(held) + a.free_pages == 64, "pages leaked"
 
-    a = PageArena(n_pages=3, page_tokens=4)
+    a = PageArena(num_pages=3, page_tokens=4)
     a.alloc("doc", 4)
     assert a.grow("doc", 12) == 2
     assert a.grow("doc", 16) is None
 
-    a = PageArena(n_pages=10, page_tokens=4)
+    a = PageArena(num_pages=10, page_tokens=4)
     a.alloc("doc", 7, capacity_tokens=11)
     assert len(a.owned["doc"]) == 3
 
@@ -64,7 +64,7 @@ def test_allocation_retention_rewind_and_pinning():
     assert not a.pinned
     assert not a.retained
 
-    a = PageArena(n_pages=4, page_tokens=16)
+    a = PageArena(num_pages=4, page_tokens=16)
     a.alloc("one-page", 16)
     a.alloc("two-pages", 17)
     a.retain("one-page")
@@ -72,7 +72,7 @@ def test_allocation_retention_rewind_and_pinning():
 
     assert a.pop_retained_victim() == ("two-pages", 2, 17)
 
-    a = PageArena(n_pages=2, page_tokens=16)
+    a = PageArena(num_pages=2, page_tokens=16)
     a.alloc("doc", 16)
     a.retain("doc")
     a.pin("doc")
@@ -81,7 +81,7 @@ def test_allocation_retention_rewind_and_pinning():
 
 
 def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
-    a = PageArena(n_pages=10, page_tokens=16)
+    a = PageArena(num_pages=10, page_tokens=16)
     parent = a.alloc("p", 40)                 # pages for 40 tokens: 3
     child = a.alloc("c", 50, borrowed=a.shared_pages("p", 32))  # borrows 2, owns 2
     assert len(child) == 2 and a.free_pages == 5

@@ -252,7 +252,7 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
             token_lengths=(3, 4, 2), summaries=summaries,
             mean_tokens=sum(summary.mean for summary in summaries),
             model=QWEN3_4B_FP8, device=H100_SXM, chunk_tokens=8192,
-            capacity=capacity, workers=1, draws=1)
+            capacity=capacity, gpus=1, draws=1)
         expected = Work()
         for a, left in enumerate(lengths[0]):
             for b, right in enumerate(lengths[1]):
@@ -283,7 +283,7 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
 def test_score_filters_compare_values_and_keep_pair_answers(catalog):
     node = Filter(node_id="filter",
                   predicate=RegularPredicate(ColumnRef("r", "", "score"), ">", 0.5),
-                  aliases=("q", "d"), written_pos=0)
+                  aliases=("q", "d"), written_position=0)
     table = Rows({"q": [0, 0, 1, 1], "d": [0, 1, 0, 1]},
                  pa.table({"score": pa.array([0.9, 0.1, 0.2, 0.8], pa.float64())}))
     result = FilterRuntime().execute(
@@ -341,11 +341,11 @@ def test_score_filter_order_is_chosen_by_cost_and_honors_override(catalog, model
     for rule, expected in (("by_cost", [1, 0]), ("as_written", [0, 1])):
         query = session.sql(sql, order=rule)
         physical = query.plan()
-        assert [node.written_pos for node in physical.nodes
+        assert [node.written_position for node in physical.nodes
                 if isinstance(node, Filter)] == expected
         assert physical.settings["order_rule"] == rule
         scores = [node for node in physical.nodes if isinstance(node, AiScore)]
-        assert [node.spec.expected_inputs for node in scores] == [2.0, 0.4]
+        assert [node.spec.expected_rows for node in scores] == [2.0, 0.4]
     session.close()
 
 
@@ -573,11 +573,11 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     query = session.sql(_score_sql(True)[1])
     request = query._prepare_physical()
     physical = query.plan()
-    assert (physical.workers, physical.settings["data_parallel_copies"]) == (2, 2)
+    assert (physical.gpus, physical.settings["data_parallel_copies"]) == (2, 2)
     assert not any(isinstance(node, Filter) for node in physical.nodes)
     node = next(node for node in physical.nodes if isinstance(node, AiScore))
     assert node.spec.aliases == ("q", "d")
-    assert node.spec.expected_inputs == 4
+    assert node.spec.expected_rows == 4
     assert node.spec.pair_fraction == 1.0
     assert node.spec.estimated_seconds > 0
     graph = physical.graph
@@ -599,10 +599,10 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
             rows = sub["inputs"]["score_rows"]
             assert all(row[0] % 2 == worker for row in rows)
             model = RerankerModelExecution.__new__(RerankerModelExecution)
-            model.documents = sub["inputs"].get("documents", execution.docs)
+            model.documents = sub["inputs"].get("documents", execution.documents)
             for alias, documents in model.documents.items():
-                assert [list(doc) for doc in documents] == [
-                    list(doc) for doc in execution.docs[alias]
+                assert [list(document) for document in documents] == [
+                    list(document) for document in execution.documents[alias]
                 ]
             model.reranker = _FakeReranker([a / 2 + b / 4 for a, b in rows])
             results.append(model.execute_rows(node, rows))
@@ -650,7 +650,7 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     def graph(aliases, draws=1):
         spec = ScoreSpec(
             name="score", aliases=aliases, query_template="", arguments=(),
-            expected_inputs=20, estimated_seconds=10.0,
+            expected_rows=20, estimated_seconds=10.0,
             prompt_token_parts=((1,),) * (len(aliases) + 1), draws=draws)
         nodes = tuple(Scan(node_id=f"input:{alias}", alias=alias,
                            input_id=alias) for alias in aliases)
@@ -672,13 +672,13 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
                           [f"{shared} {9000 + r}" for r in range(20)])
     plain = _shared_store(tmp_path / "plain.arrow",
                           [f"{9000 + r} 1 2" for r in range(20)])
-    context = PlanningContext(model=QWEN3_4B_FP8, device=H100_SXM, gpu_count=2,
+    context = PlanningContext(model=QWEN3_4B_FP8, device=H100_SXM, gpus=2,
                               document_tokens={"d": store.lengths,
                                                "e": plain.lengths},
                               backend="quail")
     def pricer(context):
         return PlanPricer(context=context, statistics=SimpleNamespace(
-            chunk=1000, stats={}, cap_pages=0), stage_works={}, live={})
+            chunk=1000, stats={}, cap_pages=0), stage_works={}, expected_rows={})
 
     rewritten = ShouldSharePrefixes().rewrite(graph(("d",)), context)
     spec = scored(rewritten)
@@ -690,7 +690,7 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     # the plan's total moves by the score's change
     unshared = graph(("d",))
     plan = apply_plan_rules(
-        PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", workers=2,
+        PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", gpus=2,
                      nodes=unshared.nodes, root=unshared.root,
                      estimator=pricer(context)),
         (ShouldSharePrefixes(),), context)

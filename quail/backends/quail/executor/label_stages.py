@@ -123,7 +123,7 @@ def document_prefixes(spec, documents, rows) -> list:
     """
     head, _ = spec.prompt_token_parts
     (alias,) = spec.aliases
-    return [concat_tokens(head, documents[alias][doc]) for doc in rows]
+    return [concat_tokens(head, documents[alias][document]) for document in rows]
 
 
 @dataclass

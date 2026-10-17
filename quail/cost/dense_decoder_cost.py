@@ -17,9 +17,9 @@ from quail.specs import ModelSpec
 def attention_projection_params(model: ModelSpec) -> int:
     """Return Q, K, V, and output projection parameters over the layers."""
     h = model.hidden
-    return sum(h * model.n_q * head + 2 * h * n_kv * head
-               + model.n_q * head * h
-               for n_kv, head in model.kv_shapes)
+    return sum(h * model.num_q_heads * head + 2 * h * num_kv_heads * head
+               + model.num_q_heads * head * h
+               for num_kv_heads, head in model.kv_shapes)
 
 
 def mlp_params(model: ModelSpec) -> int:
@@ -50,9 +50,9 @@ def attention_pair_flops(model: ModelSpec) -> tuple[int, int]:
     full_flops = sliding_flops = 0
     for layer, (_, head) in enumerate(model.kv_shapes):
         if layer in sliding:
-            sliding_flops += 4 * model.n_q * head
+            sliding_flops += 4 * model.num_q_heads * head
         else:
-            full_flops += 4 * model.n_q * head
+            full_flops += 4 * model.num_q_heads * head
     return full_flops, sliding_flops
 
 

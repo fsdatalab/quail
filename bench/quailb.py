@@ -195,13 +195,13 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
     # which the benchmark does not take
     names = list(info.columns)
     started = time.perf_counter()
-    rows = result.collect()
+    table = result.collect()
     collection_s = time.perf_counter() - started
     spans = [f"{struct.name}{SPAN_SUFFIX}" for struct in info.structs]
-    rows = rows.drop_columns([name for name in rows.column_names
+    table = table.drop_columns([name for name in table.column_names
                               if name in spans])
     return RunOutput(
-        filter_answers, join_answers, rows.rename_columns(names),
+        filter_answers, join_answers, table.rename_columns(names),
         result.report["wall_s"], dict(result.report, collection_s=collection_s),
         classify_answers=classify_answers or None,
         score_answers=score_answers or None,
@@ -433,7 +433,7 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
     return refused
 
 
-def run_suite(only=None, *, sf=0.1, config, data_dir=None,
+def run_suite(only=None, *, scale_factor=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
               h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
     """Run Quail queries through QUAIL-B and save the benchmark report.
@@ -468,14 +468,14 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
     if not only:
         # every query was skipped: a record with no queries, in the
         # shape a run of them would leave
-        return _empty_record(skipped, sf=sf, data_dir=data_dir,
+        return _empty_record(skipped, scale_factor=scale_factor, data_dir=data_dir,
                              ground_truth_collection=ground_truth_collection,
                              root=root, config=config, metadata=metadata,
                              h100_usd_per_hour=h100_usd_per_hour,
                              output_dir=output_dir)
     with quail.Session(config) as session:
         record = benchmark.run(
-            partial(run_query, session), queries=only, scale_factor=sf,
+            partial(run_query, session), queries=only, scale_factor=scale_factor,
             output_dir=output_dir, data_dir=data_dir,
             collection_id=ground_truth_collection, root=root,
             gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
@@ -486,19 +486,19 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
         return record
 
 
-def _empty_record(skipped, *, sf, data_dir, ground_truth_collection, root,
+def _empty_record(skipped, *, scale_factor, data_dir, ground_truth_collection, root,
                   config, metadata, h100_usd_per_hour, output_dir) -> dict:
     """Build a run record for a suite in which every query was skipped."""
     from quail_b import __version__
     from quail_b.run import RUN_SCHEMA_VERSION
 
     suite = benchmark.load_benchmark(
-        sorted(skipped)[:1], scale_factor=sf, data_dir=data_dir,
+        sorted(skipped)[:1], scale_factor=scale_factor, data_dir=data_dir,
         collection_id=ground_truth_collection, root=root)
     started = datetime.now(timezone.utc).isoformat()
     record = {
         "schema_version": RUN_SCHEMA_VERSION, "quail_b_version": __version__,
-        "scale_factor": sf, "corpus_id": suite.corpus_id,
+        "scale_factor": scale_factor, "corpus_id": suite.corpus_id,
         "collection_id": suite.ground_truth.collection_id,
         "reference_model": suite.ground_truth.reference_model,
         "metadata": metadata, "gpu_count": config.gpus,
@@ -531,7 +531,7 @@ def main():
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
-        sf=args.sf,
+        scale_factor=args.scale_factor,
         config=quail.EngineConfig(
             gpus=args.gpus,
             model=args.model,

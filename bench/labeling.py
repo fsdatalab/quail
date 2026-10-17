@@ -125,15 +125,15 @@ BIO4_PREDICTION_TEXT = (
 )
 
 
-def prediction_text(sf: float) -> str:
+def prediction_text(scale_factor: float) -> str:
     """The stated prediction for one scale factor's labeling pass."""
     try:
-        counts = _PREDICTIONS[float(sf)]
+        counts = _PREDICTIONS[float(scale_factor)]
     except KeyError as error:
         raise ValueError(
-            f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}"
+            f"scale factor {scale_factor} is not one of {SUPPORTED_SCALE_FACTORS}"
         ) from error
-    return f"At sf={sf}, {counts} {BIO4_PREDICTION_TEXT}"
+    return f"At sf={scale_factor}, {counts} {BIO4_PREDICTION_TEXT}"
 
 
 # One Quail query is one Parquet part, setting the resume granularity.
@@ -363,7 +363,7 @@ def _read_rows(data_dir: Path, tables: tuple[str, ...] | None = None
     return rows
 
 
-def _corpus_identity(rows: dict[str, list[dict]], sf: float) -> dict:
+def _corpus_identity(rows: dict[str, list[dict]], scale_factor: float) -> dict:
     tables = {}
     for table in sorted(rows):
         row_hashes = [_full_hash(row) for row in rows[table]]
@@ -374,7 +374,7 @@ def _corpus_identity(rows: dict[str, list[dict]], sf: float) -> dict:
     payload = {
         "schema_version": SCHEMA_VERSION,
         "benchmark": "quailb",
-        "scale_factor": sf,
+        "scale_factor": scale_factor,
         "data_seed": data.DATA_SEED,
         "source_revisions": data.SOURCE_REVISIONS,
         "tables": tables,
@@ -384,11 +384,11 @@ def _corpus_identity(rows: dict[str, list[dict]], sf: float) -> dict:
             "corpus_full_hash": full}
 
 
-def _materialize_corpus(sf: float) -> tuple[Path, dict, dict]:
+def _materialize_corpus(scale_factor: float) -> tuple[Path, dict, dict]:
     with tempfile.TemporaryDirectory(prefix="quailb_judge_") as temp:
-        data_dir = data.build_sets(temp, sf=sf)
+        data_dir = data.build_sets(temp, scale_factor=scale_factor)
         rows = _read_rows(data_dir)
-        identity = _corpus_identity(rows, sf)
+        identity = _corpus_identity(rows, scale_factor)
         target = ROOT / "corpora" / identity["corpus_id"]
         target.mkdir(parents=True, exist_ok=True)
         for source in data_dir.glob("*.parquet"):
@@ -1028,16 +1028,16 @@ def _fever_source_label(claim: dict, passage: dict):
     return claim["label"] == "SUPPORTS", "fever_annotation"
 
 
-def prepare_corpus(sf: float = SCALE_FACTOR) -> dict:
+def prepare_corpus(scale_factor: float = SCALE_FACTOR) -> dict:
     """Build the corpus and check its collection on the volume.
 
     Reports whether the collection the corpus implies is already
     complete.
     """
-    if float(sf) not in SUPPORTED_SCALE_FACTORS:
+    if float(scale_factor) not in SUPPORTED_SCALE_FACTORS:
         raise ValueError(
-            f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}")
-    _, corpus_manifest, _ = _materialize_corpus(sf)
+            f"scale factor {scale_factor} is not one of {SUPPORTED_SCALE_FACTORS}")
+    _, corpus_manifest, _ = _materialize_corpus(scale_factor)
     identities = _label_set_identities(corpus_manifest, judged_predicates())
     collection = _collection_identity(corpus_manifest, identities)
     path = (ROOT / "collections" / collection["collection_id"]
@@ -1123,7 +1123,7 @@ def judge_workload(corpus_id: str, workload: str) -> dict:
     return partial
 
 
-def finalize_collection(sf: float, corpus_id: str,
+def finalize_collection(scale_factor: float, corpus_id: str,
                         partials: dict[str, dict]) -> dict:
     """Assemble five workloads and activate their ground truth."""
     _, corpus_manifest, _ = _load_corpus(corpus_id)
@@ -1146,10 +1146,10 @@ def finalize_collection(sf: float, corpus_id: str,
     summary = {
         "cell": "quailb_judge_pass",
         "judge": QUAIL_JUDGE_SPEC,
-        "prediction": prediction_text(sf),
+        "prediction": prediction_text(scale_factor),
         "collection_id": collection["collection_id"],
         "corpus_id": corpus_manifest["corpus_id"],
-        "scale_factor": sf,
+        "scale_factor": scale_factor,
         "model": MODEL_NAME,
         "model_revision": MODEL_REVISION,
         "qwen_judgments": qwen_rows,
@@ -1194,14 +1194,14 @@ def finalize_collection(sf: float, corpus_id: str,
 
 
 def activate_reused_collection(
-        sf: float, target_corpus_id: str, source_collection_id: str,
+        scale_factor: float, target_corpus_id: str, source_collection_id: str,
         relabeled_workloads: str, *,
         relabeled_predicates: tuple[str, ...] = (),
         new_specs: tuple[PredicateSpec, ...] = ()) -> dict:
     """Build one collection from new labels and verified unchanged tables.
 
     Args:
-        sf: The scale factor.
+        scale_factor: The scale factor.
         target_corpus_id: The corpus the collection labels.
         source_collection_id: The collection whose label sets are reused.
         relabeled_workloads: Comma-separated workloads with new labels.
@@ -1223,10 +1223,10 @@ def activate_reused_collection(
             != source_collection_id):
         raise ValueError(
             f"source collection {source_collection_id} is invalid")
-    if float(source_collection["scale_factor"]) != float(sf):
+    if float(source_collection["scale_factor"]) != float(scale_factor):
         raise ValueError(
             f"source collection has scale factor "
-            f"{source_collection['scale_factor']}, expected {sf}")
+            f"{source_collection['scale_factor']}, expected {scale_factor}")
 
     source_corpus_id = source_collection["corpus_id"]
     with open(ROOT / "corpora" / source_corpus_id / "manifest.json") as f:
@@ -1234,7 +1234,7 @@ def activate_reused_collection(
     if source_corpus.get("corpus_id") != source_corpus_id:
         raise ValueError(f"source corpus {source_corpus_id} is invalid")
     if (target_corpus.get("corpus_id") != target_corpus_id
-            or float(target_corpus["scale_factor"]) != float(sf)):
+            or float(target_corpus["scale_factor"]) != float(scale_factor)):
         raise ValueError(f"target corpus {target_corpus_id} is invalid")
     names = {name.strip() for name in relabeled_workloads.split(",")
              if name.strip()}
@@ -1297,7 +1297,7 @@ def activate_reused_collection(
         "prediction": REUSE_PREDICTION_TEXT,
         "collection_id": collection["collection_id"],
         "corpus_id": target_corpus["corpus_id"],
-        "scale_factor": sf,
+        "scale_factor": scale_factor,
         "model": MODEL_NAME,
         "model_revision": MODEL_REVISION,
         "source_collection_id": source_collection_id,
@@ -1553,7 +1553,7 @@ def _copy_label_set(spec: PredicateSpec, source_label_set_id: str,
     return written
 
 
-def derive_collection(sf: float, source_collection_id: str) -> dict:
+def derive_collection(scale_factor: float, source_collection_id: str) -> dict:
     """Build one scale factor's collection from a larger one, on the CPU.
 
     Every model judgment and FEVER source label is copied by document
@@ -1561,9 +1561,9 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
     pairs the corpus sampled, so it is recomputed from the target
     corpus instead.
     """
-    if float(sf) not in SUPPORTED_SCALE_FACTORS:
+    if float(scale_factor) not in SUPPORTED_SCALE_FACTORS:
         raise ValueError(
-            f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}")
+            f"scale factor {scale_factor} is not one of {SUPPORTED_SCALE_FACTORS}")
     source_path = (ROOT / "collections" / source_collection_id
                    / "manifest.json")
     with open(source_path) as f:
@@ -1572,17 +1572,17 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
             or source.get("collection_id") != source_collection_id):
         raise ValueError(
             f"source collection {source_collection_id} is invalid")
-    if float(source["scale_factor"]) <= float(sf):
+    if float(source["scale_factor"]) <= float(scale_factor):
         raise ValueError(
             f"source collection has scale factor {source['scale_factor']}, "
-            f"which is not larger than {sf}")
+            f"which is not larger than {scale_factor}")
     missing = [spec.key for spec in judged_predicates()
                if spec.key not in source["label_sets"]]
     if missing:
         raise ValueError(f"source collection has no label set for: {missing}")
 
     t_total = time.perf_counter()
-    _, corpus_manifest, rows = _materialize_corpus(sf)
+    _, corpus_manifest, rows = _materialize_corpus(scale_factor)
     corpus_id = corpus_manifest["corpus_id"]
     identities = {
         spec.key: label_set_identity(
@@ -1623,7 +1623,7 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
         "prediction": DERIVE_PREDICTION_TEXT,
         "collection_id": collection["collection_id"],
         "corpus_id": corpus_id,
-        "scale_factor": sf,
+        "scale_factor": scale_factor,
         "model": MODEL_NAME,
         "model_revision": MODEL_REVISION,
         "source_collection_id": source_collection_id,
@@ -1829,9 +1829,9 @@ def run_compact(collection_id: str) -> str:
     image=image, memory=CPU_MEMORY_MB, timeout=2 * CPU_TIMEOUT_S,
     volumes={"/root/.cache/huggingface": hf_cache,
              "/results": results_vol})
-def run_prepare_corpus(sf: float = SCALE_FACTOR) -> str:
+def run_prepare_corpus(scale_factor: float = SCALE_FACTOR) -> str:
     _mount()
-    result = prepare_corpus(sf)
+    result = prepare_corpus(scale_factor)
     results_vol.commit()
     return json.dumps(result, sort_keys=True)
 
@@ -1856,10 +1856,10 @@ def run_judge_workload(corpus_id: str, workload: str) -> str:
 @app.function(
     image=image, memory=CPU_MEMORY_MB, timeout=CPU_TIMEOUT_S,
     volumes={"/results": results_vol})
-def run_finalize(sf: float, corpus_id: str, partials: str) -> str:
+def run_finalize(scale_factor: float, corpus_id: str, partials: str) -> str:
     """Assemble five workloads and activate their ground truth."""
     _mount()
-    summary = finalize_collection(sf, corpus_id, json.loads(partials))
+    summary = finalize_collection(scale_factor, corpus_id, json.loads(partials))
     results_vol.commit()
     return json.dumps(summary, sort_keys=True)
 
@@ -1868,12 +1868,12 @@ def run_finalize(sf: float, corpus_id: str, partials: str) -> str:
     image=image, memory=CPU_MEMORY_MB, timeout=CPU_TIMEOUT_S,
     volumes={"/results": results_vol})
 def run_activate_reused(
-        sf: float, target_corpus_id: str, source_collection_id: str,
+        scale_factor: float, target_corpus_id: str, source_collection_id: str,
         relabeled_workloads: str) -> str:
     """Build one collection from new labels and verified unchanged tables."""
     _mount()
     summary = activate_reused_collection(
-        sf, target_corpus_id, source_collection_id, relabeled_workloads)
+        scale_factor, target_corpus_id, source_collection_id, relabeled_workloads)
     results_vol.commit()
     return json.dumps(summary, sort_keys=True)
 
@@ -1884,10 +1884,10 @@ def run_activate_reused(
     image=image, memory=2 * CPU_MEMORY_MB, timeout=2 * CPU_TIMEOUT_S,
     volumes={"/root/.cache/huggingface": hf_cache,
              "/results": results_vol})
-def run_derive(sf: float, source_collection_id: str) -> str:
+def run_derive(scale_factor: float, source_collection_id: str) -> str:
     """Build one scale factor's collection from a larger one, on the CPU."""
     _mount()
-    summary = derive_collection(sf, source_collection_id)
+    summary = derive_collection(scale_factor, source_collection_id)
     results_vol.commit()
     return json.dumps(summary, sort_keys=True)
 
@@ -1904,7 +1904,7 @@ def run_publish(collection_ids: str) -> str:
 
 
 @app.local_entrypoint()
-def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
+def main(scale_factor: float = SCALE_FACTOR, compact_collection: str | None = None,
          only: str | None = None, finalize_from: str | None = None,
          reuse_from_collection: str | None = None,
          relabeled_workloads: str = "lepard",
@@ -1932,26 +1932,26 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
         return
     if derive_from_collection:
         print(f"PREDICTION: {DERIVE_PREDICTION_TEXT}", flush=True)
-        call = run_derive.spawn(sf, derive_from_collection)
+        call = run_derive.spawn(scale_factor, derive_from_collection)
         print(f"function call id (derive): {call.object_id}", flush=True)
         print(call.get(), flush=True)
         return
     prediction = (REUSE_PREDICTION_TEXT if reuse_from_collection
-                  else prediction_text(sf))
+                  else prediction_text(scale_factor))
     print(f"PREDICTION: {prediction}", flush=True)
 
     if reuse_from_collection and target_corpus:
         corpus_id = target_corpus
         prepared = None
     else:
-        call = run_prepare_corpus.spawn(sf)
+        call = run_prepare_corpus.spawn(scale_factor)
         print(f"function call id (prepare_corpus): {call.object_id}",
               flush=True)
         prepared = json.loads(call.get())
         corpus_id = prepared["corpus"]["corpus_id"]
     if reuse_from_collection:
         call = run_activate_reused.spawn(
-            sf, corpus_id, reuse_from_collection, relabeled_workloads)
+            scale_factor, corpus_id, reuse_from_collection, relabeled_workloads)
         print("function call id (activate_reused_collection): "
               f"{call.object_id}", flush=True)
         print(call.get(), flush=True)
@@ -1967,7 +1967,7 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
                     f"{function_call_id} returned workload "
                     f"{partial['workload']!r}, expected {workload!r}")
             partials[workload] = partial
-        call = run_finalize.spawn(sf, corpus_id, json.dumps(partials))
+        call = run_finalize.spawn(scale_factor, corpus_id, json.dumps(partials))
         print(f"function call id (finalize_collection): {call.object_id}",
               flush=True)
         print(call.get(), flush=True)
@@ -1997,7 +1997,7 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
         print("--only was given, so the collection is not finalized",
               flush=True)
         return
-    call = run_finalize.spawn(sf, corpus_id, json.dumps(partials))
+    call = run_finalize.spawn(scale_factor, corpus_id, json.dumps(partials))
     print(f"function call id (finalize_collection): {call.object_id}",
           flush=True)
     print(call.get(), flush=True)

@@ -36,7 +36,8 @@ def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
     tree = execution_prefix_tree(node, documents, state.loaded_model.arena)
     return execute_parts(
         state, parts, documents, DocumentKeys(node.alias, ids),
-        keep_kv=nodes[-1].keep_kv, tree=tree, attention=node.attention or "unified",
+        keep_kv=nodes[-1].keep_kv, prefix_tree=tree,
+        attention=node.attention or "unified",
         limit=inputs.get("limit"), stop_groups=inputs.get("stop_groups"),
         paged=node.arena_writes or len(nodes) > 1,
         label=f"filter ({len(nodes)} predicates)")
@@ -244,7 +245,7 @@ def filter_inputs(state, node, document_ids) -> dict:
     document_ids = id_positions(document_ids)
     return {
         "documents": DocumentPrefixes(
-            node.document_head, state["docs"][node.alias], document_ids
+            node.document_head, state["documents"][node.alias], document_ids
         ),
         "document_ids": document_ids,
         "limit": state["filter_limit"],

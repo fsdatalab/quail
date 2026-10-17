@@ -70,7 +70,7 @@ class Query:
         self.order = order
         self._plan = None
         self._searched_plan = None
-        self._doc_tokens = None
+        self._document_tokens = None
         self._token_inputs = None
         self._token_futures = {}
         self._token_finished_at = {}
@@ -107,15 +107,15 @@ class Query:
             self._planning_started_at = time.perf_counter()
             config = self.session.config
             operators = self.logical.operators()
-            self._doc_tokens = {}
+            self._document_tokens = {}
             self._token_inputs = {}
             estimated = []
             for s in operators.scans:
                 exact = self.session.inputs.token_lengths(s.provider, s.column)
                 if exact is not None:
-                    self._doc_tokens[s.alias] = exact
+                    self._document_tokens[s.alias] = exact
                     continue
-                self._doc_tokens[s.alias] = self.session.inputs.estimate_lengths(
+                self._document_tokens[s.alias] = self.session.inputs.estimate_lengths(
                     s.provider, s.column)
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
@@ -129,7 +129,7 @@ class Query:
             context = PlanningContext(
                 catalog=self.session.catalog, engine_config=config,
                 model=self.session.model, device=self.session.device,
-                gpu_count=config.gpus, document_tokens=self._doc_tokens,
+                gpus=config.gpus, document_tokens=self._document_tokens,
                 backend=config.backend, order=self.order,
                 canvas_draws=config.canvas_draws,
                 attention=config.attention,
@@ -175,7 +175,7 @@ class Query:
             self._plan = plan_query(
                 self._logical_input, model=self.session.model,
                 device=self.session.device,
-                doc_tokens=self._doc_tokens,
+                document_tokens=self._document_tokens,
                 gpus=config.gpus,
                 order=self.order,
                 canvas_draws=config.canvas_draws,
@@ -307,7 +307,7 @@ class Query:
         refine = bool(self._token_futures)
         for alias, future in list(self._token_futures.items()):
             self._token_inputs[alias] = future.result()
-            self._doc_tokens[alias] = self._token_inputs[alias].lengths
+            self._document_tokens[alias] = self._token_inputs[alias].lengths
             self._token_finished_at.setdefault(alias, time.perf_counter())
             del self._token_futures[alias]
         self.token_wait_s += time.perf_counter() - started
@@ -315,7 +315,7 @@ class Query:
             started = time.perf_counter()
             options = dict(
                 model=self.session.model,
-                device=self.session.device, doc_tokens=self._doc_tokens,
+                device=self.session.device, document_tokens=self._document_tokens,
                 gpus=self.session.config.gpus, order=self.order,
                 canvas_draws=self.session.config.canvas_draws,
                 attention=self.session.config.attention,
@@ -433,7 +433,7 @@ class Query:
         report = execution_report(
             plan, out, self.session.inputs.notes, coordinator_wall)
         sources = {
-            node.input_id: range(node.n_docs)
+            node.input_id: range(node.num_documents)
             for node in plan.nodes
             if isinstance(node, Scan)
         }
@@ -444,7 +444,7 @@ class Query:
                 runtimes=self.session.registry.runtimes,
                 sources=sources,
                 project=projection_for(
-                    self.logical, self._token_inputs, self._doc_tokens),
+                    self.logical, self._token_inputs, self._document_tokens),
                 observers=observers,
             ),
             initial_outputs=response.outputs,
@@ -475,5 +475,5 @@ class Query:
 
         (result.answer_tables, result.survivor_indices,
          result.true_join_tables, report["stages"]) = collect_answers(
-             self.logical, plan, response.outputs, self._doc_tokens)
+             self.logical, plan, response.outputs, self._document_tokens)
         return result

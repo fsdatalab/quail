@@ -22,7 +22,7 @@ class InferenceSpec:
     aliases: tuple[str, ...]
     query_template: str
     arguments: tuple[tuple[str, str], ...]
-    expected_inputs: float
+    expected_rows: float
     estimated_seconds: float
     prompt_token_parts: tuple[tuple[int, ...], ...] = ()
     share_prefixes: bool = False
@@ -37,7 +37,7 @@ class InferenceSpec:
                 (str(alias), str(column))
                 for alias, column in value["arguments"]
             ),
-            expected_inputs=float(value["expected_inputs"]),
+            expected_rows=float(value["expected_rows"]),
             estimated_seconds=float(value["estimated_seconds"]),
             prompt_token_parts=tuple(
                 tuple(part) for part in value.get("prompt_token_parts", ())
@@ -51,7 +51,7 @@ class InferenceSpec:
             "aliases": list(self.aliases),
             "query_template": self.query_template,
             "arguments": [list(argument) for argument in self.arguments],
-            "expected_inputs": self.expected_inputs,
+            "expected_rows": self.expected_rows,
             "estimated_seconds": self.estimated_seconds,
             "prompt_token_parts": [list(part) for part in self.prompt_token_parts],
             "share_prefixes": self.share_prefixes,
@@ -140,7 +140,7 @@ class AiInference(PhysicalNode):
             "batching": "token_based_admission",
             "output": None if spec is None else spec.name,
             "aliases": [] if spec is None else list(spec.aliases),
-            "expected_inputs": 0 if spec is None else spec.expected_inputs,
+            "expected_rows": 0 if spec is None else spec.expected_rows,
             "estimated_seconds": (
                 0 if spec is None else spec.estimated_seconds
             ),

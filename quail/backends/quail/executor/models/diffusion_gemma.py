@@ -74,7 +74,12 @@ class DiffusionGemmaPipeline(ModelPipeline):
         attn = self.layers[0].self_attn
         loaded = (backbone.config.sliding_window, attn.num_heads,
                   attn.num_kv_heads, attn.head_dim)
-        expected = (spec.sliding_window, spec.n_q, spec.n_kv, spec.d_head)
+        expected = (
+            spec.sliding_window,
+            spec.num_q_heads,
+            spec.num_kv_heads,
+            spec.d_head,
+        )
         if loaded != expected:
             raise ValueError(
                 f"the loaded model's geometry (window, q heads, kv heads, "
@@ -82,7 +87,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         # the engine's fp8 GEMM path is not used: the projections run
         # vLLM's own fp8 linear modules
         self.engine = engine_class(
-            arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
+            arena, num_q_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb, fp8=False)
         self._ones = {}
         for layer in self.layers:
@@ -225,7 +230,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         H, KH, D = attn.num_heads, attn.num_kv_heads, attn.head_dim
         rope = attn.rotary_emb
         q, k, v = self.engine.qkv_norm_rope_heads(
-            qkv, positions, n_q=H, n_kv=KH, head_dim=D,
+            qkv, positions, num_q_heads=H, num_kv_heads=KH, head_dim=D,
             q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
             eps=attn.q_norm.variance_epsilon, cos_sin_cache=rope.cos_sin_cache)
         q3, k3, v3 = q.view(n, H, D), k.view(n, KH, D), v.view(n, KH, D)

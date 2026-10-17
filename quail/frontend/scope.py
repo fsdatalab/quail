@@ -20,7 +20,7 @@ class Scope:
     def __init__(self, catalog: Catalog):
         self.catalog = catalog
         self.tables: list[tuple[str, str]] = []
-        self.doc_columns: dict[str, str] = {}
+        self.document_columns: dict[str, str] = {}
 
     def add_table(self, alias: str, provider: str) -> None:
         """Bring one table into scope under alias.
@@ -72,18 +72,18 @@ class Scope:
         return ColumnRef(alias=owners[0][0], provider=owners[0][1],
                          column=column)
 
-    def note_doc_column(self, ref: ColumnRef) -> None:
+    def note_document_column(self, ref: ColumnRef) -> None:
         """Record the document column a prompt reads from ref's table.
 
         Raises:
             CompileError: The table was already read through another
                 column; its KV is computed from one column only.
         """
-        seen = self.doc_columns.get(ref.alias)
+        seen = self.document_columns.get(ref.alias)
         if seen and seen != ref.column:
             raise CompileError(
                 f"alias {ref.alias!r} is referenced through two "
                 f"columns ({seen!r}, {ref.column!r}); predicates over "
                 f"one table must share one document column so its KV "
                 f"is computed once")
-        self.doc_columns[ref.alias] = ref.column
+        self.document_columns[ref.alias] = ref.column

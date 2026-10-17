@@ -84,24 +84,24 @@ def plan_request_backend(
         if scan.alias not in stats:
             raise ValueError(f"no document tokens for alias {scan.alias!r}")
         summary = stats[scan.alias]
-        n_docs = summaries[scan.alias].count
+        num_documents = summaries[scan.alias].count
         node = Scan(
             node_id=f"scan:{scan.alias}",
             alias=scan.alias,
             input_id=scan.alias,
-            n_docs=n_docs,
+            num_documents=num_documents,
             total_tokens=summaries[scan.alias].total,
-            shard_ranges=((0, n_docs),),
+            shard_ranges=((0, num_documents),),
             shard_token_loads=(summary.total_tokens,),
             predicates=regular_predicates(scan),
-            expected_docs=float(summary.n_docs) if scan.predicates else None,
+            expected_rows=float(summary.num_documents) if scan.predicates else None,
         )
         nodes.append(node)
         input_refs.append(PortRef(node.node_id, f"ids:{scan.alias}"))
 
     for node in hash_join_nodes(joins, context.pair_fractions, input_refs):
         nodes.append(node)
-        input_refs.append(PortRef(node.node_id, f"pairs:{node.written_pos}"))
+        input_refs.append(PortRef(node.node_id, f"pairs:{node.written_position}"))
 
     rule = context.order or default_order_rule(ask_filters, joins)[0]
     filter_orders, join_sequence = _order_filters_and_joins(
@@ -116,7 +116,7 @@ def plan_request_backend(
         *(predicate.prompt for spec in filter_specs
           for predicate in ask_filters[spec.alias]),
         *(call.prompt for call, _ in operators.labels.calls),
-        *(joins[written_pos].prompt for written_pos, _ in join_sequence),
+        *(joins[written_position].prompt for written_position, _ in join_sequence),
     ]
     preamble, preamble_text = request_preamble(context, prompts)
 
@@ -142,7 +142,7 @@ def plan_request_backend(
     plan = PhysicalPlan(
         model=context.model.name,
         device=context.device.name,
-        workers=1,
+        gpus=1,
         backend=backend_name,
         estimated_seconds=0.0,
         nodes=tuple(nodes),
@@ -244,10 +244,10 @@ def _corpus_stats(context) -> tuple[dict, dict]:
     }
     stats = {
         alias: CorpusStats(
-            n_docs=round(summary.count * context.scan_fractions.get(alias, 1.0)),
+            num_documents=round(summary.count * context.scan_fractions.get(alias, 1.0)),
             total_tokens=round(summary.total
                                * context.scan_fractions.get(alias, 1.0)),
-            max_doc_tokens=summary.maximum,
+            max_document_tokens=summary.maximum,
         )
         for alias, summary in summaries.items()
     }
@@ -264,15 +264,15 @@ def _order_filters_and_joins(context, operators, ask_filters, stats,
     """
     joins = operators.joins
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
-    preamble_count = preamble_tokens(
+    num_preamble_tokens = preamble_tokens(
         context.lowered(prompt) for prompt in (
             *(p.prompt for fs in ask_filters.values() for p in fs),
             *(j.prompt for j in joins)))
     filter_orders = {
         alias: order_filters_indexed(prepare_filter_costs(
             predicates,
-            prefix_tokens=(
-                preamble_count + stats[alias].mean_doc_tokens
+            mean_tokens=(
+                num_preamble_tokens + stats[alias].mean_document_tokens
             ),
             model=context.model,
             device=context.device,
@@ -281,19 +281,19 @@ def _order_filters_and_joins(context, operators, ask_filters, stats,
         ), rule)
         for alias, predicates in ask_filters.items()
     }
-    live = {
-        alias: float(summary.n_docs) for alias, summary in stats.items()
+    expected_rows = {
+        alias: float(summary.num_documents) for alias, summary in stats.items()
     }
     for alias, predicates in operators.all_filters().items():
         for predicate in predicates:
-            live[alias] *= effective_selectivity(predicate.selectivity)
+            expected_rows[alias] *= effective_selectivity(predicate.selectivity)
     search_specs = logical_join_specs(joins, context.pair_fractions, context=context)
     join_search = search_joins(
         search_specs,
-        live,
+        expected_rows,
         summaries,
         {},
-        preamble_count,
+        num_preamble_tokens,
         chunk_tokens,
         context.model,
         context.device,
@@ -316,13 +316,13 @@ def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
     if len(full_joins) == 1 and len(join_specs) == 1:
         # one full join and no gates: its true pairs are the result rows
         sink_input = PortRef(
-            request_node.node_id, f"join_answers:{full_joins[0].written_pos}")
+            request_node.node_id, f"join_answers:{full_joins[0].written_position}")
     elif full_joins:
         result_aliases = tuple(dict.fromkeys(
             alias for spec in full_joins for alias in spec.aliases
         ))
         edges = tuple(
-            PortRef(request_node.node_id, f"join_answers:{spec.written_pos}")
+            PortRef(request_node.node_id, f"join_answers:{spec.written_position}")
             for spec in full_joins
         ) + tuple(
             PortRef(request_node.node_id, f"ids:{alias}")

@@ -179,7 +179,7 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
     monkeypatch.setattr(worker, "_round", round_fn)
     monkeypatch.setattr(worker, "execute_distributed_graph", run_graph)
     result = worker.execute_quail_multi({
-        "docs": {}, "workers": 8, "model": "qwen3-4b-fp8",
+        "documents": {}, "gpus": 8, "model": "qwen3-4b-fp8",
         "physical_plan": {"device": "h100-sxm"},
         "chunk_tokens": 100, "true_ids": [1], "false_ids": [2],
     }, registry, object())

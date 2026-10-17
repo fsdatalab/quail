@@ -205,11 +205,11 @@ def build_result_declaration(
 def count_rows(declaration: acero.Declaration) -> int:
     """Count rows inside Acero without returning the rows to Python."""
     options = acero.AggregateNodeOptions(
-        [([], "count_all", None, "row_count")])
+        [([], "count_all", None, "num_rows")])
     count_declaration = acero.Declaration(
         "aggregate", options, [declaration])
     table = count_declaration.to_table()
-    return int(table.column("row_count")[0].as_py())
+    return int(table.column("num_rows")[0].as_py())
 
 
 def execute_stream(declaration: acero.Declaration, schema: pa.Schema,
@@ -295,7 +295,7 @@ class QueryResult:
                  limit: int | None = None,
                  survivor_indices: dict[str, pa.Array] | None = None,
                  true_join_tables: dict[int, pa.Table] | None = None,
-                 row_count: int | None = None):
+                 num_rows: int | None = None):
         self.columns = columns
         self.schema = output_schema
         self.report = report
@@ -310,7 +310,7 @@ class QueryResult:
         self._projection = projection
         self.survivor_indices = survivor_indices or {}
         self.true_join_tables = true_join_tables or {}
-        self._row_count = row_count
+        self._num_rows = num_rows
         self._materialized = None
 
     @classmethod
@@ -330,7 +330,7 @@ class QueryResult:
         result._projection = []
         result.survivor_indices = {}
         result.true_join_tables = {}
-        result._row_count = len(table)
+        result._num_rows = len(table)
         result._materialized = table
         return result
 
@@ -445,17 +445,17 @@ class QueryResult:
         columns = [column.to_pylist() for column in table.columns]
         return list(zip(*columns))
 
-    def known_count(self) -> int | None:
+    def known_num_rows(self) -> int | None:
         """Return the row count when it is known without running the plan."""
-        return self._row_count
+        return self._num_rows
 
     def count(self) -> int:
         """Return the result row count, computing it when needed."""
-        if self._row_count is None:
+        if self._num_rows is None:
             count = count_rows(self._declaration)
-            self._row_count = (count if self.limit is None
+            self._num_rows = (count if self.limit is None
                                else min(count, self.limit))
-        return self._row_count
+        return self._num_rows
 
     def with_limit(self, limit: int) -> "QueryResult":
         """Return the same result with a smaller row limit."""
@@ -463,8 +463,8 @@ class QueryResult:
             raise ValueError("limit must be positive")
         result = copy(self)
         result.limit = limit if self.limit is None else min(self.limit, limit)
-        if self._row_count is not None:
-            result._row_count = min(self._row_count, result.limit)
+        if self._num_rows is not None:
+            result._num_rows = min(self._num_rows, result.limit)
         return result
 
     def __len__(self) -> int:

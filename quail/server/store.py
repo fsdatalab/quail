@@ -72,7 +72,7 @@ class InputRecord:
 
     content_id: str
     path: str
-    byte_count: int
+    num_bytes: int
 
 
 def _dumps(value) -> str | None:
@@ -115,8 +115,8 @@ class Store:
         self._changed = threading.Condition(self._lock)
         self._listeners = []
         # committed write transactions since open; a checkpoint compares it
-        self.write_count = 0
-        self.durable_write_count = 0
+        self.num_writes = 0
+        self.num_durable_writes = 0
         self.closed = False
         self._conn = sqlite3.connect(
             str(self.path), check_same_thread=False, isolation_level=None)
@@ -170,9 +170,9 @@ class Store:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-            self.write_count += 1
+            self.num_writes += 1
             if durable:
-                self.durable_write_count += 1
+                self.num_durable_writes += 1
             self._changed.notify_all()
             listeners = list(self._listeners)
         for listener in listeners:
@@ -458,11 +458,11 @@ class Store:
 
     # -- inputs -----------------------------------------------------------
 
-    def put_input(self, content_id: str, path: str, byte_count: int) -> None:
+    def put_input(self, content_id: str, path: str, num_bytes: int) -> None:
         self._write(
             "INSERT OR IGNORE INTO inputs (content_id, path, byte_count, "
             "created_at) VALUES (?, ?, ?, ?)",
-            (content_id, path, byte_count, time.time()))
+            (content_id, path, num_bytes, time.time()))
 
     def get_input(self, content_id: str) -> InputRecord | None:
         with self._lock:

@@ -37,10 +37,10 @@ def test_backup_is_a_complete_copy_including_the_wal(tmp_path):
     assert fetch_one(copy, "SELECT id, state FROM queries") == (first.id, "running")
     store.close()
 
-    live = tmp_path / "fresh" / "quail.sqlite3"
-    assert restore(copy, live)
-    assert not restore(copy, live)
-    reopened = Store(live)
+    expected_rows = tmp_path / "fresh" / "quail.sqlite3"
+    assert restore(copy, expected_rows)
+    assert not restore(copy, expected_rows)
+    reopened = Store(expected_rows)
     assert reopened.recover() == [first.id]
     assert reopened.get(first.id).state == "interrupted"
     assert reopened.get(first.id).progress == {"done": 1}

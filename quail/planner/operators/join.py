@@ -43,7 +43,7 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
             left, right = prompt_aliases(j.prompt)
             head, middle, tail = map(len, parts)
             out.append(PricedJoin(
-                written_pos=i, aliases=(left, right), anchor=left,
+                written_position=i, aliases=(left, right), anchor=left,
                 anchor_free=False, semantics=j.semantics,
                 selectivity=j.selectivity,
                 frame_tokens={left: head + middle, right: 0},
@@ -56,7 +56,7 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
         lowered = context.lowered(j.prompt)
         labels = _label_counts(lowered)
         out.append(PricedJoin(
-            written_pos=i, aliases=tuple(_join_aliases(j)), anchor=j.anchor,
+            written_position=i, aliases=tuple(_join_aliases(j)), anchor=j.anchor,
             anchor_free=(j.anchor is None and j.semantics == "full"),
             semantics=j.semantics, selectivity=j.selectivity,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
@@ -68,7 +68,9 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
     return out
 
 
-def emit_join(builder, spec, step, anchor, jid, exec_idx, ports_by_alias) -> tuple:
+def emit_join(
+    builder, spec, step, anchor, join_id, exec_index, ports_by_alias
+) -> tuple:
     """Append one AI join stage and the functions that supply its pairs.
 
     Args:
@@ -76,8 +78,8 @@ def emit_join(builder, spec, step, anchor, jid, exec_idx, ports_by_alias) -> tup
         spec: The join's PricedJoin.
         step: The join's step in the chosen sequence.
         anchor: The anchor alias.
-        jid: The AiJoin node id.
-        exec_idx: The join's position in execution order.
+        join_id: The AiJoin node id.
+        exec_index: The join's position in execution order.
         ports_by_alias: alias -> the ports its documents stand at.
 
     Returns:
@@ -87,42 +89,42 @@ def emit_join(builder, spec, step, anchor, jid, exec_idx, ports_by_alias) -> tup
     pair_inputs = []
     partners = [a for a in spec.aliases if a != anchor]
     pairs_from = ""
-    if spec.written_pos in builder.pairs_src:
-        producer = builder.pairs_src[spec.written_pos]
+    if spec.written_position in builder.pairs_src:
+        producer = builder.pairs_src[spec.written_position]
         pair_inputs.append(
-            PortRef(producer.node_id, f"pairs:{spec.written_pos}"))
+            PortRef(producer.node_id, f"pairs:{spec.written_position}"))
         pairs_from = producer.node_id
-    for apply in builder.join_applies.get(spec.written_pos, ()):
+    for apply in builder.join_applies.get(spec.written_position, ()):
         # the function's pairs reach the join on their own port
-        aid = f"apply:{apply.function}"
+        apply_id = f"apply:{apply.function}"
         builder.nodes.append(Foreign(
-            node_id=aid,
+            node_id=apply_id,
             inputs=input_ports(tuple(
                 ports_by_alias[a].ids for a in apply.aliases)),
             function=apply.function, kind=apply.kind, ids="pairs",
             columns=tuple((ref.alias, ref.column)
                           for ref in apply.columns),
             aliases=tuple(apply.aliases),
-            written_pos=spec.written_pos))
-        pair_inputs.append(PortRef(aid, f"pairs:{spec.written_pos}"))
-        pairs_from = aid
+            written_position=spec.written_position))
+        pair_inputs.append(PortRef(apply_id, f"pairs:{spec.written_position}"))
+        pairs_from = apply_id
     builder.nodes.append(AiJoin(
-        node_id=jid,
+        node_id=join_id,
         inputs=input_ports(tuple(
             ports_by_alias[a].ids for a in [anchor, *partners])
                            + tuple(pair_inputs)),
-        written_pos=spec.written_pos, exec_idx=exec_idx,
+        written_position=spec.written_position, exec_index=exec_index,
         anchor=anchor, partners=tuple(partners),
         semantics=spec.semantics,
         selectivity=spec.selectivity,
-        expected_tuples=round(step.tuples, 1),
+        expected_rows=round(step.tuples, 1),
         anchor_frame_tokens=spec.frame_tokens[anchor],
         pair_tail_tokens=spec.tail_tokens,
         document_head=tuple(builder.context.lowered(
-            builder.operators.joins[spec.written_pos].prompt).preamble_token_ids),
+            builder.operators.joins[spec.written_position].prompt).preamble_token_ids),
         anchor_resident=step.resident,
         tuple_tokens=round(step.tokens, 1),
         pairs_from=pairs_from))
-    return (Ports(PortRef(jid, f"ids:{anchor}")),
-            PortRef(jid, f"join_answers:{spec.written_pos}")
+    return (Ports(PortRef(join_id, f"ids:{anchor}")),
+            PortRef(join_id, f"join_answers:{spec.written_position}")
             if spec.semantics == "full" else None)

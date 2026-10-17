@@ -70,7 +70,7 @@ on a GPU to compare estimates with measured execution.
 </Callout>
 
 ```text
-physical: backend=quail, model=qwen3-4b-fp8, workers=1
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens
 
                                                  est. rows  est. pass  est. time
@@ -82,9 +82,9 @@ physical: backend=quail, model=qwen3-4b-fp8, workers=1
         survivors stream into the join with KV pinned
         predicate 1                                      3       20%*
         Scan claims as c
-          tokens=306, mean_doc_tokens=102
+          tokens=306, mean_document_tokens=102
       Scan evidence as e
-        tokens=4,506, mean_doc_tokens=1,502
+        tokens=4,506, mean_document_tokens=1,502
       HashJoin: c.evidence_wiki_url = e.id
 ```
 

@@ -85,9 +85,9 @@ class PhysicalRequest:
                 if key.startswith(COLUMNS_PREFIX)}
 
     @property
-    def gpu_count(self) -> int:
+    def gpus(self) -> int:
         """Return the GPU count selected by the physical plan."""
-        return int(self.plan["workers"])
+        return int(self.plan["gpus"])
 
 
 @dataclass(frozen=True)
@@ -135,7 +135,7 @@ def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
     answers = (np.concatenate([np.asarray(row, dtype=bool) for row in value.values()])
                if len(value) else np.zeros(0, dtype=bool))
     return filter_answer_table(
-        node.alias, documents, np.full(len(documents), node.written_pos), answers)
+        node.alias, documents, np.full(len(documents), node.written_position), answers)
 
 
 def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
@@ -177,7 +177,7 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
         b"quail.anchor": anchor.encode("utf-8"),
         b"quail.partners": ",".join(partners).encode("utf-8"),
         b"quail.semantics": str(value["semantics"]).encode("utf-8"),
-        b"quail.written_pos": str(value["written_pos"]).encode("ascii"),
+        b"quail.written_position": str(value["written_position"]).encode("ascii"),
     }
     if value.get("selectivity") is not None:
         metadata[b"quail.selectivity"] = str(

@@ -20,7 +20,7 @@ class GpuContext:
     """Configuration for one GPU executor."""
 
     gpu_index: int
-    gpu_count: int
+    gpus: int
     model: ModelSpec
     device: DeviceSpec
     query_settings: Mapping[str, Any]
@@ -33,7 +33,7 @@ class BackendExecutionContext:
     request: Any
     graph: Any
     registry: Any
-    gpu_count: int
+    gpus: int
     runtime_state: dict[Any, Any]
 
 
@@ -66,7 +66,7 @@ class ModelBackend(Protocol):
         self,
         model: ModelSpec,
         device: DeviceSpec,
-        gpu_count: int,
+        gpus: int,
     ) -> SupportResult: ...
 
     def plan(

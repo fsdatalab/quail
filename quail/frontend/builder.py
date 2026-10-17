@@ -51,7 +51,7 @@ class Query:
         self._scope_ = Scope(catalog)
         self._scope_.add_table(provider, provider)
         self._tables = self._scope_.tables      # (alias, provider)
-        self._doc_columns = self._scope_.doc_columns
+        self._document_columns = self._scope_.document_columns
         self._filters = {}
         self._label_filters = {}     # alias -> [(name, labels, selectivity)]
         self._joins = []
@@ -90,14 +90,14 @@ class Query:
     def _resolve(self, c: ColSpec) -> ColumnRef:
         return self._scope_.resolve(c.column, c.alias)
 
-    def _note_doc_column(self, ref: ColumnRef) -> None:
-        self._scope_.note_doc_column(ref)
+    def _note_document_column(self, ref: ColumnRef) -> None:
+        self._scope_.note_document_column(ref)
 
     def _bind(self, p: PromptSpec, join: bool = False):
         refs = tuple(self._resolve(c) for c in p.cols)
         bound = self._prompts.bind("join" if join else "filter", p.template, refs)
         for r in refs:
-            self._note_doc_column(r)
+            self._note_document_column(r)
         aliases = []
         for r in refs:
             if r.alias not in aliases:
@@ -143,7 +143,7 @@ class Query:
         refs = tuple(self._resolve(c) for c in p.cols)
         bound = self._prompts.bind("score", p.template, refs)
         for ref in refs:
-            self._note_doc_column(ref)
+            self._note_document_column(ref)
         call = ModelCall(bound, "score")
         call.validate()
         self._scores[name] = Alias(call, name)
@@ -205,7 +205,7 @@ class Query:
             "label", p.template, refs, labels=labels, descriptions=descriptions,
             task_description=task_description)
         for ref in refs:
-            self._note_doc_column(ref)
+            self._note_document_column(ref)
         call = ModelCall(bound, "label", labels, descriptions,
                          probabilities=probabilities)
         call.validate()
@@ -264,7 +264,7 @@ class Query:
             call = ModelCall(bound, "extract", question=questions[field])
             call.validate()
             members.append(Alias(call, struct.member(field)))
-        self._note_doc_column(ref)
+        self._note_document_column(ref)
         self._extracts[name] = (struct, tuple(members))
         return self
 
@@ -467,8 +467,8 @@ class Query:
                     raise CompileError(
                         f"apply name {name!r} is used by two functions")
                 self._functions[name] = fn
-            for a, c in other._doc_columns.items():
-                self._note_doc_column(
+            for a, c in other._document_columns.items():
+                self._note_document_column(
                     ColumnRef(alias=a, provider=self._scope()[a],
                               column=c))
             new_aliases.append(alias)
@@ -771,7 +771,7 @@ class Query:
             logical.add_scan(
                 alias,
                 provider,
-                self._doc_columns.get(alias, ""),
+                self._document_columns.get(alias, ""),
                 tuple(self._filters.get(alias, ())),
                 tuple(self._applies.get(alias, ())),
                 tuple((column.expression, column.name) for column in wanted

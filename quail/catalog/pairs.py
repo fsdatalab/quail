@@ -44,11 +44,11 @@ def pair_table(left_alias: str, left_keys, right_alias: str,
     if len(left_keys) != len(right_keys) or not left_keys:
         raise ValueError("a pair table needs one key column per side "
                          "and at least one equality")
-    n_left = len(left_keys[0])
-    n_right = len(right_keys[0])
+    num_left = len(left_keys[0])
+    num_right = len(right_keys[0])
     names = [f"key{index}" for index in range(len(left_keys))]
-    left_columns = {left_alias: pa.array(range(n_left), type=pa.int32())}
-    right_columns = {right_alias: pa.array(range(n_right), type=pa.int32())}
+    left_columns = {left_alias: pa.array(range(num_left), type=pa.int32())}
+    right_columns = {right_alias: pa.array(range(num_right), type=pa.int32())}
     for name, left, right in zip(names, left_keys, right_keys):
         if right.type != left.type:
             right = pc.cast(right, left.type)
@@ -91,8 +91,8 @@ def estimate_pair_fraction(left_keys, right_keys) -> float:
         raise ValueError("a pair estimate needs one key column per side "
                          "and at least one equality")
     names = [f"key{index}" for index in range(len(left_keys))]
-    n_left, n_right = len(left_keys[0]), len(right_keys[0])
-    if not n_left or not n_right:
+    num_left, num_right = len(left_keys[0]), len(right_keys[0])
+    if not num_left or not num_right:
         return 0.0
 
     def value_counts(columns, count):
@@ -109,7 +109,7 @@ def estimate_pair_fraction(left_keys, right_keys) -> float:
                                matched.column("right"))).as_py() or 0
     # samples that share no key still say little about the tables, so
     # the estimate stays off zero
-    return max(pairs, 1) / (n_left * n_right)
+    return max(pairs, 1) / (num_left * num_right)
 
 
 class RowGroups:

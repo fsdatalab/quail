@@ -131,7 +131,7 @@ class SpeedOfLightEstimate:
         """Return what the estimate takes as given, for a report."""
         return {
             "persistent_kv_capacity": "unlimited",
-            "gpu_count": 1,
+            "gpus": 1,
             "survivors": "exact, from the caller's answers and labels",
             "stop_key": (
                 "a filter under a DISTINCT over its table's columns reads "
@@ -354,8 +354,8 @@ def speed_of_light_estimate(
         relation_order=tuple(best.relation_order),
         cached_prefixes=tuple(sorted(best.state_property)),
         search={
-            "dp_states": result.state_count,
-            "dp_records_generated": result.generated_count,
+            "dp_states": result.num_states,
+            "dp_records_generated": result.num_generated,
             "dp_final_records": len(result.candidates),
         },
     )

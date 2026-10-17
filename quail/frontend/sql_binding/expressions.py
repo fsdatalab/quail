@@ -75,7 +75,7 @@ class ExpressionBinder:
         self.scope = Scope(catalog)
         self.tables = self.scope.tables
         self.regular_predicates: dict[str, list[RegularPredicate]] = {}
-        self.doc_columns = self.scope.doc_columns
+        self.document_columns = self.scope.document_columns
         self.filters: dict[str, list[FilterPredicate]] = {}
         self.label_tests: dict[
             str, list[tuple[ModelCall, tuple[str, ...], float | None]]
@@ -91,12 +91,12 @@ class ExpressionBinder:
         self.scope.add_table(alias, table.name)
         return alias
 
-    def resolve_column(self, col: exp.Column, scope=None) -> ColumnRef:
-        return self.scope.resolve(col.name, col.table or None, tables=scope,
+    def resolve_column(self, col: exp.Column, tables=None) -> ColumnRef:
+        return self.scope.resolve(col.name, col.table or None, tables=tables,
                                   shown=col.sql())
 
-    def note_doc_column(self, ref: ColumnRef) -> None:
-        self.scope.note_doc_column(ref)
+    def note_document_column(self, ref: ColumnRef) -> None:
+        self.scope.note_document_column(ref)
 
     # ---- AI predicate parsing ----------------------------------------
 
@@ -191,7 +191,7 @@ class ExpressionBinder:
                 kind = "join" if join else "filter"
             prompt = self.prompts.bind(kind, template, tuple(refs))
         for r in refs:
-            self.note_doc_column(r)
+            self.note_document_column(r)
         return prompt, options, aliases
 
     def bind_ai_classify(self, node, scope=None):
@@ -312,7 +312,7 @@ class ExpressionBinder:
     def _extract_call(self, ref, question: str) -> ModelCall:
         """Bind one extraction's prompt over the document column."""
         prompt = self.prompts.bind("extract", question, (ref,))
-        self.note_doc_column(ref)
+        self.note_document_column(ref)
         call = ModelCall(prompt, "extract", question=question)
         call.validate()
         return call

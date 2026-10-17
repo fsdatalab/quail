@@ -200,13 +200,13 @@ def canonicalize_template(template: str) -> str:
     return split_frame(template)[1]
 
 
-def _check_placeholders(template: str, n_args: int) -> None:
+def _check_placeholders(template: str, num_args: int) -> None:
     import re
     slots = [int(m) for m in re.findall(r"\{(\d+)\}", template)]
-    if sorted(set(slots)) != list(range(n_args)):
+    if sorted(set(slots)) != list(range(num_args)):
         raise CompileError(
             f"PROMPT placeholders {sorted(set(slots))} do not match "
-            f"{n_args} argument(s): expected {{0}}..{{{n_args - 1}}} "
+            f"{num_args} argument(s): expected {{0}}..{{{num_args - 1}}} "
             f"each used at least once")
 
 

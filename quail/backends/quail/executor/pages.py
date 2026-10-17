@@ -11,13 +11,13 @@ class PageArena:
     the free list when its last holder frees it.
     """
 
-    def __init__(self, n_pages: int, page_tokens: int):
-        self.n_pages = n_pages
+    def __init__(self, num_pages: int, page_tokens: int):
+        self.num_pages = num_pages
         self.page_tokens = page_tokens
-        self.free = list(range(n_pages - 1, -1, -1))    # stack
+        self.free = list(range(num_pages - 1, -1, -1))    # stack
         self.owned = {}       # key -> list of page ids it alone writes
         self.borrowed = {}    # key -> leading page ids read from a parent
-        self.holds = [0] * n_pages    # page id -> keys holding it
+        self.holds = [0] * num_pages    # page id -> keys holding it
         self.tokens = {}      # key -> resident token count, borrowed included
         self.pinned = set()    # current operators depend on these keys
         self._retained_sizes = {}
@@ -152,7 +152,7 @@ class PageArena:
 
     def configure_retention(self, policy, cap_pages: int) -> None:
         """Update priorities without making active prefixes evictable."""
-        if not 0 <= cap_pages <= self.n_pages:
+        if not 0 <= cap_pages <= self.num_pages:
             raise ValueError("retention capacity must fit inside the arena")
         self.retention_policy = policy
         self.retention_cap_pages = cap_pages

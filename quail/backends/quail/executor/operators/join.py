@@ -48,9 +48,9 @@ class JoinPart(ExecutionPart):
 
         first = parts[0].node if parts else nodes[0]
         prefixes = DocumentPrefixes(
-            first.document_head, context.state["docs"][nodes[0].anchor], ids)
+            first.document_head, context.state["documents"][nodes[0].anchor], ids)
         upstream = {"documents": prefixes, "document_ids": ids, "parts": tuple(parts),
-                 "pairs": {part.node.written_pos: part.rows for part in parts
+                 "pairs": {part.node.written_position: part.rows for part in parts
                            if isinstance(part, ApplyGate) and part.node.ids == "pairs"}}
         prepared = context.model_inputs(
             nodes[0], inputs, context, upstream, nodes=nodes)
@@ -149,16 +149,20 @@ class JoinPart(ExecutionPart):
                     dtype=np.int64)
                 survivors = candidates[~np.isin(candidates, matched)]
             answer = {
-                "rows": rows, "anchor_index": anchor_ids,
-                "partner_index": inputs["partner_indices"][member.written_pos],
-                "anchor_partners": members, "anchor": member.anchor,
-                "partners": list(member.partners), "semantics": member.semantics,
-                "selectivity": member.selectivity, "written_pos": member.written_pos,
+                "rows": rows,
+                "anchor_index": anchor_ids,
+                "partner_index": inputs["partner_indices"][member.written_position],
+                "anchor_partners": members,
+                "anchor": member.anchor,
+                "partners": list(member.partners),
+                "semantics": member.semantics,
+                "selectivity": member.selectivity,
+                "written_position": member.written_position,
             }
             own_spans = stage_spans(spans, offset + j, offset + j + 1)
             results[member.node_id] = NodeResult(
                 outputs={f"ids:{member.anchor}": document_ids(survivors),
-                         f"join_answers:{member.written_pos}": answer},
+                         f"join_answers:{member.written_position}": answer},
                 metrics=NodeMetrics(
                     input_rows=len(anchor_ids) if j == 0 else len(reached_ids),
                     output_rows=len(survivors),
@@ -216,11 +220,11 @@ def _join_round_kv(anchor_keys, arena) -> dict:
     return {"hits": hits, "misses": len(anchor_keys) - hits}
 
 
-def _tuple_suffix(join, docs, member):
+def _tuple_suffix(join, documents, member):
 
     parts = []
     for alias, document in zip(join["partners"], member):
-        parts.extend((join["labels"][alias], docs[alias][document]))
+        parts.extend((join["labels"][alias], documents[alias][document]))
     parts.append(join["tail"])
     return concat_tokens(*parts)
 
@@ -240,7 +244,7 @@ def join_suffixes(group, documents, indices):
         for positions in itertools.product(*(range(len(indices[p])) for p in partners)):
             members.append([indices[p][i] for p, i in zip(partners, positions)])
             tokens.append(_tuple_suffix(join, documents, positions))
-        tuples[join["written_pos"]] = members
+        tuples[join["written_position"]] = members
         suffixes.append(tokens)
     return suffixes, tuples
 
@@ -258,14 +262,14 @@ def partner_maps(group, pair_tables, streamed=()) -> dict:
     """
     maps = {}
     for join in group:
-        if not runs_over_pairs(join) or join["written_pos"] in streamed:
+        if not runs_over_pairs(join) or join["written_position"] in streamed:
             continue
-        table = pair_tables.get(join["written_pos"])
+        table = pair_tables.get(join["written_position"])
         if table is None:
             raise ValueError(
-                f"join {join['written_pos']} runs over pairs but no pair "
+                f"join {join['written_position']} runs over pairs but no pair "
                 f"table reached it")
-        maps[join["written_pos"]] = partner_map(
+        maps[join["written_position"]] = partner_map(
             table, join["anchor"],
             pair_partner(join["anchor"], join["partners"]))
     return maps
@@ -292,7 +296,7 @@ def partner_list_builder(group, tuples_by_stage, maps):
             continue
         position = join["partners"].index(
             pair_partner(join["anchor"], join["partners"]))
-        rows = maps[join["written_pos"]]
+        rows = maps[join["written_position"]]
         cache = (np.full(len(rows.keys), None, dtype=object)
                  if isinstance(rows, RowGroups) else None)
         stage_maps.append((rows, members_by_partner(tuples, position), cache))
@@ -361,15 +365,15 @@ def prepare_join_inputs(node, inputs, context: ExecutionContext, upstream=None,
             retained_prefix_tokens_after_filters=arena.retained_prefix_tokens,
             retained_by_alias_after_filters={
                 alias: sum(key[0] == alias for key in retained)
-                for alias in state["docs"]
+                for alias in state["documents"]
             },
         )
     config = state["retention"]
     apply_retention(state["gpu"].arena, config,
                     config.get("before", {}).get(node.node_id, {}), by_alias)
-    documents = {alias: select_documents(state["docs"][alias], by_alias[alias])
+    documents = {alias: select_documents(state["documents"][alias], by_alias[alias])
                  for member in nodes for alias in member.partners}
-    prefixes = (DocumentPrefixes(node.document_head, state["docs"][node.anchor],
+    prefixes = (DocumentPrefixes(node.document_head, state["documents"][node.anchor],
                                  by_alias[node.anchor])
                 if upstream is None else upstream["documents"])
     prepared = join_inputs(nodes, documents, by_alias, prefixes, state["gpu"].arena,
@@ -392,13 +396,13 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
     maps = partner_maps(group, pair_tables, streamed=streamed_pairs)
     maps.update(streamed_pairs)
     lists_for = partner_list_builder(
-        group, [tuple_indices[stage.written_pos] for stage in nodes], maps)
+        group, [tuple_indices[stage.written_position] for stage in nodes], maps)
     anchor_ids = indices[node.anchor] if upstream is None else None
     anchor_keys = DocumentKeys(node.anchor, anchor_ids if upstream is None
                                else upstream["document_ids"])
     round_kv = _join_round_kv(anchor_keys, arena) if upstream is None else None
     last = group[-1]
-    last_tuples = tuple_indices[last["written_pos"]]
+    last_tuples = tuple_indices[last["written_position"]]
 
     def finished_answers(document, row) -> dict:
         """The anchor's last-stage matches: partner tuples that answered true.

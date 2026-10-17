@@ -115,7 +115,7 @@ def _rounds_work(prefix, shared, frame_tokens: int, runs, resident: bool,
 
 
 def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
-                    live: float, lengths, shared, chunk: int,
+                    expected_rows: float, lengths, shared, chunk: int,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0, runs=None,
                     answer_rows: float | None = None,
@@ -127,7 +127,7 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
         frame_tokens: Number of prompt tokens written after each document.
         suffixes: Request lengths in tokens, shared by all documents, in
             one round.
-        live: Expected number of documents to classify.
+        expected_rows: Expected number of documents to classify.
         lengths: Document lengths in tokens.
         shared: Shared document prefix lengths, or an empty sequence.
         chunk: Maximum tokens per forward pass.
@@ -145,11 +145,11 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
             whole vocabulary. A decision model ignores it.
 
     Returns:
-        Expected work over the documents, scaled to live, priced at
+        Expected work over the documents, scaled to the expected rows, priced at
         ideal packing.
     """
     n = len(lengths)
-    if live <= 0 or n == 0 or not (suffixes or runs):
+    if expected_rows <= 0 or n == 0 or not (suffixes or runs):
         return ClassifyCost(0.0, 0.0, Work(), 0.0, 0)
     window = model.sliding_window
     prefix = np.asarray(lengths, dtype=float) + head_tokens
@@ -174,13 +174,15 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
         rounds = 1
     if answer_rows is not None:
         rows = answer_rows
-    total = work * (live / n)
+    total = work * (expected_rows / n)
     passes = total.tokens / chunk
-    seconds = decoder_seconds(total, rows * live, passes, model, device, head_rows)
-    return ClassifyCost(seconds, passes, total, suffix_tokens * live, rounds)
+    seconds = decoder_seconds(
+        total, rows * expected_rows, passes, model, device, head_rows
+    )
+    return ClassifyCost(seconds, passes, total, suffix_tokens * expected_rows, rounds)
 
 
-def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
+def estimate(scoring: str, expected_rows: float, head_tokens: int, frame_tokens: int,
              labels, *, lengths, shared, chunk: int,
              model, device, resident: bool = False, draws: int = 1,
              starts=()) -> ClassifyCost:
@@ -188,7 +190,7 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
 
     Args:
         scoring: Label scoring rule name.
-        live: Expected number of documents to classify.
+        expected_rows: Expected number of documents to classify.
         head_tokens: Number of prompt tokens before each document.
         frame_tokens: Number of prompt tokens written after each document.
         labels: Token sequence for each label.
@@ -220,10 +222,20 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
     # rows of the head; longer labels normalize over the vocabulary
     targets = {token for ids in labels for token in ids}
     return estimate_suffixes(
-        head_tokens, frame_tokens, suffixes, live=live, lengths=lengths,
-        shared=shared, chunk=chunk, model=model, device=device,
+        head_tokens,
+        frame_tokens,
+        suffixes,
+        expected_rows=expected_rows,
+        lengths=lengths,
+        shared=shared,
+        chunk=chunk,
+        model=model,
+        device=device,
         resident=resident,
         head_rows=len(targets) if all(len(ids) == 1 for ids in labels) else 0,
-        canvas_rows=(canvas_rows if scoring == LETTERS_SCORING
-                     else model.canvas_tokens),
-        runs=runs, answer_rows=answer_rows)
+        canvas_rows=(
+            canvas_rows if scoring == LETTERS_SCORING else model.canvas_tokens
+        ),
+        runs=runs,
+        answer_rows=answer_rows,
+    )

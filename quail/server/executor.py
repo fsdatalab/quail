@@ -112,7 +112,7 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
                 "text": query.explain(),
                 "estimated_seconds": plan.estimated_seconds,
                 "backend": plan.backend,
-                "workers": plan.workers,
+                "gpus": plan.gpus,
                 "envelope": plan.to_envelope(session.registry.codecs),
             })
             if job.model_phase is not None:

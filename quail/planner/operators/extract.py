@@ -20,7 +20,7 @@ from quail.planner.operators.common import (
 from quail.planner.operators.ports import Ports
 
 
-def extract_spec(context, call, name, live, resident=False) -> ExtractSpec:
+def extract_spec(context, call, name, expected_rows, resident=False) -> ExtractSpec:
     """Build an extraction's specification and price it.
 
     The specification carries the token ids of the prompt around the
@@ -32,7 +32,7 @@ def extract_spec(context, call, name, live, resident=False) -> ExtractSpec:
         context: The planning context, with the model and tokenizer.
         call: Logical AI.EXTRACT call.
         name: Result column name.
-        live: Expected number of documents to extract from.
+        expected_rows: Expected number of documents to extract from.
         resident: Whether the documents' KV is already read, by a
             step of the same pipeline before this one.
     """
@@ -46,23 +46,31 @@ def extract_spec(context, call, name, live, resident=False) -> ExtractSpec:
     round_cost_per_token = model.kappa / device.hbm_bw / token_seconds
     spec = bind_inference(
         ExtractSpec, call.prompt, name=name,
-        expected_inputs=live, estimated_seconds=0.0,
+        expected_rows=expected_rows, estimated_seconds=0.0,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
         question=call.question,
         expected_answer_tokens=extract_cost.ExtractAssumptions().answer_tokens,
         round_cost_per_token=round_cost_per_token)
     cost = extract_cost.estimate(
-        live, lengths, len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
+        expected_rows,
+        lengths,
+        len(prompt.preamble_token_ids),
+        len(prompt.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),
-        model=context.model, device=context.device, resident=resident,
-        max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens,
+        model=context.model,
+        device=context.device,
+        resident=resident,
+        max_answer_tokens=spec.max_answer_tokens,
+        draft_tokens=spec.draft_tokens,
         draft_policy=spec.draft_policy,
-        round_cost_per_token=spec.round_cost_per_token, workers=context.gpu_count)
+        round_cost_per_token=spec.round_cost_per_token,
+        gpus=context.gpus,
+    )
     return replace(spec, estimated_seconds=cost.seconds)
 
 
-def emit_extract(builder, alias, live, names, ports, resident=False) -> tuple:
+def emit_extract(builder, alias, expected_rows, names, ports, resident=False) -> tuple:
     """Copy the answers of the alias's documents.
 
     A Filter on an extraction's answer or span follows that extraction
@@ -72,7 +80,7 @@ def emit_extract(builder, alias, live, names, ports, resident=False) -> tuple:
     Args:
         builder: The graph builder.
         alias: The table.
-        live: The documents the extractions read.
+        expected_rows: The documents the extractions read.
         names: The extractions to emit, in run order.
         ports: Where the documents stand before the extractions.
         resident: Whether the step before the run left the documents'
@@ -92,8 +100,13 @@ def emit_extract(builder, alias, live, names, ports, resident=False) -> tuple:
         # run in one pipeline (quail.physical.pipelines): a document
         # is read once for all of them, and a Filter drops it before
         # the next question
-        spec = extract_spec(builder.context, logical_node.call,
-                            logical_node.name, live, resident=resident or index > 0)
+        spec = extract_spec(
+            builder.context,
+            logical_node.call,
+            logical_node.name,
+            expected_rows,
+            resident=resident or index > 0,
+        )
         node = inference_node(
             AiExtract, spec, (ports.source,),
             index=sum(isinstance(n, AiExtract) for n in builder.nodes),
@@ -104,13 +117,14 @@ def emit_extract(builder, alias, live, names, ports, resident=False) -> tuple:
         for test in tests:
             if test.name != logical_node.name:
                 continue
-            lid = f"filter:{alias}:{test.position}"
+            filter_id = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
-                node_id=lid, inputs=input_ports((ports.rows,)),
+                node_id=filter_id, inputs=input_ports((ports.rows,)),
                 predicate=test.condition, aliases=(alias,),
-                selectivity=test.selectivity, written_pos=test.position))
-            ports = Ports(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
-            live *= effective_selectivity(test.selectivity)
+                selectivity=test.selectivity, written_position=test.position))
+            ports = Ports(PortRef(filter_id, f"ids:{alias}"),
+                          PortRef(filter_id, "rows"))
+            expected_rows *= effective_selectivity(test.selectivity)
         row_ports.append(ports.rows)
     return ports, row_ports
 

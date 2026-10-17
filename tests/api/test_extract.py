@@ -116,7 +116,7 @@ def test_extract_follows_the_filters_and_labels_of_its_table(session):
     (test,) = [n for n in plan.nodes if isinstance(n, Filter)]
     assert node.inputs[0].source.node_id == test.node_id
     # half the documents pass the label filter
-    assert node.spec.expected_inputs == pytest.approx(2 * 0.2 * 0.5)
+    assert node.spec.expected_rows == pytest.approx(2 * 0.2 * 0.5)
     assert plan.nodes[-1].columns == (
         "c.id", "kind", "lease.ends", "lease.ends_span")
 
@@ -190,8 +190,8 @@ def _candidates(session, query):
 
     query.plan()
     context = PlanningContext(
-        model=session.model, device=session.device, gpu_count=1,
-        document_tokens=query._doc_tokens, backend="quail",
+        model=session.model, device=session.device, gpus=1,
+        document_tokens=query._document_tokens, backend="quail",
         tokenizer=session.tokenizer)
     return search_candidates(query._logical_input, context, session.registry)
 
@@ -221,9 +221,9 @@ def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
     assert ("ai-extract:0", "ids:c") in [
         (port.source.node_id, port.source.port) for port in join.inputs]
     (node,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
-    assert node.spec.expected_inputs == pytest.approx(2 * 0.2)
+    assert node.spec.expected_rows == pytest.approx(2 * 0.2)
     (before,) = [n for n in written.plan.nodes if isinstance(n, AiExtract)]
-    assert before.spec.expected_inputs == 2
+    assert before.spec.expected_rows == 2
     assert node.spec.estimated_seconds < before.spec.estimated_seconds
     assert plan.nodes[-1].columns == (
         "c.id", "q.id", "lease.ends", "lease.ends_span")
@@ -411,7 +411,7 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     # an extraction keeps every document
     assert result.outputs["ids:c"].to_pylist() == [0, 1, 2, 3]
     step, = result.metrics.extension["steps"]
-    assert (step["kind"], step["output"], step["n_in"], step["n_out"]) == (
+    assert (step["kind"], step["output"], step["num_in"], step["num_out"]) == (
         "extract", "ends", 4, 3)
     assert (step["requests"], step["unanswered"], step["unaligned"]) == (4, 1, 1)
     assert step["generated_tokens"] == 4 + 1 + 2 + 3
@@ -629,7 +629,7 @@ def _answers_executor(answers):
         from quail.physical import Scan
 
         graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
-        docs = {node.alias: request.inputs[node.input_id].documents
+        documents = {node.alias: request.inputs[node.input_id].documents
                 for node in graph.nodes if isinstance(node, Scan)}
         texts = {node.alias: request.inputs[node.input_id].texts
                  for node in graph.nodes if isinstance(node, Scan)}
@@ -649,7 +649,7 @@ def _answers_executor(answers):
                     NodeMetrics(input_rows=len(ids), output_rows=len(ids),
                                 evaluated_documents=len(ids)))
 
-        state = graph_state(Answers(), docs)
+        state = graph_state(Answers(), documents)
         state["texts"] = texts
         report = execute_single_graph(
             state, {"filter_limit": None}, graph)
@@ -708,7 +708,7 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     assert extracts[1].inputs[0].source.node_id == filters[2].node_id
     # the three tests on the first field thin the second extraction,
     # which runs in the same pipeline over the resident KV
-    assert extracts[1].spec.expected_inputs == pytest.approx(2 * 0.5 ** 3)
+    assert extracts[1].spec.expected_rows == pytest.approx(2 * 0.5 ** 3)
     assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
     pipelines = build_pipelines(plan.graph)
     assert [member.node_id for member in pipelines[extracts[0].node_id]] == [
@@ -893,9 +893,9 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
     (extract,) = [n for n in selective.nodes if isinstance(n, AiExtract)]
     (classify,) = [n for n in selective.nodes if isinstance(n, AiClassify)]
     (ask,) = [n for n in selective.nodes if isinstance(n, AiFilter)]
-    assert extract.spec.expected_inputs == 2
-    assert classify.spec.expected_inputs == pytest.approx(2 * 0.05)
-    assert ask.expected_docs == pytest.approx(2 * 0.05 * 0.8, abs=0.05)
+    assert extract.spec.expected_rows == 2
+    assert classify.spec.expected_rows == pytest.approx(2 * 0.05)
+    assert ask.expected_rows == pytest.approx(2 * 0.05 * 0.8, abs=0.05)
     # the later steps are priced over the resident KV
     assert classify.spec.estimated_seconds < extract.spec.estimated_seconds
     # the ask, the classification, and the extraction show the
@@ -908,13 +908,13 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
     priced = query(0.5)
     priced.plan()
     context = PlanningContext(
-        model=session.model, device=session.device, gpu_count=1,
-        document_tokens=priced._doc_tokens, backend="quail",
+        model=session.model, device=session.device, gpus=1,
+        document_tokens=priced._document_tokens, backend="quail",
         tokenizer=session.tokenizer)
     operators = priced.logical.operators()
     statistics = cached_statistics(
         priced.logical, {}, model=session.model, device=session.device,
-        doc_tokens=priced._doc_tokens, context=context)
+        document_tokens=priced._document_tokens, context=context)
     steps = table_steps(operators, "c", range(1),
                         PlanPricing(context, statistics, "c"))
     assert [step.kind for step in steps] == ["ask", "classify", "extract"]

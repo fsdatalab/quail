@@ -27,14 +27,14 @@ class PredicateCost:
     reuse_key: Hashable | None = None
 
 
-def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
+def prepare_filter_costs(predicates, *, mean_tokens, model, device,
                          chunk_tokens, context=None,
                          lower=None) -> tuple[PredicateCost, ...]:
     """Prepare costs and reusable result identities for predicate ordering.
 
     Args:
         predicates: The model predicates of one table.
-        prefix_tokens: The preamble and mean document tokens.
+        mean_tokens: The preamble and mean document tokens.
         model: Model spec.
         device: Device spec.
         chunk_tokens: The forward pass token budget.
@@ -46,29 +46,29 @@ def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
     for predicate in predicates:
         if is_score(predicate.expression):
             _, cost = score_statistics(
-                predicate.prompt, context, chunk_tokens, mean_tokens=prefix_tokens)
+                predicate.prompt, context, chunk_tokens, mean_tokens=mean_tokens)
             first = later = cost.seconds
             reuse_key = predicate.prompt
         else:
             q = question_tokens(lower(predicate.prompt), model.canvas_tokens)
             first = partial(mul, filter_cost(
-                q, prefix_tokens, model, device, chunk_tokens, first=True))
+                q, mean_tokens, model, device, chunk_tokens, first=True))
             later = partial(mul, filter_cost(
-                q, prefix_tokens, model, device, chunk_tokens, first=False))
+                q, mean_tokens, model, device, chunk_tokens, first=False))
             reuse_key = None
         prepared.append(PredicateCost(
             effective_selectivity(predicate.selectivity), first, later, reuse_key))
     return tuple(prepared)
 
 
-def emit_filter(builder, alias, positions, live, ports, followed=False):
+def emit_filter(builder, alias, positions, expected_rows, ports, followed=False):
     """Append a run of the alias's AI filters in their chosen order.
 
     Args:
         builder: The graph builder.
         alias: The table.
         positions: The written positions to emit, in run order.
-        live: The documents the run reads.
+        expected_rows: The documents the run reads.
         ports: Where the documents stand before the run.
         followed: Whether a classification or an extraction continues
             the run's pipeline, so the filters write the documents' KV.
@@ -77,23 +77,23 @@ def emit_filter(builder, alias, positions, live, ports, followed=False):
         Where the documents stand after the run.
     """
     orders = builder.operator_order.filter_orders
-    surv = live
+    surv = expected_rows
     for i in positions:
         p = builder.operators.filters[alias][i]
-        fid = (f"ai_filter:{alias}" if i == orders[alias][0]
+        ask_id = (f"ai_filter:{alias}" if i == orders[alias][0]
                else f"ai_filter:{alias}:{i}")
         lowered = builder.context.lowered(p.prompt)
         builder.nodes.append(AiFilter(
-            node_id=fid, inputs=input_ports((ports.ids,)), alias=alias,
-            written_pos=i,
+            node_id=ask_id, inputs=input_ports((ports.ids,)), alias=alias,
+            written_position=i,
             question_tokens=question_tokens(lowered, builder.model.canvas_tokens),
             preamble_tokens=lowered.preamble_tokens,
             document_head=tuple(lowered.preamble_token_ids),
-            selectivity=p.selectivity, expected_docs=round(surv, 1),
+            selectivity=p.selectivity, expected_rows=round(surv, 1),
             arena_writes=(len(orders[alias]) > 1 or followed
                           or alias in builder.pipelined),
             stop_key=builder.stop_keys.get(alias, ())))
         surv *= effective_selectivity(p.selectivity)
-        ports = Ports(PortRef(fid, f"ids:{alias}"))
+        ports = Ports(PortRef(ask_id, f"ids:{alias}"))
     return builder.emit_applies(alias, ports)
 

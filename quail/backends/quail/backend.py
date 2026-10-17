@@ -23,7 +23,7 @@ class QuailBackend:
     reads_document_text = False
     locates_answers_in_text = True
 
-    def supports(self, model, device, gpu_count: int) -> SupportResult:
+    def supports(self, model, device, gpus: int) -> SupportResult:
         if device.name not in {"h100-sxm", "rtx-pro-6000-blackwell-server"}:
             return SupportResult.reject(
                 f"Quail does not support device {device.name!r}")
@@ -31,7 +31,7 @@ class QuailBackend:
             return SupportResult.reject(
                 f"Quail does not support model {model.name!r}: "
                 f"no forward pass for architecture {model.arch!r}")
-        if gpu_count not in {1, 2, 4, 8}:
+        if gpus not in {1, 2, 4, 8}:
             return SupportResult.reject(
                 "Quail requires 1, 2, 4, or 8 GPUs")
         return SupportResult.accept()

@@ -119,7 +119,7 @@ class SingleResultPart(ExecutionPart):
         return {self.node.node_id: self.result_value}
 
 
-def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
+def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
                   paged=True, on_answers=None) -> dict:
     """Run prepared operator work together and collect per-node results.
@@ -132,18 +132,19 @@ def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
     paged = paged or state.loaded_model.pipeline.needs_pages
     if keep_kv and not paged:
         raise ValueError("retaining document KV requires arena writes")
-    if tree is not None and not tree.shared_tokens:
-        tree = None
+    if prefix_tree is not None and not prefix_tree.shared_tokens:
+        prefix_tree = None
     settled = next((part.on_settled for part in parts
                     if part.on_settled is not None), None)
     if settled is None:
-        settled = settle_documents(state.loaded_model.arena, keys, prefixes,
+        settled = settle_documents(state.loaded_model.arena, anchor_keys, prefixes,
                                    keep_kv, state.chunk_tokens)
     stats = {}
     every, spans, tokens = run_stages(
         state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
-        stages, prefixes, state.chunk_tokens, anchor_keys=keys,
-        on_settled=settled, prefix_tree=tree, stats=stats, gpu_timing=state.gpu_timing,
+        stages, prefixes, state.chunk_tokens, anchor_keys=anchor_keys,
+        on_settled=settled, prefix_tree=prefix_tree, stats=stats,
+        gpu_timing=state.gpu_timing,
         attention_mode=next((part.attention for part in parts if part.attention),
                             attention),
         staging=input_staging(state), label=label, limit=limit,
@@ -322,7 +323,7 @@ def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
     """Return a callback that applies the final operator's KV retention setting."""
     if keep_kv and arena.retention_cap_pages is None:
         arena.retention_cap_pages = max(
-            0, arena.n_pages - arena.pages_needed(2 * budget))
+            0, arena.num_pages - arena.pages_needed(2 * budget))
 
     def settled(anchor, survived, row):
         key = keys[anchor]

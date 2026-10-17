@@ -74,7 +74,7 @@ class RequestClassifySpec:
     # note and partner label token ids, and the join whose rows it labels
     partner: str | None = None
     join_layout_token_ids: tuple[tuple[Any, ...], ...] = ()
-    join_written_pos: int | None = None
+    join_written_position: int | None = None
     # a decision model's scored options: distances before the prompt's
     # last row of each option block's end, then 0
     option_offsets: tuple[int, ...] = ()
@@ -82,7 +82,7 @@ class RequestClassifySpec:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestClassifySpec":
         partner = value.get("partner")
-        join_written_pos = value.get("join_written_pos")
+        join_written_position = value.get("join_written_position")
         return cls(
             alias=str(value["alias"]),
             output=str(value["output"]),
@@ -94,8 +94,8 @@ class RequestClassifySpec:
             partner=None if partner is None else str(partner),
             join_layout_token_ids=tuple(tuple(ids)
                                  for ids in value.get("join_layout_token_ids", ())),
-            join_written_pos=(None if join_written_pos is None
-                              else int(join_written_pos)),
+            join_written_position=(None if join_written_position is None
+                              else int(join_written_position)),
             option_offsets=tuple(int(offset)
                                  for offset in value.get("option_offsets", ())),
         )
@@ -111,7 +111,7 @@ class RequestClassifySpec:
                       for position, accepted in self.tests],
             "partner": self.partner,
             "join_layout_token_ids": [list(ids) for ids in self.join_layout_token_ids],
-            "join_written_pos": self.join_written_pos,
+            "join_written_position": self.join_written_position,
             "option_offsets": list(self.option_offsets),
         }
 
@@ -120,7 +120,7 @@ class RequestClassifySpec:
 class RequestJoinSpec:
     """One join predicate submitted over its complete cross product."""
 
-    written_pos: int
+    written_position: int
     aliases: tuple[str, ...]
     outer_aliases: tuple[str, ...]
     anchor: str | None
@@ -136,7 +136,7 @@ class RequestJoinSpec:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestJoinSpec":
         return cls(
-            written_pos=int(value["written_pos"]),
+            written_position=int(value["written_position"]),
             aliases=tuple(value["aliases"]),
             outer_aliases=tuple(value["outer_aliases"]),
             anchor=value["anchor"],
@@ -164,7 +164,7 @@ class RequestJoinSpec:
 
     def to_dict(self) -> dict:
         return {
-            "written_pos": self.written_pos,
+            "written_position": self.written_position,
             "aliases": list(self.aliases),
             "outer_aliases": list(self.outer_aliases),
             "anchor": self.anchor,
@@ -288,7 +288,7 @@ class RequestExecution(PhysicalNode):
         )
         outputs.extend(
             OutputPort(
-                f"join_answers:{spec.written_pos}",
+                f"join_answers:{spec.written_position}",
                 ValueType.JOIN_ANSWERS,
                 schema=(*spec.aliases, "answer"),
             )
@@ -350,7 +350,7 @@ class RequestExecution(PhysicalNode):
             fields[f"filter {spec.alias}"] = [
                 _short_text(text) for text in texts]
         for spec in self.joins:
-            fields[f"join {spec.written_pos + 1}"] = (
+            fields[f"join {spec.written_position + 1}"] = (
                 f"{spec.semantics}: {_short_text(spec.tail_text)}")
         for spec in self.classifies:
             fields[f"classify {spec.output}"] = list(spec.labels)

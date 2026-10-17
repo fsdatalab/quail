@@ -62,12 +62,12 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
     weight_precision, w_bytes = _weight_precision(hf_name, config)
     layers = config["num_hidden_layers"]
     hidden = config["hidden_size"]
-    n_q = config["num_attention_heads"]
-    n_kv = config["num_key_value_heads"]
-    d_head = config.get("head_dim") or hidden // n_q
+    num_q_heads = config["num_attention_heads"]
+    num_kv_heads = config["num_key_value_heads"]
+    d_head = config.get("head_dim") or hidden // num_q_heads
     intermediate = config["intermediate_size"]
-    per_layer = (hidden * (n_q + 2 * n_kv) * d_head    # qkv_proj
-                 + n_q * d_head * hidden                # o_proj
+    per_layer = (hidden * (num_q_heads + 2 * num_kv_heads) * d_head    # qkv_proj
+                 + num_q_heads * d_head * hidden                # o_proj
                  + 3 * hidden * intermediate            # gate_up, down
                  + 2 * hidden + 2 * d_head)             # four norms
     params = float(layers * per_layer + hidden)
@@ -79,8 +79,8 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
         params=params,
         layers=layers,
         hidden=hidden,
-        n_q=n_q,
-        n_kv=n_kv,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
         d_head=d_head,
         ffn_width=2 * intermediate,
         w_bytes=w_bytes,

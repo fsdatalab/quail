@@ -83,7 +83,7 @@ def transient_sliding_pages(chunk_tokens: int, window: int) -> int:
 
 def arena_pages(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int | None = None,
-                mean_doc_tokens: float | None = None) -> tuple[int, int]:
+                mean_document_tokens: float | None = None) -> tuple[int, int]:
     """Pages of the two KV pools: (every-token pool, sliding-layer pool).
 
     A model without sliding layers gets one pool and 0 sliding pages.
@@ -103,7 +103,7 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
     if not page_bytes_sliding:
         return int(free // page_bytes_full), 0
     window = model.sliding_window
-    mean = window if mean_doc_tokens is None else max(1.0, mean_doc_tokens)
+    mean = window if mean_document_tokens is None else max(1.0, mean_document_tokens)
     ratio = min(1.0, (min(mean, window) + SPLIT_EXTRA_TOKENS)
                 / (mean + SPLIT_EXTRA_TOKENS))
     full = int(free // (page_bytes_full + ratio * page_bytes_sliding))
@@ -119,14 +119,14 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
 
 def arena_tokens(model: ModelSpec, device: DeviceSpec,
                  chunk_tokens: int | None = None,
-                 mean_doc_tokens: float | None = None) -> int:
+                 mean_document_tokens: float | None = None) -> int:
     """Admission budget: tokens of document KV that can be resident at once.
 
     Computed from the memory left after resident weights and the
     activation reservation. With sliding layers this is the
     every-token pool; see arena_pages.
     """
-    full, _ = arena_pages(model, device, chunk_tokens, mean_doc_tokens)
+    full, _ = arena_pages(model, device, chunk_tokens, mean_document_tokens)
     return full * PAGE_TOKENS
 
 
@@ -134,10 +134,10 @@ def arena_tokens(model: ModelSpec, device: DeviceSpec,
 
 def _projection_shapes(model: ModelSpec):
     """Return (in_dim, out_dim) of every dense projection in a layer."""
-    qkv_out = (model.n_q + 2 * model.n_kv) * model.d_head
+    qkv_out = (model.num_q_heads + 2 * model.num_kv_heads) * model.d_head
     inter = model.intermediate
     return ((model.hidden, qkv_out),
-            (model.n_q * model.d_head, model.hidden),
+            (model.num_q_heads * model.d_head, model.hidden),
             (model.hidden, model.ffn_width),
             (inter, model.hidden))
 
@@ -161,9 +161,9 @@ def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
 def _attention_time(model: ModelSpec, device: DeviceSpec,
                     chunk: int, context: int) -> float:
     """Ideal seconds for the attention kernels in one chunk, all layers."""
-    flops = 4.0 * chunk * context * model.n_q * model.d_head
+    flops = 4.0 * chunk * context * model.num_q_heads * model.d_head
     moved = (context * model.kappa / model.layers
-             + 2.0 * chunk * model.n_q * model.d_head * ACT_BYTES)
+             + 2.0 * chunk * model.num_q_heads * model.d_head * ACT_BYTES)
     return max(flops / device.peak_flops,
                moved / device.hbm_bw) * model.layers
 
@@ -214,6 +214,6 @@ def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
     tree = _attention_time(model, device, rows, node_tokens)
     # the merge kernel reads two partial outputs and writes one, in
     # bf16, once per layer
-    merge = 3 * rows * model.n_q * model.d_head * ACT_BYTES / device.hbm_bw
+    merge = 3 * rows * model.num_q_heads * model.d_head * ACT_BYTES / device.hbm_bw
     tree += merge * model.layers
     return "tree" if tree < unified else "unified"

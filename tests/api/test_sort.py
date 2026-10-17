@@ -2,7 +2,7 @@
 
 import pyarrow as pa
 import pytest
-from helpers.planning import _optimize, _plan, node_kinds, tok
+from helpers.planning import _optimize, _plan, node_kinds, tokenizer
 
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, DocumentProvider
@@ -35,7 +35,7 @@ def _optimize_with(catalog, logical, tokens):
     """Run the built in tree rewrites with the catalog's id columns."""
     context = PlanningContext(
         catalog=catalog, model=QWEN3_4B_FP8, device=H100_SXM,
-        document_tokens=tokens, tokenizer=tok)
+        document_tokens=tokens, tokenizer=tokenizer)
     candidate, = logical_alternatives(logical, built_in_rules(), context)
     return candidate.plan, candidate.rules
 
@@ -132,7 +132,7 @@ def test_distinct_is_dropped_when_every_tables_id_is_selected(catalog):
     assert not isinstance(optimized.root, Result) or not optimized.root.distinct
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
                       registry=built_in_registry(),
-                      doc_tokens=tokens, tokenizer=tok)
+                      document_tokens=tokens, tokenizer=tokenizer)
     assert node_kinds(plan)[-2:] == ["Project", "Limit"]
     assert plan.settings["filter_limit"] == 3
     # a group's keys name it once, so DISTINCT over them is redundant too
@@ -161,7 +161,7 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
     assert node.stop_key == ("author",)
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
                       registry=built_in_registry(),
-                      doc_tokens=tokens, tokenizer=tok)
+                      document_tokens=tokens, tokenizer=tokenizer)
     ai_filter = next(node for node in plan.nodes if isinstance(node, AiFilter))
     assert ai_filter.stop_key == ("author",)
     text = explain(optimized, plan)

@@ -274,7 +274,7 @@ def compile_sql(
         logical.add_scan(
             alias,
             provider,
-            b.doc_columns.get(alias, ""),
+            b.document_columns.get(alias, ""),
             tuple(b.filters.get(alias, ())),
             regular_predicates=tuple(b.regular_predicates.get(alias, ())),
             labels=tuple(labels.get(alias, {}).items()),

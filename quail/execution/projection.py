@@ -166,7 +166,7 @@ def projection_for(logical, token_inputs, documents):
             ),
             projection=projection,
             report={},
-            row_count=(value.num_rows if isinstance(value, pa.Table)
+            num_rows=(value.num_rows if isinstance(value, pa.Table)
                        and declaration is relation.declaration
                        else None),
         )

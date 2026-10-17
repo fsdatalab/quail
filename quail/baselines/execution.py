@@ -128,7 +128,7 @@ class RequestModelExecution:
                 input_rows=sum(len(self.documents[alias]) for alias in node.aliases),
                 output_rows=sum(len(value) for value in survivors.values()),
                 evaluated_documents=sum(
-                    step["requests"] if step["kind"] == "filter" else step["n_in"]
+                    step["requests"] if step["kind"] == "filter" else step["num_in"]
                     for step in steps if not step.get("partner")
                     and step["kind"] != "join"),
                 evaluated_document_pairs=sum(step["requests"] for step in steps
@@ -209,9 +209,9 @@ class RequestModelExecution:
                 kind="filter",
                 alias=spec.alias,
                 submission=self.filter_submission,
-                n_in=len(document_ids),
-                n_out=len(survivors[spec.alias]),
-                doc_cap=result["doc_cap"],
+                num_in=len(document_ids),
+                num_out=len(survivors[spec.alias]),
+                document_cap=result["doc_cap"],
             ))
 
     def _execute_classifications(self, node, survivors, outputs, steps):
@@ -252,8 +252,8 @@ class RequestModelExecution:
                 kind="classify",
                 alias=spec.alias,
                 output=spec.output,
-                n_in=len(document_ids),
-                n_out=len(survivors[spec.alias]),
+                num_in=len(document_ids),
+                num_out=len(survivors[spec.alias]),
                 unmatched=result["unmatched"],
             ))
 
@@ -330,10 +330,10 @@ class RequestModelExecution:
             # a join over pairs asks each anchor about its own members
             allowed = None
             request_pairs = None
-            if spec.written_pos in self.pairs:
+            if spec.written_position in self.pairs:
                 allowed = allowed_members_by_anchor(
                     anchor, partners, anchor_ids, members,
-                    self.pairs[spec.written_pos])
+                    self.pairs[spec.written_position])
                 request_pairs = [
                     (anchor_index, member_index)
                     for anchor_index, mine in enumerate(allowed)
@@ -371,7 +371,7 @@ class RequestModelExecution:
                     by_alias = {anchor: anchor_id}
                     by_alias.update(zip(partners, members[member_index]))
                     rows.append(tuple(by_alias[alias] for alias in spec.aliases))
-            outputs[f"join_answers:{spec.written_pos}"] = join_answers(
+            outputs[f"join_answers:{spec.written_position}"] = join_answers(
                 spec,
                 rows,
                 answers,
@@ -396,7 +396,7 @@ class RequestModelExecution:
                     survivors[anchor] = sorted(matched)
             steps.append(request_step(result,
                 kind="join",
-                written_pos=spec.written_pos,
+                written_position=spec.written_position,
                 anchor=anchor,
                 partners=list(partners),
                 submission=submission,
@@ -411,7 +411,7 @@ class RequestModelExecution:
                 continue
             # the rows the join kept, each decoded as anchor, note,
             # partner block, and the question
-            answers = outputs[f"join_answers:{spec.join_written_pos}"]
+            answers = outputs[f"join_answers:{spec.join_written_position}"]
             kept = answers.filter(answers.column("answer"))
             pairs = list(zip(kept.column(spec.alias).to_pylist(),
                              kept.column(spec.partner).to_pylist()))
@@ -433,8 +433,8 @@ class RequestModelExecution:
                 alias=spec.alias,
                 partner=spec.partner,
                 output=spec.output,
-                n_in=len(pairs),
-                n_out=labels.num_rows,
+                num_in=len(pairs),
+                num_out=labels.num_rows,
                 unmatched=result["unmatched"],
             ))
 
@@ -466,8 +466,8 @@ class RequestModelExecution:
                 kind="extract",
                 alias=spec.alias,
                 output=spec.output,
-                n_in=len(document_ids),
-                n_out=len(document_ids) - result["unanswered"],
+                num_in=len(document_ids),
+                num_out=len(document_ids) - result["unanswered"],
                 unanswered=result["unanswered"],
                 unaligned=result["unaligned"],
             ))

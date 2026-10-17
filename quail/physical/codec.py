@@ -199,7 +199,7 @@ def plan_envelope(
     backend: str,
     model: str,
     device: str,
-    workers: int,
+    gpus: int,
     graph: PhysicalGraph,
     codecs: Mapping[str, NodeCodec],
     settings: Mapping[str, Any] | None = None,
@@ -210,7 +210,7 @@ def plan_envelope(
         "backend": backend,
         "model": model,
         "device": device,
-        "workers": workers,
+        "gpus": gpus,
         "settings": dict(settings or {}),
         "graph": encode_graph(graph, codecs),
     }
@@ -219,7 +219,7 @@ def plan_envelope(
 def check_plan_envelope(value: Mapping[str, Any]) -> None:
     """Validate a physical plan envelope."""
     required = {
-        "backend", "model", "device", "workers",
+        "backend", "model", "device", "gpus",
         "settings", "graph",
     }
     missing = required - set(value)
@@ -237,7 +237,7 @@ def check_plan_envelope(value: Mapping[str, Any]) -> None:
     for name in ("backend", "model", "device"):
         if not isinstance(value[name], str) or not value[name]:
             raise TypeError(f"physical plan {name} must be a nonempty string")
-    if not isinstance(value["workers"], int) or value["workers"] <= 0:
+    if not isinstance(value["gpus"], int) or value["gpus"] <= 0:
         raise ValueError("physical plan workers must be positive")
     if not isinstance(value["graph"], Mapping):
         raise TypeError("physical plan graph must be a mapping")

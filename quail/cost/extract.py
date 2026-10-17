@@ -1,7 +1,7 @@
 """Extraction costs: expected work priced like a classification's work.
 
 The estimate sums each document's work over every document, scales it
-to the live count, and prices the total with the component roofline
+to the expected rows, and prices the total with the component roofline
 at ideal packing, as quail/cost/classify.py does. The steps follow the
 executor (quail/backends/quail/executor/extract/): the prompt with
 the document, then the answer, one chosen token and a draft of the
@@ -106,7 +106,7 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
         # the policy's first-round choice for this document, with one stream
         policy = DraftPolicy(draft_tokens, max_answer_tokens, assumptions.answer_tokens)
         draft_tokens = policy.draft_length(
-            round_cost_per_token * (prefix + tail_tokens), 1, live=1)
+            round_cost_per_token * (prefix + tail_tokens), 1, num_streams=1)
     if resident:
         work = ask(prefix, tail_tokens, window=window)
     elif shared:
@@ -130,16 +130,16 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     return work, fed, rows
 
 
-def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
+def estimate(expected_rows: float, lengths, head_tokens: int, tail_tokens: int, *,
              chunk: int, model, device, resident: bool = False,
              shared=None, max_answer_tokens: int, draft_tokens: int,
              draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
-             workers: int = 1,
+             gpus: int = 1,
              assumptions: ExtractAssumptions | None = None) -> ExtractCost:
     """Estimate the cost of one extraction over a table.
 
     Args:
-        live: Expected number of documents to extract from.
+        expected_rows: Expected number of documents to extract from.
         lengths: Document lengths in tokens.
         head_tokens: Prompt tokens before the document.
         tail_tokens: Prompt tokens after the document, through the cue.
@@ -154,14 +154,14 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
         draft_policy: "fixed" or "adaptive", from the extraction plan.
         round_cost_per_token: One document token's KV read per round, in
             fed tokens, from the extraction plan.
-        workers: Model copies sharing the work, assuming balanced document costs.
+        gpus: Model copies sharing the work, assuming balanced document costs.
         assumptions: Expected answer length, separate from execution limits.
 
     Returns:
         Estimated execution time, work, and token counts.
     """
     n = len(lengths)
-    if live <= 0 or n == 0:
+    if expected_rows <= 0 or n == 0:
         return ExtractCost(0.0, 0.0, Work(), 0.0, 0.0)
     assumptions = ExtractAssumptions() if assumptions is None else assumptions
     work = Work()
@@ -177,10 +177,10 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
         work += own
         fed += own_fed
         rows += own_rows
-    scale = live / n
+    scale = expected_rows / n
     total = work * scale
     passes = total.tokens / chunk
-    copies = max(1, min(workers, live))
+    copies = max(1, min(gpus, expected_rows))
     seconds = decoder_seconds(total * (1 / copies), rows * scale / copies,
                               passes / copies, model, device)
     return ExtractCost(seconds, passes, total, fed * scale, rows * scale)

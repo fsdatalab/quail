@@ -231,7 +231,7 @@ class AsyncTopLogprobs(_HostReadout):
         torch: Torch module.
         F: Torch functional module.
         head: Full output head with shape (vocabulary, hidden size).
-        k: How many likeliest tokens each row returns.
+        gpus: How many likeliest tokens each row returns.
         extras: Token ids whose log probability every row returns. An
             entry that is a tuple of ids returns one value, the log
             probability of any of them.

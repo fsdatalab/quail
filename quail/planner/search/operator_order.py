@@ -14,7 +14,7 @@ from quail.planner.search.filter_order import default_order_rule, order_filters_
 from quail.planner.search.statistics import (
     PlanStatistics,
     cached_statistics,
-    live_after_filters,
+    expected_rows_after_filters,
 )
 from quail.planner.search.table_steps import (
     ASK,
@@ -36,19 +36,19 @@ class OperatorOrder:
     step_orders: dict  # alias -> its TableSteps in run order
     join_sequence: list
     join_steps: list
-    live: dict[str, float]
+    expected_rows: dict[str, float]
     filter_work: dict[str, Work]
     order_rule: str
     order_source: str
 
 
-def choose_operator_order(plan, operators, model, device, doc_tokens, order,
+def choose_operator_order(plan, operators, model, device, document_tokens, order,
                 pair_fractions, context, scan_fractions):
     """Choose operator order and estimate work without constructing graph nodes."""
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     statistics = cached_statistics(
         plan, {} if context is None else context.memo, model=model,
-        device=device, doc_tokens=doc_tokens, pair_fractions=pair_fractions,
+        device=device, document_tokens=document_tokens, pair_fractions=pair_fractions,
         scan_fractions=scan_fractions, context=context)
     stats, chunk, pre = statistics.stats, statistics.chunk, statistics.pre
     specs = statistics.specs
@@ -61,7 +61,7 @@ def choose_operator_order(plan, operators, model, device, doc_tokens, order,
     orders = {alias: [step.key for step in table if step.kind == ASK]
               for alias, table in steps.items()}
 
-    live0 = live_after_filters(plan, statistics)
+    live0 = expected_rows_after_filters(plan, statistics)
     works = filter_works(plan, statistics, model, steps)
 
     seq = [(specs[position], anchor) for position, anchor in
@@ -70,13 +70,13 @@ def choose_operator_order(plan, operators, model, device, doc_tokens, order,
     _, join_steps = joinsearch.walk(
         seq, live0, statistics.lengths, set(operators.all_filters()), pre,
         model, device)
-    anchors = {spec.written_pos: anchor for spec, anchor in seq}
+    anchors = {spec.written_position: anchor for spec, anchor in seq}
     for s in scans:
         fq = max((question_tokens(context.lowered(p.prompt), model.canvas_tokens)
                   for p in ask_filters.get(s.alias, ())), default=None)
         if fq is None:
             continue
-        need = pre + stats[s.alias].max_doc_tokens + fq
+        need = pre + stats[s.alias].max_document_tokens + fq
         if need > chunk:
             return Refusal(
                 reasons=(f"a document in {s.alias!r} needs {need} tokens "
@@ -87,9 +87,9 @@ def choose_operator_order(plan, operators, model, device, doc_tokens, order,
     for spec in specs:
         if spec.cost is not None:
             continue
-        anchor = anchors[spec.written_pos]
+        anchor = anchors[spec.written_position]
         need = join_input_tokens(
-            spec, anchor, {alias: stats[alias].max_doc_tokens
+            spec, anchor, {alias: stats[alias].max_document_tokens
                            for alias in spec.aliases}, pre)
         if need > chunk:
             return Refusal(
@@ -122,8 +122,8 @@ def filter_works(plan: LogicalPlan, statistics: PlanStatistics,
     works = {}
     for alias, predicates in plan.operators().filters.items():
         stats = statistics.stats[alias]
-        prefix = statistics.pre + stats.mean_doc_tokens
-        count, total, previous = float(stats.n_docs), Work(), None
+        prefix = statistics.pre + stats.mean_document_tokens
+        count, total, previous = float(stats.num_documents), Work(), None
         for step in step_orders.get(alias, ()):
             if step.kind == ASK and step.key in statistics.asks[alias]:
                 question = question_tokens(
@@ -166,7 +166,7 @@ def choose_step_orders(operators: Operators, statistics: PlanStatistics, *,
         if not steps:
             continue
         ordered = order_filters_indexed(
-            steps, rule, count=statistics.stats[table.alias].n_docs,
+            steps, rule, count=statistics.stats[table.alias].num_documents,
             resident=resident_after)
         orders[table.alias] = [steps[index] for index in ordered]
     return orders
@@ -196,9 +196,9 @@ def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
         return []
     base_work = sum(
         filter_works(plan, statistics, model, step_orders).values(), Work())
-    live = live_after_filters(plan, statistics)
+    expected_rows = expected_rows_after_filters(plan, statistics)
     filtered = set(plan.operators().all_filters())
-    arguments = (statistics.specs, live, statistics.lengths, filtered,
+    arguments = (statistics.specs, expected_rows, statistics.lengths, filtered,
                  statistics.pre, statistics.chunk, model, device)
     found = joinsearch.search_joins(
         *arguments, base_work=base_work, fixed_order=rule == "as_written")

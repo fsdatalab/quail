@@ -86,7 +86,7 @@ class Engine:
             vLLM's unfused equivalents.
     """
 
-    def __init__(self, arena, *, n_q, n_kv, head_dim, rotary, fp8,
+    def __init__(self, arena, *, num_q_heads, num_kv_heads, head_dim, rotary, fp8,
                  kernels="quail"):
         import torch
         from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
@@ -100,8 +100,8 @@ class Engine:
         self.torch = torch
         self.arena = arena
         self.rotary = rotary
-        self.num_q_heads = n_q
-        self.num_kv_heads = n_kv
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.use_ue8m0 = bool(is_deep_gemm_e8m0_used())
         self.fp8 = torch.float8_e4m3fn
@@ -141,9 +141,9 @@ class Engine:
             x, group_size=GROUP, column_major_scales=True,
             use_ue8m0=self.use_ue8m0)
 
-    def _col_major_scales(self, n_tokens, width):
+    def _col_major_scales(self, num_tokens, width):
         return self.torch.empty(
-            (width // GROUP, n_tokens),
+            (width // GROUP, num_tokens),
             dtype=self.torch.float32, device="cuda").permute(-1, -2)
 
     def rms_norm(self, x, norm):
@@ -192,8 +192,19 @@ class Engine:
             x_q, module.weight, scale_a=x_s, scale_b=module.weight_scale,
             out_dtype=self.torch.bfloat16, bias=getattr(module, "bias", None))
 
-    def qkv_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
-                            q_weight, k_weight, eps, cos_sin_cache):
+    def qkv_norm_rope_heads(
+        self,
+        qkv,
+        positions,
+        *,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        q_weight,
+        k_weight,
+        eps,
+        cos_sin_cache,
+    ):
         """The fused per-head q and k RMS norm plus neox rotary, any geometry.
 
         custom_qk_norm_rope with the layer's own head counts, head
@@ -204,16 +215,16 @@ class Engine:
         """
         n = qkv.shape[0]
         torch = self.torch
-        q = torch.empty((n, n_q * head_dim), dtype=torch.bfloat16,
+        q = torch.empty((n, num_q_heads * head_dim), dtype=torch.bfloat16,
                         device=qkv.device)
-        k = torch.empty((n, n_kv * head_dim), dtype=torch.bfloat16,
+        k = torch.empty((n, num_kv_heads * head_dim), dtype=torch.bfloat16,
                         device=qkv.device)
-        v = torch.empty((n, n_kv * head_dim), dtype=torch.bfloat16,
+        v = torch.empty((n, num_kv_heads * head_dim), dtype=torch.bfloat16,
                         device=qkv.device)
         self._triton_kernels()["qkv"][(n,)](
             qkv, q, k, v, cos_sin_cache, positions, q_weight, k_weight,
             qkv.stride(0), q.stride(0), k.stride(0), v.stride(0), eps,
-            QH=n_q, KH=n_kv, HD=head_dim, HALF=head_dim // 2,
+            QH=num_q_heads, KH=num_kv_heads, HD=head_dim, HALF=head_dim // 2,
             num_warps=8 if head_dim > 256 else 4)
         return q, k, v
 
@@ -310,8 +321,8 @@ class Engine:
             tl.store(q_ptr + t * stride_q + offs,
                      tl.reshape(q, (GROUP_C * GPB,)).to(
                          q_ptr.dtype.element_ty))
-            g_idx = block * GPB + tl.arange(0, GPB)
-            tl.store(s_ptr + g_idx * s_stride_g + t * s_stride_t, scale)
+            group_index = block * GPB + tl.arange(0, GPB)
+            tl.store(s_ptr + group_index * s_stride_g + t * s_stride_t, scale)
 
         # fuses vLLM's fused_add_rms_norm + per_token_group_quant_fp8
         @triton.jit
@@ -345,22 +356,22 @@ class Engine:
             tl.store(q_ptr + t * stride_q + offs,
                      tl.reshape(q, (BLOCK,)).to(q_ptr.dtype.element_ty),
                      mask=mask)
-            g_idx = tl.arange(0, BLOCK // GROUP_C)
-            tl.store(s_ptr + g_idx * s_stride_g + t * s_stride_t, scale,
-                     mask=g_idx < NG)
+            group_index = tl.arange(0, BLOCK // GROUP_C)
+            tl.store(s_ptr + group_index * s_stride_g + t * s_stride_t, scale,
+                     mask=group_index < NG)
 
         # fuses vLLM's two per-head rms_norm calls + rotary_emb
         # (five launches) into one
         @triton.jit
-        def qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, pos_ptr,
+        def qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, position_ptr,
                          qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
                          eps, QH: tl.constexpr, KH: tl.constexpr,
                          HD: tl.constexpr, HALF: tl.constexpr):
             t = tl.program_id(0)
-            pos = tl.load(pos_ptr + t)
+            position = tl.load(position_ptr + t)
             half_offs = tl.arange(0, HALF)
-            cos = tl.load(cs_ptr + pos * HD + half_offs).to(tl.float32)
-            sin = tl.load(cs_ptr + pos * HD + HALF + half_offs).to(tl.float32)
+            cos = tl.load(cs_ptr + position * HD + half_offs).to(tl.float32)
+            sin = tl.load(cs_ptr + position * HD + HALF + half_offs).to(tl.float32)
             qw_a = tl.load(qw_ptr + half_offs).to(tl.float32)
             qw_b = tl.load(qw_ptr + HALF + half_offs).to(tl.float32)
             kw_a = tl.load(kw_ptr + half_offs).to(tl.float32)
@@ -569,11 +580,11 @@ class Engine:
         # applies, written contiguous for the KV scatter
         @triton.jit
         def qkv_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, v_out_ptr, cs_ptr,
-                          pos_ptr, qw_ptr, kw_ptr, stride_qkv, stride_qo,
+                          position_ptr, qw_ptr, kw_ptr, stride_qkv, stride_qo,
                           stride_ko, stride_vo, eps, QH: tl.constexpr,
                           KH: tl.constexpr, HD: tl.constexpr,
                           HALF: tl.constexpr):
-            qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, pos_ptr,
+            qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, position_ptr,
                          qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
                          eps, QH, KH, HD, HALF)
             t = tl.program_id(0)
@@ -788,7 +799,7 @@ class Engine:
             causal=causal, fa_version=version or self.fa_version,
             return_softmax_lse=True, **extra)
 
-    def _paged(self, q3, kp, vp, cu_q, max_q, used, max_used, table, *,
+    def _paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table, *,
                causal, softmax_scale=None, window=None):
         """One paged attention call.
 
@@ -797,8 +808,8 @@ class Engine:
         """
         wide = q3.shape[-1] > FA_MAX_HEAD_DIM
         out, _ = self._fa(
-            q3, kp, vp, cu_q, None, max_q, max_used, causal=causal,
-            block_table=table, seqused_k=used,
+            q3, kp, vp, cu_q, None, max_q, max_seqused_k, causal=causal,
+            block_table=block_table, seqused_k=seqused_k,
             softmax_scale=softmax_scale, window=window,
             version=4 if wide else None)
         return out

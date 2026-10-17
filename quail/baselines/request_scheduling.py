@@ -168,12 +168,12 @@ def run_filter_sequence(
         engine.add_request(request_id, prompt, sampling_params)
 
     started = time.perf_counter()
-    live = 0
+    expected_rows = 0
     next_document = 0
     while next_document < len(body_ids) or inflight:
-        while next_document < len(body_ids) and live < document_cap:
+        while next_document < len(body_ids) and expected_rows < document_cap:
             submit(next_document, 0)
-            live += 1
+            expected_rows += 1
             next_document += 1
         for output in engine.step():
             if not output.finished or output.request_id not in inflight:
@@ -182,7 +182,7 @@ def run_filter_sequence(
             if sequence.record(document, stage, output):
                 submit(document, stage + 1)
             else:
-                live -= 1
+                expected_rows -= 1
     return sequence.result(
         time.perf_counter() - started,
         **_cap_settings(document_cap, budget_tokens, block_size,
