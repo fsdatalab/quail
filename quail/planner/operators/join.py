@@ -103,6 +103,8 @@ def emit_join(builder, spec, step, anchor, jid, exec_idx):
         expected_tuples=round(step.tuples, 1),
         anchor_frame_tokens=spec.frame_tokens[anchor],
         pair_tail_tokens=spec.tail_tokens,
+        head_token_ids=tuple(builder.context.lowered(
+            builder.operators.joins[spec.written_pos].prompt).preamble_token_ids),
         anchor_resident=step.resident,
         tuple_tokens=round(step.tokens, 1),
         pairs_from=pairs_from))

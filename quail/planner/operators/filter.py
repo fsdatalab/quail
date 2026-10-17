@@ -77,12 +77,13 @@ def emit_filter(builder, alias, positions, live, followed=False):
         p = builder.operators.filters[alias][i]
         fid = (f"ai_filter:{alias}" if i == orders[alias][0]
                else f"ai_filter:{alias}:{i}")
+        lowered = builder.context.lowered(p.prompt)
         builder.nodes.append(AiFilter(
             node_id=fid, inputs=input_ports((builder.ids_of(alias),)), alias=alias,
             written_pos=i,
-            question_tokens=question_tokens(
-                builder.context.lowered(p.prompt), builder.model.canvas_tokens),
-            preamble_tokens=builder.context.lowered(p.prompt).preamble_tokens,
+            question_tokens=question_tokens(lowered, builder.model.canvas_tokens),
+            preamble_tokens=lowered.preamble_tokens,
+            head_token_ids=tuple(lowered.preamble_token_ids),
             selectivity=p.selectivity, expected_docs=round(surv, 1),
             arena_writes=(len(orders[alias]) > 1 or followed
                           or alias in builder.pipelined),

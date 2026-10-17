@@ -131,8 +131,7 @@ class ShouldRetainKv(PhysicalRule):
         schedule.update(**coefficients(context.model, context.device),
                         cap_pages=statistics.cap_pages)
         context.settings["retention"] = schedule
-        return plan_kv_retention(
-            graph, context.gpu_count, tuple(context.settings.get("pre_ids", ())))
+        return plan_kv_retention(graph, context.gpu_count)
 
 
 class ChooseClassifyImplementation(PhysicalRule):

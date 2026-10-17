@@ -134,11 +134,9 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
              .select("c.id", "lease", "signing", "venue"))
     plan = query.plan()
     extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
-    # the extractions show the documents under the query's shared
-    # head, which the executor keys their KV by, so the plan carries it
-    # without a filter or a join
-    assert extracts[0].document_head is None
-    assert list(extracts[0].spec.prompt_token_parts[0]) == plan.settings["pre_ids"]
+    # the extractions show the documents under their prompt's head,
+    # which the executor keys their KV by
+    assert extracts[0].document_head == tuple(extracts[0].spec.prompt_token_parts[0])
     pipelines = build_pipelines(plan.graph)
     # the three run as one pipeline: the later ones read the KV the
     # first leaves and are priced without reading the document
@@ -168,8 +166,7 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
     plan = filtered.plan()
     (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
     (ai_filter,) = [n for n in plan.nodes if isinstance(n, AiFilter)]
-    assert extract.spec.shares_head
-    assert list(extract.spec.prompt_token_parts[0]) == plan.settings["pre_ids"]
+    assert extract.document_head == ai_filter.document_head != ()
     pipelines = build_pipelines(plan.graph)
     assert tuple(member.node_id for member in pipelines[ai_filter.node_id]) == (
         ai_filter.node_id, extract.node_id)
@@ -667,7 +664,7 @@ def _answers_executor(answers):
         state = graph_state(Answers(), docs)
         state["texts"] = texts
         report = execute_single_graph(
-            state, {"filter_limit": None, "pre_ids": []}, graph)
+            state, {"filter_limit": None}, graph)
         outputs = report.pop("_outputs")
         return PhysicalResponse(outputs, {
             **report, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 12})

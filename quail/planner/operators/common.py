@@ -1,6 +1,6 @@
 """What every AI operator shares: prompt token counts, specs, and plan nodes."""
 
-from quail.logical.prompts import prompt_aliases, shared_preamble
+from quail.logical.prompts import prompt_aliases
 from quail.physical.base import input_ports
 from quail.planner.prompt_lowering import LoweredPrompt
 
@@ -22,17 +22,6 @@ def preamble_tokens(lowered_prompts) -> int:
         if lowered.preamble_tokens is not None:
             return lowered.preamble_tokens
     return 0
-
-
-def shares_query_head(context, lowered: LoweredPrompt) -> bool:
-    """Return whether a prompt shows the document under the query's shared head.
-
-    Under the shared head, the prompt's document KV is the one the
-    table's other operators write and read, so the operators run in
-    one pipeline.
-    """
-    return tuple(lowered.preamble_token_ids) == tuple(context.tokenizer(
-        shared_preamble(context.model.turn_prefix, context.model.prompt_layout)))
 
 
 def bind_inference(spec_type, prompt, *, name, expected_inputs,

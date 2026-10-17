@@ -232,7 +232,7 @@ def test_plans_carry_the_decision_layout(session):
     question = node.question_token_ids
     assert "".join(question).endswith(OPTIONS + CLOSING)
     assert "".join(question).startswith("\n\nTask type: noul\nQuestion:\n")
-    assert plan.settings["pre_ids"] == _tokens("Context:\n")
+    assert node.document_head == tuple(_tokens("Context:\n"))
 
     plan = session.sql(
         "SELECT q.id, d.id FROM queries q JOIN documents d "

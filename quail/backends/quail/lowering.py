@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from quail.logical import has_score, shared_preamble
+from quail.logical import has_score
 from quail.physical import AiFilter, AiJoin
 from quail.planner.graph.builder import build_physical_plan
 from quail.planner.optimizer.candidates import PhysicalCandidate
@@ -75,13 +75,6 @@ def bind_runtime_data(plan, region, context):
     true_ids, false_ids = (
         answer_ids(context.model, tokenizer) if tokenizer is not None
         else ([], []))
-    prompts = operators.prompts
-    pre_ids = (
-        list(tokenizer(shared_preamble(context.model.turn_prefix,
-                                       context.model.prompt_layout)))
-        if tokenizer is not None else
-        list(context.lowered(prompts[0]).preamble_token_ids) if prompts else []
-    )
     return replace(
         plan,
         nodes=tuple(encoded_nodes),
@@ -90,6 +83,5 @@ def bind_runtime_data(plan, region, context):
             **plan.settings,
             "true_ids": true_ids,
             "false_ids": false_ids,
-            "pre_ids": pre_ids,
         },
     )

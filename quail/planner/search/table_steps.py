@@ -16,7 +16,6 @@ from typing import Any, Callable
 
 from quail.logical import effective_selectivity
 from quail.planner.operators.classify import classify_builder, classify_scoring
-from quail.planner.operators.common import shares_query_head
 from quail.planner.operators.extract import extract_spec
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.validation import ClassifyRefusedError
@@ -94,10 +93,8 @@ class PlanPricing:
                      for resident in (False, True))
 
     def head(self, prompt):
-        """Return a prompt's head: None under the query's shared head."""
-        lowered = self.context.lowered(prompt)
-        return (None if shares_query_head(self.context, lowered)
-                else tuple(lowered.preamble_token_ids))
+        """Return the token ids a prompt shows the document under."""
+        return tuple(self.context.lowered(prompt).preamble_token_ids)
 
 
 def table_steps(operators, alias: str, asks, pricing) -> list[TableStep]:

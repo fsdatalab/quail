@@ -479,7 +479,6 @@ def _child_filters(state, sub):
         config = sub.get("retention", {})
         apply_retention(arena, config, config.get("initial", {}))
     results = {}
-    pre = sub.get("pre_ids") or []
     filter_limit = sub.get("filter_limit")
     t0 = time.perf_counter()
     with torch.inference_mode():
@@ -502,7 +501,7 @@ def _child_filters(state, sub):
                 runtime_context, nodes,
                 {
                     "documents": DocumentPrefixes(
-                        pre,
+                        node.document_head,
                         sub["docs"][alias],
                         range(len(sub["docs"][alias])),
                     ),
@@ -553,7 +552,6 @@ def _child_joins(state, sub):
     arena = gpu.arena
     if sub.get("start_query", False):
         _reset_child_query(state)
-    pre = sub.get("pre_ids") or []
     registry = state.registry
     nodes = tuple(registry.codecs[value["type"]].decode(value)
                   for value in sub["physical_nodes"])
@@ -570,7 +568,8 @@ def _child_joins(state, sub):
                     config.get("before", {}).get(node.node_id, {}), live)
     t0 = time.perf_counter()
     with torch.inference_mode():
-        prefixes = DocumentPrefixes(pre, anchor_docs, range(len(anchor_docs)))
+        prefixes = DocumentPrefixes(node.document_head, anchor_docs,
+                                    range(len(anchor_docs)))
         prepared = join_inputs(
             nodes, {alias: partner["docs"]
                     for alias, partner in sub["partners"].items()},

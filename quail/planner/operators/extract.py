@@ -15,7 +15,6 @@ from quail.physical.base import input_ports
 from quail.planner.operators.common import (
     bind_inference,
     inference_node,
-    shares_query_head,
 )
 
 
@@ -36,7 +35,6 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
             before this one.
     """
     prompt = context.lowered(call.prompt)
-    shares_head = shares_query_head(context, prompt)
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
     spec = bind_inference(
@@ -44,7 +42,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         expected_inputs=live, estimated_seconds=0.0,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
-        question=call.question, trim=call.trim, shares_head=shares_head)
+        question=call.question, trim=call.trim)
     cost = extract_cost.estimate(
         live, lengths, len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),

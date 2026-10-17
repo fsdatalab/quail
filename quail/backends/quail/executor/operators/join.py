@@ -47,10 +47,8 @@ class JoinPart(ExecutionPart):
         from quail.backends.quail.executor.operators.apply import ApplyGate
 
         first = parts[0].node if parts else nodes[0]
-        head = first.document_head
         prefixes = DocumentPrefixes(
-            context.state["pre"] if head is None else head,
-            context.state["docs"][nodes[0].anchor], ids)
+            first.document_head, context.state["docs"][nodes[0].anchor], ids)
         upstream = {"documents": prefixes, "document_ids": ids, "parts": tuple(parts),
                  "pairs": {part.node.written_pos: part.rows for part in parts
                            if isinstance(part, ApplyGate) and part.node.ids == "pairs"}}
@@ -371,7 +369,7 @@ def prepare_join_inputs(node, inputs, context: ExecutionContext, upstream=None,
                     config.get("before", {}).get(node.node_id, {}), by_alias)
     documents = {alias: select_documents(state["docs"][alias], by_alias[alias])
                  for member in nodes for alias in member.partners}
-    prefixes = (DocumentPrefixes(state["pre"], state["docs"][node.anchor],
+    prefixes = (DocumentPrefixes(node.document_head, state["docs"][node.anchor],
                                  by_alias[node.anchor])
                 if upstream is None else upstream["documents"])
     prepared = join_inputs(nodes, documents, by_alias, prefixes, state["gpu"].arena,

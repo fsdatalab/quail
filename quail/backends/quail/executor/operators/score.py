@@ -234,8 +234,7 @@ class ScoreBatch(SingleResultPart):
     @staticmethod
     def model_inputs(node, inputs, context, sequence=None, nodes=None):
         # scored through the reranker readout over the documents
-        return {"score_inputs": inputs, "documents": context.state["docs"],
-                "pre": context.state.get("pre", [])}
+        return {"score_inputs": inputs, "documents": context.state["docs"]}
 
     def __init__(self, name, stages, scores, total_tokens, on_answers):
         self.name = name

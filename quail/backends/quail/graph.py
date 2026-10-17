@@ -94,7 +94,6 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         sources[columns_key(alias)] = table
     runtime_state = {
         **state,
-        "pre": payload.get("pre_ids") or [],
         "retention": retention,
         "filter_limit": (
             None if any(isinstance(node, AiJoin)

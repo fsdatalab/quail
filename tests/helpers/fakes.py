@@ -38,7 +38,7 @@ DOC = 1000
 QUESTION = 2000
 PARTNER = 3000
 FRAME = 4000
-SETTINGS = {"filter_limit": None, "pre_ids": [], "retention": {}}
+SETTINGS = {"filter_limit": None, "retention": {}}
 
 
 def bare_arena(arena, pages):

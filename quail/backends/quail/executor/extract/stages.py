@@ -39,8 +39,9 @@ class ExtractionStages:
         texts: The table's document texts.
         readout: Optional readout in place of the model's. Its extras
             are the none token, then the stop tokens as one group.
-        shared_head: The query's shared preamble, under which a filter
-            writes the documents' KV; None when the query has none.
+        pipeline_head: The token ids the pipeline shows the documents
+            under; an extraction under the same head reads the KV the
+            operators before it wrote.
         document_positions: Positions in the supplied documents and texts.
             None uses document_ids.
 
@@ -49,7 +50,7 @@ class ExtractionStages:
     """
 
     def __init__(self, state, specs, vocabulary: Vocabulary, document_ids,
-                 documents, texts, readout=None, shared_head=None,
+                 documents, texts, readout=None, pipeline_head=None,
                  document_positions=None):
         self.specs = list(specs)
         first = self.specs[0]
@@ -63,8 +64,8 @@ class ExtractionStages:
         if any(list(head) != self.head for head, _ in parts):
             raise ValueError("a pipeline's extractions share a prompt head")
         self.tails = [list(tail) for _, tail in parts]
-        self.shared_head = (None if shared_head is None
-                            else [int(t) for t in shared_head])
+        self.pipeline_head = (None if pipeline_head is None
+                              else [int(t) for t in pipeline_head])
         if any(len(tail) < 2 for tail in self.tails):
             raise ValueError("an extraction's tail ends in its cue after the question")
         self.vocabulary = vocabulary
@@ -143,8 +144,7 @@ class ExtractionStages:
         """
         alias = self.specs[0].alias
         key = (("extract", alias), int(document))
-        shared = (self.head == self.shared_head if self.shared_head is not None
-                  else not self.head)
+        shared = self.head == self.pipeline_head
         tokens = ids.numpy()
         same_tokens = stored is ids
         if shared and stored is not None and not same_tokens:

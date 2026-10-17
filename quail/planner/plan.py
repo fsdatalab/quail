@@ -143,8 +143,7 @@ class PhysicalPlan:
             PlanEditError: The edited operator graph is invalid.
         """
         nodes = plan_kv_retention(
-            PhysicalGraph(tuple(nodes), self.graph.root), self.workers,
-            tuple(self.settings.get("pre_ids", ()))).nodes
+            PhysicalGraph(tuple(nodes), self.graph.root), self.workers).nodes
         try:
             edited = replace(self, nodes=nodes, root=None, estimates={})
         except GraphValidationError as error:
@@ -290,8 +289,7 @@ class EngineConfig:
     attention: str | None = None
 
 
-def plan_kv_retention(graph: PhysicalGraph, workers: int = 1,
-                      shared_head: tuple[int, ...] = ()) -> PhysicalGraph:
+def plan_kv_retention(graph: PhysicalGraph, workers: int = 1) -> PhysicalGraph:
     """Set operators' KV retention from the next compatible document consumer.
 
     KV between operators on one path stays active in the scheduler. It stays
@@ -299,9 +297,6 @@ def plan_kv_retention(graph: PhysicalGraph, workers: int = 1,
     documents under the same prompt head. Worker boundaries use the same
     paths as execution.
     """
-    def head(node):
-        return shared_head if node.document_head is None else node.document_head
-
     paths = build_pipelines(graph, workers)
     ordered = graph.topological_nodes()
     starts = [node for node in ordered
@@ -313,7 +308,7 @@ def plan_kv_retention(graph: PhysicalGraph, workers: int = 1,
         following = next((later for later in starts[index + 1:]
                           if later.document_aliases == (alias,)), None)
         keep = (following is not None
-                and head(first) == head(following)
+                and first.document_head == following.document_head
                 and (workers == 1 or first.worker_pipelining
                      and following.worker_pipelining))
         model_nodes = [node for node in members if node.backend is not None]

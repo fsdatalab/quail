@@ -14,7 +14,7 @@ from quail.physical import AiFilter
 def payload():
     return dict(
         model="qwen3-4b-fp8", chunk_tokens=1000,
-        true_ids=[1], false_ids=[2], pre_ids=[9], filter_limit=None,
+        true_ids=[1], false_ids=[2], filter_limit=None,
         docs={"r": [[i] * (10 + i) for i in range(6)],
               "p": [[i] * 5 for i in range(4)]},
         filters={"r": [[7, 7]]}, filter_arena_writes={"r": True}, physical_plan={},

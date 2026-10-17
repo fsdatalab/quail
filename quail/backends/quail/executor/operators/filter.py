@@ -244,7 +244,7 @@ def filter_inputs(state, node, document_ids) -> dict:
     document_ids = id_positions(document_ids)
     return {
         "documents": DocumentPrefixes(
-            state["pre"], state["docs"][node.alias], document_ids
+            node.document_head, state["docs"][node.alias], document_ids
         ),
         "document_ids": document_ids,
         "limit": state["filter_limit"],

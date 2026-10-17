@@ -20,7 +20,6 @@ def _common_payload(payload: dict) -> dict:
         "arena_pages": payload.get("arena_pages"),
         "true_ids": payload["true_ids"],
         "false_ids": payload["false_ids"],
-        "pre_ids": payload.get("pre_ids", []),
         "filter_limit": payload.get("filter_limit"),
         "retention": payload.get("retention", {}),
         "gpu_timing": payload.get("gpu_timing", False),

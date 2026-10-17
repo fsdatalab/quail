@@ -42,9 +42,7 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
         nodes = list(group)
         parts.append(implementations[nodes[0].type_name].prepare(
             state, nodes, ids, parts, inputs, context))
-    head = first.document_head
-    prefixes = DocumentPrefixes(context.state["pre"] if head is None else head,
-                                context.state["docs"][alias], ids)
+    prefixes = DocumentPrefixes(first.document_head, context.state["docs"][alias], ids)
     results = execute_parts(
         state, parts, prefixes, DocumentKeys(alias, ids), keep_kv=members[-1].keep_kv,
         tree=execution_prefix_tree(first, prefixes, state.loaded_model.arena),

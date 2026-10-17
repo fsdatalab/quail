@@ -77,7 +77,6 @@ class DistributedQuailExecution:
                         node.alias), range(len(documents))),
                     [len(document) for document in documents], gpu_count)
         self.joins = tuple(node for node in graph.nodes if isinstance(node, AiJoin))
-        self.pre = payload.get("pre_ids") or []
         self.joins_started = False
         self.retained: dict[str, set[int]] = {}
         self.prior_shards: dict[str, list[list[int]]] = {}
@@ -152,7 +151,6 @@ class DistributedQuailExecution:
                 "document_positions": range(len(documents)),
                 "documents": {alias: select_documents(self.docs[alias], documents)},
                 "texts": {alias: texts.take(pa.array(documents))},
-                "pre": self.pre,
                 "gpu_timing": self.payload.get("gpu_timing", False),
             }})
         started = time.perf_counter()
@@ -336,7 +334,9 @@ class DistributedQuailExecution:
     def snapshot_after_filters(self):
         from quail.cost.budgets import PAGE_TOKENS
 
-        lengths = [len(self.pre) + len(self.docs[alias][document])
+        heads = {node.alias: len(node.document_head)
+                 for node in self.graph.nodes if isinstance(node, AiFilter)}
+        lengths = [heads.get(alias, 0) + len(self.docs[alias][document])
                    for alias, documents in self.retained.items()
                    for document in documents]
         self.kv_stats.update(

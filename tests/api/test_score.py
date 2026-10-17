@@ -584,7 +584,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     assert node.spec.estimated_seconds > 0
     graph = physical.graph
     payload = quail_runtime_payload(request, graph)
-    assert payload["pre_ids"] and "filter_limit" not in payload
+    assert "filter_limit" not in payload
 
     def run(kind, subs):
         subs = pickle.loads(pickle.dumps(subs))

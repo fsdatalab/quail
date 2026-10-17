@@ -349,7 +349,7 @@ def _setup(monkeypatch, trim=True, documents=None, token_documents=None,
 
     inputs = {"document_ids": (list(range(len(documents))) if document_ids is None
                                else document_ids), "documents": tokens,
-              "texts": {"c": documents}, "pre": [], "gpu_timing": gpu_timing}
+              "texts": {"c": documents}, "gpu_timing": gpu_timing}
 
     def run(name="ends", keep_kv=False):
         result = execute_extractions(
@@ -499,7 +499,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
             arena=query.loaded_model.arena)))
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": state.chunk_tokens,
-        "true_ids": [1], "false_ids": [2], "pre_ids": [],
+        "true_ids": [1], "false_ids": [2],
         "docs": {"c": tables.document_batch(DOCS, [None] * len(DOCS))},
         "texts": {"c": pa.array(DOCS)},
         "physical_plan": plan_envelope(
@@ -552,7 +552,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
     # the plain extraction continues its pipeline, so a document is
     # packed once and the extraction feeds only its question
     spec, tables = make_spec()
-    plain = replace(spec, shares_head=True)
+    plain = spec
     head = list(plain.prompt_token_parts[0])
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
@@ -569,6 +569,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
             node_id="ai_filter:c", inputs=input_ports((PortRef("input:c", "ids:c"),)),
             alias="c", arena_writes=True, question_token_ids=tuple(question),
             written_pos=0, question_tokens=len(question), preamble_tokens=len(head),
+            head_token_ids=tuple(head),
             selectivity=0.7, expected_docs=2.0),
         AiExtract(node_id="ai-extract:ends",
                   inputs=input_ports((PortRef("ai_filter:c", "ids:c"),)),
@@ -597,7 +598,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
              "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}, "gpu_timing": True}
     report = execute_single_graph(
-        state, {"filter_limit": None, "pre_ids": head, "retention": {}}, graph)
+        state, {"filter_limit": None, "retention": {}}, graph)
     table = report["_outputs"][PortRef("ai-extract:ends", "rows")].to_pydict()
     assert table["c"] == [0, 1]
     assert table["ends"] == ["March 3, 2027", "five years"]
@@ -746,7 +747,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
              "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}}
     report = execute_single_graph(
-        state, {"filter_limit": None, "pre_ids": [], "retention": {}}, graph)
+        state, {"filter_limit": None, "retention": {}}, graph)
     outputs = report["_outputs"]
     first = outputs[PortRef("ai-extract:ends", "rows")].to_pydict()
     assert first["ends"] == ["March 3, 2027", "five years", None]
@@ -789,7 +790,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
         AiExtract(node_id="ai-extract:ends",
                   inputs=input_ports((PortRef("input:c", "ids:c"),)),
                   backend_name="quail", model="qwen3-4b-fp8",
-                  spec=replace(spec, shares_head=True)),
+                  spec=spec),
         Filter(node_id="filter:c:1",
                inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
                predicate=RegularPredicate(
@@ -800,6 +801,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
             inputs=input_ports((PortRef("filter:c:1", "ids:c"),)),
             alias="c", arena_writes=True, question_token_ids=tuple(question),
             written_pos=0, question_tokens=len(question), preamble_tokens=len(head),
+            head_token_ids=tuple(head),
             selectivity=0.7, expected_docs=2.0),
     ), PortRef("ai_filter:c", "ids:c"))
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
@@ -822,7 +824,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
              "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}}
     report = execute_single_graph(
-        state, {"filter_limit": None, "pre_ids": head, "retention": {}}, graph)
+        state, {"filter_limit": None, "retention": {}}, graph)
     outputs = report["_outputs"]
     assert outputs[PortRef("ai-extract:ends", "rows")].to_pydict()["ends"] == [
         "March 3, 2027", "five years", None]
@@ -887,7 +889,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
              "device": DEVICES["h100-sxm"], "chunk_tokens": chunk,
              "docs": {"c": documents}, "texts": {"c": list(docs)}}
     report = execute_single_graph(
-        state, {"filter_limit": 1, "pre_ids": [], "retention": {}}, graph)
+        state, {"filter_limit": 1, "retention": {}}, graph)
     outputs = report["_outputs"]
     kept = outputs[PortRef("filter:c:0", "rows")].to_pydict()
     # the documents in flight when the first passed finish; the

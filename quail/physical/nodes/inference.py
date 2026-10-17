@@ -98,8 +98,8 @@ class AiInference(PhysicalNode):
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
 
     @property
-    def document_head(self) -> tuple[int, ...] | None:
-        return (self.spec.prompt_token_parts[0]
+    def document_head(self) -> tuple[int, ...]:
+        return (tuple(self.spec.prompt_token_parts[0])
                 if self.spec and self.spec.prompt_token_parts else ())
 
     @property

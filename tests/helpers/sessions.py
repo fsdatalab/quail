@@ -93,7 +93,7 @@ def make_executor(filter_truth, join_truth=None):
         if getattr(request, "relations", None):
             state["columns"] = request.column_tables()
         report = execute_single_graph(state, {
-            "filter_limit": None, "pre_ids": [],
+            "filter_limit": None,
         }, graph)
         outputs = report.pop("_outputs")
         return PhysicalResponse(outputs, {

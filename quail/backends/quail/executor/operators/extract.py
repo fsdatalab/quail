@@ -122,8 +122,7 @@ class ExtractPart(ExecutionPart):
                if hasattr(value, "column") else np.asarray(value, dtype=np.int64))
         return {"document_ids": ids,
                 "documents": context.state["docs"],
-                "texts": context.state.get("texts", {}),
-                "pre": context.state.get("pre", [])}
+                "texts": context.state.get("texts", {})}
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
@@ -133,11 +132,10 @@ class ExtractPart(ExecutionPart):
             ValueError: A document uses a different prompt or token sequence.
         """
         first = parts[0].node if parts else nodes[0]
-        head = first.document_head
         part = cls(state, nodes, ids, {
             "documents": context.state["docs"],
             "texts": context.state.get("texts", {}),
-            "pre": context.state["pre"] if head is None else head})
+            "head": first.document_head})
         alias = part.node.spec.alias
         for doc, document in zip(part.extraction.docs, part.ids):
             if doc.key != (alias, document):
@@ -158,7 +156,8 @@ class ExtractPart(ExecutionPart):
             raise ValueError(f"AI.EXTRACT needs the text of {alias!r}")
         self.extraction = ExtractionStages(
             state, [node.spec for node in nodes], load_vocabulary(state), self.ids,
-            inputs["documents"][alias], texts, shared_head=inputs.get("pre"),
+            inputs["documents"][alias], texts,
+            pipeline_head=inputs.get("head", self.node.document_head),
             document_positions=inputs.get("document_positions"))
         self.stages = self.extraction.stages
         self._results = {}

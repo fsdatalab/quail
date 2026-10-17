@@ -118,8 +118,7 @@ def fused_graph(*, classify_only=False):
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=14, estimated_seconds=0.0,
         prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
-        label_token_ids=LABEL_IDS, scoring="letters", share_prefixes=True,
-        shares_head=True)
+        label_token_ids=LABEL_IDS, scoring="letters", share_prefixes=True)
     nodes = [
         Scan(node_id="input:r", alias="r", input_id="r"),
         Scan(node_id="input:p", alias="p", input_id="p"),
@@ -196,8 +195,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         expected_inputs=4, estimated_seconds=0.0,
         prompt_token_parts=(head, (91, 92, 93)), labels=("a", "b"),
         label_token_ids=((1,), (2,)), scoring="letters",
-        draws=4 if shape == "draws" else 1, probabilities=shape == "draws",
-        shares_head=not first)
+        draws=4 if shape == "draws" else 1, probabilities=shape == "draws")
     nodes = [Scan(node_id="input:r", alias="r", input_id="r")]
     if not first:
         nodes.append(AiFilter(
@@ -366,8 +364,6 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         "device": DEVICES["h100-sxm"],
         "chunk_tokens": 64, "docs": docs,
     }
-    # the settings' shared preamble is empty, as a classification plan's is
-    assert SETTINGS["pre_ids"] == []
     if shape == "score_first":
         from quail.backends.quail.reranker import _score_table
         from quail.execution.metrics import NodeResult

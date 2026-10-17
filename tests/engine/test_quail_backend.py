@@ -59,7 +59,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     registry = built_in_registry()
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": 8192, "true_ids": [1],
-        "false_ids": [2], "pre_ids": [], "filter_limit": None,
+        "false_ids": [2], "filter_limit": None,
         "order_rule": "by_cost", "docs": {"d": [[1], [2], [3], [4]]},
         "joins": [], "filters": {}, "filter_arena_writes": {},
         "shards": {"d": ((0, 2), (1, 3))},

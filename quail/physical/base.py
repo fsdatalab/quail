@@ -112,9 +112,9 @@ class PhysicalNode:
         return ()
 
     @property
-    def document_head(self) -> tuple[int, ...] | None:
-        """Return the document's prompt head, or None for the shared preamble."""
-        return None
+    def document_head(self) -> tuple[int, ...]:
+        """Return the token ids this operator shows a document under."""
+        return ()
 
     def document_outputs(self, alias: str) -> tuple[str, ...]:
         """Return outputs that can feed the next operator for a document."""
