@@ -135,10 +135,10 @@ how they release and explain changes.
 - Do not create Modal app names. Attach GPU cells to
   `quail-milestone1` and the worker to `quail-engine`; caches and warm
   state belong to those apps.
-- To check a change, run Quail alone on a small set of queries at
-  scale factor 0.1, not the full suite. The full suite is slow. Use
-  these 13, which cover each AI operator alone, chained with the
-  others, and followed by relational operators:
+- To check a change, run these 13 queries at scale factor 0.1, with
+  Quail alone. Do not run the full suite; it is slow. Together they
+  cover each AI operator alone, chained with the others, and followed
+  by relational operators:
   - `IMDB-1`: one filter.
   - `IMDB-2`: one join.
   - `IMDB-4`: two filters, then a join.
