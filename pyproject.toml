@@ -30,6 +30,9 @@ server = [
 [project.scripts]
 quail-server = "quail.server.__main__:main"
 
+[project.entry-points."vllm.general_plugins"]
+quail = "quail.baselines.vllm_plugin:register"
+
 [project.urls]
 Documentation = "https://fsdatalab.github.io/quail"
 Repository = "https://github.com/fsdatalab/quail"

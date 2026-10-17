@@ -160,8 +160,8 @@ class ExtensionRegistry:
     ) -> ExtensionRegistry:
         """Register a Python function for a query's apply() nodes.
 
-        The function takes a dict of Arrow tables keyed by alias and
-        returns ids or pairs; see quail.logical.Apply.
+        The function takes a dict of Rows keyed by alias and returns
+        filtered Rows, ids, or pairs; see quail.logical.Apply.
         """
         if not callable(function):
             raise TypeError("register_function needs a callable")

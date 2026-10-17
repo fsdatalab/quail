@@ -88,13 +88,16 @@ A `Compare` tests a score returned by that call.
 | `ColumnRef(alias, provider, column)` | A reference to a table column. |
 | `ModelCall(prompt, kind, labels, descriptions)` | A model call. Its kind is `boolean` for `AI.IF`, `score` for `AI.SCORE`, or `label` for `AI.CLASSIFY`. |
 | `Compare(call, comparison, threshold)` | A TRUE or FALSE comparison of a model score with a threshold. |
-| `InList(column, values)` | A TRUE or FALSE test of whether a column value is in a list. |
+| `RegularPredicate(column, comparison, value, path, function)` | A comparison or text test over a source column, label, or extracted answer. |
 | `Alias(expression, name)` | A result expression with a column name. |
 
 `SemanticFilter` and `SemanticJoin` hold predicates that return TRUE or
 FALSE. A predicate can be a boolean `ModelCall` or a `Compare` around
-a score call. A label condition uses `InList` in a separate `Filter`.
-`Project.columns` holds `ColumnRef` and `Alias` expressions.
+a score call. A label condition uses `RegularPredicate` in a separate `Filter`.
+`Project.columns` holds `ColumnRef`, `ColumnExpression`, and `Alias` expressions.
+`ColumnExpression` retains source field access, scalar functions, and output names through
+planning. Projection, join keys, and `apply()` evaluate those expressions
+over Arrow values.
 
 `LogicalPlan.operators()` collects the tree's operations for planning.
 It includes scans, predicates and joins in written order, Python
@@ -221,3 +224,7 @@ complete string also measures the effect of tokenization.
 Logical rules rewrite the plan before physical planning. See the
 [optimizer](/docs/architecture/optimizer#built-in-rules) for the built-in rules
 and [Rules](/docs/extending/rules) for the extension interface.
+
+A `Scan.column` can hold a `ColumnExpression` selecting a nested text field.
+The tokenizer and length estimator evaluate that expression before reading
+the document text.

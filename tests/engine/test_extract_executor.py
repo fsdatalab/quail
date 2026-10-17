@@ -32,7 +32,7 @@ from quail.backends.quail.executor.operators.extract import (
 from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.worker import ChildState, _child_extract
+from quail.backends.quail.worker import ChildState, _child_execute
 from quail.builtins import built_in_registry
 from quail.catalog.tokens import TokenOffsets, TokenStore
 from quail.logical import ColumnRef, RegularPredicate
@@ -525,9 +525,10 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
     for _ in range(workers):
         query = _state(model)
         query.loaded_model.vocabulary = tables
-        children.append(ChildState(gpu_index=0, gpu=SimpleNamespace(
-            execution=SimpleNamespace(query=query), torch=query.torch,
-            arena=query.loaded_model.arena)))
+        execution = QuailModelExecution.__new__(QuailModelExecution)
+        execution._query = query
+        children.append(ChildState(gpu_index=0, registry=registry, gpu=SimpleNamespace(
+            execution=execution, torch=query.torch, arena=query.loaded_model.arena)))
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": state.chunk_tokens,
         "true_ids": [1], "false_ids": [2],
@@ -540,20 +541,13 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
     rounds = []
 
     def round_fn(kind, subs):
-        if kind == "filters":
-            return [{"peak_gib": 0.0} for _ in subs]
-        assert kind == "extract"
+        assert kind == "execute"
         subs = pickle.loads(pickle.dumps(subs))
         rounds.append(subs)
-        for sub in subs:
-            supplied = sub["inputs"]
-            ids = supplied["document_ids"]
-            assert len(supplied["documents"]["c"]) == len(ids)
-            assert supplied["texts"]["c"].to_pylist() == [DOCS[i] for i in ids]
-        return [_child_extract(child, sub) for child, sub in zip(children, subs)]
+        return [_child_execute(child, sub) for child, sub in zip(children, subs)]
 
     result = execute_distributed_graph(
-        payload, graph, workers, round_fn, MODELS["qwen3-4b-fp8"],
+        payload, graph, workers, round_fn,
         DEVICES["h100-sxm"], registry.runtimes, registry)
     assert len(rounds) == 1
     for node in nodes[1:]:
@@ -565,20 +559,23 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
     assert result["backend_metrics"]["inferences"][0]["none"] == 1
 
     execution = DistributedQuailExecution(
-        payload, graph, workers, round_fn, MODELS["qwen3-4b-fp8"],
-        DEVICES["h100-sxm"], registry)
-    execution.started = True
-    execution._retained_placement([
-        {"retained": {"c": sub["inputs"]["document_ids"]}}
-        for sub in rounds[0]])
-    again = execution.execute(nodes[1], {"input": pa.table({"c": [2, 0]})})
+        payload, graph, workers, round_fn)
+    first_inputs = {nodes[1].node_id: {
+        nodes[1].inputs[0].name: pa.array([0, 1, 2], pa.int32())}}
+    # Leave another group pending so the workers retain this group's KV.
+    execution.last_compute = "later"
+    execution.execute_pipeline((replace(nodes[1], keep_kv=True),), first_inputs, None)
+    next_node = nodes[1].with_inputs(input_ports((PortRef(nodes[2].node_id, "rows"),)))
+    again = execution.execute(next_node, {
+        next_node.inputs[0].name:
+            expected[nodes[2].node_id].outputs["rows"].take(pa.array([2, 0]))})
     assert again.outputs["rows"].equals(
         expected[nodes[1].node_id].outputs["rows"].take(pa.array([2, 0])))
-    assert again.metrics.fresh_tokens < expected[nodes[1].node_id].metrics.fresh_tokens
 
 
+@pytest.mark.parametrize("callback", [False, True])
 def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
-        monkeypatch):
+        monkeypatch, callback):
     # the filter writes each document under the query's shared head;
     # the plain extraction continues its pipeline, so a document is
     # packed once and the extraction feeds only its question
@@ -610,6 +607,21 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
                   backend_name="quail", model="qwen3-4b-fp8",
                   spec=replace(plain, name="starts")),
     ), PortRef("ai-extract:starts", "rows"))
+    seen = []
+    functions = {}
+    if callback:
+        from quail.physical import Foreign
+
+        def observe(rows):
+            seen.append(rows["c"].ids["c"].to_pylist())
+            return rows["c"]
+
+        functions["observe"] = observe
+        foreign = Foreign(
+            node_id="apply:observe", function="observe", aliases=("c",),
+            inputs=input_ports((PortRef("ai-extract:starts", "ids:c"),)))
+        graph = PhysicalGraph((*graph.nodes, foreign),
+                              PortRef(foreign.node_id, "ids:c"))
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
@@ -627,12 +639,14 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
              "device": DEVICES["h100-sxm"],
              "chunk_tokens": 400,
              "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
-             "texts": {"c": list(DOCS)}, "gpu_timing": True}
+             "texts": {"c": list(DOCS)}, "gpu_timing": True, "functions": functions}
     report = execute_single_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
     table = report["_outputs"][PortRef("ai-extract:ends", "rows")].to_pydict()
     assert table["c"] == [0, 1]
     assert table["ends"] == ["March 3, 2027", "five years"]
+    if callback:
+        assert sorted(seen) == [[0], [1]]
     # every document was packed once: the extraction's tail followed
     # the filter's question over the resident KV
     assert dict(model.reads) == {("c", 0): 1, ("c", 1): 1, ("c", 2): 1}
@@ -866,9 +880,13 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
     assert not arena.accounting.owned
 
 
-def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
-    # the result's limit stops the run after that many documents
-    # passed every operator; the documents still queued are not read
+@pytest.mark.parametrize("tests,limit,all_rejected", [
+    (0, 1, False), (1, 1, False), (2, 1, False),
+    (2, 3, False), (2, 20, False), (2, 1, True),
+])
+@pytest.mark.parametrize("share_prefixes", [False, True])
+def test_a_limit_ends_the_pipeline_once_enough_documents_pass(
+        monkeypatch, tests, limit, all_rejected, share_prefixes):
     from quail.physical import Filter
 
     spec, tables = make_spec()
@@ -876,23 +894,32 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
     monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
-    # twelve documents, four of each kind, so some are still queued
-    # when the first one passes
-    docs, gold = DOCS * 4, GOLD * 4
+    spec = replace(spec, share_prefixes=share_prefixes)
+    docs = [NOTHING] * 4 + [TERM] * 4 + [LEASE] * 4
+    gold = [None] * 4 + [GOLD[1]] * 4 + [GOLD[0]] * 4
+    if all_rejected:
+        docs, gold = [NOTHING] * 12, [None] * 12
     for index, text in enumerate(docs):
         model.docs[("c", index)] = text
         model.gold[("c", index)] = gold[index]
-    graph = PhysicalGraph((
+    nodes = [
         Scan(node_id="input:c", alias="c", input_id="c"),
         AiExtract(node_id="ai-extract:ends",
                   inputs=input_ports((PortRef("input:c", "ids:c"),)),
                   backend_name="quail", model="qwen3-4b-fp8", spec=spec),
-        Filter(node_id="filter:c:0",
-               inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
-               predicate=RegularPredicate(
-                   ColumnRef("c", "contracts", "ends"), "is not null"),
-               aliases=("c",), written_pos=0),
-    ), PortRef("filter:c:0", "rows"))
+    ]
+    root = PortRef("ai-extract:ends", "rows")
+    predicates = [
+        RegularPredicate(ColumnRef("c", "contracts", "ends"), "is not null"),
+        RegularPredicate(ColumnRef("c", "contracts", "ends"), "like", "%2027%"),
+    ]
+    for index, predicate in enumerate(predicates[:tests]):
+        node = Filter(node_id=f"filter:c:{index}", inputs=input_ports((root,)),
+                      predicate=predicate, aliases=("c",), written_pos=index,
+                      selectivity=1.0)
+        nodes.append(node)
+        root = PortRef(node.node_id, "rows")
+    graph = PhysicalGraph(tuple(nodes), root)
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
@@ -911,12 +938,81 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
              "device": DEVICES["h100-sxm"], "chunk_tokens": chunk,
              "docs": {"c": documents}, "texts": {"c": list(docs)}}
     report = execute_single_graph(
-        state, {"filter_limit": 1, "retention": {}}, graph)
-    outputs = report["_outputs"]
-    kept = outputs[PortRef("filter:c:0", "rows")].to_pydict()
-    # the documents in flight when the first passed finish; the
-    # queued ones are never read
-    assert kept["c"][0] == 0 and kept["ends"][0] == "March 3, 2027"
-    assert 1 <= len(kept["c"]) < len(docs)
-    assert sum(model.reads.values()) < len(docs)
+        state, {"filter_limit": limit, "retention": {}}, graph)
+    kept = report["_outputs"][root].to_pydict()
+    matching = [index for index, answer in enumerate(gold)
+                if tests == 0 or answer is not None
+                and (tests == 1 or "2027" in answer)]
+    assert set(kept["c"]) <= set(matching)
+    assert len(kept["c"]) >= min(limit, len(matching))
+    assert kept["ends"] == [gold[index] for index in kept["c"]]
+    if limit < len(matching):
+        assert sum(model.reads.values()) < len(docs)
+    else:
+        assert sorted(kept["c"]) == matching
     assert not arena.accounting.owned
+
+
+def test_classification_reads_the_last_grouped_extraction(monkeypatch):
+    from quail.physical import AiClassify, ClassifySpec
+    from quail.physical.pipelines import build_pipelines
+
+    query, model, _, _ = _setup(monkeypatch)
+    spec, tables = make_spec()
+    cue = 50000
+    original = model._row_after
+
+    def row_after(key, path):
+        if path[-1] == cue:
+            row = np.full(model.width, -5.0, dtype=np.float32)
+            row[key[1] % 2] = -1.0
+            return row
+        return original(key, path)
+
+    monkeypatch.setattr(model, "_row_after", row_after)
+    readout = SimpleNamespace(
+        dtype=np.dtype((np.float32, (1, 2))),
+        submit=lambda rows, rows_per_answer=None: np.asarray(rows)[:, :2].reshape(
+            -1, 1, 2),
+        result=lambda rows: rows)
+    monkeypatch.setattr(
+        "quail.backends.quail.executor.label_stages._label_readout",
+        lambda *args: readout)
+    nodes = [Scan(node_id="input:c", alias="c", input_id="c")]
+    for name in ("ends", "starts"):
+        previous = nodes[-1]
+        port = "ids:c" if isinstance(previous, Scan) else "rows"
+        nodes.append(AiExtract(
+            node_id=f"ai-extract:{name}", backend_name="quail", model="qwen3-4b-fp8",
+            inputs=input_ports((PortRef(previous.node_id, port),)),
+            spec=replace(spec, name=name)))
+    nodes.append(AiClassify(
+        node_id="classify:c", backend_name="quail", model="qwen3-4b-fp8",
+        inputs=input_ports((PortRef(nodes[-1].node_id, "rows"),)),
+        spec=ClassifySpec(
+            name="topic", aliases=("c",), query_template="", arguments=(),
+            expected_inputs=3, estimated_seconds=0.0,
+            prompt_token_parts=(spec.prompt_token_parts[0], (cue,)),
+            labels=("a", "b"), label_token_ids=((13,), (14,)), scoring="letters")))
+    graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "rows"))
+    assert len(build_pipelines(graph)["ai-extract:ends"]) == 3
+    execution = QuailModelExecution(SimpleNamespace())
+    execution.loaded_model = query.loaded_model
+    execution.bind_query(torch=query.torch, async_answers=query.async_answers,
+                         answer_rows=query.answer_rows, chunk_tokens=query.chunk_tokens)
+    state = {
+        "gpu": SimpleNamespace(torch=query.torch, arena=query.loaded_model.arena,
+                               pipeline=query.loaded_model.pipeline,
+                               execution=execution, spec=MODELS["qwen3-4b-fp8"]),
+        "runtimes": built_in_registry().runtimes, "device": DEVICES["h100-sxm"],
+        "chunk_tokens": 400,
+        "docs": {"c": [tables.encode_ids(text) for text in DOCS]},
+        "texts": {"c": list(DOCS)},
+    }
+    report = execute_single_graph(
+        state, {"filter_limit": None, "retention": {}}, graph)
+    rows = report["_outputs"][graph.root].to_pydict()
+    assert rows["c"] == [0, 1, 2]
+    assert rows["topic"] == ["a", "b", "a"]
+    assert rows["starts"] == GOLD
+    assert "starts_span" in rows and "ends" not in rows

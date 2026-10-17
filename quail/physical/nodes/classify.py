@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
 
+from quail.logical import PROBABILITIES_SUFFIX
+
 from ..base import PhysicalNode
 from .inference import AiInference, InferenceSpec
 from .join import AiJoin
@@ -43,6 +45,13 @@ class ClassifySpec(InferenceSpec):
     probabilities: bool = False
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     frame_tokens: int = 0
+
+    @property
+    def output_columns(self) -> tuple[str, ...]:
+        """Return document IDs, the label, and requested label probabilities."""
+        columns = super().output_columns
+        return (columns + (self.name + PROBABILITIES_SUFFIX,)
+                if self.probabilities else columns)
 
     @property
     def anchor(self) -> str:

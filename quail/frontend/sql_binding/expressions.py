@@ -6,6 +6,7 @@ from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
+from quail.frontend.sql_binding.predicates import PlainTest
 from quail.logical import (
     Alias,
     ColumnRef,
@@ -49,19 +50,6 @@ def _score_comparison(node):
     return None
 
 
-def _label_test(node):
-    """Return the AI.CLASSIFY call and tested values of an = or IN test, or None."""
-    if isinstance(node, exp.In) and isinstance(node.this, exp.AIClassify):
-        return node.this, list(node.expressions)
-    if isinstance(node, exp.EQ):
-        left, right = node.this, node.expression
-        if isinstance(left, exp.AIClassify):
-            return left, [right]
-        if isinstance(right, exp.AIClassify):
-            return right, [left]
-    return None
-
-
 def _is_ai_score_comparison(node) -> bool:
     return _score_comparison(node) is not None
 
@@ -78,7 +66,7 @@ class ExpressionBinder:
         self.doc_columns = self.scope.doc_columns
         self.filters: dict[str, list[FilterPredicate]] = {}
         self.label_tests: dict[
-            str, list[tuple[ModelCall, tuple[str, ...], float | None]]
+            str, list[tuple[ModelCall, PlainTest, float | None]]
         ] = {}
         # alias -> (RegularPredicate on an answer or span, selectivity)
         self.extract_tests: dict[str, list[tuple[RegularPredicate, float | None]]] = {}
@@ -91,9 +79,18 @@ class ExpressionBinder:
         self.scope.add_table(alias, table.name)
         return alias
 
-    def resolve_column(self, col: exp.Column, scope=None) -> ColumnRef:
-        return self.scope.resolve(col.name, col.table or None, tables=scope,
-                                  shown=col.sql())
+    def resolve_value(self, node, tables=None, function=None):
+        """Bind a source column, struct field, or length expression."""
+        if isinstance(node, exp.Length):
+            node, function = node.this, "length"
+        if not isinstance(node, exp.Column):
+            raise CompileError(f"{node.sql()} is not a column expression")
+        parts = tuple(part.name for part in node.parts)
+        scope = dict(self.tables if tables is None else tables)
+        alias = parts[0] if len(parts) > 1 and parts[0] in scope else None
+        column, *path = parts[1:] if alias is not None else parts
+        return self.scope.resolve_value(column, alias, path=path,
+                                        function=function, tables=tables)
 
     def note_doc_column(self, ref: ColumnRef) -> None:
         self.scope.note_doc_column(ref)
@@ -169,7 +166,7 @@ class ExpressionBinder:
                 raise CompileError(
                     f"PROMPT arguments must be column references, got {a.sql()}"
                 )
-            refs.append(self.resolve_column(a, scope))
+            refs.append(self.resolve_value(a, scope))
         aliases = []
         for r in refs:
             if r.alias not in aliases:
@@ -306,7 +303,7 @@ class ExpressionBinder:
                 f"AI.EXTRACT's second argument is an object of field "
                 f"questions such as {{'ends': 'When does the lease end?'}}, "
                 f"got {args[1].sql()}")
-        ref = self.resolve_column(args[0])
+        ref = self.resolve_value(args[0])
         return ref, args[1]
 
     def _extract_call(self, ref, question: str) -> ModelCall:

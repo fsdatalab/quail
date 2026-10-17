@@ -40,6 +40,16 @@ def _cuda_base() -> modal.Image:
             .env(CACHE_ENV))
 
 
+def _install_quail(image: modal.Image) -> modal.Image:
+    # uv_sync installs dependencies with --no-install-workspace; vLLM discovers
+    # Quail's process plugins through the installed package's entry points.
+    for name in ("pyproject.toml", "README.md", "LICENSE"):
+        image = image.add_local_file(name, f"/opt/quail/{name}", copy=True)
+    return (image.add_local_dir("quail", "/opt/quail/quail", copy=True)
+            .uv_pip_install("/opt/quail", extra_options="--no-deps",
+                            uv_version=UV_VERSION))
+
+
 def gpu_image(*local_dirs: tuple[str, str],
               packages: tuple[str, ...] = ()) -> modal.Image:
     """The GPU image: quail's locked dependencies and the dev group.
@@ -53,7 +63,7 @@ def gpu_image(*local_dirs: tuple[str, str],
     image = _cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
-    image = image.add_local_python_source("quail", "bench")
+    image = _install_quail(image).add_local_python_source("quail", "bench")
     for local, remote in local_dirs:
         image = image.add_local_dir(local, remote_path=remote)
     return image
@@ -75,17 +85,17 @@ def pypi_gpu_image(*local_dirs: tuple[str, str]) -> modal.Image:
 
 def sglang_image() -> modal.Image:
     """The GPU image with SGLang's serving stack in place of vLLM."""
-    return (_cuda_base()
+    image = (_cuda_base()
             .uv_sync(groups=["dev"], uv_version=UV_VERSION,
                      extra_options="--no-install-package vllm")
-            .uv_pip_install("sglang==0.5.18")
-            .add_local_python_source("quail", "bench"))
+            .uv_pip_install("sglang==0.5.18"))
+    return _install_quail(image).add_local_python_source("quail", "bench")
 
 
 def cpu_image() -> modal.Image:
     """The CPU image: the locked dependencies without the GPU stack."""
-    return (modal.Image.debian_slim(python_version="3.12")
+    image = (modal.Image.debian_slim(python_version="3.12")
             .apt_install("git")
             .uv_sync(groups=["dev"], uv_version=UV_VERSION,
-                     extra_options="--no-install-package vllm")
-            .add_local_python_source("quail", "bench"))
+                     extra_options="--no-install-package vllm"))
+    return _install_quail(image).add_local_python_source("quail", "bench")

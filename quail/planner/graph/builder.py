@@ -4,11 +4,10 @@ from dataclasses import dataclass, field, replace
 from itertools import groupby
 
 from quail.logical import (
-    PROBABILITIES_SUFFIX,
-    SPAN_SUFFIX,
     Alias,
     LogicalPlan,
     classified_above_joins,
+    column_name,
     effective_selectivity,
     extracted_above_joins,
     has_score,
@@ -18,7 +17,7 @@ from quail.logical import (
 from quail.physical import (
     AiScore,
     Barrier,
-    Exchange,
+    Filter,
     Foreign,
     HashJoin,
     PortRef,
@@ -29,7 +28,6 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.planner.graph import retention
-from quail.planner.graph.frontier import Frontier
 from quail.planner.graph.pricing import PlanPricer
 from quail.planner.graph.results import result_nodes
 from quail.planner.graph.shards import contiguous_shards
@@ -39,6 +37,7 @@ from quail.planner.operators.classify import (
 )
 from quail.planner.operators.extract import emit_extract
 from quail.planner.operators.filter import emit_filter
+from quail.planner.operators.frontier import Frontier
 from quail.planner.operators.join import emit_join
 from quail.planner.operators.score import (
     ScoreLowering,
@@ -49,10 +48,19 @@ from quail.planner.operators.score import (
 )
 from quail.planner.optimizer.context import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal
-from quail.planner.search.operator_order import choose_operator_order, resident_asks
+from quail.planner.search.operator_order import choose_operator_order
 from quail.planner.search.statistics import filter_stop_keys
-from quail.planner.search.table_steps import ASK, CLASSIFY, EXTRACT, resident_after
-from quail.planner.statistics.tables import summarize_alias
+from quail.planner.search.table_steps import (
+    APPLY,
+    ASK,
+    CLASSIFY,
+    EXTRACT,
+    TEST,
+    order_table_steps,
+    ready_table_steps,
+    resident_after,
+)
+from quail.planner.statistics.tables import summarize_alias, thin
 from quail.planner.validation import (
     ClassifyRefusedError,
     ScoreRefusedError,
@@ -82,22 +90,12 @@ def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
         if oriented is None:
             continue
         left, right, conditions = oriented
-        on = tuple(
-            (left_ref.column, right_ref.column)
-            for left_ref, right_ref in conditions
-        )
         nodes.append(HashJoin(
             node_id=f"hash_join:{left}-{right}",
             inputs=input_ports((by_alias[left], by_alias[right])),
-            left=left, right=right, on=on, written_pos=position,
+            left=left, right=right, on=conditions, written_pos=position,
             pair_fraction=pair_fractions.get(position, 1.0)))
     return nodes
-
-
-def regular_predicates(scan) -> tuple:
-    """Return a logical scan's regular predicates as (column, comparison, value)."""
-    return tuple((predicate.column.column, predicate.comparison,
-                  predicate.value) for predicate in scan.predicates)
 
 
 def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
@@ -111,7 +109,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     order and anchors by cost (quail.planner.search.operator_order), unless order
     is "as_written". A one-table classification above a SemanticJoin
     runs after the joins, over the documents the joins matched. One on
-    its table runs after the table's AI.IF filters.
+    its table is ordered with the table's AI.IF filters and extractions.
 
     The initial estimate includes filter and join work and any inference
     costs already known. The planner then runs the graph refinement rules to select
@@ -227,9 +225,18 @@ class GraphBuilder:
                        for apply in self.join_applies.get(spec.written_pos, ())):
                     barrier_aliases.add(anchor)
         self.streamed = retention.streamed_aliases(
-            self.sequence_groups, set(self.ask_filters), barrier_aliases, self.workers)
+            self.sequence_groups, set(self.ask_filters), barrier_aliases)
 
         self.nodes = []
+        self.value_ports = {}
+        self.pending_steps = {
+            alias: list(steps)
+            for alias, steps in self.operator_order.step_orders.items()
+            if any(step.joins for step in steps)}
+        self.scheduled_aliases = set(self.pending_steps)
+        self.live_steps = dict(self.operator_order.live)
+        for alias in self.scheduled_aliases:
+            self.live_steps[alias] = float(statistics.stats[alias].n_docs)
         self.scoring = (ScoreLowering(self.context, self.nodes,
                                      self.projected_scores, statistics.chunk)
                         if has_score(self.plan) else None)
@@ -253,7 +260,7 @@ class GraphBuilder:
                 total_tokens=summary.total,
                 shard_ranges=shard_ranges,
                 shard_token_loads=tuple(loads),
-                predicates=regular_predicates(s),
+                predicates=s.predicates,
                 expected_docs=(float(stats[s.alias].n_docs)
                                if s.predicates else None)))
             frontiers[s.alias] = Frontier(PortRef(sid, f"ids:{s.alias}"))
@@ -269,7 +276,7 @@ class GraphBuilder:
         between = self.classified - self.after_joins
         self.pipelined = self.streamed | {
             alias for alias in self.ask_filters
-            if self.workers == 1 and alias in between}
+            if alias in between}
         return frontiers
 
     def _emit_documents(self, frontiers: dict) -> tuple:
@@ -278,9 +285,11 @@ class GraphBuilder:
         label_ports = []
         frontiers = dict(frontiers)
         for s in self.operators.scans:
+            if s.alias in self.scheduled_aliases:
+                continue
             # a classification or extraction the planner lifted
             # above the joins is emitted after them
-            kinds = {ASK}
+            kinds = {ASK, APPLY, TEST}
             if s.alias not in self.after_joins:
                 kinds.add(CLASSIFY)
             if s.alias not in self.extract_after:
@@ -288,9 +297,10 @@ class GraphBuilder:
             frontiers[s.alias], ports = self._emit_steps(
                 s.alias, float(stats[s.alias].n_docs), kinds, frontiers[s.alias])
             label_ports += ports
+        label_ports += self._emit_ready_steps(frontiers, Joins())
         return frontiers, label_ports
 
-    def _emit_steps(self, alias, live, kinds, frontier) -> tuple:
+    def _emit_steps(self, alias, live, kinds, frontier, steps=None) -> tuple:
         """Emit the given kinds of a table's steps in run order.
 
         Consecutive steps of one kind are emitted together, each run
@@ -301,45 +311,75 @@ class GraphBuilder:
             live: The documents the first step reads.
             kinds: The step kinds to emit: ASK, CLASSIFY, EXTRACT.
             frontier: Where the documents stand before the steps.
+            steps: A scheduled subset, or None for every step of the given kinds.
 
         Returns:
             Where the documents stand after the steps, and the rows
             ports of the labels and answers SELECT returns.
         """
-        steps = [step for step in self.operator_order.step_orders.get(alias, ())
-                 if step.kind in kinds]
-        if ASK in kinds and not any(step.kind == ASK for step in steps):
-            frontier = self.emit_applies(alias, frontier)
+        if steps is None:
+            steps = [step for step in self.operator_order.step_orders.get(alias, ())
+                     if step.kind in kinds]
         label_ports = []
-        # the scores SELECT returns follow the score predicates, before
-        # the classifications and extractions read the rows
-        scores_pending = ASK in kinds and self.scoring is not None
         previous = None
-        for kind, run in groupby(steps, key=lambda step: step.kind):
+        for (kind, _), run in groupby(steps, key=lambda step: (
+                step.kind, step.key if step.tests is not None
+                or step.kind in (APPLY, TEST) else None)):
             run = list(run)
             positions = [step.key for step in run]
             resident = previous is not None and resident_after(previous, run[0])
-            if kind != ASK and scores_pending:
-                frontier = emit_projected_scores(self, alias, live, frontier)
-                scores_pending = False
-            if kind == ASK and self.scoring is not None:
+            if kind == APPLY:
+                frontier = self.emit_apply(positions[0], frontier)
+            elif kind == TEST:
+                frontier, _ = self.emit_tests(alias, positions, frontier, live,
+                                               detached=True)
+            elif kind == ASK and self.scoring is not None:
                 frontier = emit_scores(self, alias, positions, live, frontier)
             elif kind == ASK:
                 frontier = emit_filter(self, alias, positions, live, frontier,
                                        followed=run[-1] is not steps[-1])
             elif kind == CLASSIFY:
-                frontier, ports = emit_classify(self, alias, live, positions, frontier)
+                frontier, ports = emit_classify(
+                    self, alias, live, positions, frontier, tests=run[0].tests)
                 label_ports += ports
             else:
                 frontier, ports = emit_extract(self, alias, live, positions, frontier,
-                                               resident=resident)
+                                               resident=resident, tests=run[0].tests)
                 label_ports += ports
             for step in run:
                 live *= step.selectivity
             previous = run[-1]
-        if scores_pending:
+        if ASK in kinds and self.scoring is not None:
             frontier = emit_projected_scores(self, alias, live, frontier)
         return frontier, label_ports
+
+    def _join_survivors(self, frontiers, joins, aliases):
+        """Bind aliases to the documents in the currently surviving joined rows."""
+        if not aliases or not joins.pairs_edges:
+            return
+        bid = self.unique_id("barrier", "answers")
+        self.nodes.append(Barrier(
+            node_id=bid, aliases=tuple(frontiers),
+            inputs=input_ports(tuple(joins.pairs_edges)
+                               + tuple(value.ids for value in frontiers.values()))))
+        for alias in aliases:
+            frontiers[alias] = Frontier(PortRef(bid, f"ids:{alias}"))
+
+    def _emit_ready_steps(self, frontiers, joins):
+        """Emit ordered table work whose preceding joins have finished."""
+        ports = []
+        for alias, steps in ready_table_steps(self.pending_steps, joins.ids.keys()):
+            if any(step.joins for step in steps):
+                self._join_survivors(frontiers, joins, (alias,))
+            steps = order_table_steps(
+                steps, self.operator_order.order_rule, self.live_steps[alias])
+            frontiers[alias], added = self._emit_steps(
+                alias, self.live_steps[alias], {step.kind for step in steps},
+                frontiers[alias], steps)
+            ports += added
+            for step in steps:
+                self.live_steps[alias] *= step.selectivity
+        return ports
 
     def _emit_joins(self, frontiers: dict) -> tuple:
         """Create the joins and the exchanges between anchor groups.
@@ -373,14 +413,6 @@ class GraphBuilder:
                     aliases=tuple(ahead)))
                 for a in ahead:
                     frontiers[a] = Frontier(PortRef(bid, f"ids:{a}"))
-            if self.workers > 1:
-                # anchors go to the GPU holding their KV, else balanced
-                xid = self.unique_id("exchange", anchor)
-                self.nodes.append(Exchange(
-                    node_id=xid,
-                    inputs=input_ports((frontiers[anchor].ids,)),
-                    anchor=anchor))
-                frontiers[anchor] = Frontier(PortRef(xid, f"ids:{anchor}"))
             gid = self.group_ids[g]
             for rank, (spec, step) in enumerate(group):
                 jid = gid if rank == 0 else f"{gid}:predicate:{spec.written_pos}"
@@ -392,6 +424,8 @@ class GraphBuilder:
                     for a in spec.aliases:
                         if a not in joins.out_aliases:
                             joins.out_aliases.append(a)
+                thin(self.live_steps, spec)
+                joins.label_ports += self._emit_ready_steps(frontiers, joins)
                 exec_idx += 1
         return frontiers, joins
 
@@ -401,25 +435,20 @@ class GraphBuilder:
         Returns:
             The rows ports of the labels and answers SELECT returns.
         """
-        label_ports = emit_joined_classify(self, joins.ids)
-        # classifications after the joins run over the documents the joins
-        # matched: a document with at least one true pair, expected as the
-        # join selectivity times the partners it met, at most every document
-        for alias in sorted(self.after_joins | self.extract_after):
-            met = sum(
-                effective_selectivity(join.selectivity)
-                * sum(self.operator_order.live[argument.alias]
-                      for argument in join.prompt.args
-                      if argument.alias != alias)
-                for join in self.operators.joins
-                if alias in {argument.alias for argument in join.prompt.args})
+        label_ports = [*joins.label_ports, *emit_joined_classify(self, joins.ids)]
+        deferred = (self.after_joins | self.extract_after) - self.scheduled_aliases
+        pruned = deferred
+        if len(self.operator_order.join_sequence) == 1:
+            pruned = deferred - {self.operator_order.join_sequence[0][1]}
+        self._join_survivors(frontiers, joins, pruned)
+        for alias in sorted(deferred):
             kinds = set()
             if alias in self.after_joins:
                 kinds.add(CLASSIFY)
             if alias in self.extract_after:
                 kinds.add(EXTRACT)
             frontiers[alias], ports = self._emit_steps(
-                alias, self.operator_order.live[alias] * min(1.0, met), kinds,
+                alias, self.live_steps[alias], kinds,
                 frontiers[alias])
             label_ports += ports
         return label_ports
@@ -439,7 +468,7 @@ class GraphBuilder:
             sink_inputs = (score_pairs,)
         elif (len(joins.pairs_edges) == 1
               and len(self.operator_order.join_sequence) == 1
-              and not self.after_joins):
+              and not self.after_joins and not self.scheduled_aliases):
             # one full join and nothing after it: its true pairs are the
             # result rows, so no recombination is needed
             sink_inputs = (joins.pairs_edges[0],)
@@ -457,12 +486,8 @@ class GraphBuilder:
             sink_inputs = (frontiers[alias].source,)
         columns = []
         for c in self.plan.projection.columns:
-            columns.append(c.name if isinstance(c, Alias)
-                           else f"{c.alias}.{c.column}")
-            if isinstance(c, Alias) and getattr(c.expression, "probabilities", False):
-                columns.append(c.name + PROBABILITIES_SUFFIX)
-            if isinstance(c, Alias) and c.expression.kind == "extract":
-                columns.append(c.name + SPAN_SUFFIX)
+            columns.extend(c.expression.output_columns(c.name) if isinstance(c, Alias)
+                           else (column_name(c),))
         score_ports = tuple(PortRef(node.node_id, "rows") for node in self.nodes
                             if isinstance(node, AiScore)
                             and any(node.spec.name == item.name
@@ -477,14 +502,13 @@ class GraphBuilder:
         """Build the plan and bind its pricer."""
         statistics = self.operator_order.statistics
         # a score join's work is in its AiScore's estimate
-        stage_works = {step.written_pos: step.work
+        stage_works = {step.written_pos: step.worker_work(self.workers)
                        for step in self.operator_order.join_steps
                        if not is_score(
                            self.operators.joins[step.written_pos].predicate)}
         pricer = PlanPricer(
             context=self.context, statistics=statistics, stage_works=stage_works,
-            live=self.operator_order.live,
-            resident_asks=resident_asks(self.operator_order.step_orders))
+            live=self.operator_order.live)
         plan = PhysicalPlan(
             model=self.model.name, device=self.device.name, workers=self.workers,
             backend="quail", nodes=tuple(self.nodes),
@@ -521,19 +545,30 @@ class GraphBuilder:
         self.seen_ids[key] = self.seen_ids.get(key, 0) + 1
         return key if self.seen_ids[key] == 1 else f"{key}:{self.seen_ids[key]}"
 
-    def emit_applies(self, alias, frontier) -> Frontier:
-        """Append the alias's apply() functions; return where its documents stand."""
-        for apply in self.alias_applies.get(alias, ()):
-            aid = f"apply:{apply.function}"
-            self.nodes.append(Foreign(
-                node_id=aid,
-                inputs=input_ports((frontier.ids,)),
-                function=apply.function, kind=apply.kind, ids=apply.ids,
-                columns=tuple((ref.alias, ref.column)
-                              for ref in apply.columns),
-                aliases=(alias,)))
-            frontier = Frontier(PortRef(aid, f"ids:{alias}"))
-        return frontier
+    def emit_apply(self, apply, frontier) -> Frontier:
+        """Append one callback at its position in the table's sequence."""
+        (alias,) = apply.aliases
+        aid = self.unique_id("apply", apply.function)
+        self.nodes.append(Foreign(
+            node_id=aid, inputs=input_ports((frontier.ids,)),
+            function=apply.function, kind=apply.kind, ids=apply.ids,
+            columns=apply.columns, aliases=(alias,)))
+        return Frontier(PortRef(aid, f"ids:{alias}"))
+
+    def emit_tests(self, alias, tests, frontier, live, *, detached=False):
+        """Test computed values on the documents still present at this point."""
+        for test in tests:
+            source = (self.value_ports[(alias, test.condition.column.column)]
+                      if detached else frontier.rows)
+            inputs = (source, frontier.ids) if detached else (source,)
+            lid = f"filter:{alias}:{test.position}"
+            self.nodes.append(Filter(
+                node_id=lid, inputs=input_ports(inputs), predicate=test.condition,
+                aliases=(alias,), selectivity=test.selectivity,
+                written_pos=test.position))
+            frontier = Frontier(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
+            live *= effective_selectivity(test.selectivity)
+        return frontier, live
 
 
 @dataclass
@@ -545,9 +580,11 @@ class Joins:
         pairs_edges: Every full stage's passing-pairs port.
         out_aliases: The recombination's output order.
         score_pairs: The rows of the pairs the score joins keep, or None.
+        label_ports: Values computed between join stages.
     """
 
     ids: dict = field(default_factory=dict)
     pairs_edges: list = field(default_factory=list)
     out_aliases: list = field(default_factory=list)
     score_pairs: PortRef | None = None
+    label_ports: list = field(default_factory=list)

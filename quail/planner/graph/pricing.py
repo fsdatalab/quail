@@ -26,7 +26,7 @@ from quail.physical import (
 )
 from quail.physical.pipelines import build_pipelines
 from quail.planner.operators.classify import classify_scoring
-from quail.planner.sol.prefixes import document_shared_tokens, page_tree
+from quail.planner.statistics.prefixes import document_shared_tokens, page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
@@ -46,17 +46,14 @@ class PlanPricer:
         context: The planning context, with the model, device, and
             document tokens.
         statistics: The plan's PlanStatistics.
-        stage_works: Join written position -> the Work its stage does.
+        stage_works: Join written position -> expected Work per GPU worker.
         live: alias -> documents expected after its filters.
-        resident_asks: Aliases whose first ask reads KV a step before
-            it left.
     """
 
     context: object
     statistics: object
     stage_works: dict
     live: dict
-    resident_asks: frozenset = frozenset()
 
     def __call__(self, graph: PhysicalGraph) -> dict:
         """Return node id -> its explain entry: seconds, and recompute figures."""
@@ -73,21 +70,28 @@ class PlanPricer:
         return self._seconds(work) + seconds
 
     def _priced(self, graph) -> dict:
-        pipelines = build_pipelines(graph, self.context.gpu_count)
+        pipelines = build_pipelines(graph)
         anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
         last_filters = {node.alias: node.node_id for node in graph.nodes
                         if isinstance(node, AiFilter)}
-        priced_filters = set()
+        retained = {}
         out = {}
-        for node in graph.nodes:
+        for node in graph.topological_nodes():
             entry = {}
             resident = (node.node_id in pipelines
                         and pipelines[node.node_id][0] is not node)
+            if node.node_id in pipelines and not resident:
+                alias = node.document_aliases[0]
+                resident = retained.get(alias) == node.document_head
+                members = pipelines[node.node_id]
+                if any(getattr(member, "keep_kv", False) for member in members):
+                    retained[alias] = node.document_head
+                else:
+                    retained.pop(alias, None)
             if isinstance(node, AiFilter):
-                price = NodePrice(work=self._filter_work(
-                    node, resident or node.alias in priced_filters
-                    or node.alias in self.resident_asks))
-                priced_filters.add(node.alias)
+                price = NodePrice(work=self._filter_work(node, resident) * (
+                    1 / budgets.parallel_copies(
+                        self.context.gpu_count, node.expected_docs)))
                 entry["seconds"] = self._seconds(price.work)
                 if node.alias in anchored and last_filters[node.alias] == node.node_id:
                     entry.update(self._release_recompute(node))
@@ -118,12 +122,19 @@ class PlanPricer:
         if shared is None:
             return scan(mean_prefix, question, window=window) * node.expected_docs
         lengths = self.context.document_tokens[node.alias]
-        work = Work()
-        for length, borrowed in zip(lengths, shared):
-            prefix = node.preamble_tokens + int(length)
-            work += (ask(borrowed, prefix + question - borrowed, window=window)
-                     if borrowed else scan(prefix, question, window=window))
-        return work * (node.expected_docs / len(lengths))
+        key = ("filter_work", id(lengths), id(shared), node.preamble_tokens,
+               question, window)
+        memo = self.context.memo
+        if key not in memo:
+            work = Work()
+            for length, borrowed in zip(lengths, shared):
+                prefix = node.preamble_tokens + int(length)
+                work += (ask(borrowed, prefix + question - borrowed, window=window)
+                         if borrowed else scan(prefix, question, window=window))
+            # Keep arrays alive so a later input cannot reuse their identities.
+            memo[key] = (lengths, shared, work)
+        _, _, work = memo[key]
+        return work * (node.expected_docs / len(lengths)) if len(lengths) else Work()
 
     def _mean_prefix(self, node: AiFilter) -> float:
         return node.preamble_tokens + self.statistics.stats[node.alias].mean_doc_tokens
@@ -168,7 +179,7 @@ class PlanPricer:
                     max_answer_tokens=spec.max_answer_tokens,
                     draft_tokens=spec.draft_tokens, draft_policy=spec.draft_policy,
                     round_cost_per_token=spec.round_cost_per_token,
-                    workers=context.gpu_count).seconds
+                    workers=context.gpu_count, memo=context.memo).seconds
 
             return _ratio(seconds(shared), seconds(None))
         if isinstance(node, AiClassify):

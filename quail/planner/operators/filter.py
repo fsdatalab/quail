@@ -2,9 +2,9 @@
 
 from dataclasses import dataclass
 from functools import partial
-from operator import mul
 from typing import Callable, Hashable
 
+from quail.cost.budgets import parallel_copies
 from quail.cost.filters import filter_cost
 from quail.logical import (
     effective_selectivity,
@@ -12,8 +12,8 @@ from quail.logical import (
 )
 from quail.physical import AiFilter, PortRef
 from quail.physical.base import input_ports
-from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import question_tokens
+from quail.planner.operators.frontier import Frontier
 from quail.planner.operators.score import score_statistics
 
 
@@ -25,6 +25,10 @@ class PredicateCost:
     first: Callable[[float], float]
     later: Callable[[float], float]
     reuse_key: Hashable | None = None
+
+
+def _filter_seconds(cost, workers, live):
+    return cost * live / parallel_copies(workers, live)
 
 
 def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
@@ -51,10 +55,10 @@ def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
             reuse_key = predicate.prompt
         else:
             q = question_tokens(lower(predicate.prompt), model.canvas_tokens)
-            first = partial(mul, filter_cost(
-                q, prefix_tokens, model, device, chunk_tokens, first=True))
-            later = partial(mul, filter_cost(
-                q, prefix_tokens, model, device, chunk_tokens, first=False))
+            workers = 1 if context is None else context.gpu_count
+            first, later = (partial(_filter_seconds, filter_cost(
+                q, prefix_tokens, model, device, chunk_tokens, first=initial), workers)
+                for initial in (True, False))
             reuse_key = None
         prepared.append(PredicateCost(
             effective_selectivity(predicate.selectivity), first, later, reuse_key))
@@ -95,5 +99,5 @@ def emit_filter(builder, alias, positions, live, frontier, followed=False):
             stop_key=builder.stop_keys.get(alias, ())))
         surv *= effective_selectivity(p.selectivity)
         frontier = Frontier(PortRef(fid, f"ids:{alias}"))
-    return builder.emit_applies(alias, frontier)
+    return frontier
 

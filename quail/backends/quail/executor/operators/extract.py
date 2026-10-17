@@ -57,6 +57,7 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
     results = execute_parts(
         state, [part], stages.prefixes, stages.keys,
         keep_kv=nodes[-1].keep_kv, tree=tree,
+        limit=inputs.get("limit"),
         label=f"extract {', '.join(node.spec.name for node in nodes)}")
     first = nodes[0].node_id
     results[first] = replace(results[first], metrics=replace(
@@ -123,7 +124,8 @@ class ExtractPart(ExecutionPart):
                else np.asarray(value, dtype=np.int64))
         return {"document_ids": ids,
                 "documents": context.state["docs"],
-                "texts": context.state.get("texts", {})}
+                "texts": context.state.get("texts", {}),
+                "limit": context.state.get("filter_limit")}
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
@@ -169,7 +171,7 @@ class ExtractPart(ExecutionPart):
 
     @property
     def tested_columns(self) -> tuple[str, ...]:
-        """The columns a Filter in the pipeline may test."""
+        """Return the columns this part computes for pipeline conditions."""
         return tuple(name for node in self.nodes
                      for name in (node.spec.name, node.spec.span_name))
 
@@ -210,7 +212,6 @@ class ExtractPart(ExecutionPart):
         self._results = extraction_results(
             self.nodes, self.extraction, self.ids, fresh=tokens, counts=self.counts,
             own=own, stats=stats, kept=self.extraction.asked())
-        self.result_value = self._results[self.node.node_id]
 
     def results(self) -> dict:
         """Return the answer table and metrics for each extraction."""

@@ -1,16 +1,17 @@
 """Find graph paths whose operators can advance documents with resident KV."""
 
+from graphlib import CycleError, TopologicalSorter
+
 from quail.physical import AiClassify, AiJoin, PhysicalGraph, PhysicalNode
 
 
 def build_pipelines(
-    graph: PhysicalGraph, workers: int = 1, completed: tuple[str, ...] = (),
+    graph: PhysicalGraph, completed: tuple[str, ...] = (),
 ) -> dict[str, tuple[PhysicalNode, ...]]:
     """Group compatible per-document operators into pipelines.
 
     Args:
         graph: Physical operator graph.
-        workers: Number of model workers.
         completed: Nodes whose outputs are already available.
 
     Returns:
@@ -50,9 +51,6 @@ def build_pipelines(
                 if (not node.can_precede(consumer)
                         or not consumer.can_follow(node, first)):
                     continue
-                if workers > 1 and (not node.worker_pipelining
-                                    or type(consumer) is not type(node)):
-                    continue
                 if takes(consumer, alias) and consumer not in following:
                     following.append(consumer)
         if isinstance(node, AiJoin):
@@ -67,6 +65,16 @@ def build_pipelines(
         return following
 
     pipelines: dict[str, tuple[PhysicalNode, ...]] = {}
+
+    def can_group(members) -> bool:
+        proposed = {**pipelines, **{member.node_id: tuple(members)
+                                   for member in members}}
+        try:
+            execution_groups(graph, proposed)
+        except CycleError:
+            return False
+        return True
+
     followed: set[str] = set(completed)
     for node in graph.topological_nodes():
         aliases = node.document_aliases
@@ -83,19 +91,41 @@ def build_pipelines(
             after = [consumer
                      for consumer in continuation(members[-1], alias, members[0])
                      if consumer.node_id not in followed]
-            if not after:
+            if not after or not can_group([*members, *after]):
                 break
             members.extend(after)
             followed.update(consumer.node_id for consumer in after)
         joins = [member for member in members if isinstance(member, AiJoin)]
-        for join in joins if workers == 1 else ():
+        for join in joins:
             candidates = [consumer for consumer in consumers.get(
                 (join.node_id, f"join_answers:{join.written_pos}"), ())
                 if isinstance(consumer, AiClassify) and consumer.classifies_join(join)]
-            if len(candidates) == 1 and candidates[0].node_id not in followed:
-                members.append(candidates[0])
-                followed.add(candidates[0].node_id)
+            for consumer in candidates:
+                if (consumer.node_id not in followed
+                        and can_group([*members, consumer])):
+                    members.append(consumer)
+                    followed.add(consumer.node_id)
         pipeline = tuple(members)
         for member in members:
             pipelines[member.node_id] = pipeline
     return pipelines
+
+
+def execution_groups(graph: PhysicalGraph, pipelines: dict) -> tuple:
+    """Order pipelines and individual nodes after their external inputs.
+
+    Raises:
+        CycleError: Grouping nodes creates a dependency cycle.
+    """
+    groups = {}
+    owners = {}
+    for node in graph.nodes:
+        group = pipelines.get(node.node_id, (node,))
+        owner = group[0].node_id
+        groups[owner] = group
+        owners[node.node_id] = owner
+    dependencies = {
+        owner: {owners[port.source.node_id] for node in group for port in node.inputs}
+        - {owner} for owner, group in groups.items()}
+    ordered = TopologicalSorter(dependencies).static_order()
+    return tuple(groups[owner] for owner in ordered)

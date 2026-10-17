@@ -104,6 +104,13 @@ def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
     assert (CONFIG.gpus, CONFIG.backend) == (1, "quail")
 
     sources = []
+    resolutions = []
+
+    def resolve(model_name, revision, *, include_weights):
+        resolutions.append((model_name, revision, include_weights))
+        return "/snapshots/pinned-model"
+
+    monkeypatch.setattr("quail.api.session.resolve_model_path", resolve)
 
     class Tokenizer:
         def __init__(self, source):
@@ -123,7 +130,8 @@ def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
         # the session loads one encoder for the caller and warms one on
         # the tokenization thread; the thread keeps its own instance
         session.inputs.warm_tokenizer().result()
-    assert sources == ["Qwen/Qwen3-4B-FP8"] * 2
+    assert sources == ["/snapshots/pinned-model"] * 2
+    assert resolutions == [(session.model.hf_name, session.model.revision, False)]
     assert token_ids == [1, 2]
     assert all(type(token_id) is int for token_id in token_ids)
     assert piece == b"h"
@@ -389,8 +397,7 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
     assert lookup(5, 1).size == 0
     streamed[5] = [1]
     assert lookup(5, 1).tolist() == [1]
-    # two equalities: both key columns must match; integer keys on one
-    # side are cast to the other side's type
+    # Both equality keys must match, with integers promoted to a shared type.
     pairs = pair_table(
         "c", [pa.array(["u1", "u1"]), pa.array([1, 2])],
         "e", [pa.array(["u1", "u1"]), pa.array([2, 2], type=pa.int8())])
@@ -405,7 +412,8 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
         cross_stage = cross_plan.graph.nodes_by_type(AiJoin.type_name)[0]
         # c1 and c2 pair with e0 and e2, c0 with e1: 5 of 12 pairs
         hash_join = paired_plan.graph.node("hash_join:c-e")
-        assert (hash_join.left, hash_join.right, hash_join.on) == (
+        assert (hash_join.left, hash_join.right,
+                tuple((left.column, right.column) for left, right in hash_join.on)) == (
             "c", "e", (("url", "url"),))
         assert hash_join.pair_fraction == 5 / 12
         assert [port.source.node_id for port in hash_join.inputs] == [
@@ -503,3 +511,143 @@ def test_engine_import_gpu_requirement_and_quickstart_demos(
     with pytest.raises(RuntimeError, match="query failed"):
         quickstart_modal.run_query.get_raw_f()()
     assert commits == ["volume"], "a failed query still commits the volume"
+
+
+@pytest.mark.parametrize("left,right", [
+    (pa.array([1, 2], pa.int8()), pa.array([2, 300], pa.int64())),
+    (pa.array([1, 2], pa.int64()), pa.array([1.5, 2.0], pa.float64())),
+    (pa.array([-1, 7, 2**63 - 1, None], pa.int64()),
+     pa.array([7, 2**63 - 1, 2**63, 2**64 - 1, None], pa.uint64())),
+    (pa.array([-1, 7], pa.int8()), pa.array([7, 2**64 - 1], pa.uint64())),
+    (pa.array(["a", "b", None]).dictionary_encode(), pa.array(["b", "c", None])),
+    (pa.chunked_array([pa.array(["a", "b"]).dictionary_encode(),
+                       pa.array(["b", "a", None]).dictionary_encode()]),
+     pa.array(["b", "a", None])),
+    (pa.array([-1, 7], pa.int64()).dictionary_encode(),
+     pa.array([7, 2**64 - 1], pa.uint64())),
+    (pa.array([-2**63, 0, 7, 2**53, 2**53 + 1, 2**63 - 1, None], pa.int64()),
+     pa.array([-float(2**63), 0.0, 7.0, 7.5, float(2**53), float(2**63),
+               float("inf"), float("nan"), None])),
+    (pa.array([0, 7, 2**63, 2**64 - 2048, 2**64 - 1], pa.uint64()),
+     pa.array([-1.0, 0.0, 7.0, float(2**63), float(2**64 - 2048), float(2**64)])),
+    (pa.array([None, None]), pa.array([1, 2], pa.int32())),
+    (pa.array([None, None]), pa.array([None, None])),
+    (pa.array([]), pa.array([])),
+    (pa.array([0.0, -0.0, float("nan"), -float("nan"), None]),
+     pa.array([-0.0, 0.0, float("nan"), -float("nan"), None])),
+])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_join_keys_use_a_shared_type_for_execution_and_estimation(left, right, reverse):
+    if reverse:
+        left, right = right, left
+    expected = [(i, j) for i, a in enumerate(left.to_pylist())
+                for j, b in enumerate(right.to_pylist())
+                if a is not None and b is not None and a == b]
+    pairs = pair_table("l", [left], "r", [right])
+    assert list(zip(pairs["l"].to_pylist(), pairs["r"].to_pylist())) == expected
+    count = len(left) * len(right)
+    assert estimate_pair_fraction([left], [right]) == (
+        max(len(expected), 1) / count if count else 0.0)
+
+
+@pytest.mark.parametrize("kind", [
+    "signed_unsigned", "integer_float", "dictionary", "floating",
+])
+def test_mixed_join_keys_keep_exact_values_and_original_result_types(kind):
+    left, right = {
+        "signed_unsigned": (
+            pa.array([-1, 7, 2**63 - 1], pa.int64()),
+            pa.array([7, 2**63, 2**64 - 1], pa.uint64())),
+        "integer_float": (
+            pa.array([7, 2**53 + 1, 2**63 - 1], pa.int64()),
+            pa.array([7.0, float(2**53), float(2**63)])),
+        "dictionary": (pa.array(["a", "b", "c"]).dictionary_encode(),
+                       pa.array(["b", "c", "d"])),
+        "floating": (
+            pa.array([-0.0, 0.0, float("nan"), -float("nan")], pa.float32()),
+            pa.array([0.0, -0.0, float("nan"), -float("nan")], pa.float64())),
+    }[kind]
+    expected = [(i, j, a, b) for i, a in enumerate(left.to_pylist())
+                for j, b in enumerate(right.to_pylist()) if a == b]
+    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+        for name, keys in (("left_docs", left), ("right_docs", right)):
+            session.register(name, quail.DocumentProvider.from_table(pa.table({
+                "id": range(len(keys)), "key": keys, "text": ["document"] * len(keys),
+            }), id_col="id"))
+        query = session.sql("""
+            SELECT l.id, r.id, l.key, r.key FROM left_docs l JOIN right_docs r
+            ON l.key = r.key AND AI_FILTER(PROMPT('Pair? {0} {1}', l.text, r.text),
+                                         {'anchor': 'l'})
+        """)
+        result = _run(query, make_executor({}, {("l", "r"): lambda *_args: True}))
+        assert result.to_rows() == expected
+        table = result.collect()
+        assert table.schema.field("l.key").type == left.type
+        assert table.schema.field("r.key").type == right.type
+
+
+@pytest.mark.parametrize("left_alias,right_alias", [
+    ("key0", "key1"), ("left", "right"), ("right", "left"),
+])
+def test_hash_join_keeps_ids_separate_from_keys_and_aliases(left_alias, right_alias):
+    from types import SimpleNamespace
+
+    from quail.catalog.pairs import columns_key
+    from quail.execution.runtimes.dataflow import HashJoinRuntime
+    from quail.physical import HashJoin, PortRef
+    from quail.physical.base import input_ports
+
+    node = HashJoin(
+        node_id="join", left=left_alias, right=right_alias,
+        inputs=input_ports((PortRef("l", f"ids:{left_alias}"),
+                            PortRef("r", f"ids:{right_alias}"))),
+        on=((quail.ColumnRef(left_alias, "", left_alias),
+             quail.ColumnRef(right_alias, "", right_alias)),), written_pos=0)
+    context = SimpleNamespace(sources={
+        columns_key(left_alias): pa.table({left_alias: [30, 10, 20]}),
+        columns_key(right_alias): pa.table({right_alias: [20, 40, 10]}),
+    })
+    result = HashJoinRuntime().execute(
+        node, {"input:0": pa.array([1, 2]), "input:1": pa.array([0, 2])}, context)
+    assert result.outputs["pairs:0"].to_pydict() == {
+        left_alias: [1, 2], right_alias: [2, 0]}
+
+
+@pytest.mark.parametrize("alias", ["answer", "predicate", "left,side"])
+@pytest.mark.parametrize("joined", [False, True])
+def test_answer_reporting_preserves_aliases_that_match_metadata_columns(alias, joined):
+    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+        session.register("docs", quail.DocumentProvider.from_table(
+            pa.table({"id": ["a", "b"], "text": ["one", "two"]}), id_col="id"))
+        query = (session.docs("docs").alias(alias)
+                 .ai_filter(quail.prompt("q: {0}", quail.col(f"{alias}.text"))))
+        columns = [f"{alias}.id"]
+        partner = "other,side"
+        if joined:
+            query = query.ai_join(
+                session.docs("docs").alias(partner),
+                quail.prompt("j: {0} {1}", quail.col(f"{alias}.text"),
+                             quail.col(f"{partner}.text")), anchor=alias)
+            columns.append(f"{partner}.id")
+        result = _run(query.select(*columns), make_executor(
+            {alias: {"q:": [True, False]}},
+            {(alias, partner): lambda a, b: b == 1}))
+        assert result.to_rows() == ([("a", "b")] if joined else [("a",)])
+        if joined:
+            join_stage = next(stage for stage in result.report["stages"]
+                              if stage["op"] == "join")
+            assert join_stage["partners"] == [partner]
+        answers = result.answer_tables["filters"][(alias, 0)]
+        assert len(set(answers.column_names)) == answers.num_columns
+        assert answers.column(0).to_pylist() == [0, 1]
+        assert answers.column(1).to_pylist() == [0, 0]
+        assert answers.column(2).to_pylist() == [True, False]
+
+
+def test_join_answer_constructor_preserves_an_alias_named_answer():
+    from quail.execution.result import answer_table, true_answer_rows
+
+    table = answer_table({"answer": [2, 4], "other": [1, 3]},
+                         [False, True], "join_answers")
+    assert len(set(table.column_names)) == table.num_columns
+    assert true_answer_rows(table).to_pydict() == {"answer": [4], "other": [3]}

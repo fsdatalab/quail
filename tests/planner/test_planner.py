@@ -37,7 +37,13 @@ from quail.planner.optimize import refine_plan
 from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.rules import built_in_rules
 from quail.planner.search.filter_order import order_filters_indexed
-from quail.planner.statistics.tables import AliasStats, summarize_alias
+from quail.planner.statistics.tables import (
+    AliasStats,
+    pair_counts,
+    summarize_alias,
+    surviving_docs,
+    thin,
+)
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
@@ -487,9 +493,9 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
         member.node_id for member in build_pipelines(one.graph)[sequence.node_id]) == (
         "ai_filter:r", "ai_join:r")
     two = _plan(filtered, toks, gpus=2)
-    assert two.settings["retention"]["initial"] == {"r": [1.0, 0]}
+    assert two.settings["retention"]["initial"] == {}
     sequence = filter_sequence(two, "r")
-    assert (sequence.keep_kv, sequence.arena_writes) == (True, True)
+    assert (sequence.keep_kv, sequence.arena_writes) == (False, True)
 
     # a forced anchor takes one search too; refining a planned query
     # on exact tokens keeps the schedule it was made with
@@ -512,7 +518,8 @@ def _join_search_spec(position, aliases, anchor):
         label_tokens={alias: 4 for alias in aliases}, tail_tokens=6)
 
 
-def test_join_search_matches_enumeration_and_tracks_residency():
+@pytest.mark.parametrize("workers", [1, 2, 8])
+def test_join_search_matches_enumeration_and_tracks_residency(workers):
     from quail.planner.search.join_order import (
         anchor_fits,
         search_joins,
@@ -534,7 +541,7 @@ def test_join_search_matches_enumeration_and_tracks_residency():
     filtered = {"a", "c"}
     live = {"a": 10.0, "b": 6.0, "c": 8.0}
     result = search_joins(specs, live, lengths, filtered, 5, 8192,
-                          QWEN3_4B_FP8, H100_SXM)
+                          QWEN3_4B_FP8, H100_SXM, workers=workers)
     costs = []
     for order in itertools.permutations(specs):
         for anchors in itertools.product(*(spec.aliases for spec in order)):
@@ -545,9 +552,14 @@ def test_join_search_matches_enumeration_and_tracks_residency():
                 if record.anchor in seen:
                     assert record.resident != "filter"
                 seen.add(record.anchor)
-            costs.append(speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 8192).seconds)
+            per_worker = sum((record.work * (1 / max(
+                1, min(workers, record.anchor_docs))) for record in records), Work())
+            costs.append(speed_of_light(
+                per_worker, QWEN3_4B_FP8, H100_SXM, 8192).seconds)
     assert speed_of_light(
-        result.work, QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)
+        sum((step.worker_work(workers) for step in result.steps), Work()),
+        QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)
+    assert result.work == sum((step.work for step in result.steps), Work())
 
     specs = [
         _join_search_spec(0, ("a", "b"), "a"),
@@ -622,6 +634,60 @@ def test_closed_form_join_work_sums_the_per_row_work():
                 getattr(per_row, field)), (field, resident)
 
 
+def _matching_probability(count, probability):
+    return sum(probability ** sum(bits) * (1 - probability) ** (count - sum(bits))
+               for bits in itertools.product((False, True), repeat=count) if any(bits))
+
+
+def test_survivor_probability_keeps_precision_for_sparse_matches():
+    import math
+
+    assert surviving_docs(1, 1e20, 1e-20) == pytest.approx(1 - math.exp(-1))
+
+
+@pytest.mark.parametrize("semantics", ["full", "exists", "anti"])
+@pytest.mark.parametrize("partners", [0, 1, 3])
+@pytest.mark.parametrize("fraction", [0.0, 0.25, 1.0])
+def test_join_survivor_estimates_include_candidate_pairs(semantics, partners, fraction):
+    spec = replace(_join_search_spec(0, ("a", "b"), "a"), semantics=semantics,
+                   pair_fraction=fraction, selectivity=0.5)
+    live = {"a": 2.0, "b": float(partners)}
+    pairs, prefixes = pair_counts(live, spec.aliases, fraction)
+    assert pairs == 2 * partners * fraction
+    assert prefixes == pytest.approx(2 * _matching_probability(partners, fraction))
+    thin(live, spec)
+    matched = 2 * _matching_probability(partners, fraction * 0.5)
+    assert live["a"] == pytest.approx(2 - matched if semantics == "anti" else matched)
+    expected_b = (partners * _matching_probability(2, fraction * 0.5)
+                  if semantics == "full" else partners)
+    assert live["b"] == pytest.approx(expected_b)
+
+
+@pytest.mark.parametrize("partners", [0, 1, 3])
+@pytest.mark.parametrize("fraction", [0.0, 0.25, 1.0])
+@pytest.mark.parametrize("resident", [False, True])
+def test_join_work_prices_only_anchors_with_candidates(partners, fraction, resident):
+    from quail.cost.joins import partner_stream_work
+    from quail.planner.search.join_order import stage_work
+
+    spec = replace(_join_search_spec(0, ("a", "b"), "a"), pair_fraction=fraction)
+    lengths = {"a": summarize_alias([50] * 2), "b": summarize_alias([30] * partners)}
+    frame = spec.frame_tokens["a"] + spec.label_tokens["b"]
+    expected = Work()
+    for bits in itertools.product((False, True), repeat=partners):
+        if any(bits):
+            probability = (fraction ** sum(bits)
+                           * (1 - fraction) ** (partners - sum(bits)))
+            expected += ((ask(57, frame) if resident else scan(57, frame))
+                         + partner_stream_work(57 + frame,
+                                               [spec.tail_tokens + 30] * sum(bits))) \
+                * (2 * probability)
+    work = stage_work(spec, "a", {"a": 2.0, "b": float(partners)}, lengths, 7,
+                      resident=resident)
+    for field in vars(expected):
+        assert getattr(work, field) == pytest.approx(getattr(expected, field))
+
+
 def _claims_session(gpus=1, backend="quail"):
     session = quail.Session(
         EngineConfig(gpus=gpus, model="qwen3-4b-fp8", backend=backend,
@@ -669,14 +735,14 @@ def test_foreign_node_placement_and_pipelines():
             "ai_filter:c",)
         assert barrier.graph.node("apply:keep_even").kind == "barrier"
         request = _apply_query(session, "barrier")._prepare_physical()
-        assert request.column_tables()["c"].column_names == ["c", "url"]
+        assert request.column_tables()["c"].column_names == ["url"]
         assert request.column_tables()["c"].column("url").to_pylist()[:2] == [
             "u0", "u1"]
 
     with _claims_session(gpus=2) as session:
         plan = _apply_query(session, "per_batch").plan()
-        assert isinstance(plan, Refusal)
-        assert plan.constraint == "per_batch_apply_needs_one_gpu"
+        assert not isinstance(plan, Refusal)
+        assert len(build_pipelines(plan.graph)["ai_filter:c"]) > 1
         assert not isinstance(_apply_query(session, "barrier").plan(), Refusal)
     with _claims_session(backend="stock_vllm") as session:
         plan = _apply_query(session, "barrier").plan()
@@ -877,3 +943,13 @@ def test_attention_setting_forces_every_filter_and_join(catalog):
                 if isinstance(node, AiJoin)} == {path}
     with pytest.raises(ValueError, match="tree"):
         _plan(filters, tokens, attention="both")
+
+
+@pytest.mark.parametrize("documents,workers", [(64, 2), (64, 4), (1, 8)])
+def test_filter_plan_prices_parallel_document_work(catalog, documents, workers):
+    query = _five_filter_plan(catalog, (1.0,))
+    lengths = {"r": [1000] * documents}
+    serial = _plan(query, lengths)
+    parallel = _plan(query, lengths, gpus=workers)
+    assert parallel.estimated_seconds == pytest.approx(
+        serial.estimated_seconds / min(documents, workers), rel=0.01)

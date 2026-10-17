@@ -480,31 +480,35 @@ class ClassifyStages:
                 len(self.request.suffixes), self.readout_rows, -1)
         return self.request.score(logprobs)
 
-    def finish(self, answers) -> tuple[int, int]:
+    def finish(self, answers, *, frame_tokens=None) -> tuple[int, int]:
         """Finalize labels and count tokens processed after the documents.
 
         Args:
             answers: Per-stage mappings from document index to readout values.
+            frame_tokens: Fresh frame tokens per document, or None to count
+                the full frame when executing this classification on its own.
 
         Returns:
             A tuple of suffix tokens and total streamed tokens, including frames.
             For pair classification, the first value counts classified pairs
             instead of suffix tokens.
         """
+        if frame_tokens is None:
+            frame_tokens = len(self.stages[0].frame)
         if self.partners is not None:
             streamed = sum(1 + self.block_tokens[partner]
                            for _, partner in self.pair_labels)
             anchors = {anchor for anchor, _ in self.pair_labels}
-            streamed += len(anchors) * len(self.stages[0].frame)
+            streamed += len(anchors) * frame_tokens
             return len(self.pair_labels), streamed
         first = answers[0]
         if self.choice is not None:
-            frame, request = self.choice
+            _, request = self.choice
             for anchor, scores in first.items():
                 if self.labels[anchor] is None:
                     self._choose(anchor, _softmax(np.asarray(scores)), None)
             suffix_tokens = len(first) * len(request)
-            return suffix_tokens, suffix_tokens + len(first) * len(frame)
+            return suffix_tokens, suffix_tokens + len(first) * frame_tokens
         if self.decoder is not None:
             suffix_tokens = self.decoder.tokens
         else:
@@ -515,5 +519,5 @@ class ClassifyStages:
             suffix_tokens = len(first) * read
             if self.draws > 1:
                 suffix_tokens += self.extended * (self.draws - 1) * read
-        return suffix_tokens, suffix_tokens + len(first) * len(self.request.frame)
+        return suffix_tokens, suffix_tokens + len(first) * frame_tokens
 

@@ -9,6 +9,7 @@ immutable reference (a Hugging Face dataset pinned to a commit).
 from __future__ import annotations
 
 import hashlib
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -82,24 +83,23 @@ def describe(provider: TableProvider, workdir: str | Path, *,
             "revision": revision,
             "id_col": provider.id_col,
         })
-    if isinstance(provider, MemoryTableProvider):
-        source = provider.table
-    elif isinstance(provider, ArrowDatasetProvider):
-        source = provider.scan(ScanRequest(columns=provider.columns))
-    else:
+    if not isinstance(provider, (MemoryTableProvider, ArrowDatasetProvider)):
         raise TypeError(
             f"{type(provider).__name__} cannot be sent to Quail Server; "
             f"register {SUPPORTED}")
     workdir.mkdir(parents=True, exist_ok=True)
-    staging = workdir / f"snapshot-{id(provider)}.arrow"
-    try:
-        write_ipc_file(staging, source)
-    finally:
-        if not isinstance(source, pa.Table):
-            source.close()
-    content_id = file_digest(staging)
-    path = workdir / f"{content_id}.arrow"
-    staging.replace(path)
+    with tempfile.TemporaryDirectory(dir=workdir, prefix="snapshot-") as directory:
+        staging = Path(directory) / "snapshot.arrow"
+        source = (provider.table if isinstance(provider, MemoryTableProvider)
+                  else provider.scan(ScanRequest(columns=provider.columns)))
+        try:
+            write_ipc_file(staging, source)
+        finally:
+            if not isinstance(source, pa.Table):
+                source.close()
+        content_id = file_digest(staging)
+        path = workdir / f"{content_id}.arrow"
+        staging.replace(path)
     return PreparedInput({
         "kind": "snapshot",
         "content_id": content_id,

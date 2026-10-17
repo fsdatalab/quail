@@ -102,7 +102,7 @@ built-in rules of the same kind, in registration order.
 
 | Rule | Kind | Decision | Uses cost estimates |
 | --- | --- | --- | --- |
-| `should_eliminate_distinct` | Logical | Remove DISTINCT when the returned keys are unique. | No |
+| `should_eliminate_distinct` | Logical | Remove DISTINCT when an aggregate returns every grouping key. | No |
 | `should_push_down_distinct` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
 | `should_push_down_projection` | Logical | Load only columns the query uses. | No |
 | `should_push_down_filters` | Logical | Move eligible CPU filters and Python functions before joins. | No |

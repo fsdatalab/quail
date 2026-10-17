@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import math
 import time
+from contextlib import ExitStack, closing
 
 from quail.backends.quail.executor.models.decision2 import register_backbone
+from quail.baselines.vllm import VLLMClient
 
 ARCHITECTURE = "Qwen3DecisionModel"
 TASK = "token_classify"
@@ -155,7 +157,7 @@ def _uncached(params):
     return clone
 
 
-class VLLMDecisionClient:
+class VLLMDecisionClient(VLLMClient):
     """The request operations of a decision model on one vLLM LLM.
 
     Prompts are token ids: the layout tokenizes each segment apart, so
@@ -165,8 +167,7 @@ class VLLMDecisionClient:
     accepts_text = False
 
     def __init__(self, llm, capacity: dict):
-        self.llm = llm
-        self.capacity = capacity
+        super().__init__(llm, capacity)
         self.recomputed = 0
         self._counter = 0
 
@@ -185,9 +186,6 @@ class VLLMDecisionClient:
                 done[output.request_id] = output
         return [done[request_id] for request_id in ids]
 
-    def reset_prefix_cache(self):
-        return self.llm.reset_prefix_cache()
-
     def run_filter_sequence(self, params, body_ids, question_ids, read_answer, *,
                          tag="q", body_texts=None, question_texts=None):
         """Pipeline filter stages through the engine's step loop."""
@@ -202,7 +200,8 @@ class VLLMDecisionClient:
             max_num_seqs=self.capacity["max_num_seqs"])
 
 
-def boot_decision(spec, llm_kwargs: dict) -> tuple[dict, dict]:
+def boot_decision(spec, llm_kwargs: dict, *,
+                  resources: ExitStack) -> tuple[dict, dict]:
     """Load a decision checkpoint on the pooling runner.
 
     Each query sets its own pooling parameters from its plan. Prompts
@@ -211,41 +210,40 @@ def boot_decision(spec, llm_kwargs: dict) -> tuple[dict, dict]:
     Args:
         spec: The decision model's ModelSpec.
         llm_kwargs: LLM constructor arguments beyond the model.
+        resources: Owns the engine during startup and query execution.
 
     Returns:
         The engine state and the boot record.
     """
     from vllm import LLM
 
-    from quail.backends.quail.executor.model_loading import (
-        engine_args,
-        resolve_model_path,
-    )
+    from quail.backends.quail.executor.model_loading import engine_args
     from quail.baselines.vllm import _capacity
+    from quail.specs.files import resolve_model_path
 
-    register()
     path = resolve_model_path(spec.hf_name, spec.revision)
     llm_kwargs = {key: value for key, value in llm_kwargs.items()
                   if key != "tokenizer_mode"}
     llm_kwargs["skip_tokenizer_init"] = True
     started = time.perf_counter()
-    llm = LLM(runner="pooling", **engine_args(path, ARCHITECTURE), **llm_kwargs)
-    boot_s = time.perf_counter() - started
-    config = llm.llm_engine.vllm_config
-    capacity = _capacity(llm)
+    client = resources.enter_context(closing(VLLMDecisionClient(
+        LLM(runner="pooling", **engine_args(path, ARCHITECTURE), **llm_kwargs), {})))
+    llm_init_s = time.perf_counter() - started
+    config = client.llm.llm_engine.vllm_config
+    capacity = client.capacity
+    capacity.update(_capacity(config))
     capacity.update(
         enable_prefix_caching=config.cache_config.enable_prefix_caching,
         enable_chunked_prefill=config.scheduler_config.enable_chunked_prefill,
         runner="pooling", architecture=ARCHITECTURE)
     if not capacity["enable_prefix_caching"]:
         raise RuntimeError("vLLM turned prefix caching off for the decision model")
-    client = VLLMDecisionClient(llm, capacity)
     params = pooling_params((1, 0))
     warm = client.generate([{"prompt_token_ids": [0, 0]}], params)
     if not all(math.isfinite(float(v)) for v in warm[0].outputs.data):
         raise RuntimeError("the decision pooler returned no scores")
     return (
         {"client": client, "sampling_params": params, "capacity": capacity},
-        {"kind": "cold", "llm_init_s": round(boot_s, 2), "weight_load_s": None,
-         "kv_profile_s": None, "boot_s": round(boot_s, 2)},
+        {"kind": "cold", "llm_init_s": round(llm_init_s, 2), "weight_load_s": None,
+         "kv_profile_s": None},
     )

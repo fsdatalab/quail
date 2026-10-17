@@ -1,5 +1,8 @@
 """GROUP BY, aggregates, and HAVING: the Aggregate node, its runtime, the plan."""
 
+import json
+
+import numpy as np
 import pyarrow as pa
 import pytest
 from helpers.planning import _plan, node_kinds
@@ -19,6 +22,89 @@ from quail.physical.base import input_ports
 
 def _node(**fields):
     return Aggregate(node_id="aggregate", inputs=input_ports(()), **fields)
+
+
+@pytest.mark.parametrize("literal", [np.int64(1), np.float32(1.5)])
+def test_numpy_having_literal_survives_planning_and_execution(literal):
+    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+        session.register("docs", DocumentProvider.from_table(pa.table({
+            "id": [0, 1, 2], "text": ["doc"] * 3, "group": ["a", "a", "b"],
+        }), id_col="id"))
+        query = (session.docs("docs").alias("r")
+                 .ai_filter(prompt("keep: {0}", col("r.text")))
+                 .group_by("r.group").agg(n=count()).having(count() > literal)
+                 .select("r.group", "n"))
+        json.dumps(query.plan().to_envelope(session.registry.codecs))
+        assert _run(query, make_executor({"r": {"keep:": [True] * 3}})
+                    ).to_rows() == [("a", 2)]
+
+
+@pytest.mark.parametrize("function", ["sum", "min", "max"])
+@pytest.mark.parametrize("dtype,values,literal,expected", [
+    (pa.int64(), [2**53, 2**53 + 1, None], float(2**53), [1]),
+    (pa.uint64(), [0, 2**63, 2**64 - 1], 2**63, [2]),
+    (pa.float64(), [float(2**53), float(2**53 + 2), None], 2**53 + 1, [1]),
+])
+def test_having_preserves_large_numeric_values(
+        function, dtype, values, literal, expected):
+    table = pa.table({"group": range(len(values)), "value": pa.array(values, dtype)})
+    node = _node(keys=("group",), aggregates=(("answer", function, "value"),),
+                 having=(("answer", ">", literal),), columns=("group", "answer"))
+    assert aggregate_table(table, node).to_pydict() == {
+        "group": expected, "answer": [values[index] for index in expected]}
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("dtype,values", [
+    (pa.int64(), [2**63 - 1, 1]),
+    (pa.int64(), [-2**63, -1]),
+    (pa.uint64(), [2**64 - 1, 1]),
+])
+def test_integer_sum_does_not_wrap(dtype, values, grouped):
+    table = pa.table({"group": ["a"] * len(values),
+                      "value": pa.array(values, dtype)})
+    node = _node(keys=("group",) if grouped else (),
+                 aggregates=(("total", "sum", "value"),), columns=("total",))
+    with pytest.raises(pa.ArrowInvalid):
+        aggregate_table(table, node)
+
+
+@pytest.mark.parametrize("dtype,values,expected", [
+    (pa.int64(), [2**63 - 1, 1, -1, None], 2**63 - 1),
+    (pa.int64(), [-2**63, -1, 1, None], -2**63),
+    (pa.uint64(), [2**64 - 1, 0, None], 2**64 - 1),
+    (pa.int32(), [2**31 - 1, 1, None], 2**31),
+])
+def test_integer_sum_keeps_exact_totals_and_other_aggregates(dtype, values, expected):
+    table = pa.table({"group": ["a"] * len(values) + ["b"],
+                      "value": pa.array([*values, None], dtype)})
+    node = _node(keys=("group",), aggregates=(
+        ("total", "sum", "value"), ("again", "sum", "value"),
+        ("low", "min", "value"), ("n", "count", "value")),
+        columns=("group", "total", "again", "low", "n"))
+    result = aggregate_table(table, node)
+    present = [value for value in values if value is not None]
+    assert result.to_pylist() == [
+        {"group": "a", "total": expected, "again": expected,
+         "low": min(present), "n": len(present)},
+        {"group": "b", "total": None, "again": None, "low": None, "n": 0}]
+    assert result.schema.field("total").type == (
+        pa.uint64() if pa.types.is_unsigned_integer(dtype) else pa.int64())
+
+
+@pytest.mark.parametrize("dialect", ["snowflake", "bq"])
+def test_sql_integer_sum_cannot_hide_overflow_in_having(dialect):
+    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+        session.register("docs", DocumentProvider.from_table(pa.table({
+            "id": [0, 1], "text": ["doc", "doc"],
+            "amount": [2**63 - 1, 1],
+        }), id_col="id"))
+        query = session.sql(
+            "SELECT SUM(r.amount) AS total FROM docs r "
+            "WHERE AI_FILTER(PROMPT('keep: {0}', r.text)) "
+            "HAVING SUM(r.amount) > 0", dialect=dialect)
+        with pytest.raises(pa.ArrowInvalid):
+            _run(query, make_executor({"r": {"keep:": [True, True]}})).collect()
 
 
 def test_aggregate_table_groups_counts_and_filters_groups():
@@ -136,6 +222,38 @@ def session():
 TRUTH = {"r": {"q:": [1, 1, 1, 0, 1, 1]}}
 
 
+@pytest.mark.parametrize("dialect", ["snowflake", "bq"])
+@pytest.mark.parametrize("argument", ["stars", "r.stars"])
+def test_aggregate_arguments_read_source_columns_before_output_aliases(
+    session, dialect, argument,
+):
+    query = session.sql(f"""
+        SELECT r.lang AS stars, COUNT({argument}) AS n,
+            COUNT(DISTINCT {argument}) AS distinct_values,
+            SUM({argument}) AS total, AVG({argument}) AS mean
+        FROM reviews r WHERE AI_FILTER(PROMPT('q: {{0}}', r.review))
+        GROUP BY r.lang ORDER BY r.lang
+    """, dialect=dialect)
+    result = _run(query, make_executor({"r": {"q:": [1] * 6}}))
+    assert result.to_rows() == [
+        ("de", 1, 1, 5, 5.0), ("en", 3, 3, 10, 10 / 3), ("fr", 1, 1, 4, 4.0)]
+
+
+@pytest.mark.parametrize("dialect, counts", [
+    ("snowflake", [1, 1, 1, 1, 1, 1]), ("bq", [1, 1, 4]),
+])
+def test_group_by_resolves_source_and_alias_collisions_by_dialect(
+    session, dialect, counts,
+):
+    query = session.sql("""
+        SELECT r.lang AS stars, COUNT(*) AS n
+        FROM reviews r WHERE AI_FILTER(PROMPT('q: {0}', r.review))
+        GROUP BY r.lang, stars ORDER BY n
+    """, dialect=dialect)
+    result = _run(query, make_executor({"r": {"q:": [1] * 6}})).collect()
+    assert result.column("n").to_pylist() == counts
+
+
 def test_group_by_runs_on_the_result(session):
     result = _run(session.sql("""
         SELECT r.lang, COUNT(*) AS n, AVG(r.stars) AS mean, SUM(r.stars) AS total
@@ -181,6 +299,21 @@ def test_group_by_runs_on_the_result(session):
     ):
         with pytest.raises(CompileError, match=fragment):
             session.sql(sql)
+
+
+@pytest.mark.parametrize("dialect, expected", [
+    ("snowflake", []), ("bq", [("en", 4)]),
+])
+def test_having_aggregate_resolves_source_and_alias_collisions_by_dialect(
+    session, dialect, expected,
+):
+    query = session.sql("""
+        SELECT r.lang AS stars, COUNT(*) AS n
+        FROM reviews r WHERE AI_FILTER(PROMPT('q: {0}', r.review))
+        GROUP BY r.lang HAVING COUNT(stars) > 3
+    """, dialect=dialect)
+    result = _run(query, make_executor({"r": {"q:": [1] * 6}}))
+    assert result.to_rows() == expected
 
 
 def test_aggregate_internal_columns_do_not_replace_user_values():
@@ -230,3 +363,37 @@ def test_grouped_select_order_does_not_duplicate_input_columns(session):
             SELECT r.id, r.id FROM reviews r
             WHERE AI_FILTER(PROMPT('q: {0}', r.review))
         """)
+
+
+@pytest.mark.parametrize("key", [None, "category", "value"])
+@pytest.mark.parametrize("keep", [False, True])
+def test_aggregates_ignore_untyped_null_values_with_or_without_groups(key, keep):
+    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+        session.register("docs", DocumentProvider.from_table(pa.table({
+            "id": [1, 2], "body": ["text", "more text"],
+            "category": ["a", "b"], "value": [None, None],
+        }), id_col="id"))
+        selection = "" if key is None else f"r.{key}, "
+        group = "" if key is None else f"GROUP BY r.{key} ORDER BY r.{key}"
+        query = session.sql(f"""
+            SELECT {selection} COUNT(DISTINCT r.value) AS distinct_values,
+                COUNT(r.value) AS present, COUNT(*) AS total,
+                SUM(r.value) AS summed, AVG(r.value) AS mean,
+                MIN(r.value) AS minimum, MAX(r.value) AS maximum
+            FROM docs r WHERE AI_FILTER(PROMPT('q: {{0}}', r.body)) {group}
+        """)
+        result = _run(query, make_executor({"r": {"q:": [keep, keep]}}))
+        if key is None:
+            expected = [(0, 0, 2 if keep else 0, None, None, None, None)]
+        elif not keep:
+            expected = []
+        elif key == "value":
+            expected = [(None, 0, 0, 2, None, None, None, None)]
+        else:
+            expected = [(value, 0, 0, 1, None, None, None, None)
+                        for value in ("a", "b")]
+        assert result.to_rows() == expected
+        if key == "value":
+            assert pa.types.is_null(result.schema.field("r.value").type)
+        assert pa.types.is_null(result.schema.field("minimum").type)
+        assert pa.types.is_null(result.schema.field("maximum").type)

@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
+from quail.logical.expressions import (
+    ColumnExpression,
+    ColumnRef,
+    decode_column,
+    encode_column,
+)
+
 from ..base import (
     ExecutionLocation,
     OutputPort,
@@ -82,7 +89,6 @@ class AiJoin(PhysicalNode):
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
     backend: ClassVar[str] = "quail"
 
-    worker_pipelining: ClassVar[bool] = True
 
     @property
     def document_aliases(self) -> tuple[str, ...]:
@@ -189,7 +195,7 @@ class Foreign(PhysicalNode):
     function: str = ""
     kind: str = "per_batch"
     ids: str = "drop"
-    columns: tuple[tuple[str, str], ...] = ()
+    columns: tuple[ColumnRef | ColumnExpression, ...] = ()
     aliases: tuple[str, ...] = ()
     written_pos: int = -1
 
@@ -227,7 +233,7 @@ class Foreign(PhysicalNode):
             "function": self.function,
             "kind": self.kind,
             "ids": self.ids,
-            "columns": [list(column) for column in self.columns],
+            "columns": [encode_column(column) for column in self.columns],
             "aliases": list(self.aliases),
             "written_pos": self.written_pos,
         }
@@ -241,8 +247,9 @@ class Foreign(PhysicalNode):
             kind=str(attributes["kind"]),
             ids=str(attributes["ids"]),
             columns=tuple(
-                (str(alias), str(column))
-                for alias, column in attributes["columns"]
+                decode_column(column) if isinstance(column, dict)
+                else ColumnRef(str(column[0]), "", str(column[1]))
+                for column in attributes["columns"]
             ),
             aliases=tuple(attributes["aliases"]),
             written_pos=int(attributes["written_pos"]),
@@ -262,7 +269,9 @@ class HashJoin(PhysicalNode):
 
     left: str = ""
     right: str = ""
-    on: tuple[tuple[str, str], ...] = ()
+    on: tuple[
+        tuple[ColumnRef | ColumnExpression, ColumnRef | ColumnExpression], ...
+    ] = ()
     written_pos: int = -1
     pair_fraction: float = 1.0
 
@@ -279,7 +288,8 @@ class HashJoin(PhysicalNode):
         return {
             "left": self.left,
             "right": self.right,
-            "on": [list(condition) for condition in self.on],
+            "on": [[encode_column(left), encode_column(right)]
+                   for left, right in self.on],
             "written_pos": self.written_pos,
             "pair_fraction": self.pair_fraction,
         }
@@ -291,8 +301,11 @@ class HashJoin(PhysicalNode):
             inputs=inputs,
             left=str(attributes["left"]),
             right=str(attributes["right"]),
-            on=tuple((str(left), str(right))
-                     for left, right in attributes["on"]),
+            on=tuple(tuple(
+                decode_column(value) if isinstance(value, dict)
+                else ColumnRef(str(attributes[side]), "", str(value))
+                for side, value in zip(("left", "right"), condition))
+                for condition in attributes["on"]),
             written_pos=int(attributes["written_pos"]),
             pair_fraction=float(attributes.get("pair_fraction", 1.0)),
         )

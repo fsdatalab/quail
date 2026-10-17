@@ -243,7 +243,9 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
             node_id="hash_join:r-p",
             inputs=input_ports((PortRef("input:r", "ids:r"),
                                 PortRef("input:p", "ids:p"))),
-            left="r", right="p", on=(("key", "key"),), written_pos=0))
+            left="r", right="p",
+            on=((quail.ColumnRef("r", "", "key"),
+                 quail.ColumnRef("p", "", "key")),), written_pos=0))
         join_inputs.append(PortRef("hash_join:r-p", "pairs:0"))
         pairs_from = "hash_join:r-p"
     if foreign and foreign[1] == "pairs":
@@ -251,7 +253,8 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
             node_id="apply:same_key",
             inputs=input_ports((anchor_src, PortRef("input:p", "ids:p"))),
             function="same_key", kind=foreign[0], ids="pairs",
-            columns=(("r", "key"), ("p", "key")), aliases=("r", "p"),
+            columns=(quail.ColumnRef("r", "", "key"),
+                     quail.ColumnRef("p", "", "key")), aliases=("r", "p"),
             written_pos=0))
         join_inputs.append(PortRef("apply:same_key", "pairs:0"))
         pairs_from = "apply:same_key"
@@ -276,7 +279,7 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
 
 def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
                        seed=5, pages=64, stages=1, partner_tokens=20,
-                       streamed_anchors=True, shared_prefix=0, **extra):
+                       streamed_anchors=True, shared_prefix=0, workers=1, **extra):
     """Run a graph over random documents through the real graph runtime.
 
     Returns:
@@ -295,27 +298,60 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
     join_truth = {("r", d): [1 if rng.random() < 0.5 else 0
                              for _ in range(n_partners)] for d in range(n_docs)}
     model = FakeModel(filter_truth, join_truth, streamed_anchors)
-    torch = fake_torch()
-    arena = cpu_arena(pages)
-    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-    execution = QuailModelExecution(SimpleNamespace())
-    execution.bind_loaded_model(model=object(), arena=arena,
-                                pipeline=pipeline)
-    execution.bind_query(
-        torch=torch,
-        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
-                                      dtype=None),
-        answer_rows=object(),
-        chunk_tokens=120)
-    state = {
-        "gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
-                               execution=execution, spec=MODELS["qwen3-4b-fp8"]),
-        "runtimes": built_in_registry().runtimes,
-        "device": DEVICES["h100-sxm"],
-        "chunk_tokens": 120, "docs": docs, **extra,
-    }
-    result = execute_single_graph(state, SETTINGS, graph)
-    assert not arena.accounting.owned
+    def gpu():
+        torch = fake_torch()
+        arena = cpu_arena(pages)
+        pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+        execution = QuailModelExecution(SimpleNamespace())
+        execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+        execution.bind_query(
+            torch=torch,
+            async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
+                                          dtype=None),
+            answer_rows=object(), chunk_tokens=120)
+        return SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                               execution=execution, spec=MODELS["qwen3-4b-fp8"])
+
+    registry = built_in_registry()
+    for name, function in extra.get("functions", {}).items():
+        registry = registry.register_function(function, name=name)
+    if workers == 1:
+        loaded = gpu()
+        state = {
+            "gpu": loaded, "runtimes": registry.runtimes,
+            "device": DEVICES["h100-sxm"],
+            "chunk_tokens": 120, "docs": docs, **extra,
+        }
+        result = execute_single_graph(state, SETTINGS, graph)
+        assert not loaded.arena.accounting.owned
+    else:
+        from quail.backends.quail.distributed import execute_distributed_graph
+        from quail.backends.quail.worker import ChildState, _child_execute
+        from quail.physical import plan_envelope
+
+        children = [ChildState(gpu_index=index, gpu=gpu(), registry=registry)
+                    for index in range(workers)]
+        model.worker_launches = []
+
+        def round_fn(kind, subs):
+            assert kind == "execute"
+            outputs = []
+            for child, sub in zip(children, subs):
+                first = len(model.launched)
+                outputs.append(_child_execute(child, sub))
+                model.worker_launches.append(model.launched[first:])
+            return outputs
+
+        payload = {
+            **SETTINGS, **extra, "docs": docs, "chunk_tokens": 120,
+            "physical_plan": plan_envelope(
+                backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
+                workers=workers, graph=graph, codecs=registry.codecs),
+        }
+        result = execute_distributed_graph(
+            payload, graph, workers, round_fn,
+            DEVICES["h100-sxm"], registry.runtimes, registry)
+        assert all(not child.gpu.arena.accounting.owned for child in children)
     return result, model, filter_truth, join_truth
 
 
@@ -336,12 +372,14 @@ def register_claims_evidence(session, claim_words=20, text_words=100):
 def keep_even(tables):
     (alias,) = tables
     table = tables[alias]
-    return [document for document in table.column(alias).to_pylist()
+    return [document for document in table.ids[alias].to_pylist()
             if document % 2 == 0]
 
 
 def same_key(tables):
     left, right = tables["r"], tables["p"]
+    left = pa.table({"r": left.ids["r"], "key": left.column("key")})
+    right = pa.table({"p": right.ids["p"], "key": right.column("key")})
     return left.join(right, keys=["key"], join_type="inner").select(["r", "p"])
 
 

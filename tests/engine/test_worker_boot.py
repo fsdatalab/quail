@@ -1,6 +1,7 @@
 """Booting a GPU for a query, reusing it, and releasing it for another model."""
 
 import contextlib
+import gc
 import sys
 import types
 import weakref
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from quail.backends import resources
 from quail.backends.quail import worker
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.worker import LoadedGpu
@@ -25,6 +27,7 @@ def install_fake_torch(monkeypatch):
     torch.ones = lambda *args, **kwargs: SimpleNamespace()
     torch.inference_mode = contextlib.nullcontext
     torch.cuda = SimpleNamespace(mem_get_info=lambda: (40 * 2**30, 80 * 2**30),
+                                 is_initialized=lambda: False,
                                  current_blas_handle=lambda: 1,
                                  synchronize=lambda: None)
     monkeypatch.setitem(sys.modules, "torch", torch)
@@ -35,6 +38,7 @@ def install_fake_torch(monkeypatch):
 @pytest.fixture
 def booted(monkeypatch):
     install_fake_torch(monkeypatch)
+    monkeypatch.setattr(resources, "_release_vllm_parallel_state", lambda: None)
     monkeypatch.setattr(worker, "set_gpu_index", lambda index: None)
     monkeypatch.setattr(worker, "say", lambda message: None)
     for name in ("load_model", "build_pipeline", "AnswerRows", "KVArena",
@@ -95,7 +99,7 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
         request=SimpleNamespace(plan=ENVELOPE),
     ))
 
-    gpu = runtime_state[("quail", "qwen3-4b-fp8")]
+    gpu = runtime_state["gpu"]
     assert gpu.prepared_boot["kind"] == "cold"
     assert len(boots) == 1
 
@@ -136,7 +140,7 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     assert staging.buffers is buffers and "tokens" in buffers
     assert not staging.fixed_tokens
     assert len(boots) == 2
-    assert runtime_state[("quail", "qwen3-4b-fp8")] is gpu
+    assert runtime_state["gpu"] is gpu
     resized = []
     gpu.arena = SimpleNamespace(
         resize=lambda *pages, **kw: resized.append((pages, kw)))
@@ -154,60 +158,143 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     assert replacement() is None
 
 
-def test_release_clears_cuda_state_and_a_new_model_boot_triggers_it(monkeypatch):
+def test_release_clears_cuda_state(monkeypatch):
     calls = []
     cuda = SimpleNamespace(
-        is_available=lambda: True,
+        is_initialized=lambda: True,
         synchronize=lambda: calls.append("synchronize"),
         empty_cache=lambda: calls.append("empty_cache"),
         ipc_collect=lambda: calls.append("ipc_collect"),
-        memory_allocated=lambda: 123,
-        memory_reserved=lambda: 456,
     )
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
-    monkeypatch.setattr(worker.gc, "collect", lambda: calls.append("gc"))
-    monkeypatch.setattr(worker, "_release_vllm_parallel_state",
+    monkeypatch.setattr(resources.gc, "collect", lambda: calls.append("gc"))
+    monkeypatch.setattr(resources, "_release_vllm_parallel_state",
                         lambda: calls.append("release_parallel_state"))
     gpu = LoadedGpu.__new__(LoadedGpu)
     gpu.close = lambda: calls.append("close")
     booted = {("quail", "test"): gpu}
-    result = worker.release_booted_models(booted)
+    resources.release_models(booted)
     assert booted == {}
     assert calls == ["synchronize", "close", "release_parallel_state", "gc",
                      "empty_cache", "ipc_collect"]
-    assert result == {"models_released": 1, "vllm_parallel_state_released": True,
-                      "cuda_allocated_bytes": 123, "cuda_reserved_bytes": 456}
 
-    # booting a different model releases the loaded one
-    calls = []
-    monkeypatch.setattr(
-        worker, "release_booted_models",
-        lambda state: (calls.append(sorted(state)), state.clear()))
 
-    class _FakeLoaded:
-        def __init__(self, backend, context, answer_ids):
-            calls.append(("load", context.model.name))
+def test_release_drops_gpu_references_before_emptying_cuda_cache(monkeypatch):
+    gpu = LoadedGpu.__new__(LoadedGpu)
+    gpu.execution = SimpleNamespace(close=lambda: None)
+    gpu_ref = weakref.ref(gpu)
+    state = {("quail", "qwen3-4b-fp8"): gpu}
+    del gpu
+    live_at_cache_release = []
+    cuda = SimpleNamespace(
+        is_initialized=lambda: True,
+        synchronize=lambda: None,
+        empty_cache=lambda: live_at_cache_release.append(gpu_ref() is not None),
+        ipc_collect=lambda: None,
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(resources, "_release_vllm_parallel_state", lambda: None)
 
-        def bind_query(self, *args):
-            calls.append("bind")
+    resources.release_models(state)
 
-        def warm(self):
-            return 0.0, None
+    assert live_at_cache_release == [False]
+    assert gpu_ref() is None
 
-        load_model_s = arena_s = pipeline_s = 0.0
 
-    monkeypatch.setattr(worker, "LoadedGpu", _FakeLoaded)
-    monkeypatch.setattr(worker, "_boot_record",
-                        lambda gpu, cold, warm_s, tier, t: {
-                            "boot_s": 0.0, "kind": "cold" if cold else "warm"})
-    backend = SimpleNamespace(name="quail")
-    state = {("quail", "qwen3-4b-fp8"): object()}
-    context = SimpleNamespace(model=SimpleNamespace(name="qwen3-reranker"))
+@pytest.mark.parametrize("failure", ["cublas", "bind", "warm", "cancel"])
+def test_failed_boot_releases_allocations_and_can_retry(booted, monkeypatch, failure):
+    class Allocation:
+        pass
 
-    gpu, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
-    assert calls == [[("quail", "qwen3-4b-fp8")], ("load", "qwen3-reranker"),
-                     "bind"]
-    assert list(state) == [("quail", "qwen3-reranker")] and boot["kind"] == "cold"
+    allocations = []
 
-    gpu2, boot2 = worker._boot_for_query(state, backend, context, 100, [1], [2])
-    assert gpu2 is gpu and boot2["kind"] == "warm" and calls[-1] == "bind"
+    def allocate(*args, **kwargs):
+        allocation = Allocation()
+        allocations.append(weakref.ref(allocation))
+        return allocation
+
+    def fail(*args, **kwargs):
+        if failure == "cancel":
+            raise KeyboardInterrupt("startup cancelled")
+        raise RuntimeError("warmup failed")
+
+    for name in ("load_model", "KVArena", "build_pipeline", "AnswerRows",
+                 "AsyncAnswers"):
+        monkeypatch.setattr(worker, name, allocate)
+    cuda = sys.modules["torch"].cuda
+    monkeypatch.setattr(cuda, "is_initialized", lambda: True, raising=False)
+    live_at_release = []
+    monkeypatch.setattr(cuda, "empty_cache",
+                        lambda: live_at_release.append(
+                            any(reference() is not None for reference in allocations)),
+                        raising=False)
+    monkeypatch.setattr(cuda, "ipc_collect", lambda: None, raising=False)
+    monkeypatch.setattr(resources, "_release_vllm_parallel_state", lambda: None)
+    registry = built_in_registry()
+    state = {}
+    with monkeypatch.context() as startup:
+        if failure == "cublas":
+            startup.setattr(cuda, "current_blas_handle", fail)
+        else:
+            startup.setattr(LoadedGpu, "bind_query" if failure == "bind" else "warm",
+                            fail)
+        with pytest.raises(KeyboardInterrupt if failure == "cancel" else RuntimeError
+                           ) as saved:
+            worker._boot_for_query(
+                state, registry.backend("quail"),
+                worker._single_gpu_context(registry, ENVELOPE), 8192, [1], [2])
+    gc.collect()
+    assert saved.value.__traceback__ is not None
+    assert not state
+    assert allocations
+    assert all(reference() is None for reference in allocations)
+    assert live_at_release == [False]
+
+    gpu, cold = worker._boot_for_query(
+        state, registry.backend("quail"),
+        worker._single_gpu_context(registry, ENVELOPE), 8192, [1], [2])
+    reused, warm = worker._boot_for_query(
+        state, registry.backend("quail"),
+        worker._single_gpu_context(registry, ENVELOPE), 8192, [1], [2])
+    assert reused is gpu
+    assert cold["kind"] == "cold"
+    assert warm["kind"] == "warm"
+    resources.release_models(state)
+    assert all(reference() is None for reference in allocations)
+    assert live_at_release == [False, False]
+
+
+def test_worker_boot_reuses_model_and_releases_failed_preparation(booted, monkeypatch):
+    registry = built_in_registry()
+    child = worker.ChildState(gpu_index=1, registry=registry,
+                              model_path="/snapshots/qwen")
+    paths = []
+
+    def load(path, **kwargs):
+        paths.append((path, kwargs["revision"]))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(worker, "load_model", load)
+    sub = {**PAYLOAD, "workers": 2}
+    assert worker._child_boot(child, sub)["kind"] == "cold"
+    first = child.gpu
+    assert worker._child_boot(child, sub)["kind"] == "warm"
+    assert child.gpu is first
+    assert first.execution.context.gpu_index == 1
+    assert first.execution.context.gpu_count == 2
+    assert paths == [("/snapshots/qwen", None)]
+
+    def fail(self):
+        raise RuntimeError("warmup failed")
+
+    with monkeypatch.context() as startup:
+        startup.setattr(LoadedGpu, "warm", fail)
+        with pytest.raises(RuntimeError, match="warmup failed"):
+            worker._child_boot(child, sub)
+    assert child.gpu is None
+    assert child.runtime_context is None
+    assert first.model is first.arena is first.pipeline is first.execution is None
+    assert worker._child_boot(child, sub)["kind"] == "cold"
+    assert child.gpu is not first
+    assert paths == [("/snapshots/qwen", None)] * 2
+    resources.release_models({"gpu": child.gpu})

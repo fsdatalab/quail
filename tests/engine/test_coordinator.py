@@ -1,91 +1,36 @@
-"""Tests for the coordinator's round splitting and answer merging."""
+"""Typed input partitioning and output merging across workers."""
 
 import pyarrow as pa
 
 from quail.backends.quail.coordinator import (
-    filter_node_payloads,
-    join_group_payloads,
     keyed_shards,
     merge_join_answers,
+    shard_input,
 )
-from quail.physical import AiFilter
+from quail.execution.rows import Rows
+from quail.physical import InputPort, PortRef, ValueType
 
 
-def payload():
-    return dict(
-        model="qwen3-4b-fp8", chunk_tokens=1000,
-        true_ids=[1], false_ids=[2], filter_limit=None,
-        docs={"r": [[i] * (10 + i) for i in range(6)],
-              "p": [[i] * 5 for i in range(4)]},
-        filters={"r": [[7, 7]]}, filter_arena_writes={"r": True}, physical_plan={},
-        joins=[dict(anchor="r", partners=["p"], semantics="full",
-                    labels={"p": [2]}, frame=[8], tail=[3])],
-        workers=2,
-        shards={"r": ((0, 2, 4), (1, 3, 5)), "p": ((0, 1), (2, 3))})
+def test_shards_keep_anchor_rows_and_all_partners():
+    ids = pa.array([4, 1, 3], pa.int32())
+    own = InputPort("input", ValueType.DOCUMENT_IDS, PortRef("scan:r", "ids:r"))
+    partner = InputPort("partner", ValueType.DOCUMENT_IDS, PortRef("scan:p", "ids:p"))
+    assert shard_input(own, ids, "r", [1, 4]).to_pylist() == [4, 1]
+    assert shard_input(partner, ids, "r", [1, 4]) is ids
+    rows = Rows({"r": ids}, pa.table({"label": ["a", "b", "c"]}))
+    port = InputPort("input", ValueType.ROWS, PortRef("classify", "rows"))
+    selected = shard_input(port, rows, "r", [1, 4])
+    assert selected.table().to_pylist() == [
+        {"r": 4, "label": "a"}, {"r": 1, "label": "b"}]
+    pairs = pa.table({"r": [4, 1, 1, 3], "p": [0, 1, 2, 0]})
+    port = InputPort("pairs", ValueType.PAIRS, PortRef("hash", "pairs:0"))
+    assert shard_input(port, pairs, "r", [1]).to_pylist() == [
+        {"r": 1, "p": 1}, {"r": 1, "p": 2}]
 
 
-def filter_node():
-    return AiFilter(node_id="filter:r", alias="r", arena_writes=True, keep_kv=True,
-                    question_token_ids=((7, 7),))
-
-
-def test_filter_and_join_rounds_split_and_place_documents():
-    # LIMIT counts output rows: with joins, cutting survivors drops rows (#39)
-    p = payload()
-    p["filter_limit"] = 3
-    assert all(s["filter_limit"] is None for s in filter_node_payloads(
-        p, filter_node(), p["shards"], 2, has_joins=True))
-    subs = filter_node_payloads(p, filter_node(), p["shards"], 2, has_joins=False)
-    assert all(s["filter_limit"] == 3 for s in subs)
-    assert [sub["doc_index"]["r"] for sub in subs] == [[0, 2, 4], [1, 3, 5]]
-    assert subs[1]["docs"]["r"][0] == [1] * 11
-    assert "p" not in subs[0]["docs"]
-
-    # an anchor that ran no filter round has no KV to stay near: its scan
-    # shard is ignored and shards balance over the live documents
-    p = payload()
-    group = [dict(anchor="p", partners=["r"], semantics="full",
-                  labels={"r": [2]}, frame=[8], tail=[3])]
-    survivors = {"p": [0, 1], "r": [0, 1, 3]}
-    subs = join_group_payloads(p, 2, survivors, group)
-    assert [s["anchor_index"] for s in subs] == [[0], [1]]
-
-    # two full stages sharing one anchor: every worker gets both stages
-    # and every partner table of either stage
-    p = payload()
-    p["docs"]["m"] = [[9] * 3 for _ in range(3)]
-    p["joins"].append(dict(anchor="r", partners=["m"],
-                           semantics="full", labels={"m": [4]},
-                           frame=[8], tail=[3]))
-    subs = join_group_payloads(p, 2, {"r": [0, 1, 3, 4]}, p["joins"])
-    for s in subs:
-        assert len(s["joins"]) == 2
-        assert sorted(s["partners"]) == ["m", "p"]
-        assert s["partners"]["m"]["index"] == [0, 1, 2]
-        assert s["partners"]["p"]["index"] == [0, 1, 2, 3]
-    assert subs[0]["anchor_index"] == [0, 4]
-    assert subs[1]["anchor_index"] == [1, 3]
-
-    # an anchor kept by an earlier group stays on the workers that
-    # hold its KV, thinned to the live set, instead of re-sharding
-    p = payload()
-    survivors = {"r": [0, 3, 4], "p": [0, 1, 2, 3]}
-    prior = {"r": [[0, 4, 5], [1, 2, 3]]}
-    subs = join_group_payloads(p, 2, survivors, p["joins"],
-                               prior_shards=prior)
-    assert subs[0]["anchor_index"] == [0, 4]
-    assert subs[1]["anchor_index"] == [3]
-
-    p = payload()
-    survivors = {"r": [0, 1, 3, 4], "p": [0, 1, 2, 3]}
-    prior = {"r": [[0], [3]]}
-    subs = join_group_payloads(p, 2, survivors, p["joins"],
-                               prior_shards=prior)
-    assert 0 in subs[0]["anchor_index"]
-    assert 3 in subs[1]["anchor_index"]
-    assigned = [document for sub in subs for document in sub["anchor_index"]]
-    assert sorted(assigned) == survivors["r"]
-    assert len(assigned) == len(set(assigned))
+def test_stop_groups_stay_on_one_worker():
+    assert keyed_shards([0, 1, 0, 2, 1, 0], [10, 11, 12, 13, 14, 15], 2) == (
+        (0, 2, 5), (1, 3, 4))
 
 
 def test_join_merge_and_partner_lists():
@@ -123,30 +68,3 @@ def test_join_merge_and_partner_lists():
     ]
     merged = merge_join_answers([out["joins"][0] for out in outs])
     assert merged["anchor_partners"] == {0: [2], 1: [0, 1], 2: [1, 2]}
-    # a pair stage ships each worker's anchors with their live partners only
-    pairs = pa.table({"r": pa.array([0, 0, 2, 3, 5], pa.int32()),
-                      "p": pa.array([0, 3, 1, 2, 3], pa.int32())})
-    p = payload()
-    group = [dict(p["joins"][0], written_pos=0, pairs_from="hash_join:r-p")]
-    subs = join_group_payloads(p, 2, {"r": [0, 2, 3, 5], "p": [1, 3]},
-                               group, pair_tables={0: pairs})
-    assert [sub["anchor_index"] for sub in subs] == [[0, 2], [3, 5]]
-    assert [sub["pairs"][0].to_pydict() for sub in subs] == [
-        {"r": [0, 2], "p": [3, 1]}, {"r": [5], "p": [3]}]
-
-
-def test_stop_key_groups_ride_the_filter_payload_and_shard_together():
-    p = payload()
-    p["columns"] = {"r": pa.table({
-        "r": pa.array(range(6), pa.int32()),
-        "key": ["a", "b", "a", "c", "b", "a"]})}
-    node = AiFilter(node_id="filter:r", alias="r", arena_writes=True,
-                    question_token_ids=((7, 7),), stop_key=("key",))
-    subs = filter_node_payloads(p, node, p["shards"], 2, has_joins=False)
-    assert [list(sub["stop_groups"]) for sub in subs] == [[0, 0, 1], [0, 1, 2]]
-    plain = filter_node_payloads(p, filter_node(), p["shards"], 2,
-                                 has_joins=False)
-    assert all(sub["stop_groups"] is None for sub in plain)
-    # every document of a key lands on one worker
-    shards = keyed_shards([0, 1, 0, 2, 1, 0], [10, 11, 12, 13, 14, 15], 2)
-    assert shards == ((0, 2, 5), (1, 3, 4))

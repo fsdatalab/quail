@@ -385,7 +385,7 @@ async function preview(status) {
   const body = table.querySelector("tbody");
   for (const row of data.rows) {
     body.append(el("tr", {},
-      ...row.map(v => el("td", {}, v === null ? "" : String(v)))));
+      ...row.map(v => el("td", {}, v ?? ""))));
   }
   const note = `${data.rows.length} of ${data.total_rows} rows`;
   return el("div", {}, el("p", { class: "muted" }, note),

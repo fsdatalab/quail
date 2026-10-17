@@ -437,17 +437,21 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
         "March 3, 2027", None, "five years", "a phrase the document lacks"]
 
 
-def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
+@pytest.mark.parametrize("nested", [False, True])
+def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch, nested):
+    values = [{"body": text} for text in TEXTS] if nested else TEXTS
+    column = "c.text.body" if nested else "c.text"
     session = request_tests._session(
-        "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
+        "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": values})
     query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
+        f"SELECT c.id, AI.EXTRACT({column}, {{'ends': '{QUESTION}', "
         f"'term': 'How long is the term?'}}) AS lease FROM contracts c")
     boot = {"client": _PhraseClient(), "sampling_params": object(),
             "capacity": request_tests.CAPACITY}
     monkeypatch.setattr(
         "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
+        lambda self, spec, allowed_ids, *, resources: (
+            boot, {"kind": "cold", "boot_s": 0.1}))
     result = request_tests._run_stock_vllm(session, query)
     rows = result.collect()
     assert rows.column_names == ["c.id", "lease", "lease_span"]
@@ -553,6 +557,37 @@ def _fake_struct_answers(monkeypatch):
     monkeypatch.setattr(RerankerModelExecution, "execute", answer)
 
 
+@pytest.mark.parametrize("order", ["by_cost", "as_written"])
+@pytest.mark.parametrize("filtered", [False, True])
+def test_projected_score_reads_extraction_survivors(
+        session, monkeypatch, order, filtered):
+    _fake_struct_answers(monkeypatch)
+
+    class ScoredDocuments(score_tests._RowReranker):
+        def __init__(self):
+            super().__init__()
+            self.documents = []
+
+        def score(self, spec, rows, documents):
+            self.documents.extend(rows[:, 0].tolist())
+            return super().score(spec, rows, documents)
+
+    score = f"AI.SCORE(PROMPT('{'Read ' * 100}{{0}}', c.text))"
+    query = session.sql(
+        f"SELECT c.id, {score} AS score, "
+        f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+        "FROM contracts c WHERE lease.ends IS NOT NULL"
+        + (f" AND {score} > 0.05" if filtered else ""), order=order)
+    reranker = ScoredDocuments()
+    rows = score_tests._finish(query, session, reranker).collect()
+    assert rows.column("c.id").to_pylist() == [1]
+    assert rows.column("score").to_pylist() == [0.1]
+    assert rows.column("lease").to_pylist() == [{"ends": "March 3, 2027"}]
+    assert reranker.calls == 1
+    assert reranker.documents == ([0, 1] if filtered and order == "as_written"
+                                 else [0])
+
+
 @pytest.mark.parametrize("suffix", [
     "", " ORDER BY c.id DESC LIMIT 1",
     " WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.05"])
@@ -613,12 +648,13 @@ def test_extract_field_errors(session):
          .order_by("lease").select("c.id", "lease"))
 
 
-def _answers_executor(answers):
+def _answers_executor(answers, functions=None):
     """Build a fake executor whose extractions return the given answers.
 
     Args:
         answers: Document position -> the answer text or None, for
             every question.
+        functions: Registered callback functions, indexed by name.
     """
     def execute(request):
         from helpers.fakes import graph_state
@@ -652,6 +688,8 @@ def _answers_executor(answers):
 
         state = graph_state(Answers(), docs)
         state["texts"] = texts
+        state["functions"] = functions or {}
+        state["columns"] = request.column_tables()
         report = execute_single_graph(
             state, {"filter_limit": None}, graph)
         outputs = report.pop("_outputs")
@@ -659,6 +697,69 @@ def _answers_executor(answers):
             **report, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 12})
 
     return execute
+
+
+@pytest.mark.parametrize("order", ["as_written", "by_cost"])
+@pytest.mark.parametrize("kind", ["per_batch", "barrier"])
+@pytest.mark.parametrize("before_test", [False, True])
+def test_callback_keeps_its_position_between_extraction_and_answer_test(
+    session, order, kind, before_test,
+):
+    from quail.api.execute import execute_query
+
+    seen = []
+
+    def last(rows):
+        ids = rows["c"].ids["c"]
+        seen.append(ids.to_pylist())
+        return ids.slice(max(0, len(ids) - 1), 1)
+
+    builder = (session.docs("contracts").alias("c")
+               .ai_extract("c.text", {"ends": QUESTION}, name="lease"))
+    if not before_test:
+        builder.where(quail.col("lease.ends").is_not_null())
+    builder.apply(last, columns=[quail.col("c.id")], kind=kind)
+    if before_test:
+        builder.where(quail.col("lease.ends").is_not_null())
+    query = builder.select("c.id", "lease", order=order)
+    result = execute_query(query, physical_executor=_answers_executor(
+        {0: "March 3, 2027", 1: None}, session.registry.functions)).collect()
+    assert seen == ([[0, 1]] if before_test else [[0]])
+    assert result.column("c.id").to_pylist() == ([] if before_test else [1])
+
+
+@pytest.mark.parametrize("tested", ["answer", "null", "span", "length"])
+@pytest.mark.parametrize("aggregate", [False, True])
+@pytest.mark.parametrize("callback", [False, True])
+def test_extraction_filters_do_not_require_returning_the_answer(
+        session, tested, aggregate, callback):
+    from quail.api.execute import execute_query
+    from quail.frontend.expressions import count
+
+    def preserve(rows):
+        return rows["c"]
+
+    builder = (session.docs("contracts").alias("c")
+               .ai_extract("c.text", {"ends": QUESTION, "unused": "Who signed?"},
+                           name="lease"))
+    if callback:
+        builder.apply_table(preserve, columns=[quail.col("c.id")], ids="preserve")
+    condition = {
+        "answer": quail.col("lease.ends").is_not_null(),
+        "null": quail.col("lease.ends").is_null(),
+        "span": quail.col("lease_span.ends").field("start") < 20,
+        "length": quail.col("lease.ends").length() > 0,
+    }[tested]
+    builder.where(condition)
+    query = (builder.agg(n=count()).select("n") if aggregate
+             else builder.select("c.id"))
+    plan = query.plan()
+    assert [node.spec.name for node in plan.nodes
+            if isinstance(node, AiExtract)] == ["lease.ends"]
+    result = execute_query(query, physical_executor=_answers_executor(
+        {0: "March 3, 2027", 1: None}, session.registry.functions)).collect()
+    expected = 2 if tested == "null" and not aggregate else 1
+    assert result.to_pylist() == [{"n" if aggregate else "c.id": expected}]
 
 
 def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
@@ -814,10 +915,8 @@ def test_filters_on_answers_bind_in_both_dialects_and_refuse_bad_tests(session):
                .ai_extract("c.text", {"ends": QUESTION}, name="lease"))
     with pytest.raises(CompileError, match="no field 'signer'"):
         builder.where(quail.col("lease.signer").is_null())
-    with pytest.raises(CompileError, match="has no fields"):
+    with pytest.raises(CompileError, match="struct_field.*string"):
         builder.where(quail.col("c.text").field("x") == "a")
-    with pytest.raises(CompileError, match="does not return"):
-        builder.where(quail.col("lease.ends").is_null()).select("c.id")
     with pytest.raises(CompileError, match="source column"):
         builder.where((quail.col("c.id") == 1).hint(selectivity=0.5))
     with pytest.raises(TypeError, match="combines tests"):
@@ -949,3 +1048,94 @@ def test_rows_carry_their_ids_apart_from_their_values():
     assert joined.column_names == ["kind", "lease.ends", "lease.ends_span"]
     assert joined.column("lease.ends").to_pylist() == [None, "March 3, 2027"]
     assert joined.to_pydict()["c"] == [2, 0]
+
+
+def test_order_search_reuses_document_work_across_survivor_counts(
+        session, monkeypatch):
+    from quail.cost import extract
+
+    builder = (session.docs("contracts").alias("c")
+               .ai_extract("c.text", {f"f{i}": f"Question {i}?" for i in range(5)},
+                           name="answers"))
+    for i in range(5):
+        builder.where(quail.col(f"answers.f{i}").is_not_null().hint(
+            selectivity=0.1 * (i + 1)))
+    calls = []
+    original = extract.document_work
+
+    def counted(*args, **kwargs):
+        calls.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(extract, "document_work", counted)
+    plan = builder.select("c.id", "answers").plan()
+    assert not isinstance(plan, Refusal)
+    # Two documents, at most two KV states per extraction, regardless of order.
+    assert 0 < len(calls) <= 2 * 2 * 5
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_joined_builder_preserves_extraction_definitions(session, filtered):
+    session.register("questions", DocumentProvider.from_table(
+        pa.table({"id": [1], "ask": ["end dates"]}), id_col="id"))
+    right = (session.docs("contracts").alias("c")
+             .ai_extract("c.text", {"ends": QUESTION}, name="lease"))
+    if filtered:
+        right.where(quail.col("lease.ends").is_not_null())
+    built = (session.docs("questions").alias("q")
+             .ai_join(right, quail.prompt("Does {0} answer {1}?",
+                                         quail.col("c.text"), quail.col("q.ask")))
+             .select("q.id", "c.id", "lease"))
+    sql = session.sql(
+        f"SELECT q.id, c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+        "FROM questions q JOIN contracts c "
+        "ON AI_FILTER(PROMPT('Does {0} answer {1}?', c.text, q.ask))"
+        + (" WHERE lease.ends IS NOT NULL" if filtered else ""))
+    assert built.logical == sql.logical
+    plan = built.plan()
+    assert not isinstance(plan, Refusal)
+    (extract,) = [node for node in plan.nodes if isinstance(node, AiExtract)]
+    assert extract.spec.name == "lease.ends"
+    assert extract.spec.alias == "c"
+    assert plan.graph.root == sql.plan().graph.root
+
+
+@pytest.mark.parametrize("kind,name", [
+    ("extract", "lease"), ("extract", "lease_span"),
+    ("classify", "lease"), ("classify", "lease_span"),
+    ("score", "lease_span"), ("alias", "lease"),
+])
+def test_joined_extraction_names_cannot_replace_existing_names(session, kind, name):
+    left = session.docs("contracts").alias(name if kind == "alias" else "a")
+    if kind == "extract":
+        left.ai_extract("a.text", {"ends": QUESTION}, name=name)
+    elif kind == "classify":
+        left.ai_classify(quail.prompt("Which? {0}", quail.col("a.text")),
+                         ["a", "b"], name=name)
+    elif kind == "score":
+        left.ai_score(quail.prompt("Relevant? {0}", quail.col("a.text")), name=name)
+    right = (session.docs("contracts").alias("c")
+             .ai_extract("c.text", {"ends": QUESTION}, name="lease"))
+    with pytest.raises(CompileError, match="already used"):
+        left.ai_join(right, quail.prompt("Match {0} {1}?",
+                                        quail.col("a.text"), quail.col("c.text")))
+
+
+@pytest.mark.parametrize("name", ["lease_span", "lease_span_span"])
+def test_extraction_names_with_span_suffix_bind_answers_and_spans(session, name):
+    built = (session.docs("contracts").alias("c")
+             .ai_extract("c.text", {"ends": QUESTION}, name=name)
+             .where(quail.col(f"{name}.ends").is_not_null())
+             .where(quail.col(f"{name}_span.ends").field("start") >= 0)
+             .select("c.id", name))
+    sql = session.sql(
+        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS {name} "
+        f"FROM contracts c WHERE {name}.ends IS NOT NULL "
+        f"AND {name}_span.ends.start >= 0")
+    assert built.logical == sql.logical
+    from quail.api.execute import execute_query
+
+    result = execute_query(built, physical_executor=_answers_executor(
+        {0: "March 3, 2027", 1: None})).collect()
+    assert result.column("c.id").to_pylist() == [1]
+    assert result.column(name).to_pylist() == [{"ends": "March 3, 2027"}]

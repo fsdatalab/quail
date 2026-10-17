@@ -6,8 +6,6 @@ from dataclasses import replace
 
 from quail.logical import (
     Aggregate,
-    Apply,
-    LogicalPlan,
     Project,
     Result,
     SemanticFilter,
@@ -23,17 +21,7 @@ from quail.planner.rules.tree_transforms import (
 
 
 class ShouldEliminateDistinct(LogicalRule):
-    """Clear a DISTINCT that cannot remove rows.
-
-    A filter returns each document at most once and a join pairs each
-    row pair once, so the result rows are unique when the projection
-    returns the id column of every scanned table. The id column is
-    taken as a key: nothing checks it, since that would read the
-    whole column, and a table that repeats an id gets the repeated
-    rows back. The rule reads the id columns from the catalog and
-    leaves a plan alone without one, or when an apply() supplies the
-    rows. A GROUP BY whose output returns every key is unique as well.
-    """
+    """Clear DISTINCT when an aggregate returns every grouping key."""
 
     name = "should_eliminate_distinct"
 
@@ -45,18 +33,7 @@ class ShouldEliminateDistinct(LogicalRule):
             return [replace(root, distinct=False)
                     if set(root.input.keys) <= set(root.input.output)
                     else root]
-        if not isinstance(root.input, Project) or context.catalog is None:
-            return [root]
-        plan = LogicalPlan(root)
-        if any(isinstance(node, Apply) for node in plan.walk()):
-            return [root]
-        returned = {(ref.alias, ref.column)
-                    for ref in root.input.output_schema()}
-        for scan in plan.operators().scans:
-            id_column = context.catalog.get(scan.provider).id_col
-            if (scan.alias, id_column) not in returned:
-                return [root]
-        return [replace(root, distinct=False)]
+        return [root]
 
 
 class ShouldPushDownDistinct(LogicalRule):
@@ -78,7 +55,7 @@ class ShouldPushDownDistinct(LogicalRule):
             return [root]
         if not isinstance(root.input, Project):
             return [root]
-        alias = _filtered_alias(LogicalPlan(root).operators())
+        alias = _filtered_alias(root.input.input)
         if alias is None:
             return [root]
         key = _stop_key(root.input.columns, alias)
@@ -110,11 +87,9 @@ class ShouldPushDownProjection(LogicalRule):
 class ShouldPushDownFilters(LogicalRule):
     """Push cheap one-table filters below the joins above their table.
 
-    Like Catalyst's PushDownPredicates, the move is unconditional: an
-    Apply returning ids and a Filter on a label column run no model, so
-    they thin a table before the joins read it. Both front ends already
-    place such filters on their table; the rule rewrites plans built
-    another way.
+    A label condition tests each row independently and can thin its
+    table before a full join. A callback depends on its input relation
+    and keeps its position.
     """
 
     name = "should_push_down_filters"

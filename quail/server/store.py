@@ -15,9 +15,11 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
+from quail.remote.files import atomic_path
 from quail.remote.records import (
     ACTIVE_STATES,
     TERMINAL_STATES,
@@ -111,6 +113,8 @@ class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # A submission must finish its durability step before queue selection.
+        self.submission_lock = threading.Lock()
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._listeners = []
@@ -188,14 +192,9 @@ class Store:
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f"{path.name}.tmp")
-        with self._lock:
-            target = sqlite3.connect(str(temporary))
-            try:
+        with self._lock, atomic_path(path) as temporary:
+            with closing(sqlite3.connect(str(temporary))) as target:
                 self._conn.backup(target)
-            finally:
-                target.close()
-        temporary.replace(path)
 
     def _row(self, query_id: str):
         with self._lock:
@@ -315,10 +314,16 @@ class Store:
             self._changed.wait(timeout)
 
     def next_queued(self) -> QueryStatus | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM queries WHERE state = 'queued' "
-                "ORDER BY created_at, rowid LIMIT 1").fetchone()
+        """Return queued work when no submission is awaiting durability."""
+        if not self.submission_lock.acquire(blocking=False):
+            return None
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT * FROM queries WHERE state = 'queued' "
+                    "ORDER BY created_at, rowid LIMIT 1").fetchone()
+        finally:
+            self.submission_lock.release()
         return None if row is None else _row_status(row)
 
     def begin(self, query_id: str) -> int:

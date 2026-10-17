@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from sqlglot import exp
 
 from quail.logical import ColumnRef, CompileError, RegularPredicate
-from quail.logical.expressions import SPAN_SUFFIX
+from quail.logical.expressions import SPAN_SUFFIX, ColumnExpression
 
 _PLAIN_COMPARISONS = {
     exp.EQ: "=",
@@ -85,7 +85,7 @@ def _operand(node) -> tuple[exp.Expression, str | None] | None:
         node, function = node.this, "length"
     else:
         function = None
-    if isinstance(node, (exp.Column, exp.Dot)):
+    if isinstance(node, (exp.Column, exp.Dot, exp.AIClassify)):
         return node, function
     return None
 
@@ -158,6 +158,17 @@ def parse_plain_test(term, dialect: str) -> PlainTest | None:
         if comparison == "regex" and dialect == "snowflake":
             # Snowflake's REGEXP_LIKE and RLIKE match the whole value
             pattern = f"^(?:{pattern})$"
+        if comparison == "regex" and node.args.get("flag") is not None:
+            flags = _literal(node.args["flag"])
+            if not isinstance(flags, str) or set(flags) - set("cimes"):
+                raise CompileError("REGEXP_LIKE flags must use c, i, m, e, or s")
+            modes = set(flags) & {"m", "s"}
+            case = next((flag for flag in reversed(flags) if flag in "ci"), "c")
+            if case == "i":
+                modes.add("i")
+            # Extracting submatches (e) does not change a boolean match result.
+            if modes:
+                pattern = f"(?{''.join(sorted(modes))}:{pattern})"
         return PlainTest(found[0], f"not {comparison}" if negated else comparison,
                          pattern, found[1])
     if negated:
@@ -218,15 +229,11 @@ def bind_plain_test(b, test: PlainTest, tables=None) -> RegularPredicate:
         raise CompileError(
             f"{test.operand.sql()} reads a field of an AI.EXTRACT call "
             f"that SELECT does not return; name the call in SELECT")
-    parts = column_path(test.operand)
-    if len(parts) > 2:
-        raise CompileError(
-            f"{test.operand.sql()} reads a field under a column; only an "
-            f"AI.EXTRACT span named in SELECT has fields, such as "
-            f"lease{SPAN_SUFFIX}.end_date.start")
-    predicate = RegularPredicate(
-        b.resolve_column(test.operand, tables), test.comparison, test.value,
-        function=test.function)
+    expression = b.resolve_value(test.operand, tables, test.function)
+    predicate = (RegularPredicate(expression.reference, test.comparison, test.value,
+                                  expression.path, expression.function)
+                 if isinstance(expression, ColumnExpression)
+                 else RegularPredicate(expression, test.comparison, test.value))
     predicate.validate()
     return predicate
 

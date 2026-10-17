@@ -164,14 +164,16 @@ The full signature is:
 query.apply(fn, columns=(), *, name=None, ids=None, kind="per_batch")
 ```
 
-- `fn` receives a `dict[str, pa.Table]` keyed by alias. Each table
-  has the alias's row indices plus the columns you listed in `columns`.
+- `fn` receives a `dict[str, Rows]` keyed by alias. Each `Rows` has
+  document IDs in `rows.ids[alias]` and requested source columns in
+  `rows.values`, an Arrow table. Read a value with `rows.column(name)`.
 - `columns` is a list of `col(...)` references that your function
   needs to read.
 - After a `.join()`, `fn` returns a table with both alias columns
   (e.g. `c` and `e`) selecting which combinations the next AI
   predicate evaluates.
-- Without a preceding `.join()`, `fn` returns the ids to keep.
+- Without a preceding `.join()`, `fn` returns the IDs or filtered
+  `Rows` to keep.
 - `kind="per_batch"` runs on each batch of rows in a pipeline. Outside
   a pipeline, it gets all input rows in one call.
   `kind="barrier"` waits for all survivors, then runs once.
@@ -180,14 +182,17 @@ For example, instead of an `ON` clause, we can match claims to
 evidence with an Arrow join inside our function:
 
 ```python
-def match_by_url(tables):
-    """Match each claim to the evidence page its URL names."""
-    return tables["c"].join(
-        tables["e"],
-        keys=["evidence_wiki_url"],
-        right_keys=["id"],
-        join_type="inner",
-    ).select(["c", "e"])
+def match_by_url(rows):
+    """Pair each claim with the evidence row its URL names."""
+    claims = pa.table({
+        "c": rows["c"].ids["c"],
+        "url": rows["c"].column("evidence_wiki_url"),
+    })
+    evidence = pa.table({
+        "e": rows["e"].ids["e"],
+        "url": rows["e"].column("id"),
+    })
+    return claims.join(evidence, keys="url", join_type="inner").select(["c", "e"])
 
 query = (
     session.docs("claims").alias("c")

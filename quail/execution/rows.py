@@ -11,7 +11,6 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -74,7 +73,7 @@ class Rows:
 
     def take(self, indices) -> Rows:
         """Return the rows at the indices, in that order."""
-        indices = pa.array(np.asarray(indices))
+        indices = pa.array(indices).cast(pa.int64())
         return Rows({alias: pc.take(ids, indices) for alias, ids in self.ids.items()},
                     self.values.take(indices))
 

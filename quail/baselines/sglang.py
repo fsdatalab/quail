@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from contextlib import ExitStack, closing
 
 from quail.baselines.request import RequestBackend
 from quail.baselines.request_scheduling import (
@@ -12,6 +13,7 @@ from quail.baselines.request_scheduling import (
     MAX_SEQUENCES,
     run_filter_sequence_async,
 )
+from quail.specs.files import resolve_model_path
 
 PAGE_SIZE = 16
 CHUNKED_PREFILL_TOKENS = (
@@ -41,6 +43,11 @@ class SGLangClient:
     def __init__(self, engine, capacity):
         self.engine = engine
         self.capacity = capacity
+
+    def close(self):
+        """Stop the SGLang engine and its workers."""
+        self.engine.shutdown()
+        self.engine = None
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
         del use_tqdm
@@ -111,8 +118,7 @@ class SGLangClient:
         return bool(getattr(result, "success", True))
 
 
-def _capacity(engine) -> dict:
-    info = engine.get_server_info()
+def _capacity(info) -> dict:
     tokens = info.get("max_total_num_tokens")
     page_size = info.get("page_size")
     if tokens is None or page_size is None:
@@ -135,13 +141,15 @@ class SGLangEngine:
     label = "SGLang"
     runtime_package = "sglang==0.5.18"
 
-    def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
+    def boot(self, spec, allowed_ids: list[int], *,
+             resources: ExitStack) -> tuple[dict, dict]:
         """Load the spec's model and return the engine state and boot record."""
         import sglang as sgl
 
+        path = resolve_model_path(spec.hf_name, spec.revision)
         started = time.perf_counter()
-        engine = sgl.Engine(
-            model_path=spec.hf_name,
+        client = resources.enter_context(closing(SGLangClient(sgl.Engine(
+            model_path=path,
             mem_fraction_static=MEM_FRACTION_STATIC,
             max_running_requests=MAX_SEQUENCES,
             chunked_prefill_size=CHUNKED_PREFILL_TOKENS,
@@ -151,10 +159,10 @@ class SGLangEngine:
             disable_radix_cache=False,
             disable_prefill_cuda_graph=True,
             log_level="warning",
-        )
-        boot_s = time.perf_counter() - started
-        capacity = _capacity(engine)
-        client = SGLangClient(engine, capacity)
+        ), {})))
+        llm_init_s = time.perf_counter() - started
+        capacity = client.capacity
+        capacity.update(_capacity(client.engine.get_server_info()))
         sampling_params = {
             "temperature": 0.0,
             "max_new_tokens": 1,
@@ -171,14 +179,12 @@ class SGLangEngine:
                 "client": client,
                 "sampling_params": sampling_params,
                 "capacity": capacity,
-                "close": getattr(engine, "shutdown", None),
             },
             {
                 "kind": "cold",
-                "llm_init_s": round(boot_s, 2),
+                "llm_init_s": round(llm_init_s, 2),
                 "weight_load_s": None,
                 "kv_profile_s": None,
-                "boot_s": round(boot_s, 2),
             },
         )
 

@@ -1,6 +1,7 @@
 """Executor and scheduler: lifecycle, failures, cancel, timeout, restart."""
 
 import json
+import threading
 import time
 from unittest.mock import Mock
 
@@ -12,6 +13,7 @@ from helpers import server_fakes
 import quail
 from quail import progress
 from quail.builtins import built_in_registry
+from quail.execution.result import filter_answer_table
 from quail.remote import artifacts, inputs
 from quail.server.executor import ChildProcessExecutor, InProcessExecutor, load_hooks
 from quail.server.scheduler import Scheduler
@@ -93,6 +95,169 @@ def test_in_process_run_saves_a_readable_and_verified_result(store, tmp_path):
     assert not list(verified.glob("*.tmp"))
 
 
+@pytest.mark.parametrize("failure", ["start", "wait"])
+def test_scheduler_closes_failed_execution_attempts(
+        store, tmp_path, failure, monkeypatch):
+    answers = []
+
+    class SavedAnswers(artifacts.Answers):
+        def __init__(self, path):
+            super().__init__(path)
+            answers.append(self)
+
+    monkeypatch.setattr("quail.server.scheduler.Answers", SavedAnswers)
+
+    class Execution:
+        stopped = False
+
+        def wait(self, timeout):
+            raise OSError("executor unavailable")
+
+        def stop(self):
+            self.stopped = True
+
+    execution = Execution()
+
+    class Executor:
+        def start(self, job, emit):
+            emit("answers", {"document": 0})
+            if failure == "start":
+                raise OSError("executor unavailable")
+            return execution
+
+    scheduler = scheduler_for(store, tmp_path, Executor())
+    status = submit(store, tmp_path)
+    final = scheduler.run_one(status)
+    assert final.state == "failed"
+    assert final.error["type"] == "OSError"
+    assert final.error["message"] == "executor unavailable"
+    assert execution.stopped == (failure == "wait")
+    assert len(answers) == 1 and answers[0]._handle is None
+    assert artifacts.read_answers(
+        scheduler.result_directory(status.id) / artifacts.ANSWERS_FILE) == [
+            {"document": 0}]
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_scheduler_shutdown_finishes_active_work_before_closing_executor(
+        store, tmp_path, finished):
+    started, done = threading.Event(), threading.Event()
+    closed = []
+
+    class Execution:
+        def wait(self, timeout):
+            return done.wait(timeout)
+
+        def stop(self):
+            done.set()
+
+    class Executor:
+        def start(self, job, emit):
+            if finished:
+                emit("failed", {"type": "RuntimeError", "message": "finished"})
+            started.set()
+            return Execution()
+
+        def close(self):
+            closed.append(done.is_set())
+
+    scheduler = scheduler_for(store, tmp_path, Executor())
+    active = submit(store, tmp_path)
+    queued = submit(store, tmp_path)
+    scheduler.start()
+    assert started.wait(2)
+    stopping = threading.Thread(target=scheduler.stop)
+    stopping.start()
+    try:
+        stopping.join(2)
+        assert not stopping.is_alive(), "shutdown must stop the active execution"
+        assert store.get(active.id).state == ("failed" if finished else "interrupted")
+        assert store.get(queued.id).state == "queued"
+        assert closed == [True]
+    finally:
+        done.set()
+        stopping.join(5)
+
+
+def test_scheduler_shutdown_does_not_wait_for_a_submission(
+        store, tmp_path, monkeypatch):
+    selecting = threading.Event()
+    select = store.next_queued
+
+    def next_queued():
+        selecting.set()
+        return select()
+
+    monkeypatch.setattr(store, "next_queued", next_queued)
+    scheduler = scheduler_for(store, tmp_path)
+    stopping = threading.Thread(target=scheduler.stop)
+    try:
+        with store.submission_lock:
+            scheduler.start()
+            assert selecting.wait(2)
+            stopping.start()
+            stopping.join(1)
+            assert not stopping.is_alive()
+    finally:
+        stopping.join(5)
+
+
+def test_saved_answers_keep_aliases_independent_of_file_names(tmp_path):
+    aliases = ("r", "a/b", "a_b", "A", "a", "x" * 300)
+    result = quail.QueryResult.from_table(pa.table({"id": [1, 2]}))
+    result.answer_tables["filters"] = {
+        (alias, 0): filter_answer_table(alias, [index], [0], [index % 2 == 0])
+        for index, alias in enumerate(aliases)}
+    manifest = artifacts.write_result(result, tmp_path)
+    artifacts.verify_result(tmp_path, manifest)
+    entries = manifest["files"]["answers"]["filters"]
+    assert len({entry["file"].casefold() for entry in entries}) == len(aliases)
+    loaded = artifacts.load_result(tmp_path, manifest)
+    assert loaded.collect().equals(result.collect())
+    assert (loaded.answer_tables["filters"].keys()
+            == result.answer_tables["filters"].keys())
+    for key, table in result.answer_tables["filters"].items():
+        assert loaded.answer_tables["filters"][key].equals(table)
+
+    entry = next(entry for entry in entries if entry["alias"] == "r")
+    old_name = "answers/filters/r--0.arrow"
+    (tmp_path / old_name).parent.mkdir(parents=True)
+    (tmp_path / entry["file"]).rename(tmp_path / old_name)
+    entry["file"] = old_name
+    loaded = artifacts.load_result(tmp_path, manifest)
+    assert loaded.answer_tables["filters"][("r", 0)].equals(
+        result.answer_tables["filters"][("r", 0)])
+
+
+def test_interrupted_result_writes_remove_partial_files(tmp_path):
+    old = pa.table({"id": [99]})
+    target = tmp_path / "result.arrow"
+    artifacts.write_ipc_file(target, old)
+    partial = pa.table({"id": [0, 1]})
+
+    def batches():
+        yield partial.to_batches()[0]
+        raise RuntimeError("interrupted write")
+
+    with pa.RecordBatchReader.from_batches(partial.schema, batches()) as reader:
+        with pytest.raises(RuntimeError, match="interrupted write"):
+            artifacts.write_ipc_file(target, reader)
+    assert artifacts.read_table(target).equals(old)
+    assert not list(tmp_path.glob("*.tmp"))
+
+    class Unserializable:
+        def __str__(self):
+            raise RuntimeError("interrupted report")
+
+    result = quail.QueryResult.from_table(old, {"old": True})
+    artifacts.write_result(result, tmp_path)
+    result.report = {"bad": Unserializable()}
+    with pytest.raises(RuntimeError, match="interrupted report"):
+        artifacts.write_result(result, tmp_path)
+    assert json.loads((tmp_path / "report.json").read_text()) == {"old": True}
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
 def test_failed_and_cancelled_runs_are_saved_and_not_killed(
         store, tmp_path, monkeypatch):
     executor = InProcessExecutor(server_fakes.hooks)
@@ -168,18 +333,20 @@ def test_executors_switch_models_skip_warm_loads_and_stop_on_timeout(
         try:
             first = submit(store, tmp_path)
             assert scheduler.run_one(first).state == "succeeded", child
-            assert executor._loaded_model == "qwen3-4b-fp8", child
-            pid = executor._process.pid if child else None
+            assert (executor._child.loaded_model if child else executor._loaded_model) \
+                == "qwen3-4b-fp8", child
+            pid = executor._child.process.pid if child else None
             second = submit(store, tmp_path)
             assert scheduler.run_one(second).state == "succeeded", child
             if child:
-                assert executor._process.pid == pid, "same model, same child"
+                assert executor._child.process.pid == pid, "same model, same child"
             other = submit(store, tmp_path,
                            config={**server_fakes.CONFIG, "model": "qwen3-32b-fp8"})
             assert scheduler.run_one(other).state == "succeeded", child
-            assert executor._loaded_model == "qwen3-32b-fp8", child
+            assert (executor._child.loaded_model if child else executor._loaded_model) \
+                == "qwen3-32b-fp8", child
             if child:
-                assert executor._process.pid != pid, "another model, a new child"
+                assert executor._child.process.pid != pid, "another model, a new child"
         finally:
             executor.close()
             store.remove_listener(record)

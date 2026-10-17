@@ -55,6 +55,72 @@ def _session(tmp_path, tokenizer=fake_tok):
     return session
 
 
+@pytest.mark.parametrize("kind", ["per_batch", "barrier"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_apply_retains_document_values_without_returning_them(kind, nested):
+    seen = []
+    source = "payload" if nested else "body"
+    expression = col(f"r.{source}")
+    if nested:
+        expression = expression.field("body")
+    value_name = "payload.body" if nested else "body"
+
+    def deduplicate(rows):
+        values = rows["r"].column(value_name)
+        seen.extend(values.to_pylist())
+        return pa.table({"id": rows["r"].ids["r"], "text": values}).group_by(
+            "text").aggregate([("id", "min")]).column("id_min")
+
+    with quail.Session(
+        EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"), tokenizer=fake_tok,
+    ) as session:
+        texts = ["one", "one", "two"]
+        values = [{"body": text} for text in texts] if nested else texts
+        session.register("docs", quail.DocumentProvider.from_table(pa.table({
+            "id": [10, 20, 30], source: values,
+        }), id_col="id"))
+        query = (session.docs("docs").alias("r")
+                 .apply(deduplicate, columns=[expression], kind=kind)
+                 .ai_filter(prompt("q: {0}", expression)).select("r.id"))
+        result = _run(query, make_executor(
+            {"r": {"q:": [1, 1, 1]}}, functions=session.registry.functions))
+        assert seen == texts
+        assert sorted(result.to_rows()) == [(10,), (30,)]
+        assert _scans(query.logical)["r"].columns == ("id", source)
+
+
+@pytest.mark.parametrize("length", [False, True])
+@pytest.mark.parametrize("left_count, right_count", [(0, 0), (0, 3), (3, 0), (3, 3)])
+def test_join_keys_retain_document_values_without_returning_them(
+    length, left_count, right_count,
+):
+    with quail.Session(
+        EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"), tokenizer=fake_tok,
+    ) as session:
+        texts = {"a": ["one", "one", "three"][:left_count],
+                 "b": ["one", "two", "three"][:right_count]}
+        for alias, values in texts.items():
+            session.register(alias, quail.DocumentProvider.from_table(pa.table({
+                "id": pa.array(range(len(values)), pa.int64()),
+                "body": pa.array(values, pa.string()),
+            }), id_col="id"))
+        left, right = col("a.body"), col("b.body")
+        keys = (left.length(), right.length()) if length else (left, right)
+        query = (session.docs("a").alias("a")
+                 .join(session.docs("b").alias("b"), on=keys[0] == keys[1])
+                 .ai_filter(prompt("Matches? {0} {1}", left, right))
+                 .select("a.id", "b.id"))
+        result = _run(query, make_executor({}, {
+            ("a", "b"): lambda a, b: True, ("b", "a"): lambda b, a: True,
+        }))
+        expected = [(a, b) for a, first in enumerate(texts["a"])
+                    for b, second in enumerate(texts["b"])
+                    if (len(first) == len(second) if length else first == second)]
+        assert sorted(result.to_rows()) == expected
+        assert all(scan.columns == ("id", "body")
+                   for scan in _scans(query.logical).values())
+
+
 def test_projected_results_token_reuse_and_join_projection(tmp_path):
     reviews = ["good one", "bad one", "fine one"]
     calls = []
@@ -216,25 +282,19 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
     joined = plan.root.input
     assert isinstance(joined, SemanticJoin)
 
-    # an apply returning ids above the join moves onto its table's
-    # scan, below the join
     above = replace(plan.root, input=_stars_apply(joined))
-    pushed = push_down_filters(above)
-    assert isinstance(pushed.input, SemanticJoin)
-    assert pushed.input.input.left == _stars_apply(joined.input.left)
-    assert pushed.input.input.right == joined.input.right
-    LogicalPlan(pushed).validate()
+    assert push_down_filters(above) is None
+    LogicalPlan(above).validate()
     candidate, = logical_alternatives(
         LogicalPlan(above), built_in_rules(),
         PlanningContext(catalog=catalog))
     optimized, changed = candidate.plan, candidate.rules
-    assert changed == ("should_push_down_projection", "should_push_down_filters")
-    assert optimized.root == push_down_projection(pushed)
+    assert changed == ("should_push_down_projection",)
+    assert optimized.root == push_down_projection(above)
 
     # both front ends place the filter on its table, so the rule
     # leaves their plans alone
     assert push_down_filters(plan.root) is None
-    assert push_down_filters(pushed) is None
 
     # a filter on a label returns to its table, above the
     # classification that computes the label

@@ -9,6 +9,56 @@ Quail can ask several questions about a document without processing the
 whole document again for each question. See
 [Physical plans](/docs/architecture/physical-plans) for an example plan.
 
+## Loaded engines
+
+Local execution keeps one engine configuration loaded across sessions.
+Changing the engine, model specification, device specification, or GPU
+count releases the previous configuration before loading another one.
+Closing a session releases its input resources; the engine remains
+available for later queries with the same configuration.
+
+Concurrent local queries take turns using that engine. A query owns it
+from preparation through model execution, so another query cannot
+replace it while it is running. Planning and input tokenization can
+continue concurrently. Operators within a query still pipeline.
+
+Model loading and warmup finish before execution readiness is reported
+and before the coordinator starts timing query execution. The execution
+report records startup separately, including startup across GPU workers.
+
+Stock vLLM's operator-at-a-time and pipelining backends share the same
+loaded engine in local execution. They differ in how they submit requests.
+
+Each backend owns its model resources throughout startup. Quail registers
+an empty owner before loading weights or allocating KV. Local execution
+and GPU workers use the same load, bind, and warmup sequence. Failed
+preparation uses the same release path as model replacement. It stops
+the engine, drops owned references, and returns unused GPU memory before
+returning the error. A later query starts a fresh engine. vLLM workers
+default to the `spawn` process method because sessions already have
+background tokenization threads when engine loading begins.
+
+DiffusionGemma's vLLM engine runs in the current process. Its process
+setting lasts only until that engine closes. The vLLM plugin gives the
+language model lookup cache weak keys, so the cache does not keep a
+closed model's weights and KV allocated.
+
+Quail Server owns its execution in a child process and replaces that
+process when the requested backend, model, device, or GPU count changes.
+
+## Result readers
+
+Full result collection uses Acero's whole-table execution, which can run
+CPU work in parallel. It holds the document-index table until projection
+finishes. Streams and limited reads project batches as they arrive and
+run CPU work on the calling thread. Acero's threaded join readers can
+stall when closed before completion.
+
+One batch iterator applies the row limit and projection and owns the
+source reader. Arrow's C-stream interface transfers that ownership to the
+returned `RecordBatchReader`, so closing it releases the iterator and its
+source. Reaching the end or failing during a read also closes the source.
+
 ## Operator scheduling
 
 ### The runner
@@ -147,7 +197,7 @@ probabilities for classifications of individual documents.
 #### Classifying joined rows
 
 Classification can also read both documents of a joined pair. It runs
-in the join's pipeline, on one GPU, and classifies only pairs that the
+in the join's pipeline on each worker and classifies only pairs that the
 join kept. It reuses the anchor's KV when processing each pair.
 
 ## GPU execution
@@ -180,12 +230,19 @@ Each GPU holds a complete model copy and its own KV. A *coordinator* is
 the process that divides the work among GPU workers and collects their
 results.
 
-- For filters, it assigns documents using their token lengths to balance
-  work across GPUs.
-- For joins, anchors stay on the GPU that filtered them so their KV can
-  be reused. Each GPU receives the partner documents needed for its anchors.
-- Between groups of joins, it combines the results and distributes the
-  next group's anchors.
+- The planner builds the same pipelines for one or several GPUs. Each
+  worker runs the shared pipeline executor on its assigned documents.
+- The coordinator balances documents by token count. Documents keep their
+  worker assignment across pipelines so resident KV can be reused. All
+  documents with the same DISTINCT stop key stay on one worker.
+- Workers advance documents through filters, classification, extraction,
+  joins, and per-batch Python functions without waiting for the other
+  documents in their shard to finish each operator.
+- The coordinator partitions input rows and merges output rows by their
+  port types. It collects the same KV and memory measurements after every
+  pipeline, including a pipeline containing only one operator.
+- Tokenized documents are shared as file references on the host. Workers
+  receive query inputs once and reuse them for subsequent pipelines.
 
 Quail supports up to eight GPUs on one host. Each GPU holds all model
 weights; the weights are not divided between GPUs.

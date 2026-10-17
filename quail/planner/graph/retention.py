@@ -16,10 +16,10 @@ def group_sequence(seq):
     return groups
 
 
-def streamed_aliases(groups, ask_aliases, barrier_aliases, workers: int) -> set:
+def streamed_aliases(groups, ask_aliases, barrier_aliases) -> set:
     """Return the aliases whose filter sequence feeds the join anchored on it.
 
-    On one GPU, a sequence whose first use is the join anchored on it
+    A sequence whose first use is the join anchored on it
     streams its survivors into that join, so its KV needs no retention
     pool. A sequence that a join reads first as a partner, or that a
     barrier apply cuts, is not streamed.
@@ -28,7 +28,6 @@ def streamed_aliases(groups, ask_aliases, barrier_aliases, workers: int) -> set:
         groups: Consecutive join groups, as from group_sequence.
         ask_aliases: Aliases that have a filter sequence.
         barrier_aliases: Aliases whose sequence a barrier apply cuts.
-        workers: Number of model copies.
 
     Returns:
         The streamed aliases.
@@ -37,7 +36,7 @@ def streamed_aliases(groups, ask_aliases, barrier_aliases, workers: int) -> set:
     partner_before = set()
     for group in groups:
         anchor = group[0][1]
-        if workers == 1 and anchor in ask_aliases \
+        if anchor in ask_aliases \
                 and anchor not in streamed \
                 and anchor not in partner_before \
                 and anchor not in barrier_aliases:

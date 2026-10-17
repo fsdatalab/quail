@@ -32,6 +32,7 @@ from quail.baselines.request_scheduling import (
 )
 from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.result import true_answer_rows
 from quail.physical import PhysicalNode
 
 
@@ -376,7 +377,6 @@ class RequestModelExecution:
                 rows,
                 answers,
                 anchor,
-                partners,
             )
             true_rows = [row for row, answer in zip(rows, answers) if answer]
             if spec.semantics == "full":
@@ -412,7 +412,7 @@ class RequestModelExecution:
             # the rows the join kept, each decoded as anchor, note,
             # partner block, and the question
             answers = outputs[f"join_answers:{spec.join_written_pos}"]
-            kept = answers.filter(answers.column("answer"))
+            kept = true_answer_rows(answers)
             pairs = list(zip(kept.column(spec.alias).to_pylist(),
                              kept.column(spec.partner).to_pylist()))
             note, partner_label = (

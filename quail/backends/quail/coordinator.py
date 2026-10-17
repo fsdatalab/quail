@@ -1,72 +1,16 @@
-"""Coordinator: split plan payloads across GPU workers and merge answers.
+"""Partition graph inputs and merge typed outputs across GPU workers."""
 
-Called by the worker's parent process between child GPUs.
-"""
+from dataclasses import replace
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.backends.quail.executor.operators.filter import stop_groups
-from quail.backends.quail.executor.operators.join import runs_over_pairs
-from quail.catalog.pairs import pair_partner
-from quail.catalog.tokens import select_documents
+from quail.execution.ids import document_ids, id_positions
+from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.rows import Rows
+from quail.physical import ValueType
 from quail.planner import balanced_shards
-
-
-def _common_payload(payload: dict) -> dict:
-    return {
-        "model": payload["model"],
-        "chunk_tokens": payload["chunk_tokens"],
-        "arena_pages": payload.get("arena_pages"),
-        "true_ids": payload["true_ids"],
-        "false_ids": payload["false_ids"],
-        "filter_limit": payload.get("filter_limit"),
-        "retention": payload.get("retention", {}),
-        "gpu_timing": payload.get("gpu_timing", False),
-    }
-
-
-def begin_query_payloads(payload: dict, k: int) -> list[dict]:
-    """Build one empty query start payload per GPU executor."""
-    outputs = []
-    for worker in range(k):
-        sub = _common_payload(payload)
-        sub["physical_plan"] = payload["physical_plan"]
-        sub.update(
-            docs={},
-            doc_index={},
-            node_id=None,
-            worker=worker,
-            workers=k,
-        )
-        outputs.append(sub)
-    return outputs
-
-
-def filter_node_payloads(payload: dict, node, shards: dict,
-                         k: int, *, has_joins: bool) -> list[dict]:
-    """Build one typed filter node payload per GPU executor."""
-    outputs = []
-    tokens = payload["docs"][node.alias]
-    for worker in range(k):
-        shard = shards[node.alias][worker]
-        indices = shard if isinstance(shard, range) else list(shard)
-        sub = _common_payload(payload)
-        sub["physical_plan"] = payload["physical_plan"]
-        sub["filter_limit"] = (
-            None if has_joins else payload.get("filter_limit")
-        )
-        sub.update(
-            docs={node.alias: select_documents(tokens, indices)},
-            doc_index={node.alias: indices},
-            stop_groups=stop_groups(
-                node, payload.get("columns", {}).get(node.alias), indices),
-            node_id=node.node_id,
-            worker=worker,
-            workers=k,
-        )
-        outputs.append(sub)
-    return outputs
 
 
 def keyed_shards(groups, doc_tokens, k: int) -> tuple:
@@ -88,91 +32,53 @@ def keyed_shards(groups, doc_tokens, k: int) -> tuple:
     return tuple(tuple(shard) for shard in out)
 
 
-def join_group_payloads(payload: dict, k: int, survivors: dict,
-                        group: list, prior_shards: dict | None = None,
-                        *, filtered_aliases: set[str] | None = None,
-                        shards: dict | None = None,
-                        pair_tables: dict | None = None) -> list:
-    """Build per-worker sub-payloads for one anchor group's join round.
+def shard_input(port, value, alias, ids):
+    """Select one worker's anchor rows, keeping its partners unchanged."""
+    ids = document_ids(ids)
+    if port.value_type is ValueType.DOCUMENT_IDS and port.source.port == f"ids:{alias}":
+        values = document_ids(value)
+        return pc.filter(values, pc.is_in(values, value_set=ids))
+    if isinstance(value, Rows) and alias in value.ids:
+        return value.filter(pc.is_in(value.ids[alias], value_set=ids))
+    if port.value_type is ValueType.PAIRS and alias in value.column_names:
+        return value.filter(pc.is_in(value[alias], value_set=ids))
+    return value
 
-    Anchors follow the shards their KV already sits on - the shards of
-    an earlier group that kept the anchor's KV (prior_shards), else
-    their filter shards - otherwise they are re-sharded over the live
-    set. Partners are replicated to all workers.
-    """
-    if not group:
-        return []
 
-    anchor_alias = group[0]["anchor"]
+def merge_results(nodes, outputs, alias, ids, wall):
+    """Merge each output according to its port type in the input's row order."""
+    position = {int(document): index for index, document in enumerate(ids)}
 
-    def surv(alias):
-        # an alias with no filters survives whole
-        if alias in survivors:
-            return list(survivors[alias])
-        return list(range(len(payload["docs"][alias])))
+    def order(documents):
+        return np.argsort([position[int(document)] for document in
+                           id_positions(documents)], kind="stable")
 
-    live = surv(anchor_alias)
-    shards = shards if shards is not None else payload.get("shards") or {}
-    filtered_aliases = (filtered_aliases if filtered_aliases is not None
-                        else set(payload.get("filters", ())))
-    alive = set(live)
-    if prior_shards and anchor_alias in prior_shards:
-        anchor_shards = [[g for g in shard if g in alive]
-                         for shard in prior_shards[anchor_alias]]
-        placed = {g for shard in anchor_shards for g in shard}
-        missing = [g for g in live if g not in placed]
-        if missing:
-            toks = payload["docs"][anchor_alias]
-            idx_shards, _ = balanced_shards(
-                [len(toks[g]) for g in missing], k)
-            for worker, shard in enumerate(idx_shards):
-                anchor_shards[worker].extend(missing[i] for i in shard)
-    elif anchor_alias in filtered_aliases and anchor_alias in shards:
-        anchor_shards = [[g for g in shard if g in alive]
-                         for shard in shards[anchor_alias]]
-    else:
-        toks = payload["docs"][anchor_alias]
-        idx_shards, _ = balanced_shards([len(toks[g]) for g in live],
-                                        k)
-        anchor_shards = [[live[i] for i in s] for s in idx_shards]
-    partner_aliases = sorted({p for j in group for p in j["partners"]})
-    partners = {}
-    for alias in partner_aliases:
-        indices = surv(alias)
-        partners[alias] = {
-            "index": indices,
-            "docs": select_documents(payload["docs"][alias], indices),
-        }
-    # a pair stage ships each worker its anchors' live partner rows
-    pair_rows = {}
-    for j in group:
-        if not runs_over_pairs(j):
-            continue
-        partner = pair_partner(anchor_alias, j["partners"])
-        table = (pair_tables or {}).get(j["written_pos"])
-        if table is None:
-            raise ValueError(f"join {j['written_pos']} received no pair table")
-        pair_rows[j["written_pos"]] = table.filter(pc.is_in(
-            table[partner], value_set=pa.array(partners[partner]["index"],
-                                               type=table[partner].type)))
-    subs = []
-    for w in range(k):
-        sub = _common_payload(payload)
-        sub["physical_plan"] = payload["physical_plan"]
-        sub.update(joins=group,
-                   anchor_alias=anchor_alias,
-                   anchor_index=list(anchor_shards[w]),
-                   anchor_docs=select_documents(
-                       payload["docs"][anchor_alias], anchor_shards[w]
-                   ),
-                   partners=partners,
-                   pairs={position: table.filter(pc.is_in(
-                       table[anchor_alias], value_set=pa.array(
-                           anchor_shards[w], type=table[anchor_alias].type)))
-                          for position, table in pair_rows.items()},
-                   worker=w, workers=k)
-        subs.append(sub)
-    return subs
+    def merge(port, values):
+        if isinstance(values[0], pa.Table):
+            joined = pa.concat_tables(values)
+            return joined.take(order(joined[alias]))
+        if port.value_type is ValueType.DOCUMENT_IDS:
+            joined = pa.concat_arrays([document_ids(value) for value in values])
+            return joined.take(order(joined))
+        if port.value_type is ValueType.ROWS:
+            joined = Rows.concat(values)
+            return joined.take(order(joined.ids[alias]))
+        if port.value_type is ValueType.FILTER_ANSWERS:
+            return {document: answer for value in values
+                    for document, answer in value.items()}
+        if port.value_type is ValueType.JOIN_ANSWERS:
+            return merge_join_answers(values)
+        raise TypeError(f"cannot merge worker output {port.value_type.value!r}")
+
+    results = {}
+    for index, node in enumerate(nodes):
+        parts = [output["results"][node.node_id] for output in outputs]
+        metrics = sum((part.metrics for part in parts), NodeMetrics())
+        results[node.node_id] = NodeResult(
+            {port.name: merge(port, [part.outputs[port.name] for part in parts])
+             for port in node.outputs},
+            replace(metrics, wall_s=wall if index == 0 else 0.0))
+    return results
 
 
 def merge_join_answers(parts: list) -> dict:

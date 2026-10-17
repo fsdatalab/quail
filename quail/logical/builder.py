@@ -7,7 +7,6 @@ from typing import Any, Optional
 
 from quail.logical.expressions import (
     Aggregation,
-    ColumnRef,
     CompileError,
     FilterPredicate,
     ModelCall,
@@ -30,7 +29,6 @@ from quail.logical.nodes import (
 from quail.logical.plan import (
     LogicalPlan,
 )
-from quail.logical.predicates import RegularPredicate
 
 
 @dataclass(frozen=True)
@@ -72,6 +70,7 @@ class LogicalPlanBuilder:
         regular_predicates: tuple = (),
         extracts: tuple = (),
         extract_filters: tuple = (),
+        steps: tuple | None = None,
     ) -> None:
         """Add one table with its filters, applies, classifications, and extractions.
 
@@ -87,13 +86,15 @@ class LogicalPlanBuilder:
                 that a label filter tests sits below the first Filter
                 testing it; the others sit above the last Filter, in the
                 order given.
-            label_filters: (name, values, selectivity) per Filter on a
+            label_filters: (RegularPredicate, selectivity) per Filter on a
                 classification's label column, in written order.
             extracts: (call, name) per extraction, in order. They sit
                 above the classifications and label filters.
             extract_filters: (RegularPredicate, selectivity) per Filter
                 on an extraction's answer or span column, in written
                 order. Each sits right above the extraction it tests.
+            steps: Bound unary node constructors in execution order, or
+                None to assemble the declarative SQL clauses.
 
         Raises:
             CompileError: The alias is taken, a label filter names a
@@ -108,53 +109,58 @@ class LogicalPlanBuilder:
             column=column,
             predicates=tuple(regular_predicates),
         )
-        if predicates:
-            node = SemanticFilter(node, tuple(predicates))
-        for function, kind, ids, columns in applies:
-            node = Apply(
-                node,
-                function=function,
-                kind=kind,
-                ids=ids,
-                columns=tuple(columns),
-                aliases=(alias,),
-            )
-        calls = {name: call for call, name in labels}
-        classified = []
-        for name, values, selectivity in label_filters:
-            if name not in calls:
-                raise CompileError(
-                    f"a filter on a label of {alias!r} tests a "
-                    f"classification the query does not name"
+        if steps is not None:
+            for step in steps:
+                node = step(node)
+        else:
+            if predicates:
+                node = SemanticFilter(node, tuple(predicates))
+            for function, kind, ids, columns in applies:
+                node = Apply(
+                    node,
+                    function=function,
+                    kind=kind,
+                    ids=ids,
+                    columns=tuple(columns),
+                    aliases=(alias,),
                 )
-            if calls[name] not in classified:
-                node = SemanticClassify(node, calls[name], name)
-                classified.append(calls[name])
-            node = Filter(
-                node,
-                RegularPredicate(ColumnRef(alias, provider, name), "in", tuple(values)),
-                selectivity,
-            )
-        for call, name in labels:
-            if call not in classified:
-                node = SemanticClassify(node, call, name)
-                classified.append(call)
-        tests = list(extract_filters)
-        for call, name in extracts:
-            extraction = SemanticExtract(node, call, name)
-            node = extraction
-            for predicate, selectivity in extract_filters:
-                if predicate.column.column in (name, extraction.span_name):
-                    node = Filter(node, predicate, selectivity)
-                    tests.remove((predicate, selectivity))
-        if tests:
-            raise CompileError(
-                f"the filter {tests[0][0]} tests an extraction the query "
-                f"does not return")
+            calls = {name: call for call, name in labels}
+            classified = []
+            for predicate, selectivity in label_filters:
+                name = predicate.column.column
+                if name not in calls:
+                    raise CompileError(
+                        f"a filter on a label of {alias!r} tests a "
+                        f"classification the query does not name"
+                    )
+                if calls[name] not in classified:
+                    node = SemanticClassify(node, calls[name], name)
+                    classified.append(calls[name])
+                node = Filter(node, predicate, selectivity)
+            for call, name in labels:
+                if call not in classified:
+                    node = SemanticClassify(node, call, name)
+                    classified.append(call)
+            tests = list(extract_filters)
+            for call, name in extracts:
+                extraction = SemanticExtract(node, call, name)
+                node = extraction
+                for predicate, selectivity in extract_filters:
+                    if predicate.column.column in (name, extraction.span_name):
+                        node = Filter(node, predicate, selectivity)
+                        tests.remove((predicate, selectivity))
+            if tests:
+                raise CompileError(
+                    f"the filter {tests[0][0]} tests an extraction the query "
+                    f"does not compute")
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:
             self._root = node
+
+    def add_step(self, step) -> None:
+        """Append a bound unary operator constructor to the current relation."""
+        self._root = step(self._root)
 
     def add_classify(self, call: ModelCall, name: str) -> None:
         """Classify the rows of the join the call reads.

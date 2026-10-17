@@ -12,6 +12,7 @@ from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.planner.plan import EngineConfig, Refusal, RefusalError, resolve_model
+from quail.specs.files import resolve_model_path
 
 
 class Session:
@@ -164,7 +165,9 @@ class Session:
         starts.
         """
         if self._tok is None:
-            self._tok = GigatokenEncoder(self.model.hf_name)
+            path = resolve_model_path(self.model.hf_name, self.model.revision,
+                                      include_weights=False)
+            self._tok = GigatokenEncoder(path)
         return self._tok
 
     def register_functions(self, functions: dict) -> None:

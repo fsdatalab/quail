@@ -1,6 +1,7 @@
 """Python builder that mirrors AI SQL construct for construct."""
 
 from collections.abc import Mapping
+from functools import partial
 from typing import Optional
 
 from quail.catalog import Catalog
@@ -22,10 +23,12 @@ from quail.logical import (
     AggregateCall,
     Aggregation,
     Alias,
+    Apply,
     ColumnRef,
     CompileError,
     Equality,
     ExtractStruct,
+    Filter,
     FilterPredicate,
     HavingTest,
     JoinSpec,
@@ -33,11 +36,16 @@ from quail.logical import (
     LogicalPlanBuilder,
     ModelCall,
     RegularPredicate,
+    SemanticClassify,
+    SemanticExtract,
+    SemanticFilter,
     SortKey,
 )
 from quail.logical.expressions import (
     SPAN_SUFFIX,
+    ColumnExpression,
     column_name,
+    column_reference,
     validate_task_description,
 )
 
@@ -53,12 +61,13 @@ class Query:
         self._tables = self._scope_.tables      # (alias, provider)
         self._doc_columns = self._scope_.doc_columns
         self._filters = {}
-        self._label_filters = {}     # alias -> [(name, labels, selectivity)]
+        self._label_filters = {}     # alias -> [(RegularPredicate, selectivity)]
         self._joins = []
         self._pending_join = None    # (new aliases, conditions, applies)
         #                              awaiting the AI predicate over
         #                              its pairs
-        self._applies = {}           # alias -> [(name, kind, ids, refs)]
+        self._steps = {}             # alias -> bound unary node constructors
+        self._step_after = {}
         self._functions = {}         # name -> the Python function
         self._labels = {}            # name -> Alias of an AI.CLASSIFY call
         self._scores = {}            # name -> Alias of an AI.SCORE call
@@ -87,14 +96,15 @@ class Query:
     def _scope(self) -> dict:
         return dict(self._tables)
 
-    def _resolve(self, c: ColSpec) -> ColumnRef:
-        return self._scope_.resolve(c.column, c.alias)
+    def _resolve_value(self, c: ColSpec) -> ColumnRef | ColumnExpression:
+        return self._scope_.resolve_value(c.column, c.alias, path=c.path,
+                                          function=c.function)
 
     def _note_doc_column(self, ref: ColumnRef) -> None:
         self._scope_.note_doc_column(ref)
 
     def _bind(self, p: PromptSpec, join: bool = False):
-        refs = tuple(self._resolve(c) for c in p.cols)
+        refs = tuple(self._resolve_value(c) for c in p.cols)
         bound = self._prompts.bind("join" if join else "filter", p.template, refs)
         for r in refs:
             self._note_doc_column(r)
@@ -122,8 +132,10 @@ class Query:
                 f"ai_filter must reference exactly one provider, got "
                 f"{aliases}; a two-provider predicate follows join() or "
                 f"is ai_join")
-        self._filters.setdefault(aliases[0], []).append(
-            FilterPredicate(ModelCall(bound), selectivity=selectivity))
+        predicate = FilterPredicate(ModelCall(bound), selectivity=selectivity)
+        self._filters.setdefault(aliases[0], []).append(predicate)
+        self._record_step(aliases[0],
+            partial(SemanticFilter, predicates=(predicate,)))
         return self
 
     ai_if = ai_filter
@@ -140,7 +152,7 @@ class Query:
             raise CompileError(
                 f"a score needs a column name without a dot, got {name!r}")
         self._claim_name(name)
-        refs = tuple(self._resolve(c) for c in p.cols)
+        refs = tuple(self._resolve_value(c) for c in p.cols)
         bound = self._prompts.bind("score", p.template, refs)
         for ref in refs:
             self._note_doc_column(ref)
@@ -200,7 +212,7 @@ class Query:
                 labels = tuple(label for label, _ in labels)
         descriptions = tuple(descriptions or ())
         validate_task_description(task_description)
-        refs = tuple(self._resolve(c) for c in p.cols)
+        refs = tuple(self._resolve_value(c) for c in p.cols)
         bound = self._prompts.bind(
             "label", p.template, refs, labels=labels, descriptions=descriptions,
             task_description=task_description)
@@ -210,6 +222,9 @@ class Query:
                          probabilities=probabilities)
         call.validate()
         self._labels[name] = Alias(call, name)
+        if len(call.aliases()) == 1:
+            self._record_step(call.aliases()[0],
+                partial(SemanticClassify, call=call, name=name))
         return self
 
     def ai_extract(self, c, questions, *, name: str) -> "Query":
@@ -255,7 +270,7 @@ class Query:
                 f"got {name!r}")
         self._claim_name(name)
         self._claim_name(name + SPAN_SUFFIX)
-        ref = self._resolve(col(c) if isinstance(c, str) else c)
+        ref = self._resolve_value(col(c) if isinstance(c, str) else c)
         struct = ExtractStruct(name, tuple(questions))
         struct.validate()
         members = []
@@ -266,7 +281,15 @@ class Query:
             members.append(Alias(call, struct.member(field)))
         self._note_doc_column(ref)
         self._extracts[name] = (struct, tuple(members))
+        for member in members:
+            self._record_step(ref.alias, partial(
+                SemanticExtract, call=member.expression, name=member.name))
         return self
+
+    def _record_step(self, alias, step):
+        """Record a table operator and the joins preceding its declaration."""
+        self._steps.setdefault(alias, []).append(step)
+        self._step_after[step] = len(self._joins)
 
     def _claim_name(self, name: str) -> None:
         """Check that no earlier call or table alias uses the name."""
@@ -296,17 +319,7 @@ class Query:
         """
         if name not in self._labels:
             raise CompileError(f"no classification is named {name!r}")
-        call = self._labels[name].expression
-        if len(call.aliases()) != 1:
-            raise CompileError(
-                f"a filter on a label tests a one-document classification; "
-                f"{name!r} classifies pairs of {call.aliases()}")
-        (alias,) = call.aliases()
-        labels = tuple(labels)
-        RegularPredicate(ColumnRef(alias, self._scope()[alias], name), "in",
-                         labels).validate()
-        self._label_filters.setdefault(alias, []).append(
-            (name, labels, selectivity))
+        self._where_test(PredicateSpec(col(name), "in", tuple(labels), selectivity))
         return self
 
     def join(self, other: "Query", on=None) -> "Query":
@@ -332,16 +345,16 @@ class Query:
             if not isinstance(condition, EqualsSpec):
                 raise CompileError(
                     "join(on=...) takes col(...) == col(...) conditions")
-            left, right = (self._resolve(condition.left),
-                           self._resolve(condition.right))
-            sides = {left.alias, right.alias}
+            left, right = (self._resolve_value(condition.left),
+                           self._resolve_value(condition.right))
+            equality = Equality(left, right)
+            sides = set(equality.aliases())
             if new_aliases[0] not in sides or len(sides) != 2:
                 raise CompileError(
-                    f"join condition {left.alias}.{left.column} = "
-                    f"{right.alias}.{right.column} must relate the "
+                    f"join condition {equality} must relate the "
                     f"joined table {new_aliases[0]!r} to a table already "
                     f"in the query")
-            resolved.append(Equality(left, right))
+            resolved.append(equality)
         self._pending_join = (new_aliases, tuple(resolved), [])
         return self
 
@@ -354,7 +367,8 @@ class Query:
                 f"table {new_aliases[0]!r} and one other table, got "
                 f"{aliases}")
         for name, _kind, refs in applies:
-            outside = sorted({ref.alias for ref in refs} - set(aliases))
+            outside = sorted({column_reference(ref).alias for ref in refs}
+                             - set(aliases))
             if outside:
                 raise CompileError(
                     f"apply {name!r} reads tables {outside} that the join "
@@ -370,9 +384,9 @@ class Query:
               kind="per_batch") -> "Query":
         """Call a Python function between two operators.
 
-        The function receives a dict of Arrow tables keyed by alias:
-        each table holds the alias's row indices under the alias name
-        plus the listed columns. After ``join()`` it returns the pairs
+        The function receives a dict of Rows keyed by alias, with
+        document ids in ``rows.ids[alias]`` and the listed columns in
+        the Arrow table ``rows.values``. After ``join()`` it returns the pairs
         the next AI predicate is asked about, as a table with both
         alias columns. Otherwise it works on one table and returns the
         ids to keep. A function never invents an id.
@@ -399,7 +413,7 @@ class Query:
             raise CompileError(
                 f"apply name {name!r} is already used by another function")
         columns = [columns] if isinstance(columns, ColSpec) else list(columns)
-        refs = tuple(self._resolve(spec) for spec in columns)
+        refs = tuple(self._resolve_value(spec) for spec in columns)
         if self._pending_join is not None:
             if ids not in (None, "pairs"):
                 raise CompileError(
@@ -415,13 +429,14 @@ class Query:
         if ids not in ("preserve", "drop"):
             raise CompileError(
                 f"apply ids must be preserve, drop, or pairs, got {ids!r}")
-        owners = {ref.alias for ref in refs}
+        owners = {column_reference(ref).alias for ref in refs}
         if len(owners) != 1:
             raise CompileError(
                 f"apply {name!r} must work on one table; its columns "
                 f"name {sorted(owners) or 'none'}")
         (alias,) = owners
-        self._applies.setdefault(alias, []).append((name, kind, ids, refs))
+        self._record_step(alias, partial(
+            Apply, function=name, kind=kind, ids=ids, columns=refs, aliases=(alias,)))
         self._functions[name] = fn
         return self
 
@@ -447,10 +462,13 @@ class Query:
             alias, provider = other._tables[0]
             if alias in self._scope():
                 raise CompileError(f"duplicate table alias {alias!r}")
-            for name, column in other._labels.items():
-                if name in self._labels or name in self._scope():
-                    raise CompileError(f"the name {name!r} is already used")
-                self._labels[name] = column
+            self._claim_name(alias)
+            for name in (*other._labels, *other._scores, *other._extracts,
+                         *(name + SPAN_SUFFIX for name in other._extracts)):
+                self._claim_name(name)
+            self._labels.update(other._labels)
+            self._scores.update(other._scores)
+            self._extracts.update(other._extracts)
             self._scope_.add_table(alias, provider)
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
@@ -460,17 +478,14 @@ class Query:
                 self._regular_predicates.setdefault(a, []).extend(preds)
             for a, tests in other._extract_filters.items():
                 self._extract_filters.setdefault(a, []).extend(tests)
-            for a, applies in other._applies.items():
-                self._applies.setdefault(a, []).extend(applies)
+            for a, steps in other._steps.items():
+                self._steps.setdefault(a, []).extend(steps)
             for name, fn in other._functions.items():
                 if self._functions.get(name, fn) is not fn:
                     raise CompileError(
                         f"apply name {name!r} is used by two functions")
                 self._functions[name] = fn
-            for a, c in other._doc_columns.items():
-                self._note_doc_column(
-                    ColumnRef(alias=a, provider=self._scope()[a],
-                              column=c))
+            self._doc_columns.update(other._doc_columns)
             new_aliases.append(alias)
         return new_aliases
 
@@ -584,11 +599,20 @@ class Query:
         """Route one test to the scan, a label filter, or an answer filter."""
         spec = test.col
         if spec.alias is None and spec.column in self._labels:
-            if test.comparison not in ("=", "in"):
+            call = self._labels[spec.column].expression
+            if len(call.aliases()) != 1:
                 raise CompileError(
-                    f"a label is tested with == or isin(), got {test.comparison}")
-            values = test.value if test.comparison == "in" else (test.value,)
-            self.label_in(spec.column, values, test.selectivity)
+                    "a filter on a label tests a one-document classification; "
+                    f"{spec.column!r} classifies pairs of {call.aliases()}")
+            (alias,) = call.aliases()
+            predicate = RegularPredicate(
+                ColumnRef(alias, self._scope()[alias], spec.column),
+                test.comparison, test.value, spec.path, spec.function)
+            predicate.validate_text_column()
+            self._label_filters.setdefault(alias, []).append(
+                (predicate, test.selectivity))
+            self._record_step(alias, partial(
+                Filter, condition=predicate, selectivity=test.selectivity))
             return
         extracted = self._extract_column(spec)
         if extracted is not None:
@@ -600,20 +624,18 @@ class Query:
                 predicate.validate_text_column()
             self._extract_filters.setdefault(extracted.alias, []).append(
                 (predicate, test.selectivity))
+            self._record_step(extracted.alias, partial(
+                Filter, condition=predicate, selectivity=test.selectivity))
             return
-        if spec.path:
-            raise CompileError(
-                f"{spec.alias}.{spec.column} has no fields; only an "
-                f"extraction's span does, such as "
-                f"col('lease{SPAN_SUFFIX}.end_date').field('start')")
         if test.selectivity is not None:
             raise CompileError(
                 f"a hint estimates a test of a label or an answer; "
                 f"{spec.alias}.{spec.column} is a source column, tested at "
                 f"the scan")
-        ref = self._resolve(spec)
+        expression = self._resolve_value(spec)
+        ref = column_reference(expression)
         predicate = RegularPredicate(ref, test.comparison, test.value,
-                                     function=spec.function)
+                                     spec.path, spec.function)
         predicate.validate()
         self._regular_predicates.setdefault(ref.alias, []).append(predicate)
 
@@ -626,7 +648,8 @@ class Query:
         """
         if spec.alias is None:
             return None
-        name, span = spec.alias, spec.alias.endswith(SPAN_SUFFIX)
+        name = spec.alias
+        span = name not in self._extracts and name.endswith(SPAN_SUFFIX)
         if span:
             name = name[:-len(SPAN_SUFFIX)]
         if name not in self._extracts:
@@ -675,11 +698,9 @@ class Query:
                 raise CompileError(
                     "order_by takes a column name or col(...).asc() or "
                     f".desc(), got {key!r}")
-            name = (key.col.column if key.col.alias is None
-                    else f"{key.col.alias}.{key.col.column}")
             nulls_first = (key.descending if key.nulls is None
                            else key.nulls == "first")
-            self._order.append((name, key.descending, nulls_first))
+            self._order.append((key.col, key.descending, nulls_first))
         return self
 
     def group_by(self, *keys) -> "Query":
@@ -756,24 +777,43 @@ class Query:
                                                  column=name))
                 continue
             spec = col(c) if isinstance(c, str) else c
-            columns.append(self._resolve(spec))
+            columns.append(self._resolve_value(spec))
         # a classification is planned when the query returns or tests
         # its label
-        tested = {name for tests in self._label_filters.values()
-                  for name, _, _ in tests}
+        tested = {test.column.column for tests in self._label_filters.values()
+                  for test, _ in tests}
         wanted = [column for column in self._labels.values()
                   if column in columns or column.name in tested]
-        # an extraction is planned when the query returns its answer
         extracted = [column for column in columns if isinstance(column, Alias)
                      and column.expression.kind == "extract"]
+        tested = {test.column.column for tests in self._extract_filters.values()
+                  for test, _ in tests}
+        for _, members in self._extracts.values():
+            for member in members:
+                if member not in extracted and (
+                        member.name in tested or member.name + SPAN_SUFFIX in tested):
+                    extracted.append(member)
         logical = LogicalPlanBuilder()
+        after_joins = set()
+        ordered_calls = any(step.func is Apply for steps in self._steps.values()
+                            for step in steps)
         for alias, provider in self._tables:
+            steps = self._steps.get(alias, ())
+            required = {column.name for column in (*wanted, *extracted)}
+            ordered = (tuple(step for step in steps
+                             if step.func not in (SemanticClassify, SemanticExtract)
+                             or step.keywords["name"] in required)
+                       if ordered_calls else None)
+            if ordered is not None:
+                after_joins.update(step for step in ordered
+                                   if self._step_after.get(step, 0))
+                ordered = tuple(step for step in ordered if step not in after_joins)
             logical.add_scan(
                 alias,
                 provider,
                 self._doc_columns.get(alias, ""),
                 tuple(self._filters.get(alias, ())),
-                tuple(self._applies.get(alias, ())),
+                (),
                 tuple((column.expression, column.name) for column in wanted
                       if column.expression.aliases() == (alias,)),
                 tuple(self._label_filters.get(alias, ())),
@@ -783,9 +823,13 @@ class Query:
                                for column in extracted
                                if column.expression.aliases() == (alias,)),
                 extract_filters=tuple(self._extract_filters.get(alias, ())),
+                steps=ordered,
             )
-        for join in self._joins:
+        for index, join in enumerate(self._joins, 1):
             logical.add_join(join)
+            for step, after in self._step_after.items():
+                if after == index and step in after_joins:
+                    logical.add_step(step)
         for column in wanted:
             if len(column.expression.aliases()) == 2:
                 logical.add_classify(column.expression, column.name)
@@ -793,15 +837,18 @@ class Query:
                  if isinstance(column, Alias)}
         if aggregation is not None:
             named.update({a.name: a for a in aggregation.aggregates})
-        for name, _, _ in self._order:
-            if name in self._extracts:
+        for spec, _, _ in self._order:
+            if spec.alias is None and spec.column in named:
+                spec.require_plain()
+            if spec.alias is None and spec.column in self._extracts:
                 raise CompileError(
                     f"ORDER BY does not compare the AI.EXTRACT struct column "
-                    f"{name!r}; extract the field as its own column")
+                    f"{spec.column!r}; extract the field as its own column")
         order = tuple(
-            SortKey(named[name] if name in named else self._resolve(col(name)),
+            SortKey(named[spec.column] if spec.alias is None
+                    and spec.column in named else self._resolve_value(spec),
                     descending=descending, nulls_first=nulls_first)
-            for name, descending, nulls_first in self._order)
+            for spec, descending, nulls_first in self._order)
         return logical.project(tuple(columns), self._limit, order=order,
                                offset=self._offset, distinct=self._distinct,
                                aggregation=aggregation, structs=tuple(structs))
@@ -820,7 +867,7 @@ class Query:
             elif isinstance(c, str) and c in self._scores:
                 column = self._scores[c]
             else:
-                column = self._resolve(col(c) if isinstance(c, str) else c)
+                column = self._resolve_value(col(c) if isinstance(c, str) else c)
             if column not in columns:
                 columns.append(column)
             return column_name(column)

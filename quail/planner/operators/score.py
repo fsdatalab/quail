@@ -17,8 +17,8 @@ from quail.physical import (
     ScoreSpec,
 )
 from quail.physical.base import input_ports
-from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import bind_inference, inference_node
+from quail.planner.operators.frontier import Frontier
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import score_token_parts
 from quail.planner.statistics.memory import arena_capacity

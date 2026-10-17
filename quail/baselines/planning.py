@@ -16,6 +16,7 @@ from quail.logical import (
     Alias,
     Apply,
     classified_above_joins,
+    column_name,
     effective_selectivity,
 )
 from quail.logical import Aggregate as LogicalAggregate
@@ -32,7 +33,6 @@ from quail.planner import (
     hash_join_nodes,
     order_filters_indexed,
     preamble_tokens,
-    regular_predicates,
 )
 from quail.planner import (
     join_specs as logical_join_specs,
@@ -93,7 +93,7 @@ def plan_request_backend(
             total_tokens=summaries[scan.alias].total,
             shard_ranges=((0, n_docs),),
             shard_token_loads=(summary.total_tokens,),
-            predicates=regular_predicates(scan),
+            predicates=scan.predicates,
             expected_docs=float(summary.n_docs) if scan.predicates else None,
         )
         nodes.append(node)
@@ -345,12 +345,9 @@ def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
         for spec in extract_specs)
     columns = []
     for column in region.logical_plan.projection.columns:
-        if isinstance(column, Alias):
-            columns.append(column.name)
-            if column.expression.kind == "extract":
-                columns.append(column.name + SPAN_SUFFIX)
-        else:
-            columns.append(f"{column.alias}.{column.column}")
+        columns.append(column_name(column))
+        if isinstance(column, Alias) and column.expression.kind == "extract":
+            columns.append(column.name + SPAN_SUFFIX)
     nodes.append(Project(
         node_id="project",
         inputs=input_ports((sink_input, *label_ports)),

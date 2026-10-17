@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pytest
 from helpers.fakes import (
+    PARTNER,
     FakeArena,
     fake_pipeline,
     fake_torch,
@@ -18,6 +19,7 @@ from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
 from quail.builtins import built_in_registry
+from quail.logical import ColumnRef
 from quail.physical import (
     AiFilter,
     PhysicalGraph,
@@ -25,7 +27,7 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
-from quail.specs import DEVICES, MODELS
+from quail.specs import DEVICES
 
 
 def test_filter_execution_and_retention_inputs(monkeypatch):
@@ -39,10 +41,10 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
                            filtered), PortRef("filter:d", "ids:d"))
 
     def round_fn(kind, subs):
-        assert kind == "filters"
+        assert kind == "execute"
         outputs = []
         for sub in subs:
-            indices = sub["doc_index"]["d"]
+            indices = sub["inputs"]["filter:d"]["input:0"].to_pylist()
             from quail.execution.metrics import NodeMetrics, NodeResult
 
             result = NodeResult({
@@ -51,7 +53,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
                 NodeMetrics(fresh_tokens=len(indices)))
             outputs.append({
                 "results": {"filter:d": result},
-                "retained": {}, "boot_s": 0.0,
+                "retained": (), "kv_manager": {}, "boot_s": 0.0,
                 "boot_kind": "warm", "boot": {}, "peak_gib": 1.0,
             })
         return outputs
@@ -68,7 +70,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
             workers=2, graph=graph, codecs=registry.codecs),
     }
     result = execute_distributed_graph(
-        payload, graph, 2, round_fn, MODELS["qwen3-4b-fp8"],
+        payload, graph, 2, round_fn,
         DEVICES["h100-sxm"], registry.runtimes, registry)
     assert result["filters"]["d"] == {0: [True], 1: [False], 2: [True], 3: [False]}
     assert result["fresh_tokens"] == 4
@@ -105,7 +107,7 @@ def _pairs(table):
 
 def _ids(tables):
     (alias,) = tables
-    return tables[alias].column(alias).to_pylist()
+    return tables[alias].ids[alias].to_pylist()
 
 
 def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
@@ -262,7 +264,8 @@ def test_foreign_runs_per_batch_or_once_as_a_barrier_and_are_checked(monkeypatch
         ("barrier", "preserve", lambda tables: _ids(tables)[1:],
          "preserves ids but dropped"),
         ("barrier", "drop", lambda tables: [None] + _ids(tables)[1:],
-         "returned a null id"),
+         "a document id is null"),
+        ("barrier", "drop", lambda tables: [0.5], "truncated"),
     ]:
         graph = two_alias_graph(kind == "per_batch", foreign=(kind, ids))
         with pytest.raises(ValueError, match=message):
@@ -300,3 +303,131 @@ def test_predicate_nodes_keep_documents_and_join_frames_in_kv(monkeypatch):
     # The second join uses the same frame and reads only partner suffixes.
     assert metrics["join:second"]["fresh_tokens"] == len(survivors) * 4 * 20
     assert metrics["filter:r:1"]["fresh_tokens"] == sum(row[0] for row in filters)
+
+
+def test_barrier_pair_function_materializes_its_filter_without_an_extra_barrier(
+        monkeypatch):
+    graph = two_alias_graph(True, foreign=("barrier", "pairs"))
+    result, _, truth, _ = run_graph_on_arena(
+        monkeypatch, graph, seed=9, functions={"same_key": same_key},
+        columns=_key_columns([d % 4 for d in range(14)], list(range(4))),
+        streamed_anchors=False)
+    survivors = [d for d, answers in enumerate(truth) if all(answers)]
+    pairs = result["_outputs"][PortRef("apply:same_key", "pairs:0")]
+    assert _pairs(pairs) == [(d, d % 4) for d in survivors]
+    assert result["node_metrics"]["apply:same_key"]["calls"] == 1
+
+
+def test_a_pipeline_finishes_before_an_independent_consumer_of_its_filter(monkeypatch):
+    from quail.physical import Foreign
+
+    graph = two_alias_graph(True)
+    branch = Foreign(
+        node_id="apply:keep_even", kind="barrier", ids="drop", aliases=("r",),
+        function="keep_even", inputs=input_ports((PortRef("filter:r", "ids:r"),)))
+    graph = PhysicalGraph((*graph.nodes[:-1], branch, graph.nodes[-1]), graph.root)
+    result, survivors, _ = _foreign_run(monkeypatch, graph, {"keep_even": keep_even})
+    ids = result["_outputs"][PortRef("apply:keep_even", "ids:r")]
+    assert ids.column("r").to_pylist() == [d for d in survivors if d % 2 == 0]
+    assert sorted(result["joins"][0]["anchor_index"]) == survivors
+
+
+@pytest.mark.parametrize("kind", ["per_batch", "barrier"])
+def test_apply_keeps_ids_separate_from_source_columns(monkeypatch, kind):
+    from dataclasses import replace
+
+    import pyarrow.compute as pc
+
+    from quail.physical import Foreign
+
+    seen = []
+
+    def keep(rows_by_alias):
+        rows = rows_by_alias["r"]
+        ids = rows.ids["r"].to_pylist()
+        assert rows.column("r").to_pylist() == [100 + d % 4 for d in ids]
+        seen.extend(ids)
+        return rows.filter(pc.equal(rows.column("r"), 101))
+
+    graph = two_alias_graph(kind == "per_batch", foreign=(kind, "drop"))
+    graph = PhysicalGraph(tuple(
+        replace(node, columns=(ColumnRef("r", "", "r"),))
+        if isinstance(node, Foreign) else node
+        for node in graph.nodes), graph.root)
+    result, _, truth, _ = run_graph_on_arena(
+        monkeypatch, graph, seed=9, functions={"keep_even": keep},
+        columns={"r": pa.table({"r": [100 + d % 4 for d in range(14)]})})
+    survivors = [d for d, answers in enumerate(truth) if all(answers)]
+    assert sorted(seen) == survivors
+    kept = [d for d in survivors if d % 4 == 1]
+    assert sorted(result["joins"][0]["anchor_index"]) == kept
+    ids = result["_outputs"][PortRef("apply:keep_even", "ids:r")]
+    assert ids.column("r").to_pylist() == kept
+
+
+@pytest.mark.parametrize("mechanism", ["hash", "per_batch", "barrier"])
+def test_transformed_keys_reach_the_model_as_selected_pairs(monkeypatch, mechanism):
+    from dataclasses import replace
+
+    from quail.execution.rows import Rows
+    from quail.logical import ColumnExpression
+    from quail.physical import Foreign, HashJoin, decode_graph, encode_graph
+
+    def key(alias):
+        return ColumnExpression(ColumnRef(alias, "", "key"), ("text",), "length")
+
+    def same_length(rows):
+        tables = [pa.table({alias: rows[alias].ids[alias],
+                           "length": rows[alias].column("length(key.text)")})
+                  for alias in ("r", "p")]
+        pairs = tables[0].join(tables[1], keys="length").select(["r", "p"])
+        return Rows.from_table(pairs, ("r", "p"))
+
+    foreign = None if mechanism == "hash" else (mechanism, "pairs")
+    graph = two_alias_graph(mechanism != "barrier", hash_join=mechanism == "hash",
+                            foreign=foreign)
+    graph = PhysicalGraph(tuple(
+        replace(node, on=((key("r"), key("p")),)) if isinstance(node, HashJoin)
+        else replace(node, columns=(key("r"), key("p"))) if isinstance(node, Foreign)
+        else node for node in graph.nodes), graph.root)
+    codecs = built_in_registry().codecs
+    graph = decode_graph(encode_graph(graph, codecs), codecs)
+    result, _, truth, _ = run_graph_on_arena(
+        monkeypatch, graph, seed=9, functions={"same_key": same_length},
+        columns={alias: pa.table({"key": [{"text": letter * (d % 4 + 1)}
+                                         for d in range(size)]})
+                 for alias, letter, size in (("r", "x", 14), ("p", "y", 4))})
+    survivors = [d for d, answers in enumerate(truth) if all(answers)]
+    table = result["_outputs"][PortRef("group:0", "join_answers:0")]
+    assert _pairs(table) == [(d, d % 4) for d in survivors]
+    metrics = result["node_metrics"]["group:0"]
+    assert metrics["evaluated_document_pairs"] == len(survivors)
+
+
+@pytest.mark.parametrize("workers", [2, 4])
+@pytest.mark.parametrize("foreign", [
+    None, ("per_batch", "drop"), ("per_batch", "pairs"),
+])
+def test_each_worker_pipelines_filters_and_joins(monkeypatch, workers, foreign):
+    graph = two_alias_graph(True, foreign=foreign)
+    options = {"functions": {"keep_even": keep_even, "same_key": same_key},
+               "columns": _key_columns([d % 4 for d in range(80)], list(range(4)))}
+    expected, _, _, _ = run_graph_on_arena(
+        monkeypatch, graph, n_docs=80, **options)
+    actual, model, _, _ = run_graph_on_arena(
+        monkeypatch, graph, n_docs=80, workers=workers, **options)
+    assert len(model.worker_launches) == workers
+    for launched in model.worker_launches:
+        joins = [index for index, (_, specs) in enumerate(launched)
+                 if any(suffix[0] >= PARTNER for spec in specs
+                        for suffix in spec["suffixes"])]
+        filters = [index for index, (_, specs) in enumerate(launched)
+                   if any(suffix[0] < PARTNER for spec in specs
+                          for suffix in spec["suffixes"])]
+        assert min(joins) < max(filters)
+        prefills = [spec["key"][1] for _, specs in launched for spec in specs
+                    if spec["prefix"] is not None]
+        assert len(prefills) == len(set(prefills))
+    root = PortRef("group:0", "ids:r")
+    assert actual["_outputs"][root].equals(expected["_outputs"][root])
+    assert actual["fresh_tokens"] == expected["fresh_tokens"]

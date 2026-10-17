@@ -51,6 +51,9 @@ with result.execute_stream(batch_rows=1024) as reader:
         print(batch.to_pydict())
 ```
 
+Leaving the `with` block closes the result source, including when you stop
+before reading all batches or an error interrupts the loop.
+
 You can pass `limit` to `collect()` or `execute_stream()` to read fewer
 result rows. The limit does not reduce the model execution already performed.
 

@@ -38,6 +38,47 @@ from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import EngineConfig, PhysicalPlan
 
 
+def test_pipelines_schedule_joins_with_dependencies_on_both_filters():
+    from helpers.fakes import two_alias_graph
+
+    from quail.physical.base import input_ports
+    from quail.physical.pipelines import build_pipelines, execution_groups
+
+    graph = two_alias_graph(True)
+    r_filter = graph.node("filter:r")
+    p_filter = replace(r_filter, node_id="filter:p", alias="p",
+                       inputs=input_ports((PortRef("input:p", "ids:p"),)))
+    inputs = input_ports((PortRef("filter:r", "ids:r"),
+                          PortRef("filter:p", "ids:p")))
+    r_join = replace(graph.nodes[-1], inputs=inputs)
+    p_join = replace(r_join, node_id="group:1", anchor="p", partners=("r",),
+                     written_pos=1, exec_idx=1)
+    graph = PhysicalGraph((*graph.nodes[:2], r_filter, p_filter, r_join, p_join),
+                          graph.root)
+    groups = execution_groups(graph, build_pipelines(graph))
+    assert sorted(len(group) for group in groups) == [1, 1, 1, 1, 2]
+    available = set()
+    for group in groups:
+        for node in group:
+            assert all(port.source.node_id in available for port in node.inputs)
+            available.add(node.node_id)
+    assert available == {node.node_id for node in graph.nodes}
+
+
+def test_saved_plain_column_plans_decode_to_bound_expressions():
+    from quail.logical import ColumnRef
+    from quail.physical import Foreign, HashJoin
+
+    join = HashJoin.from_attributes("pairs", (), {
+        "left": "r", "right": "p", "on": [["url", "id"]], "written_pos": 0})
+    assert join.on == ((ColumnRef("r", "", "url"), ColumnRef("p", "", "id")),)
+    apply = Foreign.from_attributes("apply", (), {
+        "function": "match", "kind": "barrier", "ids": "pairs",
+        "columns": [["r", "url"], ["p", "id"]], "aliases": ["r", "p"],
+        "written_pos": 0})
+    assert apply.columns == (ColumnRef("r", "", "url"), ColumnRef("p", "", "id"))
+
+
 def test_barrier_preserves_survivor_order_and_duplicates():
     from quail.physical.base import input_ports
 

@@ -25,7 +25,7 @@ from quail.planner.operators.classify import classify_scoring
 from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import plan_kv_retention
 from quail.planner.search.statistics import cached_statistics, live_after_filters
-from quail.planner.sol.prefixes import page_tree
+from quail.planner.statistics.prefixes import page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
@@ -51,7 +51,7 @@ class ShouldPushDownLimit(PhysicalRule):
         limit = next((node for node in graph.nodes
                       if isinstance(node, Limit)), None)
         pipelines = {id(members) for members
-                     in build_pipelines(graph, context.gpu_count).values()}
+                     in build_pipelines(graph).values()}
         blocked = len(pipelines) > 1 or any(
             isinstance(node, (Sort, PhysicalAggregate, AiJoin))
             for node in graph.nodes)
@@ -72,7 +72,7 @@ class ShouldRetainKv(PhysicalRule):
 
     - A filter sequence keeps its survivors' KV (keep_kv) when a later join
       anchors on its table, unless the sequence streams into that join in
-      one pipeline on one GPU.
+      one pipeline.
     - A join keeps its anchor's KV (keep_kv) when a later group
       anchors on the same table.
     - A sequence writes KV pages only when a later stage, the next operator
@@ -118,7 +118,7 @@ class ShouldRetainKv(PhysicalRule):
             node.node_id: (after[group[0].node_id] if node is group[-1]
                            else before[group[0].node_id])
             for group in grouped for node in group}
-        paths = build_pipelines(graph, context.gpu_count)
+        paths = build_pipelines(graph)
         streamed = {
             node.alias for node in graph.nodes if isinstance(node, AiFilter)
             and any(isinstance(member, AiJoin)
@@ -129,7 +129,7 @@ class ShouldRetainKv(PhysicalRule):
         schedule.update(**coefficients(context.model, context.device),
                         cap_pages=statistics.cap_pages)
         context.settings["retention"] = schedule
-        return plan_kv_retention(graph, context.gpu_count)
+        return plan_kv_retention(graph)
 
 
 class ChooseClassifyImplementation(PhysicalRule):
@@ -141,7 +141,7 @@ class ChooseClassifyImplementation(PhysicalRule):
     per label; trie_tree, under the tree attention path; and
     trie_decode, when no label starts another.
     The documents count as resident, with their KV in the arena, when
-    the classification continues its table's filter sequence on one GPU
+    the classification continues its table's filter sequence
     before any join, or follows a classification with the same prompt
     head. A classification of joined rows always uses letters and
     arrives chosen.
@@ -168,7 +168,7 @@ class ChooseClassifyImplementation(PhysicalRule):
 
         logical = context.logical_plan
         calls = {node.name: node.call for node in logical.operators().classifies}
-        paths = build_pipelines(graph, context.gpu_count)
+        paths = build_pipelines(graph)
         chosen = {}
         for node in pending:
             table = classify_scoring(context, node.spec.anchor)

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, ClassVar, Optional
+
+import numpy as np
+import pyarrow as pa
+from pyarrow import compute as pc
 
 DESCRIPTION_WORDS = 25
 TASK_DESCRIPTION_WORDS = 50
@@ -11,6 +15,15 @@ TASK_DESCRIPTION_WORDS = 50
 
 class CompileError(ValueError):
     """Raised when a query is malformed or outside the language."""
+
+
+def literal_value(value):
+    """Unwrap NumPy numbers, booleans, and strings in scalar or tuple literals."""
+    if isinstance(value, tuple):
+        return tuple(literal_value(item) for item in value)
+    if isinstance(value, np.generic) and value.dtype.kind in "biufU":
+        return value.item()
+    return value
 
 
 @dataclass(frozen=True)
@@ -22,16 +35,130 @@ class ColumnRef:
     type_name: ClassVar[str] = "quail.column_ref"
 
 
+@dataclass(frozen=True)
+class ColumnExpression:
+    """A scalar expression over a bound source column."""
+
+    reference: ColumnRef
+    path: tuple[str, ...] = ()
+    function: str | None = None
+    output_name: str | None = None
+
+    type_name: ClassVar[str] = "quail.column_expression"
+
+    @property
+    def alias(self) -> str:
+        """Return the table alias supplying this expression's values."""
+        return self.reference.alias
+
+    @property
+    def name(self) -> str:
+        """Return the expression's result column name."""
+        return column_name(self)
+
+    def evaluate(self, values):
+        """Evaluate the column's field access and function on Arrow values."""
+        return column_values(values, self.path, self.function)
+
+    def __str__(self) -> str:
+        value = column_name(replace(self, output_name=None))
+        return (f"{value} AS {self.output_name}"
+                if self.output_name is not None else value)
+
+
+def column_values(values, path=(), function=None):
+    """Read struct fields and apply a scalar function to Arrow values.
+
+    Raises:
+        CompileError: A field or function cannot be evaluated on the values.
+    """
+    try:
+        for name in path:
+            values = pc.struct_field(_decoded_values(values), name)
+        values = _decoded_values(values)
+        if function == "length":
+            if pa.types.is_null(values.type):
+                values = values.cast(pa.string())
+            values = pc.utf8_length(values)
+        elif function is not None:
+            raise CompileError(f"unsupported column function {function!r}")
+        return values
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as error:
+        raise CompileError(str(error)) from error
+
+
+def _decoded_values(values):
+    """Return logical values from dictionary encoded Arrow storage."""
+    return (values.cast(values.type.value_type)
+            if pa.types.is_dictionary(values.type) else values)
+
+
+def hash_values(values, *, nan_equal: bool):
+    """Encode values for hashing with numeric equality for signed zeros.
+
+    Args:
+        values: An Arrow array or chunked array of keys.
+        nan_equal: Whether NaNs form one group. Otherwise NaNs become null,
+            for joins and membership tests that exclude null keys.
+    """
+    values = _decoded_values(values)
+    if pa.types.is_floating(values.type):
+        zero = pa.scalar(0, values.type)
+        nan = pa.scalar(float("nan") if nan_equal else None, values.type)
+        values = pc.if_else(pc.equal(values, zero), zero, values)
+        values = pc.if_else(pc.is_nan(values), nan, values)
+    return values
+
+
 LABEL_PREFIX = " "
 
 
-def column_name(column: ColumnRef | Alias) -> str:
+def column_name(column: str | ColumnRef | ColumnExpression | Alias, *,
+                qualified: bool = True) -> str:
     """Return the name used for a source or computed column."""
-    return (
-        f"{column.alias}.{column.column}"
-        if isinstance(column, ColumnRef)
-        else column.name
-    )
+    if isinstance(column, str):
+        return column
+    if isinstance(column, ColumnRef):
+        return f"{column.alias}.{column.column}" if qualified else column.column
+    if isinstance(column, ColumnExpression):
+        if column.output_name is not None:
+            return column.output_name
+        name = ".".join((column_name(column.reference, qualified=qualified),
+                         *column.path))
+        return f"{column.function}({name})" if column.function else name
+    return column.name
+
+
+def column_reference(expression: ColumnRef | ColumnExpression) -> ColumnRef:
+    """Return the source column read by a scalar expression."""
+    return (expression.reference
+            if isinstance(expression, ColumnExpression) else expression)
+
+
+def source_column(expression: str | ColumnRef | ColumnExpression) -> str:
+    """Return the source field needed to evaluate a column expression."""
+    return (expression if isinstance(expression, str)
+            else column_reference(expression).column)
+
+
+def evaluate_column(expression: str | ColumnRef | ColumnExpression, values):
+    """Evaluate a bound scalar expression over its source column values."""
+    return (expression.evaluate(values)
+            if isinstance(expression, ColumnExpression) else values)
+
+
+def encode_column(expression: ColumnRef | ColumnExpression) -> dict:
+    """Encode a bound scalar expression for a physical plan."""
+    return asdict(expression)
+
+
+def decode_column(value: dict) -> ColumnRef | ColumnExpression:
+    """Decode a bound scalar expression from a physical plan."""
+    if "reference" in value:
+        return ColumnExpression(ColumnRef(**value["reference"]),
+                                tuple(value.get("path", ())), value.get("function"),
+                                value.get("output_name"))
+    return ColumnRef(**value)
 
 
 @dataclass(frozen=True)
@@ -131,6 +258,14 @@ class ModelCall:
     question: str = ""
 
     type_name: ClassVar[str] = "quail.model_call"
+
+    def output_columns(self, name: str) -> tuple[str, ...]:
+        """Return the named answer and its additional computed columns."""
+        if self.probabilities:
+            return (name, name + PROBABILITIES_SUFFIX)
+        if self.kind == "extract":
+            return (name, name + SPAN_SUFFIX)
+        return (name,)
 
     def aliases(self) -> tuple[str, ...]:
         """Return the table aliases the prompt reads, in placeholder order."""
@@ -397,19 +532,16 @@ class FilterPredicate:
 class Equality:
     """One ordinary join condition: two columns of two tables are equal."""
 
-    left: ColumnRef
-    right: ColumnRef
+    left: ColumnRef | ColumnExpression
+    right: ColumnRef | ColumnExpression
 
     type_name: ClassVar[str] = "quail.equality"
 
     def aliases(self) -> tuple[str, str]:
-        return self.left.alias, self.right.alias
+        return column_reference(self.left).alias, column_reference(self.right).alias
 
     def __str__(self) -> str:
-        return (
-            f"{self.left.alias}.{self.left.column} = "
-            f"{self.right.alias}.{self.right.column}"
-        )
+        return f"{column_name(self.left)} = {column_name(self.right)}"
 
 
 def _explain(expression) -> str:
@@ -436,7 +568,7 @@ def _explain(expression) -> str:
 class SortKey:
     """One ORDER BY term: a column or a projected expression and its direction."""
 
-    expression: Any  # ColumnRef | Alias
+    expression: Any  # ColumnRef | ColumnExpression | Alias | AggregateCall
     descending: bool = False
     nulls_first: bool = False
 
@@ -450,7 +582,7 @@ class SortKey:
     def validate(self) -> None:
         if isinstance(self.expression, (Alias, AggregateCall)):
             self.expression.validate()
-        elif not isinstance(self.expression, ColumnRef):
+        elif not isinstance(self.expression, (ColumnRef, ColumnExpression)):
             raise CompileError(
                 f"a sort key is a column reference, a projected "
                 f"expression, or an aggregate, got "
@@ -512,6 +644,9 @@ class HavingTest:
     value: Any
 
     type_name: ClassVar[str] = "quail.having_test"
+
+    def __post_init__(self):
+        object.__setattr__(self, "value", literal_value(self.value))
 
     def validate(self) -> None:
         self.aggregate.validate()

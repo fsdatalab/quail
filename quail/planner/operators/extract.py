@@ -5,19 +5,16 @@ from dataclasses import replace
 from quail.cost import budgets
 from quail.cost import extract as extract_cost
 from quail.cost.dense_decoder_cost import dense_params
-from quail.logical import effective_selectivity
 from quail.physical import (
     AiExtract,
     ExtractSpec,
-    Filter,
     PortRef,
 )
-from quail.physical.base import input_ports
-from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import (
     bind_inference,
     inference_node,
 )
+from quail.planner.operators.frontier import Frontier
 
 
 def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
@@ -33,8 +30,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         call: Logical AI.EXTRACT call.
         name: Result column name.
         live: Expected number of documents to extract from.
-        shared: Whether an extraction of the same table runs right
-            before this one.
+        shared: Whether the preceding operator leaves the document KV resident.
     """
     prompt = context.lowered(call.prompt)
     (ref,) = call.prompt.args
@@ -58,11 +54,13 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         model=context.model, device=context.device, resident=shared,
         max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens,
         draft_policy=spec.draft_policy,
-        round_cost_per_token=spec.round_cost_per_token, workers=context.gpu_count)
+        round_cost_per_token=spec.round_cost_per_token, workers=context.gpu_count,
+        memo=context.memo)
     return replace(spec, estimated_seconds=cost.seconds)
 
 
-def emit_extract(builder, alias, live, names, frontier, resident=False) -> tuple:
+def emit_extract(builder, alias, live, names, frontier, resident=False,
+                 tests=None) -> tuple:
     """Copy the answers of the alias's documents.
 
     A Filter on an extraction's answer or span follows that extraction
@@ -77,6 +75,7 @@ def emit_extract(builder, alias, live, names, frontier, resident=False) -> tuple
         frontier: Where the documents stand before the extractions.
         resident: Whether the step before the run left the documents'
             KV for the first extraction to read.
+        tests: Tests to emit with these calls, or None for all their tests.
 
     Returns:
         Where the documents stand after them, and the rows ports of
@@ -85,7 +84,8 @@ def emit_extract(builder, alias, live, names, frontier, resident=False) -> tuple
     extracts = {node.name: node for node in builder.operators.extracts
                 if node.alias == alias}
     calls = [extracts[name] for name in names]
-    tests = builder.operators.extract_filters.get(alias, ())
+    tests = (builder.operators.extract_filters.get(alias, ())
+             if tests is None else tests)
     answer_ports = []
     for index, logical_node in enumerate(calls):
         # the extractions of a table and the Filters on their answers
@@ -101,16 +101,11 @@ def emit_extract(builder, alias, live, names, frontier, resident=False) -> tuple
         builder.nodes.append(node)
         frontier = Frontier(PortRef(node.node_id, f"ids:{alias}"),
                             PortRef(node.node_id, "rows"))
-        for test in tests:
-            if test.name != logical_node.name:
-                continue
-            lid = f"filter:{alias}:{test.position}"
-            builder.nodes.append(Filter(
-                node_id=lid, inputs=input_ports((frontier.rows,)),
-                predicate=test.condition, aliases=(alias,),
-                selectivity=test.selectivity, written_pos=test.position))
-            frontier = Frontier(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
-            live *= effective_selectivity(test.selectivity)
+        for column in (logical_node.name, logical_node.span_name):
+            builder.value_ports[(alias, column)] = frontier.rows
+        frontier, live = builder.emit_tests(
+            alias, [test for test in tests if test.name == logical_node.name],
+            frontier, live)
         answer_ports.append(frontier.rows)
     return frontier, answer_ports
 

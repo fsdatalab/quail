@@ -29,30 +29,22 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
     ids = id_positions(source.ids[alias] if isinstance(source, Rows) else source)
     last = max(index for index, node in enumerate(pipeline)
                if node.backend is not None)
-    members, trailing = pipeline[:last + 1], pipeline[last + 1:]
 
     def group_key(node):
         implementation = implementations[node.type_name]
         return node.type_name, None if implementation.combine else node.node_id
 
     parts = []
-    for _, group in groupby(members, group_key):
+    for _, group in groupby(pipeline, group_key):
         nodes = list(group)
         parts.append(implementations[nodes[0].type_name].prepare(
             state, nodes, ids, parts, inputs, context))
     prefixes = DocumentPrefixes(first.document_head, context.state["docs"][alias], ids)
     results = execute_parts(
-        state, parts, prefixes, DocumentKeys(alias, ids), keep_kv=members[-1].keep_kv,
+        state, parts, prefixes, DocumentKeys(alias, ids),
+        keep_kv=pipeline[last].keep_kv,
         tree=execution_prefix_tree(first, prefixes, state.loaded_model.arena),
         limit=context.state.get("filter_limit"),
         attention=getattr(first, "attention", None) or None,
         label=f"pipeline {alias}")
-    for member in trailing:
-        member_inputs = dict(inputs[member.node_id])
-        for port in member.inputs:
-            if port.source.node_id in results:
-                member_inputs[port.name] = results[
-                    port.source.node_id].outputs[port.source.port]
-        results[member.node_id] = context.runtimes[
-            member.runtime_key].execute(member, member_inputs, context)
     return results

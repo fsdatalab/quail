@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from quail.cost.budgets import parallel_copies
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, triangle
 from quail.specs import DeviceSpec, ModelSpec
@@ -95,7 +96,8 @@ class ScoreCost:
             groups=groups, shared_tokens=shared, copies=self.workers,
         )
         estimate = speed_of_light(
-            work * (1 / max(1, min(self.workers, expected_inputs))),
+            work * (1 / parallel_copies(self.workers,
+                                       min(expected_inputs, summaries[0].count))),
             self.model, self.device, self.chunk_tokens,
         ).seconds
         return work, estimate

@@ -309,7 +309,7 @@ def allowed_members_by_anchor(anchor, partners, anchor_ids, members, pairs) -> l
             for anchor_id in anchor_ids]
 
 
-def join_answers(spec, rows, answers, anchor, partners) -> pa.Table:
+def join_answers(spec, rows, answers, anchor) -> pa.Table:
     columns = {
         alias: [int(row[index]) for row in rows]
         for index, alias in enumerate(spec.aliases)
@@ -320,7 +320,6 @@ def join_answers(spec, rows, answers, anchor, partners) -> pa.Table:
         "join_answers",
         metadata={
             "anchor": anchor,
-            "partners": ",".join(partners),
             "semantics": spec.semantics,
             "written_pos": spec.written_pos,
             **(

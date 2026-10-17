@@ -80,9 +80,8 @@ class ArrowDatasetProvider:
         return self.dataset.schema
 
     def content_identity(self) -> str:
-        files = tuple(sorted(getattr(self.dataset, "files", ()) or ()))
-        value = repr((files, str(self.dataset.schema))).encode("utf-8")
-        return "arrow:" + hashlib.sha256(value).hexdigest()
+        # A dataset includes scan options and row order, not just its source files.
+        return f"arrow:{id(self.dataset)}"
 
     def statistics(self) -> TableStatistics:
         return TableStatistics(row_count=int(self.dataset.count_rows()))

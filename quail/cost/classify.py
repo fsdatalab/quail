@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from quail.cost.budgets import parallel_copies
 from quail.cost.dense_decoder_cost import decoder_seconds
 from quail.cost.work import Work, ask, decode, stream
 from quail.labels import (
@@ -119,7 +120,8 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0, runs=None,
                     answer_rows: float | None = None,
-                    head_rows: int = 0) -> ClassifyCost:
+                    head_rows: int = 0, memo: dict | None = None,
+                    workers: int = 1) -> ClassifyCost:
     """Estimate expected classification work and its roofline time.
 
     Args:
@@ -143,6 +145,9 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
             row per decode round.
         head_rows: Output-head rows each answer row multiplies; 0 is the
             whole vocabulary. A decision model ignores it.
+        workers: Model copies sharing balanced document work.
+        memo: Query-local cache of document work, independent of live count.
+            Lengths and shared-prefix arrays must be immutable during planning.
 
     Returns:
         Expected work over the documents, scaled to live, priced at
@@ -151,39 +156,54 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
     n = len(lengths)
     if live <= 0 or n == 0 or not (suffixes or runs):
         return ClassifyCost(0.0, 0.0, Work(), 0.0, 0)
-    window = model.sliding_window
-    prefix = np.asarray(lengths, dtype=float) + head_tokens
-    shared = np.asarray(shared if len(shared) else np.zeros(n), dtype=float)
-    # a borrowed prefix includes the prompt head the documents share
-    shared = np.where(shared > 0, shared + head_tokens, 0.0)
-    if runs is not None:
-        work = Work()
-        suffix_tokens = rows = 0.0
-        for fed, count in Counter(tuple(fed) for fed in runs).items():
-            share = count / len(runs)
-            work += _rounds_work(prefix, shared, frame_tokens, fed, resident,
-                                 window, canvas_rows) * share
-            suffix_tokens += sum(fed) * share
-            rows += len(fed) * share
-        rounds = max(map(len, runs))
+    key = ("classify_work", id(lengths), id(shared), head_tokens, frame_tokens,
+           tuple(suffixes), None if runs is None else tuple(map(tuple, runs)),
+           model.sliding_window, resident, canvas_rows)
+    cached = None if memo is None else memo.get(key)
+    if cached is not None:
+        _, _, work, suffix_tokens, rows, rounds = cached
     else:
-        work = (_first_work(prefix, shared, frame_tokens, resident, window)
-                + _stream_work(prefix + frame_tokens, suffixes, window, canvas_rows))
-        suffix_tokens = float(sum(suffixes))
-        rows = float(canvas_rows or sum(suffixes))
-        rounds = 1
+        source_shared = shared
+        window = model.sliding_window
+        values = getattr(lengths, "arrow_array", lengths)
+        prefix = np.asarray(values, dtype=float) + head_tokens
+        shared = np.asarray(shared if len(shared) else np.zeros(n), dtype=float)
+        # a borrowed prefix includes the prompt head the documents share
+        shared = np.where(shared > 0, shared + head_tokens, 0.0)
+        if runs is not None:
+            work = Work()
+            suffix_tokens = rows = 0.0
+            for fed, count in Counter(tuple(fed) for fed in runs).items():
+                share = count / len(runs)
+                work += _rounds_work(prefix, shared, frame_tokens, fed, resident,
+                                     window, canvas_rows) * share
+                suffix_tokens += sum(fed) * share
+                rows += len(fed) * share
+            rounds = max(map(len, runs))
+        else:
+            work = (_first_work(prefix, shared, frame_tokens, resident, window)
+                    + _stream_work(prefix + frame_tokens, suffixes,
+                                   window, canvas_rows))
+            suffix_tokens = float(sum(suffixes))
+            rows = float(canvas_rows or sum(suffixes))
+            rounds = 1
+        if memo is not None:
+            # Keep arrays alive so a later input cannot reuse their identities.
+            memo[key] = (lengths, source_shared, work, suffix_tokens, rows, rounds)
     if answer_rows is not None:
         rows = answer_rows
     total = work * (live / n)
     passes = total.tokens / chunk
-    seconds = decoder_seconds(total, rows * live, passes, model, device, head_rows)
+    copies = parallel_copies(workers, min(live, n))
+    seconds = decoder_seconds(total * (1 / copies), rows * live / copies,
+                              passes / copies, model, device, head_rows)
     return ClassifyCost(seconds, passes, total, suffix_tokens * live, rounds)
 
 
 def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
              labels, *, lengths, shared, chunk: int,
              model, device, resident: bool = False, draws: int = 1,
-             starts=()) -> ClassifyCost:
+             starts=(), memo: dict | None = None, workers: int = 1) -> ClassifyCost:
     """Estimate the cost of one classification scoring rule.
 
     Args:
@@ -200,6 +220,9 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         resident: Whether document KV is already available.
         draws: Maximum number of diffusion draws per document.
         starts: Per label, which tokens begin a new word.
+        workers: Model copies sharing balanced document work.
+        memo: Query-local cache of document work, independent of live count.
+            Lengths and shared-prefix arrays must be immutable during planning.
 
     Returns:
         Estimated execution time, work, and token counts.
@@ -226,4 +249,4 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         head_rows=len(targets) if all(len(ids) == 1 for ids in labels) else 0,
         canvas_rows=(canvas_rows if scoring == LETTERS_SCORING
                      else model.canvas_tokens),
-        runs=runs, answer_rows=answer_rows)
+        runs=runs, answer_rows=answer_rows, memo=memo, workers=workers)

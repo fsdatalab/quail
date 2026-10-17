@@ -24,10 +24,8 @@ def document_ids(value) -> pa.Array:
         value = value.column(0)
     if isinstance(value, pa.ChunkedArray):
         value = value.combine_chunks()
-    elif isinstance(value, np.ndarray):
-        value = pa.array(value)
     elif not isinstance(value, pa.Array):
-        value = pa.array(value, type=pa.int64())
+        value = pa.array(value)
     if value.null_count:
         raise ValueError("a document id is null")
     return value if value.type == ID_TYPE else value.cast(ID_TYPE)

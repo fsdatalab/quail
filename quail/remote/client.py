@@ -27,12 +27,46 @@ import pyarrow.ipc as ipc
 
 from quail.execution.result import QueryResult
 from quail.progress import say
-from quail.remote.artifacts import result_from_parts
+from quail.remote.artifacts import read_answer_tables, result_from_parts
 from quail.remote.inputs import PreparedInput, describe
 from quail.remote.records import QueryFailedError, QueryStatus, ServerError
 
 DEFAULT_POLL_S = 30.0
 TOKEN_VARIABLE = "QUAIL_SERVER_TOKEN"
+
+
+class _ResponseReader(ipc.RecordBatchStreamReader):
+    """Read an IPC stream and own its HTTP response."""
+
+    def __init__(self, response):
+        self._response = response
+        try:
+            super().__init__(pa.PythonFile(response, mode="r"))
+        except BaseException:
+            response.close()
+            raise
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self._response.close()
+
+    def read_next_batch(self):
+        return self.read_next_batch_with_custom_metadata()[0]
+
+    def read_next_batch_with_custom_metadata(self):
+        try:
+            return super().read_next_batch_with_custom_metadata()
+        except BaseException:
+            self.close()
+            raise
+
+    def read_all(self):
+        try:
+            return super().read_all()
+        finally:
+            self.close()
 
 
 class ServerClient:
@@ -137,25 +171,19 @@ class ServerClient:
         return self._request("GET", f"/v1/queries/{query_id}/files/{name}",
                              raw=True)
 
-    def result_batches(self, query_id: str) -> pa.RecordBatchReader:
+    def result_batches(self, query_id: str, *, limit: int | None = None
+                       ) -> pa.RecordBatchReader:
         """Open the saved result as a stream of Arrow record batches.
 
         The connection stays open until the reader is exhausted or
         closed.
         """
+        query = ("" if limit is None
+                 else "?" + urllib.parse.urlencode({"limit": limit}))
         response = self._open(
-            "GET", f"/v1/queries/{query_id}/result",
+            "GET", f"/v1/queries/{query_id}/result{query}",
             headers={"accept": "application/vnd.apache.arrow.stream"})
-        reader = ipc.open_stream(pa.PythonFile(response, mode="r"))
-
-        def batches():
-            try:
-                yield from reader
-            finally:
-                reader.close()
-                response.close()
-
-        return pa.RecordBatchReader.from_batches(reader.schema, batches())
+        return _ResponseReader(response)
 
 
 def _server_error(error: urllib.error.HTTPError) -> ServerError:
@@ -172,23 +200,6 @@ def _server_error(error: urllib.error.HTTPError) -> ServerError:
 def _table(payload: bytes) -> pa.Table:
     with ipc.open_file(pa.BufferReader(payload)) as reader:
         return reader.read_all()
-
-
-def _limited(reader: pa.RecordBatchReader, limit: int) -> pa.RecordBatchReader:
-    """The first ``limit`` rows of a reader, then it is closed."""
-
-    def batches():
-        left = limit
-        try:
-            for batch in reader:
-                if left <= 0:
-                    break
-                yield batch.slice(0, min(left, batch.num_rows))
-                left -= batch.num_rows
-        finally:
-            reader.close()
-
-    return pa.RecordBatchReader.from_batches(reader.schema, batches())
 
 
 class QueryRun:
@@ -278,11 +289,12 @@ class QueryRun:
             raise QueryFailedError(status)
         return status
 
-    def stream_result(self, poll_s: float = DEFAULT_POLL_S
+    def stream_result(self, poll_s: float = DEFAULT_POLL_S, *,
+                      limit: int | None = None
                       ) -> pa.RecordBatchReader:
         """Wait for completion and stream the result rows batch by batch."""
         self.wait(poll_s)
-        return self._client.result_batches(self.id)
+        return self._client.result_batches(self.id, limit=limit)
 
     def result(self, poll_s: float = DEFAULT_POLL_S) -> QueryResult:
         """Wait for completion and return the saved result.
@@ -294,16 +306,9 @@ class QueryRun:
         files = status.result["files"]
         table = self._client.result_batches(self.id).read_all()
         report = json.loads(self._client.file(self.id, files["report"]))
-        filters = {
-            (entry["alias"], entry["position"]):
-                _table(self._client.file(self.id, entry["file"]))
-            for entry in files["answers"]["filters"]
-        }
-        joins = {
-            entry["position"]: _table(self._client.file(self.id, entry["file"]))
-            for entry in files["answers"]["joins"]
-        }
-        return result_from_parts(table, report, filters, joins, self._codecs)
+        answers = read_answer_tables(
+            files["answers"], lambda name: _table(self._client.file(self.id, name)))
+        return result_from_parts(table, report, answers, self._codecs)
 
 
 class RemoteConnection:
@@ -412,8 +417,9 @@ class RemoteQuery:
         The server chooses the batch size; ``batch_rows`` is accepted for
         the local signature and ignored.
         """
-        reader = self.submit().stream_result()
-        return reader if limit is None else _limited(reader, limit)
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be nonnegative")
+        return self.submit().stream_result(limit=limit)
 
     def explain(self, **_options) -> str:
         raise RuntimeError(

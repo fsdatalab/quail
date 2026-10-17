@@ -5,8 +5,8 @@ gate_up, fp8 weights and block scales laid out for DeepGEMM. No
 engine, no scheduler, no KV pool. vLLM is a library here (loader and
 kernels), nothing more.
 
-After load, only the TRUE/FALSE output rows are retained. The full
-output head is discarded; shared input embeddings remain available.
+The loaded model retains TRUE/FALSE output rows and the full output
+head in bf16 for AI.CLASSIFY. Shared input embeddings remain available.
 
 A Decision 2.0 checkpoint keeps its Qwen3 backbone in a subfolder
 under its own tensor names; `engine_args` points vLLM at it.
@@ -17,28 +17,10 @@ instead of starting NCCL or gloo.
 """
 
 import json
-from functools import lru_cache
 from pathlib import Path
 
 from quail.backends.quail.executor.moe_configs import write_configs
-from quail.progress import say
-
-
-@lru_cache(maxsize=8)
-def resolve_model_path(model_name: str, revision: str | None = None) -> str:
-    """Download one model revision and return its local directory."""
-    path = Path(model_name).expanduser()
-    if path.is_dir():
-        return str(path.resolve())
-    from huggingface_hub import snapshot_download
-
-    say(f"preparing model files: {model_name}")
-    path = snapshot_download(
-        repo_id=model_name, revision=revision or None,
-        allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt", "*.tiktoken"],
-    )
-    say(f"model files ready: {path}")
-    return path
+from quail.specs.files import resolve_model_path
 
 
 def is_decision2(path) -> bool:

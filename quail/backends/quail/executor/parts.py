@@ -10,7 +10,7 @@ from typing import Any, ClassVar
 import numpy as np
 
 from quail.backends.quail.executor.chunk import InputStaging
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stages import Stage, frame_writes, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import prefix_tree
 from quail.logical import effective_selectivity
@@ -55,12 +55,14 @@ class ExecutionPart(ABC):
     """
 
     stages: Sequence[Stage]
+    nodes: Sequence = ()
+    tested_columns: tuple[str, ...] = ()
     combine: ClassVar[bool] = False
     execute_group: ClassVar[Callable | None] = None
     gate = None
     document_done = None
-    result_value = None
     appended_tokens = 0
+    frame_tokens = 0
     on_settled = None
     attention = None
 
@@ -104,6 +106,14 @@ class ExecutionPart(ABC):
 
 class SingleResultPart(ExecutionPart):
     """Prepared work whose execution produces one result."""
+
+    result_value = None
+
+    @property
+    def nodes(self) -> tuple:
+        """Return the physical node, or no nodes for a standalone request."""
+        node = getattr(self, "node", None)
+        return () if node is None else (node,)
 
     @abstractmethod
     def result(self, tokens, gpu_s, chunks, stats) -> Any:
@@ -157,17 +167,14 @@ def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
 
 
 def gated_stages(parts) -> list:
-    """Combine operator stages and attach intervening conditions.
+    """Combine operator stages and attach conditions before document completion.
 
     Args:
         parts: Pipeline parts in execution order. Parts without stages
-            contribute a condition checked before the next stage.
+            contribute a condition checked before the next stage or completion.
 
     Returns:
         The combined Stage list, with conditions attached to stage requests.
-
-    Raises:
-        ValueError: A trailing condition has no following stage.
     """
     for implementation, group in groupby(parts, type):
         implementation.prepare_group(list(group))
@@ -198,7 +205,19 @@ def gated_stages(parts) -> list:
             pending = []
         stages.extend(part.stages)
     if pending:
-        raise ValueError("a pipeline ends with a gate and no stage after it")
+        def finish(key):
+            for gate in pending:
+                if gate(key) is Stage.DROP:
+                    return Stage.DROP
+            return Stage.SKIP
+
+        # A skipped terminal stage counts a survivor without a model request.
+        terminal = Stage(suffixes=[], readout=stages[-1].readout, requests=finish)
+        parts[-1].stages = [terminal]
+        stages.append(terminal)
+    writes = frame_writes(stages)
+    for part, (low, high) in zip(parts, _part_slices(parts)):
+        part.frame_tokens = len(stages[low].frame) if low < high and writes[low] else 0
     return stages
 
 
@@ -270,9 +289,7 @@ def expected_survival(parts) -> float:
     """The fraction of documents expected to pass every part, by selectivity."""
     survival = 1.0
     for part in parts:
-        nodes = getattr(part, "nodes", None) or (
-            (part.node,) if hasattr(part, "node") else ())
-        for node in nodes:
+        for node in part.nodes:
             if hasattr(node, "selectivity"):
                 survival *= effective_selectivity(node.selectivity)
     return survival

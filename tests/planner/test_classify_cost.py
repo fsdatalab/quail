@@ -291,7 +291,7 @@ def test_classify_and_score_capacity_follow_the_plans_arena_split():
     # every-token pool more pages than the split for unknown lengths
     context = SimpleNamespace(
         document_tokens={"short": [300] * 8, "long": [4096] * 8}, model=model,
-        device=H100_SXM, canvas_draws=1, memo={})
+        device=H100_SXM, canvas_draws=1, memo={}, gpu_count=1)
     planned = budgets.arena_tokens(model, H100_SXM, chunk, 4096)
     assert planned > budgets.arena_tokens(model, H100_SXM, chunk)
     # the longest table's mean, as plan_statistics splits the pools
@@ -301,3 +301,88 @@ def test_classify_and_score_capacity_follow_the_plans_arena_split():
     dense = SimpleNamespace(**{**vars(context), "model": QWEN3_4B_FP8, "memo": {}})
     assert arena_capacity(dense, chunk) == budgets.arena_tokens(
         QWEN3_4B_FP8, H100_SXM, chunk)
+
+
+@pytest.mark.parametrize("scoring", ["letters", "trie_tree", "trie_decode"])
+def test_memo_reuses_classification_work_across_counts_and_pricing(
+        monkeypatch, scoring):
+    from quail.cost import classify
+
+    lengths = (100, 500, 8000)
+    cases = [(live, chunk, device, workers)
+             for workers in (1, 4)
+             for live in (0, 0.25, 1, 3, 6)
+             for chunk in (1000, 10000)
+             for device in (H100_SXM, replace(H100_SXM, hbm_bw=H100_SXM.hbm_bw / 2))]
+    expected = [_cost(lengths, scoring=scoring, live=live, chunk=chunk, device=device,
+                      workers=workers)
+                for live, chunk, device, workers in cases]
+    calls = []
+    original = classify._first_work
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(classify, "_first_work", counted)
+    memo = {}
+    actual = [_cost(lengths, scoring=scoring, live=live, chunk=chunk, device=device,
+                    memo=memo, workers=workers)
+              for live, chunk, device, workers in cases]
+    assert actual == expected
+    assert len(calls) == (3 if scoring == "trie_decode" else 1)
+
+
+def test_memo_separates_classification_work_and_readout_settings():
+    lengths = [100, 500]
+    options = dict(live=2, lengths=lengths, shared=(), chunk=CHUNK,
+                   model=QWEN3_4B_FP8, device=H100_SXM)
+    variants = [
+        {}, {"resident": True}, {"shared": [80, 200]}, {"canvas_rows": 4},
+        {"runs": ((1,), (1, 2))}, {"answer_rows": 5}, {"head_rows": 3},
+        {"model": replace(QWEN3_4B_FP8, sliding_window=128)},
+        {"lengths": [200, 1000]}, {"lengths": []},
+    ]
+    memo = {}
+    for head, frame, suffixes in ((2, 3, [1]), (4, 3, [1]), (2, 5, [1, 2])):
+        for variant in variants:
+            settings = {**options, **variant}
+            assert estimate_suffixes(head, frame, suffixes, memo=memo, **settings) == (
+                estimate_suffixes(head, frame, suffixes, **settings))
+
+
+def test_classification_planner_shares_memo_without_copying_length_columns():
+    import pyarrow as pa
+
+    from quail.planner.operators.classify import classify_scoring
+    from quail.planner.optimizer.context import PlanningContext
+
+    class Lengths:
+        arrow_array = pa.chunked_array([[100, 500]])
+
+        def __len__(self):
+            return 2
+
+    lengths = Lengths()
+    context = PlanningContext(
+        document_tokens={"r": lengths}, model=QWEN3_4B_FP8, device=H100_SXM)
+    # Recreating a scorer must preserve the source identity used by the memo.
+    first = classify_scoring(context, "r")
+    later = classify_scoring(context, "r")
+    assert first.lengths is later.lengths is lengths
+    first.estimate("trie_decode", 2, HEAD, FRAME, LABELS, False)
+    actual = later.estimate("trie_decode", 1, HEAD, FRAME, LABELS, False)
+    assert actual == _cost([100, 500], live=1, chunk=later.chunk)
+    assert len([key for key in context.memo if key[0] == "classify_work"]) == 1
+
+
+@pytest.mark.parametrize("scoring", ["letters", "trie_tree", "trie_decode"])
+@pytest.mark.parametrize("documents,workers", [(8, 2), (8, 4), (1, 8), (2, 8)])
+def test_parallel_classification_prices_active_copies(scoring, documents, workers):
+    lengths = [1000] * documents
+    serial = _cost(lengths, scoring=scoring)
+    parallel = _cost(lengths, scoring=scoring, workers=workers)
+    assert parallel.work == serial.work
+    assert parallel.passes == serial.passes
+    assert parallel.suffix_tokens == serial.suffix_tokens
+    assert parallel.seconds == pytest.approx(serial.seconds / min(documents, workers))

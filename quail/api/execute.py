@@ -1,7 +1,9 @@
 """Run a query in the current process."""
 
-import os
+import atexit
 import time
+from contextlib import nullcontext
+from threading import RLock
 
 from quail.backends import BackendExecutionContext
 from quail.execution.types import PhysicalRequest, PhysicalResponse
@@ -12,8 +14,39 @@ from quail.physical import (
 )
 from quail.planner.plan import Refusal, RefusalError
 
-# Loaded models outlive individual sessions.
-_BACKEND_STATE: dict = {}
+
+class _BackendState:
+    """Own one backend configuration and serialize its local query execution."""
+
+    def __init__(self):
+        self.lock = RLock()
+        self.configuration = None
+        self.state = {}
+        self.release = None
+
+    def bind(self, envelope, registry, backend):
+        configuration = (
+            getattr(backend, "engine_name", backend.name),
+            registry.model(envelope["model"]),
+            registry.device(envelope["device"]), envelope["workers"],
+        )
+        if configuration != self.configuration:
+            self.close()
+            self.configuration = configuration
+            self.release = getattr(backend, "release_request", None)
+        return self.state
+
+    def close(self):
+        with self.lock:
+            if self.release is not None:
+                self.release(self.state)
+            self.state.clear()
+            self.configuration = self.release = None
+
+
+_BACKEND_STATE = _BackendState()
+atexit.register(_BACKEND_STATE.close)
+
 
 def gpu_problem() -> str | None:
     """Return why this process cannot run a model, or None when it can."""
@@ -21,8 +54,6 @@ def gpu_problem() -> str | None:
         import torch
     except ImportError:
         return "torch is not installed"
-    # the default check initializes CUDA, which breaks vLLM's forked engine
-    os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
     if not torch.cuda.is_available():
         return "no CUDA GPU is visible to this process"
     return None
@@ -60,7 +91,7 @@ def _execute_physical(request, registry):
         graph=graph,
         registry=registry,
         gpu_count=request.gpu_count,
-        runtime_state=_BACKEND_STATE,
+        runtime_state=_BACKEND_STATE.bind(request.plan, registry, backend),
     ))
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a model backend must return PhysicalResponse")
@@ -101,25 +132,26 @@ def execute_query(query, physical_executor=None, plan=None,
     plan.graph.validate_backend(plan.backend)
     if plan.workers > 8:
         raise NotImplementedError("query execution supports at most 8 GPUs")
-    if physical_executor is None:
-        # Backend startup must not wait for background tokenization.
-        _prepare_backend(plan, query.session.registry)
-    if on_backend_ready is not None:
-        on_backend_ready()
-    query.wait_for_tokens()
-    physical_prepare_started = time.perf_counter()
-    request = query._prepare_physical()
-    physical_prepare_s = time.perf_counter() - physical_prepare_started
-    if on_execution_ready is not None:
-        on_execution_ready()
-    started = time.perf_counter()
-    response = (
-        physical_executor(request) if physical_executor is not None
-        else _execute_physical(request, query.session.registry)
-    )
-    if not isinstance(response, PhysicalResponse):
-        raise TypeError("a physical executor must return PhysicalResponse")
-    coordinator_wall_s = time.perf_counter() - started
+    with (_BACKEND_STATE.lock if physical_executor is None else nullcontext()):
+        if physical_executor is None:
+            # Backend startup must not wait for background tokenization.
+            _prepare_backend(plan, query.session.registry)
+        if on_backend_ready is not None:
+            on_backend_ready()
+        query.wait_for_tokens()
+        physical_prepare_started = time.perf_counter()
+        request = query._prepare_physical()
+        physical_prepare_s = time.perf_counter() - physical_prepare_started
+        if on_execution_ready is not None:
+            on_execution_ready()
+        started = time.perf_counter()
+        response = (
+            physical_executor(request) if physical_executor is not None
+            else _execute_physical(request, query.session.registry)
+        )
+        if not isinstance(response, PhysicalResponse):
+            raise TypeError("a physical executor must return PhysicalResponse")
+        coordinator_wall_s = time.perf_counter() - started
     finish_started = time.perf_counter()
     result = query.finish(response, coordinator_wall_s)
     finish_s = time.perf_counter() - finish_started
@@ -140,14 +172,15 @@ def execute_query(query, physical_executor=None, plan=None,
 def _prepare_backend(plan, registry) -> None:
     """Let the backend boot from the plan alone, before documents arrive."""
     backend = registry.backend(plan.backend)
+    envelope = plan.to_envelope(registry.codecs)
+    state = _BACKEND_STATE.bind(envelope, registry, backend)
     prepare = getattr(backend, "prepare_request", None)
     if prepare is None:
         return
-    envelope = plan.to_envelope(registry.codecs)
     prepare(BackendExecutionContext(
         request=PhysicalRequest(envelope, {}),
         graph=plan.graph,
         registry=registry,
         gpu_count=plan.workers,
-        runtime_state=_BACKEND_STATE,
+        runtime_state=state,
     ))

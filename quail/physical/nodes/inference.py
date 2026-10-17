@@ -111,12 +111,10 @@ class AiInference(PhysicalNode):
     def outputs(self) -> tuple[OutputPort, ...]:
         if self.spec is None:
             return ()
-        columns = (self.spec.output_columns if self.answer_kind == "extracts"
-                   else (*self.spec.aliases, self.spec.name))
         ports = (OutputPort("rows", ValueType.ROWS,
                             schema=self.spec.output_columns,
                             answer=AnswerOutput(self.answer_kind, self.spec.name,
-                                                columns)),)
+                                                self.spec.output_columns)),)
         if self.document_ids and len(self.spec.aliases) == 1:
             (alias,) = self.spec.aliases
             ports += (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,

@@ -83,6 +83,67 @@ class _FakeFilterEngine:
             outputs=[SimpleNamespace(token_ids=[1], text="TRUE")],
         )]
 
+    def abort_request(self, request_ids):
+        self.events.extend(("abort", request_id) for request_id in request_ids)
+        self.pending = [item for item in self.pending if item[0] not in request_ids]
+
+
+@pytest.mark.parametrize("failure", ["render", "submit", "step", "answer", "cancel"])
+def test_filter_failure_releases_requests_before_reusing_engine(monkeypatch, failure):
+    engine = _FakeFilterEngine()
+    error = KeyboardInterrupt if failure == "cancel" else RuntimeError
+    kwargs = {
+        "sampling_params": object(),
+        "body_ids": [[1], [2]],
+        "question_ids": [[9]],
+        "budget_tokens": 100,
+        "max_num_seqs": 2,
+        "tag": "retry",
+    }
+
+    def fail(*args, **kwargs):
+        raise error("request failed")
+
+    with monkeypatch.context() as patch:
+        read_answer = READ_ANSWER
+        if failure == "render":
+            def render(prompt):
+                if prompt == "second?":
+                    fail()
+                return {"prompt_token_ids": [1, 9]}
+
+            kwargs.update(body_texts=["first", "second"], question_texts=["?"],
+                          render_prompt=render)
+        elif failure == "submit":
+            add_request = engine.add_request
+
+            def submit(request_id, prompt, sampling_params):
+                add_request(request_id, prompt, sampling_params)
+                if request_id == "retry-1-0":
+                    fail()
+
+            patch.setattr(engine, "add_request", submit)
+        elif failure == "step":
+            patch.setattr(engine, "step", fail)
+        else:
+            read_answer = fail
+        with pytest.raises(error, match="request failed"):
+            run_filter_sequence(engine, read_answer=read_answer, **kwargs)
+
+    assert not engine.pending
+    aborted = [request_id for event, request_id in engine.events if event == "abort"]
+    assert aborted
+    assert set(aborted) <= {"retry-0-0", "retry-1-0"}
+    for key in ("body_texts", "question_texts", "render_prompt"):
+        kwargs.pop(key, None)
+    result = run_filter_sequence(engine, read_answer=READ_ANSWER, **kwargs)
+    assert result["survivors"] == [0, 1]
+    assert result["requests"] == 2
+    assert not engine.pending
+    assert [request_id for event, request_id in engine.events if event == "abort"] == (
+        aborted
+    )
+
 
 def test_filter_sequences_pipeline_refill_fail_and_take_empty_input():
     engine = _FakeFilterEngine()

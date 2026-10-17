@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
 
 from quail.backends.base import GpuContext
+from quail.backends.resources import release_models
 from quail.baselines.execution import RequestModelExecution
 from quail.baselines.nodes import RequestExecution
 from quail.baselines.planning import plan_request_backend
@@ -110,14 +113,27 @@ def _warm_boot() -> dict:
     }
 
 
+@dataclass
+class LoadedRequestEngine:
+    """Own a request engine and its settings."""
+
+    settings: dict
+    resources: ExitStack
+    prepared_boot: dict | None = None
+
+    def close(self):
+        """Stop the engine's workers."""
+        self.resources.close()
+
+
 @dataclass(frozen=True)
 class RequestBackend:
     """A model backend that submits one request per prompt to an engine.
 
     The engine adapter boots vLLM or SGLang and returns a client with
-    generate, reset_prefix_cache, and run_filter_sequence. The submission
-    strategies decide how filter stages and join tuples become
-    requests.
+    generate, reset_prefix_cache, and run_filter_sequence. Each engine registers
+    its client with the supplied resource stack before finishing startup.
+    The submission strategies decide how filter stages and join tuples become requests.
     """
 
     name: str
@@ -125,6 +141,11 @@ class RequestBackend:
     filter_submission: str
     join_submission: str = "anchor-major"
     locates_answers_in_text = False
+
+    @property
+    def engine_name(self) -> str:
+        """Name the loaded engine shared by compatible submission strategies."""
+        return self.engine.kind
 
     @property
     def runtime_package(self) -> str:
@@ -165,17 +186,39 @@ class RequestBackend:
     def start(self, context):
         return RequestModelExecution(context)
 
-    def execute_request(self, context):
+    def _load_engine(self, context):
         envelope = context.request.plan
         model = context.registry.model(envelope["model"])
-        state_key = ("request-engine", self.engine.kind, model.name)
-        engine_state = context.runtime_state.get(state_key)
+        engine_state = context.runtime_state.get("engine")
         if engine_state is None:
             allowed_ids = sorted(set(
                 envelope["settings"]["true_ids"]
             ) | set(envelope["settings"]["false_ids"]))
-            engine_state, boot = self.engine.boot(model, allowed_ids)
-            context.runtime_state[state_key] = engine_state
+            started = time.perf_counter()
+            with ExitStack() as rollback:
+                rollback.callback(release_models, context.runtime_state)
+                engine_state = LoadedRequestEngine({}, ExitStack())
+                context.runtime_state["engine"] = engine_state
+                engine_state.settings, boot = self.engine.boot(
+                    model, allowed_ids, resources=engine_state.resources)
+                boot = {**boot, "boot_s": round(time.perf_counter() - started, 2)}
+                rollback.pop_all()
         else:
             boot = _warm_boot()
-        return execute_request_graph(context, self, engine_state, boot)
+        return engine_state, boot
+
+    def prepare_request(self, context) -> None:
+        """Load and warm the engine before waiting for query documents."""
+        engine_state, boot = self._load_engine(context)
+        engine_state.prepared_boot = boot
+
+    def execute_request(self, context):
+        engine_state, boot = self._load_engine(context)
+        if engine_state.prepared_boot is not None:
+            boot = engine_state.prepared_boot
+            engine_state.prepared_boot = None
+        return execute_request_graph(context, self, engine_state.settings, boot)
+
+    def release_request(self, state) -> None:
+        """Release the request engine loaded for this configuration."""
+        release_models(state)

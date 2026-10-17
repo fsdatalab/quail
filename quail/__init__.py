@@ -3,6 +3,7 @@
 from quail.api import Query, RefusalError, Session
 from quail.catalog import DocumentProvider, ScanRequest, TableProvider
 from quail.execution.result import QueryResult
+from quail.execution.rows import Rows
 from quail.extensions import ExtensionRegistry
 from quail.frontend.expressions import col, prompt
 from quail.frontend.sql import SQLDialect
@@ -35,6 +36,7 @@ __all__ = [
     "QueryRun",
     "QueryStatus",
     "RefusalError",
+    "Rows",
     "ScanRequest",
     "Session",
     "SpeedOfLightEstimate",

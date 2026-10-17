@@ -38,7 +38,7 @@ def plan_region(region, context) -> tuple[PhysicalCandidate, ...]:
         context=context)
     if isinstance(plan, Refusal):
         return (PhysicalCandidate(None, plan, float("inf"), logical),)
-    refusal = joined_classification_refusal(plan.graph, context.gpu_count)
+    refusal = joined_classification_refusal(plan.graph)
     if refusal is not None:
         return (PhysicalCandidate(None, refusal, float("inf"), logical),)
     plan = bind_runtime_data(plan, region, context)

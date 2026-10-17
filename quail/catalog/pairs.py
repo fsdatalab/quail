@@ -13,6 +13,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from quail.logical.expressions import hash_values
+
 COLUMNS_PREFIX = "columns:"
 
 
@@ -41,23 +43,54 @@ def pair_table(left_alias: str, left_keys, right_alias: str,
     Returns:
         A table with columns (left_alias, right_alias), sorted by both.
     """
+    left, right = _join_key_tables(left_keys, right_keys)
+    names = left.column_names
+    left = left.append_column("left", pa.array(range(len(left)), pa.int32()))
+    right = right.append_column("right", pa.array(range(len(right)), pa.int32()))
+    joined = left.join(right, keys=names, join_type="inner")
+    return joined.select(["left", "right"]).sort_by(
+        [("left", "ascending"), ("right", "ascending")]).rename_columns(
+            [left_alias, right_alias])
+
+
+def _join_key_tables(left_keys, right_keys) -> tuple[pa.Table, pa.Table]:
+    """Build join-key tables with shared types and private column names."""
     if len(left_keys) != len(right_keys) or not left_keys:
-        raise ValueError("a pair table needs one key column per side "
+        raise ValueError("a join needs one key column per side "
                          "and at least one equality")
-    n_left = len(left_keys[0])
-    n_right = len(right_keys[0])
     names = [f"key{index}" for index in range(len(left_keys))]
-    left_columns = {left_alias: pa.array(range(n_left), type=pa.int32())}
-    right_columns = {right_alias: pa.array(range(n_right), type=pa.int32())}
-    for name, left, right in zip(names, left_keys, right_keys):
-        if right.type != left.type:
-            right = pc.cast(right, left.type)
-        left_columns[name] = left
-        right_columns[name] = right
-    joined = pa.table(left_columns).join(
-        pa.table(right_columns), keys=names, join_type="inner")
-    return joined.select([left_alias, right_alias]).sort_by(
-        [(left_alias, "ascending"), (right_alias, "ascending")])
+    columns = [_join_key_columns(left, right)
+               for left, right in zip(left_keys, right_keys)]
+    return tuple(pa.Table.from_arrays([pair[side] for pair in columns], names=names)
+                 for side in (0, 1))
+
+
+def _join_key_columns(left, right):
+    """Normalize an equality's keys without rounding integer values."""
+    left, right = (hash_values(column, nan_equal=False) for column in (left, right))
+    types = (left.type, right.type)
+    if (any(pa.types.is_integer(kind) for kind in types)
+            and any(pa.types.is_floating(kind) for kind in types)):
+        return _integral_join_key(left), _integral_join_key(right)
+    if pa.uint64() in types and any(pa.types.is_signed_integer(kind) for kind in types):
+        kind = pa.decimal128(20, 0)
+        return left.cast(kind), right.cast(kind)
+    schema = pa.unify_schemas([pa.schema([("key", kind)]) for kind in types],
+                              promote_options="permissive")
+    kind = schema.field(0).type
+    # Arrow hash joins need concrete key types even when every value is null.
+    kind = pa.bool_() if pa.types.is_null(kind) else kind
+    return left.cast(kind), right.cast(kind)
+
+
+def _integral_join_key(column):
+    """Encode numeric values that can equal signed or unsigned 64-bit integers."""
+    if pa.types.is_floating(column.type):
+        integral = pc.equal(column, pc.floor(column))
+        in_range = pc.and_kleene(pc.greater_equal(column, float(-2**63)),
+                                 pc.less(column, float(2**64)))
+        column = pc.if_else(pc.and_kleene(integral, in_range), column, None)
+    return column.cast(pa.decimal128(20, 0))
 
 
 def pair_ids_table(left_alias: str, right_alias: str, pairs) -> pa.Table:
@@ -87,24 +120,18 @@ def estimate_pair_fraction(left_keys, right_keys) -> float:
     product of the two sides' value counts, over the product of the
     sample sizes.
     """
-    if len(left_keys) != len(right_keys) or not left_keys:
-        raise ValueError("a pair estimate needs one key column per side "
-                         "and at least one equality")
-    names = [f"key{index}" for index in range(len(left_keys))]
-    n_left, n_right = len(left_keys[0]), len(right_keys[0])
+    left, right = _join_key_tables(left_keys, right_keys)
+    n_left, n_right = len(left), len(right)
     if not n_left or not n_right:
         return 0.0
+    names = left.column_names
 
-    def value_counts(columns, count):
-        table = pa.table(dict(zip(names, columns))).drop_null()
-        return table.group_by(names).aggregate(
+    def value_counts(table, count):
+        return table.drop_null().group_by(names).aggregate(
             [([], "count_all")]).rename_columns([*names, count])
 
-    # integer keys on one side are cast to the other side's type
-    right_keys = [right if right.type == left.type else pc.cast(right, left.type)
-                  for left, right in zip(left_keys, right_keys)]
-    matched = value_counts(left_keys, "left").join(
-        value_counts(right_keys, "right"), keys=names, join_type="inner")
+    matched = value_counts(left, "left").join(
+        value_counts(right, "right"), keys=names, join_type="inner")
     pairs = pc.sum(pc.multiply(matched.column("left"),
                                matched.column("right"))).as_py() or 0
     # samples that share no key still say little about the tables, so

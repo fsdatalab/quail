@@ -119,3 +119,42 @@ def test_adaptive_policy_drafts_longer_for_longer_documents():
                                     round_cost_per_token=per_token)
     # a short document's cheaper KV read earns a shorter draft
     assert short_fed - TAIL < long_fed - TAIL
+
+
+def test_memo_reuses_document_work_but_reprices_counts_and_workers(monkeypatch):
+    from quail.cost import extract
+
+    lengths = [100, 500, 8000]
+    cases = [(live, workers) for live in (0, 0.25, 1, 2, 3, 6)
+             for workers in (1, 4)]
+    expected = [_cost(lengths, live=live, workers=workers)
+                for live, workers in cases]
+    calls = []
+    original = extract.document_work
+
+    def counted(*args, **kwargs):
+        calls.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(extract, "document_work", counted)
+    memo = {}
+    actual = [_cost(lengths, live=live, workers=workers, memo=memo)
+              for live, workers in cases]
+    assert actual == expected
+    assert calls == lengths
+
+
+@pytest.mark.parametrize("options", [
+    {"resident": True}, {"shared": [80, 200]},
+    {"max_answer_tokens": 8}, {"draft_tokens": 3},
+    {"draft_policy": "adaptive", "round_cost_per_token": 0.02},
+    {"assumptions": ExtractAssumptions(answer_tokens=4)},
+])
+def test_memo_separates_extraction_configurations(options):
+    lengths = [100, 500]
+    memo = {}
+    _cost(lengths, memo=memo)
+    assert _cost(lengths, memo=memo, **options) == _cost(lengths, **options)
+    assert _cost([200, 1000], memo=memo, **options) == _cost(
+        [200, 1000], **options)
+    assert _cost([], memo=memo) == _cost([])

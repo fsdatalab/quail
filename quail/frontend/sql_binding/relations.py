@@ -11,7 +11,6 @@ from quail.frontend.sql_binding.expressions import (
     _conjuncts,
     _is_ai_score_comparison,
     _is_call,
-    _label_test,
 )
 from quail.frontend.sql_binding.predicates import (
     ai_aliases,
@@ -31,23 +30,18 @@ from quail.logical import (
 
 def _parse_equality(b, term, joined_alias: str) -> Equality:
     """Parse one ordinary ON condition: two columns compared with =."""
-    if (
-        not isinstance(term, exp.EQ)
-        or not isinstance(term.this, exp.Column)
-        or not isinstance(term.expression, exp.Column)
-    ):
+    if not isinstance(term, exp.EQ):
         raise CompileError(
             f"ON supports column = column and AI predicates, got {term.sql()}"
         )
-    left = b.resolve_column(term.this)
-    right = b.resolve_column(term.expression)
-    sides = {left.alias, right.alias}
+    equality = Equality(b.resolve_value(term.this), b.resolve_value(term.expression))
+    sides = set(equality.aliases())
     if joined_alias not in sides or len(sides) != 2:
         raise CompileError(
             f"JOIN {joined_alias} ON {term.sql()} must relate "
             f"{joined_alias!r} to a table already in the query"
         )
-    return Equality(left, right)
+    return equality
 
 
 def _from_clause(select):
@@ -169,11 +163,11 @@ class JoinBinder:
 
 
 def _has_ai_call(term) -> bool:
-    """Return whether a term asks the model, counting AI.EXTRACT only bare."""
+    """Return whether a term needs binding outside the column predicate parser."""
     return any(
         _is_call(node, "AI_FILTER")
         or _is_call(node, "AI_SCORE")
-        or isinstance(node, (exp.AIClassify, exp.Exists))
+        or isinstance(node, exp.Exists)
         or (_is_call(node, "AI_EXTRACT") and not isinstance(node.parent, exp.Dot))
         for node in term.walk()
     )
@@ -203,13 +197,13 @@ def _name_select_labels(b: ExpressionBinder, term, selected: dict):
 
 def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
                      selectivity: float | None) -> bool:
-    """Bind a test of a source column or of an AI.EXTRACT field.
+    """Bind a test of a source column, classification label, or extraction field.
 
     Args:
         b: The binder.
         term: The term.
         selected: The AI calls in SELECT, by AS name.
-        selectivity: The term's SELECTIVITY hint, or None.
+        selectivity: The term's HINT, or None.
 
     Returns:
         Whether the term was a plain test; False leaves an AI term to
@@ -224,6 +218,16 @@ def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
     test = parse_plain_test(term, b.dialect)
     if test is None:
         return False
+    if isinstance(test.operand, exp.AIClassify):
+        call, options, aliases = b.bind_ai_classify(test.operand)
+        if len(aliases) != 1:
+            raise CompileError(
+                "a filter on a label tests a one-document classification; "
+                f"this one classifies pairs of {aliases}")
+        b.label_tests.setdefault(aliases[0], []).append(
+            (call, test, options.get("selectivity")
+             if selectivity is None else selectivity))
+        return True
     found = extract_test(b, test, selected)
     if found is not None:
         alias, predicate = found
@@ -257,31 +261,6 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
         if anti:
             raise CompileError(
                 f"NOT is only supported as NOT EXISTS, got NOT {node.sql()}"
-            )
-        tested = _label_test(node)
-        if tested is not None:
-            classify_node, items = tested
-            call, options, aliases = b.bind_ai_classify(classify_node)
-            if len(aliases) != 1:
-                raise CompileError(
-                    f"a filter on a label tests a one-document "
-                    f"classification; this one classifies pairs of {aliases}"
-                )
-            accepted = []
-            for item in items:
-                if not (isinstance(item, exp.Literal) and item.is_string):
-                    raise CompileError("AI.CLASSIFY is compared with string literals")
-                accepted.append(str(item.this))
-            if len(set(accepted)) != len(accepted):
-                raise CompileError("a filter on a label lists a label twice")
-            b.label_tests.setdefault(aliases[0], []).append(
-                (call, tuple(accepted),
-                 options.get("selectivity") if hint is None else hint)
-            )
-            continue
-        if any(isinstance(call, exp.AIClassify) for call in term.walk()):
-            raise CompileError(
-                "AI.CLASSIFY in WHERE is tested with = 'label' or IN ('label', ...)"
             )
         if any(_is_call(call, "AI_EXTRACT") for call in term.walk()):
             raise CompileError(

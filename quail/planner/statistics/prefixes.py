@@ -1,4 +1,4 @@
-"""Shared prefix tokens of a token store, for the speed of light estimate."""
+"""Shared prefix tokens of a token store for plan and speed of light estimates."""
 
 from __future__ import annotations
 

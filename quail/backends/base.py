@@ -28,7 +28,14 @@ class GpuContext:
 
 @dataclass(frozen=True)
 class BackendExecutionContext:
-    """Values available to a backend inside a compute process."""
+    """Values available to a backend inside a compute process.
+
+    The runtime state belongs to one engine, model, device, and GPU count.
+    Backends with the same ``engine_name`` share a loaded engine; otherwise
+    the backend's registered name identifies its engine.
+    Backends with persistent resources implement ``release_request(state)``
+    to close them before another configuration uses the process.
+    """
 
     request: Any
     graph: Any

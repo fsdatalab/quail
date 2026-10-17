@@ -17,6 +17,7 @@ from KV.
 from dataclasses import dataclass
 from itertools import repeat
 
+from quail.cost.budgets import parallel_copies
 from quail.cost.dense_decoder_cost import decoder_seconds
 from quail.cost.draft_policy import DraftPolicy
 from quail.cost.work import Work, ask, decode, scan
@@ -135,7 +136,8 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
              shared=None, max_answer_tokens: int, draft_tokens: int,
              draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
              workers: int = 1,
-             assumptions: ExtractAssumptions | None = None) -> ExtractCost:
+             assumptions: ExtractAssumptions | None = None,
+             memo: dict | None = None) -> ExtractCost:
     """Estimate the cost of one extraction over a table.
 
     Args:
@@ -156,6 +158,8 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
             fed tokens, from the extraction plan.
         workers: Model copies sharing the work, assuming balanced document costs.
         assumptions: Expected answer length, separate from execution limits.
+        memo: Query-local cache of document work, independent of live count.
+            Lengths and shared-prefix arrays must be immutable during planning.
 
     Returns:
         Estimated execution time, work, and token counts.
@@ -164,23 +168,33 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
     if live <= 0 or n == 0:
         return ExtractCost(0.0, 0.0, Work(), 0.0, 0.0)
     assumptions = ExtractAssumptions() if assumptions is None else assumptions
-    work = Work()
-    fed = rows = 0.0
-    for index, length in enumerate(lengths):
-        own, own_fed, own_rows = document_work(
-            int(length), head_tokens, tail_tokens,
-            window=model.sliding_window, resident=resident,
-            shared=0 if shared is None else int(shared[index]),
-            max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
-            draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
-            assumptions=assumptions)
-        work += own
-        fed += own_fed
-        rows += own_rows
+    key = ("extract_work", id(lengths), id(shared), head_tokens, tail_tokens,
+           model.sliding_window, resident, max_answer_tokens, draft_tokens,
+           draft_policy, round_cost_per_token, assumptions)
+    cached = None if memo is None else memo.get(key)
+    if cached is not None:
+        _, _, work, fed, rows = cached
+    else:
+        work = Work()
+        fed = rows = 0.0
+        for index, length in enumerate(lengths):
+            own, own_fed, own_rows = document_work(
+                int(length), head_tokens, tail_tokens,
+                window=model.sliding_window, resident=resident,
+                shared=0 if shared is None else int(shared[index]),
+                max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
+                draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
+                assumptions=assumptions)
+            work += own
+            fed += own_fed
+            rows += own_rows
+        if memo is not None:
+            # Keep arrays alive so a later input cannot reuse their identities.
+            memo[key] = (lengths, shared, work, fed, rows)
     scale = live / n
     total = work * scale
     passes = total.tokens / chunk
-    copies = max(1, min(workers, live))
+    copies = parallel_copies(workers, min(live, n))
     seconds = decoder_seconds(total * (1 / copies), rows * scale / copies,
                               passes / copies, model, device)
     return ExtractCost(seconds, passes, total, fed * scale, rows * scale)

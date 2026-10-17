@@ -9,7 +9,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.backends.base import GpuContext
-from quail.execution.ids import id_positions
+from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import (
     DEFAULT_BATCH_ROWS,
@@ -37,46 +37,15 @@ def compare_score(scores, comparison: str, threshold: float):
 
 @dataclass(frozen=True)
 class ScoreRows:
-    """Document indices with an optional unexpanded Cartesian product.
-
-    ``origin`` maps each row, or each left document of a product, to
-    its position in the rows this was sharded from. None means the
-    rows are in their original order.
-    """
+    """Document indices with an optional unexpanded Cartesian product."""
 
     columns: tuple[np.ndarray, ...]
     product: bool = False
-    origin: np.ndarray | None = None
 
     def __len__(self):
         if self.product:
             return len(self.columns[0]) * len(self.columns[1])
         return len(self.columns[0])
-
-    def shard(self, count: int) -> list["ScoreRows"]:
-        """Split the rows by first document, so its KV stays on one GPU."""
-        first = self.columns[0]
-        shards = []
-        for worker in range(count):
-            keep = np.flatnonzero(first % count == worker)
-            origin = keep if self.origin is None else self.origin[keep]
-            columns = (
-                (first[keep], *self.columns[1:]) if self.product
-                else tuple(column[keep] for column in self.columns)
-            )
-            shards.append(replace(self, columns=columns, origin=origin))
-        return shards
-
-    def positions(self, start: int, end: int) -> np.ndarray:
-        """Return the original positions of rows start to end."""
-        local = np.arange(start, end, dtype=np.int64)
-        if not self.product:
-            return local if self.origin is None else self.origin[local]
-        width = len(self.columns[1])
-        left = local // width
-        if self.origin is not None:
-            left = self.origin[left]
-        return left * width + local % width
 
     def batches(self, size=DEFAULT_BATCH_ROWS):
         """Yield bounded arrays in input order.
@@ -203,14 +172,6 @@ def _candidate_rows(node, inputs):
     return ScoreRows((_ids(selected, left), _ids(selected, right))), priors
 
 
-def _batches_with_positions(rows: ScoreRows, size: int):
-    start = 0
-    for batch in rows.batches(size):
-        end = start + len(batch)
-        yield rows.positions(start, end), batch
-        start = end
-
-
 def scored_batch(node, rows, values) -> dict:
     """The answer-sink payload for one batch of scored rows.
 
@@ -238,24 +199,15 @@ def classify_outputs(node, rows: Rows) -> dict:
     return outputs
 
 
-def score_in_batches(node, inputs, score_batches, shards: int = 1,
-                     streamed: bool = False) -> NodeResult:
-    """Score the node's candidate rows, in input order.
-
-    Each shard's rows are scored in one call of ``score_batches``. A
-    Cartesian product is scored in batches of DEFAULT_BATCH_ROWS pairs.
+def score_in_batches(node, inputs, score_batch, streamed: bool = False) -> NodeResult:
+    """Score candidate rows in bounded batches and preserve their input order.
 
     Args:
-        node: The AiScore node.
-        inputs: Its input values by port name.
-        score_batches: Callable (node, batches) taking one row batch per
-            shard and returning one NodeResult per batch, each with a
-            "rows" table holding one row per input row in order.
-        shards: Row shards scored side by side; rows that share a first
-            document land in the same shard.
-        streamed: Whether ``score_batches`` sends its answers to the
-            answer sink itself. Otherwise each batch's answers are sent
-            when the batch is scored.
+        node: Score or classification node.
+        inputs: Candidate rows and preceding values by input port.
+        score_batch: Callable taking the node and one row batch, returning
+            its NodeResult in batch order.
+        streamed: Whether score_batch reports its answers to the answer sink.
     """
     if not isinstance(node, (AiScore, AiClassify)):
         raise TypeError(type(node).__name__)
@@ -263,39 +215,19 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         raise ValueError("AI.SCORE needs a score specification")
     started = time.perf_counter()
     rows, priors = _candidate_rows(node, inputs)
-    parts = rows.shard(shards) if shards > 1 else [rows]
-    width = len(node.spec.aliases)
     tables = []
-    positions = []
     metrics = NodeMetrics()
-    # a product's pairs are built per batch: the whole product may not
-    # fit in host memory
-    streams = [_batches_with_positions(
-        part, DEFAULT_BATCH_ROWS if part.product else max(1, len(part)))
-        for part in parts]
-    while streams:
-        rounds = [next(stream, None) for stream in streams]
-        if all(item is None for item in rounds):
-            break
-        batches = [
-            (np.empty(0, dtype=np.int64), np.empty((0, width), dtype=np.int32))
-            if item is None else item
-            for item in rounds
-        ]
-        results = score_batches(node, [batch for _, batch in batches])
-        for (where, batch), result in zip(batches, results):
-            tables.append(result.outputs["rows"])
-            positions.append(where)
-            metrics += result.metrics
-            sink = answer_sink()
-            if sink is not None and not streamed and len(batch):
-                sink(scored_batch(
-                    node, batch,
-                    result.outputs["rows"].column(node.spec.name).to_pylist()))
+    size = DEFAULT_BATCH_ROWS if rows.product else max(1, len(rows))
+    for batch in rows.batches(size):
+        result = score_batch(node, batch)
+        tables.append(result.outputs["rows"])
+        metrics += result.metrics
+        sink = answer_sink()
+        if sink is not None and not streamed and len(batch):
+            sink(scored_batch(
+                node, batch,
+                result.outputs["rows"].column(node.spec.name).to_pylist()))
     table = Rows.concat(tables)
-    order = np.concatenate(positions)
-    if len(order) and np.any(np.diff(order) < 0):
-        table = table.take(np.argsort(order, kind="stable"))
     for alias, prior in priors.items():
         table = table.joined(prior, alias)
     outputs = {"rows": table}
@@ -325,7 +257,7 @@ class RerankerModelExecution:
     ) -> NodeResult:
         return score_in_batches(
             node, inputs,
-            lambda node, batches: [self.execute_rows(node, b) for b in batches],
+            self.execute_rows,
             streamed=True,
         )
 
@@ -406,9 +338,13 @@ class FilterRuntime:
     def execute(self, node, inputs, context) -> NodeResult:
         if not isinstance(node, Filter):
             raise TypeError(type(node).__name__)
-        if len(inputs) != 1:
-            raise ValueError("Filter needs one score or label input")
-        table = next(iter(inputs.values()))
+        table = next(inputs[port.name] for port in node.inputs
+                     if port.value_type is ValueType.ROWS)
+        for port in node.inputs:
+            if port.value_type is ValueType.DOCUMENT_IDS:
+                alias = port.source.port.split(":", 1)[1]
+                table = table.filter(pc.is_in(
+                    table.ids[alias], value_set=document_ids(inputs[port.name])))
         return filter_scores(node, table)
 
 
@@ -429,7 +365,6 @@ def filter_scores(node, rows: Rows) -> NodeResult:
             metadata={
                 "written_pos": node.written_pos,
                 "anchor": left,
-                "partners": right,
                 "semantics": "full",
                 "comparison": node.predicate.comparison,
                 "threshold": node.predicate.value,

@@ -14,8 +14,12 @@ from quail.execution.result import (
 )
 from quail.logical import (
     Alias,
+    ColumnExpression,
+    ColumnRef,
     CompileError,
+    column_name,
 )
+from quail.logical.expressions import column_reference, evaluate_column
 from quail.physical import Project, ValueType
 
 
@@ -23,13 +27,20 @@ def projection_for(logical, token_inputs, documents):
     """Bind result projection to its scanned columns and classification calls."""
     operators = logical.operators()
     scans_by_alias = {scan.alias: scan for scan in operators.scans}
-    model_calls = {node.name: node.call
+    source_columns = {
+        column_name(ref): ref for ref in (
+            *logical.projection.columns,
+            *(key.expression for key in logical.result.order))
+        if isinstance(ref, (ColumnRef, ColumnExpression))}
+    named_calls = {node.name: node.call
                    for node in (*operators.classifies, *operators.extracts)}
-    model_calls.update({node.span_name: node.call for node in operators.extracts})
-    model_calls.update({column.name: column.expression
+    named_calls.update({column.name: column.expression
                         for column in logical.projection.columns
-                        if isinstance(column, Alias)
-                        and column.expression.kind in ("label", "extract", "score")})
+                        if isinstance(column, Alias)})
+    model_calls = {column: call for name, call in named_calls.items()
+                   for column in call.output_columns(name)}
+    label_orders = {name: pa.array(call.labels, pa.string())
+                    for name, call in named_calls.items() if call.kind == "label"}
 
     def project(node, value, labels=None):
         if not isinstance(node, Project):
@@ -46,18 +57,24 @@ def projection_for(logical, token_inputs, documents):
         fields = []
         declaration = relation.declaration
         for name in node.columns:
-            if name in relation.schema.names:
-                # a score column the graph computed; document
-                # index columns are aliases, never "alias.column"
+            if name in relation.schema.names and name not in source_columns:
                 projection.append((name, None))
                 fields.append(pa.field(
                     name, relation.schema.field(name).type
                 ))
                 continue
             table = next((table for table in (labels or {}).values()
-                          if name in table.column_names), None)
+                          if name in table.column_names and name not in source_columns),
+                         None)
             call = model_calls.get(name)
             aliases = () if call is None else call.aliases()
+            if table is not None:
+                labeled = table.column(name).combine_chunks()
+                if name in label_orders:
+                    order = label_orders[name]
+                    labeled = pa.DictionaryArray.from_arrays(
+                        pc.index_in(labeled.cast(pa.string()), order).cast(pa.int32()),
+                        order)
             if table is not None and len(aliases) == 2:
                 # a label of joined rows: each result row looks its
                 # label up by its two ids; a row without one leaves
@@ -67,8 +84,6 @@ def projection_for(logical, token_inputs, documents):
                     raise CompileError(
                         f"label column {name!r} belongs to the joined "
                         f"rows of {aliases}, not all in the result")
-                order = (None if call is None
-                         else pa.array(call.labels, pa.string()))
                 keys = pair_keys(table.column(aliases[0]),
                                   table.column(aliases[1]))
                 declaration = acero.Declaration(
@@ -76,11 +91,9 @@ def projection_for(logical, token_inputs, documents):
                         pair_keys(*(pc.field(alias) for alias in aliases))
                         .isin(keys)),
                     inputs=[declaration])
-                projection.append((tuple(aliases), (keys, table, order)))
+                projection.append((tuple(aliases), (keys, labeled)))
                 fields.append(pa.field(
-                    name,
-                    pa.string() if order is None
-                    else pa.dictionary(pa.int32(), pa.string()),
+                    name, labeled.type,
                     nullable=True,
                     metadata={b"quail.alias": aliases[0].encode("utf-8"),
                               b"quail.label": name.encode("utf-8")}))
@@ -93,31 +106,16 @@ def projection_for(logical, token_inputs, documents):
                     raise CompileError(
                         f"label column {name!r} belongs to {alias!r}, "
                         f"which is not in the result")
-                labeled = table.column(name).combine_chunks()
-                if pa.types.is_dictionary(labeled.type):
-                    labeled = labeled.cast(labeled.type.value_type)
                 # a document whose answer names no label has no row
                 # in the table, and leaves the result
                 declaration = acero.Declaration(
                     "filter", acero.FilterNodeOptions(
                         pc.field(alias).isin(table.column(alias))),
                     inputs=[declaration])
-                # position of each document's label, or the null
-                # appended past the labels for an unlabeled one
-                slots = np.full(len(documents[alias]), len(labeled),
-                                dtype=np.int64)
-                slots[table.column(alias).to_numpy()] = np.arange(
-                    len(labeled))
-                widened = pc.take(
-                    pa.concat_arrays([labeled, pa.array([None], labeled.type)]),
-                    pa.array(slots))
-                if call is not None and call.kind == "label":
-                    order = pa.array(call.labels, pa.string())
-                    values = pa.DictionaryArray.from_arrays(
-                        pc.index_in(widened, order).cast(pa.int32()),
-                        order)
-                else:
-                    values = widened
+                positions = pc.index_in(
+                    pa.array(np.arange(len(documents[alias]), dtype=np.int32)),
+                    value_set=table.column(alias))
+                values = pc.take(labeled, positions)
                 projection.append((alias, values))
                 fields.append(pa.field(
                     name, values.type, nullable=True,
@@ -125,9 +123,11 @@ def projection_for(logical, token_inputs, documents):
                               b"quail.label": name.encode("utf-8")}))
                 continue
             try:
-                alias, column = name.split(".", 1)
+                expression = source_columns[name]
+                ref = column_reference(expression)
+                alias, column = ref.alias, ref.column
                 scan = scans_by_alias[alias]
-            except (ValueError, KeyError) as error:
+            except KeyError as error:
                 raise CompileError(
                     f"unknown projection column {name!r}"
                 ) from error
@@ -141,7 +141,7 @@ def projection_for(logical, token_inputs, documents):
                     f"projection column {name!r} was not loaded by the "
                     f"scan of {alias!r}; the should_push_down_projection "
                     f"rule is not registered")
-            values = store.column(column)
+            values = evaluate_column(expression, store.column(column))
             projection.append((alias, values))
             fields.append(pa.field(
                 name,

@@ -42,7 +42,8 @@ class ClassifyBatch(SingleResultPart):
     def finish(self, every) -> int:
         """Finalize labels and count tokens processed after the documents."""
         self.reached = len(every[0]) if every else 0
-        self.suffix_tokens, self.streamed_tokens = self.plan.finish(every)
+        self.suffix_tokens, self.streamed_tokens = self.plan.finish(
+            every, frame_tokens=self.frame_tokens)
         self.stream.finish(range(len(self.plan.labels)),
                            lambda anchor: self.plan.labels[anchor])
         return self.streamed_tokens
@@ -101,8 +102,8 @@ def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
     plan = ClassifyStages(state, node.spec, len(ids),
                           lambda key: position[key[1]])
     plan.seeds = ids
-    by_node = {part.node.node_id: part for part in parts}
-    priors = [(by_node[port.source.node_id], port.source.port)
+    by_node = {member.node_id: part for part in parts for member in part.nodes}
+    priors = [(by_node[port.source.node_id], port.source)
               for port in node.inputs
               if port.value_type is ValueType.ROWS
               and port.source.node_id in by_node]
@@ -160,7 +161,7 @@ class ClassifyPart(ClassifyBatch):
                  prior_tables=()):
         self.node = node
         self.ids = ids
-        self.priors = priors      # (part, port) of each label table read
+        self.priors = priors
         self.prior_tables = prior_tables
         self.kept = kept          # KeptPairs, for joined rows
         sink = answer_sink()
@@ -175,7 +176,7 @@ class ClassifyPart(ClassifyBatch):
 
     @property
     def tested_columns(self) -> tuple[str, ...]:
-        """The columns a Filter in the pipeline may test."""
+        """Return the columns this part computes for pipeline conditions."""
         return (self.node.spec.name,)
 
     def tested_values(self, column: str, positions) -> pa.Array:
@@ -196,7 +197,8 @@ class ClassifyPart(ClassifyBatch):
                                pa.string())
             sink = answer_sink()
             if sink is not None and len(rows):
-                sink(scored_batch(self.node, rows, table))
+                sink(scored_batch(
+                    self.node, rows, table.column(spec.name).to_pylist()))
             return NodeResult(classify_outputs(self.node, table), NodeMetrics(
                 input_rows=len(pairs), output_rows=len(pairs),
                 evaluated_document_pairs=len(pairs), fresh_tokens=tokens,
@@ -216,10 +218,9 @@ class ClassifyPart(ClassifyBatch):
             table = table.with_column(
                 spec.name + PROBABILITIES_SUFFIX,
                 probability_column(spec.labels, plan.probabilities[labeled]))
-        # the labels the parts before it gave these documents, as a
-        # classify node on its own carries them from its scores input
-        for prior in (*self.prior_tables, *(part.result_value.outputs[port]
-                                             for part, port in self.priors)):
+        prior_results = (part.results()[port.node_id].outputs[port.port]
+                         for part, port in self.priors)
+        for prior in (*self.prior_tables, *prior_results):
             table = table.joined(prior, spec.aliases[0])
         return NodeResult(classify_outputs(self.node, table), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),

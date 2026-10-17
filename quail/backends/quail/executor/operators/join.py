@@ -176,7 +176,6 @@ class JoinPart(ExecutionPart):
                            if j == 0 and stats.get("pack_s") else {}),
                     }))
         self._results = results
-        self.result_value = results[node.node_id]
         if self.context is not None:
             last = nodes[-1]
             self.context.model_result(last, results[last.node_id], self.context)

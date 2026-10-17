@@ -3,7 +3,7 @@
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.execution.result import true_answer_rows
+from quail.execution.result import answer_values, true_answer_rows
 from quail.execution.rows import Rows
 from quail.physical import AiJoin, Barrier, PortRef, ValueType
 
@@ -159,16 +159,16 @@ def collect_answers(logical, plan, outputs, documents):
             pa.concat_tables(relations)
         # predicates in the order their first answers appear
         predicate_order = [
-            int(pos) for pos in pc.unique(table.column("predicate")).to_pylist()]
+            int(pos) for pos in pc.unique(table.column(1)).to_pylist()]
         predicate_order.extend(
             position for position in range(len(logical_filters[alias]))
             if position not in predicate_order
         )
         for index, written_pos in enumerate(predicate_order):
-            mask = pc.equal(table.column("predicate"), written_pos)
+            mask = pc.equal(table.column(1), written_pos)
             stage_table = table.filter(mask)
             evaluated = stage_table.num_rows
-            passed = pc.sum(stage_table.column("answer")).as_py() or 0
+            passed = pc.sum(answer_values(stage_table)).as_py() or 0
             answer_tables["filters"][(alias, written_pos)] = stage_table
             report["stages"].append(dict(
                 op="filter", alias=alias, stage=index,
@@ -203,7 +203,7 @@ def collect_answers(logical, plan, outputs, documents):
             argument.alias for argument in logical_join.prompt.args
         ]
         required_metadata = {
-            b"quail.anchor", b"quail.partners", b"quail.semantics"
+            b"quail.anchor", b"quail.semantics"
         }
         missing = required_metadata - set(metadata)
         if missing:
@@ -212,8 +212,7 @@ def collect_answers(logical, plan, outputs, documents):
                 f"{sorted(key.decode('utf-8') for key in missing)}"
             )
         anchor = metadata[b"quail.anchor"].decode("utf-8")
-        partner_text = metadata[b"quail.partners"].decode("utf-8")
-        partners = [] if not partner_text else partner_text.split(",")
+        partners = [alias for alias in logical_aliases if alias != anchor]
         semantics = metadata[b"quail.semantics"].decode("utf-8")
         missing_columns = set(logical_aliases) - set(table.column_names)
         if missing_columns:
@@ -221,7 +220,7 @@ def collect_answers(logical, plan, outputs, documents):
                 "a join answer relation is missing alias columns "
                 f"{sorted(missing_columns)}"
             )
-        answers = table.column("answer")
+        answers = answer_values(table)
         answer_tables["joins"][written_pos] = table
         report["stages"].append(dict(
             op="join", written_pos=written_pos, anchor=anchor,

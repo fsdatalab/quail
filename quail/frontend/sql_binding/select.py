@@ -1,6 +1,6 @@
 """Bind projections, grouping, and result ordering."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from sqlglot import exp
 
@@ -14,6 +14,7 @@ from quail.logical import (
     AggregateCall,
     Aggregation,
     Alias,
+    ColumnExpression,
     ColumnRef,
     CompileError,
     ExtractStruct,
@@ -61,10 +62,48 @@ def _parse_distinct(tree) -> bool:
     return True
 
 
+def _column_value(column):
+    """Return an expression independently of its output name."""
+    if isinstance(column, ColumnExpression):
+        return (replace(column, output_name=None) if column.path or column.function
+                else column.reference)
+    return column
+
+
+def _matching_column(expression, columns):
+    """Resolve an expression to its selected output when available."""
+    value = _column_value(expression)
+    for column in columns:
+        if _column_value(column) == value:
+            return column
+    names = {column_name(column) for column in columns}
+    name = column_name(expression)
+    if name in names:
+        index = 0
+        while (name := f"__column_{index}") in names:
+            index += 1
+        expression = _name_column(expression, name)
+    return expression
+
+
+def _name_column(expression, name):
+    """Assign an output name without changing the source expression."""
+    return (replace(expression, output_name=name)
+            if isinstance(expression, ColumnExpression)
+            else ColumnExpression(expression, output_name=name))
+
+
+def _named_columns(columns):
+    """Return explicitly named outputs for SQL name resolution."""
+    return {column.name: column for column in columns
+            if isinstance(column, Alias)
+            or isinstance(column, ColumnExpression) and column.output_name is not None}
+
+
 def bind_order(
     tree: exp.Select,
     b: ExpressionBinder,
-    columns: tuple[ColumnRef | Alias, ...],
+    columns: tuple[ColumnRef | ColumnExpression | Alias, ...],
     aggregation: Aggregation | None = None,
     structs: tuple[ExtractStruct, ...] = (),
 ) -> tuple[SortKey, ...]:
@@ -73,7 +112,7 @@ def bind_order(
     if order is None:
         return ()
     struct_names = {struct.name for struct in structs}
-    named = {column.name: column for column in columns if isinstance(column, Alias)}
+    named = _named_columns(columns)
     if aggregation is not None:
         named.update(
             {aggregate.name: aggregate for aggregate in aggregation.aggregates}
@@ -81,19 +120,17 @@ def bind_order(
     keys = []
     for term in order.expressions:
         target = term.this
-        if not isinstance(target, exp.Column):
-            raise CompileError(
-                f"ORDER BY {target.sql()} is not a column; give an "
-                f"expression an AS name in SELECT and order by that name"
-            )
-        if not target.table and target.name in struct_names:
+        if (isinstance(target, exp.Column) and not target.table
+                and target.name in struct_names):
             raise CompileError(
                 f"ORDER BY does not compare the AI.EXTRACT struct column "
                 f"{target.name!r}; extract the field as its own column")
-        if not target.table and target.name in named:
+        if (isinstance(target, exp.Column) and not target.table
+                and target.name in named):
             expression = named[target.name]
         else:
-            expression = b.resolve_column(target)
+            expression = _matching_column(
+                b.resolve_value(target), (*columns, *(key.expression for key in keys)))
         keys.append(
             SortKey(
                 expression,
@@ -117,7 +154,7 @@ _AGGREGATE_CLASSES = {
 class BoundSelect:
     """Columns needed before aggregation and the requested aggregate outputs."""
 
-    columns: tuple[ColumnRef | Alias, ...]
+    columns: tuple[ColumnRef | ColumnExpression | Alias, ...]
     aggregation: Aggregation | None
     structs: tuple[ExtractStruct, ...] = ()
 
@@ -127,24 +164,29 @@ class SelectBinder:
     """Resolve SELECT expressions and own their intermediate columns."""
 
     binder: ExpressionBinder
-    columns: list[ColumnRef | Alias] = field(default_factory=list)
+    columns: list[ColumnRef | ColumnExpression | Alias] = field(default_factory=list)
     plain: list[str] = field(default_factory=list)
     output: list[str] = field(default_factory=list)
     aggregates: list[AggregateCall] = field(default_factory=list)
     structs: list[ExtractStruct] = field(default_factory=list)
 
-    def register_argument(self, node: exp.Expression, hidden: str) -> str:
+    def register_argument(
+        self, node: exp.Expression, hidden: str, *, prefer_alias: bool = False,
+    ) -> str:
         """Bind an aggregate's or key's expression to a projected column name.
 
         A column or AI expression not yet projected is appended to
         ``columns``, an AI expression under the ``hidden`` name.
         """
         b, columns = self.binder, self.columns
-        names = {column.name: column for column in columns if isinstance(column, Alias)}
-        if isinstance(node, exp.Column):
-            if not node.table and node.name in names:
+        names = _named_columns(columns)
+        if isinstance(node, (exp.Column, exp.Length)):
+            if (isinstance(node, exp.Column) and not node.table
+                    and node.name in names and (prefer_alias or not any(
+                        node.name in b.catalog.get(provider).columns
+                        for _, provider in b.tables))):
                 return node.name
-            ref = b.resolve_column(node)
+            ref = _matching_column(b.resolve_value(node), columns)
             if ref not in columns:
                 columns.append(ref)
             return column_name(ref)
@@ -152,13 +194,14 @@ class SelectBinder:
             raise CompileError(f"{node.sql()} is not a column or an AI expression")
         call = b.bind_ai_value(node)
         for name, column in names.items():
-            if column.expression == call:
+            if isinstance(column, Alias) and column.expression == call:
                 return name
         columns.append(Alias(call, hidden))
         return hidden
 
     def bind_aggregate(
-        self, node: exp.Expression, name: str, hidden: str
+        self, node: exp.Expression, name: str, hidden: str, *,
+        prefer_alias: bool = False,
     ) -> AggregateCall:
         """Bind one COUNT, SUM, AVG, MIN, or MAX call."""
         function = _AGGREGATE_CLASSES[type(node)]
@@ -173,19 +216,20 @@ class SelectBinder:
                     "DISTINCT inside an aggregate is COUNT(DISTINCT column)"
                 )
             function, argument = "count_distinct", argument.expressions[0]
-        return AggregateCall(function, self.register_argument(argument, hidden), name)
+        return AggregateCall(function, self.register_argument(
+            argument, hidden, prefer_alias=prefer_alias), name)
 
     def bind_projection(self, tree: exp.Select) -> None:
         """Bind SELECT outputs and collect aggregate inputs."""
         b, columns = self.binder, self.columns
+        aggregates = []
         for index, e in enumerate(tree.expressions):
             node = e.this if isinstance(e, exp.Alias) else e
             if type(node) in _AGGREGATE_CLASSES:
                 if not isinstance(e, exp.Alias) or not e.alias:
                     raise CompileError(f"{node.sql()} needs an AS name in SELECT")
-                aggregate = self.bind_aggregate(node, e.alias, f"__agg_{index}")
-                self.aggregates.append(aggregate)
-                self.output.append(aggregate.name)
+                aggregates.append((node, e.alias, f"__agg_{index}"))
+                self.output.append(e.alias)
                 continue
             if any(type(call) in _AGGREGATE_CLASSES for call in node.walk()):
                 raise CompileError(
@@ -198,6 +242,7 @@ class SelectBinder:
                     columns.append(column)
             self.plain.extend(column_name(column) for column in selected)
             self.output.extend(column_name(column) for column in selected)
+        self.aggregates.extend(self.bind_aggregate(*args) for args in aggregates)
 
     def bind_group(self, tree: exp.Select) -> list[str]:
         """Resolve GROUP BY expressions and SELECT positions."""
@@ -210,8 +255,14 @@ class SelectBinder:
                     raise CompileError(f"GROUP BY {position} is out of range")
                 keys.append(self.output[position - 1])
                 continue
-            keys.append(self.register_argument(node, f"__key_{index}"))
-        return keys
+            keys.append(self.register_argument(
+                node, f"__key_{index}", prefer_alias=self.binder.dialect == "bq"))
+        values = {_column_value(column) for column in self.columns
+                  if column_name(column) in keys}
+        keys.extend(name for column in self.columns
+                    if (name := column_name(column)) in self.plain and name not in keys
+                    and _column_value(column) in values)
+        return list(dict.fromkeys(keys))
 
     def bind_having(self, tree: exp.Select) -> list[HavingTest]:
         """Bind HAVING conditions and register any additional aggregates."""
@@ -228,7 +279,8 @@ class SelectBinder:
                 left, right, comparison = right, left, _FLIPPED[comparison]
             if type(left) in _AGGREGATE_CLASSES:
                 candidate = self.bind_aggregate(
-                    left, f"__having_{index}", f"__agg_having_{index}"
+                    left, f"__having_{index}", f"__agg_having_{index}",
+                    prefer_alias=self.binder.dialect == "bq",
                 )
                 same = next(
                     (
@@ -335,11 +387,8 @@ def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list
                 "AI.SCORE, AI.CLASSIFY, and AI.EXTRACT in SELECT must be "
                 "direct expressions with an AS name"
             )
-        if not isinstance(e, exp.Column):
-            raise CompileError(
-                f"the SELECT list is column selection only, got "
-                f"{e.sql()}: nothing computed, per the projection "
-                f"contract"
-            )
-        columns.append(b.resolve_column(e))
+        value = b.resolve_value(e)
+        if alias is not None:
+            value = _name_column(value, alias)
+        columns.append(value)
     return columns

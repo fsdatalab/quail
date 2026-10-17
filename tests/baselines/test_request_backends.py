@@ -67,7 +67,8 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     boot = {"client": _Client(), "sampling_params": object(), "capacity": CAPACITY}
     monkeypatch.setattr(
         "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
+        lambda self, spec, allowed_ids, *, resources: (
+            boot, {"kind": "cold", "boot_s": 0.1}))
     session = _session(
         "stock_vllm",
         docs={**DOCS, "key": ["k1", "k2"]},
@@ -238,7 +239,8 @@ def test_sglang_submission_and_cancellation():
     asyncio.run(run())
 
 
-def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch):
+def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(
+        monkeypatch, tmp_path):
     from quail.backends.quail.executor.models.diffusion_gemma import canvas_token_ids
     from quail.baselines.vllm import GigatokenVLLMTokenizer, diffusion_canvas
 
@@ -282,10 +284,10 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
         sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer)
     )
     loaded = GigatokenVLLMTokenizer.from_pretrained(
-        "Qwen/Qwen3-4B-FP8", truncation_side="right"
+        str(tmp_path), truncation_side="right"
     )
     assert loaded is adapter
-    assert sources == ["Qwen/Qwen3-4B-FP8"]
+    assert sources == [str(tmp_path)]
     assert loaded.truncation_side == "right"
     assert loaded.max_token_id == 1
     assert loaded.max_chars_per_token == 3

@@ -59,10 +59,8 @@ class SemanticExtract:
         provider = next(
             (field.provider for field in fields if field.alias == self.alias), ""
         )
-        return fields + (
-            ColumnRef(self.alias, provider, self.name),
-            ColumnRef(self.alias, provider, self.span_name),
-        )
+        return fields + tuple(ColumnRef(self.alias, provider, name)
+                              for name in self.call.output_columns(self.name))
 
     def validate(self) -> None:
         self.call.validate()

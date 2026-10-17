@@ -2,11 +2,12 @@
 
 A column predicate tests a source column at the scan, or a column a
 classification or an extraction computed, in a Filter. It evaluates
-itself over Arrow values with one compute function per comparison.
+Arrow arrays while preserving numeric values across column and literal types.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, ClassVar, Optional
@@ -14,7 +15,14 @@ from typing import Any, ClassVar, Optional
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.logical.expressions import ColumnRef, CompileError
+from quail.logical.expressions import (
+    ColumnRef,
+    CompileError,
+    column_name,
+    column_values,
+    hash_values,
+    literal_value,
+)
 
 VALUE_COMPARISONS = ("=", "<>", "<", "<=", ">", ">=")
 TEXT_COMPARISONS = ("like", "ilike", "contains", "icontains", "starts with",
@@ -37,7 +45,83 @@ _COMPARE = {
     "ends with": pc.ends_with,
     "regex": pc.match_substring_regex,
 }
-_FUNCTIONS = {"length": pc.utf8_length}
+
+
+def _integer_bounds(kind):
+    """Return the inclusive limits of an Arrow integer type."""
+    signed = pa.types.is_signed_integer(kind)
+    return (-2 ** (kind.bit_width - 1) if signed else 0,
+            2 ** (kind.bit_width - int(signed)) - 1)
+
+
+def _constant_comparison(values, accepted):
+    """Return one comparison outcome for every non-null value."""
+    return pc.if_else(pc.is_valid(values), accepted, None)
+
+
+def _rounded_float(value):
+    """Round a numeric literal to float64, including integers beyond its range."""
+    try:
+        return float(value)
+    except OverflowError:
+        return math.inf if value > 0 else -math.inf
+
+
+def _numeric(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def compare_literal(values, comparison, value):
+    """Compare a column and literal without rounding integer values."""
+    if pa.types.is_null(values.type):
+        return values.cast(pa.bool_())
+    if _numeric(value) and pa.types.is_integer(values.type):
+        if isinstance(value, float):
+            if math.isnan(value):
+                return _constant_comparison(values, comparison == "<>")
+            if math.isfinite(value):
+                if comparison in ("=", "<>") and not value.is_integer():
+                    return _constant_comparison(values, comparison == "<>")
+                value = (math.ceil(value) if comparison in ("<", ">=")
+                         else math.floor(value))
+        lower, upper = _integer_bounds(values.type)
+        if value < lower:
+            return _constant_comparison(values, comparison in (">", ">=", "<>"))
+        if value > upper:
+            return _constant_comparison(values, comparison in ("<", "<=", "<>"))
+        return _COMPARE[comparison](values, pa.scalar(value, type=values.type))
+    if _numeric(value) and pa.types.is_floating(values.type):
+        rounded = _rounded_float(value)
+        if isinstance(value, int) and rounded != value:
+            if comparison in ("=", "<>"):
+                return _constant_comparison(values, comparison == "<>")
+            comparison = (("<=" if rounded < value else "<")
+                          if comparison.startswith("<") else
+                          (">" if rounded < value else ">="))
+        return _COMPARE[comparison](values, pa.scalar(rounded, pa.float64()))
+    return _COMPARE[comparison](values, pa.scalar(value))
+
+
+def _membership(values, literals):
+    """Test membership using literals representable in the column's numeric domain."""
+    if pa.types.is_null(values.type):
+        return pc.is_valid(values)
+    literals = tuple(value for value in literals if value is not None)
+    if all(_numeric(value) for value in literals):
+        if pa.types.is_integer(values.type):
+            lower, upper = _integer_bounds(values.type)
+            literals = [int(value) for value in literals if lower <= value <= upper
+                        and (isinstance(value, int) or value.is_integer())]
+            return pc.is_in(values, value_set=pa.array(literals, type=values.type),
+                            skip_nulls=True)
+        if pa.types.is_floating(values.type):
+            literals = [_rounded_float(value) for value in literals
+                        if isinstance(value, float) or _rounded_float(value) == value]
+            return pc.is_in(hash_values(values.cast(pa.float64()), nan_equal=False),
+                            value_set=hash_values(pa.array(literals, pa.float64()),
+                                                  nan_equal=False),
+                            skip_nulls=True)
+    return pc.is_in(values, value_set=pa.array(list(literals)), skip_nulls=True)
 
 
 @dataclass(frozen=True)
@@ -57,6 +141,9 @@ class RegularPredicate:
     function: Optional[str] = None
 
     type_name: ClassVar[str] = "quail.regular_predicate"
+
+    def __post_init__(self):
+        object.__setattr__(self, "value", literal_value(self.value))
 
     def aliases(self) -> tuple[str, ...]:
         return (self.column.alias,)
@@ -127,22 +214,18 @@ class RegularPredicate:
                 column.
         """
         try:
-            for field in self.path:
-                values = pc.struct_field(values, field)
-            if self.function is not None:
-                values = _FUNCTIONS[self.function](values)
+            values = column_values(values, self.path, self.function)
             comparison = self.comparison.removeprefix("not ")
             if comparison == "is null":
                 mask = pc.is_null(values)
             elif comparison == "is not null":
                 mask = pc.is_valid(values)
             elif comparison == "in":
-                mask = pc.is_in(values, value_set=pa.array(
-                    list(self.value), values.type))
+                mask = _membership(values, self.value)
             elif isinstance(self.value, str):
                 mask = _COMPARE[comparison](values, self.value)
             else:
-                mask = _COMPARE[comparison](values, pa.scalar(self.value, values.type))
+                mask = compare_literal(values, comparison, self.value)
             return pc.invert(mask) if comparison != self.comparison else mask
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError,
                 pa.ArrowTypeError, TypeError, ValueError, OverflowError) as error:
@@ -172,7 +255,7 @@ class RegularPredicate:
     @property
     def name(self) -> str:
         """The tested column as written, with its path and function."""
-        name = ".".join((self.column.alias, self.column.column, *self.path))
+        name = ".".join((column_name(self.column), *self.path))
         return f"{self.function}({name})" if self.function else name
 
     def __str__(self) -> str:

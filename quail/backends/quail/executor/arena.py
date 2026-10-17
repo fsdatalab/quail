@@ -24,6 +24,8 @@ the same methods:
   evicted_prefix_tokens
 """
 
+import math
+
 import numpy as np
 
 from quail.backends.quail.executor.pages import PageArena, _evict_event
@@ -33,8 +35,9 @@ from quail.progress import answer_sink
 class KVArena:
     """The tensor backing for the arena, plus the accounting in pages.py.
 
-    Per-layer K and V pools of shape (n_pages, page_tokens, n_kv,
-    d_head). Torch is imported when the tensor pools are created.
+    Per-layer K and V pools are views of one allocation, with shape
+    (n_pages, page_tokens, n_kv, d_head). Torch is imported when the
+    tensor pools are created.
 
     layer_kv gives each layer its own (n_kv, d_head) when the layers
     differ, as Gemma 4's sliding and full-attention layers do.
@@ -81,12 +84,16 @@ class KVArena:
         self.accounting = PageArena(n_pages, page_tokens)
         self.sliding = (PageArena(n_sliding_pages, page_tokens)
                         if self.sliding_layers else None)
-        self.k, self.v = [], []
-        for layer, (heads, dim) in enumerate(self.shapes):
-            pages = n_sliding_pages if layer in self.sliding_layers else n_pages
-            shape = (pages * page_tokens, heads, dim)
-            self.k.append(torch.empty(shape, dtype=self.dtype, device=self.device))
-            self.v.append(torch.empty(shape, dtype=self.dtype, device=self.device))
+        shapes = [
+            ((n_sliding_pages if layer in self.sliding_layers else n_pages)
+             * page_tokens, heads, dim)
+            for layer, (heads, dim) in enumerate(self.shapes)
+        ]
+        sizes = [math.prod(shape) for shape in shapes]
+        storage = torch.empty(2 * sum(sizes), dtype=self.dtype, device=self.device)
+        parts = storage.split([size for size in sizes for _ in range(2)])
+        self.k = [part.view(shape) for part, shape in zip(parts[::2], shapes)]
+        self.v = [part.view(shape) for part, shape in zip(parts[1::2], shapes)]
         # row indices stay on the host: pageable H2D copies block the
         # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU

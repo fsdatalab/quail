@@ -6,8 +6,17 @@ column, and a table read through two document columns raise the same
 CompileError from either.
 """
 
+import pyarrow as pa
+
 from quail.catalog import Catalog
 from quail.logical import ColumnRef, CompileError
+from quail.logical.expressions import (
+    ColumnExpression,
+    column_name,
+    column_reference,
+    column_values,
+    evaluate_column,
+)
 
 
 class Scope:
@@ -20,7 +29,7 @@ class Scope:
     def __init__(self, catalog: Catalog):
         self.catalog = catalog
         self.tables: list[tuple[str, str]] = []
-        self.doc_columns: dict[str, str] = {}
+        self.doc_columns: dict[str, str | ColumnExpression] = {}
 
     def add_table(self, alias: str, provider: str) -> None:
         """Bring one table into scope under alias.
@@ -72,18 +81,37 @@ class Scope:
         return ColumnRef(alias=owners[0][0], provider=owners[0][1],
                          column=column)
 
-    def note_doc_column(self, ref: ColumnRef) -> None:
+    def note_doc_column(self, ref: ColumnRef | ColumnExpression) -> None:
         """Record the document column a prompt reads from ref's table.
 
         Raises:
             CompileError: The table was already read through another
                 column; its KV is computed from one column only.
         """
+        source = column_reference(ref)
+        schema = self.catalog.get(source.provider).schema()
+        values = evaluate_column(ref, pa.array([], schema.field(source.column).type))
+        value_type = column_values(values).type
+        if not (pa.types.is_string(value_type) or pa.types.is_large_string(value_type)
+                or pa.types.is_string_view(value_type)):
+            raise CompileError(f"AI input must be text, got {value_type}")
+        document = ref if isinstance(ref, ColumnExpression) else ref.column
         seen = self.doc_columns.get(ref.alias)
-        if seen and seen != ref.column:
+        if seen is not None and seen != document:
             raise CompileError(
                 f"alias {ref.alias!r} is referenced through two "
-                f"columns ({seen!r}, {ref.column!r}); predicates over "
-                f"one table must share one document column so its KV "
-                f"is computed once")
-        self.doc_columns[ref.alias] = ref.column
+                f"columns ({column_name(seen)!r}, {column_name(document)!r}); "
+                "predicates over one table must share one document column "
+                "so its KV is computed once")
+        self.doc_columns[ref.alias] = document
+
+    def resolve_value(self, column: str, alias: str | None = None, *,
+                      path=(), function=None, tables=None):
+        """Bind a scalar column expression and resolve its Arrow result type."""
+        ref = self.resolve(column, alias, tables=tables)
+        if not path and function is None:
+            return ref
+        expression = ColumnExpression(ref, tuple(path), function)
+        schema = self.catalog.get(ref.provider).schema()
+        expression.evaluate(pa.array([], type=schema.field(ref.column).type))
+        return expression

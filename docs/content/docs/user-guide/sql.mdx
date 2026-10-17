@@ -51,6 +51,11 @@ PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
 
 Here `{0}` is the review and `{1}` is the aspect.
 
+AI inputs can also read text from source struct fields. For example, if each
+row of `reviews` has a `content` struct with a `body` string field, use
+`PROMPT('Is this review positive? {0}', r.content.body)`. The model receives
+that field's text. The same field syntax works in `AI.CLASSIFY` and `AI.EXTRACT`.
+
 ## AI.IF
 
 `AI.IF` takes a `PROMPT` and evaluates it on each row or each pair
@@ -295,7 +300,8 @@ WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body)
       IN ('negative', 'mixed');
 ```
 
-- `=` keeps one category. Other comparisons raise `CompileError`.
+- Labels support the same comparisons and text tests as source text columns,
+  including `LIKE`, `<>`, and `LENGTH(sentiment) > 5`.
 - A category that is not in the list matches no rows.
 - Quail evaluates the repeated classification once and uses its label
   in both `SELECT` and `WHERE`.
@@ -323,7 +329,7 @@ JOIN aspects a ON AI.IF(
 
 These limits apply:
 
-- The classification and its `AI.IF` join run on one GPU.
+- The classification runs in its `AI.IF` join pipeline on each GPU worker.
 - A `WHERE` condition cannot test the label of a joined row.
 - A query cannot classify joined rows and also use `AI.SCORE`.
 
@@ -448,6 +454,11 @@ to keep them. The same conditions test a label or an extraction field
 named in `SELECT`; see [AI.CLASSIFY](#aiclassify) and
 [Filter on answers](#filter-on-answers).
 
+Quail treats floating-point `0.0` and `-0.0` as equal. NaN does not match
+an equality join or an `IN` value, including another NaN. `GROUP BY`,
+`DISTINCT`, and `COUNT(DISTINCT ...)` treat all NaNs as one value,
+separate from null. These rules apply with either SQL dialect.
+
 E.g., the following SQL query returns the IDs of reviews from 2024 with
 at least four stars that mention shipping:
 
@@ -469,9 +480,13 @@ in `ON`. See [Joining](#joining).
 
 Quail supports these SQL clauses with the following limits:
 
-- **`SELECT`** lists columns and `AI.SCORE` or `AI.CLASSIFY`
-  outputs with column aliases. `*` expands to all table columns. Other
-  computed expressions are unsupported.
+- **`SELECT`** lists columns, source struct fields such as `r.details.title`,
+  `LENGTH(column)`, and `AI.SCORE` or `AI.CLASSIFY` outputs with column aliases.
+  `*` expands to all table columns. Source field access and `LENGTH()` also
+  work in `WHERE`, `GROUP BY`, aggregate arguments, `ORDER BY`, and join
+  equality keys such as `ON LENGTH(r.title) = LENGTH(p.title)`.
+  `AS` names source columns and expressions too. For example,
+  `SELECT LENGTH(r.title) AS n ... ORDER BY n` sorts by the title length.
 - **`FROM`** names a registered table, with an optional alias.
 - **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
   `RIGHT`, `FULL`) are not.
@@ -510,6 +525,9 @@ The example query uses `d.id ASC` to order documents with equal scores by ID.
 columns. Quail removes duplicates before sorting and applying `OFFSET`
 or `LIMIT`. Every sorting column must appear in `SELECT`.
 
+The provider's ID column participates in DISTINCT like any other column.
+Repeated IDs and nulls are deduplicated by their returned values.
+
 ## OFFSET
 
 `OFFSET n` skips `n` rows after sorting and before applying `LIMIT`.
@@ -522,8 +540,8 @@ evaluation early. An offset greater than zero has the same effect.
 
 ## GROUP BY and HAVING
 
-`GROUP BY` accepts table columns and names assigned to AI outputs with
-`AS`. Return grouping columns and aggregate results in `SELECT`.
+`GROUP BY` accepts table columns, source scalar expressions, and names
+assigned with `AS`. Return grouping columns and aggregate results in `SELECT`.
 Give each aggregate in `SELECT` an `AS` name.
 
 `HAVING` filters groups by comparing an aggregate with a number. Refer
@@ -564,6 +582,13 @@ Functions that take a column ignore null values. The column can contain
 stored values or AI outputs. In SQL, an aggregate can also take an
 `AI.SCORE` call directly. Without `GROUP BY`, aggregates operate on all
 rows that pass `WHERE`.
+
+`SUM` and `AVG` use wider arithmetic when their intermediate totals could
+overflow. A final result outside its output type raises an error. For example,
+imagine a table with two floating-point values, both `1e308`. Their average
+is `1e308`, but their sum exceeds the floating-point range and raises an
+overflow error. NaN and infinity in the input retain their normal arithmetic
+behavior.
 
 ## Unsupported SQL
 

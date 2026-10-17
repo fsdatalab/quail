@@ -3,7 +3,9 @@
 import pyarrow as pa
 import pytest
 from helpers.planning import _optimize, _plan, node_kinds, tok
+from helpers.sessions import CONFIG, _run, fake_tok, make_executor
 
+import quail
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, DocumentProvider
 from quail.execution.metrics import NodeResult
@@ -20,6 +22,24 @@ from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.rules import built_in_rules
 from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+
+@pytest.mark.parametrize("offset", [0, 1, 2**80])
+@pytest.mark.parametrize("limit", [1, 2**80, None])
+def test_ordered_query_uses_row_bounds_independent_of_integer_size(offset, limit):
+    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+        session.register("docs", DocumentProvider.from_table(pa.table({
+            "id": [2, 0, 1], "text": ["doc"] * 3,
+        }), id_col="id"))
+        query = (session.docs("docs").alias("r")
+                 .ai_filter(prompt("keep: {0}", col("r.text")))
+                 .order_by("r.id").offset(offset))
+        if limit is not None:
+            query = query.limit(limit)
+        result = _run(query.select("r.id"), make_executor({
+            "r": {"keep:": [True] * 3}}))
+        stop = None if limit is None else offset + limit
+        assert result.to_rows() == [(0,), (1,), (2,)][offset:stop]
 
 
 @pytest.fixture()
@@ -124,17 +144,17 @@ def test_order_by_ends_the_plan_in_a_sort_and_keeps_every_survivor(catalog):
     assert "filter_limit" not in distinct.settings
 
 
-def test_distinct_is_dropped_when_every_tables_id_is_selected(catalog):
+def test_distinct_requires_uniqueness_from_the_plan(catalog):
     tokens = {"r": [400] * 100}
     optimized, changed = _optimize_with(
         catalog, _filtered(catalog).distinct().limit(3).select("r.id"), tokens)
-    assert "should_eliminate_distinct" in changed
-    assert not isinstance(optimized.root, Result) or not optimized.root.distinct
+    assert "should_eliminate_distinct" not in changed
+    assert isinstance(optimized.root, Result) and optimized.root.distinct
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
                       registry=built_in_registry(),
                       doc_tokens=tokens, tokenizer=tok)
-    assert node_kinds(plan)[-2:] == ["Project", "Limit"]
-    assert plan.settings["filter_limit"] == 3
+    assert node_kinds(plan)[-2:] == ["Project", "Sort"]
+    assert "filter_limit" not in plan.settings
     # a group's keys name it once, so DISTINCT over them is redundant too
     grouped = (_filtered(catalog).group_by("r.author").agg(n=count())
                .distinct().select("r.author", "n"))
@@ -173,9 +193,48 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
             _filtered(catalog).ai_classify(
                 prompt("tone: {0}", col("r.review")), ["pos", "neg"],
                 name="tone").distinct().select("r.author", "tone"),
-            _filtered(catalog).distinct().select("r.id", "r.author"),
             _filtered(catalog).select("r.author")):
         optimized, changed = _optimize_with(catalog, logical, tokens)
         assert "should_push_down_distinct" not in changed
         assert all(not node.stop_key for node in optimized.walk()
                    if isinstance(node, SemanticFilter))
+
+
+@pytest.mark.parametrize("ids", [["same", "same", "other"],
+                                 [None, None, "other"], [0.0, -0.0, 1.0]])
+@pytest.mark.parametrize("joined", [False, True])
+def test_distinct_deduplicates_id_values_before_limit(ids, joined):
+    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+        session.register("docs", DocumentProvider.from_table(pa.table({
+            "id": ids, "text": ["document"] * len(ids),
+        }), id_col="id"))
+        if joined:
+            session.register("partners", DocumentProvider.from_table(pa.table({
+                "id": ["partner", "partner"], "text": ["partner"] * 2,
+            }), id_col="id"))
+            query = session.sql("""
+                SELECT DISTINCT r.id, p.id FROM docs r JOIN partners p
+                ON AI_FILTER(PROMPT('Pair? {0} {1}', r.text, p.text), {'anchor': 'r'})
+                LIMIT 2
+            """)
+            execute = make_executor({}, {("r", "p"): lambda *_args: True})
+        else:
+            query = session.sql("""
+                SELECT DISTINCT r.id FROM docs r
+                WHERE AI_FILTER(PROMPT('keep: {0}', r.text)) LIMIT 2
+            """)
+            execute = make_executor({"r": {"keep:": [True] * len(ids)}})
+        expected = [(ids[0],), (ids[2],)]
+        if joined:
+            expected = [(*row, "partner") for row in expected]
+        assert _run(query, execute).to_rows() == expected
+        assert "filter_limit" not in query.plan().settings
+
+
+@pytest.mark.parametrize("name", ["__row", "__row_min", "row_position", "column_0"])
+def test_distinct_preserves_user_columns_that_resemble_internal_names(name):
+    table = pa.table({name: ["a", "a", None, None, "b"],
+                      "other": [1, 1, 2, 2, 3]})
+    rows, metrics = _rows(_sort(columns=(name, "other"), distinct=True), table)
+    assert rows == [("a", 1), (None, 2), ("b", 3)]
+    assert (metrics.input_rows, metrics.output_rows) == (5, 3)

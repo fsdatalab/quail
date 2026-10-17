@@ -1,7 +1,7 @@
 """AI.CLASSIFY: its statistics, scoring rule, cost, spec, and plan node."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from quail.cost import budgets
 from quail.cost import classify as classify_cost
@@ -18,12 +18,10 @@ from quail.logical import LabelWork, effective_selectivity
 from quail.physical import (
     AiClassify,
     ClassifySpec,
-    Filter,
     PortRef,
 )
-from quail.physical.base import input_ports
-from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import bind_inference, inference_node
+from quail.planner.operators.frontier import Frontier
 from quail.planner.prompt_lowering import (
     choice_token_parts,
     classify_prompt_tokens,
@@ -48,8 +46,6 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
     """
     lengths = context.document_tokens[alias]
     summary = summarize_alias(lengths, context.model.sliding_window, memo=context.memo)
-    if hasattr(lengths, "arrow_array"):
-        lengths = lengths.arrow_array.to_numpy()
     chunk = budgets.chunk_budget(context.model, context.device)
     capacity = arena_capacity(context, chunk)
     return ClassifyStatistics(
@@ -59,7 +55,8 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
         draws=context.canvas_draws if context.model.answer_canvas else 1,
         model=context.model,
         device=context.device,
-        capacity=capacity, lengths=lengths, shared=tuple(shared),
+        capacity=capacity, lengths=lengths, shared=shared, memo=context.memo,
+        workers=context.gpu_count,
         tree=(budgets.tree_attention_allowed(context.model)
               and getattr(context, "attention", None) != "unified"))
 
@@ -83,6 +80,8 @@ class ClassifyStatistics:
         tree: Whether the tree attention path, which trie_tree needs, is
             available: an fp8 model without a canvas whose attention is not
             forced to unified.
+        workers: Model copies sharing the document work.
+        memo: Query-local cache shared by the operator estimators.
     """
 
     alias: str
@@ -95,8 +94,10 @@ class ClassifyStatistics:
     capacity: int = 0
     draws: int = 1
     lengths: Sequence = ()
-    shared: tuple = ()
+    shared: Sequence = ()
     tree: bool = False
+    workers: int = 1
+    memo: dict | None = field(default=None, compare=False, repr=False)
 
 
 def classify_scoring(context, alias, shared=()):
@@ -192,7 +193,7 @@ class ClassifyScoring(ClassifyStatistics):
             scoring, live, head_tokens, frame_tokens, labels,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=resident,
-            draws=self.draws, starts=starts)
+            draws=self.draws, starts=starts, memo=self.memo, workers=self.workers)
 
     def estimate_spec(self, spec: ClassifySpec,
                       resident=False) -> classify_cost.ClassifyCost:
@@ -209,7 +210,8 @@ class ClassifyScoring(ClassifyStatistics):
                 live=spec.expected_inputs, lengths=self.lengths,
                 shared=self.shared, chunk=self.chunk, model=self.model,
                 device=self.device, resident=resident,
-                answer_rows=len(spec.label_token_ids) + 1)
+                answer_rows=len(spec.label_token_ids) + 1, memo=self.memo,
+                workers=self.workers)
         return self.estimate(
             spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
             spec.label_token_ids, resident, spec.label_word_starts)
@@ -385,7 +387,8 @@ class ClassifyBuilder(ClassifyStatistics):
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=True,
             canvas_rows=self.model.canvas_tokens,
-            head_rows=len({tuple(ids) for ids in labels}))
+            head_rows=len({tuple(ids) for ids in labels}), memo=self.memo,
+            workers=self.workers)
         need = len(head) + self.longest + len(note) + max(suffixes)
         if need > self.budget:
             raise ClassifyRefusedError.over_budget(
@@ -414,7 +417,8 @@ class ClassifyBuilder(ClassifyStatistics):
         estimated = classify_cost.estimate_suffixes(
             len(head), frame, [request], live=live, lengths=self.lengths,
             shared=self.shared, chunk=self.chunk, model=self.model,
-            device=self.device, answer_rows=len(blocks) + 1)
+            device=self.device, answer_rows=len(blocks) + 1, memo=self.memo,
+            workers=self.workers)
         return bind_inference(
             ClassifySpec, call.prompt, name=name, aliases=aliases,
             expected_inputs=live, estimated_seconds=estimated.seconds,
@@ -440,7 +444,7 @@ class ClassifyBuilder(ClassifyStatistics):
             len(head), len(note) + len(partner_label), [request], live=pairs,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=True,
-            answer_rows=len(blocks) + 1)
+            answer_rows=len(blocks) + 1, memo=self.memo, workers=self.workers)
         need = len(head) + self.longest + len(note) + request
         if need > self.budget:
             raise ClassifyRefusedError.over_budget(
@@ -454,7 +458,7 @@ class ClassifyBuilder(ClassifyStatistics):
             frame_tokens=frame), estimated.work
 
 
-def emit_classify(builder, alias, live, calls, frontier) -> tuple:
+def emit_classify(builder, alias, live, calls, frontier, tests=None) -> tuple:
     """Classify the alias's documents, then keep the accepted labels.
 
     Args:
@@ -463,6 +467,7 @@ def emit_classify(builder, alias, live, calls, frontier) -> tuple:
         live: The documents the classifications read.
         calls: The classifications to emit, in run order.
         frontier: Where the documents stand before the classifications.
+        tests: Tests to emit with these calls, or None for all their tests.
 
     Returns:
         Where the documents stand after them, and the rows ports of
@@ -470,13 +475,11 @@ def emit_classify(builder, alias, live, calls, frontier) -> tuple:
     """
     label_ports = []
     table = classify_builder(builder.context, alias, "quail")
+    tests = (builder.operators.label_filters.get(alias, ()) if tests is None else tests)
     steps = []
     for call in calls:
-        steps.extend((test.call, test)
-                     for test in builder.operators.label_filters.get(alias, ())
-                     if test.call == call)
-        if call not in builder.operators.labels.tests:
-            steps.append((call, None))
+        matching = [test for test in tests if test.call == call]
+        steps.extend((call, test) for test in matching or (None,))
     classified_calls = set()
     for call, test in steps:
         if call not in classified_calls:
@@ -490,17 +493,12 @@ def emit_classify(builder, alias, live, calls, frontier) -> tuple:
             builder.nodes.append(node)
             frontier = Frontier(PortRef(node.node_id, f"ids:{alias}"),
                                 PortRef(node.node_id, "rows"))
+            builder.value_ports[(alias, spec.name)] = frontier.rows
             if call in builder.operators.labels.projected:
                 label_ports.append(frontier.rows)
             classified_calls.add(call)
         if test is not None:
-            lid = f"filter:{alias}:{test.position}"
-            builder.nodes.append(Filter(
-                node_id=lid, inputs=input_ports((frontier.rows,)),
-                predicate=test.condition, aliases=(alias,),
-                selectivity=test.selectivity, written_pos=test.position))
-            frontier = Frontier(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
-            live *= effective_selectivity(test.selectivity)
+            frontier, live = builder.emit_tests(alias, (test,), frontier, live)
     return frontier, label_ports
 
 

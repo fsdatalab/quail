@@ -104,7 +104,6 @@ class PhysicalNode:
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
     backend: ClassVar[str | None] = None
 
-    worker_pipelining: ClassVar[bool] = False
 
     @property
     def document_aliases(self) -> tuple[str, ...]:

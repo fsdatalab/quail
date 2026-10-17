@@ -24,6 +24,7 @@ from quail.logical import (
     join_conditions,
     oriented_join_conditions,
 )
+from quail.logical.expressions import column_reference, evaluate_column, source_column
 from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
 from quail.planner.optimizer.context import PlanningContext
@@ -159,7 +160,7 @@ class Query:
                 columns = s.columns
                 with_offsets = locates_answers and s.alias in offset_aliases
                 if reads_text:
-                    columns = tuple(dict.fromkeys((*columns, s.column)))
+                    columns = tuple(dict.fromkeys((*columns, source_column(s.column))))
                 if s.alias not in self._estimated:
                     self._token_inputs[s.alias] = self.session.inputs.tokenize(
                         s.provider, s.column, columns, with_offsets=with_offsets)
@@ -225,12 +226,13 @@ class Query:
 
         def keys(refs):
             out = []
-            for ref in refs:
+            for expression in refs:
+                ref = column_reference(expression)
                 key = (ref.alias, ref.column)
                 if key not in samples:
                     samples[key] = self.session.inputs.sample_columns(
                         providers[ref.alias], [ref.column])[ref.column]
-                out.append(samples[key])
+                out.append(evaluate_column(expression, samples[key]))
             return out
 
         fractions = {}
@@ -388,8 +390,9 @@ class Query:
             inputs[node.input_id] = document_input(
                 store.tokens,
                 (
-                    store.column(logical_scan.column)
-                    if logical_scan.column in store.projected_columns
+                    evaluate_column(logical_scan.column,
+                                    store.column(source_column(logical_scan.column)))
+                    if source_column(logical_scan.column) in store.projected_columns
                     else None
                 ),
             )
@@ -406,10 +409,12 @@ class Query:
         operators = self.logical.operators()
         for join in operators.joins:
             for condition in join_conditions(join):
-                for ref in (condition.left, condition.right):
+                for expression in (condition.left, condition.right):
+                    ref = column_reference(expression)
                     needed.setdefault(ref.alias, {})[ref.column] = None
         for apply in operators.applies:
-            for ref in apply.columns:
+            for expression in apply.columns:
+                ref = column_reference(expression)
                 needed.setdefault(ref.alias, {})[ref.column] = None
         for scan in operators.scans:
             for predicate in scan.predicates:
@@ -420,10 +425,8 @@ class Query:
         tables = {}
         for alias, columns in needed.items():
             store = self._token_inputs[alias]
-            arrays = {alias: pa.array(range(len(store.lengths)), pa.int32())}
-            for name in columns:
-                arrays[name] = store.column(name)
-            tables[columns_key(alias)] = pa.table(arrays)
+            tables[columns_key(alias)] = pa.table({name: store.column(name)
+                                                   for name in columns})
         return tables
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:

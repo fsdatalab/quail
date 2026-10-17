@@ -61,6 +61,13 @@ multiple `ai_if` calls. Quail reorders them by estimated cost to
 reduce total work. Pass `order="as_written"` to `select()` to keep
 the written order.
 
+AI inputs can read text from source struct fields. For example, if each
+review has a `content` struct with a `body` string field, use
+`prompt('Is this review positive? {0}', col("r.content").field("body"))`.
+The same column expression works in `ai_classify()` and `ai_extract()`.
+Token caches distinguish the selected fields and share tokens when queries
+read the same field under different table aliases.
+
 ### ai_classify
 
 `ai_classify(prompt, labels, *, name, descriptions=None, task_description="", probabilities=False)`
@@ -109,7 +116,7 @@ probability output, and limits on classifications of joined rows.
 from a document. Pass the
 document column as a string such as `"c.text"`, or use `col("c.text")`.
 Pass a dictionary that maps each field name to its question. Set `name`
-to the result column you want, and include it in `select()`.
+to the result column you want. Include it in `select()` to return the answers.
 
 For example, imagine you registered a `contracts` table with an `id`
 column and the contract text in `text`. Return the end date and the
@@ -128,8 +135,8 @@ You get `c.id`, `lease`, and `lease_span`. `lease` is a struct with one
 string field for each question. `lease_span` holds the position of each
 answer.
 
-Test a field with `where()` to keep the documents whose answer passes;
-the extraction runs once for the test and the returned column:
+Test a field with `where()` to keep the documents whose answer passes.
+You can return just the document IDs:
 
 ```python
 query = (
@@ -137,12 +144,14 @@ query = (
     .ai_extract("c.text", {"end_date": "When does the lease end?"}, name="lease")
     .where(col("lease.end_date").is_not_null().hint(selectivity=0.9)
            & col("lease.end_date").like("%2027%").hint(selectivity=0.4))
-    .select("c.id", "lease")
+    .select("c.id")
 )
 ```
 
 `col("lease_span.end_date").field("start") < 500` tests where the
-answer begins.
+answer begins. If you also return `lease`, each extraction runs once for
+both the test and the output. Fields that are neither returned nor tested
+do not run.
 
 See [`AI.EXTRACT`](/docs/user-guide/sql#aiextract) for output examples
 and supported queries.
@@ -186,7 +195,12 @@ For example, after classifying reviews into the `sentiment` column,
 `label_in("sentiment", ["negative", "mixed"])` keeps reviews with either
 of those labels.
 
-`label_in()` does not work on a classification of joined rows.
+Use `where()` for other comparisons and text tests on labels. For example,
+after classifying reviews into `sentiment`,
+`where(col("sentiment").length() > 5)` keeps labels longer than five characters.
+The predicate reads the computed label without calling the model again.
+
+Label filters do not work on a classification of joined rows.
 
 ### ai_join
 
@@ -405,6 +419,28 @@ and returns a `Query`.
 .select("*")                   # all columns from all tables
 ```
 
+Source column expressions work in `select()`, `order_by()`, `group_by()`,
+aggregate arguments, `where()`, join equality keys, and `apply()` columns.
+Use `.length()` for a text value's
+character count and `.field(name)` to read a struct field. Null values
+remain null.
+
+For example, a reviews table has an ID and review text in `body`. This
+query returns each positive review's length, with the longest first:
+
+```python
+length = col("r.body").length()
+query = (
+    session.docs("reviews").alias("r")
+    .ai_if(prompt('Is this review positive? {0}', col("r.body")))
+    .order_by(length.desc())
+    .select("r.id", length)
+)
+result = query.collect()
+```
+
+The computed result column is named `length(r.body)`.
+
 ### collect
 
 `collect(limit=None)`
@@ -426,7 +462,17 @@ user-defined function.
 `apply(fn, columns=[], name=None, ids=None, kind="per_batch")`
 
 Insert a Python function into the query plan. The function receives
-a dict of Arrow tables keyed by alias.
+a dict of `Rows` keyed by alias. Each `Rows` keeps document IDs in
+`rows.ids[alias]` and the requested source columns in the Arrow table
+`rows.values`. Read a value column with `rows.column(name)`. IDs and
+values remain separate even when a source column has the same name
+as its table alias. A function can return filtered `Rows`, an ID
+array, or an Arrow table of IDs.
+
+An expression in `columns` is evaluated before the function is called.
+The value column's name omits the table alias. For example,
+`col("r.details").field("title").length()` produces
+`rows["r"].column("length(details.title)")`.
 
 The main use case is pairing rows from two tables before an AI join.
 For example, a claims table has an `evidence_wiki_url` column that
@@ -434,21 +480,17 @@ names the evidence page for each claim. Instead of evaluating the AI
 predicate on every claim-evidence pair, you pair them by URL first:
 
 ```python
-def match_by_url(tables):
-    """Pair each claim with the evidence row its URL names.
-
-    tables["c"] is a pyarrow.Table with columns "c" (the document ids),
-    "evidence_wiki_url", and any other columns requested.
-    tables["e"] has columns "e" (the document ids) and "id".
-    The returned table must have columns "c" and "e" (the id columns
-    from each side) to identify the pairs.
-    """
-    return tables["c"].join(
-        tables["e"],
-        keys=["evidence_wiki_url"],
-        right_keys=["id"],
-        join_type="inner",
-    ).select(["c", "e"])
+def match_by_url(rows):
+    """Pair each claim with the evidence row its URL names."""
+    claims = pa.table({
+        "c": rows["c"].ids["c"],
+        "url": rows["c"].column("evidence_wiki_url"),
+    })
+    evidence = pa.table({
+        "e": rows["e"].ids["e"],
+        "url": rows["e"].column("id"),
+    })
+    return claims.join(evidence, keys="url", join_type="inner").select(["c", "e"])
 
 query = (
     session.docs("claims").alias("c")
@@ -485,8 +527,9 @@ Quail first finishes the stage before it, then calls your function one
 time with all the rows.
 
 ```python
-def deduplicate(tables):
-    reviews = tables["r"]
+def deduplicate(rows):
+    reviews = pa.table({"r": rows["r"].ids["r"],
+                        "body": rows["r"].column("body")})
     groups = reviews.group_by("body").aggregate([("r", "min")])
     return groups.column("r_min")
 
@@ -501,6 +544,10 @@ result = query.collect()
 
 The planner preserves the order of operators around `apply_table()`.
 It does not move an operator across the function call.
+A function declared after an AI join receives only documents in the
+surviving joined rows. A function declared between joins runs before
+the later join. The same ordering applies to `apply()`; its function
+receives those documents in batches.
 
 ## Errors
 

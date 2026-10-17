@@ -4,7 +4,19 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
+from quail.logical.expressions import hash_values
 from quail.logical.predicates import accepted_rows
+
+
+def group_ids(columns) -> np.ndarray:
+    """Assign one group ID to rows with equal keys, grouping nulls and NaNs."""
+    codes = []
+    for column in columns:
+        values = pc.dictionary_encode(hash_values(column, nan_equal=True))
+        if isinstance(values, pa.ChunkedArray):
+            values = values.combine_chunks()
+        codes.append(pc.fill_null(values.indices, -1).to_numpy())
+    return np.unique(np.column_stack(codes), axis=0, return_inverse=True)[1].reshape(-1)
 
 
 def selected_rows(columns: dict, predicates) -> pa.Array:

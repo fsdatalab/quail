@@ -18,8 +18,11 @@ in a batch.
 
 ## Paged KV
 
-Quail stores KV in pages of 16 tokens. The session allocates an arena,
-which is the GPU memory pool holding those pages.
+Quail stores KV in pages of 16 tokens. The loaded engine owns an arena,
+which is the GPU memory pool holding those pages. The arena reserves its
+storage in one allocation. Each layer reads and writes a separate region
+with its own shape, including layers with a sliding window. If allocation
+fails, there are no earlier layer buffers left to release.
 
 Each document has a list of page IDs. Several documents can reference the
 same page when they share a prefix. A page becomes free when no document

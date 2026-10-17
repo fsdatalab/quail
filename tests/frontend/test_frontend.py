@@ -381,7 +381,7 @@ REJECTED = [
     ("SELECT r.id FROM reviews r LEFT JOIN products p ON AI_FILTER("
      "PROMPT('x {0} {1}', r.review, p.description))", "plain JOIN"),
     ("SELECT r.id + 1 FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
-     "r.review))", "column selection"),
+     "r.review))", "not a column expression"),
     ("SELECT r.id FROM reviews r", "no AI predicate"),
     ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
      "r.review), {'selectivty': 0.3})", "unknown option"),
@@ -541,3 +541,65 @@ def test_builder_places_apply_nodes_in_the_logical_tree():
     with pytest.raises(CompileError, match="ids must be 'pairs'"):
         (base.join(docs(cat, "evidence").alias("e"))
          .apply(same_key, columns=[col("c.url")], ids="preserve"))
+
+
+@pytest.mark.parametrize("transform", ["length", "field"])
+@pytest.mark.parametrize("use", [
+    "prompt", "extract",
+])
+def test_ai_inputs_check_expression_types(catalog, transform, use):
+    builder = docs(catalog, "reviews").alias("r")
+    builder.ai_filter(prompt("Relevant? {0}", col("r.review")))
+    source = col("r.review")
+    expression = source.length() if transform == "length" else source.field("start")
+    error = "AI input must be text" if transform == "length" else "struct_field"
+    with pytest.raises(CompileError, match=error):
+        if use == "prompt":
+            builder.ai_filter(prompt("Relevant? {0}", expression))
+        elif use == "extract":
+            builder.ai_extract(expression, {"ends": "When?"}, name="lease")
+
+
+@pytest.mark.parametrize("kind", ["column", "predicate", "join", "and", "aggregate",
+                                  "having"])
+@pytest.mark.parametrize("operation", ["bool", "and", "or", "not"])
+def test_query_expressions_reject_python_boolean_operations(kind, operation):
+    from quail.frontend.expressions import count
+
+    column = col("r.id")
+    expression = {
+        "column": column,
+        "predicate": column == "x",
+        "join": column == col("p.id"),
+        "and": (column == "x") & (col("r.review") == "y"),
+        "aggregate": count(),
+        "having": count() > 1,
+    }[kind]
+    with pytest.raises(TypeError, match="no Python truth value"):
+        if operation == "bool":
+            bool(expression)
+        elif operation == "and":
+            expression and (column == "y")
+        elif operation == "or":
+            expression or (column == "y")
+        else:
+            not expression
+
+
+@pytest.mark.parametrize("operation", ["length", "field"])
+def test_column_function_cannot_be_overwritten_or_reordered(operation):
+    expression = col("r.review").length()
+    with pytest.raises(CompileError, match="cannot be followed"):
+        if operation == "length":
+            expression.length()
+        else:
+            expression.field("start")
+
+
+
+def test_apply_accepts_a_value_column_named_as_its_table(catalog):
+    plan = (docs(catalog, "reviews").alias("review")
+            .ai_filter(prompt("Relevant? {0}", col("review.review")))
+            .apply(keep_even, columns=[col("review.review")])
+            .select("review.id"))
+    plan.validate()

@@ -5,11 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+import pyarrow as pa
+
 from quail.logical.expressions import (
     Alias,
     ColumnRef,
     CompileError,
     ModelCall,
+    column_reference,
     model_call,
 )
 from quail.logical.nodes import (
@@ -50,6 +53,11 @@ class ColumnTest:
     condition: RegularPredicate
     selectivity: Optional[float]
     position: int
+
+    def accepted_labels(self) -> tuple[str, ...]:
+        """Return the classification's labels that satisfy this predicate."""
+        values = pa.array(self.call.labels, pa.string())
+        return tuple(values.filter(self.condition.evaluate(values)).to_pylist())
 
 
 @dataclass(frozen=True)
@@ -212,6 +220,7 @@ class LogicalPlan:
             labels=_label_work(classifies, columns, label_filters),
             classifies=tuple(classifies),
             extracts=tuple(extracts),
+            nodes=nodes,
         )
 
 
@@ -222,7 +231,8 @@ class Operators:
     ``walk`` lists children before parents, so scans, joins, applies,
     classifications, and extractions follow written order, each
     alias's AI.IF predicates keep their order, and each alias's label
-    filters keep theirs.
+    filters keep theirs. ``nodes`` retains the traversal order across
+    operator types so callbacks keep their position.
     """
 
     scans: tuple  # tuple[Scan, ...]
@@ -237,6 +247,7 @@ class Operators:
     #                     alias -> tuple[ColumnTest, ...] on labels
     extract_filters: dict = field(default_factory=dict)
     #                     alias -> tuple[ColumnTest, ...] on answers
+    nodes: tuple = ()
 
     def all_filters(self) -> dict:
         """Return alias -> its AI.IF predicates, then its ColumnTests."""
@@ -306,7 +317,7 @@ def oriented_join_conditions(join: "SemanticJoin") -> tuple | None:
     oriented = []
     for condition in conditions:
         left, right = condition.left, condition.right
-        if left.alias != left_alias:
+        if column_reference(left).alias != left_alias:
             left, right = right, left
         oriented.append((left, right))
     return left_alias, right_alias, tuple(oriented)

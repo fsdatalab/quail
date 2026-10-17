@@ -143,9 +143,10 @@ def run_filter_sequence(
 ):
     """Submit the next filter after each document passes.
 
-    The engine exposes add_request and step, as vLLM's LLMEngine does,
+    The engine exposes add_request, step, and abort_request, as vLLM does,
     so a passing document's next stage enters the queue while other
-    documents are still on earlier stages.
+    documents are still on earlier stages. Unfinished requests are
+    cancelled before returning an error.
     """
     document_cap = filter_document_cap(
         body_ids, question_ids, budget_tokens,
@@ -156,7 +157,6 @@ def run_filter_sequence(
 
     def submit(document, stage):
         request_id = f"{tag}-{document}-{stage}"
-        inflight[request_id] = (document, stage)
         if body_texts is not None and question_texts is not None:
             prompt = body_texts[document] + question_texts[stage]
             if render_prompt is not None:
@@ -165,24 +165,29 @@ def run_filter_sequence(
             prompt = {
                 "prompt_token_ids": body_ids[document] + question_ids[stage]
             }
+        inflight[request_id] = (document, stage)
         engine.add_request(request_id, prompt, sampling_params)
 
     started = time.perf_counter()
     live = 0
     next_document = 0
-    while next_document < len(body_ids) or inflight:
-        while next_document < len(body_ids) and live < document_cap:
-            submit(next_document, 0)
-            live += 1
-            next_document += 1
-        for output in engine.step():
-            if not output.finished or output.request_id not in inflight:
-                continue
-            document, stage = inflight.pop(output.request_id)
-            if sequence.record(document, stage, output):
-                submit(document, stage + 1)
-            else:
-                live -= 1
+    try:
+        while next_document < len(body_ids) or inflight:
+            while next_document < len(body_ids) and live < document_cap:
+                submit(next_document, 0)
+                live += 1
+                next_document += 1
+            for output in engine.step():
+                if not output.finished or output.request_id not in inflight:
+                    continue
+                document, stage = inflight.pop(output.request_id)
+                if sequence.record(document, stage, output):
+                    submit(document, stage + 1)
+                else:
+                    live -= 1
+    finally:
+        if inflight:
+            engine.abort_request(list(inflight))
     return sequence.result(
         time.perf_counter() - started,
         **_cap_settings(document_cap, budget_tokens, block_size,

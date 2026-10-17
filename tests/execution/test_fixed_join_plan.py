@@ -9,7 +9,7 @@ import quail
 from bench import quailb
 from quail.api.execute import execute_query
 from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.reranker import score_rows
+from quail.backends.quail.reranker import probability_column, score_rows
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.types import PhysicalResponse
 from quail.logical.expressions import CompileError
@@ -65,6 +65,18 @@ class FixedFeverAnswers:
         self.state = state
         self.capacity = capacity
         self.empty = empty
+
+    def run_pipeline(self, nodes, inputs, context):
+        results = {}
+        for node in nodes:
+            supplied = dict(inputs[node.node_id])
+            for port in node.inputs:
+                if port.source.node_id in results:
+                    supplied[port.name] = results[port.source.node_id].outputs[
+                        port.source.port]
+            results[node.node_id] = context.runtimes[node.runtime_key].execute(
+                node, supplied, context)
+        return results
 
     def _answers(self, document_ids):
         answers = {local: [document < 2 and not self.empty]
@@ -193,11 +205,12 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
     from quail.backends.quail import worker
     from quail.backends.quail.distributed import execute_distributed_graph
     from quail.execution.runner import ExecutionContext
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
+    from quail.specs import H100_SXM
 
     def child(docs):
         state = graph_state(None, docs)
         model = FixedFeverAnswers(state, capacity=1, empty=False)
+        model.execute_pipeline = model.run_pipeline
         state["gpu"].execution = model
         return worker.ChildState(
             gpu_index=0, gpu=state["gpu"], registry=session.registry,
@@ -219,15 +232,15 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
         children = [child(docs), child(docs)]
 
         def round_fn(kind, subs):
-            function = (worker._child_filters if kind == "filters"
-                        else worker._child_joins)
-            return [function(state, sub) for state, sub in zip(children, subs)]
+            assert kind == "execute"
+            return [worker._child_execute(state, sub)
+                    for state, sub in zip(children, subs)]
 
         monkeypatch.setattr(worker, "_child_boot", lambda state, sub: None)
         report = execute_distributed_graph(
             {**request.plan["settings"], "model": "qwen3-4b-fp8",
              "docs": docs, **extra, "physical_plan": request.plan},
-            graph, 2, round_fn, QWEN3_4B_FP8, H100_SXM,
+            graph, 2, round_fn, H100_SXM,
             session.registry.runtimes, session.registry,
         )
         assert all(not child.gpu.arena.accounting.owned for child in children)
@@ -368,6 +381,62 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         assert labels.column("topic").to_pylist() == ["science", "sport", "science"]
 
 
+@pytest.mark.parametrize("alias,column", [("c", "claim"), ("e", "text")])
+@pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_classification_probabilities_survive_join_projection(
+        monkeypatch, alias, column, filtered, empty):
+    if empty:
+        monkeypatch.setattr(FixedFeverAnswers, "labels", (None, None, None))
+    execute = FixedFeverAnswers.execute
+
+    def classify(self, node, inputs):
+        result = execute(self, node, inputs)
+        if isinstance(node, AiClassify) and node.spec.probabilities:
+            rows = result.outputs["rows"]
+            probabilities = [[0.8, 0.2] if label == "science" else [0.1, 0.9]
+                             for label in rows.column(node.spec.name).to_pylist()]
+            result.outputs["rows"] = rows.with_column(
+                node.spec.name + "_probabilities",
+                probability_column(node.spec.labels, probabilities))
+        return result
+
+    monkeypatch.setattr(FixedFeverAnswers, "execute", classify)
+    with _session() as session:
+        sources = {"c": session.docs("claims").alias("c"),
+                   "e": session.docs("evidence").alias("e")}
+        sources[alias] = sources[alias].ai_classify(
+            quail.prompt("What is {0} about?", quail.col(f"{alias}.{column}")),
+            ["science", "sport"], name="topic", probabilities=True)
+        if filtered:
+            sources[alias] = sources[alias].label_in(
+                "topic", ["science"], selectivity=0.1)
+        query = sources["c"].ai_join(
+            sources["e"], quail.prompt("Does {1} support {0}?",
+                                       quail.col("c.claim"), quail.col("e.text")),
+            selectivity=0.5).select("c.id", "e.id", "topic")
+        result = execute_query(query, physical_executor=fever_executor(
+            session, monkeypatch, 1, capacity=10))
+        expected = []
+        for claim, evidence in ((0, 0), (1, 1), (2, 0), (1, 2)):
+            document = claim if alias == "c" else evidence
+            label = FixedFeverAnswers.labels[document]
+            if label is None or filtered and label != "science":
+                continue
+            probabilities = [0.8, 0.2] if label == "science" else [0.1, 0.9]
+            expected.append({"c.id": f"c{claim}", "e.id": f"e{evidence}",
+                             "topic": label, "topic_probabilities": list(zip(
+                                 ["science", "sport"], probabilities))})
+        assert sorted(result.collect().to_pylist(), key=lambda row: (
+            row["c.id"], row["e.id"])) == sorted(expected, key=lambda row: (
+                row["c.id"], row["e.id"]))
+        classify = next(node for node in query.plan().nodes
+                        if isinstance(node, AiClassify))
+        assert "topic_probabilities" in classify.outputs[0].schema
+        assert "topic_probabilities" in result.answer_tables[
+            "classifies"]["topic"].column_names
+
+
 def test_a_classification_of_joined_rows_follows_its_join(monkeypatch):
     """A join, then a classification of each row it keeps.
 
@@ -457,7 +526,9 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
             plan = query.plan()
             stage = plan.graph.nodes_by_type(AiJoin.type_name)[0]
             hash_join = plan.graph.node("hash_join:c-e")
-            assert hash_join.on == (("evidence_wiki_url", "id"),)
+            assert tuple((left.column, right.column)
+                         for left, right in hash_join.on) == (
+                ("evidence_wiki_url", "id"),)
             assert hash_join.pair_fraction == 3 / 9
             assert stage.pairs_from == "hash_join:c-e"
             result = execute_query(

@@ -9,7 +9,6 @@ import pytest
 from helpers.fakes import cpu_arena, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.executor import model_loading
 from quail.backends.quail.executor.model_loading import (
     answer_weights,
     retain_answer_head,
@@ -17,6 +16,7 @@ from quail.backends.quail.executor.model_loading import (
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.builtins import built_in_registry
+from quail.specs.files import resolve_model_path
 
 
 @pytest.fixture
@@ -123,9 +123,9 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
 
 @pytest.fixture
 def clear_model_paths():
-    model_loading.resolve_model_path.cache_clear()
+    resolve_model_path.cache_clear()
     yield
-    model_loading.resolve_model_path.cache_clear()
+    resolve_model_path.cache_clear()
 
 
 def test_model_files_are_resolved_once_and_cached_before_children_start(
@@ -137,9 +137,9 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         return str(tmp_path / kwargs["revision"])
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", download)
-    first = model_loading.resolve_model_path("Qwen/model", "revision-a")
-    assert model_loading.resolve_model_path("Qwen/model", "revision-a") == first
-    assert model_loading.resolve_model_path("Qwen/model", "revision-b") != first
+    first = resolve_model_path("Qwen/model", "revision-a")
+    assert resolve_model_path("Qwen/model", "revision-a") == first
+    assert resolve_model_path("Qwen/model", "revision-b") != first
     assert [call["revision"] for call in calls] == ["revision-a", "revision-b"]
     assert all(call["repo_id"] == "Qwen/model" for call in calls)
     assert "*.safetensors" in calls[0]["allow_patterns"]
@@ -155,9 +155,11 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         assert revision == registry.model("qwen3-4b-fp8").revision
         return str(tmp_path)
 
-    def ensure(count):
+    def ensure(count, configuration):
         events.append("children")
         assert count == 8
+        assert configuration[0] == registry.model("qwen3-4b-fp8")
+        return SimpleNamespace(round=round_fn)
 
     def round_fn(kind, subs):
         events.append("boot")
@@ -176,11 +178,14 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
     monkeypatch.setattr(worker.time, "perf_counter", lambda: next(clock))
     monkeypatch.setattr(worker, "resolve_model_path", resolve)
     monkeypatch.setattr(worker, "_ensure_children", ensure)
-    monkeypatch.setattr(worker, "_round", round_fn)
     monkeypatch.setattr(worker, "execute_distributed_graph", run_graph)
     result = worker.execute_quail_multi({
         "docs": {}, "workers": 8, "model": "qwen3-4b-fp8",
-        "physical_plan": {"device": "h100-sxm"},
+        "physical_plan": {
+            "device": "h100-sxm", "backend": "quail",
+            "model": "qwen3-4b-fp8", "workers": 8,
+            "settings": {"chunk_tokens": 100, "true_ids": [1], "false_ids": [2]},
+        },
         "chunk_tokens": 100, "true_ids": [1], "false_ids": [2],
     }, registry, object())
     assert events == ["resolve", "children", "boot", "query"]

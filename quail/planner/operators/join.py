@@ -10,8 +10,8 @@ from quail.logical import (
 from quail.logical.prompts import prompt_aliases
 from quail.physical import AiJoin, Foreign, PortRef
 from quail.physical.base import input_ports
-from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import question_tokens
+from quail.planner.operators.frontier import Frontier
 from quail.planner.operators.score import ScoreJoinCost, score_statistics
 from quail.planner.prompt_lowering import LoweredPrompt
 
@@ -50,8 +50,6 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
                 selectivity=j.selectivity,
                 frame_tokens={left: head + middle, right: 0},
                 label_tokens={left: 0, right: 0}, tail_tokens=tail + canvas,
-                on=tuple((c.left.alias, c.left.column, c.right.alias,
-                          c.right.column) for c in conditions),
                 pair_fraction=fraction,
                 cost=ScoreJoinCost((left, right), cost, fraction)))
             continue
@@ -64,8 +62,6 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
             tail_tokens=question_tokens(lowered, canvas),
-            on=tuple((c.left.alias, c.left.column, c.right.alias,
-                      c.right.column) for c in conditions),
             pair_fraction=fraction))
     return out
 
@@ -105,14 +101,13 @@ def emit_join(builder, spec, step, anchor, jid, exec_idx, frontiers) -> JoinOutp
         pairs_from = producer.node_id
     for apply in builder.join_applies.get(spec.written_pos, ()):
         # the function's pairs reach the join on their own port
-        aid = f"apply:{apply.function}"
+        aid = builder.unique_id("apply", apply.function)
         builder.nodes.append(Foreign(
             node_id=aid,
             inputs=input_ports(tuple(
                 frontiers[a].ids for a in apply.aliases)),
             function=apply.function, kind=apply.kind, ids="pairs",
-            columns=tuple((ref.alias, ref.column)
-                          for ref in apply.columns),
+            columns=apply.columns,
             aliases=tuple(apply.aliases),
             written_pos=spec.written_pos))
         pair_inputs.append(PortRef(aid, f"pairs:{spec.written_pos}"))

@@ -131,7 +131,7 @@ class PhysicalPlan:
             PlanEditError: The edited operator graph is invalid.
         """
         nodes = plan_kv_retention(
-            PhysicalGraph(tuple(nodes), self.graph.root), self.workers).nodes
+            PhysicalGraph(tuple(nodes), self.graph.root)).nodes
         try:
             edited = replace(self, nodes=nodes, root=None, estimates={})
         except GraphValidationError as error:
@@ -139,7 +139,7 @@ class PhysicalPlan:
         if self.estimator is None:
             return edited
         scheduled = set(self.settings.get("retention", {}).get("initial", {}))
-        pipelines = build_pipelines(edited.graph, self.workers)
+        pipelines = build_pipelines(edited.graph)
         recompute = sum(
             edited.estimates.get(node.node_id, {}).get(
                 "release_recompute_seconds", 0.0)
@@ -276,7 +276,7 @@ class EngineConfig:
     attention: str | None = None
 
 
-def plan_kv_retention(graph: PhysicalGraph, workers: int = 1) -> PhysicalGraph:
+def plan_kv_retention(graph: PhysicalGraph) -> PhysicalGraph:
     """Set operators' KV retention from the next compatible document consumer.
 
     KV between operators on one path stays active in the scheduler. It stays
@@ -284,7 +284,7 @@ def plan_kv_retention(graph: PhysicalGraph, workers: int = 1) -> PhysicalGraph:
     documents under the same prompt head. Worker boundaries use the same
     paths as execution.
     """
-    paths = build_pipelines(graph, workers)
+    paths = build_pipelines(graph)
     ordered = graph.topological_nodes()
     starts = [node for node in ordered
               if node.node_id in paths and paths[node.node_id][0] is node]
@@ -295,9 +295,7 @@ def plan_kv_retention(graph: PhysicalGraph, workers: int = 1) -> PhysicalGraph:
         following = next((later for later in starts[index + 1:]
                           if later.document_aliases == (alias,)), None)
         keep = (following is not None
-                and first.document_head == following.document_head
-                and (workers == 1 or first.worker_pipelining
-                     and following.worker_pipelining))
+                and first.document_head == following.document_head)
         model_nodes = [node for node in members if node.backend is not None]
         # Joins settle anchors after any classification of their surviving pairs.
         settling = next((node for node in reversed(model_nodes)

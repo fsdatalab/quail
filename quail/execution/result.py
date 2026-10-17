@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
 from copy import copy
 from dataclasses import dataclass
+from itertools import repeat
+from weakref import finalize
 
 import numpy as np
 import pyarrow as pa
@@ -71,20 +73,28 @@ def document_index_table(columns: dict[str, Iterable[int]],
     return pa.Table.from_arrays(arrays, schema=schema)
 
 
+def _answer_field(columns, role: str, dtype) -> pa.Field:
+    """Name an answer-metadata field without shadowing a document ID."""
+    name = role
+    while name in columns:
+        name = "_" + name
+    return pa.field(name, dtype, nullable=False,
+                    metadata={b"quail.role": role.encode("utf-8")})
+
+
 def answer_table(columns: dict[str, Iterable[int]],
                  answers: Iterable[bool], kind: str,
                  metadata: dict[str, str] | None = None) -> pa.Table:
     """Build a filter or join answer table."""
     schema = document_index_schema(columns, kind)
     fields = list(schema)
-    fields.append(pa.field("answer", pa.bool_(), nullable=False))
+    fields.append(_answer_field(columns, "answer", pa.bool_()))
     schema_metadata = dict(schema.metadata or {})
     for key, value in (metadata or {}).items():
         schema_metadata[f"quail.{key}".encode("utf-8")] = \
             str(value).encode("utf-8")
     schema = pa.schema(fields, metadata=schema_metadata)
-    arrays = [pa.array(columns[field.name], type=field.type)
-              for field in schema if field.name != "answer"]
+    arrays = [pa.array(values, type=pa.int32()) for values in columns.values()]
     arrays.append(pa.array(answers, type=pa.bool_()))
     return pa.Table.from_arrays(arrays, schema=schema)
 
@@ -93,8 +103,8 @@ def filter_answer_table(alias, documents, positions, answers) -> pa.Table:
     """Build filter answers with predicate positions and alias metadata."""
     schema = pa.schema(
         [pa.field(alias, pa.int32(), nullable=False),
-         pa.field("predicate", pa.int32(), nullable=False),
-         pa.field("answer", pa.bool_(), nullable=False)],
+         _answer_field((alias,), "predicate", pa.int32()),
+         _answer_field((alias,), "answer", pa.bool_())],
         metadata={b"quail.kind": b"filter_answers",
                   b"quail.alias": alias.encode("utf-8")})
     return pa.Table.from_arrays(
@@ -122,12 +132,26 @@ def extract_answers(alias, name, span_name, document_ids, answers, spans):
                 pa.table({name: pa.array(answers, pa.string()), span_name: span_array}))
 
 
+def answer_values(table: pa.Table) -> pa.ChunkedArray:
+    """Return the final boolean column of a filter or join answer table.
+
+    Table aliases may also be named "answer", so the answer's position
+    identifies it independently of the document ID columns.
+
+    Raises:
+        ValueError: The final column is not the boolean answer column.
+    """
+    if table.num_columns:
+        field = table.schema.field(-1)
+        role = (field.metadata or {}).get(b"quail.role", field.name.encode("utf-8"))
+        if role == b"answer" and field.type == pa.bool_():
+            return table.column(-1)
+    raise ValueError("answer table has no final boolean answer column")
+
+
 def true_answer_rows(table: pa.Table) -> pa.Table:
     """Select the document-index rows whose answer is true."""
-    if "answer" not in table.schema.names:
-        raise ValueError("answer table has no answer column")
-    aliases = [name for name in table.schema.names if name != "answer"]
-    selected = table.filter(table.column("answer")).select(aliases)
+    selected = table.filter(answer_values(table)).select(range(table.num_columns - 1))
     metadata = dict(table.schema.metadata or {})
     metadata[b"quail.kind"] = b"join_answers"
     return selected.replace_schema_metadata(metadata)
@@ -170,6 +194,49 @@ def _inner_join(left: acero.Declaration, left_schema: pa.Schema,
     metadata = dict(left_schema.metadata or {})
     metadata[b"quail.kind"] = b"joined_indices"
     return declaration, pa.schema(fields, metadata=metadata)
+
+
+def joined_survivors(tables, survivors) -> dict[str, pa.Array]:
+    """Keep document IDs occurring in a complete join of each connected component.
+
+    Args:
+        tables: Relations of document IDs whose join predicates passed.
+        survivors: Input document IDs by alias, in their existing order.
+
+    Returns:
+        Surviving IDs by alias, preserving their input order and duplicates.
+    """
+    components = []
+    for table in tables:
+        aliases = set(table.column_names)
+        group = [table.cast(document_index_schema(table.column_names, "join_answers"))]
+        separate = []
+        for names, members in components:
+            if aliases & names:
+                aliases |= names
+                group.extend(members)
+            else:
+                separate.append((names, members))
+        components = [*separate, (aliases, group)]
+    result = dict(survivors)
+    for aliases, group in components:
+        limits = dict(survivors)
+        for table in group:
+            for alias in table.column_names:
+                if alias not in limits:
+                    limits[alias] = pc.unique(table[alias])
+        declaration, _ = build_result_declaration(
+            group, limits, group[0].column_names[0])
+        found = {alias: set() for alias in aliases if alias in survivors}
+        with declaration.to_reader() as reader:
+            for batch in reader:
+                for alias, values in found.items():
+                    values.update(pc.unique(batch.column(alias)).to_pylist())
+        for alias, values in found.items():
+            ids = survivors[alias]
+            result[alias] = pc.filter(ids, pc.is_in(
+                ids, value_set=pa.array(sorted(values), type=ids.type)))
+    return result
 
 
 def build_result_declaration(
@@ -233,38 +300,34 @@ def count_rows(declaration: acero.Declaration) -> int:
     return int(table.column("row_count")[0].as_py())
 
 
-def execute_stream(declaration: acero.Declaration, schema: pa.Schema,
-                   limit: int | None = None,
-                   batch_rows: int = DEFAULT_BATCH_ROWS,
+def bounded_reader(source: pa.RecordBatchReader, limit: int | None = None,
+                   batch_rows: int = DEFAULT_BATCH_ROWS, *,
+                   schema: pa.Schema | None = None,
+                   project: Callable[[pa.RecordBatch], pa.RecordBatch] | None = None,
                    ) -> pa.RecordBatchReader:
-    """Return bounded Arrow batches from an Acero declaration."""
-    if batch_rows <= 0:
-        raise ValueError("batch_rows must be positive")
-    if limit is not None and limit < 0:
-        raise ValueError("limit must be nonnegative")
-    source = declaration.to_reader()
-
+    """Read and project bounded batches while owning the source reader."""
     def batches():
         remaining = limit
         try:
-            for batch in source:
-                if remaining == 0:
-                    break
-                if remaining is not None and len(batch) > remaining:
-                    batch = batch.slice(0, remaining)
-                offset = 0
-                while offset < len(batch):
-                    length = min(batch_rows, len(batch) - offset)
-                    yield batch.slice(offset, length)
-                    offset += length
-                    if remaining is not None:
-                        remaining -= length
-                        if remaining == 0:
-                            break
+            while remaining is None or remaining > 0:
+                batch = next(source, None)
+                if batch is None:
+                    return
+                if remaining is not None:
+                    batch = batch[:remaining]
+                    remaining -= len(batch)
+                for offset in range(0, len(batch), batch_rows):
+                    part = batch.slice(offset, batch_rows)
+                    yield part if project is None else project(part)
         finally:
-            source.close()
+            close()
 
-    return pa.RecordBatchReader.from_batches(schema, batches())
+    iterator = batches()
+    # A generator's finally block does not run if it was never started.
+    close = finalize(iterator, source.close)
+    # The C stream releases its iterator on close; from_batches alone does not.
+    return pa.RecordBatchReader.from_stream(pa.RecordBatchReader.from_batches(
+        source.schema if schema is None else schema, iterator))
 
 
 def projected_column(batch: pa.RecordBatch, alias, values) -> pa.Array:
@@ -283,24 +346,25 @@ def projected_column(batch: pa.RecordBatch, alias, values) -> pa.Array:
             fields=list(values.fields))
     if isinstance(alias, tuple):
         # a label of joined rows, looked up by the row's ids
-        keys, table, order = values
+        keys, labeled = values
         positions = pc.index_in(
             pair_keys(*(batch.column(batch.schema.get_field_index(name))
                         for name in alias)),
             value_set=keys)
-        labels = pc.take(
-            table.column(table.column_names[2]).combine_chunks().cast(pa.string()),
-            positions)
-        if order is not None:
-            labels = pa.DictionaryArray.from_arrays(
-                pc.index_in(labels, order).cast(pa.int32()), order)
-        return labels
+        return pc.take(labeled, positions)
     column = batch.column(batch.schema.get_field_index(alias))
     # a computed column such as a score is carried as is
     selected = column if values is None else pc.take(values, column)
     if isinstance(selected, pa.ChunkedArray):
         selected = selected.combine_chunks()
     return selected
+
+
+def iter_rows(table: pa.Table) -> Iterator[tuple]:
+    """Yield tuples preserving column order and rows with no columns."""
+    if not table.num_columns:
+        return repeat((), table.num_rows)
+    return zip(*(column.to_pylist() for column in table.columns))
 
 
 class QueryResult:
@@ -367,6 +431,9 @@ class QueryResult:
         Returns:
             An Arrow reader that the caller should exhaust or close.
         """
+        return self._result_reader(batch_rows, limit, materialize=False)
+
+    def _result_reader(self, batch_rows, limit, *, materialize):
         if batch_rows <= 0:
             raise ValueError("batch_rows must be positive")
         effective_limit = self.limit
@@ -376,32 +443,23 @@ class QueryResult:
             effective_limit = (limit if effective_limit is None
                                else min(limit, effective_limit))
         if self._materialized is not None:
-            table = self._materialized
-            if effective_limit is not None:
-                table = table.slice(0, effective_limit)
-            return table.to_reader(max_chunksize=batch_rows)
-        indices = execute_stream(
-            self._declaration,
-            self._document_index_schema,
-            effective_limit,
-            batch_rows,
-        )
+            return self._materialized[:effective_limit].to_reader(
+                max_chunksize=batch_rows)
+        def project(batch):
+            if not self._projection:
+                return batch.select([]).replace_schema_metadata(self.schema.metadata)
+            arrays = [projected_column(batch, alias, values)
+                      for alias, values in self._projection]
+            return pa.RecordBatch.from_arrays(arrays, schema=self.schema)
 
-        def batches():
-            try:
-                for batch in indices:
-                    if not self._projection:
-                        yield batch.select([]).replace_schema_metadata(
-                            self.schema.metadata)
-                        continue
-                    arrays = [projected_column(batch, alias, values)
-                              for alias, values in self._projection]
-                    yield pa.RecordBatch.from_arrays(
-                        arrays, schema=self.schema)
-            finally:
-                indices.close()
-
-        return pa.RecordBatchReader.from_batches(self.schema, batches())
+        if materialize and effective_limit is None:
+            source = self._declaration.to_table().to_reader(max_chunksize=batch_rows)
+        else:
+            # Acero's threaded hash joins can hang on early close. Only complete
+            # table execution can use them without an intermediate stream.
+            source = self._declaration.to_reader(use_threads=False)
+        return bounded_reader(
+            source, effective_limit, batch_rows, schema=self.schema, project=project)
 
     def collect(self, limit: int | None = None,
                 batch_rows: int = DEFAULT_BATCH_ROWS
@@ -415,7 +473,7 @@ class QueryResult:
         Returns:
             A table containing only the columns projected by the query.
         """
-        reader = self.execute_stream(batch_rows=batch_rows, limit=limit)
+        reader = self._result_reader(batch_rows, limit, materialize=True)
         try:
             return reader.read_all()
         finally:
@@ -462,9 +520,7 @@ class QueryResult:
 
     def to_rows(self, limit: int | None = None) -> list[tuple]:
         """Collect projected result rows as Python tuples."""
-        table = self.collect(limit=limit)
-        columns = [column.to_pylist() for column in table.columns]
-        return list(zip(*columns))
+        return list(iter_rows(self.collect(limit=limit)))
 
     def known_count(self) -> int | None:
         """Return the row count when it is known without running the plan."""

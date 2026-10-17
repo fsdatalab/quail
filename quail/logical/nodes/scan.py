@@ -6,8 +6,11 @@ from dataclasses import dataclass, replace
 from typing import ClassVar
 
 from quail.logical.expressions import (
+    ColumnExpression,
     ColumnRef,
     CompileError,
+    column_name,
+    source_column,
 )
 from quail.logical.predicates import RegularPredicate
 
@@ -17,8 +20,8 @@ class Scan:
     """Which column of which provider supplies the document text.
 
     ``column`` is tokenized for the model. ``columns`` names the source
-    columns kept as values for the result rows, and includes ``column``
-    only when the query returns the document text itself. The
+    columns kept as values for projections, predicates, joins, callbacks,
+    and extractions. It includes ``column`` when they read the document text. The
     projection pushdown rule fills ``columns``; before it runs the
     tuple is empty. ``predicates`` are regular predicates, all of which a
     document must pass before any operator reads it.
@@ -26,7 +29,7 @@ class Scan:
 
     provider: str
     alias: str
-    column: str
+    column: str | ColumnExpression
     columns: tuple = ()  # tuple[str, ...]
     predicates: tuple = ()  # tuple[RegularPredicate, ...]
 
@@ -39,11 +42,11 @@ class Scan:
         return self.predicates
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        fields = [ColumnRef(self.alias, self.provider, self.column)]
+        fields = [ColumnRef(self.alias, self.provider, source_column(self.column))]
         fields.extend(
             ColumnRef(self.alias, self.provider, column)
             for column in self.columns
-            if column != self.column
+            if column != source_column(self.column)
         )
         return tuple(fields)
 
@@ -78,7 +81,7 @@ class Scan:
         return {
             "provider": self.provider,
             "alias": self.alias,
-            "column": self.column,
+            "column": column_name(self.column, qualified=False),
             "columns": list(self.columns),
             "predicates": [str(predicate) for predicate in self.predicates],
         }

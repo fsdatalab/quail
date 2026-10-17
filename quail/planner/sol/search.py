@@ -12,11 +12,13 @@ from typing import Callable, Mapping
 import pyarrow as pa
 
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
+from quail.catalog.selection import group_ids
 from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan
 from quail.logical import oriented_join_conditions
+from quail.logical.expressions import column_reference, evaluate_column
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
@@ -29,7 +31,10 @@ from quail.planner.search.table_steps import (
     table_steps,
 )
 from quail.planner.search.table_steps import CLASSIFY as CLASSIFY_STEP
-from quail.planner.sol.prefixes import document_shared_tokens, subset_shared_tokens
+from quail.planner.statistics.prefixes import (
+    document_shared_tokens,
+    subset_shared_tokens,
+)
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
@@ -167,10 +172,10 @@ class Search:
         self.stores = stores
         # alias -> each row's stop key value, for the aliases whose
         # filters stop a key at its first survivor
-        self.stop_groups: dict[str, list[tuple]] = {}
+        self.stop_groups: dict[str, list[int]] = {}
         for alias, key in filter_stop_keys(query.logical).items():
-            columns = [stores[alias].column(name).to_pylist() for name in key]
-            self.stop_groups[alias] = list(zip(*columns))
+            columns = [stores[alias].column(name) for name in key]
+            self.stop_groups[alias] = group_ids(columns).tolist()
         # column -> rows every filtered alias of that column computed
         # as prefixes; another alias of the column may reuse them
         self.computed_rows_by_column: dict[str, set[int]] = {}
@@ -182,11 +187,13 @@ class Search:
                 continue
             left_alias, right_alias, conditions = oriented
             left_keys = [
-                stores[left.alias].column(left.column)
+                evaluate_column(left, stores[column_reference(left).alias].column(
+                    column_reference(left).column))
                 for left, _ in conditions
             ]
             right_keys = [
-                stores[right.alias].column(right.column)
+                evaluate_column(right, stores[column_reference(right).alias].column(
+                    column_reference(right).column))
                 for _, right in conditions
             ]
             pairs = pair_table(left_alias, left_keys, right_alias, right_keys)
@@ -289,7 +296,7 @@ class Search:
         first stage it fails.
         """
         tokens = self.aliases[alias].tokens
-        groups: dict[tuple, list[int]] = {}
+        groups: dict[int, list[int]] = {}
         for row in live:
             groups.setdefault(self.stop_groups[alias][row], []).append(row)
         reached: list[list[int]] = [[] for _ in order]
@@ -399,14 +406,14 @@ class Search:
         for test in self.label_filters.get(alias, ()):
             if test.call != call:
                 continue
-            accepted = set(test.condition.value)
+            accepted = test.accepted_labels()
             passed = [row for row in live
                       if self.label(call.prompt, {alias: row}) in accepted]
             stages.append(_stage(
                 LABEL_IN, alias, call.prompt.template, test.position,
                 0, test.selectivity, live, passed, Work(),
                 name=self.labels.names[call],
-                accepted=list(test.condition.value)))
+                accepted=list(accepted)))
             live = passed
         return live, stage_work
 

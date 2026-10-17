@@ -6,8 +6,11 @@ from dataclasses import dataclass, replace
 from typing import ClassVar, Optional
 
 from quail.logical.expressions import (
+    ColumnExpression,
     ColumnRef,
     CompileError,
+    column_name,
+    column_reference,
 )
 from quail.logical.nodes.base import LogicalNode
 
@@ -22,8 +25,8 @@ class Apply:
     """A user function between two operators.
 
     The function is registered on the session under ``function`` and
-    receives an Arrow table per alias: the alias's row indices under
-    the alias name plus the listed columns. ``kind`` says how it runs:
+    receives Rows per alias, with document ids separate from the
+    listed value columns. ``kind`` says how it runs:
     ``per_batch`` on each batch of survivors a streaming operator hands
     over, ``barrier`` once over every survivor. ``ids`` says what it
     returns: ``preserve`` every input id, ``drop`` a subset of them,
@@ -35,7 +38,7 @@ class Apply:
     function: str
     kind: str
     ids: str
-    columns: tuple  # tuple[ColumnRef, ...]
+    columns: tuple[ColumnRef | ColumnExpression, ...]
     aliases: tuple  # the alias, or the join's two aliases
     written_pos: Optional[int] = None
 
@@ -67,7 +70,8 @@ class Apply:
                 f"apply {self.function!r} names tables {self.aliases} "
                 f"outside its input ({sorted(present)})"
             )
-        for ref in self.columns:
+        for expression in self.columns:
+            ref = column_reference(expression)
             if ref.alias not in self.aliases:
                 raise CompileError(
                     f"apply {self.function!r} reads {ref.alias}.{ref.column} "
@@ -92,5 +96,5 @@ class Apply:
             "function": self.function,
             "kind": self.kind,
             "ids": self.ids,
-            "columns": [f"{ref.alias}.{ref.column}" for ref in self.columns],
+            "columns": [column_name(expression) for expression in self.columns],
         }

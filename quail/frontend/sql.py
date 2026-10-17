@@ -24,10 +24,12 @@ from quail.frontend.sql_binding.select import (
 )
 from quail.logical import (
     Alias,
+    ColumnExpression,
     ColumnRef,
     CompileError,
     LogicalPlan,
     LogicalPlanBuilder,
+    RegularPredicate,
     is_score,
 )
 
@@ -117,7 +119,8 @@ def _reject_forbidden(tree) -> None:
 
 
 def _validate_query(
-    b: ExpressionBinder, joins: JoinBinder, columns: tuple[ColumnRef | Alias, ...],
+    b: ExpressionBinder, joins: JoinBinder,
+    columns: tuple[ColumnRef | ColumnExpression | Alias, ...],
     structs: tuple = (),
 ) -> None:
     """Validate output names and supported combinations of AI operators."""
@@ -181,7 +184,9 @@ def _validate_query(
         )
 
 
-def _bind_label_names(b: ExpressionBinder, columns: tuple[ColumnRef | Alias, ...]):
+def _bind_label_names(
+    b: ExpressionBinder, columns: tuple[ColumnRef | ColumnExpression | Alias, ...],
+):
     """Assign names to classifications used in projections and filters."""
     projected = tuple(column for column in columns if isinstance(column, Alias))
     # a filter on a label tests the projected column of the same call;
@@ -271,6 +276,13 @@ def compile_sql(
 
     logical = LogicalPlanBuilder()
     for alias, provider in b.tables:
+        label_filters = []
+        for call, test, selectivity in b.label_tests.get(alias, ()):
+            predicate = RegularPredicate(
+                ColumnRef(alias, provider, labels[alias][call]),
+                test.comparison, test.value, function=test.function)
+            predicate.validate_text_column()
+            label_filters.append((predicate, selectivity))
         logical.add_scan(
             alias,
             provider,
@@ -278,10 +290,7 @@ def compile_sql(
             tuple(b.filters.get(alias, ())),
             regular_predicates=tuple(b.regular_predicates.get(alias, ())),
             labels=tuple(labels.get(alias, {}).items()),
-            label_filters=tuple(
-                (labels[alias][call], accepted, selectivity)
-                for call, accepted, selectivity in b.label_tests.get(alias, ())
-            ),
+            label_filters=tuple(label_filters),
             extracts=tuple(extracts.get(alias, ())),
             extract_filters=tuple(b.extract_tests.get(alias, ())),
         )

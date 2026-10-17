@@ -17,7 +17,7 @@ def _run(query, execute):
     return execute_query(query, physical_executor=execute)
 
 
-def make_executor(filter_truth, join_truth=None):
+def make_executor(filter_truth, join_truth=None, *, functions=None):
     """Build a fake executor from filter and join truth tables."""
     def _match_key(alias, q):
         for key in filter_truth[alias]:
@@ -64,11 +64,16 @@ def make_executor(filter_truth, join_truth=None):
                 outputs = {}
                 partners = inputs["partner_indices"][node.written_pos]
                 rule = join_truth[(node.anchor, *node.partners)]
-                rows = {i: [rule(a, *pair) for pair in partners]
-                        for i, a in enumerate(anchors)}
+                members = ({i: list(inputs["anchor_partners"](anchor, 0))
+                            for i, anchor in enumerate(anchors)}
+                           if node.pairs_from else None)
+                rows = {i: [rule(a, *partners[index]) for index in (
+                    members[i] if members is not None else range(len(partners)))]
+                    for i, a in enumerate(anchors)}
                 outputs[f"join_answers:{node.written_pos}"] = {
                     "rows": rows, "anchor_index": anchors,
-                    "partner_index": partners, "anchor": node.anchor,
+                    "partner_index": partners, "anchor_partners": members,
+                    "anchor": node.anchor,
                     "partners": list(node.partners),
                     "semantics": node.semantics,
                     "selectivity": node.selectivity,
@@ -90,6 +95,7 @@ def make_executor(filter_truth, join_truth=None):
                         len(row) for row in rows.values())))
 
         state = graph_state(FixedAnswers(), docs)
+        state["functions"] = functions or {}
         if getattr(request, "relations", None):
             state["columns"] = request.column_tables()
         report = execute_single_graph(state, {

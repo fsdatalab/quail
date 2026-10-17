@@ -392,13 +392,13 @@ def test_sql_classifies_and_tests_labels(session):
     assert predicate.selectivity == 0.5
     assert predicate.condition.value == ("praise",)
     assert "d" not in filtered.logical.operators().filters
-    # equality is membership in one label, on either side
+    # Equality binds the same predicate with the literal on either side.
     for form in (f"{call} = 'refund'", f"'refund' = {call}"):
         equal = session.sql(f"SELECT d.id FROM documents d WHERE {form}")
         (predicate,) = equal.logical.operators().label_filters["d"]
-        assert predicate.condition.value == ("refund",)
+        assert predicate.condition.comparison == "="
+        assert predicate.condition.value == "refund"
     for bad in (f"SELECT d.id, {call} FROM documents d",
-                f"SELECT d.id FROM documents d WHERE {call} < 'refund'",
                 f"SELECT d.id FROM documents d WHERE {call} IN (1)"):
         with pytest.raises(CompileError):
             session.sql(bad)
@@ -422,7 +422,7 @@ def test_frontends_place_classifications_on_their_table(session):
     # projection pushdown reaches the scan through the classifications
     assert push_down_projection(plan.root) is plan.root
     (scan,) = [node for node in plan.walk() if isinstance(node, Scan)]
-    assert scan.columns == ("id", "body")
+    assert scan.columns == ("id",)
     mixed = (session.docs("documents").alias("d")
              .ai_filter(quail.prompt("Is {0} short?", quail.col("d.body")))
              .ai_classify(quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
@@ -529,9 +529,10 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.inputs[0].source.node_id == "ai_join:r"
     assert classify.spec.scoring == "trie_tree"
-    assert classify.spec.expected_inputs == pytest.approx(1.8)
-    assert round(plan.estimated_seconds, 3) == 0.062
+    assert classify.spec.expected_inputs == pytest.approx(60 * (1 - 0.99 ** 3))
+    assert round(plan.estimated_seconds, 3) == 0.259
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
+    assert staged.anchor_resident == "none"
     assert (staged.exec_idx, staged.anchor) == (0, "r")
     assert classified_above_joins(after._logical_input.root) == frozenset()
     assert classified_above_joins(after.logical.root) == {"r"}
@@ -615,26 +616,31 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
     assert classify.spec.partner is not None
     assert classify.spec.anchor == join.anchor
     assert classify.inputs[0].source.node_id == join.node_id
-    # More than one independent label consumer ends the join pipeline.
     other = stance.replace("What does DOCUMENT", "How does DOCUMENT")
-    refused = session.sql(
+    multiple = session.sql(
         f"SELECT d.id, a.id, {stance} AS stance, {other} AS other "
         "FROM documents d JOIN aspects a "
         "ON AI_FILTER(PROMPT('Does {0} mention {1}?', d.body, a.aspect))").plan()
-    assert isinstance(refused, Refusal)
-    assert refused.constraint == "joined_classify_pipeline"
-    assert "standalone pair classification" in refused.reasons[0]
+    from quail.physical.pipelines import build_pipelines
+
+    assert not isinstance(multiple, Refusal)
+    labels = [node for node in multiple.nodes if isinstance(node, AiClassify)]
+    assert {node.spec.name for node in labels} == {"stance", "other"}
+    pipelines = build_pipelines(multiple.graph)
+    assert pipelines[labels[0].node_id] == pipelines[labels[1].node_id]
+    assert any(isinstance(node, AiJoin) for node in pipelines[labels[0].node_id])
     distributed = quail.Session(
         EngineConfig(model="qwen3-4b-fp8", device="h100-sxm", gpus=2),
         tokenizer=letter_tokens)
     for name in ("documents", "aspects"):
         distributed.register(name, session.catalog.get(name))
-    refused = distributed.sql(
+    distributed_plan = distributed.sql(
         f"SELECT d.id, a.id, {stance} AS stance FROM documents d "
         "JOIN aspects a ON AI_FILTER(PROMPT('Does {0} mention {1}?', "
         "d.body, a.aspect))").plan()
-    assert isinstance(refused, Refusal)
-    assert refused.constraint == "joined_classify_pipeline"
+    assert not isinstance(distributed_plan, Refusal)
+    assert any(len(path) > 1 for path in
+               build_pipelines(distributed_plan.graph).values())
     distributed.close()
     # a joined row's label is not tested in WHERE
     with pytest.raises(CompileError, match="one table|filter on a label"):
@@ -1329,16 +1335,54 @@ def test_a_label_in_where_names_the_classification_by_its_as_name(session):
     equal = session.sql(
         f"SELECT d.id, {call} AS topic FROM documents d "
         f"WHERE HINT(topic = 'refund', {{'selectivity': 0.3}})")
-    assert str(equal.logical.root.input.condition) == "d.topic IN ('refund')"
+    assert str(equal.logical.root.input.condition) == "d.topic = 'refund'"
     assert equal.logical.root.input.selectivity == 0.3
     builder = (session.docs("documents").alias("d")
                .ai_classify(quail.prompt("What is {0} about?", quail.col("d.body")),
                             ["refund", "shipping", "praise"], name="topic")
                .where((quail.col("topic") == "refund").hint(selectivity=0.3)))
     assert builder.select("d.id", "topic").logical == equal.logical
-    with pytest.raises(CompileError, match="== or isin"):
-        builder.where(quail.col("topic").like("re%"))
     # a name that is also a column of a table in scope is ambiguous
     with pytest.raises(CompileError, match="both a column"):
         session.sql(f"SELECT d.id, {call} AS body FROM documents d "
                     f"WHERE body = 'refund'")
+
+
+@pytest.mark.parametrize("dialect", ["snowflake", "bq"])
+@pytest.mark.parametrize(("sql_test", "builder_test", "expected", "accepted"), [
+    ("LENGTH(topic) > 6", quail.col("topic").length() > 6,
+     [(9, "shipping")], ("shipping",)),
+    ("topic LIKE 're%'", quail.col("topic").like("re%"),
+     [(7, "refund")], ("refund",)),
+    ("topic <> 'refund'", quail.col("topic") != "refund",
+     [(9, "shipping")], ("shipping", "praise")),
+    ("LENGTH(topic) > 100", quail.col("topic").length() > 100, [], ()),
+])
+def test_label_predicates_keep_their_expression_in_execution_and_estimates(
+    session, dialect, sql_test, builder_test, expected, accepted,
+):
+    call = ("AI.CLASSIFY(PROMPT('What is {0} about?', d.body), "
+            "ARRAY['refund', 'shipping', 'praise'])")
+    built = (session.docs("documents").alias("d")
+             .ai_classify(quail.prompt("What is {0} about?", quail.col("d.body")),
+                          ["refund", "shipping", "praise"], name="topic")
+             .where(builder_test).select("d.id", "topic"))
+    named = session.sql(f"SELECT d.id, {call} AS topic FROM documents d "
+                        f"WHERE {sql_test}", dialect=dialect)
+    repeated = session.sql(f"SELECT d.id, {call} AS topic FROM documents d "
+                           f"WHERE {sql_test.replace('topic', call)}", dialect=dialect)
+    assert named.logical == repeated.logical == built.logical
+    labels = ["refund", "shipping"]
+    assert _finish(built, session, _Labels(labels)).to_rows() == expected
+    estimate = quail.speed_of_light_estimate(
+        built, lambda *_: True, label=lambda _, rows: labels[rows["d"]])
+    assert estimate.post_filter_counts == {"d": len(expected)}
+    with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
+                                   backend="stock_vllm"),
+                       tokenizer=letter_tokens) as baseline:
+        baseline.register("documents", session.catalog.get("documents"))
+        query = baseline.sql(f"SELECT d.id, {call} AS topic FROM documents d "
+                             f"WHERE {sql_test}", dialect=dialect)
+        request = next(node for node in query.plan().nodes
+                       if isinstance(node, RequestExecution))
+        assert request.classifies[0].tests == ((0, accepted),)

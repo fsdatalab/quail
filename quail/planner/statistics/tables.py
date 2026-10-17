@@ -105,15 +105,19 @@ def alias_stats(lengths: dict, window: int = 0) -> dict[str, AliasStats]:
 
 def surviving_docs(n_docs: float, n_partners: float,
                    tuple_selectivity) -> float:
-    """Expected distinct documents with at least one matching tuple."""
+    """Expected distinct documents with at least one matching tuple.
+
+    Tuple matches are assumed independent and uniformly distributed.
+    """
     tuple_selectivity = effective_selectivity(tuple_selectivity)
-    return n_docs * (1.0 - (1.0 - tuple_selectivity)
-                     ** max(1.0, n_partners))
+    probability = (float(n_partners > 0) if tuple_selectivity == 1 else
+                   -math.expm1(n_partners * math.log1p(-tuple_selectivity)))
+    return n_docs * probability
 
 
 def thin(live: dict, spec: PricedJoin) -> None:
     """Update live document counts after one join's selectivity."""
-    sel = spec.selectivity
+    sel = effective_selectivity(spec.selectivity) * spec.pair_fraction
     aliases = spec.aliases
 
     def others(x):
@@ -149,6 +153,5 @@ def cross_tuples(spec: PricedJoin, live: dict) -> float:
 def pair_counts(live, aliases, fraction) -> tuple[float, float]:
     """Return expected pairs and first documents with at least one pair."""
     left, right = aliases
-    touched = (1.0 if fraction >= 1 else
-               -math.expm1(live[right] * math.log1p(-fraction)))
-    return live[left] * live[right] * fraction, live[left] * touched
+    return (live[left] * live[right] * fraction,
+            surviving_docs(live[left], live[right], fraction))

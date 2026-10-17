@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 from typing import ClassVar
 
 from quail.logical.expressions import (
-    PROBABILITIES_SUFFIX,
     ColumnRef,
     CompileError,
     ModelCall,
@@ -59,12 +58,8 @@ class SemanticClassify:
         provider = next(
             (field.provider for field in fields if field.alias == self.alias), ""
         )
-        added = [ColumnRef(self.alias, provider, self.name)]
-        if self.probabilities:
-            added.append(
-                ColumnRef(self.alias, provider, self.name + PROBABILITIES_SUFFIX)
-            )
-        return fields + tuple(added)
+        return fields + tuple(ColumnRef(self.alias, provider, name)
+                              for name in self.call.output_columns(self.name))
 
     def validate(self) -> None:
         self.call.validate()

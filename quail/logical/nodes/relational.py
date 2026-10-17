@@ -9,6 +9,7 @@ from quail.logical.expressions import (
     AggregateCall,
     Aggregation,
     Alias,
+    ColumnExpression,
     ColumnRef,
     CompileError,
     ExtractStruct,
@@ -32,7 +33,7 @@ class Project:
     """
 
     input: LogicalNode
-    columns: tuple[ColumnRef | Alias, ...]
+    columns: tuple[ColumnRef | ColumnExpression | Alias, ...]
     structs: tuple[ExtractStruct, ...] = ()
     type_name: ClassVar[str] = "quail.logical_project"
 
@@ -67,17 +68,12 @@ class Project:
                         f"the answer column {column.name!r} needs a "
                         f"SemanticExtract below the Project"
                     )
-            elif not isinstance(column, ColumnRef):
+            elif not isinstance(column, (ColumnRef, ColumnExpression)):
                 raise CompileError(
                     f"a projected column is a column reference or a named "
                     f"expression, got {type(column).__name__}"
                 )
-        names = [
-            f"{column.alias}.{column.column}"
-            if isinstance(column, ColumnRef)
-            else column.name
-            for column in self.columns
-        ]
+        names = [column_name(column) for column in self.columns]
         if len(names) != len(set(names)):
             raise CompileError(f"projection names must be unique, got {names}")
         self._validate_structs()
@@ -131,8 +127,8 @@ class Project:
     def explain_fields(self) -> dict:
         fields = {
             "columns": [
-                column_name(column)
-                if isinstance(column, ColumnRef)
+                str(column) if isinstance(column, ColumnExpression)
+                else column_name(column) if isinstance(column, ColumnRef)
                 else _explain(column)
                 for column in self.columns
             ]

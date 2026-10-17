@@ -6,7 +6,11 @@ from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.runtime import QuailModelExecution
 from quail.backends.quail.lowering import plan_region
-from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
+from quail.backends.quail.worker import (
+    execute_quail_request,
+    prepare_quail_request,
+    release_quail_request,
+)
 from quail.planner.optimizer.candidates import (
     ModelRegion,
     PhysicalCandidate,
@@ -50,3 +54,7 @@ class QuailBackend:
     def execute_request(self, context) -> Any:
         """Run one Quail request inside a compute process."""
         return execute_quail_request(context)
+
+    def release_request(self, state) -> None:
+        """Release the processes and model loaded for this configuration."""
+        release_quail_request(state)

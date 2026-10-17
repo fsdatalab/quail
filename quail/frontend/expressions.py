@@ -3,9 +3,20 @@
 from dataclasses import dataclass
 from typing import Optional
 
+from quail.logical import CompileError
+
+
+class ExpressionSpec:
+    """A query expression evaluated over rows, without a Python truth value."""
+
+    def __bool__(self):
+        raise TypeError(
+            "query expressions have no Python truth value; combine where() "
+            "conditions with & or pass them as separate arguments")
+
 
 @dataclass(frozen=True, eq=False)
-class ColSpec:
+class ColSpec(ExpressionSpec):
     """A column reference, with the struct fields and function read on it.
 
     Attributes:
@@ -13,14 +24,24 @@ class ColSpec:
         column: The column or struct field name.
         path: Struct fields read under the column, such as ``("start",)``
             of an extraction's span.
-        function: A function applied to the values before a test, such
-            as ``"length"``.
+        function: A function applied to the values, such as ``"length"``.
     """
 
     alias: Optional[str]
     column: str
     path: tuple = ()
     function: Optional[str] = None
+
+    def require_plain(self) -> None:
+        """Reject transformations where only a column reference is supported.
+
+        Raises:
+            CompileError: The expression reads a field or applies a function.
+        """
+        if self.path or self.function is not None:
+            raise CompileError(
+                "this position needs a plain source column, without "
+                "functions or fields")
 
     def __eq__(self, other):
         """``col("c.url") == col("e.url")`` is a join condition.
@@ -78,11 +99,19 @@ class ColSpec:
 
     def field(self, name: str) -> "ColSpec":
         """Read a field of a struct column, such as a span's ``start``."""
-        return ColSpec(self.alias, self.column, (*self.path, name), self.function)
+        self._require_no_function()
+        return ColSpec(self.alias, self.column, (*self.path, name))
 
     def length(self) -> "ColSpec":
         """The number of characters of each value."""
+        self._require_no_function()
         return ColSpec(self.alias, self.column, self.path, "length")
+
+    def _require_no_function(self) -> None:
+        if self.function is not None:
+            raise CompileError(
+                "a column function cannot be followed by another function "
+                "or a field access")
 
     def asc(self) -> "SortSpec":
         return SortSpec(self)
@@ -129,14 +158,14 @@ class SortSpec:
 
 
 @dataclass(frozen=True)
-class EqualsSpec:
+class EqualsSpec(ExpressionSpec):
     """An unresolved ``col(...) == col(...)`` join condition."""
     left: ColSpec
     right: ColSpec
 
 
 @dataclass(frozen=True)
-class PredicateSpec:
+class PredicateSpec(ExpressionSpec):
     """An unresolved regular predicate for ``where()``.
 
     Attributes:
@@ -174,7 +203,7 @@ class PredicateSpec:
 
 
 @dataclass(frozen=True)
-class AndSpec:
+class AndSpec(ExpressionSpec):
     """Tests combined with AND: ``(col("a") > 1) & col("b").is_null()``."""
     parts: tuple
 
@@ -195,7 +224,7 @@ class PromptSpec:
 
 
 @dataclass(frozen=True)
-class AggSpec:
+class AggSpec(ExpressionSpec):
     """An unresolved aggregate for ``agg()``."""
     function: str
     col: object = None    # ColSpec, a label or score name, or None
@@ -226,7 +255,7 @@ class AggSpec:
 
 
 @dataclass(frozen=True)
-class HavingSpec:
+class HavingSpec(ExpressionSpec):
     """An unresolved ``having()`` test of an aggregate against a number."""
     agg: AggSpec
     comparison: str

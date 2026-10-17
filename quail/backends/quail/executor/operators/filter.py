@@ -1,5 +1,7 @@
 """Execute LLM filters and conditions on classification results."""
 
+from functools import partial
+
 import numpy as np
 import pyarrow.compute as pc
 
@@ -10,7 +12,8 @@ from quail.backends.quail.executor.parts import (
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.backends.quail.reranker import filter_scores
+from quail.backends.quail.reranker import FilterRuntime
+from quail.catalog.selection import group_ids
 from quail.catalog.tokens import (
     DocumentKeys,
     DocumentPrefixes,
@@ -18,6 +21,7 @@ from quail.catalog.tokens import (
 from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.physical import ValueType
 from quail.progress import answer_sink
 
 
@@ -61,7 +65,6 @@ class FilterPart(SingleResultPart):
         self.node = node
         self.ids = ids
         self.canvas_tokens = canvas_tokens
-        self.frame_tokens = 0
         self.stages = filter_stages(
             [list(node.question_token_ids)],
             async_answers)
@@ -74,9 +77,8 @@ class FilterPart(SingleResultPart):
         stages = filter_stages(
             [part.node.question_token_ids for part in parts],
             parts[0].stages[0].readout)
-        for index, (part, stage) in enumerate(zip(parts, stages)):
+        for part, stage in zip(parts, stages):
             part.stages = [stage]
-            part.frame_tokens = len(stage.frame) if index == 0 else 0
 
     def finish(self, every) -> int | None:
         """Record filter answers and leave token accounting to the pipeline."""
@@ -108,28 +110,45 @@ class ConditionGate(SingleResultPart):
     def prepare(cls, state, nodes, ids, parts, inputs, context):
         """Bind a condition to the part computing its column."""
         node = nodes[0]
-        source_id = node.inputs[0].source.node_id
-        producer = next(part for part in reversed(parts)
-                        if node.column in getattr(part, "tested_columns", ()))
-        source = next(part for part in reversed(parts)
-                      if any(member.node_id == source_id
-                             for member in getattr(part, "nodes", (part.node,))))
-        return cls(node, producer, source)
+        by_node = {member.node_id: part for part in parts for member in part.nodes}
 
-    def __init__(self, node, producer, source):
+        def supplied():
+            return {port.name: (
+                by_node[port.source.node_id].results()[
+                    port.source.node_id].outputs[port.source.port]
+                if port.source.node_id in by_node else inputs[node.node_id][port.name])
+                for port in node.inputs}
+
+        source = node
+        while True:
+            port = next(port for port in source.inputs
+                        if port.value_type == ValueType.ROWS)
+            producer = by_node.get(port.source.node_id)
+            if producer is None or node.column in producer.tested_columns:
+                break
+            source = next(member for member in producer.nodes
+                          if member.node_id == port.source.node_id)
+        if producer is not None:
+            ids = producer.ids
+            values = partial(producer.tested_values, node.column)
+        else:
+            rows = inputs[source.node_id][port.name]
+            ids = rows.ids[node.aliases[0]].to_pylist()
+            values = partial(pc.take, rows.column(node.column))
+        return cls(node, ids, values, supplied)
+
+    def __init__(self, node, ids, values, supplied):
         self.node = node
-        self.producer = producer
-        self.source = source  # the part whose rows the Filter reads
-        self.position = {document: index
-                         for index, document in enumerate(producer.ids)}
+        self.values = values
+        self.supplied = supplied
+        self.position = {document: index for index, document in enumerate(ids)}
         self.accepted = {}
 
     def gate(self, key):
         # values settle as chunks finish, so each is tested as its
         # document arrives; a repeated value, such as a label, is
         # evaluated once
-        values = self.producer.tested_values(self.node.column,
-                                             [self.position[key[1]]])
+        values = self.values([self.position[key[1]]])
         value = values[0].as_py()
         token = tuple(sorted(value.items())) if isinstance(value, dict) else value
         if token not in self.accepted:
@@ -140,9 +159,7 @@ class ConditionGate(SingleResultPart):
         return None
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
-        source_id = self.node.inputs[0].source.node_id
-        return filter_scores(self.node,
-                             self.source.results()[source_id].outputs["rows"])
+        return FilterRuntime().execute(self.node, self.supplied(), None)
 
 
 def filter_result(node, answers, tokens, document_ids,
@@ -231,12 +248,7 @@ def stop_groups(node, columns, document_ids) -> list | None:
         raise KeyError(
             f"the stop key of {node.alias!r} needs its value columns")
     positions = arrow_ids(document_ids)
-    # a null key value forms one group, like any other value
-    codes = np.column_stack([
-        pc.fill_null(pc.dictionary_encode(columns.column(name).take(positions))
-                     .combine_chunks().indices, -1).to_numpy()
-        for name in node.stop_key])
-    return np.unique(codes, axis=0, return_inverse=True)[1].reshape(-1)
+    return group_ids([columns.column(name).take(positions) for name in node.stop_key])
 
 
 def filter_inputs(state, node, document_ids) -> dict:

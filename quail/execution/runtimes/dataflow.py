@@ -12,8 +12,11 @@ from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import (
     IndexRelation,
     build_result_declaration,
+    joined_survivors,
     true_answer_rows,
 )
+from quail.execution.rows import Rows
+from quail.logical.expressions import column_name, column_reference, evaluate_column
 from quail.physical import (
     Barrier,
     Exchange,
@@ -54,34 +57,22 @@ class BarrierRuntime:
             elif port.value_type is ValueType.JOIN_ANSWERS:
                 tables.append(value if isinstance(value, pa.Table)
                               else _join_answers_table(value))
-        for table in tables:
-            table = true_answer_rows(table)
-            for alias in table.column_names:
-                if alias in survivors:
-                    table = table.filter(pc.is_in(
-                        table[alias], value_set=survivors[alias].cast(table[alias].type)
-                    ))
-            for alias in table.column_names:
-                if alias in survivors:
-                    ids = survivors[alias]
-                    survivors[alias] = pc.filter(ids, pc.is_in(
-                        ids, value_set=pc.unique(table[alias]).cast(ids.type)))
+        survivors = joined_survivors(map(true_answer_rows, tables), survivors)
         return NodeResult({f"ids:{alias}": survivors[alias]
                            for alias in node.aliases})
 
 
 def _ids_of(value) -> np.ndarray:
     """Ids an apply() returned, from a sequence, an array, or a one-column table."""
-    try:
-        return id_positions(value)
-    except ValueError as error:
-        raise ValueError(
-            "an apply() function returned a null id; an outer join "
-            "leaves nulls, use join_type='inner'") from error
+    if isinstance(value, Rows):
+        value = pa.table(value.ids)
+    return id_positions(value)
 
 
 def _pairs_of(value, left: str, right: str) -> np.ndarray:
     """(left, right) id pairs, one row each, from a table with both alias columns."""
+    if isinstance(value, Rows):
+        value = pa.table(value.ids)
     if not isinstance(value, pa.Table) or not {left, right} <= set(
             value.column_names):
         raise ValueError(
@@ -89,22 +80,6 @@ def _pairs_of(value, left: str, right: str) -> np.ndarray:
             f"columns {left!r} and {right!r}")
     return np.column_stack(
         [_ids_of(value.column(left)), _ids_of(value.column(right))])
-
-
-def alias_table(alias: str, ids, columns, names):
-    """The Arrow table an apply() function sees for one alias.
-
-    Its first column is the alias's row indices under the alias
-    name; the rest are the requested value columns for those rows.
-    """
-    ids = document_ids(ids)
-    arrays = {alias: ids}
-    for name in names:
-        if columns is None or name not in columns.column_names:
-            raise KeyError(
-                f"column {alias}.{name} is not among the request's relations")
-        arrays[name] = columns.column(name).take(ids)
-    return pa.table(arrays)
 
 
 def foreign_call(node, values, context):
@@ -134,18 +109,27 @@ def foreign_call(node, values, context):
             f"{node.node_id!r} has no id input for {missing}")
     columns = {alias: context.sources.get(columns_key(alias))
                for alias in node.aliases}
-    names = {alias: [column for owner, column in node.columns
-                     if owner == alias] for alias in node.aliases}
+    expressions = {
+        alias: tuple(dict.fromkeys(column for column in node.columns
+                                   if column_reference(column).alias == alias))
+        for alias in node.aliases}
     counters = dict(calls=0, input_rows=0, output_rows=0)
 
+    def input_rows(alias, ids):
+        ids = document_ids(ids)
+        arrays = [evaluate_column(expression, columns[alias].column(
+            column_reference(expression).column).take(ids))
+            for expression in expressions[alias]]
+        names = [column_name(expression, qualified=False)
+                 for expression in expressions[alias]]
+        return Rows({alias: ids}, pa.Table.from_arrays(arrays, names=names))
+
     def call(ids_by_alias):
-        tables = {alias: alias_table(alias, ids, columns[alias],
-                                     names[alias])
-                  for alias, ids in ids_by_alias.items()}
+        rows = {alias: input_rows(alias, ids) for alias, ids in ids_by_alias.items()}
         counters["calls"] += 1
         counters["input_rows"] += sum(
             len(ids) for ids in ids_by_alias.values())
-        result = function(tables)
+        result = function(rows)
         if node.ids == "pairs":
             left, right = node.aliases
             pairs = _pairs_of(result, left, right)
@@ -276,14 +260,15 @@ class HashJoinRuntime:
         if not isinstance(node, HashJoin):
             raise TypeError(type(node).__name__)
         sides = {}
-        for alias, names in ((node.left, [left for left, _ in node.on]),
-                             (node.right, [right for _, right in node.on])):
+        for alias, expressions in ((node.left, [left for left, _ in node.on]),
+                                   (node.right, [right for _, right in node.on])):
             port = next(port for port in node.inputs
                         if port.source.port == f"ids:{alias}")
-            table = alias_table(alias, inputs[port.name],
-                                context.sources.get(columns_key(alias)), names)
-            sides[alias] = (table.column(alias),
-                            [table.column(name) for name in names])
+            ids = document_ids(inputs[port.name])
+            columns = context.sources[columns_key(alias)]
+            sides[alias] = (ids, [evaluate_column(expression, columns.column(
+                column_reference(expression).column).take(ids))
+                for expression in expressions])
         positions = pair_table(node.left, sides[node.left][1],
                                node.right, sides[node.right][1])
         # pair_table pairs row positions; map them back to the ids read

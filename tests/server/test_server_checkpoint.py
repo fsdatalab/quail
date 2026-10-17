@@ -1,11 +1,16 @@
 """Copying the live SQLite file to another disk and restoring from it."""
 
+import os
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from helpers import server_fakes
 
+from quail.server import checkpoint as checkpoint_module
 from quail.server.checkpoint import Checkpoint, restore
 from quail.server.store import Store
 
@@ -45,6 +50,100 @@ def test_backup_is_a_complete_copy_including_the_wal(tmp_path):
     assert reopened.get(first.id).state == "interrupted"
     assert reopened.get(first.id).progress == {"done": 1}
     reopened.close()
+
+
+def test_failed_restore_can_be_retried(tmp_path, monkeypatch):
+    source, destination = tmp_path / "saved.sqlite3", tmp_path / "live.sqlite3"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE saved (value INTEGER)")
+        conn.execute("INSERT INTO saved VALUES (1)")
+    copy = checkpoint_module.shutil.copyfile
+
+    def interrupt(src, dst):
+        with open(dst, "wb") as handle:
+            handle.write(b"partial")
+        raise OSError("copy interrupted")
+
+    monkeypatch.setattr(checkpoint_module.shutil, "copyfile", interrupt)
+    with pytest.raises(OSError, match="copy interrupted"):
+        restore(source, destination)
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == [source]
+    monkeypatch.setattr(checkpoint_module.shutil, "copyfile", copy)
+    assert restore(source, destination)
+    assert fetch_one(destination, "SELECT value FROM saved") == (1,)
+
+
+def test_restore_does_not_replace_a_database_created_during_the_copy(
+        tmp_path, monkeypatch):
+    source, destination = tmp_path / "saved.sqlite3", tmp_path / "live.sqlite3"
+    source.write_bytes(b"saved")
+    copy = checkpoint_module.shutil.copyfile
+
+    def create_live(src, dst):
+        destination.write_bytes(b"live")
+        return copy(src, dst)
+
+    monkeypatch.setattr(checkpoint_module.shutil, "copyfile", create_live)
+    assert not restore(source, destination)
+    assert destination.read_bytes() == b"live"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "live.sqlite3", "saved.sqlite3"]
+
+
+def test_failed_backup_keeps_previous_copy_and_removes_temporary_file(
+        tmp_path, monkeypatch):
+    store = Store(tmp_path / "live.sqlite3")
+    target = tmp_path / "saved.sqlite3"
+    create(store)
+    store.backup(target)
+
+    def interrupted(connection):
+        connection.execute("CREATE TABLE partial (value INTEGER)")
+        connection.commit()
+        raise OSError("backup interrupted")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_conn", SimpleNamespace(backup=interrupted))
+            with pytest.raises(OSError, match="backup interrupted"):
+                store.backup(target)
+        assert fetch_one(target, "SELECT count(*) FROM queries") == (1,)
+        assert not list(tmp_path.glob("*.tmp"))
+    finally:
+        store.close()
+
+
+def test_backups_publish_in_the_order_they_are_copied(tmp_path, monkeypatch):
+    store = Store(tmp_path / "live.sqlite3")
+    target = tmp_path / "saved.sqlite3"
+    create(store)
+    publishing, release = threading.Event(), threading.Event()
+    replace = os.replace
+
+    def hold_first(source, destination):
+        if str(destination) == str(target) and not publishing.is_set():
+            publishing.set()
+            assert release.wait(5)
+        return replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", hold_first)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(store.backup, target)
+            assert publishing.wait(5)
+            second = pool.submit(store.backup, target)
+            try:
+                with pytest.raises(TimeoutError):
+                    second.result(timeout=0.2)
+            finally:
+                release.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+        assert fetch_one(target, "SELECT count(*) FROM queries") == (1,)
+        assert not list(tmp_path.glob("*.tmp"))
+    finally:
+        store.close()
 
 
 def test_checkpoint_copies_after_writes_syncs_now_and_survives_failing_commits(

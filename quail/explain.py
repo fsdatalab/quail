@@ -4,7 +4,12 @@ from collections import Counter
 from collections.abc import Mapping
 
 from quail import logical as logical_nodes
-from quail.logical import DEFAULT_SELECTIVITY, LogicalPlan, effective_selectivity
+from quail.logical import (
+    DEFAULT_SELECTIVITY,
+    LogicalPlan,
+    column_name,
+    effective_selectivity,
+)
 from quail.physical import (
     Aggregate,
     AiClassify,
@@ -35,7 +40,7 @@ def _number(value):
 
 
 def _prompt(prompt):
-    args = ", ".join(f"{arg.alias}.{arg.column}" for arg in prompt.args)
+    args = ", ".join(column_name(arg) for arg in prompt.args)
     return f"PROMPT({prompt.template!r}, {args})"
 
 
@@ -87,7 +92,8 @@ def logical_tree(logical):
                        for name, members in fields.get("structs", {}).items()]
         elif isinstance(node, logical_nodes.Scan):
             title = f"Scan {node.provider} as {node.alias}"
-            columns = ", ".join(dict.fromkeys((node.column, *node.columns)))
+            columns = ", ".join(dict.fromkeys((
+                column_name(node.column, qualified=False), *node.columns)))
             title += f" [{columns}]"
             if node.predicates:
                 title += " where " + " and ".join(
@@ -124,7 +130,7 @@ def logical_tree(logical):
         elif isinstance(node, logical_nodes.Apply):
             title = f"Apply {node.function} ({node.kind}, {node.ids})"
             details = ["columns: " + ", ".join(
-                f"{ref.alias}.{ref.column}" for ref in node.columns)]
+                column_name(ref) for ref in node.columns)]
         else:
             title = node.type_name
             details = _fields(node.explain_fields(), 0)
@@ -444,7 +450,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 stages.get(("join", node.written_pos)), "tuples")))
         elif isinstance(node, HashJoin):
             title += ": " + " and ".join(
-                f"{node.left}.{left} = {node.right}.{right}"
+                f"{column_name(left)} = {column_name(right)}"
                 for left, right in node.on)
             details.append(
                 f"pairs kept: {node.pair_fraction:.4g} of the cross product")
@@ -453,7 +459,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                       f"{', '.join(node.aliases)}")
             if node.columns:
                 details.append("columns: " + ", ".join(
-                    f"{alias}.{column}" for alias, column in node.columns))
+                    column_name(column) for column in node.columns))
         elif isinstance(node, Exchange):
             title += f": {node.anchor} to the GPU holding its KV"
         elif isinstance(node, Barrier):

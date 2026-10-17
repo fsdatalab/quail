@@ -7,10 +7,13 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.catalog.pairs import columns_key
+from quail.execution.aggregates import prepare_aggregate
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.rows import Rows
+from quail.logical.expressions import hash_values
+from quail.logical.predicates import compare_literal
 from quail.physical import Aggregate, Limit, Project, Scan, Sort
 
 
@@ -34,18 +37,14 @@ class ScanRuntime:
 def _tested_documents(node, context) -> pa.Array:
     """Return the positions of the documents that pass a scan's regular predicates."""
     from quail.catalog.selection import selected_rows
-    from quail.logical import ColumnRef, RegularPredicate
 
     columns = context.sources.get(columns_key(node.alias))
     if columns is None:
         raise KeyError(
             f"the regular predicates of {node.alias!r} need its value columns")
-    predicates = [
-        RegularPredicate(ColumnRef(node.alias, "", column), comparison, value)
-        for column, comparison, value in node.predicates]
-    values = {column: columns.column(column)
-              for column, _, _ in node.predicates}
-    return selected_rows(values, predicates)
+    values = {predicate.column.column: columns.column(predicate.column.column)
+              for predicate in node.predicates}
+    return selected_rows(values, node.predicates)
 
 
 def _row_count(value) -> int | None:
@@ -77,11 +76,12 @@ class ProjectRuntime:
         if context.project is not None:
             value = (context.project(node, value, labels) if labels
                      else context.project(node, value))
-        # a projection keeps its rows; a lazy result's count is the
-        # input's until the result runs
+        # A lazy projection may not know its output count until it runs.
         rows = _row_count(inputs[first.name]) or 0
+        output_rows = _row_count(value)
         return NodeResult({"rows": value}, NodeMetrics(
-            input_rows=rows, output_rows=_row_count(value) or rows))
+            input_rows=rows,
+            output_rows=rows if output_rows is None else output_rows))
 
 
 class LimitRuntime:
@@ -97,8 +97,6 @@ class LimitRuntime:
         rows = _row_count(value) or 0
         if isinstance(value, QueryResult):
             value = value.with_limit(node.count)
-        elif hasattr(value, "slice"):
-            value = value.slice(0, node.count)
         else:
             value = value[:node.count]
         return NodeResult({"rows": value}, NodeMetrics(
@@ -117,23 +115,19 @@ def _comparable(column, clause: str):
 
 def _distinct_indices(table: pa.Table, columns) -> pa.Array:
     """Return the first row of each distinct value of the columns, in order."""
-    keyed = pa.table({
-        **{name: _comparable(table.column(name), "DISTINCT")
-           for name in columns},
-        "__row": pa.array(np.arange(table.num_rows), pa.int64()),
-    })
-    firsts = keyed.group_by(list(columns), use_threads=False).aggregate(
-        [("__row", "min")]).column("__row_min")
+    values = {f"column_{index}": hash_values(
+        _comparable(table.column(name), "DISTINCT"), nan_equal=True)
+              for index, name in enumerate(columns)}
+    keys = list(values)
+    values["row_position"] = pa.array(np.arange(table.num_rows), pa.int64())
+    firsts = pa.table(values).group_by(keys, use_threads=False).aggregate(
+        [("row_position", "min")]).column(len(keys))
     return pc.take(firsts, pc.sort_indices(firsts))
 
 
 _AGGREGATE_KERNELS = {
     "count": "count", "count_distinct": "count_distinct", "sum": "sum",
     "avg": "mean", "min": "min", "max": "max",
-}
-_HAVING_COMPARE = {
-    "=": pc.equal, "<>": pc.not_equal, "<": pc.less, "<=": pc.less_equal,
-    ">": pc.greater, ">=": pc.greater_equal,
 }
 
 
@@ -155,6 +149,15 @@ def _rows_table(value) -> pa.Table:
     raise TypeError(f"expected rows, got {type(value).__name__}")
 
 
+def _aggregate_kernel(function, values):
+    """Choose an aggregate kernel from the function and its input values."""
+    if values is None:
+        return "count_all"
+    if function == "count_distinct" and values.null_count == len(values):
+        return "count"
+    return _AGGREGATE_KERNELS[function]
+
+
 def aggregate_table(table: pa.Table, node) -> pa.Table:
     """Group a table by the node's keys and compute its aggregates.
 
@@ -170,29 +173,56 @@ def aggregate_table(table: pa.Table, node) -> pa.Table:
     names = {name: f"column_{index}" for index, name in enumerate(arguments)}
     keyed = {names[name]: _comparable(table.column(name), "an aggregate")
              for name in arguments}
+    hash_names = {name: f"key_{index}" for index, name in enumerate(dict.fromkeys((
+        *node.keys, *(argument for _, function, argument in node.aggregates
+                      if function == "count_distinct"))))}
+    keyed.update({key: hash_values(keyed[names[name]], nan_equal=True)
+                  for name, key in hash_names.items()})
     keyed["row_position"] = pa.array(np.arange(table.num_rows), pa.int64())
+    aggregates = [
+        (name, argument, _aggregate_kernel(
+            function, None if argument is None else keyed[names[argument]]))
+        for name, function, argument in node.aggregates]
     sources = {}
+    scalars = {}
+    finalizers = {}
     specs = []
-    for _, function, argument in node.aggregates:
-        kernel = "count_all" if argument is None else _AGGREGATE_KERNELS[function]
-        if (argument, kernel) not in sources:
-            sources[(argument, kernel)] = len(node.keys) + len(specs)
-            specs.append(([], "count_all") if argument is None
-                         else (names[argument], kernel))
+    for _, argument, kernel in aggregates:
+        key = (argument, kernel)
+        if key in sources or key in scalars:
+            continue
+        source = hash_names if kernel == "count_distinct" else names
+        column = None if argument is None else source[argument]
+        if column is not None:
+            values, kernel, finish = prepare_aggregate(
+                keyed[column], kernel, grouped=bool(node.keys))
+            if kernel is None:
+                scalars[key] = finish(None)
+                continue
+            if finish is not None:
+                finalizers[len(node.keys) + len(specs)] = finish
+            column = f"aggregate_{len(specs)}"
+            keyed[column] = values
+        sources[key] = len(node.keys) + len(specs)
+        specs.append(([], "count_all") if argument is None else (column, kernel))
     grouped = pa.table(keyed).group_by(
-        [names[key] for key in node.keys], use_threads=False
+        [hash_names[key] for key in node.keys], use_threads=False
     ).aggregate(specs + [("row_position", "min")])
-    order = pc.sort_indices(grouped.column(len(node.keys) + len(specs)))
-    columns = {name: grouped.column(index)
-               for index, name in enumerate(node.keys)}
-    for name, function, argument in node.aggregates:
-        kernel = "count_all" if argument is None else _AGGREGATE_KERNELS[function]
-        columns[name] = grouped.column(sources[(argument, kernel)])
+    firsts = grouped.column(len(node.keys) + len(specs))
+    order = pc.sort_indices(firsts)
+    for index, finish in finalizers.items():
+        grouped = grouped.set_column(index, grouped.column_names[index],
+                                     finish(grouped.column(index)))
+    columns = {name: pc.take(keyed[names[name]], firsts) for name in node.keys}
+    for name, argument, kernel in aggregates:
+        key = (argument, kernel)
+        columns[name] = (scalars[key] if key in scalars
+                         else grouped.column(sources[key]))
     result = pa.table({name: pc.take(column, order)
                        for name, column in columns.items()})
     mask = None
     for name, comparison, value in node.having:
-        test = _HAVING_COMPARE[comparison](result.column(name), value)
+        test = compare_literal(result.column(name), comparison, value)
         mask = test if mask is None else pc.and_kleene(mask, test)
     if mask is not None:
         result = result.filter(pc.fill_null(mask, False))
@@ -234,6 +264,7 @@ class SortRuntime:
                  "at_start" if nulls_first else "at_end")
                 for column, descending, nulls_first in node.keys])
             table = table.take(indices)
-        table = table.slice(node.offset, node.fetch).select(list(node.columns))
+        stop = None if node.fetch is None else node.offset + node.fetch
+        table = table[node.offset:stop].select(list(node.columns))
         return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
             input_rows=rows, output_rows=table.num_rows))

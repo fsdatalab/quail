@@ -23,8 +23,6 @@ class PricedJoin:
             document when it anchors.
         label_tokens: alias -> tokens of its label block.
         tail_tokens: Tokens of the question tail after every pair.
-        on: Equality conditions as (left alias, left column, right
-            alias, right column).
         pair_fraction: The fraction of the cross product the equality
             conditions keep.
         cost: A score join's own pricing, with work(live); None for a
@@ -40,7 +38,6 @@ class PricedJoin:
     frame_tokens: Mapping[str, int]
     label_tokens: Mapping[str, int]
     tail_tokens: int
-    on: tuple[tuple[str, str, str, str], ...] = ()
     pair_fraction: float = 1.0
     cost: Any = None
 
@@ -93,7 +90,7 @@ def partner_stream_work(anchor_prefix: float, suffixes, *,
 def stage_work(spec: PricedJoin, anchor: str, n: float, tuples: float,
                lengths: dict, pre: int, *, resident: bool = False,
                window: int = 0) -> Work:
-    """Expected Work of one stage at the current live counts.
+    """Expected Work over n anchors with candidates and their tuples.
 
     The length sums make the calculation constant time in the number
     of documents without a window. With a window, it also visits the

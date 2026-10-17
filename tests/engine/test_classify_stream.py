@@ -31,6 +31,7 @@ from quail.physical import (
     AiScore,
     ClassifySpec,
     Filter,
+    Foreign,
     PhysicalGraph,
     PortRef,
     Scan,
@@ -437,9 +438,13 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         assert metrics["group:0"]["fresh_tokens"] == 2 + 2 * 2
 
 
-@pytest.mark.parametrize("classify_only", [False, True])
+@pytest.mark.parametrize("classify_only, callback", [
+    (False, None), (True, None), (False, "per_batch"),
+    (True, "per_batch"), (True, "barrier"),
+])
+@pytest.mark.parametrize("test_after_second_classify", [False, True])
 def test_streamed_classification_labels_survivors_with_their_kv_resident(
-        monkeypatch, classify_only):
+        monkeypatch, classify_only, callback, test_after_second_classify):
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     n_docs, n_partners = 14, 4
     docs = {
@@ -494,11 +499,48 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         "runtimes": built_in_registry().runtimes, "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "docs": docs,
     }
-    result = execute_single_graph(
-        state, SETTINGS, fused_graph(classify_only=classify_only))
+    graph = fused_graph(classify_only=classify_only)
+    seen = []
+    if callback is not None:
+        def observe(rows):
+            seen.append(rows["r"].ids["r"].to_pylist())
+            if callback == "barrier":
+                model.filter_truth = [[True] for _ in range(n_docs)]
+            return rows["r"]
+
+        state["functions"] = {"observe": observe}
+        foreign = Foreign(
+            node_id="apply:observe", function="observe", kind=callback,
+            ids="preserve", aliases=("r",),
+            inputs=input_ports((PortRef("classify:r", "ids:r"),)))
+        continuation = [foreign]
+        if callback == "barrier":
+            continuation.append(AiFilter(
+                node_id="filter:after", alias="r", arena_writes=True,
+                inputs=input_ports((PortRef(foreign.node_id, "ids:r"),)),
+                question_token_ids=(QUESTION,), question_tokens=1, written_pos=3))
+        nodes = [replace(node, inputs=input_ports((
+            PortRef("classify:r", "rows"), PortRef(continuation[-1].node_id, "ids:r"))))
+                 if node.node_id == "label:r" else node for node in graph.nodes]
+        graph = PhysicalGraph((*nodes, *continuation), graph.root)
+    if test_after_second_classify:
+        sources = {"classify:kind": PortRef("label:r", "rows"),
+                   "label:again": PortRef("classify:kind", "rows")}
+        nodes = [replace(node, inputs=input_ports((sources[node.node_id],)))
+                 if node.node_id in sources else node for node in graph.nodes]
+        nodes = [replace(node, inputs=input_ports((
+            PortRef("label:again", "ids:r"), PortRef("input:p", "ids:p"))))
+                 if node.node_id == "group:0" else node for node in nodes]
+        root = PortRef("label:again", "rows") if classify_only else graph.root
+        graph = PhysicalGraph(tuple(nodes), root)
+    result = execute_single_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
 
     passed = [d for d in range(n_docs) if classify_only or filter_truth[d][0]]
+    if callback is not None:
+        assert sorted(document for batch in seen for document in batch) == passed
+        assert all(len(batch) == 1 for batch in seen) if callback == "per_batch" \
+            else seen == [passed]
     batches = [(step, event) for step, event in events
                if event["node"] == "classify:r"]
     assert sorted(row for _, event in batches for row in event["rows"]) == passed
@@ -516,6 +558,8 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() \
         == accepted
     assert metrics["label:again"]["input_rows"] == len(accepted)
+    assert outputs[PortRef("label:again", "ids:r")].column("r").to_pylist() \
+        == accepted
     later = outputs[PortRef("classify:kind", "rows")]
     assert later.to_pydict() == {
         "r": accepted, "kind": ["b"] * len(accepted),
@@ -530,7 +574,8 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         assert metrics["classify:r"]["fresh_tokens"] == 2 * len(passed)
     prefills = [entry["key"][1] for chunk in model.launched for entry in chunk
                 if entry["prefix"] is not None]
-    assert sorted(prefills) == list(range(n_docs))
+    assert sorted(prefills) == sorted(
+        [*range(n_docs), *(passed if callback == "barrier" else ())])
     assert metrics["classify:r"]["evaluated_documents"] == len(passed)
     assert metrics["classify:r"]["suffix_tokens"] == len(passed)
     assert metrics["classify:kind"]["fresh_tokens"] == 2 * len(accepted)
@@ -581,16 +626,26 @@ def joined_graph(two_joins=False):
 
 
 @pytest.mark.parametrize("two_joins", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("classifications", [1, 2])
 def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
-        monkeypatch, two_joins):
+        monkeypatch, two_joins, streaming, classifications):
     from quail.physical.pipelines import build_pipelines
 
+    events = []
+    if streaming:
+        monkeypatch.setattr("quail.progress._ANSWER_SINK", events.append)
     graph = joined_graph(two_joins)
+    classifiers = [graph.nodes[-1]]
+    if classifications == 2:
+        classifiers.append(replace(
+            classifiers[0], node_id="classify:other", spec=replace(
+                classifiers[0].spec, name="other", labels=("x", "y"))))
+        graph = PhysicalGraph((*graph.nodes, classifiers[-1]),
+                              PortRef(classifiers[-1].node_id, "rows"))
     pipelines = {tuple(
         member.node_id for member in pipeline)
         for pipeline in build_pipelines(graph).values()}
-    assert pipelines == {("group:0", "group:1", "classify:rp") if two_joins
-                      else ("group:0", "classify:rp")}
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     docs = {"r": [[DOC + d] * (5 + d) for d in range(3)],
@@ -662,6 +717,21 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     assert labels.column("r").to_pylist() == [0, 0, 1]
     assert labels.column("p").to_pylist() == [0, 1, 1]
     assert labels.column("stance").to_pylist() == ["a", "b", "a"]
+    if streaming:
+        assert [event for event in events if event["kind"] == "label"] == [
+            {"kind": "label", "node": node.node_id, "output": node.spec.name,
+             "aliases": ["r", "p"], "rows": [[0, 0], [0, 1], [1, 1]],
+             "labels": [node.spec.labels[index] for index in (0, 1, 0)]}
+            for node in classifiers]
+    expected_pipeline = (("group:0", "group:1") if two_joins else ("group:0",))
+    assert pipelines == {(*expected_pipeline, *(node.node_id for node in classifiers))}
+    if classifications == 2:
+        other = outputs[PortRef("classify:other", "rows")]
+        assert other.column("r").to_pylist() == [0, 0, 1]
+        assert other.column("p").to_pylist() == [0, 1, 1]
+        assert other.column("other").to_pylist() == ["x", "y", "x"]
+        assert metrics["classify:other"]["fresh_tokens"] == metrics[
+            "classify:rp"]["fresh_tokens"] - 2 * (1 + 1)
     # the join packed the anchors once; the classification packed, per
     # anchor kept, its note and the partner label and, per pair, the
     # partner document, the question, and the cue: no second prefill
