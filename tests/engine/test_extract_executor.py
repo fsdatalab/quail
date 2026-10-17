@@ -840,3 +840,59 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
         for index in (0, 1)]
     assert report["node_metrics"]["ai_filter:c"]["evaluated_documents"] == 2
     assert not arena.accounting.owned
+
+
+def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
+    # the result's limit stops the run after that many documents
+    # passed every operator; the documents still queued are not read
+    from quail.physical import Filter
+
+    spec, tables = make_spec()
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
+    # twelve documents, four of each kind, so some are still queued
+    # when the first one passes
+    docs, gold = DOCS * 4, GOLD * 4
+    for index, text in enumerate(docs):
+        model.docs[("c", index)] = text
+        model.gold[("c", index)] = gold[index]
+    graph = PhysicalGraph((
+        Scan(node_id="input:c", alias="c", input_id="c"),
+        AiExtract(node_id="ai-extract:ends",
+                  inputs=input_ports((PortRef("input:c", "ids:c"),)),
+                  backend_name="quail", model="qwen3-4b-fp8", spec=spec),
+        Filter(node_id="filter:c:0",
+               inputs=input_ports((PortRef("ai-extract:ends", "rows"),)),
+               predicate=RegularPredicate(
+                   ColumnRef("c", "contracts", "ends"), "is not null"),
+               aliases=("c",), written_pos=0),
+    ), PortRef("filter:c:0", "rows"))
+    torch, arena = fake_torch(), cpu_arena(256)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    execution = QuailModelExecution(SimpleNamespace())
+    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.loaded_model.vocabulary = tables
+    execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+    documents = [tables.encode_ids(text) for text in docs]
+    # a chunk holds about one document and its question
+    chunk = max(len(document) for document in documents) + len(
+        spec.prompt_token_parts[0]) + len(spec.prompt_token_parts[1]) + 8
+    execution.bind_query(torch=torch, answer_rows=object(), chunk_tokens=chunk,
+                         async_answers=object())
+    state = {"gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
+                                    execution=execution, spec=MODELS["qwen3-4b-fp8"]),
+             "runtimes": built_in_registry().runtimes,
+             "device": DEVICES["h100-sxm"], "chunk_tokens": chunk,
+             "docs": {"c": documents}, "texts": {"c": list(docs)}}
+    report = execute_single_graph(
+        state, {"filter_limit": 1, "pre_ids": [], "retention": {}}, graph)
+    outputs = report["_outputs"]
+    kept = outputs[PortRef("filter:c:0", "rows")].to_pydict()
+    # the documents in flight when the first passed finish; the
+    # queued ones are never read
+    assert kept["c"][0] == 0 and kept["ends"][0] == "March 3, 2027"
+    assert 1 <= len(kept["c"]) < len(docs)
+    assert sum(model.reads.values()) < len(docs)
+    assert not arena.accounting.owned

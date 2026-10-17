@@ -15,7 +15,6 @@ from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
-    AiInference,
     AiJoin,
     AiScore,
     Limit,
@@ -36,14 +35,14 @@ class ShouldPushDownLimit(PhysicalRule):
     """Let a LIMIT end the filter run once enough documents survived.
 
     The rule puts the limit in the ``filter_limit`` setting, which the
-    executor reads to stop admitting documents once that many survived
-    the sequence's last stage. The pushdown keeps the first survivors to
-    finish, so it is sound only when those are the rows the query
-    returns: the graph ends in a Limit and has no Sort or PhysicalAggregate (an
-    ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
-    AiJoin (survivors are settled per join round), and no AiInference (a
-    score comparison after the sequence can drop survivors). Otherwise the
-    rule removes the setting.
+    executor reads to stop admitting documents once that many passed
+    every operator of their pipeline. The pushdown keeps the first
+    survivors to finish, so it is sound only when those are the rows the
+    query returns: the graph ends in a Limit, its documents run through
+    one pipeline, and it has no Sort or PhysicalAggregate (an ORDER BY,
+    DISTINCT, OFFSET, or GROUP BY needs every survivor) and no AiJoin
+    (survivors are settled per join round). Otherwise the rule removes
+    the setting.
     """
 
     name = "should_push_down_limit"
@@ -53,8 +52,11 @@ class ShouldPushDownLimit(PhysicalRule):
             return None
         limit = next((node for node in graph.nodes
                       if isinstance(node, Limit)), None)
-        blocked = any(isinstance(node, (Sort, PhysicalAggregate, AiJoin, AiInference))
-                      for node in graph.nodes)
+        pipelines = {id(members) for members
+                     in build_pipelines(graph, context.gpu_count).values()}
+        blocked = len(pipelines) > 1 or any(
+            isinstance(node, (Sort, PhysicalAggregate, AiJoin))
+            for node in graph.nodes)
         if limit is None or blocked:
             context.settings.pop("filter_limit", None)
         else:
