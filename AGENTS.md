@@ -135,6 +135,31 @@ how they release and explain changes.
 - Do not create Modal app names. Attach GPU cells to
   `quail-milestone1` and the worker to `quail-engine`; caches and warm
   state belong to those apps.
+- To check a change, run Quail alone on a small set of queries at
+  scale factor 0.1, not the full suite. The full suite is slow. Use
+  these five, which together cover the main plan shapes:
+  - `IMDB-1`: one filter.
+  - `IMDB-2`: one join.
+  - `IMDB-4`: two filters, then a join.
+  - `FEV-9`: four filters and a chain of three joins.
+  - `BIO-5`: classify.
+
+  For example:
+
+      uv run modal run --detach -m bench.quailb_parallel \
+        --model qwen3-4b-fp8 --sf 0.1 \
+        --query IMDB-1,IMDB-2,IMDB-4,FEV-9,BIO-5 \
+        --no-include-baselines --no-include-sglang \
+        2>&1 | tee "$run_log"
+
+  Run more queries, or a larger scale factor, only when the change
+  targets them or the user asks.
+- Do not run stock vLLM, pipelined vLLM, or SGLang by default.
+  `bench.quailb_parallel` runs them unless told not to, so pass
+  `--no-include-baselines --no-include-sglang`. Run a baseline only
+  for an experiment whose point is to compare Quail with it, or when
+  the user asks. Reuse saved baseline results when the queries, scale
+  factor, and model have not changed.
 - Tee every Modal run to a file; the CLI drops old log lines.
 - Do not save Modal return values to local JSON. Print the function
   call id (`fc-...`) into the tee file, and fetch the result later
