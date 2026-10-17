@@ -1,5 +1,6 @@
 """Build executable query graphs with operator order and execution settings."""
 
+from dataclasses import replace
 from functools import partial
 from itertools import groupby
 
@@ -18,6 +19,7 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.physical import (
+    AiFilter,
     AiScore,
     Barrier,
     Exchange,
@@ -467,7 +469,7 @@ class GraphBuilder:
             cap_pages=statistics.cap_pages,
             model=self.model, device=self.device, chunk=statistics.chunk,
             resident_asks=resident_asks(self.operator_order.step_orders))
-        return PhysicalPlan(
+        plan = PhysicalPlan(
             model=self.model.name, device=self.device.name, workers=self.workers,
             backend="quail", estimated_seconds=estimate,
             nodes=tuple(self.nodes),
@@ -498,6 +500,13 @@ class GraphBuilder:
                    if self.operators.labels.calls and self.model.answer_canvas else {}),
             },
             estimator=estimator)
+        # each filter carries its own price, as the inference nodes do,
+        # so a rule that changes what it computes can reprice it
+        estimates = estimator(plan.graph)
+        return replace(plan, nodes=tuple(
+            replace(node, estimated_seconds=estimates[node.node_id]["seconds"])
+            if isinstance(node, AiFilter) and "seconds" in estimates[node.node_id]
+            else node for node in plan.nodes))
 
     def ids_of(self, alias: str) -> PortRef:
         """Return the ids of the alias's documents after its latest operator.

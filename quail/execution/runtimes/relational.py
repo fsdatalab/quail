@@ -76,9 +76,11 @@ class ProjectRuntime:
         if context.project is not None:
             value = (context.project(node, value, labels) if labels
                      else context.project(node, value))
-        rows = _row_count(value) or 0
-        return NodeResult({"rows": value},
-                          NodeMetrics(input_rows=rows, output_rows=rows))
+        # a projection keeps its rows; a lazy result's count is the
+        # input's until the result runs
+        rows = _row_count(inputs[first.name]) or 0
+        return NodeResult({"rows": value}, NodeMetrics(
+            input_rows=rows, output_rows=_row_count(value) or rows))
 
 
 class LimitRuntime:

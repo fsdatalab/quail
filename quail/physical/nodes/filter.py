@@ -116,6 +116,9 @@ class AiFilter(PhysicalNode):
     # value columns of the alias; the executor reads one document of
     # each key value at a time and skips the rest once one survives
     stop_key: tuple[str, ...] = ()
+    # this filter's own model work, priced alone (the planner's
+    # node estimates); a rule that changes what it computes reprices it
+    estimated_seconds: float = 0.0
 
     type_name: ClassVar[str] = "quail.ai_filter"
     runtime_key: ClassVar[str] = type_name
@@ -157,11 +160,13 @@ class AiFilter(PhysicalNode):
             "share_prefixes": self.share_prefixes,
             "attention": self.attention,
             "stop_key": list(self.stop_key),
+            "estimated_seconds": self.estimated_seconds,
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
         value = self.attributes()
         value.pop("question_token_ids")
+        value.pop("estimated_seconds")
         return value
 
     @classmethod
@@ -182,4 +187,5 @@ class AiFilter(PhysicalNode):
             attention=str(attributes.get("attention", "")),
             stop_key=tuple(str(column)
                            for column in attributes.get("stop_key", ())),
+            estimated_seconds=float(attributes.get("estimated_seconds", 0.0)),
         )

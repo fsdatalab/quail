@@ -28,6 +28,12 @@ def inference_seconds(nodes) -> float:
                if isinstance(node, AiInference) and node.spec is not None)
 
 
+def model_seconds(nodes) -> float:
+    """Sum every model-reading node's own estimated seconds in a graph."""
+    return inference_seconds(nodes) + sum(
+        node.estimated_seconds for node in nodes if isinstance(node, AiFilter))
+
+
 @dataclass(frozen=True)
 class CorpusStats:
     n_docs: int

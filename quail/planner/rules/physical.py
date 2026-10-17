@@ -280,6 +280,12 @@ class ShouldSharePrefixes(PhysicalRule):
                 nodes.append(node)
                 continue
             if isinstance(node, AiFilter):
+                pipeline = pipelines.get(node.node_id)
+                if pipeline is None or pipeline[0].node_id == node.node_id:
+                    # the first filter of its pipeline reads the
+                    # documents, borrowing their shared prefix
+                    node = replace(node, estimated_seconds=_shared_filter_seconds(
+                        node, context, store))
                 node = replace(node, share_prefixes=True, arena_writes=True)
             elif isinstance(node, AiJoin):
                 node = replace(node, share_prefixes=True)
@@ -322,6 +328,28 @@ def _shared_extract_spec(node, context, store, *, resident=False):
     return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
 
 
+def _shared_filter_seconds(node, context, store) -> float:
+    """Price a filter's scan of its documents with their borrowed prefixes.
+
+    Each document computes its own tokens past the prefix it borrows
+    and the question, as the node estimates price it without sharing.
+    """
+    from quail.cost.budgets import chunk_budget
+    from quail.cost.sol import speed_of_light
+    from quail.cost.work import Work, ask, scan
+
+    window = context.model.sliding_window
+    lengths = context.document_tokens[node.alias]
+    work = Work()
+    for length, borrowed in zip(lengths, page_tree(store).shared):
+        prefix = node.preamble_tokens + int(length)
+        work += (ask(borrowed, prefix + node.question_tokens - borrowed, window=window)
+                 if borrowed else scan(prefix, node.question_tokens, window=window))
+    work = work * (node.expected_docs / len(lengths))
+    return speed_of_light(work, context.model, context.device,
+                          chunk_budget(context.model, context.device)).seconds
+
+
 def _shared_score_spec(spec, shared_tokens, summary, canvas_tokens):
     """Enable prefix sharing and scale the score's estimate by its fresh tokens.
 
@@ -331,10 +359,14 @@ def _shared_score_spec(spec, shared_tokens, summary, canvas_tokens):
     """
     fixed = score_fixed_tokens(tuple(map(len, spec.prompt_token_parts)),
                                canvas_tokens, spec.draws)
-    total = summary.total + summary.count * fixed
-    fresh = max(0.0, 1.0 - shared_tokens / total) if total else 1.0
+    fresh = _fresh_fraction(shared_tokens, summary.total + summary.count * fixed)
     return replace(spec, share_prefixes=True,
                    estimated_seconds=spec.estimated_seconds * fresh)
+
+
+def _fresh_fraction(shared_tokens: int, total_tokens: float) -> float:
+    """The share of a table's tokens its documents compute when they borrow."""
+    return max(0.0, 1.0 - shared_tokens / total_tokens) if total_tokens else 1.0
 
 
 def _mean(values) -> float:

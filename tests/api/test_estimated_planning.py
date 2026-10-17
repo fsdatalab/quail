@@ -3,6 +3,7 @@
 import threading
 
 import pyarrow as pa
+import pytest
 from helpers.sessions import make_executor
 
 import quail
@@ -113,6 +114,14 @@ def test_prefix_sharing_and_attention_path_are_decided_from_exact_tokens():
     refined = query.plan()
     sequence = next(n for n in refined.nodes if n.type_name == "quail.ai_filter")
     assert sequence.share_prefixes and sequence.arena_writes
+    # the filter computes the documents' fresh tokens only, and the
+    # plan's estimate drops by the same amount, as it does for an
+    # extraction that borrows
+    priced = next(n for n in first.nodes if n.type_name == "quail.ai_filter")
+    assert 0 < sequence.estimated_seconds <= priced.estimated_seconds
+    assert refined.estimated_seconds == pytest.approx(
+        first.estimated_seconds
+        - (priced.estimated_seconds - sequence.estimated_seconds))
     # nothing left to refine: the plan is stable
     query.wait_for_tokens()
     assert query.plan() is refined
@@ -124,11 +133,13 @@ def test_prefix_sharing_and_attention_path_are_decided_from_exact_tokens():
     header = " ".join(f"h{i}" for i in range(2048))
     session = _table_session([header + f" r{i}" * 8 for i in range(40)])
     query = session.sql(SQL)
-    query.plan()
+    priced = next(n for n in query.plan().nodes if n.type_name == "quail.ai_filter")
     query.wait_for_tokens()
     sequence = next(n for n in query.plan().nodes
                  if n.type_name == "quail.ai_filter")
     assert sequence.share_prefixes and sequence.attention == "tree"
+    # the readers compute their own tokens only, not the header again
+    assert sequence.estimated_seconds < 0.5 * priced.estimated_seconds
     session.close()
 
 

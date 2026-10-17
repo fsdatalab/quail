@@ -5,7 +5,7 @@ from dataclasses import replace
 from quail.physical.base import PhysicalGraph
 from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.rules import PhysicalRule
-from quail.planner.plan import inference_seconds
+from quail.planner.plan import model_seconds
 from quail.planner.validation import ClassifyRefusedError
 
 
@@ -50,7 +50,7 @@ def apply_plan_rules(plan, rules, context):
         return refused.refusal()
     if not changed and context.settings == dict(plan.settings):
         return plan
-    difference = inference_seconds(graph.nodes) - inference_seconds(plan.nodes)
+    difference = model_seconds(graph.nodes) - model_seconds(plan.nodes)
     seconds = plan.estimated_seconds + difference
     if "search_seconds" in plan.settings:
         context.settings["search_seconds"] = (
