@@ -31,9 +31,9 @@ def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
              for member in nodes]
     if len(parts) == 1 and "document_done" in inputs:
         parts[0].document_done = inputs["document_done"]
-    # Sorted admission would change which rows a limit keeps.
-    tree = (None if inputs.get("limit") is not None else execution_prefix_tree(
-        node, documents, state.loaded_model.arena))
+    # the rows a limit keeps follow admission order, which borrowing
+    # sorts by prefix; a query without ORDER BY promises no rows
+    tree = execution_prefix_tree(node, documents, state.loaded_model.arena)
     return execute_parts(
         state, parts, documents, DocumentKeys(node.alias, ids),
         keep_kv=nodes[-1].keep_kv, tree=tree, attention=node.attention or "unified",

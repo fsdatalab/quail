@@ -45,14 +45,10 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
     head = first.document_head
     prefixes = DocumentPrefixes(context.state["pre"] if head is None else head,
                                 context.state["docs"][alias], ids)
-    # a limit ends the run once that many documents passed every
-    # operator; sorted admission would change which ones those are
-    limit = context.state.get("filter_limit")
     results = execute_parts(
         state, parts, prefixes, DocumentKeys(alias, ids), keep_kv=members[-1].keep_kv,
-        tree=(None if limit is not None else execution_prefix_tree(
-            first, prefixes, state.loaded_model.arena)),
-        limit=limit,
+        tree=execution_prefix_tree(first, prefixes, state.loaded_model.arena),
+        limit=context.state.get("filter_limit"),
         attention=getattr(first, "attention", None) or None,
         label=f"pipeline {alias}")
     for member in trailing:

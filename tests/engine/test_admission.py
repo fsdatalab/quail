@@ -555,3 +555,18 @@ def test_next_stage_settlement_preserves_the_answered_stage_decision(
     assert sched.report(0, 0, 0, 1, [1]) == AdmissionReport(
         (Settlement(kind, 0, False),), ((0, 0, True),))
     assert sched.done() and sched.survivors == 0
+
+
+def test_a_limit_paces_admission_by_the_expected_survival():
+    # a limit of two survivors at a survival of a half: four anchors
+    # in flight are expected to reach it, so the fifth waits; a drop
+    # settles one and lets the next in
+    sched = JoinAdmission([50] * 8, [[10]], 500, arena_pages=100,
+                          page_tokens=16, limit=2, survival=0.5)
+    assert [a for a, *_ in sched.next_chunk(500)] == [0, 1, 2, 3]
+    assert sched.next_chunk(500) == []
+    sched.report(0, 0, 0, 1, [0])
+    assert [a for a, *_ in sched.next_chunk(500)] == [4]
+    sched.report(1, 0, 0, 1, [1])
+    sched.report(2, 0, 0, 1, [1])
+    assert sched.limit_reached() and sched.next_chunk(500) == []

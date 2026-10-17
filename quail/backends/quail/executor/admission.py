@@ -186,6 +186,10 @@ class JoinAdmission:
             before packs no frame rows. None writes every frame.
         limit: Stop admitting anchors once this many survived the last
             stage; None runs every anchor.
+        survival: The fraction of anchors expected to survive every
+            stage, or None. Under a limit, anchors are admitted only
+            while the ones in flight are expected to fall short of it;
+            None admits every anchor that fits.
         stop_groups: Per anchor, its stop key group, or None. At most
             stop_width anchors of a group are admitted at a time, and
             once one survives the last stage the group's queued anchors
@@ -215,7 +219,7 @@ class JoinAdmission:
                  resident=None, anchor_partners=None, temporary_suffix_pages=False,
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
-                 frame_writes=None, limit=None, extra_tokens=None,
+                 frame_writes=None, limit=None, survival=None, extra_tokens=None,
                  stop_groups=None, stop_width=1):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
@@ -224,6 +228,7 @@ class JoinAdmission:
             raise ValueError("answer_dtype must match stage_suffixes")
         self.advance = advance
         self.limit = limit
+        self.survival = survival
         self.survivors = 0
         n = len(prefix_tokens)
         self.groups = None if stop_groups is None else list(stop_groups)
@@ -578,7 +583,11 @@ class JoinAdmission:
         held = []
         blocked = False
         admitted = set()
+        paced = self.limit is not None and self.survival is not None
+        live = self._live() if paced else 0
         while self.pending and room >= self._min_fresh:
+            if paced and self.survivors + live * self.survival >= self.limit:
+                break       # the anchors in flight should reach the limit
             a = self.pending.popleft()
             if self._stage[a] == _DONE:
                 self._dead -= 1     # skipped by its group's survivor
@@ -626,6 +635,7 @@ class JoinAdmission:
                 self._zero_cost -= 1
             self._stage[a] = 0
             admitted.add(a)
+            live += 1
             if self.groups is not None:
                 group = self.groups[a]
                 self._group_busy[group] = self._group_busy.get(group, 0) + 1
@@ -734,6 +744,10 @@ class JoinAdmission:
         """Remove and return the queued anchors a done group skipped."""
         skipped, self._skipped = self._skipped, []
         return skipped
+
+    def _live(self) -> int:
+        """Anchors admitted and not yet settled."""
+        return sum(1 for stage in self._stage if stage >= 0)
 
     def limit_reached(self) -> bool:
         """Return whether enough documents survived to stop new admissions."""

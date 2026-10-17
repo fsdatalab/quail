@@ -81,7 +81,7 @@ class StageExecutor:
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
-                 appended_tokens=None, gpu_timing=False):
+                 appended_tokens=None, gpu_timing=False, survival=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -199,7 +199,7 @@ class StageExecutor:
             tree=prefix_tree,
             advance=partial(_advance_stage, stages),
             frame_writes=self.writes,
-            limit=limit,
+            limit=limit, survival=survival,
             stop_groups=stop_groups,
             stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,

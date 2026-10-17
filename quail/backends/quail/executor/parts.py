@@ -13,6 +13,7 @@ from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import prefix_tree
+from quail.logical import effective_selectivity
 from quail.progress import logger
 
 
@@ -121,7 +122,12 @@ class SingleResultPart(ExecutionPart):
 def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
                   paged=True, on_answers=None) -> dict:
-    """Run prepared operator work together and collect per-node results."""
+    """Run prepared operator work together and collect per-node results.
+
+    A limit ends the run once that many documents passed every part;
+    documents are admitted only while the ones in flight are expected
+    to fall short of it, by the parts' selectivities.
+    """
     stages = gated_stages(parts)
     paged = paged or state.loaded_model.pipeline.needs_pages
     if keep_kv and not paged:
@@ -141,6 +147,7 @@ def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
         attention_mode=next((part.attention for part in parts if part.attention),
                             attention),
         staging=input_staging(state), label=label, limit=limit,
+        survival=expected_survival(parts),
         stop_groups=stop_groups, paged=paged,
         on_chunk=transition_reporter(parts), on_answers=on_answers,
         appended_tokens=max(part.appended_tokens for part in parts) or None)
@@ -257,6 +264,18 @@ def complete_parts(parts, every, spans, tokens, stats):
             remainder if staged and index == staged[0] else (own[index] or 0),
             part_spans, stats if staged and index == staged[0] else {},
             low)
+
+
+def expected_survival(parts) -> float:
+    """The fraction of documents expected to pass every part, by selectivity."""
+    survival = 1.0
+    for part in parts:
+        nodes = getattr(part, "nodes", None) or (
+            (part.node,) if hasattr(part, "node") else ())
+        for node in nodes:
+            if hasattr(node, "selectivity"):
+                survival *= effective_selectivity(node.selectivity)
+    return survival
 
 
 def execution_prefix_tree(node, documents, arena):
