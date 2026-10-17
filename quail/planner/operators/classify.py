@@ -22,6 +22,7 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.base import input_ports
+from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import bind_inference, inference_node
 from quail.planner.prompt_lowering import (
     choice_token_parts,
@@ -453,7 +454,7 @@ class ClassifyBuilder(ClassifyStatistics):
             frame_tokens=frame), estimated.work
 
 
-def emit_classify(builder, alias, live, calls):
+def emit_classify(builder, alias, live, calls, frontier) -> tuple:
     """Classify the alias's documents, then keep the accepted labels.
 
     Args:
@@ -461,7 +462,13 @@ def emit_classify(builder, alias, live, calls):
         alias: The table.
         live: The documents the classifications read.
         calls: The classifications to emit, in run order.
+        frontier: Where the documents stand before the classifications.
+
+    Returns:
+        Where the documents stand after them, and the rows ports of
+        the labels SELECT returns.
     """
+    label_ports = []
     table = classify_builder(builder.context, alias, "quail")
     steps = []
     for call in calls:
@@ -471,7 +478,6 @@ def emit_classify(builder, alias, live, calls):
         if call not in builder.operators.labels.tests:
             steps.append((call, None))
     classified_calls = set()
-    scores = None
     for call, test in steps:
         if call not in classified_calls:
             spec, work = table.prepare(
@@ -479,24 +485,23 @@ def emit_classify(builder, alias, live, calls):
             if builder.scoring is not None:
                 builder.scoring.work += work
             node = table.node(
-                spec, scores or builder.source[alias],
-                              sum(isinstance(n, AiClassify) for n in builder.nodes))
+                spec, frontier.source,
+                sum(isinstance(n, AiClassify) for n in builder.nodes))
             builder.nodes.append(node)
-            scores = PortRef(node.node_id, "rows")
-            builder.source[alias] = scores
+            frontier = Frontier(PortRef(node.node_id, f"ids:{alias}"),
+                                PortRef(node.node_id, "rows"))
             if call in builder.operators.labels.projected:
-                builder.label_ports.append(scores)
+                label_ports.append(frontier.rows)
             classified_calls.add(call)
         if test is not None:
             lid = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
-                node_id=lid, inputs=input_ports((scores,)),
+                node_id=lid, inputs=input_ports((frontier.rows,)),
                 predicate=test.condition, aliases=(alias,),
                 selectivity=test.selectivity, written_pos=test.position))
-            scores = PortRef(lid, "rows")
-            builder.source[alias] = scores
+            frontier = Frontier(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
             live *= effective_selectivity(test.selectivity)
-
+    return frontier, label_ports
 
 
 def joined_calls(labels: LabelWork) -> list:
@@ -505,9 +510,18 @@ def joined_calls(labels: LabelWork) -> list:
             if len(call.aliases()) == 2]
 
 
-def emit_joined_classify(builder):
-    """Append the classifications of joined rows after their joins."""
+def emit_joined_classify(builder, join_ids) -> list:
+    """Append the classifications of joined rows after their joins.
+
+    Args:
+        builder: The graph builder.
+        join_ids: Join written position -> its AiJoin node id.
+
+    Returns:
+        The rows ports of the labels SELECT returns.
+    """
     stats = builder.operator_order.statistics.stats
+    label_ports = []
     # a classification of joined rows follows the join that keeps them,
     # in the join's pipeline: each kept row's partner block, question,
     # and label paths run over the anchor's resident KV
@@ -531,9 +545,10 @@ def emit_joined_classify(builder):
             call, builder.operators.labels.names[call], partner, pairs,
             stats[partner].mean_doc_tokens)
         node = table.node(
-            spec, PortRef(builder.join_ids[stage.written_pos],
+            spec, PortRef(join_ids[stage.written_pos],
                           f"join_answers:{stage.written_pos}"),
             sum(isinstance(n, AiClassify) for n in builder.nodes))
         builder.nodes.append(node)
         if call in builder.operators.labels.projected:
-            builder.label_ports.append(PortRef(node.node_id, "rows"))
+            label_ports.append(PortRef(node.node_id, "rows"))
+    return label_ports

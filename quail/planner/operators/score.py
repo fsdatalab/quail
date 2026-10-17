@@ -17,6 +17,7 @@ from quail.physical import (
     ScoreSpec,
 )
 from quail.physical.base import input_ports
+from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import bind_inference, inference_node
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import score_token_parts
@@ -143,7 +144,7 @@ class ScoreLowering:
         return PortRef(node.node_id, "rows")
 
 
-def emit_scores(builder, alias, positions, live):
+def emit_scores(builder, alias, positions, live, frontier) -> Frontier:
     """Append a run of the alias's score predicates in their chosen order.
 
     Args:
@@ -151,58 +152,89 @@ def emit_scores(builder, alias, positions, live):
         alias: The table.
         positions: The written positions to emit, in run order.
         live: The documents the run reads.
+        frontier: Where the documents stand before the run.
+
+    Returns:
+        Where the documents stand after the run: the last comparison's
+        rows and ids.
     """
     stats = builder.operator_order.statistics.stats
     for position in positions:
         predicate = builder.operators.filters[alias][position]
-        source = builder.source[alias]
+        source = frontier.source
         if predicate.prompt not in builder.scoring.names:
             source = builder.scoring.score(
                 predicate.prompt, f"__score_{alias}_{position}", (source,),
                 live, stats[alias].mean_doc_tokens)
-        source = builder.scoring.comparison(predicate, source, (alias,), position)
-        builder.source[alias] = source
+        rows = builder.scoring.comparison(predicate, source, (alias,), position)
+        frontier = Frontier(PortRef(rows.node_id, f"ids:{alias}"), rows)
         live *= effective_selectivity(predicate.selectivity)
+    return frontier
 
 
-def emit_projected_scores(builder, alias, live):
-    """Append the alias's scores returned in SELECT, over the live documents."""
+def emit_projected_scores(builder, alias, live, frontier) -> Frontier:
+    """Append the alias's scores returned in SELECT, over the live documents.
+
+    A score keeps every document it reads, so the documents' ids stay
+    the ones before it.
+    """
     stats = builder.operator_order.statistics.stats
     for expression in builder.projected_scores:
         call = expression.expression
         if call.aliases() != (alias,) or call.prompt in builder.scoring.names:
             continue
-        builder.source[alias] = builder.scoring.score(
-            call.prompt, expression.name, (builder.source[alias],), live,
+        rows = builder.scoring.score(
+            call.prompt, expression.name, (frontier.source,), live,
             stats[alias].mean_doc_tokens)
+        frontier = Frontier(frontier.ids, rows)
+    return frontier
 
 
+def emit_score_pair(builder, prompt, position, fraction, pair_inputs,
+                    frontiers) -> PortRef:
+    """Append the score of one pair prompt and return its rows port.
 
-def emit_score_pair(builder, prompt, position, fraction, pair_inputs):
-    """Append the score of one pair prompt and return its rows port."""
+    Args:
+        builder: The graph builder.
+        prompt: The pair prompt.
+        position: The join's written position.
+        fraction: The fraction of the cross product the pairs keep.
+        pair_inputs: The ports supplying the pairs, if any.
+        frontiers: alias -> where its documents stand.
+    """
     stats = builder.operator_order.statistics.stats
     aliases = tuple(dict.fromkeys(ref.alias for ref in prompt.args))
     expected, prefixes = pair_counts(builder.operator_order.live, aliases, fraction)
     return builder.scoring.score(
         prompt, f"__score_join_{position}",
-        tuple(builder.source[a] for a in aliases)
-        + pair_inputs,
+        tuple(frontiers[a].source for a in aliases) + pair_inputs,
         expected, sum(stats[a].mean_doc_tokens for a in aliases),
         pair_fraction=fraction, prefix_groups=prefixes)
 
 
-def emit_score_joins(builder, group):
-    """Append the scores and comparisons of one group of score joins."""
+def emit_score_joins(builder, group, frontiers, score_pairs) -> PortRef:
+    """Append the scores and comparisons of one group of score joins.
+
+    Args:
+        builder: The graph builder.
+        group: The group's (PricedJoin, step) pairs.
+        frontiers: alias -> where its documents stand.
+        score_pairs: The rows of the pairs scored so far, or None.
+
+    Returns:
+        The rows of the pairs the group keeps.
+    """
     for spec, _ in group:
         position = spec.written_pos
         join = builder.operators.joins[position]
         pair_inputs = ()
         if position in builder.pairs_src:
             producer = builder.pairs_src[position]
-            pair_inputs = (PortRef(producer.node_id,
-                                  f"pairs:{position}"),)
-        if builder.score_pairs is None:
-            builder.score_pairs = emit_score_pair(
-                builder, join.prompt, position, spec.pair_fraction, pair_inputs)
-        builder.score_pairs = builder.scoring.comparison(
-            join, builder.score_pairs, spec.aliases, position)
+            pair_inputs = (PortRef(producer.node_id, f"pairs:{position}"),)
+        if score_pairs is None:
+            score_pairs = emit_score_pair(
+                builder, join.prompt, position, spec.pair_fraction, pair_inputs,
+                frontiers)
+        score_pairs = builder.scoring.comparison(
+            join, score_pairs, spec.aliases, position)
+    return score_pairs

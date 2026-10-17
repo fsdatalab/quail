@@ -12,6 +12,7 @@ from quail.physical import (
     PortRef,
 )
 from quail.physical.base import input_ports
+from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import (
     bind_inference,
     inference_node,
@@ -52,7 +53,7 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
     return replace(spec, estimated_seconds=cost.seconds)
 
 
-def emit_extract(builder, alias, live, names):
+def emit_extract(builder, alias, live, names, frontier) -> tuple:
     """Copy the answers of the alias's documents.
 
     A Filter on an extraction's answer or span follows that extraction
@@ -64,11 +65,17 @@ def emit_extract(builder, alias, live, names):
         alias: The table.
         live: The documents the extractions read.
         names: The extractions to emit, in run order.
+        frontier: Where the documents stand before the extractions.
+
+    Returns:
+        Where the documents stand after them, and the rows ports of
+        the answers SELECT returns.
     """
     extracts = {node.name: node for node in builder.operators.extracts
                 if node.alias == alias}
     calls = [extracts[name] for name in names]
     tests = builder.operators.extract_filters.get(alias, ())
+    answer_ports = []
     for index, logical_node in enumerate(calls):
         # the extractions of a table and the Filters on their answers
         # run in one pipeline (quail.physical.pipelines): a document
@@ -77,22 +84,22 @@ def emit_extract(builder, alias, live, names):
         spec = extract_spec(builder.context, logical_node.call,
                             logical_node.name, live, shared=index > 0)
         node = inference_node(
-            AiExtract, spec, (builder.source[alias],),
+            AiExtract, spec, (frontier.source,),
             index=sum(isinstance(n, AiExtract) for n in builder.nodes),
             backend="quail", model=builder.model.name)
         builder.nodes.append(node)
-        scores = PortRef(node.node_id, "rows")
-        builder.source[alias] = scores
+        frontier = Frontier(PortRef(node.node_id, f"ids:{alias}"),
+                            PortRef(node.node_id, "rows"))
         for test in tests:
             if test.name != logical_node.name:
                 continue
             lid = f"filter:{alias}:{test.position}"
             builder.nodes.append(Filter(
-                node_id=lid, inputs=input_ports((scores,)),
+                node_id=lid, inputs=input_ports((frontier.rows,)),
                 predicate=test.condition, aliases=(alias,),
                 selectivity=test.selectivity, written_pos=test.position))
-            scores = PortRef(lid, "rows")
-            builder.source[alias] = scores
+            frontier = Frontier(PortRef(lid, f"ids:{alias}"), PortRef(lid, "rows"))
             live *= effective_selectivity(test.selectivity)
-        builder.label_ports.append(scores)
+        answer_ports.append(frontier.rows)
+    return frontier, answer_ports
 

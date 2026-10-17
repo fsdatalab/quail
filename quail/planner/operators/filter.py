@@ -12,6 +12,7 @@ from quail.logical import (
 )
 from quail.physical import AiFilter, PortRef
 from quail.physical.base import input_ports
+from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import question_tokens
 from quail.planner.operators.score import score_statistics
 
@@ -60,7 +61,7 @@ def prepare_filter_costs(predicates, *, prefix_tokens, model, device,
     return tuple(prepared)
 
 
-def emit_filter(builder, alias, positions, live, followed=False):
+def emit_filter(builder, alias, positions, live, frontier, followed=False):
     """Append a run of the alias's AI filters in their chosen order.
 
     Args:
@@ -68,8 +69,12 @@ def emit_filter(builder, alias, positions, live, followed=False):
         alias: The table.
         positions: The written positions to emit, in run order.
         live: The documents the run reads.
+        frontier: Where the documents stand before the run.
         followed: Whether a classification or an extraction continues
             the run's pipeline, so the filters write the documents' KV.
+
+    Returns:
+        Where the documents stand after the run.
     """
     orders = builder.operator_order.filter_orders
     surv = live
@@ -79,7 +84,7 @@ def emit_filter(builder, alias, positions, live, followed=False):
                else f"ai_filter:{alias}:{i}")
         lowered = builder.context.lowered(p.prompt)
         builder.nodes.append(AiFilter(
-            node_id=fid, inputs=input_ports((builder.ids_of(alias),)), alias=alias,
+            node_id=fid, inputs=input_ports((frontier.ids,)), alias=alias,
             written_pos=i,
             question_tokens=question_tokens(lowered, builder.model.canvas_tokens),
             preamble_tokens=lowered.preamble_tokens,
@@ -89,6 +94,6 @@ def emit_filter(builder, alias, positions, live, followed=False):
                           or alias in builder.pipelined),
             stop_key=builder.stop_keys.get(alias, ())))
         surv *= effective_selectivity(p.selectivity)
-        builder.source[alias] = PortRef(fid, f"ids:{alias}")
-    builder.emit_applies(alias)
+        frontier = Frontier(PortRef(fid, f"ids:{alias}"))
+    return builder.emit_applies(alias, frontier)
 

@@ -1,5 +1,7 @@
 """AI.IF over two tables: the joins as the cost model prices them."""
 
+from dataclasses import dataclass
+
 from quail.cost.joins import PricedJoin
 from quail.logical import (
     is_score,
@@ -8,6 +10,7 @@ from quail.logical import (
 from quail.logical.prompts import prompt_aliases
 from quail.physical import AiJoin, Foreign, PortRef
 from quail.physical.base import input_ports
+from quail.planner.graph.frontier import Frontier
 from quail.planner.operators.common import question_tokens
 from quail.planner.operators.score import ScoreJoinCost, score_statistics
 from quail.planner.prompt_lowering import LoweredPrompt
@@ -67,8 +70,31 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
     return out
 
 
-def emit_join(builder, spec, step, anchor, jid, exec_idx):
-    """Append one AI join stage and the functions that supply its pairs."""
+@dataclass(frozen=True)
+class JoinOutput:
+    """What one AI join stage leaves for the operators after it.
+
+    Attributes:
+        anchor: Where the anchor's documents stand after the join.
+        pairs: The port of the pairs a full join keeps, or None.
+    """
+
+    anchor: Frontier
+    pairs: PortRef | None = None
+
+
+def emit_join(builder, spec, step, anchor, jid, exec_idx, frontiers) -> JoinOutput:
+    """Append one AI join stage and the functions that supply its pairs.
+
+    Args:
+        builder: The graph builder.
+        spec: The join's PricedJoin.
+        step: The join's step in the chosen sequence.
+        anchor: The anchor alias.
+        jid: The AiJoin node id.
+        exec_idx: The join's position in execution order.
+        frontiers: alias -> where its documents stand before the join.
+    """
     pair_inputs = []
     partners = [a for a in spec.aliases if a != anchor]
     pairs_from = ""
@@ -83,7 +109,7 @@ def emit_join(builder, spec, step, anchor, jid, exec_idx):
         builder.nodes.append(Foreign(
             node_id=aid,
             inputs=input_ports(tuple(
-                builder.ids_of(a) for a in apply.aliases)),
+                frontiers[a].ids for a in apply.aliases)),
             function=apply.function, kind=apply.kind, ids="pairs",
             columns=tuple((ref.alias, ref.column)
                           for ref in apply.columns),
@@ -94,7 +120,7 @@ def emit_join(builder, spec, step, anchor, jid, exec_idx):
     builder.nodes.append(AiJoin(
         node_id=jid,
         inputs=input_ports(tuple(
-            builder.ids_of(a) for a in [anchor, *partners])
+            frontiers[a].ids for a in [anchor, *partners])
                            + tuple(pair_inputs)),
         written_pos=spec.written_pos, exec_idx=exec_idx,
         anchor=anchor, partners=tuple(partners),
@@ -108,11 +134,7 @@ def emit_join(builder, spec, step, anchor, jid, exec_idx):
         anchor_resident=step.resident,
         tuple_tokens=round(step.tokens, 1),
         pairs_from=pairs_from))
-    builder.source[anchor] = PortRef(jid, f"ids:{anchor}")
-    if spec.semantics == "full":
-        builder.pairs_edges.append(PortRef(
-            jid, f"join_answers:{spec.written_pos}"
-        ))
-        for a in [anchor] + partners:
-            if a not in builder.out_aliases:
-                builder.out_aliases.append(a)
+    return JoinOutput(
+        Frontier(PortRef(jid, f"ids:{anchor}")),
+        PortRef(jid, f"join_answers:{spec.written_pos}")
+        if spec.semantics == "full" else None)
