@@ -4,6 +4,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.execution.result import true_answer_rows
+from quail.execution.rows import Rows
 from quail.physical import AiJoin, Barrier, PortRef, ValueType
 
 
@@ -54,6 +55,11 @@ def execution_report(plan, metrics, notes, coordinator_wall):
     return report
 
 
+def _as_table(value):
+    """Rows as their table; any other value as it is."""
+    return value.table() if isinstance(value, Rows) else value
+
+
 def collect_answers(logical, plan, outputs, documents):
     """Collect answer tables, surviving rows, and measured predicate selectivity."""
     operators = logical.operators()
@@ -70,7 +76,7 @@ def collect_answers(logical, plan, outputs, documents):
             ref = PortRef(node.node_id, port.name)
             if answer is None or ref not in outputs:
                 continue
-            table = outputs[ref].select(answer.columns)
+            table = _as_table(outputs[ref]).select(answer.columns)
             if answer.kind == "classifies":
                 table = table.filter(pc.is_valid(table.column(answer.name)))
             answer_tables[answer.kind][answer.name] = table
@@ -89,6 +95,8 @@ def collect_answers(logical, plan, outputs, documents):
     join_relations = {}
     for ref, table in outputs.items():
         value_type = output_types.get(ref)
+        if isinstance(table, Rows):
+            continue
         metadata = table.schema.metadata or {}
         if value_type is ValueType.FILTER_ANSWERS:
             alias = metadata.get(b"quail.alias")

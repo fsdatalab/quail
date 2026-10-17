@@ -20,7 +20,8 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.result import extract_answer_table
+from quail.execution.result import extract_answers
+from quail.execution.rows import Rows
 from quail.physical import AiExtract
 
 
@@ -86,8 +87,8 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
     for q, node in enumerate(nodes):
         spec = node.spec
         answers, answer_spans = stages.answers(q, kept)
-        table = extract_answer_table(spec.alias, spec.name, spec.span_name,
-                                     document_ids, answers, answer_spans)
+        table = extract_answers(spec.alias, spec.name, spec.span_name,
+                                document_ids, answers, answer_spans)
         first = q == 0
         gpu_s, timed = own(q)
         results[node.node_id] = NodeResult(
@@ -118,8 +119,8 @@ class ExtractPart(ExecutionPart):
         # the one input carries the documents' ids, or the rows of an
         # earlier operator over them
         (value,) = inputs.values()
-        ids = (value.column(node.spec.alias).to_numpy()
-               if hasattr(value, "column") else np.asarray(value, dtype=np.int64))
+        ids = (value.ids[node.spec.alias].to_numpy() if isinstance(value, Rows)
+               else np.asarray(value, dtype=np.int64))
         return {"document_ids": ids,
                 "documents": context.state["docs"],
                 "texts": context.state.get("texts", {})}

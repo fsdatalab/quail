@@ -15,10 +15,10 @@ from quail.catalog.pairs import (
 from quail.execution.labels import match_label
 from quail.execution.result import (
     answer_table,
-    extract_answer_table,
+    extract_answers,
     filter_answer_table,
-    rows_table,
 )
+from quail.execution.rows import Rows
 from quail.execution.spans import line_span, locate_span, read_phrase
 
 
@@ -235,11 +235,10 @@ def choose_documents(client, spec, bodies) -> dict:
     }
 
 
-def classification_table(spec, columns, labels):
+def classification_rows(spec, columns, labels) -> Rows:
     """Build classified rows and remove rows without a matching label."""
-    table = rows_table(columns, {spec.output: pa.array(labels, pa.string())},
-                       "score_rows")
-    return table.filter(table.column(spec.output).is_valid())
+    rows = Rows(columns, pa.table({spec.output: pa.array(labels, pa.string())}))
+    return rows.filter(rows.column(spec.output).is_valid())
 
 
 def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
@@ -297,10 +296,10 @@ def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
     }
 
 
-def extract_answers(spec, document_ids, answers, spans) -> pa.Table:
+def extraction_rows(spec, document_ids, answers, spans) -> Rows:
     """Return each document's answer and character span."""
-    return extract_answer_table(spec.alias, spec.output, spec.span_output,
-                                document_ids, answers, spans)
+    return extract_answers(spec.alias, spec.output, spec.span_output,
+                           document_ids, answers, spans)
 
 
 def allowed_members_by_anchor(anchor, partners, anchor_ids, members, pairs) -> list:

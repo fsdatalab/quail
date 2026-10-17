@@ -17,6 +17,7 @@ from quail.catalog.pairs import columns_key
 from quail.catalog.tokens import select_documents
 from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.rows import Rows
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -164,7 +165,7 @@ class DistributedQuailExecution:
         results = {}
         for index, node in enumerate(nodes):
             parts = [output["results"][node.node_id] for output in outputs]
-            table = pa.concat_tables([part.outputs["rows"] for part in parts])
+            table = Rows.concat([part.outputs["rows"] for part in parts])
             metrics = sum((part.metrics for part in parts), NodeMetrics())
             results[node.node_id] = NodeResult(
                 {"rows": table.take(order), f"ids:{alias}": document_ids(ids)},

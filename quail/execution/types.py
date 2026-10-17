@@ -15,6 +15,7 @@ from quail.catalog.pairs import COLUMNS_PREFIX
 from quail.catalog.tokens import decode_token_documents
 from quail.execution.ids import document_ids
 from quail.execution.result import filter_answer_table
+from quail.execution.rows import Rows
 from quail.physical import (
     AiFilter,
     OutputPort,
@@ -187,6 +188,8 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
 
 
 def _output_table(node, port: OutputPort, value: Any) -> pa.Table:
+    if isinstance(value, Rows):
+        return value.table()
     if isinstance(value, pa.Table):
         return value
     if port.value_type is ValueType.DOCUMENT_IDS:

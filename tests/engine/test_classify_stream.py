@@ -365,7 +365,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         "chunk_tokens": 64, "docs": docs,
     }
     if shape == "score_first":
-        from quail.backends.quail.reranker import _score_table
+        from quail.backends.quail.reranker import score_rows
         from quail.execution.metrics import NodeResult
 
         execute = execution.execute
@@ -373,7 +373,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         def with_score(node, inputs):
             if node.node_id == "score:r":
                 rows = np.arange(4, dtype=np.int32).reshape(-1, 1)
-                return NodeResult({"rows": _score_table(
+                return NodeResult({"rows": score_rows(
                     rows, ("r",), "score", [0.1, 0.2, 0.3, 0.4])})
             return execute(node, inputs)
 

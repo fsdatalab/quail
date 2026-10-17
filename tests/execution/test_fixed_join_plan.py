@@ -9,7 +9,7 @@ import quail
 from bench import quailb
 from quail.api.execute import execute_query
 from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.reranker import _score_table
+from quail.backends.quail.reranker import score_rows
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.types import PhysicalResponse
 from quail.logical.expressions import CompileError
@@ -80,7 +80,7 @@ class FixedFeverAnswers:
                    if self.labels[int(document)] is not None]
         rows = np.asarray([[document] for document in labeled],
                           dtype=np.int32).reshape(-1, 1)
-        table = _score_table(
+        table = score_rows(
             rows, node.spec.aliases, node.spec.name,
             [self.labels[document] for document in labeled], pa.string())
         return labeled, table
@@ -122,7 +122,7 @@ class FixedFeverAnswers:
             labeled = [pair for pair in pairs
                        if (pair if claim_first else pair[::-1]) in self.stances]
             rows = np.asarray(labeled, dtype=np.int32).reshape(-1, 2)
-            table = _score_table(
+            table = score_rows(
                 rows, node.spec.aliases, node.spec.name,
                 [self.stances[pair if claim_first else pair[::-1]]
                  for pair in labeled], pa.string())

@@ -22,6 +22,7 @@ from quail.backends.quail.reranker import (
     score_in_batches,
 )
 from quail.catalog import Catalog, DocumentProvider
+from quail.execution.rows import Rows
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -283,11 +284,8 @@ def test_score_filters_compare_values_and_keep_pair_answers(catalog):
     node = Filter(node_id="filter",
                   predicate=RegularPredicate(ColumnRef("r", "", "score"), ">", 0.5),
                   aliases=("q", "d"), written_pos=0)
-    table = pa.table({
-        "q": pa.array([0, 0, 1, 1], pa.int32()),
-        "d": pa.array([0, 1, 0, 1], pa.int32()),
-        "score": pa.array([0.9, 0.1, 0.2, 0.8], pa.float64()),
-    })
+    table = Rows({"q": [0, 0, 1, 1], "d": [0, 1, 0, 1]},
+                 pa.table({"score": pa.array([0.9, 0.1, 0.2, 0.8], pa.float64())}))
     result = FilterRuntime().execute(
         node, {"input:0": table}, ExecutionContext(runtimes={})
     )
@@ -457,7 +455,7 @@ def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
         "aliases": ["d"], "rows": [0, 1], "scores": [0.1, 0.2]}
     assert [(entry["rows"], entry["scores"]) for entry in streamed[1:]] == [
         ([0], [0.1]), ([1], [0.2])]
-    assert result.outputs["rows"].column("d").to_pylist() == [0, 1]
+    assert result.outputs["rows"].ids["d"].to_pylist() == [0, 1]
 
     rows = ScoreRows((np.arange(100_000), np.arange(100_000)), product=True)
     assert len(rows) == 10_000_000_000
@@ -616,7 +614,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     execution.begin()
     assert execution.started
     result = execution.execute(node, {port.name: [1, 0] for port in node.inputs})
-    assert result.outputs["rows"].to_pylist() == [
+    assert result.outputs["rows"].table().to_pylist() == [
         {"q": 1, "d": 1, "score": 0.75},
         {"q": 1, "d": 0, "score": 0.5},
         {"q": 0, "d": 1, "score": 0.25},

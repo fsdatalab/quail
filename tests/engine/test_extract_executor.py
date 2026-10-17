@@ -389,7 +389,7 @@ def test_extraction_accepts_empty_input_and_sparse_document_ids(monkeypatch):
     state, _, run, _ = _setup(monkeypatch, document_ids=document_ids)
     result, _ = run()
     table = result.outputs["rows"]
-    assert table.column("c").to_pylist() == document_ids
+    assert table.ids["c"].to_pylist() == document_ids
     assert table.column("ends").to_pylist() == [GOLD[i] for i in document_ids]
     assert table.column("ends_span").is_null().to_pylist() == [
         GOLD[i] is None for i in document_ids]
@@ -527,7 +527,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
     assert len(rounds) == 1
     for node in nodes[1:]:
         actual = result["_outputs"][PortRef(node.node_id, "rows")]
-        assert actual.equals(expected[node.node_id].outputs["rows"])
+        assert actual.equals(expected[node.node_id].outputs["rows"].table())
     assert result["fresh_tokens"] == sum(
         item.metrics.fresh_tokens for item in expected.values())
     assert result["evaluated_documents"] == 2 * len(DOCS)

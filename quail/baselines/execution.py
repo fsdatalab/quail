@@ -12,10 +12,10 @@ from quail.baselines.nodes import RequestExecution
 from quail.baselines.operators import (
     allowed_members_by_anchor,
     choose_documents,
-    classification_table,
+    classification_rows,
     classify_documents,
-    extract_answers,
     extract_documents,
+    extraction_rows,
     filter_answers,
     join_answers,
     operator_at_a_time_filter,
@@ -227,12 +227,12 @@ class RequestModelExecution:
                     for document in document_ids])
             # a document whose answer names no label has no label row
             # and leaves the query
-            table = classification_table(
+            table = classification_rows(
                 spec, {spec.alias: document_ids}, result["labels"])
             outputs[f"label_answers:{spec.output}"] = table
-            labeled = list(zip(table.column(spec.alias).to_pylist(),
+            labeled = list(zip(table.ids[spec.alias].to_pylist(),
                                table.column(spec.output).to_pylist()))
-            survivors[spec.alias] = table.column(spec.alias).to_pylist()
+            survivors[spec.alias] = table.ids[spec.alias].to_pylist()
             test_answers = {}
             for index, (position, accepted) in enumerate(spec.tests):
                 kept = set(accepted)
@@ -424,7 +424,7 @@ class RequestModelExecution:
                     + note + partner_label
                     + token_list(self.documents[spec.partner][partner])
                     for anchor, partner in pairs])
-            table = classification_table(
+            table = classification_rows(
                 spec, {spec.alias: kept.column(spec.alias),
                        spec.partner: kept.column(spec.partner)}, result["labels"])
             outputs[f"label_answers:{spec.output}"] = table
@@ -459,7 +459,7 @@ class RequestModelExecution:
                 document_texts,
                 body_texts=([preamble_text + text for text in document_texts]
                             if self.submit_text else None))
-            outputs[f"extract_answers:{spec.output}"] = extract_answers(
+            outputs[f"extract_answers:{spec.output}"] = extraction_rows(
                 spec, document_ids, result["answers"], result["spans"])
             steps.append(request_step(result,
                 kind="extract",

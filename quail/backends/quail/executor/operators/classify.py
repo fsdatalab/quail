@@ -17,10 +17,9 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.reranker import (
     RerankerBatch,
-    _score_table,
-    attach_prior_columns,
     classify_outputs,
     probability_column,
+    score_rows,
     scored_batch,
 )
 from quail.catalog.selection import document_positions
@@ -192,9 +191,9 @@ class ClassifyPart(ClassifyBatch):
             rows = np.asarray(
                 [[self.ids[anchor], plan.partners.ids[partner]]
                  for anchor, partner in pairs], dtype=np.int32).reshape(-1, 2)
-            table = _score_table(rows, spec.aliases, spec.name,
-                                 [plan.pair_labels[pair] for pair in pairs],
-                                 pa.string())
+            table = score_rows(rows, spec.aliases, spec.name,
+                               [plan.pair_labels[pair] for pair in pairs],
+                               pa.string())
             sink = answer_sink()
             if sink is not None and len(rows):
                 sink(scored_batch(self.node, rows, table))
@@ -210,19 +209,18 @@ class ClassifyPart(ClassifyBatch):
                    if label is not None]
         rows = np.asarray([[self.ids[index]] for index in labeled],
                           dtype=np.int32).reshape(-1, 1)
-        table = _score_table(rows, spec.aliases, spec.name,
-                             [plan.labels[index] for index in labeled],
-                             pa.string())
+        table = score_rows(rows, spec.aliases, spec.name,
+                           [plan.labels[index] for index in labeled],
+                           pa.string())
         if plan.probabilities is not None:
-            table = table.append_column(
+            table = table.with_column(
                 spec.name + PROBABILITIES_SUFFIX,
                 probability_column(spec.labels, plan.probabilities[labeled]))
         # the labels the parts before it gave these documents, as a
         # classify node on its own carries them from its scores input
-        priors = {spec.aliases[0]: prior for prior in self.prior_tables}
-        priors.update({spec.aliases[0]: part.result_value.outputs[port]
-                       for part, port in self.priors})
-        table = attach_prior_columns(table, priors)
+        for prior in (*self.prior_tables, *(part.result_value.outputs[port]
+                                             for part, port in self.priors)):
+            table = table.joined(prior, spec.aliases[0])
         return NodeResult(classify_outputs(self.node, table), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),
             evaluated_documents=self.reached, fresh_tokens=tokens,
