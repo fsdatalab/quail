@@ -77,22 +77,23 @@ class Scope:
 
     def resolve_value(self, column: str, alias: str | None = None, *,
                       path: tuple = (), function: str | None = None,
-                      tables=None, shown: str = "") -> ColumnRef | ColumnExpression:
-        """Resolve a column with the struct fields and function read on it.
+                      name: str | None = None, tables=None,
+                      shown: str = "") -> ColumnRef | ColumnExpression:
+        """Resolve a column with the fields, function, and output name on it.
 
-        A plain column resolves to a ColumnRef; one with fields or a
-        function to a ColumnExpression, checked against the column's
-        type so an unknown field or a function over the wrong type
-        fails here rather than at execution.
+        A plain column resolves to a ColumnRef; one with fields, a
+        function, or a name to a ColumnExpression, checked against the
+        column's type so an unknown field or a function over the wrong
+        type fails here rather than at execution.
 
         Raises:
             CompileError: As resolve(), or the fields or function do
                 not apply to the column's type.
         """
         ref = self.resolve(column, alias, tables=tables, shown=shown)
-        if not path and function is None:
+        if not path and function is None and name is None:
             return ref
-        expression = ColumnExpression(ref, tuple(path), function)
+        expression = ColumnExpression(ref, tuple(path), function, name)
         expression.validate()
         schema = self.catalog.get(ref.provider).schema()
         expression.evaluate(pa.array([], type=schema.field(ref.column).type))

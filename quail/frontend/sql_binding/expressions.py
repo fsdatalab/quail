@@ -91,7 +91,7 @@ class ExpressionBinder:
         self.scope.add_table(alias, table.name)
         return alias
 
-    def resolve_value(self, node, tables=None, function=None):
+    def resolve_value(self, node, tables=None, function=None, name=None):
         """Resolve a column, a struct field under one, or LENGTH() of either.
 
         Args:
@@ -99,6 +99,7 @@ class ExpressionBinder:
             tables: (alias, provider) pairs to resolve against instead
                 of the tables in scope.
             function: The function already parsed off the node, if any.
+            name: The AS name the SELECT list gives the column, if any.
 
         Raises:
             CompileError: The node is not a column expression, or its
@@ -113,8 +114,8 @@ class ExpressionBinder:
         alias = parts[0] if len(parts) > 1 and parts[0] in scope else None
         column, *path = parts[1:] if alias is not None else parts
         return self.scope.resolve_value(column, alias, path=tuple(path),
-                                        function=function, tables=tables,
-                                        shown=node.sql())
+                                        function=function, name=name,
+                                        tables=tables, shown=node.sql())
 
     def note_document_column(self, column) -> None:
         self.scope.note_document_column(column)

@@ -30,17 +30,20 @@ class ColumnRef:
 
 @dataclass(frozen=True)
 class ColumnExpression:
-    """A struct field or a function read on a source column.
+    """A source column read with struct fields, a function, or an output name.
 
     ``path`` names the struct fields read under the column, and
     ``function`` the function applied to the values last, such as
-    ``"length"``. The expression stands wherever a column does: as a
-    prompt's document, a join key, or a column an apply() reads.
+    ``"length"``. ``name`` is the result column's name when the query
+    gives one, as SQL's ``AS``. The expression stands wherever a column
+    does: as a prompt's document, a join key, a column an apply()
+    reads, or a result column.
     """
 
     reference: ColumnRef
     path: tuple = ()  # tuple[str, ...]
     function: Optional[str] = None
+    name: Optional[str] = None
 
     type_name: ClassVar[str] = "quail.column_expression"
 
@@ -68,7 +71,9 @@ class ColumnExpression:
                              column_name(self.reference))
 
     def __str__(self) -> str:
-        return column_name(self)
+        written = column_expression_name(self.path, self.function,
+                                         column_name(self.reference))
+        return written if self.name is None else f"{written} AS {self.name}"
 
 
 def column_values(values, path: tuple = (), function: Optional[str] = None,
@@ -129,7 +134,7 @@ def column_name(column: str | ColumnRef | ColumnExpression | Alias, *,
         return column
     if isinstance(column, ColumnRef):
         return f"{column.alias}.{column.column}" if qualified else column.column
-    if isinstance(column, ColumnExpression):
+    if isinstance(column, ColumnExpression) and column.name is None:
         return column_expression_name(
             column.path, column.function,
             column_name(column.reference, qualified=qualified))
@@ -162,7 +167,8 @@ def decode_column(value: dict) -> ColumnRef | ColumnExpression:
     """Decode what encode_column wrote."""
     if "reference" in value:
         return ColumnExpression(ColumnRef(**value["reference"]),
-                                tuple(value.get("path", ())), value.get("function"))
+                                tuple(value.get("path", ())), value.get("function"),
+                                value.get("name"))
     return ColumnRef(**value)
 
 

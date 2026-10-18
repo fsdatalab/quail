@@ -92,7 +92,7 @@ class Query:
     def _resolve_value(self, c: ColSpec) -> ColumnRef | ColumnExpression:
         """Resolve a col() with the fields and function read on it."""
         return self._scope_.resolve_value(c.column, c.alias, path=c.path,
-                                          function=c.function)
+                                          function=c.function, name=c.name)
 
     def _note_document_column(self, column) -> None:
         self._scope_.note_document_column(column)
@@ -786,8 +786,7 @@ class Query:
         for column in wanted:
             if len(column.expression.aliases()) == 2:
                 logical.add_classify(column.expression, column.name)
-        named = {column.name: column for column in columns
-                 if isinstance(column, Alias)}
+        named = {column_name(column): column for column in columns}
         if aggregation is not None:
             named.update({a.name: a for a in aggregation.aggregates})
         order = []

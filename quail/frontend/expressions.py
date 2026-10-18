@@ -30,12 +30,14 @@ class ColSpec(ExpressionSpec):
             of an extraction's span.
         function: A function applied to the values before a test, such
             as ``"length"``.
+        name: The result column's name from ``named()``, as SQL's ``AS``.
     """
 
     alias: Optional[str]
     column: str
     path: tuple = ()
     function: Optional[str] = None
+    name: Optional[str] = None
 
     def __eq__(self, other):
         """``col("c.url") == col("e.url")`` is a join condition.
@@ -101,6 +103,10 @@ class ColSpec(ExpressionSpec):
         self._require_no_function()
         return ColSpec(self.alias, self.column, self.path, "length")
 
+    def named(self, name: str) -> "ColSpec":
+        """Return the column under ``name`` in the result, as SQL's ``AS``."""
+        return ColSpec(self.alias, self.column, self.path, self.function, name)
+
     def _require_no_function(self) -> None:
         if self.function is not None:
             raise CompileError(
@@ -120,7 +126,7 @@ class ColSpec(ExpressionSpec):
         return SortSpec(self, nulls="last")
 
     def __hash__(self):
-        return hash((self.alias, self.column, self.path, self.function))
+        return hash((self.alias, self.column, self.path, self.function, self.name))
 
 
 @dataclass(frozen=True)

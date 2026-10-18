@@ -131,8 +131,8 @@ class Project:
     def explain_fields(self) -> dict:
         fields = {
             "columns": [
-                column_name(column)
-                if isinstance(column, (ColumnRef, ColumnExpression))
+                column_name(column) if isinstance(column, ColumnRef)
+                else str(column) if isinstance(column, ColumnExpression)
                 else _explain(column)
                 for column in self.columns
             ]

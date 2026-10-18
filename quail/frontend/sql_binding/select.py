@@ -73,7 +73,7 @@ def bind_order(
     if order is None:
         return ()
     struct_names = {struct.name for struct in structs}
-    named = {column.name: column for column in columns if isinstance(column, Alias)}
+    named = {column_name(column): column for column in columns}
     if aggregation is not None:
         named.update(
             {aggregate.name: aggregate for aggregate in aggregation.aggregates}
@@ -139,7 +139,7 @@ class SelectBinder:
         ``columns``, an AI expression under the ``hidden`` name.
         """
         b, columns = self.binder, self.columns
-        names = {column.name: column for column in columns if isinstance(column, Alias)}
+        names = {column_name(column): column for column in columns}
         if isinstance(node, (exp.Column, exp.Length)):
             if isinstance(node, exp.Column) and not node.table and node.name in names:
                 return node.name
@@ -151,7 +151,7 @@ class SelectBinder:
             raise CompileError(f"{node.sql()} is not a column or an AI expression")
         call = b.bind_ai_value(node)
         for name, column in names.items():
-            if column.expression == call:
+            if isinstance(column, Alias) and column.expression == call:
                 return name
         columns.append(Alias(call, hidden))
         return hidden
@@ -340,5 +340,5 @@ def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list
                 f"{e.sql()}: nothing computed, per the projection "
                 f"contract"
             )
-        columns.append(b.resolve_value(e))
+        columns.append(b.resolve_value(e, name=alias or None))
     return columns

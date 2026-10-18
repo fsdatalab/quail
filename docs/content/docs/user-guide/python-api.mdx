@@ -305,9 +305,11 @@ query = (
 ```
 
 An `apply()` function sees such a column under its written name, such
-as `length(details.body)`. A field that the column does not have, or
-`length()` of a column that is not text, fails when the query is
-built.
+as `length(details.body)`. `col(...).named("n")` returns a column or
+an expression under the name `n`, as SQL's `AS`; `order_by("n")` and
+`group_by("n")` can use that name. A field that the column does not
+have, or `length()` of a column that is not text, fails when the
+query is built.
 
 ### limit
 

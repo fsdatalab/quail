@@ -134,3 +134,24 @@ def test_select_order_and_group_take_expressions(session):
     assert _run(grouped, executor).to_rows() == [("a", 2), ("b", 1)]
     distinct = filtered().distinct().order_by(kind).select(kind)
     assert _run(distinct, executor).to_rows() == [("a",), ("b",)]
+
+
+def test_a_column_returns_under_an_as_name(session):
+    length = col("r.details").field("body").length()
+    built = (session.docs("docs").alias("r")
+             .ai_filter(prompt("q: {0}", col("r.details").field("body")))
+             .order_by("n").select(col("r.id").named("key"), length.named("n")))
+    sql = session.sql("""
+        SELECT r.id AS key, LENGTH(r.details.body) AS n FROM docs r
+        WHERE AI_FILTER(PROMPT('q: {0}', r.details.body)) ORDER BY n
+    """)
+    assert sql.logical == built.logical
+    assert built.explain().count("length(r.details.body) AS n") == 1
+    result = _run(built, make_executor({"r": {"q:": [1, 1, 1]}}))
+    assert result.columns == ["key", "n"]
+    assert result.to_rows() == [("d0", 3), ("d1", 9), ("d2", 16)]
+    with pytest.raises(CompileError, match="unique"):
+        session.sql("""
+            SELECT r.id AS n, LENGTH(r.details.body) AS n FROM docs r
+            WHERE AI_FILTER(PROMPT('q: {0}', r.details.body))
+        """)
