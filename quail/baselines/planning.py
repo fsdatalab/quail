@@ -32,7 +32,6 @@ from quail.planner import (
     hash_join_nodes,
     order_filters_indexed,
     preamble_tokens,
-    regular_predicates,
 )
 from quail.planner import (
     join_specs as logical_join_specs,
@@ -93,7 +92,7 @@ def plan_request_backend(
             total_tokens=summaries[scan.alias].total,
             shard_ranges=((0, num_documents),),
             shard_token_loads=(summary.total_tokens,),
-            predicates=regular_predicates(scan),
+            predicates=tuple(scan.predicates),
             expected_rows=float(summary.num_documents) if scan.predicates else None,
         )
         nodes.append(node)

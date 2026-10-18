@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
 
+from quail.logical import RegularPredicate
+
 from ..base import (
     ExecutionLocation,
     OutputPort,
@@ -17,10 +19,10 @@ from ..base import (
 class Scan(PhysicalNode):
     """Read one tokenized document input supplied by the coordinator.
 
-    ``predicates`` are the regular predicates, as (column, comparison, value)
-    triples; the runtime keeps the documents that pass every one and
-    reads nothing else for the rest. ``expected_rows`` is the planner's
-    estimate of how many pass, from a sample; None without tests.
+    ``predicates`` are the regular predicates; the runtime keeps the
+    documents that pass every one and reads nothing else for the rest.
+    ``expected_rows`` is the planner's estimate of how many pass, from a
+    sample; None without tests.
     """
 
     alias: str = ""
@@ -29,7 +31,7 @@ class Scan(PhysicalNode):
     total_tokens: int = 0
     shard_ranges: tuple[tuple[int, int], ...] = ()
     shard_token_loads: tuple[int, ...] = ()
-    predicates: tuple[tuple[str, str, Any], ...] = ()
+    predicates: tuple[RegularPredicate, ...] = ()
     expected_rows: float | None = None
 
     type_name: ClassVar[str] = "quail.scan"
@@ -69,10 +71,7 @@ class Scan(PhysicalNode):
             "total_tokens": self.total_tokens,
             "shard_token_loads": list(self.shard_token_loads),
             "shard_ranges": [list(bounds) for bounds in self.shard_ranges],
-            "predicates": [
-                [column, comparison,
-                 list(value) if isinstance(value, tuple) else value]
-                for column, comparison, value in self.predicates],
+            "predicates": [predicate.to_dict() for predicate in self.predicates],
             "expected_rows": self.expected_rows,
         }
 
@@ -90,9 +89,7 @@ class Scan(PhysicalNode):
             "shard_token_loads": list(self.shard_token_loads),
             "shard_docs": [stop - start
                            for start, stop in self.shard_ranges],
-            "predicates": [
-                f"{column} {comparison}" + ("" if value is None else f" {value!r}")
-                for column, comparison, value in self.predicates],
+            "predicates": [str(predicate) for predicate in self.predicates],
             "expected_rows": self.expected_rows,
         }
 
@@ -110,11 +107,8 @@ class Scan(PhysicalNode):
                 for start, stop in attributes["shard_ranges"]
             ),
             shard_token_loads=tuple(attributes["shard_token_loads"]),
-            predicates=tuple(
-                (str(column), str(comparison),
-                 tuple(value) if isinstance(value, list) else value)
-                for column, comparison, value
-                in attributes.get("predicates", ())),
+            predicates=tuple(RegularPredicate.from_dict(value)
+                             for value in attributes.get("predicates", ())),
             expected_rows=(None if attributes.get("expected_rows") is None
                            else float(attributes["expected_rows"])),
         )

@@ -77,9 +77,8 @@ def test_regular_predicates_select_documents_before_the_model(session):
     plan = query.plan()
     scan = next(node for node in plan.nodes if type(node).__name__ == "Scan")
     assert (scan.num_documents, scan.expected_rows) == (6, 3.0)
-    assert scan.predicates == (
-        ("stars", ">=", 3), ("lang", "in", ("en", "fr")),
-        ("stars", "is not null", None))
+    assert [str(predicate) for predicate in scan.predicates] == [
+        "r.stars >= 3", "r.lang IN ('en', 'fr')", "r.stars IS NOT NULL"]
     assert "where r.stars >= 3 and r.lang IN ('en', 'fr')" in query.explain()
     result = _run(query, execute)
     assert seen == [6]
@@ -96,6 +95,12 @@ def test_regular_predicates_select_documents_before_the_model(session):
              .where(col("r.stars") < 4, col("r.lang") == "en")
              .select("r.id", "r.stars"))
     assert _run(built, make_executor(TRUTH)).to_rows() == [("r1", 2), ("r4", 3)]
+    # a function on a source column reaches the scan as written
+    built = (session.docs("reviews").alias("r")
+             .ai_filter(prompt("q1: {0}", col("r.review")))
+             .where(col("r.lang").length() > 2)
+             .select("r.id"))
+    assert _run(built, make_executor(TRUTH)).to_rows() == []
 
 
 def test_sql_and_builder_bind_regular_predicates(session):
@@ -209,7 +214,7 @@ def test_regular_predicates_reach_score_scans_and_may_read_the_text(session):
               .select("r.id", "s"))
     plan = scored.plan()
     scan = next(node for node in plan.nodes if isinstance(node, PhysicalScan))
-    assert scan.predicates == (("stars", ">=", 4),)
+    assert [str(predicate) for predicate in scan.predicates] == ["r.stars >= 4"]
     assert (scan.num_documents, scan.expected_rows) == (6, 3.0)
     # a test on the document column keeps the text as a value column
     text = "review 2 " + "pad " * 20

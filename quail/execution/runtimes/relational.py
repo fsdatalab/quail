@@ -37,18 +37,14 @@ class ScanRuntime:
 def _tested_documents(node, context) -> pa.Array:
     """Return the positions of the documents that pass a scan's regular predicates."""
     from quail.catalog.selection import selected_rows
-    from quail.logical import ColumnRef, RegularPredicate
 
     columns = context.sources.get(columns_key(node.alias))
     if columns is None:
         raise KeyError(
             f"the regular predicates of {node.alias!r} need its value columns")
-    predicates = [
-        RegularPredicate(ColumnRef(node.alias, "", column), comparison, value)
-        for column, comparison, value in node.predicates]
-    values = {column: columns.column(column)
-              for column, _, _ in node.predicates}
-    return selected_rows(values, predicates)
+    values = {predicate.column.column: columns.column(predicate.column.column)
+              for predicate in node.predicates}
+    return selected_rows(values, node.predicates)
 
 
 def _num_rows(value) -> int | None:

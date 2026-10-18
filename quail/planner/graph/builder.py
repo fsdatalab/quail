@@ -93,12 +93,6 @@ def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
     return nodes
 
 
-def regular_predicates(scan) -> tuple:
-    """Return a logical scan's regular predicates as (column, comparison, value)."""
-    return tuple((predicate.column.column, predicate.comparison,
-                  predicate.value) for predicate in scan.predicates)
-
-
 def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                         device: DeviceSpec, document_tokens: dict, gpus: int = 1,
                         order: str | None = None, pair_fractions=None,
@@ -252,7 +246,7 @@ class GraphBuilder:
                 total_tokens=summary.total,
                 shard_ranges=shard_ranges,
                 shard_token_loads=tuple(loads),
-                predicates=regular_predicates(s),
+                predicates=tuple(s.predicates),
                 expected_rows=(float(stats[s.alias].num_documents)
                                if s.predicates else None)))
             port_by_alias[s.alias] = PortRef(scan_id, f"rows:{s.alias}")
