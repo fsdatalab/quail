@@ -130,6 +130,9 @@ def dense_decoder_components(work: Work, model: ModelSpec,
     attn_proj = (attention_projection_params(model)
                  + gdn_projection_params(model)
                  + short_conv_projection_params(model))
+    separate_gdn = (gdn_projection_params(model)
+                    if model.gdn_weight_precision is not None else 0)
+    attn_proj -= separate_gdn
     mlp = mlp_params(model)
     full_flops, sliding_flops = attention_pair_flops(model)
     components = (
@@ -154,6 +157,15 @@ def dense_decoder_components(work: Work, model: ModelSpec,
             precision=model.attention_precision,
         ),
     )
+    if separate_gdn:
+        precision = model.gdn_weight_precision
+        components += (CostComponent(
+            name="gdn_proj",
+            flops=2.0 * separate_gdn * work.tokens,
+            bytes_moved=separate_gdn * {"fp8": 1, "bf16": 2, "fp32": 4}[
+                precision] * passes,
+            precision=precision,
+        ),)
     if model.gdn_layers:
         components += (CostComponent(
             name="gdn_core",

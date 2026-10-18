@@ -206,6 +206,9 @@ class KVArena:
         return self.accounting.slot_tokens.get(key, 0)
 
     def reset_stats(self):
+        import time
+
+        self.memory_trace_started = time.perf_counter()
         self.evicted_keys = 0
         self.evicted_pages = 0
         self.evicted_prefix_tokens = 0

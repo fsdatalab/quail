@@ -27,12 +27,11 @@ class Qwen35Pipeline(ModelPipeline):
     tree_attention = False
     warm_row_classes = False
     warm_joins = False
+    gemm_warmup = False
 
     def __init__(self, model, arena, *, spec, kernels="quail",
                  engine_class=Engine, use_gdn_kernels=True,
                  fused_norms=True):
-        import torch
-
         text = getattr(model, "language_model", model)
         self.spec = spec
         self.arena = arena
@@ -49,17 +48,14 @@ class Qwen35Pipeline(ModelPipeline):
         self.gdn_layer = next(
             layer for layer in self.layers if hasattr(layer, "linear_attn"))
         attn = self.attention_layer.self_attn
-        fp8 = attn.qkv_proj.weight.dtype == torch.float8_e4m3fn
         self.engine = engine_class(
             arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
-            fp8=fp8, kernels=kernels)
+            fp8=False, kernels=kernels)
         # The fused kernels compute element offsets in 32-bit ints, so
         # a chunk needs rows x widest_row < 2^31.
         widest = max(
-            self.gdn_layer.linear_attn.in_proj_qkvz.weight.shape[0],
-            attn.qkv_proj.weight.shape[0],
-            self.attention_layer.mlp.gate_up_proj.weight.shape[0])
+            max(module.weight.shape) for module in self.linears())
         self.max_chunk_tokens = (2**31 - 1) // widest
 
     def linears(self):
@@ -70,16 +66,12 @@ class Qwen35Pipeline(ModelPipeline):
                 mlp.gate_up_proj, mlp.down_proj)
 
     def _linear(self, x, module):
-        """One projection of x, quantized when the weights are fp8."""
-        x_q, x_s = self.engine.quant(x)
-        return self.engine.gemm(x_q, x_s, module)
+        """Apply the projection using its loaded quantization method."""
+        return module.quant_method.apply(module, x, getattr(module, "bias", None))
 
     def _gated_delta_net(self, mixer, x, phases, slot):
-        import torch
-
         mixed = self._linear(x, mixer.in_proj_qkvz)
-        # in_proj_ba is bf16 in the fp8 checkpoint too
-        beta_alpha = torch.nn.functional.linear(x, mixer.in_proj_ba.weight)
+        beta_alpha = self._linear(x, mixer.in_proj_ba)
         qkv, z = mixed.split([mixer.conv_dim, mixer.value_dim], dim=-1)
         b, a = beta_alpha.chunk(2, dim=-1)
         conv_weight = mixer.conv1d.weight
@@ -121,8 +113,7 @@ class Qwen35Pipeline(ModelPipeline):
 
     def _mlp(self, mlp, x):
         gate_up = self._linear(x, mlp.gate_up_proj)
-        d_in, d_scale = self.engine.activation_quant(gate_up)
-        return self.engine.gemm(d_in, d_scale, mlp.down_proj)
+        return self._linear(mlp.act_fn(gate_up), mlp.down_proj)
 
     def _norm(self, norm, x, residual):
         """One Gemma-style norm with the residual add, as (normed, residual)."""

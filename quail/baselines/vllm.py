@@ -45,6 +45,24 @@ class GigatokenVLLMTokenizer:
 
 
 @contextmanager
+def engine_environment(spec):
+    """Scope vLLM's process selection to construction of one engine."""
+    key = "VLLM_ENABLE_V1_MULTIPROCESSING"
+    previous = os.environ.get(key)
+    # vLLM 0.26 reads process selection from the environment in LLM's
+    # constructor. Its public LLM API has no per-instance override.
+    if spec.vision_tower or spec.canvas_tokens == 1:
+        os.environ[key] = "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+@contextmanager
 def diffusion_canvas(spec):
     """Initialize a one-token vLLM canvas with Quail's fixed token.
 
@@ -242,20 +260,8 @@ class VLLMEngine:
         if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
             RENDERER_REGISTRY.register("gigatoken", *renderer)
 
-        if spec.vision_tower:
-            # the engine core of a multimodal architecture starts without
-            # the tokenizer registered above and fails building its
-            # structured-output manager
-            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-        if spec.canvas_tokens == 1:
-            # vLLM's engine core in its own process returns the canvas
-            # row's logprobs unreliably under the step loop on long
-            # prompts (agreement with the in-process engine falls from
-            # 92 to 73 percent on agent traces,
-            # /results/ablations/diffusion_gemma_readout_probe_agent_k0_corpus_mp.json)
-            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         started = time.perf_counter()
-        with diffusion_canvas(spec) as canvas_ids:
+        with engine_environment(spec), diffusion_canvas(spec) as canvas_ids:
             llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
         boot_s = time.perf_counter() - started
         sampling_params = SamplingParams(

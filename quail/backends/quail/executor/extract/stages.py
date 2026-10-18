@@ -54,6 +54,7 @@ class ExtractionStages:
         self.specs = list(specs)
         first = self.specs[0]
         self.spec = first
+        self.recurrent = bool(getattr(state.loaded_model.arena, "n_state_slots", 0))
         if any(not first.same_decoding(spec) for spec in self.specs):
             raise ValueError("a pipeline's extractions share decoding settings")
         if any(spec.alias != first.alias for spec in self.specs):
@@ -106,9 +107,12 @@ class ExtractionStages:
             single=True, append=True, label=f"{name} tail")]
         stages.extend(
             Stage(suffixes=partial(self._step_suffix, q),
-                  suffix_tokens=1 + self.spec.draft_tokens, frame=frame,
+                  suffix_tokens=(1 + self.spec.draft_tokens)
+                  * (2 if self.recurrent else 1), frame=frame,
                   readout=self.readout, decide=partial(self._step_decide, q),
-                  discard=partial(self._step_discard, q), read_all_rows=True,
+                  discard=None if self.recurrent else partial(self._step_discard, q),
+                  replay=partial(self._step_replay, q) if self.recurrent else None,
+                  read_all_rows=True,
                   single=True, append=True, label=f"{name} round {t}")
             for t in range(1, self.spec.max_answer_tokens + 1))
         return stages
@@ -169,7 +173,8 @@ class ExtractionStages:
         answer.asked = True
         # a tail equal to the question's before it is in KV already:
         # only its cue token is fed
-        same = q > 0 and self.tails[q] == self.tails[q - 1]
+        same = (not self.recurrent and q > 0
+                and self.tails[q] == self.tails[q - 1])
         answer.fed_tokens += 1 if same else len(self.tails[q])
         self.decoder.verify(doc, q, self._rows(row), [])
         return True
@@ -194,6 +199,14 @@ class ExtractionStages:
 
     def _step_discard(self, q, key):
         return self._answer(q, key).discard
+
+    def _step_replay(self, q, key):
+        """Return the accepted inputs that advance the saved recurrent state."""
+        answer = self._answer(q, key)
+        accepted = answer.fed[:len(answer.fed) - answer.discard]
+        if not answer.done:
+            answer.fed_tokens += len(accepted)
+        return accepted
 
     def _document(self, key):
         position = np.searchsorted(self.document_ids, key[1], side="right") - 1

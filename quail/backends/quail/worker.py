@@ -12,6 +12,7 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.memory import memory_report
 from quail.backends.quail.executor.model_loading import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.operators.extract import execute_extractions
@@ -245,23 +246,6 @@ def pool_bytes(arena) -> dict:
     }
 
 
-def memory_breakdown(weights_bytes: int, pools: dict, peak_bytes: int) -> dict:
-    """Split the peak allocated bytes into weights, KV, state, and the rest.
-
-    Args:
-        weights_bytes: Bytes allocated after the model loaded.
-        pools: The pool_bytes of the arena.
-        peak_bytes: The process's peak allocated bytes, which includes
-            kernel warm-up and every query run so far.
-
-    Returns:
-        The four numbers and the peak. "other" is the peak minus the
-        three pools: activations, temporary copies, and warm-up.
-    """
-    other = peak_bytes - weights_bytes - pools["kv"] - pools["state"]
-    return {"weights": weights_bytes, "kv": pools["kv"],
-            "state": pools["state"], "other": other, "peak": peak_bytes}
-
 
 def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
     """Assemble a boot timing dict from a loaded GPU and warm results."""
@@ -429,10 +413,6 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     report["boot_s"] = boot["boot_s"]
     report["boot_kind"] = boot["kind"]
     report["boot"] = boot
-    if hasattr(gpu, "pool_bytes"):
-        report["memory_bytes"] = memory_breakdown(
-            gpu.weights_bytes, gpu.pool_bytes,
-            int(gpu.torch.cuda.max_memory_allocated()))
     return PhysicalResponse(outputs, report)
 
 
@@ -491,8 +471,8 @@ def _child_main(gpu_idx, conn):
                 inputs["documents"] = state.score_documents
                 with gpu.torch.inference_mode():
                     result = gpu.execution.execute(data["node"], inputs)
-                gpu.torch.cuda.synchronize()
-                conn.send(("ok", result))
+                conn.send(("ok", _child_results(
+                    gpu, {data["node"].node_id: result})))
             elif kind == "joins":
                 conn.send(("ok", _child_joins(state, data)))
             elif kind == "extract":
@@ -582,12 +562,13 @@ def _child_filters(state, sub):
                     "gpu_timing": sub.get("gpu_timing", False),
                 },
             )
-    return _child_results(torch, arena, results, wall_started=t0)
+    return _child_results(gpu, results, wall_started=t0)
 
 
-def _child_results(torch, arena, results, *, wall_started=None, **metrics):
+def _child_results(gpu, results, *, wall_started=None, **metrics):
     """Collect worker outputs and measurements after GPU work completes."""
-    torch.cuda.synchronize()
+    gpu.torch.cuda.synchronize()
+    arena = gpu.arena
     retained = {}
     for alias, document in arena.retained_keys():
         if isinstance(alias, tuple) and alias[0] == "extract":
@@ -602,7 +583,7 @@ def _child_results(torch, arena, results, *, wall_started=None, **metrics):
             "evicted_pages": arena.evicted_pages,
             "evicted_prefix_tokens": arena.evicted_prefix_tokens,
         },
-        "peak_gib": torch.cuda.max_memory_allocated() / 2**30,
+        "memory": memory_report(gpu),
         **({"wall_s": round(time.perf_counter() - wall_started, 2)}
            if wall_started is not None else {}),
         **metrics,
@@ -614,7 +595,7 @@ def _child_extract(state, sub):
     gpu = state.gpu
     with gpu.torch.inference_mode():
         results = execute_extractions(gpu.execution.query, sub["nodes"], sub["inputs"])
-    return _child_results(gpu.torch, gpu.arena, results)
+    return _child_results(gpu, results)
 
 
 def _child_joins(state, sub):
@@ -651,7 +632,7 @@ def _child_joins(state, sub):
     if sub.get("final_group"):
         for key in arena.resident_keys():
             arena.free_key(key)
-    return _child_results(torch, arena, results, wall_started=t0, kv_round=round_kv)
+    return _child_results(gpu, results, wall_started=t0, kv_round=round_kv)
 
 
 def _reset_child_query(state):

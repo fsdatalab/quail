@@ -173,7 +173,7 @@ def quail(model: str) -> dict:
     from transformers import AutoTokenizer
 
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.worker import checkpoint_arena_args
@@ -243,11 +243,17 @@ def quail(model: str) -> dict:
         # first stage never reaches the second
         second = _sequences(spec, tokenizer, SECOND_QUESTION)
         record["chain"] = []
+        record["fresh_second"] = []
         for (document, first), (_, other) in zip(pairs, second):
             answers = Recording()
             _run_filter(torch, arena, pipeline, answers, [document],
                         [first, other], BUDGET)
             record["chain"].append(answers.differences)
+            for key in arena.resident_keys():
+                arena.free_key(key)
+            fresh = Recording()
+            _run_filter(torch, arena, pipeline, fresh, [document], [other], BUDGET)
+            record["fresh_second"].append(fresh.differences[-1])
             for key in arena.resident_keys():
                 arena.free_key(key)
         # every document through both stages in one run
@@ -292,7 +298,10 @@ def quail(model: str) -> dict:
                               if first > 0 else [0])
     chain_match = sum(int(got == want) for got, want in zip(
         record["chain_batched_answers"], expected_chain))
+    reuse_errors = [abs(row[1] - fresh) for row, fresh in
+                    zip(record["chain"], record["fresh_second"]) if len(row) == 2]
     record["summary"] = {
+        "reuse_vs_fresh_second_max_abs_error": max(reuse_errors, default=0.0),
         "batched_mapped_documents": len(mapped),
         "batched_mapped_median_abs_error": (
             statistics.median(mapped) if mapped else None),

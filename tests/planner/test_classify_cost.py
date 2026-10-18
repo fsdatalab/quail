@@ -58,10 +58,10 @@ def _decode_outcome_work(lengths, runs, window=0, shared=None, resident=False):
         total["pairs"] += sum(fresh)
         contexts = [prompt + sum(fed[:round_]) for round_ in range(1, len(fed))]
         total["kv_read"] += kept + sum(contexts)
-        # one checkpoint read when the prefix is kept, one written when the
-        # document is computed, and one read for each later run
-        total["state_read"] += (1 if kept else 0) + len(contexts)
-        total["state_written"] += 0 if resident else 1
+        # The document remains saved while every round reads and writes
+        # the answer's checkpoint. A fresh borrower also reads its parent.
+        total["state_read"] += len(fed) + bool(borrowed and not resident)
+        total["state_written"] += len(fed) + (not resident)
         if window:
             total["sliding_pairs"] += sum(min(i, window) for i in fresh)
             total["sliding_kv_read"] += sum(
@@ -133,6 +133,8 @@ def test_one_round_rules_are_priced_like_filters():
             prefix = HEAD + length
             # the frame is written first; the request reads it and the document
             work += scan(prefix, FRAME) + stream(prefix + FRAME, [suffix])
+        work = replace(work, state_read=2 * len(lengths),
+                       state_written=2 * len(lengths))
         assert asdict(cost.work) == pytest.approx(asdict(work))
         assert cost.passes == pytest.approx(work.tokens / CHUNK)
         assert cost.seconds == pytest.approx(
@@ -149,6 +151,7 @@ def test_resident_documents_ask_instead_of_scanning():
     for length in (10, 20, 30):
         prefix = HEAD + length
         work += ask(prefix, FRAME) + stream(prefix + FRAME, [1])
+    work = replace(work, state_written=3)
     assert asdict(cost.work) == pytest.approx(asdict(work))
 
 
@@ -247,6 +250,8 @@ def test_decision_models_read_option_rows_through_their_head(resident):
         prefix = HEAD + length
         first = ask(prefix, FRAME) if resident else scan(prefix, FRAME)
         work += first + stream(prefix + FRAME, [50])
+    work = replace(work, state_read=2 * len(lengths),
+                   state_written=len(lengths) * (1 if resident else 2))
     assert asdict(cost.work) == pytest.approx(asdict(work))
     # one row per option block and the prompt's last row, through the
     # fp32 decision head; the vocabulary head is never read

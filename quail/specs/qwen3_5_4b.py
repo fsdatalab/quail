@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from .base import ModelSpec
 
 # Every fourth layer is attention (layers 3, 7, ..., 31); the other 24
@@ -43,4 +45,17 @@ QWEN3_5_4B_BF16 = ModelSpec(
     turn_prefix="<|im_start|>user\n",
     turn_suffix="<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     prompt_format="qwen3_5-chat-nonthinking-v1",
+)
+
+QWEN3_5_4B_FP8 = replace(
+    QWEN3_5_4B_BF16,
+    name="qwen3.5-4b-fp8",
+    hf_name="RedHatAI/Qwen3.5-4B-FP8-dynamic",
+    revision="397b7ba47a99b3221ebfc0cfc5a279118cb733ad",
+    w_bytes=1.0,
+    weight_precision="fp8",
+    gdn_weight_precision="bf16",
+    # Loaded bytes per GPU in /results/ablations/
+    # pr223-qwen3.5-4b-fp8-two-gpu.json, excluding KV and state pools.
+    w_mem_bytes=6_023_951_872,
 )

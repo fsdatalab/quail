@@ -123,12 +123,16 @@ class StageExecutor:
         self.frames = [list(stage.frame) for stage in self.stages]
         self.frame_ids = [np.asarray(frame, dtype=np.int64) for frame in self.frames]
         self.writes = frame_writes(self.stages)
+        if getattr(self.arena, "n_state_slots", 0):
+            self.writes = [write or (stage.rewind and bool(stage.frame))
+                           for write, stage in zip(self.writes, self.stages)]
         # a stage whose suffixes are each document's own is priced by
         # one sequence of its most tokens until a document enters it
         self.suffixes = [Suffixes.of([[0] * stage.suffix_tokens])
                          if stage.own_suffixes else Suffixes.of(stage.suffixes)
                          for stage in self.stages]
         self.own = {}      # (stage, document) -> its own Suffixes
+        self.replayed = {}
         self.read_rows = [None if stage.read_rows is None
                           else np.asarray(stage.read_rows, dtype=np.int64)
                           for stage in self.stages]
@@ -324,9 +328,12 @@ class StageExecutor:
             stage = stages[j]
             if not stage.own_suffixes:
                 return None if stage.requests is None else stage.requests(key)
+            replay = [] if stage.replay is None else stage.replay(key)
             got = stage.suffixes(key)
             if got is DROP or got is SKIP:
                 return got
+            if replay:
+                got = [list(replay) + list(tokens) for tokens in got]
             own = Suffixes.of(got)
             if len(own) and int(own.lengths.max()) > stage.suffix_tokens:
                 raise ValueError(
@@ -335,6 +342,7 @@ class StageExecutor:
                     f"{stage.suffix_tokens}")
             if len(own):
                 self.own[(j, a)] = own
+                self.replayed[(j, a)] = len(replay)
             return OwnRequests(own.lengths)
 
         return ask
@@ -438,6 +446,10 @@ class StageExecutor:
                     borrow_key=self.keys[parent] if shared else None,
                     share_points=self.share_points[a])
             kept = int(sufs.lengths.sum()) if append else 0
+            if self.stages[j].replay is not None:
+                kept = self.replayed[(j, a)]
+                rows = int(sufs.lengths.sum()) - kept
+                own["read_rows"] = [rows]
             if append or (self.writes[j] and start == 0):
                 appended[a] = path + kept
             if self.writes[j] and start == 0 and self._merged(j, start, end):

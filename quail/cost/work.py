@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -135,7 +135,8 @@ def decode(prefix, rounds, *, window: int = 0) -> Work:
     """
     work = Work()
     for tokens in rounds:
-        work += ask(prefix, tokens, window=window)
+        step = ask(prefix, tokens, window=window)
+        work += replace(step, state_written=step.state_read)
         prefix = prefix + tokens
     if np.ndim(prefix):
         # Scalar suffix lengths apply once to each document in the array.

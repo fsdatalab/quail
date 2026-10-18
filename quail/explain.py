@@ -580,6 +580,10 @@ def architecture_lines(model_name: str) -> list[str]:
               if kinds else f"{spec.layers} layers")
     gemm = ("fp8 GEMM (DeepGEMM)" if spec.weight_precision == "fp8"
             else "bf16 GEMM (cuBLAS)")
+    if spec.arch == "qwen3_5":
+        gemm = "vLLM per-layer GEMM"
+        if spec.gdn_weight_precision is not None:
+            gemm += f" (recurrent projections {spec.gdn_weight_precision})"
     paths = [f"linear layers: {gemm}"]
     if "full_attention" in kinds or "sliding_attention" in kinds:
         paths.append("attention: FlashAttention over paged KV")

@@ -78,13 +78,16 @@ class ClassifyCost:
 def _first_work(prefix, shared, tail: int, resident: bool, window: int) -> Work:
     """Sum every document's prefix-and-tail work: scan, or ask on resident KV."""
     if resident:
-        return ask(prefix, np.full_like(prefix, tail), window=window).total()
+        if not tail:
+            return Work()
+        work = ask(prefix, np.full_like(prefix, tail), window=window).total()
+        return replace(work, state_written=float(len(prefix)))
     fresh = prefix - shared + tail
     work = ask(shared, fresh, window=window).total()
-    # a document with no shared prefix scans from nothing and writes a
-    # checkpoint; one that shares a prefix reads its parent's checkpoint
-    return replace(work, state_written=float(len(prefix)),
-                   state_read=float(np.sum(shared > 0)))
+    # The document checkpoint survives while its tail advances a second
+    # checkpoint, even when both are packed into one causal request.
+    return replace(work, state_written=float(len(prefix) * (1 + bool(tail))),
+                   state_read=float(np.sum(shared > 0) + len(prefix) * bool(tail)))
 
 
 def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:

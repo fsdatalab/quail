@@ -19,7 +19,7 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
     implementation = implementations[first.type_name]
     if (implementation.execute_group is not None
             and all(node.type_name == first.type_name for node in pipeline)):
-        prepared = context.model_inputs(first, inputs[first.node_id], context)
+        prepared = context.model_inputs(first, inputs, context, nodes=pipeline)
         return implementation.execute_group(state, pipeline, prepared)
 
     alias = first.document_aliases[0]

@@ -594,7 +594,8 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
             assert len(subs) == 2
             assert all(sub["start_query"] and sub["node_id"] is None
                        for sub in subs)
-            return [{"peak_gib": 0.0} for _ in subs]
+            return [{"kv_totals": {}, "memory": {"peak_gib": 0.0}}
+                    for _ in subs]
         assert kind == "scores"
         assert all(("documents" in sub["inputs"]) == (not rounds) for sub in subs)
         rounds.append(kind)
@@ -609,7 +610,8 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
                     list(doc) for doc in execution.docs[alias]
                 ]
             model.reranker = _FakeReranker([a / 2 + b / 4 for a, b in rows])
-            results.append(model.execute_rows(node, rows))
+            results.append({"results": {node.node_id: model.execute_rows(node, rows)},
+                            "kv_totals": {}, "memory": {"peak_gib": 1.0}})
         return results
 
     execution = DistributedQuailExecution(
@@ -627,6 +629,8 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     assert result.metrics.evaluated_document_pairs == 4
     # each GPU scored its own query document's pairs in the same round
     assert len(rounds) == 1
+    assert execution.report()["peak_gib"] == 1.0
+    assert len(execution.report()["memory_workers"]) == 2
     session.close()
 
 

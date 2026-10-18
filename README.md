@@ -122,6 +122,7 @@ or use the Python builder API.
 | DiffusionGemma 26B-A4B fp8 | NVIDIA H100 SXM |
 | Decision 2.0 Kai 0.6B bf16 | NVIDIA H100 SXM |
 | Qwen3.5 4B bf16 | NVIDIA H100 SXM |
+| Qwen3.5 4B fp8 | NVIDIA H100 SXM |
 | Qwen3.5 27B fp8 | NVIDIA H100 SXM |
 | Qwen3.8 27B fp8 | NVIDIA H100 SXM |
 | LFM2 2.6B bf16 | NVIDIA H100 SXM |

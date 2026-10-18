@@ -14,10 +14,11 @@ Set `model` to the model you want to run and `device` to your GPU type.
 | Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | BF16 | `AI.SCORE` |
 | Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | BF16 | `AI.SCORE` |
 | Decision 2.0 Kai 0.6B | `"decision-2.0-kai-0.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
-| Qwen3.5 4B | `"qwen3.5-4b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
-| Qwen3.5 27B | `"qwen3.5-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
-| Qwen3.8 27B | `"qwen3.8-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
-| LFM2 2.6B | `"lfm2-2.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
+| Qwen3.5 4B | `"qwen3.5-4b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
+| Qwen3.5 4B | `"qwen3.5-4b-fp8"` | FP8 and BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
+| Qwen3.5 27B | `"qwen3.5-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
+| Qwen3.8 27B | `"qwen3.8-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
+| LFM2 2.6B | `"lfm2-2.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
 format. All listed models store KV in BF16.
@@ -26,6 +27,11 @@ The Qwen3.5, Qwen3.8 and LFM2 models are hybrid: some layers are attention
 and the rest are Gated DeltaNet or short convolution layers, which keep a
 fixed-size state instead of KV. Quail saves that state for each document
 so later questions reuse it. Hybrid models run on H100 SXM.
+
+The FP8 Qwen3.5 4B configuration uses
+[`RedHatAI/Qwen3.5-4B-FP8-dynamic`](https://huggingface.co/RedHatAI/Qwen3.5-4B-FP8-dynamic).
+Its recurrent projections remain in BF16. Quail uses each loaded layer's
+quantization method for its matrix multiplications.
 
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a

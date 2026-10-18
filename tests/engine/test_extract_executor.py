@@ -138,7 +138,8 @@ def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
     assert not stages.docs[0].answers[0].none_wins
 
 
-def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
+@pytest.mark.parametrize("recurrent", [False, True])
+def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch, recurrent):
     # "five" starts two positions; the draft follows the first, "five
     # days", and the model chooses " years" instead: the round ends
     # there, and the next round feeds " years" in the draft's place
@@ -148,7 +149,7 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
     monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
-    state = _state(model)
+    state = _state(model, recurrent=recurrent)
     state.loaded_model.vocabulary = tables
     stages = ExtractionStages(state, [spec], tables, [0],
                            [tables.encode_ids(text)], [text])
@@ -166,11 +167,15 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
     assert asked.answer == "five years" and asked.span == (13, 23)
     assert asked.written == tables.encode_ids("five years")
     five, days, years = (tables.encode_ids(w)[0] for w in ("five", " days", " years"))
-    fed = [(suffix, f) for k, suffix, kept, _, f in model.packed if k == key and kept]
+    fed = [(suffix, f) for k, suffix, kept, _, f in model.packed if k == key]
     # the cue, then the two rounds: the second starts where the first
     # verified, one token past the first round's position
     assert fed[1][0][:2] == [five, days]
-    assert fed[2][0][:1] == [years] and fed[2][1] == fed[1][1] + 1
+    if recurrent:
+        assert fed[2][0][:2] == [five, years]
+        assert fed[2][1] == fed[1][1]
+    else:
+        assert fed[2][0][:1] == [years] and fed[2][1] == fed[1][1] + 1
     assert asked.steps == 3
     assert asked.fed_tokens == (len(tables.encode_ids(TAIL)) + len(fed[1][0])
                                 + len(fed[2][0]))
@@ -252,7 +257,7 @@ class ScriptedModel:
         rows = []
         for spec in chunk.specs:
             key = spec["key"]
-            for suffix in spec["suffixes"]:
+            for index, suffix in enumerate(spec["suffixes"]):
                 suffix = [int(t) for t in suffix]
                 read_all = bool(spec.get("read_all_rows"))
                 self.packed.append((key, suffix, spec.get("write_suffix_tokens", 0),
@@ -268,7 +273,9 @@ class ScriptedModel:
                     held = held[:spec["f"] - self.prefix_len[key]]
                 path = held + suffix
                 # every row of a draft is read; otherwise the last
-                for end in (range(len(held) + 1, len(path) + 1) if read_all
+                count = (spec["read_rows"][index] if spec.get("read_rows") is not None
+                         else len(suffix))
+                for end in (range(len(path) - count + 1, len(path) + 1) if read_all
                             else [len(path)]):
                     rows.append(self._row_after(key, path[:end]))
                 if spec.get("write_suffix_tokens", 0):
@@ -330,10 +337,15 @@ def _fake_readout(tables, k):
     return value
 
 
-def _state(model, chunk_tokens=400):
+def _state(model, chunk_tokens=400, recurrent=False):
+    from quail.backends.quail.executor.pages import PageArena
+
+    arena = cpu_arena(256)
+    if recurrent:
+        arena.accounting = PageArena(256, 16, n_slots=8)
     return QueryExecutionState(
         loaded_model=LoadedModelState(
-            arena=cpu_arena(256),
+            arena=arena,
             pipeline=fake_pipeline(forward_chunk=model.forward_chunk),
             input_staging=SimpleNamespace(fixed_tokens=set()),
             model=object()),
@@ -347,7 +359,7 @@ GOLD = ["March 3, 2027", "five years", None]
 
 def _setup(monkeypatch, documents=None, token_documents=None,
            share_prefixes=False, document_ids=None, gpu_timing=False,
-           policy="fixed"):
+           policy="fixed", recurrent=False):
     """A state, its scripted model, and a node builder for one spec name."""
     spec, tables = make_spec()
     spec = replace(spec, draft_policy=policy, round_cost_per_token=0.05)
@@ -356,7 +368,7 @@ def _setup(monkeypatch, documents=None, token_documents=None,
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
     monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
-    state = _state(model)
+    state = _state(model, recurrent=recurrent)
     state.loaded_model.vocabulary = tables
     tokens = {"c": ([tables.encode_ids(text) for text in documents]
                     if token_documents is None else token_documents)}
@@ -468,9 +480,11 @@ def test_extraction_reuses_arrow_tokens_and_offsets(monkeypatch, tmp_path):
     store.close()
 
 
-@pytest.mark.parametrize("gpu_timing", [False, True])
-def test_a_pipeline_of_extractions_reads_each_document_once(monkeypatch, gpu_timing):
-    state, model, _, run_pipeline = _setup(monkeypatch, gpu_timing=gpu_timing)
+@pytest.mark.parametrize("gpu_timing,recurrent", [(False, False), (True, True)])
+def test_a_pipeline_of_extractions_reads_each_document_once(
+        monkeypatch, gpu_timing, recurrent):
+    state, model, _, run_pipeline = _setup(
+        monkeypatch, gpu_timing=gpu_timing, recurrent=recurrent)
     timing_calls = []
     event = state.torch.cuda.Event
 
@@ -540,7 +554,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, worker
 
     def round_fn(kind, subs):
         if kind == "filters":
-            return [{"peak_gib": 0.0} for _ in subs]
+            return [{"memory": {"peak_gib": 0.0}, "kv_totals": {}} for _ in subs]
         assert kind == "extract"
         subs = pickle.loads(pickle.dumps(subs))
         rounds.append(subs)

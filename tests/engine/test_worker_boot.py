@@ -45,7 +45,7 @@ def booted(monkeypatch):
                  "AsyncAnswers"):
         monkeypatch.setattr(worker, name, lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "KVArena", lambda *a, **k: SimpleNamespace(
-        k=[], v=[], gdn_state=None, conv_state=None))
+        k=[], v=[], gdn_state=None, conv_state=None, n_pages=0))
     monkeypatch.setattr(worker, "warm_kernels",
                         lambda *a, **k: {"tier": "compiled"})
 
@@ -97,7 +97,9 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
 
     monkeypatch.setattr(worker, "_boot_for_query", counting_boot)
     monkeypatch.setattr(worker, "execute_single",
-                        lambda *a, **k: {"_outputs": {}, "wall_s": 1.0})
+                        lambda gpu, *a, **k: {
+                            "_outputs": {}, "wall_s": 1.0,
+                            **worker.memory_report(gpu)})
 
     worker.prepare_quail_request(SimpleNamespace(
         gpu_count=1, registry=registry, runtime_state=runtime_state,

@@ -160,9 +160,6 @@ def extraction_refusal(context) -> Refusal | None:
     elif model.role in ("reranker", "decision") or model.canvas_tokens:
         reason = (f"AI.EXTRACT reads next-token probabilities over the "
                   f"document's tokens, which {model.name!r} does not give")
-    elif model.state_layers:
-        reason = (f"AI.EXTRACT has no recurrent-state path for hybrid model "
-                  f"{model.name!r}")
     else:
         return None
     return Refusal(reasons=(reason,), constraint="unsupported_extract_query",

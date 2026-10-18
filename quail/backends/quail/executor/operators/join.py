@@ -7,6 +7,8 @@ import numpy as np
 
 from quail.backends.quail.executor.parts import (
     ExecutionPart,
+    execute_parts,
+    execution_prefix_tree,
     gpu_seconds,
     stage_spans,
 )
@@ -36,6 +38,18 @@ class JoinPart(ExecutionPart):
     """Join predicates and their anchor KV within one scheduler run."""
 
     combine = True
+
+    @classmethod
+    def execute_group(cls, state, nodes, inputs):
+        """Run prepared join predicates through the shared document scheduler."""
+        state.gpu_timing = bool(inputs.get("gpu_timing", False))
+        part = cls(state, nodes, inputs, inputs["anchor_ids"])
+        prefixes = inputs["prefixes"]
+        return execute_parts(
+            state, [part], prefixes, inputs["anchor_keys"],
+            keep_kv=nodes[-1].keep_kv,
+            tree=execution_prefix_tree(nodes[0], prefixes, state.loaded_model.arena),
+            attention=nodes[0].attention, label=f"join ({len(nodes)} predicates)")
 
     @staticmethod
     def model_inputs(node, inputs, context, upstream=None, nodes=None):

@@ -3,7 +3,8 @@
 from types import SimpleNamespace
 
 from quail.backends.quail.backend import QuailBackend
-from quail.backends.quail.worker import memory_breakdown, pool_bytes
+from quail.backends.quail.executor.memory import memory_breakdown, merge_memory_reports
+from quail.backends.quail.worker import pool_bytes
 from quail.explain import architecture_lines
 from quail.specs import DEVICES, MODELS
 
@@ -24,7 +25,7 @@ def test_hybrid_model_lines_name_layers_precision_and_kernels(monkeypatch):
     architecture, kernels = architecture_lines("qwen3.5-4b-bf16")
     assert architecture == ("architecture=qwen3_5 (24 gated_delta_net, "
                             "8 full_attention), weights=bf16")
-    assert "bf16 GEMM (cuBLAS)" in kernels
+    assert "vLLM per-layer GEMM" in kernels
     assert "recurrence=flashinfer (QUAIL_GDN_PREFILL)" in kernels
     assert "FlashAttention over paged KV" in kernels
     architecture, kernels = architecture_lines("qwen3-4b-fp8")
@@ -58,3 +59,15 @@ def test_pool_bytes_and_breakdown_add_up():
                      "other": 386, "peak": 1_500}
     arena.gdn_state = arena.conv_state = None
     assert pool_bytes(arena) == {"kv": 80, "state": 0}
+    workers = [dict(
+        memory_bytes=parts, memory_capacity={"pages": 16, "slots": 3},
+        memory_trace_started=1.0, peak_gib=1.5,
+        memory_trace=[[2.0 + i, 4, 1, 2, 3, 100, 90, 10, 2, i]],
+        memory_events=[[3.0, "evict", {"tokens": 20}]]) for i in range(2)]
+    merged = merge_memory_reports(workers)
+    assert merged["memory_capacity"] == {"pages": 32, "slots": 6}
+    assert merged["memory_bytes"] == {key: 2 * value for key, value in parts.items()}
+    assert merged["memory_trace"][-1] == [3.0, 8, 2, 4, 6, 200, 180, 10, 2, 1]
+    assert [event[2]["worker"] for event in merged["memory_events"]] == [0, 1]
+    assert merged["memory_workers"] == workers
+    assert merge_memory_reports(workers) == merged

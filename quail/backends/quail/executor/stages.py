@@ -67,6 +67,9 @@ class Stage:
             tokens earlier append stages added, counted from the end,
             this stage's request replaces: the tokens the stage before
             fed past what it verified.
+        replay: Optional callback returning accepted tokens from the previous
+            request, before suffixes chooses the next request. These tokens
+            advance the checkpoint; the new request only reads it.
         label: Name displayed in progress messages.
         paths: Optional trie paths and ancestor references from trie_paths().
         read_mask: Optional mask of the rows read in the sole paths
@@ -90,6 +93,7 @@ class Stage:
     single: bool = False
     rewind: bool = False
     discard: Callable | None = None
+    replay: Callable | None = None
     append: bool = False
     label: str = ""
     paths: list | None = None

@@ -12,7 +12,7 @@ from quail.cost.dense_decoder_cost import (
     mlp_params,
 )
 from quail.cost.work import Work
-from quail.specs import MODELS, QWEN3_4B_FP8, QWEN3_5_4B_BF16
+from quail.specs import MODELS, QWEN3_4B_FP8, QWEN3_5_4B_BF16, QWEN3_5_4B_FP8
 
 CONFIG = (Path(__file__).parents[1] / "fixtures" / "qwen3_5_configs"
           / "qwen3.5-4b-bf16.json")
@@ -70,6 +70,13 @@ def test_dense_components_price_gdn_projections_with_the_attention_ones():
     assert attn_proj.bytes_moved == 2.0 * (8 * 36_700_160 + 24 * 42_106_880)
     assert mlp.flops == 2.0 * 1_000 * 32 * 3 * 2560 * 9216
     assert attention.flops == 0
+    fp8 = QWEN3_5_4B_FP8
+    parts = {part.name: part for part in dense_decoder_components(work, fp8, 1)}
+    assert parts["gdn_proj"].precision == "bf16"
+    assert parts["gdn_proj"].bytes_moved == 2 * gdn_projection_params(fp8)
+    assert parts["attn_proj"].precision == parts["mlp"].precision == "fp8"
+    assert fp8.checkpoint_bytes == SPEC.checkpoint_bytes
+    assert MODELS[fp8.name] is fp8
 
 
 def test_vllm_takes_no_images_for_the_vision_checkpoint_only():

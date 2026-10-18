@@ -148,6 +148,7 @@ class ModelSpec:
     gdn_value_heads: int = 0
     gdn_key_dim: int = 0
     gdn_value_dim: int = 0
+    gdn_weight_precision: Precision | None = None
     conv_width: int = 0
 
     def __post_init__(self):

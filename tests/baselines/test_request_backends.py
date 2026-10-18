@@ -239,10 +239,31 @@ def test_sglang_submission_and_cancellation():
 
 
 def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch):
+    import os
+
     from quail.backends.quail.executor.models.diffusion_gemma import canvas_token_ids
-    from quail.baselines.vllm import GigatokenVLLMTokenizer, diffusion_canvas
+    from quail.baselines.vllm import (
+        GigatokenVLLMTokenizer,
+        diffusion_canvas,
+        engine_environment,
+    )
 
     engine = VLLMEngine()
+    key = "VLLM_ENABLE_V1_MULTIPROCESSING"
+    for previous in (None, "1"):
+        if previous is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, previous)
+        for spec in (replace(QWEN3_4B_FP8, vision_tower=True),
+                     DIFFUSION_GEMMA_26B_FP8):
+            with pytest.raises(RuntimeError, match="boot failed"):
+                with engine_environment(spec):
+                    assert os.environ[key] == "0"
+                    raise RuntimeError("boot failed")
+            assert os.environ.get(key) == previous
+            with engine_environment(QWEN3_4B_FP8):
+                assert os.environ.get(key) == previous
     qwen = engine.llm_kwargs(QWEN3_4B_FP8)
     assert qwen["max_num_batched_tokens"] == 25_305
     assert qwen["tokenizer_mode"] == "gigatoken"
