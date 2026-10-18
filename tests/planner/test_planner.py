@@ -31,6 +31,7 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
+from quail.physical.codec import encode_fields
 from quail.physical.pipelines import build_pipelines
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.optimize import refine_plan
@@ -51,7 +52,8 @@ def filter_sequence(plan, alias=None):
 
 
 def join_stages(plan):
-    return [node.attributes() for node in plan.nodes if isinstance(node, AiJoin)]
+    return [encode_fields(node, exclude=("node_id", "inputs"))
+            for node in plan.nodes if isinstance(node, AiJoin)]
 
 
 def _sink_source(plan):

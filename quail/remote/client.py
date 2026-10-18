@@ -26,6 +26,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 
 from quail.execution.result import QueryResult
+from quail.physical.codec import decode_fields
 from quail.progress import say
 from quail.remote.artifacts import read_answer_tables, result_from_parts
 from quail.remote.inputs import PreparedInput, describe
@@ -145,7 +146,7 @@ class ServerClient:
                 timeout=max(self.timeout_s, size / (1 << 20)))
 
     def submit(self, body: dict) -> QueryStatus:
-        return QueryStatus.from_dict(self._request("POST", "/v1/queries",
+        return decode_fields(QueryStatus, self._request("POST", "/v1/queries",
                                                    body=body))
 
     def status(self, query_id: str, *, after: int | None = None,
@@ -156,10 +157,10 @@ class ServerClient:
                 {"after": after, "wait": f"{poll_s:g}"})
         data = self._request("GET", f"/v1/queries/{query_id}{query}",
                              timeout=self.timeout_s + poll_s)
-        return QueryStatus.from_dict(data)
+        return decode_fields(QueryStatus, data)
 
     def cancel(self, query_id: str) -> QueryStatus:
-        return QueryStatus.from_dict(
+        return decode_fields(QueryStatus,
             self._request("POST", f"/v1/queries/{query_id}/cancel"))
 
     def answers(self, query_id: str, *, after: int = 0,

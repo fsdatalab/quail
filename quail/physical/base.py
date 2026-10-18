@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from enum import Enum
 from typing import Any, ClassVar
+
+# one token id: an int of the model's vocabulary, or the word itself
+# under a tokenizer that splits text into words, as the tests' does
+Token = Any
 
 
 class ExecutionLocation(str, Enum):
@@ -135,27 +139,15 @@ class PhysicalNode:
     def outputs(self) -> tuple[OutputPort, ...]:
         raise NotImplementedError
 
-    def attributes(self) -> dict:
-        """Return node fields encoded by the node codec."""
-        return {}
-
-    @classmethod
-    def from_attributes(
-        cls,
-        node_id: str,
-        inputs: tuple[InputPort, ...],
-        attributes: Mapping[str, Any],
-    ) -> "PhysicalNode":
-        """Decode a node from codec fields."""
-        return cls(node_id=node_id, inputs=inputs)
 
     def with_inputs(self, inputs: tuple[InputPort, ...]) -> "PhysicalNode":
         """Return the same node with replacement inputs."""
         return replace(self, inputs=inputs)
 
     def explain_fields(self) -> Mapping[str, Any]:
-        """Return fields shown on one explain line."""
-        return self.attributes()
+        """Return fields shown on one explain line: the settings by default."""
+        return {field.name: getattr(self, field.name) for field in fields(self)
+                if field.name not in ("node_id", "inputs")}
 
 
 def validate_integer_setting(name: str, value: int, minimum: int = 1) -> None:

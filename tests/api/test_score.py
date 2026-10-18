@@ -38,6 +38,7 @@ from quail.physical import (
     decode_graph,
     encode_graph,
 )
+from quail.physical.codec import decode_value, encode_value
 from quail.planner.plan import EngineConfig, Refusal
 
 PROJECTION_SQL = (
@@ -672,7 +673,7 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     assert pricer(canvas)(rewritten)[1]["score"]["seconds"] == pytest.approx(
         10.0 * (1 - 19 * 400 / (8020 + 20 * 1029)))
     spec = scored(rewritten)
-    assert ScoreSpec.from_mapping(spec.to_dict()) == spec
+    assert decode_value(ScoreSpec, encode_value(spec)) == spec
     # documents with nothing in common share nothing
     assert ShouldSharePrefixes().rewrite(graph(("e",)), context) is None
     # a pair score borrows each anchor's KV already

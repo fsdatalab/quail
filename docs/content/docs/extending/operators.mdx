@@ -75,8 +75,10 @@ For your operator:
 - Subclass `PhysicalNode`. Define the settings and output ports.
 - Use a distinct `type_name` and `runtime_key`. Set `location` to the
   process where the operator will run.
-- Implement `attributes()` and `from_attributes()` to save and restore
-  the node's settings.
+- Give every setting a type annotation. The plan codec encodes the
+  node from its dataclass fields and decodes it from their types, so
+  a setting is a string, a number, a bool, an enum, a tuple, or a
+  dataclass of those.
 - Implement `execute(node, inputs, context)` in the runtime class.
   Return a `NodeResult` with a value for each output port.
 

@@ -78,32 +78,6 @@ class ExtractSpec(InferenceSpec):
         """Return the document ID, answer, and source span columns."""
         return (*super().output_columns, self.span_name)
 
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "ExtractSpec":
-        return cls(
-            **vars(InferenceSpec.from_mapping(value)),
-            question=str(value["question"]),
-            **{name: value.get(name, getattr(cls, name))
-               for name in ("max_answer_tokens", "draft_tokens", "draft_policy",
-                            "expected_answer_tokens", "round_cost_per_token",
-                            "top_tokens", "first_window_chars", "window_chars")},
-        )
-
-    def to_dict(self) -> dict:
-        return {
-            **super().to_dict(),
-            "question": self.question,
-            "max_answer_tokens": self.max_answer_tokens,
-            "draft_tokens": self.draft_tokens,
-            "draft_policy": self.draft_policy,
-            "expected_answer_tokens": self.expected_answer_tokens,
-            "round_cost_per_token": self.round_cost_per_token,
-            "top_tokens": self.top_tokens,
-            "first_window_chars": self.first_window_chars,
-            "window_chars": self.window_chars,
-        }
-
-
 @dataclass(frozen=True)
 class AiExtract(AiInference):
     """Physical operator that appends each row's answer and its span.

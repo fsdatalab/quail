@@ -40,6 +40,7 @@ from quail.api import RefusalError, Session
 from quail.builtins import built_in_registry
 from quail.execution.result import iter_rows
 from quail.logical import CompileError
+from quail.physical.codec import encode_fields
 from quail.planner.plan import EngineConfig
 from quail.remote.artifacts import (
     ANSWERS_FILE,
@@ -419,11 +420,11 @@ def _error(error: Exception, status: int | None = None) -> JSONResponse:
 
 
 def _status_response(status: QueryStatus, code: int = 200) -> JSONResponse:
-    return JSONResponse(status.to_dict(), status_code=code)
+    return JSONResponse(encode_fields(status), status_code=code)
 
 
 def _sse_event(status: QueryStatus) -> str:
-    return f"id: {status.revision}\ndata: {json.dumps(status.to_dict())}\n\n"
+    return f"id: {status.revision}\ndata: {json.dumps(encode_fields(status))}\n\n"
 
 
 def create_app(settings: ServerSettings) -> Starlette:
@@ -470,7 +471,7 @@ def create_app(settings: ServerSettings) -> Starlette:
         limit = (None if requested_limit == "all"
                  else min(int(requested_limit), 500))
         session_id = request.query_params.get("session_id")
-        items = [status.to_dict() for status in await run_in_threadpool(
+        items = [encode_fields(status) for status in await run_in_threadpool(
             server.store.list_recent, limit, session_id)]
         return JSONResponse({"queries": items})
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping
 
-from ..base import PhysicalNode
+from ..base import PhysicalNode, Token
 from .inference import AiInference, InferenceSpec
 from .join import AiJoin
 
@@ -37,11 +37,11 @@ class ClassifySpec(InferenceSpec):
     pair_fraction: float = 1.0
     draws: int = 1
     labels: tuple[str, ...] = ()
-    label_token_ids: tuple[tuple[int, ...], ...] = ()
+    label_token_ids: tuple[tuple[Token, ...], ...] = ()
     label_word_starts: tuple[tuple[bool, ...], ...] = ()
     scoring: str = "letters"
     probabilities: bool = False
-    join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    join_layout: tuple[tuple[Token, ...], tuple[Token, ...]] | None = None
     frame_tokens: int = 0
 
     @property
@@ -53,43 +53,6 @@ class ClassifySpec(InferenceSpec):
     def partner(self) -> str | None:
         """Return the partner table alias, or None for individual documents."""
         return self.aliases[1] if len(self.aliases) == 2 else None
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "ClassifySpec":
-        return cls(
-            **vars(InferenceSpec.from_mapping(value)),
-            pair_fraction=float(value.get("pair_fraction", 1.0)),
-            draws=int(value.get("draws", 1)),
-            labels=tuple(str(label) for label in value["labels"]),
-            label_token_ids=tuple(
-                tuple(int(token) for token in ids)
-                for ids in value["label_token_ids"]),
-            label_word_starts=tuple(
-                tuple(bool(flag) for flag in flags)
-                for flags in value.get("label_word_starts", ())),
-            scoring=str(value.get("scoring", "letters")),
-            probabilities=bool(value.get("probabilities", False)),
-            join_layout=(None if value.get("join_layout") is None else tuple(
-                tuple(int(token) for token in part)
-                for part in value["join_layout"])),
-            frame_tokens=int(value.get("frame_tokens", 0)),
-        )
-
-    def to_dict(self) -> dict:
-        return {
-            **super().to_dict(),
-            "pair_fraction": self.pair_fraction,
-            "draws": self.draws,
-            "labels": list(self.labels),
-            "label_token_ids": [list(ids) for ids in self.label_token_ids],
-            "label_word_starts": [list(flags) for flags in self.label_word_starts],
-            "scoring": self.scoring,
-            "probabilities": self.probabilities,
-            "join_layout": (None if self.join_layout is None
-                            else [list(part) for part in self.join_layout]),
-            "frame_tokens": self.frame_tokens,
-        }
-
 
 @dataclass(frozen=True)
 class AiClassify(AiInference):

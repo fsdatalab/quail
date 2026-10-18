@@ -63,18 +63,6 @@ class Scan(PhysicalNode):
             schema=(self.alias,),
         ),)
 
-    def attributes(self) -> dict:
-        return {
-            "alias": self.alias,
-            "input_id": self.input_id,
-            "num_documents": self.num_documents,
-            "total_tokens": self.total_tokens,
-            "shard_token_loads": list(self.shard_token_loads),
-            "shard_ranges": [list(bounds) for bounds in self.shard_ranges],
-            "predicates": [predicate.to_dict() for predicate in self.predicates],
-            "expected_rows": self.expected_rows,
-        }
-
     @property
     def shards(self) -> tuple[range, ...]:
         """Return each worker's contiguous document range."""
@@ -92,23 +80,3 @@ class Scan(PhysicalNode):
             "predicates": [str(predicate) for predicate in self.predicates],
             "expected_rows": self.expected_rows,
         }
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            alias=attributes["alias"],
-            input_id=attributes["input_id"],
-            num_documents=int(attributes["num_documents"]),
-            total_tokens=int(attributes["total_tokens"]),
-            shard_ranges=tuple(
-                (int(start), int(stop))
-                for start, stop in attributes["shard_ranges"]
-            ),
-            shard_token_loads=tuple(attributes["shard_token_loads"]),
-            predicates=tuple(RegularPredicate.from_dict(value)
-                             for value in attributes.get("predicates", ())),
-            expected_rows=(None if attributes.get("expected_rows") is None
-                           else float(attributes["expected_rows"])),
-        )

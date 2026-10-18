@@ -11,6 +11,7 @@ from ..base import (
     ExecutionLocation,
     OutputPort,
     PhysicalNode,
+    Token,
     ValueType,
 )
 
@@ -67,32 +68,12 @@ class Filter(PhysicalNode):
                        ValueType.JOIN_ANSWERS),
         )
 
-    def attributes(self) -> dict:
-        return {
-            "predicate": self.predicate.to_dict(),
-            "aliases": list(self.aliases),
-            "selectivity": self.selectivity,
-            "written_position": self.written_position,
-        }
-
     def explain_fields(self) -> Mapping[str, Any]:
         return {
             "predicate": str(self.predicate),
             "selectivity": self.selectivity,
             "aliases": list(self.aliases),
         }
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            predicate=RegularPredicate.from_dict(attributes["predicate"]),
-            aliases=tuple(attributes["aliases"]),
-            selectivity=attributes["selectivity"],
-            written_position=int(attributes["written_position"]),
-        )
-
 
 @dataclass(frozen=True)
 class AiFilter(PhysicalNode):
@@ -106,9 +87,9 @@ class AiFilter(PhysicalNode):
     preamble_tokens: int = 0
     selectivity: float | None = None
     expected_rows: float = 0.0
-    question_token_ids: tuple[Any, ...] = ()
+    question_token_ids: tuple[Token, ...] = ()
     # the token ids the documents are shown under, before the document
-    document_head: tuple[int, ...] = ()
+    document_head: tuple[Token, ...] = ()
     # documents borrow the KV pages of a document that shares their
     # token prefix (the should_share_prefixes rule)
     share_prefixes: bool = False
@@ -144,46 +125,6 @@ class AiFilter(PhysicalNode):
             ),
         )
 
-    def attributes(self) -> dict:
-        return {
-            "alias": self.alias,
-            "arena_writes": self.arena_writes,
-            "keep_kv": self.keep_kv,
-            "written_position": self.written_position,
-            "question_tokens": self.question_tokens,
-            "preamble_tokens": self.preamble_tokens,
-            "selectivity": self.selectivity,
-            "expected_rows": self.expected_rows,
-            "question_token_ids": list(self.question_token_ids),
-            "document_head": list(self.document_head),
-            "share_prefixes": self.share_prefixes,
-            "attention": self.attention,
-            "stop_key": list(self.stop_key),
-        }
-
     def explain_fields(self) -> Mapping[str, Any]:
-        value = self.attributes()
-        value.pop("question_token_ids")
-        value.pop("document_head")
-        return value
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            alias=attributes["alias"],
-            arena_writes=bool(attributes["arena_writes"]),
-            keep_kv=bool(attributes["keep_kv"]),
-            written_position=int(attributes["written_position"]),
-            question_tokens=int(attributes["question_tokens"]),
-            preamble_tokens=int(attributes["preamble_tokens"]),
-            selectivity=attributes["selectivity"],
-            expected_rows=float(attributes["expected_rows"]),
-            question_token_ids=tuple(attributes["question_token_ids"]),
-            document_head=tuple(attributes.get("document_head", ())),
-            share_prefixes=bool(attributes.get("share_prefixes", False)),
-            attention=str(attributes.get("attention", "")),
-            stop_key=tuple(str(column)
-                           for column in attributes.get("stop_key", ())),
-        )
+        return {name: value for name, value in super().explain_fields().items()
+                if name not in ("question_token_ids", "document_head")}

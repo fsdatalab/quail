@@ -57,7 +57,7 @@ def _validate_tree(expression) -> None:
 class GetField:
     """One field of a struct-valued expression."""
 
-    input: Any
+    input: Expression
     field: str
 
     type_name: ClassVar[str] = "quail.get_field"
@@ -80,7 +80,7 @@ class ScalarFunction:
     """A function of value expressions, computed row by row without the model."""
 
     function: str
-    args: tuple  # tuple[expression, ...]
+    args: tuple[Expression, ...]
 
     type_name: ClassVar[str] = "quail.scalar_function"
 
@@ -226,38 +226,6 @@ def aliased_call(expression, *kinds):
     return call if not kinds or call.kind in kinds else None
 
 
-_EXPRESSION_TYPES = {}
-
-
-def encode_expression(expression) -> dict:
-    """Encode a value expression for a physical plan."""
-    if isinstance(expression, ColumnRef):
-        fields = {"alias": expression.alias, "provider": expression.provider,
-                  "column": expression.column}
-    elif isinstance(expression, GetField):
-        fields = {"input": encode_expression(expression.input),
-                  "field": expression.field}
-    elif isinstance(expression, ScalarFunction):
-        fields = {"function": expression.function,
-                  "args": [encode_expression(argument) for argument in expression.args]}
-    else:
-        fields = {"expression": encode_expression(expression.expression),
-                  "name": expression.name}
-    return {"type": expression.type_name, **fields}
-
-
-def decode_expression(value: dict):
-    """Decode what encode_expression wrote."""
-    kind = _EXPRESSION_TYPES[value["type"]]
-    if kind is ColumnRef:
-        return ColumnRef(str(value["alias"]), str(value["provider"]),
-                         str(value["column"]))
-    if kind is GetField:
-        return GetField(decode_expression(value["input"]), str(value["field"]))
-    if kind is ScalarFunction:
-        return ScalarFunction(str(value["function"]),
-                              tuple(decode_expression(a) for a in value["args"]))
-    return Alias(decode_expression(value["expression"]), str(value["name"]))
 
 
 @dataclass(frozen=True)
@@ -516,7 +484,6 @@ def literal_value(value):
     return value.item() if isinstance(value, np.generic) else value
 
 
-
 @dataclass(frozen=True)
 class RegularPredicate:
     """A test of a value expression or a model score against literals.
@@ -529,7 +496,7 @@ class RegularPredicate:
     without the model.
     """
 
-    expression: Any
+    expression: Expression | ModelCall
     comparison: str
     value: Any = None
 
@@ -650,19 +617,6 @@ class RegularPredicate:
         """Return the rows the predicate accepts, with every null rejected."""
         return accepted_rows(self.evaluate(columns))
 
-    def to_dict(self) -> dict:
-        return {"expression": encode_expression(self.expression),
-                "comparison": self.comparison,
-                "value": (list(self.value) if isinstance(self.value, tuple)
-                          else self.value)}
-
-    @classmethod
-    def from_dict(cls, value: dict) -> "RegularPredicate":
-        """Decode a predicate from its serialized mapping."""
-        literal = value["value"]
-        return cls(decode_expression(value["expression"]), str(value["comparison"]),
-                   tuple(literal) if isinstance(literal, list) else literal)
-
     @property
     def name(self) -> str:
         """The tested expression as written."""
@@ -676,12 +630,11 @@ class RegularPredicate:
         return f"{self.name} {self.comparison} {self.value!r}"
 
 
-
 @dataclass(frozen=True)
 class Alias:
     """An expression returned under a name: a model call or a value expression."""
 
-    expression: Any
+    expression: Expression | ModelCall
     name: str
 
     type_name: ClassVar[str] = "quail.alias"
@@ -693,6 +646,10 @@ class Alias:
             _validate_tree(self.expression)
         if not self.name:
             raise CompileError("a projected expression needs a name")
+
+
+# a value expression: a tree of these nodes with ColumnRef leaves
+Expression = ColumnRef | GetField | ScalarFunction | Alias
 
 
 def model_call(expression) -> ModelCall:
@@ -971,7 +928,3 @@ class Aggregation:
         if self.having:
             parts.append("having " + " and ".join(str(t) for t in self.having))
         return "; ".join(parts)
-
-
-_EXPRESSION_TYPES.update({
-    kind.type_name: kind for kind in (ColumnRef, GetField, ScalarFunction, Alias)})

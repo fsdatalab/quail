@@ -130,15 +130,6 @@ class FirstDocuments(PhysicalNode):
         return (OutputPort(f"rows:{self.alias}", ValueType.ROWS,
                            schema=(self.alias,)),)
 
-    def attributes(self):
-        return {"alias": self.alias, "count": self.count}
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(node_id=node_id, inputs=inputs, alias=attributes["alias"],
-                   count=int(attributes["count"]))
-
-
 class FirstDocumentsRuntime:
     def execute(self, node, inputs, context):
         documents = next(iter(inputs.values()))

@@ -33,6 +33,7 @@ from quail.physical import (
     decode_graph,
     encode_graph,
 )
+from quail.physical.codec import NodeCodec, decode_value, encode_value
 from quail.physical.pipelines import build_pipelines
 from quail.planner.plan import EngineConfig, Refusal
 
@@ -461,21 +462,12 @@ def test_extraction_settings_survive_plan_serialization(session):
                     draft_policy="adaptive", expected_answer_tokens=9,
                     round_cost_per_token=0.25)
     spec = replace(node.spec, **settings)
-    assert ExtractSpec.from_mapping(spec.to_dict()) == spec
-    legacy = spec.to_dict()
-    for name in settings:
-        legacy.pop(name)
-    # a plan without the settings takes their defaults; the planner had
-    # set the round's KV read from the model and device
-    assert ExtractSpec.from_mapping(legacy) == replace(
-        node.spec, round_cost_per_token=ExtractSpec.round_cost_per_token)
+    assert decode_value(ExtractSpec, encode_value(spec)) == spec
+    # the planner set the round's KV read from the model and device
     assert node.spec.round_cost_per_token > 0
     request = RequestExtractSpec(alias="c", output="ends", question=QUESTION,
                                  tail_token_ids=(1, 2), max_answer_tokens=7)
-    assert RequestExtractSpec.from_mapping(request.to_dict()) == request
-    legacy = request.to_dict()
-    legacy.pop("max_answer_tokens")
-    assert RequestExtractSpec.from_mapping(legacy).max_answer_tokens == 64
+    assert decode_value(RequestExtractSpec, encode_value(request)) == request
 
 
 FIELDS = {"ends": QUESTION, "rent": "What is the rent?"}
@@ -512,8 +504,8 @@ def test_extract_plans_one_extraction_per_field(session):
         ("lease", (("ends", "lease.ends"), ("rent", "lease.rent"))),
         ("lease_span", (("ends", "lease.ends_span"), ("rent", "lease.rent_span"))))
     assert project.outputs[0].schema == ("c.id", "lease", "lease_span")
-    assert Project.from_attributes(
-        project.node_id, project.inputs, project.attributes()) == project
+    codec = NodeCodec(Project)
+    assert codec.decode(codec.encode(project)) == project
     assert "lease = struct(lease.ends, lease.rent)" in built.explain()
 
 
