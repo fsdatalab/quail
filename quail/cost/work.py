@@ -9,7 +9,11 @@ import numpy as np
 
 @dataclass(frozen=True)
 class Work:
-    """Tokens, full and sliding attention pairs, and KV movement."""
+    """Tokens, attention pairs, KV movement, and output-head work.
+
+    readout_flops and readout_bytes count the selected output head's
+    computation and weight reads, using the operator's packing assumption.
+    """
 
     tokens: float = 0.0
     pairs: float = 0.0
@@ -17,6 +21,8 @@ class Work:
     kv_read: float = 0.0
     sliding_pairs: float = 0.0
     sliding_kv_read: float = 0.0
+    readout_flops: float = 0.0
+    readout_bytes: float = 0.0
 
     def __add__(self, other: "Work") -> "Work":
         return Work(
@@ -26,6 +32,8 @@ class Work:
             self.kv_read + other.kv_read,
             self.sliding_pairs + other.sliding_pairs,
             self.sliding_kv_read + other.sliding_kv_read,
+            self.readout_flops + other.readout_flops,
+            self.readout_bytes + other.readout_bytes,
         )
 
     def __mul__(self, count: float) -> "Work":
@@ -36,13 +44,16 @@ class Work:
             self.kv_read * count,
             self.sliding_pairs * count,
             self.sliding_kv_read * count,
+            self.readout_flops * count,
+            self.readout_bytes * count,
         )
 
     def total(self) -> "Work":
         """Sum work over document arrays, leaving scalar counts unchanged."""
         return Work(*(float(np.sum(value)) for value in (
             self.tokens, self.pairs, self.kv_written, self.kv_read,
-            self.sliding_pairs, self.sliding_kv_read)))
+            self.sliding_pairs, self.sliding_kv_read,
+            self.readout_flops, self.readout_bytes)))
 
     def dominates(self, other: "Work") -> bool:
         """Return whether every count is no larger than the other record."""
@@ -53,6 +64,8 @@ class Work:
             and self.kv_read <= other.kv_read
             and self.sliding_pairs <= other.sliding_pairs
             and self.sliding_kv_read <= other.sliding_kv_read
+            and self.readout_flops <= other.readout_flops
+            and self.readout_bytes <= other.readout_bytes
         )
 
 

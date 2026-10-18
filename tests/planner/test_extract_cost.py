@@ -1,5 +1,7 @@
 """Extraction costs: the executor's rounds priced like a classification."""
 
+from dataclasses import replace
+
 import pytest
 
 from quail.cost.extract import (
@@ -92,14 +94,17 @@ def test_cost_uses_plan_limits_and_separate_answer_assumptions():
     context = HEAD + 100 + TAIL
     rounds = assumptions.rounds(8, 3)
     assert rounds == pytest.approx(1 + (39 / 40) ** 4)
-    assert cost.work == scan(HEAD + 100, TAIL) + _rounds_work(context, 4, rounds)
+    assert replace(cost.work, readout_flops=0, readout_bytes=0) == (
+        scan(HEAD + 100, TAIL) + _rounds_work(context, 4, rounds))
     assert cost.suffix_tokens == pytest.approx(TAIL + 4 * rounds)
     assert cost.rows == pytest.approx(1 + 4 * rounds)
     shorter = _cost([100], max_answer_tokens=8, draft_tokens=3,
                     assumptions=ExtractAssumptions(answer_tokens=2))
     assert shorter.work.tokens < cost.work.tokens
     capped = _cost([100], max_answer_tokens=1, assumptions=assumptions)
-    assert capped.work == scan(HEAD + 100, TAIL)
+    assert replace(capped.work, readout_flops=0, readout_bytes=0) == (
+        scan(HEAD + 100, TAIL))
+    assert capped.work.readout_flops == 2 * QWEN3_4B_FP8.hidden * QWEN3_4B_FP8.vocab
     windowed, _, _ = document_work(
         100, HEAD, TAIL, window=128, max_answer_tokens=8, draft_tokens=3,
         draft_policy="fixed", assumptions=assumptions)

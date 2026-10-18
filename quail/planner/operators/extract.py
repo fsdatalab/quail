@@ -34,26 +34,10 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
             before this one.
     """
     prompt = context.lowered(call.prompt)
-    # under the query's shared preamble, the prompt's document KV is
-    # the one a filter writes
-    shares_head = tuple(prompt.preamble_token_ids) == tuple(
-        context.tokenizer(shared_preamble(
-            context.model.turn_prefix, context.model.prompt_layout)))
+    spec = prepare_extract_spec(
+        call, name, live, prompt, context.model, context.device, context.tokenizer)
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
-    model, device = context.model, context.device
-    # one document token's KV read per round, in tokens of compute: the
-    # pass is compute-bound, so a fed token costs its dense FLOPs
-    token_seconds = 2 * dense_params(model) / device.peak_flops
-    round_cost_per_token = model.kappa / device.hbm_bw / token_seconds
-    spec = bind_inference(
-        ExtractSpec, call.prompt, name=name,
-        expected_inputs=live, estimated_seconds=0.0,
-        prompt_token_parts=(tuple(prompt.preamble_token_ids),
-                            tuple(prompt.tail_token_ids)),
-        question=call.question, shares_head=shares_head,
-        expected_answer_tokens=extract_cost.ExtractAssumptions().answer_tokens,
-        round_cost_per_token=round_cost_per_token)
     cost = extract_cost.estimate(
         live, lengths, len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),
@@ -62,6 +46,28 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
         draft_policy=spec.draft_policy,
         round_cost_per_token=spec.round_cost_per_token, workers=context.gpu_count)
     return replace(spec, estimated_seconds=cost.seconds)
+
+
+def prepare_extract_spec(call, name, live, prompt, model, device,
+                         tokenizer) -> ExtractSpec:
+    """Build the prompt and decoding settings of an extraction."""
+    # under the query's shared preamble, the prompt's document KV is
+    # the one a filter writes
+    shares_head = tuple(prompt.preamble_token_ids) == tuple(
+        tokenizer(shared_preamble(
+            model.turn_prefix, model.prompt_layout)))
+    # one document token's KV read per round, in tokens of compute: the
+    # pass is compute-bound, so a fed token costs its dense FLOPs
+    token_seconds = 2 * dense_params(model) / device.peak_flops
+    round_cost_per_token = model.kappa / device.hbm_bw / token_seconds
+    return bind_inference(
+        ExtractSpec, call.prompt, name=name,
+        expected_inputs=live, estimated_seconds=0.0,
+        prompt_token_parts=(tuple(prompt.preamble_token_ids),
+                            tuple(prompt.tail_token_ids)),
+        question=call.question, shares_head=shares_head,
+        expected_answer_tokens=extract_cost.ExtractAssumptions().answer_tokens,
+        round_cost_per_token=round_cost_per_token)
 
 
 def emit_extract(builder, alias, live=None):

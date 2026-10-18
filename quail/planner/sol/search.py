@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import itertools
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Mapping
 
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
+from quail.cost import budgets
+from quail.cost import extract as extract_cost
+from quail.cost.dense_decoder_cost import readout_work
 from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan
 from quail.logical import oriented_join_conditions
+from quail.planner.operators.classify import ClassifyBuilder, ClassifyScoring
+from quail.planner.operators.extract import prepare_extract_spec
 from quail.planner.operators.filter import prepare_filter_costs
-from quail.planner.prompt_lowering import lower_prompt
+from quail.planner.prompt_lowering import choice_token_parts, lower_prompt
 from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.search.leftdeep import search_left_deep
 from quail.planner.search.live_rows import PairRelation, exact_live_rows
@@ -61,7 +66,10 @@ class Search:
 
     def __init__(self, query, answer: AnswerOracle, label: LabelOracle | None,
                  model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
-                 credit_shared: bool):
+                 credit_shared: bool, extraction: extract_cost.ExtractAssumptions):
+        self.extraction = extraction
+        self.config = query.session.config
+        self.tokenizer = query.session.tokenizer
         self.answer = answer
         self.label = label
         self.model = model
@@ -182,6 +190,58 @@ class Search:
         if first:
             computed.update(live)
         return work
+
+    def answer_inputs(self, alias, live, first):
+        """Return lengths and borrowed prefixes for the live answer rows."""
+        data = self.aliases[alias]
+        computed = self.computed_rows_by_column.setdefault(data.column, set())
+        lengths = [data.tokens[row] for row in live]
+        shared = [data.tokens[row] if self.credit_shared and row in computed
+                  else data.shared[row] for row in live]
+        if first:
+            computed.update(live)
+        return lengths, shared
+
+    def classification_stats(self, alias, lengths, shared=()):
+        """Return classification settings with unlimited persistent KV."""
+        return dict(
+            alias=alias, mean=sum(lengths) / len(lengths) if lengths else 0,
+            longest=max(lengths, default=0), budget=math.inf,
+            chunk=self.chunk_tokens, model=self.model, device=self.device,
+            capacity=math.inf, lengths=lengths, shared=tuple(shared),
+            draws=self.config.canvas_draws if self.model.answer_canvas else 1,
+            tree=(budgets.tree_attention_allowed(self.model)
+                  and self.config.attention != "unified"))
+
+    def classification_work(self, call, alias, live, first):
+        """Count the selected label scoring rule and its output head."""
+        lengths, shared = self.answer_inputs(alias, live, first)
+        stats = self.classification_stats(alias, lengths, shared)
+        builder = ClassifyBuilder(**stats, tokenizer=self.tokenizer,
+                                  lower=self.lower, backend_name="quail")
+        spec, _ = builder.prepare(call, self.labels.names[call], len(live))
+        scoring = ClassifyScoring(**stats, tokenizer=self.tokenizer, lower=self.lower)
+        spec = scoring.choose_scoring(spec, call, resident=not first)
+        cost = scoring.estimate_spec(spec, resident=not first)
+        return cost.work, spec, cost.rounds
+
+    def extraction_work(self, node, alias, live, first):
+        """Count extraction rounds using the planner's answer-length assumption."""
+        prompt = self.lower(node.call.prompt)
+        spec = prepare_extract_spec(
+            node.call, node.name, len(live), prompt, self.model,
+            self.device, self.tokenizer)
+        lengths, shared = self.answer_inputs(alias, live, first)
+        head, tail = map(len, spec.prompt_token_parts)
+        cost = extract_cost.estimate(
+            len(live), lengths, head, tail, chunk=self.chunk_tokens,
+            model=self.model, device=self.device, resident=not first,
+            shared=[head + count if count else 0 for count in shared],
+            max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens,
+            draft_policy=spec.draft_policy,
+            round_cost_per_token=spec.round_cost_per_token,
+            assumptions=self.extraction)
+        return cost.work, spec, cost.rows
 
     def join_stage_work(self, anchor, partners, survivors, prompt,
                         resident_rows, cross_resident_rows=(),
@@ -332,14 +392,17 @@ class Search:
             classified = set()
             for call, test in steps:
                 if call not in classified:
-                    stage_work = self.question_work(
-                        alias, live, self.lower(call.prompt).tail_tokens, first)
+                    stage_work, spec, rounds = self.classification_work(
+                        call, alias, live, first)
                     first = False
                     work = work + stage_work
                     stages.append(_stage(
                         CLASSIFY, alias, call.prompt.template, None,
-                        self.lower(call.prompt).tail_tokens, None, live, live,
-                        stage_work, name=self.labels.names[call]))
+                        len(spec.prompt_token_parts[1]), None, live, live,
+                        stage_work, name=self.labels.names[call],
+                        scoring=spec.scoring, rounds=rounds,
+                        readout_flops=stage_work.readout_flops,
+                        readout_bytes=stage_work.readout_bytes))
                     classified.add(call)
                 if test is not None:
                     accepted = set(test.values)
@@ -355,14 +418,18 @@ class Search:
                     live = passed
             # an extraction follows the labels; it keeps every document
             for node in extracts:
-                stage_work = self.question_work(
-                    alias, live, self.lower(node.call.prompt).tail_tokens, first)
+                stage_work, spec, rows = self.extraction_work(node, alias, live, first)
                 first = False
                 work = work + stage_work
                 stages.append(_stage(
                     EXTRACT, alias, node.call.prompt.template, None,
                     self.lower(node.call.prompt).tail_tokens, None, live, live,
-                    stage_work, name=node.name))
+                    stage_work, name=node.name, answer_rows=rows,
+                    expected_answer_tokens=self.extraction.answer_tokens,
+                    max_answer_tokens=spec.max_answer_tokens,
+                    draft_tokens=spec.draft_tokens, draft_policy=spec.draft_policy,
+                    readout_flops=stage_work.readout_flops,
+                    readout_bytes=stage_work.readout_bytes))
             survivors[alias] = live
         return survivors, work, stages
 
@@ -399,6 +466,17 @@ class Search:
                 rows.update(live[other])
         return rows
 
+    def joined_classification_prompt(self, call):
+        """Return the scoring prompt used to classify joined rows."""
+        prompt = self.lower(call.prompt)
+        if self.model.role == "decision":
+            tail, _, _ = choice_token_parts(prompt, self.tokenizer)
+            return replace(prompt, tail_token_ids=tail)
+        if prompt.lettered is None:
+            raise NotImplementedError(
+                "classification of joined rows needs one-token label letters")
+        return prompt.lettered
+
     def joined_classification_work(self, call, anchor, partner, live,
                                    relation) -> tuple[Work, dict]:
         """Price one classification of the pairs a join kept, on its anchor.
@@ -417,15 +495,32 @@ class Search:
         live_partners = set(live[partner])
         anchor_rows = [row for row in live[anchor]
                        if kept.get(row, set()) & live_partners]
+        pairs = sum(len(kept[row] & live_partners) for row in anchor_rows)
+        lengths = [self.aliases[anchor].tokens[row] for row in anchor_rows]
+        builder = ClassifyBuilder(
+            **self.classification_stats(anchor, lengths),
+            tokenizer=self.tokenizer, lower=self.lower, backend_name="quail")
+        spec, _ = builder.classify_joined(
+            call, self.labels.names[call], partner, pairs,
+            max((self.aliases[partner].tokens[row]
+                 for row in live[partner]), default=0))
+        prompt = self.joined_classification_prompt(call)
         work = self.join_stage_work(
             anchor, [partner], {anchor: anchor_rows, partner: live[partner]},
-            self.lower(call.prompt), anchor_rows, allowed=kept)
-        pairs = sum(len(kept[row] & live_partners) for row in anchor_rows)
+            prompt, anchor_rows, allowed=kept)
+        rows = (len(spec.label_token_ids) + 1 if self.model.role == "decision"
+                else max(1, self.canvas))
+        targets = len({token for ids in spec.label_token_ids for token in ids})
+        work += readout_work(self.model, pairs * rows,
+                             work.tokens / self.chunk_tokens, targets)
         return work, {
             "name": self.labels.names[call],
             "template": call.prompt.template,
             "pairs": pairs,
             "fresh_tokens": work.tokens,
+            "scoring": spec.scoring,
+            "readout_flops": work.readout_flops,
+            "readout_bytes": work.readout_bytes,
         }
 
     def search_joins_sol(self, base_rows, resident, base_work):
@@ -478,8 +573,9 @@ class Search:
             for anchor in stage_aliases:
                 if not all(
                         self.anchor_fits(prompt, anchor, stage_aliases, live)
-                        for prompt in map(self.lower, [join.prompt] + [
-                            call.prompt for call in classifications])):
+                        for prompt in [self.lower(join.prompt)] + [
+                            self.joined_classification_prompt(call)
+                            for call in classifications]):
                     continue
                 partners = [alias for alias in stage_aliases if alias != anchor]
                 allowed = self.allowed_pairs.get(edge_index, {}).get(anchor)

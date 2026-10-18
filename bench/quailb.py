@@ -96,6 +96,8 @@ def canonical_templates(ground_truth) -> dict[str, str]:
     canonical = {}
     for labels in ground_truth.predicates.values():
         predicate = labels.predicate
+        if predicate["kind"] not in ("filter", "join", "classify"):
+            continue
         left = quail.ColumnRef(
             "left", predicate["left_table"], predicate["left_column"])
         right = (quail.ColumnRef("right", predicate["right_table"],

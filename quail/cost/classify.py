@@ -13,7 +13,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from quail.cost.dense_decoder_cost import decoder_seconds
+from quail.cost.dense_decoder_cost import readout_work
+from quail.cost.sol import unrounded_seconds
 from quail.cost.work import Work, ask, decode, stream
 from quail.labels import (
     DECODE_SCORING,
@@ -176,7 +177,8 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
         rows = answer_rows
     total = work * (live / n)
     passes = total.tokens / chunk
-    seconds = decoder_seconds(total, rows * live, passes, model, device, head_rows)
+    total += readout_work(model, rows * live, passes, head_rows)
+    seconds = unrounded_seconds(total, model, device, chunk)
     return ClassifyCost(seconds, passes, total, suffix_tokens * live, rounds)
 
 

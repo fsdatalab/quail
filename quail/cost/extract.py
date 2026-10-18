@@ -17,8 +17,9 @@ from KV.
 from dataclasses import dataclass
 from itertools import repeat
 
-from quail.cost.dense_decoder_cost import decoder_seconds
+from quail.cost.dense_decoder_cost import readout_work
 from quail.cost.draft_policy import DraftPolicy
+from quail.cost.sol import unrounded_seconds
 from quail.cost.work import Work, ask, decode, scan
 
 
@@ -181,6 +182,6 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
     total = work * scale
     passes = total.tokens / chunk
     copies = max(1, min(workers, live))
-    seconds = decoder_seconds(total * (1 / copies), rows * scale / copies,
-                              passes / copies, model, device)
+    total += readout_work(model, rows * scale, passes)
+    seconds = unrounded_seconds(total * (1 / copies), model, device, chunk)
     return ExtractCost(seconds, passes, total, fed * scale, rows * scale)

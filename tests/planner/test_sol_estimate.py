@@ -210,6 +210,36 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
         + estimate.join_stages[0]["fresh_tokens"])
 
 
+def test_decode_classification_counts_rounds_and_head_work():
+    model = "qwen3-4b-fp8"
+    def tokenize(text):
+        words = text.split()
+        return words * 2 if len(words) == 1 else words
+
+    with quail.Session(EngineConfig(model=model, device="h100-sxm",
+                                   attention="unified"), tokenizer=tokenize) as sess:
+        sess.register("reviews", DocumentProvider.from_table(
+            pa.table({"id": ["r0"], "body": ["one document"]}), id_col="id"))
+        query = (sess.docs("reviews").alias("r")
+                 .ai_classify(quail.prompt(CLASSIFY, quail.col("r.body")),
+                              ["other positive", "other negative",
+                               "shared positive", "shared negative"], name="tone")
+                 .select("r.id", "tone"))
+        call = _classification(query)
+        prompt = quail.lower_prompt(call.prompt, sess.tokenizer)
+        assert prompt.lettered is None
+        estimate = quail.speed_of_light_estimate(
+            query, lambda *_: True, label=lambda *_: "shared positive",
+            credit_shared_prefixes=False)
+    stage, = estimate.filter_stages
+    assert stage["scoring"] == "trie_decode"
+    assert stage["rounds"] == 2
+    assert estimate.fresh_tokens == prompt.preamble_tokens + 2 + prompt.tail_tokens + 1
+    assert estimate.work.kv_read == prompt.preamble_tokens + 2 + prompt.tail_tokens
+    assert estimate.work.readout_flops == 2 * sess.model.hidden * sess.model.vocab * 2
+    assert estimate.latency.component("readout").seconds > 0
+
+
 def test_a_classification_of_joined_rows_is_priced_per_kept_pair(tmp_path):
     with _session(tmp_path) as sess:
         join = quail.prompt(JOIN, quail.col("r.body"), quail.col("a.aspect"))
@@ -223,7 +253,8 @@ def test_a_classification_of_joined_rows_is_priced_per_kept_pair(tmp_path):
                                            quail.col("a.aspect")),
                               ["praises", "pans"], name="stance")
                  .select("r.id", "a.id", "stance"))
-        call = quail.lower_prompt(_classification(query).prompt, sess.tokenizer)
+        call = quail.lower_prompt(
+            _classification(query).prompt, sess.tokenizer).lettered
         estimate = quail.speed_of_light_estimate(query, _answer, label=_label)
 
     (stage,) = estimate.join_stages
@@ -240,6 +271,9 @@ def test_a_classification_of_joined_rows_is_priced_per_kept_pair(tmp_path):
     (classification,) = stage["classifications"]
     assert classification["name"] == "stance"
     assert classification["pairs"] == 1
+    assert classification["scoring"] == "letters"
+    assert classification["readout_flops"] == 2 * sess.model.hidden * 2
+    assert estimate.latency.component("readout").seconds > 0
     assert classification["fresh_tokens"] == parts[anchor][1] + pair_tokens
     assert estimate.classification_evaluations == 1
     assert estimate.fresh_tokens == (

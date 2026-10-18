@@ -29,6 +29,10 @@ def _cost(lengths, labels=LABELS, scoring="trie_decode", **kwargs):
     return estimate(scoring, live, HEAD, FRAME, labels, **options)
 
 
+def _decoder_work(work):
+    return replace(work, readout_flops=0.0, readout_bytes=0.0)
+
+
 def _head_bytes():
     return 2 * QWEN3_4B_FP8.hidden * QWEN3_4B_FP8.vocab
 
@@ -90,7 +94,7 @@ def test_expected_work_matches_every_label_assignment(lengths, labels, window,
         for key, value in _decode_outcome_work(lengths, picked, window,
                                                shared, resident).items():
             expected[key] += value / len(outcomes)
-    assert asdict(cost.work) == pytest.approx(expected)
+    assert asdict(_decoder_work(cost.work)) == pytest.approx(expected)
     assert cost.passes == pytest.approx(cost.work.tokens / CHUNK)
     assert cost.suffix_tokens == pytest.approx(
         sum(sum(map(sum, picked)) for picked in outcomes) / len(outcomes))
@@ -108,7 +112,7 @@ def test_sampled_label_draws_average_to_the_expected_work():
         for key, value in _decode_outcome_work(
                 lengths, [RUNS[i] for i in picks]).items():
             mean[key] += value / draws
-    assert asdict(cost.work) == pytest.approx(mean, rel=0.02)
+    assert asdict(_decoder_work(cost.work)) == pytest.approx(mean, rel=0.02)
 
 
 def test_label_and_document_order_do_not_change_the_estimate():
@@ -128,7 +132,7 @@ def test_one_round_rules_are_priced_like_filters():
             prefix = HEAD + length
             # the frame is written first; the request reads it and the document
             work += scan(prefix, FRAME) + stream(prefix + FRAME, [suffix])
-        assert asdict(cost.work) == pytest.approx(asdict(work))
+        assert asdict(_decoder_work(cost.work)) == pytest.approx(asdict(work))
         assert cost.passes == pytest.approx(work.tokens / CHUNK)
         assert cost.seconds == pytest.approx(
             unrounded_seconds(work, QWEN3_4B_FP8, H100_SXM, CHUNK)
@@ -144,7 +148,7 @@ def test_resident_documents_ask_instead_of_scanning():
     for length in (10, 20, 30):
         prefix = HEAD + length
         work += ask(prefix, FRAME) + stream(prefix + FRAME, [1])
-    assert asdict(cost.work) == pytest.approx(asdict(work))
+    assert asdict(_decoder_work(cost.work)) == pytest.approx(asdict(work))
 
 
 def test_one_token_labels_decode_as_a_merged_letters_request():
@@ -167,7 +171,11 @@ def test_smaller_chunks_pay_more_weight_reads_without_changing_work():
     device = replace(H100_SXM, peak_flops=float("inf"), bf16_flops=float("inf"))
     large = _cost((10, 20, 30), device=device)
     small = _cost((10, 20, 30), device=device, chunk=40)
-    assert asdict(small.work) == pytest.approx(asdict(large.work))
+    assert asdict(_decoder_work(small.work)) == pytest.approx(
+        asdict(_decoder_work(large.work)))
+    assert small.work.readout_flops == large.work.readout_flops
+    assert small.work.readout_bytes == pytest.approx(
+        large.work.readout_bytes * CHUNK / 40)
     assert small.suffix_tokens == large.suffix_tokens
     assert small.passes == pytest.approx(large.passes * CHUNK / 40)
     assert small.seconds > large.seconds
@@ -216,8 +224,12 @@ def test_the_estimate_is_linear_in_the_expected_document_count(live):
     cost = _cost((10,), live=live)
     single = _cost((10,))
     assert cost.rounds == (2 if live else 0)
-    assert asdict(cost.work) == pytest.approx(
-        {key: value * live for key, value in asdict(single.work).items()})
+    assert asdict(_decoder_work(cost.work)) == pytest.approx(
+        {key: value * live
+         for key, value in asdict(_decoder_work(single.work)).items()})
+    for name in ("readout_flops", "readout_bytes"):
+        assert getattr(cost.work, name) == pytest.approx(
+            getattr(single.work, name) * live)
     for name in ("seconds", "passes", "suffix_tokens"):
         assert getattr(cost, name) == pytest.approx(getattr(single, name) * live)
 
@@ -242,7 +254,7 @@ def test_decision_models_read_option_rows_through_their_head(resident):
         prefix = HEAD + length
         first = ask(prefix, FRAME) if resident else scan(prefix, FRAME)
         work += first + stream(prefix + FRAME, [50])
-    assert asdict(cost.work) == pytest.approx(asdict(work))
+    assert asdict(_decoder_work(cost.work)) == pytest.approx(asdict(work))
     # one row per option block and the prompt's last row, through the
     # fp32 decision head; the vocabulary head is never read
     assert cost.seconds == pytest.approx(
@@ -271,7 +283,11 @@ def test_one_token_labels_read_only_their_target_rows():
         + max(targets * len(lengths) / H100_SXM.arithmetic_bandwidth("bf16"),
               targets * cost.passes / H100_SXM.hbm_bw))
     longer = _cost(lengths, ((10,), (20, 21), (30,)), scoring="letters")
-    assert longer.work == cost.work
+    assert _decoder_work(longer.work) == _decoder_work(cost.work)
+    assert cost.work.readout_flops == targets * len(lengths)
+    assert cost.work.readout_bytes == targets * cost.passes
+    assert longer.work.readout_flops == _head_bytes() * len(lengths)
+    assert not longer.work.dominates(cost.work)
     assert longer.seconds == pytest.approx(
         unrounded_seconds(work, QWEN3_4B_FP8, H100_SXM, CHUNK)
         + _readout_seconds(len(lengths), cost.passes))

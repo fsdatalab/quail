@@ -86,10 +86,23 @@ conditions for comparison with measured runs. It assumes:
 - Rows that pass filters and joins are determined by answers supplied
   by the caller, such as saved reference answers and classification labels.
 
-For classification, this estimate counts the question and category text
-but excludes the extra steps used to select a label. The optimizer's
-classification estimates include the selected
-[label scoring method](/docs/architecture/execution#label-scoring).
+Classification uses the optimizer's selected
+[label scoring method](/docs/architecture/execution#label-scoring), including
+label tokens, decoding rounds, and output-head work. Greedy decoding uses
+an equal probability for each label when estimating its rounds.
+
+Extraction uses the optimizer's decoding cost calculation. It counts the
+prompt, answer and verification tokens, repeated KV reads, and output-head
+work. The default answer-length assumption is a
+geometric distribution with mean 16 tokens, capped at the answer limit.
+Drafts are assumed accepted while the answer continues. Pass
+`extraction=ExtractAssumptions(answer_tokens=...)`, imported from
+`quail.cost.extract`, to change the assumed mean.
+
+Both operators retain the ideal packing assumption across the query.
+The estimate includes decoding work but does not predict scheduling delays
+or rejected drafts. Per-stage records name the scoring rule or extraction
+settings, and `assumptions()` records the answer-length assumption.
 
 Report the supplied answers and KV assumptions with the estimate.
 If a measured run produces different answers, it can evaluate different
