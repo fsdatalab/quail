@@ -86,19 +86,11 @@ conditions for comparison with measured runs. It assumes:
 - Rows that pass filters and joins are determined by answers supplied
   by the caller, such as saved reference answers and classification labels.
 
-Classification and extraction include the model passes needed to produce
-an answer, including token scoring and the KV reads on each pass.
-Classification uses the optimizer's cost calculations for
-[label scoring](/docs/architecture/execution#label-scoring),
-averaging decoding work across possible labels.
-
-Extraction uses assumed answer lengths rather than answers from a measured
-run. The default mean is 16 tokens, before applying the answer-length limit.
-Quail checks candidate answer text copied from the document. The estimate
-counts those checks and assumes the copied text matches until the answer ends.
-
-The estimate assumes full GPU batches, including during answer generation.
-It does not account for waiting between decoding rounds.
+For classification, the estimate includes the selected
+[label scoring method](/docs/architecture/execution#label-scoring).
+Extraction includes generating and checking answer tokens. It uses the
+optimizer's cost calculation, with a default average answer length of
+16 tokens before applying the answer limit.
 
 Report the supplied answers and KV assumptions with the estimate.
 If a measured run produces different answers, it can evaluate different
