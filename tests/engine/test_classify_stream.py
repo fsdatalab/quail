@@ -787,3 +787,29 @@ def test_a_filter_after_a_classification_asks_over_the_resident_kv(monkeypatch):
                 if entry["prefix"] is not None]
     assert sorted(prefills) == list(range(num_documents))
     assert not arena.accounting.owned
+
+
+def test_a_part_counts_its_frame_only_when_it_writes_one():
+    from quail.backends.quail.executor.parts import ExecutionPart, gated_stages
+    from quail.backends.quail.executor.stages import Stage
+
+    class Part(ExecutionPart):
+        def __init__(self, frame):
+            self.stages = [Stage(suffixes=[[9]], readout=None, frame=list(frame))]
+
+        @staticmethod
+        def prepare_group(parts):
+            pass
+
+        def finish(self, every):
+            return 0
+
+        def complete(self, tokens, spans, stats, offset):
+            pass
+
+        def results(self):
+            return {}
+
+    parts = [Part([1, 2]), Part([1, 2]), Part([1, 3]), Part([])]
+    gated_stages(parts)
+    assert [part.frame_tokens for part in parts] == [2, 0, 2, 0]

@@ -10,7 +10,7 @@ from typing import Any, ClassVar
 import numpy as np
 
 from quail.backends.quail.executor.chunk import InputStaging
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stages import Stage, frame_writes, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import prefix_tree
 from quail.logical import effective_selectivity
@@ -63,6 +63,9 @@ class ExecutionPart(ABC):
     document_done = None
     result_value = None
     appended_tokens = 0
+    # the frame tokens the part's first stage writes; 0 when the stage
+    # before it left the same frame
+    frame_tokens = 0
     on_settled = None
     attention = None
 
@@ -166,17 +169,15 @@ def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=N
 
 
 def gated_stages(parts) -> list:
-    """Combine operator stages and attach intervening conditions.
+    """Combine operator stages and attach conditions to the stages after them.
 
     Args:
         parts: Pipeline parts in execution order. Parts without stages
-            contribute a condition checked before the next stage.
+            contribute a condition checked before the next stage, or
+            before the document completes when no stage follows.
 
     Returns:
         The combined Stage list, with conditions attached to stage requests.
-
-    Raises:
-        ValueError: A trailing condition has no following stage.
     """
     for implementation, group in groupby(parts, type):
         implementation.prepare_group(list(group))
@@ -206,8 +207,21 @@ def gated_stages(parts) -> list:
             first.requests = guarded
             pending = []
         stages.extend(part.stages)
-    if pending:
-        raise ValueError("a pipeline ends with a gate and no stage after it")
+    if pending and stages:
+        def finish(key, gates=tuple(pending)):
+            for gate in gates:
+                if gate(key) is Stage.DROP:
+                    return Stage.DROP
+            return Stage.SKIP
+
+        # a document that passes the trailing conditions skips this
+        # stage and counts as a survivor, with nothing asked
+        terminal = Stage(suffixes=[], readout=stages[-1].readout, requests=finish)
+        parts[-1].stages = [terminal]
+        stages.append(terminal)
+    writes = frame_writes(stages)
+    for part, (low, high) in zip(parts, _part_slices(parts)):
+        part.frame_tokens = len(stages[low].frame) if low < high and writes[low] else 0
     return stages
 
 

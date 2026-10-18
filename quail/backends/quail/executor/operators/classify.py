@@ -42,7 +42,8 @@ class ClassifyBatch(SingleResultPart):
     def finish(self, every) -> int:
         """Finalize labels and count tokens processed after the documents."""
         self.reached = len(every[0]) if every else 0
-        self.suffix_tokens, self.streamed_tokens = self.plan.finish(every)
+        self.suffix_tokens, self.streamed_tokens = self.plan.finish(
+            every, frame_tokens=self.frame_tokens)
         self.stream.finish(range(len(self.plan.labels)),
                            lambda anchor: self.plan.labels[anchor])
         return self.streamed_tokens

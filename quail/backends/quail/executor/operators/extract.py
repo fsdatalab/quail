@@ -54,7 +54,7 @@ def execute_extractions(state: QueryExecutionState, nodes, inputs) -> dict:
             if nodes[0].spec.share_prefixes else None)
     results = execute_parts(
         state, [part], stages.prefixes, stages.keys,
-        keep_kv=nodes[-1].keep_kv, prefix_tree=tree,
+        keep_kv=nodes[-1].keep_kv, prefix_tree=tree, limit=inputs.get("limit"),
         label=f"extract {', '.join(node.spec.name for node in nodes)}")
     first = nodes[0].node_id
     results[first] = replace(results[first], metrics=replace(
@@ -121,7 +121,8 @@ class ExtractPart(ExecutionPart):
                else np.asarray(value, dtype=np.int64))
         return {"document_ids": ids,
                 "documents": context.state["documents"],
-                "texts": context.state.get("texts", {})}
+                "texts": context.state.get("texts", {}),
+                "limit": context.state.get("filter_limit")}
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):

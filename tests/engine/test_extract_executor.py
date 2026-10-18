@@ -901,9 +901,11 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
     assert not arena.accounting.owned
 
 
-def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
+@pytest.mark.parametrize("limit", [1, 2])
+def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit):
     # the result's limit stops the run after that many documents
-    # passed every operator; the documents still queued are not read
+    # passed every operator, the trailing test included; the documents
+    # still queued are not read
     from quail.physical import Filter
 
     spec, tables = make_spec()
@@ -911,9 +913,10 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
     model = ScriptedModel(tables, {}, {}, 4)
     readout = _fake_readout(tables, 4)
     monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
-    # twelve documents, four of each kind, so some are still queued
-    # when the first one passes
-    texts, gold = DOCS * 4, GOLD * 4
+    # the first four documents have no answer, so the test drops them;
+    # some of the rest are still queued when enough have passed
+    texts = [NOTHING] * 4 + [LEASE] * 4 + [TERM] * 4
+    gold = [None] * 4 + [GOLD[0]] * 4 + [GOLD[1]] * 4
     for index, text in enumerate(texts):
         model.documents[("c", index)] = text
         model.gold[("c", index)] = gold[index]
@@ -946,13 +949,14 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
              "device": DEVICES["h100-sxm"], "chunk_tokens": chunk,
              "documents": {"c": documents}, "texts": {"c": list(texts)}}
     report = execute_single_graph(
-        state, {"filter_limit": 1, "retention": {}}, graph)
+        state, {"filter_limit": limit, "retention": {}}, graph)
     outputs = report["_outputs"]
     kept = outputs[PortRef("filter:c:0", "rows:c")].to_pydict()
-    # the documents in flight when the first passed finish; the
-    # queued ones are never read
-    assert kept["c"][0] == 0 and kept["ends"][0] == "March 3, 2027"
-    assert 1 <= len(kept["c"]) < len(texts)
+    # the documents that passed before the run ended have their whole
+    # answers; the queued ones are never read
+    assert limit <= len(kept["c"]) < len(texts)
+    assert all(answer is not None for answer in kept["ends"])
+    assert kept["ends"][:limit] == [gold[index] for index in kept["c"][:limit]]
     assert sum(model.reads.values()) < len(texts)
     assert not arena.accounting.owned
 
