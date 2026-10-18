@@ -1,4 +1,4 @@
-"""Build the physical plan of a decided logical plan."""
+"""Build executable query graphs with operator order and execution settings."""
 
 from functools import partial
 
@@ -46,15 +46,16 @@ from quail.planner.operators.score import (
     emit_score_pair,
     emit_scores,
 )
-from quail.planner.optimizer.physical import PlanningContext
+from quail.planner.optimizer.context import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal, inference_seconds
-from quail.planner.search.decisions import choose_plan, validate_query
+from quail.planner.search.operator_order import choose_operator_order
 from quail.planner.search.statistics import filter_stop_keys
 from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import (
     ClassifyRefusedError,
     ScoreRefusedError,
     score_projections,
+    validate_query,
 )
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -105,15 +106,15 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
     The builder chooses each table's filter order and the joins' stage
-    order and anchors by cost (quail.planner.search.ordering), unless order
+    order and anchors by cost (quail.planner.search.operator_order), unless order
     is "as_written". A one-table classification above a SemanticJoin
     runs after the joins, over the documents the joins matched. One on
     its table runs after the table's AI.IF filters.
 
-    The label_scoring physical rule picks each classification's scoring
-    rule, and the kv_retention rule picks which KV stays resident. The
-    estimate and ``search_seconds`` count only the filters, the joins,
-    and the classifications of joined rows.
+    The initial estimate includes filter and join work and any inference
+    costs already known. The planner then runs the graph refinement rules to select
+    classification implementations, KV retention, and prefix sharing before
+    comparing this candidate with others.
 
     Args:
         plan: The logical plan to compile.
@@ -139,19 +140,20 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         return refusal
     if scan_fractions is None and context is not None:
         scan_fractions = context.scan_fractions
-    decisions = choose_plan(plan, operators, model, device, doc_tokens, order,
-                            pair_fractions, context, scan_fractions)
-    if isinstance(decisions, Refusal):
-        return decisions
+    operator_order = choose_operator_order(
+        plan, operators, model, device, doc_tokens, order,
+        pair_fractions, context, scan_fractions)
+    if isinstance(operator_order, Refusal):
+        return operator_order
     return GraphBuilder(plan, model, device, doc_tokens, gpus, context,
-                        pair_fractions, decisions).build()
+                        pair_fractions, operator_order).build()
 
 
 class GraphBuilder:
-    """Construct native physical nodes from validated planning decisions."""
+    """Construct native physical nodes in the selected operator order."""
 
     def __init__(self, plan, model, device, doc_tokens, workers, context,
-                 pair_fractions, decisions):
+                 pair_fractions, operator_order):
         self.plan = plan
         self.model = model
         self.device = device
@@ -159,8 +161,8 @@ class GraphBuilder:
         self.workers = workers
         self.context = context
         self.pair_fractions = pair_fractions
-        self.decisions = decisions
-        self.operators = decisions.operators
+        self.operator_order = operator_order
+        self.operators = operator_order.operators
         self.classified = {alias for _, alias in self.operators.labels.calls}
         self.after_joins = classified_above_joins(plan.root)
         self.extract_after = extracted_above_joins(plan.root)
@@ -174,7 +176,7 @@ class GraphBuilder:
                 self.alias_applies.setdefault(apply.aliases[0], []).append(apply)
         self.ask_filters = {
             alias: [self.operators.filters[alias][position] for position in positions]
-            for alias, positions in decisions.statistics.asks.items() if positions}
+            for alias, positions in operator_order.statistics.asks.items() if positions}
         self.stop_keys = filter_stop_keys(plan)
 
     def build(self):
@@ -190,9 +192,10 @@ class GraphBuilder:
 
     def _prepare(self):
         """Prepare graph identities and KV compatibility."""
-        statistics = self.decisions.statistics
+        statistics = self.operator_order.statistics
         # a second group on the same anchor gets :2, a third :3
-        self.sequence_groups = retention.group_sequence(self.decisions.join_sequence)
+        self.sequence_groups = retention.group_sequence(
+            self.operator_order.join_sequence)
         self.group_ids = []
         self.join_ids = {}
         self.seen_ids = {}
@@ -224,7 +227,7 @@ class GraphBuilder:
 
     def _emit_scans(self):
         """Create scan and equality-join inputs."""
-        stats = self.decisions.statistics.stats
+        stats = self.operator_order.statistics.stats
         for s in self.operators.scans:
             summary = summarize_alias(
                 self.doc_tokens[s.alias], self.model.sliding_window,
@@ -260,7 +263,7 @@ class GraphBuilder:
 
     def _emit_documents(self):
         """Create inference nodes over individual tables."""
-        stats = self.decisions.statistics.stats
+        stats = self.operator_order.statistics.stats
         # documents expected after a table's model predicates, before its
         # filters on labels
         self.live_asked = {}
@@ -290,7 +293,7 @@ class GraphBuilder:
         """Create joins and the exchanges between anchor groups."""
         # group consecutive full stages on the same anchor; gates run
         # alone; anchor switches become barriers
-        steps = iter(self.decisions.join_steps)
+        steps = iter(self.operator_order.join_steps)
         groups = [[(spec, next(steps)) for spec, _ in group]
                   for group in self.sequence_groups]
         exec_idx = 0
@@ -347,17 +350,19 @@ class GraphBuilder:
             for alias in sorted(self.after_joins | self.extract_after):
                 met = sum(
                     effective_selectivity(join.selectivity)
-                    * sum(self.decisions.live[argument.alias]
+                    * sum(self.operator_order.live[argument.alias]
                           for argument in join.prompt.args
                           if argument.alias != alias)
                     for join in self.operators.joins
                     if alias in {argument.alias for argument in join.prompt.args})
                 if alias in self.after_joins:
                     emit_classify(
-                        self, alias, live=self.decisions.live[alias] * min(1.0, met))
+                        self, alias,
+                        live=self.operator_order.live[alias] * min(1.0, met))
                 if alias in self.extract_after:
                     emit_extract(
-                        self, alias, live=self.decisions.live[alias] * min(1.0, met))
+                        self, alias,
+                        live=self.operator_order.live[alias] * min(1.0, met))
         except ClassifyRefusedError as refused:
             return refused.refusal()
 
@@ -373,7 +378,7 @@ class GraphBuilder:
         """Connect result operators to surviving rows and answers."""
         if self.score_pairs is not None:
             sink_inputs = (self.score_pairs,)
-        elif (len(self.pairs_edges) == 1 and len(self.decisions.join_sequence) == 1
+        elif (len(self.pairs_edges) == 1 and len(self.operator_order.join_sequence) == 1
               and not self.after_joins):
             # one full join and nothing after it: its true pairs are the
             # result rows, so no recombination is needed
@@ -410,23 +415,23 @@ class GraphBuilder:
 
     def _finish(self):
         """Build the plan and bind its work estimator."""
-        stats = self.decisions.statistics.stats
-        statistics = self.decisions.statistics
-        stage_work = sum((step.work for step in self.decisions.join_steps
+        stats = self.operator_order.statistics.stats
+        statistics = self.operator_order.statistics
+        stage_work = sum((step.work for step in self.operator_order.join_steps
                           if not is_score(
                               self.operators.joins[step.written_pos].predicate)),
                          Work())
         estimate = (speed_of_light(
-            sum(self.decisions.filter_work.values(), Work()) + stage_work,
+            sum(self.operator_order.filter_work.values(), Work()) + stage_work,
             self.model, self.device,
             statistics.chunk).seconds + inference_seconds(self.nodes))
         stage_works = {step.written_pos: step.work
-                       for step in self.decisions.join_steps}
+                       for step in self.operator_order.join_steps}
 
         estimator = partial(
-            node_estimates, filter_works=self.decisions.filter_work,
+            node_estimates, filter_works=self.operator_order.filter_work,
             stage_works=stage_works,
-            live=self.decisions.live, stats=stats, pre=statistics.pre,
+            live=self.operator_order.live, stats=stats, pre=statistics.pre,
             cap_pages=statistics.cap_pages,
             model=self.model, device=self.device, chunk=statistics.chunk)
         return PhysicalPlan(
@@ -437,8 +442,8 @@ class GraphBuilder:
                 "chunk_tokens": statistics.chunk,
                 "arena_pages": list(statistics.arena_pages),
                 "admission_tokens": statistics.admission,
-                "order_rule": self.decisions.order_rule,
-                "order_source": self.decisions.order_source,
+                "order_rule": self.operator_order.order_rule,
+                "order_source": self.operator_order.order_source,
                 "search_seconds": estimate,
                 **({
                     "retained_kv_tokens": self.scoring.capacity,

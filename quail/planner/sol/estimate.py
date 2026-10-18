@@ -5,10 +5,13 @@ distinct document prefix computed once and kept in KV without limit,
 forward passes packed across the whole query, and no host, scheduling,
 or kernel overhead. On each alias the AI.IF filters run first in the
 planner's order, then its classifications, each followed by the label
-filters that test it. Joins are searched over every feasible eager
-binary full left deep plan and anchor choice, with exact survivors from
-caller supplied answer and label oracles at every step. A
-classification of joined rows follows its join on the join's anchor.
+filters that test it. A filter under a DISTINCT over its table's
+columns, which the executor stops at each key's first survivor, reads
+only each key's shortest survivor, or every document of a key with
+none. Joins are searched over every feasible eager binary full left
+deep plan and anchor choice, with exact survivors from caller supplied
+answer and label oracles at every step. A classification of joined
+rows follows its join on the join's anchor.
 
 A classification is priced as one question per live document: the
 reference prompt's tail (the question, the labels by name, and the
@@ -128,6 +131,10 @@ class SpeedOfLightEstimate:
             "persistent_kv_capacity": "unlimited",
             "gpu_count": 1,
             "survivors": "exact, from the caller's answers and labels",
+            "stop_key": (
+                "a filter under a DISTINCT over its table's columns reads "
+                "only each key's shortest survivor, or every document of "
+                "a key with none"),
             "filter_order": (
                 "the planner's rule for this query; an alias's "
                 "classifications follow its AI.IF filters"),
@@ -218,8 +225,9 @@ def _refuse_unpriced(logical) -> None:
         if isinstance(node, Result) and node.limit is not None \
                 and not (node.order or node.distinct or node.offset
                          or isinstance(node.input, Aggregate)):
-            # a sorted, distinct, offset, or grouped result runs every
-            # document, which the estimate prices; a bare LIMIT stops early
+            # a sorted, offset, or grouped result runs every document,
+            # and a distinct one stops each key at its first survivor;
+            # the estimate prices both. A bare LIMIT stops early.
             raise NotImplementedError(
                 "the speed of light estimate does not price LIMIT")
     operators = logical.operators()

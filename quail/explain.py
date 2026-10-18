@@ -24,6 +24,7 @@ from quail.physical import (
     Sort,
 )
 from quail.physical.pipelines import build_pipelines
+from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
 from quail.planner.plan import Refusal
 
 
@@ -115,8 +116,7 @@ def logical_tree(logical):
                        f"labels={list(node.call.labels)}"]
         elif isinstance(node, logical_nodes.SemanticExtract):
             title = f"SemanticExtract: {node.name}, {node.span_name}"
-            details = [f"question={node.call.question!r} "
-                       f"trim={'on' if node.call.trim else 'off'}"]
+            details = [f"question={node.call.question!r}"]
         elif isinstance(node, logical_nodes.Join):
             title = "Join"
             details = ([f"on {condition}" for condition in node.on]
@@ -422,7 +422,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             spec = node.spec
             title += f": {spec.name} over {spec.alias}"
             details.append(f"question={spec.question!r}, "
-                           f"trim={'on' if spec.trim else 'off'}, "
                            f"up to {spec.max_answer_tokens} answer tokens")
         elif isinstance(node, Filter):
             title += f": {node.predicate.describe()}"
@@ -537,22 +536,22 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
     return "\n".join(lines)
 
 
-def rule_lines(logical_rules, physical_rules) -> list[str]:
-    """Return the optimizer rules in run order, each marked by kind.
+def rule_lines(rules) -> list[str]:
+    """Return rule categories and the order used during search."""
+    def names(selected):
+        return ", ".join(rule.name for rule in selected) or "none"
 
-    A rule is cost-based when its ``cost_based`` attribute is true and
-    heuristic otherwise.
-    """
-    def names(rules):
-        return ", ".join(
-            rule.name + ("*" if getattr(rule, "cost_based", False) else "")
-            for rule in rules) or "none"
-
-    return ["rules, in run order (* cost-based, others heuristic):",
-            f"  logical: {names(logical_rules)}",
-            "  physical: building the plan (filter order*, join order and "
-            "anchors*, and on Quail classification placement*), then "
-            f"{names(physical_rules)}"]
+    return [
+        "optimizer rules:",
+        "  logical: " + names(rule for rule in rules if isinstance(rule, LogicalRule)),
+        "  physical: " + names(
+            rule for rule in rules if isinstance(rule, PhysicalRule)),
+        "  search: rewrite logical candidates, "
+        "then lower each alternative",
+        "  refine each graph in order: " + names(
+            rule for rule in rules if isinstance(rule, PhysicalRule)),
+        "  selection: lowest estimated cost after graph refinement",
+    ]
 
 
 def architecture_lines(model_name: str) -> list[str]:
@@ -609,8 +608,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
             node shows its measured rows, time, and tokens next to the
             estimates, and the measured totals follow the tree.
         usd_per_hour: Price of one GPU, for the measured cost per query.
-        rules: The registered logical rules and physical rules, as a
-            pair of sequences, listed when verbose.
+        rules: Registered rules in order, listed when verbose.
     """
     lines = ["logical:"]
     lines.extend("  " + line for line in logical_tree(logical).splitlines())
@@ -661,5 +659,5 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
             lines.append("  KV dtype=bf16")
         if rules is not None:
             lines.append("")
-            lines.extend(rule_lines(*rules))
+            lines.extend(rule_lines(rules))
     return "\n".join(lines)

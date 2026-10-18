@@ -23,7 +23,7 @@ class ClassifySpec(InferenceSpec):
             The trie_tree rule reads a label through the end of the
             word that tells it apart.
         scoring: The label scoring rule: letters, trie_tree, or trie_decode.
-            The planner leaves it empty until the label_scoring rule
+            The planner leaves it empty until the choose_classify_implementation rule
             picks one.
         probabilities: Whether to add a name + "_probabilities" map column.
         join_layout: Anchor note and partner label token sequences for pair

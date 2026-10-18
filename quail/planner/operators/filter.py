@@ -74,8 +74,8 @@ def filter_alias_work(preds, stats, order, pre: int, lowered,
 
 def emit_filter(builder, alias):
     """Append the alias's AI filters in their chosen order."""
-    stats = builder.decisions.statistics.stats
-    orders = builder.decisions.filter_orders
+    stats = builder.operator_order.statistics.stats
+    orders = builder.operator_order.filter_orders
     n = stats[alias].n_docs
     surv = 1.0
     for rank, i in enumerate(orders[alias]):

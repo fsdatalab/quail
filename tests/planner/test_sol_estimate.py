@@ -282,3 +282,43 @@ def test_unpriced_operators_are_refused(tmp_path):
                   .select("r.id"))
         with pytest.raises(NotImplementedError, match="'exists' joins"):
             quail.speed_of_light_estimate(exists, _answer)
+
+
+def test_a_distinct_key_reads_only_its_shortest_survivor(tmp_path):
+    # a document passes when it starts with good or zebra
+    pq.write_table(pa.table({
+        "id": ["r0", "r1", "r2", "r3", "r4"],
+        "trajectory": ["g1", "g1", "g1", "g2", "g2"],
+        "body": ["zebra film", "good film", "bad film", "awful film",
+                 "bad acting"],
+    }), tmp_path / "traces.parquet")
+
+    def answer(prompt, assignment):
+        return assignment["r"] in (0, 1)
+
+    with quail.Session(
+            EngineConfig(gpus=1, model="qwen3-4b-fp8", device="h100-sxm"),
+            tokenizer=str.split) as sess:
+        sess.register("traces", DocumentProvider.from_parquet(
+            str(tmp_path / "traces.parquet"), id_col="id"))
+        filtered = (sess.docs("traces").alias("r")
+                    .ai_filter(quail.prompt(FILTER, quail.col("r.body"))))
+        query = filtered.select("r.trajectory")
+        every = quail.speed_of_light_estimate(query, answer)
+        stopped = quail.speed_of_light_estimate(
+            filtered.distinct().select("r.trajectory"), answer)
+        per_document = quail.speed_of_light_estimate(
+            filtered.distinct().select("r.trajectory"), answer,
+            credit_shared_prefixes=False)
+
+    assert (every.filter_stages[0]["evaluated"],
+            every.filter_stages[0]["passed"]) == (5, 2)
+    # g1 reads only one of its two equally short survivors; g2 has no
+    # survivor and reads both
+    assert (stopped.filter_stages[0]["evaluated"],
+            stopped.filter_stages[0]["passed"]) == (3, 1)
+    assert stopped.post_filter_counts == {"r": 1}
+    assert stopped.assumptions()["stop_key"].startswith("a filter under")
+    # no two of the three documents read share a first token
+    assert stopped.fresh_tokens == per_document.fresh_tokens
+    assert stopped.seconds < every.seconds

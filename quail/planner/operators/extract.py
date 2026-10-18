@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from quail.cost import budgets
 from quail.cost import extract as extract_cost
+from quail.cost.dense_decoder_cost import dense_params
 from quail.logical import effective_selectivity
 from quail.logical.prompts import (
     shared_preamble,
@@ -40,24 +41,32 @@ def extract_spec(context, call, name, live, shared=False) -> ExtractSpec:
             context.model.turn_prefix, context.model.prompt_layout)))
     (ref,) = call.prompt.args
     lengths = context.document_tokens[ref.alias]
+    model, device = context.model, context.device
+    # one document token's KV read per round, in tokens of compute: the
+    # pass is compute-bound, so a fed token costs its dense FLOPs
+    token_seconds = 2 * dense_params(model) / device.peak_flops
+    round_cost_per_token = model.kappa / device.hbm_bw / token_seconds
     spec = bind_inference(
         ExtractSpec, call.prompt, name=name,
         expected_inputs=live, estimated_seconds=0.0,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
-        question=call.question, trim=call.trim, shares_head=shares_head)
+        question=call.question, shares_head=shares_head,
+        expected_answer_tokens=extract_cost.ExtractAssumptions().answer_tokens,
+        round_cost_per_token=round_cost_per_token)
     cost = extract_cost.estimate(
         live, lengths, len(prompt.preamble_token_ids), len(prompt.tail_token_ids),
         chunk=budgets.chunk_budget(context.model, context.device),
         model=context.model, device=context.device, resident=shared,
         max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens,
-        workers=context.gpu_count)
+        draft_policy=spec.draft_policy,
+        round_cost_per_token=spec.round_cost_per_token, workers=context.gpu_count)
     return replace(spec, estimated_seconds=cost.seconds)
 
 
 def emit_extract(builder, alias, live=None):
     """Copy the answers of the alias's documents, after its labels."""
-    stats = builder.decisions.statistics.stats
+    stats = builder.operator_order.statistics.stats
     calls = [node for node in builder.operators.extracts if node.alias == alias]
     if not calls or (alias in builder.extract_after and live is None):
         return

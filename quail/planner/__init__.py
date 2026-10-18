@@ -1,6 +1,6 @@
 """The planner: every transformation of a plan.
 
-Logical optimizer rules, the physical optimizer protocol, and physical
+Logical and physical rules, candidate search, and executable
 plan assembly from the cost model's numbers.
 
 No wall prediction. KV is always bf16.
@@ -8,11 +8,11 @@ No wall prediction. KV is always bf16.
 The names below are the planning interface a model backend uses.
 """
 
-from .api import plan_query, refine_plan
-from .graph.build import build_physical_plan, hash_join_nodes, regular_predicates
+from .graph.builder import build_physical_plan, hash_join_nodes, regular_predicates
 from .graph.shards import balanced_shards
 from .operators.common import preamble_tokens
 from .operators.join import join_specs
+from .optimize import plan_query, refine_plan
 from .plan import CorpusStats, EngineConfig, PhysicalPlan, Refusal
 from .search.filter_order import default_order_rule, order_filters_indexed
 

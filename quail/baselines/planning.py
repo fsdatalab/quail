@@ -11,7 +11,13 @@ from quail.baselines.lowering import (
 )
 from quail.baselines.nodes import RequestExecution
 from quail.cost import budgets
-from quail.logical import SPAN_SUFFIX, Alias, Apply, effective_selectivity
+from quail.logical import (
+    SPAN_SUFFIX,
+    Alias,
+    Apply,
+    classified_above_joins,
+    effective_selectivity,
+)
 from quail.logical import Aggregate as LogicalAggregate
 from quail.physical import (
     Limit,
@@ -32,7 +38,7 @@ from quail.planner import (
     join_specs as logical_join_specs,
 )
 from quail.planner.operators.filter import prepare_filter_costs
-from quail.planner.optimizer.physical import PhysicalCandidate
+from quail.planner.optimizer.candidates import PhysicalCandidate
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planner.prompt_lowering import answer_row_offsets, true_false_token_ids
 from quail.planner.search.join_order import search_joins
@@ -208,6 +214,12 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
             reasons=(reason,),
             constraint="classify_needs_quail_backend",
             needed=1, available=0, unit="backends")
+    if classified_above_joins(region.logical_plan.root):
+        return Refusal(
+            reasons=(f"{backend_name} runs single-document classification "
+                     "before joins",),
+            constraint="classify_placement_not_supported",
+            needed=1, available=0, unit="placements")
     return None
 
 

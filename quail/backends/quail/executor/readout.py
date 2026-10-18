@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from quail.backends.quail.executor.model import answer_weights
+from quail.backends.quail.executor.model_loading import answer_weights
 from quail.planner.prompt_lowering import true_false_ids
 
 

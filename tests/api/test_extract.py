@@ -16,7 +16,7 @@ from quail.baselines.nodes import RequestExecution, RequestExtractSpec
 from quail.catalog import DocumentProvider
 from quail.execution.metrics import NodeResult
 from quail.execution.result import extract_answer_table
-from quail.execution.spans import line_span, locate_span, read_phrase
+from quail.execution.spans import locate_span, read_phrase
 from quail.logical import (
     CompileError,
     ExtractStruct,
@@ -52,9 +52,9 @@ def session(tmp_path):
     value.close()
 
 
-def _ends(session, trim=True):
+def _ends(session):
     return (session.docs("contracts").alias("c")
-            .ai_extract("c.text", {"ends": QUESTION}, name="lease", trim=trim)
+            .ai_extract("c.text", {"ends": QUESTION}, name="lease")
             .select("c.id", "lease"))
 
 
@@ -83,10 +83,6 @@ def test_sql_and_builder_extract_the_same_answer_columns(session):
             f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
             f"FROM contracts c", dialect=dialect)
         assert query.logical == built.logical
-    loose = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}, "
-        f"{{'trim': false}}) AS lease FROM contracts c")
-    assert loose.logical == _ends(session, trim=False).logical
 
 
 def test_planning_lowers_the_extraction_prompt_once(session, monkeypatch):
@@ -183,16 +179,16 @@ def test_extractions_of_a_table_form_one_pipeline_and_are_priced_as_resident(
 
 
 def _candidates(session, query):
-    """Return the Quail backend's candidates for a planned query."""
-    from quail.planner.optimizer.physical import ModelRegion, PlanningContext
+    """Return the planner's refined candidates for a planned query."""
+    from quail.planner.optimize import search_candidates
+    from quail.planner.optimizer.context import PlanningContext
 
     query.plan()
     context = PlanningContext(
         model=session.model, device=session.device, gpu_count=1,
         document_tokens=query._doc_tokens, backend="quail",
         tokenizer=session.tokenizer)
-    return session.registry.backend("quail").plan(
-        ModelRegion(query.logical), context)
+    return search_candidates(query._logical_input, context, session.registry)
 
 
 def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
@@ -209,10 +205,11 @@ def test_extract_of_a_joined_table_is_offered_after_the_join(session, tmp_path):
     plan = query.plan()
     assert not isinstance(plan, Refusal)
     written, lifted = _candidates(session, query)
-    # the backend also offers the extraction after the join, over the
+    # The logical rule offers extraction after the join, over the
     # documents the join matched: a fifth of them by default, so the
     # lifted plan is cheaper and wins
-    assert written.logical_plan.root == query.logical.root
+    assert extracted_above_joins(written.logical_plan.root) == frozenset()
+    assert lifted.logical_plan == query.logical
     assert extracted_above_joins(lifted.logical_plan.root) == {"c"}
     assert lifted.estimated_seconds < written.estimated_seconds
     (join,) = [n for n in written.plan.nodes if isinstance(n, AiJoin)]
@@ -239,10 +236,8 @@ def test_extract_errors_and_refusals(session):
              f"FROM contracts c", "object of field questions"),
             ("SELECT c.id, AI.EXTRACT(c.text) AS x FROM contracts c",
              "object of field questions"),
-            (f"SELECT c.id, AI.EXTRACT(c.text, {fields}, {{'trim': 1}}) "
-             f"AS x FROM contracts c", "true or false"),
-            (f"SELECT c.id, AI.EXTRACT(c.text, {fields}, {{'lines': 2}}) "
-             f"AS x FROM contracts c", "unknown AI.EXTRACT option"),
+            (f"SELECT c.id, AI.EXTRACT(c.text, {fields}, {{'trim': false}}) "
+             f"AS x FROM contracts c", "takes a document column"),
             (f"SELECT c.id, UPPER(AI.EXTRACT(c.text, {fields})) AS x "
              f"FROM contracts c", "direct expressions")):
         with pytest.raises(CompileError, match=message):
@@ -301,9 +296,6 @@ def test_span_helpers_read_locate_and_widen_an_answer():
     assert locate_span("a b a b", "a b") == (0, 3)
     assert locate_span(LEASE, "April") is None
     assert locate_span(LEASE, "   ") is None
-    assert line_span(LEASE, (14, 27)) == (0, 28)
-    assert line_span(LEASE, (29, 36)) == (29, len(LEASE))
-    assert line_span("one\n\nthree", (4, 4)) == (4, 4)
 
 
 @pytest.mark.parametrize("filtered", [False, True])
@@ -393,9 +385,6 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
         RequestExtractSpec(max_answer_tokens=limit,
                            alias="c", output="ends", question=QUESTION,
                            tail_token_ids=(90,)),
-        RequestExtractSpec(max_answer_tokens=limit,
-                           alias="c", output="lines", question=QUESTION,
-                           tail_token_ids=(90,), trim=False),
     )
     node = RequestExecution(
         node_id="request-model", backend_name="stock_vllm", aliases=("c",),
@@ -404,22 +393,17 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     execution = request_tests._execution(
         documents, client=client, document_texts={"c": TEXTS})
     result = execution.execute(node, {"input:0": [0, 1, 2, 3]})
-    assert client.params == [(limit, ['"'])] * 2
-    trimmed = result.outputs["extract_answers:ends"].to_pydict()
-    assert trimmed == {
+    assert client.params == [(limit, ['"'])]
+    answers = result.outputs["extract_answers:ends"].to_pydict()
+    assert answers == {
         "c": [0, 1, 2, 3],
         "ends": ["March 3, 2027", None, "five years",
                  "a phrase the document lacks"],
         "ends_span": [{"start": 14, "end": 27}, None, {"start": 6, "end": 16},
                       None]}
-    whole = result.outputs["extract_answers:lines"].to_pydict()
-    assert whole["lines"] == ["Lease ends on March 3, 2027.", None,
-                              "Term: five years", "a phrase the document lacks"]
-    assert whole["lines_span"] == [{"start": 0, "end": 28}, None,
-                                   {"start": 0, "end": 16}, None]
     # an extraction keeps every document
     assert result.outputs["ids:c"].to_pylist() == [0, 1, 2, 3]
-    step, _ = result.metrics.extension["steps"]
+    step, = result.metrics.extension["steps"]
     assert (step["kind"], step["output"], step["n_in"], step["n_out"]) == (
         "extract", "ends", 4, 3)
     assert (step["requests"], step["unanswered"], step["unaligned"]) == (4, 1, 1)
@@ -430,8 +414,8 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
         2 + len(ids) for ids in documents["c"]) + (3 + 0 + 1 + 2)
     prompt_tokens = sum(2 + len(ids) for ids in documents["c"])
     assert step["prompt_tokens"] == prompt_tokens
-    assert result.metrics.extension["prompt_tokens"] == 2 * prompt_tokens
-    assert result.metrics.evaluated_documents == 8
+    assert result.metrics.extension["prompt_tokens"] == prompt_tokens
+    assert result.metrics.evaluated_documents == 4
     # an engine that takes text gets the preamble, the document, and
     # the tail's text, tokenized by the engine itself
     texted = _TextPhraseClient()
@@ -480,13 +464,19 @@ def test_extraction_settings_survive_plan_serialization(session):
     query = _ends(session)
     node = next(node for node in query.plan().nodes if isinstance(node, AiExtract))
     settings = dict(max_answer_tokens=7, draft_tokens=2, top_tokens=32,
-                    first_window_chars=16, window_chars=96)
+                    first_window_chars=16, window_chars=96,
+                    draft_policy="adaptive", expected_answer_tokens=9,
+                    round_cost_per_token=0.25)
     spec = replace(node.spec, **settings)
     assert ExtractSpec.from_mapping(spec.to_dict()) == spec
     legacy = spec.to_dict()
     for name in settings:
         legacy.pop(name)
-    assert ExtractSpec.from_mapping(legacy) == node.spec
+    # a plan without the settings takes their defaults; the planner had
+    # set the round's KV read from the model and device
+    assert ExtractSpec.from_mapping(legacy) == replace(
+        node.spec, round_cost_per_token=ExtractSpec.round_cost_per_token)
+    assert node.spec.round_cost_per_token > 0
     request = RequestExtractSpec(alias="c", output="ends", question=QUESTION,
                                  tail_token_ids=(1, 2), max_answer_tokens=7)
     assert RequestExtractSpec.from_mapping(request.to_dict()) == request

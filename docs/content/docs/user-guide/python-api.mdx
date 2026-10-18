@@ -103,7 +103,7 @@ probability output, and limits on classifications of joined rows.
 
 ### ai_extract
 
-`ai_extract(c, questions, *, name, trim=True)`
+`ai_extract(c, questions, *, name)`
 
 `ai_extract()` returns the answer to each of your questions, copied
 from a document. Pass the
@@ -126,7 +126,6 @@ query = (
 
 You get `c.id`, `lease`, and `lease_span`. `lease` is a struct with one
 string field for each question. `lease_span` holds the position of each
-answer. Pass `trim=False` to return the whole line that contains each
 answer.
 
 See [`AI.EXTRACT`](/docs/user-guide/sql#aiextract) for output examples

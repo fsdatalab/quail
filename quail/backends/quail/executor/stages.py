@@ -25,7 +25,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from quail.backends.quail.executor.pack import DROP, SKIP
+from quail.backends.quail.executor.admission import DROP, SKIP
 
 
 @dataclass

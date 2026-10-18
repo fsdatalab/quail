@@ -26,7 +26,8 @@ from quail.logical import (
 )
 from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
-from quail.planner.optimizer.logical import LogicalPlanningContext, apply_logical_rules
+from quail.planner.optimizer.context import PlanningContext
+from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import Refusal, RefusalError
 from quail.planner.search.statistics import filter_stop_keys
 
@@ -65,8 +66,10 @@ class Query:
                  order: str | None = None):
         self.session = session
         self.logical = logical
+        self._logical_input = logical
         self.order = order
         self._plan = None
+        self._searched_plan = None
         self._doc_tokens = None
         self._token_inputs = None
         self._token_futures = {}
@@ -74,6 +77,9 @@ class Query:
         self._estimated = ()
         self._planning_started_at = None
         self._planning_finished_at = None
+        self._replanning_s = 0.0
+        self._scan_selectivities = {}
+        self._pair_selectivities = {}
         self.token_wait_s = 0.0
 
     def token_inputs(self) -> dict:
@@ -91,7 +97,7 @@ class Query:
 
         Document lengths are exact for a tokenized column. For any other
         column they are estimated from a sample while a background thread
-        tokenizes it. The logical rules and the physical planner both read
+        tokenizes it. The tree rewrites and the physical planner both read
         these lengths.
 
         Returns:
@@ -118,8 +124,10 @@ class Query:
             scan_fractions = self._scan_fractions(operators.scans)
             pair_fractions = self._pair_fractions(
                 operators.scans, operators.joins)
-            context = LogicalPlanningContext(
-                self.session.catalog, config,
+            self._scan_selectivities = scan_fractions
+            self._pair_selectivities = pair_fractions
+            context = PlanningContext(
+                catalog=self.session.catalog, engine_config=config,
                 model=self.session.model, device=self.session.device,
                 gpu_count=config.gpus, document_tokens=self._doc_tokens,
                 backend=config.backend, order=self.order,
@@ -128,18 +136,26 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions)
-            self.logical, changed = apply_logical_rules(
-                self.logical,
+            candidates = logical_alternatives(
+                self._logical_input,
                 tuple(self.session.registry.logical_rules.values()),
                 context)
-            rewritten = self.logical.operators()
+            self.logical = candidates[0].plan
+            scans = {}
+            offset_aliases = set()
+            for candidate in candidates:
+                operators = candidate.plan.operators()
+                offset_aliases.update(alias for extract in operators.extracts
+                                      for alias in extract.call.aliases())
+                for scan in operators.scans:
+                    previous = scans.get(scan.alias, scan)
+                    scans[scan.alias] = replace(scan, columns=tuple(dict.fromkeys(
+                        (*previous.columns, *scan.columns))))
             backend = self.session.registry.backend(config.backend)
             # an extension backend may leave the capability flags unset
             reads_text = getattr(backend, "reads_document_text", False)
             locates_answers = getattr(backend, "locates_answers_in_text", False)
-            offset_aliases = {alias for extract in rewritten.extracts
-                              for alias in extract.call.aliases()}
-            for s in rewritten.scans:
+            for s in scans.values():
                 columns = s.columns
                 with_offsets = locates_answers and s.alias in offset_aliases
                 if reads_text:
@@ -157,7 +173,7 @@ class Query:
                 future.add_done_callback(record_finished)
                 self._token_futures[s.alias] = future
             self._plan = plan_query(
-                self.logical, model=self.session.model,
+                self._logical_input, model=self.session.model,
                 device=self.session.device,
                 doc_tokens=self._doc_tokens,
                 gpus=config.gpus,
@@ -169,7 +185,10 @@ class Query:
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
                 scan_fractions=scan_fractions,
-                memo=context.memo)
+                memo=context.memo, catalog=self.session.catalog,
+                engine_config=config, logical_candidates=candidates)
+            if not isinstance(self._plan, Refusal):
+                self.logical = self._plan.logical_plan
             extra = {}
             if config.gpu_timing:
                 extra["gpu_timing"] = True
@@ -177,6 +196,7 @@ class Query:
                 self._plan = replace(self._plan, settings={
                     **self._plan.settings, **extra})
             self._planning_finished_at = time.perf_counter()
+            self._searched_plan = self._plan
         return self._plan
 
     @property
@@ -185,18 +205,18 @@ class Query:
         if self._planning_started_at is None:
             return 0.0
         finished = self._planning_finished_at or time.perf_counter()
-        return finished - self._planning_started_at
+        return finished - self._planning_started_at + self._replanning_s
 
     @property
     def input_ready_s(self) -> float:
-        """Return time until planning and document tokenization finished."""
+        """Return planning and tokenization time, excluding backend startup."""
         if self._planning_started_at is None:
             return 0.0
         finished = [
             self._planning_finished_at or time.perf_counter(),
             *self._token_finished_at.values(),
         ]
-        return max(finished) - self._planning_started_at
+        return max(finished) - self._planning_started_at + self._replanning_s
 
     def _pair_fractions(self, scans, joins) -> dict:
         """Estimated pairs over the cross product, per join with conditions."""
@@ -255,6 +275,7 @@ class Query:
         result = None
         if analyze:
             result = self.run()
+            physical = self._plan
             # the root relation is lazy, so its row count is taken here
             rows = result.count()
             root = physical.graph.root.node_id
@@ -266,8 +287,7 @@ class Query:
         registry = self.session.registry
         text = explain(self.logical, physical, verbose=verbose,
                        result=result,
-                       rules=(tuple(registry.logical_rules.values()),
-                              tuple(registry.physical_rules.values())),
+                       rules=tuple(registry.rules.values()),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
         if self._estimated:
@@ -280,8 +300,8 @@ class Query:
     def wait_for_tokens(self) -> None:
         """Block until every background tokenization has finished.
 
-        A plan made on estimated lengths then gets the physical rules
-        that read the token stores applied with the exact inputs.
+        A plan made on estimated lengths is searched again with exact inputs,
+        so prefix sharing can change which logical alternative wins.
         """
         started = time.perf_counter()
         refine = bool(self._token_futures)
@@ -292,15 +312,32 @@ class Query:
             del self._token_futures[alias]
         self.token_wait_s += time.perf_counter() - started
         if refine and self._plan is not None:
-            self._plan = refine_plan(
-                self._plan, model=self.session.model,
+            started = time.perf_counter()
+            options = dict(
+                model=self.session.model,
                 device=self.session.device, doc_tokens=self._doc_tokens,
                 gpus=self.session.config.gpus, order=self.order,
                 canvas_draws=self.session.config.canvas_draws,
                 attention=self.session.config.attention,
                 backend=self.session.config.backend,
                 registry=self.session.registry,
-                tokenizer=self.session.tokenizer)
+                tokenizer=self.session.tokenizer,
+                pair_fractions=self._pair_selectivities)
+            if self._plan is self._searched_plan:
+                self._plan = plan_query(
+                    self._logical_input, scan_fractions=self._scan_selectivities,
+                    catalog=self.session.catalog, engine_config=self.session.config,
+                    **options)
+                if not isinstance(self._plan, Refusal):
+                    self.logical = self._plan.logical_plan
+            else:
+                # Explicit physical edits must survive exact tokenization.
+                self._plan = refine_plan(self._plan, **options)
+            if self.session.config.gpu_timing and not isinstance(self._plan, Refusal):
+                self._plan = replace(self._plan, settings={
+                    **self._plan.settings, "gpu_timing": True})
+            self._replanning_s += time.perf_counter() - started
+            self._estimated = ()
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.
@@ -332,10 +369,13 @@ class Query:
 
     def _prepare_physical(self):
         """Bind the query's tokenized inputs to its physical plan."""
+        self.plan()
+        self.wait_for_tokens()
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)
-        self.wait_for_tokens()
+        plan.graph.validate(runtime_keys=set(self.session.registry.runtimes))
+        plan.graph.validate_backend(plan.backend)
         inputs = {}
         logical_scans = {
             scan.alias: scan for scan in self.logical.operators().scans

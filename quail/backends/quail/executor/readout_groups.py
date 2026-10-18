@@ -58,8 +58,9 @@ class ReadoutGroups:
         """
         if self.shared_readout:
             readout = self.readout_of[0]
-            return [(0, (readout.submit(normed, rows_per_answer=rows_per_answer)
-                         if rows_per_answer is not None else readout.submit(normed)))]
+            if rows_per_answer is None:
+                return [(0, readout.submit(normed))]
+            return [(0, readout.submit(normed, rows_per_answer=rows_per_answer))]
         spans = [[] for _ in self.readout_of]
         counts = [[] for _ in self.readout_of]
         boundaries = (None if rows_per_answer is None else np.cumsum(rows_per_answer))

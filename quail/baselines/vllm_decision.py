@@ -217,7 +217,10 @@ def boot_decision(spec, llm_kwargs: dict) -> tuple[dict, dict]:
     """
     from vllm import LLM
 
-    from quail.backends.quail.executor.model import engine_args, resolve_model_path
+    from quail.backends.quail.executor.model_loading import (
+        engine_args,
+        resolve_model_path,
+    )
     from quail.baselines.vllm import _capacity
 
     register()

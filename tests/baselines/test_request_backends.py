@@ -458,3 +458,53 @@ def test_filter_clients_accept_the_pipelined_filter_call():
         signature = inspect.signature(client.run_filter_sequence)
         signature.bind(None, {}, [[1]], [[2]], None, tag="q",
                        body_texts=None, question_texts=None)
+
+
+@pytest.mark.parametrize("backend_name", ["stock_vllm", "pipelined_vllm"])
+@pytest.mark.parametrize("operation", ["classify", "extract"])
+def test_request_planner_checks_map_placement(backend_name, operation):
+    from quail.logical import LogicalPlan
+    from quail.planner.optimizer.candidates import ModelRegion
+    from quail.planner.optimizer.context import PlanningContext
+    from quail.planner.plan import Refusal
+    from quail.planner.rules.logical import ShouldLiftMaps
+
+    with _session(backend_name, docs=DOCS, partners=DOCS) as session:
+        documents = session.docs("docs").alias("d")
+        if operation == "classify":
+            documents = documents.ai_classify(
+                quail.prompt("kind of {0}", quail.col("d.body")),
+                ["a", "b"], name="kind")
+            output = "kind"
+        else:
+            documents = documents.ai_extract(
+                "d.body", {"kind": "What kind is it?"}, name="fields")
+            output = "fields"
+        query = documents.ai_join(
+            session.docs("partners").alias("p"),
+            quail.prompt("Does {0} mention {1}?", quail.col("d.body"),
+                         quail.col("p.body")), selectivity=0.1,
+        ).select("d.id", "p.id", output)
+        root = query.logical.root
+        original, lifted = ShouldLiftMaps().rewrites(root, None)
+        assert original is root
+        assert lifted != original
+        plan = query.plan()
+        assert not isinstance(plan, Refusal)
+        written, moved = plan.settings["candidates"]
+        assert written["selected"] and written["refusal"] is None
+        context = PlanningContext(
+            model=session.model, device=session.device,
+            document_tokens=query._doc_tokens, tokenizer=session.tokenizer,
+            backend=backend_name)
+        candidate, = session.registry.backend(backend_name).plan(
+            ModelRegion(LogicalPlan(lifted)), context)
+        if operation == "classify":
+            assert isinstance(candidate.plan, Refusal)
+            assert candidate.plan.constraint == "classify_placement_not_supported"
+            assert moved["refusal"] == candidate.plan.constraint
+            assert moved["estimated_seconds"] is None
+        else:
+            assert not isinstance(candidate.plan, Refusal)
+            assert moved["refusal"] is None
+            assert candidate.plan.graph == plan.graph

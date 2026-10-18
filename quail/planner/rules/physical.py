@@ -1,18 +1,4 @@
-"""Built in physical optimizer rules.
-
-- kv_retention: the KV later operators read stays resident, within
-  the retention pool's page cap: a filter sequence keeps its survivors'
-  KV for a join anchored on its table, and a join keeps its anchor's
-  KV for a later group on the same anchor.
-- label_scoring: each classification gets the label scoring rule
-  (letters, trie_tree, or trie_decode) whose estimated time is lowest.
-- prefix_sharing: documents that share a token prefix with another
-  document borrow its KV pages for the shared part instead of
-  computing it again, in filters, joins, extractions, classifications, and scores
-  of one table.
-- tree_attention: each join is annotated with the attention path the
-  cost model prefers for its partners' reads of the anchor's KV.
-"""
+"""Rules that change executable graphs."""
 
 from __future__ import annotations
 
@@ -23,7 +9,9 @@ from quail.cost.extract import estimate as extract_estimate
 from quail.cost.retention import coefficients
 from quail.cost.score import score_fixed_tokens
 from quail.physical import (
-    Aggregate,
+    Aggregate as PhysicalAggregate,
+)
+from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
@@ -37,35 +25,35 @@ from quail.physical import (
 from quail.physical.pipelines import build_pipelines
 from quail.planner.graph import retention
 from quail.planner.operators.classify import classify_scoring
+from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import plan_kv_retention
 from quail.planner.search.statistics import cached_statistics, live_after_filters
 from quail.planner.sol.prefixes import document_shared_tokens, page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
-class LimitPushdown:
+class ShouldPushDownLimit(PhysicalRule):
     """Let a LIMIT end the filter run once enough documents survived.
 
     The rule puts the limit in the ``filter_limit`` setting, which the
     executor reads to stop admitting documents once that many survived
     the sequence's last stage. The pushdown keeps the first survivors to
     finish, so it is sound only when those are the rows the query
-    returns: the graph ends in a Limit and has no Sort or Aggregate (an
+    returns: the graph ends in a Limit and has no Sort or PhysicalAggregate (an
     ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
     AiJoin (survivors are settled per join round), and no AiInference (a
     score comparison after the sequence can drop survivors). Otherwise the
     rule removes the setting.
     """
 
-    name = "limit_pushdown"
-    cost_based = False
+    name = "should_push_down_limit"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
             return None
         limit = next((node for node in graph.nodes
                       if isinstance(node, Limit)), None)
-        blocked = any(isinstance(node, (Sort, Aggregate, AiJoin, AiInference))
+        blocked = any(isinstance(node, (Sort, PhysicalAggregate, AiJoin, AiInference))
                       for node in graph.nodes)
         if limit is None or blocked:
             context.settings.pop("filter_limit", None)
@@ -74,7 +62,7 @@ class LimitPushdown:
         return None
 
 
-class KvRetention:
+class ShouldRetainKv(PhysicalRule):
     """Keep the KV that later operators read resident, within the page cap.
 
     The schedule (quail.planner.graph.retention.schedule) records, at each
@@ -96,8 +84,7 @@ class KvRetention:
     and the page cap in the ``retention`` setting.
     """
 
-    name = "kv_retention"
-    cost_based = False
+    name = "should_retain_kv"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None or context.logical_plan is None \
@@ -146,8 +133,8 @@ class KvRetention:
             graph, context.gpu_count, tuple(context.settings.get("pre_ids", ())))
 
 
-class LabelScoring:
-    """Pick each classification's label scoring rule by estimated time.
+class ChooseClassifyImplementation(PhysicalRule):
+    """Choose each classification's implementation by estimated time.
 
     Fires for every AiClassify whose spec has no scoring rule yet and
     leaves chosen ones alone, so a later pass keeps the first choice.
@@ -160,13 +147,11 @@ class LabelScoring:
     head. A classification of joined rows always uses letters and
     arrives chosen.
 
-    The rule adds the chosen rules' seconds to the ``search_seconds``
-    setting. It needs the logical plan on the context for the calls'
-    prompts.
+    Graph refinement updates the plan cost from the chosen specs.
+    The rule needs the logical plan on the context for the calls' prompts.
     """
 
-    name = "label_scoring"
-    cost_based = True
+    name = "choose_classify_implementation"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -178,7 +163,8 @@ class LabelScoring:
             return None
         if context.logical_plan is None:
             raise ValueError(
-                "label_scoring needs the logical plan on the planning context "
+                "choose_classify_implementation needs the logical plan "
+                "on the planning context "
                 "to score a classification without a scoring rule")
 
         logical = context.logical_plan
@@ -194,10 +180,6 @@ class LabelScoring:
                 work = table.estimate_spec(chosen[node.node_id].spec, resident).work
                 context.settings["estimated_fresh_tokens"] += work.tokens
                 context.settings["estimated_attention_pairs"] += work.pairs
-        context.settings["search_seconds"] = (
-            context.settings.get("search_seconds", 0.0)
-            + sum(node.spec.estimated_seconds for node in chosen.values())
-            - sum(node.spec.estimated_seconds for node in pending))
         return PhysicalGraph(
             tuple(chosen.get(node.node_id, node) for node in graph.nodes),
             graph.root)
@@ -246,7 +228,7 @@ def sharing_pays(model, device, *, shared_tokens: int, total_tokens: int,
     return saved > cost
 
 
-class PrefixSharing:
+class ShouldSharePrefixes(PhysicalRule):
     """Let documents borrow the KV pages of a document sharing their prefix.
 
     Fires for a filter whose documents share whole pages of prefix
@@ -260,8 +242,7 @@ class PrefixSharing:
     without sharing its documents follow one shared prompt head.
     """
 
-    name = "prefix_sharing"
-    cost_based = True
+    name = "should_share_prefixes"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -337,7 +318,8 @@ def _shared_extract_spec(node, context, store, *, resident=False):
         len(head), len(tail), chunk=chunk_budget(context.model, context.device),
         model=context.model, device=context.device, resident=resident,
         shared=page_tree(store).shared, max_answer_tokens=spec.max_answer_tokens,
-        draft_tokens=spec.draft_tokens, workers=context.gpu_count)
+        draft_tokens=spec.draft_tokens, draft_policy=spec.draft_policy,
+        round_cost_per_token=spec.round_cost_per_token, workers=context.gpu_count)
     return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
 
 
@@ -361,7 +343,7 @@ def _mean(values) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-class TreeAttention:
+class ChooseAttentionAlgorithm(PhysicalRule):
     """Annotate each join with the attention path the cost model prefers.
 
     A join stage has every partner of an anchor reading the anchor's
@@ -380,8 +362,7 @@ class TreeAttention:
     estimated lengths gets the path its exact tokens call for.
     """
 
-    name = "tree_attention"
-    cost_based = True
+    name = "choose_attention_algorithm"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
         if context is None:
@@ -427,16 +408,3 @@ class TreeAttention:
         if not changed:
             return None
         return PhysicalGraph(tuple(nodes), graph.root)
-
-
-def built_in_physical_rules() -> tuple:
-    """Return the physical rules registered with the built in registry.
-
-    In order: limit_pushdown, kv_retention, label_scoring,
-    prefix_sharing, and tree_attention. prefix_sharing follows
-    kv_retention because it weighs the page writes a sequence already
-    makes, and tree_attention follows prefix_sharing because a filter's
-    attention path depends on the prefixes it shares.
-    """
-    return (LimitPushdown(), KvRetention(), LabelScoring(), PrefixSharing(),
-            TreeAttention())

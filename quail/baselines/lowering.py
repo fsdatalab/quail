@@ -158,7 +158,6 @@ def lower_extractions(context, extracts) -> list[RequestExtractSpec]:
             question=node.call.question,
             tail_token_ids=tuple(
                 context.lowered(node.call.prompt).tail_token_ids),
-            trim=node.call.trim,
             tail_text=re.sub(r"\{\d+\}", "", node.call.prompt.tail),
             preamble_token_ids=tuple(
                 context.lowered(node.call.prompt).preamble_token_ids),

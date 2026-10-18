@@ -9,9 +9,9 @@ import pytest
 from helpers.fakes import cpu_arena, cpu_staging, fake_pack, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import chunk as chunk_mod
+from quail.backends.quail.executor.admission import JoinAdmission
 from quail.backends.quail.executor.models.diffusion_gemma import DiffusionGemmaPipeline
 from quail.backends.quail.executor.operators.filter import FilterPart
-from quail.backends.quail.executor.pack import JoinAdmission
 from quail.backends.quail.executor.parts import gated_stages
 from quail.backends.quail.executor.stages import filter_stages, frame_writes, run_stages
 from quail.cost import budgets
