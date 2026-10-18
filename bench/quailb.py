@@ -28,6 +28,7 @@ import quail_b as benchmark
 from bench import substrait
 from bench.results import write_json
 from quail.baselines.nodes import RequestExecution
+from quail.execution.result import answer_values
 from quail.logical.expressions import SPAN_SUFFIX
 from quail.logical.prompts import bind_classify_prompt
 from quail.physical import AiClassify, AiExtract, AiScore
@@ -155,7 +156,7 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
             continue
         filter_answers[operator.id] = pa.table({
             alias: id_column(alias, table.column(alias)),
-            "answer": table.column("answer"),
+            "answer": answer_values(table),
         })
     classify_answers = {}
     for operator in info.classifies:
@@ -171,7 +172,7 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         join_answers[join.id] = pa.table({
             **{alias: id_column(alias, table.column(alias))
                for alias in join.relations},
-            "answer": table.column("answer"),
+            "answer": answer_values(table),
         })
     score_answers = {}
     for operator in info.scores:

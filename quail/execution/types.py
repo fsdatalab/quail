@@ -13,7 +13,7 @@ import pyarrow.compute as pc
 
 from quail.catalog.pairs import COLUMNS_PREFIX
 from quail.catalog.tokens import decode_token_documents
-from quail.execution.result import filter_answer_table
+from quail.execution.result import answer_table, filter_answer_table
 from quail.execution.rows import Rows, rows_of
 from quail.physical import (
     AiFilter,
@@ -135,7 +135,6 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     """
     anchor = str(value["anchor"])
     partners = tuple(value["partners"])
-    aliases = (anchor, *partners)
     anchor_map = value["anchor_index"]
     partner_map = value["partner_index"]
     streamed = value.get("anchor_partners") or {}
@@ -155,24 +154,13 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
         columns[alias] = pc.take(documents, members)
     # answers arrive as 0/1 integers or booleans; the cast covers both
     answers = pc.cast(pa.array(chain.from_iterable(answer_parts)), pa.bool_())
-    fields = []
-    fields.extend(
-        pa.field(alias, pa.int32(), nullable=False) for alias in aliases
-    )
-    fields.append(pa.field("answer", pa.bool_(), nullable=False))
     metadata = {
-        b"quail.kind": b"join_answers",
-        b"quail.anchor": anchor.encode("utf-8"),
-        b"quail.partners": ",".join(partners).encode("utf-8"),
-        b"quail.semantics": str(value["semantics"]).encode("utf-8"),
-        b"quail.written_position": str(value["written_position"]).encode("ascii"),
+        "anchor": anchor, "semantics": value["semantics"],
+        "written_position": value["written_position"],
     }
     if value.get("selectivity") is not None:
-        metadata[b"quail.selectivity"] = str(
-            value["selectivity"]
-        ).encode("ascii")
-    arrays = [columns[alias] for alias in aliases] + [answers]
-    return pa.Table.from_arrays(arrays, schema=pa.schema(fields, metadata))
+        metadata["selectivity"] = value["selectivity"]
+    return answer_table(columns, answers, "join_answers", metadata)
 
 
 def _output_table(node, port: OutputPort, value: Any) -> pa.Table:

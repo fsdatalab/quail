@@ -200,6 +200,30 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
                                                 int(second[1]) - 1]
 
 
+@pytest.mark.parametrize("alias", ["answer", "predicate", "other,side"])
+def test_answer_tables_keep_an_alias_named_like_their_own_columns(
+        sess, alias, tmp_path):
+    """An alias named answer or predicate, or holding a comma, reports as any other."""
+    pq.write_table(pa.table({"asin": ["p0", "p1"], "description": ["pad " * 20] * 2}),
+                   tmp_path / "p.parquet")
+    sess.register("products", quail.DocumentProvider.from_parquet(
+        str(tmp_path / "p.parquet"), id_col="asin"))
+    quoted = f'"{alias}"'
+    res = _run(sess.sql(f"""
+        SELECT r.id, {quoted}.asin FROM reviews r JOIN products {quoted}
+          ON AI_FILTER(PROMPT('m {{0}} {{1}}', r.review, {quoted}.description),
+                       {{'anchor': 'r'}})
+        WHERE AI_FILTER(PROMPT('q1: {{0}}', r.review))
+    """), make_executor(TRUTH, {("r", alias): lambda a, b: (a + b) % 2 == 0}))
+    assert sorted(res.to_rows()) == [("r0", "p0"), ("r1", "p1"), ("r3", "p1"),
+                                     ("r4", "p0")]
+    (stage,) = [s for s in res.report["stages"] if s["op"] == "join"]
+    assert (stage["anchor"], stage["partners"], stage["tuples"]) == ("r", [alias], 8)
+    answers = res.answer_tables["joins"][0]
+    assert answers.column_names[:2] == ["r", alias]
+    assert len(set(answers.column_names)) == 3
+
+
 def test_query_rows_observers_saved_reports_and_streamed_results(sess):
     res = _run(sess.sql(FILTER_SQL), make_executor(TRUTH))
     assert res.columns == ["r.id"]

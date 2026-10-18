@@ -72,30 +72,55 @@ def document_index_table(columns: dict[str, Iterable[int]],
     return pa.Table.from_arrays(arrays, schema=schema)
 
 
+def free_name(base: str, taken: Iterable[str]) -> str:
+    """Return base, or base behind enough underscores to be unlike every taken name."""
+    taken = set(taken)
+    name = base
+    while name in taken:
+        name = "_" + name
+    return name
+
+
 def answer_table(columns: dict[str, Iterable[int]],
                  answers: Iterable[bool], kind: str,
                  metadata: dict[str, str] | None = None) -> pa.Table:
-    """Build a filter or join answer table."""
+    """Build a filter or join answer table: the id columns, then the answers.
+
+    The answer column comes last, under a name no alias uses.
+    """
     schema = document_index_schema(columns, kind)
     fields = list(schema)
-    fields.append(pa.field("answer", pa.bool_(), nullable=False))
+    fields.append(pa.field(free_name("answer", schema.names), pa.bool_(),
+                           nullable=False))
     schema_metadata = dict(schema.metadata or {})
     for key, value in (metadata or {}).items():
         schema_metadata[f"quail.{key}".encode("utf-8")] = \
             str(value).encode("utf-8")
     schema = pa.schema(fields, metadata=schema_metadata)
     arrays = [pa.array(columns[field.name], type=field.type)
-              for field in schema if field.name != "answer"]
+              for field in list(schema)[:-1]]
     arrays.append(pa.array(answers, type=pa.bool_()))
     return pa.Table.from_arrays(arrays, schema=schema)
 
 
+def answer_values(table: pa.Table) -> pa.ChunkedArray:
+    """Return the answers of an answer table: its last column."""
+    return table.column(table.num_columns - 1)
+
+
+def predicate_positions(table: pa.Table) -> pa.ChunkedArray:
+    """Return the written positions of a filter answer table: its second column."""
+    return table.column(1)
+
+
 def filter_answer_table(alias, documents, positions, answers) -> pa.Table:
-    """Build filter answers with predicate positions and alias metadata."""
+    """Build filter answers: the ids, the predicate positions, then the answers."""
+    predicate = free_name("predicate", (alias,))
     schema = pa.schema(
         [pa.field(alias, pa.int32(), nullable=False),
-         pa.field("predicate", pa.int32(), nullable=False),
-         pa.field("answer", pa.bool_(), nullable=False)],
+         pa.field(predicate, pa.int32(), nullable=False),
+         pa.field(free_name("answer", (alias, predicate)), pa.bool_(),
+                  nullable=False)],
         metadata={b"quail.kind": b"filter_answers",
                   b"quail.alias": alias.encode("utf-8")})
     return pa.Table.from_arrays(
@@ -105,10 +130,10 @@ def filter_answer_table(alias, documents, positions, answers) -> pa.Table:
 
 def true_answer_rows(table: pa.Table) -> pa.Table:
     """Select the document-index rows whose answer is true."""
-    if "answer" not in table.schema.names:
+    answers = answer_values(table)
+    if not pa.types.is_boolean(answers.type):
         raise ValueError("answer table has no answer column")
-    aliases = [name for name in table.schema.names if name != "answer"]
-    selected = table.filter(table.column("answer")).select(aliases)
+    selected = table.filter(answers).select(table.column_names[:-1])
     metadata = dict(table.schema.metadata or {})
     metadata[b"quail.kind"] = b"join_answers"
     return selected.replace_schema_metadata(metadata)

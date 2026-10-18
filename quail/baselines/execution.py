@@ -31,6 +31,7 @@ from quail.baselines.request_scheduling import (
 )
 from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.result import answer_values
 from quail.execution.rows import Rows, extraction_rows
 from quail.physical import PhysicalNode
 
@@ -412,7 +413,7 @@ class RequestModelExecution:
             # the rows the join kept, each decoded as anchor, note,
             # partner block, and the question
             answers = outputs[f"join_answers:{spec.join_written_position}"]
-            kept = answers.filter(answers.column("answer"))
+            kept = answers.filter(answer_values(answers))
             pairs = list(zip(kept.column(spec.alias).to_pylist(),
                              kept.column(spec.partner).to_pylist()))
             note, partner_label = (
