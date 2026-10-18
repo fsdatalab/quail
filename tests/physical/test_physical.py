@@ -57,6 +57,41 @@ def test_barrier_preserves_survivor_order_and_duplicates():
             assert values == ([[3, 1, 3], [8, 7]] if keep else [[], []])
 
 
+@pytest.mark.parametrize("shape", ["chain", "cycle", "disconnected"])
+def test_barrier_survivors_are_the_ids_of_a_complete_join(shape):
+    """A survivor needs a partner in every join at once, whatever the relation order."""
+    import itertools
+
+    from quail.physical.base import input_ports
+
+    if shape == "disconnected":
+        edges = [("a", "b", [(1, 0)]), ("c", "d", [(0, 1)])]
+        expected = {"a": [1], "b": [0], "c": [0], "d": [1]}
+    else:
+        edges = [("a", "b", [(0, 0), (1, 1)]),
+                 ("b", "c", [(1, 0)] if shape == "chain" else [(0, 0), (1, 1)])]
+        if shape == "cycle":
+            # every id has a partner in each join, but no triangle closes
+            edges.append(("a", "c", [(0, 1), (1, 0)]))
+        expected = ({"a": [1], "b": [1], "c": [0], "d": [0, 1]} if shape == "chain"
+                    else {"a": [], "b": [], "c": [], "d": [0, 1]})
+    for ordered in itertools.permutations(edges):
+        ports = [PortRef(f"scan:{alias}", f"rows:{alias}") for alias in expected]
+        values = [pa.array([0, 1], pa.int32()) for _ in ports]
+        for index, (left, right, pairs) in enumerate(ordered):
+            ports.append(PortRef(f"join:{index}", f"join_answers:{index}"))
+            values.append(pa.table({
+                left: pa.array([pair[0] for pair in pairs], pa.int32()),
+                right: pa.array([pair[1] for pair in pairs], pa.int32()),
+                "answer": [True] * len(pairs)}))
+        node = Barrier(node_id="barrier", aliases=tuple(expected),
+                       inputs=input_ports(tuple(ports)))
+        outputs = BarrierRuntime().execute(
+            node, {f"input:{i}": value for i, value in enumerate(values)}, None).outputs
+        assert {alias: outputs[f"rows:{alias}"].ids[alias].to_pylist()
+                for alias in expected} == expected, ordered
+
+
 @dataclass(frozen=True)
 class FirstDocuments(PhysicalNode):
     alias: str = ""

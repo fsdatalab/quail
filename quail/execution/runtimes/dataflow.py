@@ -12,6 +12,7 @@ from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import (
     IndexRelation,
     build_result_declaration,
+    joined_survivors,
     true_answer_rows,
 )
 from quail.execution.rows import Rows, as_table
@@ -55,18 +56,8 @@ class BarrierRuntime:
             elif port.value_type is ValueType.JOIN_ANSWERS:
                 tables.append(value if isinstance(value, pa.Table)
                               else _join_answers_table(value))
-        for table in tables:
-            table = true_answer_rows(table)
-            for alias in table.column_names:
-                if alias in survivors:
-                    table = table.filter(pc.is_in(
-                        table[alias], value_set=survivors[alias].cast(table[alias].type)
-                    ))
-            for alias in table.column_names:
-                if alias in survivors:
-                    ids = survivors[alias]
-                    survivors[alias] = pc.filter(ids, pc.is_in(
-                        ids, value_set=pc.unique(table[alias]).cast(ids.type)))
+        survivors = joined_survivors(
+            [true_answer_rows(table) for table in tables], survivors)
         return NodeResult({f"rows:{alias}": Rows({alias: survivors[alias]})
                            for alias in node.aliases})
 

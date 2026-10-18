@@ -151,6 +151,45 @@ def _inner_join(left: acero.Declaration, left_schema: pa.Schema,
     return declaration, pa.schema(fields, metadata=metadata)
 
 
+def joined_survivors(tables: Iterable[pa.Table],
+                     survivors: dict[str, pa.Array]) -> dict[str, pa.Array]:
+    """Keep the ids that take part in a complete join of their relations.
+
+    Relations sharing an alias form one component, joined as a whole,
+    so an id survives only with a partner in every relation at once.
+
+    Args:
+        tables: Relations of the id pairs whose join predicates passed.
+        survivors: alias -> its ids before the joins, in order.
+
+    Returns:
+        alias -> the surviving ids, in their input order with duplicates.
+    """
+    components = []
+    for table in tables:
+        aliases = set(table.column_names)
+        group = [table.cast(document_index_schema(table.column_names, "join_answers"))]
+        apart = []
+        for names, members in components:
+            if aliases & names:
+                aliases |= names
+                group.extend(members)
+            else:
+                apart.append((names, members))
+        components = [*apart, (aliases, group)]
+    kept = dict(survivors)
+    for aliases, group in components:
+        limits = {alias: survivors.get(alias, pc.unique(table[alias]))
+                  for table in group for alias in table.column_names}
+        declaration, _ = build_result_declaration(group, limits, group[0].column_names[0])
+        joined = declaration.to_table(use_threads=False)
+        for alias in aliases & set(survivors):
+            ids = survivors[alias]
+            kept[alias] = pc.filter(ids, pc.is_in(
+                ids, value_set=pc.unique(joined[alias]).cast(ids.type)))
+    return kept
+
+
 def build_result_declaration(
         true_join_tables: Iterable[pa.Table],
         survivor_indices: dict[str, pa.Array],
