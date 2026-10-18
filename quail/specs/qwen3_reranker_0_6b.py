@@ -1,4 +1,5 @@
 from .base import ModelSpec
+from .prompts import QWEN3_RERANKER_PROMPT_FORMAT
 
 QWEN3_RERANKER_0_6B_BF16 = ModelSpec(
     name="qwen3-reranker-0.6b-bf16",
@@ -19,6 +20,7 @@ QWEN3_RERANKER_0_6B_BF16 = ModelSpec(
     weight_precision="bf16",
     attention_precision="bf16",
     role="reranker",
+    prompt_format=QWEN3_RERANKER_PROMPT_FORMAT,
     # The activation reserve is sized per hidden unit and undercounts this
     # model's warm-up at its memory-bound chunk (349k tokens OOMed on an
     # H100); 64k is far past the compute knee.
