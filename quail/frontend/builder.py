@@ -626,7 +626,9 @@ class Query:
         """
         if spec.alias is None:
             return None
-        name, span = spec.alias, spec.alias.endswith(SPAN_SUFFIX)
+        name = spec.alias
+        # an extraction may itself be named with the span suffix
+        span = name not in self._extracts and name.endswith(SPAN_SUFFIX)
         if span:
             name = name[:-len(SPAN_SUFFIX)]
         if name not in self._extracts:

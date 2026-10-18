@@ -3,9 +3,24 @@
 from dataclasses import dataclass
 from typing import Optional
 
+from quail.logical import CompileError
+
+
+class ExpressionSpec:
+    """A query expression built for where(), join(), or having().
+
+    It has no Python truth value: ``and``, ``or``, and ``not`` would
+    evaluate it in Python and silently drop the test.
+    """
+
+    def __bool__(self):
+        raise TypeError(
+            "query expressions have no Python truth value; combine where() "
+            "tests with & or pass them as separate arguments")
+
 
 @dataclass(frozen=True, eq=False)
-class ColSpec:
+class ColSpec(ExpressionSpec):
     """A column reference, with the struct fields and function read on it.
 
     Attributes:
@@ -78,11 +93,19 @@ class ColSpec:
 
     def field(self, name: str) -> "ColSpec":
         """Read a field of a struct column, such as a span's ``start``."""
-        return ColSpec(self.alias, self.column, (*self.path, name), self.function)
+        self._require_no_function()
+        return ColSpec(self.alias, self.column, (*self.path, name))
 
     def length(self) -> "ColSpec":
         """The number of characters of each value."""
+        self._require_no_function()
         return ColSpec(self.alias, self.column, self.path, "length")
+
+    def _require_no_function(self) -> None:
+        if self.function is not None:
+            raise CompileError(
+                f"{self.function}() is the last step of a column expression; "
+                "a function cannot be followed by a field or another function")
 
     def asc(self) -> "SortSpec":
         return SortSpec(self)
@@ -129,14 +152,14 @@ class SortSpec:
 
 
 @dataclass(frozen=True)
-class EqualsSpec:
+class EqualsSpec(ExpressionSpec):
     """An unresolved ``col(...) == col(...)`` join condition."""
     left: ColSpec
     right: ColSpec
 
 
 @dataclass(frozen=True)
-class PredicateSpec:
+class PredicateSpec(ExpressionSpec):
     """An unresolved regular predicate for ``where()``.
 
     Attributes:
@@ -174,7 +197,7 @@ class PredicateSpec:
 
 
 @dataclass(frozen=True)
-class AndSpec:
+class AndSpec(ExpressionSpec):
     """Tests combined with AND: ``(col("a") > 1) & col("b").is_null()``."""
     parts: tuple
 
@@ -195,7 +218,7 @@ class PromptSpec:
 
 
 @dataclass(frozen=True)
-class AggSpec:
+class AggSpec(ExpressionSpec):
     """An unresolved aggregate for ``agg()``."""
     function: str
     col: object = None    # ColSpec, a label or score name, or None
@@ -226,7 +249,7 @@ class AggSpec:
 
 
 @dataclass(frozen=True)
-class HavingSpec:
+class HavingSpec(ExpressionSpec):
     """An unresolved ``having()`` test of an aggregate against a number."""
     agg: AggSpec
     comparison: str

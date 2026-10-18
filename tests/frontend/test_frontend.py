@@ -541,3 +541,21 @@ def test_builder_places_apply_nodes_in_the_logical_tree():
     with pytest.raises(CompileError, match="ids must be 'pairs'"):
         (base.join(docs(cat, "evidence").alias("e"))
          .apply(same_key, columns=[col("c.url")], ids="preserve"))
+
+
+def test_expression_specs_reject_python_truth_and_stacked_functions(catalog):
+    review = col("r.review")
+    for expression in (review, review == "x", review == col("p.id"),
+                       (review == "x") & (col("r.stars") > 1)):
+        with pytest.raises(TypeError, match="no Python truth value"):
+            bool(expression)
+    with pytest.raises(CompileError, match="cannot be followed"):
+        review.length().field("start")
+    with pytest.raises(CompileError, match="cannot be followed"):
+        review.length().length()
+    # an extraction named with the span suffix is still an extraction
+    plan = (docs(catalog, "reviews").alias("r")
+            .ai_extract("r.review", {"ends": "When?"}, name="x_span")
+            .where(col("x_span.ends") != "")
+            .select("r.id", "x_span"))
+    assert plan.root.input.condition.column.column == "x_span.ends"
