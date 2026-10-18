@@ -24,7 +24,11 @@ from quail.logical import (
     join_conditions,
     oriented_join_conditions,
 )
-from quail.logical.expressions import column_reference, evaluate_column, source_column
+from quail.logical.expressions import (
+    column_references,
+    evaluate_expression,
+    source_columns,
+)
 from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
 from quail.planner.optimizer.context import PlanningContext
@@ -161,7 +165,7 @@ class Query:
                 with_offsets = locates_answers and s.alias in offset_aliases
                 if reads_text:
                     columns = tuple(dict.fromkeys(
-                        (*columns, source_column(s.column))))
+                        (*columns, *source_columns(s.column))))
                 if s.alias not in self._estimated:
                     self._token_inputs[s.alias] = self.session.inputs.tokenize(
                         s.provider, s.column, columns, with_offsets=with_offsets)
@@ -228,12 +232,14 @@ class Query:
         def keys(expressions):
             out = []
             for expression in expressions:
-                ref = column_reference(expression)
-                key = (ref.alias, ref.column)
-                if key not in samples:
-                    samples[key] = self.session.inputs.sample_columns(
-                        providers[ref.alias], [ref.column])[ref.column]
-                out.append(evaluate_column(expression, samples[key]))
+                refs = column_references(expression)
+                for ref in refs:
+                    if (ref.alias, ref.column) not in samples:
+                        samples[(ref.alias, ref.column)] = (
+                            self.session.inputs.sample_columns(
+                                providers[ref.alias], [ref.column])[ref.column])
+                out.append(evaluate_expression(expression, pa.table({
+                    ref.column: samples[(ref.alias, ref.column)] for ref in refs})))
             return out
 
         fractions = {}
@@ -253,10 +259,10 @@ class Query:
         for scan in scans:
             if not scan.predicates:
                 continue
-            columns = self.session.inputs.sample_columns(
+            columns = pa.table(self.session.inputs.sample_columns(
                 scan.provider,
-                [predicate.column.column for predicate in scan.predicates])
-            sampled = len(next(iter(columns.values())))
+                [predicate.column.column for predicate in scan.predicates]))
+            sampled = columns.num_rows
             kept = len(selected_rows(columns, scan.predicates))
             # a sample that keeps nothing, or everything, says little
             # about the rest, so the estimate stays off 0 and 1
@@ -388,12 +394,12 @@ class Query:
                 continue
             store = self._token_inputs[node.alias]
             logical_scan = logical_scans[node.alias]
-            source = source_column(logical_scan.column)
             inputs[node.input_id] = document_input(
                 store.tokens,
                 (
-                    evaluate_column(logical_scan.column, store.column(source))
-                    if source in store.projected_columns
+                    evaluate_expression(logical_scan.column, store)
+                    if set(source_columns(logical_scan.column))
+                    <= set(store.projected_columns)
                     else None
                 ),
             )
@@ -410,13 +416,13 @@ class Query:
         operators = self.logical.operators()
         for join in operators.joins:
             for condition in join_conditions(join):
-                for expression in (condition.left, condition.right):
-                    ref = column_reference(expression)
+                for ref in column_references(condition.left) + column_references(
+                        condition.right):
                     needed.setdefault(ref.alias, {})[ref.column] = None
         for apply in operators.applies:
             for expression in apply.columns:
-                ref = column_reference(expression)
-                needed.setdefault(ref.alias, {})[ref.column] = None
+                for ref in column_references(expression):
+                    needed.setdefault(ref.alias, {})[ref.column] = None
         for scan in operators.scans:
             for predicate in scan.predicates:
                 needed.setdefault(scan.alias, {})[predicate.column.column] = None

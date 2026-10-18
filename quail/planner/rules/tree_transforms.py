@@ -31,28 +31,37 @@ from quail.logical import (
     model_call,
 )
 from quail.logical.expressions import (
-    ColumnExpression,
-    column_reference,
-    source_column,
+    GetField,
+    ScalarFunction,
+    aliased_call,
+    column_references,
+    source_columns,
 )
 
 
 def _column_refs(expression) -> tuple[ColumnRef, ...]:
     """Return the source columns one logical expression reads."""
-    if isinstance(expression, (ColumnRef, ColumnExpression)):
-        return (column_reference(expression),)
+    if isinstance(expression, (ColumnRef, GetField, ScalarFunction)):
+        return column_references(expression)
+    if isinstance(expression, Alias) and aliased_call(expression) is None:
+        return column_references(expression.expression)
     if isinstance(expression, FilterPredicate):
         return _column_refs(expression.expression)
     if isinstance(expression, (ModelCall, Compare, Alias)):
-        return tuple(map(column_reference, model_call(expression).prompt.args))
+        return _refs_of(model_call(expression).prompt.args)
     if isinstance(expression, RegularPredicate):
-        return (expression.column,)
+        return column_references(expression.expression)
     if isinstance(expression, Equality):
-        return (column_reference(expression.left),
-                column_reference(expression.right))
+        return _refs_of((expression.left, expression.right))
     if isinstance(expression, SortKey):
         return _column_refs(expression.expression)
     return ()
+
+
+def _refs_of(expressions) -> tuple[ColumnRef, ...]:
+    """Return the source columns several expressions read, in first use order."""
+    return tuple(dict.fromkeys(
+        ref for expression in expressions for ref in _column_refs(expression)))
 
 
 def push_down_projection(root: LogicalNode) -> LogicalNode:
@@ -84,19 +93,18 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     } | {
         (ref.alias, ref.column)
         for expression in (projection.columns if projection is not None else ())
-        if isinstance(expression, Alias)
+        if aliased_call(expression) is not None
         for ref in _column_refs(expression)
     }
     for node in plan.walk():
         if isinstance(node, Apply):
-            refs = map(column_reference, node.columns)
+            refs = _refs_of(node.columns)
         elif isinstance(node, Join):
-            refs = [column_reference(ref) for condition in node.on
-                    for ref in (condition.left, condition.right)]
+            refs = _refs_of(node.on)
         elif isinstance(node, SemanticExtract):
-            refs = map(column_reference, node.call.prompt.args)
+            refs = _refs_of(node.call.prompt.args)
         elif isinstance(node, Scan):
-            refs = [predicate.column for predicate in node.predicates]
+            refs = _refs_of(node.predicates)
         else:
             continue
         valued.update((ref.alias, ref.column) for ref in refs)
@@ -115,7 +123,7 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         if isinstance(node, Scan):
             columns = tuple(
                 column for column in needed.get(node.alias, ())
-                if column != source_column(node.column)
+                if column not in source_columns(node.column)
                 or (node.alias, column) in valued
             )
             return node if columns == node.columns else replace(

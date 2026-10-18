@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
 import pyarrow as pa
@@ -10,9 +10,8 @@ from pyarrow import compute as pc
 
 DESCRIPTION_WORDS = 25
 TASK_DESCRIPTION_WORDS = 50
-# functions a column expression applies to a column's values
-COLUMN_FUNCTIONS = ("length",)
-_FUNCTIONS = {"length": pc.utf8_length}
+# the functions a ScalarFunction may compute, by name
+SCALAR_FUNCTIONS = {"length": pc.utf8_length}
 
 
 class CompileError(ValueError):
@@ -27,149 +26,228 @@ class ColumnRef:
 
     type_name: ClassVar[str] = "quail.column_ref"
 
+    def validate(self) -> None:
+        if not self.alias or not self.column:
+            raise CompileError("a column reference names a table alias and a column")
+
+    def __str__(self) -> str:
+        return column_name(self)
+
+
+def _validate_tree(expression) -> None:
+    """Validate one value expression, whatever its node type."""
+    if not isinstance(expression, (ColumnRef, GetField, ScalarFunction, Alias)):
+        raise CompileError(
+            f"a value expression is a column, a field, a function, or an "
+            f"alias, got {type(expression).__name__}")
+    expression.validate()
+
 
 @dataclass(frozen=True)
-class ColumnExpression:
-    """A source column read with struct fields, a function, or an output name.
+class GetField:
+    """One field of a struct-valued expression."""
 
-    ``path`` names the struct fields read under the column, and
-    ``function`` the function applied to the values last, such as
-    ``"length"``. ``name`` is the result column's name when the query
-    gives one, as SQL's ``AS``. The expression stands wherever a column
-    does: as a prompt's document, a join key, a column an apply()
-    reads, or a result column.
-    """
+    input: Any
+    field: str
 
-    reference: ColumnRef
-    path: tuple = ()  # tuple[str, ...]
-    function: Optional[str] = None
-    name: Optional[str] = None
-
-    type_name: ClassVar[str] = "quail.column_expression"
+    type_name: ClassVar[str] = "quail.get_field"
 
     @property
     def alias(self) -> str:
-        return self.reference.alias
-
-    @property
-    def provider(self) -> str:
-        return self.reference.provider
+        return table_alias(self)
 
     def validate(self) -> None:
-        if not isinstance(self.reference, ColumnRef):
-            raise CompileError("a column expression reads a column reference")
-        if self.function is not None and self.function not in COLUMN_FUNCTIONS:
-            raise CompileError(
-                f"unsupported column function {self.function!r}; "
-                f"supported: {', '.join(COLUMN_FUNCTIONS)}")
-        if any(not isinstance(field, str) or not field for field in self.path):
-            raise CompileError("a column path names struct fields")
-
-    def evaluate(self, values):
-        """Return the expression's values over the source column's values."""
-        return column_values(values, self.path, self.function,
-                             column_name(self.reference))
+        _validate_tree(self.input)
+        if not isinstance(self.field, str) or not self.field:
+            raise CompileError("a field access names a struct field")
 
     def __str__(self) -> str:
-        written = column_expression_name(self.path, self.function,
-                                         column_name(self.reference))
-        return written if self.name is None else f"{written} AS {self.name}"
+        return column_name(self)
 
 
-def column_values(values, path: tuple = (), function: Optional[str] = None,
-                  name: str = ""):
-    """Read struct fields under Arrow values and apply a function to them.
+@dataclass(frozen=True)
+class ScalarFunction:
+    """A function of value expressions, computed row by row without the model."""
+
+    function: str
+    args: tuple  # tuple[expression, ...]
+
+    type_name: ClassVar[str] = "quail.scalar_function"
+
+    @property
+    def alias(self) -> str:
+        return table_alias(self)
+
+    def validate(self) -> None:
+        if self.function not in SCALAR_FUNCTIONS:
+            raise CompileError(
+                f"unsupported column function {self.function!r}; "
+                f"supported: {', '.join(SCALAR_FUNCTIONS)}")
+        for argument in self.args:
+            _validate_tree(argument)
+
+    def __str__(self) -> str:
+        return column_name(self)
+
+
+def column_expression(reference: ColumnRef, path: tuple = (),
+                      function: Optional[str] = None, name: Optional[str] = None):
+    """Build the expression tree a front end writes as fields, a function, and a name.
+
+    For example, ``col("r.details").field("body").length().named("n")``
+    becomes ``Alias(ScalarFunction("length", (GetField(ref, "body"),)), "n")``.
+    """
+    expression = reference
+    for field in path:
+        expression = GetField(expression, field)
+    if function is not None:
+        expression = ScalarFunction(function, (expression,))
+    return expression if name is None else Alias(expression, name)
+
+
+def evaluate_expression(expression, columns):
+    """Evaluate a value expression over the columns of one table.
 
     Args:
-        values: The source column's values, an Arrow array or chunked array.
-        path: The struct fields to read, outermost first.
-        function: The function applied last, one of COLUMN_FUNCTIONS.
-        name: The column as written, for the error message.
+        expression: A column name, or a tree of ColumnRef, GetField,
+            ScalarFunction, and Alias nodes.
+        columns: The table, record batch, or scan input the columns come
+            from, read with ``column(name)``.
 
     Raises:
-        CompileError: The values have no such field, or the function
-            does not take them.
+        CompileError: A field does not exist, or a function does not
+            take its arguments' types.
     """
-    read = name or "the column"
-    for field in path:
+    if isinstance(expression, str):
+        return columns.column(expression)
+    if isinstance(expression, ColumnRef):
+        return columns.column(expression.column)
+    if isinstance(expression, Alias):
+        return evaluate_expression(expression.expression, columns)
+    if isinstance(expression, GetField):
+        values = evaluate_expression(expression.input, columns)
+        read = column_name(expression.input)
         if not pa.types.is_struct(values.type):
             raise CompileError(f"{read} has no fields; it is {values.type}")
-        if values.type.get_field_index(field) < 0:
+        if values.type.get_field_index(expression.field) < 0:
             raise CompileError(
-                f"{read} has no field {field!r}; its fields are "
+                f"{read} has no field {expression.field!r}; its fields are "
                 f"{[item.name for item in values.type]}")
-        values = pc.struct_field(values, field)
-        read = f"{read}.{field}"
-    if function is not None:
-        try:
-            values = _FUNCTIONS[function](values)
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError,
-                pa.ArrowTypeError, KeyError, TypeError) as error:
-            raise CompileError(
-                f"{function}({read}) cannot be evaluated on {values.type}: "
-                f"{error}") from error
-    return values
+        return pc.struct_field(values, expression.field)
+    arguments = [evaluate_expression(argument, columns) for argument in expression.args]
+    try:
+        return SCALAR_FUNCTIONS[expression.function](*arguments)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError,
+            TypeError) as error:
+        raise CompileError(
+            f"{column_name(expression)} cannot be evaluated on "
+            f"{[str(values.type) for values in arguments]}: {error}") from error
 
 
-def column_expression_name(path: tuple, function: Optional[str],
-                           column: str = "") -> str:
-    """Return a column with its fields and function as written."""
-    name = ".".join(part for part in (column, *path) if part)
-    return f"{function}({name})" if function else name
+def column_references(expression) -> tuple[ColumnRef, ...]:
+    """Return the source columns a value expression reads, in first use order."""
+    if isinstance(expression, ColumnRef):
+        return (expression,)
+    if isinstance(expression, Alias):
+        return column_references(expression.expression)
+    if isinstance(expression, GetField):
+        return column_references(expression.input)
+    if isinstance(expression, ScalarFunction):
+        return tuple(dict.fromkeys(
+            ref for argument in expression.args for ref in column_references(argument)))
+    return ()
+
+
+def source_columns(expression) -> tuple[str, ...]:
+    """Return the names of the source columns a document column reads."""
+    if isinstance(expression, str):
+        return (expression,)
+    return tuple(dict.fromkeys(ref.column for ref in column_references(expression)))
+
+
+def table_alias(expression) -> str:
+    """Return the one table alias a value expression reads.
+
+    Raises:
+        CompileError: The expression reads two tables, or none.
+    """
+    aliases = tuple(dict.fromkeys(ref.alias for ref in column_references(expression)))
+    if len(aliases) != 1:
+        raise CompileError(
+            f"{column_name(expression)} must read one table, not {list(aliases)}")
+    return aliases[0]
 
 
 LABEL_PREFIX = " "
 
 
-def column_name(column: str | ColumnRef | ColumnExpression | Alias, *,
-                qualified: bool = True) -> str:
-    """Return the name used for a source or computed column.
+def column_name(column, *, qualified: bool = True) -> str:
+    """Return the name used for a source, computed, or projected column.
 
     Args:
-        column: A column name, reference, expression, or projected
-            expression.
-        qualified: Whether a reference carries its table alias.
+        column: A column name, a value expression, or a projected or
+            aggregated expression with a name.
+        qualified: Whether a column reference carries its table alias.
     """
     if isinstance(column, str):
         return column
     if isinstance(column, ColumnRef):
         return f"{column.alias}.{column.column}" if qualified else column.column
-    if isinstance(column, ColumnExpression) and column.name is None:
-        return column_expression_name(
-            column.path, column.function,
-            column_name(column.reference, qualified=qualified))
+    if isinstance(column, GetField):
+        return f"{column_name(column.input, qualified=qualified)}.{column.field}"
+    if isinstance(column, ScalarFunction):
+        arguments = ", ".join(column_name(argument, qualified=qualified)
+                              for argument in column.args)
+        return f"{column.function}({arguments})"
     return column.name
 
 
-def column_reference(expression: ColumnRef | ColumnExpression) -> ColumnRef:
-    """Return the source column an expression reads."""
-    return (expression.reference if isinstance(expression, ColumnExpression)
-            else expression)
+def aliased_call(expression, *kinds):
+    """Return the model call an Alias projects, or None.
+
+    Args:
+        expression: A projected column.
+        kinds: When given, the model call kinds that count.
+    """
+    if not isinstance(expression, Alias) or not isinstance(
+            expression.expression, ModelCall):
+        return None
+    call = expression.expression
+    return call if not kinds or call.kind in kinds else None
 
 
-def source_column(column: str | ColumnRef | ColumnExpression) -> str:
-    """Return the name of the source column a document column reads."""
-    return column if isinstance(column, str) else column_reference(column).column
+_EXPRESSION_TYPES = {}
 
 
-def evaluate_column(column: str | ColumnRef | ColumnExpression, values):
-    """Return a document column's values over its source column's values."""
-    return (column.evaluate(values) if isinstance(column, ColumnExpression)
-            else values)
+def encode_expression(expression) -> dict:
+    """Encode a value expression for a physical plan."""
+    if isinstance(expression, ColumnRef):
+        fields = {"alias": expression.alias, "provider": expression.provider,
+                  "column": expression.column}
+    elif isinstance(expression, GetField):
+        fields = {"input": encode_expression(expression.input),
+                  "field": expression.field}
+    elif isinstance(expression, ScalarFunction):
+        fields = {"function": expression.function,
+                  "args": [encode_expression(argument) for argument in expression.args]}
+    else:
+        fields = {"expression": encode_expression(expression.expression),
+                  "name": expression.name}
+    return {"type": expression.type_name, **fields}
 
 
-def encode_column(expression: ColumnRef | ColumnExpression) -> dict:
-    """Encode a column reference or expression for a physical plan."""
-    return asdict(expression)
-
-
-def decode_column(value: dict) -> ColumnRef | ColumnExpression:
-    """Decode what encode_column wrote."""
-    if "reference" in value:
-        return ColumnExpression(ColumnRef(**value["reference"]),
-                                tuple(value.get("path", ())), value.get("function"),
-                                value.get("name"))
-    return ColumnRef(**value)
+def decode_expression(value: dict):
+    """Decode what encode_expression wrote."""
+    kind = _EXPRESSION_TYPES[value["type"]]
+    if kind is ColumnRef:
+        return ColumnRef(str(value["alias"]), str(value["provider"]),
+                         str(value["column"]))
+    if kind is GetField:
+        return GetField(decode_expression(value["input"]), str(value["field"]))
+    if kind is ScalarFunction:
+        return ScalarFunction(str(value["function"]),
+                              tuple(decode_expression(a) for a in value["args"]))
+    return Alias(decode_expression(value["expression"]), str(value["name"]))
 
 
 @dataclass(frozen=True)
@@ -443,15 +521,18 @@ class Compare:
 
 @dataclass(frozen=True)
 class Alias:
-    """A model call returned as a named result column."""
+    """An expression returned under a name: a model call or a value expression."""
 
-    expression: ModelCall
+    expression: Any
     name: str
 
     type_name: ClassVar[str] = "quail.alias"
 
     def validate(self) -> None:
-        self.expression.validate()
+        if isinstance(self.expression, ModelCall):
+            self.expression.validate()
+        else:
+            _validate_tree(self.expression)
         if not self.name:
             raise CompileError("a projected expression needs a name")
 
@@ -462,7 +543,7 @@ def model_call(expression) -> ModelCall:
         return expression
     if isinstance(expression, Compare):
         return expression.call
-    if isinstance(expression, Alias):
+    if isinstance(expression, Alias) and isinstance(expression.expression, ModelCall):
         return expression.expression
     raise TypeError(f"{type(expression).__name__} holds no model call")
 
@@ -483,7 +564,7 @@ def has_score(plan) -> bool:
         )
         or any(is_score(join.predicate) for join in operators.joins)
         or any(
-            isinstance(expression, Alias) and expression.expression.kind == "score"
+            aliased_call(expression, "score") is not None
             for expression in operators.projections
         )
     )
@@ -535,8 +616,8 @@ class FilterPredicate:
 class Equality:
     """One ordinary join condition: two columns of two tables are equal."""
 
-    left: ColumnRef | ColumnExpression
-    right: ColumnRef | ColumnExpression
+    left: Any  # a value expression over one table
+    right: Any
 
     type_name: ClassVar[str] = "quail.equality"
 
@@ -554,11 +635,16 @@ def _explain(expression) -> str:
             f"{expression.threshold}"
         )
     if isinstance(expression, Alias):
-        if expression.expression.kind in ("label", "extract"):
+        call = aliased_call(expression)
+        if call is None:
+            return f"{column_name(expression.expression)} AS {expression.name}"
+        if call.kind in ("label", "extract"):
             # the SemanticClassify or SemanticExtract below computes
             # the column
             return expression.name
-        return f"{_explain(expression.expression)} AS {expression.name}"
+        return f"{_explain(call)} AS {expression.name}"
+    if isinstance(expression, (ColumnRef, GetField, ScalarFunction)):
+        return column_name(expression)
     if expression.kind == "label":
         return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"
     if expression.kind == "extract":
@@ -571,7 +657,7 @@ def _explain(expression) -> str:
 class SortKey:
     """One ORDER BY term: a column or a projected expression and its direction."""
 
-    expression: Any  # ColumnRef | ColumnExpression | Alias | AggregateCall
+    expression: Any  # a value expression, an Alias, or an AggregateCall
     descending: bool = False
     nulls_first: bool = False
 
@@ -583,14 +669,10 @@ class SortKey:
         return column_name(self.expression)
 
     def validate(self) -> None:
-        if isinstance(self.expression, (Alias, AggregateCall, ColumnExpression)):
+        if isinstance(self.expression, AggregateCall):
             self.expression.validate()
-        elif not isinstance(self.expression, ColumnRef):
-            raise CompileError(
-                f"a sort key is a column reference, a projected "
-                f"expression, or an aggregate, got "
-                f"{type(self.expression).__name__}"
-            )
+        else:
+            _validate_tree(self.expression)
 
     def __str__(self) -> str:
         return (
@@ -733,3 +815,7 @@ class Aggregation:
         if self.having:
             parts.append("having " + " and ".join(str(t) for t in self.having))
         return "; ".join(parts)
+
+
+_EXPRESSION_TYPES.update({
+    kind.type_name: kind for kind in (ColumnRef, GetField, ScalarFunction, Alias)})

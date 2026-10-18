@@ -12,6 +12,7 @@ from quail.logical import (
     has_score,
     is_score,
 )
+from quail.logical.expressions import aliased_call
 from quail.logical.prompts import prompt_aliases
 from quail.physical import AiClassify, AiJoin
 from quail.physical.pipelines import build_pipelines
@@ -40,7 +41,7 @@ def score_projections(logical) -> tuple[Alias, ...]:
     return tuple(
         expression
         for expression in logical.projection.columns
-        if isinstance(expression, Alias) and expression.expression.kind == "score"
+        if aliased_call(expression, "score") is not None
     )
 
 

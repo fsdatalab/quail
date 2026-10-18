@@ -13,13 +13,13 @@ from quail.baselines.nodes import RequestExecution
 from quail.cost import budgets
 from quail.logical import (
     SPAN_SUFFIX,
-    Alias,
     Apply,
     classified_above_joins,
     column_name,
     effective_selectivity,
 )
 from quail.logical import Aggregate as LogicalAggregate
+from quail.logical.expressions import aliased_call
 from quail.physical import (
     Limit,
     PortRef,
@@ -198,8 +198,7 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
                 needed=1, available=0, unit="backends")
         if refusal is not None:
             return refusal
-    if any(isinstance(column, Alias)
-           and getattr(column.expression, "probabilities", False)
+    if any(getattr(aliased_call(column), "probabilities", False)
            for column in region.logical_plan.projection.columns):
         return Refusal(
             reasons=(f"AI.CLASSIFY on {backend_name} decodes the label "
@@ -346,7 +345,7 @@ def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
     columns = []
     for column in region.logical_plan.projection.columns:
         columns.append(column_name(column))
-        if isinstance(column, Alias) and column.expression.kind == "extract":
+        if aliased_call(column, "extract") is not None:
             columns.append(column.name + SPAN_SUFFIX)
     nodes.append(Project(
         node_id="project",

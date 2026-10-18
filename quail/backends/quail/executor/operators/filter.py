@@ -1,6 +1,7 @@
 """Execute LLM filters and conditions on classification results."""
 
 import numpy as np
+import pyarrow as pa
 
 from quail.backends.quail.executor.parts import (
     SingleResultPart,
@@ -132,7 +133,8 @@ class ConditionGate(SingleResultPart):
         value = values[0].as_py()
         token = tuple(sorted(value.items())) if isinstance(value, dict) else value
         if token not in self.accepted:
-            self.accepted[token] = bool(self.node.predicate.accepts(values)[0].as_py())
+            self.accepted[token] = bool(self.node.predicate.accepts(
+                pa.table({self.node.column: values}))[0].as_py())
         return None if self.accepted[token] else Stage.DROP
 
     def finish(self, every):

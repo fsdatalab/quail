@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 from typing import ClassVar, Optional
 
 from quail.logical.expressions import (
-    ColumnExpression,
     ColumnRef,
     CompileError,
     column_name,
@@ -38,7 +37,7 @@ class Apply:
     function: str
     kind: str
     ids: str
-    columns: tuple  # tuple[ColumnRef | ColumnExpression, ...]
+    columns: tuple  # value expressions, each over one of the aliases
     aliases: tuple  # the alias, or the join's two aliases
     written_position: Optional[int] = None
 
@@ -71,8 +70,7 @@ class Apply:
                 f"outside its input ({sorted(present)})"
             )
         for column in self.columns:
-            if isinstance(column, ColumnExpression):
-                column.validate()
+            column.validate()
             if column.alias not in self.aliases:
                 raise CompileError(
                     f"apply {self.function!r} reads {column_name(column)} "

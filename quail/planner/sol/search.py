@@ -17,7 +17,7 @@ from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan
 from quail.logical import oriented_join_conditions
-from quail.logical.expressions import column_name, column_reference, evaluate_column
+from quail.logical.expressions import column_name, evaluate_expression
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
@@ -55,8 +55,7 @@ ANSWER_TEST = "ANSWER TEST"
 
 def _key_values(stores, key):
     """Return one join key's values from the alias's store."""
-    ref = column_reference(key)
-    return evaluate_column(key, stores[ref.alias].column(ref.column))
+    return evaluate_expression(key, stores[key.alias])
 
 class _EstimatePricing:
     """Price a table's steps as the estimate prices a question.
@@ -446,7 +445,7 @@ class Search:
         answers = pa.array(
             [self.answer(node.call.prompt, {node.alias: row}) for row in rows],
             pa.string())
-        kept = condition.accepts(answers)
+        kept = condition.accepts(pa.table({condition.column.column: answers}))
         return [row for row, keep in zip(rows, kept.to_pylist()) if keep]
 
     # ---- joins -----------------------------------------------------

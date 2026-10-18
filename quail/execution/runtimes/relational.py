@@ -42,9 +42,7 @@ def _tested_documents(node, context) -> pa.Array:
     if columns is None:
         raise KeyError(
             f"the regular predicates of {node.alias!r} need its value columns")
-    values = {predicate.column.column: columns.column(predicate.column.column)
-              for predicate in node.predicates}
-    return selected_rows(values, node.predicates)
+    return selected_rows(columns, node.predicates)
 
 
 def _num_rows(value) -> int | None:

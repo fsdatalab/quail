@@ -13,12 +13,14 @@ from quail.execution.result import (
     true_answer_rows,
 )
 from quail.logical import (
-    Alias,
-    ColumnExpression,
-    ColumnRef,
     CompileError,
 )
-from quail.logical.expressions import column_name, column_reference, evaluate_column
+from quail.logical.expressions import (
+    aliased_call,
+    column_name,
+    column_references,
+    evaluate_expression,
+)
 from quail.physical import Project, ValueType
 
 
@@ -31,14 +33,13 @@ def projection_for(logical, token_inputs, documents):
         column_name(column): column
         for column in (*logical.projection.columns,
                        *(key.expression for key in logical.result.order))
-        if isinstance(column, (ColumnRef, ColumnExpression))}
+        if column_references(column)}
     model_calls = {node.name: node.call
                    for node in (*operators.classifies, *operators.extracts)}
     model_calls.update({node.span_name: node.call for node in operators.extracts})
-    model_calls.update({column.name: column.expression
-                        for column in logical.projection.columns
-                        if isinstance(column, Alias)
-                        and column.expression.kind in ("label", "extract", "score")})
+    model_calls.update({column.name: call for column in logical.projection.columns
+                        if (call := aliased_call(column, "label", "extract", "score"))
+                        is not None})
 
     def project(node, value, labels=None):
         if not isinstance(node, Project):
@@ -135,18 +136,19 @@ def projection_for(logical, token_inputs, documents):
                 continue
             if name not in source_columns:
                 raise CompileError(f"unknown projection column {name!r}")
-            source = column_reference(source_columns[name])
+            source = column_references(source_columns[name])[0]
             if source.alias not in relation.schema.names:
                 raise CompileError(
                     f"projection column {name!r} is not in the result"
                 )
             store = token_inputs[source.alias]
-            if source.column not in store.projected_columns:
-                raise CompileError(
-                    f"projection column {name!r} was not loaded by the "
-                    f"scan of {source.alias!r}; the should_push_down_projection "
-                    f"rule is not registered")
-            values = evaluate_column(source_columns[name], store.column(source.column))
+            for ref in column_references(source_columns[name]):
+                if ref.column not in store.projected_columns:
+                    raise CompileError(
+                        f"projection column {name!r} was not loaded by the "
+                        f"scan of {source.alias!r}; the "
+                        f"should_push_down_projection rule is not registered")
+            values = evaluate_expression(source_columns[name], store)
             projection.append((source.alias, values))
             fields.append(pa.field(
                 name,

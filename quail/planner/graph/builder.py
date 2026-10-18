@@ -6,7 +6,6 @@ from itertools import groupby
 from quail.logical import (
     PROBABILITIES_SUFFIX,
     SPAN_SUFFIX,
-    Alias,
     LogicalPlan,
     classified_above_joins,
     column_name,
@@ -16,6 +15,7 @@ from quail.logical import (
     is_score,
     oriented_join_conditions,
 )
+from quail.logical.expressions import aliased_call
 from quail.physical import (
     AiScore,
     Barrier,
@@ -459,9 +459,9 @@ class GraphBuilder:
         columns = []
         for c in self.plan.projection.columns:
             columns.append(column_name(c))
-            if isinstance(c, Alias) and getattr(c.expression, "probabilities", False):
+            if getattr(aliased_call(c), "probabilities", False):
                 columns.append(c.name + PROBABILITIES_SUFFIX)
-            if isinstance(c, Alias) and c.expression.kind == "extract":
+            if aliased_call(c, "extract") is not None:
                 columns.append(c.name + SPAN_SUFFIX)
         score_ports = tuple(PortRef(node.node_id, node.rows_port) for node in self.nodes
                             if isinstance(node, AiScore)

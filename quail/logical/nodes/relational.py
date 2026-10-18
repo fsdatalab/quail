@@ -9,15 +9,15 @@ from quail.logical.expressions import (
     AggregateCall,
     Aggregation,
     Alias,
-    ColumnExpression,
     ColumnRef,
     CompileError,
     ExtractStruct,
     HavingTest,
     SortKey,
     _explain,
+    aliased_call,
     column_name,
-    column_reference,
+    column_references,
     packed_columns,
 )
 from quail.logical.nodes.base import LogicalNode
@@ -27,14 +27,14 @@ from quail.logical.nodes.extract import extractions
 
 @dataclass(frozen=True)
 class Project:
-    """Select source columns, expressions over them, and named model outputs.
+    """Select value expressions over source columns and named model outputs.
 
     The fields of each ExtractStruct are extraction Aliases among the
     columns; the result returns them packed into the struct's columns.
     """
 
     input: LogicalNode
-    columns: tuple[ColumnRef | ColumnExpression | Alias, ...]
+    columns: tuple  # value expressions and Aliases
     structs: tuple[ExtractStruct, ...] = ()
     type_name: ClassVar[str] = "quail.logical_project"
 
@@ -45,37 +45,27 @@ class Project:
         return self.columns
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        return tuple(column_reference(column) for column in self.columns
-                     if isinstance(column, (ColumnRef, ColumnExpression)))
+        return tuple(dict.fromkeys(
+            ref for column in self.columns if aliased_call(column) is None
+            for ref in column_references(column)))
 
     def validate(self) -> None:
         computed = {(node.call, node.name) for node in classifications(self.input)}
         extracted = {(node.call, node.name) for node in extractions(self.input)}
         for column in self.columns:
-            if isinstance(column, Alias):
-                column.validate()
-                if (
-                    column.expression.kind == "label"
-                    and (column.expression, column.name) not in computed
-                ):
-                    raise CompileError(
-                        f"the label column {column.name!r} needs a "
-                        f"SemanticClassify below the Project"
-                    )
-                if (
-                    column.expression.kind == "extract"
-                    and (column.expression, column.name) not in extracted
-                ):
-                    raise CompileError(
-                        f"the answer column {column.name!r} needs a "
-                        f"SemanticExtract below the Project"
-                    )
-            elif isinstance(column, ColumnExpression):
-                column.validate()
-            elif not isinstance(column, ColumnRef):
+            column.validate()
+            call = aliased_call(column)
+            if call is not None and call.kind == "label" and (
+                    call, column.name) not in computed:
                 raise CompileError(
-                    f"a projected column is a column reference or a named "
-                    f"expression, got {type(column).__name__}"
+                    f"the label column {column.name!r} needs a "
+                    f"SemanticClassify below the Project"
+                )
+            if call is not None and call.kind == "extract" and (
+                    call, column.name) not in extracted:
+                raise CompileError(
+                    f"the answer column {column.name!r} needs a "
+                    f"SemanticExtract below the Project"
                 )
         names = [column_name(column) for column in self.columns]
         if len(names) != len(set(names)):
@@ -84,8 +74,7 @@ class Project:
 
     def _validate_structs(self) -> None:
         extracted = {column.name: column for column in self.columns
-                     if isinstance(column, Alias)
-                     and column.expression.kind == "extract"}
+                     if aliased_call(column, "extract") is not None}
         members = set()
         for struct in self.structs:
             struct.validate()
@@ -129,14 +118,7 @@ class Project:
         return replace(self, columns=expressions)
 
     def explain_fields(self) -> dict:
-        fields = {
-            "columns": [
-                column_name(column) if isinstance(column, ColumnRef)
-                else str(column) if isinstance(column, ColumnExpression)
-                else _explain(column)
-                for column in self.columns
-            ]
-        }
+        fields = {"columns": [_explain(column) for column in self.columns]}
         if self.structs:
             fields["structs"] = {struct.name: list(struct.members)
                                  for struct in self.structs}

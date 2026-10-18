@@ -6,10 +6,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from quail.logical.expressions import (
-    Alias,
     ColumnRef,
     CompileError,
     ModelCall,
+    aliased_call,
     model_call,
 )
 from quail.logical.nodes import (
@@ -76,7 +76,7 @@ def _label_work(classifies, columns, label_filters) -> LabelWork:
     projected = {
         column.expression: column.name
         for column in columns
-        if isinstance(column, Alias) and column.expression.kind == "label"
+        if aliased_call(column, "label") is not None
     }
     names = {node.call: node.name for node in classifies}
     tests = {}
@@ -207,7 +207,7 @@ class LogicalPlan:
             joins=tuple(joins),
             applies=tuple(applies),
             projections=tuple(
-                column for column in columns if isinstance(column, Alias)
+                column for column in columns if aliased_call(column) is not None
             ),
             labels=_label_work(classifies, columns, label_filters),
             classifies=tuple(classifies),

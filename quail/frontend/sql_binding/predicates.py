@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from sqlglot import exp
 
 from quail.logical import ColumnRef, CompileError, RegularPredicate
-from quail.logical.expressions import SPAN_SUFFIX, ColumnExpression, column_reference
+from quail.logical.expressions import SPAN_SUFFIX, column_expression
 
 _PLAIN_COMPARISONS = {
     exp.EQ: "=",
@@ -218,10 +218,8 @@ def bind_plain_test(b, test: PlainTest, tables=None) -> RegularPredicate:
         raise CompileError(
             f"{test.operand.sql()} reads a field of an AI.EXTRACT call "
             f"that SELECT does not return; name the call in SELECT")
-    expression = b.resolve_value(test.operand, tables, test.function)
-    path = expression.path if isinstance(expression, ColumnExpression) else ()
-    predicate = RegularPredicate(column_reference(expression), test.comparison,
-                                 test.value, path, test.function)
+    predicate = RegularPredicate(b.resolve_value(test.operand, tables, test.function),
+                                 test.comparison, test.value)
     predicate.validate()
     return predicate
 
@@ -286,8 +284,9 @@ def extract_test(b, test: PlainTest, selected: dict) -> tuple | None:
     (alias,) = member.expression.aliases()
     column = struct.member(field) + (SPAN_SUFFIX if path else "")
     predicate = RegularPredicate(
-        ColumnRef(alias, dict(b.tables)[alias], column), test.comparison,
-        test.value, tuple(path), test.function)
+        column_expression(ColumnRef(alias, dict(b.tables)[alias], column),
+                          tuple(path), test.function),
+        test.comparison, test.value)
     if path:
         predicate.validate()
     else:

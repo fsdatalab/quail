@@ -16,7 +16,11 @@ from quail.execution.result import (
     true_answer_rows,
 )
 from quail.execution.rows import Rows, as_table
-from quail.logical.expressions import column_name, column_reference, evaluate_column
+from quail.logical.expressions import (
+    column_name,
+    column_references,
+    evaluate_expression,
+)
 from quail.physical import (
     Barrier,
     Exchange,
@@ -101,11 +105,11 @@ def alias_table(alias: str, ids, columns, expressions):
 
 def relation_values(columns, expression):
     """Return one key or apply() column's values from the alias's value table."""
-    ref = column_reference(expression)
-    if columns is None or ref.column not in columns.column_names:
-        raise KeyError(
-            f"column {ref.alias}.{ref.column} is not among the request's relations")
-    return evaluate_column(expression, columns.column(ref.column))
+    for ref in column_references(expression):
+        if columns is None or ref.column not in columns.column_names:
+            raise KeyError(f"column {ref.alias}.{ref.column} is not among the "
+                           f"request's relations")
+    return evaluate_expression(expression, columns)
 
 
 def foreign_call(node, values, context):

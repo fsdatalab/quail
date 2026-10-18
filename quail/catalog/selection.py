@@ -7,16 +7,16 @@ from pyarrow import compute as pc
 from quail.logical.predicates import accepted_rows
 
 
-def selected_rows(columns: dict, predicates) -> pa.Array:
+def selected_rows(columns, predicates) -> pa.Array:
     """Return the positions of the rows that pass every predicate.
 
     Args:
-        columns: Each predicate's column values, keyed by column name.
+        columns: The table holding every predicate's column.
         predicates: The RegularPredicate tests, combined with AND.
     """
     mask = None
     for predicate in predicates:
-        test = predicate.evaluate(columns[predicate.column.column])
+        test = predicate.evaluate(columns)
         mask = test if mask is None else pc.and_kleene(mask, test)
     return pc.indices_nonzero(accepted_rows(mask))
 

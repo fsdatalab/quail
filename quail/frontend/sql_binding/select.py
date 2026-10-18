@@ -21,6 +21,7 @@ from quail.logical import (
     SortKey,
     column_name,
 )
+from quail.logical.expressions import aliased_call
 
 
 def _parse_limit(tree) -> int | None:
@@ -151,7 +152,7 @@ class SelectBinder:
             raise CompileError(f"{node.sql()} is not a column or an AI expression")
         call = b.bind_ai_value(node)
         for name, column in names.items():
-            if isinstance(column, Alias) and column.expression == call:
+            if aliased_call(column) == call:
                 return name
         columns.append(Alias(call, hidden))
         return hidden

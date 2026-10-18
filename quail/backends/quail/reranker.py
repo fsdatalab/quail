@@ -343,7 +343,7 @@ class FilterRuntime:
 
 def filter_scores(node, rows: Rows) -> NodeResult:
     """Apply a filter to rows of scores, labels, or answers."""
-    answers = node.predicate.accepts(rows.column(node.column))
+    answers = node.predicate.accepts(rows)
     filtered = rows.filter(answers)
     if len(node.aliases) == 1:
         answer_name = f"filter_answers:{node.aliases[0]}"

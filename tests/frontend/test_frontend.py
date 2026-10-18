@@ -99,9 +99,9 @@ def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
     filt = pairs.left
     assert isinstance(filt, SemanticFilter)
     assert filt.predicates[0].selectivity == 0.3
-    assert (filt.input.provider, filt.input.column) == ("reviews", "review")
-    assert (pairs.right.provider, pairs.right.column) == \
-        ("products", "description")
+    assert (filt.input.provider, str(filt.input.column)) == ("reviews", "r.review")
+    assert (pairs.right.provider, str(pairs.right.column)) == \
+        ("products", "p.description")
     # the join template is the per-tuple question and is never canonicalized
     assert join.prompt.template == "Review {0} discusses product {1}"
 

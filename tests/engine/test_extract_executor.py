@@ -34,7 +34,7 @@ from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_execute
 from quail.builtins import built_in_registry
 from quail.catalog.tokens import TokenOffsets, TokenStore
-from quail.logical import ColumnRef, RegularPredicate
+from quail.logical import ColumnRef, GetField, RegularPredicate
 from quail.physical import (
     AiExtract,
     AiFilter,
@@ -759,7 +759,8 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
         Filter(node_id="filter:c:1",
                inputs=input_ports((PortRef("ai-extract:starts", "rows:c"),)),
                predicate=RegularPredicate(
-                   ColumnRef("c", "contracts", "starts_span"), "<", 40, ("start",)),
+                   GetField(ColumnRef("c", "contracts", "starts_span"), "start"),
+                   "<", 40),
                aliases=("c",), written_position=1),
     ), PortRef("filter:c:1", "rows:c"))
     assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]

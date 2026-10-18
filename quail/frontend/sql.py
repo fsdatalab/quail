@@ -30,6 +30,7 @@ from quail.logical import (
     LogicalPlanBuilder,
     is_score,
 )
+from quail.logical.expressions import aliased_call
 
 FORBIDDEN = (
     (exp.Qualify, "QUALIFY"),
@@ -127,7 +128,8 @@ def _validate_query(
                 f"output name {struct.name!r} is also a table "
                 f"alias; pick another AS name"
             )
-    projected = tuple(column for column in columns if isinstance(column, Alias))
+    projected = tuple(column for column in columns
+                      if aliased_call(column) is not None)
     projected_scores = tuple(
         column for column in projected if column.expression.kind == "score"
     )
@@ -183,7 +185,8 @@ def _validate_query(
 
 def _bind_label_names(b: ExpressionBinder, columns: tuple[ColumnRef | Alias, ...]):
     """Assign names to classifications used in projections and filters."""
-    projected = tuple(column for column in columns if isinstance(column, Alias))
+    projected = tuple(column for column in columns
+                      if aliased_call(column) is not None)
     # a filter on a label tests the projected column of the same call;
     # a classification only tested is named after its first test's
     # position among the alias's filters
@@ -264,7 +267,7 @@ def compile_sql(
     named, labels = _bind_label_names(b, columns)
     extracts = {}
     for column in columns:
-        if isinstance(column, Alias) and column.expression.kind == "extract":
+        if aliased_call(column, "extract") is not None:
             extracts.setdefault(column.expression.aliases()[0], []).append(
                 (column.expression, column.name)
             )

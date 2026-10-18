@@ -5,12 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
-from quail.logical.expressions import (
-    ColumnExpression,
-    ColumnRef,
-    decode_column,
-    encode_column,
-)
+from quail.logical.expressions import decode_expression, encode_expression
 
 from ..base import (
     ExecutionLocation,
@@ -193,7 +188,7 @@ class Foreign(PhysicalNode):
     function: str = ""
     kind: str = "per_batch"
     ids: str = "drop"
-    columns: tuple[ColumnRef | ColumnExpression, ...] = ()
+    columns: tuple = ()  # value expressions, each over one of the aliases
     aliases: tuple[str, ...] = ()
     written_position: int = -1
 
@@ -231,7 +226,7 @@ class Foreign(PhysicalNode):
             "function": self.function,
             "kind": self.kind,
             "ids": self.ids,
-            "columns": [encode_column(column) for column in self.columns],
+            "columns": [encode_expression(column) for column in self.columns],
             "aliases": list(self.aliases),
             "written_position": self.written_position,
         }
@@ -244,7 +239,7 @@ class Foreign(PhysicalNode):
             function=str(attributes["function"]),
             kind=str(attributes["kind"]),
             ids=str(attributes["ids"]),
-            columns=tuple(decode_column(column)
+            columns=tuple(decode_expression(column)
                           for column in attributes["columns"]),
             aliases=tuple(attributes["aliases"]),
             written_position=int(attributes["written_position"]),
@@ -265,8 +260,7 @@ class HashJoin(PhysicalNode):
 
     left: str = ""
     right: str = ""
-    on: tuple[tuple[ColumnRef | ColumnExpression,
-                    ColumnRef | ColumnExpression], ...] = ()
+    on: tuple = ()  # (left key, right key) value expressions
     written_position: int = -1
     pair_fraction: float = 1.0
 
@@ -283,7 +277,7 @@ class HashJoin(PhysicalNode):
         return {
             "left": self.left,
             "right": self.right,
-            "on": [[encode_column(left), encode_column(right)]
+            "on": [[encode_expression(left), encode_expression(right)]
                    for left, right in self.on],
             "written_position": self.written_position,
             "pair_fraction": self.pair_fraction,
@@ -296,7 +290,7 @@ class HashJoin(PhysicalNode):
             inputs=inputs,
             left=str(attributes["left"]),
             right=str(attributes["right"]),
-            on=tuple((decode_column(left), decode_column(right))
+            on=tuple((decode_expression(left), decode_expression(right))
                      for left, right in attributes["on"]),
             written_position=int(attributes["written_position"]),
             pair_fraction=float(attributes.get("pair_fraction", 1.0)),

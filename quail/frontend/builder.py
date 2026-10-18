@@ -37,9 +37,9 @@ from quail.logical import (
 )
 from quail.logical.expressions import (
     SPAN_SUFFIX,
-    ColumnExpression,
+    aliased_call,
+    column_expression,
     column_name,
-    column_reference,
     validate_task_description,
 )
 
@@ -89,8 +89,8 @@ class Query:
     def _scope(self) -> dict:
         return dict(self._tables)
 
-    def _resolve_value(self, c: ColSpec) -> ColumnRef | ColumnExpression:
-        """Resolve a col() with the fields and function read on it."""
+    def _resolve_value(self, c: ColSpec):
+        """Resolve a col() to a value expression over a source column."""
         return self._scope_.resolve_value(c.column, c.alias, path=c.path,
                                           function=c.function, name=c.name)
 
@@ -470,10 +470,8 @@ class Query:
                     raise CompileError(
                         f"apply name {name!r} is used by two functions")
                 self._functions[name] = fn
-            for a, c in other._document_columns.items():
-                self._note_document_column(
-                    c if isinstance(c, ColumnExpression)
-                    else ColumnRef(alias=a, provider=self._scope()[a], column=c))
+            for c in other._document_columns.values():
+                self._note_document_column(c)
             new_aliases.append(alias)
         return new_aliases
 
@@ -596,7 +594,8 @@ class Query:
         extracted = self._extract_column(spec)
         if extracted is not None:
             predicate = RegularPredicate(
-                extracted, test.comparison, test.value, spec.path, spec.function)
+                column_expression(extracted, spec.path, spec.function),
+                test.comparison, test.value)
             if spec.path:
                 predicate.validate()
             else:
@@ -609,11 +608,11 @@ class Query:
                 f"a hint estimates a test of a label or an answer; "
                 f"{spec.alias}.{spec.column} is a source column, tested at "
                 f"the scan")
-        ref = column_reference(self._resolve_value(spec))
-        predicate = RegularPredicate(ref, test.comparison, test.value,
-                                     spec.path, spec.function)
+        predicate = RegularPredicate(self._resolve_value(spec), test.comparison,
+                                     test.value)
         predicate.validate()
-        self._regular_predicates.setdefault(ref.alias, []).append(predicate)
+        self._regular_predicates.setdefault(predicate.column.alias, []).append(
+            predicate)
 
     def _extract_column(self, spec: ColSpec) -> Optional[ColumnRef]:
         """Resolve a col() naming an extraction's answer or span, or None.
@@ -761,8 +760,8 @@ class Query:
         wanted = [column for column in self._labels.values()
                   if column in columns or column.name in tested]
         # an extraction is planned when the query returns its answer
-        extracted = [column for column in columns if isinstance(column, Alias)
-                     and column.expression.kind == "extract"]
+        extracted = [column for column in columns
+                     if aliased_call(column, "extract") is not None]
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(

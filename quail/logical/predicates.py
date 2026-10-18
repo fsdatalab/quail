@@ -17,12 +17,14 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.logical.expressions import (
-    COLUMN_FUNCTIONS,
     ColumnRef,
     CompileError,
-    column_expression_name,
+    ScalarFunction,
     column_name,
-    column_values,
+    column_references,
+    decode_expression,
+    encode_expression,
+    evaluate_expression,
 )
 
 VALUE_COMPARISONS = ("=", "<>", "<", "<=", ">", ">=")
@@ -133,24 +135,34 @@ def _membership(values, literals):
 
 @dataclass(frozen=True)
 class RegularPredicate:
-    """A test of one column against literals, decided without the model.
+    """A test of a value expression against literals, decided without the model.
 
-    ``value`` is the literal compared with, a tuple of literals for
-    ``in``, and None for the null tests. ``path`` names the struct
-    fields read under the column, such as ``("start",)`` of an
-    extraction's span. ``function`` is applied to the values first.
+    ``expression`` reads one source column, with fields or a function
+    on it, such as the ``start`` field of an extraction's span. ``value``
+    is the literal compared with, a tuple of literals for ``in``, and
+    None for the null tests.
     """
 
-    column: ColumnRef
+    expression: Any
     comparison: str
     value: Any = None
-    path: tuple = ()  # tuple[str, ...]
-    function: Optional[str] = None
 
     type_name: ClassVar[str] = "quail.regular_predicate"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "value", literal_value(self.value))
+
+    @property
+    def column(self) -> ColumnRef:
+        """The one source column the expression reads."""
+        (column,) = column_references(self.expression)
+        return column
+
+    @property
+    def function(self) -> Optional[str]:
+        """The function applied last, or None."""
+        return (self.expression.function
+                if isinstance(self.expression, ScalarFunction) else None)
 
     def aliases(self) -> tuple[str, ...]:
         return (self.column.alias,)
@@ -161,19 +173,14 @@ class RegularPredicate:
         return self.comparison.removeprefix("not ") in TEXT_COMPARISONS
 
     def validate(self) -> None:
-        if not isinstance(self.column, ColumnRef):
-            raise CompileError("a column predicate tests a column reference")
+        if len(column_references(self.expression)) != 1:
+            raise CompileError("a column predicate tests one column")
+        self.expression.validate()
         if self.comparison not in COLUMN_COMPARISONS:
             raise CompileError(
                 f"unsupported column comparison {self.comparison!r}; "
                 f"supported: {', '.join(COLUMN_COMPARISONS)}"
             )
-        if self.function is not None and self.function not in COLUMN_FUNCTIONS:
-            raise CompileError(
-                f"unsupported column function {self.function!r}; "
-                f"supported: {', '.join(COLUMN_FUNCTIONS)}")
-        if any(not isinstance(field, str) or not field for field in self.path):
-            raise CompileError("a column path names struct fields")
         if self.comparison == "in":
             if not isinstance(self.value, tuple) or not self.value:
                 raise CompileError("IN needs a non-empty list of literals")
@@ -206,22 +213,22 @@ class RegularPredicate:
                 isinstance(v, (str, bool)) for v in values):
             raise CompileError(f"{self.name} compares with a number")
 
-    def evaluate(self, values) -> pa.ChunkedArray:
+    def evaluate(self, columns) -> pa.ChunkedArray:
         """Return a boolean array of the rows the predicate accepts.
 
         A null compared with a literal is neither accepted nor rejected
         and comes back null; accepts() treats it as rejected.
 
         Args:
-            values: The column's values, an Arrow array or chunked array.
+            columns: The table, record batch, or rows holding the
+                tested column, read with ``column(name)``.
 
         Raises:
             CompileError: The literal cannot be compared with the
                 column's values, such as a string against a number
                 column.
         """
-        values = column_values(values, self.path, self.function,
-                               column_name(self.column))
+        values = evaluate_expression(self.expression, columns)
         try:
             comparison = self.comparison.removeprefix("not ")
             if comparison == "is null":
@@ -241,30 +248,27 @@ class RegularPredicate:
                 f"{self} cannot be evaluated on a column of type "
                 f"{values.type}: {error}") from error
 
-    def accepts(self, values) -> pa.Array:
+    def accepts(self, columns) -> pa.Array:
         """Return the rows the predicate accepts, with every null rejected."""
-        return accepted_rows(self.evaluate(values))
+        return accepted_rows(self.evaluate(columns))
 
     def to_dict(self) -> dict:
-        return {"column": vars(self.column), "comparison": self.comparison,
+        return {"expression": encode_expression(self.expression),
+                "comparison": self.comparison,
                 "value": (list(self.value) if isinstance(self.value, tuple)
-                          else self.value),
-                "path": list(self.path), "function": self.function}
+                          else self.value)}
 
     @classmethod
     def from_dict(cls, value: dict) -> "RegularPredicate":
         """Decode a predicate from its serialized mapping."""
         literal = value["value"]
-        return cls(ColumnRef(**value["column"]), str(value["comparison"]),
-                   tuple(literal) if isinstance(literal, list) else literal,
-                   tuple(str(field) for field in value.get("path", ())),
-                   value.get("function"))
+        return cls(decode_expression(value["expression"]), str(value["comparison"]),
+                   tuple(literal) if isinstance(literal, list) else literal)
 
     @property
     def name(self) -> str:
-        """The tested column as written, with its path and function."""
-        return column_expression_name(
-            self.path, self.function, f"{self.column.alias}.{self.column.column}")
+        """The tested expression as written."""
+        return column_name(self.expression)
 
     def __str__(self) -> str:
         if self.comparison == "in":

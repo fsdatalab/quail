@@ -7,7 +7,15 @@ from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 import quail
 from quail.catalog.selection import selected_rows
 from quail.frontend.expressions import col, prompt
-from quail.logical import ColumnRef, CompileError, RegularPredicate, Scan
+from quail.logical import (
+    ColumnRef,
+    CompileError,
+    GetField,
+    RegularPredicate,
+    ScalarFunction,
+    Scan,
+)
+from quail.logical.expressions import column_expression
 
 REF = ColumnRef("r", "reviews", "stars")
 
@@ -17,18 +25,17 @@ def _predicate(comparison, value=None):
 
 
 def test_predicates_evaluate_with_nulls_rejected():
-    stars = pa.chunked_array([[3, None, 4], [5, 1]])
+    stars = pa.table({"stars": pa.chunked_array([[3, None, 4], [5, 1]])})
     assert _predicate(">=", 4).evaluate(stars).to_pylist() == [
         False, None, True, True, False]
     assert _predicate("in", (1, 3)).evaluate(stars).to_pylist() == [
         True, False, False, False, True]
     assert _predicate("is null").evaluate(stars).to_pylist() == [
         False, True, False, False, False]
-    assert selected_rows({"stars": stars}, (
+    assert selected_rows(stars, (
         _predicate("is not null"), _predicate("<>", 4))).to_pylist() == [0, 3, 4]
     # a float literal compares with an integer column; a string does not
-    assert selected_rows({"stars": stars}, (_predicate(">", 3.5),)
-                         ).to_pylist() == [2, 3]
+    assert selected_rows(stars, (_predicate(">", 3.5),)).to_pylist() == [2, 3]
     with pytest.raises(CompileError, match="cannot be evaluated"):
         _predicate("=", "five").evaluate(stars)
 
@@ -235,11 +242,13 @@ def test_regular_predicates_reach_score_scans_and_may_read_the_text(session):
 
 
 def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
-    names = pa.chunked_array([["Acme Corp", None, "acme inc"], ["Beta"]])
+    names = pa.table({"name": pa.chunked_array([["Acme Corp", None, "acme inc"],
+                                                ["Beta"]])})
     name = ColumnRef("r", "reviews", "name")
 
     def passes(comparison, value=None, path=(), function=None):
-        predicate = RegularPredicate(name, comparison, value, path, function)
+        predicate = RegularPredicate(column_expression(name, path, function),
+                                     comparison, value)
         return predicate.evaluate(names).to_pylist()
 
     assert passes("like", "Acme%") == [True, None, False, False]
@@ -253,23 +262,25 @@ def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
     assert passes("regex", "^(?:acme)$") == [False, None, False, False]
     assert passes("<", 5, function="length") == [False, None, False, True]
     assert passes("=", "Beta") == [False, None, False, True]
-    spans = pa.chunked_array([pa.StructArray.from_arrays(
+    spans = pa.table({"name": pa.chunked_array([pa.StructArray.from_arrays(
         [pa.array([14, 0]), pa.array([27, 3])], names=["start", "end"],
-        mask=pa.array([False, True]))])
-    predicate = RegularPredicate(name, "<", 20, ("start",))
+        mask=pa.array([False, True]))])})
+    predicate = RegularPredicate(GetField(name, "start"), "<", 20)
     assert predicate.evaluate(spans).to_pylist() == [True, None]
     # a text test needs a string; a path needs a struct
     with pytest.raises(CompileError, match="compares with a string"):
         RegularPredicate(name, "like", 3).validate()
     with pytest.raises(CompileError, match="unsupported column function"):
-        RegularPredicate(name, "<", 3, function="upper").validate()
+        RegularPredicate(ScalarFunction("upper", (name,)), "<", 3).validate()
     with pytest.raises(CompileError, match="has no fields"):
-        RegularPredicate(name, "<", 3, ("start",)).evaluate(names)
+        RegularPredicate(GetField(name, "start"), "<", 3).evaluate(names)
     # source columns take the same tests, at the scan
     reviews = ColumnRef("r", "reviews", "review")
-    assert selected_rows({"review": names, "name": names}, (
+    both = names.append_column("review", names.column("name"))
+    assert selected_rows(both, (
         RegularPredicate(reviews, "ilike", "%acme%"),
-        RegularPredicate(name, ">", 5, function="length"))).to_pylist() == [0, 2]
+        RegularPredicate(ScalarFunction("length", (name,)), ">", 5),
+    )).to_pylist() == [0, 2]
 
 
 def test_stop_key_groups_follow_numeric_equality():
