@@ -49,6 +49,17 @@ def test_device_memory_budgets():
         assert budgets.arena_tokens(model, B200) > budgets.arena_tokens(model, H100_SXM)
         assert budgets.arena_tokens(model, L40S) < budgets.arena_tokens(model, H100_SXM)
     assert budgets.minimum_weight_gpus(QWEN3_32B_FP8, L40S) == 1
+    # The int32 kernel index still caps 32B on H100 and B200. On L40S
+    # the memory bound would spend the leftover on two activation
+    # chunks, so the chunk shrinks until the arena holds that chunk.
+    cap = budgets.kernel_index_cap(QWEN3_32B_FP8)
+    assert budgets.chunk_budget(QWEN3_32B_FP8, H100_SXM) == cap
+    assert budgets.chunk_budget(QWEN3_32B_FP8, B200) == cap
+    l40s_chunk = budgets.chunk_budget(QWEN3_32B_FP8, L40S)
+    assert l40s_chunk < cap
+    full, sliding = budgets.arena_pages(QWEN3_32B_FP8, L40S, l40s_chunk)
+    assert sliding == 0
+    assert full * budgets.PAGE_TOKENS >= l40s_chunk
 
 
 def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():

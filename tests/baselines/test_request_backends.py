@@ -294,7 +294,11 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
     assert l40s_util == pytest.approx(0.865, abs=1e-3)
     assert l40s_util == gpu_memory_utilization(L40S, QWEN3_4B_FP8)
     qwen32 = engine.llm_kwargs(QWEN3_32B_FP8, L40S)
-    assert qwen32["gpu_memory_utilization"] == 0.91
+    assert qwen32["gpu_memory_utilization"] == pytest.approx(0.775, abs=1e-3)
+    assert engine.llm_kwargs(QWEN3_32B_FP8, H100_SXM)[
+        "gpu_memory_utilization"] == pytest.approx(0.866, abs=1e-3)
+    assert engine.llm_kwargs(QWEN3_32B_FP8, B200)[
+        "gpu_memory_utilization"] == 0.91
     assert qwen32["max_model_len"] == -1
     # the mixture-of-experts model batches its own chunk cap; its
     # one-row canvas commits after one denoising step, and stays under

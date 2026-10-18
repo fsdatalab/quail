@@ -329,6 +329,7 @@ def run_all(
     canvas_draws: str = "",
     device: str = "h100-sxm",
     gpus: int = 1,
+    timeout_s: int = 43200,
 ):
     from quail_b import select_queries
 
@@ -374,6 +375,7 @@ def run_all(
             if include_quail or include_baselines or include_dumb_vllm:
                 family_call = run_query_family.with_options(
                     gpu=modal_gpu_type(device, gpus),
+                    timeout=timeout_s,
                 ).spawn(
                     model=model,
                     scale_factor=scale_factor,
@@ -558,7 +560,10 @@ def main(
     canvas_draws: str = "",
     device: str = "h100-sxm",
     gpus: int = 1,
+    timeout_s: int = 43200,
 ):
+    if timeout_s < 1 or timeout_s > 86400:
+        raise ValueError("timeout_s must be from 1 to 86400 seconds")
     if finish:
         # finish an earlier run whose orchestrator died
         call = finish_run.spawn(finish)
@@ -571,7 +576,7 @@ def main(
         f"{uuid.uuid4().hex[:8]}")
     run_dir = str(Path(output_dir) / run_id)
     print(f"run directory: {run_dir}", flush=True)
-    call = run_all.spawn(
+    call = run_all.with_options(timeout=timeout_s).spawn(
         run_dir=run_dir,
         model=model,
         scale_factor=scale_factor,
@@ -588,6 +593,7 @@ def main(
         canvas_draws=canvas_draws,
         device=device,
         gpus=gpus,
+        timeout_s=timeout_s,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

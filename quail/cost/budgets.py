@@ -54,12 +54,43 @@ def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     """Effective chunk budget, floored at the compute knee.
 
     The budget is min(memory bound, kernel index cap, the spec's own
-    cap when it has one) before the floor.
+    cap when it has one) before the floor. A model without a sliding
+    window is then shrunk until two chunks of activations leave one
+    chunk of KV. The memory bound's slack of 2 and that two-chunk
+    reserve are the same bytes, so a memory-bound chunk would
+    otherwise leave an empty arena.
     """
     b = min(chunk_memory_bound(model, device), kernel_index_cap(model))
     if model.chunk_cap_tokens:
         b = min(b, model.chunk_cap_tokens)
-    return max(b, int(compute_knee(model, device)))
+    b = max(b, int(compute_knee(model, device)))
+    return _chunk_leaving_kv(model, device, b)
+
+
+def _chunk_leaving_kv(model: ModelSpec, device: DeviceSpec, chunk: int) -> int:
+    """Shrink a chunk until its activation reserve leaves its own KV.
+
+    Args:
+        model: The model being budgeted.
+        device: The device it runs on.
+        chunk: The budget before the KV check.
+
+    Returns:
+        ``chunk`` when it already leaves one chunk of KV, or a smaller
+        one. A sliding-window model is unchanged; its arena check is
+        ``arena_pages``.
+    """
+    if model.sliding_window or chunk < 1:
+        return chunk
+    free = device.mem_bytes * POOL_FRACTION - model.W_resident
+    per = ACT_RESERVE_CHUNKS * model.act_per_token + model.kappa_full
+    if per > 0:
+        chunk = min(chunk, max(1, int(free // per)))
+    full, _ = arena_pages(model, device, chunk)
+    while chunk > 1 and full * PAGE_TOKENS < chunk:
+        chunk -= 1
+        full, _ = arena_pages(model, device, chunk)
+    return chunk
 
 
 def sliding_kv_fits(model: ModelSpec, device: DeviceSpec,
