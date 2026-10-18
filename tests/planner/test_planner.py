@@ -7,7 +7,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from helpers.fakes import keep_even, register_claims_evidence, two_alias_graph
-from helpers.planning import _optimize, _plan, node_kinds
+from helpers.planning import _optimize, _plan, node_kinds, token_lengths
 
 import quail
 from quail.builtins import built_in_registry
@@ -505,7 +505,8 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
     forced = _plan(_join_sequence(catalog, anchors=("t", None)), tokens)
     assert searches == [True]
     refined = refine_plan(
-        forced, model=QWEN3_4B_FP8, device=H100_SXM, document_tokens=tokens,
+        forced, model=QWEN3_4B_FP8, device=H100_SXM,
+        document_tokens=token_lengths(tokens),
         registry=built_in_registry())
     assert refined.settings["retention"] == forced.settings["retention"]
     assert refined.nodes == forced.nodes

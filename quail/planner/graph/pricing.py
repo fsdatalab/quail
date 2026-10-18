@@ -20,6 +20,7 @@ from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
+    AiInference,
     AiJoin,
     AiScore,
     PhysicalGraph,
@@ -86,7 +87,8 @@ class PlanPricer:
                 (alias,) = node.document_aliases
                 resident = retained.get(alias) == node.document_head
                 members = pipelines[node.node_id]
-                if any(member.keep_kv for member in members):
+                if any(isinstance(member, (AiFilter, AiJoin, AiInference))
+                       and member.keep_kv for member in members):
                     retained[alias] = node.document_head
                 else:
                     retained.pop(alias, None)

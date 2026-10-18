@@ -599,11 +599,11 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
     lines.append("")
     lines.extend("  " + line for line in physical_tree(
         physical.graph, logical=logical, verbose=verbose,
-        estimates=None if isinstance(physical, Refusal) else physical.estimates,
+        estimates=physical.estimates,
         metrics=None if result is None else result.node_metrics,
         stages=None if result is None else measured_stages(result.report),
     ).splitlines())
-    if not isinstance(physical, Refusal) and physical.estimates:
+    if physical.estimates:
         lines.append("  est. time is each node's work alone; node times do "
                      "not add up to the plan estimate")
         lines.append("  because chunk packing shares forward passes across "

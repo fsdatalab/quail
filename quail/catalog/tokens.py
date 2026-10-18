@@ -175,9 +175,9 @@ class TokenLengths(Sequence):
     """
 
     def __init__(self, values, store: "TokenStore | None" = None):
-        self.arrow_array = (values if isinstance(values, pa.ChunkedArray)
-                            else pa.chunked_array([pa.array(values)]))
-        self.arrow_array = self.arrow_array.cast(pa.int64())
+        self.arrow_array = (values.cast(pa.int64())
+                            if isinstance(values, pa.ChunkedArray)
+                            else pa.chunked_array([pa.array(values, pa.int64())]))
         self.store = store
 
     def __len__(self):

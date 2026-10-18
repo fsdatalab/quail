@@ -67,6 +67,9 @@ class AsyncAnswers:
     """
 
     dtype = None    # answers arrive as Python lists of bits
+    # the readout contract a stage reads: one trailing row, no normalizer
+    trailing_rows = 1
+    normalize = False
 
     def __init__(self, torch, rows):
         self.torch = torch
@@ -393,6 +396,8 @@ class DecisionRows:
         head: The model's DecisionHead.
         offsets: Distances before the last row, options first, ending in 0.
     """
+
+    normalize = False
 
     def __init__(self, torch, head, offsets):
         self.torch = torch

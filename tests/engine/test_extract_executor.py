@@ -44,7 +44,7 @@ from quail.physical import (
     plan_envelope,
 )
 from quail.physical.base import input_ports
-from quail.specs import DEVICES, MODELS
+from quail.specs import DEVICES, MODELS, QWEN3_4B_FP8
 
 
 @pytest.mark.parametrize(("scores", "stop", "chosen", "done"), [
@@ -332,6 +332,7 @@ def _fake_readout(tables, k):
 def _state(model, chunk_tokens=400):
     return QueryExecutionState(
         loaded_model=LoadedModelState(
+            model_spec=QWEN3_4B_FP8,
             arena=cpu_arena(256),
             pipeline=fake_pipeline(forward_chunk=model.forward_chunk),
             input_staging=SimpleNamespace(fixed_tokens=set()),

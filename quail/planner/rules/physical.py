@@ -13,6 +13,7 @@ from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
+    AiInference,
     AiJoin,
     AiScore,
     Limit,
@@ -254,6 +255,7 @@ class ShouldSharePrefixes(PhysicalRule):
         shared_by_alias = {}
         for node in graph.nodes:
             if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract, AiScore))
+                    or (isinstance(node, AiInference) and node.spec is None)
                     or node.share_prefixes
                     or (isinstance(node, AiScore) and len(node.spec.aliases) != 1)):
                 nodes.append(node)
@@ -329,8 +331,8 @@ class ChooseAttentionAlgorithm(PhysicalRule):
         for node in graph.nodes:
             path = None
             if isinstance(node, AiFilter):
-                lengths = context.document_tokens.get(node.alias, ())
-                store = lengths.store
+                lengths = context.document_tokens.get(node.alias)
+                store = None if lengths is None else lengths.store
                 path = "unified"
                 if tree_available and node.share_prefixes and store is not None:
                     path = filter_attention(

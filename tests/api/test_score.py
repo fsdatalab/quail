@@ -41,6 +41,7 @@ from quail.physical import (
 )
 from quail.physical.codec import decode_value, encode_value
 from quail.planner.plan import EngineConfig, Refusal
+from quail.specs import QWEN3_4B_FP8
 
 PROJECTION_SQL = (
     "SELECT d.id, "
@@ -476,6 +477,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     )
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
+            model_spec=QWEN3_4B_FP8,
             arena=object(),
             pipeline=object(),
             model=object(),
@@ -694,6 +696,7 @@ def test_shared_score_borrows_prefixes_and_reads_the_cue(monkeypatch):
                            prompt_token_parts=((1,), (2, 3)))
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
+            model_spec=QWEN3_4B_FP8,
             model=object(), arena=SimpleNamespace(page_tokens=2),
             pipeline=SimpleNamespace(canvas_ids=())),
         torch=object(), async_answers=fake_readout(), answer_rows=object(),

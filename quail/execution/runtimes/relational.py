@@ -51,8 +51,6 @@ def _num_rows(value) -> int | None:
     """Rows of a table or sequence, or None when counting would run a plan."""
     if isinstance(value, QueryResult):
         return value.known_num_rows()
-    if isinstance(value, (pa.Table, pa.RecordBatch)):
-        return value.num_rows
     return len(value) if isinstance(value, Sized) else None
 
 

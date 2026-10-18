@@ -101,8 +101,6 @@ class PhysicalNode:
 
     node_id: str
     inputs: tuple[InputPort, ...] = ()
-    # whether the node keeps its documents' KV for a later operator
-    keep_kv: bool = False
 
     type_name: ClassVar[str] = "quail.physical_node"
     runtime_key: ClassVar[str] = "quail.physical_node"

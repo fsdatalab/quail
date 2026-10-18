@@ -52,12 +52,6 @@ class PlanningContext:
     memo: dict = field(default_factory=dict, compare=False, repr=False)
 
 
-    def __post_init__(self) -> None:
-        # a test may give plain counts; the planner reads one type
-        object.__setattr__(self, "document_tokens", {
-            alias: lengths if isinstance(lengths, TokenLengths)
-            else TokenLengths(lengths)
-            for alias, lengths in self.document_tokens.items()})
     def lowered(self, prompt) -> LoweredPrompt:
         """Return the tokenized prompt, reusing an earlier result when available.
 
