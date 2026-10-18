@@ -430,6 +430,15 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
         "c", [pa.array(["u1", "u1"]), pa.array([1, 2])],
         "e", [pa.array(["u1", "u1"]), pa.array([2, 2], type=pa.int8())])
     assert pairs.to_pydict() == {"c": [1, 1], "e": [0, 1]}
+    # numbers pair by value: a float pairs an integer only at an
+    # integral value, and a large unsigned key never wraps to a signed one
+    pairs = pair_table("c", [pa.array([1, 2, 3])],
+                       "e", [pa.array([1.5, 2.0, -0.0, float("nan")])])
+    assert pairs.to_pydict() == {"c": [1], "e": [1]}
+    pairs = pair_table("c", [pa.array([2**64 - 1, 7], pa.uint64())],
+                       "e", [pa.array([-1, 7], pa.int64())])
+    assert pairs.to_pydict() == {"c": [1], "e": [1]}
+    assert estimate_pair_fraction([pa.array([1, 2])], [pa.array([2.0, 2.5])]) == 1 / 4
 
     with quail.Session(CONFIG, tokenizer=lambda text: list(text.encode())) as session:
         register_claims_evidence(session)

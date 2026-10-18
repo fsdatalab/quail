@@ -21,6 +21,23 @@ def selected_rows(columns: dict, predicates) -> pa.Array:
     return pc.indices_nonzero(accepted_rows(mask))
 
 
+def group_ids(columns) -> np.ndarray:
+    """Number the rows so rows with equal keys share a number.
+
+    Nulls form one group and NaNs another, like any other value.
+
+    Args:
+        columns: The key columns, Arrow arrays of one length.
+    """
+    codes = []
+    for column in columns:
+        values = pc.dictionary_encode(equality_keys(column, nan_equal=True))
+        if isinstance(values, pa.ChunkedArray):
+            values = values.combine_chunks()
+        codes.append(pc.fill_null(values.indices, -1).to_numpy())
+    return np.unique(np.column_stack(codes), axis=0, return_inverse=True)[1].reshape(-1)
+
+
 def equality_keys(values, *, nan_equal: bool):
     """Return values as keys that group and join by numeric equality.
 

@@ -1,7 +1,6 @@
 """Execute LLM filters and conditions on classification results."""
 
 import numpy as np
-import pyarrow.compute as pc
 
 from quail.backends.quail.executor.parts import (
     SingleResultPart,
@@ -11,6 +10,7 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.reranker import filter_scores
+from quail.catalog.selection import group_ids
 from quail.catalog.tokens import (
     DocumentKeys,
     DocumentPrefixes,
@@ -233,12 +233,7 @@ def stop_groups(node, columns, document_ids) -> list | None:
         raise KeyError(
             f"the stop key of {node.alias!r} needs its value columns")
     positions = arrow_ids(document_ids)
-    # a null key value forms one group, like any other value
-    codes = np.column_stack([
-        pc.fill_null(pc.dictionary_encode(columns.column(name).take(positions))
-                     .combine_chunks().indices, -1).to_numpy()
-        for name in node.stop_key])
-    return np.unique(codes, axis=0, return_inverse=True)[1].reshape(-1)
+    return group_ids([columns.column(name).take(positions) for name in node.stop_key])
 
 
 def filter_inputs(state, node, document_ids) -> dict:

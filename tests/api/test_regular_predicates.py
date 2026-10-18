@@ -270,3 +270,12 @@ def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
     assert selected_rows({"review": names, "name": names}, (
         RegularPredicate(reviews, "ilike", "%acme%"),
         RegularPredicate(name, ">", 5, function="length"))).to_pylist() == [0, 2]
+
+
+def test_stop_key_groups_follow_numeric_equality():
+    from quail.catalog.selection import group_ids
+
+    values = pa.array([-0.0, 0.0, float("nan"), float("nan"), 1.0, None, None])
+    groups = group_ids([values, values.dictionary_encode()]).tolist()
+    assert groups[0] == groups[1] and groups[2] == groups[3]
+    assert groups[5] == groups[6] and len(set(groups)) == 4
