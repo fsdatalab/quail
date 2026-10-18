@@ -79,13 +79,22 @@ def test_in_process_run_saves_a_readable_and_verified_result(store, tmp_path):
     verified.mkdir()
     table = pa.table({"r.id": ["r0", "r3"]})
     result = quail.QueryResult.from_table(table, {"backend": "quail"})
-    join_answers = pa.table({"r": [0], "p": [1], "answer": [True]})
-    result.answer_tables = {"joins": {0: join_answers}}
+    # every answer kind is saved under the key the result gives it
+    result.answer_tables = {
+        "filters": {("r", 0): pa.table({"r": [0, 3], "answer": [True, True]})},
+        "joins": {0: pa.table({"r": [0], "p": [1], "answer": [True]})},
+        "classifies": {"kind": pa.table({"r": [0], "kind": ["a"]})},
+        "scores": {"score": pa.table({"r": [0], "score": [0.5]})},
+        "extracts": {"lease": pa.table({"r": [0], "lease": ["x"]})},
+    }
     manifest = artifacts.write_result(result, verified)
     artifacts.verify_result(verified, manifest)
     loaded = artifacts.load_result(verified, manifest)
     assert loaded.to_rows() == [("r0",), ("r3",)]
-    assert loaded.answer_tables["joins"][0].equals(join_answers)
+    for kind, tables in result.answer_tables.items():
+        assert loaded.answer_tables[kind].keys() == tables.keys()
+        for key, table in tables.items():
+            assert loaded.answer_tables[kind][key].equals(table)
     with pytest.raises(ValueError, match="holds 2 rows"):
         artifacts.verify_result(verified, {**manifest, "rows": 3})
     (verified / "result.arrow").unlink()

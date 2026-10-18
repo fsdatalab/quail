@@ -44,6 +44,7 @@ from quail.planner.plan import EngineConfig
 from quail.remote.artifacts import (
     ANSWERS_FILE,
     RESULT_FILE,
+    answer_files,
     iter_ipc_stream,
     read_answers,
 )
@@ -326,9 +327,7 @@ class Server:
     def result_file(self, status: QueryStatus, name: str) -> Path:
         directory = self.result_directory(status)
         files = status.result["files"]
-        allowed = {files["result"], files["report"]}
-        allowed.update(entry["file"] for kind in ("filters", "joins")
-                       for entry in files["answers"][kind])
+        allowed = {files["result"], files["report"], *answer_files(files)}
         if name not in allowed:
             raise InvalidRequestError(f"{name!r} is not a file of this result")
         return directory / name

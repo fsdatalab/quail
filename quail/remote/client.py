@@ -27,7 +27,7 @@ import pyarrow.ipc as ipc
 
 from quail.execution.result import QueryResult
 from quail.progress import say
-from quail.remote.artifacts import result_from_parts
+from quail.remote.artifacts import read_answer_tables, result_from_parts
 from quail.remote.inputs import PreparedInput, describe
 from quail.remote.records import QueryFailedError, QueryStatus, ServerError
 
@@ -304,16 +304,9 @@ class QueryRun:
         files = status.result["files"]
         table = self._client.result_batches(self.id).read_all()
         report = json.loads(self._client.file(self.id, files["report"]))
-        filters = {
-            (entry["alias"], entry["position"]):
-                _table(self._client.file(self.id, entry["file"]))
-            for entry in files["answers"]["filters"]
-        }
-        joins = {
-            entry["position"]: _table(self._client.file(self.id, entry["file"]))
-            for entry in files["answers"]["joins"]
-        }
-        return result_from_parts(table, report, filters, joins, self._codecs)
+        answers = read_answer_tables(
+            files, lambda name: _table(self._client.file(self.id, name)))
+        return result_from_parts(table, report, answers, self._codecs)
 
 
 class RemoteConnection:

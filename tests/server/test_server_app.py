@@ -237,7 +237,7 @@ def test_http_lifecycle_events_files_and_durable_submissions(make_client):
         table = reader.read_all()
     assert sorted(table.column("r.id").to_pylist()) == ["r0", "r3"]
     answers = client.get(
-        f"/v1/queries/{query_id}/files/answers/filters/r--0.arrow")
+        f"/v1/queries/{query_id}/files/answers/filters/0.arrow")
     assert answers.status_code == 200
     forbidden = client.get(f"/v1/queries/{query_id}/files/../quail.sqlite3")
     assert forbidden.status_code in (400, 404)
