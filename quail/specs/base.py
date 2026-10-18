@@ -109,13 +109,6 @@ class ModelSpec:
     #                       to every prompt: Quail tokenizes without special
     #                       tokens, so the prefix carries it, and the text
     #                       sent to vLLM drops it because vLLM adds its own
-    extract_turn_prefix: str = ""    # chat-turn text before an AI.EXTRACT
-    #                                  prompt, when it differs from
-    #                                  turn_prefix; a prefix unlike the
-    #                                  AI.IF turn's keeps an extraction
-    #                                  from reading a filter's document KV
-    extract_turn_suffix: str = ""    # chat-turn text between an AI.EXTRACT
-    #                                  prompt's answer template and its cue
     prompt_format: str = "raw-v1"    # names the turn layout in run records
     prompt_layout: str = "ai-if"     # the PROMPT_LAYOUTS entry AI.IF
     #                                  prompts are written in
@@ -282,13 +275,6 @@ class ModelSpec:
     def turn(self) -> tuple[str, str]:
         """The chat-turn text wrapped around every prompt."""
         return self.turn_prefix, self.turn_suffix
-
-    @property
-    def extract_turn(self) -> tuple[str, str]:
-        """The chat-turn text wrapped around an AI.EXTRACT prompt."""
-        if self.extract_turn_prefix or self.extract_turn_suffix:
-            return self.extract_turn_prefix, self.extract_turn_suffix
-        return self.turn
 
     # W_mem and W_resident are the weight-memory names used throughout
     # the code and the engine wiki.

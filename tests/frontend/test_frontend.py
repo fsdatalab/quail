@@ -8,6 +8,7 @@ from helpers.fakes import keep_even, same_key
 from quail.catalog import Catalog, DocumentProvider
 from quail.frontend.builder import docs
 from quail.frontend.expressions import col, prompt
+from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
     ANSWER_CUE,
@@ -541,3 +542,47 @@ def test_builder_places_apply_nodes_in_the_logical_tree():
     with pytest.raises(CompileError, match="ids must be 'pairs'"):
         (base.join(docs(cat, "evidence").alias("e"))
          .apply(same_key, columns=[col("c.url")], ids="preserve"))
+
+
+def test_model_chat_turns_share_the_document_across_operators():
+    from quail.logical.prompts import render_join_prompt_text
+    from quail.specs import MODELS
+
+    refs = (ColumnRef("a", "documents", "text"),
+            ColumnRef("b", "documents", "text"))
+    for model in MODELS.values():
+        if model.role != "generative":
+            continue
+        gemma = model.arch == "diffusion_gemma"
+        start, end = ("<|turn>", "<turn|>") if gemma else (
+            "<|im_start|>", "<|im_end|>")
+        prefix = (
+            ("<bos>" if gemma else "")
+            + start + "system\nYou are an expert at text analysis" + end + "\n"
+            + start + "user\nDOCUMENT:\n")
+        binder = PromptBinder(model)
+        bound = [
+            binder.bind("filter", "{0}\nIs it a lease?", refs[:1]),
+            binder.bind("join", "Does {0} refer to {1}?", refs),
+            binder.bind("label", "{0}\nWhat kind?", refs[:1],
+                        labels=("lease", "deed")),
+            binder.bind("label", "Do {0} and {1} match?", refs,
+                        labels=("match", "different")),
+            binder.bind("extract", "When does it end?", refs[:1]),
+        ]
+        for item in bound:
+            assert item.preamble == prefix
+            if item.kind == "join":
+                text = render_join_prompt_text(item, ("Lease", "Deed"), 0)
+            else:
+                text = item.preamble + item.tail.replace("{0}", "Lease")
+            assert text.count(start + "system\n") == 1
+            assert text.count(start + "user\n") == 1
+            assert text.count(end) == 2
+            assert text.count(start + ("model" if gemma else "assistant")) == 1
+            if item.kind == "extract":
+                assert text.endswith('Phrase: "')
+            else:
+                assert text.endswith(model.turn_suffix)
+        lowered = lower_prompt(bound[2], lambda text: list(text.encode()))
+        assert lowered.label_prefix == ""

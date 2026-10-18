@@ -811,6 +811,7 @@ def test_reranker_prompts_render_stored_documents_and_the_ai_if_frame(catalog):
     )
     from quail.specs import MODELS
 
+    assert QWEN3_RERANKER_SYSTEM_TEXT.startswith("You are an expert at text analysis")
     assert "\n" not in QWEN3_RERANKER_SYSTEM_TEXT
     assert "based on the Query and the Instruct provided." \
         in QWEN3_RERANKER_SYSTEM_TEXT

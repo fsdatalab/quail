@@ -291,9 +291,6 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
                 f"reports no prompt pieces")
             return None
         pieces["scores"].append({"id": operator.id, "tail": list(tail)})
-    # an extraction's plain prompt: its head is the document label
-    # inside the model's extract turn, which differs from the AI.IF
-    # preamble on a model that answers AI.IF raw
     for operator in info.extracts:
         head, tail = _extract_parts(query.plan(), _extract_name(info, operator))
         if not pieces["preamble"]:
