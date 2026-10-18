@@ -44,8 +44,13 @@ def begin_query_payloads(payload: dict, gpus: int) -> list[dict]:
 
 
 def filter_node_payloads(payload: dict, node, shards: dict,
-                         gpus: int, *, has_joins: bool) -> list[dict]:
-    """Build one typed filter node payload per GPU executor."""
+                         gpus: int, *, final: bool) -> list[dict]:
+    """Build one typed filter node payload per GPU executor.
+
+    The result limit ends the filters' run only when final: the
+    filters are the query's last model operators, so no later
+    operator can drop a survivor.
+    """
     outputs = []
     tokens = payload["documents"][node.alias]
     for worker in range(gpus):
@@ -53,9 +58,7 @@ def filter_node_payloads(payload: dict, node, shards: dict,
         indices = shard if isinstance(shard, range) else list(shard)
         sub = _common_payload(payload)
         sub["physical_plan"] = payload["physical_plan"]
-        sub["filter_limit"] = (
-            None if has_joins else payload.get("filter_limit")
-        )
+        sub["filter_limit"] = payload.get("filter_limit") if final else None
         sub.update(
             documents={node.alias: select_documents(tokens, indices)},
             document_index={node.alias: indices},

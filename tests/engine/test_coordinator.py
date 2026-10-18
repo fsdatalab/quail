@@ -30,12 +30,13 @@ def filter_node():
 
 
 def test_filter_and_join_rounds_split_and_place_documents():
-    # LIMIT counts output rows: with joins, cutting survivors drops rows (#39)
+    # LIMIT counts output rows: a later operator may drop a survivor,
+    # so only the last model operators' run ends at the limit
     p = payload()
     p["filter_limit"] = 3
     assert all(s["filter_limit"] is None for s in filter_node_payloads(
-        p, filter_node(), p["shards"], 2, has_joins=True))
-    subs = filter_node_payloads(p, filter_node(), p["shards"], 2, has_joins=False)
+        p, filter_node(), p["shards"], 2, final=False))
+    subs = filter_node_payloads(p, filter_node(), p["shards"], 2, final=True)
     assert all(s["filter_limit"] == 3 for s in subs)
     assert [sub["document_index"]["r"] for sub in subs] == [[0, 2, 4], [1, 3, 5]]
     assert subs[1]["documents"]["r"][0] == [1] * 11
@@ -142,10 +143,9 @@ def test_stop_key_groups_ride_the_filter_payload_and_shard_together():
         "key": ["a", "b", "a", "c", "b", "a"]})}
     node = AiFilter(node_id="filter:r", alias="r", arena_writes=True,
                     question_token_ids=((7, 7),), stop_key=("key",))
-    subs = filter_node_payloads(p, node, p["shards"], 2, has_joins=False)
+    subs = filter_node_payloads(p, node, p["shards"], 2, final=True)
     assert [list(sub["stop_groups"]) for sub in subs] == [[0, 0, 1], [0, 1, 2]]
-    plain = filter_node_payloads(p, filter_node(), p["shards"], 2,
-                                 has_joins=False)
+    plain = filter_node_payloads(p, filter_node(), p["shards"], 2, final=True)
     assert all(sub["stop_groups"] is None for sub in plain)
     # every document of a key lands on one worker
     shards = keyed_shards([0, 1, 0, 2, 1, 0], [10, 11, 12, 13, 14, 15], 2)

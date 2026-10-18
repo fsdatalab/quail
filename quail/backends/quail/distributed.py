@@ -78,6 +78,7 @@ class DistributedQuailExecution:
                         node.alias), range(len(documents))),
                     [len(document) for document in documents], gpus)
         self.joins = tuple(node for node in graph.nodes if isinstance(node, AiJoin))
+        self.last_compute = compute_subgraph(graph).nodes[-1].node_id
         self.joins_started = False
         self.retained: dict[str, set[int]] = {}
         self.prior_shards: dict[str, list[list[int]]] = {}
@@ -139,7 +140,7 @@ class DistributedQuailExecution:
             self.begin()
         alias = nodes[0].spec.alias
         (source,) = inputs.values()
-        ids = id_positions(source)
+        ids = id_positions(source.ids[alias] if isinstance(source, Rows) else source)
         positions = self._extraction_positions(alias, ids)
         texts = self.payload["texts"][alias]
         if not isinstance(texts, (pa.Array, pa.ChunkedArray)):
@@ -231,13 +232,9 @@ class DistributedQuailExecution:
                 tuple(document for document in shard if document in survivors)
                 for shard in shards[node.alias]
             )
+        final = any(member.node_id == self.last_compute for member in nodes)
         subs = coordinator.filter_node_payloads(
-            self.payload,
-            node,
-            shards,
-            self.gpus,
-            has_joins=bool(self.joins),
-        )
+            self.payload, node, shards, self.gpus, final=final)
         for sub in subs:
             sub["start_query"] = not self.started
             sub["node_ids"] = [member.node_id for member in nodes]
@@ -249,6 +246,8 @@ class DistributedQuailExecution:
             self.peak_gib,
             *(output.get("peak_gib", 0.0) for output in outputs),
         )
+        for worker, output in enumerate(outputs):
+            self.child_totals[worker] = output.get("kv_totals")
         self._retained_placement(outputs)
         results = {}
         for j, member in enumerate(nodes):
@@ -258,7 +257,7 @@ class DistributedQuailExecution:
                         f"filter_answers:{node.alias}"].items()}
             survivors = np.sort(np.concatenate([
                 id_positions(part.outputs[f"rows:{node.alias}"]) for part in parts]))
-            if j == len(nodes) - 1 and not self.joins:
+            if j == len(nodes) - 1 and final:
                 survivors = survivors[:self.payload.get("filter_limit")]
             results[member.node_id] = NodeResult(
                 {f"rows:{node.alias}": Rows({node.alias: survivors}),
