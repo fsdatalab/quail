@@ -716,6 +716,28 @@ def test_foreign_node_placement_and_pipelines():
                        for pipeline in build_pipelines(graph).values()})
 
     assert sequences(two_alias_graph(True)) == [("filter:r", "group:0")]
+    # two joins, each anchored on the other's filtered table, would
+    # each wait for the other's pipeline: the joins run apart
+    from quail.physical.pipelines import execution_groups
+
+    graph = two_alias_graph(True)
+    r_filter = graph.node("filter:r")
+    p_filter = replace(r_filter, node_id="filter:p", alias="p",
+                       inputs=input_ports((PortRef("input:p", "rows:p"),)))
+    inputs = input_ports((PortRef("filter:r", "rows:r"),
+                          PortRef("filter:p", "rows:p")))
+    r_join = replace(graph.nodes[-1], inputs=inputs)
+    p_join = replace(r_join, node_id="group:1", anchor="p", partners=("r",),
+                     written_position=1, exec_index=1)
+    graph = PhysicalGraph((*graph.nodes[:2], r_filter, p_filter, r_join, p_join),
+                          graph.root)
+    groups = execution_groups(graph, build_pipelines(graph))
+    assert sorted(len(group) for group in groups) == [1, 1, 1, 1, 2]
+    available = set()
+    for group in groups:
+        for node in group:
+            assert all(port.source.node_id in available for port in node.inputs)
+            available.add(node.node_id)
     assert sequences(two_alias_graph(True, foreign=("per_batch", "drop"))) == [
         ("filter:r", "apply:keep_even", "group:0")]
     assert sequences(two_alias_graph(True, foreign=("per_batch", "pairs"))) == [
