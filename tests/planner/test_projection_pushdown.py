@@ -173,7 +173,7 @@ def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
         raise ValueError("tokenizer failed")
 
     session = _session(tmp_path)
-    session._tok = broken
+    session._tokenizer = broken
 
     with pytest.raises(ValueError, match="tokenizer failed"):
         session.inputs.tokenize("reviews", "review", ("id",))

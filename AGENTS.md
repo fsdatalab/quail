@@ -28,7 +28,11 @@ Write like two engineers talking at a whiteboard.
   then optional Args, Returns, and Raises. Say what the code does, not
   why it was written or what it replaced.
 - Use one name for each concept across the planner, the executor, the
-  docs, and the metrics.
+  docs, and the metrics. `tools/check_names.py` enforces the chosen
+  words; see Names below.
+- Whatever opens a file, a process, or an engine owns it: enter it on
+  an `ExitStack` or in `closing()`, and release it on the failure
+  path as well as the normal one.
 
 # Checks
 
@@ -53,6 +57,23 @@ CI runs these on every pull request. Run them before pushing:
   containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a
   prompts module or folder, or plainly HTML or SQL. Docstrings are
   exempt. Shorten long messages and log lines.
+- `tools/check_names.py` reports two names for one concept or one
+  name for two: duplicate function bodies, a parameter passed on
+  under another keyword, identifiers that differ by a synonym, and a
+  variable named for a type it does not hold. `--inventory` lists
+  what the code defines, for finding such names by hand.
+
+## Tests
+
+- An end-to-end test answers the model from `tests/helpers/oracle.py`:
+  `Oracle` holds the planted truth, `oracle_executor` runs a request's
+  graph on it, and `finish` runs a query to its result. Do not add
+  another fake of the executor or the model.
+- A bug fix gets one small regression case, in the test file that
+  already covers that path. Name a test as a sentence stating the
+  behavior, such as `test_a_failed_boot_releases_the_gpu`.
+- A test checks the behavior the user sees, such as the rows returned
+  or the files left behind, not the order of internal calls.
 
 # Names
 
@@ -71,6 +92,35 @@ CI runs these on every pull request. Run them before pushing:
 - Every `Session` takes an `EngineConfig` that names `model` and
   `device`; neither has a default. `gpus` defaults to 1 and `backend`
   to `"quail"`.
+
+## Names in code
+
+One word per concept, following Spark, DuckDB, and DataFusion where
+they have one. When a concept has no name yet, ask before inventing
+one. `tools/check_names.py` enforces the chosen words:
+
+- `document` and `documents`, not `doc` or `docs` (the public `docs()`
+  API keeps its name).
+- A count is `num_<things>`, such as `num_documents` or `num_pages`,
+  never `n_<things>`, `<thing>_count`, or `number_of_<things>`.
+- `gpus` is the GPU count everywhere: the planner, the executor, the
+  settings, and the metrics. `workers` names worker handles only.
+- `expected_rows` is the rows an operator expects to see, whatever it
+  reads: documents, pairs, or tuples. `survivors` are the ids still in
+  play after an operator.
+- `index` not `idx`, `position` not `pos`, `count` not `cnt`,
+  `tokens` not `toks`, `tokenizer` not `tok`, `seconds` not `secs`,
+  `estimate` not `est`, `config` not `cfg`; `written_position` and
+  `exec_index` for a node's places in the query and the run.
+- `resident` is KV already read; `document_head` is the prompt tokens
+  an operator shows before each document; `run` or `configuration`,
+  never `arm`.
+- Every document operator emits one `rows:<alias>` port carrying
+  `Rows`, and a pair operator emits `rows`. Read ids from `Rows` with
+  `document_ids()`; do not keep a separate ids port.
+- A variable named for a type holds that type: `rows`, `scored`,
+  `labels`, and `answers` hold `Rows`; `table`, `batch`, and
+  `relation` hold Arrow tables.
 
 # Scope
 

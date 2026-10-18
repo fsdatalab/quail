@@ -56,7 +56,7 @@ class Session:
                 unit="configurations",
             ))
         self.catalog = Catalog()
-        self._tok = tokenizer      # injectable for tests
+        self._tokenizer = tokenizer      # injectable for tests
         self.inputs = InputStore(
             self.catalog, tokenizer=lambda: self.tokenizer,
             tokenizer_name="configured tokenizer" if tokenizer else "Gigatoken")
@@ -164,10 +164,10 @@ class Session:
         as bytes; the planner uses it to find the word each label token
         starts.
         """
-        if self._tok is None:
-            self._tok = GigatokenEncoder(resolve_model_path(
+        if self._tokenizer is None:
+            self._tokenizer = GigatokenEncoder(resolve_model_path(
                 self.model.hf_name, self.model.revision, include_weights=False))
-        return self._tok
+        return self._tokenizer
 
     def register_functions(self, functions: dict) -> None:
         """Register a query's apply() functions once each, by name."""

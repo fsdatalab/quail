@@ -97,7 +97,7 @@ def test_planning_lowers_the_extraction_prompt_once(session, monkeypatch):
             seen.append(text)
         return tokenizer(text)
 
-    monkeypatch.setattr(session, "_tok", count_prompt)
+    monkeypatch.setattr(session, "_tokenizer", count_prompt)
     assert not isinstance(query.plan(), Refusal)
     assert len(seen) == 1, seen
 
