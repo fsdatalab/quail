@@ -13,13 +13,18 @@ from dataclasses import dataclass
 
 from quail.cost import work as _workload
 from quail.cost.dense_decoder_cost import dense_decoder_components
-from quail.cost.roofline import ComponentLatency, component_latencies
+from quail.cost.roofline import ComponentLatency, component_latencies, sum_latencies
 from quail.specs import DeviceSpec, ModelSpec
 
 
 def _latencies(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
                passes: float) -> tuple[ComponentLatency, ...]:
     """Return the priced decoder components for one work record."""
+    if work.batches:
+        return sum_latencies([
+            _latencies(work.unbatched(), model, device, passes),
+            *(_latencies(batch, model, device, count)
+              for batch, count in work.batches)])
     return component_latencies(
         dense_decoder_components(work, model, passes), device)
 
@@ -37,7 +42,7 @@ def unrounded_seconds(work: _workload.Work, model: ModelSpec, device: DeviceSpec
     """Return component time with fractional ideal forward passes."""
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be at least 1")
-    passes = work.tokens / chunk_tokens
+    passes = max(0.0, work.unbatched().tokens) / chunk_tokens
     return sum(component.seconds
                for component in _latencies(work, model, device, passes))
 
@@ -47,7 +52,7 @@ class SpeedOfLight:
     """The complete bound and its component breakdown."""
 
     work: _workload.Work
-    passes: int
+    passes: float
     components: tuple[ComponentLatency, ...]
 
     def component(self, name: str) -> ComponentLatency:
@@ -84,7 +89,7 @@ class SpeedOfLight:
             f"pairs          {work.pairs:>18,.0f}",
             f"kv written     {work.kv_written:>18,.0f}",
             f"kv read        {work.kv_read:>18,.0f}",
-            f"forward passes {self.passes:>18,d}",
+            f"forward passes {self.passes:>18,.2f}",
             f"bytes moved    {self.bytes_moved:>18,.0f}",
         ]
         for latency in self.components:
@@ -107,9 +112,9 @@ def speed_of_light(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
     """Price aggregate query work with ideal query-wide packing."""
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be at least 1")
-    passes = math.ceil(work.tokens / chunk_tokens) if work.tokens else 0
+    passes = math.ceil(max(0.0, work.unbatched().tokens) / chunk_tokens)
     return SpeedOfLight(
         work=work,
-        passes=passes,
+        passes=passes + sum(count for _, count in work.batches),
         components=_latencies(work, model, device, passes),
     )

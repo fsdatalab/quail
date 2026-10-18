@@ -295,10 +295,9 @@ def test_classify_plans_filters_and_returns_labels(session):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     (test,) = [n for n in plan.nodes if isinstance(n, Filter)]
     assert classify.spec.labels == ("refund", "shipping", "praise")
-    assert classify.spec.label_token_ids[0] == tuple(_bytes("refund"))
-    # a tokenizer without decode marks no word start
-    assert classify.spec.label_word_starts == tuple(
-        (False,) * len(ids) for ids in classify.spec.label_token_ids)
+    assert classify.spec.scoring == "letters"
+    assert classify.spec.label_token_ids == ((65,), (66,), (67,))
+    assert classify.spec.label_word_starts == ()
     assert test.predicate == InList("topic", ("refund", "shipping"))
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
@@ -453,7 +452,7 @@ def test_frontends_place_classifications_on_their_table(session):
             in text.split("SemanticClassify")[0])
     assert "Project: d.id, topic" in text
     assert "AiClassify: topic over d" in text
-    assert "rule=trie_decode, labels=3" in text
+    assert "rule=letters, labels=3" in text
     assert "Filter: topic IN ['refund', 'shipping']" in text
 
 

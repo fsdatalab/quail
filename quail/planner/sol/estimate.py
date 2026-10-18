@@ -16,8 +16,8 @@ rows follows its join on the join's anchor.
 Classification uses the planner's selected scoring rule, including its
 label tokens, decode rounds, and output head. Extraction uses the
 planner's expected answer-length curve and draft policy, including
-verification rows and KV reads. Both use ideal
-query-wide packing; answer lengths and draft acceptance remain assumptions.
+verification rows and KV reads. Both use ideal packing within each step;
+answer lengths and draft acceptance remain assumptions.
 
 Every operator in the plan is priced or refused: an Apply, an AI.SCORE
 predicate or column, a LIMIT, or a join without full semantics raises
@@ -149,7 +149,7 @@ class SpeedOfLightEstimate:
                 "draft_policy": "the planner's first-round adaptive choice",
                 "included": "decode and verification rows, KV, and output head",
             },
-            "packing": "ideal query-wide packing, including answer rounds",
+            "packing": "ideal packing within each dependent answer step",
             "plan_space": "all feasible eager binary full left deep plans",
             "cached_values": (
                 "document prefixes used by filters, classifications, "

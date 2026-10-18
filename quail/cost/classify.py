@@ -2,10 +2,9 @@
 
 The estimate sums each document's work (quail/cost/work.py) over every
 document, weights each label's greedy decode rounds by its share of
-the labels, and prices the total with the component roofline at ideal
-packing: forward passes are tokens divided by the chunk, as in
-quail/cost/sol.py. KV capacity, the two-pass round delay, and admission
-order do not enter, just as they do not enter filter and join costs.
+the labels, and prices each dependent step with ideal batch packing.
+Each nonempty step reads the weights. KV capacity and admission order
+are not simulated.
 """
 
 from collections import Counter
@@ -13,9 +12,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from quail.cost.dense_decoder_cost import readout_work
+from quail.cost.batches import batch_work, cached_profile
 from quail.cost.sol import unrounded_seconds
-from quail.cost.work import Work, ask, decode, stream
+from quail.cost.work import Work, ask, stream
 from quail.labels import (
     DECODE_SCORING,
     LETTERS_SCORING,
@@ -63,7 +62,7 @@ class ClassifyCost:
 
     Attributes:
         seconds: Component roofline time of the expected work at ideal packing.
-        passes: Expected fresh tokens divided by the chunk.
+        passes: Expected weight reads across the packed steps.
         work: Expected token, attention, and KV work.
         suffix_tokens: Expected suffix tokens streamed after the documents.
         rounds: Maximum number of rounds needed by any label.
@@ -101,18 +100,34 @@ def _canvas_work(work: Work, canvas_rows: int) -> Work:
     return work
 
 
-def _rounds_work(prefix, shared, frame_tokens: int, runs, resident: bool,
-                 window: int, canvas_rows: int) -> Work:
-    """Sum every document's work over one label's decode rounds.
-
-    The first run is packed with the frame into the prefix's request;
-    each later run streams after everything fed before it.
-    """
-    first_tail = frame_tokens + runs[0]
-    work = _first_work(prefix, shared, first_tail, resident, window)
-    context = prefix + first_tail
-    rounds = decode(context, runs[1:], window=window).total()
-    return work + _canvas_work(rounds, canvas_rows)
+def _profile(prefix, shared, frame_tokens, suffixes, resident, window,
+             canvas_rows, runs, answer_rows):
+    """Summarize token and KV work by dependent step."""
+    n = len(prefix)
+    if runs is None:
+        work = (_first_work(prefix, shared, frame_tokens, resident, window)
+                + _stream_work(prefix + frame_tokens, suffixes, window, canvas_rows))
+        rows = canvas_rows or sum(suffixes)
+        rows = rows if answer_rows is None else answer_rows
+        return [(work, rows * n, 1.0)], float(sum(suffixes)), 1
+    steps = []
+    suffix_tokens = 0.0
+    for fed, count in Counter(tuple(fed) for fed in runs).items():
+        share = count / len(runs)
+        context = prefix + frame_tokens
+        for index, tokens in enumerate(fed):
+            own = (_first_work(prefix, shared, frame_tokens + tokens, resident, window)
+                   if index == 0 else _canvas_work(
+                       ask(context, np.full_like(prefix, tokens),
+                           window=window).total(),
+                       canvas_rows))
+            if index == len(steps):
+                steps.append((Work(), 0.0, 0.0))
+            old, rows, probability = steps[index]
+            steps[index] = (old + own * share, rows + n * share, probability + share)
+            context = context + tokens
+        suffix_tokens += sum(fed) * share
+    return steps, suffix_tokens, len(steps)
 
 
 def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
@@ -120,7 +135,7 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0, runs=None,
                     answer_rows: float | None = None,
-                    head_rows: int = 0) -> ClassifyCost:
+                    head_rows: int = 0, memo=None) -> ClassifyCost:
     """Estimate expected classification work and its roofline time.
 
     Args:
@@ -144,6 +159,7 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
             row per decode round.
         head_rows: Output-head rows each answer row multiplies; 0 is the
             whole vocabulary. A decision model ignores it.
+        memo: Query memo for document-length-dependent step summaries.
 
     Returns:
         Expected work over the documents, scaled to live, priced at
@@ -152,32 +168,21 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
     n = len(lengths)
     if live <= 0 or n == 0 or not (suffixes or runs):
         return ClassifyCost(0.0, 0.0, Work(), 0.0, 0)
-    window = model.sliding_window
-    prefix = np.asarray(lengths, dtype=float) + head_tokens
-    shared = np.asarray(shared if len(shared) else np.zeros(n), dtype=float)
-    # a borrowed prefix includes the prompt head the documents share
-    shared = np.where(shared > 0, shared + head_tokens, 0.0)
-    if runs is not None:
-        work = Work()
-        suffix_tokens = rows = 0.0
-        for fed, count in Counter(tuple(fed) for fed in runs).items():
-            share = count / len(runs)
-            work += _rounds_work(prefix, shared, frame_tokens, fed, resident,
-                                 window, canvas_rows) * share
-            suffix_tokens += sum(fed) * share
-            rows += len(fed) * share
-        rounds = max(map(len, runs))
-    else:
-        work = (_first_work(prefix, shared, frame_tokens, resident, window)
-                + _stream_work(prefix + frame_tokens, suffixes, window, canvas_rows))
-        suffix_tokens = float(sum(suffixes))
-        rows = float(canvas_rows or sum(suffixes))
-        rounds = 1
-    if answer_rows is not None:
-        rows = answer_rows
-    total = work * (live / n)
-    passes = total.tokens / chunk
-    total += readout_work(model, rows * live, passes, head_rows)
+    key = ("classify_steps", id(lengths), id(shared), head_tokens, frame_tokens,
+           tuple(suffixes), resident, model.sliding_window, canvas_rows,
+           None if runs is None else tuple(map(tuple, runs)), answer_rows)
+
+    def build():
+        prefix = np.asarray(getattr(lengths, "arrow_array", lengths), dtype=float)
+        prefix = prefix + head_tokens
+        borrowed = np.asarray(shared if len(shared) else np.zeros(n), dtype=float)
+        borrowed = np.where(borrowed > 0, borrowed + head_tokens, 0.0)
+        return _profile(prefix, borrowed, frame_tokens, suffixes, resident,
+                        model.sliding_window, canvas_rows, runs, answer_rows)
+
+    steps, suffix_tokens, rounds = cached_profile(memo, key, (lengths, shared), build)
+    total = batch_work(steps, live, n, chunk, model, head_rows)
+    passes = sum(count for _, count in total.batches)
     seconds = unrounded_seconds(total, model, device, chunk)
     return ClassifyCost(seconds, passes, total, suffix_tokens * live, rounds)
 
@@ -185,7 +190,7 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
 def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
              labels, *, lengths, shared, chunk: int,
              model, device, resident: bool = False, draws: int = 1,
-             starts=()) -> ClassifyCost:
+             starts=(), memo=None) -> ClassifyCost:
     """Estimate the cost of one classification scoring rule.
 
     Args:
@@ -202,6 +207,7 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         resident: Whether document KV is already available.
         draws: Maximum number of diffusion draws per document.
         starts: Per label, which tokens begin a new word.
+        memo: Query memo for document-length-dependent step summaries.
 
     Returns:
         Estimated execution time, work, and token counts.
@@ -228,4 +234,4 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         head_rows=len(targets) if all(len(ids) == 1 for ids in labels) else 0,
         canvas_rows=(canvas_rows if scoring == LETTERS_SCORING
                      else model.canvas_tokens),
-        runs=runs, answer_rows=answer_rows)
+        runs=runs, answer_rows=answer_rows, memo=memo)

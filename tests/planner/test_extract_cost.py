@@ -1,5 +1,6 @@
 """Extraction costs: the executor's rounds priced like a classification."""
 
+import math
 from dataclasses import replace
 
 import pytest
@@ -9,7 +10,7 @@ from quail.cost.extract import (
     document_work,
     estimate,
 )
-from quail.cost.work import ask, decode, scan
+from quail.cost.work import Work, ask, decode, scan
 from quail.physical import ExtractSpec
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -34,13 +35,16 @@ def _document(length, **kwargs):
     return document_work(length, HEAD, TAIL, **options)
 
 
-def _rounds_work(context, round_tokens, rounds):
-    """The decode work of a fractional number of equal rounds."""
-    whole = int(rounds)
-    work = decode(context, [round_tokens] * whole)
-    if rounds > whole:
-        work += ask(context + whole * round_tokens, round_tokens) * (rounds - whole)
-    return work
+def _rounds_work(context, round_tokens, limit=64, mean=16):
+    """Average work over every possible capped answer length."""
+    total = Work()
+    q = 1 - 1 / mean
+    cap = math.ceil((limit - 1) / round_tokens)
+    for length in range(1, limit + 1):
+        probability = q ** (length - 1) * (1 if length == limit else 1 - q)
+        count = min(cap, math.ceil(length / round_tokens))
+        total += decode(context, [round_tokens] * count) * probability
+    return total
 
 
 def test_expected_rounds_follow_the_answer_length_curve():
@@ -66,25 +70,30 @@ def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     context = HEAD + 100 + TAIL
     round_tokens = 1 + 16
     rounds = ExtractAssumptions().rounds(ExtractSpec.max_answer_tokens, 16)
-    answer = _rounds_work(context, round_tokens, rounds)
-    assert work == scan(HEAD + 100, TAIL) + answer
+    answer = _rounds_work(context, round_tokens)
+    assert vars(work) == pytest.approx(vars(scan(HEAD + 100, TAIL) + answer))
     assert fed == pytest.approx(TAIL + rounds * round_tokens)
     assert rows == pytest.approx(1 + rounds * round_tokens)
     # resident KV turns the scan into a question over it
     resident, _, _ = _document(100, resident=True)
-    assert resident == ask(HEAD + 100, TAIL) + answer
+    assert vars(resident) == pytest.approx(vars(ask(HEAD + 100, TAIL) + answer))
     assert resident.tokens < work.tokens
     shared, _, _ = _document(100, shared=80)
-    assert shared == ask(80, HEAD + 100 + TAIL - 80) + answer
+    assert vars(shared) == pytest.approx(vars(ask(80, HEAD + 100 + TAIL - 80) + answer))
     assert shared.tokens == pytest.approx(work.tokens - 80)
     assert _document(100, resident=True, shared=80)[0] == resident
 
 
-def test_parallel_estimate_preserves_work_and_limits_used_workers():
-    one = _cost([100, 100])
-    two = _cost([100, 100], workers=2)
+def test_parallel_estimate_preserves_work_and_limits_used_workers(monkeypatch):
+    lengths, memo = [100, 100], {}
+    one = _cost(lengths, memo=memo)
+    with monkeypatch.context() as patch:
+        patch.setattr("quail.cost.extract._document_steps",
+                      lambda *args, **kwargs: pytest.fail("rescanned document lengths"))
+        two = _cost(lengths, workers=2, memo=memo)
     assert two.work == one.work
-    assert two.seconds == pytest.approx(one.seconds / 2)
+    assert one.seconds / 2 < two.seconds <= one.seconds
+    assert two.seconds == pytest.approx(_cost([100]).seconds)
     assert _cost([100], workers=8).seconds == _cost([100]).seconds
 
 
@@ -94,15 +103,15 @@ def test_cost_uses_plan_limits_and_separate_answer_assumptions():
     context = HEAD + 100 + TAIL
     rounds = assumptions.rounds(8, 3)
     assert rounds == pytest.approx(1 + (39 / 40) ** 4)
-    assert replace(cost.work, readout_flops=0, readout_bytes=0) == (
-        scan(HEAD + 100, TAIL) + _rounds_work(context, 4, rounds))
+    assert replace(cost.work, readout_flops=0, readout_bytes=0, batches=()) == (
+        scan(HEAD + 100, TAIL) + _rounds_work(context, 4, limit=8, mean=40))
     assert cost.suffix_tokens == pytest.approx(TAIL + 4 * rounds)
     assert cost.rows == pytest.approx(1 + 4 * rounds)
     shorter = _cost([100], max_answer_tokens=8, draft_tokens=3,
                     assumptions=ExtractAssumptions(answer_tokens=2))
     assert shorter.work.tokens < cost.work.tokens
     capped = _cost([100], max_answer_tokens=1, assumptions=assumptions)
-    assert replace(capped.work, readout_flops=0, readout_bytes=0) == (
+    assert replace(capped.work, readout_flops=0, readout_bytes=0, batches=()) == (
         scan(HEAD + 100, TAIL))
     assert capped.work.readout_flops == 2 * QWEN3_4B_FP8.hidden * QWEN3_4B_FP8.vocab
     windowed, _, _ = document_work(

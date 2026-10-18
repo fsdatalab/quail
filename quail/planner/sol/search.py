@@ -67,6 +67,7 @@ class Search:
     def __init__(self, query, answer: AnswerOracle, label: LabelOracle | None,
                  model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
                  credit_shared: bool, extraction: extract_cost.ExtractAssumptions):
+        self.memo = {}
         self.extraction = extraction
         self.config = query.session.config
         self.tokenizer = query.session.tokenizer
@@ -208,7 +209,7 @@ class Search:
             alias=alias, mean=sum(lengths) / len(lengths) if lengths else 0,
             longest=max(lengths, default=0), budget=math.inf,
             chunk=self.chunk_tokens, model=self.model, device=self.device,
-            capacity=math.inf, lengths=lengths, shared=tuple(shared),
+            capacity=math.inf, lengths=lengths, shared=tuple(shared), memo=self.memo,
             draws=self.config.canvas_draws if self.model.answer_canvas else 1,
             tree=(budgets.tree_attention_allowed(self.model)
                   and self.config.attention != "unified"))
@@ -240,7 +241,7 @@ class Search:
             max_answer_tokens=spec.max_answer_tokens, draft_tokens=spec.draft_tokens,
             draft_policy=spec.draft_policy,
             round_cost_per_token=spec.round_cost_per_token,
-            assumptions=self.extraction)
+            assumptions=self.extraction, memo=self.memo)
         return cost.work, spec, cost.rows
 
     def join_stage_work(self, anchor, partners, survivors, prompt,

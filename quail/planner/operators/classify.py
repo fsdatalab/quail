@@ -1,7 +1,7 @@
 """AI.CLASSIFY: its statistics, scoring rule, cost, spec, and plan node."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from quail.cost import budgets
 from quail.cost import classify as classify_cost
@@ -48,8 +48,6 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
     """
     lengths = context.document_tokens[alias]
     summary = summarize_alias(lengths, context.model.sliding_window, memo=context.memo)
-    if hasattr(lengths, "arrow_array"):
-        lengths = lengths.arrow_array.to_numpy()
     chunk = budgets.chunk_budget(context.model, context.device)
     capacity = arena_capacity(context, chunk)
     return ClassifyStatistics(
@@ -59,7 +57,7 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
         draws=context.canvas_draws if context.model.answer_canvas else 1,
         model=context.model,
         device=context.device,
-        capacity=capacity, lengths=lengths, shared=tuple(shared),
+        capacity=capacity, lengths=lengths, shared=tuple(shared), memo=context.memo,
         tree=(budgets.tree_attention_allowed(context.model)
               and getattr(context, "attention", None) != "unified"))
 
@@ -97,6 +95,7 @@ class ClassifyStatistics:
     lengths: Sequence = ()
     shared: tuple = ()
     tree: bool = False
+    memo: dict | None = field(default=None, compare=False, repr=False)
 
 
 def classify_scoring(context, alias, shared=()):
@@ -192,7 +191,7 @@ class ClassifyScoring(ClassifyStatistics):
             scoring, live, head_tokens, frame_tokens, labels,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=resident,
-            draws=self.draws, starts=starts)
+            draws=self.draws, starts=starts, memo=self.memo)
 
     def estimate_spec(self, spec: ClassifySpec,
                       resident=False) -> classify_cost.ClassifyCost:
@@ -209,7 +208,7 @@ class ClassifyScoring(ClassifyStatistics):
                 live=spec.expected_inputs, lengths=self.lengths,
                 shared=self.shared, chunk=self.chunk, model=self.model,
                 device=self.device, resident=resident,
-                answer_rows=len(spec.label_token_ids) + 1)
+                answer_rows=len(spec.label_token_ids) + 1, memo=self.memo)
         return self.estimate(
             spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
             spec.label_token_ids, resident, spec.label_word_starts)
@@ -384,7 +383,7 @@ class ClassifyBuilder(ClassifyStatistics):
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=True,
             canvas_rows=self.model.canvas_tokens,
-            head_rows=len({tuple(ids) for ids in labels}))
+            head_rows=len({tuple(ids) for ids in labels}), memo=self.memo)
         need = len(head) + self.longest + len(note) + max(suffixes)
         if need > self.budget:
             raise ClassifyRefusedError.over_budget(
@@ -413,7 +412,7 @@ class ClassifyBuilder(ClassifyStatistics):
         estimated = classify_cost.estimate_suffixes(
             len(head), frame, [request], live=live, lengths=self.lengths,
             shared=self.shared, chunk=self.chunk, model=self.model,
-            device=self.device, answer_rows=len(blocks) + 1)
+            device=self.device, answer_rows=len(blocks) + 1, memo=self.memo)
         return bind_inference(
             ClassifySpec, call.prompt, name=name, aliases=aliases,
             expected_inputs=live, estimated_seconds=estimated.seconds,
@@ -439,7 +438,7 @@ class ClassifyBuilder(ClassifyStatistics):
             len(head), len(note) + len(partner_label), [request], live=pairs,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=True,
-            answer_rows=len(blocks) + 1)
+            answer_rows=len(blocks) + 1, memo=self.memo)
         need = len(head) + self.longest + len(note) + request
         if need > self.budget:
             raise ClassifyRefusedError.over_budget(

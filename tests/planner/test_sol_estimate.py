@@ -234,6 +234,8 @@ def test_decode_classification_counts_rounds_and_head_work():
     stage, = estimate.filter_stages
     assert stage["scoring"] == "trie_decode"
     assert stage["rounds"] == 2
+    assert estimate.latency.passes == 2
+    assert estimate.work.readout_bytes == 2 * sess.model.hidden * sess.model.vocab * 2
     assert estimate.fresh_tokens == prompt.preamble_tokens + 2 + prompt.tail_tokens + 1
     assert estimate.work.kv_read == prompt.preamble_tokens + 2 + prompt.tail_tokens
     assert estimate.work.readout_flops == 2 * sess.model.hidden * sess.model.vocab * 2

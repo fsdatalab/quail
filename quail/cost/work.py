@@ -13,6 +13,7 @@ class Work:
 
     readout_flops and readout_bytes count the selected output head's
     computation and weight reads, using the operator's packing assumption.
+    batches records dependent step totals already included in these counts.
     """
 
     tokens: float = 0.0
@@ -23,6 +24,7 @@ class Work:
     sliding_kv_read: float = 0.0
     readout_flops: float = 0.0
     readout_bytes: float = 0.0
+    batches: tuple[tuple[Work, float], ...] = ()
 
     def __add__(self, other: "Work") -> "Work":
         return Work(
@@ -34,6 +36,7 @@ class Work:
             self.sliding_kv_read + other.sliding_kv_read,
             self.readout_flops + other.readout_flops,
             self.readout_bytes + other.readout_bytes,
+            self.batches + other.batches,
         )
 
     def __mul__(self, count: float) -> "Work":
@@ -46,6 +49,7 @@ class Work:
             self.sliding_kv_read * count,
             self.readout_flops * count,
             self.readout_bytes * count,
+            tuple((work * count, passes * count) for work, passes in self.batches),
         )
 
     def total(self) -> "Work":
@@ -53,10 +57,15 @@ class Work:
         return Work(*(float(np.sum(value)) for value in (
             self.tokens, self.pairs, self.kv_written, self.kv_read,
             self.sliding_pairs, self.sliding_kv_read,
-            self.readout_flops, self.readout_bytes)))
+            self.readout_flops, self.readout_bytes)), batches=self.batches)
 
     def dominates(self, other: "Work") -> bool:
         """Return whether every count is no larger than the other record."""
+        if self.batches or other.batches:
+            return (len(self.batches) == len(other.batches)
+                    and self.unbatched().dominates(other.unbatched())
+                    and all(a.dominates(b) and x <= y
+                            for (a, x), (b, y) in zip(self.batches, other.batches)))
         return (
             self.tokens <= other.tokens
             and self.pairs <= other.pairs
@@ -67,6 +76,21 @@ class Work:
             and self.readout_flops <= other.readout_flops
             and self.readout_bytes <= other.readout_bytes
         )
+
+    def unbatched(self) -> Work:
+        """Return the work not assigned to dependent batches."""
+        if not self.batches:
+            return self
+        counted = sum((work for work, _ in self.batches), Work())
+        return Work(
+            max(0.0, self.tokens - counted.tokens),
+            max(0.0, self.pairs - counted.pairs),
+            max(0.0, self.kv_written - counted.kv_written),
+            max(0.0, self.kv_read - counted.kv_read),
+            max(0.0, self.sliding_pairs - counted.sliding_pairs),
+            max(0.0, self.sliding_kv_read - counted.sliding_kv_read),
+            max(0.0, self.readout_flops - counted.readout_flops),
+            max(0.0, self.readout_bytes - counted.readout_bytes))
 
 
 def triangle(n: float, window: int = 0) -> float:
