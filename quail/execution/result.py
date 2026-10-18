@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import itertools
+import weakref
+from collections.abc import Callable, Iterable
 from copy import copy
 from dataclasses import dataclass
 
@@ -181,7 +183,8 @@ def joined_survivors(tables: Iterable[pa.Table],
     for aliases, group in components:
         limits = {alias: survivors.get(alias, pc.unique(table[alias]))
                   for table in group for alias in table.column_names}
-        declaration, _ = build_result_declaration(group, limits, group[0].column_names[0])
+        declaration, _ = build_result_declaration(
+            group, limits, group[0].column_names[0])
         joined = declaration.to_table(use_threads=False)
         for alias in aliases & set(survivors):
             ids = survivors[alias]
@@ -251,38 +254,57 @@ def count_rows(declaration: acero.Declaration) -> int:
     return int(table.column("num_rows")[0].as_py())
 
 
-def execute_stream(declaration: acero.Declaration, schema: pa.Schema,
-                   limit: int | None = None,
-                   batch_rows: int = DEFAULT_BATCH_ROWS,
-                   ) -> pa.RecordBatchReader:
-    """Return bounded Arrow batches from an Acero declaration."""
+def bounded_reader(source: pa.RecordBatchReader, limit: int | None = None,
+                   batch_rows: int = DEFAULT_BATCH_ROWS, *,
+                   schema: pa.Schema | None = None,
+                   project: Callable | None = None) -> pa.RecordBatchReader:
+    """Return a reader of at most limit rows that owns the source reader.
+
+    The source is read only while rows are still wanted, so a limit
+    never reads a batch past itself, and it is closed when the
+    returned reader is closed, exhausted, or dropped unread.
+
+    Args:
+        source: The reader of the rows.
+        limit: Maximum rows to return, or every row when None.
+        batch_rows: Maximum rows in each returned batch.
+        schema: The returned batches' schema, when project changes it.
+        project: A function from a source batch to a returned batch.
+    """
     if batch_rows <= 0:
         raise ValueError("batch_rows must be positive")
     if limit is not None and limit < 0:
         raise ValueError("limit must be nonnegative")
-    source = declaration.to_reader()
 
     def batches():
         remaining = limit
         try:
-            for batch in source:
-                if remaining == 0:
-                    break
-                if remaining is not None and len(batch) > remaining:
-                    batch = batch.slice(0, remaining)
-                offset = 0
-                while offset < len(batch):
-                    length = min(batch_rows, len(batch) - offset)
-                    yield batch.slice(offset, length)
-                    offset += length
-                    if remaining is not None:
-                        remaining -= length
-                        if remaining == 0:
-                            break
+            while remaining is None or remaining > 0:
+                batch = next(source, None)
+                if batch is None:
+                    return
+                if remaining is not None:
+                    batch = batch[:remaining]
+                    remaining -= len(batch)
+                for offset in range(0, len(batch), batch_rows):
+                    part = batch.slice(offset, batch_rows)
+                    yield part if project is None else project(part)
         finally:
-            source.close()
+            close()
 
-    return pa.RecordBatchReader.from_batches(schema, batches())
+    iterator = batches()
+    # a generator never started runs no finally block
+    close = weakref.finalize(iterator, source.close)
+    # the C stream releases the iterator on close; from_batches alone does not
+    return pa.RecordBatchReader.from_stream(pa.RecordBatchReader.from_batches(
+        source.schema if schema is None else schema, iterator))
+
+
+def iter_rows(table: pa.Table):
+    """Yield the rows of a table as tuples, by column position."""
+    if table.num_columns == 0:
+        return itertools.repeat((), table.num_rows)
+    return zip(*(column.to_pylist() for column in table.columns))
 
 
 def projected_column(batch: pa.RecordBatch, alias, values) -> pa.Array:
@@ -396,30 +418,20 @@ class QueryResult:
         if self._materialized is not None:
             table = self._materialized
             if effective_limit is not None:
-                table = table.slice(0, effective_limit)
+                table = table[:effective_limit]
             return table.to_reader(max_chunksize=batch_rows)
-        indices = execute_stream(
-            self._declaration,
-            self._document_index_schema,
-            effective_limit,
-            batch_rows,
-        )
 
-        def batches():
-            try:
-                for batch in indices:
-                    if not self._projection:
-                        yield batch.select([]).replace_schema_metadata(
-                            self.schema.metadata)
-                        continue
-                    arrays = [projected_column(batch, alias, values)
-                              for alias, values in self._projection]
-                    yield pa.RecordBatch.from_arrays(
-                        arrays, schema=self.schema)
-            finally:
-                indices.close()
+        def project(batch):
+            if not self._projection:
+                return batch.select([]).replace_schema_metadata(self.schema.metadata)
+            return pa.RecordBatch.from_arrays(
+                [projected_column(batch, alias, values)
+                 for alias, values in self._projection], schema=self.schema)
 
-        return pa.RecordBatchReader.from_batches(self.schema, batches())
+        # a threaded Acero reader can stall when closed before its end
+        return bounded_reader(
+            self._declaration.to_reader(use_threads=False), effective_limit,
+            batch_rows, schema=self.schema, project=project)
 
     def collect(self, limit: int | None = None,
                 batch_rows: int = DEFAULT_BATCH_ROWS
@@ -480,9 +492,7 @@ class QueryResult:
 
     def to_rows(self, limit: int | None = None) -> list[tuple]:
         """Collect projected result rows as Python tuples."""
-        table = self.collect(limit=limit)
-        columns = [column.to_pylist() for column in table.columns]
-        return list(zip(*columns))
+        return list(iter_rows(self.collect(limit=limit)))
 
     def known_num_rows(self) -> int | None:
         """Return the row count when it is known without running the plan."""

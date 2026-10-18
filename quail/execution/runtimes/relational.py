@@ -97,8 +97,6 @@ class LimitRuntime:
         rows = _num_rows(value) or 0
         if isinstance(value, QueryResult):
             value = value.with_limit(node.count)
-        elif hasattr(value, "slice"):
-            value = value.slice(0, node.count)
         else:
             value = value[:node.count]
         return NodeResult({"rows": value}, NodeMetrics(
@@ -228,6 +226,7 @@ class SortRuntime:
                  "at_start" if nulls_first else "at_end")
                 for column, descending, nulls_first in node.keys])
             table = table.take(indices)
-        table = table.slice(node.offset, node.fetch).select(list(node.columns))
+        stop = None if node.fetch is None else node.offset + node.fetch
+        table = table[node.offset:stop].select(list(node.columns))
         return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
             input_rows=rows, output_rows=table.num_rows))

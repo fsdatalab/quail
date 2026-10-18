@@ -38,6 +38,7 @@ from starlette.routing import Route
 
 from quail.api import RefusalError, Session
 from quail.builtins import built_in_registry
+from quail.execution.result import iter_rows
 from quail.logical import CompileError
 from quail.planner.plan import EngineConfig
 from quail.remote.artifacts import (
@@ -554,9 +555,11 @@ def create_app(settings: ServerSettings) -> Starlette:
 
         def read():
             with ipc.open_file(str(path)) as reader:
-                table = reader.read_all().slice(0, limit)
+                table = reader.read_all()[:limit]
+            # text keeps big integers, decimals, dates, and NaN as they are
             return {"columns": table.column_names,
-                    "rows": [list(row.values()) for row in table.to_pylist()],
+                    "rows": [[None if value is None else str(value) for value in row]
+                             for row in iter_rows(table)],
                     "total_rows": status.result["rows"]}
 
         return JSONResponse(await run_in_threadpool(read))
