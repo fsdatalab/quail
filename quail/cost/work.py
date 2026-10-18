@@ -61,7 +61,7 @@ class Work:
 
     def dominates(self, other: "Work") -> bool:
         """Return whether every count is no larger than the other record."""
-        if self.batches or other.batches:
+        if self.batches != other.batches:
             return (len(self.batches) == len(other.batches)
                     and self.unbatched().dominates(other.unbatched())
                     and all(a.dominates(b) and x <= y
