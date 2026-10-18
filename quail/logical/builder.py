@@ -127,6 +127,11 @@ class LogicalPlanBuilder:
                     f"a filter on a label of {alias!r} tests a "
                     f"classification the query does not name"
                 )
+            unknown = sorted(set(values) - set(calls[name].labels))
+            if unknown:
+                raise CompileError(
+                    f"the filter on {name!r} lists {unknown}, which are not "
+                    f"among its labels {list(calls[name].labels)}")
             if calls[name] not in classified:
                 node = SemanticClassify(node, calls[name], name)
                 classified.append(calls[name])

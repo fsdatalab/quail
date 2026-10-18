@@ -343,8 +343,9 @@ class ChooseAttentionAlgorithm(PhysicalRule):
                 path = "unified"
                 if tree_available:
                     stage = node
-                    readers = (stage.expected_rows / len(lengths)
-                               if len(lengths) else 1.0)
+                    # the partners each live anchor reads, on average
+                    readers = (stage.expected_rows / stage.anchor_documents
+                               if stage.anchor_documents else 1.0)
                     # a partner's rows: its document and the question tail
                     rows = stage.pair_tail_tokens + sum(
                         _mean(context.document_tokens.get(partner, ()))

@@ -119,6 +119,7 @@ def emit_join(
         semantics=spec.semantics,
         selectivity=spec.selectivity,
         expected_rows=round(step.tuples, 1),
+        anchor_documents=round(step.anchor_documents, 1),
         anchor_frame_tokens=spec.frame_tokens[anchor],
         pair_tail_tokens=spec.tail_tokens,
         document_head=tuple(builder.context.lowered(

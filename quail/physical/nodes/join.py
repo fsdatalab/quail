@@ -51,6 +51,8 @@ class AiJoin(PhysicalNode):
     semantics: str = "full"
     selectivity: float | None = None
     expected_rows: float = 0.0
+    # the anchors expected to reach the join, after the filters before it
+    anchor_documents: float = 0.0
     anchor_frame_tokens: int = 0
     pair_tail_tokens: int = 0
     tuple_tokens: float = 0.0

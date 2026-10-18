@@ -747,14 +747,11 @@ def test_streamed_classifications_share_one_pipeline(session):
 
 def test_classify_refusals_and_builder_errors(session):
     query = _topic(session)
-    # a label the classification cannot return matches no row; the
-    # filter is accepted and plans as a test nothing passes
-    none = (session.docs("documents").alias("d").ai_classify(
-        quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
-        name="x").label_in("x", ["c"]).select("d.id"))
-    (test,) = [n for n in none.plan().nodes if isinstance(n, Filter)]
-    assert test.predicate == RegularPredicate(
-        ColumnRef("d", "documents", "x"), "in", ("c",))
+    # a label the classification cannot return would match no row
+    with pytest.raises(CompileError, match="not among its labels"):
+        (session.docs("documents").alias("d").ai_classify(
+            quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
+            name="x").label_in("x", ["c"]).select("d.id"))
     with pytest.raises(CompileError, match="differ ignoring case"):
         session.docs("documents").alias("d").ai_classify(
             quail.prompt("{0}", quail.col("d.body")), ["a", "A"], name="x")
