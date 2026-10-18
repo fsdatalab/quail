@@ -128,8 +128,8 @@ You get `c.id`, `lease`, and `lease_span`. `lease` is a struct with one
 string field for each question. `lease_span` holds the position of each
 answer.
 
-Test a field with `where()` to keep the documents whose answer passes;
-the extraction runs once for the test and the returned column:
+`where()` on a field keeps the documents whose answer passes. The
+extraction runs once:
 
 ```python
 query = (
@@ -141,8 +141,8 @@ query = (
 )
 ```
 
-`col("lease_span.end_date").field("start") < 500` tests where the
-answer begins.
+`col("lease_span.end_date").field("start") < 500` tests the answer's
+position.
 
 See [`AI.EXTRACT`](/docs/user-guide/sql#aiextract) for output examples
 and supported queries.
@@ -256,11 +256,9 @@ column, and `&` to combine conditions, as in PySpark.
 for nulls rather than comparing with `None`. `~` before a text test
 negates it.
 
-A column can also be a label from `ai_classify()`
-(`col("sentiment").isin([...])`) or a field from `ai_extract()`
-(`col("lease.end_date").is_not_null()`). Such a test runs right after
-the call that computes the column, and `.hint(selectivity=...)` on
-the test estimates the fraction of documents it keeps, 0.2 without one.
+A test on an `ai_classify()` label or an `ai_extract()` field runs
+right after that call. `.hint(selectivity=...)` gives the planner the
+fraction it keeps; the default is 0.2.
 
 E.g., the following query returns the IDs of reviews from 2024 with at
 least four stars that mention shipping:
@@ -281,19 +279,14 @@ different tables, use [`join()`](#join).
 
 ### Column expressions
 
-`col(...).field(name)` reads a field of a struct column, and
-`col(...).length()`, `lower()`, `upper()`, and `trim()` compute on a
-text value. All of them stand wherever a
-column does: as a prompt's document, in a `join()` condition, as a
-column an `apply()` function reads, in a `where()` test, and in
-`select()`, `order_by()`, `group_by()`, and `agg()`. A returned
-expression is named as written, such as `r.details.kind` or
-`length(r.body)`. The document a prompt reads must be text, so a
-struct column goes through `field()`.
+`col(...).field(name)` reads a field of a struct column.
+`col(...).length()`, `lower()`, `upper()`, and `trim()` compute on
+text. Both stand wherever a column does: in a prompt, a `join()`
+condition, `where()`, `apply()`, `select()`, `order_by()`,
+`group_by()`, and `agg()`. A returned expression is named as written,
+such as `length(r.body)`.
 
-For example, imagine a `pages` table whose `details` column is a
-struct with `body` and `url` fields. This query asks the model about
-the `body` field and pairs pages with sources by the `url` field:
+For example, `details` is a struct with `body` and `url` fields:
 
 ```python
 query = (
@@ -306,12 +299,9 @@ query = (
 )
 ```
 
-An `apply()` function sees such a column under its written name, such
-as `length(details.body)`. `col(...).named("n")` returns a column or
-an expression under the name `n`, as SQL's `AS`; `order_by("n")` and
-`group_by("n")` can use that name. A field that the column does not
-have, or `length()` of a column that is not text, fails when the
-query is built.
+`col(...).named("n")` names a returned column, as SQL's `AS`;
+`order_by("n")` and `group_by("n")` can use the name. A missing field
+or a function on the wrong type fails when the query is built.
 
 ### limit
 

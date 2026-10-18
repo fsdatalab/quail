@@ -86,13 +86,12 @@ conditions for comparison with measured runs. It assumes:
 - Rows that pass filters and joins are determined by answers supplied
   by the caller, such as saved reference answers and classification labels.
 
-For classification, this estimate counts the question and category text
-and one readout row per document, whatever
+A classification costs its question and one readout row per
+document, whatever
 [label scoring method](/docs/architecture/execution#label-scoring) the
-optimizer selects. For extraction, it counts the question and then the
-reference answer verified in one pass over the document's KV, each
-answer token a readout row. It does not count the rounds an engine
-spends finding the answer.
+optimizer selects. An extraction costs its question and one pass that
+verifies the reference answer, one readout row per answer token. The
+rounds an engine spends finding the answer are not counted.
 
 Report the supplied answers and KV assumptions with the estimate.
 If a measured run produces different answers, it can evaluate different

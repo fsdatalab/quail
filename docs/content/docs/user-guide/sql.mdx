@@ -51,12 +51,11 @@ PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
 
 Here `{0}` is the review and `{1}` is the aspect.
 
-A column argument can read a field of a struct column, such as
-`r.details.body`, or be `LENGTH`, `LOWER`, `UPPER`, or `TRIM` of a
-column. The same expressions work in
-`ON`, `WHERE`, `SELECT`, `ORDER BY`, and `GROUP BY`; a returned
-expression is named as written, such as `length(r.body)`. The document
-the prompt reads must be text, so a struct column needs a field.
+A column argument can be a struct field, such as `r.details.body`,
+or `LENGTH`, `LOWER`, `UPPER`, or `TRIM` of a column. The same
+expressions work in `ON`, `WHERE`, `SELECT`, `ORDER BY`, and
+`GROUP BY`. A returned expression is named as written, such as
+`length(r.body)`.
 
 ## AI.IF
 
@@ -306,9 +305,8 @@ WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body)
 - A category that is not in the list matches no rows.
 - Quail evaluates the repeated classification once and uses its label
   in both `SELECT` and `WHERE`.
-- `WHERE` can name the label by its `AS` name instead of repeating the
-  call: `WHERE sentiment IN ('negative', 'mixed')`. The name must not
-  also be a column of a table in the query.
+- `WHERE` can name the label by its `AS` name:
+  `WHERE sentiment IN ('negative', 'mixed')`.
 
 #### Classify joined rows
 
@@ -385,10 +383,9 @@ questions about one document read the same document KV.
 
 ### Filter on answers
 
-`WHERE` can test a field of an extraction named in `SELECT`. Quail
-extracts once, keeps the documents whose answer passes, and returns the
-answer. For example, keep the leases whose end date was found and
-mentions 2027:
+`WHERE` can test a field of an extraction named in `SELECT`. The
+extraction runs once. For example, keep the leases whose end date was
+found and mentions 2027:
 
 ```sql
 SELECT c.id,
@@ -398,29 +395,18 @@ WHERE HINT(lease.end_date IS NOT NULL, {'selectivity': 0.9})
   AND HINT(lease.end_date LIKE '%2027%', {'selectivity': 0.4});
 ```
 
-A field is tested with the conditions of [WHERE and ON](#where-and-on):
-the comparisons, `IN`, `IS [NOT] NULL`, the text tests, and `LENGTH()`,
-`LOWER()`, `UPPER()`, or `TRIM()` of the field.
-A null answer fails every test but `IS NULL`. A span field is tested
-by its `start` or `end`: `lease_span.end_date.start < 500` keeps the
-answers that begin in the first 500 characters. Repeating the call
-with the field works too: `AI.EXTRACT(...).end_date IS NOT NULL`.
+The conditions are those of [WHERE and ON](#where-and-on). A null
+answer fails every test but `IS NULL`. A span field is tested by its
+`start` or `end`: `lease_span.end_date.start < 500`.
 
-`HINT(test, {'selectivity': fraction})` estimates the fraction of
-documents a test on a label or an answer keeps, 0.2 without it; it
-does not change which pass. It wraps a test of an `AI.CLASSIFY` label
-the same way, `HINT(sentiment IN ('negative', 'mixed'), {'selectivity':
-0.3})`, and then overrides the call's `selectivity` option.
+`HINT(test, {'selectivity': fraction})` tells the planner the fraction
+a test on a label or an answer keeps; the default is 0.2. It does not
+change which rows pass.
 
-The planner orders a table's `AI.IF` conditions, its classifications
-with their label tests, and its extractions with their answer tests
-together, by estimated cost per rejected document. An extraction costs
-more than an `AI.IF`, so it usually runs after the `AI.IF` and
-`AI.CLASSIFY` conditions, over the documents they kept; a test that
-rejects most documents can move its extraction first. A test on one
-field keeps the documents a later field is extracted from. Pass
-`order="as_written"` to `session.sql()` or `select()` to keep the
-written order.
+The planner orders a table's `AI.IF`, `AI.CLASSIFY`, and `AI.EXTRACT`
+steps by estimated cost per rejected document, so an extraction
+usually runs last, over the documents the cheaper tests kept. Pass
+`order="as_written"` to `session.sql()` to keep the written order.
 
 These limits apply:
 
@@ -451,11 +437,10 @@ which rows to join. Both support the following conditions on table columns:
 | Test the text ignoring case or spaces | `LOWER(column)`, `UPPER(column)`, `TRIM(column)` compared with a string |
 
 Values can be numbers, strings, or booleans. `IN` requires a non-empty
-list of constant values. Combine conditions with `AND`. `NOT` before a
-text test negates it. Comparisons exclude null values. Use `IS NULL`
-to keep them. The same conditions test a label or an extraction field
-named in `SELECT`; see [AI.CLASSIFY](#aiclassify) and
-[Filter on answers](#filter-on-answers).
+list of constant values. Combine conditions with `AND`; `NOT` negates
+a text test. Comparisons exclude null values. Use `IS NULL` to keep
+them. The same conditions test a label or an extraction field named in
+`SELECT`; see [Filter on answers](#filter-on-answers).
 
 E.g., the following SQL query returns the IDs of reviews from 2024 with
 at least four stars that mention shipping:
@@ -478,8 +463,7 @@ in `ON`. See [Joining](#joining).
 
 Quail supports these SQL clauses with the following limits:
 
-- **`SELECT`** lists columns, struct fields, `LENGTH`, `LOWER`, `UPPER`,
-  or `TRIM` of a column, and
+- **`SELECT`** lists columns, struct fields, column functions, and
   `AI.SCORE` or `AI.CLASSIFY` outputs, each with an optional `AS`
   name. `*` expands to all table columns. Other computed expressions
   are unsupported.
@@ -534,8 +518,9 @@ evaluation early. An offset greater than zero has the same effect.
 
 ## GROUP BY and HAVING
 
-`GROUP BY` accepts table columns, struct fields, `LENGTH(column)`, and
-names assigned to AI outputs with `AS`. Return grouping columns and aggregate results in `SELECT`.
+`GROUP BY` accepts table columns, struct fields, column functions, and
+names assigned to AI outputs with `AS`. Return grouping columns and
+aggregate results in `SELECT`.
 Give each aggregate in `SELECT` an `AS` name.
 
 `HAVING` filters groups by comparing an aggregate with a number. Refer
