@@ -303,7 +303,7 @@ def test_classify_and_score_capacity_follow_the_plans_arena_split():
     # every-token pool more pages than the split for unknown lengths
     context = SimpleNamespace(
         document_tokens={"short": [300] * 8, "long": [4096] * 8}, model=model,
-        device=H100_SXM, canvas_draws=1, memo={})
+        device=H100_SXM, canvas_draws=1, memo={}, gpus=1)
     planned = budgets.arena_tokens(model, H100_SXM, chunk, 4096)
     assert planned > budgets.arena_tokens(model, H100_SXM, chunk)
     # the longest table's mean, as plan_statistics splits the pools
@@ -313,3 +313,14 @@ def test_classify_and_score_capacity_follow_the_plans_arena_split():
     dense = SimpleNamespace(**{**vars(context), "model": QWEN3_4B_FP8, "memo": {}})
     assert arena_capacity(dense, chunk) == budgets.arena_tokens(
         QWEN3_4B_FP8, H100_SXM, chunk)
+
+
+@pytest.mark.parametrize("num_documents,gpus", [(8, 2), (1, 8), (2, 8)])
+def test_parallel_classification_divides_time_by_the_copies_in_use(
+        num_documents, gpus):
+    lengths = [100] * num_documents
+    serial = _cost(lengths)
+    parallel = _cost(lengths, gpus=gpus)
+    assert parallel.work == serial.work
+    assert parallel.seconds == pytest.approx(
+        serial.seconds / min(num_documents, gpus))

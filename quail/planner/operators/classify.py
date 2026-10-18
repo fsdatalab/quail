@@ -58,7 +58,7 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
         draws=context.canvas_draws if context.model.answer_canvas else 1,
         model=context.model,
         device=context.device,
-        capacity=capacity, lengths=lengths, shared=tuple(shared),
+        capacity=capacity, lengths=lengths, shared=tuple(shared), gpus=context.gpus,
         tree=(budgets.tree_attention_allowed(context.model)
               and getattr(context, "attention", None) != "unified"))
 
@@ -82,6 +82,7 @@ class ClassifyStatistics:
         tree: Whether the tree attention path, which trie_tree needs, is
             available: an fp8 model without a canvas whose attention is not
             forced to unified.
+        gpus: Model copies sharing the documents evenly.
     """
 
     alias: str
@@ -96,6 +97,7 @@ class ClassifyStatistics:
     lengths: Sequence = ()
     shared: tuple = ()
     tree: bool = False
+    gpus: int = 1
 
 
 def classify_scoring(context, alias, shared=()):
@@ -191,7 +193,7 @@ class ClassifyScoring(ClassifyStatistics):
             scoring, expected_rows, head_tokens, frame_tokens, labels,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=resident,
-            draws=self.draws, starts=starts)
+            draws=self.draws, starts=starts, gpus=self.gpus)
 
     def estimate_spec(self, spec: ClassifySpec,
                       resident=False) -> classify_cost.ClassifyCost:
@@ -208,7 +210,7 @@ class ClassifyScoring(ClassifyStatistics):
                 expected_rows=spec.expected_rows, lengths=self.lengths,
                 shared=self.shared, chunk=self.chunk, model=self.model,
                 device=self.device, resident=resident,
-                answer_rows=len(spec.label_token_ids) + 1)
+                answer_rows=len(spec.label_token_ids) + 1, gpus=self.gpus)
         return self.estimate(
             spec.scoring, spec.expected_rows, len(head), len(tail) - 1,
             spec.label_token_ids, resident, spec.label_word_starts)
@@ -386,7 +388,7 @@ class ClassifyBuilder(ClassifyStatistics):
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=True,
             canvas_rows=self.model.canvas_tokens,
-            head_rows=len({tuple(ids) for ids in labels}))
+            head_rows=len({tuple(ids) for ids in labels}), gpus=self.gpus)
         need = len(head) + self.longest + len(note) + max(suffixes)
         if need > self.budget:
             raise ClassifyRefusedError.over_budget(
@@ -423,6 +425,7 @@ class ClassifyBuilder(ClassifyStatistics):
             model=self.model,
             device=self.device,
             answer_rows=len(blocks) + 1,
+            gpus=self.gpus,
         )
         return bind_inference(
             ClassifySpec, call.prompt, name=name, aliases=aliases,
@@ -450,7 +453,7 @@ class ClassifyBuilder(ClassifyStatistics):
             expected_rows=expected_rows,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=True,
-            answer_rows=len(blocks) + 1)
+            answer_rows=len(blocks) + 1, gpus=self.gpus)
         need = len(head) + self.longest + len(note) + request
         if need > self.budget:
             raise ClassifyRefusedError.over_budget(

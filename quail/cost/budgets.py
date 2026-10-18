@@ -217,3 +217,8 @@ def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
     merge = 3 * rows * model.num_q_heads * model.d_head * ACT_BYTES / device.hbm_bw
     tree += merge * model.layers
     return "tree" if tree < unified else "unified"
+
+
+def parallel_copies(gpus: int, num_documents: float) -> float:
+    """Return the model copies that share work spread evenly over documents."""
+    return max(1.0, min(gpus, num_documents))

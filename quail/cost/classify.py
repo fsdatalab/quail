@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from quail.cost.budgets import parallel_copies
 from quail.cost.dense_decoder_cost import decoder_seconds
 from quail.cost.work import Work, ask, decode, stream
 from quail.labels import (
@@ -119,7 +120,7 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0, runs=None,
                     answer_rows: float | None = None,
-                    head_rows: int = 0) -> ClassifyCost:
+                    head_rows: int = 0, gpus: int = 1) -> ClassifyCost:
     """Estimate expected classification work and its roofline time.
 
     Args:
@@ -143,6 +144,7 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
             row per decode round.
         head_rows: Output-head rows each answer row multiplies; 0 is the
             whole vocabulary. A decision model ignores it.
+        gpus: Model copies sharing the documents evenly.
 
     Returns:
         Expected work over the documents, scaled to the expected rows, priced at
@@ -176,16 +178,16 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
         rows = answer_rows
     total = work * (expected_rows / n)
     passes = total.tokens / chunk
-    seconds = decoder_seconds(
-        total, rows * expected_rows, passes, model, device, head_rows
-    )
+    copies = parallel_copies(gpus, min(expected_rows, n))
+    seconds = decoder_seconds(total * (1 / copies), rows * expected_rows / copies,
+                              passes / copies, model, device, head_rows)
     return ClassifyCost(seconds, passes, total, suffix_tokens * expected_rows, rounds)
 
 
 def estimate(scoring: str, expected_rows: float, head_tokens: int, frame_tokens: int,
              labels, *, lengths, shared, chunk: int,
              model, device, resident: bool = False, draws: int = 1,
-             starts=()) -> ClassifyCost:
+             starts=(), gpus: int = 1) -> ClassifyCost:
     """Estimate the cost of one classification scoring rule.
 
     Args:
@@ -202,6 +204,7 @@ def estimate(scoring: str, expected_rows: float, head_tokens: int, frame_tokens:
         resident: Whether document KV is already available.
         draws: Maximum number of diffusion draws per document.
         starts: Per label, which tokens begin a new word.
+        gpus: Model copies sharing the documents evenly.
 
     Returns:
         Estimated execution time, work, and token counts.
@@ -238,4 +241,5 @@ def estimate(scoring: str, expected_rows: float, head_tokens: int, frame_tokens:
         ),
         runs=runs,
         answer_rows=answer_rows,
+        gpus=gpus,
     )
