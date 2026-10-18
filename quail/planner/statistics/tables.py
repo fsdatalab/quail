@@ -104,16 +104,28 @@ def alias_stats(lengths: dict, window: int = 0) -> dict[str, AliasStats]:
 
 
 def surviving_documents(num_documents: float, num_partners: float,
-                   tuple_selectivity) -> float:
-    """Expected distinct documents with at least one matching tuple."""
+                        tuple_selectivity) -> float:
+    """Expected documents with at least one matching tuple.
+
+    Tuple matches are taken as independent and evenly spread.
+    """
     tuple_selectivity = effective_selectivity(tuple_selectivity)
-    return num_documents * (1.0 - (1.0 - tuple_selectivity)
-                     ** max(1.0, num_partners))
+    if tuple_selectivity >= 1:
+        probability = float(num_partners > 0)
+    else:
+        # log1p and expm1 keep a tiny match probability over many
+        # partners from rounding to zero
+        probability = -math.expm1(num_partners * math.log1p(-tuple_selectivity))
+    return num_documents * probability
 
 
 def thin(expected_rows: dict, spec: PricedJoin) -> None:
-    """Update live document counts after one join's selectivity."""
-    sel = spec.selectivity
+    """Update live document counts after one join's selectivity.
+
+    A tuple matches when the equality conditions keep it and the model
+    accepts it.
+    """
+    sel = effective_selectivity(spec.selectivity) * spec.pair_fraction
     aliases = spec.aliases
 
     def others(x):
@@ -149,8 +161,5 @@ def cross_tuples(spec: PricedJoin, expected_rows: dict) -> float:
 def pair_counts(expected_rows, aliases, fraction) -> tuple[float, float]:
     """Return expected pairs and first documents with at least one pair."""
     left, right = aliases
-    touched = (1.0 if fraction >= 1 else
-               -math.expm1(expected_rows[right] * math.log1p(-fraction)))
-    return expected_rows[left] * expected_rows[right] * fraction, expected_rows[
-        left
-    ] * touched
+    return (expected_rows[left] * expected_rows[right] * fraction,
+            surviving_documents(expected_rows[left], expected_rows[right], fraction))

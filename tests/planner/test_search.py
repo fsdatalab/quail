@@ -214,3 +214,34 @@ def test_logical_alternatives_finish_before_physical_rules(query):
     assert first_physical > 0
     assert events[:first_physical] == ["logical"] * first_physical
     assert events[first_physical:] == ["physical", "physical"]
+
+
+def test_a_filter_above_the_joins_thins_nothing_before_them(query):
+    from quail.logical import classified_above_joins
+    from quail.planner.search.statistics import (
+        cached_statistics,
+        expected_rows_after_filters,
+    )
+
+    session = query.session
+    built = (session.docs("documents").alias("d")
+             .ai_filter(quail.prompt("Signed? {0}", quail.col("d.text")),
+                        selectivity=0.5)
+             .ai_join(session.docs("questions").alias("q"), quail.prompt(
+                 "Pair? {0} {1}", quail.col("d.text"), quail.col("q.text")),
+                 anchor="d", selectivity=0.1)
+             .ai_classify(quail.prompt("Kind? {0}", quail.col("d.text")),
+                          ["a", "b"], name="kind")
+             .label_in("kind", ["a"], selectivity=0.3)
+             .select("d.id", "q.id"))
+    context = context_for(built)
+    expected = {}
+    for candidate in search_candidates(built._logical_input, context,
+                                       session.registry):
+        logical = candidate.logical_plan
+        statistics = cached_statistics(
+            logical, {}, model=session.model, device=session.device,
+            document_tokens=built._document_tokens, context=context)
+        lifted = bool(classified_above_joins(logical.root))
+        expected[lifted] = expected_rows_after_filters(logical, statistics)
+    assert expected == {False: {"d": 3.0, "q": 1.0}, True: {"d": 10.0, "q": 1.0}}

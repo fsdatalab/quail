@@ -66,7 +66,8 @@ def choose_operator_order(plan, operators, model, device, document_tokens, order
 
     seq = [(specs[position], anchor) for position, anchor in
            choose_join_sequence(plan, statistics, steps, model=model,
-                                device=device, rule=rule)]
+                                device=device, rule=rule,
+                                gpus=1 if context is None else context.gpus)]
     _, join_steps = joinsearch.walk(
         seq, live0, statistics.lengths, set(operators.all_filters()), pre,
         model, device)
@@ -173,7 +174,8 @@ def choose_step_orders(operators: Operators, statistics: PlanStatistics, *,
 
 
 def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
-                         step_orders: dict, *, model, device, rule: str) -> list:
+                         step_orders: dict, *, model, device, rule: str,
+                         gpus: int = 1) -> list:
     """Return [(written position, anchor)] for the joins in run order.
 
     The left-deep search (join_order.search_joins) prices every
@@ -191,6 +193,7 @@ def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
         model: Model spec.
         device: Device spec.
         rule: "by_cost" or "as_written".
+        gpus: Model copies the anchors are spread over.
     """
     if not plan.operators().joins:
         return []
@@ -201,10 +204,11 @@ def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
     arguments = (statistics.specs, expected_rows, statistics.lengths, filtered,
                  statistics.pre, statistics.chunk, model, device)
     found = joinsearch.search_joins(
-        *arguments, base_work=base_work, fixed_order=rule == "as_written")
+        *arguments, base_work=base_work, fixed_order=rule == "as_written",
+        gpus=gpus)
     if found is None:
         found = joinsearch.search_joins(
-            *arguments, base_work=base_work, fixed_order=True)
+            *arguments, base_work=base_work, fixed_order=True, gpus=gpus)
     return list(found.seq)
 
 

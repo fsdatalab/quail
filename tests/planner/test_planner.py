@@ -516,6 +516,30 @@ def _join_search_spec(position, aliases, anchor):
         label_tokens={alias: 4 for alias in aliases}, tail_tokens=6)
 
 
+def test_join_survivors_count_candidate_pairs_without_rounding_to_zero():
+    import math
+
+    from quail.cost import joins
+    from quail.planner.search.join_order import stage_work
+    from quail.planner.statistics.tables import surviving_documents, thin
+
+    assert surviving_documents(1, 1e20, 1e-20) == pytest.approx(1 - math.exp(-1))
+    assert surviving_documents(5, 0, 0.5) == 0
+    # an anchor matches when the equality keeps a pair and the model accepts it
+    spec = replace(_join_search_spec(0, ("a", "b"), "a"), semantics="exists",
+                   pair_fraction=0.25, selectivity=0.5)
+    expected_rows = {"a": 2.0, "b": 3.0}
+    thin(expected_rows, spec)
+    assert expected_rows == {"a": pytest.approx(2 * (1 - 0.875 ** 3)), "b": 3.0}
+    # the join reads only the anchors that have a candidate partner
+    lengths = {"a": summarize_alias([50] * 2), "b": summarize_alias([30] * 3)}
+    expected_rows = {"a": 2.0, "b": 3.0}
+    work = stage_work(spec, "a", expected_rows, lengths, 7)
+    assert work == joins.stage_work(spec, "a", 2 * (1 - 0.75 ** 3),
+                                    2 * 3 * 0.25, lengths, 7)
+    assert stage_work(spec, "a", {"a": 2.0, "b": 0.0}, lengths, 7) == Work()
+
+
 def test_join_search_matches_enumeration_and_tracks_residency():
     from quail.planner.search.join_order import (
         anchor_fits,
