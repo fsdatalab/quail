@@ -170,19 +170,25 @@ def run_filter_sequence(
     started = time.perf_counter()
     expected_rows = 0
     next_document = 0
-    while next_document < len(body_ids) or inflight:
-        while next_document < len(body_ids) and expected_rows < document_cap:
-            submit(next_document, 0)
-            expected_rows += 1
-            next_document += 1
-        for output in engine.step():
-            if not output.finished or output.request_id not in inflight:
-                continue
-            document, stage = inflight.pop(output.request_id)
-            if sequence.record(document, stage, output):
-                submit(document, stage + 1)
-            else:
-                expected_rows -= 1
+    try:
+        while next_document < len(body_ids) or inflight:
+            while next_document < len(body_ids) and expected_rows < document_cap:
+                submit(next_document, 0)
+                expected_rows += 1
+                next_document += 1
+            for output in engine.step():
+                if not output.finished or output.request_id not in inflight:
+                    continue
+                document, stage = inflight.pop(output.request_id)
+                if sequence.record(document, stage, output):
+                    submit(document, stage + 1)
+                else:
+                    expected_rows -= 1
+    finally:
+        if inflight:
+            # the engine is reused by the next query; a request left
+            # queued would run there and take KV from it
+            engine.abort_request(list(inflight))
     return sequence.result(
         time.perf_counter() - started,
         **_cap_settings(document_cap, budget_tokens, block_size,

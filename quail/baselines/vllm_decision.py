@@ -128,6 +128,15 @@ class _RetryingEngine:
         self.prompts[request_id] = (prompt, params)
         self.engine.add_request(request_id, prompt, params)
 
+    def abort_request(self, request_ids):
+        retries = [retry for retry, original in self.retries.items()
+                   if original in request_ids]
+        for retry in retries:
+            del self.retries[retry]
+        for request_id in request_ids:
+            self.prompts.pop(request_id, None)
+        self.engine.abort_request(list(request_ids) + retries)
+
     def step(self):
         ready = []
         for output in self.engine.step():
