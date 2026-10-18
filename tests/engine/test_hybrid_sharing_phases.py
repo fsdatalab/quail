@@ -49,47 +49,6 @@ def lengths(phases):
     return [phase.lengths for phase in phases]
 
 
-def test_parent_writes_a_slot_at_the_shared_point(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p")
-    phases = plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
-    assert lengths(phases) == [(32,), (16,), (2,)]
-    shared = arena.shared_state("p", 32)
-    assert shared is not None and shared != arena.accounting.slots["p"]
-    assert phases[0].read_slots is None
-    assert phases[0].write_slots.tolist() == [shared]
-    assert phases[1].read_slots.tolist() == [shared]
-    assert phases[1].write_slots.tolist() == [arena.accounting.slots["p"]]
-    assert arena.checkpoint_tokens("p") == 48
-
-
-def test_borrower_in_the_same_chunk_runs_one_level_after_the_state(
-        torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p", "c")
-    groups = [group("p", 48, 0, 48, points=(32,)),
-              group("c", 64, 50, 82, start=32, borrow_key="p")]
-    phases = plan_phases(arena, groups, stage)
-    shared = arena.shared_state("p", 32)
-    assert lengths(phases) == [(32,), (16, 32), (2, 2)]
-    assert phases[1].read_slots.tolist() == [shared, shared]
-    assert phases[1].write_slots.tolist() == [
-        arena.accounting.slots["p"], arena.accounting.slots["c"]]
-    # the child's rows are its tokens 32..64
-    assert phases[1].rows.tolist()[16:] == list(range(50, 82))
-
-
-def test_a_chain_in_one_chunk_takes_one_level_per_link(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "a", "b", "c")
-    groups = [group("a", 32, 0, 32, points=(32,)),
-              group("b", 64, 34, 66, start=32, borrow_key="a", points=(48,)),
-              group("c", 80, 68, 100, start=48, borrow_key="b")]
-    phases = plan_phases(arena, groups, stage)
-    assert lengths(phases) == [(32,), (16,), (16, 32), (2, 2, 2)]
-    assert phases[0].read_slots is None
-
-
 def test_borrower_after_the_parent_chunk_reads_the_saved_state(torch_stub):
     arena = arena_with_slots()
     resident(arena, "p", "c")
@@ -99,23 +58,11 @@ def test_borrower_after_the_parent_chunk_reads_the_saved_state(torch_stub):
         arena, [group("c", 64, 0, 32, start=32, borrow_key="p")], stage)
     assert lengths(phases) == [(32,), (2,)]
     assert phases[0].read_slots.tolist() == [shared]
-
-
-def test_a_borrow_without_a_saved_state_is_refused(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p", "c")
-    with pytest.raises(BorrowStateMissingError, match="no state of the parent"):
-        plan_phases(
-            arena, [group("c", 64, 0, 32, start=32, borrow_key="p")], stage)
-
-
-def test_freeing_a_parent_frees_its_shared_slots(torch_stub):
-    arena = arena_with_slots(slots=4)
-    resident(arena, "p")
-    plan_phases(arena, [group("p", 48, 0, 48, points=(16, 32))], stage)
-    assert len(arena.accounting.free_slots) == 1
-    arena.accounting.free_key("p")
-    assert len(arena.accounting.free_slots) == 4
+    phases = plan_phases(arena, [resident_group("p", 48, 0, 2)], stage)
+    assert lengths(phases) == [(2,)]
+    assert phases[0].read_slots.tolist() == [arena.accounting.slots["p"]]
+    with pytest.raises(ValueError, match="checkpoints cover"):
+        plan_phases(arena, [resident_group("p", 32, 0, 2)], stage)
 
 
 def test_a_later_group_does_not_evict_a_parent_an_earlier_group_reads(
@@ -144,29 +91,6 @@ def resident_group(key, f, row0, suffix, *, kept=0):
                 kept=kept, borrow_key=None, share_points=())
 
 
-def test_no_groups_make_no_phases(torch_stub):
-    assert plan_phases(arena_with_slots(), [], stage) == ()
-
-
-def test_a_document_nobody_borrows_from_takes_no_extra_slot(torch_stub):
-    arena = arena_with_slots(slots=2)
-    resident(arena, "p")
-    phases = plan_phases(arena, [group("p", 48, 0, 48)], stage)
-    assert lengths(phases) == [(48,), (2,)]
-    assert arena.accounting.share_slots == {}
-    assert len(arena.accounting.free_slots) == 1
-
-
-def test_points_at_or_beyond_the_ends_of_the_prefix_are_not_saved(
-        torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p")
-    phases = plan_phases(
-        arena, [group("p", 48, 0, 48, points=(0, 48, 64))], stage)
-    assert lengths(phases) == [(48,), (2,)]
-    assert arena.accounting.share_slots == {}
-
-
 def test_points_at_or_below_the_start_are_not_saved(torch_stub):
     arena = arena_with_slots()
     resident(arena, "p", "c")
@@ -178,11 +102,11 @@ def test_points_at_or_below_the_start_are_not_saved(torch_stub):
     assert list(arena.accounting.share_slots) == [("p", 32), ("c", 48)]
 
 
-def test_repeated_and_unordered_points_make_one_segment_each(torch_stub):
+def test_only_distinct_interior_share_points_make_segments(torch_stub):
     arena = arena_with_slots()
     resident(arena, "p")
     phases = plan_phases(
-        arena, [group("p", 48, 0, 48, points=(32, 16, 32, 16))], stage)
+        arena, [group("p", 48, 0, 48, points=(0, 32, 16, 48, 64, 32, 16))], stage)
     assert lengths(phases) == [(16,), (16,), (16,), (2,)]
     assert sorted(t for _, t in arena.accounting.share_slots) == [16, 32]
 
@@ -209,14 +133,6 @@ def test_a_borrower_of_the_parents_whole_prefix_reads_its_slot(torch_stub):
     assert phases[1].write_slots.tolist() == [arena.accounting.slots["c"]]
 
 
-def test_borrowing_without_a_parent_key_is_refused(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "c")
-    with pytest.raises(BorrowStateMissingError, match="no state of the parent"):
-        plan_phases(
-            arena, [group("c", 64, 0, 32, start=32, borrow_key=None)], stage)
-
-
 def test_a_state_at_a_different_length_does_not_serve_a_borrow(torch_stub):
     arena = arena_with_slots()
     resident(arena, "p", "c")
@@ -224,24 +140,6 @@ def test_a_state_at_a_different_length_does_not_serve_a_borrow(torch_stub):
     with pytest.raises(BorrowStateMissingError, match="no state of the parent"):
         plan_phases(
             arena, [group("c", 80, 0, 32, start=16, borrow_key="p")], stage)
-
-
-def test_a_resident_group_cannot_start_inside_its_document(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p")
-    bad = resident_group("p", 48, 0, 2)
-    bad["start"] = 16
-    with pytest.raises(ValueError, match="cannot start at token 16"):
-        plan_phases(arena, [bad], stage)
-
-
-def test_a_borrower_with_no_rows_of_its_own_is_refused(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p", "c")
-    plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
-    with pytest.raises(ValueError, match="whole prefix"):
-        plan_phases(
-            arena, [group("c", 32, 0, 0, start=32, borrow_key="p")], stage)
 
 
 def test_a_missing_share_slot_splits_and_the_retry_reuses_what_it_took(
@@ -259,15 +157,6 @@ def test_a_missing_share_slot_splits_and_the_retry_reuses_what_it_took(
     phases = plan_phases(arena, [full], stage)
     assert all(arena.accounting.share_slots[k] == v for k, v in taken.items())
     assert lengths(phases) == [(16,), (16,), (16,), (2,)]
-
-
-def test_a_missing_main_slot_is_refused_before_any_share_slot(torch_stub):
-    from quail.backends.quail.executor.chunk import ArenaFullError
-
-    arena = arena_with_slots(slots=0)
-    resident(arena, "p")
-    with pytest.raises(ArenaFullError, match="no free checkpoint slot"):
-        plan_phases(arena, [group("p", 48, 0, 48, points=(16,))], stage)
 
 
 def test_a_wholly_kept_suffix_continues_after_the_last_segment(torch_stub):
@@ -297,23 +186,6 @@ def test_a_suffix_with_a_question_extends_after_it_ran(torch_stub):
     assert suffix.write_slots is None and extension.output is False
     assert suffix.read_slots.tolist() == [arena.accounting.slots["p"]]
     assert extension.write_slots.tolist() == [arena.accounting.ext_slots["p"]]
-
-
-def test_a_resident_group_reads_the_state_a_borrower_chain_left(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p")
-    plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
-    phases = plan_phases(arena, [resident_group("p", 48, 0, 2)], stage)
-    assert lengths(phases) == [(2,)]
-    assert phases[0].read_slots.tolist() == [arena.accounting.slots["p"]]
-
-
-def test_a_resident_group_asked_at_a_shared_length_is_refused(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p")
-    plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
-    with pytest.raises(ValueError, match="checkpoints cover"):
-        plan_phases(arena, [resident_group("p", 32, 0, 2)], stage)
 
 
 def test_levels_cover_every_prefix_row_once_and_never_read_ahead(

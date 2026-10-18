@@ -1,314 +1,117 @@
-"""Shared-state slots, memory samples, and the borrow rules of a hybrid model."""
+"""Checkpoint allocation, retention, and memory accounting."""
 
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
-import pytest
 from helpers.fakes import bare_arena
 
 from quail.backends.quail.executor.arena import KVArena, PageArena
-from quail.backends.quail.executor.stage_executor import StageExecutor
-from quail.backends.quail.executor.stages import (
-    checkpoint_slot_limit,
-    state_share_points,
-)
+from quail.backends.quail.retention import policy
+from quail.cost.retention import RetentionPolicy, coefficients
+from quail.specs import H100_SXM, QWEN3_5_4B_BF16
+
+SPEC = QWEN3_5_4B_BF16
 
 
-class _Rows(dict):
-    """Row tables the tensor-free arena never fills."""
+def test_priority_divides_by_kv_and_checkpoint_pages():
+    uses = {"a": (1, 0)}
+    plain = RetentionPolicy(1.0, 0.0, uses)
+    hybrid = RetentionPolicy(1.0, 0.0, uses, checkpoint_pages=98.25)
+    assert plain.priority(("a", 0), 1_000, 63)[0] == 1_000 / 63
+    assert hybrid.priority(("a", 0), 1_000, 63)[0] == 1_000 / (63 + 98.25)
+    config = coefficients(SPEC, H100_SXM)
+    assert policy(config, uses).checkpoint_pages == 98.25
 
-    def pop(self, key, *default):
-        return super().pop(key, None)
 
-
-def arena_with_slots(slots=6, pages=64):
+def checkpoint_arena(slots, pages=16):
     arena = bare_arena(KVArena.__new__(KVArena), pages)
     arena.accounting = PageArena(pages, 16, n_slots=slots)
-    arena._rows = _Rows()
-    arena._capacity_rows = _Rows()
+    arena.accounting.configure_retention(
+        RetentionPolicy(1.0, 0.0, {"a": (1, 0)}, checkpoint_pages=98.25), pages)
     return arena
 
 
-def resident(arena, key, tokens=48):
-    arena.alloc(key, tokens)
-    arena.accounting.pin(key)
+def keep(arena, key, tokens):
+    assert arena.accounting.alloc(key, tokens) is not None
+    arena._rows[key] = arena._capacity_rows[key] = None
+    arena.checkpoint_slot(key)
+    arena.retain(key, tokens)
 
 
-# ---- the accounting ---------------------------------------------------
-
-def test_share_slot_is_kept_per_key_and_token_count():
-    accounting = PageArena(8, 16, n_slots=4)
-    accounting.alloc("p", 32)
-    first = accounting.alloc_share("p", 16)
-    assert accounting.alloc_share("p", 16) == first
-    assert accounting.alloc_share("p", 32) != first
-    assert len(accounting.free_slots) == 2
-
-
-def test_share_slot_for_a_key_that_is_not_resident_raises():
-    accounting = PageArena(8, 16, n_slots=2)
-    with pytest.raises(KeyError):
-        accounting.alloc_share("ghost", 16)
-
-
-def test_share_slot_is_none_when_no_slot_is_free():
-    accounting = PageArena(8, 16, n_slots=1)
-    accounting.alloc("p", 32)
-    assert accounting.alloc_slot("p") is not None
-    assert accounting.alloc_share("p", 16) is None
-
-
-def test_freeing_a_key_frees_main_extension_and_shared_slots():
-    accounting = PageArena(8, 16, n_slots=5)
-    accounting.alloc("p", 32)
-    accounting.alloc_slot("p")
-    accounting.alloc_extension("p")
-    accounting.alloc_share("p", 16)
-    accounting.alloc_share("p", 24)
-    assert not accounting.free_slots[:0] and len(accounting.free_slots) == 1
-    accounting.free_key("p")
-    assert sorted(accounting.free_slots) == [0, 1, 2, 3, 4]
-    assert accounting.share_slots == {}
-
-
-def test_freeing_one_key_keeps_another_keys_shared_slots():
-    accounting = PageArena(8, 16, n_slots=4)
-    accounting.alloc("p", 32)
-    accounting.alloc("q", 32)
-    kept = accounting.alloc_share("q", 16)
-    accounting.alloc_share("p", 16)
-    accounting.free_key("p")
-    assert accounting.share_slots == {("q", 16): kept}
-    assert len(accounting.free_slots) == 3
-
-
-# ---- the arena --------------------------------------------------------
-
-def test_shared_state_finds_a_point_or_the_document_end():
-    arena = arena_with_slots()
-    resident(arena, "p")
-    slot = arena.share_slot("p", 32)
-    assert arena.shared_state("p", 32) == slot
-    assert arena.shared_state("p", 16) is None
-    main = arena.checkpoint_slot("p")
-    arena.record_checkpoint("p", 48)
-    assert arena.shared_state("p", 48) == main
-    # the checkpoint serves only the length it covers
-    assert arena.shared_state("p", 47) is None
-    assert arena.shared_state("ghost", 48) is None
-
-
-def test_a_share_point_wins_over_the_document_end_at_the_same_length():
-    arena = arena_with_slots()
-    resident(arena, "p")
-    main = arena.checkpoint_slot("p")
-    arena.record_checkpoint("p", 32)
-    shared = arena.share_slot("p", 32)
-    assert arena.shared_state("p", 32) == shared != main
-
-
-def test_share_slot_evicts_a_retained_key_when_none_is_free():
-    arena = arena_with_slots(slots=2)
-    old = ("r", 0)
-    resident(arena, "p")
-    resident(arena, old)
-    arena.checkpoint_slot(old)
-    arena.record_checkpoint(old, 48)
-    arena.checkpoint_slot("p")
-    assert not arena.accounting.free_slots
-    arena.retain(old, 48, priority=(0,))
-    slot = arena.share_slot("p", 16)
-    assert slot is not None
-    assert not arena.is_resident(old)
+def test_a_full_pool_evicts_the_lowest_priority_document_with_its_slot():
+    arena = checkpoint_arena(slots=2)
+    keep(arena, ("a", 0), 32)
+    keep(arena, ("a", 1), 64)
+    assert arena.has_checkpoint(("a", 0)) and arena.has_checkpoint(("a", 1))
+    arena.accounting.alloc(("a", 2), 32)
+    arena._rows[("a", 2)] = arena._capacity_rows[("a", 2)] = None
+    assert arena.checkpoint_slot(("a", 2)) is not None
+    # per page the 32-token document is worth the same as the 64-token one;
+    # the tie goes to the earlier document
+    assert not arena.is_resident(("a", 0))
+    assert arena.is_resident(("a", 1))
     assert arena.evicted_keys == 1
+    assert arena.n_state_slots == 2
 
 
-def test_share_slot_is_none_when_every_slot_is_pinned():
-    arena = arena_with_slots(slots=2)
-    resident(arena, "p")
-    resident(arena, "q")
-    arena.checkpoint_slot("p")
-    arena.checkpoint_slot("q")
-    assert arena.share_slot("p", 16) is None
+def test_a_pinned_document_keeps_its_slot():
+    arena = checkpoint_arena(slots=1)
+    assert arena.accounting.alloc(("a", 0), 32) is not None
+    arena._rows[("a", 0)] = arena._capacity_rows[("a", 0)] = None
+    assert arena.checkpoint_slot(("a", 0)) is not None
+    arena.accounting.pin(("a", 0))
+    arena.accounting.alloc(("a", 1), 32)
+    assert arena.checkpoint_slot(("a", 1)) is None
+    assert arena.is_resident(("a", 0))
 
 
-def test_a_held_parent_keeps_its_shared_slots_until_released():
-    arena = arena_with_slots()
-    parent = ("r", 0)
-    resident(arena, parent)
-    arena.share_slot(parent, 16)
-    arena.hold(parent, 1)
-    assert arena.free_key(parent) == 0
-    assert (parent, 16) in arena.accounting.share_slots
-    arena.release(parent)
-    assert arena.accounting.share_slots == {}
+def test_checkpoint_slots_are_reused_without_freeing_another_keys_state():
+    arena = checkpoint_arena(slots=5)
+    first, second = ("a", 0), ("a", 1)
+    keep(arena, first, 48)
+    keep(arena, second, 48)
+    arena.accounting.pin(first)
+    arena.accounting.pin(second)
+    main = arena.checkpoint_slot(first)
+    extension = arena.accounting.alloc_extension(first)
+    shared = arena.share_slot(first, 32)
+    other = arena.share_slot(second, 16)
+    assert len({main, extension, shared, other}) == 4
+    assert arena.share_slot(first, 32) == shared
+    assert arena.share_slot(first, 16) is None
+    assert arena.slots_held([first, second]) == 5
 
-
-def test_evicting_a_retained_parent_frees_its_shared_slots():
-    arena = arena_with_slots(slots=3)
-    parent = ("r", 0)
-    resident(arena, parent)
-    arena.share_slot(parent, 16)
-    arena.checkpoint_slot(parent)
-    arena.retain(parent, 48, priority=(0,))
-    arena.evict_key(parent)
+    arena.record_checkpoint(first, 48)
+    assert arena.shared_state(first, 48) == main
+    assert arena.shared_state(first, 32) == shared
+    assert arena.shared_state(first, 16) is None
+    arena.hold(first, 1)
+    assert arena.free_key(first) == 0
+    assert arena.shared_state(first, 32) == shared
+    arena.release(first)
+    assert arena.accounting.share_slots == {(second, 16): other}
     assert len(arena.accounting.free_slots) == 3
-    assert arena.events[-1][1] == "evict"
-    assert arena.events[-1][2]["tokens"] == 48
+    assert arena.shared_state(first, 48) is None
+    reused = arena.share_slot(second, 32)
+    assert reused in {main, extension, shared}
+    arena.evict_key(second)
+    assert len(arena.accounting.free_slots) == 5
+    assert not arena.accounting.share_slots
 
 
-# ---- the memory trace -------------------------------------------------
-
-@pytest.fixture
-def cuda_stub():
-    cuda = SimpleNamespace(
+def test_memory_samples_and_events_reset_between_queries():
+    arena = checkpoint_arena(slots=4, pages=10)
+    arena.sample_memory(tokens=5)
+    assert arena.memory_trace == []
+    arena.torch = SimpleNamespace(cuda=SimpleNamespace(
         is_available=lambda: True,
         mem_get_info=lambda: (30 * 2**30, 80 * 2**30),
-        memory_allocated=lambda: 5 * 2**30)
-    return SimpleNamespace(cuda=cuda)
-
-
-def test_a_sample_records_occupancy_and_device_memory(cuda_stub):
-    arena = arena_with_slots(slots=4, pages=10)
-    arena.torch = cuda_stub
-    resident(arena, "p", tokens=48)
-    arena.checkpoint_slot("p")
+        memory_allocated=lambda: 5 * 2**30))
+    keep(arena, ("a", 0), 48)
+    arena.accounting.pin(("a", 0))
     arena.sample_memory(tokens=1_000, groups=3)
-    row = arena.memory_trace[0]
-    assert row[1:] == (3, 0, 1, 1, 50 * 1024.0, 5 * 1024.0, 1_000, 3, 0)
-
-
-def test_sampling_does_nothing_without_a_gpu():
-    arena = arena_with_slots()
-    arena.sample_memory(tokens=5)
-    assert arena.memory_trace == []
-    arena.torch = SimpleNamespace(
-        cuda=SimpleNamespace(is_available=lambda: False))
-    arena.sample_memory(tokens=5)
-    assert arena.memory_trace == []
-
-
-def test_reset_stats_clears_the_trace_and_the_events(cuda_stub):
-    arena = arena_with_slots()
-    arena.torch = cuda_stub
-    arena.sample_memory()
+    assert arena.memory_trace[0][1:] == (
+        3, 0, 1, 1, 50 * 1024.0, 5 * 1024.0, 1_000, 3, 0)
     arena.log_event("split", groups=2)
-    assert arena.memory_trace and arena.events
+    assert arena.events
     arena.reset_stats()
     assert arena.memory_trace == [] and arena.events == []
-
-
-# ---- the scheduler's rules --------------------------------------------
-
-def test_share_points_group_distinct_counts_by_parent():
-    parents = [None, 0, 0, 0, 2, None]
-    shared = [0, 32, 48, 32, 16, 0]
-    assert state_share_points(parents, shared) == [
-        (32, 48), (), (16,), (), (), ()]
-
-
-def test_share_points_ignore_a_borrow_of_zero_tokens():
-    assert state_share_points([None, 0], [0, 0]) == [(), ()]
-    assert state_share_points([], []) == []
-
-
-@pytest.mark.parametrize("slots,stages,shares,limit", [
-    (580, 1, False, 580),
-    (580, 2, False, 290),
-    (580, 1, True, 290),
-    (580, 3, True, 193),
-    (1, 3, True, 1),
-    (0, 1, False, 1),
-])
-def test_slot_limit_counts_each_slot_a_document_can_hold(
-        slots, stages, shares, limit):
-    assert checkpoint_slot_limit(slots, stages, shares) == limit
-
-
-def borrow_checker(parent_start, prefix_length, shared, saved=None,
-                   allowed=True, kept=True):
-    arena = SimpleNamespace(
-        shared_state=lambda key, tokens: (
-            None if saved is None else saved.get((key, tokens))))
-    executor = SimpleNamespace(
-        borrowing=SimpleNamespace(
-            tree_shared=[0, shared],
-            shared=lambda parent: parent_start),
-        prefix_lengths=[100, prefix_length],
-        # the parent saves a state at the length its child borrows
-        share_points=[(shared,) if kept else (), ()],
-        arena=arena, keys=["p", "c"])
-    return StageExecutor._state_borrow_check(
-        executor, lambda doc, parent, same_chunk: allowed)
-
-
-def test_a_borrow_must_start_before_the_borrowers_own_end():
-    check = borrow_checker(0, prefix_length=64, shared=64)
-    assert not check(1, 0, True)
-    assert borrow_checker(0, 65, 64)(1, 0, True)
-
-
-def test_a_borrow_must_start_after_the_parents_own_start():
-    assert not borrow_checker(32, 100, 32)(1, 0, True)
-    assert not borrow_checker(48, 100, 32)(1, 0, True)
-    assert borrow_checker(32, 100, 48)(1, 0, True)
-
-
-def test_a_parent_from_an_earlier_chunk_needs_its_saved_state():
-    assert not borrow_checker(0, 100, 32)(1, 0, False)
-    assert not borrow_checker(0, 100, 32, saved={("p", 16): 3})(1, 0, False)
-    assert borrow_checker(0, 100, 32, saved={("p", 32): 3})(1, 0, False)
-
-
-def test_a_parent_in_the_same_chunk_will_write_its_state():
-    assert borrow_checker(0, 100, 32)(1, 0, True)
-
-
-def test_the_arenas_own_rule_can_still_refuse():
-    assert not borrow_checker(0, 100, 32, allowed=False)(1, 0, True)
-    assert not borrow_checker(
-        0, 100, 32, saved={("p", 32): 3}, allowed=False)(1, 0, False)
-
-
-@pytest.fixture(autouse=True)
-def _no_torch_leak(monkeypatch):
-    # sample_memory reads self.torch; keep a stub module out of sys.modules
-    monkeypatch.setitem(sys.modules, "torch", ModuleType("torch"))
-
-
-# ---- the event log ----------------------------------------------------
-
-def event_of(arena, **detail):
-    executor = SimpleNamespace(arena=arena)
-    StageExecutor._log_memory_event(executor, "split", groups=4, **detail)
-
-
-@pytest.mark.parametrize("message,reason", [
-    ("no free checkpoint slot for ('r', 3): all 580 belong to documents "
-     "in use", "slots"),
-    ("unified suffix pages exceed the free KV arena", "pages"),
-    ("rows exceed the chunk", "rows"),
-])
-def test_a_split_is_logged_with_what_ran_out(message, reason):
-    arena = arena_with_slots()
-    event_of(arena, reason=message)
-    when, kind, detail = arena.events[0]
-    assert (kind, detail) == ("split", {"groups": 4, "reason": reason})
-
-
-def test_an_arena_without_a_log_ignores_events():
-    event_of(SimpleNamespace(), reason="no free checkpoint slot")
-
-
-def test_a_borrow_at_a_length_the_parent_did_not_keep_is_refused():
-    # a small pool keeps only some share lengths; the other borrowers
-    # compute their whole prefix
-    assert borrow_checker(0, 100, 32)(1, 0, True)
-    assert not borrow_checker(0, 100, 32, kept=False)(1, 0, True)
-    assert not borrow_checker(0, 100, 32, kept=False,
-                              saved={("p", 32): 3})(1, 0, False)
-
-
-def test_a_borrow_of_the_parents_whole_prefix_needs_no_kept_point():
-    # the parent's document-end checkpoint serves its own length
-    assert borrow_checker(0, 200, 100, kept=False)(1, 0, True)

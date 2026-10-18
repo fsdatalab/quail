@@ -11,6 +11,9 @@ import quail.backends.quail.executor.gdn as gdn  # noqa: E402
 
 
 def test_launches_cap_the_sequences_and_match_one_pass(monkeypatch):
+    from quail.cost.budgets import CHECKPOINT_PASS_QUESTIONS
+
+    assert 2 * gdn.SEQUENCES_PER_LAUNCH <= CHECKPOINT_PASS_QUESTIONS
     key_heads, value_heads, key_dim, value_dim = 2, 4, 8, 8
     spec = SimpleNamespace(gdn_value_heads=value_heads)
     lengths = [1, 2, 3, 1, 2, 1, 3]
@@ -50,11 +53,3 @@ def test_launches_cap_the_sequences_and_match_one_pass(monkeypatch):
                                          lengths, 0.5)
     torch.testing.assert_close(out, expected)
     torch.testing.assert_close(written, expected_state)
-
-
-def test_a_launch_holds_two_state_copies_within_the_pass_reserve():
-    from quail.cost.budgets import CHECKPOINT_PASS_QUESTIONS
-
-    # the gathered state and the final state are two copies per sequence,
-    # and the reserve counts one copy per question
-    assert 2 * gdn.SEQUENCES_PER_LAUNCH <= CHECKPOINT_PASS_QUESTIONS

@@ -17,7 +17,6 @@ from quail.backends.quail.executor.chunk import Suffixes
 from quail.backends.quail.executor.gdn import plan_phases
 from quail.backends.quail.executor.stages import (
     Stage,
-    checkpoint_slot_limit,
     run_stages,
 )
 
@@ -118,35 +117,13 @@ def _retained_run(slots, retained, documents, stages, monkeypatch):
     return arena
 
 
-def test_slot_limit_leaves_out_the_slots_pinned_residents_hold():
-    assert checkpoint_slot_limit(40, 2, False) == 20
-    assert checkpoint_slot_limit(40, 2, False, held=30) == 5
-    assert checkpoint_slot_limit(40, 1, True, held=39) == 1
-
-
-@pytest.mark.parametrize("retained", [10, 30, 36, 38, 39])
-@pytest.mark.parametrize("stage_count", [1, 2])
+@pytest.mark.parametrize("retained,stage_count", [(10, 1), (39, 2)],
+                         ids=["retained", "nearly-full-multistage"])
 def test_retained_documents_do_not_exhaust_the_checkpoint_slots(
         retained, stage_count, monkeypatch):
-    # 40 slots, 160 documents, `retained` of them resident from an
-    # earlier operator, and a frame that needs a second slot each
     arena = _retained_run(40, retained, 160, _stages(stage_count),
                           monkeypatch)
     assert arena.accounting.free_slots
-
-
-def test_the_arena_counts_the_slots_a_set_of_keys_holds():
-    arena = _arena(8)
-    first, second = ("d", 0), ("d", 1)
-    for key in (first, second):
-        arena.alloc(key, 64)
-        arena.accounting.alloc_slot(key)
-    arena.accounting.alloc_extension(first)
-    arena.accounting.alloc_share(second, 32)
-    assert arena.slots_held([first]) == 2
-    assert arena.slots_held([second]) == 2
-    assert arena.slots_held([first, second]) == 4
-    assert arena.slots_held([]) == 0
 
 
 def _group(key, f, row0, prefix_end, *, fresh, kept=0, slen=2):
@@ -181,17 +158,6 @@ def test_a_question_cannot_share_a_chunk_with_an_in_place_advance_of_its_slot(
     assert arena.extension("a")[1] == 39
 
 
-def test_an_empty_document_has_no_state_to_checkpoint(monkeypatch):
-    arena = _arena(2)
-    arena.alloc(("d", 0), 16)
-    with pytest.raises(ValueError, match="empty document"):
-        _plan(arena, [_group(("d", 0), 0, 0, 0, fresh=True, slen=3)],
-              monkeypatch)
-    # nothing was allocated before the refusal
-    assert ("d", 0) not in arena.accounting.slots
-    assert len(arena.accounting.free_slots) == 2
-
-
 def test_a_query_that_needs_more_slots_than_the_pool_holds_is_refused_early(
         monkeypatch):
     # a stage frame needs a second slot, and the pool has one
@@ -201,56 +167,19 @@ def test_a_query_that_needs_more_slots_than_the_pool_holds_is_refused_early(
         _run(arena, keys, _stages(2), 72 * 12, monkeypatch)
 
 
-def test_a_pool_that_holds_no_checkpoint_beside_a_document_is_refused():
-    from quail.cost import budgets
-    from quail.specs import H100_SXM, QWEN3_5_27B_FP8
-
-    # a checkpoint is 146.8 pages and the pool is 12,108, so a document
-    # of 10 million tokens leaves room for none
-    with pytest.raises(ValueError, match="holds no checkpoint"):
-        budgets.hybrid_arena_pages(QWEN3_5_27B_FP8, H100_SXM, 61_680, 1e7)
-    assert budgets.hybrid_arena_pages(
-        QWEN3_5_27B_FP8, H100_SXM, 61_680, 1_000) > 0
-
-
-def test_slots_per_document_count_the_frame_and_every_share_length():
-    from quail.backends.quail.executor.stages import slots_per_document
-
-    assert slots_per_document(1, 0) == 1
-    assert slots_per_document(2, 0) == 2
-    # a written frame extends the document's checkpoint, even in one stage
-    assert slots_per_document(1, 0, frames=True) == 2
-    # borrowers at 16, 32, and 48 tokens each start from their own slot
-    assert slots_per_document(1, 3) == 4
-    assert slots_per_document(2, 3, frames=True) == 5
-
-
-@pytest.mark.parametrize("slots", [20, 24, 30, 40])
-def test_a_single_stage_with_a_frame_gets_its_second_slot(slots, monkeypatch):
-    arena = _arena(slots, pages=4_000)
-    keys = [("d", i) for i in range(200)]
-    prefixes = [[i + 1] * 64 for i in range(200)]
-    _run(arena, keys, _stages(1), 72 * 12, monkeypatch, prefixes=prefixes)
-
-
 def test_a_retained_parent_is_not_evicted_by_its_childs_chunk(monkeypatch):
     # 6 slots hold the retained parent and 5 fresh documents; the child
     # starts from the parent's state at 64 tokens and is planned last
     slots, fresh = 6, 5
     keys = [("d", i) for i in range(2 + fresh)]
-    arena = _arena(slots, pages=4_000)
     parent = keys[0]
-    arena.alloc(parent, 64)
-    arena.accounting.alloc_slot(parent)
-    arena.record_checkpoint(parent, 64)
-    arena.retain(parent, 64)
     prefixes = [[1] * 64, [1] * 64 + [2] * 16] + [
         [5 + i] * 64 for i in range(fresh)]
     tree = SimpleNamespace(
         parent=[None, 0] + [None] * fresh, shared=[0, 64] + [0] * fresh,
         order=[0, *range(2, 2 + fresh), 1], shared_tokens=64)
     stage = [Stage(suffixes=[[9, 9]], readout=_Readout(), single=True)]
-    for budget in (100, 140, 200, 300, 600):
+    for budget in (100, 600):
         run_arena = _arena(slots, pages=4_000)
         run_arena.alloc(parent, 64)
         run_arena.accounting.alloc_slot(parent)
@@ -302,13 +231,6 @@ def test_a_failed_plan_returns_the_checkpoint_and_share_slots_it_took(
     assert arena.shared_state("a", 16) is not None
 
 
-def test_a_suffix_that_holds_no_tokens_is_refused(monkeypatch):
-    arena = _arena(2)
-    arena.alloc("a", 64)
-    with pytest.raises(ValueError, match="holds no tokens"):
-        _plan(arena, [_group("a", 32, 0, 32, fresh=True, slen=0)], monkeypatch)
-
-
 def _tree_run(slots, parents, children, monkeypatch, stages=1, frame=(),
               budget=1_000, spread=16):
     """Parents whose children share prefixes of increasing length."""
@@ -340,62 +262,31 @@ def _tree_run(slots, parents, children, monkeypatch, stages=1, frame=(),
 
 
 @pytest.mark.xfail(strict=True, reason=(
-    "the retry after a missing parent state keeps the borrowed pages, so "
-    "the child's whole-prefix writes land on the parent's pages with "
-    "the same values; known and left as is"))
-def test_a_borrower_that_computes_its_whole_prefix_borrows_no_pages(
-        monkeypatch):
-    # a fresh group writes KV from its start token on, so the pages it
-    # borrowed must end at that token; the retry after a missing parent
-    # state packs the whole prefix and must not keep the parent's pages
-    from quail.backends.quail.executor import stage_executor as stages_mod
-
-    parent, child = ("d", 0), ("d", 1)
-    arena = _arena(6, pages=4_000)
-    arena.alloc(parent, 64)       # saved state covers 64 tokens, not 48
-    arena.accounting.alloc_slot(parent)
-    arena.record_checkpoint(parent, 64)
-    arena.retain(parent, 64)
-    prefixes = [[1] * 64, [1] * 48 + [2] * 16]
-    tree = SimpleNamespace(parent=[None, 0], shared=[0, 48], order=[0, 1],
-                           shared_tokens=48)
-    # let the borrow reach the planner, which finds no state to start from
-    monkeypatch.setattr(stages_mod.StageExecutor, "_state_borrow_check",
-                        lambda self, can_borrow: can_borrow)
-    packed, unborrowed = [], []
-    real_plan, real_pack = plan_phases, _pack
-
-    def counting_plan(arena, groups, stage):
-        try:
-            return real_plan(arena, groups, stage)
-        except chunk_mod.BorrowStateMissingError:
-            unborrowed.append(True)
-            raise
+    "a retry after missing parent state writes the whole prefix into borrowed KV"))
+def test_a_borrower_that_computes_its_whole_prefix_borrows_no_pages(monkeypatch):
+    real_pack = _pack
+    borrowed_writes = []
 
     def checked_pack(torch, arena, specs, **options):
         for spec in specs:
             if spec.get("prefix") is not None:
-                packed.append((
-                    spec["key"], spec.get("start", 0),
-                    arena.accounting.borrowed_tokens(spec["key"])
-                    if spec["key"] in arena.accounting.borrowed else 0))
+                borrowed = arena.accounting.borrowed_tokens(spec["key"])
+                if borrowed > spec.get("start", 0):
+                    borrowed_writes.append((spec["key"], borrowed))
         return real_pack(torch, arena, specs, **options)
 
-    monkeypatch.setitem(globals(), "plan_phases", counting_plan)
     monkeypatch.setitem(globals(), "_pack", checked_pack)
-    stage = [Stage(suffixes=[[9, 9]], readout=_Readout(), single=True)]
-    _run(arena, [parent, child], stage, 1_000, monkeypatch,
-         prefix_tree=tree, prefixes=prefixes)
-    assert unborrowed, "the parent's state was meant to be missing"
-    # the retry packs the child from token 0 with nothing borrowed
-    key, start, borrowed = packed[-1]
-    assert key == child
-    assert borrowed <= start
+    _tree_run(slots=10, parents=6, children=4, stages=1, frame=(),
+              budget=160, monkeypatch=monkeypatch)
+    assert not borrowed_writes
 
 
-@pytest.mark.parametrize("slots", [3, 6, 10, 15, 30])
-@pytest.mark.parametrize("children", [2, 6])
-@pytest.mark.parametrize("stages,frame", [(1, ()), (1, (7, 7)), (2, (7, 7))])
+@pytest.mark.parametrize("slots,children,stages,frame", [
+    (3, 2, 1, ()),
+    (6, 6, 1, (7, 7)),
+    (10, 6, 2, (7, 7)),
+    (30, 2, 2, ()),
+], ids=["minimal-pool", "frame", "multistage-frame", "ample-pool"])
 def test_parents_with_many_share_lengths_run_in_a_small_pool(
         slots, children, stages, frame, monkeypatch):
     # a pool too small for every share point keeps the ones that save

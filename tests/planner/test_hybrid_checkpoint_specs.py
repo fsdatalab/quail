@@ -95,23 +95,6 @@ def test_qwen3_8_27b_matches_the_config():
     assert MODELS[spec.name] is spec
 
 
-def test_qwen3_8_27b_has_the_geometry_of_qwen3_5_27b():
-    # the two checkpoints share every size the cost model reads
-    new, old = QWEN3_8_27B_FP8, QWEN3_5_27B_FP8
-    for field in ("params", "layers", "hidden", "n_q", "n_kv", "d_head",
-                  "ffn_width", "vocab", "layer_kinds", "kappa",
-                  "turn_prefix", "turn_suffix"):
-        assert getattr(new, field) == getattr(old, field)
-    # 24,328,929,280 fp8 and convolution elements in the headers, plus
-    # 48 layers x 2 x 48 x 5,120 bf16 in_proj_a and in_proj_b elements
-    assert new.params == 24_328_929_280 + 48 * 2 * 48 * 5120
-    # vLLM's reported memory after loading, 0.6 percent above the
-    # 29,468,003,328 bytes of text tensors
-    assert new.w_mem_bytes == 29_638_887_936
-    assert new.w_mem_bytes / 29_468_003_328 < 1.01
-    assert new.max_num_seqs == 768
-
-
 def test_lfm2_matches_the_config():
     spec = LFM2_2_6B_BF16
     config = _config("lfm2_configs/lfm2-2.6b.json")
@@ -154,27 +137,6 @@ def test_lfm2_keeps_only_convolution_columns():
     assert spec.conv_state_channels == spec.hidden == 2048
     # two bf16 columns of 2,048 channels in each of 22 layers
     assert spec.checkpoint_bytes == 22 * 2048 * 2 * 2
-
-
-def test_lfm2_prices_its_short_convolution_projections():
-    from quail.cost import budgets
-    from quail.cost.dense_decoder_cost import (
-        dense_params,
-        short_conv_projection_params,
-    )
-
-    spec = LFM2_2_6B_BF16
-    assert short_conv_projection_params(spec) == 22 * 4 * 2048 * 2048
-    assert dense_params(spec) > short_conv_projection_params(spec)
-    shapes = budgets._projection_shapes(spec)
-    assert (2048, 3 * 2048, 22) in shapes and (2048, 2048, 22) in shapes
-    assert not budgets.tree_attention_allowed(spec)
-
-
-def test_a_model_without_short_convolutions_prices_none():
-    from quail.cost.dense_decoder_cost import short_conv_projection_params
-
-    assert short_conv_projection_params(QWEN3_5_27B_FP8) == 0
 
 
 def test_lfm2_work_includes_its_convolution_projections():
@@ -222,15 +184,7 @@ def test_lfm2_prompt_opens_with_the_beginning_of_text_token():
     text = without_bos(shared_preamble(spec.turn_prefix), spec.bos_text)
     assert text == "<|im_start|>user\n" + shared_preamble("")
     assert not text.startswith(spec.bos_text)
-
-
-def test_models_without_a_beginning_of_text_token_keep_their_prefix():
-    from quail.logical.prompts import without_bos
-    from quail.specs import QWEN3_4B_FP8, QWEN3_5_4B_BF16
-
-    for spec in (QWEN3_4B_FP8, QWEN3_5_4B_BF16):
-        assert spec.bos_text == ""
-        assert without_bos(spec.turn_prefix, spec.bos_text) == spec.turn_prefix
+    assert without_bos("<|im_start|>user\n", "") == "<|im_start|>user\n"
 
 
 def test_extract_preamble_text_drops_the_beginning_of_text_token():

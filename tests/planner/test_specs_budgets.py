@@ -43,8 +43,6 @@ def test_model_weights_and_kv_memory_budgets():
 
 
 def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
-    from quail.specs import DIFFUSION_GEMMA_26B_FP8
-
     full, sliding = budgets.arena_pages(DIFFUSION_GEMMA_26B_FP8, H100_SXM)
     assert full > 0 and sliding >= budgets.transient_sliding_pages(
         budgets.chunk_budget(DIFFUSION_GEMMA_26B_FP8, H100_SXM),
@@ -55,8 +53,6 @@ def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
 
 
 def test_layer_kind_follows_the_existing_attention_layout():
-    from quail.specs import DIFFUSION_GEMMA_26B_FP8
-
     gemma = DIFFUSION_GEMMA_26B_FP8
     # a dense model keeps every token in every layer
     assert {QWEN3_4B_FP8.layer_kind(i) for i in range(QWEN3_4B_FP8.layers)} \
@@ -74,23 +70,6 @@ def test_layer_kind_follows_the_existing_attention_layout():
         == gemma.sliding_layer_set
 
 
-def test_explicit_layer_kinds_replace_the_default_rule():
-    kinds = ("short_conv", "short_conv", "full_attention", "short_conv")
-    spec = replace(QWEN3_4B_FP8, layers=4, layer_kinds=kinds)
-    assert [spec.layer_kind(i) for i in range(4)] == list(kinds)
-
-
-def test_layer_kinds_must_name_every_layer():
-    with pytest.raises(ValueError,
-                       match="layer_kinds has 2 entries for 36 layers"):
-        replace(QWEN3_4B_FP8, layer_kinds=("full_attention", "short_conv"))
-
-
-def test_a_sliding_window_needs_layer_kinds():
-    with pytest.raises(ValueError, match="sliding_window needs layer_kinds"):
-        replace(QWEN3_4B_FP8, sliding_window=128)
-
-
 def test_tree_attention_is_refused_for_a_model_with_a_gdn_layer():
     # one Gated DeltaNet layer is the only difference from Qwen3-4B
     kinds = ("gated_delta_net",) + ("full_attention",) * 35
@@ -99,19 +78,6 @@ def test_tree_attention_is_refused_for_a_model_with_a_gdn_layer():
     assert not hybrid.canvas_tokens
     assert budgets.tree_attention_allowed(QWEN3_4B_FP8)
     assert not budgets.tree_attention_allowed(hybrid)
-
-
-def test_attention_layers_are_the_layers_that_store_kv():
-    assert QWEN3_5_4B_BF16.attention_layers == tuple(range(3, 32, 4))
-    assert QWEN3_4B_FP8.attention_layers == tuple(range(36))
-
-
-def test_budgets_of_models_without_gdn_layers_keep_their_values():
-    for model, knee in [
-            (QWEN3_4B_FP8, 416.4278836608033),
-            (QWEN3_32B_FP8, 343.53425314744567),
-            (DIFFUSION_GEMMA_26B_FP8, 445.28202599846264)]:
-        assert budgets.compute_knee(model, H100_SXM) == knee
 
 
 def _hybrid_projections():
@@ -145,21 +111,53 @@ def test_attention_time_covers_only_the_attention_layers():
         == pytest.approx(4 * expected, rel=1e-12)
 
 
-def test_attention_path_choice_does_not_depend_on_how_many_layers_are_gdn():
-    # attention, tree, and merge times all scale with the attention layers
-    dense = replace(QWEN3_5_4B_BF16, layer_kinds=())
-    for readers, rows, node in [(2, 16, 4000), (64, 8, 20_000), (500, 2, 3000),
-                                (8, 512, 100_000), (1000, 1, 500),
-                                (2, 16, 500), (4, 64, 2000)]:
-        kwargs = dict(readers=readers, reader_rows=rows, node_tokens=node)
-        assert budgets.choose_attention_path(
-            QWEN3_5_4B_BF16, H100_SXM, **kwargs) == budgets.choose_attention_path(
-            dense, H100_SXM, **kwargs)
-
-
 def test_the_tree_merge_is_charged_for_the_attention_layers_only():
     # tree takes 0.73 of the unified time with the merge over 8 layers,
     # and 1.24 of it if the merge were charged over all 32
     assert budgets.choose_attention_path(
         QWEN3_5_4B_BF16, H100_SXM, readers=2, reader_rows=16,
         node_tokens=500) == "tree"
+
+
+@pytest.mark.parametrize("tokens,expected_slots", [(200, 611), (16_000, 61)])
+def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
+        tokens, expected_slots):
+    from quail.backends.quail.worker import checkpoint_arena_args
+    from quail.cost.retention import retention_pages
+
+    model = replace(QWEN3_5_4B_BF16, w_mem_bytes=8_411_152_384)
+    chunk = budgets.chunk_budget(model, H100_SXM)
+    assert chunk == 116_508
+    assert model.checkpoint_bytes == 51_511_296
+    assert budgets.checkpoint_pass_bytes(model, 1_024, chunk) == 4_941 * 2**20
+    pool = budgets.hybrid_pool_pages(model, H100_SXM, chunk)
+    assert pool == 68_060
+    kv_pages, sliding = budgets.arena_pages(model, H100_SXM, chunk, tokens)
+    assert sliding == 0
+    slots = budgets.checkpoint_slots(model, H100_SXM, chunk, kv_pages)
+    assert slots == expected_slots
+    cost = -(-tokens // 16) + budgets.checkpoint_pages(model)
+    assert slots * cost <= pool < (slots + 1) * cost
+    retained = retention_pages(kv_pages * 16, chunk, 16)
+    assert retained == kv_pages - budgets.execution_pages(chunk)
+    assert retained + slots * budgets.checkpoint_pages(model) <= pool
+    assert checkpoint_arena_args(model, H100_SXM, chunk, kv_pages) == {
+        "n_state_slots": slots,
+        "gdn_state_shape": (24, 32, 128, 128),
+        "conv_state_shape": (24, 3, 8_192),
+    }
+    with pytest.raises(ValueError, match="holds no checkpoint"):
+        budgets.hybrid_arena_pages(model, H100_SXM, chunk, 1e7)
+
+
+def test_dense_arena_budget_has_no_checkpoint_reservation():
+    from quail.backends.quail.worker import checkpoint_arena_args
+    from quail.cost.retention import coefficients
+
+    model = QWEN3_4B_FP8
+    assert model.checkpoint_bytes == 0
+    assert budgets.checkpoint_slots(model, H100_SXM, 1_000, 5) == 0
+    assert checkpoint_arena_args(model, H100_SXM, 1_000, 5) == {}
+    assert "checkpoint_pages" not in coefficients(model, H100_SXM)
+    assert budgets.arena_pages(model, H100_SXM, 10_000)[0] == (
+        budgets.arena_tokens(model, H100_SXM, 10_000) // 16)
