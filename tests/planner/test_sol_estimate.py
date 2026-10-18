@@ -9,6 +9,7 @@ import pytest
 
 import quail
 from quail.catalog import DocumentProvider
+from quail.cost.work import Work, ask, scan
 from quail.planner.plan import EngineConfig
 from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_USD_PER_HOUR
 
@@ -193,6 +194,10 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
     assert distinct.post_filter_counts == {"r": 3}
     assert distinct.as_dict()["classification_evaluations"] == 3
 
+    # one readout row per classified document
+    assert distinct.filter_stages[0]["answer_rows"] == 3
+    assert distinct.latency.component("readout").seconds > 0
+
     stages = estimate.filter_stages
     assert [stage["operator"] for stage in stages] == [
         "AI.IF", "AI.CLASSIFY", "IN"]
@@ -211,6 +216,31 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
     assert estimate.fresh_tokens == (
         stages[0]["fresh_tokens"] + stages[1]["fresh_tokens"]
         + estimate.join_stages[0]["fresh_tokens"])
+
+
+def test_an_extraction_verifies_its_reference_answer_after_the_cue(tmp_path):
+    reference = {0: "good", 1: ["bad", "film"], 2: None}
+    with _session(tmp_path) as sess:
+        query = (sess.docs("reviews").alias("r")
+                 .ai_extract("r.body", {"tone": "What is the tone?"}, name="x")
+                 .select("r.id", "x"))
+        (node,) = query.logical.operators().extracts
+        lowered = quail.lower_prompt(node.call.prompt, sess.tokenizer)
+        estimate = quail.speed_of_light_estimate(
+            query, lambda prompt, assignment: reference[assignment["r"]],
+            credit_shared_prefixes=False)
+    (stage,) = estimate.filter_stages
+    # each document's question, then its answer: a span and its closing
+    # quote per span, or the quote alone, verified over the question's KV
+    context = lowered.preamble_tokens + 2 + lowered.tail_tokens
+    expected = Work()
+    for tokens in (2, 4, 1):
+        expected += scan(context - lowered.tail_tokens, lowered.tail_tokens)
+        expected += ask(context, tokens)
+    assert estimate.work == expected
+    assert stage["answer_rows"] == 7
+    assert stage["fresh_tokens"] == 3 * context + 7
+    assert estimate.latency.component("readout").seconds > 0
 
 
 def test_a_classification_of_joined_rows_is_priced_per_kept_pair(tmp_path):

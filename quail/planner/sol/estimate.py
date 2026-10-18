@@ -15,10 +15,9 @@ rows follows its join on the join's anchor.
 
 A classification is priced as one question per live document: the
 reference prompt's tail (the question, the labels by name, and the
-answer cue) over the document's prefix, read at the cue's row as a
-filter's answer is. The rows a scoring rule appends to read the label
-(a letter, a trie, or decode rounds) are an execution choice and are
-not counted.
+answer cue) over the document's prefix, and one readout row at the cue
+that confirms the reference label. An extraction's reference answer is
+verified in one pass after the cue, each of its tokens a readout row.
 
 Every operator in the plan is priced or refused: an Apply, an AI.SCORE
 predicate or column, a LIMIT, or a join without full semantics raises
@@ -35,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from quail.cost import budgets
-from quail.cost.sol import SpeedOfLight, speed_of_light
+from quail.cost.sol import SpeedOfLight
 from quail.cost.work import Work
 from quail.logical import (
     SPAN_SUFFIX,
@@ -142,12 +141,11 @@ class SpeedOfLightEstimate:
                 "classifications follow its AI.IF filters"),
             "classification": (
                 "the reference prompt's tail per document or joined row, "
-                "read at the answer cue; a scoring rule's extra rows are "
-                "not counted"),
+                "and one readout row at the cue"),
             "extraction": (
-                "the plain prompt's tail per document, read once at the "
-                "cue; the lines answer, the start step, and the span "
-                "passes are not counted"),
+                "the plain prompt's tail per document, then the reference "
+                "answer verified in one pass after the cue, each token a "
+                "readout row"),
             "plan_space": "all feasible eager binary full left deep plans",
             "cached_values": (
                 "document prefixes used by filters, classifications, "
@@ -341,7 +339,7 @@ def speed_of_light_estimate(
         chunk_tokens=chunk_tokens,
         credit_shared_prefixes=credit_shared_prefixes,
         work=best.work,
-        latency=speed_of_light(best.work, model, device, chunk_tokens),
+        latency=search.latency(best),
         usd_per_hour=device.usd_per_hour,
         alias_columns={
             alias: data.column for alias, data in search.aliases.items()},

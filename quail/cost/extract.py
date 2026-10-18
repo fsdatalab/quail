@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from itertools import repeat
 
 from quail.cost.budgets import parallel_copies
-from quail.cost.dense_decoder_cost import decoder_seconds
 from quail.cost.draft_policy import DraftPolicy
+from quail.cost.sol import unrounded_seconds
 from quail.cost.work import Work, ask, decode, scan
 
 
@@ -210,8 +210,8 @@ def estimate(expected_rows: float, lengths, head_tokens: int, tail_tokens: int, 
         memo=memo)
     scale = expected_rows / n
     total = work * scale
-    passes = total.tokens / chunk
     copies = parallel_copies(gpus, min(expected_rows, n))
-    seconds = decoder_seconds(total * (1 / copies), rows * scale / copies,
-                              passes / copies, model, device)
+    seconds = unrounded_seconds(total * (1 / copies), model, device, chunk,
+                                rows=rows * scale / copies)
+    passes = total.tokens / chunk
     return ExtractCost(seconds, passes, total, fed * scale, rows * scale)

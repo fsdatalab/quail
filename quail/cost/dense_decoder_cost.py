@@ -9,7 +9,7 @@ params a full chunk reads.
 
 from __future__ import annotations
 
-from quail.cost.roofline import CostComponent, component_latencies
+from quail.cost.roofline import CostComponent
 from quail.cost.work import Work
 from quail.specs import ModelSpec
 
@@ -56,15 +56,16 @@ def attention_pair_flops(model: ModelSpec) -> tuple[int, int]:
     return full_flops, sliding_flops
 
 
-def dense_decoder_components(work: Work, model: ModelSpec,
-                             passes: float) -> tuple[CostComponent, ...]:
-    """Build the modeled decoder components for one work record."""
+def dense_decoder_components(work: Work, model: ModelSpec, passes: float,
+                             rows: float = 0.0, head_rows: int = 0,
+                             ) -> tuple[CostComponent, ...]:
+    """Build the modeled decoder components, with a readout when rows is set."""
     if passes < 0:
         raise ValueError("passes must be nonnegative")
     attn_proj = attention_projection_params(model)
     mlp = mlp_params(model)
     full_flops, sliding_flops = attention_pair_flops(model)
-    return (
+    components = (
         CostComponent(
             name="attn_proj",
             flops=2.0 * attn_proj * work.tokens,
@@ -86,6 +87,9 @@ def dense_decoder_components(work: Work, model: ModelSpec,
             precision=model.attention_precision,
         ),
     )
+    if rows:
+        components += (_readout(model, rows, passes, head_rows),)
+    return components
 
 
 def _readout(model, rows: float, passes: float, head_rows: int) -> CostComponent:
@@ -107,12 +111,3 @@ def _readout(model, rows: float, passes: float, head_rows: int) -> CostComponent
     head = 2.0 * model.hidden * (head_rows or model.vocab)
     return CostComponent(name="readout", flops=head * rows,
                          bytes_moved=head * passes, precision="bf16")
-
-
-def decoder_seconds(work: Work, rows: float, passes: float, model, device,
-             head_rows: int = 0) -> float:
-    """Price work, answer rows, and forward passes with the component roofline."""
-    components = dense_decoder_components(work, model, passes=passes)
-    components += (_readout(model, rows, passes, head_rows),)
-    return sum(component.seconds
-               for component in component_latencies(components, device))

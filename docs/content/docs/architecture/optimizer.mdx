@@ -87,9 +87,12 @@ conditions for comparison with measured runs. It assumes:
   by the caller, such as saved reference answers and classification labels.
 
 For classification, this estimate counts the question and category text
-but excludes the extra steps used to select a label. The optimizer's
-classification estimates include the selected
-[label scoring method](/docs/architecture/execution#label-scoring).
+and one readout row per document, whatever
+[label scoring method](/docs/architecture/execution#label-scoring) the
+optimizer selects. For extraction, it counts the question and then the
+reference answer verified in one pass over the document's KV, each
+answer token a readout row. It does not count the rounds an engine
+spends finding the answer.
 
 Report the supplied answers and KV assumptions with the estimate.
 If a measured run produces different answers, it can evaluate different

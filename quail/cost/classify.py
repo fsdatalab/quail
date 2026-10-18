@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from quail.cost.budgets import parallel_copies
-from quail.cost.dense_decoder_cost import decoder_seconds
+from quail.cost.sol import unrounded_seconds
 from quail.cost.work import Work, ask, decode, stream
 from quail.labels import (
     DECODE_SCORING,
@@ -177,10 +177,11 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
     if answer_rows is not None:
         rows = answer_rows
     total = work * (expected_rows / n)
-    passes = total.tokens / chunk
     copies = parallel_copies(gpus, min(expected_rows, n))
-    seconds = decoder_seconds(total * (1 / copies), rows * expected_rows / copies,
-                              passes / copies, model, device, head_rows)
+    seconds = unrounded_seconds(
+        total * (1 / copies), model, device, chunk,
+        rows=rows * expected_rows / copies, head_rows=head_rows)
+    passes = total.tokens / chunk
     return ClassifyCost(seconds, passes, total, suffix_tokens * expected_rows, rounds)
 
 

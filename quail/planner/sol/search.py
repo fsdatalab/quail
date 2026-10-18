@@ -14,7 +14,7 @@ import pyarrow as pa
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
 from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
-from quail.cost.sol import speed_of_light
+from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan
 from quail.logical import oriented_join_conditions
 from quail.logical.expressions import column_name, evaluate_expression
@@ -150,12 +150,14 @@ class Search:
                 self.joined_classifications.setdefault(
                     frozenset(call.aliases()), []).append(call)
         self.order = query.order
-        tokenizer = query.session.tokenizer
+        self.tokenizer = query.session.tokenizer
         self._lowered = {}
+        # readout rows of the answers the filter stages read
+        self.answer_rows = 0.0
 
         def lower(prompt):
             if prompt not in self._lowered:
-                self._lowered[prompt] = lower_prompt(prompt, tokenizer)
+                self._lowered[prompt] = lower_prompt(prompt, self.tokenizer)
             return self._lowered[prompt]
 
         self.lower = lower
@@ -403,10 +405,11 @@ class Search:
         """Classify the live rows, then apply the label filters testing the call."""
         stage_work = self.question_work(
             alias, rows, self.lower(call.prompt).tail_tokens, first)
+        self.answer_rows += len(rows)
         stages.append(_stage(
             CLASSIFY, alias, call.prompt.template, None,
             self.lower(call.prompt).tail_tokens, None, rows, rows,
-            stage_work, name=self.labels.names[call]))
+            stage_work, name=self.labels.names[call], answer_rows=len(rows)))
         for test in self.label_filters.get(alias, ()):
             if test.call != call:
                 continue
@@ -422,17 +425,30 @@ class Search:
         return rows, stage_work
 
     def extract_stage(self, alias, node, rows, first, stages):
-        """Extract from the live rows, then apply the tests of the answers."""
-        stage_work = self.question_work(
-            alias, rows, self.lower(node.call.prompt).tail_tokens, first)
+        """Extract from the live rows, then apply the tests of the answers.
+
+        The reference answer is verified in one pass after the cue:
+        each of its spans and a closing quote, or the quote alone when
+        it has none, each token a readout row.
+        """
+        tail = self.lower(node.call.prompt).tail_tokens
+        stage_work = self.question_work(alias, rows, tail, first)
+        answers = {row: self.answer(node.call.prompt, {alias: row}) for row in rows}
+        answer_rows = 0
+        for row, answer in answers.items():
+            spans = [answer] if isinstance(answer, str) else list(answer or ())
+            tokens = sum(len(self.tokenizer(span)) + 1 for span in spans) or 1
+            context = self.pre + self.aliases[alias].tokens[row] + tail
+            stage_work = stage_work + ask(context, tokens, window=self.window)
+            answer_rows += tokens
+        self.answer_rows += answer_rows
         stages.append(_stage(
-            EXTRACT, alias, node.call.prompt.template, None,
-            self.lower(node.call.prompt).tail_tokens, None, rows, rows,
-            stage_work, name=node.name))
+            EXTRACT, alias, node.call.prompt.template, None, tail, None, rows,
+            rows, stage_work, name=node.name, answer_rows=answer_rows))
         for test in self.extract_filters.get(alias, ()):
             if test.name != node.name:
                 continue
-            passed = self.answer_survivors(node, test.condition, rows)
+            passed = self.answer_survivors(test.condition, rows, answers)
             stages.append(_stage(
                 ANSWER_TEST, alias, node.call.prompt.template,
                 test.position, 0, test.selectivity, rows, passed, Work(),
@@ -440,12 +456,10 @@ class Search:
             rows = passed
         return rows, stage_work
 
-    def answer_survivors(self, node, condition, rows) -> list:
+    def answer_survivors(self, condition, rows, answers) -> list:
         """Return the live rows whose reference answer passes the condition."""
-        answers = pa.array(
-            [self.answer(node.call.prompt, {node.alias: row}) for row in rows],
-            pa.string())
-        kept = condition.accepts(pa.table({condition.column.column: answers}))
+        kept = condition.accepts(pa.table({condition.column.column: pa.array(
+            [answers[row] for row in rows], pa.string())}))
         return [row for row, keep in zip(rows, kept.to_pylist()) if keep]
 
     # ---- joins -----------------------------------------------------
@@ -508,7 +522,16 @@ class Search:
             "template": call.prompt.template,
             "pairs": pairs,
             "fresh_tokens": work.tokens,
+            "answer_rows": pairs,
         }
+
+    def latency(self, candidate) -> SpeedOfLight:
+        """Price a candidate's work with its answer rows."""
+        rows = self.answer_rows + sum(
+            record["answer_rows"] for step in candidate.steps
+            for record in step["classifications"])
+        return speed_of_light(candidate.work, self.model, self.device,
+                              self.chunk_tokens, rows=rows)
 
     def search_joins_sol(self, base_rows, resident, base_work):
         """Search every feasible left deep plan over the exact filtered rows.
@@ -610,15 +633,10 @@ class Search:
         if not search.candidates:
             raise ValueError("query join graph has no connected left deep plan")
 
-        def candidate_seconds(candidate):
-            return speed_of_light(
-                candidate.work, self.model, self.device,
-                self.chunk_tokens).seconds
-
         best = min(
             search.candidates,
             key=lambda candidate: (
-                candidate_seconds(candidate),
+                self.latency(candidate).seconds,
                 candidate.work.tokens,
                 candidate.work.pairs,
                 candidate.work.kv_written,

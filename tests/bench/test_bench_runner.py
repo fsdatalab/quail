@@ -310,6 +310,16 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
         "c": ["ct0", "ct2"],
         "contract": [{"audit_rights": "audit yearly"}, {"audit_rights": None}]}
     assert turn[0].startswith("<|im_start|>system\n")
+    # the estimate's oracle returns each extraction's reference spans
+    (operator,) = spec.info.extracts
+    (item,) = [item for item in PREDICATE_BY_KEY.values()
+               if item.template == operator.prompt]
+    truth = GroundTruthCollection("gt_extract", "c_extract", 0.1, None, {
+        item.key: PredicateLabels(item.key, f"ls_{item.key}", predicate_payload(item),
+                                  {("ct0", None): ["audit yearly"]}, {})})
+    (node,) = query.logical.operators().extracts
+    answer = answer_oracle(truth, {"contracts": CONTRACTS}, turn)
+    assert answer(node.call.prompt, {"c": 0}) == ["audit yearly"]
     pieces = output.prompt_pieces
     assert pieces is not None
     assert [piece["id"] for piece in pieces["filters"]] == ["filter-1"]

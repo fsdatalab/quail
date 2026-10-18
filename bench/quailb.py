@@ -30,7 +30,7 @@ from bench.results import write_json
 from quail.baselines.nodes import RequestExecution
 from quail.execution.result import answer_values
 from quail.logical.expressions import SPAN_SUFFIX
-from quail.logical.prompts import bind_classify_prompt
+from quail.logical.prompts import bind_classify_prompt, bind_extract_prompt
 from quail.physical import AiClassify, AiExtract, AiScore
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import lower_prompt
@@ -92,8 +92,19 @@ def queries(session) -> dict:
     return listed
 
 
-def canonical_templates(ground_truth) -> dict[str, str]:
-    """Map each predicate's template as Quail binds it to the written one."""
+def _prompt_key(prompt) -> str:
+    """Return what tells a bound prompt apart: its template, or an extraction's tail."""
+    return prompt.tail if prompt.kind == "extract" else prompt.template
+
+
+def canonical_templates(ground_truth, turn=("", "")) -> dict[str, str]:
+    """Map each predicate's prompt as Quail binds it to the written template.
+
+    Args:
+        ground_truth: The saved predicates and their answers.
+        turn: The model's chat turn text, which an extraction's tail
+            carries.
+    """
     canonical = {}
     for labels in ground_truth.predicates.values():
         predicate = labels.predicate
@@ -109,10 +120,12 @@ def canonical_templates(ground_truth) -> dict[str, str]:
                 predicate["template"],
                 (left,) if right is None else (left, right),
                 predicate["labels"])
+        elif predicate["kind"] == "extract":
+            bound = bind_extract_prompt((left,), predicate["template"], turn)
         else:
             bound = quail.bind_join_prompt(
                 predicate["template"], (left, right))
-        canonical[bound.template] = predicate["template"]
+        canonical[_prompt_key(bound)] = predicate["template"]
     return canonical
 
 
@@ -120,14 +133,20 @@ def _ids(table: pa.Table) -> list[str]:
     return [str(row_id) for row_id in table.column("id").to_pylist()]
 
 
-def answer_oracle(ground_truth, tables):
+def answer_oracle(ground_truth, tables, turn=("", "")):
     """Return the oracle Quail's speed of light estimate takes.
 
     The callable maps (prompt, assignment) to the saved reference answer:
-    TRUE or FALSE for an AI.IF prompt and the label for an AI.CLASSIFY
-    prompt, so it serves as both the `answer` and the `label` oracle.
+    TRUE or FALSE for an AI.IF prompt, the label for an AI.CLASSIFY
+    prompt, and the spans for an AI.EXTRACT prompt, so it serves as both
+    the `answer` and the `label` oracle.
+
+    Args:
+        ground_truth: The saved predicates and their answers.
+        tables: The corpus tables, by name.
+        turn: The chat turn text of the model the query is built for.
     """
-    templates = canonical_templates(ground_truth)
+    templates = canonical_templates(ground_truth, turn)
     ids_by_table = {name: _ids(table) for name, table in tables.items()}
 
     def answer(prompt, assignment):
@@ -135,7 +154,7 @@ def answer_oracle(ground_truth, tables):
             ids_by_table[arg.provider][assignment[arg.alias]]
             for arg in prompt.args
         )
-        return reference_answer(ground_truth, templates[prompt.template], ids)
+        return reference_answer(ground_truth, templates[_prompt_key(prompt)], ids)
 
     return answer
 

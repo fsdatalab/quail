@@ -259,8 +259,8 @@ def test_extract_errors_and_refusals(session):
          .ai_classify(quail.prompt("{0}", quail.col("c.text")), ["a", "b"],
                       name="lease_span"))
     # the speed of light estimate prices an extraction as one question
-    # per document, read once at the cue
-    estimate = quail.speed_of_light_estimate(_ends(session), lambda *_: True)
+    # per document, then its reference answer verified after the cue
+    estimate = quail.speed_of_light_estimate(_ends(session), lambda *_: "March")
     (stage,) = estimate.filter_stages
     assert (stage["operator"], stage["alias"], stage["name"]) == (
         "AI.EXTRACT", "c", "lease.ends")
