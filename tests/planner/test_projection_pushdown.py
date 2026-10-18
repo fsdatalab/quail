@@ -27,6 +27,7 @@ from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import EngineConfig
 from quail.planner.rules import built_in_rules
 from quail.planner.rules.tree_transforms import (
+    lift_maps,
     push_down_filters,
     push_down_projection,
 )
@@ -216,25 +217,20 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
     joined = plan.root.input
     assert isinstance(joined, SemanticJoin)
 
-    # an apply returning ids above the join moves onto its table's
-    # scan, below the join
+    # an apply above the join stays there: its function sees the
+    # join's survivors
     above = replace(plan.root, input=_stars_apply(joined))
-    pushed = push_down_filters(above)
-    assert isinstance(pushed.input, SemanticJoin)
-    assert pushed.input.input.left == _stars_apply(joined.input.left)
-    assert pushed.input.input.right == joined.input.right
-    LogicalPlan(pushed).validate()
+    assert push_down_filters(above) is None
     candidate, = logical_alternatives(
         LogicalPlan(above), built_in_rules(),
         PlanningContext(catalog=catalog))
     optimized, changed = candidate.plan, candidate.rules
-    assert changed == ("should_push_down_projection", "should_push_down_filters")
-    assert optimized.root == push_down_projection(pushed)
+    assert changed == ("should_push_down_projection",)
+    assert optimized.root == push_down_projection(above)
 
     # both front ends place the filter on its table, so the rule
     # leaves their plans alone
     assert push_down_filters(plan.root) is None
-    assert push_down_filters(pushed) is None
 
     # a filter on a label returns to its table, above the
     # classification that computes the label
@@ -255,6 +251,20 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
             joined.input, left=label_filter.input))))
     LogicalPlan(lifted).validate()
     assert push_down_filters(lifted) == labelled.root
+    # the placement rule offers the lifted plan for a full join, and
+    # keeps a gate's inner table classified and filtered before the gate
+    assert [type(node).__name__ for node in LogicalPlan(
+        lift_maps(labelled.root)).walk()][-4:] == [
+        "SemanticJoin", "SemanticClassify", "Filter", "Project"]
+    inner = (docs(catalog, "reviews").alias("r")
+             .ai_join(docs(catalog, "products").alias("p")
+                      .ai_classify(prompt("kind of {0}", col("p.description")),
+                                   ["a", "b"], name="kind")
+                      .label_in("kind", ["a"]),
+                      prompt("same {0} {1}", col("r.review"),
+                             col("p.description")), semantics="exists")
+             .select("r.id"))
+    assert lift_maps(inner.root) is None
 
     # a gate's inner table and an apply returning pairs keep their
     # filters above them
