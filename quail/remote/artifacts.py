@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
-from quail.execution.result import QueryResult
+from quail.execution.result import QueryResult, bounded_reader
 from quail.remote.files import published
 
 RESULT_FILE = "result.arrow"
@@ -149,8 +150,19 @@ def verify_result(directory: str | Path, manifest: dict) -> None:
             pass
 
 
-def read_table(path: str | Path) -> pa.Table:
+@contextmanager
+def _file_batches(path: str | Path, limit: int | None = None):
+    """Yield a reader of at most limit rows of a saved IPC file, then close the file."""
     with ipc.open_file(str(path)) as reader:
+        source = pa.RecordBatchReader.from_batches(reader.schema, (
+            reader.get_batch(index) for index in range(reader.num_record_batches)))
+        with bounded_reader(source, limit) as batches:
+            yield batches
+
+
+def read_table(path: str | Path, limit: int | None = None) -> pa.Table:
+    """Read at most limit rows of a saved IPC file."""
+    with _file_batches(path, limit) as reader:
         return reader.read_all()
 
 
@@ -175,17 +187,17 @@ class _Chunks:
         return out
 
 
-def iter_ipc_stream(path: str | Path):
-    """Yield the batches of a saved IPC file as one Arrow IPC stream.
+def iter_ipc_stream(path: str | Path, limit: int | None = None):
+    """Yield at most limit rows of a saved IPC file as one Arrow IPC stream.
 
     The stream format is sequential, so a reader can take each batch as
     it arrives instead of waiting for the whole file.
     """
     chunks = _Chunks()
-    with ipc.open_file(str(path)) as reader:
+    with _file_batches(path, limit) as reader:
         with ipc.new_stream(chunks, reader.schema) as writer:
-            for index in range(reader.num_record_batches):
-                writer.write_batch(reader.get_batch(index))
+            for batch in reader:
+                writer.write_batch(batch)
                 yield chunks.take()
     yield chunks.take()
 

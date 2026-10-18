@@ -352,3 +352,69 @@ def test_a_retry_waits_for_the_first_submission_to_be_durable(make_client, monke
             first.result(timeout=5)
         # the retry saw no record of the discarded first attempt
         assert retry.result(timeout=5).state == "queued"
+
+
+@pytest.mark.parametrize("finish", ["all", "disconnect", "send_error", "cancel"])
+def test_the_result_stream_closes_its_file_however_the_response_ends(
+        make_client, monkeypatch, finish):
+    from contextlib import contextmanager
+
+    from starlette.requests import ClientDisconnect
+
+    client = make_client()
+    query_id = client.post("/v1/queries", json=submission(upload(client))).json()["id"]
+    assert wait_done(client, query_id)["state"] == "succeeded"
+    endpoint = next(route.endpoint for route in client.app.routes
+                    if route.name == "result_stream")
+    open_file = ipc.open_file
+    closed = []
+
+    @contextmanager
+    def tracked_file(path):
+        with open_file(path) as reader:
+            try:
+                yield reader
+            finally:
+                closed.append(path)
+
+    monkeypatch.setattr(ipc, "open_file", tracked_file)
+
+    async def scenario():
+        sent = asyncio.Event()
+        response = await endpoint(SimpleNamespace(
+            path_params={"query_id": query_id}, query_params={"limit": "1"}))
+        assert response.headers["x-quail-rows"] == "1"
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                sent.set()
+                if finish == "send_error":
+                    raise OSError("client disconnected")
+                if finish in {"disconnect", "cancel"}:
+                    await asyncio.Event().wait()
+
+        async def receive():
+            if finish == "disconnect":
+                await sent.wait()
+                return {"type": "http.disconnect"}
+            await asyncio.Event().wait()
+
+        # an ASGI 2.3 server reports a disconnect on receive; 2.4 on send
+        spec = "2.3" if finish == "disconnect" else "2.4"
+        task = asyncio.create_task(response(
+            {"type": "http", "asgi": {"spec_version": spec}}, receive, send))
+        if finish == "cancel":
+            await asyncio.wait_for(sent.wait(), timeout=2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif finish == "send_error":
+            with pytest.raises(ClientDisconnect):
+                await task
+        else:
+            await asyncio.wait_for(task, timeout=5)
+        assert len(closed) == 1
+
+    asyncio.run(scenario())
+    bad = client.get(f"/v1/queries/{query_id}/result", params={"limit": -1})
+    assert bad.status_code == 400

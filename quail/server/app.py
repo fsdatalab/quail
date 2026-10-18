@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import pyarrow.ipc as ipc
+from starlette._utils import create_collapsing_task_group
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
@@ -377,6 +378,23 @@ class Server:
         return 201
 
 
+class _ResultStreamResponse(StreamingResponse):
+    """A streamed result file, closed when the response ends however it ends."""
+
+    def __init__(self, path: Path, limit: int | None, rows: int):
+        self._stream = iter_ipc_stream(path, limit)
+        super().__init__(
+            self._stream, media_type=ARROW_STREAM,
+            headers={"x-quail-rows": str(rows if limit is None else min(rows, limit))})
+
+    async def __call__(self, scope, receive, send):
+        with contextlib.closing(self._stream):
+            # a cancelled response waits for its thread-pool read before
+            # the file closes under it
+            async with create_collapsing_task_group() as tasks:
+                tasks.start_soon(super().__call__, scope, receive, send)
+
+
 class _TokenMiddleware:
     """Require ``Authorization: Bearer <token>`` on every /v1 route."""
 
@@ -514,13 +532,18 @@ def create_app(settings: ServerSettings) -> Starlette:
         """The result rows as an Arrow IPC stream, one batch at a time."""
         query_id = request.path_params["query_id"]
         try:
+            limit = request.query_params.get("limit")
+            limit = None if limit is None else int(limit)
+            if limit is not None and limit < 0:
+                raise ValueError
+        except ValueError:
+            return _error(InvalidRequestError("limit must be a nonnegative integer"))
+        try:
             status = server.store.get(query_id)
             path = server.result_file(status, RESULT_FILE)
         except ServerError as error:
             return _error(error)
-        return StreamingResponse(
-            iter_ipc_stream(path), media_type=ARROW_STREAM,
-            headers={"x-quail-rows": str(status.result["rows"])})
+        return _ResultStreamResponse(path, limit, status.result["rows"])
 
     async def result_file(request):
         query_id = request.path_params["query_id"]
