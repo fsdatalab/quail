@@ -5,7 +5,7 @@ from helpers.fakes import cpu_staging
 from helpers.kv_checker import Run, Setup, answer, chain, passthrough
 
 from quail.backends.quail.executor.stage_executor import StageExecutor
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stages import Stage, StageRequests, run_stages
 
 
 @pytest.mark.parametrize("path", ["unified", "tree"])
@@ -44,7 +44,8 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
 
     monkeypatch.setattr(StageExecutor, "_run_one", launch)
     readout = passthrough()
-    stages = [Stage(suffixes=lambda _, suffix=suffix: [suffix], suffix_tokens=1,
+    stages = [Stage(suffixes=lambda _, suffix=suffix: StageRequests([suffix]),
+                    suffix_tokens=1,
                     frame=frame,
                     readout=readout if shared_readout else passthrough(),
                     decide=decide(j), single=True, append=True)

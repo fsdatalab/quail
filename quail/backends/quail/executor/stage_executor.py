@@ -131,8 +131,7 @@ class StageExecutor:
         self.suffixes = [Suffixes.of([[0] * stage.suffix_tokens])
                          if stage.own_suffixes else Suffixes.of(stage.suffixes)
                          for stage in self.stages]
-        self.own = {}      # (stage, document) -> its own Suffixes
-        self.replayed = {}
+        self.own = {}      # (stage, document) -> its StageRequests
         self.read_rows = [None if stage.read_rows is None
                           else np.asarray(stage.read_rows, dtype=np.int64)
                           for stage in self.stages]
@@ -291,7 +290,8 @@ class StageExecutor:
 
     def _suffixes_of(self, j, a):
         """Return the suffixes document a requests at stage j."""
-        return self.own[(j, a)] if self.stages[j].own_suffixes else self.suffixes[j]
+        return (self.own[(j, a)].suffixes if self.stages[j].own_suffixes
+                else self.suffixes[j])
 
     def _entry_rows(self, a, j, start, end, carried):
         f = self.prefix_lengths[a]
@@ -320,29 +320,23 @@ class StageExecutor:
         """
         if not self.asking:
             return None
-        from quail.backends.quail.executor.chunk import Suffixes
-
         stages = self.stages
 
         def ask(j):
             stage = stages[j]
             if not stage.own_suffixes:
                 return None if stage.requests is None else stage.requests(key)
-            replay = [] if stage.replay is None else stage.replay(key)
             got = stage.suffixes(key)
             if got is DROP or got is SKIP:
                 return got
-            if replay:
-                got = [list(replay) + list(tokens) for tokens in got]
-            own = Suffixes.of(got)
+            own = got.suffixes
             if len(own) and int(own.lengths.max()) > stage.suffix_tokens:
                 raise ValueError(
                     f"{stage.label or f'stage {j}'}: a document's suffix has "
                     f"{int(own.lengths.max())} tokens, over the stage's "
                     f"{stage.suffix_tokens}")
             if len(own):
-                self.own[(j, a)] = own
-                self.replayed[(j, a)] = len(replay)
+                self.own[(j, a)] = got
             return OwnRequests(own.lengths)
 
         return ask
@@ -408,12 +402,13 @@ class StageExecutor:
             f = self.prefix_lengths[a]
             frame = self.frames[j]
             append = self.stages[j].append
+            request = self.own.get((j, a))
             # a written frame, or a rewinding stage, replaces any path
             # an earlier stage kept
             rewinds = self.writes[j] or self.stages[j].rewind
             path = 0 if rewinds and start == 0 else self.appended[a]
-            if path and self.stages[j].discard is not None:
-                path = max(0, path - int(self.stages[j].discard(key)))
+            if request is not None:
+                path = max(0, path - request.discard)
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
             prefix = None
@@ -424,8 +419,10 @@ class StageExecutor:
             read_all = self.stages[j].read_all_rows
             rows = int(sufs.lengths.sum()) if read_all else len(sufs)
             own = {}
-            if self.read_rows[j] is not None:
-                own["read_rows"] = self.read_rows[j][np.asarray(list(indices))]
+            read_rows = (request.read_rows if request is not None
+                         else self.read_rows[j])
+            if read_rows is not None:
+                own["read_rows"] = np.asarray(read_rows)[np.asarray(list(indices))]
                 rows = int(own["read_rows"].sum())
             if self.read_masks[j] is not None:
                 own["read_mask"] = self.read_masks[j]
@@ -446,10 +443,8 @@ class StageExecutor:
                     borrow_key=self.keys[parent] if shared else None,
                     share_points=self.share_points[a])
             kept = int(sufs.lengths.sum()) if append else 0
-            if self.stages[j].replay is not None:
-                kept = self.replayed[(j, a)]
-                rows = int(sufs.lengths.sum()) - kept
-                own["read_rows"] = [rows]
+            if request is not None and request.write_suffix_tokens is not None:
+                kept = request.write_suffix_tokens
             if append or (self.writes[j] and start == 0):
                 appended[a] = path + kept
             if self.writes[j] and start == 0 and self._merged(j, start, end):

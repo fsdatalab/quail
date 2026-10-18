@@ -22,7 +22,7 @@ from quail.backends.quail.executor.extract.decode import (
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.backends.quail.executor.model_loading import full_output_head
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
-from quail.backends.quail.executor.stages import Stage
+from quail.backends.quail.executor.stages import Stage, StageRequests
 from quail.catalog.tokens import concat_tokens
 
 
@@ -110,8 +110,6 @@ class ExtractionStages:
                   suffix_tokens=(1 + self.spec.draft_tokens)
                   * (2 if self.recurrent else 1), frame=frame,
                   readout=self.readout, decide=partial(self._step_decide, q),
-                  discard=None if self.recurrent else partial(self._step_discard, q),
-                  replay=partial(self._step_replay, q) if self.recurrent else None,
                   read_all_rows=True,
                   single=True, append=True, label=f"{name} round {t}")
             for t in range(1, self.spec.max_answer_tokens + 1))
@@ -190,30 +188,23 @@ class ExtractionStages:
         return self.decoder.rows(row)
 
     def _step_suffix(self, q, key):
-        """Feed the chosen token, then the document's next tokens as a draft."""
+        """Build the next answer request and its retained token count."""
         doc = self._document(key)
         answer = doc.answers[q]
         if answer.done:
             return Stage.SKIP
-        return [self.decoder.draft(answer, doc.rho, q)]
-
-    def _step_discard(self, q, key):
-        return self._answer(q, key).discard
-
-    def _step_replay(self, q, key):
-        """Return the accepted inputs that advance the saved recurrent state."""
-        answer = self._answer(q, key)
         accepted = answer.fed[:len(answer.fed) - answer.discard]
-        if not answer.done:
+        tokens = self.decoder.draft(answer, doc.rho, q)
+        if self.recurrent:
             answer.fed_tokens += len(accepted)
-        return accepted
+            return StageRequests([accepted + tokens],
+                                 write_suffix_tokens=len(accepted),
+                                 read_rows=[len(tokens)])
+        return StageRequests([tokens], discard=answer.discard)
 
     def _document(self, key):
         position = np.searchsorted(self.document_ids, key[1], side="right") - 1
         return self.docs[self.document_order[position]]
-
-    def _answer(self, q, key):
-        return self._document(key).answers[q]
 
     def _step_decide(self, q, anchor, row):
         """Verify the round's draft by the row after each of its tokens."""

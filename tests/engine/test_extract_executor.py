@@ -174,6 +174,8 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch, recurrent):
     if recurrent:
         assert fed[2][0][:2] == [five, years]
         assert fed[2][1] == fed[1][1]
+        kept = [entry[2] for entry in model.packed if entry[0] == key]
+        assert kept[1:] == [0, 1]
     else:
         assert fed[2][0][:1] == [years] and fed[2][1] == fed[1][1] + 1
     assert asked.steps == 3
@@ -440,9 +442,9 @@ def test_extraction_accepts_empty_input_and_sparse_document_ids(monkeypatch):
         state, [spec], vocabulary, [10_000_000, 2], None, DOCS,
         document_positions=[0, 1])
     assert stages.document_ids.nbytes + stages.document_order.nbytes == 32
-    for i, doc in enumerate(stages.docs):
-        doc.answers[0].discard = i + 1
-        assert stages._step_discard(0, doc.key) == i + 1
+    for doc in stages.docs:
+        assert stages._document(doc.key) is doc
+
 
 def _run(monkeypatch, documents=None):
     _, model, run, _ = _setup(monkeypatch, documents)
