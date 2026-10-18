@@ -9,13 +9,9 @@ from quail.logical.expressions import (
     Prompt,
     validate_question,
 )
+from quail.specs.prompts import TEXT_ANALYSIS_SYSTEM_PROMPT
 
-# Fixed preamble before every document. Must be a formatting label,
-# not an instruction; instruction text here biases short-document
-# completions. A model's chat-turn text (ModelSpec.turn), when it has
-# any, wraps the whole prompt: its opening piece goes before this
-# preamble and its closing piece after the answer cue, so the user
-# message stays open across the reusable document prefix.
+# The model's turn stays open across the shared document prefix.
 SHARED_PRE = "DOCUMENT:\n"
 
 
@@ -28,7 +24,6 @@ def shared_preamble(turn_prefix: str, layout: str = "ai-if") -> str:
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is DOCUMENT {}.)"
 JOIN_QUESTION_SEP = "\n\n"                 # anchor note -> question
-DATA_PROCESSING_INSTRUCTION = "You are performing a data processing task."
 TASK_INSTRUCTION = "Evaluate TRUE or FALSE for the following question: "
 ANSWER_CUE = "\nANSWER:"
 
@@ -624,7 +619,7 @@ QWEN3_RERANKER_INSTRUCTION = (
     "Judge whether the document meets the requirements in the query."
 )
 QWEN3_RERANKER_SYSTEM_TEXT = (
-    f"{DATA_PROCESSING_INSTRUCTION} "
+    f"{TEXT_ANALYSIS_SYSTEM_PROMPT}. "
     "Judge whether the Document meets the requirements based on the Query "
     "and the Instruct provided. Note that the answer can only be \"yes\" "
     "or \"no\"."

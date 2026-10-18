@@ -300,7 +300,7 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
             oracle, **_REPORT, store=None))
         output = run_output(result, spec.info, {"contracts": CONTRACTS})
         output.prompt_pieces = prompt_pieces(query, spec.info, {})
-        turn = sess.model.extract_turn
+        turn = sess.model.turn
     assert output.filter_answers["filter-1"].to_pydict() == {
         "c": ["ct0", "ct1", "ct2"], "answer": [True, False, True]}
     assert output.extract_answers["extract-1"].to_pydict() == {
@@ -309,14 +309,12 @@ def test_an_extract_query_reports_every_answer_and_its_pieces(tmp_path):
     assert output.rows.to_pydict() == {
         "c": ["ct0", "ct2"],
         "contract": [{"audit_rights": "audit yearly"}, {"audit_rights": None}]}
-    # the extraction's turn has no opener: its head is the AI.IF
-    # preamble, so the query reports its pieces under one preamble
-    assert not turn[0]
+    assert turn[0].startswith("<|im_start|>system\n")
     pieces = output.prompt_pieces
     assert pieces is not None
     assert [piece["id"] for piece in pieces["filters"]] == ["filter-1"]
     assert [piece["id"] for piece in pieces["extracts"]] == ["extract-1"]
-    assert pieces["preamble"] == list(sess.tokenizer("DOCUMENT:\n"))
+    assert pieces["preamble"] == list(sess.tokenizer(turn[0] + "DOCUMENT:\n"))
 
     alone = get_query("CUAD-1")
     with _session(tmp_path) as sess:
@@ -356,7 +354,7 @@ def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
         result = _execute(query, nodes, cached_tokens=0)
         output = run_output(result, spec.info, {"contracts": CONTRACTS})
         pieces = prompt_pieces(query, spec.info, {})
-        turn = sess.model.extract_turn
+        turn = sess.model.turn
     assert output.extract_answers["extract-1"].to_pydict() == {
         "c": ["ct0", "ct1", "ct2"], "answer": ["audit yearly", None, "will"]}
     assert output.rows.column_names == ["c", "contract"]
@@ -408,7 +406,7 @@ def test_benchmark_results_and_scoring(tmp_path):
     assert measured["regret_tokens"] == 2000 - measured["minimum_tokens"]
 
 
-def test_benchmark_query_prompts_labels_and_raw_rendering():
+def test_benchmark_query_prompts_labels_and_chat_rendering():
     for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
         corpus, truth = fever_truth()
         spec = get_query("FEV-9")
@@ -450,7 +448,7 @@ def test_benchmark_query_prompts_labels_and_raw_rendering():
             # only the FEVER tables are registered
             assert all(query_id.startswith("FEV-")
                        for query_id in queries(session)), backend
-    # the benchmark renders the same raw prompt text as Quail
+    # Saved reference prompts omit the model turn.
     turn = QWEN3_4B_FP8.turn
     for spec in PREDICATES:
         left = quail.ColumnRef("left", spec.left_table, spec.left_column)
@@ -459,18 +457,20 @@ def test_benchmark_query_prompts_labels_and_raw_rendering():
             assert prompt.tail.startswith("{0}")
             expected = (prompt.preamble + "doc one"
                         + prompt.tail.replace("{0}", "", 1))
-            assert render_filter_prompt(spec.template, "doc one") == expected
+            assert (turn[0] + render_filter_prompt(spec.template, "doc one")
+                    + turn[1]) == expected
         else:
             right = quail.ColumnRef("right", spec.right_table, spec.right_column)
             prompt = quail.bind_join_prompt(spec.template, (left, right), turn=turn)
             documents = ("doc one", "doc two")
             for anchor in (0, 1):
-                assert render_join_prompt(spec.template, documents, anchor) == (
+                assert (turn[0] + render_join_prompt(spec.template, documents, anchor)
+                        + turn[1]) == (
                     render_join_prompt_text(prompt, documents, anchor))
 
 
 @pytest.mark.parametrize("case", ("IMDB-11", "IMDB-14", "IMDB-15"))
-def test_classification_pieces_are_the_named_reference_prompt(tmp_path, case):
+def test_classification_pieces_wrap_the_named_reference_prompt(tmp_path, case):
     from quail_b.minimum import validate_prompt_pieces
     from quail_b.rendering import render_classify_prompt
 
@@ -517,6 +517,8 @@ def test_classification_pieces_are_the_named_reference_prompt(tmp_path, case):
             assert piece["anchor"] == operator.relation
             partner = "the acting"
             rendered += text(piece["frame"]) + text(piece["label"]) + partner
-        assert rendered + text(piece["tail"]) == render_classify_prompt(
+        expected = render_classify_prompt(
             operator.prompt, "good film", operator.labels,
             operator.descriptions, partner=partner)
+        assert rendered + text(piece["tail"]) == (
+            sess.model.turn_prefix + expected + sess.model.turn_suffix)

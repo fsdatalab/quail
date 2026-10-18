@@ -26,7 +26,7 @@ def test_qwen3_spec_matches_built_in(name):
     for field in ARCHITECTURE:
         assert getattr(spec, field) == getattr(built_in, field), field
     assert spec.role == built_in.role
-    assert spec.extract_turn == built_in.extract_turn
+    assert spec.turn == built_in.turn
     if built_in.role != "reranker":
         # the reranker specs count the embedding table in params
         assert spec.params == pytest.approx(built_in.params, rel=0.01)

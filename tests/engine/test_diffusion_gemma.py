@@ -55,8 +55,10 @@ def test_spec_geometry_budgets_costs_and_turn_text():
     assert QWEN3_4B_FP8.kv_shapes == ((8, 128),) * 36
     assert QWEN3_4B_FP8.kappa == 147_456.0
     assert SPEC.canvas_tokens == 1
-    assert SPEC.turn == ("<bos><|turn>user\n",
-                         "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
+    assert SPEC.turn == (
+        "<bos><|turn>system\nYou are an expert at text analysis<turn|>\n"
+        "<|turn>user\n",
+        "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
     assert SPEC.canvas_answer_row == 0
     assert budgets.chunk_budget(SPEC, H100_SXM) == SPEC.chunk_cap_tokens
     assert budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM) == \

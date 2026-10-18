@@ -791,7 +791,7 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
 
     # the steps run as one pipeline whatever their order: each reads
     # the KV the step before it left, rewound past its answer
-    usual, selective = query(0.5).plan(), query(0.05).plan()
+    usual, selective = query(0.7).plan(), query(0.05).plan()
     for plan in (usual, selective):
         (extract,) = [n for n in plan.nodes if isinstance(n, AiExtract)]
         pipeline = build_pipelines(plan.graph)[extract.node_id]
@@ -800,8 +800,8 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
             node.node_id for node in plan.nodes
             if type(node).__name__ not in ("Scan", "Project"))
     # the ask rejects a tenth, the label test a fifth; an extraction
-    # test rejecting half ranks the extraction before the ask, and one
-    # rejecting nearly every document puts it first
+    # test rejecting three tenths ranks the extraction before the ask,
+    # and one rejecting nearly every document puts it first
     assert order(usual) == ["ai-classify:0", "ai-extract:0", "ai_filter:c"]
     assert order(selective) == ["ai-extract:0", "ai-classify:0", "ai_filter:c"]
     # the result reads the documents the last step keeps, whatever
@@ -842,7 +842,7 @@ def test_a_tables_steps_are_ordered_by_cost_per_rejected_document(session):
     assert order(written) == ["ai_filter:c", "ai-classify:0", "ai-extract:0"]
     # the speed of light estimate runs the same orders
     reference = {0: "March 3, 2027", 1: None}
-    for selectivity, stages in ((0.5, [
+    for selectivity, stages in ((0.7, [
             ("AI.CLASSIFY", 2, 2), ("IN", 2, 2), ("AI.EXTRACT", 2, 2),
             ("ANSWER TEST", 2, 1), ("AI.IF", 1, 1)]), (0.05, [
             ("AI.EXTRACT", 2, 2), ("ANSWER TEST", 2, 1), ("AI.CLASSIFY", 1, 1),

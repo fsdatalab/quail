@@ -285,7 +285,7 @@ def test_classify_plans_filters_and_returns_labels(session):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     (test,) = [n for n in plan.nodes if isinstance(n, Filter)]
     assert classify.spec.labels == ("refund", "shipping", "praise")
-    assert classify.spec.label_token_ids[0] == tuple(_bytes(" refund"))
+    assert classify.spec.label_token_ids[0] == tuple(_bytes("refund"))
     # a tokenizer without decode marks no word start
     assert classify.spec.label_word_starts == tuple(
         (False,) * len(ids) for ids in classify.spec.label_token_ids)
@@ -519,7 +519,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     assert classify.inputs[0].source.node_id == "ai_join:r"
     assert classify.spec.scoring == "trie_tree"
     assert classify.spec.expected_rows == pytest.approx(1.8)
-    assert round(plan.estimated_seconds, 3) == 0.259
+    assert round(plan.estimated_seconds, 3) == 0.322
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
     assert (staged.exec_index, staged.anchor) == (0, "r")
     assert classified_above_joins(after._logical_input.root) == frozenset()
@@ -571,7 +571,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert (classify.spec.scoring, classify.spec.expected_rows) == (
         "trie_tree", 30.0)
-    assert round(plan.estimated_seconds, 3) == 0.410
+    assert round(plan.estimated_seconds, 3) == 0.464
     written_candidate, lifted_candidate = _candidates(session, before)
     assert (written_candidate.estimated_seconds
             <= lifted_candidate.estimated_seconds)
