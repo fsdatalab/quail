@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import bisect
-import os
 from collections.abc import Sequence
+from contextlib import ExitStack
+from pathlib import Path
 from threading import local
 
 import numpy as np
@@ -184,13 +185,13 @@ class TokenLengths(Sequence):
 
 def _write_all(writer, batches):
     """Write every batch through one store writer and open the store."""
-    try:
+    with ExitStack() as rollback:
+        rollback.callback(writer.abort)
         for batch in batches:
             writer.write_batch(batch)
-    except Exception:
-        writer.abort()
-        raise
-    return writer.finish()
+        store = writer.finish()
+        rollback.pop_all()
+        return store
 
 
 class _StoreWriter:
@@ -199,8 +200,12 @@ class _StoreWriter:
     def __init__(self, path: str, schema: pa.Schema):
         self.path = path
         self._schema = schema
-        self._sink = pa.OSFile(path, "wb")
-        self._writer = pa.ipc.new_file(self._sink, schema)
+        with ExitStack() as rollback, ExitStack() as resources:
+            self._sink = resources.enter_context(pa.OSFile(path, "wb"))
+            rollback.callback(Path(path).unlink, missing_ok=True)
+            self._writer = resources.enter_context(pa.ipc.new_file(self._sink, schema))
+            self._resources = resources.pop_all()
+            rollback.pop_all()
 
     def _write(self, arrays) -> None:
         self._writer.write_batch(
@@ -208,18 +213,14 @@ class _StoreWriter:
         )
 
     def _close(self) -> None:
-        self._writer.close()
-        self._sink.close()
+        self._resources.close()
 
     def abort(self) -> None:
         """Close the file and delete it."""
         try:
             self._close()
         finally:
-            try:
-                os.unlink(self.path)
-            except FileNotFoundError:
-                pass
+            Path(self.path).unlink(missing_ok=True)
 
 
 class GigatokenEncoder:
@@ -389,10 +390,12 @@ class ColumnStore:
 
     def __init__(self, path: str):
         self.path = path
-        self._source = pa.memory_map(path, "r")
-        self._reader = pa.ipc.open_file(self._source)
-        self.name = self._reader.schema.names[0]
-        self._values = None
+        with ExitStack() as resources:
+            self._source = resources.enter_context(pa.memory_map(path, "r"))
+            self._reader = resources.enter_context(pa.ipc.open_file(self._source))
+            self.name = self._reader.schema.names[0]
+            self._values = None
+            self._resources = resources.pop_all()
 
     @classmethod
     def write(cls, path: str, batches, field: pa.Field) -> "ColumnStore":
@@ -417,7 +420,7 @@ class ColumnStore:
 
     def close(self) -> None:
         """Close the memory mapped Arrow file."""
-        self._source.close()
+        self._resources.close()
 
 
 class TokenStore(Sequence):
@@ -429,25 +432,27 @@ class TokenStore(Sequence):
 
     def __init__(self, path: str):
         self.path = path
-        self._source = pa.memory_map(path, "r")
-        self._reader = pa.ipc.open_file(self._source)
-        self.has_offsets = self._offset_column in self._reader.schema.names
-        self._documents_by_batch = []
-        self._length_batches = []
-        self._ends = []
-        total = 0
-        for index in range(self._reader.num_record_batches):
-            batch = self._reader.get_batch(index)
-            self._documents_by_batch.append(
-                ArrowTokenDocuments(
-                    batch.column(self._token_column),
-                    batch.column(self._offset_column) if self.has_offsets else None)
-            )
-            self._length_batches.append(batch.column(self._count_column))
-            total += len(batch)
-            self._ends.append(total)
-        self._lengths = TokenLengths(self)
-        self._prefix_index = None
+        with ExitStack() as resources:
+            self._source = resources.enter_context(pa.memory_map(path, "r"))
+            self._reader = resources.enter_context(pa.ipc.open_file(self._source))
+            self.has_offsets = self._offset_column in self._reader.schema.names
+            self._documents_by_batch = []
+            self._length_batches = []
+            self._ends = []
+            total = 0
+            for index in range(self._reader.num_record_batches):
+                batch = self._reader.get_batch(index)
+                self._documents_by_batch.append(
+                    ArrowTokenDocuments(
+                        batch.column(self._token_column),
+                        batch.column(self._offset_column) if self.has_offsets
+                        else None))
+                self._length_batches.append(batch.column(self._count_column))
+                total += len(batch)
+                self._ends.append(total)
+            self._lengths = TokenLengths(self)
+            self._prefix_index = None
+            self._resources = resources.pop_all()
 
     @classmethod
     def write(
@@ -502,7 +507,7 @@ class TokenStore(Sequence):
     def close(self) -> None:
         """Close the memory mapped Arrow file."""
         self._prefix_index = None
-        self._source.close()
+        self._resources.close()
 
     def select(self, indices) -> "TokenSelection":
         """Return a file reference for selected document positions."""

@@ -315,3 +315,42 @@ def test_apply_and_join_keys_keep_the_document_text_as_values(tmp_path):
     pairs = {("r", "p"): lambda r, p: True, ("p", "r"): lambda p, r: True}
     assert _run(query, make_executor({}, pairs)).to_rows() == [("r1", "p0")]
     session.close()
+
+
+@pytest.mark.parametrize("kind", ["tokens", "column"])
+@pytest.mark.parametrize("phase", ["write", "open"])
+def test_a_store_that_fails_to_finish_leaves_no_file_or_handle(
+        tmp_path, monkeypatch, kind, phase):
+    from quail.catalog import tokens
+
+    path = tmp_path / "store.arrow"
+    table = pa.table({"body": ["hello", "world"]})
+    handles = []
+    for name in ("OSFile", "memory_map"):
+        original = getattr(pa, name)
+
+        def opened(*args, _original=original, **kwargs):
+            handles.append(_original(*args, **kwargs))
+            return handles[-1]
+
+        monkeypatch.setattr(pa, name, opened)
+
+    def batches():
+        yield from table.to_batches()
+        if phase == "write":
+            raise KeyboardInterrupt("store failure")
+
+    def fail(*args, **kwargs):
+        raise OSError("store failure")
+
+    if phase == "open":
+        monkeypatch.setattr(pa.ipc, "open_file", fail)
+    with pytest.raises((KeyboardInterrupt, OSError), match="store failure"):
+        if kind == "tokens":
+            tokens.TokenStore.write(str(path), batches(), document_column="body",
+                                    tokenizer=lambda text: list(text.encode()),
+                                    token_type=pa.int32())
+        else:
+            tokens.ColumnStore.write(str(path), batches(), table.schema.field(0))
+    assert handles and all(handle.closed for handle in handles)
+    assert not path.exists()
