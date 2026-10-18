@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from contextlib import ExitStack, closing
 
 from quail.baselines.request import RequestBackend
 from quail.baselines.request_scheduling import (
@@ -105,6 +106,11 @@ class SGLangClient:
             max_num_seqs=self.capacity["max_num_seqs"],
         ))
 
+    def close(self):
+        """Stop the engine and its workers."""
+        self.engine.shutdown()
+        self.engine = None
+
     def reset_prefix_cache(self):
         result = self.engine.flush_cache()
         if isinstance(result, bool):
@@ -136,8 +142,15 @@ class SGLangEngine:
     label = "SGLang"
     runtime_package = "sglang==0.5.18"
 
-    def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
-        """Load the spec's model and return the engine state and boot record."""
+    def boot(self, spec, allowed_ids: list[int], *,
+             resources: ExitStack) -> tuple[dict, dict]:
+        """Load the spec's model and return its settings and boot record.
+
+        Args:
+            spec: The model to load.
+            allowed_ids: The token ids a filter answer may be.
+            resources: Owns the engine; closing it stops the engine.
+        """
         import sglang as sgl
 
         path = resolve_model_path(spec.hf_name, spec.revision)
@@ -154,9 +167,10 @@ class SGLangEngine:
             disable_prefill_cuda_graph=True,
             log_level="warning",
         )
+        client = resources.enter_context(closing(SGLangClient(engine, {})))
         boot_s = time.perf_counter() - started
-        capacity = _capacity(engine)
-        client = SGLangClient(engine, capacity)
+        capacity = client.capacity
+        capacity.update(_capacity(engine))
         sampling_params = {
             "temperature": 0.0,
             "max_new_tokens": 1,
@@ -173,7 +187,6 @@ class SGLangEngine:
                 "client": client,
                 "sampling_params": sampling_params,
                 "capacity": capacity,
-                "close": getattr(engine, "shutdown", None),
             },
             {
                 "kind": "cold",

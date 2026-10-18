@@ -1,6 +1,7 @@
 """CPU tests for vLLM and SGLang backend interfaces."""
 
 import asyncio
+import os
 import sys
 from dataclasses import replace
 from types import SimpleNamespace
@@ -67,7 +68,8 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     boot = {"client": _Client(), "sampling_params": object(), "capacity": CAPACITY}
     monkeypatch.setattr(
         "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
+        lambda self, spec, allowed_ids, *, resources: (
+            boot, {"kind": "cold", "boot_s": 0.1}))
     session = _session(
         "stock_vllm",
         documents={**DOCS, "key": ["k1", "k2"]},
@@ -511,3 +513,69 @@ def test_request_planner_checks_map_placement(backend_name, operation):
             assert not isinstance(candidate.plan, Refusal)
             assert moved["refusal"] is None
             assert candidate.plan.graph == plan.graph
+
+
+class _Adapter:
+    """An engine adapter whose boot fails until told otherwise."""
+
+    kind = "fake"
+
+    def __init__(self):
+        self.live = []
+        self.fail = True
+
+    def boot(self, spec, allowed_ids, *, resources):
+        client = SimpleNamespace(close=lambda: self.live.remove(client))
+        self.live.append(client)
+        resources.callback(client.close)
+        if self.fail:
+            raise RuntimeError("warmup failed")
+        return {"client": client}, {"kind": "cold"}
+
+
+def test_a_request_backend_owns_its_engine_from_boot_to_release(monkeypatch):
+    monkeypatch.setattr("quail.backends.resources._release_vllm_parallel_state",
+                        lambda: None)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        cuda=SimpleNamespace(is_initialized=lambda: False)))
+    adapter = _Adapter()
+    backend = stock_vllm_backend().__class__("test", adapter, "pipelined")
+    context = SimpleNamespace(
+        registry=built_in_registry(), runtime_state={},
+        request=SimpleNamespace(plan={
+            "model": "qwen3-4b-fp8",
+            "settings": {"true_ids": [1], "false_ids": [2]}}))
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        backend.prepare_request(context)
+    assert adapter.live == [] and context.runtime_state == {}
+
+    adapter.fail = False
+    backend.prepare_request(context)
+    engine = context.runtime_state["engine"]
+    assert len(adapter.live) == 1
+    assert engine.prepared_boot["kind"] == "cold"
+    monkeypatch.setattr("quail.baselines.request.execute_request_graph",
+                        lambda context, backend, settings, boot: boot["kind"])
+    assert backend.execute_request(context) == "cold"
+    assert backend.execute_request(context) == "warm"
+    backend.release_request(context.runtime_state)
+    assert adapter.live == [] and context.runtime_state == {}
+
+
+@pytest.mark.parametrize("initial", [None, "1"])
+def test_in_process_vllm_lasts_for_one_engine(monkeypatch, initial):
+    from quail.baselines.vllm import in_process_vllm
+
+    name = "VLLM_ENABLE_V1_MULTIPROCESSING"
+    if initial is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, initial)
+    cleared = []
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(
+        envs=SimpleNamespace(disable_envs_cache=lambda: cleared.append(1))))
+    with pytest.raises(RuntimeError, match="boot failed"), in_process_vllm():
+        assert os.environ[name] == "0"
+        raise RuntimeError("boot failed")
+    assert os.environ.get(name) == initial
+    assert len(cleared) == 2

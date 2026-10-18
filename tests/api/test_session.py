@@ -538,3 +538,26 @@ def test_engine_import_gpu_requirement_and_quickstart_demos(
     with pytest.raises(RuntimeError, match="query failed"):
         quickstart_modal.run_query.get_raw_f()()
     assert commits == ["volume"], "a failed query still commits the volume"
+
+
+def test_the_process_keeps_one_engine_configuration_at_a_time():
+    events = []
+
+    class Backend:
+        def __init__(self, engine_name):
+            self.name = self.engine_name = engine_name
+
+        def release_request(self, state):
+            events.append(("release", self.engine_name, state.pop("engine")))
+
+    state = execution._BackendState()
+    envelope = {"model": "qwen3-4b-fp8", "device": "h100-sxm", "gpus": 1}
+    vllm = Backend("vllm")
+    assert state.bind(envelope, vllm) is state.bind(envelope, Backend("vllm"))
+    state.state["engine"] = "first"
+    state.bind({**envelope, "model": "qwen3-32b-fp8"}, vllm)["engine"] = "second"
+    state.bind(envelope, Backend("quail"))["engine"] = "third"
+    state.close()
+    state.close()
+    assert events == [("release", "vllm", "first"), ("release", "vllm", "second"),
+                      ("release", "quail", "third")]

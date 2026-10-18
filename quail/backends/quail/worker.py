@@ -4,8 +4,9 @@ One GPU runs in the calling process. Several GPUs use one child process
 per GPU, each with its own CUDA context and arena.
 """
 
-import gc
+import atexit
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,7 @@ from quail.backends.quail.executor.state import GpuRuntime
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.retention import apply_retention
+from quail.backends.resources import release_models
 from quail.catalog.tokens import (
     DocumentPrefixes,
     decode_payload_documents,
@@ -44,7 +46,7 @@ from quail.progress import say, set_gpu_index
 from quail.specs.files import resolve_model_path
 
 # Children outlive sessions so later queries can reuse their loaded models.
-_CHILDREN: list = []
+_WORKERS = None
 
 
 class LoadedGpu:
@@ -249,26 +251,34 @@ def _single_gpu_context(registry, envelope):
 
 def _boot_for_query(runtime_state, backend, gpu_context,
                     chunk_tokens, true_ids, false_ids, arena_pages=None):
-    """Load or reuse a GPU, bind a query, warm kernels."""
-    key = (backend.name, gpu_context.model.name)
-    gpu = runtime_state.get(key)
+    """Load or reuse the process's GPU, bind a query, warm kernels."""
+    gpu, boot = _boot_gpu(runtime_state.pop("gpu", None), backend, gpu_context,
+                          chunk_tokens, true_ids, false_ids, arena_pages)
+    runtime_state["gpu"] = gpu
+    return gpu, boot
+
+
+def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
+              arena_pages=None, *, model_path=None):
+    """Prepare a GPU for a query, releasing it when preparation fails.
+
+    A gpu of None loads the model; otherwise the loaded GPU is reused.
+    """
     t_boot = time.perf_counter()
-    if gpu is None:
-        loaded = [name for _, name in runtime_state if name != key[1]]
-        if loaded:
-            # one model's weights and KV arena take the GPU; another
-            # model cannot load beside them
-            say(f"releasing {', '.join(loaded)} to load {key[1]}")
-            release_booted_models(runtime_state)
-        gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids)
-        runtime_state[key] = gpu
-        cold = True
-    else:
-        cold = False
-    gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
-    warm_s, warm_tier = gpu.warm()
-    boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
-    say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
+    cold = gpu is None
+    state = {}
+    with ExitStack() as rollback:
+        # a failed boot must leave the GPU free for the next attempt
+        rollback.callback(release_models, state)
+        if cold:
+            gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids,
+                            model_path=model_path)
+        state["gpu"] = gpu
+        gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
+        warm_s, warm_tier = gpu.warm()
+        boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
+        say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
+        rollback.pop_all()
     return gpu, boot
 
 
@@ -299,53 +309,17 @@ def execute_quail_request(context):
     return execute_quail_multi(payload, context.registry, context.graph)
 
 
-def _release_vllm_parallel_state() -> None:
-    try:
-        from vllm.distributed.parallel_state import (
-            destroy_distributed_environment,
-            destroy_model_parallel,
-        )
-    except ImportError:
-        return
-
-    destroy_model_parallel()
-    destroy_distributed_environment()
-
-
-def release_booted_models(runtime_state: dict) -> dict:
-    """Release Quail GPU state before another engine uses this process."""
-    import torch
-
-    released = len(runtime_state)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    for state in runtime_state.values():
-        if isinstance(state, LoadedGpu):
-            state.close()
-    runtime_state.clear()
-    _release_vllm_parallel_state()
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    return {
-        "models_released": released,
-        "vllm_parallel_state_released": True,
-        "cuda_allocated_bytes": (
-            int(torch.cuda.memory_allocated())
-            if torch.cuda.is_available() else 0),
-        "cuda_reserved_bytes": (
-            int(torch.cuda.memory_reserved())
-            if torch.cuda.is_available() else 0),
-    }
+def release_quail_request(state: dict) -> None:
+    """Release the GPU child processes and the model loaded in this process."""
+    _close_children()
+    release_models(state)
 
 
 def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     """Execute one Quail payload on the worker's own GPU."""
     gpu_context = _single_gpu_context(registry, payload["physical_plan"])
 
-    key = (backend.name, gpu_context.model.name)
-    gpu = runtime_state.get(key)
+    gpu = runtime_state.get("gpu")
     boot = None
     if isinstance(gpu, LoadedGpu):
         boot = gpu.prepared_boot
@@ -439,26 +413,17 @@ def _child_boot(state, sub):
     spec = registry.model(sub["model"])
     device = registry.device(envelope["device"])
     backend = registry.backend(envelope["backend"])
-    t_boot = time.perf_counter()
-    gpu = state.gpu
-    if gpu is None:
-        gpu = LoadedGpu(backend, GpuContext(
+    gpu, state.gpu = state.gpu, None
+    gpu, boot = _boot_gpu(
+        gpu, backend, GpuContext(
             gpu_index=state.gpu_index, gpus=sub["gpus"],
-            model=spec, device=device, query_settings={},
-        ), sub["true_ids"] + sub["false_ids"],
-            model_path=state.model_path)
-        state.gpu = gpu
-        cold = True
-    else:
-        cold = False
-    gpu.bind_query(sub["true_ids"], sub["false_ids"],
-                   sub["chunk_tokens"], sub.get("arena_pages"))
+            model=spec, device=device, query_settings={}),
+        sub["chunk_tokens"], sub["true_ids"], sub["false_ids"],
+        sub.get("arena_pages"), model_path=state.model_path)
+    state.gpu = gpu
     state.runtime_context = ExecutionContext(
         runtimes=registry.runtimes, model_execution=gpu.execution,
     )
-    warm_s, warm_tier = gpu.warm()
-    boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
-    say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
     return boot
 
 
@@ -595,30 +560,90 @@ def _reset_child_query(state):
     arena.reset_stats()
 
 
-def _ensure_children(k):
-    import multiprocessing as mp
-    if len(_CHILDREN) >= k:
-        return
-    ctx = mp.get_context("spawn")
-    for gpu in range(len(_CHILDREN), k):
-        parent_conn, child_conn = ctx.Pipe()
-        proc = ctx.Process(target=_child_main, args=(gpu, child_conn),
-                           daemon=True)
-        proc.start()
-        _CHILDREN.append((proc, parent_conn))
+class GpuWorkers:
+    """The child process and pipe of each GPU, for one configuration.
+
+    Args:
+        count: How many GPUs, one child each.
+        configuration: The model, device, backend, and GPU count the
+            children were started for.
+    """
+
+    def __init__(self, count, configuration):
+        import multiprocessing as mp
+
+        self.configuration = configuration
+        self.children = []
+        context = mp.get_context("spawn")
+        try:
+            for gpu in range(count):
+                parent_conn, child_conn = context.Pipe()
+                try:
+                    process = context.Process(
+                        target=_child_main, args=(gpu, child_conn), daemon=True)
+                    process.start()
+                except BaseException:
+                    parent_conn.close()
+                    raise
+                finally:
+                    child_conn.close()
+                self.children.append((process, parent_conn))
+        except BaseException:
+            self.close(terminate=True)
+            raise
+
+    @property
+    def alive(self) -> bool:
+        return bool(self.children) and all(
+            process.is_alive() for process, _ in self.children)
+
+    def round(self, kind, subs):
+        """Send one round to the children and collect their results."""
+        for (_, conn), sub in zip(self.children, subs):
+            conn.send((kind, sub))
+        outs = []
+        for (_, conn), _sub in zip(self.children, subs):
+            status, data = conn.recv()
+            if status != "ok":
+                raise RuntimeError(f"GPU child failed:\n{data}")
+            outs.append(data)
+        return outs
+
+    def close(self, *, terminate=False):
+        """Stop every child and close its pipe."""
+        children, self.children = self.children, []
+        for process, conn in children:
+            if not terminate and process.is_alive():
+                try:
+                    conn.send(("shutdown", None))
+                except (BrokenPipeError, OSError):
+                    pass
+            conn.close()
+        for process, _ in children:
+            if terminate:
+                process.terminate()
+            process.join()
+            process.close()
 
 
-def _round(kind, subs):
-    """Send one round to children and collect results."""
-    for (_, conn), sub in zip(_CHILDREN, subs):
-        conn.send((kind, sub))
-    outs = []
-    for (_, conn), _sub in zip(_CHILDREN, subs):
-        status, data = conn.recv()
-        if status != "ok":
-            raise RuntimeError(f"GPU child failed:\n{data}")
-        outs.append(data)
-    return outs
+def _close_children():
+    global _WORKERS
+    workers, _WORKERS = _WORKERS, None
+    if workers is not None:
+        workers.close()
+
+
+atexit.register(_close_children)
+
+
+def _ensure_children(count, configuration) -> GpuWorkers:
+    """Return live children for the configuration, replacing any others."""
+    global _WORKERS
+    if (_WORKERS is None or _WORKERS.configuration != configuration
+            or not _WORKERS.alive):
+        _close_children()
+        _WORKERS = GpuWorkers(count, configuration)
+    return _WORKERS
 
 
 def execute_quail_multi(payload, registry, graph):
@@ -630,20 +655,22 @@ def execute_quail_multi(payload, registry, graph):
     started = time.perf_counter()
     model_path = resolve_model_path(spec.hf_name, spec.revision)
     model_files_s = time.perf_counter() - started
-    _ensure_children(gpus)
+    envelope = payload["physical_plan"]
+    workers = _ensure_children(gpus, (
+        payload["model"], envelope["device"], envelope["backend"], gpus))
     setup = {key: payload[key] for key in (
         "model", "physical_plan", "gpus", "chunk_tokens", "true_ids", "false_ids",
     )}
     setup["arena_pages"] = payload.get("arena_pages")
     setup.update(registry=registry, model_path=model_path)
-    boots = _round("boot", [setup] * gpus)
+    boots = workers.round("boot", [setup] * gpus)
     boot_s = round(time.perf_counter() - started, 2)
     say(f"all {gpus} GPUs ready; running the query")
     report = execute_distributed_graph(
         payload,
         graph,
         gpus,
-        _round,
+        workers.round,
         spec,
         registry.device(payload["physical_plan"]["device"]),
         registry.runtimes,

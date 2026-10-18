@@ -50,8 +50,14 @@ class ModelExecution(Protocol):
 class ModelBackend(Protocol):
     """Planner and execution factory for one model backend.
 
+    A backend may leave out engine_name, which then equals name, and
+    the prepare_request and release_request methods; without
+    release_request its runtime state lives until the process ends.
+
     Attributes:
         name: The registered backend name.
+        engine_name: The engine the backend loads; backends with the
+            same engine name share a loaded model.
         reads_document_text: Whether the backend reads each scanned
             document as text, so the scan carries its text column.
         locates_answers_in_text: Whether the backend locates extracted
@@ -59,6 +65,7 @@ class ModelBackend(Protocol):
     """
 
     name: str
+    engine_name: str
     reads_document_text: bool
     locates_answers_in_text: bool
 
@@ -84,4 +91,8 @@ class ModelBackend(Protocol):
         context: BackendExecutionContext,
     ) -> Any:
         """Execute one request inside a compute process."""
+        ...
+
+    def release_request(self, state: dict[Any, Any]) -> None:
+        """Release the engine this backend loaded into state."""
         ...

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 
 from quail.baselines.request import RequestBackend
 from quail.baselines.request_scheduling import (
@@ -79,6 +79,26 @@ def diffusion_canvas(spec):
         yield tokens
     finally:
         diffusion_gemma.DiffusionGemmaRequestStates = original
+
+
+@contextmanager
+def in_process_vllm():
+    """Run vLLM's engine core in this process for one engine's lifetime."""
+    from vllm import envs
+
+    name = "VLLM_ENABLE_V1_MULTIPROCESSING"
+    previous = os.environ.get(name)
+    # vLLM reads the environment once and caches it, process mode included
+    envs.disable_envs_cache()
+    os.environ[name] = "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+        envs.disable_envs_cache()
 
 
 def _capacity(llm) -> dict:
@@ -160,6 +180,11 @@ class VLLMClient:
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()
 
+    def close(self):
+        """Stop the engine and its workers."""
+        self.llm.llm_engine.engine_core.shutdown()
+        self.llm = None
+
     def run_filter_sequence(self, sampling_params, body_ids, question_ids,
                          read_answer, *, tag="q", body_texts=None,
                          question_texts=None):
@@ -217,12 +242,22 @@ class VLLMEngine:
         kwargs.update(diffusion_kwargs(spec))
         return kwargs
 
-    def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
-        """Load the spec's model and return the engine state and boot record."""
+    def boot(self, spec, allowed_ids: list[int], *,
+             resources: ExitStack) -> tuple[dict, dict]:
+        """Load the spec's model and return its settings and boot record.
+
+        Args:
+            spec: The model to load.
+            allowed_ids: The token ids a filter answer may be.
+            resources: Owns the engine; closing it stops the engine.
+        """
+        # a session tokenizes on background threads before the engine
+        # starts, and a forked worker would inherit their locks
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         if spec.role == "decision":
             from quail.baselines.vllm_decision import boot_decision
 
-            return boot_decision(spec, self.llm_kwargs(spec))
+            return boot_decision(spec, self.llm_kwargs(spec), resources=resources)
         from vllm import LLM, SamplingParams
         from vllm.renderers.registry import RENDERER_REGISTRY
         from vllm.tokenizers import TokenizerRegistry
@@ -242,15 +277,17 @@ class VLLMEngine:
             # prompts (agreement with the in-process engine falls from
             # 92 to 73 percent on agent traces,
             # /results/ablations/diffusion_gemma_readout_probe_agent_k0_corpus_mp.json)
-            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+            resources.enter_context(in_process_vllm())
         path = resolve_model_path(spec.hf_name, spec.revision)
         started = time.perf_counter()
         with diffusion_canvas(spec) as canvas_ids:
             llm = LLM(model=path, **self.llm_kwargs(spec))
+            client = resources.enter_context(closing(VLLMClient(llm, {})))
         boot_s = time.perf_counter() - started
         sampling_params = SamplingParams(
             **sampling_kwargs(allowed_ids, spec.canvas_tokens))
-        capacity = _capacity(llm)
+        capacity = client.capacity
+        capacity.update(_capacity(llm))
         cache = llm.llm_engine.vllm_config.cache_config
         capacity.update(
             enable_prefix_caching=cache.enable_prefix_caching,
@@ -262,7 +299,6 @@ class VLLMEngine:
             max_denoising_steps=1 if spec.canvas_tokens == 1 else None,
             logprobs=sampling_params.logprobs,
         )
-        client = VLLMClient(llm, capacity)
         client.generate(["TRUE"], sampling_params)
         return (
             {

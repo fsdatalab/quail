@@ -159,10 +159,6 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         assert revision == registry.model("qwen3-4b-fp8").revision
         return str(tmp_path)
 
-    def ensure(count):
-        events.append("children")
-        assert count == 8
-
     def round_fn(kind, subs):
         events.append("boot")
         assert kind == "boot"
@@ -170,6 +166,12 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         assert all(sub["registry"] is registry
                    and sub["model_path"] == str(tmp_path) for sub in subs)
         return [{"boot_s": 3.0, "kind": "cold"}] * 8
+
+    def ensure(count, configuration):
+        events.append("children")
+        assert count == 8
+        assert configuration == ("qwen3-4b-fp8", "h100-sxm", "quail", 8)
+        return SimpleNamespace(round=round_fn)
 
     def run_graph(*args):
         assert events == ["resolve", "children", "boot"]
@@ -180,11 +182,10 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
     monkeypatch.setattr(worker.time, "perf_counter", lambda: next(clock))
     monkeypatch.setattr(worker, "resolve_model_path", resolve)
     monkeypatch.setattr(worker, "_ensure_children", ensure)
-    monkeypatch.setattr(worker, "_round", round_fn)
     monkeypatch.setattr(worker, "execute_distributed_graph", run_graph)
     result = worker.execute_quail_multi({
         "documents": {}, "gpus": 8, "model": "qwen3-4b-fp8",
-        "physical_plan": {"device": "h100-sxm"},
+        "physical_plan": {"device": "h100-sxm", "backend": "quail"},
         "chunk_tokens": 100, "true_ids": [1], "false_ids": [2],
     }, registry, object())
     assert events == ["resolve", "children", "boot", "query"]

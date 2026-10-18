@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from contextlib import ExitStack
+from dataclasses import dataclass, field
 from typing import Any
 
 from quail.backends.base import GpuContext
+from quail.backends.resources import release_models
 from quail.baselines.execution import RequestModelExecution
 from quail.baselines.nodes import RequestExecution
 from quail.baselines.planning import plan_request_backend
@@ -110,6 +113,26 @@ def _warm_boot() -> dict:
     }
 
 
+@dataclass
+class LoadedRequestEngine:
+    """One request engine loaded for a backend configuration.
+
+    Attributes:
+        settings: The client, sampling parameters, and capacity the
+            engine adapter's boot returned.
+        resources: Owns the engine; closing it stops the engine.
+        prepared_boot: The boot record of a prepare_request not yet
+            consumed by an execute_request.
+    """
+
+    settings: dict = field(default_factory=dict)
+    resources: ExitStack = field(default_factory=ExitStack)
+    prepared_boot: dict | None = None
+
+    def close(self) -> None:
+        self.resources.close()
+
+
 @dataclass(frozen=True)
 class RequestBackend:
     """A model backend that submits one request per prompt to an engine.
@@ -125,6 +148,10 @@ class RequestBackend:
     filter_submission: str
     join_submission: str = "anchor-major"
     locates_answers_in_text = False
+
+    @property
+    def engine_name(self) -> str:
+        return self.engine.kind
 
     @property
     def runtime_package(self) -> str:
@@ -165,17 +192,38 @@ class RequestBackend:
     def start(self, context):
         return RequestModelExecution(context)
 
-    def execute_request(self, context):
+    def _load_engine(self, context) -> tuple[LoadedRequestEngine, dict]:
+        """Boot the engine into the runtime state, or reuse the one there."""
+        engine = context.runtime_state.get("engine")
+        if engine is not None:
+            return engine, _warm_boot()
         envelope = context.request.plan
         model = context.registry.model(envelope["model"])
-        state_key = ("request-engine", self.engine.kind, model.name)
-        engine_state = context.runtime_state.get(state_key)
-        if engine_state is None:
-            allowed_ids = sorted(set(
-                envelope["settings"]["true_ids"]
-            ) | set(envelope["settings"]["false_ids"]))
-            engine_state, boot = self.engine.boot(model, allowed_ids)
-            context.runtime_state[state_key] = engine_state
-        else:
-            boot = _warm_boot()
-        return execute_request_graph(context, self, engine_state, boot)
+        allowed_ids = sorted(set(
+            envelope["settings"]["true_ids"]
+        ) | set(envelope["settings"]["false_ids"]))
+        started = time.perf_counter()
+        with ExitStack() as rollback:
+            # a failed boot must leave the GPU free for the next attempt
+            rollback.callback(release_models, context.runtime_state)
+            engine = LoadedRequestEngine()
+            context.runtime_state["engine"] = engine
+            engine.settings, boot = self.engine.boot(
+                model, allowed_ids, resources=engine.resources)
+            rollback.pop_all()
+        return engine, {**boot, "boot_s": round(time.perf_counter() - started, 2)}
+
+    def prepare_request(self, context) -> None:
+        """Boot and warm the engine before the query's documents are ready."""
+        engine, boot = self._load_engine(context)
+        engine.prepared_boot = boot
+
+    def execute_request(self, context):
+        engine, boot = self._load_engine(context)
+        if engine.prepared_boot is not None:
+            boot, engine.prepared_boot = engine.prepared_boot, None
+        return execute_request_graph(context, self, engine.settings, boot)
+
+    def release_request(self, state) -> None:
+        """Stop the engine loaded for this configuration."""
+        release_models(state)
