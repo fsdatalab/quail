@@ -31,23 +31,19 @@ from quail.logical import (
 
 def _parse_equality(b, term, joined_alias: str) -> Equality:
     """Parse one ordinary ON condition: two columns compared with =."""
-    if (
-        not isinstance(term, exp.EQ)
-        or not isinstance(term.this, exp.Column)
-        or not isinstance(term.expression, exp.Column)
-    ):
+    if not isinstance(term, exp.EQ) or not all(
+            isinstance(side, (exp.Column, exp.Length))
+            for side in (term.this, term.expression)):
         raise CompileError(
             f"ON supports column = column and AI predicates, got {term.sql()}"
         )
-    left = b.resolve_column(term.this)
-    right = b.resolve_column(term.expression)
-    sides = {left.alias, right.alias}
-    if joined_alias not in sides or len(sides) != 2:
+    equality = Equality(b.resolve_value(term.this), b.resolve_value(term.expression))
+    if joined_alias not in equality.aliases() or len(set(equality.aliases())) != 2:
         raise CompileError(
             f"JOIN {joined_alias} ON {term.sql()} must relate "
             f"{joined_alias!r} to a table already in the query"
         )
-    return Equality(left, right)
+    return equality
 
 
 def _from_clause(select):

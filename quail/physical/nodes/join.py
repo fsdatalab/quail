@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
+from quail.logical.expressions import (
+    ColumnExpression,
+    ColumnRef,
+    decode_column,
+    encode_column,
+)
+
 from ..base import (
     ExecutionLocation,
     OutputPort,
@@ -179,12 +186,14 @@ class Foreign(PhysicalNode):
     over a materialized input. Barrier functions run once over all surviving
     rows and end the preceding pipeline. The function may preserve or remove
     input IDs, or return pairs of input IDs; it cannot create new IDs.
+    ``columns`` are the source columns and expressions over them the
+    function reads, named for it as written.
     """
 
     function: str = ""
     kind: str = "per_batch"
     ids: str = "drop"
-    columns: tuple[tuple[str, str], ...] = ()
+    columns: tuple[ColumnRef | ColumnExpression, ...] = ()
     aliases: tuple[str, ...] = ()
     written_position: int = -1
 
@@ -222,7 +231,7 @@ class Foreign(PhysicalNode):
             "function": self.function,
             "kind": self.kind,
             "ids": self.ids,
-            "columns": [list(column) for column in self.columns],
+            "columns": [encode_column(column) for column in self.columns],
             "aliases": list(self.aliases),
             "written_position": self.written_position,
         }
@@ -235,10 +244,8 @@ class Foreign(PhysicalNode):
             function=str(attributes["function"]),
             kind=str(attributes["kind"]),
             ids=str(attributes["ids"]),
-            columns=tuple(
-                (str(alias), str(column))
-                for alias, column in attributes["columns"]
-            ),
+            columns=tuple(decode_column(column)
+                          for column in attributes["columns"]),
             aliases=tuple(attributes["aliases"]),
             written_position=int(attributes["written_position"]),
         )
@@ -248,16 +255,18 @@ class Foreign(PhysicalNode):
 class HashJoin(PhysicalNode):
     """Pair the rows of two tables whose key columns are equal.
 
-    ``on`` lists (left column, right column) pairs; a row pair is kept
-    when every listed pair of values is equal. The node reads the key
-    columns as values and writes the pairs the join at ``written_position``
+    ``on`` lists (left key, right key) pairs, each a source column or an
+    expression over one; a row pair is kept when every listed pair of
+    values is equal. The node reads the key columns as values and
+    writes the pairs the join at ``written_position``
     asks the model about. ``pair_fraction`` is the planner's estimate
     of the pairs kept over the cross product.
     """
 
     left: str = ""
     right: str = ""
-    on: tuple[tuple[str, str], ...] = ()
+    on: tuple[tuple[ColumnRef | ColumnExpression,
+                    ColumnRef | ColumnExpression], ...] = ()
     written_position: int = -1
     pair_fraction: float = 1.0
 
@@ -274,7 +283,8 @@ class HashJoin(PhysicalNode):
         return {
             "left": self.left,
             "right": self.right,
-            "on": [list(condition) for condition in self.on],
+            "on": [[encode_column(left), encode_column(right)]
+                   for left, right in self.on],
             "written_position": self.written_position,
             "pair_fraction": self.pair_fraction,
         }
@@ -286,7 +296,7 @@ class HashJoin(PhysicalNode):
             inputs=inputs,
             left=str(attributes["left"]),
             right=str(attributes["right"]),
-            on=tuple((str(left), str(right))
+            on=tuple((decode_column(left), decode_column(right))
                      for left, right in attributes["on"]),
             written_position=int(attributes["written_position"]),
             pair_fraction=float(attributes.get("pair_fraction", 1.0)),

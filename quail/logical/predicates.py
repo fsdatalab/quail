@@ -16,7 +16,14 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.logical.expressions import ColumnRef, CompileError
+from quail.logical.expressions import (
+    COLUMN_FUNCTIONS,
+    ColumnRef,
+    CompileError,
+    column_expression_name,
+    column_name,
+    column_values,
+)
 
 VALUE_COMPARISONS = ("=", "<>", "<", "<=", ">", ">=")
 TEXT_COMPARISONS = ("like", "ilike", "contains", "icontains", "starts with",
@@ -24,8 +31,6 @@ TEXT_COMPARISONS = ("like", "ilike", "contains", "icontains", "starts with",
 COLUMN_COMPARISONS = (
     *VALUE_COMPARISONS, "in", "is null", "is not null",
     *TEXT_COMPARISONS, *(f"not {comparison}" for comparison in TEXT_COMPARISONS))
-# functions applied to the column's values before the comparison
-COLUMN_FUNCTIONS = ("length",)
 
 _COMPARE = {
     "=": pc.equal, "<>": pc.not_equal,
@@ -39,7 +44,6 @@ _COMPARE = {
     "ends with": pc.ends_with,
     "regex": pc.match_substring_regex,
 }
-_FUNCTIONS = {"length": pc.utf8_length}
 
 
 def literal_value(value):
@@ -216,11 +220,9 @@ class RegularPredicate:
                 column's values, such as a string against a number
                 column.
         """
+        values = column_values(values, self.path, self.function,
+                               column_name(self.column))
         try:
-            for field in self.path:
-                values = pc.struct_field(values, field)
-            if self.function is not None:
-                values = _FUNCTIONS[self.function](values)
             comparison = self.comparison.removeprefix("not ")
             if comparison == "is null":
                 mask = pc.is_null(values)
@@ -261,8 +263,8 @@ class RegularPredicate:
     @property
     def name(self) -> str:
         """The tested column as written, with its path and function."""
-        name = ".".join((self.column.alias, self.column.column, *self.path))
-        return f"{self.function}({name})" if self.function else name
+        return column_expression_name(
+            self.path, self.function, f"{self.column.alias}.{self.column.column}")
 
     def __str__(self) -> str:
         if self.comparison == "in":

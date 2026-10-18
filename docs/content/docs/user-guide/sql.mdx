@@ -51,6 +51,11 @@ PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
 
 Here `{0}` is the review and `{1}` is the aspect.
 
+A column argument can read a field of a struct column, such as
+`r.details.body`, or be `LENGTH(column)`. The same expressions work in
+`ON` conditions and `WHERE` tests. The document the prompt reads must
+be text, so a struct column needs a field.
+
 ## AI.IF
 
 `AI.IF` takes a `PROMPT` and evaluates it on each row or each pair

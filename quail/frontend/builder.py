@@ -37,7 +37,9 @@ from quail.logical import (
 )
 from quail.logical.expressions import (
     SPAN_SUFFIX,
+    ColumnExpression,
     column_name,
+    column_reference,
     validate_task_description,
 )
 
@@ -90,11 +92,16 @@ class Query:
     def _resolve(self, c: ColSpec) -> ColumnRef:
         return self._scope_.resolve(c.column, c.alias)
 
-    def _note_document_column(self, ref: ColumnRef) -> None:
-        self._scope_.note_document_column(ref)
+    def _resolve_value(self, c: ColSpec) -> ColumnRef | ColumnExpression:
+        """Resolve a col() with the fields and function read on it."""
+        return self._scope_.resolve_value(c.column, c.alias, path=c.path,
+                                          function=c.function)
+
+    def _note_document_column(self, column) -> None:
+        self._scope_.note_document_column(column)
 
     def _bind(self, p: PromptSpec, join: bool = False):
-        refs = tuple(self._resolve(c) for c in p.cols)
+        refs = tuple(self._resolve_value(c) for c in p.cols)
         bound = self._prompts.bind("join" if join else "filter", p.template, refs)
         for r in refs:
             self._note_document_column(r)
@@ -140,7 +147,7 @@ class Query:
             raise CompileError(
                 f"a score needs a column name without a dot, got {name!r}")
         self._claim_name(name)
-        refs = tuple(self._resolve(c) for c in p.cols)
+        refs = tuple(self._resolve_value(c) for c in p.cols)
         bound = self._prompts.bind("score", p.template, refs)
         for ref in refs:
             self._note_document_column(ref)
@@ -200,7 +207,7 @@ class Query:
                 labels = tuple(label for label, _ in labels)
         descriptions = tuple(descriptions or ())
         validate_task_description(task_description)
-        refs = tuple(self._resolve(c) for c in p.cols)
+        refs = tuple(self._resolve_value(c) for c in p.cols)
         bound = self._prompts.bind(
             "label", p.template, refs, labels=labels, descriptions=descriptions,
             task_description=task_description)
@@ -255,7 +262,7 @@ class Query:
                 f"got {name!r}")
         self._claim_name(name)
         self._claim_name(name + SPAN_SUFFIX)
-        ref = self._resolve(col(c) if isinstance(c, str) else c)
+        ref = self._resolve_value(col(c) if isinstance(c, str) else c)
         struct = ExtractStruct(name, tuple(questions))
         struct.validate()
         members = []
@@ -332,16 +339,15 @@ class Query:
             if not isinstance(condition, EqualsSpec):
                 raise CompileError(
                     "join(on=...) takes col(...) == col(...) conditions")
-            left, right = (self._resolve(condition.left),
-                           self._resolve(condition.right))
-            sides = {left.alias, right.alias}
+            equality = Equality(self._resolve_value(condition.left),
+                                self._resolve_value(condition.right))
+            sides = set(equality.aliases())
             if new_aliases[0] not in sides or len(sides) != 2:
                 raise CompileError(
-                    f"join condition {left.alias}.{left.column} = "
-                    f"{right.alias}.{right.column} must relate the "
-                    f"joined table {new_aliases[0]!r} to a table already "
-                    f"in the query")
-            resolved.append(Equality(left, right))
+                    f"join condition {equality} must relate the joined "
+                    f"table {new_aliases[0]!r} to a table already in the "
+                    f"query")
+            resolved.append(equality)
         self._pending_join = (new_aliases, tuple(resolved), [])
         return self
 
@@ -399,7 +405,7 @@ class Query:
             raise CompileError(
                 f"apply name {name!r} is already used by another function")
         columns = [columns] if isinstance(columns, ColSpec) else list(columns)
-        refs = tuple(self._resolve(spec) for spec in columns)
+        refs = tuple(self._resolve_value(spec) for spec in columns)
         if self._pending_join is not None:
             if ids not in (None, "pairs"):
                 raise CompileError(
@@ -469,8 +475,8 @@ class Query:
                 self._functions[name] = fn
             for a, c in other._document_columns.items():
                 self._note_document_column(
-                    ColumnRef(alias=a, provider=self._scope()[a],
-                              column=c))
+                    c if isinstance(c, ColumnExpression)
+                    else ColumnRef(alias=a, provider=self._scope()[a], column=c))
             new_aliases.append(alias)
         return new_aliases
 
@@ -601,19 +607,14 @@ class Query:
             self._extract_filters.setdefault(extracted.alias, []).append(
                 (predicate, test.selectivity))
             return
-        if spec.path:
-            raise CompileError(
-                f"{spec.alias}.{spec.column} has no fields; only an "
-                f"extraction's span does, such as "
-                f"col('lease{SPAN_SUFFIX}.end_date').field('start')")
         if test.selectivity is not None:
             raise CompileError(
                 f"a hint estimates a test of a label or an answer; "
                 f"{spec.alias}.{spec.column} is a source column, tested at "
                 f"the scan")
-        ref = self._resolve(spec)
+        ref = column_reference(self._resolve_value(spec))
         predicate = RegularPredicate(ref, test.comparison, test.value,
-                                     function=spec.function)
+                                     spec.path, spec.function)
         predicate.validate()
         self._regular_predicates.setdefault(ref.alias, []).append(predicate)
 

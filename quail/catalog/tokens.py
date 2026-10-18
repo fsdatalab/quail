@@ -12,6 +12,8 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
+from quail.logical.expressions import ColumnExpression, evaluate_column, source_column
+
 
 class TokenView(Sequence):
     def __init__(self, values, character_offsets=None):
@@ -311,7 +313,8 @@ class TokenOffsets:
 class TokenStoreWriter(_StoreWriter):
     """Tokenize source batches into a token store file."""
 
-    def __init__(self, path: str, *, document_column: str, tokenizer,
+    def __init__(self, path: str, *, document_column: str | ColumnExpression,
+                 tokenizer,
                  token_type: pa.DataType, offsets_encoder=None, existing_tokens=None):
         self._document_column = document_column
         self._tokenizer = tokenizer
@@ -336,9 +339,8 @@ class TokenStoreWriter(_StoreWriter):
 
     def write_batch(self, batch: pa.RecordBatch) -> None:
         """Tokenize the document column of one source batch."""
-        texts = batch.column(
-            batch.schema.get_field_index(self._document_column)
-        )
+        texts = evaluate_column(self._document_column, batch.column(
+            batch.schema.get_field_index(source_column(self._document_column))))
         offsets = None
         batch_arrow = getattr(self._tokenizer, "batch_arrow", None)
         if self._existing_tokens is not None:

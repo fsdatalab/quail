@@ -30,20 +30,26 @@ from quail.logical import (
     is_score,
     model_call,
 )
+from quail.logical.expressions import (
+    ColumnExpression,
+    column_reference,
+    source_column,
+)
 
 
 def _column_refs(expression) -> tuple[ColumnRef, ...]:
-    """Return the column references one logical expression reads."""
-    if isinstance(expression, ColumnRef):
-        return (expression,)
+    """Return the source columns one logical expression reads."""
+    if isinstance(expression, (ColumnRef, ColumnExpression)):
+        return (column_reference(expression),)
     if isinstance(expression, FilterPredicate):
         return _column_refs(expression.expression)
     if isinstance(expression, (ModelCall, Compare, Alias)):
-        return tuple(model_call(expression).prompt.args)
+        return tuple(map(column_reference, model_call(expression).prompt.args))
     if isinstance(expression, RegularPredicate):
         return (expression.column,)
     if isinstance(expression, Equality):
-        return (expression.left, expression.right)
+        return (column_reference(expression.left),
+                column_reference(expression.right))
     if isinstance(expression, SortKey):
         return _column_refs(expression.expression)
     return ()
@@ -83,12 +89,12 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     }
     for node in plan.walk():
         if isinstance(node, Apply):
-            refs = node.columns
+            refs = map(column_reference, node.columns)
         elif isinstance(node, Join):
-            refs = [ref for condition in node.on
+            refs = [column_reference(ref) for condition in node.on
                     for ref in (condition.left, condition.right)]
         elif isinstance(node, SemanticExtract):
-            refs = node.call.prompt.args
+            refs = map(column_reference, node.call.prompt.args)
         elif isinstance(node, Scan):
             refs = [predicate.column for predicate in node.predicates]
         else:
@@ -109,7 +115,8 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         if isinstance(node, Scan):
             columns = tuple(
                 column for column in needed.get(node.alias, ())
-                if column != node.column or (node.alias, column) in valued
+                if column != source_column(node.column)
+                or (node.alias, column) in valued
             )
             return node if columns == node.columns else replace(
                 node, columns=columns)

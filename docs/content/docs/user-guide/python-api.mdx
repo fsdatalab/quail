@@ -278,6 +278,35 @@ Quail applies a `where()` on a source column before AI operators even
 if it appears later in the builder chain. To compare columns from
 different tables, use [`join()`](#join).
 
+### Column expressions
+
+`col(...).field(name)` reads a field of a struct column, and
+`col(...).length()` the length of a text value. Both stand wherever a
+column does: as a prompt's document, in a `join()` condition, as a
+column an `apply()` function reads, or in a `where()` test. The
+document a prompt reads must be text, so a struct column goes through
+`field()`.
+
+For example, imagine a `pages` table whose `details` column is a
+struct with `body` and `url` fields. This query asks the model about
+the `body` field and pairs pages with sources by the `url` field:
+
+```python
+query = (
+    session.docs("pages").alias("p")
+    .join(session.docs("sources").alias("s"),
+          on=col("p.details").field("url") == col("s.url"))
+    .ai_if(prompt("Does the page cite the source?\n\n{0}\n\n{1}",
+                  col("p.details").field("body"), col("s.text")))
+    .select("p.id", "s.id")
+)
+```
+
+An `apply()` function sees such a column under its written name, such
+as `length(details.body)`. A field that the column does not have, or
+`length()` of a column that is not text, fails when the query is
+built.
+
 ### limit
 
 `limit(n)`

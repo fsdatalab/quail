@@ -17,7 +17,7 @@ from quail.catalog import DocumentProvider
 from quail.execution.metrics import NodeResult
 from quail.execution.runtimes import BarrierRuntime
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
-from quail.logical import LogicalPlan
+from quail.logical import ColumnRef, LogicalPlan
 from quail.physical import (
     Barrier,
     ExecutionLocation,
@@ -107,7 +107,7 @@ def test_hash_join_keeps_ids_apart_from_a_key_column_named_like_its_alias(aliase
         node_id="join", left=left, right=right, written_position=0,
         inputs=input_ports((PortRef("l", f"rows:{left}"),
                             PortRef("r", f"rows:{right}"))),
-        on=((left, right),))
+        on=((ColumnRef(left, left, left), ColumnRef(right, right, right)),))
     context = SimpleNamespace(sources={
         columns_key(left): pa.table({left: [30, 10, 20]}),
         columns_key(right): pa.table({right: [20, 40, 10]})})

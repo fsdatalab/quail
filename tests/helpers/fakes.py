@@ -21,6 +21,7 @@ from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.pages import PageArena
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
+from quail.logical import ColumnRef
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -243,7 +244,8 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
             node_id="hash_join:r-p",
             inputs=input_ports((PortRef("input:r", "rows:r"),
                                 PortRef("input:p", "rows:p"))),
-            left="r", right="p", on=(("key", "key"),), written_position=0))
+            left="r", right="p", written_position=0,
+            on=((ColumnRef("r", "r", "key"), ColumnRef("p", "p", "key")),)))
         join_inputs.append(PortRef("hash_join:r-p", "pairs:0"))
         pairs_from = "hash_join:r-p"
     if foreign and foreign[1] == "pairs":
@@ -251,7 +253,8 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
             node_id="apply:same_key",
             inputs=input_ports((anchor_src, PortRef("input:p", "rows:p"))),
             function="same_key", kind=foreign[0], ids="pairs",
-            columns=(("r", "key"), ("p", "key")), aliases=("r", "p"),
+            columns=(ColumnRef("r", "r", "key"), ColumnRef("p", "p", "key")),
+            aliases=("r", "p"),
             written_position=0))
         join_inputs.append(PortRef("apply:same_key", "pairs:0"))
         pairs_from = "apply:same_key"

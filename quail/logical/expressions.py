@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, ClassVar, Optional
+
+import pyarrow as pa
+from pyarrow import compute as pc
 
 DESCRIPTION_WORDS = 25
 TASK_DESCRIPTION_WORDS = 50
+# functions a column expression applies to a column's values
+COLUMN_FUNCTIONS = ("length",)
+_FUNCTIONS = {"length": pc.utf8_length}
 
 
 class CompileError(ValueError):
@@ -22,16 +28,142 @@ class ColumnRef:
     type_name: ClassVar[str] = "quail.column_ref"
 
 
+@dataclass(frozen=True)
+class ColumnExpression:
+    """A struct field or a function read on a source column.
+
+    ``path`` names the struct fields read under the column, and
+    ``function`` the function applied to the values last, such as
+    ``"length"``. The expression stands wherever a column does: as a
+    prompt's document, a join key, or a column an apply() reads.
+    """
+
+    reference: ColumnRef
+    path: tuple = ()  # tuple[str, ...]
+    function: Optional[str] = None
+
+    type_name: ClassVar[str] = "quail.column_expression"
+
+    @property
+    def alias(self) -> str:
+        return self.reference.alias
+
+    @property
+    def provider(self) -> str:
+        return self.reference.provider
+
+    def validate(self) -> None:
+        if not isinstance(self.reference, ColumnRef):
+            raise CompileError("a column expression reads a column reference")
+        if self.function is not None and self.function not in COLUMN_FUNCTIONS:
+            raise CompileError(
+                f"unsupported column function {self.function!r}; "
+                f"supported: {', '.join(COLUMN_FUNCTIONS)}")
+        if any(not isinstance(field, str) or not field for field in self.path):
+            raise CompileError("a column path names struct fields")
+
+    def evaluate(self, values):
+        """Return the expression's values over the source column's values."""
+        return column_values(values, self.path, self.function,
+                             column_name(self.reference))
+
+    def __str__(self) -> str:
+        return column_name(self)
+
+
+def column_values(values, path: tuple = (), function: Optional[str] = None,
+                  name: str = ""):
+    """Read struct fields under Arrow values and apply a function to them.
+
+    Args:
+        values: The source column's values, an Arrow array or chunked array.
+        path: The struct fields to read, outermost first.
+        function: The function applied last, one of COLUMN_FUNCTIONS.
+        name: The column as written, for the error message.
+
+    Raises:
+        CompileError: The values have no such field, or the function
+            does not take them.
+    """
+    read = name or "the column"
+    for field in path:
+        if not pa.types.is_struct(values.type):
+            raise CompileError(f"{read} has no fields; it is {values.type}")
+        if values.type.get_field_index(field) < 0:
+            raise CompileError(
+                f"{read} has no field {field!r}; its fields are "
+                f"{[item.name for item in values.type]}")
+        values = pc.struct_field(values, field)
+        read = f"{read}.{field}"
+    if function is not None:
+        try:
+            values = _FUNCTIONS[function](values)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError,
+                pa.ArrowTypeError, KeyError, TypeError) as error:
+            raise CompileError(
+                f"{function}({read}) cannot be evaluated on {values.type}: "
+                f"{error}") from error
+    return values
+
+
+def column_expression_name(path: tuple, function: Optional[str],
+                           column: str = "") -> str:
+    """Return a column with its fields and function as written."""
+    name = ".".join(part for part in (column, *path) if part)
+    return f"{function}({name})" if function else name
+
+
 LABEL_PREFIX = " "
 
 
-def column_name(column: ColumnRef | Alias) -> str:
-    """Return the name used for a source or computed column."""
-    return (
-        f"{column.alias}.{column.column}"
-        if isinstance(column, ColumnRef)
-        else column.name
-    )
+def column_name(column: str | ColumnRef | ColumnExpression | Alias, *,
+                qualified: bool = True) -> str:
+    """Return the name used for a source or computed column.
+
+    Args:
+        column: A column name, reference, expression, or projected
+            expression.
+        qualified: Whether a reference carries its table alias.
+    """
+    if isinstance(column, str):
+        return column
+    if isinstance(column, ColumnRef):
+        return f"{column.alias}.{column.column}" if qualified else column.column
+    if isinstance(column, ColumnExpression):
+        return column_expression_name(
+            column.path, column.function,
+            column_name(column.reference, qualified=qualified))
+    return column.name
+
+
+def column_reference(expression: ColumnRef | ColumnExpression) -> ColumnRef:
+    """Return the source column an expression reads."""
+    return (expression.reference if isinstance(expression, ColumnExpression)
+            else expression)
+
+
+def source_column(column: str | ColumnRef | ColumnExpression) -> str:
+    """Return the name of the source column a document column reads."""
+    return column if isinstance(column, str) else column_reference(column).column
+
+
+def evaluate_column(column: str | ColumnRef | ColumnExpression, values):
+    """Return a document column's values over its source column's values."""
+    return (column.evaluate(values) if isinstance(column, ColumnExpression)
+            else values)
+
+
+def encode_column(expression: ColumnRef | ColumnExpression) -> dict:
+    """Encode a column reference or expression for a physical plan."""
+    return asdict(expression)
+
+
+def decode_column(value: dict) -> ColumnRef | ColumnExpression:
+    """Decode what encode_column wrote."""
+    if "reference" in value:
+        return ColumnExpression(ColumnRef(**value["reference"]),
+                                tuple(value.get("path", ())), value.get("function"))
+    return ColumnRef(**value)
 
 
 @dataclass(frozen=True)
@@ -397,8 +529,8 @@ class FilterPredicate:
 class Equality:
     """One ordinary join condition: two columns of two tables are equal."""
 
-    left: ColumnRef
-    right: ColumnRef
+    left: ColumnRef | ColumnExpression
+    right: ColumnRef | ColumnExpression
 
     type_name: ClassVar[str] = "quail.equality"
 
@@ -406,10 +538,7 @@ class Equality:
         return self.left.alias, self.right.alias
 
     def __str__(self) -> str:
-        return (
-            f"{self.left.alias}.{self.left.column} = "
-            f"{self.right.alias}.{self.right.column}"
-        )
+        return f"{column_name(self.left)} = {column_name(self.right)}"
 
 
 def _explain(expression) -> str:

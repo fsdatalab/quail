@@ -16,6 +16,7 @@ from quail.execution.result import (
     true_answer_rows,
 )
 from quail.execution.rows import Rows, as_table
+from quail.logical.expressions import column_name, column_reference, evaluate_column
 from quail.physical import (
     Barrier,
     Exchange,
@@ -83,26 +84,28 @@ def _pairs_of(value, left: str, right: str) -> np.ndarray:
         [_ids_of(value.column(left)), _ids_of(value.column(right))])
 
 
-def alias_table(alias: str, ids, columns, names):
+def alias_table(alias: str, ids, columns, expressions):
     """The Arrow table an apply() function sees for one alias.
 
     Its first column is the alias's row indices under the alias
-    name; the rest are the requested value columns for those rows.
+    name; the rest are the requested columns for those rows, each
+    named as the query wrote it, such as ``length(body)``.
     """
     ids = document_ids(ids)
     arrays = {alias: ids}
-    for name in names:
-        if columns is None or name not in columns.column_names:
-            raise KeyError(
-                f"column {alias}.{name} is not among the request's relations")
-        arrays[name] = columns.column(name).take(ids)
+    for expression in expressions:
+        arrays[column_name(expression, qualified=False)] = relation_values(
+            columns, expression).take(ids)
     return pa.table(arrays)
 
 
-def _key_column(alias, columns, name):
-    if columns is None or name not in columns.column_names:
-        raise KeyError(f"column {alias}.{name} is not among the request's relations")
-    return columns.column(name)
+def relation_values(columns, expression):
+    """Return one key or apply() column's values from the alias's value table."""
+    ref = column_reference(expression)
+    if columns is None or ref.column not in columns.column_names:
+        raise KeyError(
+            f"column {ref.alias}.{ref.column} is not among the request's relations")
+    return evaluate_column(expression, columns.column(ref.column))
 
 
 def foreign_call(node, values, context):
@@ -132,13 +135,13 @@ def foreign_call(node, values, context):
             f"{node.node_id!r} has no id input for {missing}")
     columns = {alias: context.sources.get(columns_key(alias))
                for alias in node.aliases}
-    names = {alias: [column for owner, column in node.columns
-                     if owner == alias] for alias in node.aliases}
+    expressions = {alias: [column for column in node.columns
+                           if column.alias == alias] for alias in node.aliases}
     counters = dict(calls=0, input_rows=0, output_rows=0)
 
     def call(ids_by_alias):
         tables = {alias: alias_table(alias, ids, columns[alias],
-                                     names[alias])
+                                     expressions[alias])
                   for alias, ids in ids_by_alias.items()}
         counters["calls"] += 1
         counters["input_rows"] += sum(
@@ -271,15 +274,15 @@ class HashJoinRuntime:
         if not isinstance(node, HashJoin):
             raise TypeError(type(node).__name__)
         sides = {}
-        for alias, names in ((node.left, [left for left, _ in node.on]),
-                             (node.right, [right for _, right in node.on])):
+        for alias, keys in ((node.left, [left for left, _ in node.on]),
+                            (node.right, [right for _, right in node.on])):
             port = next(port for port in node.inputs
                         if port.source.port == f"rows:{alias}")
             ids = document_ids(inputs[port.name])
             columns = context.sources.get(columns_key(alias))
             # a key column may carry the alias's name: the ids stay apart
-            sides[alias] = (ids, [_key_column(alias, columns, name).take(ids)
-                                  for name in names])
+            sides[alias] = (ids, [relation_values(columns, key).take(ids)
+                                  for key in keys])
         positions = pair_table(node.left, sides[node.left][1],
                                node.right, sides[node.right][1])
         # pair_table pairs row positions; map them back to the ids read

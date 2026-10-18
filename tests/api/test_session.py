@@ -30,6 +30,7 @@ from quail.execution.result import (
     count_rows,
     document_index_table,
 )
+from quail.logical import ColumnRef
 from quail.physical import AiJoin
 from quail.planner.plan import EngineConfig
 
@@ -450,7 +451,8 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
         # c1 and c2 pair with e0 and e2, c0 with e1: 5 of 12 pairs
         hash_join = paired_plan.graph.node("hash_join:c-e")
         assert (hash_join.left, hash_join.right, hash_join.on) == (
-            "c", "e", (("url", "url"),))
+            "c", "e", ((ColumnRef("c", "claims", "url"),
+                        ColumnRef("e", "evidence", "url")),))
         assert hash_join.pair_fraction == 5 / 12
         assert [port.source.node_id for port in hash_join.inputs] == [
             "scan:c", "scan:e"]

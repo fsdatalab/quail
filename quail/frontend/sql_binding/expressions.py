@@ -6,6 +6,7 @@ from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
+from quail.frontend.sql_binding.predicates import column_path
 from quail.logical import (
     Alias,
     ColumnRef,
@@ -95,8 +96,33 @@ class ExpressionBinder:
         return self.scope.resolve(col.name, col.table or None, tables=tables,
                                   shown=col.sql())
 
-    def note_document_column(self, ref: ColumnRef) -> None:
-        self.scope.note_document_column(ref)
+    def resolve_value(self, node, tables=None, function=None):
+        """Resolve a column, a struct field under one, or LENGTH() of either.
+
+        Args:
+            node: The column or LENGTH(column) expression.
+            tables: (alias, provider) pairs to resolve against instead
+                of the tables in scope.
+            function: The function already parsed off the node, if any.
+
+        Raises:
+            CompileError: The node is not a column expression, or its
+                column, field, or function does not resolve.
+        """
+        if isinstance(node, exp.Length) and function is None:
+            node, function = node.this, "length"
+        if not isinstance(node, exp.Column):
+            raise CompileError(f"{node.sql()} is not a column expression")
+        parts = column_path(node)
+        scope = dict(self.tables if tables is None else tables)
+        alias = parts[0] if len(parts) > 1 and parts[0] in scope else None
+        column, *path = parts[1:] if alias is not None else parts
+        return self.scope.resolve_value(column, alias, path=tuple(path),
+                                        function=function, tables=tables,
+                                        shown=node.sql())
+
+    def note_document_column(self, column) -> None:
+        self.scope.note_document_column(column)
 
     # ---- AI predicate parsing ----------------------------------------
 
@@ -165,11 +191,11 @@ class ExpressionBinder:
         template = str(p_args[0].this)
         refs = []
         for a in p_args[1:]:
-            if not isinstance(a, exp.Column):
+            if not isinstance(a, (exp.Column, exp.Length)):
                 raise CompileError(
                     f"PROMPT arguments must be column references, got {a.sql()}"
                 )
-            refs.append(self.resolve_column(a, scope))
+            refs.append(self.resolve_value(a, scope))
         aliases = []
         for r in refs:
             if r.alias not in aliases:
@@ -297,7 +323,7 @@ class ExpressionBinder:
             raise CompileError(
                 "AI.EXTRACT takes a document column and an object of field "
                 "questions")
-        if not isinstance(args[0], exp.Column):
+        if not isinstance(args[0], (exp.Column, exp.Length)):
             raise CompileError(
                 f"AI.EXTRACT's first argument is a document column, "
                 f"got {args[0].sql()}")
@@ -306,7 +332,7 @@ class ExpressionBinder:
                 f"AI.EXTRACT's second argument is an object of field "
                 f"questions such as {{'ends': 'When does the lease end?'}}, "
                 f"got {args[1].sql()}")
-        ref = self.resolve_column(args[0])
+        ref = self.resolve_value(args[0])
         return ref, args[1]
 
     def _extract_call(self, ref, question: str) -> ModelCall:

@@ -6,8 +6,11 @@ from dataclasses import dataclass, replace
 from typing import ClassVar
 
 from quail.logical.expressions import (
+    ColumnExpression,
     ColumnRef,
     CompileError,
+    column_name,
+    source_column,
 )
 from quail.logical.predicates import RegularPredicate
 
@@ -16,9 +19,11 @@ from quail.logical.predicates import RegularPredicate
 class Scan:
     """Which column of which provider supplies the document text.
 
-    ``column`` is tokenized for the model. ``columns`` names the source
-    columns kept as values for the result rows, and includes ``column``
-    only when the query returns the document text itself. The
+    ``column`` is tokenized for the model: a source column's name, or a
+    ColumnExpression reading a struct field or a function of one.
+    ``columns`` names the source columns kept as values for the result
+    rows, and includes the document's source column only when the
+    query returns its text. The
     projection pushdown rule fills ``columns``; before it runs the
     tuple is empty. ``predicates`` are regular predicates, all of which a
     document must pass before any operator reads it.
@@ -26,7 +31,7 @@ class Scan:
 
     provider: str
     alias: str
-    column: str
+    column: str | ColumnExpression
     columns: tuple = ()  # tuple[str, ...]
     predicates: tuple = ()  # tuple[RegularPredicate, ...]
 
@@ -39,17 +44,24 @@ class Scan:
         return self.predicates
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        fields = [ColumnRef(self.alias, self.provider, self.column)]
+        source = source_column(self.column)
+        fields = [ColumnRef(self.alias, self.provider, source)]
         fields.extend(
             ColumnRef(self.alias, self.provider, column)
             for column in self.columns
-            if column != self.column
+            if column != source
         )
         return tuple(fields)
 
     def validate(self) -> None:
         if not self.provider or not self.alias or not self.column:
             raise CompileError("Scan needs a provider, alias, and column")
+        if isinstance(self.column, ColumnExpression):
+            self.column.validate()
+            if self.column.alias != self.alias:
+                raise CompileError(
+                    f"Scan {self.alias!r} reads the document column "
+                    f"{self.column} of another table")
         if len(set(self.columns)) != len(self.columns):
             raise CompileError(
                 f"Scan {self.alias!r} lists a column twice: {self.columns}"
@@ -78,7 +90,7 @@ class Scan:
         return {
             "provider": self.provider,
             "alias": self.alias,
-            "column": self.column,
+            "column": column_name(self.column, qualified=False),
             "columns": list(self.columns),
             "predicates": [str(predicate) for predicate in self.predicates],
         }

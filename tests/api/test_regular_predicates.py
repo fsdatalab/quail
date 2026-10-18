@@ -263,7 +263,7 @@ def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
         RegularPredicate(name, "like", 3).validate()
     with pytest.raises(CompileError, match="unsupported column function"):
         RegularPredicate(name, "<", 3, function="upper").validate()
-    with pytest.raises(CompileError, match="cannot be evaluated"):
+    with pytest.raises(CompileError, match="has no fields"):
         RegularPredicate(name, "<", 3, ("start",)).evaluate(names)
     # source columns take the same tests, at the scan
     reviews = ColumnRef("r", "reviews", "review")

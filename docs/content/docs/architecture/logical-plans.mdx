@@ -64,7 +64,7 @@ Nodes are frozen dataclasses. Rewrites use `with_children()`,
 
 | Node | Meaning |
 | --- | --- |
-| `Scan(provider, alias, column)` | Read a document column from a registered table. |
+| `Scan(provider, alias, column)` | Read a document column from a registered table. The column is a name or a `ColumnExpression` over one. |
 | `SemanticFilter(input, predicates)` | Evaluate model predicates over one table and keep passing rows. |
 | `Join(left, right, on)` | Form pairs from two inputs. Optional column equalities restrict the pairs. Without `on`, it forms every pair. |
 | `SemanticJoin(input, predicate, semantics, selectivity, anchor)` | Evaluate a model predicate over the pairs from a `Join`. The semantics are `full`, `exists`, or `anti`. |
@@ -86,6 +86,7 @@ A `Compare` tests a score returned by that call.
 | Expression | Value |
 | --- | --- |
 | `ColumnRef(alias, provider, column)` | A reference to a table column. |
+| `ColumnExpression(reference, path, function)` | A struct field under a column, a function of it, or both. It stands where a column does: as a prompt's document, a join key, or an `Apply` column. |
 | `ModelCall(prompt, kind, labels, descriptions)` | A model call. Its kind is `boolean` for `AI.IF`, `score` for `AI.SCORE`, or `label` for `AI.CLASSIFY`. |
 | `Compare(call, comparison, threshold)` | A TRUE or FALSE comparison of a model score with a threshold. |
 | `InList(column, values)` | A TRUE or FALSE test of whether a column value is in a list. |

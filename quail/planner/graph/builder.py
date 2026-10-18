@@ -81,14 +81,10 @@ def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
         if oriented is None:
             continue
         left, right, conditions = oriented
-        on = tuple(
-            (left_ref.column, right_ref.column)
-            for left_ref, right_ref in conditions
-        )
         nodes.append(HashJoin(
             node_id=f"hash_join:{left}-{right}",
             inputs=input_ports((by_alias[left], by_alias[right])),
-            left=left, right=right, on=on, written_position=position,
+            left=left, right=right, on=conditions, written_position=position,
             pair_fraction=pair_fractions.get(position, 1.0)))
     return nodes
 
@@ -533,9 +529,7 @@ class GraphBuilder:
                 node_id=apply_id,
                 inputs=input_ports((port,)),
                 function=apply.function, kind=apply.kind, ids=apply.ids,
-                columns=tuple((ref.alias, ref.column)
-                              for ref in apply.columns),
-                aliases=(alias,)))
+                columns=apply.columns, aliases=(alias,)))
             port = PortRef(apply_id, f"rows:{alias}")
         return port
 

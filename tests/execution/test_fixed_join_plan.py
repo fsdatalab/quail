@@ -11,7 +11,7 @@ from quail.api.execute import execute_query
 from quail.backends.quail.graph import execute_single_graph
 from quail.execution.metrics import NodeMetrics
 from quail.execution.types import PhysicalResponse
-from quail.logical.expressions import CompileError
+from quail.logical.expressions import CompileError, column_name
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -353,7 +353,9 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
             plan = query.plan()
             stage = plan.graph.nodes_by_type(AiJoin.type_name)[0]
             hash_join = plan.graph.node("hash_join:c-e")
-            assert hash_join.on == (("evidence_wiki_url", "id"),)
+            assert [(column_name(left), column_name(right))
+                    for left, right in hash_join.on] == [
+                        ("c.evidence_wiki_url", "e.id")]
             assert hash_join.pair_fraction == 3 / 9
             assert stage.pairs_from == "hash_join:c-e"
             result = execute_query(

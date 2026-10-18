@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from sqlglot import exp
 
 from quail.logical import ColumnRef, CompileError, RegularPredicate
-from quail.logical.expressions import SPAN_SUFFIX
+from quail.logical.expressions import SPAN_SUFFIX, ColumnExpression, column_reference
 
 _PLAIN_COMPARISONS = {
     exp.EQ: "=",
@@ -218,15 +218,10 @@ def bind_plain_test(b, test: PlainTest, tables=None) -> RegularPredicate:
         raise CompileError(
             f"{test.operand.sql()} reads a field of an AI.EXTRACT call "
             f"that SELECT does not return; name the call in SELECT")
-    parts = column_path(test.operand)
-    if len(parts) > 2:
-        raise CompileError(
-            f"{test.operand.sql()} reads a field under a column; only an "
-            f"AI.EXTRACT span named in SELECT has fields, such as "
-            f"lease{SPAN_SUFFIX}.end_date.start")
-    predicate = RegularPredicate(
-        b.resolve_column(test.operand, tables), test.comparison, test.value,
-        function=test.function)
+    expression = b.resolve_value(test.operand, tables, test.function)
+    path = expression.path if isinstance(expression, ColumnExpression) else ()
+    predicate = RegularPredicate(column_reference(expression), test.comparison,
+                                 test.value, path, test.function)
     predicate.validate()
     return predicate
 

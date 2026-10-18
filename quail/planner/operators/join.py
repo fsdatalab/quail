@@ -5,6 +5,7 @@ from quail.logical import (
     is_score,
     join_conditions,
 )
+from quail.logical.expressions import column_name
 from quail.logical.prompts import prompt_aliases
 from quail.physical import AiJoin, Foreign, PortRef
 from quail.physical.base import input_ports
@@ -12,6 +13,11 @@ from quail.planner.operators.common import question_tokens
 from quail.planner.operators.score import ScoreJoinCost, score_statistics
 from quail.planner.prompt_lowering import LoweredPrompt
 
+
+def _priced_key(condition) -> tuple:
+    """Return one equality as (left alias, left key, right alias, right key)."""
+    return (condition.left.alias, column_name(condition.left, qualified=False),
+            condition.right.alias, column_name(condition.right, qualified=False))
 
 def _join_aliases(join) -> list:
     """Return the join's table aliases in placeholder order."""
@@ -47,8 +53,7 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
                 selectivity=j.selectivity,
                 frame_tokens={left: head + middle, right: 0},
                 label_tokens={left: 0, right: 0}, tail_tokens=tail + canvas,
-                on=tuple((c.left.alias, c.left.column, c.right.alias,
-                          c.right.column) for c in conditions),
+                on=tuple(_priced_key(c) for c in conditions),
                 pair_fraction=fraction,
                 cost=ScoreJoinCost((left, right), cost, fraction)))
             continue
@@ -61,8 +66,7 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
             tail_tokens=question_tokens(lowered, canvas),
-            on=tuple((c.left.alias, c.left.column, c.right.alias,
-                      c.right.column) for c in conditions),
+            on=tuple(_priced_key(c) for c in conditions),
             pair_fraction=fraction))
     return out
 
@@ -101,9 +105,7 @@ def emit_join(
             inputs=input_ports(tuple(
                 port_by_alias[a] for a in apply.aliases)),
             function=apply.function, kind=apply.kind, ids="pairs",
-            columns=tuple((ref.alias, ref.column)
-                          for ref in apply.columns),
-            aliases=tuple(apply.aliases),
+            columns=apply.columns, aliases=tuple(apply.aliases),
             written_position=spec.written_position))
         pair_inputs.append(PortRef(apply_id, f"pairs:{spec.written_position}"))
         pairs_from = apply_id

@@ -17,6 +17,7 @@ from quail.cost.joins import longest_join_input, partner_stream_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan
 from quail.logical import oriented_join_conditions
+from quail.logical.expressions import column_name, column_reference, evaluate_column
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
@@ -50,6 +51,12 @@ EXTRACT = "AI.EXTRACT"
 LABEL_IN = "IN"
 ANSWER_TEST = "ANSWER TEST"
 
+
+
+def _key_values(stores, key):
+    """Return one join key's values from the alias's store."""
+    ref = column_reference(key)
+    return evaluate_column(key, stores[ref.alias].column(ref.column))
 
 class _EstimatePricing:
     """Price a table's steps as the estimate prices a question.
@@ -163,7 +170,8 @@ class Search:
             shared = (document_shared_tokens(store) if credit_shared
                       else [0] * len(tokens))
             self.aliases[scan_node.alias] = _AliasData(
-                column=f"{scan_node.provider}.{scan_node.column}",
+                column=f"{scan_node.provider}."
+                       f"{column_name(scan_node.column, qualified=False)}",
                 tokens=tokens,
                 shared=shared,
             )
@@ -184,14 +192,8 @@ class Search:
             if oriented is None:
                 continue
             left_alias, right_alias, conditions = oriented
-            left_keys = [
-                stores[left.alias].column(left.column)
-                for left, _ in conditions
-            ]
-            right_keys = [
-                stores[right.alias].column(right.column)
-                for _, right in conditions
-            ]
+            left_keys = [_key_values(stores, left) for left, _ in conditions]
+            right_keys = [_key_values(stores, right) for _, right in conditions]
             pairs = pair_table(left_alias, left_keys, right_alias, right_keys)
             self.allowed_pairs[position] = {
                 left_alias: partner_map(pairs, left_alias, right_alias),
