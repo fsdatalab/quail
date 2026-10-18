@@ -1,4 +1,5 @@
 from .base import ModelSpec
+from .prompts import TEXT_ANALYSIS_SYSTEM_PROMPT
 
 # Eight attention layers (2, 5, 9, 13, 17, 21, 24, 27); the other 22 are
 # short convolutions.
@@ -33,8 +34,9 @@ LFM2_2_6B_BF16 = ModelSpec(
         "full_attention" if layer in _ATTENTION_LAYERS else "short_conv"
         for layer in range(30)),
     # the chat template opens with the beginning-of-text token
-    turn_prefix="<|startoftext|><|im_start|>user\n",
+    turn_prefix=("<|startoftext|><|im_start|>system\n"
+                 f"{TEXT_ANALYSIS_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n"),
     bos_text="<|startoftext|>",
     turn_suffix="<|im_end|>\n<|im_start|>assistant\n",
-    prompt_format="lfm2-chat-v1",
+    prompt_format="lfm2-chat-text-analysis-v1",
 )

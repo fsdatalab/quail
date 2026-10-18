@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 from .base import ModelSpec
+from .prompts import QWEN3_PROMPT_FORMAT, QWEN3_TURN_PREFIX, QWEN3_TURN_SUFFIX
 
 # Every fourth layer is attention (layers 3, 7, ..., 31); the other 24
 # are Gated DeltaNet.
@@ -42,9 +43,9 @@ QWEN3_5_4B_BF16 = ModelSpec(
     conv_width=4,
     # the chat template's turn with thinking off; a raw prompt makes the
     # model open a <think> block, and no answer names a label
-    turn_prefix="<|im_start|>user\n",
-    turn_suffix="<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-    prompt_format="qwen3_5-chat-nonthinking-v1",
+    turn_prefix=QWEN3_TURN_PREFIX,
+    turn_suffix=QWEN3_TURN_SUFFIX,
+    prompt_format=QWEN3_PROMPT_FORMAT,
 )
 
 QWEN3_5_4B_FP8 = replace(

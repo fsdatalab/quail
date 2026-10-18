@@ -182,7 +182,8 @@ def test_lfm2_prompt_opens_with_the_beginning_of_text_token():
     assert shared_preamble(spec.turn_prefix).startswith(spec.bos_text)
     # vLLM adds the token itself, so the text it receives must not repeat it
     text = without_bos(shared_preamble(spec.turn_prefix), spec.bos_text)
-    assert text == "<|im_start|>user\n" + shared_preamble("")
+    assert text == ("<|im_start|>system\nYou are an expert at text analysis"
+                    "<|im_end|>\n<|im_start|>user\n" + shared_preamble(""))
     assert not text.startswith(spec.bos_text)
     assert without_bos("<|im_start|>user\n", "") == "<|im_start|>user\n"
 
