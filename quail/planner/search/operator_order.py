@@ -210,17 +210,3 @@ def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
         found = joinsearch.search_joins(
             *arguments, base_work=base_work, fixed_order=True, gpus=gpus)
     return list(found.seq)
-
-
-def resident_asks(step_orders: dict) -> frozenset:
-    """Return the aliases whose first ask reads KV a step before it left."""
-    resident = set()
-    for alias, steps in step_orders.items():
-        previous = None
-        for step in steps:
-            if step.kind == ASK:
-                if previous is not None and resident_after(previous, step):
-                    resident.add(alias)
-                break
-            previous = step
-    return frozenset(resident)

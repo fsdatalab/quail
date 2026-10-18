@@ -48,15 +48,12 @@ class PlanPricer:
         statistics: The plan's PlanStatistics.
         stage_works: Join written position -> the Work its stage does.
         expected_rows: alias -> documents expected after its filters.
-        resident_asks: Aliases whose first ask reads KV a step before
-            it left.
     """
 
     context: object
     statistics: object
     stage_works: dict
     expected_rows: dict
-    resident_asks: frozenset = frozenset()
 
     def __call__(self, graph: PhysicalGraph) -> tuple[float, dict]:
         """Price a graph: its seconds, and node id -> its explain entry.
@@ -78,17 +75,25 @@ class PlanPricer:
         anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
         last_filters = {node.alias: node.node_id for node in graph.nodes
                         if isinstance(node, AiFilter)}
-        priced_filters = set()
+        # alias -> the document head of the KV a finished pipeline kept
+        retained = {}
         out = {}
-        for node in graph.nodes:
+        for node in graph.topological_nodes():
             entry = {}
             resident = (node.node_id in pipelines
                         and pipelines[node.node_id][0] is not node)
+            if node.node_id in pipelines and not resident:
+                (alias,) = node.document_aliases
+                resident = retained.get(alias) == node.document_head
+                members = pipelines[node.node_id]
+                if any(getattr(member, "keep_kv", False) for member in members):
+                    retained[alias] = node.document_head
+                else:
+                    retained.pop(alias, None)
             if isinstance(node, AiFilter):
-                price = NodePrice(work=self._filter_work(
-                    node, resident or node.alias in priced_filters
-                    or node.alias in self.resident_asks))
-                priced_filters.add(node.alias)
+                price = NodePrice(work=self._filter_work(node, resident) * (
+                    1 / budgets.parallel_copies(self.context.gpus,
+                                                node.expected_rows)))
                 entry["seconds"] = self._seconds(price.work)
                 if node.alias in anchored and last_filters[node.alias] == node.node_id:
                     entry.update(self._release_recompute(node))
@@ -121,6 +126,8 @@ class PlanPricer:
         if shared is None:
             return scan(mean_prefix, question, window=window) * node.expected_rows
         lengths = self.context.document_tokens[node.alias]
+        if not len(lengths):
+            return Work()
         work = Work()
         for length, shared in zip(lengths, shared):
             prefix = node.preamble_tokens + int(length)

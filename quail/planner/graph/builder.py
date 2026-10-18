@@ -48,7 +48,7 @@ from quail.planner.operators.score import (
 )
 from quail.planner.optimizer.context import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal
-from quail.planner.search.operator_order import choose_operator_order, resident_asks
+from quail.planner.search.operator_order import choose_operator_order
 from quail.planner.search.statistics import filter_stop_keys
 from quail.planner.search.table_steps import ASK, CLASSIFY, EXTRACT, resident_after
 from quail.planner.statistics.tables import summarize_alias
@@ -487,8 +487,7 @@ class GraphBuilder:
                            self.operators.joins[step.written_position].predicate)}
         pricer = PlanPricer(
             context=self.context, statistics=statistics, stage_works=stage_works,
-            expected_rows=self.operator_order.expected_rows,
-            resident_asks=resident_asks(self.operator_order.step_orders))
+            expected_rows=self.operator_order.expected_rows)
         plan = PhysicalPlan(
             model=self.model.name, device=self.device.name, gpus=self.gpus,
             backend="quail", nodes=tuple(self.nodes),

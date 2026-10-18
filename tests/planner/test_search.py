@@ -245,3 +245,34 @@ def test_a_filter_above_the_joins_thins_nothing_before_them(query):
         lifted = bool(classified_above_joins(logical.root))
         expected[lifted] = expected_rows_after_filters(logical, statistics)
     assert expected == {False: {"d": 3.0, "q": 1.0}, True: {"d": 10.0, "q": 1.0}}
+
+
+@pytest.mark.parametrize("retain", [False, True])
+def test_a_filter_after_a_barrier_is_priced_over_the_kv_the_sequence_kept(
+        query, retain):
+    from quail.physical import AiFilter, Barrier, PortRef
+    from quail.physical.base import input_ports
+
+    built = (query.session.docs("documents").alias("d")
+             .ai_filter(quail.prompt("First? {0}", quail.col("d.text")),
+                        selectivity=1.0)
+             .ai_filter(quail.prompt("Second? {0}", quail.col("d.text")),
+                        selectivity=1.0)
+             .select("d.id", order="as_written"))
+    plan = built.plan()
+    scan, first, second, project = plan.nodes
+    assert isinstance(second, AiFilter)
+    # the second filter starts its own pipeline after a barrier; it
+    # reads the first one's KV only when that pipeline kept it
+    barrier = Barrier(node_id="barrier:d", next_anchor="d", aliases=("d",),
+                      inputs=input_ports((PortRef(first.node_id, "rows:d"),)))
+    graph = PhysicalGraph((
+        scan, replace(first, keep_kv=retain), barrier,
+        replace(second, inputs=input_ports((PortRef("barrier:d", "rows:d"),))),
+        project), plan.root)
+    work = plan.estimator._priced(graph)[second.node_id][0].work
+    prefix = (second.preamble_tokens
+              + plan.estimator.statistics.stats["d"].mean_document_tokens)
+    assert first.expected_rows == second.expected_rows == 20
+    assert work.tokens == pytest.approx(
+        20 * (second.question_tokens + (0 if retain else prefix)))
