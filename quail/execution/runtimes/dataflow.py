@@ -99,6 +99,12 @@ def alias_table(alias: str, ids, columns, names):
     return pa.table(arrays)
 
 
+def _key_column(alias, columns, name):
+    if columns is None or name not in columns.column_names:
+        raise KeyError(f"column {alias}.{name} is not among the request's relations")
+    return columns.column(name)
+
+
 def foreign_call(node, values, context):
     """Bind a user function to its input columns and collect call metrics.
 
@@ -269,10 +275,11 @@ class HashJoinRuntime:
                              (node.right, [right for _, right in node.on])):
             port = next(port for port in node.inputs
                         if port.source.port == f"rows:{alias}")
-            table = alias_table(alias, inputs[port.name],
-                                context.sources.get(columns_key(alias)), names)
-            sides[alias] = (table.column(alias),
-                            [table.column(name) for name in names])
+            ids = document_ids(inputs[port.name])
+            columns = context.sources.get(columns_key(alias))
+            # a key column may carry the alias's name: the ids stay apart
+            sides[alias] = (ids, [_key_column(alias, columns, name).take(ids)
+                                  for name in names])
         positions = pair_table(node.left, sides[node.left][1],
                                node.right, sides[node.right][1])
         # pair_table pairs row positions; map them back to the ids read

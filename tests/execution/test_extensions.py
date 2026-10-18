@@ -190,3 +190,22 @@ def test_node_registration_validation_and_execution():
         )
     assert CustomInput.type_name not in registry.codecs
     assert CustomInput.runtime_key not in registry.runtimes
+
+
+def test_a_projection_returning_no_rows_reports_none():
+    import pyarrow as pa
+
+    from quail.execution.result import QueryResult
+    from quail.physical import Project
+    from quail.physical.base import input_ports
+
+    graph = PhysicalGraph((
+        Scan(node_id="scan", alias="d", input_id="d", num_documents=2),
+        Project(node_id="project", inputs=input_ports((PortRef("scan", "rows:d"),)),
+                columns=("d.id",))), PortRef("project", "rows"))
+    empty = QueryResult.from_table(pa.table({"d.id": pa.array([], pa.int64())}))
+    report = GenericRunner().run(graph, ExecutionContext(
+        runtimes=built_in_registry().runtimes, sources={"d": [0, 1]},
+        project=lambda *_: empty))
+    metrics = report.nodes["project"].metrics
+    assert (metrics.input_rows, metrics.output_rows) == (2, 0)

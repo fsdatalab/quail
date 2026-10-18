@@ -673,7 +673,7 @@ def test_foreign_node_placement_and_pipelines():
             "ai_filter:c",)
         assert barrier.graph.node("apply:keep_even").kind == "barrier"
         request = _apply_query(session, "barrier")._prepare_physical()
-        assert request.column_tables()["c"].column_names == ["c", "url"]
+        assert request.column_tables()["c"].column_names == ["url"]
         assert request.column_tables()["c"].column("url").to_pylist()[:2] == [
             "u0", "u1"]
 

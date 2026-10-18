@@ -80,8 +80,9 @@ class ProjectRuntime:
         # a projection keeps its rows; a lazy result's count is the
         # input's until the result runs
         rows = _num_rows(inputs[first.name]) or 0
+        output_rows = _num_rows(value)
         return NodeResult({"rows": value}, NodeMetrics(
-            input_rows=rows, output_rows=_num_rows(value) or rows))
+            input_rows=rows, output_rows=rows if output_rows is None else output_rows))
 
 
 class LimitRuntime:

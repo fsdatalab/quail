@@ -92,6 +92,30 @@ def test_barrier_survivors_are_the_ids_of_a_complete_join(shape):
                 for alias in expected} == expected, ordered
 
 
+@pytest.mark.parametrize("aliases", [("key0", "key1"), ("left", "right"),
+                                     ("right", "left")])
+def test_hash_join_keeps_ids_apart_from_a_key_column_named_like_its_alias(aliases):
+    from types import SimpleNamespace
+
+    from quail.catalog.pairs import columns_key
+    from quail.execution.runtimes.dataflow import HashJoinRuntime
+    from quail.physical import HashJoin
+    from quail.physical.base import input_ports
+
+    left, right = aliases
+    node = HashJoin(
+        node_id="join", left=left, right=right, written_position=0,
+        inputs=input_ports((PortRef("l", f"rows:{left}"),
+                            PortRef("r", f"rows:{right}"))),
+        on=((left, right),))
+    context = SimpleNamespace(sources={
+        columns_key(left): pa.table({left: [30, 10, 20]}),
+        columns_key(right): pa.table({right: [20, 40, 10]})})
+    result = HashJoinRuntime().execute(
+        node, {"input:0": pa.array([1, 2]), "input:1": pa.array([0, 2])}, context)
+    assert result.outputs["pairs:0"].to_pydict() == {left: [1, 2], right: [2, 0]}
+
+
 @dataclass(frozen=True)
 class FirstDocuments(PhysicalNode):
     alias: str = ""

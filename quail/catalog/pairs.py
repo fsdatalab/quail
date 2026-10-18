@@ -46,7 +46,10 @@ def pair_table(left_alias: str, left_keys, right_alias: str,
                          "and at least one equality")
     num_left = len(left_keys[0])
     num_right = len(right_keys[0])
+    # the key columns sit beside the index columns, so no key may take an alias's name
     names = [f"key{index}" for index in range(len(left_keys))]
+    while set(names) & {left_alias, right_alias}:
+        names = ["_" + name for name in names]
     left_columns = {left_alias: pa.array(range(num_left), type=pa.int32())}
     right_columns = {right_alias: pa.array(range(num_right), type=pa.int32())}
     for name, left, right in zip(names, left_keys, right_keys):

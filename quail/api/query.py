@@ -420,10 +420,8 @@ class Query:
         tables = {}
         for alias, columns in needed.items():
             store = self._token_inputs[alias]
-            arrays = {alias: pa.array(range(len(store.lengths)), pa.int32())}
-            for name in columns:
-                arrays[name] = store.column(name)
-            tables[columns_key(alias)] = pa.table(arrays)
+            tables[columns_key(alias)] = pa.table(
+                {name: store.column(name) for name in columns})
         return tables
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:

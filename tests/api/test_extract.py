@@ -3,6 +3,7 @@
 from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -873,3 +874,5 @@ def test_rows_carry_their_ids_apart_from_their_values():
     assert joined.column_names == ["kind", "lease.ends", "lease.ends_span"]
     assert joined.column("lease.ends").to_pylist() == [None, "March 3, 2027"]
     assert joined.to_pydict()["c"] == [2, 0]
+    for none in ([], (), np.array([])):
+        assert joined.take(none).num_rows == 0
