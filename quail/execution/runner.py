@@ -123,8 +123,10 @@ class GenericRunner:
                     for member in pipeline}
                 started = time.perf_counter()
                 results = context.run_pipeline(pipeline, inputs, context)
-                for member in pipeline:
-                    record(member, results[member.node_id], started)
+                # a pipeline's wall is charged once, to its first member
+                for index, member in enumerate(pipeline):
+                    record(member, results[member.node_id],
+                           started if index == 0 else None)
                 continue
             supplied = {
                 output.name: values[(node.node_id, output.name)]

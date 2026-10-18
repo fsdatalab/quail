@@ -156,19 +156,34 @@ def filter_stop_keys(plan: LogicalPlan) -> dict:
     return keys
 
 
-def expected_rows_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
-    """Return the expected live documents per alias after its filters run.
+def filters_before_joins(plan: LogicalPlan) -> list:
+    """Return the Filter and SemanticFilter nodes that run before any join.
 
-    A filter above a join thins nothing before the joins: its table's
-    documents all reach the first join.
+    A filter above a join thins nothing before the joins, and computes
+    no KV its join could reuse.
     """
+    return [node for node in plan.walk()
+            if isinstance(node, (Filter, SemanticFilter))
+            and not any(isinstance(below, SemanticJoin)
+                        for below in LogicalPlan(node.input).walk())]
+
+
+def filtered_before_joins(plan: LogicalPlan) -> set:
+    """Return the aliases whose documents a filter before the joins computed."""
+    aliases = set()
+    for node in filters_before_joins(plan):
+        if isinstance(node, Filter):
+            aliases.add(node.condition.column.alias)
+        else:
+            aliases.update(model_call(predicate.expression).aliases()[0]
+                           for predicate in node.predicates)
+    return aliases
+
+
+def expected_rows_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
+    """Return the expected live documents per alias after its filters run."""
     expected_rows = {a: float(st.num_documents) for a, st in statistics.stats.items()}
-    for node in plan.walk():
-        if not isinstance(node, (Filter, SemanticFilter)):
-            continue
-        if any(isinstance(below, SemanticJoin)
-               for below in LogicalPlan(node.input).walk()):
-            continue
+    for node in filters_before_joins(plan):
         if isinstance(node, Filter):
             alias = node.condition.column.alias
             expected_rows[alias] *= effective_selectivity(node.selectivity)

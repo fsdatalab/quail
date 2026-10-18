@@ -27,7 +27,7 @@ from quail.physical import (
 )
 from quail.physical.pipelines import build_pipelines
 from quail.planner.operators.classify import classify_scoring
-from quail.planner.statistics.prefixes import document_shared_tokens, page_tree
+from quail.planner.statistics.prefixes import page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
@@ -133,7 +133,9 @@ class PlanPricer:
         work = Work()
         for length, shared in zip(lengths, shared):
             prefix = node.preamble_tokens + int(length)
-            work += (ask(shared, prefix + question - shared, window=window)
+            # a borrowed prefix includes the prompt head the documents share
+            borrowed = shared + node.preamble_tokens if shared else 0
+            work += (ask(borrowed, prefix + question - borrowed, window=window)
                      if shared else scan(prefix, question, window=window))
         return work * (node.expected_rows / len(lengths))
 
@@ -193,8 +195,7 @@ class PlanPricer:
                     spec, resident).seconds
 
             whole = seconds(())
-            return (seconds(document_shared_tokens(self._store(alias))) / whole
-                    if whole else 1.0)
+            return seconds(shared) / whole if whole else 1.0
         # a score's time is taken as proportional to the tokens it
         # computes, its documents borrowing the table's share of theirs
         summary = summarize_alias(context.document_tokens[alias],

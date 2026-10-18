@@ -71,6 +71,10 @@ class Apply:
             )
         for column in self.columns:
             column.validate()
+            if column_name(column, qualified=False) in self.aliases:
+                raise CompileError(
+                    f"apply {self.function!r} reads {column_name(column)}, named "
+                    f"like the table alias the function's ids column takes")
             if column.alias not in self.aliases:
                 raise CompileError(
                     f"apply {self.function!r} reads {column_name(column)} "

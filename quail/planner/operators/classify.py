@@ -549,6 +549,7 @@ def emit_joined_classify(builder, join_ids) -> list:
         table = classify_builder(builder.context, anchor, "quail")
         join = builder.operators.joins[stage.written_position]
         pairs = (effective_selectivity(join.selectivity)
+                 * (builder.pair_fractions or {}).get(stage.written_position, 1.0)
                  * builder.operator_order.expected_rows[anchor]
                  * builder.operator_order.expected_rows[partner])
         spec, _ = table.classify_joined(

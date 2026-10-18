@@ -408,10 +408,11 @@ class GraphBuilder:
         for alias in sorted(self.after_joins | self.extract_after):
             met = sum(
                 effective_selectivity(join.selectivity)
+                * (self.pair_fractions or {}).get(position, 1.0)
                 * sum(self.operator_order.expected_rows[argument.alias]
                       for argument in join.prompt.args
                       if argument.alias != alias)
-                for join in self.operators.joins
+                for position, join in enumerate(self.operators.joins)
                 if alias in {argument.alias for argument in join.prompt.args})
             kinds = set()
             if alias in self.after_joins:
@@ -477,7 +478,7 @@ class GraphBuilder:
         """Build the plan and bind its pricer."""
         statistics = self.operator_order.statistics
         # a score join's work is in its AiScore's estimate
-        stage_works = {step.written_position: step.work
+        stage_works = {step.written_position: step.copy_work(self.gpus)
                        for step in self.operator_order.join_steps
                        if not is_score(
                            self.operators.joins[step.written_position].predicate)}

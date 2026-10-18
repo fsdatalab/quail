@@ -111,7 +111,9 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     if resident:
         work = ask(prefix, tail_tokens, window=window)
     elif shared:
-        work = ask(shared, prefix + tail_tokens - shared, window=window)
+        # a borrowed prefix includes the prompt head the documents share
+        borrowed = shared + head_tokens
+        work = ask(borrowed, prefix + tail_tokens - borrowed, window=window)
     else:
         work = scan(prefix, tail_tokens, window=window)
     context = prefix + tail_tokens

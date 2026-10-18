@@ -497,20 +497,6 @@ class JoinAdmission:
         cum = self._cum_of(a, j)
         return cum[i + 1] - cum[i]
 
-    def admit(self, prefix_tokens, resident_pages=None, partners=None):
-        """Queue one more anchor behind the pending ones; returns its index.
-
-        resident_pages says the anchor's prefix KV is already in the
-        arena on that many pages, so it packs no prefix tokens.
-        partners is the anchor's per-stage partner index lists, as in
-        anchor_partners.
-        """
-        a = self._register(prefix_tokens, resident_pages, partners)
-        self.borrowing.add()
-        if self._stage[a] == -1:
-            self.pending.append(a)
-        return a
-
     def take_settled(self):
         """Remove and return documents settled without a forward pass.
 

@@ -183,8 +183,10 @@ class JoinPart(ExecutionPart):
         self._results = results
         self.result_value = results[node.node_id]
         if self.context is not None:
-            last = nodes[-1]
-            self.context.model_result(last, results[last.node_id], self.context)
+            # the first predicate's hits count the anchors that reached
+            # the group on resident KV
+            first = nodes[0]
+            self.context.model_result(first, results[first.node_id], self.context)
 
     def results(self) -> dict:
         """Return results for every join predicate in the group."""

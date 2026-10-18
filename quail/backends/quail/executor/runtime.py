@@ -89,8 +89,6 @@ class QuailModelExecution:
             # reranker readout, not the document scheduler
             execution = self._reranker_execution(inputs["documents"])
             self.query.gpu_timing = bool(inputs.get("gpu_timing", False))
-            if "score_rows" in inputs:
-                return execution.execute_rows(node, inputs["score_rows"])
             return execution.execute(node, inputs["score_inputs"])
         raise TypeError(
             f"Quail cannot execute physical node {node.type_name!r}")

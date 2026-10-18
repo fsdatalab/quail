@@ -232,8 +232,8 @@ class Server:
         if hooks is not None and hooks.tokenizer is not None:
             return hooks.tokenizer
         if engine.model not in self._tokenizers:
-            session = Session(engine, registry=self.registry)
-            self._tokenizers[engine.model] = session.tokenizer
+            with Session(engine, registry=self.registry) as session:
+                self._tokenizers[engine.model] = session.tokenizer
         return self._tokenizers[engine.model]
 
     def compile(self, spec: dict, engine: EngineConfig, inputs: dict,
@@ -412,6 +412,22 @@ class _TokenMiddleware:
         await self.app(scope, receive, send)
 
 
+def _number(request, name: str, default, kind=int):
+    """Return a numeric query parameter, or raise a 400 for a malformed one.
+
+    Raises:
+        InvalidRequestError: The parameter is not a number of the kind.
+    """
+    value = request.query_params.get(name)
+    if value is None:
+        return default
+    try:
+        return kind(value)
+    except ValueError as error:
+        raise InvalidRequestError(
+            f"{name} must be a {kind.__name__}, got {value!r}") from error
+
+
 def _error(error: Exception, status: int | None = None) -> JSONResponse:
     code = status or getattr(error, "status", 500)
     return JSONResponse(
@@ -468,8 +484,11 @@ def create_app(settings: ServerSettings) -> Starlette:
 
     async def list_queries(request):
         requested_limit = request.query_params.get("limit", "50")
-        limit = (None if requested_limit == "all"
-                 else min(int(requested_limit), 500))
+        try:
+            limit = (None if requested_limit == "all"
+                     else min(_number(request, "limit", 50), 500))
+        except ServerError as error:
+            return _error(error)
         session_id = request.query_params.get("session_id")
         items = [encode_fields(status) for status in await run_in_threadpool(
             server.store.list_recent, limit, session_id)]
@@ -477,11 +496,12 @@ def create_app(settings: ServerSettings) -> Starlette:
 
     async def get_status(request):
         query_id = request.path_params["query_id"]
-        after = request.query_params.get("after")
-        wait = min(float(request.query_params.get("wait", "0")), MAX_WAIT_S)
         try:
+            after = (None if request.query_params.get("after") is None
+                     else _number(request, "after", 0))
+            wait = min(_number(request, "wait", 0.0, float), MAX_WAIT_S)
             if after is not None and wait > 0:
-                status = await server.wait_status(query_id, int(after), wait)
+                status = await server.wait_status(query_id, after, wait)
             else:
                 status = await run_in_threadpool(server.store.get, query_id)
         except ServerError as error:
@@ -558,9 +578,9 @@ def create_app(settings: ServerSettings) -> Starlette:
 
     async def saved_answers(request):
         query_id = request.path_params["query_id"]
-        after = max(int(request.query_params.get("after", "0")), 0)
-        limit = min(int(request.query_params.get("limit", "1000")), 10_000)
         try:
+            after = max(_number(request, "after", 0), 0)
+            limit = min(_number(request, "limit", 1000), 10_000)
             status = server.store.get(query_id)
         except ServerError as error:
             return _error(error)
@@ -569,8 +589,8 @@ def create_app(settings: ServerSettings) -> Starlette:
 
     async def rows(request):
         query_id = request.path_params["query_id"]
-        limit = min(int(request.query_params.get("limit", "20")), 1000)
         try:
+            limit = min(_number(request, "limit", 20), 1000)
             status = server.store.get(query_id)
             path = server.result_file(status, RESULT_FILE)
         except ServerError as error:

@@ -177,6 +177,12 @@ class RequestBackend:
             return SupportResult.reject(
                 f"the {label} request backends use one model copy on one GPU"
             )
+        if model.canvas_tokens == 1 and not getattr(self.engine, "reads_logprobs",
+                                                     False):
+            return SupportResult.reject(
+                f"{label} does not support model {model.name!r}: its answer is "
+                f"read from the first canvas row's logprobs, which {label} "
+                f"does not return")
         return SupportResult.accept()
 
     def plan(self, region, context):

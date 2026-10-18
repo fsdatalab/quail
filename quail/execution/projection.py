@@ -77,8 +77,7 @@ def projection_for(logical, token_inputs, documents):
                     raise CompileError(
                         f"label column {name!r} belongs to the joined "
                         f"rows of {aliases}, not all in the result")
-                order = (None if call is None
-                         else pa.array(call.labels, pa.string()))
+                order = pa.array(call.labels, pa.string())
                 keys = pair_keys(table.column(aliases[0]),
                                   table.column(aliases[1]))
                 declaration = acero.Declaration(
@@ -88,10 +87,7 @@ def projection_for(logical, token_inputs, documents):
                     inputs=[declaration])
                 projection.append((tuple(aliases), (keys, table, order)))
                 fields.append(pa.field(
-                    name,
-                    pa.string() if order is None
-                    else pa.dictionary(pa.int32(), pa.string()),
-                    nullable=True,
+                    name, pa.dictionary(pa.int32(), pa.string()), nullable=True,
                     metadata={b"quail.alias": aliases[0].encode("utf-8"),
                               b"quail.label": name.encode("utf-8")}))
                 continue

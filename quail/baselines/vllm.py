@@ -215,6 +215,8 @@ class VLLMEngine:
     runtime_package = "vllm==0.26.0"
     # a request can decode an answer as text
     scores_labels = True
+    # a request returns the logprobs a canvas model's answer is read from
+    reads_logprobs = True
     # a decision model runs on the pooling runner
     roles = frozenset({"generative", "decision"})
 

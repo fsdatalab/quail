@@ -488,13 +488,13 @@ class GpuWorkers:
         """Send one round to the children and collect their results."""
         for (_, conn), sub in zip(self.children, subs):
             conn.send((kind, sub))
-        outs = []
-        for (_, conn), _sub in zip(self.children, subs):
-            status, data = conn.recv()
+        # every reply is read before an error is raised, so the pipes
+        # stay in step with the children for the next round
+        replies = [conn.recv() for (_, conn), _sub in zip(self.children, subs)]
+        for status, data in replies:
             if status != "ok":
                 raise RuntimeError(f"GPU child failed:\n{data}")
-            outs.append(data)
-        return outs
+        return [data for _, data in replies]
 
     def close(self, *, terminate=False):
         """Stop every child and close its pipe."""

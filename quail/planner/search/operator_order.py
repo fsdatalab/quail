@@ -15,6 +15,7 @@ from quail.planner.search.statistics import (
     PlanStatistics,
     cached_statistics,
     expected_rows_after_filters,
+    filtered_before_joins,
 )
 from quail.planner.search.table_steps import (
     ASK,
@@ -69,7 +70,7 @@ def choose_operator_order(plan, operators, model, device, document_tokens, order
                                 device=device, rule=rule,
                                 gpus=1 if context is None else context.gpus)]
     _, join_steps = joinsearch.walk(
-        seq, live0, statistics.lengths, set(operators.all_filters()), pre,
+        seq, live0, statistics.lengths, filtered_before_joins(plan), pre,
         model, device)
     anchors = {spec.written_position: anchor for spec, anchor in seq}
     for s in scans:
@@ -197,10 +198,12 @@ def choose_join_sequence(plan: LogicalPlan, statistics: PlanStatistics,
     """
     if not plan.operators().joins:
         return []
+    # the filters' work in one copy's units, as the join steps are priced
     base_work = sum(
-        filter_works(plan, statistics, model, step_orders).values(), Work())
+        filter_works(plan, statistics, model, step_orders).values(), Work()) * (
+        1 / gpus)
     expected_rows = expected_rows_after_filters(plan, statistics)
-    filtered = set(plan.operators().all_filters())
+    filtered = filtered_before_joins(plan)
     arguments = (statistics.specs, expected_rows, statistics.lengths, filtered,
                  statistics.pre, statistics.chunk, model, device)
     found = joinsearch.search_joins(

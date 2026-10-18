@@ -345,8 +345,8 @@ class TokenStoreWriter(_StoreWriter):
         super().__init__(path, schema)
 
     def write_batch(self, batch: pa.RecordBatch) -> None:
-        """Tokenize the document column of one source batch."""
-        texts = evaluate_expression(self._document_column, batch)
+        """Tokenize the document column of one source batch; a null is empty."""
+        texts = pc.fill_null(evaluate_expression(self._document_column, batch), "")
         offsets = None
         batch_arrow = getattr(self._tokenizer, "batch_arrow", None)
         if self._existing_tokens is not None:
@@ -358,7 +358,7 @@ class TokenStoreWriter(_StoreWriter):
             self._row += len(texts)
         elif batch_arrow is None:
             tokens = pa.array(
-                [self._tokenizer(text.as_py()) for text in texts],
+                [self._tokenizer(text) for text in texts.to_pylist()],
                 type=self._token_list_type)
         else:
             tokens = batch_arrow(texts).cast(self._token_list_type)

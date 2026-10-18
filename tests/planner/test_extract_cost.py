@@ -72,9 +72,10 @@ def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     resident, _, _ = _document(100, resident=True)
     assert resident == ask(HEAD + 100, TAIL) + answer
     assert resident.tokens < work.tokens
+    # a borrowed prefix includes the prompt head
     shared, _, _ = _document(100, shared=80)
-    assert shared == ask(80, HEAD + 100 + TAIL - 80) + answer
-    assert shared.tokens == pytest.approx(work.tokens - 80)
+    assert shared == ask(HEAD + 80, 100 + TAIL - 80) + answer
+    assert shared.tokens == pytest.approx(work.tokens - 80 - HEAD)
     assert _document(100, resident=True, shared=80)[0] == resident
 
 

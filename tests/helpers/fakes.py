@@ -157,7 +157,7 @@ def fake_torch():
             Event=lambda **kw: SimpleNamespace(
                 record=lambda: None, elapsed_time=lambda other: 2.0),
             synchronize=lambda: None,
-            max_memory_allocated=lambda: 0))
+            max_memory_allocated=lambda: 0, reset_peak_memory_stats=lambda: None))
 
 
 def fake_pack(torch, arena, specs, **kw):

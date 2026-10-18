@@ -85,6 +85,8 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
+    # the peak memory reported is this query's, not the process's
+    state["gpu"].torch.cuda.reset_peak_memory_stats()
     retention = payload.get("retention", {})
     apply_retention(arena, retention, retention.get("initial", {}))
     documents = state["documents"]
