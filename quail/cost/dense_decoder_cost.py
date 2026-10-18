@@ -157,6 +157,11 @@ def dense_decoder_components(work: Work, model: ModelSpec,
             precision=model.attention_precision,
         ),
     )
+    if model.experts:
+        router = model.layers * model.hidden * model.experts
+        components += (CostComponent(
+            name="router", flops=2.0 * router * work.tokens,
+            bytes_moved=2 * router * passes, precision="bf16"),)
     if separate_gdn:
         precision = model.gdn_weight_precision
         components += (CostComponent(

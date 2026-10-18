@@ -18,6 +18,7 @@ CUDA_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 # every kernel cache under one mount, so a volume keeps them warm
 CACHE_ENV = {
     "QUAIL_CACHE_DIR": "/root/.cache/kernels",
+    "FLASHINFER_WORKSPACE_BASE": "/root/.cache/kernels",
     "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
     "VLLM_LOGGING_LEVEL": "WARNING",
     "VLLM_USE_FLASHINFER_SAMPLER": "0",

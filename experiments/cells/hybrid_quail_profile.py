@@ -91,7 +91,7 @@ def profile(model: str, backend: str = "triton") -> dict:
 
     from quail.backends.quail.executor import gdn
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.worker import checkpoint_arena_args
@@ -107,6 +107,7 @@ def profile(model: str, backend: str = "triton") -> dict:
     loaded = load_model(spec.hf_name, spec.revision or None,
                         answer_token_ids=true_ids | false_ids,
                         max_batched_tokens=budget,
+                        moe_backend=spec.moe_backend,
                         text_only=spec.vision_tower)
     full_pages, sliding = budgets.arena_pages(
         spec, H100_SXM, budget, DOCUMENT_TOKENS)
@@ -139,7 +140,8 @@ def profile(model: str, backend: str = "triton") -> dict:
     import quail.backends.quail.executor.models.qwen3_5 as pipeline_module
     pipeline_module.gdn_core = timed("gdn_core", pipeline_module.gdn_core)
     pipeline._attention = timed("attention_layer", pipeline._attention)
-    pipeline._mlp = timed("mlp", pipeline._mlp)
+    pipeline.feed_forwards = tuple(
+        timed("mlp", forward) for forward in pipeline.feed_forwards)
     # the prefix phase starts from zero state; a suffix phase reads a slot
     current = {"phase": ""}
     phase_tokens = defaultdict(int)

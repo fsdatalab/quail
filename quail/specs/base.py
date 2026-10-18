@@ -52,13 +52,13 @@ class AnswerCanvas:
 @dataclass(frozen=True)
 class ModelSpec:
     name: str
-    params: float        # P: dense parameter count; 2P FLOPs per token
+    params: float        # active projection parameters per token
     layers: int          # L
     hidden: int          # h
     n_q: int             # query heads
     n_kv: int            # KV heads
     d_head: int          # head dim
-    ffn_width: int       # widest projection's output columns
+    ffn_width: int       # dense or shared gate_up output columns
     #                      (gate_up: 2 x intermediate at Qwen3)
     w_bytes: float       # weight bytes per param (fp8 = 1)
     hf_name: str = ""    # the checkpoint (weights + tokenizer)
@@ -237,8 +237,13 @@ class ModelSpec:
     @property
     def widest_projection(self) -> int:
         """Output columns of the widest dense projection in any layer."""
-        return max(self.ffn_width, max(
-            (self.n_q + 2 * n_kv) * d_head for n_kv, d_head in self.kv_shapes))
+        query_width = 2 if self.attn_output_gate else 1
+        attention = max(
+            (query_width * self.n_q + 2 * n_kv) * head
+            for n_kv, head in self.kv_shapes)
+        gdn = (2 * self.gdn_key_heads * self.gdn_key_dim
+               + 2 * self.gdn_value_heads * self.gdn_value_dim)
+        return max(self.ffn_width, attention, gdn)
 
     @property
     def kappa(self) -> float:
@@ -302,8 +307,16 @@ class ModelSpec:
 
     @property
     def act_per_token(self) -> float:
-        """Peak activation bytes per batched token."""
-        return ACT_BYTES_PER_HIDDEN * self.hidden
+        """Reserved activation bytes per batched token."""
+        dense = ACT_BYTES_PER_HIDDEN * self.hidden
+        # Triton experts use two BF16 workspaces, plus activation quantization
+        # and routing buffers. They are reused across layers.
+        expert = 2 * self.experts_active * (
+            max(self.hidden, self.expert_intermediate)
+            + max(self.hidden, 2 * self.expert_intermediate)
+            + self.expert_intermediate)
+        routing = 4 * self.experts + 16 * self.experts_active
+        return dense + expert + routing
 
     @property
     def intermediate(self) -> int:

@@ -113,6 +113,8 @@ def reference(model: str) -> dict:
     """Stock vLLM's TRUE minus FALSE logprob for each sequence."""
     import os
 
+    os.environ["VLLM_DEEP_GEMM_WARMUP"] = "skip"
+
     from transformers import AutoTokenizer
 
     from quail.baselines.vllm import VLLMEngine
@@ -151,7 +153,8 @@ def reference(model: str) -> dict:
         best_false = max(logprobs[i].logprob for i in false_ids
                          if i in logprobs)
         differences.append(best_true - best_false)
-    record = {"model": model, "tokens": [len(d) + len(q) for d, q in pairs],
+    record = {"model": model, "deep_gemm_warmup": "skip",
+              "tokens": [len(d) + len(q) for d, q in pairs],
               "difference": differences[:SEQUENCES],
               "difference_second": differences[SEQUENCES:],
               "true_ids": sorted(true_ids),
@@ -190,7 +193,9 @@ def quail(model: str) -> dict:
     allowed = sorted(set(ref["true_ids"]) | set(ref["false_ids"]))
     loaded = load_model(spec.hf_name, spec.revision or None,
                         answer_token_ids=allowed, max_batched_tokens=BUDGET,
+                        moe_backend=spec.moe_backend,
                         text_only=spec.vision_tower)
+    model_memory_bytes = torch.cuda.memory_allocated()
     full_pages, sliding = budgets.arena_pages(spec, H100_SXM, BUDGET)
     arena = KVArena(
         n_layers=spec.layers, n_pages=full_pages,
@@ -215,9 +220,14 @@ def quail(model: str) -> dict:
             self.differences.extend((true - false).float().tolist())
             return super().submit(normed)
 
-    record = {"model": model, "slots": arena.n_state_slots,
+    record = {"model": model, "model_memory_bytes": model_memory_bytes,
+              "slots": arena.n_state_slots,
               "pages": full_pages, "alone": [], "batched": [],
               "alone_bits": [], "batched_bits": []}
+    if spec.experts:
+        expert = pipeline.layers[0].mlp.experts.routed_experts
+        record["expert_kernel"] = type(
+            expert.quant_method.moe_kernel.fused_experts).__name__
     with torch.inference_mode():
         for document, question in pairs:
             answers = Recording()

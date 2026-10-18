@@ -1,8 +1,8 @@
-"""Qwen3.5 forward pass over vLLM's loaded Qwen3.5 text model.
+"""Qwen hybrid forward pass over vLLM's loaded dense or MoE text model.
 
 Layers alternate three Gated DeltaNet layers and one gated attention
 layer. Each is input RMSNorm, token mixer, post-attention RMSNorm,
-gated MLP. Both RMSNorms are Gemma-style (weight + 1).
+dense or expert feed-forward block. Both RMSNorms are Gemma-style (weight + 1).
 
 A Gated DeltaNet mixer projects to q, k, v, and z in one GEMM and to
 b and a in a small bf16 one, runs the convolution and recurrence from
@@ -13,13 +13,17 @@ paged attention, scales the result by sigmoid of the gate, and
 projects out.
 """
 
+from functools import partial
+
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.gdn import gdn_core
 from quail.backends.quail.executor.models.base import ModelPipeline
+from quail.backends.quail.executor.moe import init_moe_workspace
+from quail.cost.budgets import kernel_index_cap
 
 
 class Qwen35Pipeline(ModelPipeline):
-    """Forward passes for Qwen3.5 checkpoints loaded by vLLM."""
+    """Forward passes for dense and MoE Qwen hybrid checkpoints."""
 
     # head dim 256 runs paged attention only, and a hybrid chunk reads
     # its documents from checkpoints, which the unified path plans
@@ -52,18 +56,14 @@ class Qwen35Pipeline(ModelPipeline):
             arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
             fp8=False, kernels=kernels)
-        # The fused kernels compute element offsets in 32-bit ints, so
-        # a chunk needs rows x widest_row < 2^31.
-        widest = max(
-            max(module.weight.shape) for module in self.linears())
-        self.max_chunk_tokens = (2**31 - 1) // widest
-
-    def linears(self):
-        gdn = self.gdn_layer.linear_attn
-        attn = self.attention_layer.self_attn
-        mlp = self.attention_layer.mlp
-        return (gdn.in_proj_qkvz, gdn.out_proj, attn.qkv_proj, attn.o_proj,
-                mlp.gate_up_proj, mlp.down_proj)
+        self.feed_forwards = tuple(
+            layer.mlp if spec.experts else partial(self._mlp, layer.mlp)
+            for layer in self.layers)
+        if spec.experts:
+            init_moe_workspace()
+            self.warm_tokens += (4096, 8192, 16384)
+            self.warm_row_classes = True
+        self.max_chunk_tokens = kernel_index_cap(spec)
 
     def _linear(self, x, module):
         """Apply the projection using its loaded quantization method."""
@@ -128,10 +128,14 @@ class Qwen35Pipeline(ModelPipeline):
         from contextlib import nullcontext
 
         from vllm.config import set_current_vllm_config
+        from vllm.forward_context import set_forward_context
 
         context = (nullcontext() if self.vllm_config is None
                    else set_current_vllm_config(self.vllm_config))
-        with context:
+        forward = (set_forward_context(
+            None, self.vllm_config, num_tokens=chunk.input_ids.shape[0])
+            if self.spec.experts else nullcontext())
+        with context, forward:
             return self._forward(chunk)
 
     def _forward(self, chunk):
@@ -145,7 +149,7 @@ class Qwen35Pipeline(ModelPipeline):
         hidden = self.embed(chunk.input_ids)
         residual = None
         slot = 0
-        for layer in self.layers:
+        for layer, feed_forward in zip(self.layers, self.feed_forwards):
             x, residual = self._norm(layer.input_layernorm, hidden, residual)
             if hasattr(layer, "linear_attn"):
                 x = self._gated_delta_net(layer.linear_attn, x, phases, slot)
@@ -156,7 +160,7 @@ class Qwen35Pipeline(ModelPipeline):
                 x = self._attention(layer.self_attn, x, chunk.positions, chunk)
             x, residual = self._norm(layer.post_attention_layernorm, x,
                                      residual)
-            hidden = self._mlp(layer.mlp, x)
+            hidden = feed_forward(x)
         final = chunk.final_indices
         normed, _ = self._norm(self.final_norm, hidden.index_select(0, final),
                                residual.index_select(0, final))

@@ -93,6 +93,10 @@ class _SingleRank:
 
     def __init__(self, torch):
         self.device = torch.device("cuda:0")
+        self.device_group = self
+
+    def size(self):
+        return self.world_size
 
     @property
     def is_first_rank(self):
@@ -141,6 +145,7 @@ def _install_single_rank_groups(torch):
     ps._TP = group
     ps._PP = group
     ps._DP = group
+    ps._EP = group
     ps._PCP = group
     ps._DCP = group
     ps._NODE_COUNT = 1

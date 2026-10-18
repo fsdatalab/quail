@@ -11,7 +11,7 @@ import numpy as np
 
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
-from quail.backends.quail.executor.moe import FP8Experts
+from quail.backends.quail.executor.moe import FP8Experts, init_moe_workspace
 from quail.cost import budgets
 from quail.specs.base import CANVAS_SEED
 
@@ -23,19 +23,6 @@ def canvas_token_ids(vocab: int, tokens: int, seed: int = CANVAS_SEED) -> tuple:
     """
     rng = np.random.default_rng(seed)
     return tuple(int(i) for i in rng.integers(0, vocab, tokens))
-
-
-def _init_moe_workspace():
-    """Give vLLM's fused MoE kernels the scratch buffers its worker would.
-
-    The buffers grow to the largest chunk on first use and stay
-    allocated; nothing locks them.
-    """
-    import torch
-    from vllm.v1.worker import workspace
-
-    if not workspace.is_workspace_manager_initialized():
-        workspace.init_workspace_manager(torch.device("cuda"))
 
 
 class DiffusionGemmaPipeline(ModelPipeline):
@@ -102,7 +89,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         # an empty canvas reads the answer at the prompt's last row
         self.canvas_answer_row = (spec.canvas_answer_row
                                   if spec.canvas_tokens else 0)
-        _init_moe_workspace()
+        init_moe_workspace()
         self.max_chunk_tokens = budgets.kernel_index_cap(spec)
         self.experts = [FP8Experts(layer.moe.experts, self.engine)
                         if layer.enable_moe_block else None

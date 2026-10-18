@@ -3,8 +3,9 @@
 from dataclasses import dataclass, field
 
 from quail.cost.budgets import checkpoint_pages
-from quail.cost.dense_decoder_cost import attention_pair_flops, dense_params
-from quail.cost.work import triangle
+from quail.cost.dense_decoder_cost import attention_pair_flops
+from quail.cost.sol import compute_seconds
+from quail.cost.work import Work, triangle
 
 
 @dataclass(frozen=True)
@@ -40,8 +41,8 @@ def coefficients(model, device) -> dict:
     full, sliding = attention_pair_flops(model)
     bandwidth = device.arithmetic_bandwidth(model.attention_precision)
     config = {
-        "linear_seconds": 2 * dense_params(model) / device.arithmetic_bandwidth(
-            model.weight_precision),
+        "linear_seconds": compute_seconds(
+            Work(tokens=1, pairs=0, kv_written=0, kv_read=0), model, device),
         "pair_seconds": full / bandwidth,
         "sliding_pair_seconds": sliding / bandwidth,
         "sliding_window": model.sliding_window,
