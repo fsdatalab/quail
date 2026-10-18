@@ -272,7 +272,7 @@ class RerankerModelExecution:
             object if isinstance(spec, ClassifySpec) else np.float32))
         sink = answer_sink()
         streams = (sink is not None and len(rows)
-                   and getattr(self.reranker, "streams_answers", False))
+                   and self.reranker.streams_answers)
         extra = {}
         if streams:
             extra["on_answers"] = lambda positions, values: sink(

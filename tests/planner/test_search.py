@@ -62,7 +62,7 @@ class PlacementCost(PhysicalRule):
         self.seen.append(lifted)
         if lifted and self.refuse:
             raise ClassifyRefusedError("test candidate cannot run", 2, 1)
-        exact = all(hasattr(lengths, "_store")
+        exact = all(lengths.store is not None
                     for lengths in context.document_tokens.values())
         if self.exact and not exact:
             return None

@@ -166,23 +166,31 @@ class ArrowTokenDocuments(Sequence):
 
 
 class TokenLengths(Sequence):
-    """Read document lengths from a token store without copying them."""
+    """Per document token counts, exact from a token store or estimated.
 
-    def __init__(self, store: "TokenStore"):
-        self._store = store
+    Attributes:
+        arrow_array: The counts as an int64 chunked array.
+        store: The token store the counts were read from, or None for
+            an estimate.
+    """
+
+    def __init__(self, values, store: "TokenStore | None" = None):
+        self.arrow_array = (values if isinstance(values, pa.ChunkedArray)
+                            else pa.chunked_array([pa.array(values)]))
+        self.arrow_array = self.arrow_array.cast(pa.int64())
+        self.store = store
 
     def __len__(self):
-        return len(self._store)
-
-    @property
-    def arrow_array(self) -> pa.ChunkedArray:
-        return pa.chunked_array(self._store._length_batches, type=pa.int64())
+        return len(self.arrow_array)
 
     def __getitem__(self, index):
         if isinstance(index, slice):
-            return [self[i] for i in range(*index.indices(len(self)))]
-        batch_index, local = _locate_chunk(index, len(self), self._store._ends)
-        return self._store._length_batches[batch_index][local].as_py()
+            return self.arrow_array[index].to_pylist()
+        return self.arrow_array[index].as_py()
+
+    def __array__(self, dtype=None, copy=None):
+        values = self.arrow_array.to_numpy()
+        return values if dtype is None else values.astype(dtype, copy=False)
 
 
 def _write_all(writer, batches):
@@ -450,7 +458,8 @@ class TokenStore(Sequence):
                 self._length_batches.append(batch.column(self._count_column))
                 total += len(batch)
                 self._ends.append(total)
-            self._lengths = TokenLengths(self)
+            self._lengths = TokenLengths(
+                pa.chunked_array(self._length_batches, type=pa.int64()), self)
             self._prefix_index = None
             self._resources = resources.pop_all()
 
@@ -695,8 +704,7 @@ class PrefixTree:
     def reader_groups(self, lengths):
         """Group document rows by their borrowed parent and prefix length."""
         if self._reader_groups is None:
-            lengths = getattr(lengths, "arrow_array", lengths)
-            rows = pc.subtract(pa.array(lengths), pa.array(self.shared, pa.int64()))
+            rows = pc.subtract(lengths.arrow_array, pa.array(self.shared, pa.int64()))
             table = pa.table({"parent": pa.array(self.parent, pa.int64()),
                               "shared": pa.array(self.shared, pa.int64()),
                               "rows": rows}).drop_null()

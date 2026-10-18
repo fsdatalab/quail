@@ -22,6 +22,7 @@ from quail.catalog.providers import Catalog, ScanRequest
 from quail.catalog.tokens import (
     ColumnStoreWriter,
     ScanInput,
+    TokenLengths,
     TokenOffsets,
     TokenStoreWriter,
 )
@@ -202,8 +203,7 @@ class InputStore:
         store = self._token_stores.get((identity, _column_key(column)))
         return None if store is None else store.lengths
 
-    def estimate_lengths(self, provider_name: str,
-                         column) -> list[int]:
+    def estimate_lengths(self, provider_name: str, column) -> TokenLengths:
         """Estimate document token counts from a tokenized sample.
 
         Tokenizes the first ESTIMATE_SAMPLE documents and repeats their
@@ -241,7 +241,7 @@ class InputStore:
                         ).cast(pa.int64()).to_pylist())
             finally:
                 reader.close()
-        self._length_estimates[key] = lengths
+        self._length_estimates[key] = lengths = TokenLengths(lengths)
         say(f"estimated {provider_name}.{_column_key(column)}: "
             f"{len(lengths):,} documents, "
             f"about {sum(lengths):,} tokens from a {len(sample)} document "

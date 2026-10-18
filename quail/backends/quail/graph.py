@@ -120,7 +120,7 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
         model_result=record_model_result,
         state=runtime_state,
         functions=state.get("functions", {}),
-        run_pipeline=getattr(execution, "execute_pipeline", None),
+        run_pipeline=execution.execute_pipeline,
     )
 
 

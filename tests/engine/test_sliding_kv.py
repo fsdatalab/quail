@@ -1,7 +1,7 @@
 """The sliding-layer KV pool: window origins, trimming, and one page currency."""
 
 import pytest
-from helpers.fakes import cpu_staging, plain_arena
+from helpers.fakes import cpu_staging, fake_readout, plain_arena
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena
@@ -436,7 +436,7 @@ def test_join_anchor_keeps_its_window_for_a_later_child(monkeypatch):
     cpu = SimpleNamespace(**{n: getattr(torch, n) for n in dir(torch)
                              if not n.startswith("_")})
     cpu.cuda, cpu.inference_mode = fake.cuda, fake.inference_mode
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    answers = fake_readout()
     arena = cpu_arena(pages=64, sliding_pages=32)
     stats = {}
     _, _, tokens = run_stages(

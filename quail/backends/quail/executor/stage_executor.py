@@ -6,10 +6,14 @@ from itertools import groupby
 
 import numpy as np
 
-from quail.backends.quail.executor.admission import DROP, SKIP, JoinAdmission
+from quail.backends.quail.executor.admission import (
+    DROP,
+    SKIP,
+    JoinAdmission,
+    OwnRequests,
+)
 from quail.backends.quail.executor.readout_groups import ReadoutGroups
 from quail.backends.quail.executor.stages import (
-    OwnRequests,
     PendingAnswers,
     _advance_stage,
     frame_writes,
@@ -37,9 +41,8 @@ def forward_chunk(pipeline, arena, chunk):
     temporaries whether the pass returns or raises.
     """
     try:
-        graphs = getattr(pipeline, "decode_graphs", None)
-        if graphs is not None:
-            return graphs.forward(chunk)
+        if pipeline.decode_graphs is not None:
+            return pipeline.decode_graphs.forward(chunk)
         return pipeline.forward_chunk(chunk)
     finally:
         keys, chunk.temporary_keys = chunk.temporary_keys, ()

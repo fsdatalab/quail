@@ -15,6 +15,7 @@ from helpers.fakes import (
     cpu_arena,
     fake_pack,
     fake_pipeline,
+    fake_readout,
     fake_torch,
 )
 
@@ -308,6 +309,9 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
         return rows
 
     class FakeReadout:
+        trailing_rows = 1
+        normalize = False
+
         def __init__(self, targets, rows):
             self.targets = np.asarray(targets)
             self.rows = rows
@@ -350,8 +354,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_sequence_pipeline(
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.bind_query(
         torch=torch,
-        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
-                                      dtype=None),
+        async_answers=fake_readout(),
         answer_rows=object(), chunk_tokens=64)
     execution.loaded_model.model_spec = SimpleNamespace(
         name="tiny", vocab=vocab, answer_canvas=settings)
@@ -465,8 +468,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.bind_query(
         torch=torch,
-        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
-                                      dtype=None),
+        async_answers=fake_readout(),
         answer_rows=object(), chunk_tokens=120)
     def submit(rows, rows_per_answer=None):
         # (answers, rows, targets), padded; a frame entry's one row is
@@ -484,10 +486,9 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
             start += count
         return padded
 
-    execution.loaded_model.label_readout = SimpleNamespace(
+    execution.loaded_model.label_readout = fake_readout(
         targets=np.asarray(TARGETS), rows=1,
-        dtype=np.dtype((np.float32, (1, len(TARGETS)))), submit=submit,
-        result=lambda rows: rows)
+        dtype=np.dtype((np.float32, (1, len(TARGETS)))), submit=submit)
     state = {
         "gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
                                execution=execution, spec=MODELS["qwen3-4b-fp8"]),
@@ -613,12 +614,14 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.bind_query(
         torch=torch,
-        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
-                                      dtype=None),
+        async_answers=fake_readout(),
         answer_rows=object(), chunk_tokens=120)
     from quail.backends.quail.executor import label_stages as label_stages_module
 
     class FakeReadout:
+        trailing_rows = 1
+        normalize = False
+
         def __init__(self, targets, rows):
             self.targets = np.asarray(targets)
             self.rows = rows
@@ -711,8 +714,7 @@ def test_a_filter_after_a_classification_asks_over_the_resident_kv(monkeypatch):
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.bind_query(
         torch=torch,
-        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
-                                      dtype=None),
+        async_answers=fake_readout(),
         answer_rows=object(), chunk_tokens=120)
 
     def submit(rows, rows_per_answer=None):
@@ -724,10 +726,9 @@ def test_a_filter_after_a_classification_asks_over_the_resident_kv(monkeypatch):
                                  else np.zeros(len(TARGETS)))
         return padded
 
-    execution.loaded_model.label_readout = SimpleNamespace(
+    execution.loaded_model.label_readout = fake_readout(
         targets=np.asarray(TARGETS), rows=1,
-        dtype=np.dtype((np.float32, (1, len(TARGETS)))), submit=submit,
-        result=lambda rows: rows)
+        dtype=np.dtype((np.float32, (1, len(TARGETS)))), submit=submit)
     graph = fused_graph(classify_only=True)
     nodes = [node for node in graph.nodes if node.node_id != "classify:kind"]
     nodes.insert(0, Scan(node_id="input:r", alias="r", input_id="r"))

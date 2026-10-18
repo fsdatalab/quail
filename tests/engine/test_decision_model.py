@@ -18,6 +18,7 @@ from quail.backends.quail.executor.stages import Stage
 from quail.baselines.nodes import RequestExecution
 from quail.baselines.request import RequestBackend
 from quail.catalog import Catalog, DocumentProvider
+from quail.catalog.tokens import TokenLengths
 from quail.logical import (
     ColumnRef,
     bind_join_prompt,
@@ -466,8 +467,9 @@ def test_classification_tree_scoring_follows_the_executor_gate():
 
     def table(model):
         context = SimpleNamespace(
-            document_tokens={"d": [100, 200]}, model=model, device=H100_SXM,
-            canvas_draws=1, tokenizer=_tokens, memo={}, gpus=1)
+            document_tokens={"d": TokenLengths([100, 200])}, model=model,
+            device=H100_SXM, canvas_draws=1, tokenizer=_tokens, memo={}, gpus=1,
+            attention=None)
         return classify_statistics(context, "d")
 
     assert not table(DECISION_2_KAI_0_6B_BF16).tree

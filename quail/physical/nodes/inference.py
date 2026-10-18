@@ -55,6 +55,11 @@ class AiInference(PhysicalNode):
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
 
     @property
+    def share_prefixes(self) -> bool:
+        """Whether the node borrows an earlier document's prefix KV."""
+        return self.spec is not None and self.spec.share_prefixes
+
+    @property
     def document_head(self) -> tuple[int, ...]:
         return (tuple(self.spec.prompt_token_parts[0])
                 if self.spec and self.spec.prompt_token_parts else ())

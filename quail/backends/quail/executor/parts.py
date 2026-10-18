@@ -14,6 +14,7 @@ from quail.backends.quail.executor.stages import Stage, frame_writes, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import prefix_tree
 from quail.logical import effective_selectivity
+from quail.physical import AiFilter, AiJoin, Filter
 from quail.progress import logger
 
 
@@ -57,6 +58,8 @@ class ExecutionPart(ABC):
     stages: Sequence[Stage]
     # the physical nodes the part executes, every member of a group
     nodes: Sequence = ()
+    # the computed columns a later condition may test
+    tested_columns: tuple = ()
     combine: ClassVar[bool] = False
     execute_group: ClassVar[Callable | None] = None
     gate = None
@@ -110,11 +113,13 @@ class ExecutionPart(ABC):
 class SingleResultPart(ExecutionPart):
     """Prepared work whose execution produces one result."""
 
+    # the physical node the part executes; None for a standalone batch
+    node = None
+
     @property
     def nodes(self) -> tuple:
         """Return the part's physical node, or nothing for a standalone batch."""
-        node = getattr(self, "node", None)
-        return () if node is None else (node,)
+        return () if self.node is None else (self.node,)
 
     @abstractmethod
     def result(self, tokens, gpu_s, chunks, stats) -> Any:
@@ -294,15 +299,14 @@ def survival(parts) -> float:
     fraction = 1.0
     for part in parts:
         for node in part.nodes:
-            if hasattr(node, "selectivity"):
+            if isinstance(node, (AiFilter, AiJoin, Filter)):
                 fraction *= effective_selectivity(node.selectivity)
     return fraction
 
 
 def execution_prefix_tree(node, documents, arena):
     """Build the requested prefix tree, or return None if sharing is disabled."""
-    settings = getattr(node, "spec", node)
-    if not settings.share_prefixes:
+    if not node.share_prefixes:
         return None
     return shared_prefix_tree(node.document_aliases[0], documents, arena)
 

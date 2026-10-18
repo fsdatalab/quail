@@ -303,13 +303,12 @@ def run_graph_on_arena(monkeypatch, graph, *, num_documents=14, num_partners=4,
     torch = fake_torch()
     arena = cpu_arena(pages)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-    execution = QuailModelExecution(SimpleNamespace())
+    execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
     execution.bind_loaded_model(model=object(), arena=arena,
                                 pipeline=pipeline)
     execution.bind_query(
         torch=torch,
-        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
-                                      dtype=None),
+        async_answers=fake_readout(),
         answer_rows=object(),
         chunk_tokens=120)
     state = {
@@ -403,7 +402,7 @@ class FakeArena:
 def graph_state(model_execution, documents):
     return {
         "gpu": SimpleNamespace(torch=fake_torch(), arena=FakeArena(),
-                               pipeline=SimpleNamespace(), execution=model_execution,
+                               pipeline=fake_pipeline(), execution=model_execution,
                                spec=MODELS["qwen3-4b-fp8"]),
         "runtimes": built_in_registry().runtimes,
         "device": DEVICES["h100-sxm"],
@@ -424,3 +423,11 @@ def plain_arena(pages=64):
         dtype=torch.float32,
         device="cpu",
     )
+
+
+def fake_readout(**attributes):
+    """A readout with the base class's defaults and the given attributes."""
+    return SimpleNamespace(**{
+        "trailing_rows": 1, "normalize": False, "dtype": None,
+        "submit": lambda value, rows_per_answer=None: value,
+        "result": lambda value: value, **attributes})

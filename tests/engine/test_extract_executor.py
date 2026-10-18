@@ -14,7 +14,7 @@ from helpers.extract_fakes import (
     TERM,
     make_spec,
 )
-from helpers.fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch
+from helpers.fakes import cpu_arena, fake_pack, fake_pipeline, fake_readout, fake_torch
 
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.distributed import (
@@ -319,8 +319,7 @@ class ScriptedModel:
 def _fake_readout(tables, k):
     """A readout over scripted rows."""
     width = 2 + 2 * k
-    value = SimpleNamespace(k=k, width=width, ragged=True)
-    value.dtype = np.dtype(object)
+    value = fake_readout(k=k, width=width, ragged=True, dtype=np.dtype(object))
 
     def submit(rows, rows_per_answer=None):
         values = np.asarray(rows, dtype=np.float32)[:, :width]
@@ -338,7 +337,7 @@ def _state(model, chunk_tokens=400):
             input_staging=SimpleNamespace(fixed_tokens=set()),
             model=object()),
         torch=fake_torch(), chunk_tokens=chunk_tokens, answer_rows=object(),
-        async_answers=object())
+        async_answers=fake_readout())
 
 
 DOCS = [LEASE, TERM, NOTHING]
@@ -523,12 +522,13 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
     for _ in range(gpus):
         torch, arena = fake_torch(), cpu_arena(256)
         pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-        execution = QuailModelExecution(SimpleNamespace())
+        execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
         execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
         execution.loaded_model.vocabulary = tables
         execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
         execution.bind_query(torch=torch, answer_rows=object(),
-                             chunk_tokens=state.chunk_tokens, async_answers=object())
+                             chunk_tokens=state.chunk_tokens,
+                             async_answers=fake_readout())
         children.append(ChildState(gpu_index=0, registry=registry, gpu=SimpleNamespace(
             execution=execution, torch=torch, arena=arena, pipeline=pipeline,
             spec=MODELS["qwen3-4b-fp8"])))
@@ -620,13 +620,13 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
     )
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-    execution = QuailModelExecution(SimpleNamespace())
+    execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.loaded_model.vocabulary = tables
     execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
     execution.bind_query(
         torch=torch, answer_rows=object(), chunk_tokens=400,
-        async_answers=SimpleNamespace(
+        async_answers=fake_readout(
             submit=lambda rows: [float(np.asarray(r).ravel()[0]) for r in rows],
             result=lambda v: v, dtype=None))
     state = {"gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
@@ -767,12 +767,12 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
             ] == ["ai-extract:ends", "filter:c:0", "ai-extract:starts", "filter:c:1"]
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-    execution = QuailModelExecution(SimpleNamespace())
+    execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.loaded_model.vocabulary = tables
     execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
     execution.bind_query(torch=torch, answer_rows=object(), chunk_tokens=400,
-                         async_answers=object())
+                         async_answers=fake_readout())
     state = {"gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
                                     execution=execution, spec=MODELS["qwen3-4b-fp8"]),
              "runtimes": built_in_registry().runtimes,
@@ -857,13 +857,13 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
             ] == ["ai-extract:ends", "filter:c:1", "ai_filter:c"]
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-    execution = QuailModelExecution(SimpleNamespace())
+    execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.loaded_model.vocabulary = tables
     execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
     execution.bind_query(
         torch=torch, answer_rows=object(), chunk_tokens=400,
-        async_answers=SimpleNamespace(
+        async_answers=fake_readout(
             submit=lambda rows: [float(np.asarray(r).ravel()[0]) for r in rows],
             result=lambda v: v, dtype=None))
     state = {"gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
@@ -925,7 +925,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit
     ), PortRef("filter:c:0", "rows:c"))
     torch, arena = fake_torch(), cpu_arena(256)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-    execution = QuailModelExecution(SimpleNamespace())
+    execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
     execution.loaded_model.vocabulary = tables
     execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
@@ -934,7 +934,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit
     chunk = max(len(document) for document in documents) + len(
         spec.prompt_token_parts[0]) + len(spec.prompt_token_parts[1]) + 8
     execution.bind_query(torch=torch, answer_rows=object(), chunk_tokens=chunk,
-                         async_answers=object())
+                         async_answers=fake_readout())
     state = {"gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
                                     execution=execution, spec=MODELS["qwen3-4b-fp8"]),
              "runtimes": built_in_registry().runtimes,

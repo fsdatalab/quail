@@ -86,7 +86,7 @@ class PlanPricer:
                 (alias,) = node.document_aliases
                 resident = retained.get(alias) == node.document_head
                 members = pipelines[node.node_id]
-                if any(getattr(member, "keep_kv", False) for member in members):
+                if any(member.keep_kv for member in members):
                     retained[alias] = node.document_head
                 else:
                     retained.pop(alias, None)
@@ -203,13 +203,13 @@ class PlanPricer:
         return max(0.0, 1.0 - sum(shared) / total) if total else 1.0
 
     def _store(self, alias: str):
-        return getattr(self.context.document_tokens.get(alias), "_store", None)
+        lengths = self.context.document_tokens.get(alias)
+        return None if lengths is None else lengths.store
 
     def _shared(self, node, alias: str):
         """Per document, the prefix tokens a node borrows, or None without sharing."""
-        settings = getattr(node, "spec", node)
         store = self._store(alias)
-        if not settings.share_prefixes or store is None:
+        if not node.share_prefixes or store is None:
             return None
         return page_tree(store).shared
 

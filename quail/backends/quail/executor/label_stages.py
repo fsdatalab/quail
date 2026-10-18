@@ -148,7 +148,7 @@ def _label_readout(state: QueryExecutionState, targets, rows: int, normalize: bo
     readout = state.loaded_model.label_readout
     if (readout is None or list(readout.targets.tolist()) != targets
             or readout.rows != rows
-            or getattr(readout, "normalize", normalize) != normalize):
+            or readout.normalize != normalize):
         torch = state.torch
         head = full_output_head(state.loaded_model.model)
         readout = AsyncLabelLogprobs(
@@ -214,7 +214,7 @@ class ClassifyStages:
             sum(request.read_mask) if request.read_mask is not None
             else max(map(len, request.suffixes)) if read_all else 1)
         # a letters stage on a canvas model reads its canvas's rows
-        answer_canvas = getattr(state.loaded_model.model_spec, "answer_canvas", None)
+        answer_canvas = state.loaded_model.model_spec.answer_canvas
         if spec.scoring == "letters" and answer_canvas is not None:
             self.canvas_rows = answer_canvas.rows
             self.readout_rows = readout_rows = self.canvas_rows

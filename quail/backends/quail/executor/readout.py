@@ -108,6 +108,12 @@ def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
 class _HostReadout:
     """Copy readout tensors asynchronously using reusable pinned buffers."""
 
+    # the rows a stage reads at the end of each suffix
+    trailing_rows = 1
+    # whether label scores are normalized over the vocabulary, for
+    # readouts that score labels
+    normalize = False
+
     def __init__(self, torch):
         self.torch = torch
         self.available = []

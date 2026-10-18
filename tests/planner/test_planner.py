@@ -12,6 +12,7 @@ from helpers.planning import _optimize, _plan, node_kinds
 import quail
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, DocumentProvider
+from quail.catalog.tokens import TokenLengths
 from quail.cost.filters import filter_cost
 from quail.cost.joins import PricedJoin
 from quail.cost.sol import speed_of_light
@@ -534,7 +535,8 @@ def test_join_survivors_count_candidate_pairs_without_rounding_to_zero():
     thin(expected_rows, spec)
     assert expected_rows == {"a": pytest.approx(2 * (1 - 0.875 ** 3)), "b": 3.0}
     # the join reads only the anchors that have a candidate partner
-    lengths = {"a": summarize_alias([50] * 2), "b": summarize_alias([30] * 3)}
+    lengths = {"a": summarize_alias(TokenLengths([50] * 2)),
+               "b": summarize_alias(TokenLengths([30] * 3))}
     expected_rows = {"a": 2.0, "b": 3.0}
     work = stage_work(spec, "a", expected_rows, lengths, 7)
     assert work == joins.stage_work(spec, "a", 2 * (1 - 0.75 ** 3),
@@ -558,7 +560,7 @@ def test_join_search_matches_enumeration_and_tracks_residency():
              for index, (aliases, selectivity) in enumerate([
                  (("a", "b"), 0.01), (("b", "c"), 0.1),
              ])]
-    lengths = {alias: summarize_alias(tokens) for alias, tokens in [
+    lengths = {alias: summarize_alias(TokenLengths(tokens)) for alias, tokens in [
         ("a", [800] * 20), ("b", [100] * 30), ("c", [400] * 10),
     ]}
     filtered = {"a", "c"}
@@ -585,7 +587,8 @@ def test_join_search_matches_enumeration_and_tracks_residency():
         _join_search_spec(2, ("a", "c"), "a"),
     ]
     expected_rows = {"a": 3.0, "b": 3.0, "c": 2.0}
-    lengths = {"a": [90, 100, 110], "b": [400] * 3, "c": [50] * 2}
+    lengths = {"a": TokenLengths([90, 100, 110]), "b": TokenLengths([400] * 3),
+               "c": TokenLengths([50] * 2)}
     assert anchor_fits(specs[0], "a", lengths, 10, 100_000)
     assert not anchor_fits(specs[0], "a", lengths, 10, 500)
     current = search_joins(
@@ -604,7 +607,7 @@ def test_join_search_matches_enumeration_and_tracks_residency():
         _join_search_spec(2, ("c", "d"), "c"),
     ]
     expected_rows = {alias: 2.0 for alias in "abcd"}
-    lengths = {alias: [100, 120] for alias in "abcd"}
+    lengths = {alias: TokenLengths([100, 120]) for alias in "abcd"}
 
     assert search_joins(specs, expected_rows, lengths, {}, 10, 100_000,
                         QWEN3_4B_FP8, H100_SXM) is None
@@ -635,8 +638,8 @@ def test_closed_form_join_work_sums_the_per_row_work():
 
     spec = _join_search_spec(0, ("a", "b"), "a")
     pre, anchor_len, partner_len, documents, partners = 7, 50, 30, 4, 3
-    lengths = {"a": summarize_alias([anchor_len] * documents),
-               "b": summarize_alias([partner_len] * partners)}
+    lengths = {"a": summarize_alias(TokenLengths([anchor_len] * documents)),
+               "b": summarize_alias(TokenLengths([partner_len] * partners))}
     frame = spec.frame_tokens["a"] + spec.label_tokens["b"]
     suffixes = [spec.tail_tokens + partner_len] * partners
     for resident in (False, True):

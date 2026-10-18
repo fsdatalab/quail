@@ -6,6 +6,7 @@ from dataclasses import asdict, replace
 import numpy as np
 import pytest
 
+from quail.catalog.tokens import TokenLengths
 from quail.cost.classify import estimate, estimate_suffixes
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.sol import unrounded_seconds
@@ -302,7 +303,8 @@ def test_classify_and_score_capacity_follow_the_plans_arena_split():
     # documents four times the sliding window: the split gives the
     # every-token pool more pages than the split for unknown lengths
     context = SimpleNamespace(
-        document_tokens={"short": [300] * 8, "long": [4096] * 8}, model=model,
+        document_tokens={"short": TokenLengths([300] * 8),
+                         "long": TokenLengths([4096] * 8)}, model=model,
         device=H100_SXM, canvas_draws=1, memo={}, gpus=1)
     planned = budgets.arena_tokens(model, H100_SXM, chunk, 4096)
     assert planned > budgets.arena_tokens(model, H100_SXM, chunk)

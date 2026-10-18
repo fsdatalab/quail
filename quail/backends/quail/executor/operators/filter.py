@@ -111,7 +111,7 @@ class ConditionGate(SingleResultPart):
         node = nodes[0]
         source_id = node.inputs[0].source.node_id
         producer = next(part for part in reversed(parts)
-                        if node.column in getattr(part, "tested_columns", ()))
+                        if node.column in part.tested_columns)
         source = next(part for part in reversed(parts)
                       if any(member.node_id == source_id for member in part.nodes))
         return cls(node, producer, source)

@@ -57,7 +57,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     classification chunk.
     """
     # a readout of several trailing rows needs a question that long
-    trailing = getattr(async_ans, "trailing_rows", 1)
+    trailing = 1 if async_ans is None else async_ans.trailing_rows
     warm_documents, question, document = _warm_inputs(budget, max(16, trailing))
     q_max = len(question)
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)

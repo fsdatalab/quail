@@ -55,6 +55,9 @@ class Oracle:
         streams: Whether a score call reports each row as it is scored.
     """
 
+    # the oracle runs one node at a time; a pipeline falls back to that
+    execute_pipeline = None
+
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
                  answers=None, *, probabilities=False, retain=0,
                  join_metrics=None, streams=False):

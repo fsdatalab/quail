@@ -108,7 +108,7 @@ class Stage:
                 raise ValueError("a stage whose suffixes come from a callback "
                                  "takes no requests, paths, read_rows, or canvas")
             return
-        trailing = getattr(self.readout, "trailing_rows", 1)
+        trailing = 1 if self.readout is None else self.readout.trailing_rows
         if self.read_rows is None and trailing > 1:
             self.read_rows = [trailing] * len(self.suffixes)
             self.read_all_rows = True
@@ -117,19 +117,6 @@ class Stage:
     def own_suffixes(self) -> bool:
         """Whether each document's suffixes come from the callback."""
         return callable(self.suffixes)
-
-
-class OwnRequests(list):
-    """A document's requests at a stage whose suffixes are its own.
-
-    The indices run over the document's own sequences, and lengths
-    holds their token counts, which the admission prices in place of
-    the stage's shared list.
-    """
-
-    def __init__(self, lengths):
-        super().__init__(range(len(lengths)))
-        self.lengths = np.asarray(lengths, dtype=np.int64)
 
 
 def shared_preamble_tokens(question_ids) -> int:

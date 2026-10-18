@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from helpers.fakes import fake_pipeline, fake_torch
+from helpers.fakes import fake_pipeline, fake_readout, fake_torch
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.operators.filter import FilterPart
 from quail.backends.quail.executor.parts import gated_stages
@@ -304,7 +304,7 @@ def cpu_torch():
 
 def passthrough():
     """An answer readout that returns the model's answers as they are."""
-    return SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    return fake_readout()
 
 
 def answer(h):

@@ -123,7 +123,7 @@ class LoadedGpu:
         survives in the arena between queries.
         """
         if arena_pages is not None:
-            graphs = getattr(self.pipeline, "decode_graphs", None)
+            graphs = self.pipeline.decode_graphs
             if (graphs is not None and tuple(arena_pages)
                     != (self.arena.num_pages, self.arena.num_sliding_pages)):
                 self.torch.cuda.synchronize()
@@ -162,7 +162,7 @@ class LoadedGpu:
                                     model_name=self.spec.hf_name,
                                     model=self.model)
                 tier = warm["tier"]
-            graphs = getattr(self.pipeline, "decode_graphs", None)
+            graphs = self.pipeline.decode_graphs
             if graphs is not None and graphs.prepare():
                 tier = tier or "graphs"
         if tier is None:
@@ -174,9 +174,7 @@ class LoadedGpu:
 
     def close(self):
         """Release GPU resources held by the execution context."""
-        close_fn = getattr(self.execution, "close", None)
-        if callable(close_fn):
-            close_fn()
+        self.execution.close()
 
 
 def decision_offsets(spec, path) -> tuple[int, ...]:

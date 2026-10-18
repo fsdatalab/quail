@@ -187,11 +187,6 @@ class ChooseClassifyImplementation(PhysicalRule):
             graph.root)
 
 
-def _token_store(document_tokens):
-    """The token store behind an alias's document lengths, or None."""
-    return getattr(document_tokens, "_store", None)
-
-
 def page_aligned_shared_tokens(store) -> int:
     """Tokens a prefix tree over the store saves in whole KV pages."""
     return page_tree(store).shared_tokens
@@ -258,15 +253,15 @@ class ShouldSharePrefixes(PhysicalRule):
         }
         shared_by_alias = {}
         for node in graph.nodes:
-            settings = getattr(node, "spec", node)
             if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract, AiScore))
-                    or settings is None or settings.share_prefixes
-                    or (isinstance(node, AiScore) and len(settings.aliases) != 1)):
+                    or node.share_prefixes
+                    or (isinstance(node, AiScore) and len(node.spec.aliases) != 1)):
                 nodes.append(node)
                 continue
-            alias = (settings.aliases[0] if isinstance(node, AiScore)
+            alias = (node.spec.aliases[0] if isinstance(node, AiScore)
                      else node.document_aliases[0])
-            store = _token_store(context.document_tokens.get(alias))
+            lengths = context.document_tokens.get(alias)
+            store = None if lengths is None else lengths.store
             if store is None:
                 nodes.append(node)
                 continue
@@ -335,7 +330,7 @@ class ChooseAttentionAlgorithm(PhysicalRule):
             path = None
             if isinstance(node, AiFilter):
                 lengths = context.document_tokens.get(node.alias, ())
-                store = _token_store(lengths)
+                store = lengths.store
                 path = "unified"
                 if tree_available and node.share_prefixes and store is not None:
                     path = filter_attention(

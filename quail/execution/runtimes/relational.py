@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sized
+
 import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
@@ -49,11 +51,9 @@ def _num_rows(value) -> int | None:
     """Rows of a table or sequence, or None when counting would run a plan."""
     if isinstance(value, QueryResult):
         return value.known_num_rows()
-    if hasattr(value, "num_rows"):
-        return int(value.num_rows)
-    if hasattr(value, "__len__"):
-        return len(value)
-    return None
+    if isinstance(value, (pa.Table, pa.RecordBatch)):
+        return value.num_rows
+    return len(value) if isinstance(value, Sized) else None
 
 
 class ProjectRuntime:

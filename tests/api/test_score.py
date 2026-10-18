@@ -7,7 +7,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.fakes import letter_tokens
+from helpers.fakes import fake_readout, letter_tokens
 from helpers.oracle import Oracle, finish
 from helpers.rerankers import _run_graph
 
@@ -23,6 +23,7 @@ from quail.backends.quail.reranker import (
     score_in_batches,
 )
 from quail.catalog import Catalog, DocumentProvider
+from quail.catalog.tokens import TokenLengths
 from quail.execution.rows import Rows
 from quail.execution.runner import (
     ExecutionContext,
@@ -247,7 +248,7 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     assert score_work(0, 15, 9).tokens == 0
 
     lengths = ([5, 9], [2, 4, 8])
-    summaries = tuple(summarize_alias(values) for values in lengths)
+    summaries = tuple(summarize_alias(TokenLengths(values)) for values in lengths)
     for capacity in (100, 1):
         cost = ScoreCost(
             token_lengths=(3, 4, 2), summaries=summaries,
@@ -482,9 +483,9 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
         torch=object(),
         answer_rows=object(),
         chunk_tokens=1234,
-        async_answers=object(),
+        async_answers=fake_readout(),
     )
-    monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
+    monkeypatch.setattr(module, "AsyncScores", lambda *args: fake_readout())
 
     state.gpu_timing = True
 
@@ -516,7 +517,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
             model=object(), arena=object(),
             pipeline=SimpleNamespace(canvas_ids=(7,)),
             model_spec=SimpleNamespace(vocab=50)),
-        torch=object(), async_answers=object(), answer_rows=object(),
+        torch=object(), async_answers=fake_readout(), answer_rows=object(),
         chunk_tokens=1234)
 
     def run_stages(torch, arena, pipeline, stages, prefixes, budget, **kwargs):
@@ -574,7 +575,8 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
             assert documents == [1, 0]
             model = RerankerModelExecution.__new__(RerankerModelExecution)
             model.documents = execution.documents
-            model.reranker = SimpleNamespace(score=lambda spec, rows, documents: (
+            model.reranker = SimpleNamespace(streams_answers=False,
+                                             score=lambda spec, rows, documents: (
                 RerankerBatch([a / 2 + b / 4 for a, b in rows], fresh_tokens=12,
                               cached_tokens=3)))
             results.append({"results": {node.node_id: model.execute(node, inputs)},
@@ -694,9 +696,9 @@ def test_shared_score_borrows_prefixes_and_reads_the_cue(monkeypatch):
         loaded_model=LoadedModelState(
             model=object(), arena=SimpleNamespace(page_tokens=2),
             pipeline=SimpleNamespace(canvas_ids=())),
-        torch=object(), async_answers=object(), answer_rows=object(),
+        torch=object(), async_answers=fake_readout(), answer_rows=object(),
         chunk_tokens=1234)
-    monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
+    monkeypatch.setattr(module, "AsyncScores", lambda *args: fake_readout())
     seen = []
 
     def run_stages(torch, arena, pipeline, stages, prefixes, budget, **kwargs):

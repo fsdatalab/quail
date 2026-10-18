@@ -47,8 +47,7 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
     """
     lengths = context.document_tokens[alias]
     summary = summarize_alias(lengths, context.model.sliding_window, memo=context.memo)
-    if hasattr(lengths, "arrow_array"):
-        lengths = lengths.arrow_array.to_numpy()
+    lengths = lengths.arrow_array.to_numpy()
     chunk = budgets.chunk_budget(context.model, context.device)
     capacity = arena_capacity(context, chunk)
     return ClassifyStatistics(
@@ -60,7 +59,7 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
         device=context.device,
         capacity=capacity, lengths=lengths, shared=tuple(shared), gpus=context.gpus,
         tree=(budgets.tree_attention_allowed(context.model)
-              and getattr(context, "attention", None) != "unified"))
+              and context.attention != "unified"))
 
 
 @dataclass(frozen=True)

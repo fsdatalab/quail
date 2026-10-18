@@ -6,7 +6,14 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
+from helpers.fakes import (
+    cpu_arena,
+    fake_pack,
+    fake_pipeline,
+    fake_readout,
+    fake_torch,
+    letter_tokens,
+)
 from helpers.oracle import Oracle, finish
 
 import quail
@@ -196,23 +203,20 @@ def test_classifier_decodes_one_choice_per_round(monkeypatch):
         return np.asarray(rows, dtype=np.float32)
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    readout = SimpleNamespace(
-        targets=np.asarray(targets), rows=1,
-        dtype=np.dtype((np.float32, (4,))),
-        submit=lambda rows, rows_per_answer=None: rows,
-        result=lambda rows: rows)
+    readout = fake_readout(targets=np.asarray(targets), rows=1, normalize=True,
+                           dtype=np.dtype((np.float32, (4,))))
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
             arena=cpu_arena(64),
             pipeline=fake_pipeline(forward_chunk=forward),
             label_readout=readout,
             input_staging=SimpleNamespace(fixed_tokens=set()),
-            model=object(),
+            model=object(), model_spec=QWEN3_4B_FP8,
         ),
         torch=fake_torch(),
         chunk_tokens=64,
         answer_rows=object(),
-        async_answers=object(),
+        async_answers=fake_readout(),
     )
     arena = state.loaded_model.arena
     reserved = {}
@@ -1101,22 +1105,21 @@ def test_classifier_scores_the_packed_trie(monkeypatch, worded):
             row += count
         return out
 
-    readout = SimpleNamespace(
-        targets=np.asarray(targets), rows=read_count,
-        dtype=np.dtype((np.float32, (read_count, len(targets)))),
-        submit=submit, result=lambda rows: rows)
+    readout = fake_readout(
+        targets=np.asarray(targets), rows=read_count, normalize=True,
+        dtype=np.dtype((np.float32, (read_count, len(targets)))), submit=submit)
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
             arena=cpu_arena(64),
             pipeline=fake_pipeline(forward_chunk=forward),
             label_readout=readout,
             input_staging=SimpleNamespace(fixed_tokens=set()),
-            model=object(),
+            model=object(), model_spec=QWEN3_4B_FP8,
         ),
         torch=fake_torch(),
         chunk_tokens=64,
         answer_rows=object(),
-        async_answers=object(),
+        async_answers=fake_readout(),
     )
     batch = QuailClassifier(state).classify(
         spec, [[0], [1]], {"d": [[10, 11], [12]]})
@@ -1272,7 +1275,7 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
         return padded
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    readout = SimpleNamespace(targets=np.asarray([1, 2]), rows=4,
+    readout = fake_readout(targets=np.asarray([1, 2]), rows=4,
                               dtype=np.dtype((np.float32, (4, 2))),
                               submit=submit, result=lambda rows: rows)
     state = QueryExecutionState(
@@ -1289,7 +1292,7 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
         torch=fake_torch(),
         chunk_tokens=64,
         answer_rows=object(),
-        async_answers=object(),
+        async_answers=fake_readout(),
     )
     documents = {"d": [[9]] * 4 + [[10, 11], [12]]}
     batch = QuailClassifier(state).classify(spec, [[4], [5]], documents)

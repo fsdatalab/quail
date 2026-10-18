@@ -38,9 +38,10 @@ def booted(monkeypatch):
     install_fake_torch(monkeypatch)
     monkeypatch.setattr(worker, "set_gpu_index", lambda index: None)
     monkeypatch.setattr(worker, "say", lambda message: None)
-    for name in ("load_model", "build_pipeline", "AnswerRows", "KVArena",
-                 "AsyncAnswers"):
+    for name in ("load_model", "AnswerRows", "KVArena", "AsyncAnswers"):
         monkeypatch.setattr(worker, name, lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(worker, "build_pipeline",
+                        lambda *a, **k: SimpleNamespace(decode_graphs=None))
     monkeypatch.setattr(worker, "warm_kernels",
                         lambda *a, **k: {"tier": "compiled"})
 

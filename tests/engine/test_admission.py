@@ -3,7 +3,7 @@
 import random
 
 import pytest
-from helpers.fakes import expected_filter_rows
+from helpers.fakes import expected_filter_rows, fake_readout
 
 from quail.backends.quail.executor.admission import (
     DROP,
@@ -204,8 +204,6 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
 
     By default, document 1 shares its first 32 tokens with document 0.
     """
-    from types import SimpleNamespace
-
     from helpers.fakes import (
         DOC,
         QUESTION,
@@ -223,7 +221,7 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
         monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = FakeModel(truth, {})
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    answers = fake_readout()
     arena = cpu_arena(pages)
     if cap is not None:
         arena.retention_cap_pages = cap
@@ -415,7 +413,6 @@ def test_filter_stop_groups_skip_a_queued_child_and_release_its_parent(
 
 
 def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
-    from types import SimpleNamespace
 
     from helpers.fakes import (
         DOC,
@@ -449,7 +446,7 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
                 for spec in chunk.specs for suffix in spec["suffixes"]]
 
     pipeline = fake_pipeline(forward_chunk=forward)
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    answers = fake_readout()
     arena = cpu_arena(64)
     stats = {}
     out, _, tokens = run_stages(

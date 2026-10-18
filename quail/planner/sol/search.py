@@ -166,7 +166,7 @@ class Search:
         for scan_node in self.scans:
             store = stores[scan_node.alias]
             tokens = [int(length) for length in store.lengths]
-            shared = (document_shared_tokens(store) if credit_shared
+            shared = (document_shared_tokens(store.tokens) if credit_shared
                       else [0] * len(tokens))
             self.aliases[scan_node.alias] = _AliasData(
                 column=f"{scan_node.provider}."
@@ -358,7 +358,7 @@ class Search:
                 if self.credit_shared:
                     # a skipped document computes no prefix for another
                     self.aliases[alias].shared = subset_shared_tokens(
-                        self.stores[alias], reached[0])
+                        self.stores[alias].tokens, reached[0])
             previous = None
             for index, step in enumerate(ordered):
                 if reached is not None:

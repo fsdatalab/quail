@@ -5,9 +5,7 @@ import numpy as np
 
 def balanced_shards(document_tokens, gpus: int):
     """Greedily partition documents into shards balanced by token count."""
-    lengths = np.asarray(
-        getattr(document_tokens, "arrow_array", document_tokens), dtype=np.int64
-    )
+    lengths = np.asarray(document_tokens, dtype=np.int64)
     if gpus == 1:
         return (tuple(range(len(lengths))),), [int(lengths.sum())]
     order = np.argsort(-lengths, kind="stable")
@@ -25,9 +23,7 @@ def contiguous_shards(document_tokens, gpus: int, *, total=None):
     num_documents = len(document_tokens)
     if gpus == 1 and total is not None:
         return ((0, num_documents),), [total]
-    lengths = np.asarray(
-        getattr(document_tokens, "arrow_array", document_tokens), dtype=np.int64
-    )
+    lengths = np.asarray(document_tokens, dtype=np.int64)
     cumulative = np.concatenate(([0], np.cumsum(lengths)))
     total = int(cumulative[-1])
     zeros = np.flatnonzero(lengths == 0)

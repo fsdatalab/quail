@@ -40,7 +40,7 @@ class QuailModelExecution:
         self.close()
         self.loaded_model = LoadedModelState(
             model=model, arena=arena, pipeline=pipeline,
-            model_spec=getattr(self.context, "model", None),
+            model_spec=self.context.model,
             decision_head=decision_head)
 
     def close(self) -> None:

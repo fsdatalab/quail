@@ -6,7 +6,14 @@ import types
 from types import SimpleNamespace
 
 import pytest
-from helpers.fakes import cpu_arena, cpu_staging, fake_pack, fake_pipeline, fake_torch
+from helpers.fakes import (
+    cpu_arena,
+    cpu_staging,
+    fake_pack,
+    fake_pipeline,
+    fake_readout,
+    fake_torch,
+)
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.admission import JoinAdmission
@@ -89,7 +96,7 @@ def test_spec_geometry_budgets_costs_and_turn_text():
 
 def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
         monkeypatch):
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    answers = fake_readout()
     documents = [[5] * 20, [6] * 30]
     questions = [[40, 41, 42], [40, 41, 43, 44]]
     # the questions' shared preamble is the frame, written once; each

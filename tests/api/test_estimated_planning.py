@@ -31,14 +31,14 @@ def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
     session = _session()
     estimates = session.inputs.estimate_lengths("documents", "body")
     # tokens per byte is constant here, so the estimate is exact
-    assert estimates == lengths
+    assert list(estimates) == lengths
     assert session.inputs.estimate_lengths("documents", "body") is estimates
     session.close()
     # a larger table repeats the sample's lengths over the row count
     # instead of scanning the column
     monkeypatch.setattr("quail.catalog.inputs.ESTIMATE_SAMPLE", 2)
     session = _session()
-    assert session.inputs.estimate_lengths("documents", "body") == [2, 4] * 3
+    assert list(session.inputs.estimate_lengths("documents", "body")) == [2, 4] * 3
     session.close()
 
     monkeypatch.setattr(execution, "gpu_problem", lambda: None)

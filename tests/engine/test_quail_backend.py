@@ -7,6 +7,7 @@ import pytest
 from helpers.fakes import (
     FakeArena,
     fake_pipeline,
+    fake_readout,
     fake_torch,
     keep_even,
     run_graph_on_arena,
@@ -25,7 +26,7 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
-from quail.specs import DEVICES
+from quail.specs import DEVICES, MODELS
 
 
 def test_filter_execution_and_retention_inputs(monkeypatch):
@@ -82,10 +83,10 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
 
     monkeypatch.setattr("quail.backends.quail.executor.parts.run_stages",
                         fake_run_stages)
-    execution = QuailModelExecution(SimpleNamespace())
+    execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
     execution.bind_loaded_model(
         model=object(), arena=arena, pipeline=fake_pipeline())
-    execution.bind_query(torch=fake_torch(), async_answers=object(),
+    execution.bind_query(torch=fake_torch(), async_answers=fake_readout(),
                          answer_rows=object(), chunk_tokens=8192)
     result = execution.execute(filtered, {
         "documents": [[1]], "document_ids": [10]})

@@ -3,7 +3,6 @@
 import math
 from dataclasses import dataclass
 
-import pyarrow as pa
 import pyarrow.compute as pc
 
 from quail.cost.joins import PricedJoin
@@ -57,11 +56,7 @@ def summarize_alias(lengths, window: int = 0, *, memo=None) -> AliasStats:
     key = ("alias_stats", id(lengths), window)
     if memo is not None and key in memo:
         return memo[key][1]
-    values = getattr(lengths, "arrow_array", lengths)
-    if not isinstance(values, (pa.Array, pa.ChunkedArray)):
-        values = pa.array(values, type=pa.int64())
-    else:
-        values = values.cast(pa.int64())
+    values = lengths.arrow_array
     short_counts = ()
     if window:
         counts = pc.value_counts(pc.filter(values, pc.less(values, window)))

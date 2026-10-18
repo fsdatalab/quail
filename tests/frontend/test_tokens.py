@@ -11,6 +11,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers, trainers
 from quail.catalog.tokens import (
     ArrowTokenDocuments,
     GigatokenEncoder,
+    TokenLengths,
     TokenOffsets,
     TokenStore,
     concat_tokens,
@@ -67,11 +68,14 @@ def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypa
         assert contiguous_shards(store.lengths, 2) == (((0, 2), (2, 3)), [3, 3])
         assert summarize_alias(store.lengths, 3, memo=memo) is summary
         assert summarize_alias(store.lengths, memo=memo).short_counts == ()
-        assert summarize_alias([4], 3, memo=memo) == AliasStats(1, 4, 16, 4, 3)
-    assert summarize_alias(pa.array([], pa.int32()), 3) == AliasStats(0, 0, 0, 0, 3)
-    assert summarize_alias([]).variance == 0
-    assert summarize_alias([100_000_000, 100_000_001]).variance == 0.25
-    assert summarize_alias(pa.array([100_000], pa.int32())).squared == 10_000_000_000
+        assert summarize_alias(TokenLengths([4]), 3, memo=memo) == AliasStats(
+            1, 4, 16, 4, 3)
+    assert summarize_alias(TokenLengths(pa.array([], pa.int32())), 3) == AliasStats(
+        0, 0, 0, 0, 3)
+    assert summarize_alias(TokenLengths([])).variance == 0
+    assert summarize_alias(TokenLengths([100_000_000, 100_000_001])).variance == 0.25
+    assert summarize_alias(
+        TokenLengths(pa.array([100_000], pa.int32()))).squared == 10_000_000_000
     index = store.prefix_index
     with monkeypatch.context() as patch:
         patch.setattr("quail.catalog.tokens._token_array",
@@ -105,9 +109,10 @@ def test_prefix_tree_borrows_whole_pages_and_siblings_share_one_parent():
     assert tree.parent == [None, 0, 0, None, None]
     assert tree.shared == [0, 32, 32, 0, 0]
     assert tree.shared_tokens == 64
-    groups = tree.reader_groups([len(document) for document in documents])
+    lengths = TokenLengths([len(document) for document in documents])
+    groups = tree.reader_groups(lengths)
     assert [values.tolist() for values in groups] == [[32], [2], [38]]
-    assert tree.reader_groups([len(document) for document in documents]) is groups
+    assert tree.reader_groups(lengths) is groups
     parents_first = {index: position for position, index in enumerate(tree.order)}
     assert all(parent is None or parents_first[parent] < parents_first[index]
                for index, parent in enumerate(tree.parent))

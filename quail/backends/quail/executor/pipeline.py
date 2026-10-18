@@ -8,6 +8,7 @@ from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import DocumentKeys, DocumentPrefixes
 from quail.execution.ids import id_positions
 from quail.execution.rows import Rows
+from quail.physical import AiFilter, AiJoin
 
 
 def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> dict:
@@ -49,5 +50,6 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
         keep_kv=pipeline[last].keep_kv,
         prefix_tree=execution_prefix_tree(first, prefixes, state.loaded_model.arena),
         limit=context.state.get("filter_limit"),
-        attention=getattr(first, "attention", None) or None,
+        attention=(first.attention or None
+                   if isinstance(first, (AiFilter, AiJoin)) else None),
         label=f"pipeline {alias}")

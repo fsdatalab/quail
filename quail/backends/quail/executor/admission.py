@@ -13,6 +13,18 @@ from dataclasses import dataclass
 import numpy as np
 
 
+class OwnRequests(list):
+    """A document's requests at a stage whose suffixes are its own.
+
+    The indices run over the document's own sequences, and lengths
+    holds their token counts, which the admission prices in place of
+    the stage's shared list.
+    """
+
+    def __init__(self, lengths):
+        super().__init__(range(len(lengths)))
+        self.lengths = np.asarray(lengths, dtype=np.int64)
+
 def pages_for(tokens: int, page_tokens: int) -> int:
     """Pages needed for `tokens` rows (suffix KV is never paged)."""
     return -(-tokens // page_tokens)
@@ -373,7 +385,7 @@ class JoinAdmission:
         """
         if lst is None:
             return None, None
-        lengths = getattr(lst, "lengths", None)
+        lengths = lst.lengths if isinstance(lst, OwnRequests) else None
         lst = np.asarray(lst, dtype=np.int64)
         if lengths is None:
             invalid = (lst < 0) | (lst >= len(self.stages[j]))
