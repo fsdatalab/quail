@@ -13,12 +13,11 @@ deep plan and anchor choice, with exact survivors from caller supplied
 answer and label oracles at every step. A classification of joined
 rows follows its join on the join's anchor.
 
-A classification is priced as one question per live document: the
-reference prompt's tail (the question, the labels by name, and the
-answer cue) over the document's prefix, read at the cue's row as a
-filter's answer is. The rows a scoring rule appends to read the label
-(a letter, a trie, or decode rounds) are an execution choice and are
-not counted.
+Classification uses the planner's selected scoring rule, including its
+label tokens, decode rounds, and output head. Extraction uses the
+planner's expected answer-length curve and draft policy, including
+verification rows, KV reads, and recurrent-state replay. Both use ideal
+query-wide packing; answer lengths and draft acceptance remain assumptions.
 
 Every operator in the plan is priced or refused: an Apply, an AI.SCORE
 predicate or column, a LIMIT, or a join without full semantics raises
@@ -35,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from quail.cost import budgets
+from quail.cost.extract import ExtractAssumptions
 from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work
 from quail.logical import (
@@ -84,6 +84,7 @@ class SpeedOfLightEstimate:
     relation_order: tuple[str, ...]
     cached_prefixes: tuple[str, ...]
     search: dict = field(default_factory=dict)
+    extraction: ExtractAssumptions = field(default_factory=ExtractAssumptions)
 
     @property
     def seconds(self) -> float:
@@ -139,13 +140,16 @@ class SpeedOfLightEstimate:
                 "the planner's rule for this query; an alias's "
                 "classifications follow its AI.IF filters"),
             "classification": (
-                "the reference prompt's tail per document or joined row, "
-                "read at the answer cue; a scoring rule's extra rows are "
-                "not counted"),
-            "extraction": (
-                "the plain prompt's tail per document, read once at the "
-                "cue; the lines answer, the start step, and the span "
-                "passes are not counted"),
+                "the planner's selected scoring rule, including decoding and "
+                "output-head work; greedy label outcomes are equally likely"),
+            "extraction": {
+                "expected_answer_tokens": self.extraction.answer_tokens,
+                "answer_length_distribution": "geometric, capped at the answer limit",
+                "draft_acceptance": "accepted while the answer continues",
+                "draft_policy": "the planner's first-round adaptive choice",
+                "included": "decode and verification rows, KV, replay, and output head",
+            },
+            "packing": "ideal query-wide packing, including answer rounds",
             "plan_space": "all feasible eager binary full left deep plans",
             "cached_values": (
                 "document prefixes used by filters, classifications, "
@@ -184,6 +188,10 @@ class SpeedOfLightEstimate:
             "sliding_kv_read": self.work.sliding_kv_read,
             "kv_written": self.work.kv_written,
             "kv_read": self.work.kv_read,
+            "state_written": self.work.state_written,
+            "state_read": self.work.state_read,
+            "readout_flops": self.work.readout_flops,
+            "readout_bytes": self.work.readout_bytes,
             "components": [
                 {
                     "name": component.name,
@@ -286,6 +294,7 @@ def speed_of_light_estimate(
     device: DeviceSpec | None = None,
     chunk_tokens: int | None = None,
     credit_shared_prefixes: bool = True,
+    extraction: ExtractAssumptions | None = None,
 ) -> SpeedOfLightEstimate:
     """Return the ideal time of one query on one device.
 
@@ -308,6 +317,8 @@ def speed_of_light_estimate(
             prefix once across documents and aliases of one column.
             False computes each alias's document once and reuses it
             only across that document's own questions.
+        extraction: Expected extraction answer-length curve. Defaults to the
+            planner's geometric curve with mean 16 tokens; no model is run.
 
     Raises:
         NotImplementedError: The plan holds an operator the estimate
@@ -320,7 +331,7 @@ def speed_of_light_estimate(
         chunk_tokens = budgets.chunk_budget(model, device)
     _refuse_unpriced(query.logical)
     search = Search(query, answer, label, model, device, chunk_tokens,
-                    credit_shared_prefixes)
+                    credit_shared_prefixes, extraction or ExtractAssumptions())
     survivors, filter_work, filter_stages = search.run_filters()
     resident = frozenset(stage["alias"] for stage in filter_stages
                          if stage["operator"] != LABEL_IN)
@@ -344,6 +355,7 @@ def speed_of_light_estimate(
         join_stages=tuple(best.steps),
         relation_order=tuple(best.relation_order),
         cached_prefixes=tuple(sorted(best.state_property)),
+        extraction=search.extraction,
         search={
             "dp_states": result.state_count,
             "dp_records_generated": result.generated_count,

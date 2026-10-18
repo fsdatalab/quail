@@ -253,9 +253,18 @@ def test_extract_errors_and_refusals(session):
         (builder.ai_extract("c.text", {"ends": QUESTION}, name="lease")
          .ai_classify(quail.prompt("{0}", quail.col("c.text")), ["a", "b"],
                       name="lease_span"))
-    # the speed of light estimate prices an extraction as one question
-    # per document, read once at the cue
-    estimate = quail.speed_of_light_estimate(_ends(session), lambda *_: True)
+    from quail.cost.extract import ExtractAssumptions
+
+    query = _ends(session)
+    estimate = quail.speed_of_light_estimate(query, lambda *_: True)
+    cue = quail.speed_of_light_estimate(
+        query, lambda *_: True, extraction=ExtractAssumptions(answer_tokens=0))
+    assert estimate.fresh_tokens > cue.fresh_tokens
+    assert estimate.work.kv_read > cue.work.kv_read
+    assert estimate.work.readout_flops > cue.work.readout_flops
+    assert estimate.seconds > cue.seconds
+    assert cue.filter_stages[0]["answer_rows"] == 2
+    assert estimate.assumptions()["extraction"]["expected_answer_tokens"] == 16
     (stage,) = estimate.filter_stages
     assert (stage["operator"], stage["alias"], stage["name"]) == (
         "AI.EXTRACT", "c", "lease.ends")

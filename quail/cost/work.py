@@ -15,6 +15,8 @@ class Work:
     sequence's state is saved for later reuse, and one read when a
     sequence starts from a saved state. The bytes of one checkpoint
     come from the model, and are zero for a model without state layers.
+    readout_flops and readout_bytes count the selected output head's
+    computation and weight reads, using the operator's packing assumption.
     """
 
     tokens: float = 0.0
@@ -25,6 +27,8 @@ class Work:
     sliding_kv_read: float = 0.0
     state_written: float = 0.0
     state_read: float = 0.0
+    readout_flops: float = 0.0
+    readout_bytes: float = 0.0
 
     def __add__(self, other: "Work") -> "Work":
         return Work(
@@ -36,6 +40,8 @@ class Work:
             self.sliding_kv_read + other.sliding_kv_read,
             self.state_written + other.state_written,
             self.state_read + other.state_read,
+            self.readout_flops + other.readout_flops,
+            self.readout_bytes + other.readout_bytes,
         )
 
     def __mul__(self, count: float) -> "Work":
@@ -48,6 +54,8 @@ class Work:
             self.sliding_kv_read * count,
             self.state_written * count,
             self.state_read * count,
+            self.readout_flops * count,
+            self.readout_bytes * count,
         )
 
     def total(self) -> "Work":
@@ -55,7 +63,7 @@ class Work:
         return Work(*(float(np.sum(value)) for value in (
             self.tokens, self.pairs, self.kv_written, self.kv_read,
             self.sliding_pairs, self.sliding_kv_read, self.state_written,
-            self.state_read)))
+            self.state_read, self.readout_flops, self.readout_bytes)))
 
     def dominates(self, other: "Work") -> bool:
         """Return whether every count is no larger than the other record."""
@@ -68,6 +76,8 @@ class Work:
             and self.sliding_kv_read <= other.sliding_kv_read
             and self.state_written <= other.state_written
             and self.state_read <= other.state_read
+            and self.readout_flops <= other.readout_flops
+            and self.readout_bytes <= other.readout_bytes
         )
 
 
