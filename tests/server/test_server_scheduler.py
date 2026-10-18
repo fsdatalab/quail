@@ -110,7 +110,7 @@ def test_failed_and_cancelled_runs_are_saved_and_not_killed(
     bad = scheduler.run_one(
         submit(store, tmp_path, sql="SELECT r.nothing FROM reviews r"))
     assert (bad.state, bad.error["type"]) == ("failed", "CompileError")
-    assert executor._loaded_model is None
+    assert executor.loaded_model is None
 
     queued = submit(store, tmp_path)
     store.request_cancel(queued.id)
@@ -178,18 +178,18 @@ def test_executors_switch_models_skip_warm_loads_and_stop_on_timeout(
         try:
             first = submit(store, tmp_path)
             assert scheduler.run_one(first).state == "succeeded", child
-            assert executor._loaded_model == "qwen3-4b-fp8", child
-            pid = executor._process.pid if child else None
+            assert executor.loaded_model == "qwen3-4b-fp8", child
+            pid = executor._child.process.pid if child else None
             second = submit(store, tmp_path)
             assert scheduler.run_one(second).state == "succeeded", child
             if child:
-                assert executor._process.pid == pid, "same model, same child"
+                assert executor._child.process.pid == pid, "same model, same child"
             other = submit(store, tmp_path,
                            config={**server_fakes.CONFIG, "model": "qwen3-32b-fp8"})
             assert scheduler.run_one(other).state == "succeeded", child
-            assert executor._loaded_model == "qwen3-32b-fp8", child
+            assert executor.loaded_model == "qwen3-32b-fp8", child
             if child:
-                assert executor._process.pid != pid, "another model, a new child"
+                assert executor._child.process.pid != pid, "another model, a new child"
         finally:
             executor.close()
             store.remove_listener(record)
