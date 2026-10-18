@@ -59,26 +59,41 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     Scan, so the path holds the complete set.
 
     The document column is always tokenized. It is kept as a value too
-    only when the root projection returns it.
+    only when something reads its text: the root projection or a sort
+    key returns it, a score reads it, a scan predicate tests it, an
+    apply() function or a join condition reads it, or an extraction
+    locates its answers in it.
     """
     plan = LogicalPlan(root)
     projection = next((node for node in reversed(plan.walk())
                        if isinstance(node, Project)), None)
     result = plan.result
-    returned = {
+    valued = {
         (ref.alias, ref.column)
         for ref in (projection.output_schema() if projection is not None else ())
     } | {
         (ref.alias, ref.column)
         for key in result.order
         for ref in _column_refs(key)
-    }
-    score_inputs = {
+    } | {
         (ref.alias, ref.column)
         for expression in (projection.columns if projection is not None else ())
         if isinstance(expression, Alias)
         for ref in _column_refs(expression)
     }
+    for node in plan.walk():
+        if isinstance(node, Apply):
+            refs = node.columns
+        elif isinstance(node, Join):
+            refs = [ref for condition in node.on
+                    for ref in (condition.left, condition.right)]
+        elif isinstance(node, SemanticExtract):
+            refs = node.call.prompt.args
+        elif isinstance(node, Scan):
+            refs = [predicate.column for predicate in node.predicates]
+        else:
+            continue
+        valued.update((ref.alias, ref.column) for ref in refs)
 
     def descend(node, needed):
         needed = {alias: dict(columns) for alias, columns in needed.items()}
@@ -92,13 +107,9 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
             for field in node.output_schema()[len(node.input.output_schema()):]:
                 needed.get(field.alias, {}).pop(field.column, None)
         if isinstance(node, Scan):
-            tested = {predicate.column.column for predicate in node.predicates}
             columns = tuple(
                 column for column in needed.get(node.alias, ())
-                if column != node.column
-                or (node.alias, column) in returned
-                or (node.alias, column) in score_inputs
-                or column in tested
+                if column != node.column or (node.alias, column) in valued
             )
             return node if columns == node.columns else replace(
                 node, columns=columns)
@@ -115,8 +126,8 @@ def _lets_through(node, alias: str) -> bool:
 
     True for a Join, a full SemanticJoin, a classification of joined
     rows, and any node on another table. False for the table's own
-    sequence, a gate (an exists or anti join), an Apply returning a join's
-    pairs, and any other node.
+    sequence, a gate (an exists or anti join), an Apply reading the
+    table or returning a join's pairs, and any other node.
     """
     if isinstance(node, Join):
         return True
@@ -141,8 +152,8 @@ def _place_filter(filter_node, node, alias: str):
 
     Returns:
         The subtree under node with the filter as low as it goes, or
-        None when a gate, an Apply returning pairs, or the table's own
-        sequence stops it before any Join.
+        None when a gate, an Apply, or the table's own sequence stops
+        it before any Join.
     """
     if isinstance(node, Join):
         left = {field.alias for field in node.left.output_schema()}

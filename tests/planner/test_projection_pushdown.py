@@ -276,3 +276,42 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
         columns=(), aliases=("r", "p"), written_position=0))
     above = replace(labelled.root, input=_stars_apply(pairs))
     assert push_down_filters(above) is None
+
+
+def test_apply_and_join_keys_keep_the_document_text_as_values(tmp_path):
+    from helpers.oracle import Oracle, oracle_executor
+
+    session = _session(tmp_path)
+    seen = []
+
+    def first_two(tables):
+        table = tables["r"]
+        seen.extend(table.column("review").to_pylist())
+        return table.column("r").to_pylist()[:2]
+
+    query = (session.docs("reviews").alias("r")
+             .apply(first_two, columns=[col("r.review")])
+             .ai_filter(prompt("q: {0}", col("r.review")))
+             .select("r.id"))
+    query.plan()
+    assert sorted(_scans(query.logical)["r"].columns) == ["id", "review"]
+    result = _run(query, oracle_executor(Oracle(filters={"r": {"q:": [1, 0, 1]}}),
+                                         functions=session.registry.functions))
+    # the function runs over the filter's survivors and reads their text
+    assert seen == ["good one", "fine one"]
+    assert result.to_rows() == [("r0",), ("r2",)]
+
+    session.register("products", quail.DocumentProvider.from_table(pa.table({
+        "asin": ["p0", "p1"], "description": ["bad one", "other"],
+    }), id_col="asin"))
+    query = (session.docs("reviews").alias("r")
+             .join(session.docs("products").alias("p"),
+                   on=col("r.review") == col("p.description"))
+             .ai_filter(prompt("m {0} {1}", col("r.review"), col("p.description")))
+             .select("r.id", "p.asin"))
+    query.plan()
+    assert sorted(_scans(query.logical)["r"].columns) == ["id", "review"]
+    assert sorted(_scans(query.logical)["p"].columns) == ["asin", "description"]
+    pairs = {("r", "p"): lambda r, p: True, ("p", "r"): lambda p, r: True}
+    assert _run(query, make_executor({}, pairs)).to_rows() == [("r1", "p0")]
+    session.close()
