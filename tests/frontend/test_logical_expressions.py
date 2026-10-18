@@ -7,7 +7,6 @@ import pytest
 from quail.logical import (
     Alias,
     ColumnRef,
-    Compare,
     CompileError,
     Filter,
     FilterPredicate,
@@ -39,9 +38,10 @@ def _pair_call(kind="boolean"):
 
 
 INVALID_PREDICATES = [
-    (Compare(_filter_call(), ">=", 0.5), "only an AI.SCORE call compares"),
-    (Compare(_filter_call("score"), "=", 0.5), "unsupported AI.SCORE comparison"),
-    (Compare(_filter_call("score"), ">=", 1.5), "between 0 and 1"),
+    (RegularPredicate(_filter_call(), ">=", 0.5), "only an AI.SCORE call compares"),
+    (RegularPredicate(_filter_call("score"), "=", 0.5),
+     "unsupported AI.SCORE comparison"),
+    (RegularPredicate(_filter_call("score"), ">=", 1.5), "between 0 and 1"),
     (_filter_call("score"), "only when compared"),
     (ModelCall(bind_prompt("q {0}", (R,)), "text"), "kind must be one of"),
     (ModelCall(bind_prompt("q {0}", (R,)), "label"), "at least two labels"),
@@ -61,7 +61,7 @@ def test_model_calls_and_predicates_validate_kind_comparison_and_input():
     assert call.aliases() == ("r", "p")
     assert is_score(call)
     assert not is_score(_filter_call())
-    compare = Compare(call, ">=", 0.5)
+    compare = RegularPredicate(call, ">=", 0.5)
     assert model_call(compare) is call
     assert model_call(Alias(call, "s")) is call
 
@@ -91,7 +91,7 @@ def test_operators_walk_lists_each_operator_in_written_order():
     r = Scan("reviews", "r", "review")
     p = Scan("products", "p", "description")
     first = FilterPredicate(_filter_call(), selectivity=0.5)
-    second = FilterPredicate(Compare(_filter_call("score"), ">", 0.2))
+    second = FilterPredicate(RegularPredicate(_filter_call("score"), ">", 0.2))
     joined = SemanticJoin(
         Join(SemanticFilter(r, (first, second)), p), _pair_call()
     )

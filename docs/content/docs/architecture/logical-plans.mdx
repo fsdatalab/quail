@@ -81,23 +81,23 @@ of a joined pair. Conditions on labels of joined pairs are unsupported.
 
 Expressions describe the values an operator computes or tests. For
 example, a `ModelCall` represents a prompt evaluated on each input row.
-A `Compare` tests a score returned by that call.
+A `RegularPredicate` tests a column, or a score returned by that
+call, against a literal.
 
 | Expression | Value |
 | --- | --- |
 | `ColumnRef(alias, provider, column)` | A reference to a table column. The leaf of a value expression. |
 | `GetField(input, field)` | One field of a struct-valued expression. |
 | `ScalarFunction(function, args)` | A function of value expressions, such as `length`, computed row by row without the model. |
-| `RegularPredicate(expression, comparison, value)` | A test of a value expression against a literal, decided without the model. |
+| `RegularPredicate(expression, comparison, value)` | A test of a value expression against a literal, decided without the model; or an `AI.SCORE` call compared with a threshold. |
 | `ModelCall(prompt, kind, labels, descriptions)` | A model call. Its kind is `boolean` for `AI.IF`, `score` for `AI.SCORE`, or `label` for `AI.CLASSIFY`. |
-| `Compare(call, comparison, threshold)` | A TRUE or FALSE comparison of a model score with a threshold. |
-| `InList(column, values)` | A TRUE or FALSE test of whether a column value is in a list. |
 | `Alias(expression, name)` | A model call or a value expression returned under a name. |
 
 `SemanticFilter` and `SemanticJoin` hold predicates that return TRUE or
-FALSE. A predicate can be a boolean `ModelCall` or a `Compare` around
-a score call. A label condition uses `InList` in a separate `Filter`.
-`Project.columns` holds `ColumnRef` and `Alias` expressions.
+FALSE. A predicate can be a boolean `ModelCall` or a `RegularPredicate`
+comparing a score call with a threshold. A label condition is a
+`RegularPredicate` in a separate `Filter`. `Project.columns` holds
+value expressions and `Alias` expressions.
 
 `LogicalPlan.operators()` collects the tree's operations for planning.
 It includes scans, predicates and joins in written order, Python

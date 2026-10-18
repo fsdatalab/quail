@@ -9,7 +9,6 @@ from quail.frontend.scope import Scope
 from quail.frontend.sql_binding.predicates import column_path
 from quail.logical import (
     Alias,
-    Compare,
     CompileError,
     ExtractStruct,
     FilterPredicate,
@@ -479,7 +478,7 @@ class ExpressionBinder:
         return ModelCall(prompt, "boolean"), options, aliases
 
     def bind_ai_score(self, node, allowed: set, scope=None, join=None):
-        """Parse a compared AI.SCORE call into a Compare, options, and aliases.
+        """Parse a compared AI.SCORE call into a predicate, options, and aliases.
 
         The threshold may be on either side of the comparison.
         """
@@ -499,7 +498,7 @@ class ExpressionBinder:
             scope=scope,
             join=join,
         )
-        expression = Compare(ModelCall(prompt, "score"), comparison, value)
+        expression = RegularPredicate(ModelCall(prompt, "score"), comparison, value)
         return expression, options, aliases
 
 

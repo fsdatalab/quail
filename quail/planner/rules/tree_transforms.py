@@ -9,7 +9,6 @@ from quail.logical import (
     Alias,
     Apply,
     ColumnRef,
-    Compare,
     Equality,
     Filter,
     FilterPredicate,
@@ -47,10 +46,10 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return column_references(expression.expression)
     if isinstance(expression, FilterPredicate):
         return _column_refs(expression.expression)
-    if isinstance(expression, (ModelCall, Compare, Alias)):
+    if isinstance(expression, (ModelCall, Alias)):
         return _refs_of(model_call(expression).prompt.args)
     if isinstance(expression, RegularPredicate):
-        return column_references(expression.expression)
+        return _column_refs(expression.expression)
     if isinstance(expression, Equality):
         return _refs_of((expression.left, expression.right))
     if isinstance(expression, SortKey):

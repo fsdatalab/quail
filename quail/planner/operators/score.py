@@ -136,7 +136,7 @@ class ScoreLowering:
             inputs=input_ports((source,)),
             predicate=RegularPredicate(
                 ColumnRef(alias, "", self.names[predicate.prompt]),
-                expression.comparison, expression.threshold),
+                expression.comparison, expression.value),
             aliases=tuple(aliases), selectivity=predicate.selectivity,
             written_position=position)
         self.nodes.append(node)

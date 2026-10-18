@@ -239,9 +239,9 @@ def _refuse_unpriced(logical) -> None:
             if not (isinstance(expression, ModelCall)
                     and expression.kind == "boolean"):
                 raise NotImplementedError(
-                    f"the speed of light estimate does not price the "
-                    f"{type(expression).__name__} filter on {alias!r}; "
-                    f"it prices AI.IF and label filters")
+                    f"the speed of light estimate does not price the filter "
+                    f"{expression} on {alias!r}; it prices AI.IF and label "
+                    f"filters")
     for tests in operators.extract_filters.values():
         for test in tests:
             if test.condition.column.column.endswith(SPAN_SUFFIX):

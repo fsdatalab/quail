@@ -205,11 +205,11 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
     )
     join = plan.root.input
     assert isinstance(join, SemanticJoin)
-    assert (join.predicate.comparison, join.predicate.threshold) == ("<", 0.8)
-    assert join.predicate.call.aliases() == ("q", "d")
+    assert (join.predicate.comparison, join.predicate.value) == ("<", 0.8)
+    assert join.predicate.expression.aliases() == ("q", "d")
     (predicate,) = plan.operators().filters["d"]
     expression = predicate.expression
-    assert (expression.comparison, expression.threshold) == (">=", 0.5)
+    assert (expression.comparison, expression.value) == (">=", 0.5)
 
 
 def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):

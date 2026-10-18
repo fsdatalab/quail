@@ -8,6 +8,7 @@ from typing import ClassVar, Optional
 from quail.logical.expressions import (
     ColumnRef,
     CompileError,
+    RegularPredicate,
     _explain,
     model_call,
     validate_predicate,
@@ -15,7 +16,6 @@ from quail.logical.expressions import (
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.classify import classifications
 from quail.logical.nodes.extract import extractions
-from quail.logical.predicates import RegularPredicate
 
 
 @dataclass(frozen=True)

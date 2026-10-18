@@ -12,6 +12,7 @@ from quail.logical.expressions import (
     FilterPredicate,
     ModelCall,
     Prompt,
+    RegularPredicate,
     model_call,
 )
 from quail.logical.nodes import (
@@ -30,7 +31,6 @@ from quail.logical.nodes import (
 from quail.logical.plan import (
     LogicalPlan,
 )
-from quail.logical.predicates import RegularPredicate
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,7 @@ class JoinSpec:
     """The join predicate (or one EXISTS/anti term), pre-assembly."""
 
     aliases: tuple  # newly joined table aliases
-    predicate: Any  # ModelCall | Compare
+    predicate: Any  # ModelCall | RegularPredicate over an AI.SCORE call
     semantics: str = "full"
     selectivity: Optional[float] = None
     anchor: Optional[str] = None

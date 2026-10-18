@@ -9,6 +9,7 @@ from quail.logical.expressions import (
     ColumnRef,
     CompileError,
     ModelCall,
+    RegularPredicate,
     aliased_call,
     model_call,
 )
@@ -26,7 +27,6 @@ from quail.logical.nodes import (
     SemanticFilter,
     SemanticJoin,
 )
-from quail.logical.predicates import RegularPredicate
 
 
 @dataclass(frozen=True)

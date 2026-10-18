@@ -275,7 +275,7 @@ def test_unpriced_operators_are_refused(tmp_path):
         compared = sess.sql(
             "SELECT r.id FROM reviews AS r "
             "WHERE AI.SCORE(PROMPT('Rate {0}', r.body)) > 0.5")
-        with pytest.raises(NotImplementedError, match="Compare filter"):
+        with pytest.raises(NotImplementedError, match="does not price the filter"):
             quail.speed_of_light_estimate(compared, _answer)
         exists = (sess.docs("reviews").alias("r")
                   .ai_join(sess.docs("aspects").alias("a"),

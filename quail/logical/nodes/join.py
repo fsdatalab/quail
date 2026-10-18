@@ -79,7 +79,7 @@ class SemanticJoin:
 
     input: LogicalNode  # a Join, under any Apply that
     #                                    returns its pairs
-    predicate: Any  # ModelCall | Compare
+    predicate: Any  # ModelCall | RegularPredicate over an AI.SCORE call
     semantics: str = "full"  # full | exists | anti
     selectivity: Optional[float] = None  # fraction of tuples that pass
     anchor: Optional[str] = None  # table alias whose KV is kept;

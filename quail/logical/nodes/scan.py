@@ -8,11 +8,11 @@ from typing import Any, ClassVar
 from quail.logical.expressions import (
     ColumnRef,
     CompileError,
+    RegularPredicate,
     column_name,
     column_references,
     source_columns,
 )
-from quail.logical.predicates import RegularPredicate
 
 
 @dataclass(frozen=True)

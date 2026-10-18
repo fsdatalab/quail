@@ -5,6 +5,7 @@ from quail.logical.builder import (
     LogicalPlanBuilder,
 )
 from quail.logical.expressions import (
+    COLUMN_COMPARISONS,
     DEFAULT_SELECTIVITY,
     PROBABILITIES_SUFFIX,
     SCORE_COMPARISONS,
@@ -13,7 +14,6 @@ from quail.logical.expressions import (
     Aggregation,
     Alias,
     ColumnRef,
-    Compare,
     CompileError,
     Equality,
     ExtractStruct,
@@ -21,6 +21,8 @@ from quail.logical.expressions import (
     GetField,
     HavingTest,
     ModelCall,
+    RegularPredicate,
+    ScalarFunction,
     SortKey,
     column_name,
     effective_selectivity,
@@ -54,11 +56,6 @@ from quail.logical.plan import (
     join_outer_input,
     oriented_join_conditions,
 )
-from quail.logical.predicates import (
-    COLUMN_COMPARISONS,
-    RegularPredicate,
-    ScalarFunction,
-)
 from quail.logical.prompts import (
     ANSWER_CUE,
     SHARED_PRE,
@@ -84,7 +81,6 @@ __all__ = [
     "Alias",
     "Apply",
     "ColumnRef",
-    "Compare",
     "CompileError",
     "COLUMN_COMPARISONS",
     "DEFAULT_SELECTIVITY",

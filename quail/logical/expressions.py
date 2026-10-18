@@ -5,8 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
+import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
+
+from quail.logical.predicates import (
+    COLUMN_COMPARISONS,
+    COMPARISON_KERNELS,
+    TEXT_COMPARISONS,
+    accepted_rows,
+    compare_literal,
+    membership,
+)
 
 DESCRIPTION_WORDS = 25
 TASK_DESCRIPTION_WORDS = 50
@@ -499,24 +509,172 @@ def validate_task_description(text: str) -> None:
         )
 
 
+def literal_value(value):
+    """Return a literal as a plain Python value: a NumPy scalar becomes one."""
+    if isinstance(value, tuple):
+        return tuple(literal_value(item) for item in value)
+    return value.item() if isinstance(value, np.generic) else value
+
+
+
 @dataclass(frozen=True)
-class Compare:
-    """A score compared with a threshold; answers yes or no."""
+class RegularPredicate:
+    """A test of a value expression or a model score against literals.
 
-    call: ModelCall
+    ``expression`` reads one source column, with fields or a function
+    on it, such as the ``start`` field of an extraction's span; or it
+    is an AI.SCORE call, compared with a threshold between 0 and 1.
+    ``value`` is the literal compared with, a tuple of literals for
+    ``in``, and None for the null tests. A column test is decided
+    without the model.
+    """
+
+    expression: Any
     comparison: str
-    threshold: float
+    value: Any = None
 
-    type_name: ClassVar[str] = "quail.compare"
+    type_name: ClassVar[str] = "quail.regular_predicate"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", literal_value(self.value))
+
+    @property
+    def column(self) -> ColumnRef:
+        """The one source column the expression reads."""
+        (column,) = column_references(self.expression)
+        return column
+
+    @property
+    def function(self) -> Optional[str]:
+        """The function applied last, or None."""
+        return (self.expression.function
+                if isinstance(self.expression, ScalarFunction) else None)
+
+    def aliases(self) -> tuple[str, ...]:
+        if isinstance(self.expression, ModelCall):
+            return self.expression.aliases()
+        return (self.column.alias,)
+
+    @property
+    def text(self) -> bool:
+        """Whether the comparison tests text against a pattern."""
+        return self.comparison.removeprefix("not ") in TEXT_COMPARISONS
 
     def validate(self) -> None:
-        self.call.validate()
-        if self.call.kind != "score":
-            raise CompileError("only an AI.SCORE call compares with a threshold")
-        if self.comparison not in SCORE_COMPARISONS:
-            raise CompileError(f"unsupported AI.SCORE comparison {self.comparison!r}")
-        if not 0.0 <= self.threshold <= 1.0:
-            raise CompileError("AI.SCORE threshold must be between 0 and 1")
+        if isinstance(self.expression, ModelCall):
+            self.expression.validate()
+            if self.expression.kind != "score":
+                raise CompileError("only an AI.SCORE call compares with a threshold")
+            if self.comparison not in SCORE_COMPARISONS:
+                raise CompileError(
+                    f"unsupported AI.SCORE comparison {self.comparison!r}")
+            if not isinstance(self.value, (int, float)) or not 0 <= self.value <= 1:
+                raise CompileError("AI.SCORE threshold must be between 0 and 1")
+            return
+        if len(column_references(self.expression)) != 1:
+            raise CompileError("a column predicate tests one column")
+        self.expression.validate()
+        if self.comparison not in COLUMN_COMPARISONS:
+            raise CompileError(
+                f"unsupported column comparison {self.comparison!r}; "
+                f"supported: {', '.join(COLUMN_COMPARISONS)}"
+            )
+        if self.comparison == "in":
+            if not isinstance(self.value, tuple) or not self.value:
+                raise CompileError("IN needs a non-empty list of literals")
+            if len(set(self.value)) != len(self.value):
+                raise CompileError(f"{self.name} IN lists a value twice")
+        elif self.comparison.startswith("is"):
+            if self.value is not None:
+                raise CompileError("a null test takes no value")
+        elif self.text:
+            if not isinstance(self.value, str):
+                raise CompileError(f"{self.comparison} compares with a string")
+        elif self.value is None or isinstance(self.value, (tuple, list)):
+            raise CompileError(f"{self.comparison} compares with one literal")
+
+    def validate_text_column(self) -> None:
+        """Check the literals of a test over a text column, such as an answer.
+
+        Raises:
+            CompileError: The text is compared with a number or boolean,
+                or its length with a string.
+        """
+        self.validate()
+        if self.comparison.startswith("is"):
+            return
+        values = self.value if isinstance(self.value, tuple) else (self.value,)
+        if self.function is None and any(not isinstance(v, str) for v in values):
+            raise CompileError(
+                f"{self.name} is text; {self.comparison} compares it with a string")
+        if self.function == "length" and any(
+                isinstance(v, (str, bool)) for v in values):
+            raise CompileError(f"{self.name} compares with a number")
+
+    def evaluate(self, columns) -> pa.ChunkedArray:
+        """Return a boolean array of the rows the predicate accepts.
+
+        A null compared with a literal is neither accepted nor rejected
+        and comes back null; accepts() treats it as rejected.
+
+        Args:
+            columns: The table, record batch, or rows holding the
+                tested column, read with ``column(name)``.
+
+        Raises:
+            CompileError: The literal cannot be compared with the
+                column's values, such as a string against a number
+                column.
+        """
+        values = evaluate_expression(self.expression, columns)
+        try:
+            comparison = self.comparison.removeprefix("not ")
+            if comparison == "is null":
+                mask = pc.is_null(values)
+            elif comparison == "is not null":
+                mask = pc.is_valid(values)
+            elif comparison == "in":
+                mask = membership(values, self.value)
+            elif isinstance(self.value, str):
+                mask = COMPARISON_KERNELS[comparison](values, self.value)
+            else:
+                mask = compare_literal(values, comparison, self.value)
+            return pc.invert(mask) if comparison != self.comparison else mask
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError,
+                pa.ArrowTypeError, TypeError, ValueError, OverflowError) as error:
+            raise CompileError(
+                f"{self} cannot be evaluated on a column of type "
+                f"{values.type}: {error}") from error
+
+    def accepts(self, columns) -> pa.Array:
+        """Return the rows the predicate accepts, with every null rejected."""
+        return accepted_rows(self.evaluate(columns))
+
+    def to_dict(self) -> dict:
+        return {"expression": encode_expression(self.expression),
+                "comparison": self.comparison,
+                "value": (list(self.value) if isinstance(self.value, tuple)
+                          else self.value)}
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "RegularPredicate":
+        """Decode a predicate from its serialized mapping."""
+        literal = value["value"]
+        return cls(decode_expression(value["expression"]), str(value["comparison"]),
+                   tuple(literal) if isinstance(literal, list) else literal)
+
+    @property
+    def name(self) -> str:
+        """The tested expression as written."""
+        return _explain(self.expression)
+
+    def __str__(self) -> str:
+        if self.comparison == "in":
+            return f"{self.name} IN ({', '.join(repr(v) for v in self.value)})"
+        if self.comparison.startswith("is"):
+            return f"{self.name} {self.comparison.upper()}"
+        return f"{self.name} {self.comparison} {self.value!r}"
+
 
 
 @dataclass(frozen=True)
@@ -541,9 +699,8 @@ def model_call(expression) -> ModelCall:
     """Return the model call inside a predicate or projected expression."""
     if isinstance(expression, ModelCall):
         return expression
-    if isinstance(expression, Compare):
-        return expression.call
-    if isinstance(expression, Alias) and isinstance(expression.expression, ModelCall):
+    if isinstance(expression, (RegularPredicate, Alias)) and isinstance(
+            expression.expression, ModelCall):
         return expression.expression
     raise TypeError(f"{type(expression).__name__} holds no model call")
 
@@ -571,8 +728,9 @@ def has_score(plan) -> bool:
 
 
 def validate_predicate(expression) -> None:
-    """Check that an expression answers yes or no for every row."""
-    if isinstance(expression, Compare):
+    """Check that an expression asks the model yes or no for every row."""
+    if isinstance(expression, RegularPredicate) and isinstance(
+            expression.expression, ModelCall):
         expression.validate()
         return
     if isinstance(expression, ModelCall):
@@ -592,7 +750,8 @@ def validate_predicate(expression) -> None:
             )
         return
     raise CompileError(
-        f"a predicate is a model call or a comparison, got {type(expression).__name__}"
+        f"a predicate is a model call or a comparison of an AI.SCORE call, "
+        f"got {expression}"
     )
 
 
@@ -600,7 +759,7 @@ def validate_predicate(expression) -> None:
 class FilterPredicate:
     """One predicate over a table's documents, with its selectivity hint."""
 
-    expression: Any  # ModelCall | Compare
+    expression: Any  # ModelCall | RegularPredicate over an AI.SCORE call
     selectivity: Optional[float] = None  # fraction of documents that
     #                                       pass; None means not given
 
@@ -629,11 +788,8 @@ class Equality:
 
 
 def _explain(expression) -> str:
-    if isinstance(expression, Compare):
-        return (
-            f"{_explain(expression.call)} {expression.comparison} "
-            f"{expression.threshold}"
-        )
+    if isinstance(expression, RegularPredicate):
+        return str(expression)
     if isinstance(expression, Alias):
         call = aliased_call(expression)
         if call is None:
