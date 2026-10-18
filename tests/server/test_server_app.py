@@ -1,10 +1,13 @@
 """HTTP routes of Quail Server, driven with Starlette's test client."""
 
+import asyncio
 import hashlib
 import io
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
@@ -12,6 +15,7 @@ import pytest
 from helpers import server_fakes
 
 from quail.remote import inputs
+from quail.remote.records import ServerError
 
 pytest.importorskip("starlette")
 
@@ -280,3 +284,71 @@ def test_bearer_token_guards_the_api_but_not_the_page(make_client):
     assert client.get("/queries").status_code == 200
 
 
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_a_cancelled_upload_leaves_no_partial_file(make_client, concurrent):
+    client = make_client()
+    server = client.app.state.server
+    payload = ipc_bytes(server_fakes.reviews_table())
+    content_id = hashlib.sha256(payload).hexdigest()
+
+    async def scenario():
+        waiting = asyncio.Event()
+
+        async def paused_body():
+            yield payload[:100]
+            waiting.set()
+            await asyncio.Event().wait()
+
+        async def complete_body():
+            yield payload
+
+        complete = SimpleNamespace(stream=complete_body)
+        task = asyncio.create_task(server.save_upload(
+            SimpleNamespace(stream=paused_body), content_id))
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=2)
+            if concurrent:
+                assert await server.save_upload(complete, content_id) == 201
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert not list(server.inputs_dir.glob("*.tmp"))
+        if not concurrent:
+            assert not list(server.inputs_dir.iterdir())
+            assert await server.save_upload(complete, content_id) == 201
+        assert (server.inputs_dir / f"{content_id}.arrow").read_bytes() == payload
+
+    asyncio.run(scenario())
+
+
+def test_a_retry_waits_for_the_first_submission_to_be_durable(make_client, monkeypatch):
+    client = make_client()
+    content_id = upload(client)
+    server = client.app.state.server
+    server.scheduler.stop()
+    syncing, release = threading.Event(), threading.Event()
+
+    def sync():
+        if not syncing.is_set():
+            syncing.set()
+            assert release.wait(5)
+            raise OSError("volume commit failed")
+
+    server.add_sync(sync)
+    body = submission(content_id, query_id="retry")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first = pool.submit(server.accept, body)
+        assert syncing.wait(5)
+        retry = pool.submit(server.accept, body)
+        queued = pool.submit(server.store.next_queued)
+        try:
+            with pytest.raises(TimeoutError):
+                retry.result(timeout=0.2)
+            assert queued.result(timeout=1) is None
+        finally:
+            release.set()
+        with pytest.raises(ServerError, match="volume commit failed"):
+            first.result(timeout=5)
+        # the retry saw no record of the discarded first attempt
+        assert retry.result(timeout=5).state == "queued"

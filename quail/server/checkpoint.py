@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from quail.remote.files import published
 from quail.server.store import Store
 
 logger = logging.getLogger("quail.server")
@@ -30,7 +31,12 @@ def restore(source: Path, destination: Path) -> bool:
     if destination.exists() or not source.exists():
         return False
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, destination)
+    # a failed copy leaves nothing behind, so a later restore can try again
+    try:
+        with published(destination, overwrite=False) as temporary:
+            shutil.copyfile(source, temporary)
+    except FileExistsError:
+        return False
     return True
 
 

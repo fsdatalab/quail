@@ -127,3 +127,51 @@ def test_server_runs_closers_before_closing_the_store(tmp_path):
     assert seen == [False]
     assert service.store.closed
     assert (tmp_path / "data" / "quail.sqlite3").exists()
+
+
+def test_a_failed_restore_or_backup_leaves_the_files_as_they_were(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from quail.server import checkpoint as checkpoint_module
+    from quail.server.checkpoint import restore
+
+    source, destination = tmp_path / "saved.sqlite3", tmp_path / "live.sqlite3"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE saved (value INTEGER)")
+        conn.execute("INSERT INTO saved VALUES (1)")
+    copy = checkpoint_module.shutil.copyfile
+
+    def interrupted_copy(src, dst):
+        with open(dst, "wb") as handle:
+            handle.write(b"partial")
+        raise OSError("copy interrupted")
+
+    monkeypatch.setattr(checkpoint_module.shutil, "copyfile", interrupted_copy)
+    with pytest.raises(OSError, match="copy interrupted"):
+        restore(source, destination)
+    # nothing is left behind, so the next restore is not blocked
+    assert list(tmp_path.iterdir()) == [source]
+    monkeypatch.setattr(checkpoint_module.shutil, "copyfile", copy)
+    assert restore(source, destination)
+    assert fetch_one(destination, "SELECT value FROM saved") == (1,)
+
+    store = Store(tmp_path / "store.sqlite3")
+    target = tmp_path / "backup.sqlite3"
+    create(store)
+    store.backup(target)
+
+    def interrupted_backup(connection):
+        connection.execute("CREATE TABLE partial (value INTEGER)")
+        connection.commit()
+        raise OSError("backup interrupted")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_conn", SimpleNamespace(backup=interrupted_backup))
+            with pytest.raises(OSError, match="backup interrupted"):
+                store.backup(target)
+        assert fetch_one(target, "SELECT count(*) FROM queries") == (1,)
+        assert not list(tmp_path.glob("*.tmp"))
+    finally:
+        store.close()

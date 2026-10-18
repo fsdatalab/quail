@@ -17,7 +17,6 @@ import hashlib
 import json
 import os
 import time
-import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -47,6 +46,7 @@ from quail.remote.artifacts import (
     iter_ipc_stream,
     read_answers,
 )
+from quail.remote.files import published
 from quail.remote.inputs import resolve
 from quail.remote.records import (
     InvalidRequestError,
@@ -280,20 +280,24 @@ class Server:
         paths = self.snapshot_paths(inputs)
         self.compile(spec, engine, inputs, paths)
         config = asdict(engine)
-        existed = query_id is not None and self.store.find(query_id) is not None
-        status = self.store.create(spec=spec, config=config, inputs=inputs,
-                                   timeout_s=float(timeout_s),
-                                   query_id=query_id, session_id=session_id)
-        if existed:
-            return status
-        try:
-            for sync in self._syncs:
-                sync()
-        except Exception as error:
-            self.store.discard(status.id)
-            raise ServerError(
-                f"the submission could not be saved durably: {error}"
-            ) from error
+        # the record is created and made durable under one lock: the
+        # scheduler cannot select it, and a retry of the same id cannot
+        # see it, until the syncs have run or the record is discarded
+        with self.store.submission_lock:
+            existed = query_id is not None and self.store.find(query_id) is not None
+            status = self.store.create(spec=spec, config=config, inputs=inputs,
+                                       timeout_s=float(timeout_s),
+                                       query_id=query_id, session_id=session_id)
+            if existed:
+                return status
+            try:
+                for sync in self._syncs:
+                    sync()
+            except Exception as error:
+                self.store.discard(status.id)
+                raise ServerError(
+                    f"the submission could not be saved durably: {error}"
+                ) from error
         return status
 
     async def wait_status(self, query_id: str, after: int,
@@ -347,10 +351,12 @@ class Server:
             async for _ in request.stream():
                 pass
             return 200
-        temporary = self.inputs_dir / f"upload-{uuid.uuid4().hex}.tmp"
         digest = hashlib.sha256()
         size = 0
-        try:
+        path = self.inputs_dir / f"{content_id}.arrow"
+        # published removes the partial file however the upload ends,
+        # a cancelled request included
+        with published(path) as temporary:
             with open(temporary, "wb") as handle:
                 async for chunk in request.stream():
                     size += len(chunk)
@@ -365,14 +371,8 @@ class Server:
             if digest.hexdigest() != content_id:
                 raise InvalidRequestError(
                     "the uploaded bytes do not hash to the given content id")
-            path = self.inputs_dir / f"{content_id}.arrow"
             with ipc.open_file(str(temporary)):
                 pass
-            os.replace(temporary, path)
-        except Exception:
-            if temporary.exists():
-                temporary.unlink()
-            raise
         self.store.put_input(content_id, str(path), size)
         return 201
 

@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
 from quail.execution.result import QueryResult
+from quail.remote.files import published
 
 RESULT_FILE = "result.arrow"
 REPORT_FILE = "report.json"
@@ -75,7 +75,6 @@ def write_ipc_file(path: Path, reader_or_table) -> int:
 
     The file appears under ``path`` only once it is complete.
     """
-    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     rows = 0
     if isinstance(reader_or_table, pa.Table):
         schema = reader_or_table.schema
@@ -83,14 +82,13 @@ def write_ipc_file(path: Path, reader_or_table) -> int:
     else:
         schema = reader_or_table.schema
         batches = reader_or_table
-    with pa.OSFile(str(temporary), "wb") as sink:
+    with published(path) as temporary, pa.OSFile(str(temporary), "wb") as sink:
         with ipc.new_file(sink, schema) as writer:
             for batch in batches:
                 writer.write_batch(batch)
                 rows += batch.num_rows
         sink.flush()
         os.fsync(sink.fileno())
-    os.replace(temporary, path)
     return rows
 
 
@@ -119,13 +117,11 @@ def write_result(result: QueryResult, directory: str | Path) -> dict:
         name = f"answers/joins/{position}.arrow"
         write_ipc_file(directory / name, table)
         joins.append({"position": position, "file": name})
-    report_path = directory / REPORT_FILE
-    temporary = report_path.with_name(f"{REPORT_FILE}.{uuid.uuid4().hex}.tmp")
-    with open(temporary, "w", encoding="utf-8") as handle:
+    with published(directory / REPORT_FILE) as temporary, \
+            open(temporary, "w", encoding="utf-8") as handle:
         json.dump(result.report, handle, default=str)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, report_path)
     return {
         "rows": rows,
         "columns": list(result.columns),

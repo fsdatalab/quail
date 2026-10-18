@@ -1,6 +1,7 @@
 """Executor and scheduler: lifecycle, failures, cancel, timeout, restart."""
 
 import json
+import threading
 import time
 from unittest.mock import Mock
 
@@ -290,3 +291,110 @@ def test_describe_and_resolve_supported_providers(tmp_path):
         inputs.resolve(memory.spec, {})
     with pytest.raises(inputs.InvalidRequestError, match="unknown input kind"):
         inputs.resolve({"kind": "s3"}, {})
+
+
+def test_an_interrupted_result_write_leaves_the_old_files(tmp_path):
+    old = pa.table({"id": [99]})
+    target = tmp_path / "result.arrow"
+    artifacts.write_ipc_file(target, old)
+
+    def batches():
+        yield pa.table({"id": [0, 1]}).to_batches()[0]
+        raise RuntimeError("interrupted write")
+
+    with pa.RecordBatchReader.from_batches(old.schema, batches()) as reader:
+        with pytest.raises(RuntimeError, match="interrupted write"):
+            artifacts.write_ipc_file(target, reader)
+    assert artifacts.read_table(target).equals(old)
+
+    class Unserializable:
+        def __str__(self):
+            raise RuntimeError("interrupted report")
+
+    result = quail.QueryResult.from_table(old, {"old": True})
+    artifacts.write_result(result, tmp_path)
+    result.report = {"bad": Unserializable()}
+    with pytest.raises(RuntimeError, match="interrupted report"):
+        artifacts.write_result(result, tmp_path)
+    assert json.loads((tmp_path / "report.json").read_text()) == {"old": True}
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+@pytest.mark.parametrize("failure", ["start", "wait"])
+def test_a_failed_execution_attempt_finishes_its_record_and_closes_its_answers(
+        store, tmp_path, failure, monkeypatch):
+    answers = []
+
+    class SavedAnswers(artifacts.Answers):
+        def __init__(self, path):
+            super().__init__(path)
+            answers.append(self)
+
+    monkeypatch.setattr("quail.server.scheduler.Answers", SavedAnswers)
+
+    class Execution:
+        stopped = False
+
+        def wait(self, timeout):
+            raise OSError("executor unavailable")
+
+        def stop(self):
+            self.stopped = True
+
+    execution = Execution()
+
+    class Executor:
+        def start(self, job, emit):
+            emit("answers", {"document": 0})
+            if failure == "start":
+                raise OSError("executor unavailable")
+            return execution
+
+    scheduler = scheduler_for(store, tmp_path, Executor())
+    status = submit(store, tmp_path)
+    final = scheduler.run_one(store.get(status.id))
+    assert (final.state, final.error["type"]) == ("failed", "OSError")
+    assert execution.stopped == (failure == "wait")
+    (saved,) = answers
+    assert saved._handle is None
+
+
+def test_shutdown_finishes_the_active_record_before_closing_the_executor(
+        store, tmp_path):
+    started, done = threading.Event(), threading.Event()
+    closed = []
+
+    class Execution:
+        def wait(self, timeout):
+            return done.wait(timeout)
+
+        def stop(self):
+            done.set()
+
+    class Executor:
+        def start(self, job, emit):
+            started.set()
+            return Execution()
+
+        def close(self):
+            closed.append(done.is_set())
+
+    scheduler = scheduler_for(store, tmp_path, Executor())
+    active = submit(store, tmp_path)
+    queued = submit(store, tmp_path)
+    scheduler.start()
+    assert started.wait(2)
+    scheduler.stop()
+    assert closed == [True]
+    assert store.get(active.id).state == "interrupted"
+    assert store.get(queued.id).state == "queued"
+
+
+def test_shutdown_does_not_wait_for_a_submission_in_flight(store, tmp_path):
+    scheduler = scheduler_for(store, tmp_path)
+    with store.submission_lock:
+        scheduler.start()
+        stopping = threading.Thread(target=scheduler.stop)
+        stopping.start()
+        stopping.join(2)
+        assert not stopping.is_alive()
