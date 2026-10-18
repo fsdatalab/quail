@@ -59,9 +59,19 @@ def test_a_pinned_document_keeps_its_slot():
     arena._rows[("a", 0)] = arena._capacity_rows[("a", 0)] = None
     assert arena.checkpoint_slot(("a", 0)) is not None
     arena.accounting.pin(("a", 0))
-    arena.accounting.alloc(("a", 1), 32)
-    assert arena.checkpoint_slot(("a", 1)) is None
+    free_pages = arena.free_pages
+    assert not arena.reserve(("a", 1), 32, capacity_tokens=48)
+    assert arena.free_pages == free_pages
+    assert not arena.is_resident(("a", 1))
     assert arena.is_resident(("a", 0))
+    arena.free_key(("a", 0))
+    assert arena.reserve(("a", 1), 32, capacity_tokens=48)
+    assert arena.has_checkpoint(("a", 1))
+    arena.retain(("a", 1), 32)
+    slot = arena.checkpoint_slot(("a", 1))
+    assert not arena.reserve(("a", 1), 32, capacity_tokens=48, extension=True)
+    assert arena.checkpoint_slot(("a", 1)) == slot
+    assert arena.is_resident(("a", 1))
 
 
 def test_checkpoint_slots_are_reused_without_freeing_another_keys_state():
@@ -87,7 +97,10 @@ def test_checkpoint_slots_are_reused_without_freeing_another_keys_state():
     arena.hold(first, 1)
     assert arena.free_key(first) == 0
     assert arena.shared_state(first, 32) == shared
+    arena.read_state((first,))
     arena.release(first)
+    assert arena.shared_state(first, 32) == shared
+    arena.done_reading((first,))
     assert arena.accounting.share_slots == {(second, 16): other}
     assert len(arena.accounting.free_slots) == 3
     assert arena.shared_state(first, 48) is None

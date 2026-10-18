@@ -259,26 +259,41 @@ def _tree_run(slots, parents, children, monkeypatch, stages=1, frame=(),
                        for _ in range(stages)]
     _run(arena, keys, run_stages_, budget, monkeypatch, prefix_tree=tree,
          prefixes=docs)
+    return arena
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "a retry after missing parent state writes the whole prefix into borrowed KV"))
-def test_a_borrower_that_computes_its_whole_prefix_borrows_no_pages(monkeypatch):
+def test_admission_reserves_kv_and_checkpoints_before_packing(monkeypatch):
     real_pack = _pack
-    borrowed_writes = []
+    borrowed_tokens = 0
 
     def checked_pack(torch, arena, specs, **options):
+        nonlocal borrowed_tokens
+        accounting = arena.accounting
+        slots = (dict(accounting.slots), dict(accounting.ext_slots),
+                 dict(accounting.share_slots))
         for spec in specs:
+            assert spec["key"] in accounting.slots
             if spec.get("prefix") is not None:
-                borrowed = arena.accounting.borrowed_tokens(spec["key"])
-                if borrowed > spec.get("start", 0):
-                    borrowed_writes.append((spec["key"], borrowed))
-        return real_pack(torch, arena, specs, **options)
+                borrowed = accounting.borrowed_tokens(spec["key"])
+                assert borrowed <= spec.get("start", 0)
+                borrowed_tokens += borrowed
+        result = real_pack(torch, arena, specs, **options)
+        assert result.tokens <= 160
+        assert slots == (accounting.slots, accounting.ext_slots,
+                         accounting.share_slots)
+        return result
 
     monkeypatch.setitem(globals(), "_pack", checked_pack)
-    _tree_run(slots=10, parents=6, children=4, stages=1, frame=(),
-              budget=160, monkeypatch=monkeypatch)
-    assert not borrowed_writes
+    arena = _tree_run(slots=10, parents=6, children=4, stages=1, frame=(),
+                      budget=160, monkeypatch=monkeypatch)
+    assert borrowed_tokens > 0
+    assert not arena._holds and not arena._reading
+    assert all(event[1] == "evict" for event in arena.events)
+    for key in arena.resident_keys():
+        arena.free_key(key)
+    assert arena.free_pages == arena.n_pages
+    assert len(arena.accounting.free_slots) == arena.n_state_slots
+    assert not any(arena.accounting.holds)
 
 
 @pytest.mark.parametrize("slots,children,stages,frame", [

@@ -194,9 +194,8 @@ class KVArena:
     def extension(self, key):
         """The key's second checkpoint as (slot, tokens), or None."""
         slot = self.accounting.ext_slots.get(key)
-        if slot is None:
-            return None
-        return slot, self.accounting.ext_tokens[key]
+        tokens = self.accounting.ext_tokens.get(key)
+        return None if slot is None or tokens is None else (slot, tokens)
 
     def record_checkpoint(self, key, tokens: int) -> None:
         """Note that the key's checkpoint covers its first `tokens` tokens."""
@@ -527,6 +526,67 @@ class KVArena:
             self.accounting.pin(key)
         return pages
 
+    def reserve(self, key, tokens, *, capacity_tokens, borrow=None,
+                extension=False, share_points=()):
+        """Reserve KV pages and checkpoint slots for one admitted document.
+
+        Args:
+            key: Document key.
+            tokens: Document prefix length.
+            capacity_tokens: Prefix and the largest retained suffix.
+            borrow: Optional parent key and shared prefix length.
+            extension: Whether stages save state after the document.
+            share_points: Prefix lengths whose states children reuse.
+
+        Returns:
+            True once both resources are allocated. False leaves the document
+            unchanged, though unused retained documents may have been evicted.
+        """
+        accounting = self.accounting
+        borrowed, borrowed_s, start_s = self._borrow_plan(borrow)
+        if key in accounting.owned:
+            held = len(accounting.table_pages(key))
+            start_s = self._sliding_start[key]
+            held_s = (len(self.sliding.table_pages(key))
+                      if self.sliding is not None else 0)
+        else:
+            held, held_s = len(borrowed), len(borrowed_s)
+        need = max(0, accounting.pages_needed(capacity_tokens) - held)
+        need_s = (max(0, self.sliding.pages_needed(capacity_tokens - start_s)
+                      - held_s) if self.sliding is not None else 0)
+        slots = 0
+        if self.n_state_slots:
+            slots = (int(key not in accounting.slots)
+                     + int(extension and key not in accounting.ext_slots)
+                     + sum((key, point) not in accounting.share_slots
+                           for point in share_points))
+
+        def available():
+            return (accounting.free_pages >= need
+                    and len(accounting.free_slots) >= slots
+                    and (self.sliding is None
+                         or self.sliding.free_pages >= need_s))
+
+        # Neither the candidate's existing state nor its parent's state can
+        # be evicted to make room for the candidate's reservation.
+        protected = (key,) if borrow is None else (key, borrow[0])
+        self.read_state(protected)
+        try:
+            self._evict_until(available)
+            if not available():
+                return False
+            self.activate(key, tokens, capacity_tokens=capacity_tokens,
+                          base_tokens=tokens, borrow=borrow)
+            if self.n_state_slots:
+                accounting.alloc_slot(key)
+                if extension:
+                    accounting.alloc_extension(key)
+                for point in share_points:
+                    accounting.alloc_share(key, point)
+            return True
+        finally:
+            self.done_reading(protected)
+
     def alloc_temporary(self, tokens: int, sliding_tokens: int | None = None):
         key = object()
         pages = self.alloc(key, tokens, base_tokens=0,
@@ -561,7 +621,7 @@ class KVArena:
             self._lift_floor(key)
 
     def read_state(self, keys) -> None:
-        """Keep each key's slots while the chunk being planned reads them."""
+        """Keep each key's pages and slots until its admitted readers run."""
         for key in keys:
             self._reading[key] = self._reading.get(key, 0) + 1
 
@@ -571,6 +631,9 @@ class KVArena:
             self._reading[key] -= 1
             if not self._reading[key]:
                 del self._reading[key]
+                if key in self._deferred and key not in self._holds:
+                    self._deferred.remove(key)
+                    self.free_key(key)
 
     def drop_holds(self, keys=None) -> bool:
         """Release every hold on the keys (all keys by default).
@@ -590,7 +653,7 @@ class KVArena:
 
         Returns the pages that went free now.
         """
-        if key in self._holds:
+        if key in self._holds or key in self._reading:
             self._deferred.add(key)
             return 0
         self._window_floor.pop(key, None)

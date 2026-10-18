@@ -290,29 +290,6 @@ def state_share_points(parents, shared, limit=None):
     return points
 
 
-def slots_per_document(n_stages, shares, frames=False):
-    """Checkpoint slots one document in flight holds.
-
-    One slot, a second once a later stage or a written frame extends
-    it, and one more for each distinct length at which borrowers start
-    from a state inside it.
-
-    Args:
-        n_stages: Stages the query runs.
-        shares: Most distinct lengths any document's borrowers start at.
-        frames: Whether a stage writes a frame or appends tokens.
-    """
-    return 1 + (1 if n_stages > 1 or frames else 0) + int(shares)
-
-
-def checkpoint_slot_limit(n_slots, n_stages, shares, held=0, frames=False):
-    """Most documents in flight that the checkpoint slots can serve.
-
-    `held` slots belong to resident documents pinned for the run, so
-    they serve no fresh document.
-    """
-    return max(1, (n_slots - held)
-               // slots_per_document(n_stages, shares, frames))
 @dataclass
 class PendingAnswers:
     """One launched chunk's readout and progress through its document decisions."""

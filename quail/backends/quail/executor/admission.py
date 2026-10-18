@@ -197,6 +197,9 @@ class JoinAdmission:
             one suffix is written into the anchor's own pages.
         answer_dtype: The answer array type, one for every stage or a
             list per stage; None records 0/1 lists.
+        reserve: Optional callable(anchor, borrow) that reserves the anchor's
+            storage before admission. borrow is None or (parent, shared tokens).
+            False leaves the anchor queued; True commits the reservation.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
@@ -216,7 +219,7 @@ class JoinAdmission:
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, extra_tokens=None,
-                 stop_groups=None, stop_width=1):
+                 stop_groups=None, stop_width=1, reserve=None):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -293,9 +296,7 @@ class JoinAdmission:
         self._settled = []         # events for anchors that never ran
         self.in_flight = 0         # launched groups not yet reported
         self.blocked_pages = 0
-        # most anchors admitted and unfinished at once; a model that
-        # keeps a checkpoint per document sets it from its slot count
-        self.active_limit = None
+        self.reserve = reserve
         self.answers = [dict() for _ in range(k)]
         resident = dict(resident or {})
         anchor_partners = dict(anchor_partners or {})
@@ -581,11 +582,7 @@ class JoinAdmission:
         held = []
         blocked = False
         admitted = set()
-        active = (0 if self.active_limit is None
-                  else sum(1 for stage in self._stage if stage >= 0))
         while self.pending and room >= self._min_fresh:
-            if self.active_limit is not None and active >= self.active_limit:
-                break
             a = self.pending.popleft()
             if self._stage[a] == _DONE:
                 self._dead -= 1     # skipped by its group's survivor
@@ -625,6 +622,9 @@ class JoinAdmission:
                 self.blocked_pages = (
                     need + self._suffix_page_cost(a, 0, 0) - free_pages)
                 break
+            if self.reserve is not None and not self.reserve(a, borrow):
+                held.append(a)
+                break
             temporary_pages += pages
             groups.append((a, 0, 0, end, carried > 0))
             room -= carried + tokens
@@ -632,7 +632,6 @@ class JoinAdmission:
             if not self._page_cost[a]:
                 self._zero_cost -= 1
             self._stage[a] = 0
-            active += 1
             admitted.add(a)
             if self.groups is not None:
                 group = self.groups[a]
