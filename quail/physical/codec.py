@@ -167,12 +167,10 @@ def _decode_union(members, value):
     for member in members:
         if member is type(None) or (isinstance(member, type) and is_dataclass(member)):
             continue
-        if get_origin(member) is not None or (
-                isinstance(member, type) and isinstance(value, member)):
-            try:
-                return decode_value(member, value)
-            except (ValueError, TypeError):
-                continue
+        try:
+            return decode_value(member, value)
+        except (ValueError, TypeError):
+            continue
     raise ValueError(f"{value!r} fits none of {members}")
 
 

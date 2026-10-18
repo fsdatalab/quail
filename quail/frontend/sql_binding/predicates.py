@@ -262,6 +262,10 @@ def extract_test(b, test: PlainTest, selected: dict) -> tuple | None:
                 raise CompileError(
                     f"{operand.sql()} reads a span; test its start or end, "
                     f"such as {name}{SPAN_SUFFIX}.{field}.start")
+            if test.function is not None:
+                raise CompileError(
+                    f"{operand.sql()} is a number; {test.function.upper()}() "
+                    f"takes text")
         elif name in selected:
             if path:
                 raise CompileError(f"{operand.sql()} reads a field under an answer")

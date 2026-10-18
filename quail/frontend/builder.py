@@ -81,6 +81,8 @@ class Query:
 
     def alias(self, a: str) -> "Query":
         if (self._joins or self._filters or self._label_filters
+                or self._regular_predicates or self._scores or self._extracts
+                or self._applies or self._document_columns or self._labels
                 or len(self._tables) != 1):
             raise CompileError("alias() must come right after docs()")
         self._tables[0] = (a, self._tables[0][1])
@@ -89,8 +91,26 @@ class Query:
     def _scope(self) -> dict:
         return dict(self._tables)
 
-    def _resolve_value(self, c: ColSpec):
-        """Resolve a col() to a value expression over a source column."""
+    def _resolve_value(self, c: ColSpec, *, named: bool = False):
+        """Resolve a col() to a value expression over a source column.
+
+        Args:
+            c: The column as written.
+            named: Whether the column may carry a result name from
+                ``named()``; only a selected, sorted, or grouped column
+                may.
+
+        Raises:
+            CompileError: The column is named where it is read as an
+                input, or its name is a table alias or an earlier name.
+        """
+        if c.name is not None and not named:
+            raise CompileError(
+                f"{c.name!r} names a result column; a prompt argument, a "
+                f"join key, an apply() column, and a where() test read a "
+                f"column, not a name")
+        if c.name is not None:
+            self._claim_name(c.name)
         return self._scope_.resolve_value(c.column, c.alias, path=c.path,
                                           function=c.function, name=c.name)
 
@@ -273,12 +293,16 @@ class Query:
         return self
 
     def _claim_name(self, name: str) -> None:
-        """Check that no earlier call or table alias uses the name."""
+        """Check that no earlier call, table alias, or source column uses the name."""
         if (name in self._labels or name in self._scores
                 or name in self._extracts
                 or any(name == n + SPAN_SUFFIX for n in self._extracts)
                 or name in self._scope()):
             raise CompileError(f"the name {name!r} is already used")
+        for alias, provider in self._tables:
+            if name in self._catalog.get(provider).columns:
+                raise CompileError(
+                    f"the name {name!r} is a column of {alias!r}; pick another")
 
     def label_in(self, name: str, labels,
                  selectivity: Optional[float] = None) -> "Query":
@@ -450,10 +474,12 @@ class Query:
             alias, provider = other._tables[0]
             if alias in self._scope():
                 raise CompileError(f"duplicate table alias {alias!r}")
-            for name, column in other._labels.items():
-                if name in self._labels or name in self._scope():
-                    raise CompileError(f"the name {name!r} is already used")
-                self._labels[name] = column
+            self._claim_name(alias)
+            for name in (*other._labels, *other._scores, *other._extracts):
+                self._claim_name(name)
+            self._labels.update(other._labels)
+            self._scores.update(other._scores)
+            self._extracts.update(other._extracts)
             self._scope_.add_table(alias, provider)
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
@@ -643,6 +669,10 @@ class Query:
             raise CompileError(
                 f"{spec.alias}.{spec.column} is a span; test its start or "
                 f"end with .field('start') or .field('end')")
+        if span and spec.function is not None:
+            raise CompileError(
+                f"{spec.alias}.{spec.column}.{spec.path[0]} is a number; "
+                f"{spec.function}() takes text")
         if not span and spec.path:
             raise CompileError(f"{spec.alias}.{spec.column} has no fields")
         member = next(m for m in members if m.name == struct.member(spec.column))
@@ -752,7 +782,8 @@ class Query:
                                                  provider=provider,
                                                  column=name))
                 continue
-            columns.append(self._resolve_value(col(c) if isinstance(c, str) else c))
+            columns.append(self._resolve_value(col(c) if isinstance(c, str) else c,
+                                               named=True))
         # a classification is planned when the query returns or tests
         # its label
         tested = {name for tests in self._label_filters.values()
@@ -796,7 +827,7 @@ class Query:
                     f"{spec.column!r}; extract the field as its own column")
             expression = (named[spec.column]
                           if spec.alias is None and spec.column in named
-                          else self._resolve_value(spec))
+                          else self._resolve_value(spec, named=True))
             order.append(SortKey(expression, descending=descending,
                                  nulls_first=nulls_first))
         return logical.project(tuple(columns), self._limit, order=tuple(order),
@@ -817,7 +848,12 @@ class Query:
             elif isinstance(c, str) and c in self._scores:
                 column = self._scores[c]
             else:
-                column = self._resolve_value(col(c) if isinstance(c, str) else c)
+                column = self._resolve_value(col(c) if isinstance(c, str) else c,
+                                             named=True)
+            named = next((c for c in columns if isinstance(c, Alias)
+                          and c.expression == column), None)
+            if named is not None:
+                return named.name
             if column not in columns:
                 columns.append(column)
             return column_name(column)

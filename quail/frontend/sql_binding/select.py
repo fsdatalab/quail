@@ -145,6 +145,10 @@ class SelectBinder:
             if isinstance(node, exp.Column) and not node.table and node.name in names:
                 return node.name
             column = b.resolve_value(node)
+            named = next((c for c in columns if isinstance(c, Alias)
+                          and c.expression == column), None)
+            if named is not None:
+                return named.name
             if column not in columns:
                 columns.append(column)
             return column_name(column)

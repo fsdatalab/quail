@@ -28,6 +28,7 @@ from quail.logical import (
     CompileError,
     LogicalPlan,
     LogicalPlanBuilder,
+    column_name,
     is_score,
 )
 from quail.logical.expressions import aliased_call
@@ -128,6 +129,16 @@ def _validate_query(
                 f"output name {struct.name!r} is also a table "
                 f"alias; pick another AS name"
             )
+    for column in columns:
+        name = column_name(column)
+        if isinstance(column, Alias) and name in dict(b.tables):
+            raise CompileError(
+                f"output name {name!r} is also a table alias; pick another AS name")
+        if isinstance(column, Alias) and any(
+                name in b.catalog.get(provider).columns for _, provider in b.tables):
+            raise CompileError(
+                f"output name {name!r} is also a column of a table in the query; "
+                f"pick another AS name")
     projected = tuple(column for column in columns
                       if aliased_call(column) is not None)
     projected_scores = tuple(

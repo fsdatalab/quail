@@ -6,11 +6,14 @@ column, and a table read through two document columns raise the same
 CompileError from either.
 """
 
+import pyarrow as pa
+
 from quail.catalog import Catalog
 from quail.logical import ColumnRef, CompileError
 from quail.logical.expressions import (
     column_expression,
     column_name,
+    column_references,
     evaluate_expression,
     table_alias,
 )
@@ -107,6 +110,13 @@ class Scope:
                 column; its KV is computed from one column only.
         """
         alias = table_alias(column)
+        provider = column_references(column)[0].provider
+        values = evaluate_expression(
+            column, self.catalog.get(provider).schema().empty_table())
+        if not (pa.types.is_string(values.type) or pa.types.is_large_string(
+                values.type)):
+            raise CompileError(
+                f"a prompt reads text; {column_name(column)} is {values.type}")
         seen = self.document_columns.get(alias)
         if seen is not None and seen != column:
             raise CompileError(
