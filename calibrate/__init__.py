@@ -5,7 +5,7 @@ than Quail's own kernels, so the rate does not depend on Quail's code:
 
   gemm       fp8 matmuls with stas00's mamf-finder (cuBLAS): the GPU's
              MAMF and MSMF
-  to_spec    turns the saved summaries into the sustained_fp8_flops
+  to_spec    turns the saved summaries into the mamf_fp8_flops
              field of quail/specs/<device>.py
   modal_app  runs gemm on Modal
 

@@ -9,7 +9,7 @@ The package uses a vendor library (cuBLAS). It does not use the Quail
 kernels. Changes to the Quail kernels do not change the measured rate.
 
 [`to_spec.py`](to_spec.py) changes the results into the
-`sustained_fp8_flops` field of `quail/specs/<device>.py`. This package
+`mamf_fp8_flops` field of `quail/specs/<device>.py`. This package
 is not in the `quail` wheel.
 
 In this document, a "measurement" is one execution of `gemm.py`.
@@ -17,7 +17,7 @@ In this document, a "measurement" is one execution of `gemm.py`.
 ## GEMM rate: gemm.py
 
 [`gemm.py`](gemm.py) finds the highest fp8 GEMM rates of the GPU. The
-cost model uses the MAMF as `sustained_fp8_flops`.
+cost model uses the MAMF as `mamf_fp8_flops`.
 
 ### Software that gemm.py uses
 
@@ -163,7 +163,7 @@ this rate, the SoL estimate is a lower bound on each GPU in the table.
 ## Make the device specification: to_spec.py
 
 [`to_spec.py`](to_spec.py) reads the GEMM summaries of all the GPUs.
-It writes `sustained_fp8_flops` as the highest MAMF of all the
+It writes `mamf_fp8_flops` as the highest MAMF of all the
 mamf-finder calls. For this reason, the SoL estimate stays a lower
 bound on each GPU of the type.
 

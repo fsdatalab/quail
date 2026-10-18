@@ -1,4 +1,4 @@
-"""Turn calibrate's saved GEMM summaries into a device's sustained_fp8_flops.
+"""Turn calibrate's saved GEMM summaries into a device's mamf_fp8_flops.
 
 Pass the GEMM summaries, or directories holding them, from any number of
 GPUs. For example, after a Modal run:
@@ -6,7 +6,7 @@ GPUs. For example, after a Modal run:
     modal volume get quail-results calibrate/h100-sxm .
     uv run python -m calibrate.to_spec h100-sxm
 
-sustained_fp8_flops is the best MAMF of any mamf-finder run, so the
+mamf_fp8_flops is the best MAMF of any mamf-finder run, so the
 speed-of-light estimate stays a lower bound on every GPU of the type.
 """
 
@@ -44,20 +44,20 @@ def best_mamf(summary: dict) -> float:
                 if run.get("mamf")), default=0.0)
 
 
-def sustained_fp8_flops(gemm: list[dict]) -> float:
+def mamf_fp8_flops(gemm: list[dict]) -> float:
     """Return the best MAMF over every GEMM summary, in FLOP/s."""
     return max(best_mamf(s) for s in gemm) * 1e12
 
 
 def spec_text(gemm: list[dict]) -> str:
-    """Return the DeviceSpec's sustained_fp8_flops field."""
+    """Return the DeviceSpec's mamf_fp8_flops field."""
     mamf = ", ".join(f"{best_mamf(s):.0f}" for s in gemm)
-    return (f"    sustained_fp8_flops={sustained_fp8_flops(gemm):.4g},"
+    return (f"    mamf_fp8_flops={mamf_fp8_flops(gemm):.4g},"
             f"  # best MAMF over {len({gpu_id(s) for s in gemm})} GPUs: {mamf}\n")
 
 
 def main(argv=None) -> None:
-    """Print sustained_fp8_flops for the summaries under the given paths."""
+    """Print mamf_fp8_flops for the summaries under the given paths."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("paths", nargs="+", type=Path,
                         help="summary.json files or directories holding them")

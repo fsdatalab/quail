@@ -53,7 +53,7 @@ def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
 
 
 def test_gemms_price_at_the_measured_rate_when_known():
-    assert H100_SXM.gemm_flops == H100_SXM.sustained_fp8_flops == 1.629e15
+    assert H100_SXM.gemm_flops == H100_SXM.mamf_fp8_flops == 1.629e15
     assert H100_SXM.arithmetic_bandwidth("fp8") == 1.629e15
     rtx = RTX_PRO_6000_BLACKWELL_SERVER
     assert rtx.gemm_flops == rtx.peak_flops

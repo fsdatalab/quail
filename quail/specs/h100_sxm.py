@@ -12,10 +12,10 @@ H100_SXM = DeviceSpec(
     #                        (https://www.nvidia.com/en-us/data-center/h100/)
     usd_per_hour=3.9492,
     price_source="https://modal.com/pricing",
-    sustained_fp8_flops=1.629e15,  # highest mamf-finder MAMF over 8 H100s
-    #                                (1,500 to 1,629 TFLOPS):
-    #                                /results/calibrate/h100-sxm/gemm/
-    #                                20261013T221653Z/
+    mamf_fp8_flops=1.629e15,  # highest mamf-finder MAMF over 8 H100s
+    #                           (1,500 to 1,629 TFLOPS):
+    #                           /results/calibrate/h100-sxm/gemm/
+    #                           20261013T221653Z/
 )
 
 # The price every $/query number in reports uses: query hours times

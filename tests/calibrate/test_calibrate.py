@@ -7,7 +7,7 @@ import pytest
 from calibrate import gemm
 from calibrate.gemm import fetch_mamf_finder, mamf_runs, parse_log
 from calibrate.targets import TARGETS
-from calibrate.to_spec import load, spec_text, sustained_fp8_flops
+from calibrate.to_spec import load, mamf_fp8_flops, spec_text
 
 # lines in the format of mamf-finder's README example output
 MAMF_LOG_TEXT = """\
@@ -74,6 +74,6 @@ def test_spec_text_takes_the_best_mamf_over_gpus(tmp_path):
     (tmp_path / "other.json").write_text("{}")
     summaries = load([tmp_path])
     assert len(summaries) == 2
-    assert sustained_fp8_flops(summaries) == 1629e12
+    assert mamf_fp8_flops(summaries) == 1629e12
     text = spec_text(summaries)
-    assert "sustained_fp8_flops=1.629e+15" in text and "over 2 GPUs" in text
+    assert "mamf_fp8_flops=1.629e+15" in text and "over 2 GPUs" in text

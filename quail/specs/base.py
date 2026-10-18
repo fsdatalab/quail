@@ -226,14 +226,14 @@ class DeviceSpec:
     usd_per_hour: float = 0.0    # rental price of one device; 0 means
     #                              no price is known
     price_source: str = ""       # where usd_per_hour was read from
-    sustained_fp8_flops: float = 0.0    # highest fp8 GEMM rate measured
-    #                                     (mamf-finder's MAMF); 0 means
-    #                                     none was measured
+    mamf_fp8_flops: float = 0.0    # highest fp8 GEMM rate measured
+    #                                (mamf-finder's MAMF); 0 means
+    #                                none was measured
 
     @property
     def gemm_flops(self) -> float:
         """Return the fp8 GEMM rate: measured when known, else the peak."""
-        return self.sustained_fp8_flops or self.peak_flops
+        return self.mamf_fp8_flops or self.peak_flops
 
     @property
     def attn_flops(self) -> float:
