@@ -18,7 +18,6 @@ from helpers.fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch
 
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.distributed import (
-    DistributedQuailExecution,
     execute_distributed_graph,
 )
 from quail.backends.quail.executor import chunk as chunk_mod
@@ -32,7 +31,7 @@ from quail.backends.quail.executor.operators.extract import (
 from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.worker import ChildState, _child_extract
+from quail.backends.quail.worker import ChildState, _child_execute
 from quail.builtins import built_in_registry
 from quail.catalog.tokens import TokenOffsets, TokenStore
 from quail.logical import ColumnRef, RegularPredicate
@@ -513,21 +512,26 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
     nodes = [Scan(node_id="input:c", alias="c", input_id="c")]
     for name in ("ends", "starts"):
         previous = nodes[-1]
-        port = "rows:c"
         nodes.append(AiExtract(
             node_id=f"ai-extract:{name}", backend_name="quail", model="qwen3-4b-fp8",
-            inputs=input_ports((PortRef(previous.node_id, port),)),
+            inputs=input_ports((PortRef(previous.node_id, "rows:c"),)),
             spec=replace(spec, name=name, share_prefixes=True),
             keep_kv=name == "starts"))
-    graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "rows"))
+    graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "rows:c"))
     registry = built_in_registry()
     children = []
     for _ in range(gpus):
-        query = _state(model)
-        query.loaded_model.vocabulary = tables
-        children.append(ChildState(gpu_index=0, gpu=SimpleNamespace(
-            execution=SimpleNamespace(query=query), torch=query.torch,
-            arena=query.loaded_model.arena)))
+        torch, arena = fake_torch(), cpu_arena(256)
+        pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+        execution = QuailModelExecution(SimpleNamespace())
+        execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+        execution.loaded_model.vocabulary = tables
+        execution.loaded_model.input_staging = SimpleNamespace(fixed_tokens=set())
+        execution.bind_query(torch=torch, answer_rows=object(),
+                             chunk_tokens=state.chunk_tokens, async_answers=object())
+        children.append(ChildState(gpu_index=0, registry=registry, gpu=SimpleNamespace(
+            execution=execution, torch=torch, arena=arena, pipeline=pipeline,
+            spec=MODELS["qwen3-4b-fp8"])))
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": state.chunk_tokens,
         "true_ids": [1], "false_ids": [2],
@@ -540,22 +544,20 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
     rounds = []
 
     def round_fn(kind, subs):
-        if kind == "filters":
-            return [{"peak_gib": 0.0} for _ in subs]
-        assert kind == "extract"
+        assert kind == "execute"
         subs = pickle.loads(pickle.dumps(subs))
         rounds.append(subs)
-        for sub in subs:
-            supplied = sub["inputs"]
-            ids = supplied["document_ids"]
-            assert len(supplied["documents"]["c"]) == len(ids)
-            assert supplied["texts"]["c"].to_pylist() == [DOCS[i] for i in ids]
-        return [_child_extract(child, sub) for child, sub in zip(children, subs)]
+        return [_child_execute(child, sub) for child, sub in zip(children, subs)]
 
     result = execute_distributed_graph(
-        payload, graph, gpus, round_fn, MODELS["qwen3-4b-fp8"],
-        DEVICES["h100-sxm"], registry.runtimes, registry)
+        payload, graph, gpus, round_fn, DEVICES["h100-sxm"], registry.runtimes,
+        registry)
     assert len(rounds) == 1
+    # every worker ran the whole pipeline over its own documents
+    shards = [sub["inputs"]["ai-extract:ends"]["input:0"].ids["c"].to_pylist()
+              for sub in rounds[0]]
+    assert sorted(document for shard in shards for document in shard) == [0, 1, 2]
+    assert all(sub["pipeline"] and sub["final"] for sub in rounds[0])
     for node in nodes[1:]:
         actual = result["_outputs"][PortRef(node.node_id, "rows:c")]
         assert actual.equals(expected[node.node_id].outputs["rows:c"].table())
@@ -563,18 +565,7 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
         item.metrics.fresh_tokens for item in expected.values())
     assert result["evaluated_documents"] == 2 * len(DOCS)
     assert result["backend_metrics"]["inferences"][0]["none"] == 1
-
-    execution = DistributedQuailExecution(
-        payload, graph, gpus, round_fn, MODELS["qwen3-4b-fp8"],
-        DEVICES["h100-sxm"], registry)
-    execution.started = True
-    execution._retained_placement([
-        {"retained": {"c": sub["inputs"]["document_ids"]}}
-        for sub in rounds[0]])
-    again = execution.execute(nodes[1], {"input": pa.table({"c": [2, 0]})})
-    assert again.outputs["rows:c"].table().equals(
-        expected[nodes[1].node_id].outputs["rows:c"].take(pa.array([2, 0])).table())
-    assert again.metrics.fresh_tokens < expected[nodes[1].node_id].metrics.fresh_tokens
+    assert all(not child.gpu.arena.accounting.owned for child in children)
 
 
 def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(

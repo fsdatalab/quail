@@ -101,18 +101,17 @@ def classification_refusal(context) -> Refusal | None:
                    needed=1, available=0, unit="queries")
 
 
-def joined_classification_refusal(graph, gpus: int) -> Refusal | None:
+def joined_classification_refusal(graph) -> Refusal | None:
     """Check that each pair classification can run in its join's pipeline.
 
     Args:
         graph: Physical operator graph.
-        gpus: Number of model workers.
 
     Returns:
         A Refusal if a pair classification cannot share its source join's
-        pipeline on one worker, or None if every pair classification can run.
+        pipeline, or None if every pair classification can run.
     """
-    pipelines = build_pipelines(graph) if gpus == 1 else {}
+    pipelines = build_pipelines(graph)
     for node in graph.nodes:
         if not isinstance(node, AiClassify) or node.spec.partner is None:
             continue
@@ -124,8 +123,8 @@ def joined_classification_refusal(graph, gpus: int) -> Refusal | None:
             continue
         return Refusal(
             reasons=(f"AI.CLASSIFY {node.spec.name!r} over a document pair "
-                     "must run in its join's pipeline on one GPU; this plan "
-                     "requires unsupported standalone pair classification",),
+                     "must run in its join's pipeline; this plan requires "
+                     "unsupported standalone pair classification",),
             constraint="joined_classify_pipeline", needed=1, available=0,
             unit="supported join pipelines")
     return None
@@ -269,13 +268,6 @@ def validate_query(plan, operators, context, model, device, gpus):
             f"each apply() needs its own name; {names} repeat one")
     if any(len(group) > 1 for group in join_applies.values()):
         raise CompileError("a join takes one apply() returning pairs")
-    if gpus > 1 and any(apply.kind == "per_batch" for apply in applies):
-        return Refusal(
-            reasons=("per-batch apply() requires one GPU; "
-                     "use apply_table() or set gpus=1",),
-            constraint="per_batch_apply_needs_one_gpu",
-            needed=1, available=gpus, unit="gpus")
-
     weight_gpus = budgets.minimum_weight_gpus(model, device)
     if weight_gpus > 1:
         return Refusal(

@@ -701,11 +701,10 @@ def test_foreign_node_placement_and_pipelines():
         assert request.column_tables()["c"].column("url").to_pylist()[:2] == [
             "u0", "u1"]
 
+    # every worker runs the per-batch apply in its own pipeline
     with _claims_session(gpus=2) as session:
-        plan = _apply_query(session, "per_batch").plan()
-        assert isinstance(plan, Refusal)
-        assert plan.constraint == "per_batch_apply_needs_one_gpu"
-        assert not isinstance(_apply_query(session, "barrier").plan(), Refusal)
+        for kind in ("per_batch", "barrier"):
+            assert not isinstance(_apply_query(session, kind).plan(), Refusal)
     with _claims_session(backend="stock_vllm") as session:
         plan = _apply_query(session, "barrier").plan()
         assert isinstance(plan, Refusal)

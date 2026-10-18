@@ -54,7 +54,7 @@ class ShouldPushDownLimit(PhysicalRule):
         limit = next((node for node in graph.nodes
                       if isinstance(node, Limit)), None)
         pipelines = {id(members) for members
-                     in build_pipelines(graph, context.gpus).values()}
+                     in build_pipelines(graph).values()}
         blocked = len(pipelines) > 1 or any(
             isinstance(node, (Sort, PhysicalAggregate, AiJoin))
             for node in graph.nodes)
@@ -121,7 +121,7 @@ class ShouldRetainKv(PhysicalRule):
             node.node_id: (after[group[0].node_id] if node is group[-1]
                            else before[group[0].node_id])
             for group in grouped for node in group}
-        paths = build_pipelines(graph, context.gpus)
+        paths = build_pipelines(graph)
         streamed = {
             node.alias for node in graph.nodes if isinstance(node, AiFilter)
             and any(isinstance(member, AiJoin)
@@ -132,7 +132,7 @@ class ShouldRetainKv(PhysicalRule):
         schedule.update(**coefficients(context.model, context.device),
                         cap_pages=statistics.cap_pages)
         context.settings["retention"] = schedule
-        return plan_kv_retention(graph, context.gpus)
+        return plan_kv_retention(graph)
 
 
 class ChooseClassifyImplementation(PhysicalRule):
@@ -171,7 +171,7 @@ class ChooseClassifyImplementation(PhysicalRule):
 
         logical = context.logical_plan
         calls = {node.name: node.call for node in logical.operators().classifies}
-        paths = build_pipelines(graph, context.gpus)
+        paths = build_pipelines(graph)
         chosen = {}
         for node in pending:
             table = classify_scoring(context, node.spec.anchor)

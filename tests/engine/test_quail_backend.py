@@ -25,7 +25,7 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
-from quail.specs import DEVICES, MODELS
+from quail.specs import DEVICES
 
 
 def test_filter_execution_and_retention_inputs(monkeypatch):
@@ -39,10 +39,10 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
                            filtered), PortRef("filter:d", "rows:d"))
 
     def round_fn(kind, subs):
-        assert kind == "filters"
+        assert kind == "execute"
         outputs = []
         for sub in subs:
-            indices = sub["document_index"]["d"]
+            indices = sub["inputs"]["filter:d"]["input:0"].ids["d"].to_pylist()
             from quail.execution.metrics import NodeMetrics, NodeResult
 
             result = NodeResult({
@@ -50,9 +50,8 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
                 "filter_answers:d": {index: [index % 2 == 0] for index in indices}},
                 NodeMetrics(fresh_tokens=len(indices)))
             outputs.append({
-                "results": {"filter:d": result},
-                "retained": {}, "boot_s": 0.0,
-                "boot_kind": "warm", "boot": {}, "peak_gib": 1.0,
+                "results": {"filter:d": result}, "retained": (),
+                "kv_manager": {"evicted_keys": 1}, "peak_gib": 1.0,
             })
         return outputs
 
@@ -68,10 +67,11 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
             gpus=2, graph=graph, codecs=registry.codecs),
     }
     result = execute_distributed_graph(
-        payload, graph, 2, round_fn, MODELS["qwen3-4b-fp8"],
-        DEVICES["h100-sxm"], registry.runtimes, registry)
+        payload, graph, 2, round_fn, DEVICES["h100-sxm"], registry.runtimes,
+        registry)
     assert result["filters"]["d"] == {0: [True], 1: [False], 2: [True], 3: [False]}
     assert result["fresh_tokens"] == 4
+    assert result["kv_manager"]["evicted_keys"] == 2 and result["peak_gib"] == 1.0
 
     arena = FakeArena()
     arena.owned.add(("d", 10))

@@ -111,11 +111,6 @@ class QuailModelExecution:
             self._reranker = execution
         return execution
 
-    def execute_predicates(self, nodes, inputs) -> dict:
-        """Run consecutive filter or join predicates with resident document KV."""
-        return execution_parts()[nodes[0].type_name].execute_group(
-            self.query, nodes, inputs)
-
     def execute_pipeline(self, pipeline, inputs, context) -> dict:
         """Execute a model pipeline with this executor's loaded state."""
         return execute_pipeline(self.query, pipeline, inputs, context)

@@ -425,10 +425,8 @@ def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
                   for port in score_node.inputs}
         # a reranker that reports while scoring streams each answer once
         model.reranker = Oracle(streams=True)
-        result = score_in_batches(
-            score_node, inputs,
-            lambda node, batches: [model.execute_rows(node, b) for b in batches],
-            streamed=True)
+        result = score_in_batches(score_node, inputs, model.execute_rows,
+                                  streamed=True)
     finally:
         set_answer_sink(None)
     session.close()
@@ -450,15 +448,8 @@ def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
                                   [[2, 4], [2, 1], [2, 3], [0, 4], [0, 1], [0, 3]])
     empty = ScoreRows((np.empty(0, dtype=np.int32), np.arange(3)), product=True)
     assert list(empty.batches())[0].shape == (0, 2)
-    rows = ScoreRows((np.array([3, 0, 1]), np.array([7, 8])), product=True)
-    even, odd = rows.shard(2)
-    assert even.columns[0].tolist() == [0] and odd.columns[0].tolist() == [3, 1]
-    assert odd.positions(0, 4).tolist() == [0, 1, 4, 5]
-    assert even.positions(0, 2).tolist() == [2, 3]
-    plain = ScoreRows((np.array([3, 0, 1]),))
-    assert [shard.positions(0, len(shard)).tolist() for shard in plain.shard(2)] \
-        == [[1], [0, 2]]
     # a product batch ends on a first-document boundary when partners fit
+    rows = ScoreRows((np.array([3, 0, 1]), np.array([7, 8])), product=True)
     assert [len(batch) for batch in rows.batches(size=5)] == [4, 2]
 
 
@@ -569,34 +560,28 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     assert "filter_limit" not in payload
 
     def run(kind, subs):
+        assert kind == "execute"
         subs = pickle.loads(pickle.dumps(subs))
-        if kind == "filters":
-            assert len(subs) == 2
-            assert all(sub["start_query"] and sub["node_id"] is None
-                       for sub in subs)
-            return [{"peak_gib": 0.0} for _ in subs]
-        assert kind == "scores"
-        assert all(("documents" in sub["inputs"]) == (not rounds) for sub in subs)
         rounds.append(kind)
         results = []
-        for worker, sub in enumerate(subs):
-            rows = sub["inputs"]["score_rows"]
-            assert all(row[0] % 2 == worker for row in rows)
+        for sub in subs:
+            assert sub["nodes"] == (node,)
+            inputs = sub["inputs"][node.node_id]
+            queries = inputs["input:0"].to_pylist()
+            documents = list(inputs["input:1"])
+            shards.append(queries)
+            assert documents == [1, 0]
             model = RerankerModelExecution.__new__(RerankerModelExecution)
-            model.documents = sub["inputs"].get("documents", execution.documents)
-            for alias, documents in model.documents.items():
-                assert [list(document) for document in documents] == [
-                    list(document) for document in execution.documents[alias]
-                ]
-            model.reranker = _FakeReranker([a / 2 + b / 4 for a, b in rows])
-            results.append(model.execute_rows(node, rows))
+            model.documents = execution.documents
+            model.reranker = SimpleNamespace(score=lambda spec, rows, documents: (
+                RerankerBatch([a / 2 + b / 4 for a, b in rows], fresh_tokens=12,
+                              cached_tokens=3)))
+            results.append({"results": {node.node_id: model.execute(node, inputs)},
+                            "retained": (), "kv_manager": {}, "peak_gib": 0.0})
         return results
 
-    execution = DistributedQuailExecution(
-        payload, graph, 2, run, session.model, session.device, session.registry
-    )
-    execution.begin()
-    assert execution.started
+    shards = []
+    execution = DistributedQuailExecution(payload, graph, 2, run)
     result = execution.execute(node, {port.name: [1, 0] for port in node.inputs})
     assert result.outputs["rows"].table().to_pylist() == [
         {"q": 1, "d": 1, "score": 0.75},
@@ -605,8 +590,9 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
         {"q": 0, "d": 0, "score": 0.0},
     ]
     assert result.metrics.evaluated_document_pairs == 4
-    # each GPU scored its own query document's pairs in the same round
-    assert len(rounds) == 1
+    # each GPU scored its own query documents' pairs in the same round
+    assert len(rounds) == 1 and sorted(sum(shards, [])) == [0, 1]
+    assert all(len(shard) == 1 for shard in shards)
     session.close()
 
 

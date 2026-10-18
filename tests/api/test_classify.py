@@ -614,12 +614,15 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
         tokenizer=letter_tokens)
     for name in ("documents", "aspects"):
         distributed.register(name, session.catalog.get(name))
-    refused = distributed.sql(
+    # every worker runs the join and the classification as one pipeline
+    spread = distributed.sql(
         f"SELECT d.id, a.id, {stance} AS stance FROM documents d "
         "JOIN aspects a ON AI_FILTER(PROMPT('Does {0} mention {1}?', "
         "d.body, a.aspect))").plan()
-    assert isinstance(refused, Refusal)
-    assert refused.constraint == "joined_classify_pipeline"
+    assert not isinstance(spread, Refusal)
+    (classify,) = [n for n in spread.nodes if isinstance(n, AiClassify)]
+    assert classify.node_id in {member.node_id for member in build_pipelines(
+        spread.graph)[classify.inputs[0].source.node_id]}
     distributed.close()
     # a joined row's label is not tested in WHERE
     with pytest.raises(CompileError, match="one table|filter on a label"):

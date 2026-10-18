@@ -71,7 +71,7 @@ class PlanPricer:
         return self._seconds(work) + seconds, entries
 
     def _priced(self, graph) -> dict:
-        pipelines = build_pipelines(graph, self.context.gpus)
+        pipelines = build_pipelines(graph)
         anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
         last_filters = {node.alias: node.node_id for node in graph.nodes
                         if isinstance(node, AiFilter)}

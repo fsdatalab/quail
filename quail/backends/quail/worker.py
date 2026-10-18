@@ -15,8 +15,6 @@ from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.model_loading import load_model
 from quail.backends.quail.executor.models import build_pipeline
-from quail.backends.quail.executor.operators.extract import execute_extractions
-from quail.backends.quail.executor.operators.join import join_inputs
 from quail.backends.quail.executor.readout import (
     AnswerRows,
     AsyncAnswers,
@@ -26,19 +24,19 @@ from quail.backends.quail.executor.readout import (
 )
 from quail.backends.quail.executor.state import GpuRuntime
 from quail.backends.quail.executor.warmup import warm_kernels
-from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.retention import apply_retention
+from quail.backends.quail.graph import (
+    execute_single_graph,
+    execution_context,
+    execution_measurements,
+)
 from quail.backends.resources import release_models
 from quail.catalog.tokens import (
-    DocumentPrefixes,
     decode_payload_documents,
 )
 from quail.cost import budgets
 from quail.execution.runner import ExecutionContext
 from quail.execution.types import PhysicalResponse
 from quail.physical import (
-    AiFilter,
-    AiJoin,
     Scan,
     decode_graph,
 )
@@ -343,7 +341,13 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
 
 def execute_single(gpu: GpuRuntime, payload: dict, registry, graph) -> dict:
     """Execute the typed Quail graph on one GPU."""
-    runtime_state = {
+    state = _execution_state(gpu, payload, registry)
+    return execute_single_graph(state, payload, graph)
+
+
+def _execution_state(gpu, payload, registry) -> dict:
+    """Return the single-GPU executor's state for one worker and query."""
+    return {
         "gpu": gpu,
         "documents": decode_payload_documents(payload["documents"]),
         "texts": payload.get("texts", {}),
@@ -354,19 +358,17 @@ def execute_single(gpu: GpuRuntime, payload: dict, registry, graph) -> dict:
         "chunk_tokens": payload["chunk_tokens"],
         "gpu_timing": payload.get("gpu_timing", False),
     }
-    return execute_single_graph(runtime_state, payload, graph)
 
 
 @dataclass
 class ChildState:
-    """GPU resources and query inputs owned by one worker process."""
+    """GPU resources and the bound query of one worker process."""
 
     gpu_index: int
     gpu: LoadedGpu | None = None
     registry: Any = None
     model_path: str | None = None
     runtime_context: ExecutionContext | None = None
-    score_documents: Any = None
 
 
 def _child_main(gpu_index, conn):
@@ -386,22 +388,8 @@ def _child_main(gpu_index, conn):
                 state.registry = data["registry"]
                 state.model_path = data["model_path"]
                 conn.send(("ok", _child_boot(state, data)))
-            elif kind == "filters":
-                conn.send(("ok", _child_filters(state, data)))
-            elif kind == "scores":
-                gpu = state.gpu
-                inputs = data["inputs"]
-                if "documents" in inputs:
-                    state.score_documents = inputs["documents"]
-                inputs["documents"] = state.score_documents
-                with gpu.torch.inference_mode():
-                    result = gpu.execution.execute(data["node"], inputs)
-                gpu.torch.cuda.synchronize()
-                conn.send(("ok", result))
-            elif kind == "joins":
-                conn.send(("ok", _child_joins(state, data)))
-            elif kind == "extract":
-                conn.send(("ok", _child_extract(state, data)))
+            elif kind == "execute":
+                conn.send(("ok", _child_execute(state, data)))
         except Exception:
             import traceback
             conn.send(("err", traceback.format_exc()))
@@ -414,150 +402,51 @@ def _child_boot(state, sub):
     device = registry.device(envelope["device"])
     backend = registry.backend(envelope["backend"])
     gpu, state.gpu = state.gpu, None
-    gpu, boot = _boot_gpu(
+    state.runtime_context = None
+    state.gpu, boot = _boot_gpu(
         gpu, backend, GpuContext(
             gpu_index=state.gpu_index, gpus=sub["gpus"],
             model=spec, device=device, query_settings={}),
         sub["chunk_tokens"], sub["true_ids"], sub["false_ids"],
         sub.get("arena_pages"), model_path=state.model_path)
-    state.gpu = gpu
-    state.runtime_context = ExecutionContext(
-        runtimes=registry.runtimes, model_execution=gpu.execution,
-    )
     return boot
 
 
-def _execute_predicates(context, nodes, inputs):
-    """Dispatch one predicate or a pipeline of predicates on the worker."""
-    if len(nodes) == 1:
-        node = nodes[0]
-        return {node.node_id: context.runtimes[node.runtime_key].execute(
-            node, inputs, context)}
-    return context.model_execution.execute_predicates(nodes, inputs)
+def _child_execute(state, sub) -> dict:
+    """Run one graph group on this worker's share of its documents.
 
-
-def _child_filters(state, sub):
-    gpu = state.gpu
-    torch = gpu.torch
-    arena = gpu.arena
-    if sub.get("start_query", True):
-        _reset_child_query(state)
-        config = sub.get("retention", {})
-        apply_retention(arena, config, config.get("initial", {}))
-    results = {}
-    filter_limit = sub.get("filter_limit")
-    t0 = time.perf_counter()
-    with torch.inference_mode():
-        node_id = sub.get("node_id")
-        if node_id is not None:
-            graph = decode_graph(
-                sub["physical_plan"]["graph"],
-                state.registry.codecs,
-            )
-            nodes = tuple(graph.node(member)
-                          for member in sub.get("node_ids", (node_id,)))
-            node = nodes[0]
-            if not isinstance(node, AiFilter):
-                raise TypeError(
-                    f"child filter received {node.type_name!r}")
-            alias = node.alias
-            index = sub["document_index"][alias]
-            runtime_context = state.runtime_context
-            results = _execute_predicates(
-                runtime_context, nodes,
-                {
-                    "documents": DocumentPrefixes(
-                        node.document_head,
-                        sub["documents"][alias],
-                        range(len(sub["documents"][alias])),
-                    ),
-                    "document_ids": index,
-                    "limit": filter_limit,
-                    "stop_groups": sub.get("stop_groups"),
-                    "gpu_timing": sub.get("gpu_timing", False),
-                },
-            )
-    return _child_results(torch, arena, results, wall_started=t0)
-
-
-def _child_results(torch, arena, results, *, wall_started=None, **metrics):
-    """Collect worker outputs and measurements after GPU work completes."""
-    torch.cuda.synchronize()
-    retained = {}
-    for alias, document in arena.retained_keys():
-        if isinstance(alias, tuple) and alias[0] == "extract":
-            alias = alias[1]
-        retained.setdefault(alias, []).append(document)
-    return {
-        "results": results,
-        "retained": {alias: sorted(documents)
-                     for alias, documents in retained.items()},
-        "kv_totals": {
-            "evicted_keys": arena.evicted_keys,
-            "evicted_pages": arena.evicted_pages,
-            "evicted_prefix_tokens": arena.evicted_prefix_tokens,
-        },
-        "peak_gib": torch.cuda.max_memory_allocated() / 2**30,
-        **({"wall_s": round(time.perf_counter() - wall_started, 2)}
-           if wall_started is not None else {}),
-        **metrics,
-    }
-
-
-def _child_extract(state, sub):
-    """Extract answers on one worker and report its retained document KV."""
+    The first group of a query carries the query itself; the worker
+    binds it to the same execution context a single GPU uses.
+    """
+    if "query" in sub:
+        payload = sub["query"]
+        graph = decode_graph(payload["physical_plan"]["graph"], state.registry.codecs)
+        state.runtime_context = execution_context(
+            _execution_state(state.gpu, payload, state.registry), payload, graph)
+    context = state.runtime_context
+    context.state["filter_limit"] = sub["limit"]
+    nodes, inputs = sub["nodes"], sub["inputs"]
     gpu = state.gpu
     with gpu.torch.inference_mode():
-        results = execute_extractions(gpu.execution.query, sub["nodes"], sub["inputs"])
-    return _child_results(gpu.torch, gpu.arena, results)
-
-
-def _child_joins(state, sub):
-    gpu = state.gpu
-    torch = gpu.torch
-    arena = gpu.arena
-    if sub.get("start_query", False):
-        _reset_child_query(state)
-    registry = state.registry
-    nodes = tuple(registry.codecs[value["type"]].decode(value)
-                  for value in sub["physical_nodes"])
-    node = nodes[0]
-    if not isinstance(node, AiJoin):
-        raise TypeError(f"child join received {node.type_name!r}")
-    anchor_alias = node.anchor
-    anchors_glob = list(sub["anchor_index"])
-    anchor_documents = sub["anchor_documents"]
-    config = sub.get("retention", {})
-    expected_rows = {
-        alias: partner["index"] for alias, partner in sub["partners"].items()
-    }
-    expected_rows[anchor_alias] = anchors_glob
-    apply_retention(arena, config,
-                    config.get("before", {}).get(node.node_id, {}), expected_rows)
-    t0 = time.perf_counter()
-    with torch.inference_mode():
-        prefixes = DocumentPrefixes(node.document_head, anchor_documents,
-                                    range(len(anchor_documents)))
-        prepared = join_inputs(
-            nodes, {alias: partner["documents"]
-                    for alias, partner in sub["partners"].items()},
-            expected_rows, prefixes, arena, config, sub.get("pairs", {}))
-        round_kv = prepared["kv_round"]
-        prepared["gpu_timing"] = sub.get("gpu_timing", False)
-        results = _execute_predicates(state.runtime_context, nodes, prepared)
-    if sub.get("final_group"):
-        for key in arena.resident_keys():
-            arena.free_key(key)
-    return _child_results(torch, arena, results, wall_started=t0, kv_round=round_kv)
-
-
-def _reset_child_query(state):
-    """Clear KV and counters before a child starts a new query."""
-    gpu = state.gpu
-    arena = gpu.arena
-    for key in arena.resident_keys():
-        arena.free_key(key)
-    arena.reset_stats()
+        if sub["pipeline"] and context.run_pipeline is not None:
+            results = context.run_pipeline(nodes, inputs, context)
+        else:
+            # an executor without pipelines runs the group node by node
+            results = {}
+            for node in nodes:
+                node_inputs = dict(inputs[node.node_id])
+                for port in node.inputs:
+                    if port.source.node_id in results:
+                        node_inputs[port.name] = results[
+                            port.source.node_id].outputs[port.source.port]
+                results[node.node_id] = context.runtimes[node.runtime_key].execute(
+                    node, node_inputs, context)
+    gpu.torch.cuda.synchronize()
+    if sub["final"]:
+        for key in gpu.arena.resident_keys():
+            gpu.arena.free_key(key)
+    return {"results": results, "retained": tuple(gpu.arena.retained_keys()),
+            **execution_measurements(context)}
 
 
 class GpuWorkers:
@@ -667,15 +556,9 @@ def execute_quail_multi(payload, registry, graph):
     boot_s = round(time.perf_counter() - started, 2)
     say(f"all {gpus} GPUs ready; running the query")
     report = execute_distributed_graph(
-        payload,
-        graph,
-        gpus,
-        workers.round,
-        spec,
+        payload, graph, gpus, workers.round,
         registry.device(payload["physical_plan"]["device"]),
-        registry.runtimes,
-        registry,
-    )
+        registry.runtimes, registry)
     slowest = max(boots, key=lambda boot: boot["boot_s"])
     report["boot_s"] = boot_s
     report["boot_kind"] = "cold" if any(b["kind"] == "cold" for b in boots) else "warm"

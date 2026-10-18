@@ -91,17 +91,14 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
     """Return a physical executor that runs the FEVER fakes on one or two GPUs."""
     from quail.backends.quail import worker
     from quail.backends.quail.distributed import execute_distributed_graph
-    from quail.execution.runner import ExecutionContext
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
+    from quail.specs import H100_SXM
 
     def child(documents):
         model = fever_oracle(capacity=1, empty=False)
         state = graph_state(model, documents)
         model.arena = state["gpu"].arena
         return worker.ChildState(
-            gpu_index=0, gpu=state["gpu"], registry=session.registry,
-            runtime_context=ExecutionContext(
-                runtimes=session.registry.runtimes, model_execution=model))
+            gpu_index=0, gpu=state["gpu"], registry=session.registry)
 
     def execute(request):
         graph = decode_graph(request.plan["graph"], session.registry.codecs)
@@ -119,16 +116,15 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
         children = [child(documents), child(documents)]
 
         def round_fn(kind, subs):
-            function = (worker._child_filters if kind == "filters"
-                        else worker._child_joins)
-            return [function(state, sub) for state, sub in zip(children, subs)]
+            assert kind == "execute"
+            return [worker._child_execute(state, sub)
+                    for state, sub in zip(children, subs)]
 
-        monkeypatch.setattr(worker, "_child_boot", lambda state, sub: None)
         report = execute_distributed_graph(
             {**request.plan["settings"], "model": "qwen3-4b-fp8",
              "documents": documents, **extra, "physical_plan": request.plan},
-            graph, 2, round_fn, QWEN3_4B_FP8, H100_SXM,
-            session.registry.runtimes, session.registry,
+            graph, 2, round_fn, H100_SXM, session.registry.runtimes,
+            session.registry,
         )
         assert all(not child.gpu.arena.accounting.owned for child in children)
         for node in graph.nodes:

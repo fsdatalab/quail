@@ -76,9 +76,11 @@ def record_model_result(node, result: NodeResult,
         state["kv_stats"]["join_anchor_hits"] += result.metrics.kv_hits
 
 
-def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
-    """Execute one Quail model graph on one GPU executor."""
-    torch = state["gpu"].torch
+def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
+    """Bind a query's inputs, retention, and runtimes to one GPU executor.
+
+    The arena is emptied first: nothing survives from the last query.
+    """
     arena = state["gpu"].arena
     for key in arena.resident_keys():
         arena.free_key(key)
@@ -110,7 +112,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         },
     }
     execution = state["gpu"].execution
-    context = ExecutionContext(
+    return ExecutionContext(
         runtimes=state["runtimes"],
         model_execution=execution,
         sources=sources,
@@ -120,25 +122,38 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         functions=state.get("functions", {}),
         run_pipeline=getattr(execution, "execute_pipeline", None),
     )
+
+
+def execution_measurements(context: ExecutionContext) -> dict:
+    """Return one GPU's KV counters and peak memory for the query so far."""
+    gpu = context.state["gpu"]
+    arena = gpu.arena
+    return {
+        "kv_manager": {
+            **context.state["kv_stats"],
+            "evicted_keys": arena.evicted_keys,
+            "evicted_pages": arena.evicted_pages,
+            "evicted_prefix_tokens": arena.evicted_prefix_tokens,
+        },
+        "peak_gib": round(gpu.torch.cuda.max_memory_allocated() / 2**30, 2),
+    }
+
+
+def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
+    """Execute one Quail model graph on one GPU executor."""
+    context = execution_context(state, payload, graph)
+    torch = state["gpu"].torch
+    arena = state["gpu"].arena
     started = time.perf_counter()
     with torch.inference_mode():
         result = GenericRunner().run(compute_subgraph(graph), context)
     torch.cuda.synchronize()
     wall = time.perf_counter() - started
-
     for key in arena.resident_keys():
         arena.free_key(key)
-    kv_manager = {
-        **runtime_state["kv_stats"],
-        "evicted_keys": arena.evicted_keys,
-        "evicted_pages": arena.evicted_pages,
-        "evicted_prefix_tokens": arena.evicted_prefix_tokens,
-    }
-
     report = graph_report(graph, result, wall, state["device"],
                           gpu_timing=state.get("gpu_timing", False))
-    report.update(kv_manager=kv_manager,
-                  peak_gib=round(torch.cuda.max_memory_allocated() / 2**30, 2))
+    report.update(execution_measurements(context))
     return report
 
 

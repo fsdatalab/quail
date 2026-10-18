@@ -82,7 +82,6 @@ class AiJoin(PhysicalNode):
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
     backend: ClassVar[str] = "quail"
 
-    worker_pipelining: ClassVar[bool] = True
 
     @property
     def document_aliases(self) -> tuple[str, ...]:

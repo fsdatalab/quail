@@ -106,12 +106,11 @@ class GenericRunner:
                 observer.after_node(node, result)
 
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
-        pipelines = (build_pipelines(graph, context.gpus, completed)
+        pipelines = (build_pipelines(graph, completed)
                      if context.run_pipeline else {})
         for node in graph.topological_nodes():
             pipeline = pipelines.get(node.node_id)
-            if pipeline is not None and (context.gpus == 1
-                                         or pipeline[0].worker_pipelining):
+            if pipeline is not None:
                 if node is not pipeline[-1]:
                     continue
                 inside = {member.node_id for member in pipeline}
