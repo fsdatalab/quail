@@ -143,6 +143,10 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
     assert [call["revision"] for call in calls] == ["revision-a", "revision-b"]
     assert all(call["repo_id"] == "Qwen/model" for call in calls)
     assert "*.safetensors" in calls[0]["allow_patterns"]
+    # a tokenizer-only download is its own cache entry without the weights
+    assert model_loading.resolve_model_path(
+        "Qwen/model", "revision-a", include_weights=False) == first
+    assert "*.safetensors" not in calls[2]["allow_patterns"]
 
     # the files are cached before the GPU children start
     from quail.backends.quail import worker

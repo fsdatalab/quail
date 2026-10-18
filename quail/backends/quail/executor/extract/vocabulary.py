@@ -165,7 +165,7 @@ def load_vocabulary(state) -> Vocabulary:
     """Return the loaded model's vocabulary index, loading its tokenizer once."""
     loaded = state.loaded_model
     if loaded.vocabulary is None:
-        from quail.backends.quail.executor.model_loading import resolve_model_path
+        from quail.specs.files import resolve_model_path
 
         spec = loaded.model_spec
         path = resolve_model_path(spec.hf_name, spec.revision)

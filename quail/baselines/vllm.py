@@ -12,6 +12,7 @@ from quail.baselines.request_scheduling import (
     MAX_SEQUENCES,
     run_filter_sequence,
 )
+from quail.specs.files import resolve_model_path
 
 GPU_MEMORY_UTILIZATION = 0.91
 CUDA_GRAPH_CAPTURE_SIZE = 8_192
@@ -36,7 +37,9 @@ class GigatokenVLLMTokenizer:
         from gigatoken import Tokenizer
 
         truncation_side = kwargs.pop("truncation_side", "left")
-        tokenizer = Tokenizer(path_or_repo_id).as_hf()
+        path = resolve_model_path(path_or_repo_id, kwargs.get("revision"),
+                                  include_weights=False)
+        tokenizer = Tokenizer(path).as_hf()
         tokenizer.truncation_side = truncation_side
         vocab = tokenizer.get_vocab()
         tokenizer.max_token_id = max(vocab.values())
@@ -240,9 +243,10 @@ class VLLMEngine:
             # 92 to 73 percent on agent traces,
             # /results/ablations/diffusion_gemma_readout_probe_agent_k0_corpus_mp.json)
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        path = resolve_model_path(spec.hf_name, spec.revision)
         started = time.perf_counter()
         with diffusion_canvas(spec) as canvas_ids:
-            llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
+            llm = LLM(model=path, **self.llm_kwargs(spec))
         boot_s = time.perf_counter() - started
         sampling_params = SamplingParams(
             **sampling_kwargs(allowed_ids, spec.canvas_tokens))

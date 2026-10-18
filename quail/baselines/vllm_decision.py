@@ -226,11 +226,9 @@ def boot_decision(spec, llm_kwargs: dict) -> tuple[dict, dict]:
     """
     from vllm import LLM
 
-    from quail.backends.quail.executor.model_loading import (
-        engine_args,
-        resolve_model_path,
-    )
+    from quail.backends.quail.executor.model_loading import engine_args
     from quail.baselines.vllm import _capacity
+    from quail.specs.files import resolve_model_path
 
     register()
     path = resolve_model_path(spec.hf_name, spec.revision)

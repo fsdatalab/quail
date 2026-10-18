@@ -281,11 +281,14 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
     monkeypatch.setitem(
         sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer)
     )
+    monkeypatch.setattr(
+        "quail.baselines.vllm.resolve_model_path",
+        lambda name, revision, **kwargs: f"{name}@{revision}")
     loaded = GigatokenVLLMTokenizer.from_pretrained(
-        "Qwen/Qwen3-4B-FP8", truncation_side="right"
+        "Qwen/Qwen3-4B-FP8", truncation_side="right", revision="pinned"
     )
     assert loaded is adapter
-    assert sources == ["Qwen/Qwen3-4B-FP8"]
+    assert sources == ["Qwen/Qwen3-4B-FP8@pinned"]
     assert loaded.truncation_side == "right"
     assert loaded.max_token_id == 1
     assert loaded.max_chars_per_token == 3

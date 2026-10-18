@@ -126,13 +126,15 @@ def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
             return b"hello"[:len(ids)]
 
     monkeypatch.setitem(sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer))
+    monkeypatch.setattr("quail.api.session.resolve_model_path",
+                        lambda name, revision, **kwargs: f"{name}@{revision}")
     with quail.Session(CONFIG) as session:
         token_ids = session.tokenizer("hello")
         piece = session.tokenizer.decode([1])
         # the session loads one encoder for the caller and warms one on
         # the tokenization thread; the thread keeps its own instance
         session.inputs.warm_tokenizer().result()
-    assert sources == ["Qwen/Qwen3-4B-FP8"] * 2
+    assert sources == ["Qwen/Qwen3-4B-FP8@" + session.model.revision] * 2
     assert token_ids == [1, 2]
     assert all(type(token_id) is int for token_id in token_ids)
     assert piece == b"h"

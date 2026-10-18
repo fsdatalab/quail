@@ -12,6 +12,7 @@ from quail.baselines.request_scheduling import (
     MAX_SEQUENCES,
     run_filter_sequence_async,
 )
+from quail.specs.files import resolve_model_path
 
 PAGE_SIZE = 16
 CHUNKED_PREFILL_TOKENS = (
@@ -139,9 +140,10 @@ class SGLangEngine:
         """Load the spec's model and return the engine state and boot record."""
         import sglang as sgl
 
+        path = resolve_model_path(spec.hf_name, spec.revision)
         started = time.perf_counter()
         engine = sgl.Engine(
-            model_path=spec.hf_name,
+            model_path=path,
             mem_fraction_static=MEM_FRACTION_STATIC,
             max_running_requests=MAX_SEQUENCES,
             chunked_prefill_size=CHUNKED_PREFILL_TOKENS,
