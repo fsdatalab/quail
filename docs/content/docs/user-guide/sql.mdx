@@ -53,8 +53,9 @@ Here `{0}` is the review and `{1}` is the aspect.
 
 A column argument can read a field of a struct column, such as
 `r.details.body`, or be `LENGTH(column)`. The same expressions work in
-`ON` conditions and `WHERE` tests. The document the prompt reads must
-be text, so a struct column needs a field.
+`ON`, `WHERE`, `SELECT`, `ORDER BY`, and `GROUP BY`; a returned
+expression is named as written, such as `length(r.body)`. The document
+the prompt reads must be text, so a struct column needs a field.
 
 ## AI.IF
 
@@ -474,9 +475,9 @@ in `ON`. See [Joining](#joining).
 
 Quail supports these SQL clauses with the following limits:
 
-- **`SELECT`** lists columns and `AI.SCORE` or `AI.CLASSIFY`
-  outputs with column aliases. `*` expands to all table columns. Other
-  computed expressions are unsupported.
+- **`SELECT`** lists columns, struct fields, `LENGTH(column)`, and
+  `AI.SCORE` or `AI.CLASSIFY` outputs with column aliases. `*` expands
+  to all table columns. Other computed expressions are unsupported.
 - **`FROM`** names a registered table, with an optional alias.
 - **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
   `RIGHT`, `FULL`) are not.
@@ -484,8 +485,9 @@ Quail supports these SQL clauses with the following limits:
 
 ## ORDER BY
 
-`ORDER BY` sorts result rows by table columns or names assigned to AI
-outputs with `AS`. AI expressions cannot appear directly in `ORDER BY`.
+`ORDER BY` sorts result rows by table columns, struct fields,
+`LENGTH(column)`, or names assigned to AI outputs with `AS`. AI
+expressions cannot appear directly in `ORDER BY`.
 Sorting columns need not appear in `SELECT`, except when using
 `SELECT DISTINCT`.
 
@@ -527,8 +529,8 @@ evaluation early. An offset greater than zero has the same effect.
 
 ## GROUP BY and HAVING
 
-`GROUP BY` accepts table columns and names assigned to AI outputs with
-`AS`. Return grouping columns and aggregate results in `SELECT`.
+`GROUP BY` accepts table columns, struct fields, `LENGTH(column)`, and
+names assigned to AI outputs with `AS`. Return grouping columns and aggregate results in `SELECT`.
 Give each aggregate in `SELECT` an `AS` name.
 
 `HAVING` filters groups by comparing an aggregate with a number. Refer

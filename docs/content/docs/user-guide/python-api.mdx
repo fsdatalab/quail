@@ -283,9 +283,11 @@ different tables, use [`join()`](#join).
 `col(...).field(name)` reads a field of a struct column, and
 `col(...).length()` the length of a text value. Both stand wherever a
 column does: as a prompt's document, in a `join()` condition, as a
-column an `apply()` function reads, or in a `where()` test. The
-document a prompt reads must be text, so a struct column goes through
-`field()`.
+column an `apply()` function reads, in a `where()` test, and in
+`select()`, `order_by()`, `group_by()`, and `agg()`. A returned
+expression is named as written, such as `r.details.kind` or
+`length(r.body)`. The document a prompt reads must be text, so a
+struct column goes through `field()`.
 
 For example, imagine a `pages` table whose `details` column is a
 struct with `body` and `url` fields. This query asks the model about

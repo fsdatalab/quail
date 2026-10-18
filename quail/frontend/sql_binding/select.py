@@ -81,19 +81,18 @@ def bind_order(
     keys = []
     for term in order.expressions:
         target = term.this
-        if not isinstance(target, exp.Column):
+        if not isinstance(target, (exp.Column, exp.Length)):
             raise CompileError(
                 f"ORDER BY {target.sql()} is not a column; give an "
                 f"expression an AS name in SELECT and order by that name"
             )
-        if not target.table and target.name in struct_names:
+        bare = target.name if isinstance(target, exp.Column) and not target.table \
+            else None
+        if bare in struct_names:
             raise CompileError(
                 f"ORDER BY does not compare the AI.EXTRACT struct column "
-                f"{target.name!r}; extract the field as its own column")
-        if not target.table and target.name in named:
-            expression = named[target.name]
-        else:
-            expression = b.resolve_column(target)
+                f"{bare!r}; extract the field as its own column")
+        expression = named[bare] if bare in named else b.resolve_value(target)
         keys.append(
             SortKey(
                 expression,
@@ -141,13 +140,13 @@ class SelectBinder:
         """
         b, columns = self.binder, self.columns
         names = {column.name: column for column in columns if isinstance(column, Alias)}
-        if isinstance(node, exp.Column):
-            if not node.table and node.name in names:
+        if isinstance(node, (exp.Column, exp.Length)):
+            if isinstance(node, exp.Column) and not node.table and node.name in names:
                 return node.name
-            ref = b.resolve_column(node)
-            if ref not in columns:
-                columns.append(ref)
-            return column_name(ref)
+            column = b.resolve_value(node)
+            if column not in columns:
+                columns.append(column)
+            return column_name(column)
         if not (_is_call(node, "AI_SCORE") or isinstance(node, exp.AIClassify)):
             raise CompileError(f"{node.sql()} is not a column or an AI expression")
         call = b.bind_ai_value(node)
@@ -335,11 +334,11 @@ def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list
                 "AI.SCORE, AI.CLASSIFY, and AI.EXTRACT in SELECT must be "
                 "direct expressions with an AS name"
             )
-        if not isinstance(e, exp.Column):
+        if not isinstance(e, (exp.Column, exp.Length)):
             raise CompileError(
                 f"the SELECT list is column selection only, got "
                 f"{e.sql()}: nothing computed, per the projection "
                 f"contract"
             )
-        columns.append(b.resolve_column(e))
+        columns.append(b.resolve_value(e))
     return columns

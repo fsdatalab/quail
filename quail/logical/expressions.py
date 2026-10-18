@@ -565,7 +565,7 @@ def _explain(expression) -> str:
 class SortKey:
     """One ORDER BY term: a column or a projected expression and its direction."""
 
-    expression: Any  # ColumnRef | Alias
+    expression: Any  # ColumnRef | ColumnExpression | Alias | AggregateCall
     descending: bool = False
     nulls_first: bool = False
 
@@ -577,7 +577,7 @@ class SortKey:
         return column_name(self.expression)
 
     def validate(self) -> None:
-        if isinstance(self.expression, (Alias, AggregateCall)):
+        if isinstance(self.expression, (Alias, AggregateCall, ColumnExpression)):
             self.expression.validate()
         elif not isinstance(self.expression, ColumnRef):
             raise CompileError(

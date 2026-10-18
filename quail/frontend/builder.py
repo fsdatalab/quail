@@ -89,9 +89,6 @@ class Query:
     def _scope(self) -> dict:
         return dict(self._tables)
 
-    def _resolve(self, c: ColSpec) -> ColumnRef:
-        return self._scope_.resolve(c.column, c.alias)
-
     def _resolve_value(self, c: ColSpec) -> ColumnRef | ColumnExpression:
         """Resolve a col() with the fields and function read on it."""
         return self._scope_.resolve_value(c.column, c.alias, path=c.path,
@@ -678,11 +675,9 @@ class Query:
                 raise CompileError(
                     "order_by takes a column name or col(...).asc() or "
                     f".desc(), got {key!r}")
-            name = (key.col.column if key.col.alias is None
-                    else f"{key.col.alias}.{key.col.column}")
             nulls_first = (key.descending if key.nulls is None
                            else key.nulls == "first")
-            self._order.append((name, key.descending, nulls_first))
+            self._order.append((key.col, key.descending, nulls_first))
         return self
 
     def group_by(self, *keys) -> "Query":
@@ -758,8 +753,7 @@ class Query:
                                                  provider=provider,
                                                  column=name))
                 continue
-            spec = col(c) if isinstance(c, str) else c
-            columns.append(self._resolve(spec))
+            columns.append(self._resolve_value(col(c) if isinstance(c, str) else c))
         # a classification is planned when the query returns or tests
         # its label
         tested = {name for tests in self._label_filters.values()
@@ -796,16 +790,18 @@ class Query:
                  if isinstance(column, Alias)}
         if aggregation is not None:
             named.update({a.name: a for a in aggregation.aggregates})
-        for name, _, _ in self._order:
-            if name in self._extracts:
+        order = []
+        for spec, descending, nulls_first in self._order:
+            if spec.alias is None and spec.column in self._extracts:
                 raise CompileError(
                     f"ORDER BY does not compare the AI.EXTRACT struct column "
-                    f"{name!r}; extract the field as its own column")
-        order = tuple(
-            SortKey(named[name] if name in named else self._resolve(col(name)),
-                    descending=descending, nulls_first=nulls_first)
-            for name, descending, nulls_first in self._order)
-        return logical.project(tuple(columns), self._limit, order=order,
+                    f"{spec.column!r}; extract the field as its own column")
+            expression = (named[spec.column]
+                          if spec.alias is None and spec.column in named
+                          else self._resolve_value(spec))
+            order.append(SortKey(expression, descending=descending,
+                                 nulls_first=nulls_first))
+        return logical.project(tuple(columns), self._limit, order=tuple(order),
                                offset=self._offset, distinct=self._distinct,
                                aggregation=aggregation, structs=tuple(structs))
 
@@ -823,7 +819,7 @@ class Query:
             elif isinstance(c, str) and c in self._scores:
                 column = self._scores[c]
             else:
-                column = self._resolve(col(c) if isinstance(c, str) else c)
+                column = self._resolve_value(col(c) if isinstance(c, str) else c)
             if column not in columns:
                 columns.append(column)
             return column_name(column)

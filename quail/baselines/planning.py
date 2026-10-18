@@ -16,6 +16,7 @@ from quail.logical import (
     Alias,
     Apply,
     classified_above_joins,
+    column_name,
     effective_selectivity,
 )
 from quail.logical import Aggregate as LogicalAggregate
@@ -344,12 +345,9 @@ def _result_nodes(region, request_node, aliases, join_specs, extract_specs,
         for spec in extract_specs)
     columns = []
     for column in region.logical_plan.projection.columns:
-        if isinstance(column, Alias):
-            columns.append(column.name)
-            if column.expression.kind == "extract":
-                columns.append(column.name + SPAN_SUFFIX)
-        else:
-            columns.append(f"{column.alias}.{column.column}")
+        columns.append(column_name(column))
+        if isinstance(column, Alias) and column.expression.kind == "extract":
+            columns.append(column.name + SPAN_SUFFIX)
     nodes.append(Project(
         node_id="project",
         inputs=input_ports((sink_input, *label_ports)),

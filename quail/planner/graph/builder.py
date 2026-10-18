@@ -9,6 +9,7 @@ from quail.logical import (
     Alias,
     LogicalPlan,
     classified_above_joins,
+    column_name,
     effective_selectivity,
     extracted_above_joins,
     has_score,
@@ -457,8 +458,7 @@ class GraphBuilder:
             sink_inputs = (port_by_alias[alias],)
         columns = []
         for c in self.plan.projection.columns:
-            columns.append(c.name if isinstance(c, Alias)
-                           else f"{c.alias}.{c.column}")
+            columns.append(column_name(c))
             if isinstance(c, Alias) and getattr(c.expression, "probabilities", False):
                 columns.append(c.name + PROBABILITIES_SUFFIX)
             if isinstance(c, Alias) and c.expression.kind == "extract":

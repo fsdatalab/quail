@@ -9,6 +9,7 @@ from quail.logical.expressions import (
     AggregateCall,
     Aggregation,
     Alias,
+    ColumnExpression,
     ColumnRef,
     CompileError,
     ExtractStruct,
@@ -16,6 +17,7 @@ from quail.logical.expressions import (
     SortKey,
     _explain,
     column_name,
+    column_reference,
     packed_columns,
 )
 from quail.logical.nodes.base import LogicalNode
@@ -25,14 +27,14 @@ from quail.logical.nodes.extract import extractions
 
 @dataclass(frozen=True)
 class Project:
-    """Select source columns and named model outputs.
+    """Select source columns, expressions over them, and named model outputs.
 
     The fields of each ExtractStruct are extraction Aliases among the
     columns; the result returns them packed into the struct's columns.
     """
 
     input: LogicalNode
-    columns: tuple[ColumnRef | Alias, ...]
+    columns: tuple[ColumnRef | ColumnExpression | Alias, ...]
     structs: tuple[ExtractStruct, ...] = ()
     type_name: ClassVar[str] = "quail.logical_project"
 
@@ -43,7 +45,8 @@ class Project:
         return self.columns
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        return tuple(column for column in self.columns if isinstance(column, ColumnRef))
+        return tuple(column_reference(column) for column in self.columns
+                     if isinstance(column, (ColumnRef, ColumnExpression)))
 
     def validate(self) -> None:
         computed = {(node.call, node.name) for node in classifications(self.input)}
@@ -67,17 +70,14 @@ class Project:
                         f"the answer column {column.name!r} needs a "
                         f"SemanticExtract below the Project"
                     )
+            elif isinstance(column, ColumnExpression):
+                column.validate()
             elif not isinstance(column, ColumnRef):
                 raise CompileError(
                     f"a projected column is a column reference or a named "
                     f"expression, got {type(column).__name__}"
                 )
-        names = [
-            f"{column.alias}.{column.column}"
-            if isinstance(column, ColumnRef)
-            else column.name
-            for column in self.columns
-        ]
+        names = [column_name(column) for column in self.columns]
         if len(names) != len(set(names)):
             raise CompileError(f"projection names must be unique, got {names}")
         self._validate_structs()
@@ -132,7 +132,7 @@ class Project:
         fields = {
             "columns": [
                 column_name(column)
-                if isinstance(column, ColumnRef)
+                if isinstance(column, (ColumnRef, ColumnExpression))
                 else _explain(column)
                 for column in self.columns
             ]

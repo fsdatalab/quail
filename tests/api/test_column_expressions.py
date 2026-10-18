@@ -9,6 +9,7 @@ from helpers.sessions import CONFIG, _run, fake_tok, make_executor
 
 import quail
 from quail import col, prompt
+from quail.frontend.expressions import count
 from quail.logical import CompileError, Scan
 from quail.physical import Foreign, HashJoin, decode_graph, encode_graph
 
@@ -18,9 +19,9 @@ def session():
     with quail.Session(CONFIG, tokenizer=fake_tok) as session:
         session.register("docs", quail.DocumentProvider.from_table(pa.table({
             "id": ["d0", "d1", "d2"],
-            "details": [{"body": "one", "url": "u1"},
-                        {"body": "two words", "url": "u2"},
-                        {"body": "three words here", "url": "u3"}],
+            "details": [{"body": "one", "url": "u1", "kind": "a"},
+                        {"body": "two words", "url": "u2", "kind": "b"},
+                        {"body": "three words here", "url": "u3", "kind": "a"}],
         }), id_col="id"))
         session.register("partners", quail.DocumentProvider.from_table(pa.table({
             "id": ["p0", "p1", "p2"],
@@ -107,3 +108,29 @@ def test_a_bad_field_or_function_fails_before_the_query_runs(session):
     with pytest.raises(CompileError, match="has no field 'title'"):
         session.sql("SELECT r.id FROM docs r "
                     "WHERE AI_FILTER(PROMPT('q: {0}', r.details.title))")
+
+
+def test_select_order_and_group_take_expressions(session):
+    body = col("r.details").field("body")
+    kind = col("r.details").field("kind")
+
+    def filtered():
+        return session.docs("docs").alias("r").ai_filter(prompt("q: {0}", body))
+
+    executor = make_executor({"r": {"q:": [1, 1, 1]}})
+    rows = _run(filtered().order_by(body.length().desc())
+                .select("r.id", body, kind), executor)
+    assert rows.to_rows() == [("d2", "three words here", "a"),
+                              ("d1", "two words", "b"), ("d0", "one", "a")]
+    assert rows.columns == ["r.id", "r.details.body", "r.details.kind"]
+    grouped = (filtered().group_by(kind).agg(n=count()).order_by(kind)
+               .select(kind, "n"))
+    sql = session.sql("""
+        SELECT r.details.kind, COUNT(*) AS n FROM docs r
+        WHERE AI_FILTER(PROMPT('q: {0}', r.details.body))
+        GROUP BY r.details.kind ORDER BY r.details.kind
+    """)
+    assert sql.logical == grouped.logical
+    assert _run(grouped, executor).to_rows() == [("a", 2), ("b", 1)]
+    distinct = filtered().distinct().order_by(kind).select(kind)
+    assert _run(distinct, executor).to_rows() == [("a",), ("b",)]

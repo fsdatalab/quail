@@ -9,7 +9,6 @@ from quail.frontend.scope import Scope
 from quail.frontend.sql_binding.predicates import column_path
 from quail.logical import (
     Alias,
-    ColumnRef,
     Compare,
     CompileError,
     ExtractStruct,
@@ -91,10 +90,6 @@ class ExpressionBinder:
         alias = table.alias or table.name
         self.scope.add_table(alias, table.name)
         return alias
-
-    def resolve_column(self, col: exp.Column, tables=None) -> ColumnRef:
-        return self.scope.resolve(col.name, col.table or None, tables=tables,
-                                  shown=col.sql())
 
     def resolve_value(self, node, tables=None, function=None):
         """Resolve a column, a struct field under one, or LENGTH() of either.
