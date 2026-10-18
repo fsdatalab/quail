@@ -523,6 +523,11 @@ class HavingTest:
         if not isinstance(self.value, (int, float)) or isinstance(self.value, bool):
             raise CompileError("HAVING compares an aggregate with a number")
 
+    def __post_init__(self) -> None:
+        value = self.value
+        object.__setattr__(self, "value", value.item() if hasattr(value, "item")
+                           and not isinstance(value, (int, float)) else value)
+
     def __str__(self) -> str:
         return f"{self.aggregate.name} {self.comparison} {self.value!r}"
 

@@ -7,10 +7,13 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.catalog.pairs import columns_key
+from quail.catalog.selection import equality_keys
+from quail.execution.aggregates import prepare_aggregate
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import QueryResult
 from quail.execution.rows import Rows, as_table
+from quail.logical.predicates import compare_literal
 from quail.physical import Aggregate, Limit, Project, Scan, Sort
 
 
@@ -116,13 +119,14 @@ def _comparable(column, clause: str):
 
 def _distinct_indices(table: pa.Table, columns) -> pa.Array:
     """Return the first row of each distinct value of the columns, in order."""
-    keyed = pa.table({
-        **{name: _comparable(table.column(name), "DISTINCT")
-           for name in columns},
-        "__row": pa.array(np.arange(table.num_rows), pa.int64()),
-    })
-    firsts = keyed.group_by(list(columns), use_threads=False).aggregate(
-        [("__row", "min")]).column("__row_min")
+    # internal names stay clear of the user's, and are read by position
+    keyed = {f"key_{index}": equality_keys(
+        _comparable(table.column(name), "DISTINCT"), nan_equal=True)
+        for index, name in enumerate(columns)}
+    keys = list(keyed)
+    keyed["row_position"] = pa.array(np.arange(table.num_rows), pa.int64())
+    firsts = pa.table(keyed).group_by(keys, use_threads=False).aggregate(
+        [("row_position", "min")]).column(len(keys))
     return pc.take(firsts, pc.sort_indices(firsts))
 
 
@@ -130,12 +134,6 @@ _AGGREGATE_KERNELS = {
     "count": "count", "count_distinct": "count_distinct", "sum": "sum",
     "avg": "mean", "min": "min", "max": "max",
 }
-_HAVING_COMPARE = {
-    "=": pc.equal, "<>": pc.not_equal, "<": pc.less, "<=": pc.less_equal,
-    ">": pc.greater, ">=": pc.greater_equal,
-}
-
-
 def _rows_table(value) -> pa.Table:
     """Return a node's rows input as one Arrow table."""
     value = as_table(value)
@@ -148,12 +146,21 @@ def _rows_table(value) -> pa.Table:
     raise TypeError(f"expected rows, got {type(value).__name__}")
 
 
+def _aggregate_kernel(function: str, values) -> str:
+    kernel = _AGGREGATE_KERNELS[function]
+    # Arrow cannot count the distinct values of an untyped null column
+    if kernel == "count_distinct" and pa.types.is_null(values.type):
+        return "count"
+    return kernel
+
+
 def aggregate_table(table: pa.Table, node) -> pa.Table:
     """Group a table by the node's keys and compute its aggregates.
 
-    Dictionary key columns are grouped by their values. A null argument
-    value is left out of every aggregate but count(*). Groups come out
-    in the order their first rows appear.
+    Dictionary key columns are grouped by their values, and numeric
+    keys by numeric equality. A null argument value is left out of
+    every aggregate but count(*). Groups come out in the order their
+    first rows appear.
     """
     arguments = list(dict.fromkeys((*node.keys, *(
         argument for _, _, argument in node.aggregates
@@ -163,29 +170,54 @@ def aggregate_table(table: pa.Table, node) -> pa.Table:
     names = {name: f"column_{index}" for index, name in enumerate(arguments)}
     keyed = {names[name]: _comparable(table.column(name), "an aggregate")
              for name in arguments}
+    hashed = {name: f"key_{index}" for index, name in enumerate(dict.fromkeys((
+        *node.keys, *(argument for _, function, argument in node.aggregates
+                      if function == "count_distinct"))))}
+    keyed.update({key: equality_keys(keyed[names[name]], nan_equal=True)
+                  for name, key in hashed.items()})
     keyed["row_position"] = pa.array(np.arange(table.num_rows), pa.int64())
-    sources = {}
-    specs = []
-    for _, function, argument in node.aggregates:
-        kernel = "count_all" if argument is None else _AGGREGATE_KERNELS[function]
-        if (argument, kernel) not in sources:
-            sources[(argument, kernel)] = len(node.keys) + len(specs)
-            specs.append(([], "count_all") if argument is None
-                         else (names[argument], kernel))
+    aggregates = [
+        (name, argument, _aggregate_kernel(
+            function, None if argument is None else keyed[names[argument]]))
+        for name, function, argument in node.aggregates]
+    sources, scalars, finishers, specs = {}, {}, {}, []
+    for _, argument, kernel in aggregates:
+        key = (argument, kernel)
+        if key in sources or key in scalars:
+            continue
+        column = None
+        if argument is not None:
+            source = hashed if kernel == "count_distinct" else names
+            values, kernel, finish = prepare_aggregate(
+                keyed[source[argument]], kernel, grouped=bool(node.keys))
+            if kernel is None:
+                scalars[key] = finish(None)
+                continue
+            if finish is not None:
+                finishers[len(node.keys) + len(specs)] = finish
+            column = f"aggregate_{len(specs)}"
+            keyed[column] = values
+        sources[key] = len(node.keys) + len(specs)
+        specs.append(([], "count_all") if argument is None else (column, kernel))
     grouped = pa.table(keyed).group_by(
-        [names[key] for key in node.keys], use_threads=False
+        [hashed[key] for key in node.keys], use_threads=False
     ).aggregate(specs + [("row_position", "min")])
-    order = pc.sort_indices(grouped.column(len(node.keys) + len(specs)))
-    columns = {name: grouped.column(index)
-               for index, name in enumerate(node.keys)}
-    for name, function, argument in node.aggregates:
-        kernel = "count_all" if argument is None else _AGGREGATE_KERNELS[function]
-        columns[name] = grouped.column(sources[(argument, kernel)])
+    firsts = grouped.column(len(node.keys) + len(specs))
+    order = pc.sort_indices(firsts)
+    for index, finish in finishers.items():
+        grouped = grouped.set_column(index, grouped.column_names[index],
+                                     finish(grouped.column(index)))
+    # the keys keep their own type: the first row of each group supplies them
+    columns = {name: pc.take(keyed[names[name]], firsts) for name in node.keys}
+    for name, argument, kernel in aggregates:
+        key = (argument, kernel)
+        columns[name] = (scalars[key] if key in scalars
+                         else grouped.column(sources[key]))
     result = pa.table({name: pc.take(column, order)
                        for name, column in columns.items()})
     mask = None
     for name, comparison, value in node.having:
-        test = _HAVING_COMPARE[comparison](result.column(name), value)
+        test = compare_literal(result.column(name), comparison, value)
         mask = test if mask is None else pc.and_kleene(mask, test)
     if mask is not None:
         result = result.filter(pc.fill_null(mask, False))

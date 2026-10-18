@@ -21,6 +21,27 @@ def selected_rows(columns: dict, predicates) -> pa.Array:
     return pc.indices_nonzero(accepted_rows(mask))
 
 
+def equality_keys(values, *, nan_equal: bool):
+    """Return values as keys that group and join by numeric equality.
+
+    A signed zero becomes 0, and NaN either forms one group or becomes
+    null, so a join or a membership test skips it. A dictionary column
+    is decoded first.
+
+    Args:
+        values: An Arrow array or chunked array.
+        nan_equal: Whether every NaN counts as one key.
+    """
+    if pa.types.is_dictionary(values.type):
+        values = values.cast(values.type.value_type)
+    if pa.types.is_floating(values.type):
+        zero = pa.scalar(0, values.type)
+        nan = pa.scalar(float("nan") if nan_equal else None, values.type)
+        values = pc.if_else(pc.equal(values, zero), zero, values)
+        values = pc.if_else(pc.is_nan(values), nan, values)
+    return values
+
+
 def document_positions(ids) -> np.ndarray:
     """Map document IDs to positions in a selection; absent IDs map to -1."""
     ids = np.asarray(ids, dtype=np.int64)
