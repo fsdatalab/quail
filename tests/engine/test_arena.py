@@ -137,3 +137,38 @@ def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
     # the parent still holds the borrowed page; one own page goes free
     assert a.drop_leading("s", 2) == 1
     assert a.borrowed["s"] == [] and len(a.owned["s"]) == 1
+
+
+def test_the_arena_allocates_its_pools_once_and_views_them_per_layer(monkeypatch):
+    import math
+
+    torch = pytest.importorskip("torch")
+    from quail.backends.quail.executor.arena import KVArena
+
+    shapes = [(2, 8), (1, 4), (3, 8)]
+    allocations = []
+    empty = torch.empty
+
+    def allocate(size, **kwargs):
+        allocations.append(size if isinstance(size, int) else math.prod(size))
+        if len(allocations) == 2:
+            raise MemoryError("out of memory")
+        return empty(size, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    arena = KVArena(num_layers=3, num_pages=3, page_tokens=4, num_kv_heads=2,
+                    d_head=8, layer_kv=shapes, dtype=torch.float32, device="cpu")
+    assert allocations == [2 * 12 * sum(heads * dim for heads, dim in shapes)]
+    for layer, (heads, dim) in enumerate(shapes):
+        key, value = arena.layer_kv(layer)
+        key.fill_(layer)
+        value.fill_(10 + layer)
+    for layer, (heads, dim) in enumerate(shapes):
+        key, value = arena.layer_kv(layer)
+        assert key.shape == value.shape == (12, heads, dim)
+        assert key.is_contiguous() and torch.all(key == layer)
+        assert torch.all(value == 10 + layer)
+        assert arena.paged_kv(layer)[0].shape == (3, 4, heads, dim)
+    with pytest.raises(MemoryError, match="out of memory"):
+        arena.resize(5)
+    assert arena.k is None and len(allocations) == 2

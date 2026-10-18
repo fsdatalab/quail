@@ -24,6 +24,8 @@ the same methods:
   evicted_prefix_tokens
 """
 
+import math
+
 import numpy as np
 
 from quail.backends.quail.executor.pages import PageArena, _evict_event
@@ -81,12 +83,17 @@ class KVArena:
         self.accounting = PageArena(num_pages, page_tokens)
         self.sliding = (PageArena(num_sliding_pages, page_tokens)
                         if self.sliding_layers else None)
-        self.k, self.v = [], []
-        for layer, (heads, dim) in enumerate(self.shapes):
-            pages = num_sliding_pages if layer in self.sliding_layers else num_pages
-            shape = (pages * page_tokens, heads, dim)
-            self.k.append(torch.empty(shape, dtype=self.dtype, device=self.device))
-            self.v.append(torch.empty(shape, dtype=self.dtype, device=self.device))
+        shapes = [
+            ((num_sliding_pages if layer in self.sliding_layers else num_pages)
+             * page_tokens, heads, dim)
+            for layer, (heads, dim) in enumerate(self.shapes)]
+        sizes = [math.prod(shape) for shape in shapes]
+        # one allocation: a failure leaves no layer's pool behind, and
+        # the pools cannot fragment the allocator between each other
+        storage = torch.empty(2 * sum(sizes), dtype=self.dtype, device=self.device)
+        parts = storage.split([size for size in sizes for _ in range(2)])
+        self.k = [part.view(shape) for part, shape in zip(parts[::2], shapes)]
+        self.v = [part.view(shape) for part, shape in zip(parts[1::2], shapes)]
         # row indices stay on the host: pageable H2D copies block the
         # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU
