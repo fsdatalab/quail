@@ -19,13 +19,13 @@ class ApplyGate(SingleResultPart):
         """Bind an apply call to its document and partner inputs."""
         node = nodes[0]
         values = {}
+        internal = {member.node_id for part in parts for member in part.nodes}
         for port in node.inputs:
             if not port.source.port.startswith("rows:"):
                 continue
             port_alias = port.source.port.split(":", 1)[1]
             values[port_alias] = (
-                ids if port.source.node_id in {
-                    part.node.node_id for part in parts}
+                ids if port.source.node_id in internal
                 else inputs[node.node_id][port.name])
         call, metrics = foreign_call(node, values, context)
         return cls(node, call, metrics,

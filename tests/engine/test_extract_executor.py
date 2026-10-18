@@ -955,3 +955,37 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch):
     assert 1 <= len(kept["c"]) < len(texts)
     assert sum(model.reads.values()) < len(texts)
     assert not arena.accounting.owned
+
+
+def test_operators_after_grouped_extractions_read_the_last_member(monkeypatch):
+    from quail.backends.quail.executor.operators import classify as classify_module
+    from quail.backends.quail.executor.operators.apply import ApplyGate
+    from quail.physical import AiClassify, ClassifySpec, Foreign, PortRef
+
+    spec, _ = make_spec()
+    extracts = [AiExtract(node_id=f"ai-extract:{name}", backend_name="quail",
+                          model="qwen3-4b-fp8", spec=replace(spec, name=name))
+                for name in ("ends", "starts")]
+    group = SimpleNamespace(nodes=extracts)
+    last = PortRef("ai-extract:starts", "rows:c")
+    monkeypatch.setattr(classify_module, "ClassifyStages",
+                        lambda *args, **kwargs: SimpleNamespace(
+                            partners=None, stages=(), labels=[]))
+    monkeypatch.setattr(classify_module, "answer_sink", lambda: None)
+    classify = AiClassify(
+        node_id="classify:c", backend_name="quail", model="qwen3-4b-fp8",
+        inputs=input_ports((last,)),
+        spec=ClassifySpec(name="topic", aliases=("c",), query_template="",
+                          arguments=(), expected_rows=3, estimated_seconds=0.0,
+                          labels=("a", "b"), label_token_ids=((13,), (14,)),
+                          scoring="letters"))
+    part = classify_module.classification_part(None, classify, [0, 1, 2], [group], {})
+    assert part.priors == [(group, last)] and part.prior_tables == []
+    monkeypatch.setattr("quail.backends.quail.executor.operators.apply.foreign_call",
+                        lambda node, values, context: (values, None))
+    apply = Foreign(node_id="apply:keep", inputs=input_ports((last,)),
+                    function="keep", kind="per_batch", ids="drop", columns=(),
+                    aliases=("c",))
+    gate = ApplyGate.prepare(None, [apply], [0, 1, 2], [group], {"apply:keep": {}},
+                             None)
+    assert gate.call == {"c": [0, 1, 2]}

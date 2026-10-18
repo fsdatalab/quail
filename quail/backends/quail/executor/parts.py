@@ -55,6 +55,8 @@ class ExecutionPart(ABC):
     """
 
     stages: Sequence[Stage]
+    # the physical nodes the part executes, every member of a group
+    nodes: Sequence = ()
     combine: ClassVar[bool] = False
     execute_group: ClassVar[Callable | None] = None
     gate = None
@@ -104,6 +106,12 @@ class ExecutionPart(ABC):
 
 class SingleResultPart(ExecutionPart):
     """Prepared work whose execution produces one result."""
+
+    @property
+    def nodes(self) -> tuple:
+        """Return the part's physical node, or nothing for a standalone batch."""
+        node = getattr(self, "node", None)
+        return () if node is None else (node,)
 
     @abstractmethod
     def result(self, tokens, gpu_s, chunks, stats) -> Any:
@@ -271,9 +279,7 @@ def survival(parts) -> float:
     """The fraction of documents expected to pass every part, by selectivity."""
     fraction = 1.0
     for part in parts:
-        nodes = getattr(part, "nodes", None) or (
-            (part.node,) if hasattr(part, "node") else ())
-        for node in nodes:
+        for node in part.nodes:
             if hasattr(node, "selectivity"):
                 fraction *= effective_selectivity(node.selectivity)
     return fraction

@@ -101,8 +101,8 @@ def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
     plan = ClassifyStages(state, node.spec, len(ids),
                           lambda key: position[key[1]])
     plan.seeds = ids
-    by_node = {part.node.node_id: part for part in parts}
-    priors = [(by_node[port.source.node_id], port.source.port)
+    by_node = {member.node_id: part for part in parts for member in part.nodes}
+    priors = [(by_node[port.source.node_id], port.source)
               for port in node.inputs
               if port.value_type is ValueType.ROWS
               and port.source.node_id in by_node]
@@ -160,7 +160,7 @@ class ClassifyPart(ClassifyBatch):
                  prior_tables=()):
         self.node = node
         self.ids = ids
-        self.priors = priors      # (part, port) of each label scored read
+        self.priors = priors      # (part, source port) of each rows input it reads
         self.prior_tables = prior_tables
         self.kept = kept          # KeptPairs, for joined rows
         sink = answer_sink()
@@ -196,7 +196,8 @@ class ClassifyPart(ClassifyBatch):
                                pa.string())
             sink = answer_sink()
             if sink is not None and len(rows):
-                sink(scored_batch(self.node, rows, scored))
+                sink(scored_batch(self.node, rows,
+                                  scored.column(spec.name).to_pylist()))
             return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
                 input_rows=len(pairs), output_rows=len(pairs),
                 evaluated_document_pairs=len(pairs), fresh_tokens=tokens,
@@ -218,8 +219,9 @@ class ClassifyPart(ClassifyBatch):
                 probability_column(spec.labels, plan.probabilities[labeled]))
         # the labels the parts before it gave these documents, as a
         # classify node on its own carries them from its scores input
-        for prior in (*self.prior_tables, *(part.result_value.outputs[port]
-                                             for part, port in self.priors)):
+        prior_results = (part.results()[port.node_id].outputs[port.port]
+                         for part, port in self.priors)
+        for prior in (*self.prior_tables, *prior_results):
             scored = scored.joined(prior, spec.aliases[0])
         return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),
