@@ -185,7 +185,7 @@ class PlanPricer:
                     max_answer_tokens=spec.max_answer_tokens,
                     draft_tokens=spec.draft_tokens, draft_policy=spec.draft_policy,
                     round_cost_per_token=spec.round_cost_per_token,
-                    gpus=context.gpus).seconds
+                    gpus=context.gpus, memo=context.memo).seconds
 
             whole = seconds(None)
             return seconds(shared) / whole if whole else 1.0

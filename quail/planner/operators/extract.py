@@ -65,6 +65,7 @@ def extract_spec(context, call, name, expected_rows, resident=False) -> ExtractS
         draft_policy=spec.draft_policy,
         round_cost_per_token=spec.round_cost_per_token,
         gpus=context.gpus,
+        memo=context.memo,
     )
     return replace(spec, estimated_seconds=cost.seconds)
 

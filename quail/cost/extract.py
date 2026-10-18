@@ -133,12 +133,46 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     return work, fed, rows
 
 
+def table_work(lengths, head_tokens: int, tail_tokens: int, *, window: int,
+               resident: bool, shared, max_answer_tokens: int,
+               draft_tokens: int, draft_policy: str,
+               round_cost_per_token: float, assumptions: ExtractAssumptions,
+               memo=None) -> tuple[Work, float, float]:
+    """Return the work, fed tokens, and readout rows of every document.
+
+    The sum runs the draft policy once per document, so a planner
+    passes its memo to compute it once per table and prompt; the key
+    holds the length and shared columns by identity, and the memo
+    keeps them alive so another column cannot reuse an identity.
+    """
+    key = ("extract_work", id(lengths), id(shared), head_tokens, tail_tokens,
+           window, resident, max_answer_tokens, draft_tokens, draft_policy,
+           round_cost_per_token, assumptions)
+    if memo is not None and key in memo:
+        return memo[key][2]
+    work = Work()
+    fed = rows = 0.0
+    for index, length in enumerate(lengths):
+        own, own_fed, own_rows = document_work(
+            int(length), head_tokens, tail_tokens, window=window,
+            resident=resident, shared=0 if shared is None else int(shared[index]),
+            max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
+            draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
+            assumptions=assumptions)
+        work += own
+        fed += own_fed
+        rows += own_rows
+    if memo is not None:
+        memo[key] = (lengths, shared, (work, fed, rows))
+    return work, fed, rows
+
+
 def estimate(expected_rows: float, lengths, head_tokens: int, tail_tokens: int, *,
              chunk: int, model, device, resident: bool = False,
              shared=None, max_answer_tokens: int, draft_tokens: int,
              draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
-             gpus: int = 1,
-             assumptions: ExtractAssumptions | None = None) -> ExtractCost:
+             gpus: int = 1, assumptions: ExtractAssumptions | None = None,
+             memo=None) -> ExtractCost:
     """Estimate the cost of one extraction over a table.
 
     Args:
@@ -159,6 +193,7 @@ def estimate(expected_rows: float, lengths, head_tokens: int, tail_tokens: int, 
             fed tokens, from the extraction plan.
         gpus: Model copies sharing the work, assuming balanced document costs.
         assumptions: Expected answer length, separate from execution limits.
+        memo: Where table_work keeps the per-table sum, or None.
 
     Returns:
         Estimated execution time, work, and token counts.
@@ -166,20 +201,13 @@ def estimate(expected_rows: float, lengths, head_tokens: int, tail_tokens: int, 
     n = len(lengths)
     if expected_rows <= 0 or n == 0:
         return ExtractCost(0.0, 0.0, Work(), 0.0, 0.0)
-    assumptions = ExtractAssumptions() if assumptions is None else assumptions
-    work = Work()
-    fed = rows = 0.0
-    for index, length in enumerate(lengths):
-        own, own_fed, own_rows = document_work(
-            int(length), head_tokens, tail_tokens,
-            window=model.sliding_window, resident=resident,
-            shared=0 if shared is None else int(shared[index]),
-            max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
-            draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
-            assumptions=assumptions)
-        work += own
-        fed += own_fed
-        rows += own_rows
+    work, fed, rows = table_work(
+        lengths, head_tokens, tail_tokens, window=model.sliding_window,
+        resident=resident, shared=shared, max_answer_tokens=max_answer_tokens,
+        draft_tokens=draft_tokens, draft_policy=draft_policy,
+        round_cost_per_token=round_cost_per_token,
+        assumptions=ExtractAssumptions() if assumptions is None else assumptions,
+        memo=memo)
     scale = expected_rows / n
     total = work * scale
     passes = total.tokens / chunk
