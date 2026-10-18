@@ -1,4 +1,5 @@
 from .base import AnswerCanvas, ModelSpec
+from .prompts import TEXT_ANALYSIS_SYSTEM_PROMPT
 
 DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     name="diffusion-gemma-26b-a4b-fp8",
@@ -35,9 +36,10 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     # the 16-row canvas vLLM decodes with; the letters rule reads its
     # first row after seeding the turn close and padding behind it
     answer_canvas=AnswerCanvas(rows=16, turn_close_id=106, pad_id=0),
-    turn_prefix="<bos><|turn>user\n",
+    turn_prefix=(f"<bos><|turn>system\n{TEXT_ANALYSIS_SYSTEM_PROMPT}<turn|>\n"
+                 "<|turn>user\n"),
     turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
-    prompt_format="gemma4-chat-nonthinking-v1",
+    prompt_format="gemma4-chat-text-analysis-v1",
     moe_backend="triton",
     # Bound expert workspace and attention buffers for 512-wide heads.
     chunk_cap_tokens=65_536,
