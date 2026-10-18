@@ -110,6 +110,25 @@ def test_a_bad_field_or_function_fails_before_the_query_runs(session):
                     "WHERE AI_FILTER(PROMPT('q: {0}', r.details.title))")
 
 
+def test_text_functions_stand_where_a_column_does(session):
+    body, kind = col("r.details").field("body"), col("r.details").field("kind")
+    built = (session.docs("docs").alias("r")
+             .ai_filter(prompt("q: {0}", body))
+             .where(kind.upper() == "A")
+             .select("r.id", kind.upper(), body.trim(), body.lower()))
+    written = session.sql(
+        "SELECT r.id, UPPER(r.details.kind), TRIM(r.details.body), "
+        "LOWER(r.details.body) FROM docs r "
+        "WHERE AI_FILTER(PROMPT('q: {0}', r.details.body)) "
+        "AND UPPER(r.details.kind) = 'A'")
+    assert written.logical == built.logical
+    rows = _run(built, make_executor({"r": {"q:": [1, 1, 1]}}))
+    assert rows.to_rows() == [("d0", "A", "one", "one"),
+                              ("d2", "A", "three words here", "three words here")]
+    assert rows.columns == ["r.id", "upper(r.details.kind)",
+                            "trim(r.details.body)", "lower(r.details.body)"]
+
+
 def test_select_order_and_group_take_expressions(session):
     body = col("r.details").field("body")
     kind = col("r.details").field("kind")

@@ -250,6 +250,7 @@ column, and `&` to combine conditions, as in PySpark.
 | Find text | `col(...).contains(text, ignore_case=False)`, `col(...).startswith(text)`, `col(...).endswith(text)` |
 | Match a regular expression | `col(...).rlike(pattern)` |
 | Test the length | `col(...).length() < 40` |
+| Test the text ignoring case or spaces | `col(...).lower() == "lease"`, `col(...).upper()`, `col(...).trim()` |
 
 `isin()` takes a non-empty iterable of values. Use `is_null()` to test
 for nulls rather than comparing with `None`. `~` before a text test
@@ -281,7 +282,8 @@ different tables, use [`join()`](#join).
 ### Column expressions
 
 `col(...).field(name)` reads a field of a struct column, and
-`col(...).length()` the length of a text value. Both stand wherever a
+`col(...).length()`, `lower()`, `upper()`, and `trim()` compute on a
+text value. All of them stand wherever a
 column does: as a prompt's document, in a `join()` condition, as a
 column an `apply()` function reads, in a `where()` test, and in
 `select()`, `order_by()`, `group_by()`, and `agg()`. A returned

@@ -6,7 +6,11 @@ from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
-from quail.frontend.sql_binding.predicates import column_path
+from quail.frontend.sql_binding.predicates import (
+    COLUMN_NODES,
+    column_path,
+    unwrap_function,
+)
 from quail.logical import (
     Alias,
     CompileError,
@@ -104,8 +108,8 @@ class ExpressionBinder:
             CompileError: The node is not a column expression, or its
                 column, field, or function does not resolve.
         """
-        if isinstance(node, exp.Length) and function is None:
-            node, function = node.this, "length"
+        if function is None:
+            node, function = unwrap_function(node)
         if not isinstance(node, exp.Column):
             raise CompileError(f"{node.sql()} is not a column expression")
         parts = column_path(node)
@@ -186,7 +190,7 @@ class ExpressionBinder:
         template = str(p_args[0].this)
         refs = []
         for a in p_args[1:]:
-            if not isinstance(a, (exp.Column, exp.Length)):
+            if not isinstance(a, COLUMN_NODES):
                 raise CompileError(
                     f"PROMPT arguments must be column references, got {a.sql()}"
                 )
@@ -318,7 +322,7 @@ class ExpressionBinder:
             raise CompileError(
                 "AI.EXTRACT takes a document column and an object of field "
                 "questions")
-        if not isinstance(args[0], (exp.Column, exp.Length)):
+        if not isinstance(args[0], COLUMN_NODES):
             raise CompileError(
                 f"AI.EXTRACT's first argument is a document column, "
                 f"got {args[0].sql()}")

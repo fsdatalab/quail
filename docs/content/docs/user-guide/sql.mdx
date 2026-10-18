@@ -52,7 +52,8 @@ PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
 Here `{0}` is the review and `{1}` is the aspect.
 
 A column argument can read a field of a struct column, such as
-`r.details.body`, or be `LENGTH(column)`. The same expressions work in
+`r.details.body`, or be `LENGTH`, `LOWER`, `UPPER`, or `TRIM` of a
+column. The same expressions work in
 `ON`, `WHERE`, `SELECT`, `ORDER BY`, and `GROUP BY`; a returned
 expression is named as written, such as `length(r.body)`. The document
 the prompt reads must be text, so a struct column needs a field.
@@ -398,7 +399,8 @@ WHERE HINT(lease.end_date IS NOT NULL, {'selectivity': 0.9})
 ```
 
 A field is tested with the conditions of [WHERE and ON](#where-and-on):
-the comparisons, `IN`, `IS [NOT] NULL`, the text tests, and `LENGTH()`.
+the comparisons, `IN`, `IS [NOT] NULL`, the text tests, and `LENGTH()`,
+`LOWER()`, `UPPER()`, or `TRIM()` of the field.
 A null answer fails every test but `IS NULL`. A span field is tested
 by its `start` or `end`: `lease_span.end_date.start < 500` keeps the
 answers that begin in the first 500 characters. Repeating the call
@@ -446,6 +448,7 @@ which rows to join. Both support the following conditions on table columns:
 | Find text | Snowflake `CONTAINS`, `STARTSWITH`, `ENDSWITH`; BigQuery `CONTAINS_SUBSTR` (ignores case), `STARTS_WITH`, `ENDS_WITH` |
 | Match a regular expression | Snowflake `REGEXP_LIKE`, `RLIKE` (the whole value); BigQuery `REGEXP_CONTAINS` (anywhere) |
 | Test the length | `LENGTH(column)` compared with a number |
+| Test the text ignoring case or spaces | `LOWER(column)`, `UPPER(column)`, `TRIM(column)` compared with a string |
 
 Values can be numbers, strings, or booleans. `IN` requires a non-empty
 list of constant values. Combine conditions with `AND`. `NOT` before a
@@ -475,7 +478,8 @@ in `ON`. See [Joining](#joining).
 
 Quail supports these SQL clauses with the following limits:
 
-- **`SELECT`** lists columns, struct fields, `LENGTH(column)`, and
+- **`SELECT`** lists columns, struct fields, `LENGTH`, `LOWER`, `UPPER`,
+  or `TRIM` of a column, and
   `AI.SCORE` or `AI.CLASSIFY` outputs, each with an optional `AS`
   name. `*` expands to all table columns. Other computed expressions
   are unsupported.
@@ -486,8 +490,8 @@ Quail supports these SQL clauses with the following limits:
 
 ## ORDER BY
 
-`ORDER BY` sorts result rows by table columns, struct fields,
-`LENGTH(column)`, or names assigned to AI outputs with `AS`. AI
+`ORDER BY` sorts result rows by table columns, struct fields, a
+column function, or names assigned to AI outputs with `AS`. AI
 expressions cannot appear directly in `ORDER BY`.
 Sorting columns need not appear in `SELECT`, except when using
 `SELECT DISTINCT`.

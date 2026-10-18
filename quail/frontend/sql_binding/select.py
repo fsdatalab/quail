@@ -9,7 +9,11 @@ from quail.frontend.sql_binding.expressions import (
     _conjuncts,
     _is_call,
 )
-from quail.frontend.sql_binding.predicates import _FLIPPED, _PLAIN_COMPARISONS
+from quail.frontend.sql_binding.predicates import (
+    _FLIPPED,
+    _PLAIN_COMPARISONS,
+    COLUMN_NODES,
+)
 from quail.logical import (
     AggregateCall,
     Aggregation,
@@ -82,7 +86,7 @@ def bind_order(
     keys = []
     for term in order.expressions:
         target = term.this
-        if not isinstance(target, (exp.Column, exp.Length)):
+        if not isinstance(target, COLUMN_NODES):
             raise CompileError(
                 f"ORDER BY {target.sql()} is not a column; give an "
                 f"expression an AS name in SELECT and order by that name"
@@ -141,7 +145,7 @@ class SelectBinder:
         """
         b, columns = self.binder, self.columns
         names = {column_name(column): column for column in columns}
-        if isinstance(node, (exp.Column, exp.Length)):
+        if isinstance(node, COLUMN_NODES):
             if isinstance(node, exp.Column) and not node.table and node.name in names:
                 return node.name
             column = b.resolve_value(node)
@@ -339,7 +343,7 @@ def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list
                 "AI.SCORE, AI.CLASSIFY, and AI.EXTRACT in SELECT must be "
                 "direct expressions with an AS name"
             )
-        if not isinstance(e, (exp.Column, exp.Length)):
+        if not isinstance(e, COLUMN_NODES):
             raise CompileError(
                 f"the SELECT list is column selection only, got "
                 f"{e.sql()}: nothing computed, per the projection "

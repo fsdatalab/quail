@@ -79,12 +79,21 @@ class PlainTest:
     function: str | None = None
 
 
+# the SQL functions of one column, by the name the expression tree uses
+SQL_FUNCTIONS = {exp.Length: "length", exp.Lower: "lower", exp.Upper: "upper",
+                 exp.Trim: "trim"}
+COLUMN_NODES = (exp.Column, *SQL_FUNCTIONS)
+
+
+def unwrap_function(node) -> tuple[exp.Expression, str | None]:
+    """Return the node under a column function and the function's name."""
+    function = SQL_FUNCTIONS.get(type(node))
+    return (node.this, function) if function else (node, None)
+
+
 def _operand(node) -> tuple[exp.Expression, str | None] | None:
     """Return the column a test reads and the function around it, or None."""
-    if isinstance(node, exp.Length):
-        node, function = node.this, "length"
-    else:
-        function = None
+    node, function = unwrap_function(node)
     if isinstance(node, (exp.Column, exp.Dot)):
         return node, function
     return None

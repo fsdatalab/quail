@@ -100,8 +100,23 @@ class ColSpec(ExpressionSpec):
 
     def length(self) -> "ColSpec":
         """The number of characters of each value."""
+        return self._function("length")
+
+    def lower(self) -> "ColSpec":
+        """Each value in lower case."""
+        return self._function("lower")
+
+    def upper(self) -> "ColSpec":
+        """Each value in upper case."""
+        return self._function("upper")
+
+    def trim(self) -> "ColSpec":
+        """Each value without the whitespace around it."""
+        return self._function("trim")
+
+    def _function(self, name: str) -> "ColSpec":
         self._require_no_function()
-        return ColSpec(self.alias, self.column, self.path, "length")
+        return ColSpec(self.alias, self.column, self.path, name)
 
     def named(self, name: str) -> "ColSpec":
         """Return the column under ``name`` in the result, as SQL's ``AS``."""

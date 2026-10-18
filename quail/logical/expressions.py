@@ -21,7 +21,8 @@ from quail.logical.predicates import (
 DESCRIPTION_WORDS = 25
 TASK_DESCRIPTION_WORDS = 50
 # the functions a ScalarFunction may compute, by name
-SCALAR_FUNCTIONS = {"length": pc.utf8_length}
+SCALAR_FUNCTIONS = {"length": pc.utf8_length, "lower": pc.utf8_lower,
+                    "upper": pc.utf8_upper, "trim": pc.utf8_trim_whitespace}
 
 
 class CompileError(ValueError):

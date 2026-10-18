@@ -271,7 +271,7 @@ def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
     with pytest.raises(CompileError, match="compares with a string"):
         RegularPredicate(name, "like", 3).validate()
     with pytest.raises(CompileError, match="unsupported column function"):
-        RegularPredicate(ScalarFunction("upper", (name,)), "<", 3).validate()
+        RegularPredicate(ScalarFunction("reverse", (name,)), "<", 3).validate()
     with pytest.raises(CompileError, match="has no fields"):
         RegularPredicate(GetField(name, "start"), "<", 3).evaluate(names)
     # source columns take the same tests, at the scan
