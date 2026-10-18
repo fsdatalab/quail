@@ -81,6 +81,8 @@ exclude = [
 # uv's Python builds include the C headers Triton needs at startup
 python-preference = "only-managed"
 required-version = "==0.12.13"
+# vLLM 0.26.0 requires cutlass-dsl==4.6.0, which fails FA4 split-KV.
+override-dependencies = ["nvidia-cutlass-dsl[cu13]==4.6.2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
