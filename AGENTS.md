@@ -74,8 +74,10 @@ CI runs these on every pull request. Run them before pushing:
 # Scope
 
 - Filter and join queries on Qwen3 4B fp8, Qwen3 32B fp8,
-  DiffusionGemma 26B-A4B fp8, or Decision-2.0-Kai 0.6B bf16, on one
-  H100 per model copy. No tensor-parallel weight sharding.
+  DiffusionGemma 26B-A4B fp8, Decision-2.0-Kai 0.6B bf16, or the hybrid
+  models Qwen3.5 4B bf16, Qwen3.5 27B fp8, Qwen3.8 27B fp8, and LFM2
+  2.6B bf16, on one H100 per model copy. No tensor-parallel weight
+  sharding.
 - `AI.MAP` is on the roadmap.
   Open-ended generation, speculation, and forking are not supported.
 

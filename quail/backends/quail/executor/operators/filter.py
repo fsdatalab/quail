@@ -49,6 +49,8 @@ class FilterPart(SingleResultPart):
 
     @staticmethod
     def model_inputs(node, inputs, context, sequence=None, nodes=None):
+        if nodes is not None:
+            inputs = inputs[node.node_id]
         return filter_inputs(context.state, node, next(iter(inputs.values())))
 
     @classmethod

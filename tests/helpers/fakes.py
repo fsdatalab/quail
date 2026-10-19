@@ -54,6 +54,7 @@ def bare_arena(arena, pages):
     arena._base = {}
     arena._sliding_start = {}
     arena._holds = {}
+    arena._reading = {}
     arena._deferred = set()
     arena._window_floor = {}
     arena._trimmed = set()
@@ -186,6 +187,26 @@ def fake_pack(torch, arena, specs, **kw):
     else:
         rows_per_answer = np.asarray(rows_per_answer, dtype=np.int64)
     meta = {}
+    if arena.n_state_slots:
+        from quail.backends.quail.executor.gdn import plan_phases
+
+        groups, offset = [], 0
+        for spec in specs:
+            fresh = spec["prefix"] is not None
+            prefix_end = offset + (len(spec["prefix"]) if fresh else 0)
+            lengths = np.asarray([len(s) for s in spec["suffixes"]])
+            ends = prefix_end + np.cumsum(lengths)
+            kept = spec.get("write_suffix_tokens", 0)
+            groups.append(dict(
+                key=spec["key"], fresh=fresh, f=spec["f"], row0=offset,
+                prefix_end=prefix_end, start=spec.get("start", 0),
+                kept=kept, keeps=bool(kept),
+                suffix_spans=(ends - lengths, ends),
+                borrow_key=spec.get("borrow_key"),
+                share_points=spec.get("share_points", ())))
+            offset = int(ends[-1])
+        meta["gdn"] = plan_phases(
+            arena, groups, lambda name, values, dtype: np.asarray(values))
     return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=(),
                            fresh_keys=(), rows_per_answer=rows_per_answer,
                            meta=meta)

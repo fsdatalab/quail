@@ -55,7 +55,8 @@ class KVArena:
     def __init__(self, n_layers: int, n_pages: int, page_tokens: int,
                  n_kv: int, d_head: int, dtype=None, device="cuda",
                  layer_kv=None, sliding_layers=(), sliding_window=0,
-                 n_sliding_pages=0):
+                 n_sliding_pages=0, n_state_slots=0, gdn_state_shape=None,
+                 conv_state_shape=None):
         import torch
         self.torch = torch
         self.dtype = dtype or torch.bfloat16
@@ -73,12 +74,16 @@ class KVArena:
         self.window = sliding_window if self.sliding_layers else 0
         if self.sliding_layers and n_sliding_pages <= 0:
             raise ValueError("sliding layers need a sliding pool")
-        self._build(n_pages, page_tokens, n_sliding_pages)
+        if n_state_slots and not (gdn_state_shape and conv_state_shape):
+            raise ValueError("checkpoint slots need the state shapes")
+        self.gdn_state_shape = gdn_state_shape
+        self.conv_state_shape = conv_state_shape
+        self._build(n_pages, page_tokens, n_sliding_pages, n_state_slots)
         self.reset_stats()
 
-    def _build(self, n_pages, page_tokens, n_sliding_pages):
+    def _build(self, n_pages, page_tokens, n_sliding_pages, n_state_slots=0):
         torch = self.torch
-        self.accounting = PageArena(n_pages, page_tokens)
+        self.accounting = PageArena(n_pages, page_tokens, n_state_slots)
         self.sliding = (PageArena(n_sliding_pages, page_tokens)
                         if self.sliding_layers else None)
         self.k, self.v = [], []
@@ -87,6 +92,16 @@ class KVArena:
             shape = (pages * page_tokens, heads, dim)
             self.k.append(torch.empty(shape, dtype=self.dtype, device=self.device))
             self.v.append(torch.empty(shape, dtype=self.dtype, device=self.device))
+        # one checkpoint per slot: the recurrent state in fp32 and the
+        # convolution columns in bf16, each across every GDN layer
+        self.gdn_state = self.conv_state = None
+        if n_state_slots:
+            self.gdn_state = torch.zeros(
+                (n_state_slots, *self.gdn_state_shape),
+                dtype=torch.float32, device=self.device)
+            self.conv_state = torch.zeros(
+                (n_state_slots, *self.conv_state_shape),
+                dtype=self.dtype, device=self.device)
         # row indices stay on the host: pageable H2D copies block the
         # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU
@@ -95,13 +110,14 @@ class KVArena:
         self._base = {}       # key -> tokens the window is anchored below
         self._sliding_start = {}  # key -> logical row of its first sliding page
         self._holds = {}      # key -> queued keys that will borrow from it
+        self._reading = {}    # key -> groups of the planned chunk reading it
         self._deferred = set()    # held keys freed by their operator
         self._window_floor = {}   # key -> lowest sliding row a borrower reads
         self._trimmed = set()     # keys past their own pass's trim_window
 
     def resize(self, n_pages: int, n_sliding_pages: int = 0, *,
-               free_resident: bool = False) -> None:
-        """Rebuild both pools at new sizes.
+               free_resident: bool = False, n_state_slots: int = 0) -> None:
+        """Rebuild the pools at new sizes.
 
         Nothing survives a rebuild; free_resident frees every resident
         key first, and without it a resident key is an error.
@@ -112,16 +128,123 @@ class KVArena:
                 self.free_key(key)
         if self.accounting.owned:
             raise RuntimeError("the arena holds keys; free them before resizing")
-        if (n_pages, n_sliding_pages) == (self.n_pages, self.n_sliding_pages):
+        if (n_pages, n_sliding_pages, n_state_slots) == (
+                self.n_pages, self.n_sliding_pages, self.n_state_slots):
             return
         page_tokens = self.page_tokens
         self.k = self.v = None
-        self._build(n_pages, page_tokens, n_sliding_pages)
+        self.gdn_state = self.conv_state = None
+        self._build(n_pages, page_tokens, n_sliding_pages, n_state_slots)
+
+    # ---- checkpoints ---------------------------------------------------
+
+    @property
+    def n_state_slots(self) -> int:
+        return self.accounting.n_slots
+
+    def checkpoint_slot(self, key):
+        """The key's checkpoint slot, evicting retained keys to free one.
+
+        Returns None when every slot belongs to a pinned or held key.
+        Evicting a retained key frees its KV pages and its slot
+        together.
+        """
+        slot = self.accounting.alloc_slot(key)
+        if slot is None:
+            self._evict_until(lambda: bool(self.accounting.free_slots))
+            slot = self.accounting.alloc_slot(key)
+        return slot
+
+    def has_checkpoint(self, key) -> bool:
+        return key in self.accounting.slots
+
+    def extension_slot(self, key):
+        """The key's second checkpoint slot, evicting retained keys to free one."""
+        slot = self.accounting.alloc_extension(key)
+        if slot is None:
+            self._evict_until(lambda: bool(self.accounting.free_slots))
+            slot = self.accounting.alloc_extension(key)
+        return slot
+
+    def share_slot(self, key, tokens: int):
+        """The slot for the key's state after `tokens` tokens, evicting if short.
+
+        Returns None when every slot belongs to a pinned or held key.
+        """
+        slot = self.accounting.alloc_share(key, tokens)
+        if slot is None:
+            self._evict_until(lambda: bool(self.accounting.free_slots))
+            slot = self.accounting.alloc_share(key, tokens)
+        return slot
+
+    def shared_state(self, key, tokens: int):
+        """The slot holding the key's state after `tokens` tokens, or None.
+
+        The document-end checkpoint serves the key's own length.
+        """
+        slot = self.accounting.share_slots.get((key, tokens))
+        if slot is None and self.accounting.slot_tokens.get(key) == tokens:
+            slot = self.accounting.slots.get(key)
+        return slot
+
+    def record_extension(self, key, tokens: int) -> None:
+        """Note that the key's second checkpoint covers `tokens` tokens."""
+        self.accounting.ext_tokens[key] = tokens
+
+    def extension(self, key):
+        """The key's second checkpoint as (slot, tokens), or None."""
+        slot = self.accounting.ext_slots.get(key)
+        tokens = self.accounting.ext_tokens.get(key)
+        return None if slot is None or tokens is None else (slot, tokens)
+
+    def record_checkpoint(self, key, tokens: int) -> None:
+        """Note that the key's checkpoint covers its first `tokens` tokens."""
+        self.accounting.slot_tokens[key] = tokens
+
+    def checkpoint_tokens(self, key) -> int:
+        """Tokens the key's checkpoint covers; 0 when it has none."""
+        return self.accounting.slot_tokens.get(key, 0)
 
     def reset_stats(self):
+        import time
+
+        self.memory_trace_started = time.perf_counter()
         self.evicted_keys = 0
         self.evicted_pages = 0
         self.evicted_prefix_tokens = 0
+        self.memory_trace = []
+        self.events = []
+
+    def log_event(self, kind: str, **detail) -> None:
+        """Record what the engine did, with the time it did it."""
+        import time
+
+        self.events.append((round(time.perf_counter(), 4), kind, detail))
+
+    def sample_memory(self, tokens: int = 0, groups: int = 0) -> None:
+        """Append the arena's occupancy and the device's memory use.
+
+        Called after each forward pass; the rows are
+        (seconds, pages in use, retained pages, resident keys,
+        checkpoint slots in use, device MiB in use, torch MiB allocated,
+        tokens in the chunk, groups in the chunk, keys evicted so far).
+        """
+        import time
+
+        torch = getattr(self, "torch", None)
+        if torch is None or not torch.cuda.is_available():
+            return
+        free, total = torch.cuda.mem_get_info()
+        accounting = self.accounting
+        self.memory_trace.append((
+            round(time.perf_counter(), 4),
+            accounting.n_pages - len(accounting.free),
+            accounting.retained_pages,
+            len(accounting.owned),
+            accounting.n_slots - len(accounting.free_slots),
+            round((total - free) / 2**20, 1),
+            round(torch.cuda.memory_allocated() / 2**20, 1),
+            tokens, groups, self.evicted_keys))
 
     # ---- the window --------------------------------------------------
 
@@ -271,6 +394,14 @@ class KVArena:
             capacity_s = len(self.sliding.table_pages(key)) * self.page_tokens
             self._sliding_rows[key] = self._page_rows(self.sliding, key, capacity_s)
 
+    def slots_held(self, keys) -> int:
+        """Checkpoint slots the given keys hold: main, extension, and share."""
+        keys = set(keys)
+        held = self.accounting
+        return (sum(1 for key in held.slots if key in keys)
+                + sum(1 for key in held.ext_slots if key in keys)
+                + sum(1 for point in held.share_slots if point[0] in keys))
+
     def pin(self, key):
         self.accounting.pin(key)
 
@@ -292,6 +423,8 @@ class KVArena:
         if self.sliding is not None:
             self.sliding.rewind(key, tokens - self._sliding_start[key])
         self._refresh_rows(key, tokens)
+        # a rewound key's state past its document is not needed again
+        self.accounting.drop_extension(key)
         self.accounting.retain(key, priority)
         cap = self.accounting.retention_cap_pages
         before = self.free_pages
@@ -312,11 +445,13 @@ class KVArena:
     def _evict_until(self, satisfied) -> tuple:
         """Evict retained prefixes in priority order until satisfied() holds.
 
-        A held key is never evicted: a queued borrower will read it.
+        A held key is never evicted: a queued borrower will read it. Nor
+        is a key the chunk being planned reads.
         """
         keys = []
+        keep = set(self._holds) | set(self._reading)
         while not satisfied():
-            victim = self.accounting.pop_retained_victim(keep=self._holds)
+            victim = self.accounting.pop_retained_victim(keep=keep)
             if victim is None:
                 break
             keys.append(victim[0])
@@ -340,6 +475,7 @@ class KVArena:
         """
         prefix_tokens = self.accounting.tokens[key]
         pages = self.free_key(key)
+        self.log_event("evict", pages=pages, tokens=prefix_tokens)
         self.evicted_keys += 1
         self.evicted_pages += pages
         self.evicted_prefix_tokens += prefix_tokens
@@ -393,6 +529,67 @@ class KVArena:
             self.accounting.pin(key)
         return pages
 
+    def reserve(self, key, tokens, *, capacity_tokens, borrow=None,
+                extension=False, share_points=()):
+        """Reserve KV pages and checkpoint slots for one admitted document.
+
+        Args:
+            key: Document key.
+            tokens: Document prefix length.
+            capacity_tokens: Prefix and the largest retained suffix.
+            borrow: Optional parent key and shared prefix length.
+            extension: Whether stages save state after the document.
+            share_points: Prefix lengths whose states children reuse.
+
+        Returns:
+            True once both resources are allocated. False leaves the document
+            unchanged, though unused retained documents may have been evicted.
+        """
+        accounting = self.accounting
+        borrowed, borrowed_s, start_s = self._borrow_plan(borrow)
+        if key in accounting.owned:
+            held = len(accounting.table_pages(key))
+            start_s = self._sliding_start[key]
+            held_s = (len(self.sliding.table_pages(key))
+                      if self.sliding is not None else 0)
+        else:
+            held, held_s = len(borrowed), len(borrowed_s)
+        need = max(0, accounting.pages_needed(capacity_tokens) - held)
+        need_s = (max(0, self.sliding.pages_needed(capacity_tokens - start_s)
+                      - held_s) if self.sliding is not None else 0)
+        slots = 0
+        if self.n_state_slots:
+            slots = (int(key not in accounting.slots)
+                     + int(extension and key not in accounting.ext_slots)
+                     + sum((key, point) not in accounting.share_slots
+                           for point in share_points))
+
+        def available():
+            return (accounting.free_pages >= need
+                    and len(accounting.free_slots) >= slots
+                    and (self.sliding is None
+                         or self.sliding.free_pages >= need_s))
+
+        # Neither the candidate's existing state nor its parent's state can
+        # be evicted to make room for the candidate's reservation.
+        protected = (key,) if borrow is None else (key, borrow[0])
+        self.read_state(protected)
+        try:
+            self._evict_until(available)
+            if not available():
+                return False
+            self.activate(key, tokens, capacity_tokens=capacity_tokens,
+                          base_tokens=tokens, borrow=borrow)
+            if self.n_state_slots:
+                accounting.alloc_slot(key)
+                if extension:
+                    accounting.alloc_extension(key)
+                for point in share_points:
+                    accounting.alloc_share(key, point)
+            return True
+        finally:
+            self.done_reading(protected)
+
     def alloc_temporary(self, tokens: int, sliding_tokens: int | None = None):
         key = object()
         pages = self.alloc(key, tokens, base_tokens=0,
@@ -426,6 +623,21 @@ class KVArena:
         else:
             self._lift_floor(key)
 
+    def read_state(self, keys) -> None:
+        """Keep each key's pages and slots until its admitted readers run."""
+        for key in keys:
+            self._reading[key] = self._reading.get(key, 0) + 1
+
+    def done_reading(self, keys) -> None:
+        """Undo read_state for the same keys."""
+        for key in keys:
+            self._reading[key] -= 1
+            if not self._reading[key]:
+                del self._reading[key]
+                if key in self._deferred and key not in self._holds:
+                    self._deferred.remove(key)
+                    self.free_key(key)
+
     def drop_holds(self, keys=None) -> bool:
         """Release every hold on the keys (all keys by default).
 
@@ -444,7 +656,7 @@ class KVArena:
 
         Returns the pages that went free now.
         """
-        if key in self._holds:
+        if key in self._holds or key in self._reading:
             self._deferred.add(key)
             return 0
         self._window_floor.pop(key, None)

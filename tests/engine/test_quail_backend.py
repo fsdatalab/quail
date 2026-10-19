@@ -52,7 +52,9 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
             outputs.append({
                 "results": {"filter:d": result},
                 "retained": {}, "boot_s": 0.0,
-                "boot_kind": "warm", "boot": {}, "peak_gib": 1.0,
+                "boot_kind": "warm", "boot": {}, "kv_totals": {},
+                "memory": {"peak_gib": 1.0,
+                           "memory_capacity": {"pages": 16, "slots": 2}},
             })
         return outputs
 
@@ -72,6 +74,8 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
         DEVICES["h100-sxm"], registry.runtimes, registry)
     assert result["filters"]["d"] == {0: [True], 1: [False], 2: [True], 3: [False]}
     assert result["fresh_tokens"] == 4
+    assert result["memory_capacity"] == {"pages": 32, "slots": 4}
+    assert len(result["memory_workers"]) == 2
 
     arena = FakeArena()
     arena.owned.add(("d", 10))
@@ -178,6 +182,22 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
                          [("full", False), ("anti", True)])
 def test_a_join_without_a_filter_settles_anchors_with_no_pairs(
         monkeypatch, semantics, keep_kv):
+    from quail.backends.quail.worker import _execute_predicates
+    from quail.execution.runner import ExecutionContext
+    from quail.physical import AiJoin
+
+    execute_pipeline = QuailModelExecution.execute_pipeline
+
+    def worker_pipeline(execution, pipeline, inputs, context):
+        if all(isinstance(node, AiJoin) for node in pipeline):
+            prepared = context.model_inputs(
+                pipeline[0], inputs, context, nodes=pipeline)
+            worker_context = ExecutionContext(
+                runtimes=context.runtimes, model_execution=execution)
+            return _execute_predicates(worker_context, pipeline, prepared)
+        return execute_pipeline(execution, pipeline, inputs, context)
+
+    monkeypatch.setattr(QuailModelExecution, "execute_pipeline", worker_pipeline)
     retained = []
     retain = KVArena.retain
 

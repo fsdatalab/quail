@@ -45,6 +45,24 @@ class GigatokenVLLMTokenizer:
 
 
 @contextmanager
+def engine_environment(spec):
+    """Scope vLLM's process selection to construction of one engine."""
+    key = "VLLM_ENABLE_V1_MULTIPROCESSING"
+    previous = os.environ.get(key)
+    # vLLM 0.26 reads process selection from the environment in LLM's
+    # constructor. Its public LLM API has no per-instance override.
+    if spec.vision_tower or spec.canvas_tokens == 1:
+        os.environ[key] = "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+@contextmanager
 def diffusion_canvas(spec):
     """Initialize a one-token vLLM canvas with Quail's fixed token.
 
@@ -112,6 +130,13 @@ def diffusion_kwargs(spec) -> dict:
         # vLLM refuses a request for more logprobs than this
         kwargs["max_logprobs"] = DIFFUSION_LOGPROBS
     return kwargs
+
+
+def text_only_kwargs(spec) -> dict:
+    """Turn off image and video inputs of a checkpoint with a vision tower."""
+    if not spec.vision_tower:
+        return {}
+    return {"limit_mm_per_prompt": {"image": 0, "video": 0}}
 
 
 def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
@@ -209,9 +234,11 @@ class VLLMEngine:
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
-                             else MAX_SEQUENCES),
+                             else min(MAX_SEQUENCES,
+                                      spec.max_num_seqs or MAX_SEQUENCES)),
         }
         kwargs.update(diffusion_kwargs(spec))
+        kwargs.update(text_only_kwargs(spec))
         return kwargs
 
     def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
@@ -233,15 +260,8 @@ class VLLMEngine:
         if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
             RENDERER_REGISTRY.register("gigatoken", *renderer)
 
-        if spec.canvas_tokens == 1:
-            # vLLM's engine core in its own process returns the canvas
-            # row's logprobs unreliably under the step loop on long
-            # prompts (agreement with the in-process engine falls from
-            # 92 to 73 percent on agent traces,
-            # /results/ablations/diffusion_gemma_readout_probe_agent_k0_corpus_mp.json)
-            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         started = time.perf_counter()
-        with diffusion_canvas(spec) as canvas_ids:
+        with engine_environment(spec), diffusion_canvas(spec) as canvas_ids:
             llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
         boot_s = time.perf_counter() - started
         sampling_params = SamplingParams(
@@ -289,7 +309,7 @@ class DefaultVLLMEngine(VLLMEngine):
     label = "vLLM with default settings"
 
     def llm_kwargs(self, spec) -> dict:
-        return diffusion_kwargs(spec)
+        return {**diffusion_kwargs(spec), **text_only_kwargs(spec)}
 
 
 def stock_vllm_backend() -> RequestBackend:

@@ -22,7 +22,7 @@ from quail.backends.quail.executor.extract.decode import (
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.backends.quail.executor.model_loading import full_output_head
 from quail.backends.quail.executor.readout import AsyncTopLogprobs
-from quail.backends.quail.executor.stages import Stage
+from quail.backends.quail.executor.stages import Stage, StageRequests
 from quail.catalog.tokens import concat_tokens
 
 
@@ -54,6 +54,7 @@ class ExtractionStages:
         self.specs = list(specs)
         first = self.specs[0]
         self.spec = first
+        self.recurrent = bool(getattr(state.loaded_model.arena, "n_state_slots", 0))
         if any(not first.same_decoding(spec) for spec in self.specs):
             raise ValueError("a pipeline's extractions share decoding settings")
         if any(spec.alias != first.alias for spec in self.specs):
@@ -106,9 +107,10 @@ class ExtractionStages:
             single=True, append=True, label=f"{name} tail")]
         stages.extend(
             Stage(suffixes=partial(self._step_suffix, q),
-                  suffix_tokens=1 + self.spec.draft_tokens, frame=frame,
+                  suffix_tokens=(1 + self.spec.draft_tokens)
+                  * (2 if self.recurrent else 1), frame=frame,
                   readout=self.readout, decide=partial(self._step_decide, q),
-                  discard=partial(self._step_discard, q), read_all_rows=True,
+                  read_all_rows=True,
                   single=True, append=True, label=f"{name} round {t}")
             for t in range(1, self.spec.max_answer_tokens + 1))
         return stages
@@ -169,7 +171,8 @@ class ExtractionStages:
         answer.asked = True
         # a tail equal to the question's before it is in KV already:
         # only its cue token is fed
-        same = q > 0 and self.tails[q] == self.tails[q - 1]
+        same = (not self.recurrent and q > 0
+                and self.tails[q] == self.tails[q - 1])
         answer.fed_tokens += 1 if same else len(self.tails[q])
         self.decoder.verify(doc, q, self._rows(row), [])
         return True
@@ -185,22 +188,23 @@ class ExtractionStages:
         return self.decoder.rows(row)
 
     def _step_suffix(self, q, key):
-        """Feed the chosen token, then the document's next tokens as a draft."""
+        """Build the next answer request and its retained token count."""
         doc = self._document(key)
         answer = doc.answers[q]
         if answer.done:
             return Stage.SKIP
-        return [self.decoder.draft(answer, doc.rho, q)]
-
-    def _step_discard(self, q, key):
-        return self._answer(q, key).discard
+        accepted = answer.fed[:len(answer.fed) - answer.discard]
+        tokens = self.decoder.draft(answer, doc.rho, q)
+        if self.recurrent:
+            answer.fed_tokens += len(accepted)
+            return StageRequests([accepted + tokens],
+                                 write_suffix_tokens=len(accepted),
+                                 read_rows=[len(tokens)])
+        return StageRequests([tokens], discard=answer.discard)
 
     def _document(self, key):
         position = np.searchsorted(self.document_ids, key[1], side="right") - 1
         return self.docs[self.document_order[position]]
-
-    def _answer(self, q, key):
-        return self._document(key).answers[q]
 
     def _step_decide(self, q, anchor, row):
         """Verify the round's draft by the row after each of its tokens."""

@@ -9,6 +9,7 @@ import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail import coordinator
+from quail.backends.quail.executor.memory import merge_memory_reports
 from quail.backends.quail.executor.operators.filter import stop_groups
 from quail.backends.quail.graph import graph_report
 from quail.backends.quail.prompts import join_request
@@ -83,7 +84,7 @@ class DistributedQuailExecution:
         self.prior_shards: dict[str, list[list[int]]] = {}
         self.started = False
         self.child_totals = [None] * gpu_count
-        self.peak_gib = 0.0
+        self.worker_memory = [{} for _ in range(gpu_count)]
         self.kv_stats = {
             "retained_after_filters": 0,
             "retained_pages_after_filters": 0,
@@ -156,12 +157,9 @@ class DistributedQuailExecution:
                 "gpu_timing": self.payload.get("gpu_timing", False),
             }})
         started = time.perf_counter()
-        outputs = self.round_fn("extract", subs)
+        outputs = self._round("extract", subs)
         wall = time.perf_counter() - started
         self._retained_placement(outputs)
-        for worker, output in enumerate(outputs):
-            self.child_totals[worker] = output["kv_totals"]
-            self.peak_gib = max(self.peak_gib, output["peak_gib"])
         order = pa.array(np.argsort(np.concatenate(positions)))
         results = {}
         for index, node in enumerate(nodes):
@@ -180,6 +178,8 @@ class DistributedQuailExecution:
 
     def _score_round(self, node, batches):
         """Score one batch per GPU child and return their results in order."""
+        if not self.started:
+            self.begin()
         subs = [{"node": node, "inputs": {
             "score_rows": batch,
             "gpu_timing": self.payload.get("gpu_timing", False)}}
@@ -192,7 +192,8 @@ class DistributedQuailExecution:
             for sub in subs:
                 sub["inputs"]["documents"] = documents
             self.score_documents_sent = True
-        return self.round_fn("scores", subs)
+        return [output["results"][node.node_id]
+                for output in self._round("scores", subs)]
 
     def begin(self):
         """Start a query that has no filter node."""
@@ -201,12 +202,8 @@ class DistributedQuailExecution:
         )
         for sub in subs:
             sub["start_query"] = True
-        outputs = self.round_fn("filters", subs)
+        self._round("filters", subs)
         self.started = True
-        self.peak_gib = max(
-            self.peak_gib,
-            *(output.get("peak_gib", 0.0) for output in outputs),
-        )
 
     def _execute_filter(self, node, inputs):
         return self._execute_filters((node,), inputs)[node.node_id]
@@ -236,13 +233,9 @@ class DistributedQuailExecution:
             sub["start_query"] = not self.started
             sub["node_ids"] = [member.node_id for member in nodes]
         started = time.perf_counter()
-        outputs = self.round_fn("filters", subs)
+        outputs = self._round("filters", subs)
         wall = time.perf_counter() - started
         self.started = True
-        self.peak_gib = max(
-            self.peak_gib,
-            *(output.get("peak_gib", 0.0) for output in outputs),
-        )
         self._retained_placement(outputs)
         results = {}
         for j, member in enumerate(nodes):
@@ -293,15 +286,14 @@ class DistributedQuailExecution:
                 physical_nodes=encoded_nodes,
             )
         started = time.perf_counter()
-        outputs = self.round_fn("joins", subs)
+        outputs = self._round("joins", subs)
         wall = time.perf_counter() - started
         self.started = True
         hits = 0
         misses = 0
-        for index, output in enumerate(outputs):
+        for output in outputs:
             hits += output["kv_round"]["hits"]
             misses += output["kv_round"]["misses"]
-            self.child_totals[index] = output["kv_totals"]
         self.kv_stats["join_anchor_hits"] += hits
         self.kv_stats["join_anchor_misses"] += misses
 
@@ -347,14 +339,21 @@ class DistributedQuailExecution:
                 alias: len(documents) for alias, documents in self.retained.items()},
         )
 
+    def _round(self, kind, subs):
+        """Collect every operator's latest worker measurements."""
+        outputs = self.round_fn(kind, subs)
+        for worker, output in enumerate(outputs):
+            self.child_totals[worker] = output["kv_totals"]
+            self.worker_memory[worker] = output["memory"]
+        return outputs
+
     def report(self):
-        for totals in self.child_totals:
-            for key, value in (totals or {}).items():
-                self.kv_stats[key] = self.kv_stats.get(key, 0) + value
-        return {
-            "kv_manager": dict(self.kv_stats),
-            "peak_gib": self.peak_gib,
-        }
+        totals = dict(self.kv_stats)
+        for worker in self.child_totals:
+            for key, value in (worker or {}).items():
+                totals[key] = totals.get(key, 0) + value
+        return {"kv_manager": totals, **merge_memory_reports(self.worker_memory)}
+
 
 _ONE_GPU_APPLY = ("per-batch apply() functions run on one GPU; the "
                   "planner refuses them for several")

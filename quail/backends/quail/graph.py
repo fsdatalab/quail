@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+from quail.backends.quail.executor.memory import memory_report
 from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.reranker import FilterRuntime
 from quail.backends.quail.retention import apply_retention
@@ -138,8 +139,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
 
     report = graph_report(graph, result, wall, state["device"],
                           gpu_timing=state.get("gpu_timing", False))
-    report.update(kv_manager=kv_manager,
-                  peak_gib=round(torch.cuda.max_memory_allocated() / 2**30, 2))
+    report.update(kv_manager=kv_manager, **memory_report(state["gpu"]))
     return report
 
 

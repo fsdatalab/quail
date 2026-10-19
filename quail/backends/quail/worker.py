@@ -12,6 +12,7 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.memory import memory_report
 from quail.backends.quail.executor.model_loading import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.operators.extract import execute_extractions
@@ -73,8 +74,10 @@ class LoadedGpu:
                                 revision=None if model_path else spec.revision,
                                 answer_token_ids=answer_token_ids,
                                 max_batched_tokens=budget,
-                                moe_backend=spec.moe_backend)
+                                moe_backend=spec.moe_backend,
+                                text_only=spec.vision_tower)
         self.load_model_s = time.perf_counter() - t0
+        self.weights_bytes = int(torch.cuda.memory_allocated())
 
         # cuBLAS allocates its handle outside PyTorch's caching allocator.
         # At the warm-up peak the allocator holds every free byte, so
@@ -86,6 +89,7 @@ class LoadedGpu:
 
         t0 = time.perf_counter()
         full_pages, sliding_pages = budgets.arena_pages(spec, device, budget)
+        self.device = device
         self.arena = KVArena(n_layers=spec.layers,
                              n_pages=full_pages,
                              page_tokens=budgets.PAGE_TOKENS,
@@ -94,8 +98,11 @@ class LoadedGpu:
                              layer_kv=spec.kv_shapes,
                              sliding_layers=spec.sliding_layer_set,
                              sliding_window=spec.sliding_window,
-                             n_sliding_pages=sliding_pages)
+                             n_sliding_pages=sliding_pages,
+                             **checkpoint_arena_args(spec, device, budget,
+                                                     full_pages))
         self.arena_s = time.perf_counter() - t0
+        self.pool_bytes = pool_bytes(self.arena)
 
         t0 = time.perf_counter()
         self.decision_head = None
@@ -122,12 +129,18 @@ class LoadedGpu:
         survives in the arena between queries.
         """
         if arena_pages is not None:
+            slots = checkpoint_arena_args(
+                self.spec, self.device, chunk_tokens, arena_pages[0])
             graphs = getattr(self.pipeline, "decode_graphs", None)
             if (graphs is not None and tuple(arena_pages)
                     != (self.arena.n_pages, self.arena.n_sliding_pages)):
                 self.torch.cuda.synchronize()
                 graphs.invalidate()
-            self.arena.resize(*arena_pages, free_resident=True)
+            self.arena.resize(*arena_pages, free_resident=True,
+                              **{k: v for k, v in slots.items()
+                                 if k == "n_state_slots"})
+            self.pool_bytes = pool_bytes(self.arena)
+        self.torch.cuda.reset_peak_memory_stats()
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
         if self.decision_head is not None:
@@ -178,6 +191,21 @@ class LoadedGpu:
             close_fn()
 
 
+def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages) -> dict:
+    """KVArena arguments for the checkpoint slots; empty without state layers."""
+    if not spec.state_layers:
+        return {}
+    layers = len(spec.state_layers)
+    return {
+        "n_state_slots": budgets.checkpoint_slots(
+            spec, device, chunk_tokens, kv_pages),
+        "gdn_state_shape": (layers, spec.gdn_value_heads,
+                            spec.gdn_value_dim, spec.gdn_key_dim),
+        "conv_state_shape": (layers, spec.conv_width - 1,
+                             spec.conv_state_channels),
+    }
+
+
 def decision_offsets(spec, path) -> tuple[int, ...]:
     """The rows a decision readout reads, as distances before the last row."""
     from gigatoken import Tokenizer
@@ -195,6 +223,28 @@ def decision_offsets(spec, path) -> tuple[int, ...]:
             f"and the last row; layout {spec.prompt_layout!r} gives "
             f"{len(offsets)} rows")
     return offsets
+
+
+def pool_bytes(arena) -> dict:
+    """Return the bytes of an arena's KV pages and checkpoint state.
+
+    Args:
+        arena: A KVArena, or any object with the k, v, gdn_state and
+            conv_state tensors.
+
+    Returns:
+        {"kv": ..., "state": ...} in bytes. State is the Gated DeltaNet
+        recurrent state plus the convolution columns, or 0.
+    """
+    def size(tensor):
+        return 0 if tensor is None else int(
+            tensor.numel() * tensor.element_size())
+
+    return {
+        "kv": sum(size(t) for t in list(arena.k) + list(arena.v)),
+        "state": size(arena.gdn_state) + size(arena.conv_state),
+    }
+
 
 
 def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
@@ -421,8 +471,8 @@ def _child_main(gpu_idx, conn):
                 inputs["documents"] = state.score_documents
                 with gpu.torch.inference_mode():
                     result = gpu.execution.execute(data["node"], inputs)
-                gpu.torch.cuda.synchronize()
-                conn.send(("ok", result))
+                conn.send(("ok", _child_results(
+                    gpu, {data["node"].node_id: result})))
             elif kind == "joins":
                 conn.send(("ok", _child_joins(state, data)))
             elif kind == "extract":
@@ -512,12 +562,13 @@ def _child_filters(state, sub):
                     "gpu_timing": sub.get("gpu_timing", False),
                 },
             )
-    return _child_results(torch, arena, results, wall_started=t0)
+    return _child_results(gpu, results, wall_started=t0)
 
 
-def _child_results(torch, arena, results, *, wall_started=None, **metrics):
+def _child_results(gpu, results, *, wall_started=None, **metrics):
     """Collect worker outputs and measurements after GPU work completes."""
-    torch.cuda.synchronize()
+    gpu.torch.cuda.synchronize()
+    arena = gpu.arena
     retained = {}
     for alias, document in arena.retained_keys():
         if isinstance(alias, tuple) and alias[0] == "extract":
@@ -532,7 +583,7 @@ def _child_results(torch, arena, results, *, wall_started=None, **metrics):
             "evicted_pages": arena.evicted_pages,
             "evicted_prefix_tokens": arena.evicted_prefix_tokens,
         },
-        "peak_gib": torch.cuda.max_memory_allocated() / 2**30,
+        "memory": memory_report(gpu),
         **({"wall_s": round(time.perf_counter() - wall_started, 2)}
            if wall_started is not None else {}),
         **metrics,
@@ -544,7 +595,7 @@ def _child_extract(state, sub):
     gpu = state.gpu
     with gpu.torch.inference_mode():
         results = execute_extractions(gpu.execution.query, sub["nodes"], sub["inputs"])
-    return _child_results(gpu.torch, gpu.arena, results)
+    return _child_results(gpu, results)
 
 
 def _child_joins(state, sub):
@@ -581,7 +632,7 @@ def _child_joins(state, sub):
     if sub.get("final_group"):
         for key in arena.resident_keys():
             arena.free_key(key)
-    return _child_results(torch, arena, results, wall_started=t0, kv_round=round_kv)
+    return _child_results(gpu, results, wall_started=t0, kv_round=round_kv)
 
 
 def _reset_child_query(state):

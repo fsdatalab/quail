@@ -9,7 +9,7 @@ order do not enter, just as they do not enter filter and join costs.
 """
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -78,9 +78,16 @@ class ClassifyCost:
 def _first_work(prefix, shared, tail: int, resident: bool, window: int) -> Work:
     """Sum every document's prefix-and-tail work: scan, or ask on resident KV."""
     if resident:
-        return ask(prefix, np.full_like(prefix, tail), window=window).total()
+        if not tail:
+            return Work()
+        work = ask(prefix, np.full_like(prefix, tail), window=window).total()
+        return replace(work, state_written=float(len(prefix)))
     fresh = prefix - shared + tail
-    return ask(shared, fresh, window=window).total()
+    work = ask(shared, fresh, window=window).total()
+    # The document checkpoint survives while its tail advances a second
+    # checkpoint, even when both are packed into one causal request.
+    return replace(work, state_written=float(len(prefix) * (1 + bool(tail))),
+                   state_read=float(np.sum(shared > 0) + len(prefix) * bool(tail)))
 
 
 def _stream_work(context, suffixes, window: int, canvas_rows: int) -> Work:

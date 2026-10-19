@@ -14,7 +14,7 @@ reads the document, question, and previously accepted answer tokens
 from KV.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import repeat
 
 from quail.cost.dense_decoder_cost import decoder_seconds
@@ -81,6 +81,7 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
                   shared: int = 0, max_answer_tokens: int, draft_tokens: int,
                   draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
                   assumptions: ExtractAssumptions | None = None,
+                  recurrent: bool = False,
                   ) -> tuple[Work, float, float]:
     """Return one document's work, its fed tokens, and its readout rows.
 
@@ -99,6 +100,7 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
         round_cost_per_token: One document token's KV read per round, in
             fed tokens, from the extraction plan.
         assumptions: Expected answer length, separate from execution limits.
+        recurrent: Whether rounds replay accepted inputs to advance a checkpoint.
     """
     assumptions = ExtractAssumptions() if assumptions is None else assumptions
     prefix = head_tokens + length
@@ -114,6 +116,9 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     else:
         work = scan(prefix, tail_tokens, window=window)
     context = prefix + tail_tokens
+    if recurrent:
+        work = replace(work, state_read=1 + bool(shared and not resident),
+                       state_written=1 + (not resident))
     fed = float(tail_tokens)
     rows = 1.0
     # each round appends the chosen token and the draft, and reads
@@ -121,10 +126,20 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     round_tokens = 1 + draft_tokens
     rounds = assumptions.rounds(max_answer_tokens, draft_tokens)
     whole = int(rounds)
-    work += decode(context, repeat(round_tokens, whole), window=window)
-    if rounds > whole:
-        work += ask(context + whole * round_tokens, round_tokens,
-                    window=window) * (rounds - whole)
+    if recurrent:
+        for index in range(whole + (rounds > whole)):
+            probability = min(1.0, rounds - index)
+            replay = round_tokens if index else 0
+            step = ask(context + max(0, index - 1) * round_tokens,
+                       replay + round_tokens, window=window)
+            work += replace(step, state_read=1 + bool(replay),
+                            state_written=float(bool(replay))) * probability
+            fed += replay * probability
+    else:
+        work += decode(context, repeat(round_tokens, whole), window=window)
+        if rounds > whole:
+            step = ask(context + whole * round_tokens, round_tokens, window=window)
+            work += replace(step, state_written=step.state_read) * (rounds - whole)
     fed += rounds * round_tokens
     rows += rounds * round_tokens
     return work, fed, rows
@@ -173,7 +188,7 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
             shared=0 if shared is None else int(shared[index]),
             max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
             draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
-            assumptions=assumptions)
+            assumptions=assumptions, recurrent=bool(model.state_layers))
         work += own
         fed += own_fed
         rows += own_rows

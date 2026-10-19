@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from quail.backends.quail.executor.attention import ATTENTION_PATHS
+from quail.backends.quail.executor.gdn import plan_phases
 
 
 @dataclass
@@ -50,6 +51,17 @@ class Chunk:
 
 class ArenaFullError(RuntimeError):
     """The KV arena has too few free pages to pack the chunk."""
+
+
+class BorrowStateMissingError(ArenaFullError):
+    """A borrower's parent holds no state at the length it borrows.
+
+    The borrower can compute its whole prefix instead.
+    """
+
+    def __init__(self, key, message):
+        super().__init__(message)
+        self.key = key
 
 
 def _tick(timing, key, t0):
@@ -576,7 +588,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     prefix_end=prefix_end, row1=token_count,
                     suffix_spans=(s_row0 + begins, s_row0 + ends),
                     canvas=bool(n and width),
-                    keeps=bool(g.get("write_suffix_tokens"))))
+                    keeps=bool(g.get("write_suffix_tokens")),
+                    kept=int(g.get("write_suffix_tokens") or 0),
+                    borrow_key=g.get("borrow_key"),
+                    share_points=g.get("share_points", ())))
             elif not fresh:
                 raise ValueError(
                     "unified attention requires pages for a kept "
@@ -774,9 +789,20 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     table=unified["sliding"]["table"].index_select(0, seq),
                     used=unified["sliding"]["used"].index_select(0, seq),
                     max_used=max(pools[1].lengths[i] for i in canvas_seq))
+    gdn = None
+    if getattr(arena, "n_state_slots", 0):
+        if attention_mode != "unified":
+            raise ValueError("a model with Gated DeltaNet layers runs "
+                             "the unified attention path")
+        try:
+            gdn = plan_phases(arena, unified_groups, stage)
+        except Exception:
+            for key in temporary_keys:
+                arena.free_key(key)
+            raise
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads,
-        unified=unified, canvas=canvas_meta,
+        unified=unified, canvas=canvas_meta, gdn=gdn,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)
     out = Chunk(

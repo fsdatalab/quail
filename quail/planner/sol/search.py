@@ -159,7 +159,9 @@ class Search:
         if shared_tokens == 0:
             return scan(prefix, suffix, window=self.window)
         resident = self.pre + shared_tokens
-        return ask(resident, prefix - resident + suffix, window=self.window)
+        # the document saves its own state after reading the parent's
+        return ask(resident, prefix - resident + suffix,
+                   window=self.window) + Work(state_written=1.0)
 
     def question_work(self, alias: str, live, tail: int, first: bool) -> Work:
         """Return the work of one question asked of every live document.
@@ -221,11 +223,16 @@ class Search:
                             in zip(suffixes, partner_rows)
                             if partner_row[0] in mine]
             prefix = self.pre + self.aliases[anchor].tokens[row]
-            work = work + (ask(prefix, frame, window=self.window)
-                           if row in resident_rows
-                           else self.first_use(anchor, row, frame))
+            if row in resident_rows:
+                # the frame's state is saved for every partner to start from
+                work = work + ask(prefix, frame, window=self.window) + Work(
+                    state_written=1.0)
+            else:
+                work = work + self.first_use(anchor, row, frame)
+            # every partner starts from the frame's saved state
             work = work + partner_stream_work(
-                prefix + frame, streamed, window=self.window)
+                prefix + frame, streamed, window=self.window) + Work(
+                    state_read=float(len(streamed)))
         return work
 
     # ---- filters and classifications --------------------------------
