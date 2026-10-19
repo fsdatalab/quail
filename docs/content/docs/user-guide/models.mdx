@@ -26,7 +26,7 @@ format. All listed models store KV in BF16.
 The Qwen3.5, Qwen3.8 and LFM2 models are hybrid: some layers are attention
 and the rest are Gated DeltaNet or short convolution layers, which keep a
 fixed-size state instead of KV. Quail saves that state for each document
-so later questions reuse it. Hybrid models run on H100 SXM.
+so later questions reuse it.
 
 The FP8 Qwen3.5 4B configuration uses
 [`RedHatAI/Qwen3.5-4B-FP8-dynamic`](https://huggingface.co/RedHatAI/Qwen3.5-4B-FP8-dynamic).
