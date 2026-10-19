@@ -31,7 +31,9 @@ def kernel_index_cap(model: ModelSpec) -> int:
 
     Constraint: rows x widest projection < 2^31.
     """
-    return INT32_MAX // model.widest_projection
+    width = max(model.widest_projection, model.experts_active
+                * max(model.hidden, 2 * model.expert_intermediate))
+    return INT32_MAX // width
 
 
 def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:

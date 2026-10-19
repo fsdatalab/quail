@@ -10,7 +10,7 @@ records the same difference and its answer bit.
 
 Two steps, each in its own container so the engines do not share a GPU.
 
-Prediction: for each anchor, the sorted per-pair differences agree with
+Prediction: for each anchor, the per-pair differences agree with
 stock vLLM within 0.25 nats at the median and 1.0 at the maximum, and
 the answer bit (TRUE > FALSE) of every pair agrees on at least 95
 percent of pairs.
@@ -93,6 +93,8 @@ def _run_join(torch, arena, pipeline, answers, anchors, suffixes, frame, budget)
               volumes=VOLUMES)
 def reference(model: str) -> dict:
     """Stock vLLM's TRUE minus FALSE logprob for every pair prompt."""
+    os.environ["VLLM_DEEP_GEMM_WARMUP"] = "skip"
+
     from transformers import AutoTokenizer
 
     from quail.baselines.vllm import VLLMEngine
@@ -129,7 +131,8 @@ def reference(model: str) -> dict:
         best_false = max(logprobs[i].logprob for i in false_ids
                          if i in logprobs)
         differences.append(best_true - best_false)
-    record = {"model": model, "anchors": len(anchors), "partners": PARTNERS,
+    record = {"model": model, "deep_gemm_warmup": "skip",
+              "anchors": len(anchors), "partners": PARTNERS,
               "anchor_tokens": [len(a) for a in anchors],
               "difference": differences,
               "true_ids": sorted(true_ids), "false_ids": sorted(false_ids)}
@@ -145,14 +148,15 @@ def reference(model: str) -> dict:
               volumes=VOLUMES)
 def quail(model: str) -> dict:
     """Quail's TRUE minus FALSE logit for every pair, through run_stages."""
+    import numpy as np
     import torch
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
-    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+    from quail.backends.quail.executor.readout import AnswerRows
     from quail.backends.quail.worker import checkpoint_arena_args
     from quail.cost import budgets
     from quail.specs import H100_SXM, MODELS
@@ -167,6 +171,7 @@ def quail(model: str) -> dict:
     allowed = sorted(set(ref["true_ids"]) | set(ref["false_ids"]))
     loaded = load_model(spec.hf_name, spec.revision or None,
                         answer_token_ids=allowed, max_batched_tokens=BUDGET,
+                        moe_backend=spec.moe_backend,
                         text_only=spec.vision_tower)
     full_pages, sliding = budgets.arena_pages(spec, H100_SXM, BUDGET)
     arena = KVArena(
@@ -180,17 +185,18 @@ def quail(model: str) -> dict:
     rows = AnswerRows(torch, F, loaded, set(ref["true_ids"]),
                       set(ref["false_ids"]))
 
-    class Recording(AsyncAnswers):
-        """Reads each answer's TRUE minus FALSE logit."""
+    class Differences:
+        """Read TRUE minus FALSE logits as stage values."""
 
-        def __init__(self):
-            super().__init__(torch, rows)
-            self.differences = []
+        dtype = np.float32
 
         def submit(self, normed):
             true, false = rows.logits(normed)
-            self.differences.extend((true - false).float().tolist())
-            return super().submit(normed)
+            return (true - false).float().cpu().numpy()
+
+        @staticmethod
+        def result(handle):
+            return handle
 
     record = {"model": model, "slots": arena.n_state_slots,
               "alone": [], "alone_bits": [], "together": [],
@@ -198,20 +204,20 @@ def quail(model: str) -> dict:
     with torch.inference_mode():
         # each anchor alone, then every anchor in one run
         for anchor in anchors:
-            answers = Recording()
+            answers = Differences()
             out = _run_join(torch, arena, pipeline, answers, [anchor],
                             suffixes, frame, BUDGET)
-            record["alone"].append(sorted(answers.differences))
+            record["alone"].append(out[0].tolist())
             record["alone_bits"].append(
-                [int(b) for b in out[0]])
+                [int(b > 0) for b in out[0]])
             for key in arena.resident_keys():
                 arena.free_key(key)
-        answers = Recording()
+        answers = Differences()
         out = _run_join(torch, arena, pipeline, answers, anchors,
                         suffixes, frame, BUDGET)
-        record["together"] = sorted(answers.differences)
+        record["together"] = [float(v) for i in range(len(anchors)) for v in out[i]]
         record["together_bits"] = [
-            [int(b) for b in out[i]] for i in range(len(anchors))]
+            [int(b > 0) for b in out[i]] for i in range(len(anchors))]
         for key in arena.resident_keys():
             arena.free_key(key)
     torch.cuda.synchronize()
@@ -222,12 +228,12 @@ def quail(model: str) -> dict:
     errors, agree = [], []
     for got, want, bits in zip(record["alone"], per_anchor,
                                record["alone_bits"]):
-        errors.extend(abs(a - b) for a, b in zip(sorted(got), sorted(want)))
+        errors.extend(abs(a - b) for a, b in zip(got, want))
         # bit i is partner i; the reference bit is the sign of its difference
         want_bits = [int(v > 0) for v in want]
         agree.extend(int(b == w) for b, w in zip(bits, want_bits))
     together_errors = [abs(a - b) for a, b in zip(
-        record["together"], sorted(reference))]
+        record["together"], reference)]
     together_agree = [
         int(b == int(w > 0))
         for bits, want in zip(record["together_bits"], per_anchor)

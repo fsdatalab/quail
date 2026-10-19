@@ -237,6 +237,8 @@ class VLLMEngine:
                              else min(MAX_SEQUENCES,
                                       spec.max_num_seqs or MAX_SEQUENCES)),
         }
+        if spec.moe_backend is not None:
+            kwargs["moe_backend"] = spec.moe_backend
         kwargs.update(diffusion_kwargs(spec))
         kwargs.update(text_only_kwargs(spec))
         return kwargs
