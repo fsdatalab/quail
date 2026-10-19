@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 
 from quail.baselines.request import RequestBackend
 from quail.baselines.request_scheduling import (
@@ -12,6 +12,7 @@ from quail.baselines.request_scheduling import (
     MAX_SEQUENCES,
     run_filter_sequence,
 )
+from quail.specs.files import resolve_model_path
 
 GPU_MEMORY_UTILIZATION = 0.91
 CUDA_GRAPH_CAPTURE_SIZE = 8_192
@@ -36,7 +37,9 @@ class GigatokenVLLMTokenizer:
         from gigatoken import Tokenizer
 
         truncation_side = kwargs.pop("truncation_side", "left")
-        tokenizer = Tokenizer(path_or_repo_id).as_hf()
+        path = resolve_model_path(path_or_repo_id, kwargs.get("revision"),
+                                  include_weights=False)
+        tokenizer = Tokenizer(path).as_hf()
         tokenizer.truncation_side = truncation_side
         vocab = tokenizer.get_vocab()
         tokenizer.max_token_id = max(vocab.values())
@@ -47,10 +50,14 @@ class GigatokenVLLMTokenizer:
 @contextmanager
 def engine_environment(spec):
     """Scope vLLM's process selection to construction of one engine."""
+    from vllm import envs
+
     key = "VLLM_ENABLE_V1_MULTIPROCESSING"
     previous = os.environ.get(key)
     # vLLM 0.26 reads process selection from the environment in LLM's
-    # constructor. Its public LLM API has no per-instance override.
+    # constructor, and caches what it read; its public LLM API has no
+    # per-instance override
+    envs.disable_envs_cache()
     if spec.vision_tower or spec.canvas_tokens == 1:
         os.environ[key] = "0"
     try:
@@ -60,6 +67,7 @@ def engine_environment(spec):
             os.environ.pop(key, None)
         else:
             os.environ[key] = previous
+        envs.disable_envs_cache()
 
 
 @contextmanager
@@ -94,6 +102,7 @@ def diffusion_canvas(spec):
         yield tokens
     finally:
         diffusion_gemma.DiffusionGemmaRequestStates = original
+
 
 
 def _capacity(llm) -> dict:
@@ -182,6 +191,11 @@ class VLLMClient:
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()
 
+    def close(self):
+        """Stop the engine and its workers."""
+        self.llm.llm_engine.engine_core.shutdown()
+        self.llm = None
+
     def run_filter_sequence(self, sampling_params, body_ids, question_ids,
                          read_answer, *, tag="q", body_texts=None,
                          question_texts=None):
@@ -212,6 +226,8 @@ class VLLMEngine:
     runtime_package = "vllm==0.26.0"
     # a request can decode an answer as text
     scores_labels = True
+    # a request returns the logprobs a canvas model's answer is read from
+    reads_logprobs = True
     # a decision model runs on the pooling runner
     roles = frozenset({"generative", "decision"})
 
@@ -243,12 +259,22 @@ class VLLMEngine:
         kwargs.update(text_only_kwargs(spec))
         return kwargs
 
-    def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
-        """Load the spec's model and return the engine state and boot record."""
+    def boot(self, spec, allowed_ids: list[int], *,
+             resources: ExitStack) -> tuple[dict, dict]:
+        """Load the spec's model and return its settings and boot record.
+
+        Args:
+            spec: The model to load.
+            allowed_ids: The token ids a filter answer may be.
+            resources: Owns the engine; closing it stops the engine.
+        """
+        # a session tokenizes on background threads before the engine
+        # starts, and a forked worker would inherit their locks
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         if spec.role == "decision":
             from quail.baselines.vllm_decision import boot_decision
 
-            return boot_decision(spec, self.llm_kwargs(spec))
+            return boot_decision(spec, self.llm_kwargs(spec), resources=resources)
         from vllm import LLM, SamplingParams
         from vllm.renderers.registry import RENDERER_REGISTRY
         from vllm.tokenizers import TokenizerRegistry
@@ -262,13 +288,16 @@ class VLLMEngine:
         if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
             RENDERER_REGISTRY.register("gigatoken", *renderer)
 
+        path = resolve_model_path(spec.hf_name, spec.revision)
         started = time.perf_counter()
         with engine_environment(spec), diffusion_canvas(spec) as canvas_ids:
-            llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
+            llm = LLM(model=path, **self.llm_kwargs(spec))
+            client = resources.enter_context(closing(VLLMClient(llm, {})))
         boot_s = time.perf_counter() - started
         sampling_params = SamplingParams(
             **sampling_kwargs(allowed_ids, spec.canvas_tokens))
-        capacity = _capacity(llm)
+        capacity = client.capacity
+        capacity.update(_capacity(llm))
         cache = llm.llm_engine.vllm_config.cache_config
         capacity.update(
             enable_prefix_caching=cache.enable_prefix_caching,
@@ -280,7 +309,6 @@ class VLLMEngine:
             max_denoising_steps=1 if spec.canvas_tokens == 1 else None,
             logprobs=sampling_params.logprobs,
         )
-        client = VLLMClient(llm, capacity)
         client.generate(["TRUE"], sampling_params)
         return (
             {

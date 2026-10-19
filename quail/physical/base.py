@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from enum import Enum
 from typing import Any, ClassVar
+
+# one token id: an int of the model's vocabulary, or the word itself
+# under a tokenizer that splits text into words, as the tests' does
+Token = Any
 
 
 class ExecutionLocation(str, Enum):
@@ -18,7 +22,6 @@ class ExecutionLocation(str, Enum):
 class ValueType(str, Enum):
     """Value passed between physical node ports."""
 
-    DOCUMENT_IDS = "document_ids"
     FILTER_ANSWERS = "filter_answers"
     JOIN_ANSWERS = "join_answers"
     LABEL_ANSWERS = "label_answers"
@@ -67,8 +70,8 @@ class OutputPort:
 
 def value_type_for_port(name: str) -> ValueType:
     """Return the built in value type for a port name."""
-    if name.startswith("ids:"):
-        return ValueType.DOCUMENT_IDS
+    if name == "rows" or name.startswith("rows:"):
+        return ValueType.ROWS
     if name.startswith("filter_answers:"):
         return ValueType.FILTER_ANSWERS
     if name.startswith("join_answers:"):
@@ -104,7 +107,6 @@ class PhysicalNode:
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
     backend: ClassVar[str | None] = None
 
-    worker_pipelining: ClassVar[bool] = False
 
     @property
     def document_aliases(self) -> tuple[str, ...]:
@@ -112,17 +114,22 @@ class PhysicalNode:
         return ()
 
     @property
-    def document_head(self) -> tuple[int, ...] | None:
-        """Return the document's prompt head, or None for the shared preamble."""
-        return None
+    def document_head(self) -> tuple[int, ...]:
+        """Return the token ids this operator shows a document under."""
+        return ()
 
     def document_outputs(self, alias: str) -> tuple[str, ...]:
         """Return outputs that can feed the next operator for a document."""
-        return (f"ids:{alias}",)
+        return (f"rows:{alias}",)
 
     def can_follow(self, previous: "PhysicalNode", first: "PhysicalNode") -> bool:
-        """Return whether this operator can use the preceding document KV."""
-        return True
+        """Return whether this operator can use the preceding document KV.
+
+        It can when the pipeline shows the documents under this
+        operator's prompt head; the executor rewinds the KV past what
+        the operator before appended.
+        """
+        return first.document_head == self.document_head
 
     def can_precede(self, consumer: "PhysicalNode") -> bool:
         """Return whether a consumer can run before other documents finish."""
@@ -132,27 +139,15 @@ class PhysicalNode:
     def outputs(self) -> tuple[OutputPort, ...]:
         raise NotImplementedError
 
-    def attributes(self) -> dict:
-        """Return node fields encoded by the node codec."""
-        return {}
-
-    @classmethod
-    def from_attributes(
-        cls,
-        node_id: str,
-        inputs: tuple[InputPort, ...],
-        attributes: Mapping[str, Any],
-    ) -> "PhysicalNode":
-        """Decode a node from codec fields."""
-        return cls(node_id=node_id, inputs=inputs)
 
     def with_inputs(self, inputs: tuple[InputPort, ...]) -> "PhysicalNode":
         """Return the same node with replacement inputs."""
         return replace(self, inputs=inputs)
 
     def explain_fields(self) -> Mapping[str, Any]:
-        """Return fields shown on one explain line."""
-        return self.attributes()
+        """Return fields shown on one explain line: the settings by default."""
+        return {field.name: getattr(self, field.name) for field in fields(self)
+                if field.name not in ("node_id", "inputs")}
 
 
 def validate_integer_setting(name: str, value: int, minimum: int = 1) -> None:

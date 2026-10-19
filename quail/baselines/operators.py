@@ -15,9 +15,9 @@ from quail.catalog.pairs import (
 from quail.execution.labels import match_label
 from quail.execution.result import (
     answer_table,
-    extract_answer_table,
     filter_answer_table,
 )
+from quail.execution.rows import Rows
 from quail.execution.spans import locate_span, read_phrase
 
 
@@ -65,8 +65,8 @@ def operator_at_a_time_filter(client, sampling_params, bodies, questions,
         active = next_active
         stages.append({
             "stage": stage_index,
-            "n_in": len(evaluated),
-            "n_out": len(active),
+            "num_in": len(evaluated),
+            "num_out": len(active),
         })
     return {
         "wall_s": time.perf_counter() - started,
@@ -112,8 +112,8 @@ def pipelined_filter(client, sampling_params, bodies, questions, read_answer,
         ]
         stages.append({
             "stage": stage - 1,
-            "n_in": len(evaluated),
-            "n_out": sum(
+            "num_in": len(evaluated),
+            "num_out": sum(
                 bool(result["answers"][(document, stage)])
                 for document in evaluated
             ),
@@ -234,13 +234,10 @@ def choose_documents(client, spec, bodies) -> dict:
     }
 
 
-def classification_table(spec, columns, labels):
+def classification_rows(spec, columns, labels) -> Rows:
     """Build classified rows and remove rows without a matching label."""
-    table = pa.table({
-        **{alias: pa.array(values, pa.int32()) for alias, values in columns.items()},
-        spec.output: pa.array(labels, pa.string()),
-    })
-    return table.filter(table.column(spec.output).is_valid())
+    rows = Rows(columns, pa.table({spec.output: pa.array(labels, pa.string())}))
+    return rows.filter(rows.column(spec.output).is_valid())
 
 
 def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
@@ -296,12 +293,6 @@ def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
     }
 
 
-def extract_answers(spec, document_ids, answers, spans) -> pa.Table:
-    """Return each document's answer and character span."""
-    return extract_answer_table(spec.alias, spec.output, spec.span_output,
-                                document_ids, answers, spans)
-
-
 def allowed_members_by_anchor(anchor, partners, anchor_ids, members, pairs) -> list:
     """Per anchor, the member indices its equality conditions allow."""
     position = partners.index(pair_partner(anchor, partners))
@@ -324,7 +315,7 @@ def join_answers(spec, rows, answers, anchor, partners) -> pa.Table:
             "anchor": anchor,
             "partners": ",".join(partners),
             "semantics": spec.semantics,
-            "written_pos": spec.written_pos,
+            "written_position": spec.written_position,
             **(
                 {"selectivity": spec.selectivity}
                 if spec.selectivity is not None else {}

@@ -5,9 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
-from quail.cost.extract import estimate as extract_estimate
 from quail.cost.retention import coefficients
-from quail.cost.score import score_fixed_tokens
 from quail.physical import (
     Aggregate as PhysicalAggregate,
 )
@@ -20,15 +18,21 @@ from quail.physical import (
     AiScore,
     Limit,
     PhysicalGraph,
+    PortRef,
     Sort,
+    Window,
 )
+from quail.physical.base import input_ports
 from quail.physical.pipelines import build_pipelines
 from quail.planner.graph import retention
 from quail.planner.operators.classify import classify_scoring
 from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import plan_kv_retention
-from quail.planner.search.statistics import cached_statistics, live_after_filters
-from quail.planner.sol.prefixes import document_shared_tokens, page_tree
+from quail.planner.search.statistics import (
+    cached_statistics,
+    expected_rows_after_filters,
+)
+from quail.planner.statistics.prefixes import page_tree
 from quail.planner.statistics.tables import summarize_alias
 
 
@@ -36,14 +40,15 @@ class ShouldPushDownLimit(PhysicalRule):
     """Let a LIMIT end the filter run once enough documents survived.
 
     The rule puts the limit in the ``filter_limit`` setting, which the
-    executor reads to stop admitting documents once that many survived
-    the sequence's last stage. The pushdown keeps the first survivors to
-    finish, so it is sound only when those are the rows the query
-    returns: the graph ends in a Limit and has no Sort or PhysicalAggregate (an
-    ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
-    AiJoin (survivors are settled per join round), and no AiInference (a
-    score comparison after the sequence can drop survivors). Otherwise the
-    rule removes the setting.
+    executor reads to stop admitting documents once that many passed
+    every operator of their pipeline. The pushdown keeps the first
+    survivors to finish, so it is sound only when those are the rows the
+    query returns: the graph ends in a Limit, its documents run through
+    one pipeline, and it has no Sort, PhysicalAggregate, or Window (an
+    ORDER BY, DISTINCT, OFFSET, GROUP BY, or window function needs
+    every survivor) and no AiJoin
+    (survivors are settled per join round). Otherwise the rule removes
+    the setting.
     """
 
     name = "should_push_down_limit"
@@ -53,13 +58,83 @@ class ShouldPushDownLimit(PhysicalRule):
             return None
         limit = next((node for node in graph.nodes
                       if isinstance(node, Limit)), None)
-        blocked = any(isinstance(node, (Sort, PhysicalAggregate, AiJoin, AiInference))
-                      for node in graph.nodes)
+        pipelines = {id(members) for members
+                     in build_pipelines(graph).values()}
+        blocked = len(pipelines) > 1 or any(
+            isinstance(node, (Sort, PhysicalAggregate, Window, AiJoin))
+            for node in graph.nodes)
         if limit is None or blocked:
             context.settings.pop("filter_limit", None)
         else:
             context.settings["filter_limit"] = limit.count
         return None
+
+
+def _window_sort_keys(call) -> tuple:
+    """The Sort keys that order rows as the window call's partition and order do."""
+    return tuple((name, False, False) for name in call.partition) + tuple(call.order)
+
+
+class ShouldEliminateWindowSort(PhysicalRule):
+    """Drop a Sort whose order the Window before it already produced.
+
+    A Window's rows come out in its last call's partition and order, so
+    a Sort over the same keys, with no DISTINCT, OFFSET, or LIMIT, has
+    nothing to do; the Window returns the Sort's columns instead.
+    """
+
+    name = "should_eliminate_window_sort"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        sort = next((node for node in graph.nodes if isinstance(node, Sort)), None)
+        if sort is None or sort.distinct or sort.offset or sort.fetch is not None:
+            return None
+        window = graph.node(sort.inputs[0].source.node_id)
+        if not isinstance(window, Window) or graph.root.node_id != sort.node_id \
+                or sort.keys != _window_sort_keys(window.calls[-1]):
+            return None
+        nodes = tuple(replace(node, columns=sort.columns) if node is window else node
+                      for node in graph.nodes if node is not sort)
+        return PhysicalGraph(nodes, sort.inputs[0].source)
+
+
+class ShouldPushDownLimitThroughWindow(PhysicalRule):
+    """Turn a LIMIT after an unpartitioned window into a top-k before it.
+
+    A window with an ORDER BY and no PARTITION BY gives each row a value
+    that depends on the rows before it only, so the first k rows in that
+    order get the same values whether or not the rest are there. The
+    Limit becomes a Sort with a fetch under the Window. lead reads the
+    row after, so it keeps the Limit.
+    """
+
+    name = "should_push_down_limit_through_window"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        limit = next((node for node in graph.nodes if isinstance(node, Limit)), None)
+        if limit is None or graph.root.node_id != limit.node_id:
+            return None
+        window = graph.node(limit.inputs[0].source.node_id)
+        if not isinstance(window, Window):
+            return None
+        orders = {call.order for call in window.calls}
+        if len(orders) != 1 or not next(iter(orders)) or any(
+                call.partition or call.function == "lead" for call in window.calls):
+            return None
+        below = window.inputs[0].source
+        top = Sort(node_id="top", inputs=input_ports((below,)),
+                   keys=tuple(next(iter(orders))),
+                   columns=graph.node(below.node_id).outputs[0].schema,
+                   fetch=limit.count)
+        nodes = []
+        for node in graph.nodes:
+            if node is limit:
+                continue
+            if node is window:
+                nodes.append(top)
+                node = replace(node, inputs=input_ports((PortRef("top", "rows"),)))
+            nodes.append(node)
+        return PhysicalGraph(tuple(nodes), limit.inputs[0].source)
 
 
 class ShouldRetainKv(PhysicalRule):
@@ -93,7 +168,7 @@ class ShouldRetainKv(PhysicalRule):
         logical = context.logical_plan
         statistics = cached_statistics(
             logical, context.memo, model=context.model, device=context.device,
-            doc_tokens=context.document_tokens,
+            document_tokens=context.document_tokens,
             pair_fractions=context.pair_fractions,
             scan_fractions=context.scan_fractions, context=context)
         joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
@@ -104,11 +179,11 @@ class ShouldRetainKv(PhysicalRule):
                     or node.semantics != "full"):
                 grouped.append([])
             grouped[-1].append(node)
-        groups = [[(statistics.specs[node.written_pos], node.anchor)
+        groups = [[(statistics.specs[node.written_position], node.anchor)
                    for node in group] for group in grouped]
         schedule = retention.schedule(
             [predicate for group in groups for predicate in group],
-            live_after_filters(logical, statistics),
+            expected_rows_after_filters(logical, statistics),
             [group[0].node_id for group in grouped])
         before, after = schedule["before"], schedule["after"]
         schedule["before"] = {
@@ -118,7 +193,7 @@ class ShouldRetainKv(PhysicalRule):
             node.node_id: (after[group[0].node_id] if node is group[-1]
                            else before[group[0].node_id])
             for group in grouped for node in group}
-        paths = build_pipelines(graph, context.gpu_count)
+        paths = build_pipelines(graph)
         streamed = {
             node.alias for node in graph.nodes if isinstance(node, AiFilter)
             and any(isinstance(member, AiJoin)
@@ -129,8 +204,7 @@ class ShouldRetainKv(PhysicalRule):
         schedule.update(**coefficients(context.model, context.device),
                         cap_pages=statistics.cap_pages)
         context.settings["retention"] = schedule
-        return plan_kv_retention(
-            graph, context.gpu_count, tuple(context.settings.get("pre_ids", ())))
+        return plan_kv_retention(graph)
 
 
 class ChooseClassifyImplementation(PhysicalRule):
@@ -169,7 +243,7 @@ class ChooseClassifyImplementation(PhysicalRule):
 
         logical = context.logical_plan
         calls = {node.name: node.call for node in logical.operators().classifies}
-        paths = build_pipelines(graph, context.gpu_count)
+        paths = build_pipelines(graph)
         chosen = {}
         for node in pending:
             table = classify_scoring(context, node.spec.anchor)
@@ -183,11 +257,6 @@ class ChooseClassifyImplementation(PhysicalRule):
         return PhysicalGraph(
             tuple(chosen.get(node.node_id, node) for node in graph.nodes),
             graph.root)
-
-
-def _token_store(document_tokens):
-    """The token store behind an alias's document lengths, or None."""
-    return getattr(document_tokens, "_store", None)
 
 
 def page_aligned_shared_tokens(store) -> int:
@@ -249,7 +318,6 @@ class ShouldSharePrefixes(PhysicalRule):
             return None
         nodes = []
         changed = False
-        pipelines = build_pipelines(graph, context.gpu_count)
         summaries = {
             alias: summarize_alias(lengths, context.model.sliding_window,
                                    memo=context.memo)
@@ -257,15 +325,16 @@ class ShouldSharePrefixes(PhysicalRule):
         }
         shared_by_alias = {}
         for node in graph.nodes:
-            settings = getattr(node, "spec", node)
             if (not isinstance(node, (AiFilter, AiJoin, AiClassify, AiExtract, AiScore))
-                    or settings is None or settings.share_prefixes
-                    or (isinstance(node, AiScore) and len(settings.aliases) != 1)):
+                    or (isinstance(node, AiInference) and node.spec is None)
+                    or node.share_prefixes
+                    or (isinstance(node, AiScore) and len(node.spec.aliases) != 1)):
                 nodes.append(node)
                 continue
-            alias = (settings.aliases[0] if isinstance(node, AiScore)
+            alias = (node.spec.aliases[0] if isinstance(node, AiScore)
                      else node.document_aliases[0])
-            store = _token_store(context.document_tokens.get(alias))
+            lengths = context.document_tokens.get(alias)
+            store = None if lengths is None else lengths.store
             if store is None:
                 nodes.append(node)
                 continue
@@ -279,63 +348,18 @@ class ShouldSharePrefixes(PhysicalRule):
                     total_tokens=summaries[alias].total, writes_pages=writes_pages):
                 nodes.append(node)
                 continue
+            # the plan's pricer prices a sharing node over its fresh tokens
             if isinstance(node, AiFilter):
                 node = replace(node, share_prefixes=True, arena_writes=True)
             elif isinstance(node, AiJoin):
                 node = replace(node, share_prefixes=True)
-            elif isinstance(node, AiScore):
-                node = replace(node, spec=_shared_score_spec(
-                    node.spec, shared, summaries[alias], context.model.canvas_tokens))
             else:
-                pipeline = pipelines.get(node.node_id)
-                resident = pipeline is not None and pipeline[0].node_id != node.node_id
-                prepare = (_shared_classify_spec if isinstance(node, AiClassify)
-                           else _shared_extract_spec)
-                node = replace(node, spec=prepare(
-                    node, context, store, resident=resident))
+                node = replace(node, spec=replace(node.spec, share_prefixes=True))
             nodes.append(node)
             changed = True
         if not changed:
             return None
         return PhysicalGraph(tuple(nodes), graph.root)
-
-
-def _shared_classify_spec(node, context, store, *, resident=False):
-    """Enable prefix sharing and update the classification cost estimate."""
-    table = classify_scoring(context, node.spec.aliases[0],
-                           shared=document_shared_tokens(store))
-    return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
-
-
-def _shared_extract_spec(node, context, store, *, resident=False):
-    """Enable extraction prefix sharing and price the borrowed document KV."""
-    from quail.cost.budgets import chunk_budget
-
-    spec = node.spec
-    head, tail = spec.prompt_token_parts
-    cost = extract_estimate(
-        spec.expected_inputs, context.document_tokens[spec.alias],
-        len(head), len(tail), chunk=chunk_budget(context.model, context.device),
-        model=context.model, device=context.device, resident=resident,
-        shared=page_tree(store).shared, max_answer_tokens=spec.max_answer_tokens,
-        draft_tokens=spec.draft_tokens, draft_policy=spec.draft_policy,
-        round_cost_per_token=spec.round_cost_per_token, workers=context.gpu_count)
-    return replace(spec, share_prefixes=True, estimated_seconds=cost.seconds)
-
-
-def _shared_score_spec(spec, shared_tokens, summary, canvas_tokens):
-    """Enable prefix sharing and scale the score's estimate by its fresh tokens.
-
-    Assumes time is proportional to the tokens the score computes, and
-    that the scored documents borrow the same share of their tokens as
-    the whole table.
-    """
-    fixed = score_fixed_tokens(tuple(map(len, spec.prompt_token_parts)),
-                               canvas_tokens, spec.draws)
-    total = summary.total + summary.count * fixed
-    fresh = max(0.0, 1.0 - shared_tokens / total) if total else 1.0
-    return replace(spec, share_prefixes=True,
-                   estimated_seconds=spec.estimated_seconds * fresh)
 
 
 def _mean(values) -> float:
@@ -378,8 +402,8 @@ class ChooseAttentionAlgorithm(PhysicalRule):
         for node in graph.nodes:
             path = None
             if isinstance(node, AiFilter):
-                lengths = context.document_tokens.get(node.alias, ())
-                store = _token_store(lengths)
+                lengths = context.document_tokens.get(node.alias)
+                store = None if lengths is None else lengths.store
                 path = "unified"
                 if tree_available and node.share_prefixes and store is not None:
                     path = filter_attention(
@@ -390,8 +414,9 @@ class ChooseAttentionAlgorithm(PhysicalRule):
                 path = "unified"
                 if tree_available:
                     stage = node
-                    readers = (stage.expected_tuples / len(lengths)
-                               if len(lengths) else 1.0)
+                    # the partners each live anchor reads, on average
+                    readers = (stage.expected_rows / stage.anchor_documents
+                               if stage.anchor_documents else 1.0)
                     # a partner's rows: its document and the question tail
                     rows = stage.pair_tail_tokens + sum(
                         _mean(context.document_tokens.get(partner, ()))

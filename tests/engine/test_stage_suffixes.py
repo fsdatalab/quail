@@ -37,16 +37,16 @@ def test_own_suffixes_follow_each_documents_answers(path, monkeypatch):
     # every suffix a document can be fed, and its answer, planted by hash
     answers = {}
     want = {}
-    for d, doc in enumerate(DOCS):
-        bit = _plant(answers, doc + CUE)
+    for d, document in enumerate(DOCS):
+        bit = _plant(answers, document + CUE)
         if d == 1:
             bits = []
         else:
-            bits = [_plant(answers, doc + CUE + suffix) for suffix in _second(bit)]
+            bits = [_plant(answers, document + CUE + suffix) for suffix in _second(bit)]
         (third,) = _third(bits)
-        bit2 = _plant(answers, doc + CUE + third)
+        bit2 = _plant(answers, document + CUE + third)
         (fourth,) = _fourth(bit2)
-        bit3 = _plant(answers, doc + CUE + third + fourth)
+        bit3 = _plant(answers, document + CUE + third + fourth)
         want[d] = (bit, bits, bit2, bit3)
     setup = Setup(path=path)
     run = Run(setup, answers)
@@ -89,15 +89,15 @@ def test_own_suffixes_follow_each_documents_answers(path, monkeypatch):
     # each document packs its prefix and cue once, its two second-stage
     # suffixes (3 tokens, none for the skipped document), and one token
     # at each of the two appended stages
-    assert tokens == sum(len(doc) for doc in DOCS) + 4 + 3 * 3 + 4 + 4
+    assert tokens == sum(len(document) for document in DOCS) + 4 + 3 * 3 + 4 + 4
     assert not run.arena.accounting.owned
 
 
 def test_own_suffix_over_its_most_tokens_is_refused(monkeypatch):
     cpu_staging(monkeypatch)
     answers = {}
-    for doc in DOCS:
-        _plant(answers, doc + CUE)
+    for document in DOCS:
+        _plant(answers, document + CUE)
     setup = Setup(path="unified")
     run = Run(setup, answers)
     stages = [

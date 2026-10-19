@@ -66,18 +66,18 @@ def lower_classifications(context, operators,
             parts = {part_alias: (label, frame)
                      for part_alias, label, frame
                      in context.lowered(call.prompt).label_token_ids}
-            written_pos = next(
+            written_position = next(
                 (position for position, join in enumerate(joins)
                  if {argument.alias for argument in join.prompt.args}
                  == set(call.aliases())), None)
-            if written_pos is None:
+            if written_position is None:
                 raise ValueError(
                     f"the classification of {alias!r} x {partner!r} pairs "
                     f"needs a join of the two")
             pair = dict(partner=partner,
                         join_layout_token_ids=(tuple(parts[alias][1]),
                                         tuple(parts[partner][0])),
-                        join_written_pos=written_pos)
+                        join_written_position=written_position)
         classify_specs.append(RequestClassifySpec(
             alias=alias,
             output=label_plan.names[call],
@@ -87,7 +87,7 @@ def lower_classifications(context, operators,
                 tuple(context.tokenizer(label_text(label)))
                 for label in call.labels),
             tests=tuple(
-                (test.position, test.values)
+                (test.position, test.condition.value)
                 for test in operators.label_filters.get(alias, ())
                 if test.call == call),
             option_offsets=(_option_offsets(call.prompt, context.tokenizer)
@@ -100,8 +100,8 @@ def lower_classifications(context, operators,
 def lower_joins(context, joins, join_sequence) -> list[RequestJoinSpec]:
     """Build one join spec per join, in the searched sequence."""
     join_specs = []
-    for written_pos, selected_anchor in join_sequence:
-        join = joins[written_pos]
+    for written_position, selected_anchor in join_sequence:
+        join = joins[written_position]
         prompt = context.lowered(join.prompt)
         aliases_in_prompt = tuple(argument.alias for argument in prompt.args)
         labels = tuple(
@@ -126,7 +126,7 @@ def lower_joins(context, joins, join_sequence) -> list[RequestJoinSpec]:
             field.alias for field in join_outer_input(join).output_schema()
         ))
         join_specs.append(RequestJoinSpec(
-            written_pos=written_pos,
+            written_position=written_position,
             aliases=aliases_in_prompt,
             outer_aliases=outer_aliases,
             anchor=selected_anchor,

@@ -12,8 +12,8 @@ QWEN3_5_27B_FP8 = ModelSpec(
     #                         norms and the embedding excluded
     layers=64,
     hidden=5120,
-    n_q=24,
-    n_kv=4,
+    num_q_heads=24,
+    num_kv_heads=4,
     d_head=256,
     ffn_width=34816,       # gate_up output: 2 x 17408 intermediate
     w_bytes=1.0,           # fp8 weights, block scales in bf16

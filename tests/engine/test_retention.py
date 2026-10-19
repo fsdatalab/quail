@@ -79,7 +79,7 @@ def test_retention_priority_capacity_eviction_and_its_report():
 def test_retention_costs_and_future_use():
     def stage(position, aliases):
         return PricedJoin(
-            written_pos=position, aliases=aliases, anchor=aliases[0],
+            written_position=position, aliases=aliases, anchor=aliases[0],
             anchor_free=False, semantics='full', selectivity=0.1,
             frame_tokens={alias: 0 for alias in aliases},
             label_tokens={alias: 0 for alias in aliases}, tail_tokens=0)

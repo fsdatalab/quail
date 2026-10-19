@@ -143,15 +143,15 @@ def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
 
 
 def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
-                       mean_doc_tokens: float | None) -> int:
+                       mean_document_tokens: float | None) -> int:
     """Arena KV pages: two chunks of execution plus the retained KV.
 
     A retained document of `l` tokens costs ceil(l / 16) KV pages plus
     its checkpoint, so the pool holds floor(pool / that) documents, and
     the KV the checkpoints leave is retained KV.
     """
-    mean = CHECKPOINT_DEFAULT_DOC_TOKENS if mean_doc_tokens is None else max(
-        1.0, mean_doc_tokens)
+    mean = CHECKPOINT_DEFAULT_DOC_TOKENS if mean_document_tokens is None else max(
+        1.0, mean_document_tokens)
     pool = hybrid_pool_pages(model, device, chunk_tokens)
     ckpt = checkpoint_pages(model)
     slots = int(pool // (-(-mean // PAGE_TOKENS) + ckpt))
@@ -167,7 +167,7 @@ def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
 
 def arena_pages(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int | None = None,
-                mean_doc_tokens: float | None = None) -> tuple[int, int]:
+                mean_document_tokens: float | None = None) -> tuple[int, int]:
     """Pages of the two KV pools: (every-token pool, sliding-layer pool).
 
     A model with Gated DeltaNet layers gets the KV pages left beside its
@@ -186,14 +186,14 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
         chunk_tokens = chunk_budget(model, device)
     if model.state_layers:
         return hybrid_arena_pages(model, device, chunk_tokens,
-                                  mean_doc_tokens), 0
+                                  mean_document_tokens), 0
     free = arena_bytes(model, device, chunk_tokens)
     page_bytes_full = model.kappa_full * PAGE_TOKENS
     page_bytes_sliding = model.kappa_sliding * PAGE_TOKENS
     if not page_bytes_sliding:
         return int(free // page_bytes_full), 0
     window = model.sliding_window
-    mean = window if mean_doc_tokens is None else max(1.0, mean_doc_tokens)
+    mean = window if mean_document_tokens is None else max(1.0, mean_document_tokens)
     ratio = min(1.0, (min(mean, window) + SPLIT_EXTRA_TOKENS)
                 / (mean + SPLIT_EXTRA_TOKENS))
     full = int(free // (page_bytes_full + ratio * page_bytes_sliding))
@@ -209,14 +209,14 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
 
 def arena_tokens(model: ModelSpec, device: DeviceSpec,
                  chunk_tokens: int | None = None,
-                 mean_doc_tokens: float | None = None) -> int:
+                 mean_document_tokens: float | None = None) -> int:
     """Admission budget: tokens of document KV that can be resident at once.
 
     Computed from the memory left after resident weights and the
     activation reservation. With sliding layers this is the
     every-token pool; see arena_pages.
     """
-    full, _ = arena_pages(model, device, chunk_tokens, mean_doc_tokens)
+    full, _ = arena_pages(model, device, chunk_tokens, mean_document_tokens)
     return full * PAGE_TOKENS
 
 
@@ -230,11 +230,11 @@ def _projection_shapes(model: ModelSpec):
     projections in its layers, and the MLP in every layer.
     """
     query_width = 2 if model.attn_output_gate else 1
-    qkv_out = (query_width * model.n_q + 2 * model.n_kv) * model.d_head
+    qkv_out = (query_width * model.num_q_heads + 2 * model.num_kv_heads) * model.d_head
     inter = model.intermediate
     attention = len(model.attention_layers)
     shapes = [(model.hidden, qkv_out, attention),
-              (model.n_q * model.d_head, model.hidden, attention),
+              (model.num_q_heads * model.d_head, model.hidden, attention),
               (model.hidden, model.ffn_width, model.layers),
               (inter, model.hidden, model.layers)]
     if model.gdn_layers:
@@ -273,9 +273,9 @@ def _attention_time(model: ModelSpec, device: DeviceSpec,
                     chunk: int, context: int) -> float:
     """Ideal seconds for the attention kernels in one chunk, all layers."""
     layers = len(model.attention_layers)
-    flops = 4.0 * chunk * context * model.n_q * model.d_head
+    flops = 4.0 * chunk * context * model.num_q_heads * model.d_head
     moved = (context * model.kappa / layers
-             + 2.0 * chunk * model.n_q * model.d_head * ACT_BYTES)
+             + 2.0 * chunk * model.num_q_heads * model.d_head * ACT_BYTES)
     return max(flops / device.peak_flops,
                moved / device.hbm_bw) * layers
 
@@ -327,6 +327,11 @@ def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
     tree = _attention_time(model, device, rows, node_tokens)
     # the merge kernel reads two partial outputs and writes one, in
     # bf16, once per layer
-    merge = 3 * rows * model.n_q * model.d_head * ACT_BYTES / device.hbm_bw
+    merge = 3 * rows * model.num_q_heads * model.d_head * ACT_BYTES / device.hbm_bw
     tree += merge * len(model.attention_layers)
     return "tree" if tree < unified else "unified"
+
+
+def parallel_copies(gpus: int, num_documents: float) -> float:
+    """Return the model copies that share work spread evenly over documents."""
+    return max(1.0, min(gpus, num_documents))

@@ -26,8 +26,8 @@ def memory_report(gpu) -> dict:
         "memory_trace": list(getattr(arena, "memory_trace", ())),
         "memory_trace_started": getattr(arena, "memory_trace_started", 0.0),
         "memory_events": [list(event) for event in getattr(arena, "events", ())],
-        "memory_capacity": {"pages": arena.n_pages,
-                            "slots": getattr(arena, "n_state_slots", 0)},
+        "memory_capacity": {"pages": arena.num_pages,
+                            "slots": getattr(arena, "num_state_slots", 0)},
         "peak_gib": peak / 2**30,
     }
     if hasattr(gpu, "pool_bytes"):

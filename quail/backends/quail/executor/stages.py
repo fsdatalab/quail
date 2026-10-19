@@ -128,7 +128,7 @@ class Stage:
                 raise ValueError("a stage whose suffixes come from a callback "
                                  "takes no requests, paths, read_rows, or canvas")
             return
-        trailing = getattr(self.readout, "trailing_rows", 1)
+        trailing = 1 if self.readout is None else self.readout.trailing_rows
         if self.read_rows is None and trailing > 1:
             self.read_rows = [trailing] * len(self.suffixes)
             self.read_all_rows = True
@@ -137,19 +137,6 @@ class Stage:
     def own_suffixes(self) -> bool:
         """Whether each document's suffixes come from the callback."""
         return callable(self.suffixes)
-
-
-class OwnRequests(list):
-    """A document's requests at a stage whose suffixes are its own.
-
-    The indices run over the document's own sequences, and lengths
-    holds their token counts, which the admission prices in place of
-    the stage's shared list.
-    """
-
-    def __init__(self, lengths):
-        super().__init__(range(len(lengths)))
-        self.lengths = np.asarray(lengths, dtype=np.int64)
 
 
 def shared_preamble_tokens(question_ids) -> int:
@@ -212,7 +199,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                limit=None, paged=True, unit="documents", count_answers=False,
                label=None, default_attention="tree", on_chunk=None,
                on_answers=None, stop_groups=None, appended_tokens=None,
-               gpu_timing=False):
+               gpu_timing=False, survival=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -239,6 +226,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             host seconds spent building chunks.
         limit: Stop admitting documents once this many survived the
             last stage; the rest never run.
+        survival: The fraction of documents expected to survive every
+            stage, or None. Under a limit, documents are admitted only
+            while the ones in flight are expected to fall short of it.
         stop_groups: Per document, its stop key group, or None. One
             document of a group runs at a time, and once one survives
             the last stage the group's queued documents never run.
@@ -277,7 +267,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         torch, arena, pipeline, stages, anchor_prefixes, budget,
         anchor_keys=anchor_keys, on_settled=on_settled, staging=staging,
         attention_mode=attention_mode, prefix_tree=prefix_tree, stats=stats,
-        limit=limit, paged=paged or pipeline.needs_pages,
+        limit=limit, survival=survival, paged=paged or pipeline.needs_pages,
         unit=unit, count_answers=count_answers,
         label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers, stop_groups=stop_groups,

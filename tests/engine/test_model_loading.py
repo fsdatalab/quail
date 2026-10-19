@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from helpers.fakes import cpu_arena, fake_pipeline, fake_torch
+from helpers.fakes import cpu_arena, fake_pipeline, fake_readout, fake_torch
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor import model_loading
@@ -98,7 +98,7 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
                 "unified suffix pages exceed the free KV arena")
         sizes.append(len(specs))
         modes.add(kw["attention_mode"])
-        return SimpleNamespace(specs=specs, tokens=len(specs),
+        return SimpleNamespace(specs=specs, tokens=len(specs), layout=[],
                                attention_mode=kw["attention_mode"],
                                temporary_keys=(), fresh_keys=(),
                                rows_per_answer=None)
@@ -109,7 +109,7 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
     monkeypatch.setattr(arena, "evict_retained",
                         lambda need: evictions.append(need) or ())
     pipeline = fake_pipeline(forward_chunk=lambda chunk: [1] * len(chunk.specs))
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    answers = fake_readout()
     answers_out, _, _ = run_stages(
         fake_torch(), arena, pipeline,
         [Stage(suffixes=[[3, 4]], readout=answers)], [[1] * 8, [2] * 8], 64,
@@ -143,6 +143,10 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
     assert [call["revision"] for call in calls] == ["revision-a", "revision-b"]
     assert all(call["repo_id"] == "Qwen/model" for call in calls)
     assert "*.safetensors" in calls[0]["allow_patterns"]
+    # a tokenizer-only download is its own cache entry without the weights
+    assert model_loading.resolve_model_path(
+        "Qwen/model", "revision-a", include_weights=False) == first
+    assert "*.safetensors" not in calls[2]["allow_patterns"]
 
     # the files are cached before the GPU children start
     from quail.backends.quail import worker
@@ -155,10 +159,6 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         assert revision == registry.model("qwen3-4b-fp8").revision
         return str(tmp_path)
 
-    def ensure(count):
-        events.append("children")
-        assert count == 8
-
     def round_fn(kind, subs):
         events.append("boot")
         assert kind == "boot"
@@ -166,6 +166,12 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         assert all(sub["registry"] is registry
                    and sub["model_path"] == str(tmp_path) for sub in subs)
         return [{"boot_s": 3.0, "kind": "cold"}] * 8
+
+    def ensure(count, configuration):
+        events.append("children")
+        assert count == 8
+        assert configuration == ("qwen3-4b-fp8", "h100-sxm", "quail", 8)
+        return SimpleNamespace(round=round_fn)
 
     def run_graph(*args):
         assert events == ["resolve", "children", "boot"]
@@ -176,11 +182,10 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
     monkeypatch.setattr(worker.time, "perf_counter", lambda: next(clock))
     monkeypatch.setattr(worker, "resolve_model_path", resolve)
     monkeypatch.setattr(worker, "_ensure_children", ensure)
-    monkeypatch.setattr(worker, "_round", round_fn)
     monkeypatch.setattr(worker, "execute_distributed_graph", run_graph)
     result = worker.execute_quail_multi({
-        "docs": {}, "workers": 8, "model": "qwen3-4b-fp8",
-        "physical_plan": {"device": "h100-sxm"},
+        "documents": {}, "gpus": 8, "model": "qwen3-4b-fp8",
+        "physical_plan": {"device": "h100-sxm", "backend": "quail"},
         "chunk_tokens": 100, "true_ids": [1], "false_ids": [2],
     }, registry, object())
     assert events == ["resolve", "children", "boot", "query"]

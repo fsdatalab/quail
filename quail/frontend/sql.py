@@ -28,12 +28,13 @@ from quail.logical import (
     CompileError,
     LogicalPlan,
     LogicalPlanBuilder,
+    column_name,
     is_score,
 )
+from quail.logical.expressions import aliased_call
 
 FORBIDDEN = (
     (exp.Qualify, "QUALIFY"),
-    (exp.Window, "window functions"),
     (exp.Union, "UNION"),
     (exp.Except, "EXCEPT"),
     (exp.Intersect, "INTERSECT"),
@@ -127,7 +128,18 @@ def _validate_query(
                 f"output name {struct.name!r} is also a table "
                 f"alias; pick another AS name"
             )
-    projected = tuple(column for column in columns if isinstance(column, Alias))
+    for column in columns:
+        name = column_name(column)
+        if isinstance(column, Alias) and name in dict(b.tables):
+            raise CompileError(
+                f"output name {name!r} is also a table alias; pick another AS name")
+        if isinstance(column, Alias) and any(
+                name in b.catalog.get(provider).columns for _, provider in b.tables):
+            raise CompileError(
+                f"output name {name!r} is also a column of a table in the query; "
+                f"pick another AS name")
+    projected = tuple(column for column in columns
+                      if aliased_call(column) is not None)
     projected_scores = tuple(
         column for column in projected if column.expression.kind == "score"
     )
@@ -183,7 +195,8 @@ def _validate_query(
 
 def _bind_label_names(b: ExpressionBinder, columns: tuple[ColumnRef | Alias, ...]):
     """Assign names to classifications used in projections and filters."""
-    projected = tuple(column for column in columns if isinstance(column, Alias))
+    projected = tuple(column for column in columns
+                      if aliased_call(column) is not None)
     # a filter on a label tests the projected column of the same call;
     # a classification only tested is named after its first test's
     # position among the alias's filters
@@ -251,7 +264,7 @@ def compile_sql(
     distinct = _parse_distinct(tree)
 
     b = ExpressionBinder(catalog, prompts or PromptBinder(
-        turn=turn, layout=layout))
+        turn=turn, layout=layout), dialect=dialect.value)
 
     joins = JoinBinder(b)
     joins.bind_tables(tree)
@@ -259,12 +272,13 @@ def compile_sql(
 
     selection = SelectBinder(b).bind(tree)
     columns, aggregation = selection.columns, selection.aggregation
-    order = bind_order(tree, b, columns, aggregation, selection.structs)
+    order = bind_order(tree, b, columns, aggregation, selection.structs,
+                       selection.windows)
     _validate_query(b, joins, columns, selection.structs)
     named, labels = _bind_label_names(b, columns)
     extracts = {}
     for column in columns:
-        if isinstance(column, Alias) and column.expression.kind == "extract":
+        if aliased_call(column, "extract") is not None:
             extracts.setdefault(column.expression.aliases()[0], []).append(
                 (column.expression, column.name)
             )
@@ -274,7 +288,7 @@ def compile_sql(
         logical.add_scan(
             alias,
             provider,
-            b.doc_columns.get(alias, ""),
+            b.document_columns.get(alias, ""),
             tuple(b.filters.get(alias, ())),
             regular_predicates=tuple(b.regular_predicates.get(alias, ())),
             labels=tuple(labels.get(alias, {}).items()),
@@ -283,6 +297,7 @@ def compile_sql(
                 for call, accepted, selectivity in b.label_tests.get(alias, ())
             ),
             extracts=tuple(extracts.get(alias, ())),
+            extract_filters=tuple(b.extract_tests.get(alias, ())),
         )
     for join in b.joins:
         logical.add_join(join)
@@ -300,4 +315,6 @@ def compile_sql(
         distinct=distinct,
         aggregation=aggregation,
         structs=selection.structs,
+        windows=selection.windows,
+        output=selection.output,
     )

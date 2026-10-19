@@ -17,7 +17,7 @@ def join_request(node) -> dict:
         "partners": list(node.partners),
         "semantics": node.semantics,
         "selectivity": node.selectivity,
-        "written_pos": node.written_pos,
+        "written_position": node.written_position,
         "pairs_from": node.pairs_from,
         "frame": frame,
         "labels": labels,

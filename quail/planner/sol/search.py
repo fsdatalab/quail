@@ -5,25 +5,41 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass
+from functools import partial
+from operator import mul
 from typing import Callable, Mapping
 
+import pyarrow as pa
+
 from quail.catalog.pairs import RowGroups, pair_table, partner_map
+from quail.cost.filters import filter_cost
 from quail.cost.joins import longest_join_input, partner_stream_work
-from quail.cost.sol import speed_of_light
+from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan
 from quail.logical import oriented_join_conditions
+from quail.logical.expressions import column_name, evaluate_expression
 from quail.planner.operators.filter import prepare_filter_costs
 from quail.planner.prompt_lowering import lower_prompt
 from quail.planner.search.filter_order import default_order_rule, order_filters_indexed
 from quail.planner.search.leftdeep import search_left_deep
-from quail.planner.search.live_rows import PairRelation, exact_live_rows
 from quail.planner.search.statistics import filter_stop_keys
-from quail.planner.sol.prefixes import document_shared_tokens, subset_shared_tokens
+from quail.planner.search.survivors import PairRelation, exact_survivors
+from quail.planner.search.table_steps import (
+    ASK,
+    resident_after,
+    table_steps,
+)
+from quail.planner.search.table_steps import CLASSIFY as CLASSIFY_STEP
+from quail.planner.statistics.prefixes import (
+    document_shared_tokens,
+    subset_shared_tokens,
+)
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
-# in the prompt to a row index of that alias's corpus table
-AnswerOracle = Callable[[object, Mapping[str, int]], bool]
+# in the prompt to a row index of that alias's corpus table; for an
+# AI.EXTRACT prompt, the reference answer text, or None for no answer
+AnswerOracle = Callable[[object, Mapping[str, int]], object]
 # label(prompt, assignment) -> str, the reference label of an
 # AI.CLASSIFY prompt for one row assignment
 LabelOracle = Callable[[object, Mapping[str, int]], str]
@@ -33,6 +49,47 @@ FILTER = "AI.IF"
 CLASSIFY = "AI.CLASSIFY"
 EXTRACT = "AI.EXTRACT"
 LABEL_IN = "IN"
+ANSWER_TEST = "ANSWER TEST"
+
+
+
+def _key_values(stores, key):
+    """Return one join key's values from the alias's store."""
+    return evaluate_expression(key, stores[key.alias])
+
+class _EstimatePricing:
+    """Price a table's steps as the estimate prices a question.
+
+    Every step is one question of its tail over the live documents,
+    under the query's shared head.
+    """
+
+    def __init__(self, search, mean_tokens: float):
+        self.search = search
+        self.mean_tokens = mean_tokens
+
+    def asks(self, predicates) -> tuple:
+        search = self.search
+        return prepare_filter_costs(
+            predicates, mean_tokens=self.mean_tokens, model=search.model,
+            device=search.device, chunk_tokens=search.chunk_tokens,
+            lower=search.lower)
+
+    def _question(self, prompt) -> tuple:
+        search = self.search
+        tail = search.lower(prompt).tail_tokens
+        return tuple(partial(mul, filter_cost(
+            tail, self.mean_tokens, search.model, search.device,
+            search.chunk_tokens, first=fresh)) for fresh in (True, False))
+
+    def classify(self, call, name: str) -> tuple:
+        return self._question(call.prompt)
+
+    def extract(self, node) -> tuple:
+        return self._question(node.call.prompt)
+
+    def document_head(self, prompt):
+        return None
 
 
 @dataclass
@@ -74,12 +131,14 @@ class Search:
         self.window = model.sliding_window
         stores = query.token_inputs()
         operators = query.logical.operators()
+        self.logical_operators = operators
         self.scans, self.filters, self.joins = (
             operators.scans, operators.filters, operators.joins
         )
         self.labels = operators.labels
         self.label_filters = operators.label_filters
         self.extracts = operators.extracts
+        self.extract_filters = operators.extract_filters
         if self.labels.calls and label is None:
             raise ValueError(
                 "the query classifies documents; pass label=(prompt, "
@@ -91,12 +150,14 @@ class Search:
                 self.joined_classifications.setdefault(
                     frozenset(call.aliases()), []).append(call)
         self.order = query.order
-        tokenizer = query.session.tokenizer
+        self.tokenizer = query.session.tokenizer
         self._lowered = {}
+        # readout rows of the answers the filter stages read
+        self.answer_rows = 0.0
 
         def lower(prompt):
             if prompt not in self._lowered:
-                self._lowered[prompt] = lower_prompt(prompt, tokenizer)
+                self._lowered[prompt] = lower_prompt(prompt, self.tokenizer)
             return self._lowered[prompt]
 
         self.lower = lower
@@ -107,10 +168,11 @@ class Search:
         for scan_node in self.scans:
             store = stores[scan_node.alias]
             tokens = [int(length) for length in store.lengths]
-            shared = (document_shared_tokens(store) if credit_shared
+            shared = (document_shared_tokens(store.tokens) if credit_shared
                       else [0] * len(tokens))
             self.aliases[scan_node.alias] = _AliasData(
-                column=f"{scan_node.provider}.{scan_node.column}",
+                column=f"{scan_node.provider}."
+                       f"{column_name(scan_node.column, qualified=False)}",
                 tokens=tokens,
                 shared=shared,
             )
@@ -131,14 +193,8 @@ class Search:
             if oriented is None:
                 continue
             left_alias, right_alias, conditions = oriented
-            left_keys = [
-                stores[left.alias].column(left.column)
-                for left, _ in conditions
-            ]
-            right_keys = [
-                stores[right.alias].column(right.column)
-                for _, right in conditions
-            ]
+            left_keys = [_key_values(stores, left) for left, _ in conditions]
+            right_keys = [_key_values(stores, right) for _, right in conditions]
             pairs = pair_table(left_alias, left_keys, right_alias, right_keys)
             self.allowed_pairs[position] = {
                 left_alias: partner_map(pairs, left_alias, right_alias),
@@ -163,7 +219,7 @@ class Search:
         return ask(resident, prefix - resident + suffix,
                    window=self.window) + Work(state_written=1.0)
 
-    def question_work(self, alias: str, live, tail: int, first: bool) -> Work:
+    def question_work(self, alias: str, rows, tail: int, first: bool) -> Work:
         """Return the work of one question asked of every live document.
 
         The first question on an alias computes each document's prefix,
@@ -175,14 +231,14 @@ class Search:
             self.aliases[alias].column, set())
         suffix = tail + self.canvas
         work = Work()
-        for row in live:
+        for row in rows:
             if first and not (self.credit_shared and row in computed):
                 work = work + self.first_use(alias, row, suffix)
             else:
                 prefix = self.pre + tokens[row]
                 work = work + ask(prefix, suffix, window=self.window)
         if first:
-            computed.update(live)
+            computed.update(rows)
         return work
 
     def join_stage_work(self, anchor, partners, survivors, prompt,
@@ -237,7 +293,7 @@ class Search:
 
     # ---- filters and classifications --------------------------------
 
-    def stop_key_rows(self, alias, live, order, predicates) -> list[list[int]]:
+    def stop_key_rows(self, alias, rows, order, predicates) -> list[list[int]]:
         """Return per stage the rows read when each key stops at a survivor.
 
         A key with a row that survives every stage reads only its
@@ -247,23 +303,23 @@ class Search:
         """
         tokens = self.aliases[alias].tokens
         groups: dict[tuple, list[int]] = {}
-        for row in live:
+        for row in rows:
             groups.setdefault(self.stop_groups[alias][row], []).append(row)
         reached: list[list[int]] = [[] for _ in order]
         for rows in groups.values():
             survivors = [
                 row for row in rows
-                if all(self.answer(predicates[written_pos].prompt, {alias: row})
-                       for written_pos in order)]
+                if all(self.answer(predicates[written_position].prompt, {alias: row})
+                       for written_position in order)]
             if survivors:
                 shortest = min(survivors, key=lambda row: tokens[row])
                 for stage in reached:
                     stage.append(shortest)
                 continue
             for row in rows:
-                for index, written_pos in enumerate(order):
+                for index, written_position in enumerate(order):
                     reached[index].append(row)
-                    if not self.answer(predicates[written_pos].prompt,
+                    if not self.answer(predicates[written_position].prompt,
                                        {alias: row}):
                         break
         return [sorted(rows) for rows in reached]
@@ -271,12 +327,11 @@ class Search:
     def run_filters(self):
         """Apply each alias's filters and classifications with exact answers.
 
-        The AI.IF filters run first in the planner's order. Then each
-        classification runs once over the live documents, followed by
-        the label filters that test it, in written order; the
-        classifications no label filter tests follow. An alias whose
-        filters carry a stop key reads only each key's shortest
-        survivor, or every document of a key with none.
+        The AI.IF asks, the classifications with the label filters that
+        test them, and the extractions with the tests of their answers
+        run in the planner's order, by cost per rejected document. An
+        alias whose filters carry a stop key reads only each key's
+        shortest survivor, or every document of a key with none.
 
         Returns:
             (survivors by alias, work, stage records).
@@ -298,115 +353,156 @@ class Search:
             if not asks and not calls and not extracts:
                 continue
             tokens = self.aliases[alias].tokens
-            mean_tokens = sum(tokens) / len(tokens) if tokens else 0
-            order = [asks[index] for index in order_filters_indexed(
-                prepare_filter_costs(
-                    [predicates[position] for position in asks],
-                    prefix_tokens=self.pre + mean_tokens,
-                    model=self.model, device=self.device,
-                    chunk_tokens=self.chunk_tokens, lower=self.lower),
-                rule)] if asks else []
-            live = survivors[alias]
+            mean_document_tokens = sum(tokens) / len(tokens) if tokens else 0
+            steps = table_steps(self.logical_operators, alias, asks,
+                                _EstimatePricing(self, self.pre + mean_document_tokens))
+            ordered = [steps[index] for index in order_filters_indexed(
+                steps, rule, count=len(survivors[alias]), resident=resident_after)]
+            rows = survivors[alias]
             reached = None
-            if order and alias in self.stop_groups:
-                reached = self.stop_key_rows(alias, live, order, predicates)
+            if alias in self.stop_groups and all(
+                    step.kind == ASK for step in ordered):
+                order = [step.key for step in ordered]
+                reached = self.stop_key_rows(alias, rows, order, predicates)
                 if self.credit_shared:
                     # a skipped document computes no prefix for another
                     self.aliases[alias].shared = subset_shared_tokens(
-                        self.stores[alias], reached[0])
-            first = True
-            for index, written_pos in enumerate(order):
+                        self.stores[alias].tokens, reached[0])
+            previous = None
+            for index, step in enumerate(ordered):
                 if reached is not None:
-                    live = reached[index]
-                predicate = predicates[written_pos]
-                stage_work = self.question_work(
-                    alias, live, self.lower(predicate.prompt).tail_tokens, first)
-                first = False
+                    rows = reached[index]
+                # a step reads the documents afresh unless the step
+                # before it left their KV in the pipeline
+                first = previous is None or not resident_after(previous, step)
+                previous = step
+                if step.kind == ASK:
+                    rows, stage_work = self.ask_stage(
+                        alias,
+                        predicates[step.key],
+                        step.key,
+                        rows,
+                        first,
+                        stages,
+                    )
+                elif step.kind == CLASSIFY_STEP:
+                    rows, stage_work = self.classify_stage(
+                        alias, step.key, rows, first, stages)
+                else:
+                    node = next(node for node in extracts if node.name == step.key)
+                    rows, stage_work = self.extract_stage(
+                        alias, node, rows, first, stages
+                    )
                 work = work + stage_work
-                passed = [
-                    row for row in live
-                    if self.answer(predicate.prompt, {alias: row})
-                ]
-                stages.append(_stage(
-                    FILTER, alias, predicate.prompt.template, written_pos,
-                    self.lower(predicate.prompt).tail_tokens, predicate.selectivity,
-                    live, passed, stage_work))
-                live = passed
-            steps = [(test.call, test)
-                     for test in self.label_filters.get(alias, ())]
-            steps.extend((call, None) for call in calls
-                         if call not in self.labels.tests)
-            classified = set()
-            for call, test in steps:
-                if call not in classified:
-                    stage_work = self.question_work(
-                        alias, live, self.lower(call.prompt).tail_tokens, first)
-                    first = False
-                    work = work + stage_work
-                    stages.append(_stage(
-                        CLASSIFY, alias, call.prompt.template, None,
-                        self.lower(call.prompt).tail_tokens, None, live, live,
-                        stage_work, name=self.labels.names[call]))
-                    classified.add(call)
-                if test is not None:
-                    accepted = set(test.values)
-                    passed = [
-                        row for row in live
-                        if self.label(call.prompt, {alias: row}) in accepted
-                    ]
-                    stages.append(_stage(
-                        LABEL_IN, alias, call.prompt.template, test.position,
-                        0, test.selectivity, live, passed, Work(),
-                        name=self.labels.names[call],
-                        accepted=list(test.values)))
-                    live = passed
-            # an extraction follows the labels; it keeps every document
-            for node in extracts:
-                stage_work = self.question_work(
-                    alias, live, self.lower(node.call.prompt).tail_tokens, first)
-                first = False
-                work = work + stage_work
-                stages.append(_stage(
-                    EXTRACT, alias, node.call.prompt.template, None,
-                    self.lower(node.call.prompt).tail_tokens, None, live, live,
-                    stage_work, name=node.name))
-            survivors[alias] = live
+            survivors[alias] = rows
         return survivors, work, stages
+
+    def ask_stage(self, alias, predicate, written_position, rows, first, stages):
+        """Run one AI.IF over the live rows; return the survivors and work."""
+        stage_work = self.question_work(
+            alias, rows, self.lower(predicate.prompt).tail_tokens, first)
+        passed = [row for row in rows if self.answer(predicate.prompt, {alias: row})]
+        stages.append(_stage(
+            FILTER, alias, predicate.prompt.template, written_position,
+            self.lower(predicate.prompt).tail_tokens, predicate.selectivity,
+            rows, passed, stage_work))
+        return passed, stage_work
+
+    def classify_stage(self, alias, call, rows, first, stages):
+        """Classify the live rows, then apply the label filters testing the call."""
+        stage_work = self.question_work(
+            alias, rows, self.lower(call.prompt).tail_tokens, first)
+        self.answer_rows += len(rows)
+        stages.append(_stage(
+            CLASSIFY, alias, call.prompt.template, None,
+            self.lower(call.prompt).tail_tokens, None, rows, rows,
+            stage_work, name=self.labels.names[call], answer_rows=len(rows)))
+        for test in self.label_filters.get(alias, ()):
+            if test.call != call:
+                continue
+            accepted = set(test.condition.value)
+            passed = [row for row in rows
+                      if self.label(call.prompt, {alias: row}) in accepted]
+            stages.append(_stage(
+                LABEL_IN, alias, call.prompt.template, test.position,
+                0, test.selectivity, rows, passed, Work(),
+                name=self.labels.names[call],
+                accepted=list(test.condition.value)))
+            rows = passed
+        return rows, stage_work
+
+    def extract_stage(self, alias, node, rows, first, stages):
+        """Extract from the live rows, then apply the tests of the answers.
+
+        The reference answer is verified in one pass after the cue:
+        each of its spans and a closing quote, or the quote alone when
+        it has none, each token a readout row.
+        """
+        tail = self.lower(node.call.prompt).tail_tokens
+        stage_work = self.question_work(alias, rows, tail, first)
+        answers = {row: self.answer(node.call.prompt, {alias: row}) for row in rows}
+        answer_rows = 0
+        for row, answer in answers.items():
+            spans = [answer] if isinstance(answer, str) else list(answer or ())
+            tokens = sum(len(self.tokenizer(span)) + 1 for span in spans) or 1
+            context = self.pre + self.aliases[alias].tokens[row] + tail
+            stage_work = stage_work + ask(context, tokens, window=self.window)
+            answer_rows += tokens
+        self.answer_rows += answer_rows
+        stages.append(_stage(
+            EXTRACT, alias, node.call.prompt.template, None, tail, None, rows,
+            rows, stage_work, name=node.name, answer_rows=answer_rows))
+        for test in self.extract_filters.get(alias, ()):
+            if test.name != node.name:
+                continue
+            passed = self.answer_survivors(test.condition, rows, answers)
+            stages.append(_stage(
+                ANSWER_TEST, alias, node.call.prompt.template,
+                test.position, 0, test.selectivity, rows, passed, Work(),
+                name=node.name, condition=str(test.condition)))
+            rows = passed
+        return rows, stage_work
+
+    def answer_survivors(self, condition, rows, answers) -> list:
+        """Return the live rows whose reference answer passes the condition."""
+        kept = condition.accepts(pa.table({condition.column.column: pa.array(
+            [answers[row] for row in rows], pa.string())}))
+        return [row for row, keep in zip(rows, kept.to_pylist()) if keep]
 
     # ---- joins -----------------------------------------------------
 
-    def anchor_fits(self, prompt, anchor, stage_aliases, live) -> bool:
+    def anchor_fits(self, prompt, anchor, stage_aliases, survivors) -> bool:
         """Return whether the longest tuple fits one forward pass."""
         labels_by_alias, tail = _prompt_token_counts(prompt)
 
         def longest(alias):
-            return max((self.aliases[alias].tokens[row] for row in live[alias]),
+            return max((self.aliases[alias].tokens[row] for row in survivors[alias]),
                        default=0)
 
         partners = [alias for alias in stage_aliases if alias != anchor]
         frame = labels_by_alias[anchor]["frame"]
-        if not live[anchor] or any(not live[partner] for partner in partners):
+        if not survivors[anchor] or any(not survivors[partner] for partner in partners):
             return self.pre + longest(anchor) + frame <= self.chunk_tokens
         return longest_join_input(
             self.pre, longest(anchor), frame, tail,
             [(labels_by_alias[partner]["label"], longest(partner))
              for partner in partners]) <= self.chunk_tokens
 
-    def cross_resident(self, anchor, live, live_cache) -> set[int]:
+    def cross_resident(self, anchor, survivors, survivors_cache) -> set[int]:
         """Return anchor rows whose prefix another alias of its column holds.
 
         A filtered alias computed every row of its column. An alias in
-        live_cache holds the prefixes of its live rows; it computed at
+        survivors_cache holds the prefixes of its live rows; it computed at
         least those, so the credit is conservative.
         """
         column = self.aliases[anchor].column
         rows = set(self.computed_rows_by_column.get(column, ()))
-        for other in live_cache:
+        for other in survivors_cache:
             if other != anchor and self.aliases[other].column == column:
-                rows.update(live[other])
+                rows.update(survivors[other])
         return rows
 
-    def joined_classification_work(self, call, anchor, partner, live,
+    def joined_classification_work(self, call, anchor, partner, survivors,
                                    relation) -> tuple[Work, dict]:
         """Price one classification of the pairs a join kept, on its anchor.
 
@@ -421,19 +517,28 @@ class Search:
                                        if relation.left == anchor
                                        else (right_row, left_row))
             kept.setdefault(anchor_row, set()).add(partner_row)
-        live_partners = set(live[partner])
-        anchor_rows = [row for row in live[anchor]
-                       if kept.get(row, set()) & live_partners]
+        partner_survivors = set(survivors[partner])
+        anchor_rows = [row for row in survivors[anchor]
+                       if kept.get(row, set()) & partner_survivors]
         work = self.join_stage_work(
-            anchor, [partner], {anchor: anchor_rows, partner: live[partner]},
+            anchor, [partner], {anchor: anchor_rows, partner: survivors[partner]},
             self.lower(call.prompt), anchor_rows, allowed=kept)
-        pairs = sum(len(kept[row] & live_partners) for row in anchor_rows)
+        pairs = sum(len(kept[row] & partner_survivors) for row in anchor_rows)
         return work, {
             "name": self.labels.names[call],
             "template": call.prompt.template,
             "pairs": pairs,
             "fresh_tokens": work.tokens,
+            "answer_rows": pairs,
         }
+
+    def latency(self, candidate) -> SpeedOfLight:
+        """Price a candidate's work with its answer rows."""
+        rows = self.answer_rows + sum(
+            record["answer_rows"] for step in candidate.steps
+            for record in step["classifications"])
+        return speed_of_light(candidate.work, self.model, self.device,
+                              self.chunk_tokens, rows=rows)
 
     def search_joins_sol(self, base_rows, resident, base_work):
         """Search every feasible left deep plan over the exact filtered rows.
@@ -463,65 +568,65 @@ class Search:
             edge_relations.append(PairRelation(left, right, passing))
             edge_aliases.append(frozenset((left, right)))
 
-        live_cache = {}
+        survivors_cache = {}
 
-        def live_for(active_edges: frozenset[int]):
-            if active_edges not in live_cache:
-                live_cache[active_edges] = exact_live_rows(
+        def survivors_for(active_edges: frozenset[int]):
+            if active_edges not in survivors_cache:
+                survivors_cache[active_edges] = exact_survivors(
                     base_rows,
                     tuple(edge_relations[index]
                           for index in sorted(active_edges)),
                 )
-            return live_cache[active_edges]
+            return survivors_cache[active_edges]
 
         def price_step(edge_index, relations, applied, cached):
             join = joins[edge_index]
             relation = edge_relations[edge_index]
             stage_aliases = (relation.left, relation.right)
             added = edge_aliases[edge_index] - relations
-            live = live_for(applied)
+            survivors = survivors_for(applied)
             classifications = self.joined_classifications.get(
                 frozenset(stage_aliases), ())
             for anchor in stage_aliases:
                 if not all(
-                        self.anchor_fits(prompt, anchor, stage_aliases, live)
+                        self.anchor_fits(prompt, anchor, stage_aliases, survivors)
                         for prompt in map(self.lower, [join.prompt] + [
                             call.prompt for call in classifications])):
                     continue
                 partners = [alias for alias in stage_aliases if alias != anchor]
                 allowed = self.allowed_pairs.get(edge_index, {}).get(anchor)
                 stage_work = self.join_stage_work(
-                    anchor, partners, live, self.lower(join.prompt),
-                    live[anchor] if anchor in cached else (),
-                    self.cross_resident(anchor, live, cached),
+                    anchor, partners, survivors, self.lower(join.prompt),
+                    survivors[anchor] if anchor in cached else (),
+                    self.cross_resident(anchor, survivors, cached),
                     allowed=allowed,
                 )
                 classified = []
                 for call in classifications:
                     call_work, record = self.joined_classification_work(
-                        call, anchor, partners[0], live, relation)
+                        call, anchor, partners[0], survivors, relation)
                     stage_work = stage_work + call_work
                     classified.append(record)
                 next_cache = cached | {anchor}
                 passing = sum(
                     1
-                    for left_row in live[relation.left]
-                    for right_row in live[relation.right]
+                    for left_row in survivors[relation.left]
+                    for right_row in survivors[relation.right]
                     if (left_row, right_row) in relation.pairs
                 )
                 step = {
                     "template": join.prompt.template,
-                    "written_pos": edge_index,
+                    "written_position": edge_index,
                     "added_alias": next(iter(added), None),
                     "aliases": list(stage_aliases),
                     "anchor": anchor,
                     "partners": partners,
                     "evaluated_pairs": (
-                        math.prod(len(live[alias]) for alias in stage_aliases)
+                        math.prod(len(survivors[alias]) for alias in stage_aliases)
                         if allowed is None else sum(
-                            sum(1 for partner_row in live[partners[0]]
+                            sum(1 for partner_row in survivors[partners[0]]
                                 if partner_row in allowed.get(row, ()))
-                            for row in live[anchor])),
+                            for row in survivors[anchor])),
                     "passing_pairs": passing,
                     "fresh_tokens": stage_work.tokens,
                     "classifications": classified,
@@ -535,15 +640,10 @@ class Search:
         if not search.candidates:
             raise ValueError("query join graph has no connected left deep plan")
 
-        def candidate_seconds(candidate):
-            return speed_of_light(
-                candidate.work, self.model, self.device,
-                self.chunk_tokens).seconds
-
         best = min(
             search.candidates,
             key=lambda candidate: (
-                candidate_seconds(candidate),
+                self.latency(candidate).seconds,
                 candidate.work.tokens,
                 candidate.work.pairs,
                 candidate.work.kv_written,
@@ -554,19 +654,21 @@ class Search:
         return best, search
 
 
-def _stage(operator, alias, template, written_pos, question_tokens,
-           selectivity, live, passed, work, **extra) -> dict:
+def _stage(operator, alias, template, written_position, question_tokens,
+           selectivity, rows, passed, work, **extra) -> dict:
     """Return one alias stage's record."""
     return {
         "operator": operator,
         "alias": alias,
         "template": template,
-        "written_pos": written_pos,
+        "written_position": written_position,
         "question_tokens": question_tokens,
         "provided_selectivity": selectivity,
-        "evaluated": len(live),
+        "evaluated": len(rows),
         "passed": len(passed),
-        "selectivity": (round(len(passed) / len(live), 6) if live else 0.0),
+        "selectivity": (
+            round(len(passed) / len(rows), 6) if rows else 0.0
+        ),
         "fresh_tokens": work.tokens,
         **extra,
     }

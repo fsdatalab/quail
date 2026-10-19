@@ -1,0 +1,524 @@
+---
+title: SQL functions
+---
+
+Use SQL functions and clauses to process rows alongside
+[AI functions](/docs/user-guide/sql/ai-functions). Quail supports text
+expressions, conditions, grouping, sorting, and windows. Every query
+must include an AI function.
+
+Examples use BigQuery syntax unless a different dialect is named.
+See the [SQL reference](/docs/user-guide/sql) for dialect selection.
+
+## Functions and query clauses
+
+Select a row to jump to its syntax and examples. The entries follow the
+same order as the sections below.
+
+<div className="function-index">
+
+| Function or clause | Description |
+| --- | --- |
+| [`SELECT`, `FROM`](#select-from-join-limit) | Selects columns from a registered table. |
+| [`JOIN`, `CROSS JOIN`](#joins) | Forms document pairs for an AI condition. |
+| [`EXISTS`, `NOT EXISTS`](#exists-and-not-exists) | Keeps rows with a match, or with no matches. |
+| [`WHERE`, `ON`](#where-and-on) | Filters rows and restricts join pairs. |
+| [`ORDER BY`](#order-by) | Sorts result rows. |
+| [`SELECT DISTINCT`](#select-distinct) | Removes duplicate result rows. |
+| [`LIMIT`](#select-from-join-limit) | Returns at most the requested number of rows. |
+| [`OFFSET`](#offset) | Skips rows before applying a limit. |
+| [`LENGTH(column)`](#lengthcolumn) | Counts characters in a text value. |
+| [`LOWER(column)`](#lowercolumn) | Converts text to lowercase. |
+| [`UPPER(column)`](#uppercolumn) | Converts text to uppercase. |
+| [`TRIM(column)`](#trimcolumn) | Removes whitespace at both ends of the text. |
+| [`column LIKE pattern`](#column-like-pattern) | Matches a SQL text pattern. |
+| [`column ILIKE pattern`](#column-ilike-pattern) | Matches a SQL text pattern without case sensitivity. |
+| [`CONTAINS_SUBSTR(column, text)`](#contains_substrcolumn-text) | Finds text without case sensitivity (BigQuery). |
+| [`CONTAINS(column, text)`](#containscolumn-text) | Finds text with case sensitivity (Snowflake). |
+| [`STARTS_WITH(column, text)`](#starts_withcolumn-text) | Tests the start of a value. Snowflake uses `STARTSWITH`. |
+| [`ENDS_WITH(column, text)`](#ends_withcolumn-text) | Tests the end of a value. Snowflake uses `ENDSWITH`. |
+| [`REGEXP_CONTAINS(column, pattern)`](#regexp_containscolumn-pattern) | Finds a regular expression match anywhere in the value (BigQuery). |
+| [`REGEXP_LIKE(column, pattern)`](#regexp_likecolumn-pattern) | Matches a regular expression against the whole value (Snowflake). |
+| [`GROUP BY`, `HAVING`](#group-by-and-having) | Groups rows and filters aggregate results. |
+| [`COUNT(*)`](#count) | Counts rows. |
+| [`COUNT(column)`](#countcolumn) | Counts values that are not null. |
+| [`COUNT(DISTINCT column)`](#countdistinct-column) | Counts distinct values that are not null. |
+| [`SUM(column)`](#sumcolumn) | Adds values. |
+| [`AVG(column)`](#avgcolumn) | Computes the average. |
+| [`MIN(column)`](#mincolumn) | Returns the smallest value. |
+| [`MAX(column)`](#maxcolumn) | Returns the largest value. |
+| [`ROW_NUMBER() OVER (...)`](#row_number-over-) | Numbers rows within each partition, starting at 1. |
+| [`LAG(column) OVER (...)`](#lagcolumn-over-) | Reads the preceding row's value. |
+| [`LEAD(column) OVER (...)`](#leadcolumn-over-) | Reads the following row's value. |
+| [`SUM(column) OVER (...)`](#sumcolumn-over-) | Computes the running sum through the current row. |
+| [`COUNT(*) OVER (...)`](#count-over-) | Counts rows through the current row. |
+| [`COUNT(column) OVER (...)`](#countcolumn-over-) | Counts non-null values through the current row. |
+
+</div>
+
+## SQL clauses
+
+### SELECT, FROM, JOIN, LIMIT
+
+Quail supports these SQL clauses with the following limits:
+
+- **`SELECT`** lists columns, [column expressions](#column-expressions),
+  `AI.SCORE`, `AI.CLASSIFY`, or `AI.EXTRACT` outputs, and
+  [window functions](#window-functions). Use `AS` to name a result
+  column. AI outputs and window functions require a name. `*` expands
+  to all table columns.
+- **`FROM`** names a registered table, with an optional alias.
+- **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
+  `RIGHT`, `FULL`) are not.
+- **`LIMIT`** takes a positive integer.
+
+### Joins
+
+Use `JOIN` or `CROSS JOIN` to form document pairs for an AI condition.
+A join must include an AI function. Column comparisons in `ON` can
+restrict the pairs sent to the model. See
+[AI join examples](/docs/user-guide/sql/ai-functions#joining).
+
+### EXISTS and NOT EXISTS
+
+Use `EXISTS` to keep a row with at least one AI match. Use `NOT EXISTS`
+to keep a row with no AI matches. The subquery must have the form
+`SELECT 1 FROM <table> WHERE AI.IF(...)`. See the
+[query examples](/docs/user-guide/sql/ai-functions#exists-and-not-exists).
+
+### WHERE and ON
+
+`WHERE` keeps rows that satisfy the given conditions. `ON` specifies
+which rows to join. Both support the following conditions on table columns:
+
+| Condition | SQL |
+| --- | --- |
+| Compare with a value | `=`, `<>`, `<`, `<=`, `>`, `>=` |
+| Match a value in a list | `IN (...)` |
+| Keep null values | `IS NULL` |
+| Keep non-null values | `IS NOT NULL` |
+
+Values can be numbers, strings, or booleans. `IN` requires a non-empty
+list of constant values. Combine conditions with `AND`.
+Comparisons exclude null values. Use `IS NULL` to keep them.
+
+For example, imagine a `reviews` table with columns `id`, `body`, `year`,
+and `stars`. Return IDs of reviews from 2024 with at least four stars
+that mention shipping:
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE r.year = 2024
+  AND r.stars >= 4
+  AND AI.IF(PROMPT('Does the review mention shipping? {0}', r.body))
+```
+
+Quail checks the year and rating before evaluating `AI.IF`.
+
+A condition in `ON` filters the table containing the referenced column.
+Comparisons between columns from different tables require `column = column`
+in `ON`. See [Joining](/docs/user-guide/sql/ai-functions#joining).
+
+
+### ORDER BY
+
+`ORDER BY` sorts result rows by columns or
+[column expressions](#column-expressions). To sort by a score or
+classification label or window output, use its `AS` name. AI calls cannot appear
+directly in `ORDER BY`.
+Sorting columns need not appear in `SELECT`, except when using
+`SELECT DISTINCT`.
+
+The default direction is `ASC`. Use `DESC` for descending order.
+`NULLS FIRST` or `NULLS LAST` overrides the dialect's default null placement:
+
+- BigQuery puts nulls first for `ASC` and last for `DESC`.
+- Snowflake puts nulls last for `ASC` and first for `DESC`.
+
+For example, imagine a `documents` table with customer messages in `body`.
+This query returns ten documents with the highest refund-request scores:
+
+```sql
+SELECT d.id,
+       AI.SCORE(PROMPT('Does the customer request a refund? {0}', d.body))
+           AS refund_score
+FROM documents d
+ORDER BY refund_score DESC NULLS LAST, d.id ASC
+LIMIT 10
+```
+
+The example query uses `d.id ASC` to order documents with equal scores by ID.
+
+### SELECT DISTINCT
+
+`SELECT DISTINCT` removes duplicate rows by comparing all selected
+columns. Quail removes duplicates before sorting and applying `OFFSET`
+or `LIMIT`. Every sorting column must appear in `SELECT`.
+
+### OFFSET
+
+`OFFSET n` skips `n` rows after sorting and before applying `LIMIT`.
+The count must be an integer greater than or equal to zero. Use `ORDER BY`
+to specify which rows to skip. Without an explicit order, the skipped
+rows can differ between runs.
+
+Sorting or removing duplicates prevents `LIMIT` from stopping AI
+evaluation early. An offset greater than zero has the same effect.
+
+## Column expressions
+
+Use a dotted path to read a field of a struct column, such as
+`r.details.body`. Text functions can read text columns
+or fields within a struct.
+
+For example, imagine a `pages` table with an `id` column and a `details`
+struct containing a `body` field. Return the IDs and text lengths of
+pages that discuss shipping:
+
+```sql
+SELECT p.id, LENGTH(p.details.body) AS body_length
+FROM pages p
+WHERE AI.IF(PROMPT('Does the page discuss shipping? {0}', p.details.body))
+ORDER BY body_length;
+```
+
+- Struct fields and text functions work in `PROMPT`, `ON`, `WHERE`,
+  `SELECT`, `ORDER BY`, `GROUP BY`, and aggregate arguments.
+- Use `AS` to name a result column. Without `AS`, Quail uses the expression
+  text, such as `length(p.details.body)`.
+- Each expression supports one text function. Nested functions, such
+  as `LOWER(TRIM(p.details.body))`, are unsupported.
+
+For example, the function entries below use a review row where `r.body`
+is `' Great Film '`, including the spaces at both ends.
+
+### `LENGTH(column)`
+
+Counts characters, including spaces.
+
+`LENGTH(r.body)` returns `12`.
+
+### `LOWER(column)`
+
+Converts text to lowercase and preserves spaces.
+
+`LOWER(r.body)` returns `' great film '`.
+
+### `UPPER(column)`
+
+Converts text to uppercase and preserves spaces.
+
+`UPPER(r.body)` returns `' GREAT FILM '`.
+
+### `TRIM(column)`
+
+Removes whitespace at both ends of the text.
+
+`TRIM(r.body)` returns `'Great Film'`.
+
+## Text conditions
+
+Each condition tests a text column against a constant string or pattern.
+Text function names differ between BigQuery and Snowflake.
+
+- Text conditions exclude null values. Use `NOT` to negate a text
+  condition, such as `NOT CONTAINS_SUBSTR(r.body, 'shipping')`.
+  Negated conditions also exclude null values.
+- To compare text length or change case before a comparison, use a
+  [column expression](#column-expressions), such as `LENGTH(r.body) < 40`
+  or `LOWER(r.body) = 'shipping'`.
+- Text conditions also work on [extracted answers](/docs/user-guide/sql/ai-functions#filter-on-answers).
+  Classification labels support only `=` and `IN`.
+
+For example, the entries below use a review row where `r.body` is
+`'Great Film'`.
+
+### `column LIKE pattern`
+
+Matches text with case sensitivity. `%` matches any text; `_` matches one character.
+
+`r.body LIKE '%Film%'` returns `TRUE`.
+
+### `column ILIKE pattern`
+
+Uses the same patterns as `LIKE` and ignores case.
+
+`r.body ILIKE '%film%'` returns `TRUE`.
+
+### `CONTAINS_SUBSTR(column, text)`
+
+Finds the supplied text anywhere in the value, ignoring case.
+
+`CONTAINS_SUBSTR(r.body, 'film')` returns `TRUE`.
+
+Use this function in the BigQuery dialect.
+
+### `CONTAINS(column, text)`
+
+Finds the supplied text anywhere in the value, with case sensitivity.
+
+`CONTAINS(r.body, 'film')` returns `FALSE`.
+
+Use this function in the Snowflake dialect.
+
+### `STARTS_WITH(column, text)`
+
+Tests whether the value begins with the supplied text, with case sensitivity.
+
+`STARTS_WITH(r.body, 'Great')` returns `TRUE`.
+
+In Snowflake, use `STARTSWITH(r.body, 'Great')`.
+
+### `ENDS_WITH(column, text)`
+
+Tests whether the value ends with the supplied text, with case sensitivity.
+
+`ENDS_WITH(r.body, 'Film')` returns `TRUE`.
+
+In Snowflake, use `ENDSWITH(r.body, 'Film')`.
+
+### `REGEXP_CONTAINS(column, pattern)`
+
+Finds a regular expression match anywhere in the value.
+
+`REGEXP_CONTAINS(r.body, 'Film')` returns `TRUE`.
+
+Use this function in the BigQuery dialect.
+
+### `REGEXP_LIKE(column, pattern)`
+
+Requires a regular expression match against the whole value.
+
+`REGEXP_LIKE(r.body, 'Film')` returns `FALSE`.
+
+Use this function in the Snowflake dialect. `RLIKE(column, pattern)` is an alias.
+
+Use `REGEXP_LIKE(r.body, '.*Film.*')` to match "Film" anywhere in the value.
+
+## GROUP BY and HAVING
+
+`GROUP BY` groups rows by columns or [column expressions](#column-expressions).
+To group by a score or classification label, use its `AS` name.
+Return grouping columns and aggregate results in `SELECT`, and give
+each aggregate an `AS` name.
+
+`HAVING` filters groups by comparing an aggregate with a number. Refer
+to the aggregate by its name or write the function call. Combine
+conditions with `AND`.
+
+For example, imagine a `reviews` table with review text in `body` and
+numeric ratings in `stars`. Return the count and average rating for
+each sentiment, keeping sentiments with more than ten reviews:
+
+```sql
+SELECT AI.CLASSIFY(PROMPT('What is the sentiment of this review? {0}', r.body),
+                   ['positive', 'negative', 'mixed']) AS sentiment,
+       COUNT(*) AS review_count,
+       AVG(r.stars) AS avg_stars
+FROM reviews r
+GROUP BY sentiment
+HAVING review_count > 10
+ORDER BY review_count DESC
+```
+
+Quail classifies every review before computing the counts and averages.
+Adding `LIMIT` reduces the number of returned groups, not the reviews
+that Quail classifies.
+
+### Aggregate functions
+
+Functions that take a column ignore null values. The column can contain
+stored values or AI outputs. In SQL, an aggregate can also take an
+`AI.SCORE` call directly. Without `GROUP BY`, aggregates operate on all
+rows that pass `WHERE`.
+
+For example, the aggregate entries below use a group of four reviews
+whose `r.stars` values are `2`, `5`, `5`, and `NULL`.
+
+#### `COUNT(*)`
+
+Counts every row in the group.
+
+`COUNT(*)` returns `4`.
+
+In Python, use `count()`.
+
+#### `COUNT(column)`
+
+Counts values that are not null.
+
+`COUNT(r.stars)` returns `3`.
+
+In Python, use `count(column)`.
+
+#### `COUNT(DISTINCT column)`
+
+Counts each distinct non-null value once.
+
+`COUNT(DISTINCT r.stars)` returns `2`.
+
+In Python, use `count_distinct(column)`.
+
+#### `SUM(column)`
+
+Adds the non-null values.
+
+`SUM(r.stars)` returns `12`.
+
+In Python, use `sum_(column)`.
+
+#### `AVG(column)`
+
+Computes the average of the non-null values.
+
+`AVG(r.stars)` returns `4.0`.
+
+In Python, use `avg(column)`.
+
+#### `MIN(column)`
+
+Returns the smallest non-null value.
+
+`MIN(r.stars)` returns `2`.
+
+In Python, use `min_(column)`.
+
+#### `MAX(column)`
+
+Returns the largest non-null value.
+
+`MAX(r.stars)` returns `5`.
+
+In Python, use `max_(column)`.
+
+## Window functions
+
+Window functions add values computed from related result rows, such as
+the previous row's label or a running total. Each input row remains a
+separate result row. A partition is the group of rows used for each
+calculation.
+
+Write `function(...) OVER (...) AS name` in `SELECT`:
+
+- `PARTITION BY` groups rows for the calculation. Without it, all
+  result rows belong to one partition.
+- `ORDER BY` inside `OVER` orders rows within each partition. Include
+  a unique key when ties would make the previous or next row ambiguous.
+- The query's outer `ORDER BY` sets the returned row order. It can use
+  a window output's `AS` name.
+
+For example, imagine a `steps` table with one row per agent step.
+It has columns `id`, `run_id`, `step_index`, `cost`, and `text`, with
+unique step indexes within each run. Classify each step, return the
+previous step's label, and compute the running cost within each run:
+
+```sql
+SELECT s.id,
+       AI.CLASSIFY(
+           PROMPT('What does the agent do here?\n\n{0}', s.text),
+           ['plan', 'act', 'reflect']) AS kind,
+       LAG(kind) OVER (
+           PARTITION BY s.run_id ORDER BY s.step_index) AS previous,
+       SUM(s.cost) OVER (
+           PARTITION BY s.run_id ORDER BY s.step_index) AS running_cost
+FROM steps s
+ORDER BY s.run_id, s.step_index;
+```
+
+The first step in each run has a null `previous` value. Later steps use
+the label already computed for the preceding row. The window calculation
+does not call the model again. A window can read a source column or an
+AI output named earlier in `SELECT`.
+
+### Supported functions
+
+`SUM` treats null values as zero, including when every value so far is
+null. `LAG` and `LEAD` preserve null values in the neighboring row.
+Rows with null partition keys belong to the same partition.
+
+For example, the window entries below use one run with `s.cost` values
+`2`, `NULL`, and `5`, in `s.step_index` order. Each expression uses
+`OVER (PARTITION BY s.run_id ORDER BY s.step_index)`. Results are listed
+in step order. In Python, append `.over(partition_by="s.run_id",
+order_by="s.step_index")` to the function.
+
+#### `ROW_NUMBER() OVER (...)`
+
+Numbers rows within the partition, starting at 1.
+
+`ROW_NUMBER() OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `1, 2, 3`.
+
+In Python, use `row_number()`.
+
+#### `LAG(column) OVER (...)`
+
+Reads the preceding row, or returns null for the first row.
+
+`LAG(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `NULL, 2, NULL`.
+
+In Python, use `lag(column)`.
+
+#### `LEAD(column) OVER (...)`
+
+Reads the following row, or returns null for the last row.
+
+`LEAD(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `NULL, 5, NULL`.
+
+In Python, use `lead(column)`.
+
+#### `SUM(column) OVER (...)`
+
+Adds values through the current row, treating null as zero.
+
+`SUM(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `2, 2, 7`.
+
+In Python, use `sum_(column)`.
+
+#### `COUNT(*) OVER (...)`
+
+Counts every row through the current row.
+
+`COUNT(*) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `1, 2, 3`.
+
+In Python, use `count()`.
+
+#### `COUNT(column) OVER (...)`
+
+Counts non-null values through the current row.
+
+`COUNT(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `1, 1, 2`.
+
+In Python, use `count(column)`.
+
+### Window limits
+
+- Windows require the Quail backend. They run after AI functions, so
+  adding `LIMIT` does not stop model evaluation early.
+- `LAG` and `LEAD` require `ORDER BY` inside `OVER`. They read only the
+  immediately preceding or following row. Offset and default arguments
+  are unsupported.
+- Each window call must be a separate `SELECT` item with an `AS` name.
+  Arithmetic around a window call is unsupported.
+- `SUM` and `COUNT` accumulate one row at a time. Explicit `ROWS` or
+  `RANGE` frames are unsupported.
+- A query cannot combine windows with `GROUP BY` or ordinary aggregates.
+  `QUALIFY` and window functions other than those listed above are
+  unsupported.
+
+See [Python `window()`](/docs/user-guide/python-api/non-ai-functions#window) for the builder
+form and [Window rules](/docs/architecture/optimizer#window-rules) for
+sort reuse and limit placement.
+
+## Unsupported SQL
+
+- `QUALIFY` and window functions outside the [supported list](#supported-functions)
+- `UNION`, `EXCEPT`, `INTERSECT`
+- `OR` between conditions
+- `BETWEEN` and arithmetic in column comparisons
+- Queries with no AI function
+- `JOIN` with only relational predicates (no AI function)
+- Outer joins (`LEFT`, `RIGHT`, `FULL`)
+- `AI.MAP`
+
+Using any of these raises `quail.logical.CompileError`.

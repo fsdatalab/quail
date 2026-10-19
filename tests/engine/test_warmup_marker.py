@@ -42,21 +42,21 @@ def test_concurrent_processes_compile_once_and_touch_in_parallel(tmp_path):
     start, touch = ctx.Barrier(3), ctx.Barrier(2)
     compiles = ctx.Value("i", 0)
     results = ctx.Queue()
-    workers = [ctx.Process(target=_concurrent_warmup,
+    gpus = [ctx.Process(target=_concurrent_warmup,
                            args=(path, start, touch, compiles, results))
                for _ in range(3)]
     try:
-        for worker in workers:
+        for worker in gpus:
             worker.start()
-        for worker in workers:
+        for worker in gpus:
             worker.join(timeout=20)
             assert worker.exitcode == 0
         assert compiles.value == 1
-        assert sorted(results.get(timeout=2) for _ in workers) == [
+        assert sorted(results.get(timeout=2) for _ in gpus) == [
             "compile", "touch", "touch"]
         assert json.loads((tmp_path / "warm.json").read_text()) == {"version": 1}
     finally:
-        for worker in workers:
+        for worker in gpus:
             if worker.is_alive():
                 worker.terminate()
                 worker.join(timeout=5)
@@ -99,7 +99,7 @@ def test_forward_warm_runs_a_classification_chunk(monkeypatch):
     from types import SimpleNamespace
 
     joins = []
-    def run_stages(torch, arena, pipeline, stages, docs, budget, **kw):
+    def run_stages(torch, arena, pipeline, stages, documents, budget, **kw):
         joins.extend(stage for stage in stages if len(stage.suffixes) > 1)
 
     monkeypatch.setattr(warmup, "run_stages", run_stages)

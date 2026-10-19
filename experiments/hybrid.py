@@ -127,7 +127,7 @@ def run_filter(torch, arena, pipeline, answers, documents, questions, budget,
     stages = filter_stages(questions, answers)
     last = len(stages) - 1
     arena.retention_cap_pages = max(
-        0, arena.n_pages - arena.pages_needed(2 * budget))
+        0, arena.num_pages - arena.pages_needed(2 * budget))
 
     def on_settled(document, survived, row):
         if arena.is_resident(document):

@@ -1,7 +1,7 @@
 """Extraction costs: expected work priced like a classification's work.
 
 The estimate sums each document's work over every document, scales it
-to the live count, and prices the total with the component roofline
+to the expected rows, and prices the total with the component roofline
 at ideal packing, as quail/cost/classify.py does. The steps follow the
 executor (quail/backends/quail/executor/extract/): the prompt with
 the document, then the answer, one chosen token and a draft of the
@@ -17,8 +17,9 @@ from KV.
 from dataclasses import dataclass, replace
 from itertools import repeat
 
-from quail.cost.dense_decoder_cost import decoder_seconds
+from quail.cost.budgets import parallel_copies
 from quail.cost.draft_policy import DraftPolicy
+from quail.cost.sol import unrounded_seconds
 from quail.cost.work import Work, ask, decode, scan
 
 
@@ -108,11 +109,13 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
         # the policy's first-round choice for this document, with one stream
         policy = DraftPolicy(draft_tokens, max_answer_tokens, assumptions.answer_tokens)
         draft_tokens = policy.draft_length(
-            round_cost_per_token * (prefix + tail_tokens), 1, live=1)
+            round_cost_per_token * (prefix + tail_tokens), 1, num_streams=1)
     if resident:
         work = ask(prefix, tail_tokens, window=window)
     elif shared:
-        work = ask(shared, prefix + tail_tokens - shared, window=window)
+        # a borrowed prefix includes the prompt head the documents share
+        borrowed = shared + head_tokens
+        work = ask(borrowed, prefix + tail_tokens - borrowed, window=window)
     else:
         work = scan(prefix, tail_tokens, window=window)
     context = prefix + tail_tokens
@@ -145,16 +148,50 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     return work, fed, rows
 
 
-def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
+def table_work(lengths, head_tokens: int, tail_tokens: int, *, window: int,
+               resident: bool, shared, max_answer_tokens: int,
+               draft_tokens: int, draft_policy: str,
+               round_cost_per_token: float, assumptions: ExtractAssumptions,
+               recurrent: bool = False, memo=None) -> tuple[Work, float, float]:
+    """Return the work, fed tokens, and readout rows of every document.
+
+    The sum runs the draft policy once per document, so a planner
+    passes its memo to compute it once per table and prompt; the key
+    holds the length and shared columns by identity, and the memo
+    keeps them alive so another column cannot reuse an identity.
+    """
+    key = ("extract_work", id(lengths), id(shared), head_tokens, tail_tokens,
+           window, resident, max_answer_tokens, draft_tokens, draft_policy,
+           round_cost_per_token, assumptions, recurrent)
+    if memo is not None and key in memo:
+        return memo[key][2]
+    work = Work()
+    fed = rows = 0.0
+    for index, length in enumerate(lengths):
+        own, own_fed, own_rows = document_work(
+            int(length), head_tokens, tail_tokens, window=window,
+            resident=resident, shared=0 if shared is None else int(shared[index]),
+            max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
+            draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
+            assumptions=assumptions, recurrent=recurrent)
+        work += own
+        fed += own_fed
+        rows += own_rows
+    if memo is not None:
+        memo[key] = (lengths, shared, (work, fed, rows))
+    return work, fed, rows
+
+
+def estimate(expected_rows: float, lengths, head_tokens: int, tail_tokens: int, *,
              chunk: int, model, device, resident: bool = False,
              shared=None, max_answer_tokens: int, draft_tokens: int,
              draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
-             workers: int = 1,
-             assumptions: ExtractAssumptions | None = None) -> ExtractCost:
+             gpus: int = 1, assumptions: ExtractAssumptions | None = None,
+             memo=None) -> ExtractCost:
     """Estimate the cost of one extraction over a table.
 
     Args:
-        live: Expected number of documents to extract from.
+        expected_rows: Expected number of documents to extract from.
         lengths: Document lengths in tokens.
         head_tokens: Prompt tokens before the document.
         tail_tokens: Prompt tokens after the document, through the cue.
@@ -169,33 +206,27 @@ def estimate(live: float, lengths, head_tokens: int, tail_tokens: int, *,
         draft_policy: "fixed" or "adaptive", from the extraction plan.
         round_cost_per_token: One document token's KV read per round, in
             fed tokens, from the extraction plan.
-        workers: Model copies sharing the work, assuming balanced document costs.
+        gpus: Model copies sharing the work, assuming balanced document costs.
         assumptions: Expected answer length, separate from execution limits.
+        memo: Where table_work keeps the per-table sum, or None.
 
     Returns:
         Estimated execution time, work, and token counts.
     """
     n = len(lengths)
-    if live <= 0 or n == 0:
+    if expected_rows <= 0 or n == 0:
         return ExtractCost(0.0, 0.0, Work(), 0.0, 0.0)
-    assumptions = ExtractAssumptions() if assumptions is None else assumptions
-    work = Work()
-    fed = rows = 0.0
-    for index, length in enumerate(lengths):
-        own, own_fed, own_rows = document_work(
-            int(length), head_tokens, tail_tokens,
-            window=model.sliding_window, resident=resident,
-            shared=0 if shared is None else int(shared[index]),
-            max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
-            draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
-            assumptions=assumptions, recurrent=bool(model.state_layers))
-        work += own
-        fed += own_fed
-        rows += own_rows
-    scale = live / n
+    work, fed, rows = table_work(
+        lengths, head_tokens, tail_tokens, window=model.sliding_window,
+        resident=resident, shared=shared, max_answer_tokens=max_answer_tokens,
+        draft_tokens=draft_tokens, draft_policy=draft_policy,
+        round_cost_per_token=round_cost_per_token,
+        assumptions=ExtractAssumptions() if assumptions is None else assumptions,
+        recurrent=bool(model.state_layers), memo=memo)
+    scale = expected_rows / n
     total = work * scale
+    copies = parallel_copies(gpus, min(expected_rows, n))
+    seconds = unrounded_seconds(total * (1 / copies), model, device, chunk,
+                                rows=rows * scale / copies)
     passes = total.tokens / chunk
-    copies = max(1, min(workers, live))
-    seconds = decoder_seconds(total * (1 / copies), rows * scale / copies,
-                              passes / copies, model, device)
     return ExtractCost(seconds, passes, total, fed * scale, rows * scale)

@@ -8,13 +8,14 @@ from typing import ClassVar, Optional
 from quail.logical.expressions import (
     ColumnRef,
     CompileError,
-    InList,
+    RegularPredicate,
     _explain,
     model_call,
     validate_predicate,
 )
 from quail.logical.nodes.base import LogicalNode
 from quail.logical.nodes.classify import classifications
+from quail.logical.nodes.extract import extractions
 
 
 @dataclass(frozen=True)
@@ -74,12 +75,12 @@ class SemanticFilter:
 class Filter:
     """Rows whose condition holds, decided without the model.
 
-    The condition tests the label column a one-table SemanticClassify
-    below adds.
+    The condition tests a column a one-table SemanticClassify or a
+    SemanticExtract below adds: a label, an answer, or an answer's span.
     """
 
     input: LogicalNode
-    condition: InList
+    condition: RegularPredicate
     selectivity: Optional[float] = None  # fraction of rows that pass;
     #                                       None means not given
 
@@ -97,15 +98,10 @@ class Filter:
     def validate(self) -> None:
         self.condition.validate()
         column = self.condition.column
-        if not any(
-            node.alias == column.alias
-            and node.name == column.column
-            and len(node.call.aliases()) == 1
-            for node in classifications(self.input)
-        ):
+        if (column.alias, column.column) not in computed_columns(self.input):
             raise CompileError(
-                f"a Filter tests the label column of a one-table "
-                f"classification below it; nothing below computes "
+                f"a Filter tests a column a one-table classification or "
+                f"an extraction below it computes; nothing below computes "
                 f"{column.alias}.{column.column}"
             )
 
@@ -121,6 +117,19 @@ class Filter:
 
     def explain_fields(self) -> dict:
         return {
-            "condition": _explain(self.condition),
+            "condition": str(self.condition),
             "selectivity": self.selectivity,
         }
+
+
+def computed_columns(node) -> frozenset:
+    """Return the columns the classifications and extractions below compute.
+
+    The columns are (alias, column) pairs: labels, answers, and answer
+    spans at or below the node.
+    """
+    columns = {(found.alias, found.name) for found in classifications(node)
+               if len(found.call.aliases()) == 1}
+    for found in extractions(node):
+        columns.update({(found.alias, found.name), (found.alias, found.span_name)})
+    return frozenset(columns)

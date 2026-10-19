@@ -193,7 +193,7 @@ def _plan_phases(arena, groups, stage, undo):
             if source is None:
                 raise ArenaFullError(
                     f"no free checkpoint slot for {key!r}: all "
-                    f"{arena.n_state_slots} belong to documents in use")
+                    f"{arena.num_state_slots} belong to documents in use")
             undo.append(("checkpoint", key, had_slot, previous))
             first, last = group["row0"], group["prefix_end"]
             read = None

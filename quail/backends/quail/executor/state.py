@@ -26,7 +26,7 @@ class LoadedModelState:
     model: Any
     arena: KVArena
     pipeline: ModelPipeline
-    model_spec: ModelSpec | None = None
+    model_spec: ModelSpec
     input_staging: InputStaging | None = None
     label_readout: AsyncLabelLogprobs | None = None
     # a decision model's option-scoring head; None for other models

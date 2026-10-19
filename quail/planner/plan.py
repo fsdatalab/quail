@@ -6,7 +6,6 @@ from typing import Any, Mapping
 from quail.logical import LogicalPlan
 from quail.physical import (
     AiFilter,
-    AiInference,
     AiJoin,
     Barrier,
     Exchange,
@@ -22,21 +21,15 @@ from quail.physical.pipelines import build_pipelines
 from quail.specs import MODELS
 
 
-def inference_seconds(nodes) -> float:
-    """Sum the inference operators' estimated seconds in a physical graph."""
-    return sum(node.spec.estimated_seconds for node in nodes
-               if isinstance(node, AiInference) and node.spec is not None)
-
-
 @dataclass(frozen=True)
 class CorpusStats:
-    n_docs: int
+    num_documents: int
     total_tokens: int
-    max_doc_tokens: int
+    max_document_tokens: int
 
     @property
-    def mean_doc_tokens(self) -> float:
-        return self.total_tokens / max(1, self.n_docs)
+    def mean_document_tokens(self) -> float:
+        return self.total_tokens / max(1, self.num_documents)
 
 @dataclass(frozen=True)
 class Refusal:
@@ -70,14 +63,15 @@ class PhysicalPlan:
 
     estimates holds, per node id, the node's own estimated seconds
     and, for a filter sequence a later join anchors on, the recompute it
-    would pay if its KV were released instead of pinned. estimator
-    recomputes them for an edited graph; it is not compared or shown.
+    would pay if its KV were released instead of pinned. estimator, a
+    PlanPricer, recomputes them and the plan's seconds for an edited
+    graph; it is not compared or shown.
     logical_plan records the selected tree for query execution and explain.
     """
 
     model: str
     device: str
-    workers: int
+    gpus: int
     backend: str = "quail"
     estimated_seconds: float = 0.0
     nodes: tuple = ()          # typed nodes in topological order
@@ -103,7 +97,7 @@ class PhysicalPlan:
         object.__setattr__(self, "root", graph.root)
         object.__setattr__(self, "graph", graph)
         if self.estimator is not None and not self.estimates:
-            object.__setattr__(self, "estimates", self.estimator(graph))
+            object.__setattr__(self, "estimates", self.estimator(graph)[1])
 
 
     def _edge(self, producer: str, consumer: str) -> tuple:
@@ -137,25 +131,24 @@ class PhysicalPlan:
             PlanEditError: The edited operator graph is invalid.
         """
         nodes = plan_kv_retention(
-            PhysicalGraph(tuple(nodes), self.graph.root), self.workers,
-            tuple(self.settings.get("pre_ids", ()))).nodes
+            PhysicalGraph(tuple(nodes), self.graph.root)).nodes
         try:
             edited = replace(self, nodes=nodes, root=None, estimates={})
         except GraphValidationError as error:
             raise PlanEditError(str(error)) from error
-        base = self.settings.get("search_seconds")
-        if base is None:
+        if self.estimator is None:
             return edited
         scheduled = set(self.settings.get("retention", {}).get("initial", {}))
-        pipelines = build_pipelines(edited.graph, self.workers)
+        pipelines = build_pipelines(edited.graph)
         recompute = sum(
             edited.estimates.get(node.node_id, {}).get(
                 "release_recompute_seconds", 0.0)
             for node in edited.nodes
             if isinstance(node, AiFilter) and node.alias not in scheduled
             and not isinstance(pipelines[node.node_id][-1], AiJoin))
-        return replace(edited, estimated_seconds=base + recompute,
-                       estimates=edited.estimates)
+        seconds, estimates = self.estimator(edited.graph)
+        return replace(edited, estimated_seconds=seconds + recompute,
+                       estimates=estimates)
 
     def insert(self, node: PhysicalNode, *, between: tuple) -> "PhysicalPlan":
         """Put node on the edge from producer to consumer.
@@ -242,7 +235,7 @@ class PhysicalPlan:
             backend=self.backend,
             model=self.model,
             device=self.device,
-            workers=self.workers,
+            gpus=self.gpus,
             graph=self.graph,
             codecs=codecs,
             settings=self.settings,
@@ -284,19 +277,15 @@ class EngineConfig:
     attention: str | None = None
 
 
-def plan_kv_retention(graph: PhysicalGraph, workers: int = 1,
-                      shared_head: tuple[int, ...] = ()) -> PhysicalGraph:
+def plan_kv_retention(graph: PhysicalGraph) -> PhysicalGraph:
     """Set operators' KV retention from the next compatible document consumer.
 
     KV between operators on one path stays active in the scheduler. It stays
     available after the path finishes when the next path reads the same
-    documents under the same prompt head. Worker boundaries use the same
-    paths as execution.
+    documents under the same prompt head. Every worker runs the same
+    paths over its own documents.
     """
-    def head(node):
-        return shared_head if node.document_head is None else node.document_head
-
-    paths = build_pipelines(graph, workers)
+    paths = build_pipelines(graph)
     ordered = graph.topological_nodes()
     starts = [node for node in ordered
               if node.node_id in paths and paths[node.node_id][0] is node]
@@ -307,9 +296,7 @@ def plan_kv_retention(graph: PhysicalGraph, workers: int = 1,
         following = next((later for later in starts[index + 1:]
                           if later.document_aliases == (alias,)), None)
         keep = (following is not None
-                and head(first) == head(following)
-                and (workers == 1 or first.worker_pipelining
-                     and following.worker_pipelining))
+                and first.document_head == following.document_head)
         model_nodes = [node for node in members if node.backend is not None]
         # Joins settle anchors after any classification of their surviving pairs.
         settling = next((node for node in reversed(model_nodes)

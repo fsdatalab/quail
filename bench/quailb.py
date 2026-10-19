@@ -28,8 +28,9 @@ import quail_b as benchmark
 from bench import substrait
 from bench.results import write_json
 from quail.baselines.nodes import RequestExecution
+from quail.execution.result import answer_values
 from quail.logical.expressions import SPAN_SUFFIX
-from quail.logical.prompts import bind_classify_prompt
+from quail.logical.prompts import bind_classify_prompt, bind_extract_prompt
 from quail.physical import AiClassify, AiExtract, AiScore
 from quail.planner.plan import Refusal
 from quail.planner.prompt_lowering import lower_prompt
@@ -91,8 +92,19 @@ def queries(session) -> dict:
     return listed
 
 
-def canonical_templates(ground_truth) -> dict[str, str]:
-    """Map each predicate's template as Quail binds it to the written one."""
+def _prompt_key(prompt) -> str:
+    """Return what tells a bound prompt apart: its template, or an extraction's tail."""
+    return prompt.tail if prompt.kind == "extract" else prompt.template
+
+
+def canonical_templates(ground_truth, turn=("", "")) -> dict[str, str]:
+    """Map each predicate's prompt as Quail binds it to the written template.
+
+    Args:
+        ground_truth: The saved predicates and their answers.
+        turn: The model's chat turn text, which an extraction's tail
+            carries.
+    """
     canonical = {}
     for labels in ground_truth.predicates.values():
         predicate = labels.predicate
@@ -108,10 +120,12 @@ def canonical_templates(ground_truth) -> dict[str, str]:
                 predicate["template"],
                 (left,) if right is None else (left, right),
                 predicate["labels"])
+        elif predicate["kind"] == "extract":
+            bound = bind_extract_prompt((left,), predicate["template"], turn)
         else:
             bound = quail.bind_join_prompt(
                 predicate["template"], (left, right))
-        canonical[bound.template] = predicate["template"]
+        canonical[_prompt_key(bound)] = predicate["template"]
     return canonical
 
 
@@ -119,14 +133,20 @@ def _ids(table: pa.Table) -> list[str]:
     return [str(row_id) for row_id in table.column("id").to_pylist()]
 
 
-def answer_oracle(ground_truth, tables):
+def answer_oracle(ground_truth, tables, turn=("", "")):
     """Return the oracle Quail's speed of light estimate takes.
 
     The callable maps (prompt, assignment) to the saved reference answer:
-    TRUE or FALSE for an AI.IF prompt and the label for an AI.CLASSIFY
-    prompt, so it serves as both the `answer` and the `label` oracle.
+    TRUE or FALSE for an AI.IF prompt, the label for an AI.CLASSIFY
+    prompt, and the spans for an AI.EXTRACT prompt, so it serves as both
+    the `answer` and the `label` oracle.
+
+    Args:
+        ground_truth: The saved predicates and their answers.
+        tables: The corpus tables, by name.
+        turn: The chat turn text of the model the query is built for.
     """
-    templates = canonical_templates(ground_truth)
+    templates = canonical_templates(ground_truth, turn)
     ids_by_table = {name: _ids(table) for name, table in tables.items()}
 
     def answer(prompt, assignment):
@@ -134,7 +154,7 @@ def answer_oracle(ground_truth, tables):
             ids_by_table[arg.provider][assignment[arg.alias]]
             for arg in prompt.args
         )
-        return reference_answer(ground_truth, templates[prompt.template], ids)
+        return reference_answer(ground_truth, templates[_prompt_key(prompt)], ids)
 
     return answer
 
@@ -155,7 +175,7 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
             continue
         filter_answers[operator.id] = pa.table({
             alias: id_column(alias, table.column(alias)),
-            "answer": table.column("answer"),
+            "answer": answer_values(table),
         })
     classify_answers = {}
     for operator in info.classifies:
@@ -171,7 +191,7 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         join_answers[join.id] = pa.table({
             **{alias: id_column(alias, table.column(alias))
                for alias in join.relations},
-            "answer": table.column("answer"),
+            "answer": answer_values(table),
         })
     score_answers = {}
     for operator in info.scores:
@@ -195,13 +215,13 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
     # which the benchmark does not take
     names = list(info.columns)
     started = time.perf_counter()
-    rows = result.collect()
+    table = result.collect()
     collection_s = time.perf_counter() - started
     spans = [f"{struct.name}{SPAN_SUFFIX}" for struct in info.structs]
-    rows = rows.drop_columns([name for name in rows.column_names
+    table = table.drop_columns([name for name in table.column_names
                               if name in spans])
     return RunOutput(
-        filter_answers, join_answers, rows.rename_columns(names),
+        filter_answers, join_answers, table.rename_columns(names),
         result.report["wall_s"], dict(result.report, collection_s=collection_s),
         classify_answers=classify_answers or None,
         score_answers=score_answers or None,
@@ -437,7 +457,7 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
     return refused
 
 
-def run_suite(only=None, *, sf=0.1, config, data_dir=None,
+def run_suite(only=None, *, scale_factor=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
               h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
     """Run Quail queries through QUAIL-B and save the benchmark report.
@@ -472,14 +492,14 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
     if not only:
         # every query was skipped: a record with no queries, in the
         # shape a run of them would leave
-        return _empty_record(skipped, sf=sf, data_dir=data_dir,
+        return _empty_record(skipped, scale_factor=scale_factor, data_dir=data_dir,
                              ground_truth_collection=ground_truth_collection,
                              root=root, config=config, metadata=metadata,
                              h100_usd_per_hour=h100_usd_per_hour,
                              output_dir=output_dir)
     with quail.Session(config) as session:
         record = benchmark.run(
-            partial(run_query, session), queries=only, scale_factor=sf,
+            partial(run_query, session), queries=only, scale_factor=scale_factor,
             output_dir=output_dir, data_dir=data_dir,
             collection_id=ground_truth_collection, root=root,
             gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
@@ -490,19 +510,19 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
         return record
 
 
-def _empty_record(skipped, *, sf, data_dir, ground_truth_collection, root,
+def _empty_record(skipped, *, scale_factor, data_dir, ground_truth_collection, root,
                   config, metadata, h100_usd_per_hour, output_dir) -> dict:
     """Build a run record for a suite in which every query was skipped."""
     from quail_b import __version__
     from quail_b.run import RUN_SCHEMA_VERSION
 
     suite = benchmark.load_benchmark(
-        sorted(skipped)[:1], scale_factor=sf, data_dir=data_dir,
+        sorted(skipped)[:1], scale_factor=scale_factor, data_dir=data_dir,
         collection_id=ground_truth_collection, root=root)
     started = datetime.now(timezone.utc).isoformat()
     record = {
         "schema_version": RUN_SCHEMA_VERSION, "quail_b_version": __version__,
-        "scale_factor": sf, "corpus_id": suite.corpus_id,
+        "scale_factor": scale_factor, "corpus_id": suite.corpus_id,
         "collection_id": suite.ground_truth.collection_id,
         "reference_model": suite.ground_truth.reference_model,
         "metadata": metadata, "gpu_count": config.gpus,
@@ -535,7 +555,7 @@ def main():
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
-        sf=args.sf,
+        scale_factor=args.scale_factor,
         config=quail.EngineConfig(
             gpus=args.gpus,
             model=args.model,

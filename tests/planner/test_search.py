@@ -41,8 +41,8 @@ def query(tmp_path):
 def context_for(query):
     query.plan()
     return PlanningContext(
-        model=query.session.model, device=query.session.device, gpu_count=1,
-        document_tokens=query._doc_tokens, backend="quail",
+        model=query.session.model, device=query.session.device, gpus=1,
+        document_tokens=query._document_tokens, backend="quail",
         tokenizer=query.session.tokenizer)
 
 
@@ -62,7 +62,7 @@ class PlacementCost(PhysicalRule):
         self.seen.append(lifted)
         if lifted and self.refuse:
             raise ClassifyRefusedError("test candidate cannot run", 2, 1)
-        exact = all(hasattr(lengths, "_store")
+        exact = all(lengths.store is not None
                     for lengths in context.document_tokens.values())
         if self.exact and not exact:
             return None
@@ -131,9 +131,8 @@ def test_prefix_sharing_is_priced_for_every_placement(query):
         assert extract.spec.share_prefixes
         assert "retention" in candidate.plan.settings
         assert candidate.estimated_seconds < raw.estimated_seconds
-        assert candidate.plan.settings["search_seconds"] == pytest.approx(
-            candidate.estimated_seconds)
-        assert candidate.plan.estimates[extract.node_id]["seconds"] == (
+        # the sharing extraction is priced over its fresh tokens
+        assert candidate.plan.estimates[extract.node_id]["seconds"] < (
             extract.spec.estimated_seconds)
 
 
@@ -215,3 +214,65 @@ def test_logical_alternatives_finish_before_physical_rules(query):
     assert first_physical > 0
     assert events[:first_physical] == ["logical"] * first_physical
     assert events[first_physical:] == ["physical", "physical"]
+
+
+def test_a_filter_above_the_joins_thins_nothing_before_them(query):
+    from quail.logical import classified_above_joins
+    from quail.planner.search.statistics import (
+        cached_statistics,
+        expected_rows_after_filters,
+    )
+
+    session = query.session
+    built = (session.docs("documents").alias("d")
+             .ai_filter(quail.prompt("Signed? {0}", quail.col("d.text")),
+                        selectivity=0.5)
+             .ai_join(session.docs("questions").alias("q"), quail.prompt(
+                 "Pair? {0} {1}", quail.col("d.text"), quail.col("q.text")),
+                 anchor="d", selectivity=0.1)
+             .ai_classify(quail.prompt("Kind? {0}", quail.col("d.text")),
+                          ["a", "b"], name="kind")
+             .label_in("kind", ["a"], selectivity=0.3)
+             .select("d.id", "q.id"))
+    context = context_for(built)
+    expected = {}
+    for candidate in search_candidates(built._logical_input, context,
+                                       session.registry):
+        logical = candidate.logical_plan
+        statistics = cached_statistics(
+            logical, {}, model=session.model, device=session.device,
+            document_tokens=built._document_tokens, context=context)
+        lifted = bool(classified_above_joins(logical.root))
+        expected[lifted] = expected_rows_after_filters(logical, statistics)
+    assert expected == {False: {"d": 3.0, "q": 1.0}, True: {"d": 10.0, "q": 1.0}}
+
+
+@pytest.mark.parametrize("retain", [False, True])
+def test_a_filter_after_a_barrier_is_priced_over_the_kv_the_sequence_kept(
+        query, retain):
+    from quail.physical import AiFilter, Barrier, PortRef
+    from quail.physical.base import input_ports
+
+    built = (query.session.docs("documents").alias("d")
+             .ai_filter(quail.prompt("First? {0}", quail.col("d.text")),
+                        selectivity=1.0)
+             .ai_filter(quail.prompt("Second? {0}", quail.col("d.text")),
+                        selectivity=1.0)
+             .select("d.id", order="as_written"))
+    plan = built.plan()
+    scan, first, second, project = plan.nodes
+    assert isinstance(second, AiFilter)
+    # the second filter starts its own pipeline after a barrier; it
+    # reads the first one's KV only when that pipeline kept it
+    barrier = Barrier(node_id="barrier:d", next_anchor="d", aliases=("d",),
+                      inputs=input_ports((PortRef(first.node_id, "rows:d"),)))
+    graph = PhysicalGraph((
+        scan, replace(first, keep_kv=retain), barrier,
+        replace(second, inputs=input_ports((PortRef("barrier:d", "rows:d"),))),
+        project), plan.root)
+    work = plan.estimator._priced(graph)[second.node_id][0].work
+    prefix = (second.preamble_tokens
+              + plan.estimator.statistics.stats["d"].mean_document_tokens)
+    assert first.expected_rows == second.expected_rows == 20
+    assert work.tokens == pytest.approx(
+        20 * (second.question_tokens + (0 if retain else prefix)))

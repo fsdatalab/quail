@@ -38,7 +38,7 @@ class Lfm2Pipeline(ModelPipeline):
             layer for layer in self.layers if hasattr(layer, "short_conv"))
         attn = self.attention_layer.self_attn
         self.engine = engine_class(
-            arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
+            arena, num_q_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
             fp8=False, kernels=kernels)
         widest = max(

@@ -72,6 +72,10 @@ class _FakeFilterEngine:
         self.pending.append((request_id, prompt["prompt_token_ids"]))
         self.events.append(("add", request_id))
 
+    def abort_request(self, request_ids):
+        self.pending = [item for item in self.pending if item[0] not in request_ids]
+        self.events.extend(("abort", request_id) for request_id in request_ids)
+
     def step(self):
         request_id, prompt_token_ids = self.pending.pop(0)
         self.events.append(("finish", request_id))
@@ -195,3 +199,35 @@ class _ParityClient:
                 prompt_token_ids=ids,
                 num_cached_tokens=ids[0] % 7))
         return outs
+
+
+@pytest.mark.parametrize("failure", ["submit", "step", "answer"])
+def test_a_failed_filter_sequence_aborts_its_queued_requests(monkeypatch, failure):
+    engine = _FakeFilterEngine()
+    read_answer = READ_ANSWER
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("request failed")
+
+    if failure == "submit":
+        add_request = engine.add_request
+
+        def submit(request_id, prompt, sampling_params):
+            add_request(request_id, prompt, sampling_params)
+            if request_id == "retry-1-0":
+                fail()
+
+        monkeypatch.setattr(engine, "add_request", submit)
+    elif failure == "step":
+        monkeypatch.setattr(engine, "step", fail)
+    else:
+        read_answer = fail
+    with pytest.raises(RuntimeError, match="request failed"):
+        run_filter_sequence(
+            engine, sampling_params=object(), body_ids=[[1], [2]],
+            question_ids=[[9]], budget_tokens=100, tag="retry",
+            read_answer=read_answer, max_num_seqs=2)
+    assert not engine.pending
+    aborted = {request_id for event, request_id in engine.events
+               if event == "abort"}
+    assert aborted and aborted <= {"retry-0-0", "retry-1-0"}

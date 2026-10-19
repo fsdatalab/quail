@@ -25,8 +25,8 @@ def test_spec_matches_the_config(name):
     config = json.loads((CONFIG.parent / f"{name}.json").read_text())["text_config"]
     assert spec.layers == config["num_hidden_layers"]
     assert spec.hidden == config["hidden_size"]
-    assert spec.n_q == config["num_attention_heads"]
-    assert spec.n_kv == config["num_key_value_heads"]
+    assert spec.num_q_heads == config["num_attention_heads"]
+    assert spec.num_kv_heads == config["num_key_value_heads"]
     assert spec.d_head == config["head_dim"]
     intermediate = config.get("intermediate_size",
                               config.get("shared_expert_intermediate_size"))

@@ -10,6 +10,7 @@ from ..base import (
     ExecutionLocation,
     OutputPort,
     PhysicalNode,
+    Token,
     ValueType,
 )
 
@@ -22,40 +23,10 @@ class InferenceSpec:
     aliases: tuple[str, ...]
     query_template: str
     arguments: tuple[tuple[str, str], ...]
-    expected_inputs: float
+    expected_rows: float
     estimated_seconds: float
-    prompt_token_parts: tuple[tuple[int, ...], ...] = ()
+    prompt_token_parts: tuple[tuple[Token, ...], ...] = ()
     share_prefixes: bool = False
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "InferenceSpec":
-        return cls(
-            name=str(value["name"]),
-            aliases=tuple(value["aliases"]),
-            query_template=str(value["query_template"]),
-            arguments=tuple(
-                (str(alias), str(column))
-                for alias, column in value["arguments"]
-            ),
-            expected_inputs=float(value["expected_inputs"]),
-            estimated_seconds=float(value["estimated_seconds"]),
-            prompt_token_parts=tuple(
-                tuple(part) for part in value.get("prompt_token_parts", ())
-            ),
-            share_prefixes=bool(value.get("share_prefixes", False)),
-        )
-
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "aliases": list(self.aliases),
-            "query_template": self.query_template,
-            "arguments": [list(argument) for argument in self.arguments],
-            "expected_inputs": self.expected_inputs,
-            "estimated_seconds": self.estimated_seconds,
-            "prompt_token_parts": [list(part) for part in self.prompt_token_parts],
-            "share_prefixes": self.share_prefixes,
-        }
 
     @property
     def output_columns(self) -> tuple[str, ...]:
@@ -70,19 +41,6 @@ class ScoreSpec(InferenceSpec):
     pair_fraction: float = 1.0
     draws: int = 1
 
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "ScoreSpec":
-        return cls(
-            **vars(InferenceSpec.from_mapping(value)),
-            pair_fraction=float(value.get("pair_fraction", 1.0)),
-            draws=int(value.get("draws", 1)),
-        )
-
-    def to_dict(self) -> dict:
-        return {**super().to_dict(), "pair_fraction": self.pair_fraction,
-                "draws": self.draws}
-
-
 @dataclass(frozen=True)
 class AiInference(PhysicalNode):
     """Append model outputs to candidate rows."""
@@ -94,12 +52,16 @@ class AiInference(PhysicalNode):
 
     answer_kind: ClassVar[str] = "scores"
     spec_type: ClassVar[type[InferenceSpec]] = InferenceSpec
-    document_ids: ClassVar[bool] = False
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
 
     @property
-    def document_head(self) -> tuple[int, ...] | None:
-        return (self.spec.prompt_token_parts[0]
+    def share_prefixes(self) -> bool:
+        """Whether the node borrows an earlier document's prefix KV."""
+        return self.spec is not None and self.spec.share_prefixes
+
+    @property
+    def document_head(self) -> tuple[int, ...]:
+        return (tuple(self.spec.prompt_token_parts[0])
                 if self.spec and self.spec.prompt_token_parts else ())
 
     @property
@@ -113,23 +75,16 @@ class AiInference(PhysicalNode):
             return ()
         columns = (self.spec.output_columns if self.answer_kind == "extracts"
                    else (*self.spec.aliases, self.spec.name))
-        ports = (OutputPort("rows", ValueType.ROWS,
-                            schema=self.spec.output_columns,
-                            answer=AnswerOutput(self.answer_kind, self.spec.name,
-                                                columns)),)
-        if self.document_ids and len(self.spec.aliases) == 1:
-            (alias,) = self.spec.aliases
-            ports += (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
-                                 schema=(alias,)),)
-        return ports
+        return (OutputPort(self.rows_port, ValueType.ROWS,
+                           schema=self.spec.output_columns,
+                           answer=AnswerOutput(self.answer_kind, self.spec.name,
+                                               columns)),)
 
-    def attributes(self) -> dict:
-        return {
-            "backend_name": self.backend_name,
-            "keep_kv": self.keep_kv,
-            "model": self.model,
-            "spec": None if self.spec is None else self.spec.to_dict(),
-        }
+    @property
+    def rows_port(self) -> str:
+        """The output carrying the rows: per alias for one table, rows for pairs."""
+        aliases = () if self.spec is None else self.spec.aliases
+        return f"rows:{aliases[0]}" if len(aliases) == 1 else "rows"
 
     def explain_fields(self) -> Mapping[str, Any]:
         spec = self.spec
@@ -140,25 +95,12 @@ class AiInference(PhysicalNode):
             "batching": "token_based_admission",
             "output": None if spec is None else spec.name,
             "aliases": [] if spec is None else list(spec.aliases),
-            "expected_inputs": 0 if spec is None else spec.expected_inputs,
+            "expected_rows": 0 if spec is None else spec.expected_rows,
             "estimated_seconds": (
                 0 if spec is None else spec.estimated_seconds
             ),
             "share_prefixes": False if spec is None else spec.share_prefixes,
         }
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        value = attributes["spec"]
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            backend_name=str(attributes["backend_name"]),
-            keep_kv=bool(attributes.get("keep_kv", False)),
-            model=str(attributes["model"]),
-            spec=None if value is None else cls.spec_type.from_mapping(value),
-        )
-
 
 @dataclass(frozen=True)
 class AiScore(AiInference):

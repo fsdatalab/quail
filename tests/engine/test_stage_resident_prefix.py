@@ -19,9 +19,9 @@ def test_a_resident_prefix_of_another_length_is_fed_afresh(path, monkeypatch):
     # a filter leaves each document's KV resident under its table key;
     # a later operator shows the document after a prompt head
     answers = {}
-    for doc in DOCS:
-        answers[chain(doc + QUESTION)] = 1
-        h = chain(HEAD + doc + CUE)
+    for document in DOCS:
+        answers[chain(document + QUESTION)] = 1
+        h = chain(HEAD + document + CUE)
         answers[h] = answer(h)
     setup = Setup(path=path)
     run = Run(setup, answers)
@@ -37,14 +37,14 @@ def test_a_resident_prefix_of_another_length_is_fed_afresh(path, monkeypatch):
                attention_mode=path)
     assert all(run.arena.is_resident(key) for key in keys)
 
-    headed = [HEAD + doc for doc in DOCS]
+    headed = [HEAD + document for document in DOCS]
     out, _, tokens = run_stages(
         run.torch, run.arena, run.pipeline,
         [Stage(suffixes=[CUE], readout=passthrough(), single=True)],
         headed, setup.budget, anchor_keys=keys, attention_mode=path)
     # the checking model fails any row that reads KV no request wrote
-    for d, doc in enumerate(DOCS):
-        assert out[0][d] == [answers[chain(HEAD + doc + CUE)]], f"document {d}"
+    for d, document in enumerate(DOCS):
+        assert out[0][d] == [answers[chain(HEAD + document + CUE)]], f"document {d}"
     assert tokens == sum(len(prefix) for prefix in headed) + len(DOCS)
     assert not run.arena.accounting.owned
 
@@ -53,12 +53,12 @@ def test_a_resident_prefix_of_another_length_is_fed_afresh(path, monkeypatch):
 def test_borrowed_prefix_and_accepted_decode_tokens_survive_rounds(path, monkeypatch):
     cpu_staging(monkeypatch)
     shared = list(range(1000, 1016))
-    docs = [shared + [1020, 1021], shared + [1030, 1031]]
+    documents = [shared + [1020, 1021], shared + [1030, 1031]]
     frame = [30, 31]
     paths = [frame + [32], frame + [32, 41, 42, 43],
              frame + [32, 41, 42, 44, 45], [50, 51, 52], [50, 51, 52, 53]]
-    expected = {chain(doc + tail): float(index + 1)
-                for doc in docs for index, tail in enumerate(paths)}
+    expected = {chain(document + tail): float(index + 1)
+                for document in documents for index, tail in enumerate(paths)}
     setup = Setup(path=path)
     run = Run(setup, expected)
     stages = [
@@ -77,11 +77,13 @@ def test_borrowed_prefix_and_accepted_decode_tokens_survive_rounds(path, monkeyp
     ]
     stats = {}
     output, _, tokens = run_stages(
-        run.torch, run.arena, run.pipeline, stages, docs, setup.budget,
-        attention_mode=path, prefix_tree=prefix_tree(docs, setup.page_tokens),
+        run.torch, run.arena, run.pipeline, stages, documents, setup.budget,
+        attention_mode=path, prefix_tree=prefix_tree(documents, setup.page_tokens),
         stats=stats)
     assert stats["borrowed_tokens"] == 16
-    assert tokens == sum(map(len, docs)) - 16 + len(docs) * (3 + 3 + 2 + 3 + 1)
+    assert tokens == sum(map(len, documents)) - 16 + len(documents) * (
+        3 + 3 + 2 + 3 + 1
+    )
     for index in range(len(stages)):
         assert output[index] == {0: [float(index + 1)], 1: [float(index + 1)]}
     assert not run.arena.accounting.owned

@@ -1,6 +1,7 @@
 """Executor and scheduler: lifecycle, failures, cancel, timeout, restart."""
 
 import json
+import threading
 import time
 from unittest.mock import Mock
 
@@ -78,13 +79,22 @@ def test_in_process_run_saves_a_readable_and_verified_result(store, tmp_path):
     verified.mkdir()
     table = pa.table({"r.id": ["r0", "r3"]})
     result = quail.QueryResult.from_table(table, {"backend": "quail"})
-    join_answers = pa.table({"r": [0], "p": [1], "answer": [True]})
-    result.answer_tables = {"joins": {0: join_answers}}
+    # every answer kind is saved under the key the result gives it
+    result.answer_tables = {
+        "filters": {("r", 0): pa.table({"r": [0, 3], "answer": [True, True]})},
+        "joins": {0: pa.table({"r": [0], "p": [1], "answer": [True]})},
+        "classifies": {"kind": pa.table({"r": [0], "kind": ["a"]})},
+        "scores": {"score": pa.table({"r": [0], "score": [0.5]})},
+        "extracts": {"lease": pa.table({"r": [0], "lease": ["x"]})},
+    }
     manifest = artifacts.write_result(result, verified)
     artifacts.verify_result(verified, manifest)
     loaded = artifacts.load_result(verified, manifest)
     assert loaded.to_rows() == [("r0",), ("r3",)]
-    assert loaded.answer_tables["joins"][0].equals(join_answers)
+    for kind, tables in result.answer_tables.items():
+        assert loaded.answer_tables[kind].keys() == tables.keys()
+        for key, table in tables.items():
+            assert loaded.answer_tables[kind][key].equals(table)
     with pytest.raises(ValueError, match="holds 2 rows"):
         artifacts.verify_result(verified, {**manifest, "rows": 3})
     (verified / "result.arrow").unlink()
@@ -100,7 +110,7 @@ def test_failed_and_cancelled_runs_are_saved_and_not_killed(
     bad = scheduler.run_one(
         submit(store, tmp_path, sql="SELECT r.nothing FROM reviews r"))
     assert (bad.state, bad.error["type"]) == ("failed", "CompileError")
-    assert executor._loaded_model is None
+    assert executor.loaded_model is None
 
     queued = submit(store, tmp_path)
     store.request_cancel(queued.id)
@@ -168,18 +178,18 @@ def test_executors_switch_models_skip_warm_loads_and_stop_on_timeout(
         try:
             first = submit(store, tmp_path)
             assert scheduler.run_one(first).state == "succeeded", child
-            assert executor._loaded_model == "qwen3-4b-fp8", child
-            pid = executor._process.pid if child else None
+            assert executor.loaded_model == "qwen3-4b-fp8", child
+            pid = executor._child.process.pid if child else None
             second = submit(store, tmp_path)
             assert scheduler.run_one(second).state == "succeeded", child
             if child:
-                assert executor._process.pid == pid, "same model, same child"
+                assert executor._child.process.pid == pid, "same model, same child"
             other = submit(store, tmp_path,
                            config={**server_fakes.CONFIG, "model": "qwen3-32b-fp8"})
             assert scheduler.run_one(other).state == "succeeded", child
-            assert executor._loaded_model == "qwen3-32b-fp8", child
+            assert executor.loaded_model == "qwen3-32b-fp8", child
             if child:
-                assert executor._process.pid != pid, "another model, a new child"
+                assert executor._child.process.pid != pid, "another model, a new child"
         finally:
             executor.close()
             store.remove_listener(record)
@@ -290,3 +300,110 @@ def test_describe_and_resolve_supported_providers(tmp_path):
         inputs.resolve(memory.spec, {})
     with pytest.raises(inputs.InvalidRequestError, match="unknown input kind"):
         inputs.resolve({"kind": "s3"}, {})
+
+
+def test_an_interrupted_result_write_leaves_the_old_files(tmp_path):
+    old = pa.table({"id": [99]})
+    target = tmp_path / "result.arrow"
+    artifacts.write_ipc_file(target, old)
+
+    def batches():
+        yield pa.table({"id": [0, 1]}).to_batches()[0]
+        raise RuntimeError("interrupted write")
+
+    with pa.RecordBatchReader.from_batches(old.schema, batches()) as reader:
+        with pytest.raises(RuntimeError, match="interrupted write"):
+            artifacts.write_ipc_file(target, reader)
+    assert artifacts.read_table(target).equals(old)
+
+    class Unserializable:
+        def __str__(self):
+            raise RuntimeError("interrupted report")
+
+    result = quail.QueryResult.from_table(old, {"old": True})
+    artifacts.write_result(result, tmp_path)
+    result.report = {"bad": Unserializable()}
+    with pytest.raises(RuntimeError, match="interrupted report"):
+        artifacts.write_result(result, tmp_path)
+    assert json.loads((tmp_path / "report.json").read_text()) == {"old": True}
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+@pytest.mark.parametrize("failure", ["start", "wait"])
+def test_a_failed_execution_attempt_finishes_its_record_and_closes_its_answers(
+        store, tmp_path, failure, monkeypatch):
+    answers = []
+
+    class SavedAnswers(artifacts.Answers):
+        def __init__(self, path):
+            super().__init__(path)
+            answers.append(self)
+
+    monkeypatch.setattr("quail.server.scheduler.Answers", SavedAnswers)
+
+    class Execution:
+        stopped = False
+
+        def wait(self, timeout):
+            raise OSError("executor unavailable")
+
+        def stop(self):
+            self.stopped = True
+
+    execution = Execution()
+
+    class Executor:
+        def start(self, job, emit):
+            emit("answers", {"document": 0})
+            if failure == "start":
+                raise OSError("executor unavailable")
+            return execution
+
+    scheduler = scheduler_for(store, tmp_path, Executor())
+    status = submit(store, tmp_path)
+    final = scheduler.run_one(store.get(status.id))
+    assert (final.state, final.error["type"]) == ("failed", "OSError")
+    assert execution.stopped == (failure == "wait")
+    (saved,) = answers
+    assert saved._handle is None
+
+
+def test_shutdown_finishes_the_active_record_before_closing_the_executor(
+        store, tmp_path):
+    started, done = threading.Event(), threading.Event()
+    closed = []
+
+    class Execution:
+        def wait(self, timeout):
+            return done.wait(timeout)
+
+        def stop(self):
+            done.set()
+
+    class Executor:
+        def start(self, job, emit):
+            started.set()
+            return Execution()
+
+        def close(self):
+            closed.append(done.is_set())
+
+    scheduler = scheduler_for(store, tmp_path, Executor())
+    active = submit(store, tmp_path)
+    queued = submit(store, tmp_path)
+    scheduler.start()
+    assert started.wait(2)
+    scheduler.stop()
+    assert closed == [True]
+    assert store.get(active.id).state == "interrupted"
+    assert store.get(queued.id).state == "queued"
+
+
+def test_shutdown_does_not_wait_for_a_submission_in_flight(store, tmp_path):
+    scheduler = scheduler_for(store, tmp_path)
+    with store.submission_lock:
+        scheduler.start()
+        stopping = threading.Thread(target=scheduler.stop)
+        stopping.start()
+        stopping.join(2)
+        assert not stopping.is_alive()

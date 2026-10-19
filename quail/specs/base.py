@@ -55,8 +55,8 @@ class ModelSpec:
     params: float        # active projection parameters per token
     layers: int          # L
     hidden: int          # h
-    n_q: int             # query heads
-    n_kv: int            # KV heads
+    num_q_heads: int             # query heads
+    num_kv_heads: int            # KV heads
     d_head: int          # head dim
     ffn_width: int       # dense or shared gate_up output columns
     #                      (gate_up: 2 x intermediate at Qwen3)
@@ -81,8 +81,8 @@ class ModelSpec:
     #                               head (its key, query, and MLP rows);
     #                               the head's FLOPs and bytes follow
     # KV geometry of the full_attention layers, when it differs from the
-    # sliding layers' n_kv x d_head; 0 means the same as theirs.
-    full_n_kv: int = 0         # KV heads of a full-attention layer
+    # sliding layers' num_kv_heads x d_head; 0 means the same as theirs.
+    full_num_kv_heads: int = 0         # KV heads of a full-attention layer
     full_d_head: int = 0       # head dim of a full-attention layer
     sliding_window: int = 0    # tokens the other layers see behind each
     #                            row; 0 means no layer slides
@@ -228,10 +228,11 @@ class ModelSpec:
     @property
     def kv_shapes(self) -> tuple:
         """Per layer, the (KV heads, head dim) its KV stores."""
-        full = (self.full_n_kv or self.n_kv, self.full_d_head or self.d_head)
+        full = (self.full_num_kv_heads or self.num_kv_heads,
+                self.full_d_head or self.d_head)
         return tuple(
             (0, 0) if not self.keeps_kv(i)
-            else full if self.is_full_layer(i) else (self.n_kv, self.d_head)
+            else full if self.is_full_layer(i) else (self.num_kv_heads, self.d_head)
             for i in range(self.layers))
 
     @property
@@ -239,8 +240,8 @@ class ModelSpec:
         """Output columns of the widest dense projection in any layer."""
         query_width = 2 if self.attn_output_gate else 1
         attention = max(
-            (query_width * self.n_q + 2 * n_kv) * head
-            for n_kv, head in self.kv_shapes)
+            (query_width * self.num_q_heads + 2 * num_kv_heads) * head
+            for num_kv_heads, head in self.kv_shapes)
         gdn = (2 * self.gdn_key_heads * self.gdn_key_dim
                + 2 * self.gdn_value_heads * self.gdn_value_dim)
         return max(self.ffn_width, attention, gdn)
@@ -252,8 +253,8 @@ class ModelSpec:
 
     @property
     def kv_elements_per_token(self) -> int:
-        """KV elements per token, dtype-free: 2 * sum of n_kv * d_head."""
-        return 2 * sum(n_kv * d_head for n_kv, d_head in self.kv_shapes)
+        """KV elements per token, dtype-free: 2 * sum of num_kv_heads * d_head."""
+        return 2 * sum(num_kv_heads * d_head for num_kv_heads, d_head in self.kv_shapes)
 
     @property
     def sliding_layer_set(self) -> frozenset:
@@ -268,7 +269,8 @@ class ModelSpec:
         """KV bytes per token on the sliding layers alone."""
         sliding = self.sliding_layer_set
         return 2 * self.kv_bytes * sum(
-            n_kv * d_head for i, (n_kv, d_head) in enumerate(self.kv_shapes)
+            num_kv_heads * d_head
+            for i, (num_kv_heads, d_head) in enumerate(self.kv_shapes)
             if i in sliding)
 
     @property

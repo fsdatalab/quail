@@ -1,34 +1,28 @@
 ---
-title: SQL reference
+title: AI functions
 ---
 
-## What is AI-SQL?
+Use AI functions to filter and join documents, score answers, assign
+labels, and extract text. The examples use BigQuery syntax. See the
+[SQL reference](/docs/user-guide/sql) for dialect selection and a first query.
 
-AI-SQL extends standard SQL with operators that call a language model
-during query execution. You can filter rows, join tables, score documents,
-assign labels, and extract answers using natural language instructions.
+## Functions
 
-For example, suppose you registered a `reviews` table with columns `id`
-and `body`. This query returns IDs of reviews that discuss the movie's
-ending:
+Select a function to jump to its arguments, examples, and limits.
+Square brackets mark optional arguments.
 
-```sql
-SELECT r.id
-FROM reviews r
-WHERE AI.IF(PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body))
-```
+<div className="function-index">
 
-The model reads each review and returns TRUE or FALSE. Quail keeps
-the rows where the answer is TRUE.
+| Function | Description |
+| --- | --- |
+| [`PROMPT(template, column, ...)`](#prompt) | Combines instructions with document columns. |
+| [`AI.IF(prompt[, options])`](#aiif) | Keeps documents or pairs that satisfy a model question. |
+| [`AI.SCORE(prompt[, options])`](#aiscore) | Returns a score from 0 to 1 for a model question. |
+| [`AI.CLASSIFY(input, categories[, options])`](#aiclassify) | Assigns one of the supplied labels. |
+| [`AI.EXTRACT(input, questions)`](#aiextract) | Copies answers from a document and returns their positions. |
+| [`HINT(condition, options)`](#planning-hints) | Sets the estimated pass fraction for a label or answer condition. |
 
-Quail supports Snowflake and BigQuery syntax:
-
-```python
-session.sql(text, dialect="snowflake")  # AI_FILTER syntax
-session.sql(text, dialect="bq")         # AI.IF syntax
-```
-
-The examples below use the BigQuery dialect (`dialect="bq"`).
+</div>
 
 ## PROMPT
 
@@ -50,6 +44,9 @@ PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
 ```
 
 Here `{0}` is the review and `{1}` is the aspect.
+
+A prompt argument can also read a struct field or apply a text function
+to a column. See [Column expressions](/docs/user-guide/sql/sql-functions#column-expressions).
 
 ## AI.IF
 
@@ -283,22 +280,22 @@ classifications of joined rows return labels only.
 
 #### Filter by category
 
-Use `IN` in `WHERE` to keep negative or mixed reviews:
+Use the classification's `AS` name in `WHERE` to filter by its label.
+For example, keep negative or mixed reviews from the `reviews` table:
 
 ```sql
 SELECT r.id,
        AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
                    ARRAY['positive', 'negative', 'mixed']) AS sentiment
 FROM reviews r
-WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
-                  ARRAY['positive', 'negative', 'mixed'])
-      IN ('negative', 'mixed');
+WHERE sentiment IN ('negative', 'mixed');
 ```
 
 - `=` keeps one category. Other comparisons raise `CompileError`.
 - A category that is not in the list matches no rows.
-- Quail evaluates the repeated classification once and uses its label
-  in both `SELECT` and `WHERE`.
+- You can also repeat the `AI.CLASSIFY` call in `WHERE`. Quail evaluates
+  the classification once and uses its label for both the filter and
+  the result.
 
 #### Classify joined rows
 
@@ -373,154 +370,56 @@ In Python, `text[start:end]` returns the answer.
 Each question is a separate extraction. On the Quail backend, the
 questions about one document read the same document KV.
 
-`WHERE`, `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result
-of an extraction.
+### Filter on answers
+
+Use the extraction's `AS` name to filter by an answer field in `WHERE`.
+For example, with the same `contracts` table, keep leases whose
+extracted end date contains "2027":
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.text, {'end_date': 'When does the lease end?'}) AS lease
+FROM contracts c
+WHERE lease.end_date LIKE '%2027%';
+```
+
+Quail extracts the answer once and uses it for both the filter and the
+result. Documents with no answer are excluded. Use
+`lease.end_date IS NULL` to keep documents where no end date was found.
+
+Answer fields support the conditions listed in [WHERE and ON](/docs/user-guide/sql/sql-functions#where-and-on).
+You can also test an answer's position. For example,
+`lease_span.end_date.start < 500` keeps answers that start within the
+document's first 500 characters.
+
+Quail may reorder a table's AI filters, classifications, and extractions
+to reduce estimated work. A condition on an answer runs after the
+extraction that produces it. Use a [planning hint](#planning-hints) to
+set the expected fraction of documents that pass, or pass
+`order="as_written"` to `session.sql()` to preserve the written order.
+
+### Limits
+
+- Use a model that supports `AI.EXTRACT`. See
+  [Supported models and GPUs](/docs/user-guide/models).
+- Filters on answers run on the Quail backend only.
+- `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result of an
+  extraction.
 
 For the Python form, see
-[`ai_extract()`](/docs/user-guide/python-api#ai_extract).
+[`ai_extract()`](/docs/user-guide/python-api/ai-functions#ai_extract).
 
-## WHERE and ON
+## Planning hints
 
-`WHERE` keeps rows that satisfy the given conditions. `ON` specifies
-which rows to join. Both support the following conditions on table columns:
+Use `HINT(condition, {'selectivity': fraction})` on a classification
+label or extracted answer to estimate the fraction of documents that
+pass. Quail uses the estimate to choose the order of AI functions.
 
-| Condition | SQL |
-| --- | --- |
-| Compare with a value | `=`, `<>`, `<`, `<=`, `>`, `>=` |
-| Match a value in a list | `IN (...)` |
-| Keep null values | `IS NULL` |
-| Keep non-null values | `IS NOT NULL` |
-
-Values can be numbers, strings, or booleans. `IN` requires a non-empty
-list of constant values. Combine conditions with `AND`.
-Comparisons exclude null values. Use `IS NULL` to keep them.
-
-E.g., the following SQL query returns the IDs of reviews from 2024 with
-at least four stars that mention shipping:
+For example, in the lease query above, replace the `WHERE` clause with:
 
 ```sql
-SELECT r.id
-FROM reviews r
-WHERE r.year = 2024
-  AND r.stars >= 4
-  AND AI.IF(PROMPT('Does the review mention shipping? {0}', r.body))
+WHERE HINT(lease.end_date LIKE '%2027%', {'selectivity': 0.4})
 ```
 
-Quail checks the year and rating before evaluating `AI.IF`.
-
-A condition in `ON` filters the table containing the referenced column.
-Comparisons between columns from different tables require `column = column`
-in `ON`. See [Joining](#joining).
-
-## SELECT, FROM, JOIN, LIMIT
-
-Quail supports these SQL clauses with the following limits:
-
-- **`SELECT`** lists columns and `AI.SCORE` or `AI.CLASSIFY`
-  outputs with column aliases. `*` expands to all table columns. Other
-  computed expressions are unsupported.
-- **`FROM`** names a registered table, with an optional alias.
-- **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
-  `RIGHT`, `FULL`) are not.
-- **`LIMIT`** takes a positive integer.
-
-## ORDER BY
-
-`ORDER BY` sorts result rows by table columns or names assigned to AI
-outputs with `AS`. AI expressions cannot appear directly in `ORDER BY`.
-Sorting columns need not appear in `SELECT`, except when using
-`SELECT DISTINCT`.
-
-The default direction is `ASC`. Use `DESC` for descending order.
-`NULLS FIRST` or `NULLS LAST` overrides the dialect's default null placement:
-
-- BigQuery puts nulls first for `ASC` and last for `DESC`.
-- Snowflake puts nulls last for `ASC` and first for `DESC`.
-
-E.g., imagine a `documents` table with customer messages in `body`.
-This query returns ten documents with the highest refund-request scores:
-
-```sql
-SELECT d.id,
-       AI.SCORE(PROMPT('Does the customer request a refund? {0}', d.body))
-           AS refund_score
-FROM documents d
-ORDER BY refund_score DESC NULLS LAST, d.id ASC
-LIMIT 10
-```
-
-The example query uses `d.id ASC` to order documents with equal scores by ID.
-
-## SELECT DISTINCT
-
-`SELECT DISTINCT` removes duplicate rows by comparing all selected
-columns. Quail removes duplicates before sorting and applying `OFFSET`
-or `LIMIT`. Every sorting column must appear in `SELECT`.
-
-## OFFSET
-
-`OFFSET n` skips `n` rows after sorting and before applying `LIMIT`.
-The count must be an integer greater than or equal to zero. Use `ORDER BY`
-to specify which rows to skip. Without an explicit order, the skipped
-rows can differ between runs.
-
-Sorting or removing duplicates prevents `LIMIT` from stopping AI
-evaluation early. An offset greater than zero has the same effect.
-
-## GROUP BY and HAVING
-
-`GROUP BY` accepts table columns and names assigned to AI outputs with
-`AS`. Return grouping columns and aggregate results in `SELECT`.
-Give each aggregate in `SELECT` an `AS` name.
-
-`HAVING` filters groups by comparing an aggregate with a number. Refer
-to the aggregate by its name or write the function call. Combine
-conditions with `AND`.
-
-E.g., the following SQL query returns the review count and average star
-rating for each sentiment. It keeps sentiments with more than ten reviews:
-
-```sql
-SELECT AI.CLASSIFY(PROMPT('What is the sentiment of this review? {0}', r.body),
-                   ['positive', 'negative', 'mixed']) AS sentiment,
-       COUNT(*) AS review_count,
-       AVG(r.stars) AS avg_stars
-FROM reviews r
-GROUP BY sentiment
-HAVING review_count > 10
-ORDER BY review_count DESC
-```
-
-Quail classifies every review before computing the counts and averages.
-Adding `LIMIT` reduces the number of returned groups, not the reviews
-that Quail classifies.
-
-### Aggregate functions
-
-| SQL | Python | Returns |
-| --- | --- | --- |
-| `COUNT(*)` | `count()` | Number of rows |
-| `COUNT(column)` | `count(column)` | Number of non-null values |
-| `COUNT(DISTINCT column)` | `count_distinct(column)` | Number of distinct non-null values |
-| `SUM(column)` | `sum_(column)` | Sum |
-| `AVG(column)` | `avg(column)` | Average |
-| `MIN(column)` | `min_(column)` | Smallest value |
-| `MAX(column)` | `max_(column)` | Largest value |
-
-Functions that take a column ignore null values. The column can contain
-stored values or AI outputs. In SQL, an aggregate can also take an
-`AI.SCORE` call directly. Without `GROUP BY`, aggregates operate on all
-rows that pass `WHERE`.
-
-## Unsupported SQL
-
-- Window functions, `QUALIFY`
-- `UNION`, `EXCEPT`, `INTERSECT`
-- `OR` between conditions
-- `BETWEEN`, `LIKE`, and arithmetic in column comparisons
-- Queries with no AI operator
-- `JOIN` with only relational predicates (no AI operator)
-- Outer joins (`LEFT`, `RIGHT`, `FULL`)
-- `AI.MAP`
-
-Using any of these raises `quail.logical.CompileError`.
+The hint estimates that 40% of documents pass. The default is 20%.
+A hint affects planning only; it does not change which rows pass.

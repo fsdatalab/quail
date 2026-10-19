@@ -108,13 +108,13 @@ class ShouldPushDownProjection(LogicalRule):
 
 
 class ShouldPushDownFilters(LogicalRule):
-    """Push cheap one-table filters below the joins above their table.
+    """Push one-table label and answer filters below the joins above their table.
 
-    Like Catalyst's PushDownPredicates, the move is unconditional: an
-    Apply returning ids and a Filter on a label column run no model, so
-    they thin a table before the joins read it. Both front ends already
-    place such filters on their table; the rule rewrites plans built
-    another way.
+    Like Catalyst's PushDownPredicates, the move is unconditional: a
+    Filter on a label column runs no model, so it thins a table before
+    the joins read it. Both front ends already place such filters on
+    their table; the rule rewrites plans built another way. An Apply
+    stays where it was written, since its function sees its input rows.
     """
 
     name = "should_push_down_filters"

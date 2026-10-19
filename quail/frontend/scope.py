@@ -6,8 +6,17 @@ column, and a table read through two document columns raise the same
 CompileError from either.
 """
 
+import pyarrow as pa
+
 from quail.catalog import Catalog
 from quail.logical import ColumnRef, CompileError
+from quail.logical.expressions import (
+    column_expression,
+    column_name,
+    column_references,
+    evaluate_expression,
+    table_alias,
+)
 
 
 class Scope:
@@ -20,7 +29,7 @@ class Scope:
     def __init__(self, catalog: Catalog):
         self.catalog = catalog
         self.tables: list[tuple[str, str]] = []
-        self.doc_columns: dict[str, str] = {}
+        self.document_columns: dict = {}  # alias -> the document expression
 
     def add_table(self, alias: str, provider: str) -> None:
         """Bring one table into scope under alias.
@@ -72,18 +81,48 @@ class Scope:
         return ColumnRef(alias=owners[0][0], provider=owners[0][1],
                          column=column)
 
-    def note_doc_column(self, ref: ColumnRef) -> None:
-        """Record the document column a prompt reads from ref's table.
+    def resolve_value(self, column: str, alias: str | None = None, *,
+                      path: tuple = (), function: str | None = None,
+                      name: str | None = None, tables=None, shown: str = ""):
+        """Resolve a column with the fields, function, and output name on it.
+
+        The expression is checked against the column's type, so an
+        unknown field or a function over the wrong type fails here
+        rather than at execution.
+
+        Raises:
+            CompileError: As resolve(), or the fields or function do
+                not apply to the column's type.
+        """
+        ref = self.resolve(column, alias, tables=tables, shown=shown)
+        expression = column_expression(ref, tuple(path), function, name)
+        if expression is not ref:
+            expression.validate()
+            schema = self.catalog.get(ref.provider).schema()
+            evaluate_expression(expression, schema.empty_table())
+        return expression
+
+    def note_document_column(self, column) -> None:
+        """Record the document column a prompt reads from the column's table.
 
         Raises:
             CompileError: The table was already read through another
                 column; its KV is computed from one column only.
         """
-        seen = self.doc_columns.get(ref.alias)
-        if seen and seen != ref.column:
+        alias = table_alias(column)
+        provider = column_references(column)[0].provider
+        values = evaluate_expression(
+            column, self.catalog.get(provider).schema().empty_table())
+        if not (pa.types.is_string(values.type) or pa.types.is_large_string(
+                values.type)):
             raise CompileError(
-                f"alias {ref.alias!r} is referenced through two "
-                f"columns ({seen!r}, {ref.column!r}); predicates over "
-                f"one table must share one document column so its KV "
+                f"a prompt reads text; {column_name(column)} is {values.type}")
+        seen = self.document_columns.get(alias)
+        if seen is not None and seen != column:
+            raise CompileError(
+                f"alias {alias!r} is referenced through two columns "
+                f"({column_name(seen, qualified=False)!r}, "
+                f"{column_name(column, qualified=False)!r}); predicates "
+                f"over one table must share one document column so its KV "
                 f"is computed once")
-        self.doc_columns[ref.alias] = ref.column
+        self.document_columns[alias] = column

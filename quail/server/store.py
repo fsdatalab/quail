@@ -15,9 +15,11 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
+from quail.remote.files import published
 from quail.remote.records import (
     ACTIVE_STATES,
     TERMINAL_STATES,
@@ -72,7 +74,7 @@ class InputRecord:
 
     content_id: str
     path: str
-    byte_count: int
+    num_bytes: int
 
 
 def _dumps(value) -> str | None:
@@ -111,12 +113,14 @@ class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # held while a submission is created and made durable
+        self.submission_lock = threading.Lock()
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._listeners = []
         # committed write transactions since open; a checkpoint compares it
-        self.write_count = 0
-        self.durable_write_count = 0
+        self.num_writes = 0
+        self.num_durable_writes = 0
         self.closed = False
         self._conn = sqlite3.connect(
             str(self.path), check_same_thread=False, isolation_level=None)
@@ -170,9 +174,9 @@ class Store:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-            self.write_count += 1
+            self.num_writes += 1
             if durable:
-                self.durable_write_count += 1
+                self.num_durable_writes += 1
             self._changed.notify_all()
             listeners = list(self._listeners)
         for listener in listeners:
@@ -188,14 +192,11 @@ class Store:
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f"{path.name}.tmp")
-        with self._lock:
-            target = sqlite3.connect(str(temporary))
-            try:
+        # the copy and its publication share the lock, so backups land
+        # in the order they were taken
+        with self._lock, published(path) as temporary:
+            with closing(sqlite3.connect(str(temporary))) as target:
                 self._conn.backup(target)
-            finally:
-                target.close()
-        temporary.replace(path)
 
     def _row(self, query_id: str):
         with self._lock:
@@ -315,10 +316,16 @@ class Store:
             self._changed.wait(timeout)
 
     def next_queued(self) -> QueryStatus | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM queries WHERE state = 'queued' "
-                "ORDER BY created_at, rowid LIMIT 1").fetchone()
+        """Return the oldest queued record, or None while a submission is in flight."""
+        if not self.submission_lock.acquire(blocking=False):
+            return None
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT * FROM queries WHERE state = 'queued' "
+                    "ORDER BY created_at, rowid LIMIT 1").fetchone()
+        finally:
+            self.submission_lock.release()
         return None if row is None else _row_status(row)
 
     def begin(self, query_id: str) -> int:
@@ -458,11 +465,11 @@ class Store:
 
     # -- inputs -----------------------------------------------------------
 
-    def put_input(self, content_id: str, path: str, byte_count: int) -> None:
+    def put_input(self, content_id: str, path: str, num_bytes: int) -> None:
         self._write(
             "INSERT OR IGNORE INTO inputs (content_id, path, byte_count, "
             "created_at) VALUES (?, ?, ?, ?)",
-            (content_id, path, byte_count, time.time()))
+            (content_id, path, num_bytes, time.time()))
 
     def get_input(self, content_id: str) -> InputRecord | None:
         with self._lock:

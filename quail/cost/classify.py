@@ -13,7 +13,8 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from quail.cost.dense_decoder_cost import decoder_seconds
+from quail.cost.budgets import parallel_copies
+from quail.cost.sol import unrounded_seconds
 from quail.cost.work import Work, ask, decode, stream
 from quail.labels import (
     DECODE_SCORING,
@@ -122,11 +123,11 @@ def _rounds_work(prefix, shared, frame_tokens: int, runs, resident: bool,
 
 
 def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
-                    live: float, lengths, shared, chunk: int,
+                    expected_rows: float, lengths, shared, chunk: int,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0, runs=None,
                     answer_rows: float | None = None,
-                    head_rows: int = 0) -> ClassifyCost:
+                    head_rows: int = 0, gpus: int = 1) -> ClassifyCost:
     """Estimate expected classification work and its roofline time.
 
     Args:
@@ -134,7 +135,7 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
         frame_tokens: Number of prompt tokens written after each document.
         suffixes: Request lengths in tokens, shared by all documents, in
             one round.
-        live: Expected number of documents to classify.
+        expected_rows: Expected number of documents to classify.
         lengths: Document lengths in tokens.
         shared: Shared document prefix lengths, or an empty sequence.
         chunk: Maximum tokens per forward pass.
@@ -150,13 +151,14 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
             row per decode round.
         head_rows: Output-head rows each answer row multiplies; 0 is the
             whole vocabulary. A decision model ignores it.
+        gpus: Model copies sharing the documents evenly.
 
     Returns:
-        Expected work over the documents, scaled to live, priced at
+        Expected work over the documents, scaled to the expected rows, priced at
         ideal packing.
     """
     n = len(lengths)
-    if live <= 0 or n == 0 or not (suffixes or runs):
+    if expected_rows <= 0 or n == 0 or not (suffixes or runs):
         return ClassifyCost(0.0, 0.0, Work(), 0.0, 0)
     window = model.sliding_window
     prefix = np.asarray(lengths, dtype=float) + head_tokens
@@ -181,21 +183,24 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
         rounds = 1
     if answer_rows is not None:
         rows = answer_rows
-    total = work * (live / n)
+    total = work * (expected_rows / n)
+    copies = parallel_copies(gpus, min(expected_rows, n))
+    seconds = unrounded_seconds(
+        total * (1 / copies), model, device, chunk,
+        rows=rows * expected_rows / copies, head_rows=head_rows)
     passes = total.tokens / chunk
-    seconds = decoder_seconds(total, rows * live, passes, model, device, head_rows)
-    return ClassifyCost(seconds, passes, total, suffix_tokens * live, rounds)
+    return ClassifyCost(seconds, passes, total, suffix_tokens * expected_rows, rounds)
 
 
-def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
+def estimate(scoring: str, expected_rows: float, head_tokens: int, frame_tokens: int,
              labels, *, lengths, shared, chunk: int,
              model, device, resident: bool = False, draws: int = 1,
-             starts=()) -> ClassifyCost:
+             starts=(), gpus: int = 1) -> ClassifyCost:
     """Estimate the cost of one classification scoring rule.
 
     Args:
         scoring: Label scoring rule name.
-        live: Expected number of documents to classify.
+        expected_rows: Expected number of documents to classify.
         head_tokens: Number of prompt tokens before each document.
         frame_tokens: Number of prompt tokens written after each document.
         labels: Token sequence for each label.
@@ -207,6 +212,7 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         resident: Whether document KV is already available.
         draws: Maximum number of diffusion draws per document.
         starts: Per label, which tokens begin a new word.
+        gpus: Model copies sharing the documents evenly.
 
     Returns:
         Estimated execution time, work, and token counts.
@@ -227,10 +233,21 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
     # rows of the head; longer labels normalize over the vocabulary
     targets = {token for ids in labels for token in ids}
     return estimate_suffixes(
-        head_tokens, frame_tokens, suffixes, live=live, lengths=lengths,
-        shared=shared, chunk=chunk, model=model, device=device,
+        head_tokens,
+        frame_tokens,
+        suffixes,
+        expected_rows=expected_rows,
+        lengths=lengths,
+        shared=shared,
+        chunk=chunk,
+        model=model,
+        device=device,
         resident=resident,
         head_rows=len(targets) if all(len(ids) == 1 for ids in labels) else 0,
-        canvas_rows=(canvas_rows if scoring == LETTERS_SCORING
-                     else model.canvas_tokens),
-        runs=runs, answer_rows=answer_rows)
+        canvas_rows=(
+            canvas_rows if scoring == LETTERS_SCORING else model.canvas_tokens
+        ),
+        runs=runs,
+        answer_rows=answer_rows,
+        gpus=gpus,
+    )

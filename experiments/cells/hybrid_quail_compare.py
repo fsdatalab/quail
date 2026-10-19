@@ -167,11 +167,12 @@ def quail(model: str) -> dict:
     model_memory_bytes = torch.cuda.memory_allocated()
     full_pages, sliding = budgets.arena_pages(spec, H100_SXM, BUDGET)
     arena = KVArena(
-        n_layers=spec.layers, n_pages=full_pages,
-        page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv, d_head=spec.d_head,
+        num_layers=spec.layers, num_pages=full_pages,
+        page_tokens=budgets.PAGE_TOKENS, num_kv_heads=spec.num_kv_heads,
+        d_head=spec.d_head,
         dtype=torch.bfloat16, layer_kv=spec.kv_shapes,
         sliding_layers=spec.sliding_layer_set,
-        sliding_window=spec.sliding_window, n_sliding_pages=sliding,
+        sliding_window=spec.sliding_window, num_sliding_pages=sliding,
         **checkpoint_arena_args(spec, H100_SXM, BUDGET, full_pages))
     pipeline = build_pipeline(spec, loaded, arena)
     rows = AnswerRows(torch, F, loaded, set(ref["true_ids"]),
@@ -190,7 +191,7 @@ def quail(model: str) -> dict:
             return super().submit(normed)
 
     record = {"model": model, "model_memory_bytes": model_memory_bytes,
-              "slots": arena.n_state_slots,
+              "slots": arena.num_state_slots,
               "pages": full_pages, "alone": [], "batched": [],
               "alone_bits": [], "batched_bits": []}
     if spec.experts:

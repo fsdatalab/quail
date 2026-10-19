@@ -1,20 +1,7 @@
-"""A fake reranker and a runner that finishes a query through it."""
+"""A runner that executes a query's compute graph on a reranker."""
 
-from quail.api.execute import execute_query
-from quail.backends.quail.reranker import RerankerBatch, RerankerModelExecution
-from quail.execution.metrics import scalar_node_metrics
+from quail.backends.quail.reranker import RerankerModelExecution
 from quail.execution.runner import ExecutionContext, GenericRunner, compute_subgraph
-from quail.execution.types import PhysicalResponse, export_physical_outputs
-
-
-class _RowReranker:
-    def __init__(self):
-        self.calls = 0
-
-    def score(self, spec, rows, documents):
-        self.calls += 1
-        scores = [(int(sum(row)) + 1) / 10 for row in rows]
-        return RerankerBatch(scores, fresh_tokens=len(rows), cached_tokens=0)
 
 
 def _run_graph(session, query, request, reranker):
@@ -37,15 +24,3 @@ def _run_graph(session, query, request, reranker):
         ),
     )
     return graph, model, run
-
-
-def _finish(query, session, reranker):
-    def execute(request):
-        graph, _, run = _run_graph(session, query, request, reranker)
-        return PhysicalResponse(
-            export_physical_outputs(graph, run),
-            {"backend": "quail", "wall_s": 0.1, "fresh_tokens": 12,
-             "cached_tokens": 3, "node_metrics": scalar_node_metrics(run.nodes)},
-        )
-
-    return execute_query(query, physical_executor=execute)

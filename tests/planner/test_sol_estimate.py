@@ -9,6 +9,7 @@ import pytest
 
 import quail
 from quail.catalog import DocumentProvider
+from quail.cost.work import Work, ask, scan
 from quail.planner.plan import EngineConfig
 from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_USD_PER_HOUR
 
@@ -123,7 +124,10 @@ def test_planner_and_estimate_price_hybrid_queries_and_prefix_reuse(tmp_path):
         pre = quail.lower_prompt(query.logical.operators().filters["r"][0].prompt,
                                  session.tokenizer).preamble_tokens
     assert exact.join_stages[0]["anchor"] == "r"
-    assert exact.seconds == pytest.approx(planned.estimated_seconds)
+    # the plan credits the shared prefix as the estimate does; the two
+    # differ only in packing the filters' and the join's passes
+    assert shared.seconds < exact.seconds
+    assert planned.estimated_seconds == pytest.approx(shared.seconds, rel=0.05)
     assert exact.work.sliding_pairs < exact.work.pairs
     assert exact.work.sliding_kv_read < exact.work.kv_read
     assert exact.work.pairs - shared.work.pairs == sum(range(1, pre + 1031))
@@ -190,6 +194,10 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
     assert distinct.post_filter_counts == {"r": 3}
     assert distinct.as_dict()["classification_evaluations"] == 3
 
+    # one readout row per classified document
+    assert distinct.filter_stages[0]["answer_rows"] == 3
+    assert distinct.latency.component("readout").seconds > 0
+
     stages = estimate.filter_stages
     assert [stage["operator"] for stage in stages] == [
         "AI.IF", "AI.CLASSIFY", "IN"]
@@ -208,6 +216,31 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
     assert estimate.fresh_tokens == (
         stages[0]["fresh_tokens"] + stages[1]["fresh_tokens"]
         + estimate.join_stages[0]["fresh_tokens"])
+
+
+def test_an_extraction_verifies_its_reference_answer_after_the_cue(tmp_path):
+    reference = {0: "good", 1: ["bad", "film"], 2: None}
+    with _session(tmp_path) as sess:
+        query = (sess.docs("reviews").alias("r")
+                 .ai_extract("r.body", {"tone": "What is the tone?"}, name="x")
+                 .select("r.id", "x"))
+        (node,) = query.logical.operators().extracts
+        lowered = quail.lower_prompt(node.call.prompt, sess.tokenizer)
+        estimate = quail.speed_of_light_estimate(
+            query, lambda prompt, assignment: reference[assignment["r"]],
+            credit_shared_prefixes=False)
+    (stage,) = estimate.filter_stages
+    # each document's question, then its answer: a span and its closing
+    # quote per span, or the quote alone, verified over the question's KV
+    context = lowered.preamble_tokens + 2 + lowered.tail_tokens
+    expected = Work()
+    for tokens in (2, 4, 1):
+        expected += scan(context - lowered.tail_tokens, lowered.tail_tokens)
+        expected += ask(context, tokens)
+    assert estimate.work == expected
+    assert stage["answer_rows"] == 7
+    assert stage["fresh_tokens"] == 3 * context + 7
+    assert estimate.latency.component("readout").seconds > 0
 
 
 def test_a_classification_of_joined_rows_is_priced_per_kept_pair(tmp_path):
@@ -272,7 +305,7 @@ def test_unpriced_operators_are_refused(tmp_path):
         compared = sess.sql(
             "SELECT r.id FROM reviews AS r "
             "WHERE AI.SCORE(PROMPT('Rate {0}', r.body)) > 0.5")
-        with pytest.raises(NotImplementedError, match="Compare filter"):
+        with pytest.raises(NotImplementedError, match="does not price the filter"):
             quail.speed_of_light_estimate(compared, _answer)
         exists = (sess.docs("reviews").alias("r")
                   .ai_join(sess.docs("aspects").alias("a"),

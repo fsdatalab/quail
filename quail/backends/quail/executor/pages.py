@@ -11,20 +11,20 @@ class PageArena:
     the free list when its last holder frees it.
     """
 
-    def __init__(self, n_pages: int, page_tokens: int, n_slots: int = 0):
-        self.n_pages = n_pages
+    def __init__(self, num_pages: int, page_tokens: int, num_slots: int = 0):
+        self.num_pages = num_pages
         self.page_tokens = page_tokens
-        self.n_slots = n_slots
-        self.free_slots = list(range(n_slots - 1, -1, -1))    # stack
+        self.num_slots = num_slots
+        self.free_slots = list(range(num_slots - 1, -1, -1))    # stack
         self.slots = {}    # key -> the checkpoint slot it holds
         self.slot_tokens = {}    # key -> tokens its checkpoint covers
         self.ext_slots = {}    # key -> slot of the state past retained suffix
         self.ext_tokens = {}    # key -> tokens that second checkpoint covers
         self.share_slots = {}    # (key, tokens) -> slot of the state there
-        self.free = list(range(n_pages - 1, -1, -1))    # stack
+        self.free = list(range(num_pages - 1, -1, -1))    # stack
         self.owned = {}       # key -> list of page ids it alone writes
         self.borrowed = {}    # key -> leading page ids read from a parent
-        self.holds = [0] * n_pages    # page id -> keys holding it
+        self.holds = [0] * num_pages    # page id -> keys holding it
         self.tokens = {}      # key -> resident token count, borrowed included
         self.pinned = set()    # current operators depend on these keys
         self._retained_sizes = {}
@@ -219,7 +219,7 @@ class PageArena:
 
     def configure_retention(self, policy, cap_pages: int) -> None:
         """Update priorities without making active prefixes evictable."""
-        if not 0 <= cap_pages <= self.n_pages:
+        if not 0 <= cap_pages <= self.num_pages:
             raise ValueError("retention capacity must fit inside the arena")
         self.retention_policy = policy
         self.retention_cap_pages = cap_pages
@@ -286,7 +286,7 @@ class PageArena:
     def row_indices(self, key, tokens=None):
         """Flat row positions of the document's tokens inside a pool.
 
-        The pool is viewed as (n_pages * page_tokens, ...): page p holds
+        The pool is viewed as (num_pages * page_tokens, ...): page p holds
         rows p*page_tokens .. p*page_tokens + page_tokens.
         """
         rows = []

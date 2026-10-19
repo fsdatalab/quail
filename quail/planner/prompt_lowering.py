@@ -179,10 +179,10 @@ def lower_prompt(prompt: Prompt, tokenizer) -> LoweredPrompt:
         lettered=lettered)
 
 
-def true_false_ids(tok):
+def true_false_ids(tokenizer):
     """Return TRUE and FALSE token sets from a Hugging Face tokenizer."""
     true, false = true_false_token_ids(
-        lambda text: tok(text, add_special_tokens=False)["input_ids"])
+        lambda text: tokenizer(text, add_special_tokens=False)["input_ids"])
     return set(true), set(false)
 
 

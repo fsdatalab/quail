@@ -28,7 +28,7 @@ class _Rows(dict):
 
 def _arena(slots, pages=100_000):
     arena = bare_arena(KVArena.__new__(KVArena), pages)
-    arena.accounting = PageArena(pages, 16, n_slots=slots)
+    arena.accounting = PageArena(pages, 16, num_slots=slots)
     arena._rows = _Rows()
     arena._capacity_rows = _Rows()
     return arena
@@ -61,13 +61,16 @@ def _pack(torch, arena, specs, **options):
             fresh.append(spec["key"])
     phases = plan_phases(arena, groups, lambda name, values, dtype: np.asarray(values))
     return SimpleNamespace(
-        specs=specs, tokens=rows, temporary_keys=(), fresh_keys=tuple(fresh),
+        specs=specs, tokens=rows, layout=[], temporary_keys=(),
+        fresh_keys=tuple(fresh),
         rows_per_answer=(), meta={"gdn": phases},
         n=sum(len(spec["suffixes"]) for spec in specs))
 
 
 class _Readout:
     dtype = None
+    trailing_rows = 1
+    normalize = False
 
     def submit(self, normed, rows_per_answer=None):
         return normed
@@ -291,8 +294,8 @@ def test_admission_reserves_kv_and_checkpoints_before_packing(monkeypatch):
     assert all(event[1] == "evict" for event in arena.events)
     for key in arena.resident_keys():
         arena.free_key(key)
-    assert arena.free_pages == arena.n_pages
-    assert len(arena.accounting.free_slots) == arena.n_state_slots
+    assert arena.free_pages == arena.num_pages
+    assert len(arena.accounting.free_slots) == arena.num_state_slots
     assert not any(arena.accounting.holds)
 
 

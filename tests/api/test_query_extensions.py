@@ -61,7 +61,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
         ]
         filter_node = next(node for node in graph.nodes if isinstance(node, AiFilter))
         run = RunResult(None, {filter_node.node_id: NodeResult({
-            "ids:d": [0],
+            "rows:d": [0],
             "filter_answers:d": {0: [True], 1: [False]},
         })}, NodeMetrics())
         return PhysicalResponse(
@@ -74,9 +74,11 @@ def test_query_scans_provider_and_preserves_extension_objects(
     monkeypatch.setattr(runtime, "_prepare_backend", lambda plan, registry: None)
 
     session.registry.register_physical_rule(CheckPlanning())
-    session.register("docs", quail.DocumentProvider.from_parquet(path, id_col="id"))
+    session.register(
+        "documents", quail.DocumentProvider.from_parquet(path, id_col="id")
+    )
     response = session.sql(
-        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('keep {0}', d.body))"
+        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('keep {0}', d.body))"
     ).run()
     materialized = quail.QueryResult.from_table(response.collect(), response.report)
     materialized.plan = response.plan
@@ -117,11 +119,11 @@ def test_tokenization_loads_columns_from_every_logical_candidate():
         quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
         tokenizer=_tokens)
     session.registry.register_logical_rule(ExtraColumn())
-    session.register("docs", quail.DocumentProvider.from_table(
+    session.register("documents", quail.DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two"], "extra": [1, 2]}),
         id_col="id"))
     query = session.sql(
-        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
+        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
     stores = query.token_inputs()
     assert stores["d"].column("extra").to_pylist() == [1, 2]
     assert len(query.plan().settings["candidates"]) == 2

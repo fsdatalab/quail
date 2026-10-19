@@ -6,10 +6,10 @@ file, so later queries read only what they project. It also samples a
 column for the planner's estimates.
 """
 
-import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack, closing
 from itertools import chain
 from numbers import Integral
 from pathlib import Path
@@ -22,8 +22,15 @@ from quail.catalog.providers import Catalog, ScanRequest
 from quail.catalog.tokens import (
     ColumnStoreWriter,
     ScanInput,
+    TokenLengths,
     TokenOffsets,
     TokenStoreWriter,
+)
+from quail.logical.expressions import (
+    Alias,
+    column_name,
+    evaluate_expression,
+    source_columns,
 )
 from quail.progress import Progress, say
 
@@ -31,6 +38,23 @@ from quail.progress import Progress, say
 ESTIMATE_SAMPLE = 1024
 # rows written per tokenization step, so progress stays responsive
 TOKENIZE_ROWS = 2048
+
+
+def _column_key(column) -> tuple:
+    """Key a document column by what it reads, not by its table alias or name.
+
+    Two aliases of one provider that read the same expression share
+    one token file. The source columns are part of the key, so a
+    column literally named ``details.body`` and the field ``body`` of
+    a struct column ``details`` stay apart.
+    """
+    while isinstance(column, Alias):
+        column = column.expression
+    return (column_name(column, qualified=False), source_columns(column))
+
+
+def _column_label(column) -> str:
+    return _column_key(column)[0]
 
 
 class InputStore:
@@ -52,7 +76,7 @@ class InputStore:
         self._token_stores = {}
         self._replaced_token_stores = []
         self._column_stores = {}
-        self._store_count = 0
+        self.num_stores = 0
         self._token_directory = None
         self._corpus_tokenizers = {}
         self._length_estimates = {}
@@ -89,11 +113,13 @@ class InputStore:
             self._token_offsets = TokenOffsets(token_bytes())
         return self._token_offsets
 
-    def tokenize(self, provider_name: str, column: str,
+    def tokenize(self, provider_name: str, column,
                  projected_columns=(), *, with_offsets=False) -> ScanInput:
         """Tokenize one document column and keep value columns beside it.
 
-        The token file is cached per document column. Each value column
+        The document column is a value expression over the provider's
+        columns, such as a column reference or a struct field. The
+        token file is cached per document column. Each value column
         is cached in its own file, so a later query that returns other
         columns reads only those columns from the provider and does not
         tokenize the documents again.
@@ -106,7 +132,7 @@ class InputStore:
         provider = self.catalog.get(provider_name)
         identity = provider.content_identity()
         projected_columns = tuple(dict.fromkeys(projected_columns))
-        token_key = (identity, column)
+        token_key = (identity, _column_key(column))
         missing = [
             name for name in projected_columns
             if (identity, name) not in self._column_stores
@@ -145,7 +171,7 @@ class InputStore:
         """
         return self._background_executor().submit(self.tokenizer, "")
 
-    def tokenize_async(self, provider_name: str, column: str,
+    def tokenize_async(self, provider_name: str, column,
                        projected_columns=(), *, with_offsets=False) -> Future:
         """Start tokenize() on a background thread and return its Future."""
         return self._background_executor().submit(
@@ -180,13 +206,13 @@ class InputStore:
             for index, column in enumerate(columns)
         }
 
-    def token_lengths(self, provider_name: str, column: str):
+    def token_lengths(self, provider_name: str, column):
         """Return the exact token counts when the column is tokenized."""
         identity = self.catalog.get(provider_name).content_identity()
-        store = self._token_stores.get((identity, column))
+        store = self._token_stores.get((identity, _column_key(column)))
         return None if store is None else store.lengths
 
-    def estimate_lengths(self, provider_name: str, column: str) -> list[int]:
+    def estimate_lengths(self, provider_name: str, column) -> TokenLengths:
         """Estimate document token counts from a tokenized sample.
 
         Tokenizes the first ESTIMATE_SAMPLE documents and repeats their
@@ -196,54 +222,59 @@ class InputStore:
         lengths, which the sample's tokens per byte scale.
         """
         provider = self.catalog.get(provider_name)
-        key = (provider.content_identity(), column)
+        key = (provider.content_identity(), _column_key(column))
         if key in self._length_estimates:
             return self._length_estimates[key]
         started = time.perf_counter()
-        row_count = provider.statistics().row_count
-        sample = self.sample_columns(provider_name, (column,))[column].to_pylist()
+        num_rows = provider.statistics().num_rows
+        sources = source_columns(column)
+        sample = pc.fill_null(evaluate_expression(
+            column, pa.table(self.sample_columns(provider_name, sources))), ""
+        ).to_pylist()
         # Defer fast-tokenizer initialization to the background tokenization pass.
-        tok = self.tokenizer
-        sample_lengths = [max(1, len(tok(text))) for text in sample]
-        if row_count is not None:
+        tokenizer = self.tokenizer
+        sample_lengths = [max(1, len(tokenizer(text))) for text in sample]
+        if num_rows is not None:
             lengths = [sample_lengths[index % len(sample_lengths)]
-                       for index in range(row_count)] if sample_lengths else []
+                       for index in range(num_rows)] if sample_lengths else []
         else:
             sample_tokens = sum(sample_lengths)
             sample_bytes = sum(len(text.encode("utf-8")) for text in sample)
             ratio = sample_tokens / sample_bytes if sample_bytes else 0.0
             lengths = []
-            reader = provider.scan(ScanRequest(columns=(column,)))
+            reader = provider.scan(ScanRequest(columns=sources))
             try:
                 for batch in reader:
                     lengths.extend(
                         max(1, round(n * ratio)) for n in pc.binary_length(
-                            batch.column(0)).cast(pa.int64()).to_pylist())
+                            evaluate_expression(column, batch)
+                        ).cast(pa.int64()).to_pylist())
             finally:
                 reader.close()
-        self._length_estimates[key] = lengths
-        say(f"estimated {provider_name}.{column}: {len(lengths):,} documents, "
+        say(f"estimated {provider_name}.{_column_label(column)}: "
+            f"{len(lengths):,} documents, "
             f"about {sum(lengths):,} tokens from a {len(sample)} document "
             f"sample, {time.perf_counter() - started:.1f} s")
+        self._length_estimates[key] = lengths = TokenLengths(lengths)
         return lengths
 
     def _corpus_tokenizer(self, provider_name, column, texts):
         """Cache the session tokenizer and token type for one column."""
-        key = (self.catalog.get(provider_name).content_identity(), column)
+        key = (self.catalog.get(provider_name).content_identity(),
+               _column_key(column))
         if key not in self._corpus_tokenizers:
-            tok = self.tokenizer
-            self.notes.append(
-                f"{provider_name}.{column}: tokenizer: {self.tokenizer_name}"
-            )
+            tokenizer = self.tokenizer
+            self.notes.append(f"{provider_name}.{_column_label(column)}: "
+                              f"tokenizer: {self.tokenizer_name}")
             first_token = next(
-                (token for text in texts for token in tok(text)), None
+                (token for text in texts for token in tokenizer(text)), None
             )
             token_type = (
                 pa.int32()
                 if first_token is None or isinstance(first_token, Integral)
                 else pa.string()
             )
-            self._corpus_tokenizers[key] = (tok, token_type)
+            self._corpus_tokenizers[key] = (tokenizer, token_type)
         return self._corpus_tokenizers[key]
 
     def _store_path(self) -> str:
@@ -251,13 +282,14 @@ class InputStore:
             self._token_directory = TemporaryDirectory(
                 prefix="quail-tokens-"
             )
-        self._store_count += 1
+        self.num_stores += 1
         return str(
             Path(self._token_directory.name)
-            / f"input-{self._store_count}.arrow"
+            / f"input-{self.num_stores}.arrow"
         )
 
-    def _pick_tokenizer(self, reader, provider_name: str, column: str):
+    def _pick_tokenizer(self, reader, provider_name: str,
+                        column):
         """Sample the first documents to choose a tokenizer and token type."""
         buffered = []
         text_sample = []
@@ -267,14 +299,14 @@ class InputStore:
             except StopIteration:
                 break
             buffered.append(batch)
-            texts = batch.column(batch.schema.get_field_index(column))
+            texts = pc.fill_null(evaluate_expression(column, batch), "")
             needed = 25 - len(text_sample)
             text_sample.extend(texts.slice(0, needed).to_pylist())
-        tok, token_type = self._corpus_tokenizer(
+        tokenizer, token_type = self._corpus_tokenizer(
             provider_name, column, text_sample)
-        return buffered, tok, token_type
+        return buffered, tokenizer, token_type
 
-    def _load(self, provider_name: str, column: str | None,
+    def _load(self, provider_name: str, column,
               value_columns: tuple[str, ...], *, offsets_encoder=None) -> None:
         """Scan the provider once and write the missing store files.
 
@@ -288,94 +320,99 @@ class InputStore:
         provider = self.catalog.get(provider_name)
         identity = provider.content_identity()
         scan_columns = tuple(dict.fromkeys(
-            ((column,) if column is not None else ()) + value_columns
-        ))
-        scan_reader = provider.scan(ScanRequest(columns=scan_columns))
-        reader = iter(scan_reader)
-        token_writer = None
-        column_writers = {}
-        writers = []
-        try:
-            batches = reader
-            if column is not None:
-                existing = self._token_stores.get((identity, column))
-                existing_tokens = existing.arrow_array if existing is not None else None
-                if existing_tokens is None:
-                    buffered, tok, token_type = self._pick_tokenizer(
-                        reader, provider_name, column)
-                    batches = chain(buffered, reader)
-                else:
-                    tok, token_type = self.tokenizer, existing_tokens.type.value_type
-                if offsets_encoder is not None:
-                    self.notes.append(f"{provider_name}.{column}: tokenizer: "
-                                      f"{self.tokenizer_name} with character offsets")
-                token_writer = TokenStoreWriter(
-                    self._store_path(),
-                    document_column=column,
-                    tokenizer=tok,
-                    token_type=token_type,
-                    offsets_encoder=offsets_encoder,
-                    existing_tokens=existing_tokens,
-                )
-                writers.append(token_writer)
-            source_schema = provider.schema()
-            for name in value_columns:
-                column_writers[name] = ColumnStoreWriter(
-                    self._store_path(), source_schema.field(name))
-                writers.append(column_writers[name])
-            progress = None
-            if column is not None:
-                say(f"tokenizing {provider_name}.{column} "
-                    f"({self.notes[-1].split(': ', 1)[-1]})")
-                progress = Progress(f"tokenizing {provider_name}.{column}")
-            rows = 0
-            for batch in batches:
-                for start in range(0, batch.num_rows, TOKENIZE_ROWS):
-                    piece = batch.slice(start, TOKENIZE_ROWS)
-                    for writer in writers:
-                        writer.write_batch(piece)
-                    rows += piece.num_rows
-                    if progress is not None:
-                        progress.update(rows)
-        except Exception:
-            for writer in writers:
-                writer.abort()
-            raise
-        finally:
-            scan_reader.close()
-        token_store = (
-            token_writer.finish() if token_writer is not None else None)
-        if progress is not None:
-            progress.finish(f"tokenized {provider_name}.{column}",
-                            f"{sum(token_store.lengths):,} tokens")
-        column_stores = {
-            name: writer.finish() for name, writer in column_writers.items()
-        }
-        # every file for one provider must line up row for row, so a
-        # later scan must return as many rows as the earlier one did
-        known_rows = next(
-            (len(store) for (store_identity, _), store in chain(
-                self._token_stores.items(), self._column_stores.items())
-             if store_identity == identity),
-            None)
-        written = list(column_stores.items())
+            (source_columns(column) if column is not None else ())
+            + value_columns))
+        with ExitStack() as rollback:
+            token_writer = None
+            column_writers = {}
+            writers = []
+            with closing(provider.scan(ScanRequest(columns=scan_columns))) as scan:
+                reader = iter(scan)
+                batches = reader
+                if column is not None:
+                    existing = self._token_stores.get(
+                        (identity, _column_key(column)))
+                    existing_tokens = (existing.arrow_array if existing is not None
+                                       else None)
+                    if existing_tokens is None:
+                        buffered, tokenizer, token_type = self._pick_tokenizer(
+                            reader, provider_name, column)
+                        batches = chain(buffered, reader)
+                    else:
+                        tokenizer, token_type = (
+                            self.tokenizer,
+                            existing_tokens.type.value_type,
+                        )
+                    if offsets_encoder is not None:
+                        self.notes.append(
+                            f"{provider_name}.{_column_label(column)}: tokenizer: "
+                            f"{self.tokenizer_name} with character offsets")
+                    token_writer = TokenStoreWriter(
+                        self._store_path(),
+                        document_column=column,
+                        tokenizer=tokenizer,
+                        token_type=token_type,
+                        offsets_encoder=offsets_encoder,
+                        existing_tokens=existing_tokens,
+                    )
+                    rollback.callback(token_writer.abort)
+                    writers.append(token_writer)
+                source_schema = provider.schema()
+                for name in value_columns:
+                    writer = ColumnStoreWriter(
+                        self._store_path(), source_schema.field(name))
+                    rollback.callback(writer.abort)
+                    column_writers[name] = writer
+                    writers.append(writer)
+                progress = None
+                if column is not None:
+                    label = f"{provider_name}.{_column_label(column)}"
+                    say(f"tokenizing {label} ({self.notes[-1].split(': ', 1)[-1]})")
+                    progress = Progress(f"tokenizing {label}")
+                rows = 0
+                for batch in batches:
+                    for start in range(0, batch.num_rows, TOKENIZE_ROWS):
+                        piece = batch.slice(start, TOKENIZE_ROWS)
+                        for writer in writers:
+                            writer.write_batch(piece)
+                        rows += piece.num_rows
+                        if progress is not None:
+                            progress.update(rows)
+            # a finished store is closed and deleted with the rest on failure
+            token_store = token_writer.finish() if token_writer is not None else None
+            if token_store is not None:
+                rollback.callback(token_store.close)
+            column_stores = {}
+            for name, writer in column_writers.items():
+                store = writer.finish()
+                rollback.callback(store.close)
+                column_stores[name] = store
+            # every file for one provider must line up row for row, so a
+            # later scan must return as many rows as the earlier one did
+            known_rows = next(
+                (len(store) for (store_identity, _), store in chain(
+                    self._token_stores.items(), self._column_stores.items())
+                 if store_identity == identity),
+                None)
+            written = list(column_stores.items())
+            if token_store is not None:
+                written.append((_column_label(column), token_store))
+            for name, store in written:
+                rows = len(store)
+                if known_rows is not None and rows != known_rows:
+                    raise RuntimeError(
+                        f"{provider_name}.{name} returned {rows} rows but an "
+                        f"earlier scan returned {known_rows}; the provider "
+                        f"does not scan in a stable order")
+            if progress is not None:
+                progress.finish(f"tokenized {label}",
+                                f"{sum(token_store.lengths):,} tokens")
+            rollback.pop_all()
         if token_store is not None:
-            written.append((column, token_store))
-        for name, store in written:
-            rows = len(store)
-            if known_rows is not None and rows != known_rows:
-                for _, bad in written:
-                    bad.close()
-                    os.unlink(bad.path)
-                raise RuntimeError(
-                    f"{provider_name}.{name} returned {rows} rows but an "
-                    f"earlier scan returned {known_rows}; the provider "
-                    f"does not scan in a stable order")
-        if token_store is not None:
-            previous = self._token_stores.get((identity, column))
+            previous = self._token_stores.get((identity, _column_key(column)))
             if previous is not None:
                 # In-flight requests can still reference the previous store.
                 self._replaced_token_stores.append(previous)
-            self._token_stores[(identity, column)] = token_store
+            self._token_stores[(identity, _column_key(column))] = token_store
         for name, store in column_stores.items():
             self._column_stores[(identity, name)] = store

@@ -18,6 +18,7 @@ from quail.backends.quail.executor.stages import Stage
 from quail.baselines.nodes import RequestExecution
 from quail.baselines.request import RequestBackend
 from quail.catalog import Catalog, DocumentProvider
+from quail.catalog.tokens import TokenLengths
 from quail.logical import (
     ColumnRef,
     bind_join_prompt,
@@ -232,7 +233,7 @@ def test_plans_carry_the_decision_layout(session):
     question = node.question_token_ids
     assert "".join(question).endswith(OPTIONS + CLOSING)
     assert "".join(question).startswith("\n\nTask type: noul\nQuestion:\n")
-    assert plan.settings["pre_ids"] == _tokens("Context:\n")
+    assert node.document_head == tuple(_tokens("Context:\n"))
 
     plan = session.sql(
         "SELECT q.id, d.id FROM queries q JOIN documents d "
@@ -466,8 +467,9 @@ def test_classification_tree_scoring_follows_the_executor_gate():
 
     def table(model):
         context = SimpleNamespace(
-            document_tokens={"d": [100, 200]}, model=model, device=H100_SXM,
-            canvas_draws=1, tokenizer=_tokens, memo={})
+            document_tokens={"d": TokenLengths([100, 200])}, model=model,
+            device=H100_SXM, canvas_draws=1, tokenizer=_tokens, memo={}, gpus=1,
+            attention=None)
         return classify_statistics(context, "d")
 
     assert not table(DECISION_2_KAI_0_6B_BF16).tree

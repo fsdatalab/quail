@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 STATES = (
     "queued", "planning", "running",
@@ -111,12 +111,3 @@ class QueryStatus:
     def done(self) -> bool:
         """Return whether the query reached a terminal state."""
         return self.state in TERMINAL_STATES
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> QueryStatus:
-        known = {name for name in cls.__dataclass_fields__}
-        return cls(**{key: value for key, value in data.items()
-                      if key in known})

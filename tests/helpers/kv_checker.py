@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from helpers.fakes import fake_pipeline, fake_torch
+from helpers.fakes import fake_pipeline, fake_readout, fake_torch
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.operators.filter import FilterPart
 from quail.backends.quail.executor.parts import gated_stages
@@ -76,8 +76,8 @@ class HashModel:
     def __init__(self, arena, answers, canvas):
         self.page = arena.page_tokens
         self.window = arena.window
-        self.full = Pool(arena.accounting.n_pages, self.page)
-        self.sliding = (Pool(arena.sliding.n_pages, self.page)
+        self.full = Pool(arena.accounting.num_pages, self.page)
+        self.sliding = (Pool(arena.sliding.num_pages, self.page)
                         if arena.has_sliding else None)
         self.answers = answers      # request hash -> answer bit
         self.canvas = canvas
@@ -147,10 +147,10 @@ class HashModel:
                 "a query row is not written where it reads itself"
             previous = 0
             if view:
-                token, pos, previous = value(
+                token, read_position, previous = value(
                     self.full, full, phys(table, i, view - 1))
-                assert pos == position - 1, \
-                    f"row at {position} reads position {pos} before it"
+                assert read_position == position - 1, \
+                    f"row at {position} reads position {read_position} before it"
             hashes[row] = mix(previous, ids[row])
             return hashes[row]
 
@@ -251,8 +251,8 @@ class HashModel:
                 i = read_of[row]
                 assert read_used[i] == position, \
                     f"row at {position} reads {read_used[i]} resident rows"
-                _, pos, previous = value(phys(i, position - 1))
-                assert pos == position - 1
+                _, read_position, previous = value(phys(i, position - 1))
+                assert read_position == position - 1
             else:
                 assert position == 0, \
                     f"row at {position} starts a segment and reads nothing"
@@ -273,8 +273,8 @@ class HashModel:
     def _check_chain(read, rows):
         previous = 0
         for v in range(rows):
-            token, pos, h = read(v)
-            assert pos == v, f"resident row {v} holds position {pos}"
+            token, position, h = read(v)
+            assert position == v, f"resident row {v} holds position {position}"
             assert h == mix(previous, token), \
                 f"resident row {v} was overwritten"
             previous = h
@@ -282,14 +282,14 @@ class HashModel:
 
 def make_arena(setup):
     if setup.window is not None:
-        return KVArena(n_layers=2, n_pages=setup.pages,
-                       page_tokens=setup.page_tokens, n_kv=1, d_head=1,
+        return KVArena(num_layers=2, num_pages=setup.pages,
+                       page_tokens=setup.page_tokens, num_kv_heads=1, d_head=1,
                        dtype=torch.float32, device="cpu",
                        layer_kv=[(1, 1), (1, 1)], sliding_layers=(1,),
                        sliding_window=setup.window,
-                       n_sliding_pages=setup.sliding_pages)
-    return KVArena(n_layers=1, n_pages=setup.pages,
-                   page_tokens=setup.page_tokens, n_kv=1, d_head=1,
+                       num_sliding_pages=setup.sliding_pages)
+    return KVArena(num_layers=1, num_pages=setup.pages,
+                   page_tokens=setup.page_tokens, num_kv_heads=1, d_head=1,
                    dtype=torch.float32, device="cpu")
 
 
@@ -304,7 +304,7 @@ def cpu_torch():
 
 def passthrough():
     """An answer readout that returns the model's answers as they are."""
-    return SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    return fake_readout()
 
 
 def answer(h):
@@ -324,30 +324,30 @@ class Run:
                                       canvas_ids=setup.canvas)
         self.torch = cpu_torch()
 
-    def tree(self, docs):
-        return prefix_tree(docs, self.setup.page_tokens)
+    def tree(self, documents):
+        return prefix_tree(documents, self.setup.page_tokens)
 
 
-def check_filter(docs, questions, setup):
+def check_filter(documents, questions, setup):
     """Run a filter chain and check its answers and its KV reads."""
     tail = list(setup.canvas)
     answers = {}
-    for doc in docs:
+    for document in documents:
         for q in questions:
-            h = chain(doc + q + tail)
+            h = chain(document + q + tail)
             answers[h] = answer(h)
     run = Run(setup, answers)
     parts = [FilterPart(SimpleNamespace(question_token_ids=q),
-                        list(range(len(docs))), passthrough(), len(tail))
+                        list(range(len(documents))), passthrough(), len(tail))
              for q in questions]
     got, _, _ = run_stages(
-        run.torch, run.arena, run.pipeline, gated_stages(parts), docs,
-        setup.budget, anchor_keys=[("d", i) for i in range(len(docs))],
-        attention_mode=setup.path, prefix_tree=run.tree(docs))
-    for d, doc in enumerate(docs):
+        run.torch, run.arena, run.pipeline, gated_stages(parts), documents,
+        setup.budget, anchor_keys=[("d", i) for i in range(len(documents))],
+        attention_mode=setup.path, prefix_tree=run.tree(documents))
+    for d, document in enumerate(documents):
         want = []
         for q in questions:
-            want.append(answers[chain(doc + q + tail)])
+            want.append(answers[chain(document + q + tail)])
             if not want[-1]:
                 break
         assert [int(stage[d][0]) for stage in got if d in stage] == want, (
@@ -404,27 +404,27 @@ def check_join(anchors, frame, partners, setup, retain=False):
     assert not run.arena.accounting.owned
 
 
-def check_feed(docs, question, frame, partners, setup):
+def check_feed(documents, question, frame, partners, setup):
     """Run a filter whose survivors' KV feeds a join, and check both."""
     tail = list(setup.canvas)
-    answers = _join_answers(docs, frame, partners, tail)
-    for doc in docs:
-        h = chain(doc + question + tail)
+    answers = _join_answers(documents, frame, partners, tail)
+    for document in documents:
+        h = chain(document + question + tail)
         answers[h] = answer(h >> 3)
     run = Run(setup, answers)
-    keys = [("d", i) for i in range(len(docs))]
+    keys = [("d", i) for i in range(len(documents))]
     stage_list = filter_stages([question], passthrough()) + [
         Stage(suffixes=partners, readout=passthrough(), frame=frame)]
     out, _, _ = run_stages(
-        run.torch, run.arena, run.pipeline, stage_list, docs, setup.budget,
-        anchor_keys=keys, prefix_tree=run.tree(docs),
+        run.torch, run.arena, run.pipeline, stage_list, documents, setup.budget,
+        anchor_keys=keys, prefix_tree=run.tree(documents),
         attention_mode=setup.path)
-    survivors = {d for d, doc in enumerate(docs)
-                 if answers[chain(doc + question + tail)]}
+    survivors = {d for d, document in enumerate(documents)
+                 if answers[chain(document + question + tail)]}
     assert set(out[1]) == survivors
     for d in survivors:
-        doc = docs[d]
-        assert out[1][d] == [answers[chain(doc + frame + p + tail)]
+        document = documents[d]
+        assert out[1][d] == [answers[chain(document + frame + p + tail)]
                              for p in partners], f"anchor {d}"
     assert not run.arena.accounting.owned
 

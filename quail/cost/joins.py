@@ -11,7 +11,7 @@ class PricedJoin:
     """One join with the token counts the cost model prices it by.
 
     Attributes:
-        written_pos: The join's position among the query's joins.
+        written_position: The join's position among the query's joins.
         aliases: Its tables in placeholder order.
         anchor: The table whose document KV the join reuses, or None
             when the search chooses it.
@@ -27,11 +27,11 @@ class PricedJoin:
             alias, right column).
         pair_fraction: The fraction of the cross product the equality
             conditions keep.
-        cost: A score join's own pricing, with work(live); None for a
+        cost: A score join's own pricing, with work(expected_rows); None for a
             join the model answers.
     """
 
-    written_pos: int
+    written_position: int
     aliases: tuple[str, ...]
     anchor: str | None
     anchor_free: bool

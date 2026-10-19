@@ -12,7 +12,14 @@ from quail.frontend.sql_binding.expressions import (
     _is_ai_score_comparison,
     _is_call,
     _label_test,
-    _regular_predicate,
+)
+from quail.frontend.sql_binding.predicates import (
+    COLUMN_NODES,
+    ai_aliases,
+    bind_plain_test,
+    extract_test,
+    parse_plain_test,
+    unwrap_hint,
 )
 from quail.logical import (
     Alias,
@@ -25,23 +32,19 @@ from quail.logical import (
 
 def _parse_equality(b, term, joined_alias: str) -> Equality:
     """Parse one ordinary ON condition: two columns compared with =."""
-    if (
-        not isinstance(term, exp.EQ)
-        or not isinstance(term.this, exp.Column)
-        or not isinstance(term.expression, exp.Column)
-    ):
+    if not isinstance(term, exp.EQ) or not all(
+            isinstance(side, COLUMN_NODES)
+            for side in (term.this, term.expression)):
         raise CompileError(
             f"ON supports column = column and AI predicates, got {term.sql()}"
         )
-    left = b.resolve_column(term.this)
-    right = b.resolve_column(term.expression)
-    sides = {left.alias, right.alias}
-    if joined_alias not in sides or len(sides) != 2:
+    equality = Equality(b.resolve_value(term.this), b.resolve_value(term.expression))
+    if joined_alias not in equality.aliases() or len(set(equality.aliases())) != 2:
         raise CompileError(
             f"JOIN {joined_alias} ON {term.sql()} must relate "
             f"{joined_alias!r} to a table already in the query"
         )
-    return Equality(left, right)
+    return equality
 
 
 def _from_clause(select):
@@ -96,8 +99,10 @@ class JoinBinder:
                         raise CompileError(
                             "AI.SCORE must be compared with <, <=, >, or >="
                         )
-                    plain = _regular_predicate(b, term)
-                    if plain is not None:
+                    test = None if _has_ai_call(term) else parse_plain_test(
+                        term, b.dialect)
+                    if test is not None:
+                        plain = bind_plain_test(b, test)
                         b.regular_predicates.setdefault(plain.column.alias, []).append(
                             plain
                         )
@@ -160,13 +165,84 @@ class JoinBinder:
         )
 
 
+def _has_ai_call(term) -> bool:
+    """Return whether a term asks the model, counting AI.EXTRACT only bare."""
+    return any(
+        _is_call(node, "AI_FILTER")
+        or _is_call(node, "AI_SCORE")
+        or isinstance(node, (exp.AIClassify, exp.Exists))
+        or (_is_call(node, "AI_EXTRACT") and not isinstance(node.parent, exp.Dot))
+        for node in term.walk()
+    )
+
+
+def _name_select_labels(b: ExpressionBinder, term, selected: dict):
+    """Replace a bare column named after an AI.CLASSIFY in SELECT with the call.
+
+    Raises:
+        CompileError: The name is also a column of a table in scope.
+    """
+    for column in list(term.find_all(exp.Column)):
+        if column.table or column.name not in selected:
+            continue
+        if not isinstance(selected[column.name], exp.AIClassify):
+            continue
+        if any(column.name in b.catalog.get(provider).columns
+               for _, provider in b.tables):
+            raise CompileError(
+                f"{column.name!r} is both a column of a table in scope and "
+                f"an AS name in SELECT; qualify or rename it")
+        if column is term:
+            return selected[column.name].copy()
+        column.replace(selected[column.name].copy())
+    return term
+
+
+def _bind_plain_term(b: ExpressionBinder, term, selected: dict,
+                     selectivity: float | None) -> bool:
+    """Bind a test of a source column or of an AI.EXTRACT field.
+
+    Args:
+        b: The binder.
+        term: The term.
+        selected: The AI calls in SELECT, by AS name.
+        selectivity: The term's SELECTIVITY hint, or None.
+
+    Returns:
+        Whether the term was a plain test; False leaves an AI term to
+        its binder.
+
+    Raises:
+        CompileError: A test of a source column carries a hint; the
+            scan applies it before any model call, so it has no cost.
+    """
+    if _has_ai_call(term):
+        return False
+    test = parse_plain_test(term, b.dialect)
+    if test is None:
+        return False
+    found = extract_test(b, test, selected)
+    if found is not None:
+        alias, predicate = found
+        b.extract_tests.setdefault(alias, []).append((predicate, selectivity))
+    else:
+        if selectivity is not None:
+            raise CompileError(
+                f"HINT estimates a test of a label or an answer; "
+                f"{term.sql()} tests a source column, applied at the scan")
+        plain = bind_plain_test(b, test)
+        b.regular_predicates.setdefault(plain.column.alias, []).append(plain)
+    return True
+
+
 def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None:
     """Bind WHERE conditions to scans and joins."""
     where = tree.args.get("where")
+    selected = ai_aliases(tree)
     for term in _conjuncts(where.this) if where else []:
-        plain = _regular_predicate(b, term)
-        if plain is not None:
-            b.regular_predicates.setdefault(plain.column.alias, []).append(plain)
+        term, hint = unwrap_hint(b, term)
+        term = _name_select_labels(b, term, selected)
+        if _bind_plain_term(b, term, selected, hint):
             continue
         anti = False
         node = term
@@ -196,7 +272,8 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
             if len(set(accepted)) != len(accepted):
                 raise CompileError("a filter on a label lists a label twice")
             b.label_tests.setdefault(aliases[0], []).append(
-                (call, tuple(accepted), options.get("selectivity"))
+                (call, tuple(accepted),
+                 options.get("selectivity") if hint is None else hint)
             )
             continue
         if any(isinstance(call, exp.AIClassify) for call in term.walk()):
@@ -205,7 +282,9 @@ def bind_where(b: ExpressionBinder, tree: exp.Select, joins: JoinBinder) -> None
             )
         if any(_is_call(call, "AI_EXTRACT") for call in term.walk()):
             raise CompileError(
-                "AI.EXTRACT is a SELECT column, not a predicate")
+                "an AI.EXTRACT call is not a predicate; test one of its "
+                "fields, such as AI.EXTRACT(...).end_date IS NOT NULL, or "
+                "its AS name from SELECT")
         if _is_ai_score_comparison(term):
             predicate, options, aliases = b.bind_ai_score(term, SCORE_OPTION_KEYS)
         else:

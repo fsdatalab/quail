@@ -5,9 +5,17 @@ import pytest
 from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
 
 import quail
-from quail.execution.selection import evaluate_predicate, selected_rows
+from quail.catalog.selection import selected_rows
 from quail.frontend.expressions import col, prompt
-from quail.logical import ColumnRef, CompileError, RegularPredicate, Scan
+from quail.logical import (
+    ColumnRef,
+    CompileError,
+    GetField,
+    RegularPredicate,
+    ScalarFunction,
+    Scan,
+)
+from quail.logical.expressions import column_expression
 
 REF = ColumnRef("r", "reviews", "stars")
 
@@ -17,20 +25,19 @@ def _predicate(comparison, value=None):
 
 
 def test_predicates_evaluate_with_nulls_rejected():
-    stars = pa.chunked_array([[3, None, 4], [5, 1]])
-    assert evaluate_predicate(stars, _predicate(">=", 4)).to_pylist() == [
+    stars = pa.table({"stars": pa.chunked_array([[3, None, 4], [5, 1]])})
+    assert _predicate(">=", 4).evaluate(stars).to_pylist() == [
         False, None, True, True, False]
-    assert evaluate_predicate(stars, _predicate("in", (1, 3))).to_pylist() == [
+    assert _predicate("in", (1, 3)).evaluate(stars).to_pylist() == [
         True, False, False, False, True]
-    assert evaluate_predicate(stars, _predicate("is null")).to_pylist() == [
+    assert _predicate("is null").evaluate(stars).to_pylist() == [
         False, True, False, False, False]
-    assert selected_rows({"stars": stars}, (
+    assert selected_rows(stars, (
         _predicate("is not null"), _predicate("<>", 4))).to_pylist() == [0, 3, 4]
     # a float literal compares with an integer column; a string does not
-    assert selected_rows({"stars": stars}, (_predicate(">", 3.5),)
-                         ).to_pylist() == [2, 3]
+    assert selected_rows(stars, (_predicate(">", 3.5),)).to_pylist() == [2, 3]
     with pytest.raises(CompileError, match="cannot be evaluated"):
-        evaluate_predicate(stars, _predicate("=", "five"))
+        _predicate("=", "five").evaluate(stars)
 
 
 @pytest.fixture()
@@ -76,10 +83,9 @@ def test_regular_predicates_select_documents_before_the_model(session):
         "AND r.stars IS NOT NULL")
     plan = query.plan()
     scan = next(node for node in plan.nodes if type(node).__name__ == "Scan")
-    assert (scan.n_docs, scan.expected_docs) == (6, 3.0)
-    assert scan.predicates == (
-        ("stars", ">=", 3), ("lang", "in", ("en", "fr")),
-        ("stars", "is not null", None))
+    assert (scan.num_documents, scan.expected_rows) == (6, 3.0)
+    assert [str(predicate) for predicate in scan.predicates] == [
+        "r.stars >= 3", "r.lang IN ('en', 'fr')", "r.stars IS NOT NULL"]
     assert "where r.stars >= 3 and r.lang IN ('en', 'fr')" in query.explain()
     result = _run(query, execute)
     assert seen == [6]
@@ -87,7 +93,7 @@ def test_regular_predicates_select_documents_before_the_model(session):
     stage = next(s for s in result.report["stages"] if s["op"] == "filter")
     assert stage["evaluated"] == 3
     # answer tables and survivors hold positions in the registered table
-    answers = result.answer_tables["filters"][("r", stage["written_pos"])]
+    answers = result.answer_tables["filters"][("r", stage["written_position"])]
     assert answers.column("r").to_pylist() == [0, 2, 4]
     assert result.survivor_indices["r"].to_pylist() == [0]
 
@@ -96,6 +102,12 @@ def test_regular_predicates_select_documents_before_the_model(session):
              .where(col("r.stars") < 4, col("r.lang") == "en")
              .select("r.id", "r.stars"))
     assert _run(built, make_executor(TRUTH)).to_rows() == [("r1", 2), ("r4", 3)]
+    # a function on a source column reaches the scan as written
+    built = (session.docs("reviews").alias("r")
+             .ai_filter(prompt("q1: {0}", col("r.review")))
+             .where(col("r.lang").length() > 2)
+             .select("r.id"))
+    assert _run(built, make_executor(TRUTH)).to_rows() == []
 
 
 def test_sql_and_builder_bind_regular_predicates(session):
@@ -127,7 +139,7 @@ def test_sql_and_builder_bind_regular_predicates(session):
         with pytest.raises(CompileError, match=fragment):
             session.sql(f"SELECT r.id FROM reviews r WHERE {sql} AND "
                         f"AI_FILTER(PROMPT('q: {{0}}', r.review))")
-    with pytest.raises(CompileError, match="regular predicates"):
+    with pytest.raises(CompileError, match="takes tests"):
         session.docs("reviews").alias("r").where("r.stars > 3")
     # a plain test in ON restricts the joined table
     session.register("products", quail.DocumentProvider.from_table(pa.table({
@@ -193,7 +205,7 @@ def test_two_joins_on_one_table_sample_each_key_column(session):
     """)
     plan = query.plan()
     assert not isinstance(plan, Refusal)
-    fractions = {node.written_pos: node.pair_fraction for node in plan.nodes
+    fractions = {node.written_position: node.pair_fraction for node in plan.nodes
                  if isinstance(node, HashJoin)}
     # stars 5, 2, 4, null, 3, 5 against prices 5, 2: three of twelve;
     # langs en x4, fr, de against en, fr: five of twelve
@@ -209,8 +221,8 @@ def test_regular_predicates_reach_score_scans_and_may_read_the_text(session):
               .select("r.id", "s"))
     plan = scored.plan()
     scan = next(node for node in plan.nodes if isinstance(node, PhysicalScan))
-    assert scan.predicates == (("stars", ">=", 4),)
-    assert (scan.n_docs, scan.expected_docs) == (6, 3.0)
+    assert [str(predicate) for predicate in scan.predicates] == ["r.stars >= 4"]
+    assert (scan.num_documents, scan.expected_rows) == (6, 3.0)
     # a test on the document column keeps the text as a value column
     text = "review 2 " + "pad " * 20
     query = (session.docs("reviews").alias("r")
@@ -227,3 +239,54 @@ def test_regular_predicates_reach_score_scans_and_may_read_the_text(session):
              .where(col("r.review") == "review 3 " + "pad " * 20)
              .select("r.id"))
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r3",)]
+
+
+def test_text_tests_paths_and_functions_evaluate_with_one_arrow_call_each():
+    names = pa.table({"name": pa.chunked_array([["Acme Corp", None, "acme inc"],
+                                                ["Beta"]])})
+    name = ColumnRef("r", "reviews", "name")
+
+    def passes(comparison, value=None, path=(), function=None):
+        predicate = RegularPredicate(column_expression(name, path, function),
+                                     comparison, value)
+        return predicate.evaluate(names).to_pylist()
+
+    assert passes("like", "Acme%") == [True, None, False, False]
+    assert passes("ilike", "%ACME%") == [True, None, True, False]
+    assert passes("not ilike", "%ACME%") == [False, None, False, True]
+    assert passes("contains", "inc") == [False, None, True, False]
+    assert passes("icontains", "CORP") == [True, None, False, False]
+    assert passes("starts with", "B") == [False, None, False, True]
+    assert passes("ends with", "c") == [False, None, True, False]
+    assert passes("regex", r"\binc\b") == [False, None, True, False]
+    assert passes("regex", "^(?:acme)$") == [False, None, False, False]
+    assert passes("<", 5, function="length") == [False, None, False, True]
+    assert passes("=", "Beta") == [False, None, False, True]
+    spans = pa.table({"name": pa.chunked_array([pa.StructArray.from_arrays(
+        [pa.array([14, 0]), pa.array([27, 3])], names=["start", "end"],
+        mask=pa.array([False, True]))])})
+    predicate = RegularPredicate(GetField(name, "start"), "<", 20)
+    assert predicate.evaluate(spans).to_pylist() == [True, None]
+    # a text test needs a string; a path needs a struct
+    with pytest.raises(CompileError, match="compares with a string"):
+        RegularPredicate(name, "like", 3).validate()
+    with pytest.raises(CompileError, match="unsupported column function"):
+        RegularPredicate(ScalarFunction("reverse", (name,)), "<", 3).validate()
+    with pytest.raises(CompileError, match="has no fields"):
+        RegularPredicate(GetField(name, "start"), "<", 3).evaluate(names)
+    # source columns take the same tests, at the scan
+    reviews = ColumnRef("r", "reviews", "review")
+    both = names.append_column("review", names.column("name"))
+    assert selected_rows(both, (
+        RegularPredicate(reviews, "ilike", "%acme%"),
+        RegularPredicate(ScalarFunction("length", (name,)), ">", 5),
+    )).to_pylist() == [0, 2]
+
+
+def test_stop_key_groups_follow_numeric_equality():
+    from quail.catalog.selection import group_ids
+
+    values = pa.array([-0.0, 0.0, float("nan"), float("nan"), 1.0, None, None])
+    groups = group_ids([values, values.dictionary_encode()]).tolist()
+    assert groups[0] == groups[1] and groups[2] == groups[3]
+    assert groups[5] == groups[6] and len(set(groups)) == 4

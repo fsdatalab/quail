@@ -142,7 +142,7 @@ def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
     assert retained == kv_pages - budgets.execution_pages(chunk)
     assert retained + slots * budgets.checkpoint_pages(model) <= pool
     assert checkpoint_arena_args(model, H100_SXM, chunk, kv_pages) == {
-        "n_state_slots": slots,
+        "num_state_slots": slots,
         "gdn_state_shape": (24, 32, 128, 128),
         "conv_state_shape": (24, 3, 8_192),
     }

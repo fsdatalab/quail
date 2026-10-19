@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from quail.remote.files import published
 from quail.server.store import Store
 
 logger = logging.getLogger("quail.server")
@@ -30,7 +31,12 @@ def restore(source: Path, destination: Path) -> bool:
     if destination.exists() or not source.exists():
         return False
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, destination)
+    # a failed copy leaves nothing behind, so a later restore can try again
+    try:
+        with published(destination, overwrite=False) as temporary:
+            shutil.copyfile(source, temporary)
+    except FileExistsError:
+        return False
     return True
 
 
@@ -72,8 +78,8 @@ class Checkpoint:
         ``force`` copies any new write now, ignoring the progress timer.
         """
         with self._lock:
-            count = self.store.write_count
-            durable = self.store.durable_write_count
+            count = self.store.num_writes
+            durable = self.store.num_durable_writes
             if count == self._seen or self.store.closed:
                 return False
             progress_only = durable == self._seen_durable

@@ -30,6 +30,7 @@ from quail.execution.result import (
     count_rows,
     document_index_table,
 )
+from quail.logical import ColumnRef
 from quail.physical import AiJoin
 from quail.planner.plan import EngineConfig
 
@@ -43,13 +44,17 @@ def test_session_upgrades_and_reuses_offsets_without_invalidating_old_tokens():
 
     encode.token_bytes = lambda: {ord(char): char.encode() for char in "café東京"}
     with quail.Session(CONFIG, tokenizer=encode) as session:
-        session.register("docs", quail.DocumentProvider.from_table(
+        session.register("documents", quail.DocumentProvider.from_table(
             pa.table({"id": [1, 2], "text": ["café", "東京"]}), id_col="id"))
-        previous = session.inputs.tokenize("docs", "text").tokens
+        previous = session.inputs.tokenize("documents", "text").tokens
         assert not previous.has_offsets
         calls.clear()
-        upgraded = session.inputs.tokenize("docs", "text", with_offsets=True).tokens
-        repeated = session.inputs.tokenize("docs", "text", with_offsets=True).tokens
+        upgraded = session.inputs.tokenize(
+            "documents", "text", with_offsets=True
+        ).tokens
+        repeated = session.inputs.tokenize(
+            "documents", "text", with_offsets=True
+        ).tokens
         assert upgraded is repeated and upgraded.has_offsets
         assert not calls
         assert list(previous[0]) == list(upgraded[0]) == encode("café")
@@ -71,9 +76,14 @@ def test_offset_tokenization_uses_gigatoken_without_transformers(monkeypatch):
                         SimpleNamespace(Tokenizer=lambda source: fast))
     monkeypatch.setitem(sys.modules, "transformers", None)
     with quail.Session(CONFIG) as session:
-        session.register("docs", quail.DocumentProvider.from_table(
-            pa.table({"id": [1, 2], "text": texts}), id_col="id"))
-        scan = session.inputs.tokenize_async("docs", "text", with_offsets=True).result()
+        session.register(
+            "documents",
+            quail.DocumentProvider.from_table(
+                pa.table({"id": [1, 2], "text": texts}), id_col="id"
+            ),
+        )
+        scan = session.inputs.tokenize_async(
+            "documents", "text", with_offsets=True).result()
         for index, encoding in enumerate(expected):
             assert list(scan.tokens[index]) == encoding.ids
             assert scan.tokens[index].character_offsets.tolist() == [
@@ -117,13 +127,15 @@ def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
             return b"hello"[:len(ids)]
 
     monkeypatch.setitem(sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer))
+    monkeypatch.setattr("quail.api.session.resolve_model_path",
+                        lambda name, revision, **kwargs: f"{name}@{revision}")
     with quail.Session(CONFIG) as session:
         token_ids = session.tokenizer("hello")
         piece = session.tokenizer.decode([1])
         # the session loads one encoder for the caller and warms one on
         # the tokenization thread; the thread keeps its own instance
         session.inputs.warm_tokenizer().result()
-    assert sources == ["Qwen/Qwen3-4B-FP8"] * 2
+    assert sources == ["Qwen/Qwen3-4B-FP8@" + session.model.revision] * 2
     assert token_ids == [1, 2]
     assert all(type(token_id) is int for token_id in token_ids)
     assert piece == b"h"
@@ -187,8 +199,32 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     assert re.search(rf"(?:1st: )?predicate {first[1]}\s+6\s+6\s+50%\s+66\.7%$",
                      explained, re.M)
     stages = [s for s in result.report["stages"] if s["op"] == "filter"]
-    assert [s["written_pos"] for s in stages] == [int(first[1]) - 1,
+    assert [s["written_position"] for s in stages] == [int(first[1]) - 1,
                                                 int(second[1]) - 1]
+
+
+@pytest.mark.parametrize("alias", ["answer", "predicate", "other,side"])
+def test_answer_tables_keep_an_alias_named_like_their_own_columns(
+        sess, alias, tmp_path):
+    """An alias named answer or predicate, or holding a comma, reports as any other."""
+    pq.write_table(pa.table({"asin": ["p0", "p1"], "description": ["pad " * 20] * 2}),
+                   tmp_path / "p.parquet")
+    sess.register("products", quail.DocumentProvider.from_parquet(
+        str(tmp_path / "p.parquet"), id_col="asin"))
+    quoted = f'"{alias}"'
+    res = _run(sess.sql(f"""
+        SELECT r.id, {quoted}.asin FROM reviews r JOIN products {quoted}
+          ON AI_FILTER(PROMPT('m {{0}} {{1}}', r.review, {quoted}.description),
+                       {{'anchor': 'r'}})
+        WHERE AI_FILTER(PROMPT('q1: {{0}}', r.review))
+    """), make_executor(TRUTH, {("r", alias): lambda a, b: (a + b) % 2 == 0}))
+    assert sorted(res.to_rows()) == [("r0", "p0"), ("r1", "p1"), ("r3", "p1"),
+                                     ("r4", "p0")]
+    (stage,) = [s for s in res.report["stages"] if s["op"] == "join"]
+    assert (stage["anchor"], stage["partners"], stage["tuples"]) == ("r", [alias], 8)
+    answers = res.answer_tables["joins"][0]
+    assert answers.column_names[:2] == ["r", alias]
+    assert len(set(answers.column_names)) == 3
 
 
 def test_query_rows_observers_saved_reports_and_streamed_results(sess):
@@ -379,7 +415,7 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
     from quail.backends.quail.executor.operators.join import partner_list_builder
 
     streamed = {}
-    group = [dict(anchor="a", partners=["b"], written_pos=j, pairs_from="pairs")
+    group = [dict(anchor="a", partners=["b"], written_position=j, pairs_from="pairs")
              for j in range(2)]
     lookup = partner_list_builder(
         group, [[[7], [1], [7], [3]]] * 2, {0: grouped, 1: streamed})
@@ -395,6 +431,15 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
         "c", [pa.array(["u1", "u1"]), pa.array([1, 2])],
         "e", [pa.array(["u1", "u1"]), pa.array([2, 2], type=pa.int8())])
     assert pairs.to_pydict() == {"c": [1, 1], "e": [0, 1]}
+    # numbers pair by value: a float pairs an integer only at an
+    # integral value, and a large unsigned key never wraps to a signed one
+    pairs = pair_table("c", [pa.array([1, 2, 3])],
+                       "e", [pa.array([1.5, 2.0, -0.0, float("nan")])])
+    assert pairs.to_pydict() == {"c": [1], "e": [1]}
+    pairs = pair_table("c", [pa.array([2**64 - 1, 7], pa.uint64())],
+                       "e", [pa.array([-1, 7], pa.int64())])
+    assert pairs.to_pydict() == {"c": [1], "e": [1]}
+    assert estimate_pair_fraction([pa.array([1, 2])], [pa.array([2.0, 2.5])]) == 1 / 4
 
     with quail.Session(CONFIG, tokenizer=lambda text: list(text.encode())) as session:
         register_claims_evidence(session)
@@ -406,7 +451,8 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
         # c1 and c2 pair with e0 and e2, c0 with e1: 5 of 12 pairs
         hash_join = paired_plan.graph.node("hash_join:c-e")
         assert (hash_join.left, hash_join.right, hash_join.on) == (
-            "c", "e", (("url", "url"),))
+            "c", "e", ((ColumnRef("c", "claims", "url"),
+                        ColumnRef("e", "evidence", "url")),))
         assert hash_join.pair_fraction == 5 / 12
         assert [port.source.node_id for port in hash_join.inputs] == [
             "scan:c", "scan:e"]
@@ -414,8 +460,8 @@ def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
         assert paired_stage.pairs_from == "hash_join:c-e"
         assert not cross_stage.pairs_from
         assert "hash_join:c-e" not in {node.node_id for node in cross_plan.nodes}
-        assert paired_stage.expected_tuples == round(
-            cross_stage.expected_tuples * 5 / 12, 1)
+        assert paired_stage.expected_rows == round(
+            cross_stage.expected_rows * 5 / 12, 1)
         assert paired_plan.estimated_seconds < cross_plan.estimated_seconds
         assert "HashJoin" in paired.explain() and "c.url = e.url" in paired.explain()
         # the request carries the key columns, not the pairs
@@ -503,3 +549,26 @@ def test_engine_import_gpu_requirement_and_quickstart_demos(
     with pytest.raises(RuntimeError, match="query failed"):
         quickstart_modal.run_query.get_raw_f()()
     assert commits == ["volume"], "a failed query still commits the volume"
+
+
+def test_the_process_keeps_one_engine_configuration_at_a_time():
+    events = []
+
+    class Backend:
+        def __init__(self, engine_name):
+            self.name = self.engine_name = engine_name
+
+        def release_request(self, state):
+            events.append(("release", self.engine_name, state.pop("engine")))
+
+    state = execution._BackendState()
+    envelope = {"model": "qwen3-4b-fp8", "device": "h100-sxm", "gpus": 1}
+    vllm = Backend("vllm")
+    assert state.bind(envelope, vllm) is state.bind(envelope, Backend("vllm"))
+    state.state["engine"] = "first"
+    state.bind({**envelope, "model": "qwen3-32b-fp8"}, vllm)["engine"] = "second"
+    state.bind(envelope, Backend("quail"))["engine"] = "third"
+    state.close()
+    state.close()
+    assert events == [("release", "vllm", "first"), ("release", "vllm", "second"),
+                      ("release", "quail", "third")]

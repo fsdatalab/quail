@@ -24,7 +24,7 @@ def test_priority_divides_by_kv_and_checkpoint_pages():
 
 def checkpoint_arena(slots, pages=16):
     arena = bare_arena(KVArena.__new__(KVArena), pages)
-    arena.accounting = PageArena(pages, 16, n_slots=slots)
+    arena.accounting = PageArena(pages, 16, num_slots=slots)
     arena.accounting.configure_retention(
         RetentionPolicy(1.0, 0.0, {"a": (1, 0)}, checkpoint_pages=98.25), pages)
     return arena
@@ -50,7 +50,7 @@ def test_a_full_pool_evicts_the_lowest_priority_document_with_its_slot():
     assert not arena.is_resident(("a", 0))
     assert arena.is_resident(("a", 1))
     assert arena.evicted_keys == 1
-    assert arena.n_state_slots == 2
+    assert arena.num_state_slots == 2
 
 
 def test_a_pinned_document_keeps_its_slot():

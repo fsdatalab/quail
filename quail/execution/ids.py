@@ -1,4 +1,4 @@
-"""Document ids: the value every ``ids:`` port carries between operators."""
+"""Document rows: the value every ``rows:`` port carries between operators."""
 
 import numpy as np
 import pyarrow as pa
@@ -17,6 +17,10 @@ def document_ids(value) -> pa.Array:
         ValueError: The value holds a null, or a table with several
             columns.
     """
+    if hasattr(value, "ids") and hasattr(value, "values"):
+        if len(value.ids) != 1:
+            raise ValueError("rows over several tables name no single document")
+        (value,) = value.ids.values()
     if isinstance(value, pa.Table):
         if value.num_columns != 1:
             raise ValueError(

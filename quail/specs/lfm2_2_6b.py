@@ -12,8 +12,8 @@ LFM2_2_6B_BF16 = ModelSpec(
     #                        norms and the embedding excluded
     layers=30,
     hidden=2048,
-    n_q=32,
-    n_kv=8,
+    num_q_heads=32,
+    num_kv_heads=8,
     d_head=64,
     ffn_width=21504,       # gate_up output: 2 x 10752 intermediate
     w_bytes=2.0,           # bf16 weights

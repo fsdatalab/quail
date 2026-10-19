@@ -6,10 +6,14 @@ from itertools import groupby
 
 import numpy as np
 
-from quail.backends.quail.executor.admission import DROP, SKIP, JoinAdmission
+from quail.backends.quail.executor.admission import (
+    DROP,
+    SKIP,
+    JoinAdmission,
+    OwnRequests,
+)
 from quail.backends.quail.executor.readout_groups import ReadoutGroups
 from quail.backends.quail.executor.stages import (
-    OwnRequests,
     PendingAnswers,
     _advance_stage,
     frame_writes,
@@ -18,14 +22,14 @@ from quail.backends.quail.executor.stages import (
 from quail.progress import Progress, logger
 
 
-def attention_path(pipeline, requested, default="unified") -> str:
+def attention_path(pipeline, requested, default_attention="unified") -> str:
     """The path a filter stream or join runs: the plan's request where the model has it.
 
-    None asks for the default. A model without tree attention, and a
+    None asks for the default_attention. A model without tree attention, and a
     canvas model (whose rows the tree path does not pack), run unified.
     """
     if requested is None:
-        requested = default
+        requested = default_attention
     if requested == "tree" and pipeline.tree_attention and not pipeline.canvas_ids:
         return "tree"
     return "unified"
@@ -38,15 +42,11 @@ def forward_chunk(pipeline, arena, chunk):
     temporaries whether the pass returns or raises.
     """
     try:
-        graphs = getattr(pipeline, "decode_graphs", None)
-        if graphs is not None:
-            out = graphs.forward(chunk)
+        if pipeline.decode_graphs is not None:
+            out = pipeline.decode_graphs.forward(chunk)
         else:
             out = pipeline.forward_chunk(chunk)
-        sample = getattr(arena, "sample_memory", None)
-        if sample is not None:
-            sample(getattr(chunk, "tokens", 0),
-                   len(getattr(chunk, "layout", ())))
+        arena.sample_memory(chunk.tokens, len(chunk.layout))
         return out
     finally:
         keys, chunk.temporary_keys = chunk.temporary_keys, ()
@@ -63,8 +63,8 @@ def borrow_check(arena, keys, borrowing):
     chunk or earlier, has the pages it has: it may have trimmed its
     window in an earlier query.
     """
-    def can_borrow(doc, parent, same_chunk):
-        shared = borrowing.tree_shared[doc]
+    def can_borrow(document, parent, same_chunk):
+        shared = borrowing.tree_shared[document]
         if not same_chunk or arena.is_resident(keys[parent]):
             return arena.can_borrow(keys[parent], shared)
         return arena.origin(borrowing.shared(parent)) <= arena.origin(shared)
@@ -74,9 +74,9 @@ def borrow_check(arena, keys, borrowing):
 def lowest_borrows(borrowing):
     """Per document, the fewest tokens any of its borrowers shares."""
     lowest = {}
-    for doc, parent in enumerate(borrowing.tree_parent):
+    for document, parent in enumerate(borrowing.tree_parent):
         if parent is not None:
-            shared = borrowing.tree_shared[doc]
+            shared = borrowing.tree_shared[document]
             lowest[parent] = min(lowest.get(parent, shared), shared)
     return lowest
 
@@ -88,7 +88,7 @@ class StageExecutor:
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, count_answers, label,
                  default_attention, on_chunk, on_answers, stop_groups=None,
-                 appended_tokens=None, gpu_timing=False):
+                 appended_tokens=None, gpu_timing=False, survival=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
 
@@ -123,7 +123,7 @@ class StageExecutor:
         self.frames = [list(stage.frame) for stage in self.stages]
         self.frame_ids = [np.asarray(frame, dtype=np.int64) for frame in self.frames]
         self.writes = frame_writes(self.stages)
-        if getattr(self.arena, "n_state_slots", 0):
+        if getattr(self.arena, "num_state_slots", 0):
             self.writes = [write or (stage.rewind and bool(stage.frame))
                            for write, stage in zip(self.writes, self.stages)]
         # a stage whose suffixes are each document's own is priced by
@@ -142,7 +142,7 @@ class StageExecutor:
         if any(stage.paths is not None for stage in self.stages):
             attention_mode = "tree"
         self.mode = attention_path(
-            self.pipeline, attention_mode, default=default_attention)
+            self.pipeline, attention_mode, default_attention=default_attention)
         self.canvas = tuple(self.pipeline.canvas_ids)
         self.answer_row = self.pipeline.canvas_answer_row
         self.canvas_rows = [len(self.canvas) if stage.canvas is None
@@ -195,7 +195,7 @@ class StageExecutor:
             [s.lengths + rows
              for s, rows in zip(self.suffixes, self.canvas_rows)],
             budget,
-            self.arena.n_pages if self.paged else 1 << 62,
+            self.arena.num_pages if self.paged else 1 << 62,
             self.arena.page_tokens,
             frame_tokens=[len(f) for f in self.frames], resident=resident,
             anchor_partners={a: self._requests_of(a, key)
@@ -209,7 +209,7 @@ class StageExecutor:
             tree=prefix_tree,
             advance=partial(_advance_stage, stages),
             frame_writes=self.writes,
-            limit=limit,
+            limit=limit, survival=survival,
             stop_groups=stop_groups,
             stop_width=self._stop_width(stop_groups, budget),
             extra_tokens=self.capacity_extra,
@@ -223,26 +223,26 @@ class StageExecutor:
         self._extends = False
         spec = getattr(self.pipeline, "spec", None)
         if (self.paged and getattr(spec, "state_layers", ())
-                and not getattr(self.arena, "n_state_slots", 0)):
+                and not getattr(self.arena, "num_state_slots", 0)):
             raise ValueError(
                 "the arena has no checkpoint slots: the pool cannot hold "
                 "one document's state beside a chunk's KV, so a document "
                 "this long needs a smaller chunk or a larger pool")
-        if self.paged and getattr(self.arena, "n_state_slots", 0):
+        if self.paged and getattr(self.arena, "num_state_slots", 0):
             self._extends = (any(self.writes)
                              or any(s.append for s in self.stages))
             # a parent holds one slot per share length beside its own and
             # its extension, and its borrowers need slots of their own, so
             # a small pool keeps only the lengths that save the most
             base = 1 + int(self._extends)
-            room = max(0, (self.arena.n_state_slots - base) // 3)
+            room = max(0, (self.arena.num_state_slots - base) // 3)
             self.share_points = state_share_points(
                 self.borrowing.tree_parent, self.borrowing.tree_shared,
                 limit=room)
             need = base + max(map(len, self.share_points), default=0)
-            if self.arena.n_state_slots < need:
+            if self.arena.num_state_slots < need:
                 raise ValueError(
-                    f"the arena has {self.arena.n_state_slots} checkpoint "
+                    f"the arena has {self.arena.num_state_slots} checkpoint "
                     f"slots and this query holds {need} per document in "
                     f"flight; a document this long needs a smaller chunk "
                     f"or a larger pool")
@@ -265,7 +265,7 @@ class StageExecutor:
             self.label = " > ".join(stage.label or f"stage {j}"
                                    for j, stage in enumerate(self.stages))
         self.counting_answers = count_answers
-        total = (sum(self.sched.partner_count(a, j) for a in range(len(self.prefixes))
+        total = (sum(self.sched.num_partners(a, j) for a in range(len(self.prefixes))
                      for j in range(k))
                  if self.counting_answers else len(self.prefixes))
         self.progress = Progress(self.label, total=total, unit=unit)
@@ -508,23 +508,23 @@ class StageExecutor:
             entry.values = self.readouts.results(entry.handles)
             entry.positions = np.zeros(len(self.readouts), dtype=np.int64)
         groups = entry.groups[entry.at:entry.at + entry.step]
-        values, pos = entry.values, entry.positions
+        values, position = entry.values, entry.positions
         transitions = []
         for a, j, start, end, _ in groups:
             key = self.readouts.group_key[j]
             if self.writes[j] and start == 0 and not self._merged(j, start, end):
-                pos[key] += 1        # the frame entry's answer means nothing
-            cnt = end - start
-            rows = values[key][pos[key]:pos[key] + cnt]
+                position[key] += 1        # the frame entry's answer means nothing
+            count = end - start
+            rows = values[key][position[key]:position[key] + count]
             result = self.sched.report(a, j, start, end, rows)
-            if self.stages[j].own_suffixes and end == self.sched.partner_count(a, j):
+            if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
                 del self.own[(j, a)]
             if self.on_answers is not None:
                 self.on_answers(a, j, start, end, rows)
             for settlement in result.settlements:
                 self._event(settlement)
             transitions.extend(result.transitions)
-            pos[key] += cnt
+            position[key] += count
         entry.at += len(groups)
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)

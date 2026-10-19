@@ -106,7 +106,7 @@ class GreedyDecoder:
         self.label = np.full(documents, -1, dtype=np.int64)
         self.tokens = 0     # tokens requested so far
 
-    def requests(self, doc):
+    def requests(self, document):
         """Return the request that feeds the document's next run.
 
         The first request feeds the answer cue and the forced tokens
@@ -114,39 +114,39 @@ class GreedyDecoder:
         last choice picked; the earlier path is already in KV.
 
         Args:
-            doc: Document index.
+            document: Document index.
 
         Returns:
             A one-element list holding the run's suffix index, or None
             if the document already has a label.
         """
-        if self.label[doc] >= 0:
+        if self.label[document] >= 0:
             return None
-        index = self.pending[doc]
+        index = self.pending[document]
         self.tokens += len(self.suffixes[index])
         return [index]
 
-    def update(self, doc, row):
+    def update(self, document, row):
         """Advance a document to its highest-scoring allowed token.
 
         Args:
-            doc: Document index.
+            document: Document index.
             row: Token log probabilities in target-column order, read at
                 the document's current choice node.
         """
-        node = self.node[doc]
+        node = self.node[document]
         if node in self.leaf:
-            self.label[doc] = self.leaf[node]
+            self.label[document] = self.leaf[node]
             return
         best = min(self.trie[node],
                    key=lambda token: (-float(row[self.column[token]]),
                                       self.order[token]))
         target, run = self.runs.after[node, best]
         if run is None:
-            self.label[doc] = self.leaf[target]
+            self.label[document] = self.leaf[target]
         else:
-            self.node[doc] = target
-            self.pending[doc] = run
+            self.node[document] = target
+            self.pending[document] = run
 
 
 def trie_paths(label_ids, read=None) -> list:

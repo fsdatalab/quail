@@ -34,7 +34,7 @@ def _run_stock_vllm(session, query):
     response = session.registry.backend("stock_vllm").execute_request(
         BackendExecutionContext(
             request=query._prepare_physical(), graph=plan.graph,
-            registry=session.registry, gpu_count=1, runtime_state={}))
+            registry=session.registry, gpus=1, runtime_state={}))
     return query.finish(response)
 
 
@@ -54,7 +54,7 @@ class _Client:
 
 def _execution(documents, *, model=QWEN3_4B_FP8, **settings):
     return RequestModelExecution(GpuContext(
-        gpu_index=0, gpu_count=1, model=model, device=H100_SXM, query_settings={
+        gpu_index=0, gpus=1, model=model, device=H100_SXM, query_settings={
             "client": _Client(), "sampling_params": object(),
             "documents": documents, "true_ids": [1], "capacity": CAPACITY,
             "filter_submission": "operator-at-a-time",

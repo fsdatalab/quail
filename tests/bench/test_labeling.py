@@ -187,9 +187,9 @@ class _FakeSession:
         pass
 
 
-def _write_corpus(root, sf, rows):
+def _write_corpus(root, scale_factor, rows):
     """Write one corpus under root the way _materialize_corpus does."""
-    identity = labeling._corpus_identity(rows, sf)
+    identity = labeling._corpus_identity(rows, scale_factor)
     target = root / "corpora" / identity["corpus_id"]
     target.mkdir(parents=True, exist_ok=True)
     for table, table_rows in rows.items():
@@ -294,7 +294,7 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
         passages=[("passage a", ["p2"]), ("passage b", ["p1"])])
     monkeypatch.setattr(
         labeling, "_materialize_corpus",
-        lambda sf: _write_corpus(tmp_path, sf, target_rows))
+        lambda scale_factor: _write_corpus(tmp_path, scale_factor, target_rows))
 
     summary = labeling.derive_collection(0.1, "gt_source")
 

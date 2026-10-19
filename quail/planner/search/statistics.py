@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from quail.cost import budgets
 from quail.cost.retention import retention_pages
 from quail.logical import (
+    Filter,
     LogicalPlan,
     SemanticFilter,
-    classified_above_joins,
+    SemanticJoin,
     effective_selectivity,
     is_score,
     model_call,
@@ -65,7 +66,7 @@ def ask_positions(filters) -> dict:
 
 
 def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
-                    device: DeviceSpec, doc_tokens: dict,
+                    device: DeviceSpec, document_tokens: dict,
                     pair_fractions=None, scan_fractions=None,
                     context=None) -> PlanStatistics:
     """Gather the statistics of one logical plan.
@@ -74,7 +75,7 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
         plan: The logical plan.
         model: Model spec.
         device: Device spec.
-        doc_tokens: alias -> per-document token counts, of every
+        document_tokens: alias -> per-document token counts, of every
             document in the table.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
@@ -97,20 +98,20 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
         *operators.prompts, *(node.call.prompt for node in operators.extracts))}
     lengths = {a: summarize_alias(t, model.sliding_window,
                                   memo=context.memo if context is not None else None)
-               for a, t in doc_tokens.items()}
+               for a, t in document_tokens.items()}
     chunk = budgets.chunk_budget(model, device)
     arena_split = pool_split(model, device, chunk, lengths.values())
     for alias, fraction in (scan_fractions or {}).items():
         if alias in lengths:
             lengths[alias] = scale_alias(lengths[alias], fraction)
     stats = {
-        a: CorpusStats(n_docs=s.count, total_tokens=s.total,
-                       max_doc_tokens=s.maximum)
+        a: CorpusStats(num_documents=s.count, total_tokens=s.total,
+                       max_document_tokens=s.maximum)
         for a, s in lengths.items()
     }
     for s in operators.scans:
         if s.alias not in stats:
-            raise ValueError(f"no doc_tokens for alias {s.alias!r}")
+            raise ValueError(f"no document_tokens for alias {s.alias!r}")
     admission = arena_split[0] * budgets.PAGE_TOKENS
     return PlanStatistics(
         stats=stats, lengths=lengths, chunk=chunk,
@@ -128,7 +129,7 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
 
 
 def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
-                      device: DeviceSpec, doc_tokens: dict,
+                      device: DeviceSpec, document_tokens: dict,
                       pair_fractions=None, scan_fractions=None,
                       context=None) -> PlanStatistics:
     """Return plan_statistics, computed once per memo and plan root.
@@ -139,7 +140,7 @@ def cached_statistics(plan: LogicalPlan, memo: dict, *, model: ModelSpec,
     key = ("statistics", plan.root)
     if key not in memo:
         memo[key] = plan_statistics(
-            plan, model=model, device=device, doc_tokens=doc_tokens,
+            plan, model=model, device=device, document_tokens=document_tokens,
             pair_fractions=pair_fractions, scan_fractions=scan_fractions,
             context=context)
     return memo[key]
@@ -155,24 +156,42 @@ def filter_stop_keys(plan: LogicalPlan) -> dict:
     return keys
 
 
-def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
-    """Return the expected live documents per alias after its filters run.
+def filters_before_joins(plan: LogicalPlan) -> list:
+    """Return the Filter and SemanticFilter nodes that run before any join.
 
-    A filter on a label of a table classified after the joins thins
-    nothing before them.
+    A filter above a join thins nothing before the joins, and computes
+    no KV its join could reuse.
     """
-    after_joins = classified_above_joins(plan.root)
-    operators = plan.operators()
-    live = {a: float(st.n_docs) for a, st in statistics.stats.items()}
-    for alias in operators.all_filters():
-        survival = 1.0
-        for predicate in operators.filters.get(alias, ()):
-            survival *= effective_selectivity(predicate.selectivity)
-        if alias not in after_joins:
-            for test in operators.label_filters.get(alias, ()):
-                survival *= effective_selectivity(test.selectivity)
-        live[alias] *= survival
-    return live
+    return [node for node in plan.walk()
+            if isinstance(node, (Filter, SemanticFilter))
+            and not any(isinstance(below, SemanticJoin)
+                        for below in LogicalPlan(node.input).walk())]
+
+
+def filtered_before_joins(plan: LogicalPlan) -> set:
+    """Return the aliases whose documents a filter before the joins computed."""
+    aliases = set()
+    for node in filters_before_joins(plan):
+        if isinstance(node, Filter):
+            aliases.add(node.condition.column.alias)
+        else:
+            aliases.update(model_call(predicate.expression).aliases()[0]
+                           for predicate in node.predicates)
+    return aliases
+
+
+def expected_rows_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
+    """Return the expected live documents per alias after its filters run."""
+    expected_rows = {a: float(st.num_documents) for a, st in statistics.stats.items()}
+    for node in filters_before_joins(plan):
+        if isinstance(node, Filter):
+            alias = node.condition.column.alias
+            expected_rows[alias] *= effective_selectivity(node.selectivity)
+        else:
+            for predicate in node.predicates:
+                (alias,) = model_call(predicate.expression).aliases()
+                expected_rows[alias] *= effective_selectivity(predicate.selectivity)
+    return expected_rows
 
 
 

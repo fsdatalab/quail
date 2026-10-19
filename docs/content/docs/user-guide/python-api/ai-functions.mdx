@@ -1,0 +1,197 @@
+---
+title: AI functions
+---
+
+Use AI functions to filter and join documents, score answers, classify
+rows, and extract text. Calling these builder functions creates a query.
+The model runs when you call `run()` or `collect()`.
+
+## Functions
+
+Select a row to jump to its arguments and examples.
+
+<div className="function-index">
+
+| Function | Description |
+| --- | --- |
+| [`ai_if(prompt, ...)`](#ai_if) | Keeps documents that satisfy a model question. |
+| [`ai_join(others, prompt, ...)`](#ai_join) | Joins documents using a model question. |
+| [`ai_score(prompt, name=...)`](#ai_score) | Adds a score from 0 to 1 for each document. |
+| [`ai_classify(prompt, labels, ...)`](#ai_classify) | Assigns one of the supplied labels. |
+| [`ai_extract(column, questions, ...)`](#ai_extract) | Copies answers from a document and returns their positions. |
+
+</div>
+
+The examples use a `session` with registered tables. See
+[Sessions](/docs/user-guide/sessions) for setup and
+[table registration](/docs/user-guide/sessions#registering-tables).
+Import the column and prompt helpers:
+
+```python
+from quail import col, prompt
+```
+
+## ai_if
+
+`ai_if(prompt, selectivity=None)`
+
+Filter rows with an AI predicate. The model evaluates the prompt on
+each row and keeps those that return TRUE.
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_if(
+        prompt('Is this review positive?\n\n{0}', col("r.body")),
+        selectivity=0.6)
+    .select("r.id")
+)
+result = query.collect()
+```
+
+`selectivity` is optional; a predicate without one is planned as if
+20% of its rows pass. If you want to apply several predicates, add
+multiple `ai_if` calls. Quail reorders them by estimated cost to
+reduce total work. Pass `order="as_written"` to `select()` to keep
+the written order.
+
+## ai_join
+
+`ai_join(others, prompt, selectivity=None, anchor=None, semantics="full")`
+
+Join two or more tables with an AI predicate. The model evaluates the
+prompt on each pair of rows.
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_join(
+        session.docs("aspects").alias("a"),
+        prompt('Does the review discuss this aspect?\n\n{0}\n\n{1}',
+               col("r.body"), col("a.aspect")),
+        selectivity=0.15)
+    .select("r.id", "a.aspect")
+)
+result = query.collect()
+```
+
+`selectivity` and `anchor` are optional. Pass `semantics="exists"` to
+keep outer rows that match at least one inner row, or
+`semantics="anti"` to keep outer rows that match none.
+
+## ai_score
+
+`ai_score(prompt, name=...)`
+
+Add an [`AI.SCORE`](/docs/user-guide/sql/ai-functions#aiscore) column with the given
+`name`. Use that name to select, sort, or aggregate the scores.
+
+For example, imagine a `reviews` table with customer messages in `body`.
+Return up to ten reviews with the highest scores for requesting a refund:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_score(prompt('Does the customer request a refund?\n\n{0}',
+                     col("r.body")), name="refund_score")
+    .order_by(col("refund_score").desc())
+    .limit(10)
+    .select("r.id", "refund_score")
+)
+```
+
+## ai_classify
+
+`ai_classify(prompt, labels, *, name, descriptions=None, task_description="", probabilities=False)`
+
+Assign one supplied label to each document. `name` sets the label column's
+name. Include that name in `select()` to return it, or use [`label_in()`](/docs/user-guide/python-api/non-ai-functions#label_in)
+to keep only documents with selected labels.
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `prompt` | `Prompt` | Question and document columns, built with `prompt()`. |
+| `labels` | `Iterable[str]`, `Iterable[tuple[str, str \| None]]`, or `str` | Labels, label and description pairs, or a registered label table name. |
+| `name` | `str` | Name of the result column. |
+| `descriptions` | `Iterable[str \| None]` or `None` | Optional description for each label, in the same order. |
+| `task_description` | `str` | Extra instructions, up to 50 words. Defaults to `""`. |
+| `probabilities` | `bool` | Also returns `<name>_probabilities`, a map from each label to its probability. Defaults to `False`. |
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_classify(
+        prompt('What sentiment does this review express? {0}', col("r.body")),
+        ["positive", "negative", "neutral", "mixed"],
+        name="sentiment")
+    .label_in("sentiment", ["negative", "mixed"], selectivity=0.3)
+    .select("r.id", "sentiment")
+)
+result = query.collect()
+```
+
+In this example, Quail classifies each review once. It keeps negative
+and mixed reviews, then returns their IDs and sentiment labels. The
+`selectivity=0.3` hint estimates that 30% of reviews pass the label
+condition; it does not change which labels pass.
+
+Provide descriptions through either label pairs or `descriptions`.
+Using both raises a compilation error. The
+[SQL reference](/docs/user-guide/sql/ai-functions#aiclassify) lists label requirements,
+probability output, and limits on classifications of joined rows.
+
+## ai_extract
+
+`ai_extract(c, questions, *, name)`
+
+`ai_extract()` returns the answer to each of your questions, copied
+from a document. Pass the
+document column as a string such as `"c.text"`, or use `col("c.text")`.
+Pass a dictionary that maps each field name to its question. Set `name`
+to the result column you want, and include it in `select()`.
+
+For example, imagine you registered a `contracts` table with an `id`
+column and the contract text in `text`. Return the end date and the
+signer of each lease:
+
+```python
+query = (
+    session.docs("contracts").alias("c")
+    .ai_extract("c.text", {"end_date": "When does the lease end?",
+                           "signer": "Who signed the lease?"}, name="lease")
+    .select("c.id", "lease")
+)
+```
+
+You get `c.id`, `lease`, and `lease_span`. `lease` is a struct with one
+string field for each question. `lease_span` holds the position of each
+answer.
+
+Use [`where()`](/docs/user-guide/python-api/non-ai-functions#where) to filter documents by an extracted answer. For example,
+with the same `contracts` table, keep leases whose extracted end date
+contains "2027":
+
+```python
+query = (
+    session.docs("contracts").alias("c")
+    .ai_extract("c.text", {"end_date": "When does the lease end?"}, name="lease")
+    .where(col("lease.end_date").like("%2027%"))
+    .select("c.id", "lease")
+)
+```
+
+Quail extracts the answer once and uses it for both the filter and the
+result. Documents with no answer are excluded. To keep them, use
+`col("lease.end_date").is_null()` instead.
+
+You can also filter by an answer's position. For example,
+`col("lease_span.end_date").field("start") < 500` keeps answers that
+start within the document's first 500 characters. Answer filters
+require the Quail backend. See [Planning hints](/docs/user-guide/python-api/non-ai-functions#planning-hints) to
+set the expected fraction of documents that pass.
+
+See [`AI.EXTRACT`](/docs/user-guide/sql/ai-functions#aiextract) for output examples
+and supported queries.
+
+See [Non-AI functions](/docs/user-guide/python-api/non-ai-functions)
+for conditions on AI outputs, sorting, aggregation, and result collection.

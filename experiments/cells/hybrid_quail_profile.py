@@ -81,11 +81,12 @@ def profile(model: str, backend: str = "triton") -> dict:
     full_pages, sliding = budgets.arena_pages(
         spec, H100_SXM, budget, DOCUMENT_TOKENS)
     arena = KVArena(
-        n_layers=spec.layers, n_pages=full_pages,
-        page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv, d_head=spec.d_head,
+        num_layers=spec.layers, num_pages=full_pages,
+        page_tokens=budgets.PAGE_TOKENS, num_kv_heads=spec.num_kv_heads,
+        d_head=spec.d_head,
         dtype=torch.bfloat16, layer_kv=spec.kv_shapes,
         sliding_layers=spec.sliding_layer_set,
-        sliding_window=spec.sliding_window, n_sliding_pages=sliding,
+        sliding_window=spec.sliding_window, num_sliding_pages=sliding,
         **checkpoint_arena_args(spec, H100_SXM, budget, full_pages))
     pipeline = build_pipeline(spec, loaded, arena)
     rows = AnswerRows(torch, F, loaded, true_ids, false_ids)

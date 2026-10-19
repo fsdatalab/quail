@@ -3,7 +3,13 @@
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.execution.result import true_answer_rows
+from quail.execution.ids import document_ids
+from quail.execution.result import (
+    answer_values,
+    predicate_positions,
+    true_answer_rows,
+)
+from quail.execution.rows import Rows, as_table
 from quail.physical import AiJoin, Barrier, PortRef, ValueType
 
 
@@ -71,7 +77,7 @@ def collect_answers(logical, plan, outputs, documents):
             ref = PortRef(node.node_id, port.name)
             if answer is None or ref not in outputs:
                 continue
-            table = outputs[ref].select(answer.columns)
+            table = as_table(outputs[ref]).select(answer.columns)
             if answer.kind == "classifies":
                 table = table.filter(pc.is_valid(table.column(answer.name)))
             answer_tables[answer.kind][answer.name] = table
@@ -90,6 +96,8 @@ def collect_answers(logical, plan, outputs, documents):
     join_relations = {}
     for ref, table in outputs.items():
         value_type = output_types.get(ref)
+        if isinstance(table, Rows):
+            continue
         metadata = table.schema.metadata or {}
         if value_type is ValueType.FILTER_ANSWERS:
             alias = metadata.get(b"quail.alias")
@@ -101,13 +109,13 @@ def collect_answers(logical, plan, outputs, documents):
                 alias.decode("utf-8"), []
             ).append(table)
         elif value_type is ValueType.JOIN_ANSWERS:
-            written_pos = metadata.get(b"quail.written_pos")
-            if written_pos is None:
+            written_position = metadata.get(b"quail.written_position")
+            if written_position is None:
                 raise ValueError(
                     "a join answer relation needs "
-                    "quail.written_pos metadata"
+                    "quail.written_position metadata"
                 )
-            position = int(written_pos.decode("ascii"))
+            position = int(written_position.decode("ascii"))
             if position in join_relations:
                 raise ValueError(
                     f"duplicate join answer relation {position}"
@@ -133,41 +141,37 @@ def collect_answers(logical, plan, outputs, documents):
 
     for node in plan.graph.topological_nodes():
         for output in node.outputs:
-            if output.value_type is not ValueType.DOCUMENT_IDS:
+            if not output.name.startswith("rows:"):
                 continue
             ref = PortRef(node.node_id, output.name)
             if ref not in outputs:
                 continue
-            table = outputs[ref]
-            if len(table.column_names) != 1:
-                raise ValueError(
-                    "a document id relation needs one alias column"
-                )
-            alias = table.column_names[0]
-            survivors[alias] = (
-                table.column(alias).combine_chunks().cast(pa.int32()))
+            alias = output.name.split(":", 1)[1]
+            survivors[alias] = document_ids(as_table(outputs[ref]).column(alias))
 
     for alias, relations in filter_relations.items():
         table = relations[0] if len(relations) == 1 else \
             pa.concat_tables(relations)
         # predicates in the order their first answers appear
         predicate_order = [
-            int(pos) for pos in pc.unique(table.column("predicate")).to_pylist()]
+            int(position)
+            for position in pc.unique(predicate_positions(table)).to_pylist()
+        ]
         predicate_order.extend(
             position for position in range(len(logical_filters[alias]))
             if position not in predicate_order
         )
-        for index, written_pos in enumerate(predicate_order):
-            mask = pc.equal(table.column("predicate"), written_pos)
+        for index, written_position in enumerate(predicate_order):
+            mask = pc.equal(predicate_positions(table), written_position)
             stage_table = table.filter(mask)
             evaluated = stage_table.num_rows
-            passed = pc.sum(stage_table.column("answer")).as_py() or 0
-            answer_tables["filters"][(alias, written_pos)] = stage_table
+            passed = pc.sum(answer_values(stage_table)).as_py() or 0
+            answer_tables["filters"][(alias, written_position)] = stage_table
             report["stages"].append(dict(
                 op="filter", alias=alias, stage=index,
-                written_pos=written_pos,
+                written_position=written_position,
                 provided_selectivity=(
-                    logical_filters[alias][written_pos].selectivity
+                    logical_filters[alias][written_position].selectivity
                 ),
                 observed_selectivity=round(
                     passed / max(1, evaluated), 4
@@ -186,18 +190,16 @@ def collect_answers(logical, plan, outputs, documents):
         position for position in sorted(join_relations)
         if position not in expected_order
     )
-    for written_pos in expected_order:
-        if written_pos not in join_relations:
+    for written_position in expected_order:
+        if written_position not in join_relations:
             continue
-        table = join_relations[written_pos]
+        table = join_relations[written_position]
         metadata = table.schema.metadata or {}
-        logical_join = logical_joins[written_pos]
+        logical_join = logical_joins[written_position]
         logical_aliases = [
             argument.alias for argument in logical_join.prompt.args
         ]
-        required_metadata = {
-            b"quail.anchor", b"quail.partners", b"quail.semantics"
-        }
+        required_metadata = {b"quail.anchor", b"quail.semantics"}
         missing = required_metadata - set(metadata)
         if missing:
             raise ValueError(
@@ -205,8 +207,7 @@ def collect_answers(logical, plan, outputs, documents):
                 f"{sorted(key.decode('utf-8') for key in missing)}"
             )
         anchor = metadata[b"quail.anchor"].decode("utf-8")
-        partner_text = metadata[b"quail.partners"].decode("utf-8")
-        partners = [] if not partner_text else partner_text.split(",")
+        partners = [alias for alias in logical_aliases if alias != anchor]
         semantics = metadata[b"quail.semantics"].decode("utf-8")
         missing_columns = set(logical_aliases) - set(table.column_names)
         if missing_columns:
@@ -214,10 +215,10 @@ def collect_answers(logical, plan, outputs, documents):
                 "a join answer relation is missing alias columns "
                 f"{sorted(missing_columns)}"
             )
-        answers = table.column("answer")
-        answer_tables["joins"][written_pos] = table
+        answers = answer_values(table)
+        answer_tables["joins"][written_position] = table
         report["stages"].append(dict(
-            op="join", written_pos=written_pos, anchor=anchor,
+            op="join", written_position=written_position, anchor=anchor,
             partners=partners,
             semantics=semantics,
             provided_selectivity=logical_join.selectivity,
@@ -227,5 +228,5 @@ def collect_answers(logical, plan, outputs, documents):
             tuples=len(answers),
         ))
         if semantics == "full":
-            true_join_tables[written_pos] = true_answer_rows(table)
+            true_join_tables[written_position] = true_answer_rows(table)
     return answer_tables, survivors, true_join_tables, report["stages"]

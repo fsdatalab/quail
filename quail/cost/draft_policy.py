@@ -26,9 +26,9 @@ LIVE_BUCKETS = (1, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000)
 _LIVE_LOGS = [math.log1p(b) for b in LIVE_BUCKETS]
 
 
-def _bucket(live: int) -> int:
+def _bucket(num_streams: int) -> int:
     """Return the index of the live-position range nearest live on a log scale."""
-    x = math.log1p(live)
+    x = math.log1p(num_streams)
     i = bisect.bisect_left(_LIVE_LOGS, x)
     if i == 0 or i == len(_LIVE_LOGS):
         return min(i, len(_LIVE_LOGS) - 1)
@@ -73,25 +73,25 @@ class DraftPolicy:
         tail = self._curve[written:]
         return tail / tail[0] if tail[0] > 0 else np.ones_like(tail)
 
-    def source_odds(self, live: int) -> float:
+    def source_odds(self, num_streams: int) -> float:
         """Return P(the position followed is the answer's source) given live positions.
 
-        The seed is 1 / live, no position preferred, blended by count
+        The seed is 1 / num_streams, no position preferred, blended by count
         with the drafted rounds seen at that many positions.
         """
-        if live <= 1:
+        if num_streams <= 1:
             return 1.0
-        b = _bucket(live)
+        b = _bucket(num_streams)
         seed = PRIOR_WEIGHT / LIVE_BUCKETS[b]
         return (seed + self.accepts[b]) / (PRIOR_WEIGHT + self.trials[b])
 
-    def draft_length(self, rho: float, written: int, live: int) -> int:
+    def draft_length(self, rho: float, written: int, num_streams: int) -> int:
         """Return the draft length for a round.
 
         Args:
             rho: The round's KV read, in fed tokens.
             written: The answer's tokens so far.
-            live: How many document positions the answer so far fits.
+            num_streams: How many document positions the answer so far fits.
         """
         room = min(self.cap, self.max_answer_tokens - written - 1)
         if room <= 0:
@@ -100,7 +100,7 @@ class DraftPolicy:
         survival = self.survival(written)[:room + 1]
         # the chosen token, then each draft token while the answer goes
         # on and the position followed is its source
-        writes = survival[0] + self.source_odds(live) * np.cumsum(
+        writes = survival[0] + self.source_odds(num_streams) * np.cumsum(
             np.concatenate(([0.0], survival[1:])))
         return int(gammas[int(np.argmin((1 + gammas + rho) / writes))])
 
@@ -110,13 +110,13 @@ class DraftPolicy:
         self.settled += 1
         self._curve = None
 
-    def observe(self, live: int, accepted: bool) -> None:
+    def observe(self, num_streams: int, accepted: bool) -> None:
         """Record whether a drafted round's first draft token was written.
 
         Args:
-            live: How many document positions the answer fit when drafting.
+            num_streams: How many document positions the answer fit when drafting.
             accepted: Whether the model chose the first draft token.
         """
-        b = _bucket(live)
+        b = _bucket(num_streams)
         self.trials[b] += 1
         self.accepts[b] += accepted

@@ -15,7 +15,7 @@ ModelSpec.checkpoint_bytes for every write and every read in Work.
 
 from __future__ import annotations
 
-from quail.cost.roofline import CostComponent, component_latencies
+from quail.cost.roofline import CostComponent
 from quail.cost.work import Work
 from quail.specs import ModelSpec
 
@@ -27,9 +27,9 @@ def attention_projection_params(model: ModelSpec) -> int:
     """Return Q, K, V, and output projection parameters over the layers."""
     h = model.hidden
     query_width = 2 if model.attn_output_gate else 1
-    return sum(h * query_width * model.n_q * head + 2 * h * n_kv * head
-               + model.n_q * head * h
-               for n_kv, head in model.kv_shapes)
+    return sum(h * query_width * model.num_q_heads * head + 2 * h * num_kv_heads * head
+               + model.num_q_heads * head * h
+               for num_kv_heads, head in model.kv_shapes)
 
 
 def gdn_projection_params(model: ModelSpec) -> int:
@@ -116,15 +116,16 @@ def attention_pair_flops(model: ModelSpec) -> tuple[int, int]:
     full_flops = sliding_flops = 0
     for layer, (_, head) in enumerate(model.kv_shapes):
         if layer in sliding:
-            sliding_flops += 4 * model.n_q * head
+            sliding_flops += 4 * model.num_q_heads * head
         else:
-            full_flops += 4 * model.n_q * head
+            full_flops += 4 * model.num_q_heads * head
     return full_flops, sliding_flops
 
 
-def dense_decoder_components(work: Work, model: ModelSpec,
-                             passes: float) -> tuple[CostComponent, ...]:
-    """Build the modeled decoder components for one work record."""
+def dense_decoder_components(work: Work, model: ModelSpec, passes: float,
+                             rows: float = 0.0, head_rows: int = 0,
+                             ) -> tuple[CostComponent, ...]:
+    """Build the modeled decoder components, with a readout when rows is set."""
     if passes < 0:
         raise ValueError("passes must be nonnegative")
     attn_proj = (attention_projection_params(model)
@@ -193,6 +194,8 @@ def dense_decoder_components(work: Work, model: ModelSpec,
             bytes_moved=0.0,
             precision="fp32",
         ),)
+    if rows:
+        components += (_readout(model, rows, passes, head_rows),)
     return components
 
 
@@ -215,12 +218,3 @@ def _readout(model, rows: float, passes: float, head_rows: int) -> CostComponent
     head = 2.0 * model.hidden * (head_rows or model.vocab)
     return CostComponent(name="readout", flops=head * rows,
                          bytes_moved=head * passes, precision="bf16")
-
-
-def decoder_seconds(work: Work, rows: float, passes: float, model, device,
-             head_rows: int = 0) -> float:
-    """Price work, answer rows, and forward passes with the component roofline."""
-    components = dense_decoder_components(work, model, passes=passes)
-    components += (_readout(model, rows, passes, head_rows),)
-    return sum(component.seconds
-               for component in component_latencies(components, device))

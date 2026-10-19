@@ -38,14 +38,14 @@ def _warm_inputs(budget, question_tokens=16):
     Cycled to any length the passes need. Fixed small ids; only the
     counts matter to the kernels.
     """
-    doc = [10 + (i % 500) for i in range(512)]
+    document = [10 + (i % 500) for i in range(512)]
     question = [10 + (i % 500) for i in range(question_tokens)]
     q_max = len(question)
-    warm_docs, used = [], 0
-    while used + len(doc) + q_max <= budget:
-        warm_docs.append(doc)
-        used += len(doc) + q_max
-    return warm_docs or [doc[:max(8, budget - q_max)]], question, doc
+    warm_documents, used = [], 0
+    while used + len(document) + q_max <= budget:
+        warm_documents.append(document)
+        used += len(document) + q_max
+    return warm_documents or [document[:max(8, budget - q_max)]], question, document
 
 
 def _warm_convolutions(torch, pipeline, budget):
@@ -77,15 +77,15 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     """
     _warm_convolutions(torch, pipeline, budget)
     # a readout of several trailing rows needs a question that long
-    trailing = getattr(async_ans, "trailing_rows", 1)
-    warm_docs, question, doc = _warm_inputs(budget, max(16, trailing))
+    trailing = 1 if async_ans is None else async_ans.trailing_rows
+    warm_documents, question, document = _warm_inputs(budget, max(16, trailing))
     q_max = len(question)
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
         run_stages(
             torch, arena, pipeline,
-            filter_stages([question], async_ans), warm_docs, budget,
+            filter_stages([question], async_ans), warm_documents, budget,
             attention_mode=mode)
         # small chunks, one document each: the trailing-chunk shapes
         # of gated multi-stage runs (see ModelPipeline.warm_tokens)
@@ -93,7 +93,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
             if t >= budget:
                 continue
             logger.debug("kernels: warming %s attention, %s tokens", mode, t)
-            body = (doc * (t // len(doc) + 1))[:max(8, t - q_max)]
+            body = (document * (t // len(document) + 1))[:max(8, t - q_max)]
             run_stages(
                 torch, arena, pipeline,
                 filter_stages([question], async_ans), [body], budget,
@@ -107,7 +107,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         logger.debug("kernels: warming join forward pass")
         run_stages(
             torch, arena, pipeline,
-            [Stage(suffixes=[question] * 8, readout=async_ans)], warm_docs, budget)
+            [Stage(suffixes=[question] * 8, readout=async_ans)], warm_documents, budget)
     if join_chunk and trailing == 1:
         # a classification: the question as the frame after each
         # document, then many short suffixes of mixed lengths; a
@@ -117,15 +117,15 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         run_stages(
             torch, arena, pipeline,
             [Stage(suffixes=labels, readout=async_ans, frame=question)],
-            warm_docs, budget)
+            warm_documents, budget)
     logger.debug("kernels: warming filter without KV writes")
     run_stages(
         torch, arena, pipeline,
-        filter_stages([question], async_ans), warm_docs, budget,
+        filter_stages([question], async_ans), warm_documents, budget,
         paged=False, default_attention="unified")
 
 
-def _warm_row_classes(torch, arena, pipeline, mode):
+def _warm_row_classes(torch, arena, pipeline, attention_mode):
     """Run one chunk for each row-count class pair in ROW_CLASSES.
 
     Each chunk holds m one-token rows that read a cached document and
@@ -136,7 +136,7 @@ def _warm_row_classes(torch, arena, pipeline, mode):
         torch: The torch module.
         arena: The KV arena the passes write.
         pipeline: The model pipeline.
-        mode: The attention path, "tree" or "unified".
+        attention_mode: The attention path, "tree" or "unified".
     """
     from quail.backends.quail.executor.chunk import pack_chunk
     from quail.backends.quail.executor.stage_executor import forward_chunk
@@ -154,7 +154,7 @@ def _warm_row_classes(torch, arena, pipeline, mode):
         # takes a one-token question whose answer is not read
         forward_chunk(pipeline, arena, pack_chunk(
             torch, arena, [dict(key=key, prefix=prefix, f=cached, suffixes=[[11]])
-                           for key in keys], attention_mode=mode))
+                           for key in keys], attention_mode=attention_mode))
         for n, m in ROW_CLASSES:
             groups = [dict(key=key, prefix=None, f=cached, suffixes=[[11]],
                            write_suffix_tokens=1, single=True)
@@ -166,7 +166,7 @@ def _warm_row_classes(torch, arena, pipeline, mode):
                                    f=n - m, suffixes=[]))
             try:
                 forward_chunk(pipeline, arena, pack_chunk(
-                    torch, arena, groups, attention_mode=mode))
+                    torch, arena, groups, attention_mode=attention_mode))
             finally:
                 if arena.is_resident(filler):
                     arena.free_key(filler)

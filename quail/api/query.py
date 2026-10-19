@@ -11,18 +11,23 @@ import pyarrow as pa
 from quail.api.execute import execute_query
 from quail.catalog import inputs
 from quail.catalog.pairs import columns_key, estimate_pair_fraction
+from quail.catalog.selection import selected_rows
 from quail.execution.metrics import NodeMetrics, scalar_node_metrics
 from quail.execution.projection import projection_for
 from quail.execution.reporting import collect_answers, execution_report
 from quail.execution.result import QueryResult
 from quail.execution.runner import ExecutionContext, GenericRunner
-from quail.execution.selection import selected_rows
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
 from quail.logical import (
     LogicalPlan,
     join_conditions,
     oriented_join_conditions,
+)
+from quail.logical.expressions import (
+    column_references,
+    evaluate_expression,
+    source_columns,
 )
 from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
@@ -70,7 +75,7 @@ class Query:
         self.order = order
         self._plan = None
         self._searched_plan = None
-        self._doc_tokens = None
+        self._document_tokens = None
         self._token_inputs = None
         self._token_futures = {}
         self._token_finished_at = {}
@@ -107,15 +112,15 @@ class Query:
             self._planning_started_at = time.perf_counter()
             config = self.session.config
             operators = self.logical.operators()
-            self._doc_tokens = {}
+            self._document_tokens = {}
             self._token_inputs = {}
             estimated = []
             for s in operators.scans:
                 exact = self.session.inputs.token_lengths(s.provider, s.column)
                 if exact is not None:
-                    self._doc_tokens[s.alias] = exact
+                    self._document_tokens[s.alias] = exact
                     continue
-                self._doc_tokens[s.alias] = self.session.inputs.estimate_lengths(
+                self._document_tokens[s.alias] = self.session.inputs.estimate_lengths(
                     s.provider, s.column)
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
@@ -129,7 +134,7 @@ class Query:
             context = PlanningContext(
                 catalog=self.session.catalog, engine_config=config,
                 model=self.session.model, device=self.session.device,
-                gpu_count=config.gpus, document_tokens=self._doc_tokens,
+                gpus=config.gpus, document_tokens=self._document_tokens,
                 backend=config.backend, order=self.order,
                 canvas_draws=config.canvas_draws,
                 attention=config.attention,
@@ -159,7 +164,8 @@ class Query:
                 columns = s.columns
                 with_offsets = locates_answers and s.alias in offset_aliases
                 if reads_text:
-                    columns = tuple(dict.fromkeys((*columns, s.column)))
+                    columns = tuple(dict.fromkeys(
+                        (*columns, *source_columns(s.column))))
                 if s.alias not in self._estimated:
                     self._token_inputs[s.alias] = self.session.inputs.tokenize(
                         s.provider, s.column, columns, with_offsets=with_offsets)
@@ -175,7 +181,7 @@ class Query:
             self._plan = plan_query(
                 self._logical_input, model=self.session.model,
                 device=self.session.device,
-                doc_tokens=self._doc_tokens,
+                document_tokens=self._document_tokens,
                 gpus=config.gpus,
                 order=self.order,
                 canvas_draws=config.canvas_draws,
@@ -223,14 +229,17 @@ class Query:
         providers = {scan.alias: scan.provider for scan in scans}
         samples = {}
 
-        def keys(refs):
+        def keys(expressions):
             out = []
-            for ref in refs:
-                key = (ref.alias, ref.column)
-                if key not in samples:
-                    samples[key] = self.session.inputs.sample_columns(
-                        providers[ref.alias], [ref.column])[ref.column]
-                out.append(samples[key])
+            for expression in expressions:
+                refs = column_references(expression)
+                for ref in refs:
+                    if (ref.alias, ref.column) not in samples:
+                        samples[(ref.alias, ref.column)] = (
+                            self.session.inputs.sample_columns(
+                                providers[ref.alias], [ref.column])[ref.column])
+                out.append(evaluate_expression(expression, pa.table({
+                    ref.column: samples[(ref.alias, ref.column)] for ref in refs})))
             return out
 
         fractions = {}
@@ -250,10 +259,10 @@ class Query:
         for scan in scans:
             if not scan.predicates:
                 continue
-            columns = self.session.inputs.sample_columns(
+            columns = pa.table(self.session.inputs.sample_columns(
                 scan.provider,
-                [predicate.column.column for predicate in scan.predicates])
-            sampled = len(next(iter(columns.values())))
+                [predicate.column.column for predicate in scan.predicates]))
+            sampled = columns.num_rows
             kept = len(selected_rows(columns, scan.predicates))
             # a sample that keeps nothing, or everything, says little
             # about the rest, so the estimate stays off 0 and 1
@@ -307,7 +316,7 @@ class Query:
         refine = bool(self._token_futures)
         for alias, future in list(self._token_futures.items()):
             self._token_inputs[alias] = future.result()
-            self._doc_tokens[alias] = self._token_inputs[alias].lengths
+            self._document_tokens[alias] = self._token_inputs[alias].lengths
             self._token_finished_at.setdefault(alias, time.perf_counter())
             del self._token_futures[alias]
         self.token_wait_s += time.perf_counter() - started
@@ -315,7 +324,7 @@ class Query:
             started = time.perf_counter()
             options = dict(
                 model=self.session.model,
-                device=self.session.device, doc_tokens=self._doc_tokens,
+                device=self.session.device, document_tokens=self._document_tokens,
                 gpus=self.session.config.gpus, order=self.order,
                 canvas_draws=self.session.config.canvas_draws,
                 attention=self.session.config.attention,
@@ -388,8 +397,9 @@ class Query:
             inputs[node.input_id] = document_input(
                 store.tokens,
                 (
-                    store.column(logical_scan.column)
-                    if logical_scan.column in store.projected_columns
+                    evaluate_expression(logical_scan.column, store)
+                    if set(source_columns(logical_scan.column))
+                    <= set(store.projected_columns)
                     else None
                 ),
             )
@@ -406,11 +416,13 @@ class Query:
         operators = self.logical.operators()
         for join in operators.joins:
             for condition in join_conditions(join):
-                for ref in (condition.left, condition.right):
+                for ref in column_references(condition.left) + column_references(
+                        condition.right):
                     needed.setdefault(ref.alias, {})[ref.column] = None
         for apply in operators.applies:
-            for ref in apply.columns:
-                needed.setdefault(ref.alias, {})[ref.column] = None
+            for expression in apply.columns:
+                for ref in column_references(expression):
+                    needed.setdefault(ref.alias, {})[ref.column] = None
         for scan in operators.scans:
             for predicate in scan.predicates:
                 needed.setdefault(scan.alias, {})[predicate.column.column] = None
@@ -420,10 +432,8 @@ class Query:
         tables = {}
         for alias, columns in needed.items():
             store = self._token_inputs[alias]
-            arrays = {alias: pa.array(range(len(store.lengths)), pa.int32())}
-            for name in columns:
-                arrays[name] = store.column(name)
-            tables[columns_key(alias)] = pa.table(arrays)
+            tables[columns_key(alias)] = pa.table(
+                {name: store.column(name) for name in columns})
         return tables
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
@@ -433,7 +443,7 @@ class Query:
         report = execution_report(
             plan, out, self.session.inputs.notes, coordinator_wall)
         sources = {
-            node.input_id: range(node.n_docs)
+            node.input_id: range(node.num_documents)
             for node in plan.nodes
             if isinstance(node, Scan)
         }
@@ -444,7 +454,7 @@ class Query:
                 runtimes=self.session.registry.runtimes,
                 sources=sources,
                 project=projection_for(
-                    self.logical, self._token_inputs, self._doc_tokens),
+                    self.logical, self._token_inputs, self._document_tokens),
                 observers=observers,
             ),
             initial_outputs=response.outputs,
@@ -475,5 +485,5 @@ class Query:
 
         (result.answer_tables, result.survivor_indices,
          result.true_join_tables, report["stages"]) = collect_answers(
-             self.logical, plan, response.outputs, self._doc_tokens)
+             self.logical, plan, response.outputs, self._document_tokens)
         return result

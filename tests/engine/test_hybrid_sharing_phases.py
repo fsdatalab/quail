@@ -24,7 +24,7 @@ def torch_stub(monkeypatch):
 
 def arena_with_slots(slots=8):
     arena = bare_arena(KVArena.__new__(KVArena), 64)
-    arena.accounting = PageArena(64, 16, n_slots=slots)
+    arena.accounting = PageArena(64, 16, num_slots=slots)
     return arena
 
 
@@ -152,7 +152,7 @@ def test_a_missing_share_slot_splits_and_the_retry_reuses_what_it_took(
     with pytest.raises(ArenaFullError, match="share"):
         plan_phases(arena, [full], stage)
     taken = dict(arena.accounting.share_slots)
-    arena.accounting.n_slots += 1
+    arena.accounting.num_slots += 1
     arena.accounting.free_slots.append(2)
     phases = plan_phases(arena, [full], stage)
     assert all(arena.accounting.share_slots[k] == v for k, v in taken.items())

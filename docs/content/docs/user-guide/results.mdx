@@ -35,15 +35,12 @@ print(rows.to_pydict())
 result rows. `collect()` reads the rows into a `pyarrow.Table`.
 Calling `result.collect()` does not run the model again.
 
-Collect the rows before closing the session. On Modal, collect them
-before the GPU function returns. Result collection can read temporary
-files that are removed when the session closes.
+`query.collect()` is a shortcut for `query.run().collect()`. It returns
+the table directly. Use `query.run()` when you also want a `QueryResult`
+to inspect the execution metrics and plan.
 
-If you only need the rows, you can use `query.collect()` instead.
-It calls `run()` and then collects the rows. To read rows in batches,
-use `result.execute_stream()`. It returns an Arrow reader with batches of
-rows from the completed run. Read all batches or close the reader before
-closing the session:
+To read the completed query's results in batches, use
+`result.execute_stream()`. It returns an Arrow reader:
 
 ```python
 with result.execute_stream(batch_rows=1024) as reader:
@@ -118,7 +115,7 @@ For example, for three input reviews, the physical plan includes lines
 like these. The excerpt omits the token budgets and prompt text:
 
 ```text
-physical: backend=quail, model=qwen3-4b-fp8, workers=1
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
 
                          est. rows   est. pass   est. time
   Project: r.id                0.6
@@ -144,12 +141,9 @@ The `est. pass` column shows the selectivity used by the planner.
 If you did not supply a selectivity, the output marks the default
 with `*` and explains it below the plan.
 
-Time estimates use peak GPU compute rates and memory bandwidth.
-They exclude CPU work and kernel launch time. Actual GPU execution
-can take longer. Operator time estimates do not add up to the query
-estimate because operators can share model execution.
-See [Cost estimates](/docs/architecture/optimizer#cost-estimates)
-for the assumptions.
+Quail estimates GPU time using peak compute speed and memory bandwidth.
+These estimates are often too optimistic.
+See [Cost estimates](/docs/architecture/optimizer#cost-estimates) for more details.
 
 ### Show execution settings
 

@@ -34,7 +34,7 @@ class AnswerState:
     none_lp: float = NEG
     best_lp: float = NEG
     written: list = field(default_factory=list)   # the answer's tokens so far
-    live: list = field(default_factory=list)      # streams the writing fits
+    streams: list = field(default_factory=list)      # the drafts the writing fits
     fed: list = field(default_factory=list)       # the last round's tokens
     discard: int = 0    # tokens of the last round past what it verified
     done: bool = False
@@ -63,7 +63,7 @@ class Decoder:
 
     Args:
         vocabulary: The model's vocabulary index.
-        k: How many likeliest tokens each readout row carries.
+        gpus: How many likeliest tokens each readout row carries.
         width: The values in each readout row: none, the stop, then
             k ids and k log probabilities.
         questions: How many questions the pipeline asks.
@@ -107,10 +107,10 @@ class Decoder:
             q: The question's index.
         """
         at = len(answer.written)
-        stream = min(answer.live, key=lambda s: s.char)
+        stream = min(answer.streams, key=lambda s: s.char)
         length = self.spec.draft_tokens
         if self.policies is not None:
-            length = self.policies[q].draft_length(rho, at, len(answer.live))
+            length = self.policies[q].draft_length(rho, at, len(answer.streams))
         draft = []
         for i in range(length):
             token = stream.next(at + i, self.vocabulary)
@@ -131,7 +131,7 @@ class Decoder:
         self.top = int(ids[np.argmax(self.scores[ids])])
         return self.scores, float(values[0]), float(values[1])
 
-    def verify(self, doc: Document, q: int, rows, fed) -> None:
+    def verify(self, document: Document, q: int, rows, fed) -> None:
         """Choose the answer's tokens from a round's rows, in order.
 
         Row i follows token i of the round's fed tokens, so the token
@@ -141,43 +141,45 @@ class Decoder:
         that write the draft are decided together.
 
         Args:
-            doc: The document.
+            document: The document.
             q: The question's index.
             rows: The readout rows of the round.
             fed: The round's fed tokens.
         """
-        answer = doc.answers[q]
+        answer = document.answers[q]
         answer.steps += 1
         answer.discard = 0
         rows = np.asarray(rows)
         # a draft along one of several live positions tells the policy
         # whether that position was the answer's source
-        live = len(answer.live) if answer.written and len(fed) > 1 else 1
+        num_streams = (
+            len(answer.streams) if answer.written and len(fed) > 1 else 1
+        )
         accepted = 0
-        if answer.written and len(answer.live) == 1:
+        if answer.written and len(answer.streams) == 1:
             accepted = self.accepted(answer, rows, fed)
             rows = rows[accepted:]
         if accepted:
-            self.observe(q, live, True)
+            self.observe(q, num_streams, True)
             written = min(accepted, self.spec.max_answer_tokens - len(answer.written))
             answer.written.extend(fed[1:written + 1])
             if len(answer.written) >= self.spec.max_answer_tokens:
-                self.settle(doc, q)
+                self.settle(document, q)
                 return
         for i, values in enumerate(rows):
-            token = self.choose(doc, q, values)
+            token = self.choose(document, q, values)
             if answer.done:
                 return
             after = accepted + i + 1
-            if after == 1 and live > 1:
-                self.observe(q, live, token == fed[1])
+            if after == 1 and num_streams > 1:
+                self.observe(q, num_streams, token == fed[1])
             if after < len(fed) and token != fed[after]:
                 answer.discard = len(fed) - after
                 return
 
-    def observe(self, q: int, live: int, accepted: bool) -> None:
-        if self.policies is not None and live > 1:
-            self.policies[q].observe(live, accepted)
+    def observe(self, q: int, num_streams: int, accepted: bool) -> None:
+        if self.policies is not None and num_streams > 1:
+            self.policies[q].observe(num_streams, accepted)
 
     def accepted(self, answer: AnswerState, rows: np.ndarray, fed) -> int:
         """Return how many leading rows write the draft token fed after them.
@@ -220,7 +222,7 @@ class Decoder:
         writes = (lp_draft > stop) & ~(lp_merged > best) & ~leaves
         return int(np.argmin(writes)) if not writes.all() else n
 
-    def choose(self, doc: Document, q: int, values):
+    def choose(self, document: Document, q: int, values):
         """Choose the answer's next token among the document's continuations.
 
         The answer is the document text the model writes before its
@@ -239,55 +241,56 @@ class Decoder:
         Returns:
             The token written, or None when the answer ended.
         """
-        answer = doc.answers[q]
+        answer = document.answers[q]
         vocabulary = self.vocabulary
         lp, none_lp, stop_lp = self.lp(values)
         if not answer.written:
-            starts = first_tokens(vocabulary, lp, doc.scan)
+            starts = first_tokens(vocabulary, lp, document.scan)
             answer.none_lp = none_lp
             answer.best_lp = starts.best_lp
             answer.none_wins = (max(none_lp, stop_lp) > answer.best_lp
                                 or self.leaves(lp, starts.allows(self.top),
                                                answer.best_lp, stop_lp))
             if answer.none_wins:
-                self.settle(doc, q)
+                self.settle(document, q)
                 return None
             token = starts.best_token
-            answer.live = make_streams(
-                vocabulary, doc.text, starts, token,
+            answer.streams = make_streams(
+                vocabulary, document.text, starts, token,
                 first_window_chars=self.spec.first_window_chars,
                 window_chars=self.spec.window_chars)
         else:
             at = len(answer.written)
-            ensure_tokens(answer.live, at, vocabulary)
+            ensure_tokens(answer.streams, at, vocabulary)
             best, joined, joined_lp, allowed, next_tokens = self.continuations(
                 answer, at, lp)
             best_lp = NEG if best is None else lp[best]
             if joined is not None and joined_lp > max(best_lp, stop_lp):
                 answer.written.append(joined)
                 if next_tokens is not None:
-                    answer.live = [s for s, keep in zip(
-                        answer.live, next_tokens == joined) if keep]
-                self.settle(doc, q)
+                    answer.streams = [s for s, keep in zip(
+                        answer.streams, next_tokens == joined) if keep]
+                self.settle(document, q)
                 return None
             if (best is None or stop_lp >= best_lp
                     or self.leaves(lp, allowed, best_lp, stop_lp)):
-                self.settle(doc, q)
+                self.settle(document, q)
                 return None
             token = best
             if next_tokens is not None:
-                answer.live = [s for s, keep in zip(answer.live, next_tokens == token)
-                               if keep]
+                answer.streams = [
+                    s for s, keep in zip(answer.streams, next_tokens == token) if keep
+                ]
         answer.written.append(token)
         if len(answer.written) >= self.spec.max_answer_tokens:
-            self.settle(doc, q)
+            self.settle(document, q)
         return token
 
     def continuations(self, answer: AnswerState, at: int, lp) -> tuple:
         """Rate the next tokens and quote endings of the answer's live streams."""
         merged_ids = self.vocabulary.merged
-        if len(answer.live) == 1:
-            stream = answer.live[0].stream
+        if len(answer.streams) == 1:
+            stream = answer.streams[0].stream
             best = stream[at] if at < len(stream) else None
             merged = int(merged_ids[best]) if best is not None else -1
             joined_lp = lp[merged] if merged >= 0 else NEG
@@ -295,8 +298,8 @@ class Decoder:
             allowed = self.top == best or self.top == merged
             return best, joined, joined_lp, allowed, None
         next_tokens = np.fromiter(
-            (s.stream[at] if at < len(s.stream) else -1 for s in answer.live),
-            dtype=np.int64, count=len(answer.live))
+            (s.stream[at] if at < len(s.stream) else -1 for s in answer.streams),
+            dtype=np.int64, count=len(answer.streams))
         following = np.unique(next_tokens[next_tokens >= 0])
         best = int(following[np.argmax(lp[following])]) if len(following) else None
         merged = merged_ids[following]
@@ -317,22 +320,22 @@ class Decoder:
         return (lp[top] > max(best_lp, stop_lp) and not top_allowed
                 and not vocabulary.is_stop[top] and top != vocabulary.none_id)
 
-    def settle(self, doc: Document, q: int) -> None:
+    def settle(self, document: Document, q: int) -> None:
         """Set the question's answer for the document: its span, or none.
 
         Among the streams the writing fits, the first position of the
         document wins.
         """
-        answer = doc.answers[q]
+        answer = document.answers[q]
         answer.done = True
-        if answer.none_wins or not answer.written or not answer.live:
+        if answer.none_wins or not answer.written or not answer.streams:
             answer.answer, answer.span = None, None
             return
         if self.policies is not None:
             self.policies[q].settle(len(answer.written))
-        stream = min(answer.live, key=lambda s: s.char)
+        stream = min(answer.streams, key=lambda s: s.char)
         start, end = stream.char, stream.ends[len(answer.written) - 1]
-        text = doc.text
+        text = document.text
         while start < end and text[start].isspace():
             start += 1
         while end > start and text[end - 1].isspace():

@@ -77,25 +77,28 @@ def record_model_result(node, result: NodeResult,
         state["kv_stats"]["join_anchor_hits"] += result.metrics.kv_hits
 
 
-def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
-    """Execute one Quail model graph on one GPU executor."""
-    torch = state["gpu"].torch
+def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
+    """Bind a query's inputs, retention, and runtimes to one GPU executor.
+
+    The arena is emptied first: nothing survives from the last query.
+    """
     arena = state["gpu"].arena
     for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
+    # the peak memory reported is this query's, not the process's
+    state["gpu"].torch.cuda.reset_peak_memory_stats()
     retention = payload.get("retention", {})
     apply_retention(arena, retention, retention.get("initial", {}))
-    docs = state["docs"]
+    documents = state["documents"]
     sources = {
-        alias: range(len(documents))
-        for alias, documents in docs.items()
+        alias: range(len(tokens))
+        for alias, tokens in documents.items()
     }
     for alias, table in state.get("columns", {}).items():
         sources[columns_key(alias)] = table
     runtime_state = {
         **state,
-        "pre": payload.get("pre_ids") or [],
         "retention": retention,
         "filter_limit": (
             None if any(isinstance(node, AiJoin)
@@ -112,7 +115,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         },
     }
     execution = state["gpu"].execution
-    context = ExecutionContext(
+    return ExecutionContext(
         runtimes=state["runtimes"],
         model_execution=execution,
         sources=sources,
@@ -120,30 +123,45 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         model_result=record_model_result,
         state=runtime_state,
         functions=state.get("functions", {}),
-        run_pipeline=getattr(execution, "execute_pipeline", None),
+        run_pipeline=execution.execute_pipeline,
     )
+
+
+def execution_measurements(context: ExecutionContext) -> dict:
+    """Return one GPU's KV counters and memory report for the query so far."""
+    gpu = context.state["gpu"]
+    arena = gpu.arena
+    return {
+        "kv_manager": {
+            **context.state["kv_stats"],
+            "evicted_keys": arena.evicted_keys,
+            "evicted_pages": arena.evicted_pages,
+            "evicted_prefix_tokens": arena.evicted_prefix_tokens,
+        },
+        "memory": memory_report(gpu),
+    }
+
+
+def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
+    """Execute one Quail model graph on one GPU executor."""
+    context = execution_context(state, payload, graph)
+    torch = state["gpu"].torch
+    arena = state["gpu"].arena
     started = time.perf_counter()
     with torch.inference_mode():
         result = GenericRunner().run(compute_subgraph(graph), context)
     torch.cuda.synchronize()
     wall = time.perf_counter() - started
-
     for key in arena.resident_keys():
         arena.free_key(key)
-    kv_manager = {
-        **runtime_state["kv_stats"],
-        "evicted_keys": arena.evicted_keys,
-        "evicted_pages": arena.evicted_pages,
-        "evicted_prefix_tokens": arena.evicted_prefix_tokens,
-    }
-
     report = graph_report(graph, result, wall, state["device"],
                           gpu_timing=state.get("gpu_timing", False))
-    report.update(kv_manager=kv_manager, **memory_report(state["gpu"]))
+    measurements = execution_measurements(context)
+    report.update(kv_manager=measurements["kv_manager"], **measurements["memory"])
     return report
 
 
-def graph_report(graph, result, wall, device, *, workers=1, gpu_timing=False):
+def graph_report(graph, result, wall, device, *, gpus=1, gpu_timing=False):
     """Collect graph outputs, execution metrics, and GPU cost."""
     filters, joins = model_answers(graph, result)
     report = {
@@ -157,7 +175,7 @@ def graph_report(graph, result, wall, device, *, workers=1, gpu_timing=False):
         "evaluated_document_pairs": result.metrics.evaluated_document_pairs,
         "usd_per_query": (
             None if device.usd_per_hour is None
-            else wall / 3600 * workers * device.usd_per_hour
+            else wall / 3600 * gpus * device.usd_per_hour
         ),
         "backend_metrics": {"inferences": [
             dict(value.metrics.extension)
@@ -188,7 +206,7 @@ def throughput(graph, metrics, seconds: float) -> dict:
                 metrics.evaluated_document_pairs / seconds,
         }
     documents = sum(
-        node.n_docs for node in graph.nodes if isinstance(node, Scan)
+        node.num_documents for node in graph.nodes if isinstance(node, Scan)
     )
     return {"documents_per_second": documents / seconds}
 
@@ -205,7 +223,7 @@ def model_answers(graph, result) -> tuple[dict, list]:
                 combined.setdefault(document, []).extend(answers)
         elif isinstance(node, AiJoin):
             joins.append(result.nodes[node.node_id].outputs[
-                f"join_answers:{node.written_pos}"])
+                f"join_answers:{node.written_position}"])
     return filters, joins
 
 

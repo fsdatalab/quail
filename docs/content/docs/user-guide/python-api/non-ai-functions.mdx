@@ -1,0 +1,477 @@
+---
+title: Non-AI functions
+---
+
+Use these functions to filter and transform rows, control result shape,
+and collect query results. They can read source columns or the outputs
+of [AI functions](/docs/user-guide/python-api/ai-functions).
+`collect()` executes the query, including its AI functions.
+
+## Functions
+
+Select a row to jump to its arguments and examples.
+
+<div className="function-index">
+
+| Function | Description |
+| --- | --- |
+| [`where(*tests) / filter(*tests)`](#where) | Keeps rows that satisfy every condition. |
+| [`label_in(name, labels, ...)`](#label_in) | Keeps rows with a matching classification label. |
+| [`join(other, on=None)`](#join) | Restricts document pairs before an AI condition. |
+| [`col(name)`](#column-expressions) | Reads columns and builds field or text expressions. |
+| [`order_by(*keys)`](#order_by) | Sorts result rows. |
+| [`distinct()`](#distinct) | Removes duplicate result rows. |
+| [`offset(n)`](#offset) | Skips rows before applying a limit. |
+| [`limit(n)`](#limit) | Returns at most the requested number of rows. |
+| [`select(*columns)`](#select) | Names the result columns and creates a query. |
+| [`group_by(*keys)`](#group_by) | Groups rows by column values. |
+| [`agg(**aggregates)`](#agg) | Computes values for each group or the whole result. |
+| [`having(*tests)`](#having) | Filters aggregate results. |
+| [`window(**calls)`](#window) | Computes values across related rows, keeping each row. |
+| [`apply(fn, ...)`](#apply) | Runs a Python function on query rows. |
+| [`apply_table(fn, ...)`](#apply_table) | Runs a Python function after all preceding rows are ready. |
+| [`collect(limit=None)`](#collect) | Executes the query and returns an Arrow table. |
+
+</div>
+
+The examples use a `session` with registered tables. See
+[Sessions](/docs/user-guide/sessions) for setup and
+[table registration](/docs/user-guide/sessions#registering-tables).
+Import the column and prompt helpers:
+
+```python
+from quail import col, prompt
+```
+
+## Conditions and joins
+
+### where
+
+`where(*tests)`, also `filter(*tests)`
+
+Keep rows that satisfy every condition. Use `col("name")` to refer to a
+column. Pass conditions as separate arguments, or combine them with `&`.
+Put parentheses around each comparison when using `&`.
+
+| Condition | Syntax |
+| --- | --- |
+| Compare with a value | `==`, `!=`, `<`, `<=`, `>`, `>=` |
+| Match a value in a collection | `col(...).isin(values)` |
+| Keep null values | `col(...).is_null()` |
+| Keep non-null values | `col(...).is_not_null()` |
+
+`isin()` takes a non-empty iterable of values. Use `is_null()` to test
+for nulls rather than comparing with `None`.
+
+For example, imagine a `reviews` table with columns `id`, `body`, `year`,
+and `stars`. Return IDs of reviews from 2024 with at least four stars
+that mention shipping:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .where((col("r.year") == 2024) & (col("r.stars") >= 4))
+    .ai_if(prompt('Does the review mention shipping?\n\n{0}', col("r.body")))
+    .select("r.id")
+)
+result = query.collect()
+```
+
+Quail checks source columns before calling the model, even when `where()`
+appears after an AI function in the builder chain. A condition on an
+extracted answer or classification label runs after the model produces
+that value. Classification labels support only `==` and `isin()`.
+To compare columns from different tables, use [`join()`](#join).
+
+#### Text conditions
+
+Use these methods on source text columns or extracted answers:
+
+| Method | Condition |
+| --- | --- |
+| `.like(pattern)` | Matches a SQL pattern. `%` matches any text, and `_` matches one character. |
+| `.ilike(pattern)` | Matches a SQL pattern, ignoring case. |
+| `.contains(text)` | Contains the supplied text. Pass `ignore_case=True` to ignore case. |
+| `.startswith(text)` | Starts with the supplied text. |
+| `.endswith(text)` | Ends with the supplied text. |
+| `.rlike(pattern)` | Contains a match for the regular expression. |
+
+For example, `col("r.body").contains("shipping", ignore_case=True)`
+keeps reviews that contain "shipping" in any case. Use `~` to negate
+a text condition, such as `~col("r.body").like("%shipping%")`.
+Text conditions exclude null values, including when negated.
+
+#### Planning hints
+
+For a condition on a classification label or extracted answer, use
+`.hint(selectivity=...)` to estimate the fraction of documents that pass.
+Quail uses the estimate to choose the order of AI functions.
+
+For example, `col("lease.end_date").like("%2027%").hint(selectivity=0.4)`
+estimates that 40% of documents pass. The default is 20%. A hint affects
+planning only; it does not change which rows pass.
+
+### label_in
+
+`label_in(name: str, labels: Iterable[str], selectivity: float | None = None)`
+
+Keep documents whose computed label matches one of the supplied values.
+Call [`ai_classify()`](/docs/user-guide/python-api/ai-functions#ai_classify) first to create the label column. `label_in()`
+tests that column without calling the model again.
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `name` | `str` | Column name given to an earlier `ai_classify()` call. |
+| `labels` | `Iterable[str]` | Labels to keep, such as `["negative", "mixed"]`. A list or tuple of strings works. |
+| `selectivity` | `float` or `None` | Estimated fraction of documents kept. `None` uses the default estimate of `0.2`. |
+
+For example, after classifying reviews into the `sentiment` column,
+`label_in("sentiment", ["negative", "mixed"])` keeps reviews with either
+of those labels.
+
+`label_in()` does not work on a classification of joined rows.
+
+### join
+
+`join(other, on=None)`
+
+Add relational predicates to restrict which pairs the model sees.
+Follow `join()` with `ai_if()` over both tables:
+
+```python
+query = (
+    session.docs("claims").alias("c")
+    .join(
+        session.docs("evidence").alias("e"),
+        on=col("c.wiki_url") == col("e.id"))
+    .ai_if(
+        prompt('Does the passage support the claim?\n\n{0}\n\n{1}',
+               col("c.claim"), col("e.text")))
+    .select("c.id", "e.id")
+)
+result = query.collect()
+```
+
+## Column expressions
+
+Use `.field(name)` to read a field of a struct column. You can apply
+one of the following functions to a text column or text field:
+
+| Method | Returns |
+| --- | --- |
+| `.length()` | The number of characters. |
+| `.lower()` | The text in lowercase. |
+| `.upper()` | The text in uppercase. |
+| `.trim()` | The text with leading and trailing whitespace removed. |
+
+For example, imagine a `pages` table with an `id` column and a `details`
+struct containing a `body` field. Return the IDs and text lengths of
+pages that discuss shipping:
+
+```python
+body = col("p.details").field("body")
+
+query = (
+    session.docs("pages").alias("p")
+    .ai_if(prompt("Does the page discuss shipping?\n\n{0}", body))
+    .order_by("body_length")
+    .select("p.id", body.length().named("body_length"))
+)
+```
+
+Use `.named(...)` to set a result column's name. You can use that name
+in `order_by()` or `group_by()`. Without a name, Quail uses the expression
+text, such as `length(p.details.body)`.
+
+- Struct fields and text functions also work in prompts, `join()`
+  conditions, `where()`, `apply()`, and aggregate arguments.
+- A column expression can contain only one text function. Chaining
+  functions, such as `.trim().lower()`, is unsupported.
+- A missing field or a function applied to the wrong type raises
+  `CompileError` when you build the query.
+
+## Result rows
+
+### order_by
+
+`order_by(*keys)`
+
+Sort result rows by table columns or AI output columns. Pass each column
+as a string or a `col()` expression.
+
+Use `.asc()` or `.desc()` on a `col()` expression to set the direction.
+The default is ascending. Use `.nulls_first()` or `.nulls_last()` to set
+where nulls appear. By default, ascending order puts nulls last and
+descending order puts them first.
+
+For example, imagine a `reviews` table with text in `body` and ratings in `stars`.
+The query below returns up to ten positive reviews with the highest ratings:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .order_by(col("r.stars").desc().nulls_last(), "r.id")
+    .limit(10)
+    .select("r.id", "r.body")
+)
+result = query.collect()
+```
+
+Quail evaluates every review before sorting the positive reviews. In this
+query, Quail uses `"r.id"` to order reviews with equal ratings. The limit
+applies after sorting.
+
+Sorting columns need not appear in `select()`, except when using
+`distinct()`.
+
+### distinct
+
+`distinct()`
+
+Remove duplicate rows by comparing all columns passed to `select()`.
+Quail removes duplicates before sorting and applying `offset()` or
+`limit()`. Every sorting column must appear in `select()`.
+
+Sorting or removing duplicates prevents `limit()` from stopping AI
+evaluation early. An offset greater than zero has the same effect.
+
+### offset
+
+`offset(n)`
+
+Skip `n` rows before applying `limit()`. The argument must be an integer
+greater than or equal to zero. Use `order_by()` to specify which rows to
+skip. Without an explicit order, the skipped rows can differ between runs.
+
+### limit
+
+`limit(n)`
+
+Return at most `n` rows.
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .limit(100)
+    .select("r.id", "r.body")
+)
+```
+
+### select
+
+`select(*cols)`
+
+Specify which columns to return. Call `select()` last in the builder
+chain to create a `Query`.
+
+```python
+.select("r.id")               # one column
+.select("r.id", "a.aspect")   # multiple columns
+.select("*")                   # all columns from all tables
+```
+
+## Aggregates and windows
+
+### group_by
+
+`group_by(*keys)`
+
+Group rows by the given columns. Each column can be a name or a `col()`
+expression, including a name assigned by `ai_classify()` or `ai_score()`.
+
+### agg
+
+`agg(**aggregates)`
+
+Compute aggregates for each group. Without `group_by()`, compute them
+over all rows that pass the query's filters.
+
+Use `count()`, `count_distinct()`, `sum_()`, `avg()`, `min_()`, or `max_()`
+from `quail.frontend.expressions`. Each keyword argument names an output
+column. In `select()`, use grouping columns or those output names.
+See [aggregate functions](/docs/user-guide/sql/sql-functions#aggregate-functions)
+for the supported functions and their treatment of nulls.
+
+### having
+
+`having(*tests)`
+
+Keep groups that satisfy all the given conditions. Compare an aggregate
+with a number using `==`, `!=`, `<`, `<=`, `>`, or `>=`.
+
+For example, the following query returns the review count and average star rating
+for each sentiment. It keeps sentiments with more than ten reviews:
+
+```python
+from quail.frontend.expressions import avg, count
+
+query = (
+    session.docs("reviews").alias("r")
+    .ai_classify(
+        prompt('What is the sentiment of this review?\n\n{0}', col("r.body")),
+        ["positive", "negative", "mixed"], name="sentiment")
+    .group_by("sentiment")
+    .agg(review_count=count(), avg_stars=avg("r.stars"))
+    .having(count() > 10)
+    .order_by(col("review_count").desc())
+    .select("sentiment", "review_count", "avg_stars")
+)
+result = query.collect()
+```
+
+### window
+
+`window(**calls)`
+
+Add values computed from related result rows, such as the previous
+row's label or a running total. A partition is the group of rows used
+for each calculation. Each keyword argument names an output column
+that you can use in `select()` or `order_by()`.
+
+Import `row_number`, `lag`, `lead`, `sum_`, or `count` from
+`quail.frontend.expressions`, and call `.over(...)` on the function:
+
+- `partition_by` sets the columns that group rows. Omit it to use all
+  result rows as one partition.
+- `order_by` sets the order within each partition. It accepts column
+  names or sort expressions such as `col("s.step_index").desc()`.
+  `lag()` and `lead()` require an order.
+- Both arguments accept one key or a list of keys. Include a unique
+  key when ties would make the previous or next row ambiguous.
+
+For example, imagine a `steps` table with one row per agent step.
+It has columns `id`, `run_id`, `step_index`, `cost`, and `text`, with
+unique step indexes within each run. Classify each step, return the
+previous step's label, and compute the running cost within each run:
+
+```python
+from quail.frontend.expressions import lag, sum_
+
+step_order = {"partition_by": "s.run_id", "order_by": "s.step_index"}
+
+query = (
+    session.docs("steps").alias("s")
+    .ai_classify(prompt("What does the agent do here?\n\n{0}", col("s.text")),
+                 ["plan", "act", "reflect"], name="kind")
+    .window(
+        previous=lag("kind").over(**step_order),
+        running_cost=sum_("s.cost").over(**step_order),
+    )
+    .order_by("s.run_id", "s.step_index")
+    .select("s.id", "kind", "previous", "running_cost")
+)
+```
+
+The first step in each run has a null `previous` value. Later steps use
+the label already computed for the preceding row. The window calculation
+does not call the model again.
+
+Windows require the Quail backend and run after AI functions. A
+`limit()` can reduce window computation, but it does not stop model
+evaluation early. A query cannot combine windows with `group_by()` or
+`agg()`. In a query with windows, name each returned column explicitly
+instead of using `select("*")` or returning an extraction struct.
+
+See [Window functions](/docs/user-guide/sql/sql-functions#window-functions) for each
+function's output, null handling, and supported limits.
+
+## User-defined functions
+
+User-defined functions run on the CPU between AI functions. They do
+not run on the GPU. Quail may reorder AI filters and joins around
+each other, but it will not move an AI function across a
+user-defined function.
+
+### apply
+
+`apply(fn, columns=[], name=None, ids=None, kind="per_batch")`
+
+Insert a Python function into the query plan. The function receives
+a dict of Arrow tables keyed by alias.
+
+The main use case is pairing rows from two tables before an AI join.
+For example, a claims table has an `evidence_wiki_url` column that
+names the evidence page for each claim. Instead of evaluating the AI
+predicate on every claim-evidence pair, you pair them by URL first:
+
+```python
+def match_by_url(tables):
+    """Pair each claim with the evidence row its URL names.
+
+    tables["c"] is a pyarrow.Table with columns "c" (the document ids),
+    "evidence_wiki_url", and any other columns requested.
+    tables["e"] has columns "e" (the document ids) and "id".
+    The returned table must have columns "c" and "e" (the id columns
+    from each side) to identify the pairs.
+    """
+    return tables["c"].join(
+        tables["e"],
+        keys=["evidence_wiki_url"],
+        right_keys=["id"],
+        join_type="inner",
+    ).select(["c", "e"])
+
+query = (
+    session.docs("claims").alias("c")
+    .join(session.docs("evidence").alias("e"))
+    .apply(match_by_url,
+           columns=[col("c.evidence_wiki_url"), col("e.id")])
+    .ai_if(
+        prompt('Does the passage support the claim?\n\n{0}\n\n{1}',
+               col("c.claim"), col("e.text")))
+    .select("c.id", "e.id")
+)
+result = query.collect()
+```
+
+You can also use `apply` after a filter to drop rows with custom
+Python logic before the next AI function runs.
+
+`kind="per_batch"` (the default) runs the function on each batch of
+rows in a pipeline. Outside a pipeline, the function gets all input rows
+in one call. Use `apply_table()` when the function needs all rows at
+once.
+
+### apply_table
+
+`apply_table(fn, columns=[], name=None, ids=None)`
+
+Like `apply`, but waits for the preceding stage to finish and calls
+`fn` once with all surviving rows. Equivalent to
+`apply(..., kind="barrier")`.
+
+Use this when your function needs to see every surviving row at once.
+In a pipeline, `apply` gets the rows in batches. With `apply_table`,
+Quail first finishes the stage before it, then calls your function one
+time with all the rows.
+
+```python
+def deduplicate(tables):
+    reviews = tables["r"]
+    groups = reviews.group_by("body").aggregate([("r", "min")])
+    return groups.column("r_min")
+
+query = (
+    session.docs("reviews").alias("r")
+    .apply_table(deduplicate, columns=[col("r.body")])
+    .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .select("r.id")
+)
+result = query.collect()
+```
+
+The planner preserves the order of function calls around `apply_table()`.
+It does not move a function call before or after `apply_table()`.
+
+## Execute a query
+
+### collect
+
+`collect(limit=None)`
+
+Execute the query and return a `pyarrow.Table`. This is when the
+model runs. See [Explain plans and runs](/docs/user-guide/results)
+for `run()`, `explain()`, `explain(analyze=True)`, and the
+execution report.

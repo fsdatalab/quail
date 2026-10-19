@@ -15,10 +15,9 @@ rows follows its join on the join's anchor.
 
 A classification is priced as one question per live document: the
 reference prompt's tail (the question, the labels by name, and the
-answer cue) over the document's prefix, read at the cue's row as a
-filter's answer is. The rows a scoring rule appends to read the label
-(a letter, a trie, or decode rounds) are an execution choice and are
-not counted.
+answer cue) over the document's prefix, and one readout row at the cue
+that confirms the reference label. An extraction's reference answer is
+verified in one pass after the cue, each of its tokens a readout row.
 
 Every operator in the plan is priced or refused: an Apply, an AI.SCORE
 predicate or column, a LIMIT, or a join without full semantics raises
@@ -35,9 +34,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from quail.cost import budgets
-from quail.cost.sol import SpeedOfLight, speed_of_light
+from quail.cost.sol import SpeedOfLight
 from quail.cost.work import Work
 from quail.logical import (
+    SPAN_SUFFIX,
     Aggregate,
     Filter,
     Join,
@@ -49,8 +49,10 @@ from quail.logical import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    Window,
 )
 from quail.planner.sol.search import (
+    ANSWER_TEST,
     CLASSIFY,
     EXTRACT,
     FILTER,
@@ -62,7 +64,7 @@ from quail.planner.sol.search import (
 from quail.specs import DeviceSpec, ModelSpec
 
 _PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, SemanticExtract,
-                 Filter, Join, SemanticJoin, Project, Aggregate, Result)
+                 Filter, Join, SemanticJoin, Project, Aggregate, Window, Result)
 
 
 @dataclass(frozen=True)
@@ -129,7 +131,7 @@ class SpeedOfLightEstimate:
         """Return what the estimate takes as given, for a report."""
         return {
             "persistent_kv_capacity": "unlimited",
-            "gpu_count": 1,
+            "gpus": 1,
             "survivors": "exact, from the caller's answers and labels",
             "stop_key": (
                 "a filter under a DISTINCT over its table's columns reads "
@@ -140,12 +142,11 @@ class SpeedOfLightEstimate:
                 "classifications follow its AI.IF filters"),
             "classification": (
                 "the reference prompt's tail per document or joined row, "
-                "read at the answer cue; a scoring rule's extra rows are "
-                "not counted"),
+                "and one readout row at the cue"),
             "extraction": (
-                "the plain prompt's tail per document, read once at the "
-                "cue; the lines answer, the start step, and the span "
-                "passes are not counted"),
+                "the plain prompt's tail per document, then the reference "
+                "answer verified in one pass after the cue, each token a "
+                "readout row"),
             "plan_space": "all feasible eager binary full left deep plans",
             "cached_values": (
                 "document prefixes used by filters, classifications, "
@@ -224,7 +225,7 @@ def _refuse_unpriced(logical) -> None:
                 f"the speed of light estimate does not price {node.type_name}")
         if isinstance(node, Result) and node.limit is not None \
                 and not (node.order or node.distinct or node.offset
-                         or isinstance(node.input, Aggregate)):
+                         or isinstance(node.input, (Aggregate, Window))):
             # a sorted, offset, or grouped result runs every document,
             # and a distinct one stops each key at its first survivor;
             # the estimate prices both. A bare LIMIT stops early.
@@ -237,9 +238,16 @@ def _refuse_unpriced(logical) -> None:
             if not (isinstance(expression, ModelCall)
                     and expression.kind == "boolean"):
                 raise NotImplementedError(
-                    f"the speed of light estimate does not price the "
-                    f"{type(expression).__name__} filter on {alias!r}; "
-                    f"it prices AI.IF and label filters")
+                    f"the speed of light estimate does not price the filter "
+                    f"{expression} on {alias!r}; it prices AI.IF and label "
+                    f"filters")
+    for tests in operators.extract_filters.values():
+        for test in tests:
+            if test.condition.column.column.endswith(SPAN_SUFFIX):
+                raise NotImplementedError(
+                    f"the speed of light estimate does not price the test "
+                    f"{test.condition} of an answer's span; the answer "
+                    f"oracle gives the answer's text only")
     for join in operators.joins:
         if not (isinstance(join.predicate, ModelCall)
                 and join.predicate.kind == "boolean"):
@@ -323,7 +331,7 @@ def speed_of_light_estimate(
                     credit_shared_prefixes)
     survivors, filter_work, filter_stages = search.run_filters()
     resident = frozenset(stage["alias"] for stage in filter_stages
-                         if stage["operator"] != LABEL_IN)
+                         if stage["operator"] not in (LABEL_IN, ANSWER_TEST))
     base_rows = {alias: tuple(rows) for alias, rows in survivors.items()}
     best, result = search.search_joins_sol(base_rows, resident, filter_work)
     return SpeedOfLightEstimate(
@@ -332,7 +340,7 @@ def speed_of_light_estimate(
         chunk_tokens=chunk_tokens,
         credit_shared_prefixes=credit_shared_prefixes,
         work=best.work,
-        latency=speed_of_light(best.work, model, device, chunk_tokens),
+        latency=search.latency(best),
         usd_per_hour=device.usd_per_hour,
         alias_columns={
             alias: data.column for alias, data in search.aliases.items()},
@@ -345,8 +353,8 @@ def speed_of_light_estimate(
         relation_order=tuple(best.relation_order),
         cached_prefixes=tuple(sorted(best.state_property)),
         search={
-            "dp_states": result.state_count,
-            "dp_records_generated": result.generated_count,
+            "dp_states": result.num_states,
+            "dp_records_generated": result.num_generated,
             "dp_final_records": len(result.candidates),
         },
     )

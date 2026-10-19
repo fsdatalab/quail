@@ -49,3 +49,12 @@ def test_table_provider_scans_and_validation(monkeypatch):
 
     assert table.column_names == ["id", "body"]
     assert table.to_pydict() == {"id": ["a", "b"], "body": ["first", "second"]}
+
+
+def test_each_dataset_object_has_its_own_identity():
+    table = pa.table({"id": [1, 2, 3], "body": ["a", "b", "c"]})
+    dataset = ds.dataset(table)
+    low, high = dataset.filter(ds.field("id") <= 1), dataset.filter(ds.field("id") > 1)
+    identities = [DocumentProvider.from_dataset(value, id_col="id").content_identity()
+                  for value in (dataset, low, high, dataset)]
+    assert len(set(identities)) == 3 and identities[0] == identities[3]

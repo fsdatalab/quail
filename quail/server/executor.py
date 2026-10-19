@@ -17,6 +17,8 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field, replace
+from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from typing import Callable, Protocol
 
 from quail.remote.inputs import resolve
@@ -112,7 +114,7 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
                 "text": query.explain(),
                 "estimated_seconds": plan.estimated_seconds,
                 "backend": plan.backend,
-                "workers": plan.workers,
+                "gpus": plan.gpus,
                 "envelope": plan.to_envelope(session.registry.codecs),
             })
             if job.model_phase is not None:
@@ -197,39 +199,40 @@ class _ThreadExecution:
         self._stopped = True
 
 
+def _model_phase(model, loaded_model) -> dict | None:
+    """Describe loading the model, or return None when it is loaded."""
+    if loaded_model == model:
+        return None
+    if loaded_model is None:
+        return {
+            "name": "loading_model",
+            "message": f"Loading and warming model {model}",
+            "model": model,
+        }
+    return {
+        "name": "switching_model",
+        "message": f"Switching from {loaded_model} and loading {model}",
+        "previous_model": loaded_model,
+        "model": model,
+    }
+
+
 class InProcessExecutor:
     """Run jobs on a thread of the server process (tests and CPU-only)."""
 
     def __init__(self, hooks: Hooks | None = None):
         self.hooks = hooks
-        self._loaded_model = None
+        self.loaded_model = None
 
     def start(self, job: Job, emit: Emit) -> Execution:
-        model = job.config.get("model")
-        if self._loaded_model is None:
-            model_phase = {
-                "name": "loading_model",
-                "message": f"Loading and warming model {model}",
-                "model": model,
-            }
-        elif self._loaded_model != model:
-            model_phase = {
-                "name": "switching_model",
-                "message": (
-                    f"Switching from {self._loaded_model} and loading {model}"
-                ),
-                "previous_model": self._loaded_model,
-                "model": model,
-            }
-        else:
-            model_phase = None
-        job = replace(job, model_phase=model_phase)
+        job = replace(job, model_phase=_model_phase(
+            job.config.get("model"), self.loaded_model))
         return _ThreadExecution(
             job, emit, self.hooks,
-            model_ready=lambda ready: setattr(self, "_loaded_model", ready))
+            model_ready=lambda ready: setattr(self, "loaded_model", ready))
 
     def close(self) -> None:
-        self._loaded_model = None
+        self.loaded_model = None
 
 
 def _child_main(conn, hooks_reference: str | None) -> None:
@@ -270,164 +273,151 @@ def _child_main(conn, hooks_reference: str | None) -> None:
 
 
 @dataclass
+class _Child:
+    """One worker process, its pipe, and the model it has loaded."""
+
+    process: BaseProcess
+    connection: Connection
+    model: str
+    loaded_model: str | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @classmethod
+    def spawn(cls, model: str, hooks_reference: str | None) -> _Child:
+        import multiprocessing as mp
+
+        context = mp.get_context("spawn")
+        parent_conn, child_conn = context.Pipe()
+        try:
+            # not a daemon: a multi-GPU run starts its own worker
+            # processes, which a daemonic process may not do
+            process = context.Process(
+                target=_child_main, args=(child_conn, hooks_reference),
+                name="quail-server-executor", daemon=False)
+            process.start()
+        except BaseException:
+            parent_conn.close()
+            raise
+        finally:
+            child_conn.close()
+        return cls(process, parent_conn, model)
+
+    def close(self, *, graceful: bool = False) -> None:
+        """Stop the process, asking first when graceful, and close its pipe."""
+        with self._lock:
+            if graceful and self.process.is_alive():
+                with contextlib.suppress(OSError, ValueError):
+                    self.connection.send(None)
+                self.process.join(10)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join(30)
+            self.connection.close()
+
+
+@dataclass
 class _ChildExecution:
-    executor: ChildProcessExecutor
+    child: _Child
     emit: Emit
     job: Job
     _done: threading.Event = field(default_factory=threading.Event)
+    _events_lock: threading.Lock = field(default_factory=threading.Lock)
     _stopped: bool = False
 
     def run(self) -> None:
-        conn = self.executor._conn
         try:
             while True:
                 try:
-                    kind, payload = conn.recv()
-                except (EOFError, OSError):
-                    if not self._stopped:
-                        self.emit("failed", {
-                            "type": "ExecutorExit",
-                            "message": "the executor process exited during "
-                                       f"query {self.job.id}",
-                            "traceback": "",
-                        })
-                    with self.executor._lock:
-                        self.executor._discard_child()
+                    kind, payload = self.child.connection.recv()
+                except (EOFError, OSError, ValueError):
+                    self.child.close()
+                    with self._events_lock:
+                        if not self._stopped:
+                            self.emit("failed", {
+                                "type": "ExecutorExit",
+                                "message": "the executor process exited during "
+                                           f"query {self.job.id}",
+                                "traceback": "",
+                            })
                     return
                 if kind == "done":
                     return
-                if kind == "model_ready":
-                    self.executor._mark_model_ready(payload["model"])
-                    continue
-                if not self._stopped:
-                    self.emit(kind, payload)
+                with self._events_lock:
+                    if self._stopped:
+                        continue
+                    if kind == "model_ready":
+                        self.child.loaded_model = payload["model"]
+                    else:
+                        self.emit(kind, payload)
+        except BaseException:
+            # an event the server could not save leaves the job's
+            # progress unknown; the child must not run on unobserved
+            self.child.close()
+            raise
         finally:
-            self._done.set()
+            with self._events_lock:
+                self._done.set()
 
     def wait(self, timeout: float) -> bool:
         return self._done.wait(timeout)
 
     def stop(self) -> None:
-        self._stopped = True
-        self.executor._kill_child()
+        with self._events_lock:
+            if self._done.is_set():
+                return
+            self._stopped = True
+        self.child.close()
 
 
 class ChildProcessExecutor:
     """Run jobs in one long-lived child process that keeps the model warm.
 
-    ``stop`` kills the child; the next job starts a fresh one, which
-    pays the model boot again. That is the reliable stop the current
-    GPU loop offers. A job that names a different model than the child
-    has loaded also gets a fresh child: one model's weights and KV take
-    the whole GPU, and a new process is the sure way to give them back.
+    ``stop`` kills the job's child; the next job starts a fresh one,
+    which pays the model boot again. That is the reliable stop the
+    current GPU loop offers. A job that names a different model than
+    the child has loaded also gets a fresh child: one model's weights
+    and KV take the whole GPU, and a new process is the sure way to
+    give them back.
     """
 
     def __init__(self, hooks_reference: str | None = None):
         self.hooks_reference = hooks_reference
-        self._process = None
-        self._conn = None
-        self._child_model = None
-        self._loaded_model = None
+        self._child = None
         self._lock = threading.Lock()
         atexit.register(self.close)
 
-    def _ensure_child(self) -> None:
-        import multiprocessing as mp
-
-        if self._process is not None and self._process.is_alive():
-            return
-        self._discard_child()
-        context = mp.get_context("spawn")
-        parent_conn, child_conn = context.Pipe()
-        # not a daemon: a multi-GPU run starts its own worker processes,
-        # which a daemonic process may not do. The child exits on its own
-        # when the pipe closes, and close() kills it at interpreter exit.
-        process = context.Process(
-            target=_child_main, args=(child_conn, self.hooks_reference),
-            name="quail-server-executor", daemon=False)
-        process.start()
-        child_conn.close()
-        self._process, self._conn = process, parent_conn
-
-    def _discard_child(self) -> None:
-        conn, self._conn = self._conn, None
-        self._process = None
-        self._child_model = None
-        self._loaded_model = None
-        if conn is not None:
-            with contextlib.suppress(OSError):
-                conn.close()
-
-    def _kill_child(self) -> None:
-        with self._lock:
-            process = self._process
-            if process is not None and process.is_alive():
-                process.kill()
-                process.join(30)
-
-    def _mark_model_ready(self, model: str) -> None:
-        with self._lock:
-            if self._process is not None and self._process.is_alive():
-                self._loaded_model = model
+    @property
+    def loaded_model(self) -> str | None:
+        child = self._child
+        return child.loaded_model if child is not None else None
 
     def start(self, job: Job, emit: Emit) -> Execution:
         with self._lock:
             model = job.config.get("model")
-            alive = self._process is not None and self._process.is_alive()
-            loaded_model = self._loaded_model if alive else None
-            child_model = self._child_model if alive else None
-            if child_model not in (None, model):
-                if loaded_model is None:
-                    model_phase = {
-                        "name": "loading_model",
-                        "message": f"Loading and warming model {model}",
-                        "model": model,
-                    }
-                else:
-                    model_phase = {
-                        "name": "switching_model",
-                        "message": (
-                            f"Switching from {loaded_model} and loading {model}"
-                        ),
-                        "previous_model": loaded_model,
-                        "model": model,
-                    }
-                self._close_child_unlocked()
-            elif loaded_model != model:
-                model_phase = {
-                    "name": "loading_model",
-                    "message": f"Loading and warming model {model}",
-                    "model": model,
-                }
-            else:
-                model_phase = None
-            self._ensure_child()
-            self._child_model = model
-            job = replace(job, model_phase=model_phase)
-            self._conn.send(job)
-            execution = _ChildExecution(self, emit, job)
-        threading.Thread(target=execution.run, daemon=True,
-                         name=f"quail-job-{job.id[:8]}").start()
-        return execution
+            child = self._child
+            alive = child is not None and child.process.is_alive()
+            loaded_model = child.loaded_model if alive else None
+            if not alive or child.model != model:
+                self._child = None
+                if child is not None:
+                    child.close(graceful=True)
+                child = self._child = _Child.spawn(model, self.hooks_reference)
+                if loaded_model == model:
+                    loaded_model = None
+            job = replace(job, model_phase=_model_phase(model, loaded_model))
+            execution = _ChildExecution(child, emit, job)
+            try:
+                child.connection.send(job)
+                threading.Thread(target=execution.run, daemon=True,
+                                 name=f"quail-job-{job.id[:8]}").start()
+            except BaseException:
+                self._child = None
+                child.close()
+                raise
+            return execution
 
     def close(self) -> None:
         with self._lock:
-            self._close_child_unlocked()
-
-    def _close_child_unlocked(self) -> None:
-        """Ask the child to exit, then make sure it did."""
-        if self._conn is not None and self._process is not None \
-                and self._process.is_alive():
-            try:
-                self._conn.send(None)
-            except (OSError, ValueError):
-                pass
-            self._process.join(10)
-        self._kill_child_unlocked()
-
-    def _kill_child_unlocked(self) -> None:
-        if self._process is not None and self._process.is_alive():
-            self._process.kill()
-            self._process.join(30)
-        self._discard_child()
-        self._loaded_model = None
+            child, self._child = self._child, None
+            if child is not None:
+                child.close(graceful=True)

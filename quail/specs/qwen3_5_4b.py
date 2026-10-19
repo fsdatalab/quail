@@ -14,8 +14,8 @@ QWEN3_5_4B_BF16 = ModelSpec(
     #                        norms and the embedding excluded
     layers=32,
     hidden=2560,
-    n_q=16,
-    n_kv=4,
+    num_q_heads=16,
+    num_kv_heads=4,
     d_head=256,
     ffn_width=18432,       # gate_up output: 2 x 9216 intermediate
     w_bytes=2.0,           # bf16 weights
