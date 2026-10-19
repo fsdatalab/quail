@@ -124,6 +124,7 @@ class Qwen35Pipeline(ModelPipeline):
     def forward_chunk(self, chunk):
         from contextlib import nullcontext
 
+        import torch
         from vllm.config import set_current_vllm_config
         from vllm.forward_context import set_forward_context
 
@@ -132,7 +133,10 @@ class Qwen35Pipeline(ModelPipeline):
         forward = (set_forward_context(
             None, self.vllm_config, num_tokens=chunk.input_ids.shape[0])
             if self.spec.experts else nullcontext())
-        with context, forward:
+        # Register Quail's stream before vLLM can lazily select a different one.
+        stream = (torch.cuda.stream(torch.cuda.current_stream())
+                  if self.spec.experts else nullcontext())
+        with context, forward, stream:
             return self._forward(chunk)
 
     def _forward(self, chunk):
