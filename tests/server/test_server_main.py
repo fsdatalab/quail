@@ -1,5 +1,7 @@
 """The quail-server command: defaults, GPU detection, and the start banner."""
 
+import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -62,3 +64,37 @@ def test_options_override_detection_and_defaults(tmp_path):
         detect_device(None)
     with pytest.raises(SystemExit, match="'NVIDIA H100 PCIe' is not"):
         detect_device("NVIDIA H100 PCIe")
+
+
+@pytest.mark.parametrize("device,gpu", [
+    ("h100-sxm", "H100!"), ("l40s", "L40S"), ("b200", "B200"),
+])
+def test_modal_preserves_the_deployed_device_on_remote_import(monkeypatch, device, gpu):
+    import modal
+
+    deployment = {}
+    decorate = modal.App.cls
+
+    def capture(app, **options):
+        deployment.update(options)
+        return decorate(app, **options)
+
+    def load():
+        spec = importlib.util.find_spec("quail.server.modal_app")
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+        return module
+
+    monkeypatch.setattr(modal.App, "cls", capture)
+    monkeypatch.delenv("QUAIL_SERVER_DEVICE", raising=False)
+    args = [] if device == "h100-sxm" else ["--device", device]
+    monkeypatch.setattr(sys, "argv", ["quail.server.modal_app", *args])
+    assert load().DEVICE == device
+    assert deployment["gpu"] == gpu
+    assert deployment["env"] == {"QUAIL_SERVER_DEVICE": device}
+
+    monkeypatch.setenv("QUAIL_SERVER_DEVICE", deployment["env"]["QUAIL_SERVER_DEVICE"])
+    monkeypatch.setattr(sys, "argv", ["modal._container_entrypoint"])
+    assert load().DEVICE == device
+    assert deployment["gpu"] == gpu

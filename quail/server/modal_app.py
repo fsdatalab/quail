@@ -49,14 +49,14 @@ GPUS = 1
 
 
 def _device_from_argv(argv=None) -> str:
-    """Read ``--device`` the same way ``quail-server`` does.
+    """Read the device from the command line or container environment.
 
-    ``modal deploy`` has no ``--device`` flag, so the default is
-    ``h100-sxm``. ``python -m quail.server.modal_app --device l40s``
-    sets it before the class decorator runs.
+    The remote container receives the selected device in ``QUAIL_SERVER_DEVICE``.
+    Without either setting, use ``h100-sxm``.
     """
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--device", default="h100-sxm")
+    parser.add_argument(
+        "--device", default=os.environ.get("QUAIL_SERVER_DEVICE", "h100-sxm"))
     args, _unknown = parser.parse_known_args(argv)
     if args.device not in DEVICES:
         raise SystemExit(
@@ -80,6 +80,7 @@ kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=Tr
 
 @app.cls(
     image=gpu_image(),
+    env={"QUAIL_SERVER_DEVICE": DEVICE},
     gpu=modal_gpu_type(DEVICE, GPUS),
     volumes={
         str(VOLUME_DIR): results_volume,
@@ -140,8 +141,8 @@ def main(argv=None) -> None:
         prog="python -m quail.server.modal_app",
         description="Deploy Quail Server on Modal.")
     parser.add_argument(
-        "--device", default="h100-sxm",
-        help="registered device to rent; default h100-sxm")
+        "--device", default=DEVICE,
+        help=f"registered device to rent; default {DEVICE}")
     args = parser.parse_args(argv)
     if args.device != DEVICE:
         raise SystemExit(
