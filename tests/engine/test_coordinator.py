@@ -3,7 +3,6 @@
 import pyarrow as pa
 
 from quail.backends.quail.coordinator import (
-    keyed_shards,
     merge_join_answers,
     merge_results,
     shard_input,
@@ -41,11 +40,6 @@ def test_merged_rows_follow_the_input_order_and_sum_the_metrics():
     assert merged.outputs["rows:r"].ids["r"].to_pylist() == [3, 4, 0]
     assert merged.outputs["filter_answers:r"] == {4: [True], 0: [True], 3: [True]}
     assert (merged.metrics.fresh_tokens, merged.metrics.wall_s) == (3, 2.0)
-
-
-def test_stop_key_groups_stay_on_one_worker():
-    assert keyed_shards([0, 1, 0, 2, 1, 0], [10, 11, 12, 13, 14, 15], 2) == (
-        (0, 2, 5), (1, 3, 4))
 
 
 def test_join_merge_and_partner_lists():

@@ -27,7 +27,7 @@ def session(request):
     ) as session:
         session.register("contracts", quail.DocumentProvider.from_table(
             pa.table({"id": range(len(TEXTS)), "text": TEXTS,
-                      "group": ["lease"] * len(TEXTS)}), id_col="id"))
+                      "group": ["lease", "sale", "lease", "sale"]}), id_col="id"))
         yield session
 
 
@@ -147,7 +147,7 @@ def test_a_stop_key_keeps_its_group_on_one_worker_and_sums_the_counters(session)
              .distinct().select("c.group"))
     workers = FixedWorkers(session)
     result = execute_query(query, physical_executor=workers.execute)
-    assert result.to_rows() == [("lease",)]
-    assert len(workers.filtered) == 1
+    assert result.to_rows() == [("lease",), ("sale",)]
+    assert sorted(workers.filtered) == [0, 1]
     assert result.report["kv_manager"]["evicted_keys"] == 2 * session.config.gpus
     assert result.report["peak_gib"] == 1.0

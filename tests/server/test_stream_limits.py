@@ -58,11 +58,17 @@ def test_the_response_closes_with_its_reader(read):
         with reader:
             pass
     assert response.closed
-    # a response that is not an Arrow stream, or that ends early, closes too
+
+
+def test_an_invalid_or_truncated_stream_closes_its_response():
     client, response = _client_of(b"not an Arrow stream")
     with pytest.raises(pa.ArrowInvalid):
         client.result_batches("example")
     assert response.closed
+    table = pa.table({"id": [1, 2, 3]})
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
     client, response = _client_of(sink.getvalue().to_pybytes()[:-12])
     with pytest.raises(OSError):
         list(client.result_batches("example"))
