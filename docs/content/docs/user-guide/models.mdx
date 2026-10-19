@@ -24,12 +24,6 @@ Set `model` to the model you want to run and `device` to your GPU type.
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
 format. All listed models store KV in BF16.
 
-Qwen3.6 35B-A3B uses the
-[`Qwen/Qwen3.6-35B-A3B-FP8`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)
-checkpoint. Each token uses eight routed experts and one shared expert.
-Each H100 holds the complete model. Quail uses its text inputs and the
-shared Qwen chat template with thinking disabled.
-
 `AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
 `AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a
 document. See the
