@@ -7,9 +7,9 @@ import pytest
 from quail.cost import budgets
 from quail.specs import (
     B200,
-    L40S,
     DIFFUSION_GEMMA_26B_FP8,
     H100_SXM,
+    L40S,
     QWEN3_4B_FP8,
     QWEN3_5_4B_BF16,
     QWEN3_32B_FP8,

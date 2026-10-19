@@ -29,7 +29,7 @@ pipelined vLLM. SGLang is off.
       --only-device h100-sxm \
       2>&1 | tee "$log"
 
-Each ``--submit`` job is one ``quail.bench.quailb_parallel`` detach
+Each ``--submit`` job is one ``bench.quailb_parallel`` detach
 on ``quail-milestone1``. Results stay on quail-results. After a run:
 
     modal volume get quail-results /benchmarks/quailb/<run_id>
@@ -135,9 +135,9 @@ def modal_argv(job: Job) -> list[str]:
     """The ``modal run --detach`` argv for one job."""
     return [
         sys.executable, "-m", "modal", "run", "--detach",
-        "-m", "quail.bench.quailb_parallel",
+        "-m", "bench.quailb_parallel",
         "--model", job.model,
-        "--sf", str(SF),
+        "--scale-factor", str(SF),
         "--device", job.device,
         "--gpus", str(GPUS),
         "--query", ",".join(job.queries),

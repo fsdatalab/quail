@@ -89,7 +89,7 @@ def modal_argv(job: Job) -> list[str]:
         sys.executable, "-m", "modal", "run", "--detach",
         "-m", "bench.quailb_parallel",
         "--model", MODEL,
-        "--sf", str(SF),
+        "--scale-factor", str(SF),
         "--device", DEVICE,
         "--gpus", str(job.gpus),
         "--query", job.query,

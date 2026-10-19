@@ -6,7 +6,7 @@ separate container because its package version conflicts with vLLM.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
     uv run modal run --detach -m bench.quailb_parallel \
-      --model qwen3-4b-fp8 --sf 0.1 --device h100-sxm \
+      --model qwen3-4b-fp8 --scale-factor 0.1 --device h100-sxm \
       2>&1 | tee "$run_log"
 
 The local entrypoint starts one remote function. Detached mode keeps that

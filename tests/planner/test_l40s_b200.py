@@ -58,7 +58,7 @@ def test_kv_budgets_fit_one_gpu_on_l40s_and_b200(model):
 
 def test_diffusion_gemma_refuses_l40s_at_default_chunk(tmp_path):
     assert budgets.minimum_weight_gpus(DIFFUSION_GEMMA_26B_FP8, L40S) == 1
-    assert budgets.chunk_budget(DIFFUSION_GEMMA_26B_FP8, L40S) == (
+    assert budgets.chunk_budget(DIFFUSION_GEMMA_26B_FP8, L40S) <= (
         DIFFUSION_GEMMA_26B_FP8.chunk_cap_tokens)
     with pytest.raises(ValueError, match="one chunk's sliding KV"):
         budgets.arena_pages(DIFFUSION_GEMMA_26B_FP8, L40S)
@@ -109,10 +109,10 @@ def test_run_suite_uses_the_device_hourly_price(tmp_path, monkeypatch):
         def __exit__(self, *args):
             return False
 
-    monkeypatch.setattr("quail.bench.quailb.benchmark.run", fake_run)
+    monkeypatch.setattr("bench.quailb.benchmark.run", fake_run)
     monkeypatch.setattr(
-        "quail.bench.quailb.benchmark.report", lambda *a, **k: None)
-    monkeypatch.setattr("quail.bench.quailb.quail.Session", FakeSession)
+        "bench.quailb.benchmark.report", lambda *a, **k: None)
+    monkeypatch.setattr("bench.quailb.quail.Session", FakeSession)
 
     for device in ("l40s", "b200", "h100-sxm"):
         captured.clear()

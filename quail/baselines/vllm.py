@@ -318,7 +318,8 @@ class VLLMEngine:
         if spec.role == "decision":
             from quail.baselines.vllm_decision import boot_decision
 
-            return boot_decision(spec, self.llm_kwargs(spec, device), resources=resources)
+            return boot_decision(
+                spec, self.llm_kwargs(spec, device), resources=resources)
         from vllm import LLM, SamplingParams
         from vllm.renderers.registry import RENDERER_REGISTRY
         from vllm.tokenizers import TokenizerRegistry
