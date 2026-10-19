@@ -5,7 +5,7 @@ from .extract import AiExtract, ExtractSpec
 from .filter import AiFilter, Filter
 from .inference import AiInference, AiScore, InferenceSpec, ScoreSpec
 from .join import AiJoin, Barrier, Foreign, HashJoin
-from .relational import Aggregate, Exchange, Limit, Project, Recombine, Sort
+from .relational import Aggregate, Exchange, Limit, Project, Recombine, Sort, Window
 from .scan import Scan
 
 __all__ = [
@@ -30,5 +30,6 @@ __all__ = [
     "Scan",
     "ScoreSpec",
     "Sort",
+    "Window",
     "predicate_from_mapping",
 ]

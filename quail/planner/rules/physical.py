@@ -19,6 +19,7 @@ from quail.physical import (
     Limit,
     PhysicalGraph,
     Sort,
+    Window,
 )
 from quail.physical.pipelines import build_pipelines
 from quail.planner.graph import retention
@@ -41,8 +42,9 @@ class ShouldPushDownLimit(PhysicalRule):
     every operator of their pipeline. The pushdown keeps the first
     survivors to finish, so it is sound only when those are the rows the
     query returns: the graph ends in a Limit, its documents run through
-    one pipeline, and it has no Sort or PhysicalAggregate (an ORDER BY,
-    DISTINCT, OFFSET, or GROUP BY needs every survivor) and no AiJoin
+    one pipeline, and it has no Sort, PhysicalAggregate, or Window (an
+    ORDER BY, DISTINCT, OFFSET, GROUP BY, or window function needs
+    every survivor) and no AiJoin
     (survivors are settled per join round). Otherwise the rule removes
     the setting.
     """
@@ -57,7 +59,7 @@ class ShouldPushDownLimit(PhysicalRule):
         pipelines = {id(members) for members
                      in build_pipelines(graph).values()}
         blocked = len(pipelines) > 1 or any(
-            isinstance(node, (Sort, PhysicalAggregate, AiJoin))
+            isinstance(node, (Sort, PhysicalAggregate, Window, AiJoin))
             for node in graph.nodes)
         if limit is None or blocked:
             context.settings.pop("filter_limit", None)

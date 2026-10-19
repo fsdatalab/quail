@@ -13,6 +13,7 @@ from quail.frontend.expressions import (
     PredicateSpec,
     PromptSpec,
     SortSpec,
+    WindowSpec,
     col,
 )
 from quail.frontend.label_tables import read_label_table
@@ -34,6 +35,7 @@ from quail.logical import (
     ModelCall,
     RegularPredicate,
     SortKey,
+    WindowCall,
 )
 from quail.logical.expressions import (
     SPAN_SUFFIX,
@@ -76,6 +78,7 @@ class Query:
         self._group = []             # key columns or names
         self._aggs = {}              # name -> AggSpec
         self._having = []            # HavingSpec
+        self._windows = {}           # name -> WindowSpec
 
     # ---- scope -------------------------------------------------------
 
@@ -695,18 +698,7 @@ class Query:
                 ``col(...)`` with ``.asc()`` or ``.desc()`` and an
                 optional ``.nulls_first()`` or ``.nulls_last()``.
         """
-        for key in keys:
-            if isinstance(key, str):
-                key = col(key)
-            if isinstance(key, ColSpec):
-                key = SortSpec(key)
-            if not isinstance(key, SortSpec):
-                raise CompileError(
-                    "order_by takes a column name or col(...).asc() or "
-                    f".desc(), got {key!r}")
-            nulls_first = (key.descending if key.nulls is None
-                           else key.nulls == "first")
-            self._order.append((key.col, key.descending, nulls_first))
+        self._order.extend(_sort_keys(keys))
         return self
 
     def group_by(self, *keys) -> "Query":
@@ -722,6 +714,16 @@ class Query:
                     f"agg() takes count(), count_distinct(), sum_(), avg(), "
                     f"min_(), or max_(), got {spec!r} for {name!r}")
             self._aggs[name] = spec
+        return self
+
+    def window(self, **calls) -> "Query":
+        """Add named window functions, such as ``n=row_number().over(...)``."""
+        for name, spec in calls.items():
+            if not isinstance(spec, WindowSpec):
+                raise CompileError(
+                    f"window() takes row_number(), lag(), lead(), sum_(), or "
+                    f"count() with .over(...), got {spec!r} for {name!r}")
+            self._windows[name] = spec
         return self
 
     def having(self, *tests) -> "Query":
@@ -762,8 +764,13 @@ class Query:
                 raise CompileError(
                     "GROUP BY does not read AI.EXTRACT struct columns; "
                     "extract each field as its own column")
+            if self._windows:
+                raise CompileError(
+                    "a window function and group_by() in one query are not "
+                    "supported")
             columns, aggregation = self._aggregation(cols)
-        for c in () if aggregation is not None else cols:
+        windows, output = self._windowing(columns, cols)
+        for c in () if aggregation is not None or windows else cols:
             if isinstance(c, str) and c in self._labels:
                 columns.append(self._labels[c])
                 continue
@@ -819,6 +826,7 @@ class Query:
         named = {column_name(column): column for column in columns}
         if aggregation is not None:
             named.update({a.name: a for a in aggregation.aggregates})
+        named.update({window.name: window for window in windows})
         order = []
         for spec, descending, nulls_first in self._order:
             if spec.alias is None and spec.column in self._extracts:
@@ -832,7 +840,51 @@ class Query:
                                  nulls_first=nulls_first))
         return logical.project(tuple(columns), self._limit, order=tuple(order),
                                offset=self._offset, distinct=self._distinct,
-                               aggregation=aggregation, structs=tuple(structs))
+                               aggregation=aggregation, structs=tuple(structs),
+                               windows=windows, output=output)
+
+    def _project(self, columns: list, c) -> str:
+        """Add the column or named output ``c`` to ``columns``; return its name."""
+        if isinstance(c, str) and c in self._labels:
+            column = self._labels[c]
+        elif isinstance(c, str) and c in self._scores:
+            column = self._scores[c]
+        else:
+            column = self._resolve_value(col(c) if isinstance(c, str) else c,
+                                         named=True)
+        named = next((c for c in columns if isinstance(c, Alias)
+                      and c.expression == column), None)
+        if named is not None:
+            return named.name
+        if column not in columns:
+            columns.append(column)
+        return column_name(column)
+
+    def _windowing(self, columns: list, cols) -> tuple:
+        """Bind window() to the selected names.
+
+        Returns:
+            The WindowCalls and the result columns in select() order.
+        """
+        if not self._windows:
+            return (), ()
+        if any(c in self._extracts or c == "*" for c in cols if isinstance(c, str)):
+            raise CompileError(
+                "window() does not read AI.EXTRACT struct columns or *; "
+                "name each column")
+        # the selected columns come first, then what only a window reads
+        output = tuple(c if isinstance(c, str) and c in self._windows
+                       else self._project(columns, c) for c in cols)
+        windows = []
+        for name, spec in self._windows.items():
+            argument = None if spec.col is None else self._project(columns, spec.col)
+            windows.append(WindowCall(
+                spec.function, argument,
+                tuple(self._project(columns, c) for c in spec.partition),
+                tuple((self._project(columns, key), descending, nulls_first)
+                      for key, descending, nulls_first in _sort_keys(spec.order)),
+                name))
+        return tuple(windows), output
 
     def _aggregation(self, cols) -> tuple:
         """Bind group_by(), agg(), and having() to the selected names.
@@ -843,20 +895,7 @@ class Query:
         columns = []
 
         def project(c) -> str:
-            if isinstance(c, str) and c in self._labels:
-                column = self._labels[c]
-            elif isinstance(c, str) and c in self._scores:
-                column = self._scores[c]
-            else:
-                column = self._resolve_value(col(c) if isinstance(c, str) else c,
-                                             named=True)
-            named = next((c for c in columns if isinstance(c, Alias)
-                          and c.expression == column), None)
-            if named is not None:
-                return named.name
-            if column not in columns:
-                columns.append(column)
-            return column_name(column)
+            return self._project(columns, c)
 
         keys = tuple(project(c) for c in self._group)
         aggregates = []
@@ -882,6 +921,24 @@ class Query:
                 output.append(project(c))
         return columns, Aggregation(keys, tuple(aggregates), tuple(output),
                                     tuple(tests))
+
+
+def _sort_keys(keys) -> list:
+    """Return (column, descending, nulls_first) for order_by() keys."""
+    out = []
+    for key in keys:
+        if isinstance(key, str):
+            key = col(key)
+        if isinstance(key, ColSpec):
+            key = SortSpec(key)
+        if not isinstance(key, SortSpec):
+            raise CompileError(
+                "order_by takes a column name or col(...).asc() or "
+                f".desc(), got {key!r}")
+        nulls_first = (key.descending if key.nulls is None
+                       else key.nulls == "first")
+        out.append((key.col, key.descending, nulls_first))
+    return out
 
 
 def docs(catalog: Catalog, provider: str,

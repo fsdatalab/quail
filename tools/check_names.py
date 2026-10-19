@@ -203,6 +203,10 @@ def _identifiers(tree, defined=frozenset()):
             yield node.attr, node.lineno
 
 
+# names SQL fixes, kept as SQL spells them
+SQL_NAMES = frozenset({"row_number"})
+
+
 def synonyms(modules) -> list[str]:
     """Report identifiers that use a word the project does not use."""
     defined = _defined(modules)
@@ -210,7 +214,8 @@ def synonyms(modules) -> list[str]:
     for file, tree in modules:
         seen = set()
         for identifier, lineno in _identifiers(tree, defined):
-            if identifier in seen or identifier.startswith("__"):
+            if identifier in seen or identifier.startswith("__") \
+                    or identifier in SQL_NAMES:
                 continue
             seen.add(identifier)
             canonical = _canonical(identifier)

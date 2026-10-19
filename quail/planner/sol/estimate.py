@@ -49,6 +49,7 @@ from quail.logical import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    Window,
 )
 from quail.planner.sol.search import (
     ANSWER_TEST,
@@ -63,7 +64,7 @@ from quail.planner.sol.search import (
 from quail.specs import DeviceSpec, ModelSpec
 
 _PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, SemanticExtract,
-                 Filter, Join, SemanticJoin, Project, Aggregate, Result)
+                 Filter, Join, SemanticJoin, Project, Aggregate, Window, Result)
 
 
 @dataclass(frozen=True)
@@ -224,7 +225,7 @@ def _refuse_unpriced(logical) -> None:
                 f"the speed of light estimate does not price {node.type_name}")
         if isinstance(node, Result) and node.limit is not None \
                 and not (node.order or node.distinct or node.offset
-                         or isinstance(node.input, Aggregate)):
+                         or isinstance(node.input, (Aggregate, Window))):
             # a sorted, offset, or grouped result runs every document,
             # and a distinct one stops each key at its first survivor;
             # the estimate prices both. A bare LIMIT stops early.

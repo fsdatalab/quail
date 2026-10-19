@@ -96,6 +96,10 @@ class BoundBuilder:
         self._inner.having(*tests)
         return self
 
+    def window(self, **calls):
+        self._inner.window(**calls)
+        return self
+
     def offset(self, n):
         self._inner.offset(n)
         return self

@@ -26,6 +26,7 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    Window,
 )
 
 
@@ -100,7 +101,7 @@ class LogicalPlan:
     def projection(self) -> Project:
         """Return the projection that supplies result columns."""
         node = self.root
-        while isinstance(node, (Result, Aggregate)):
+        while isinstance(node, (Result, Aggregate, Window)):
             node = node.input
         if not isinstance(node, Project):
             raise CompileError("a query plan needs a projection")

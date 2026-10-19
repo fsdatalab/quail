@@ -398,6 +398,38 @@ query = (
 result = query.collect()
 ```
 
+### window
+
+`window(**calls)`
+
+Compute a function over each row's partition, as SQL's `OVER`. Each
+keyword argument names an output column; use the name in `select()`
+or `order_by()`. The function is `row_number()`, `lag(column)`,
+`lead(column)`, `sum_(column)`, or `count()` from
+`quail.frontend.expressions`, with `.over(partition_by=..., order_by=...)`.
+`sum_()` and `count()` run from the partition's first row to the
+current one. The column can be a name assigned by `ai_classify()`.
+
+For example, keep each step's label next to the label of the step
+before it in the same run:
+
+```python
+from quail.frontend.expressions import lag
+
+query = (
+    session.docs("steps").alias("s")
+    .ai_classify(prompt("What does the agent do here?\n\n{0}", col("s.text")),
+                 ["plan", "act", "reflect"], name="kind")
+    .window(previous=lag("kind").over(partition_by="s.run_id",
+                                     order_by="s.step_index"))
+    .select("s.id", "kind", "previous")
+)
+```
+
+Windows run after the AI operators, over every row they keep, so a
+`limit()` does not stop the model early. A query cannot have both
+`window()` and `group_by()`.
+
 ### offset
 
 `offset(n)`

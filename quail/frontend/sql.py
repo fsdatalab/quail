@@ -35,7 +35,6 @@ from quail.logical.expressions import aliased_call
 
 FORBIDDEN = (
     (exp.Qualify, "QUALIFY"),
-    (exp.Window, "window functions"),
     (exp.Union, "UNION"),
     (exp.Except, "EXCEPT"),
     (exp.Intersect, "INTERSECT"),
@@ -273,7 +272,8 @@ def compile_sql(
 
     selection = SelectBinder(b).bind(tree)
     columns, aggregation = selection.columns, selection.aggregation
-    order = bind_order(tree, b, columns, aggregation, selection.structs)
+    order = bind_order(tree, b, columns, aggregation, selection.structs,
+                       selection.windows)
     _validate_query(b, joins, columns, selection.structs)
     named, labels = _bind_label_names(b, columns)
     extracts = {}
@@ -315,4 +315,6 @@ def compile_sql(
         distinct=distinct,
         aggregation=aggregation,
         structs=selection.structs,
+        windows=selection.windows,
+        output=selection.output,
     )

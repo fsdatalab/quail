@@ -785,7 +785,7 @@ class SortKey:
     def validate(self) -> None:
         if isinstance(self.expression, AggregateCall):
             self.expression.validate()
-        else:
+        elif not isinstance(self.expression, WindowCall):
             _validate_tree(self.expression)
 
     def __str__(self) -> str:
@@ -796,6 +796,58 @@ class SortKey:
 
 
 AGGREGATE_FUNCTIONS = ("count", "count_distinct", "sum", "avg", "min", "max")
+
+WINDOW_FUNCTIONS = ("row_number", "lag", "lead", "sum", "count")
+
+
+@dataclass(frozen=True)
+class WindowCall:
+    """One function over the rows of each row's partition, under a name.
+
+    ``argument`` names a projected column, or is None for row_number
+    and count(*). ``partition`` names the projected columns that group
+    the rows, and ``order`` the (column, descending, nulls_first) keys
+    that order each partition. sum and count run from the partition's
+    first row to the current one.
+    """
+
+    function: str
+    argument: Optional[str]
+    partition: tuple[str, ...]
+    order: tuple[tuple[str, bool, bool], ...]
+    name: str
+
+    type_name: ClassVar[str] = "quail.window_call"
+
+    def validate(self, projected: tuple) -> None:
+        """Check the function and that every column it reads is projected."""
+        if self.function not in WINDOW_FUNCTIONS:
+            raise CompileError(
+                f"unsupported window function {self.function!r}; supported: "
+                f"{', '.join(WINDOW_FUNCTIONS)}")
+        if self.function == "row_number" and self.argument is not None:
+            raise CompileError("row_number() takes no column")
+        if self.function in ("lag", "lead", "sum") and self.argument is None:
+            raise CompileError(f"{self.function}() needs a column")
+        if self.function in ("lag", "lead") and not self.order:
+            raise CompileError(f"{self.function}() needs an ORDER BY in its window")
+        for column in (self.argument, *self.partition,
+                       *(name for name, _, _ in self.order)):
+            if column is not None and column not in projected:
+                raise CompileError(
+                    f"the window {self.name!r} reads {column!r}, which is not "
+                    f"a projected column")
+
+    def __str__(self) -> str:
+        clauses = []
+        if self.partition:
+            clauses.append("partition by " + ", ".join(self.partition))
+        if self.order:
+            clauses.append("order by " + ", ".join(
+                f"{name}{' desc' if descending else ''}"
+                for name, descending, _ in self.order))
+        return (f"{self.name} = {self.function}({self.argument or ''}) "
+                f"over ({' '.join(clauses)})")
 
 
 HAVING_COMPARISONS = ("=", "<>", "<", "<=", ">", ">=")

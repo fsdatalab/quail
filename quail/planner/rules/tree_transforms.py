@@ -26,6 +26,7 @@ from quail.logical import (
     SemanticFilter,
     SemanticJoin,
     SortKey,
+    Window,
     is_score,
     model_call,
 )
@@ -258,7 +259,7 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     Returns:
         The rewritten root, or None when no classification or extraction moved.
     """
-    if isinstance(root, (Result, Aggregate)):
+    if isinstance(root, (Result, Aggregate, Window)):
         rewritten = lift_maps(root.input)
         return None if rewritten is None else root.with_children((rewritten,))
     nodes = LogicalPlan(root).walk()

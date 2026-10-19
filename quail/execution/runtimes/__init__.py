@@ -15,6 +15,7 @@ from quail.execution.runtimes.relational import (
     ProjectRuntime,
     ScanRuntime,
     SortRuntime,
+    WindowRuntime,
 )
 from quail.physical import (
     Aggregate,
@@ -27,6 +28,7 @@ from quail.physical import (
     Recombine,
     Scan,
     Sort,
+    Window,
 )
 
 __all__ = [
@@ -41,6 +43,7 @@ __all__ = [
     "RecombineRuntime",
     "ScanRuntime",
     "SortRuntime",
+    "WindowRuntime",
     "built_in_runtimes",
 ]
 
@@ -57,5 +60,6 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
         Project.runtime_key: ProjectRuntime(),
         Aggregate.runtime_key: AggregateRuntime(),
         Sort.runtime_key: SortRuntime(),
+        Window.runtime_key: WindowRuntime(),
         Limit.runtime_key: LimitRuntime(),
     }

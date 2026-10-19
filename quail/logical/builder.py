@@ -27,6 +27,7 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    Window,
 )
 from quail.logical.plan import (
     LogicalPlan,
@@ -248,7 +249,23 @@ class LogicalPlanBuilder:
         distinct: bool = False,
         aggregation: Aggregation | None = None,
         structs: tuple = (),
+        windows: tuple = (),
+        output: tuple = (),
     ) -> LogicalPlan:
+        """Build the plan's result nodes over the projected columns.
+
+        Args:
+            columns: The projected value expressions and Aliases.
+            limit: LIMIT, or None.
+            order: The SortKeys of ORDER BY.
+            offset: OFFSET.
+            distinct: Whether the result is DISTINCT.
+            aggregation: GROUP BY and its aggregates, or None.
+            structs: The AI.EXTRACT struct columns the projection packs.
+            windows: The WindowCalls over the projected or grouped rows.
+            output: The result columns in SELECT order when windows
+                are present.
+        """
         if self._root is None:
             raise CompileError("a logical plan needs an input table")
         if not columns and aggregation is None:
@@ -270,6 +287,8 @@ class LogicalPlanBuilder:
                 aggregation.output,
                 aggregation.having,
             )
+        if windows:
+            node = Window(node, tuple(windows), tuple(output))
         if limit is not None or order or offset or distinct:
             node = Result(node, limit, tuple(order), offset, distinct)
         plan = LogicalPlan(node)

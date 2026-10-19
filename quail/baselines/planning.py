@@ -19,6 +19,7 @@ from quail.logical import (
     effective_selectivity,
 )
 from quail.logical import Aggregate as LogicalAggregate
+from quail.logical import Window as LogicalWindow
 from quail.logical.expressions import aliased_call
 from quail.physical import (
     Limit,
@@ -174,10 +175,10 @@ def _refusal(region, context, *, backend_name: str, scores_labels: bool,
             needed=1, available=0, unit="backends")
     root = region.logical_plan.result
     if root.order or root.distinct or root.offset \
-            or isinstance(root.input, LogicalAggregate):
+            or isinstance(root.input, (LogicalAggregate, LogicalWindow)):
         return Refusal(
-            reasons=("ORDER BY, DISTINCT, OFFSET, and GROUP BY run on "
-                     "the Quail backend only",),
+            reasons=("ORDER BY, DISTINCT, OFFSET, GROUP BY, and window "
+                     "functions run on the Quail backend only",),
             constraint="sort_needs_quail_backend",
             needed=1, available=0, unit="backends")
     if has_extract(region.logical_plan):

@@ -36,6 +36,7 @@ from .nodes import (
     Recombine,
     Scan,
     Sort,
+    Window,
 )
 
 TYPE_KEY = "type"
@@ -245,6 +246,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         Project,
         Aggregate,
         Sort,
+        Window,
         Limit,
     ))
 

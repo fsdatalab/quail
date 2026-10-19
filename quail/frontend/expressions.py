@@ -268,6 +268,32 @@ class AggSpec(ExpressionSpec):
     def __hash__(self):
         return hash((self.function, self.col))
 
+    def over(self, partition_by=(), order_by=()) -> "WindowSpec":
+        """Compute the function over each row's partition, as SQL's OVER.
+
+        Args:
+            partition_by: Column names or ``col()`` expressions that
+                group the rows; a string names one column.
+            order_by: Keys ordering each partition, as ``order_by()``
+                takes them; a string names one column.
+        """
+        return WindowSpec(self.function, self.col,
+                          _listed(partition_by), _listed(order_by))
+
+
+def _listed(keys) -> tuple:
+    return (keys,) if isinstance(keys, (str, ExpressionSpec, SortSpec)) \
+        else tuple(keys)
+
+
+@dataclass(frozen=True)
+class WindowSpec(ExpressionSpec):
+    """An unresolved window function for ``window()``."""
+    function: str
+    col: object    # ColSpec, a label or score name, or None
+    partition: tuple
+    order: tuple
+
 
 @dataclass(frozen=True)
 class HavingSpec(ExpressionSpec):
@@ -280,6 +306,21 @@ class HavingSpec(ExpressionSpec):
 def count(c=None) -> AggSpec:
     """``count()`` counts rows; ``count("r.id")`` counts non-null values."""
     return AggSpec("count", c)
+
+
+def row_number() -> AggSpec:
+    """The row's position in its partition, from 1; needs ``over()``."""
+    return AggSpec("row_number", None)
+
+
+def lag(c) -> AggSpec:
+    """The column's value on the row before, in the window's order."""
+    return AggSpec("lag", c)
+
+
+def lead(c) -> AggSpec:
+    """The column's value on the row after, in the window's order."""
+    return AggSpec("lead", c)
 
 
 def count_distinct(c) -> AggSpec:

@@ -41,6 +41,7 @@ from .nodes import (
     Scan,
     ScoreSpec,
     Sort,
+    Window,
 )
 
 __all__ = [
@@ -67,6 +68,7 @@ __all__ = [
     "InputPort",
     "Limit",
     "Sort",
+    "Window",
     "NodeCodec",
     "OutputPort",
     "AiFilter",

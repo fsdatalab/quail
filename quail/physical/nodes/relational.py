@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
-from quail.logical.expressions import packed_columns
+from quail.logical.expressions import WindowCall, packed_columns
 
 from ..base import (
     ExecutionLocation,
@@ -133,6 +133,27 @@ class Sort(PhysicalNode):
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
+
+@dataclass(frozen=True)
+class Window(PhysicalNode):
+    """Compute window functions over the result rows on the coordinator.
+
+    ``calls`` read input columns and append one column each. ``columns``
+    are the output columns, input columns and window names in result
+    order.
+    """
+
+    calls: tuple[WindowCall, ...] = ()
+    columns: tuple[str, ...] = ()
+
+    type_name: ClassVar[str] = "quail.window"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
+
 
 @dataclass(frozen=True)
 class Limit(PhysicalNode):

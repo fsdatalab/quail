@@ -27,6 +27,7 @@ from quail.physical import (
     Recombine,
     Scan,
     Sort,
+    Window,
 )
 from quail.physical.pipelines import build_pipelines
 from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
@@ -85,6 +86,8 @@ def logical_tree(logical):
             return
         if isinstance(node, logical_nodes.Aggregate):
             title = f"Aggregate: {node.specification()}"
+        elif isinstance(node, logical_nodes.Window):
+            title = "Window: " + "; ".join(str(call) for call in node.calls)
         elif isinstance(node, logical_nodes.Project):
             fields = node.explain_fields()
             title = f"Project: {', '.join(fields['columns'])}"
@@ -288,7 +291,7 @@ def _estimated_rows(graph):
             value = inputs[0] if inputs else None
             if value is not None:
                 value *= effective_selectivity(node.selectivity)
-        elif isinstance(node, (Project, Limit, Sort, Exchange)) \
+        elif isinstance(node, (Project, Limit, Sort, Window, Exchange)) \
                 and len(inputs) == 1:
             value = inputs[0]
             if isinstance(node, Limit) and value is not None:
@@ -378,6 +381,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 details.append("having " + " and ".join(
                     f"{name} {comparison} {value!r}"
                     for name, comparison, value in node.having))
+        elif isinstance(node, Window):
+            title += ": " + ", ".join(node.columns)
+            details.extend(str(call) for call in node.calls)
         elif isinstance(node, Sort):
             title += ": " + ", ".join(
                 f"{column} {'DESC' if descending else 'ASC'} "
