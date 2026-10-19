@@ -1,0 +1,40 @@
+---
+title: SQL reference
+---
+
+AI-SQL extends standard SQL with functions that call a language model
+during query execution. You can filter rows, join tables, score documents,
+assign labels, and extract answers using natural language instructions.
+
+<Cards>
+  <Card title="AI functions" href="/docs/user-guide/sql/ai-functions"
+        description="Filter and join documents, score answers, classify rows, and extract text." />
+  <Card title="SQL functions" href="/docs/user-guide/sql/sql-functions"
+        description="Text functions, conditions, aggregates, windows, and query clauses." />
+</Cards>
+
+## Write a query
+
+For example, suppose you registered a `reviews` table with columns `id`
+and `body`. This query returns IDs of reviews that discuss the movie's
+ending:
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE AI.IF(PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body))
+```
+
+The model reads each review and returns TRUE or FALSE. Quail keeps
+the rows where the answer is TRUE.
+
+Quail supports Snowflake and BigQuery syntax:
+
+```python
+session.sql(text, dialect="snowflake")  # AI_FILTER syntax
+session.sql(text, dialect="bq")         # AI.IF syntax
+```
+
+The query above uses the BigQuery dialect (`dialect="bq"`).
+
+For Python, see the [builder API](/docs/user-guide/python-api).

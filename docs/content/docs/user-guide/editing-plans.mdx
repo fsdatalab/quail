@@ -2,12 +2,18 @@
 title: Editing physical plans
 ---
 
-You can inspect and edit a physical plan before executing it. This
-example inserts a barrier between a filter and a join, then shows how
-to add a Python function through the query builder.
+Quail chooses an execution plan for each query. Edit that plan when you
+want to test how a different execution schedule affects performance.
 
-The example runs on the CPU. It plans queries and prints their structure;
-it does not load model weights or run inference.
+For example, a query filters claims before joining them with evidence
+passages. The join can start as claims pass the filter. Adding a barrier
+makes the join wait until the filter finishes. You can compare the
+execution times of these two plans.
+
+The example below builds and prints both plans on the CPU. To measure
+their execution times, run them on a GPU with `query.run(plan=...)`.
+The guide also shows how to add Python code that selects which document
+pairs reach the model.
 
 The full example is in
 [`demos/plan_walkthrough.py`][demoscript].

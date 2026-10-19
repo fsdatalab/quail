@@ -100,7 +100,7 @@ with quail.Session(
 
 See [Quail Server](https://fsdatalab.github.io/quail/docs/user-guide/server).
 
-## Supported operators
+## Supported functions
 
 You can use filters and joins evaluated by a language model,
 `EXISTS` / `NOT EXISTS`, numeric scores (`AI.SCORE`), classification

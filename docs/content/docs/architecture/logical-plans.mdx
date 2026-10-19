@@ -21,10 +21,11 @@ For example, imagine a query that classifies reviews by sentiment and
 returns only negative reviews. Its logical plan has these operations:
 
 ```text
-Project: r.id, sentiment
-  Filter: sentiment IN ('negative')
-    SemanticClassify: sentiment
-      Scan: reviews as r
+Result
+  Project: r.id, sentiment
+    Filter: sentiment IN ('negative')
+      SemanticClassify: sentiment
+        Scan: reviews as r
 ```
 
 `SemanticClassify` calls the model and adds a label column. `Filter` tests
@@ -64,44 +65,68 @@ Nodes are frozen dataclasses. Rewrites use `with_children()`,
 
 | Node | Meaning |
 | --- | --- |
-| `Scan(provider, alias, column)` | Read a document column from a registered table. The column is a value expression over the table's columns. |
+| `Scan(provider, alias, column)` | Read document text from a registered table. |
 | `SemanticFilter(input, predicates)` | Evaluate model predicates over one table and keep passing rows. |
 | `Join(left, right, on)` | Form pairs from two inputs. Optional column equalities restrict the pairs. Without `on`, it forms every pair. |
 | `SemanticJoin(input, predicate, semantics, selectivity, anchor)` | Evaluate a model predicate over the pairs from a `Join`. The semantics are `full`, `exists`, or `anti`. |
 | `SemanticClassify(input, call, name)` | Evaluate an `AI.CLASSIFY` call and add the label column `name`. |
-| `Filter(input, condition, selectivity)` | Keep rows that satisfy a condition on a computed label. |
+| `SemanticExtract(input, call, name)` | Extract one answer field and its character positions from each document. |
+| `Filter(input, condition, selectivity)` | Keep rows that satisfy a condition on a label, extracted answer, or answer position. |
 | `Apply(input, function, kind, ids, columns, aliases)` | Run a registered Python function on input rows or pairs. |
-| `Project(input, columns, limit)` | Select result columns and optionally limit the result. This is the root node. |
+| `Project(input, columns, structs)` | Select values and assemble extraction structs. |
+| `Aggregate(input, keys, aggregates, output, having)` | Group projected rows and compute aggregate values. |
+| `Window(input, calls, output)` | Add window values to projected rows, preserving individual rows. |
+| `Result(input, limit, order, offset, distinct)` | Set result order, remove duplicates, and apply an offset and limit. This is the root node. |
 
 A query joining three or more tables uses one `SemanticJoin` for each
 binary join. A classification may read one document or both documents
 of a joined pair. Conditions on labels of joined pairs are unsupported.
 
+A window query places `Window` between `Project` and `Result`. The
+projection supplies source columns and AI outputs used by the window.
+The window adds values such as a previous row's label or a running
+sum. `Result` specifies the final row order and limit.
+
 ## Expressions
 
-Expressions describe the values an operator computes or tests. For
-example, a `ModelCall` represents a prompt evaluated on each input row.
-A `RegularPredicate` tests a column, or a score returned by that
-call, against a literal.
+Expressions describe the values an operator reads, computes, or tests.
+A value expression reads a column, accesses a struct field, or applies
+a function without calling the model. A `ModelCall` describes an AI
+operation.
 
 | Expression | Value |
 | --- | --- |
-| `ColumnRef(alias, provider, column)` | A reference to a table column. The leaf of a value expression. |
-| `GetField(input, field)` | One field of a struct-valued expression. |
-| `ScalarFunction(function, args)` | A function of value expressions, such as `length`, computed row by row without the model. |
-| `RegularPredicate(expression, comparison, value)` | A test of a value expression against a literal, decided without the model; or an `AI.SCORE` call compared with a threshold. |
-| `ModelCall(prompt, kind, labels, descriptions)` | A model call. Its kind is `boolean` for `AI.IF`, `score` for `AI.SCORE`, or `label` for `AI.CLASSIFY`. |
-| `Alias(expression, name)` | A model call or a value expression returned under a name. |
+| `ColumnRef(alias, provider, column)` | A reference to a table column. |
+| `GetField(input, field)` | A field read from a struct. |
+| `ScalarFunction(function, args)` | A value computed for each row, such as text length. |
+| `RegularPredicate(expression, comparison, value)` | A condition on a value, such as `length(r.body) < 40`. |
+| `ModelCall(prompt, kind, labels, descriptions)` | An AI operation. The kind is `boolean`, `score`, `label`, or `extract`. |
+| `Alias(expression, name)` | An expression returned under a specified column name. |
+| `WindowCall(function, argument, partition, order, name)` | A window function with its input column, partition keys, order keys, and output name. |
 
-`SemanticFilter` and `SemanticJoin` hold predicates that return TRUE or
-FALSE. A predicate can be a boolean `ModelCall` or a `RegularPredicate`
-comparing a score call with a threshold. A label condition is a
-`RegularPredicate` in a separate `Filter`. `Project.columns` holds
-value expressions and `Alias` expressions.
+For example, `LENGTH(r.details.body)` reads the `details` column,
+selects its `body` field, and computes the text length. Its expression is:
+
+```python
+ScalarFunction("length", (
+    GetField(ColumnRef("r", "reviews", "details"), "body"),
+))
+```
+
+Operators use these expressions as follows:
+
+- `Scan.column` specifies the text to tokenize. It can read a source
+  column directly or use a value expression, such as a struct field.
+- `SemanticFilter` and `SemanticJoin` test a boolean `ModelCall` or a
+  `RegularPredicate` that compares an `AI.SCORE` call with a threshold.
+- `Filter` tests a label, extracted answer, or answer position with a
+  `RegularPredicate`. The condition does not call the model again.
+- `Project.columns` specifies the returned values and their names.
 
 `LogicalPlan.operators()` collects the tree's operations for planning.
 It includes scans, predicates and joins in written order, Python
-functions, score and classification calls, and label conditions.
+functions, score, classification, and extraction calls, and conditions
+on their answers.
 
 ## Prompt binding
 

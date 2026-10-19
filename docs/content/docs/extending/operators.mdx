@@ -11,11 +11,12 @@ It explains the methods your operator must implement.
 After you implement the classes, register them and add the operator to a plan.
 
 To call a Python function between existing operators, use
-[`apply()`](/docs/user-guide/python-api#apply).
+[`apply()`](/docs/user-guide/python-api/non-ai-functions#apply).
 
 ## Implement the classes
 
-In the example, `Scan` returns document IDs for a prepared table.
+In the example, `Scan` returns a `Rows` value containing document IDs
+for a prepared table.
 Its node class stores the table alias and source identifier.
 For your operator, define the fields needed to perform your operation.
 
@@ -57,17 +58,19 @@ class Scan(PhysicalNode):
 
 An output *port* declares the name and value type of an output.
 Your runtime must return a value under each declared output name.
-In the example, `ScanRuntime` reads the prepared document IDs and returns
-them under the name declared by `Scan`:
+In the example, `ScanRuntime` reads the prepared document IDs and wraps
+them in `Rows`. It returns that value under the name declared by `Scan`:
 
 ```python
+from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeResult
+from quail.execution.rows import Rows
 
 
 class ScanRuntime:
     def execute(self, node, inputs, context):
-        value = context.sources[node.input_id]
-        return NodeResult({f"rows:{node.alias}": value})
+        ids = document_ids(context.sources[node.input_id])
+        return NodeResult({f"rows:{node.alias}": Rows({node.alias: ids})})
 ```
 
 For your operator:
@@ -75,10 +78,10 @@ For your operator:
 - Subclass `PhysicalNode`. Define the settings and output ports.
 - Use a distinct `type_name` and `runtime_key`. Set `location` to the
   process where the operator will run.
-- Give every setting a type annotation. The plan codec encodes the
-  node from its dataclass fields and decodes it from their types, so
-  a setting is a string, a number, a bool, an enum, a tuple, or a
-  dataclass of those.
+- Give every setting a type annotation. Quail saves the node's
+  dataclass fields and uses their types to restore them. Supported
+  values include strings, numbers, booleans, enums, and nested
+  dataclasses, with tuples, lists, or dictionaries to hold collections.
 - Implement `execute(node, inputs, context)` in the runtime class.
   Return a `NodeResult` with a value for each output port.
 

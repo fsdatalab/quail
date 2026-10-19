@@ -2,18 +2,35 @@
 title: Metrics
 ---
 
-Use `result.report` to read a query's execution times and token counts.
+Quail records execution time, row counts, and token counts for each query.
+The report includes totals for the query and measurements for individual
+operators in its plan.
+
+## Read a query report
+
+Call `query.run()` to execute a query. The returned `QueryResult` has a
+`report` containing the measurements from that run.
+
+For example, imagine a `reviews` table registered on `session`, with
+review IDs in `id` and review text in `body`. Run a filter and read its
+execution time and token count:
 
 ```python
+query = session.sql("""
+    SELECT r.id
+    FROM reviews r
+    WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body))
+""", dialect="bq")
+
 result = query.run()
 report = result.report
 print("Query time in seconds:", report["wall_s"])
 print("Model startup time in seconds:", report["boot_s"])
-print("Fresh tokens:", report["fresh_tokens"])
+print("Tokens computed:", report["fresh_tokens"])
 ```
 
-The example uses an existing `query` from SQL or the Python builder.
-For measurements beside the plan's estimates, use
+Queries built with the [Python API](/docs/user-guide/python-api) return
+the same report. To compare measurements with the plan's estimates, use
 [`result.explain()`](/docs/user-guide/results#measure-the-plan).
 
 ## Query totals

@@ -2,13 +2,13 @@
   "title": "User guide",
   "pages": [
     "quickstart",
-    "sql",
     "sessions",
+    "sql",
     "python-api",
-    "editing-plans",
     "results",
-    "server",
     "metrics",
+    "editing-plans",
+    "server",
     "models"
   ],
   "defaultOpen": true
