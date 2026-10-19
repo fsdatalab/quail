@@ -12,18 +12,15 @@ Each phase runs every sequence of one kind in one pass over its rows,
 in the order plan_phases documents: a phase reads the slots the ones
 before it wrote.
 
-The reference functions are plain torch and define the maths. The
-convolution and the recurrence can also run vLLM's fused kernels on the
-same tensors.
+The convolution and recurrence run vLLM's kernels.
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 
 from quail.cost.budgets import CHECKPOINT_PASS_QUESTIONS
-
-L2_EPS = 1e-6
 
 
 @dataclass
@@ -40,6 +37,8 @@ class GdnPhase:
             state in, or None when none is kept.
         output: Whether the sequences' outputs feed the next layer;
             False for rows another phase already produced.
+        conv_metadata: vLLM convolution metadata shared by all layers.
+            A phase consistently starts from zero or from saved state.
     """
 
     rows: object
@@ -48,6 +47,7 @@ class GdnPhase:
     read_slots: object = None
     write_slots: object = None
     output: bool = True
+    conv_metadata: object = None
 
 
 def plan_phases(arena, groups, stage):
@@ -317,124 +317,6 @@ def _plan_phases(arena, groups, stage, undo):
     return tuple(phases)
 
 
-# ---- reference maths --------------------------------------------------
-
-def l2_normalize(x):
-    """Scale the last dimension of x to unit length."""
-    import torch
-
-    x = x.float()
-    return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + L2_EPS)
-
-
-def causal_conv_reference(x, weight, lengths, history=None, bias=None,
-                          activate=True):
-    """Depthwise causal convolution, then SiLU, per sequence of packed rows.
-
-    Args:
-        x: (rows, channels) inputs of the sequences back to back.
-        weight: (channels, width) filter taps; the last tap is the
-            current row.
-        lengths: Rows per sequence.
-        history: (sequences, width - 1, channels) input columns before
-            each sequence, oldest first; None means zeros.
-        bias: Optional (channels,) bias.
-        activate: Whether SiLU follows the convolution; a short
-            convolution layer has none.
-
-    Returns:
-        (output with x's shape, tails), where tails is
-        (sequences, width - 1, channels): each sequence's last width - 1
-        input columns, which the next row would read as its history.
-    """
-    import torch
-    import torch.nn.functional as F
-
-    rows, channels = x.shape
-    width = weight.shape[1]
-    lengths_t = torch.as_tensor(list(lengths), device=x.device)
-    starts = torch.cumsum(lengths_t, 0) - lengths_t
-    sequence = torch.repeat_interleave(
-        torch.arange(len(lengths), device=x.device), lengths_t)
-    offset = torch.arange(rows, device=x.device) - starts[sequence]
-    out = torch.zeros((rows, channels), dtype=torch.float32, device=x.device)
-    for back in range(width):
-        tap = weight[:, width - 1 - back].float()
-        source = (torch.arange(rows, device=x.device) - back).clamp(min=0)
-        column = x[source].float()
-        before = offset < back
-        if history is None:
-            column = torch.where(before[:, None], 0.0, column)
-        elif before.any():
-            past = history[sequence[before], width - 1 - back + offset[before]]
-            column[before] = past.float()
-        out += column * tap
-    if bias is not None:
-        out += bias.float()
-    tails = _conv_tails(x, lengths_t, starts, history, width)
-    return (F.silu(out) if activate else out).to(x.dtype), tails
-
-
-def _conv_tails(x, lengths, starts, history, width):
-    """Each sequence's last width - 1 input columns, oldest first."""
-    import torch
-
-    count = lengths.shape[0]
-    index = lengths[:, None] + torch.arange(width - 1, device=x.device)
-    in_history = index < width - 1
-    row = (starts[:, None] + index - (width - 1)).clamp(min=0)
-    tails = x[row.clamp(max=x.shape[0] - 1)]
-    pad = (history if history is not None
-           else torch.zeros((count, width - 1, x.shape[1]), dtype=x.dtype,
-                            device=x.device))
-    old = pad.gather(1, index.clamp(max=width - 2)[:, :, None].expand(
-        -1, -1, x.shape[1]))
-    return torch.where(in_history[:, :, None], old.to(x.dtype), tails)
-
-
-def gated_delta_reference(q, k, v, g, beta, state, lengths, scale):
-    """Gated delta rule over packed sequences, one token at a time.
-
-    Per token: S <- exp(g) * S (I - beta k k^T) + beta v k^T, and the
-    output is S q. Queries and keys are L2-normalized and the query is
-    multiplied by scale first.
-
-    Args:
-        q: (rows, key heads, key dim).
-        k: (rows, key heads, key dim).
-        v: (rows, value heads, value dim).
-        g: (rows, value heads) log of the decay.
-        beta: (rows, value heads) write strength.
-        state: (sequences, value heads, value dim, key dim), float32;
-            updated in place to each sequence's final state.
-        lengths: Rows per sequence.
-        scale: Query multiplier after normalization.
-
-    Returns:
-        (rows, value heads, value dim) outputs, in v's dtype.
-    """
-    import torch
-
-    value_heads = v.shape[1]
-    repeat = value_heads // q.shape[1]
-    q = l2_normalize(q).repeat_interleave(repeat, dim=1) * scale
-    k = l2_normalize(k).repeat_interleave(repeat, dim=1)
-    out = torch.empty(v.shape, dtype=torch.float32, device=v.device)
-    decay = g.float().exp()
-    row = 0
-    for index, length in enumerate(lengths):
-        s = state[index]
-        for t in range(row, row + length):
-            s = s * decay[t][:, None, None]
-            predicted = (s * k[t][:, None, :]).sum(-1)
-            delta = (v[t].float() - predicted) * beta[t].float()[:, None]
-            s = s + delta[:, :, None] * k[t][:, None, :]
-            out[t] = (s * q[t][:, None, :]).sum(-1)
-        state[index] = s
-        row += length
-    return out.to(v.dtype)
-
-
 # ---- kernel path ------------------------------------------------------
 
 def gdn_prefill_backend():
@@ -460,155 +342,99 @@ def gdn_prefill_backend():
     return "triton"
 
 
-def _flashinfer_delta_rule(q, k, v, g, beta, state, cu_seqlens):
+def _flashinfer_delta_rule(q, k, v, g, beta, state, cu_seqlens,
+                          output_final_state):
     """The same rule through FlashInfer's prefill kernel, as vLLM calls it."""
     import torch
     from flashinfer.gdn_prefill import chunk_gated_delta_rule
-    from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 
-    out, final = chunk_gated_delta_rule(
-        q=l2norm_fwd(q[None].contiguous()).squeeze(0),
-        k=l2norm_fwd(k[None].contiguous()).squeeze(0),
+    result = chunk_gated_delta_rule(
+        q=q.contiguous(), k=k.contiguous(),
         v=v.contiguous(), g=torch.exp(g.float()).contiguous(),
         beta=beta.float().contiguous(), initial_state=state.float(),
-        output_final_state=True, cu_seqlens=cu_seqlens.long())
-    return out, final
+        output_final_state=output_final_state, cu_seqlens=cu_seqlens.long())
+    return result if output_final_state else (result, None)
 
 
-def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale):
-    """The same rule through a chunked kernel; state is updated in place.
+def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale, *,
+                       output_final_state):
+    """Return the recurrence outputs and optional final state.
 
-    The kernel normalizes q and k itself and takes key heads fewer than
-    value heads without repeating them. The backend is chosen by
-    gdn_prefill_backend().
+    Inputs q and k are already normalized; g is the log decay. The
+    kernel takes key heads fewer than value heads without repeating
+    them. The backend is chosen by gdn_prefill_backend().
     """
     if gdn_prefill_backend() == "flashinfer":
-        out, final = _flashinfer_delta_rule(q, k, v, g, beta, state,
-                                            cu_seqlens)
-        state.copy_(final)
-        return out
+        return _flashinfer_delta_rule(q, k, v, g, beta, state,
+                                      cu_seqlens, output_final_state)
     from vllm.third_party.flash_linear_attention.ops import (
         chunk_gated_delta_rule,
     )
 
     out, final = chunk_gated_delta_rule(
         q=q[None], k=k[None], v=v[None], g=g[None], beta=beta[None],
-        initial_state=state, output_final_state=True,
+        initial_state=state, output_final_state=output_final_state,
         cu_seqlens=cu_seqlens.long(), scale=scale,
-        use_qk_l2norm_in_kernel=True)
-    state.copy_(final)
-    return out[0]
-
-
-# rows and channels one convolution program covers
-CONV_ROWS = 16
-CONV_BLOCK = 128
-_CONV_KERNEL = None
-
-
-def _conv_triton_kernel():
-    """Build the convolution kernel once; triton is imported on first use."""
-    global _CONV_KERNEL
-    if _CONV_KERNEL is not None:
-        return _CONV_KERNEL
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def conv_silu(x_ptr, w_ptr, bias_ptr, hist_ptr, seq_ptr, within_ptr,
-                  out_ptr, rows, channels, stride_x, stride_hs, stride_ht,
-                  stride_o, W: tl.constexpr, ROWS: tl.constexpr,
-                  BLOCK: tl.constexpr, HAS_HIST: tl.constexpr,
-                  HAS_BIAS: tl.constexpr, ACTIVATE: tl.constexpr):
-        # A program owns ROWS consecutive packed rows by BLOCK channels.
-        index = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-        row_ok = index < rows
-        col_ok = cols < channels
-        sequence = tl.load(seq_ptr + index, mask=row_ok, other=0).to(tl.int64)
-        within = tl.load(within_ptr + index, mask=row_ok, other=0)
-        # int64 so row * stride cannot overflow on a long chunk
-        source = index.to(tl.int64)
-        acc = tl.zeros((ROWS, BLOCK), dtype=tl.float32)
-        for back in tl.static_range(W):
-            tap = tl.load(w_ptr + cols * W + (W - 1 - back), mask=col_ok,
-                          other=0.0).to(tl.float32)
-            inside = row_ok & ((within - back) >= 0)
-            value = tl.load(
-                x_ptr + (source - back)[:, None] * stride_x + cols[None, :],
-                mask=inside[:, None] & col_ok[None, :],
-                other=0.0).to(tl.float32)
-            if HAS_HIST:
-                outside = row_ok & ((within - back) < 0)
-                past = tl.load(
-                    hist_ptr + sequence[:, None] * stride_hs
-                    + (W - 1 - back + within)[:, None] * stride_ht
-                    + cols[None, :],
-                    mask=outside[:, None] & col_ok[None, :],
-                    other=0.0).to(tl.float32)
-                value = value + past
-            acc += value * tap[None, :]
-        if HAS_BIAS:
-            acc += tl.load(bias_ptr + cols, mask=col_ok,
-                           other=0.0).to(tl.float32)[None, :]
-        if ACTIVATE:
-            out = acc * tl.sigmoid(acc)
-        else:
-            out = acc
-        tl.store(out_ptr + source[:, None] * stride_o + cols[None, :],
-                 out.to(out_ptr.dtype.element_ty),
-                 mask=row_ok[:, None] & col_ok[None, :])
-
-    _CONV_KERNEL = conv_silu
-    return _CONV_KERNEL
+        use_qk_l2norm_in_kernel=False)
+    return out[0], final
 
 
 def causal_conv_kernel(x, weight, phase, history, bias=None, activate=True):
-    """The same convolution as one Triton kernel over the packed rows.
+    """Run vLLM's convolution and return outputs and updated private history.
 
     Args:
-        x: (rows, channels) inputs of the phase's sequences back to back.
-        weight: (channels, width) filter taps; the last tap is the
-            current row.
-        phase: The GdnPhase whose lengths bound the sequences.
-        history: (sequences, width - 1, channels) input columns before
-            each sequence, or None for zeros.
-        bias: Optional (channels,) bias.
+        x: Packed inputs with shape (rows, channels).
+        weight: Convolution weights with shape (channels, width).
+        phase: Sequence lengths and cached convolution metadata.
+        history: Private state with shape (capacity, width - 1, channels),
+            updated in place. None starts each sequence from zero.
+        bias: Optional per-channel bias.
         activate: Whether SiLU follows the convolution.
 
     Returns:
-        (output with x's shape, tails), as causal_conv_reference does.
+        The outputs and each sequence's final convolution state.
     """
     import torch
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
+    from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
 
-    rows, channels = x.shape
-    width = weight.shape[1]
-    device = x.device
-    lengths = torch.as_tensor(phase.lengths, device=device)
-    starts = torch.cumsum(lengths, 0) - lengths
-    sequence = torch.repeat_interleave(
-        torch.arange(len(phase.lengths), device=device), lengths)
-    within = (torch.arange(rows, device=device) - starts[sequence]).int()
-    out = torch.empty_like(x)
-    x = x.contiguous()
-    weight = weight.contiguous()
-    has_history = history is not None
-    hist = history if has_history else x
-    _conv_triton_kernel()[(triton_cdiv(rows, CONV_ROWS),
-                           triton_cdiv(channels, CONV_BLOCK))](
-        x, weight, bias if bias is not None else x, hist,
-        sequence.int(), within, out, rows, channels, x.stride(0),
-        hist.stride(0) if has_history else 0,
-        hist.stride(1) if has_history else 0, out.stride(0),
-        W=width, ROWS=CONV_ROWS, BLOCK=CONV_BLOCK, HAS_HIST=has_history,
-        HAS_BIAS=bias is not None, ACTIVATE=activate, num_warps=4)
-    tails = _conv_tails(x, lengths, starts, history, width)
-    return out, tails
+    if phase.conv_metadata is None:
+        bounds = torch.tensor([0, *np.cumsum(phase.lengths)], dtype=torch.int32)
+        nums, batches, offsets = compute_causal_conv1d_metadata(
+            bounds, device=x.device)
+        count = len(phase.lengths)
+        phase.conv_metadata = SimpleNamespace(
+            nums_dict=nums, batch_ptr=batches, token_chunk_offset_ptr=offsets,
+            cache_indices=torch.arange(count, dtype=torch.int32, device=x.device),
+            has_initial_state=torch.full(
+                (count,), history is not None, dtype=torch.bool, device=x.device))
+    metadata = phase.conv_metadata
+    if history is None:
+        capacity = 1 << (len(phase.lengths) - 1).bit_length()
+        history = x.new_empty((capacity, weight.shape[1] - 1, x.shape[1]))
+    out = causal_conv1d_fn(
+        x.T, weight, bias, conv_states=history.transpose(1, 2),
+        query_start_loc=phase.cu_seqlens, cache_indices=metadata.cache_indices,
+        has_initial_state=metadata.has_initial_state,
+        # Slot zero holds the first sequence; no private slot is reserved.
+        null_block_id=None,
+        activation="silu" if activate else None, metadata=metadata)
+    return out.T, history[:len(phase.lengths)]
 
 
-def triton_cdiv(value, block):
-    """Blocks of `block` covering `value` elements."""
-    return -(-value // block)
+def _conv_history(arena, phase, layer_slot):
+    """Gather a layer's convolution history into private state."""
+    import torch
+
+    if phase.read_slots is None:
+        return None
+    count = len(phase.lengths)
+    # vLLM specializes on capacity; powers of two bound the compiled variants.
+    capacity = 1 << (count - 1).bit_length()
+    source = arena.conv_state[:, layer_slot]
+    history = source.new_empty((capacity, *source.shape[1:]))
+    torch.index_select(source, 0, phase.read_slots, out=history[:count])
+    return history
 
 
 # a CUDA launch has at most this many blocks along its second grid axis,
@@ -624,10 +450,9 @@ SEQUENCES_PER_LAUNCH = CHECKPOINT_PASS_QUESTIONS // 2
 def _kernel_in_batches(spec, q, k, v, g, beta, load, store, phase, scale):
     """Run the chunked kernel over as many sequences as one launch holds.
 
-    A launch gathers its sequences' state with load(first, last), the
-    kernel updates it in place, and store(first, last, state) writes it
-    back, so the copies of one layer are bounded by the launch size and
-    not by the number of questions in the chunk.
+    A launch gathers its sequences' state with load(first, last).
+    When store is supplied, store(first, last, state) saves the final
+    state. Temporary state is bounded by the launch size.
     """
     import torch
 
@@ -642,28 +467,21 @@ def _kernel_in_batches(spec, q, k, v, g, beta, load, store, phase, scale):
         last = min(count, first + per_launch)
         low, high = starts[first], starts[last]
         state = load(first, last)
-        pieces.append(gated_delta_kernel(
+        out, final = gated_delta_kernel(
             q[low:high], k[low:high], v[low:high], g[low:high],
             beta[low:high], state,
-            phase.cu_seqlens[first:last + 1] - low, scale))
-        store(first, last, state)
+            phase.cu_seqlens[first:last + 1] - low, scale,
+            output_final_state=store is not None)
+        pieces.append(out)
+        if store is not None:
+            store(first, last, final)
+        del state, final
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
 
 # ---- the layer --------------------------------------------------------
 
-def gated_rms_norm(x, gate, weight, eps):
-    """RMS-normalize the last dimension of x, scale by weight, gate by SiLU."""
-    import torch
-    import torch.nn.functional as F
-
-    normed = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True)
-                                     + eps)
-    scaled = weight * normed.to(x.dtype)
-    return (scaled.float() * F.silu(gate.float())).to(x.dtype)
-
-
-def short_conv_core(inputs, weight, phases, arena, layer_slot, *, use_kernels):
+def short_conv_core(inputs, weight, phases, arena, layer_slot):
     """Run one short convolution layer's causal convolution.
 
     Args:
@@ -672,7 +490,6 @@ def short_conv_core(inputs, weight, phases, arena, layer_slot, *, use_kernels):
         phases: The chunk's phases from plan_phases.
         arena: KVArena holding the checkpoint pools.
         layer_slot: Index of this layer among the state layers.
-        use_kernels: Whether the convolution runs the Triton kernel.
 
     Returns:
         (rows, channels) convolution outputs, with no activation.
@@ -684,14 +501,9 @@ def short_conv_core(inputs, weight, phases, arena, layer_slot, *, use_kernels):
         if phase is None:
             continue
         mixed = inputs.index_select(0, phase.rows)
-        history = (None if phase.read_slots is None
-                   else arena.conv_state[phase.read_slots, layer_slot])
-        if use_kernels:
-            mixed, tails = causal_conv_kernel(
-                mixed, weight, phase, history, None, activate=False)
-        else:
-            mixed, tails = causal_conv_reference(
-                mixed, weight, phase.lengths, history, None, activate=False)
+        history = _conv_history(arena, phase, layer_slot)
+        mixed, tails = causal_conv_kernel(
+            mixed, weight, phase, history, None, activate=False)
         if phase.write_slots is not None:
             arena.conv_state[phase.write_slots, layer_slot] = tails
         if phase.output:
@@ -699,57 +511,47 @@ def short_conv_core(inputs, weight, phases, arena, layer_slot, *, use_kernels):
     return out
 
 
-def gdn_core(geometry, tensors, phases, arena, layer_slot, *, use_kernels):
+def gdn_core(geometry, tensors, phases, arena, layer_slot):
     """Run one Gated DeltaNet layer's convolution and recurrence.
 
     Args:
         geometry: The model spec, for its head counts and dimensions.
         tensors: Dict with qkv (rows, conv channels), b, a, conv_weight,
             conv_bias, A_log, and dt_bias.
-        phases: (prefix phase, suffix phase) from plan_phases.
+        phases: The chunk's phases from plan_phases.
         arena: KVArena holding the checkpoint pools.
         layer_slot: Index of this layer among the Gated DeltaNet layers.
-        use_kernels: Whether the recurrence runs vLLM's kernel.
 
     Returns:
         (rows, value heads, value dim) recurrence outputs.
     """
     import torch
-    import torch.nn.functional as F
+    from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep
 
     spec = geometry
     qkv = tensors["qkv"]
     rows = qkv.shape[0]
     out = torch.zeros((rows, spec.gdn_value_heads, spec.gdn_value_dim),
                       dtype=qkv.dtype, device=qkv.device)
-    key_width = spec.gdn_key_heads * spec.gdn_key_dim
-    beta = tensors["b"].sigmoid()
-    gate = (-tensors["A_log"].float().exp()
-            * F.softplus(tensors["a"].float() + tensors["dt_bias"].float()))
     scale = spec.gdn_key_dim ** -0.5
     for phase in phases:
         if phase is None:
             continue
         mixed = qkv.index_select(0, phase.rows)
-        history = (None if phase.read_slots is None
-                   else arena.conv_state[phase.read_slots, layer_slot])
-        if use_kernels:
-            mixed, tails = causal_conv_kernel(
-                mixed, tensors["conv_weight"], phase, history,
-                tensors["conv_bias"])
-        else:
-            mixed, tails = causal_conv_reference(
-                mixed, tensors["conv_weight"], phase.lengths, history,
-                tensors["conv_bias"])
+        history = _conv_history(arena, phase, layer_slot)
+        mixed, tails = causal_conv_kernel(
+            mixed, tensors["conv_weight"], phase, history,
+            tensors["conv_bias"])
         if phase.write_slots is not None:
             arena.conv_state[phase.write_slots, layer_slot] = tails
-        q, k, v = mixed.split([key_width, key_width, mixed.shape[1]
-                               - 2 * key_width], dim=-1)
-        q = q.reshape(-1, spec.gdn_key_heads, spec.gdn_key_dim)
-        k = k.reshape(-1, spec.gdn_key_heads, spec.gdn_key_dim)
-        v = v.reshape(-1, spec.gdn_value_heads, spec.gdn_value_dim)
-        g = gate.index_select(0, phase.rows)
-        b = beta.index_select(0, phase.rows)
+        q, k, v, g, b = fused_post_conv_prep(
+            conv_output=mixed,
+            a=tensors["a"].index_select(0, phase.rows),
+            b=tensors["b"].index_select(0, phase.rows),
+            A_log=tensors["A_log"], dt_bias=tensors["dt_bias"],
+            num_k_heads=spec.gdn_key_heads, head_k_dim=spec.gdn_key_dim,
+            head_v_dim=spec.gdn_value_dim, apply_l2norm=True,
+            output_g_exp=False)
         def load(first, last, phase=phase):
             if phase.read_slots is None:
                 return torch.zeros(
@@ -759,18 +561,11 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, use_kernels):
             return arena.gdn_state[phase.read_slots[first:last], layer_slot]
 
         def store(first, last, state, phase=phase):
-            if phase.write_slots is not None:
-                arena.gdn_state[phase.write_slots[first:last],
-                                layer_slot] = state
+            arena.gdn_state[phase.write_slots[first:last], layer_slot] = state
 
-        if use_kernels:
-            core = _kernel_in_batches(spec, q, k, v, g, b, load, store,
-                                      phase, scale)
-        else:
-            state = load(0, len(phase.lengths))
-            core = gated_delta_reference(q, k, v, g, b, state,
-                                         phase.lengths, scale)
-            store(0, len(phase.lengths), state)
+        core = _kernel_in_batches(
+            spec, q, k, v, g, b, load,
+            store if phase.write_slots is not None else None, phase, scale)
         if phase.output:
             out.index_copy_(0, phase.rows, core)
     return out

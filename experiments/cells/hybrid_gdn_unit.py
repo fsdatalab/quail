@@ -3,10 +3,10 @@
 Random bf16 tensors with the Qwen3.5-4B geometry, sequences of mixed
 lengths from one token to a few hundred. The convolution is compared
 with and without a history, and the recurrence from zero and from a
-random state. The recurrence also runs on q, k, and v that are column
-slices of one wider tensor, as the layer passes them, and the
-convolution runs over one sequence long enough that a row offset times
-the channel count passes 2^31.
+random state. Fused preparation normalizes q and k and computes the
+gates from contiguous and strided projection outputs. The convolution
+runs over one sequence long enough that a row offset times the channel
+count passes 2^31.
 
 Prediction: the batched convolution matches the reference within 0.05
 absolute and its tails exactly; the chunked recurrence matches the
@@ -27,7 +27,7 @@ import modal
 
 try:
     from quail.deploy.images import gpu_image
-    image = gpu_image()
+    image = gpu_image().add_local_python_source("experiments")
 except ImportError:    # a container without the local quail package
     image = None
 
@@ -43,7 +43,10 @@ def check(backend: str = "triton") -> dict:
     """Return the largest differences between the reference and the kernels."""
     os.environ["QUAIL_GDN_PREFILL"] = backend
     import torch
+    import torch.nn.functional as F
+    from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep
 
+    from experiments.hybrid import causal_conv_reference, gated_delta_reference
     from quail.backends.quail.executor import gdn
     from quail.specs import MODELS
 
@@ -63,12 +66,12 @@ def check(backend: str = "triton") -> dict:
     weight = torch.randn(channels, width, device=device,
                          dtype=torch.bfloat16) * 0.5
     bias = None
-    phase = gdn.GdnPhase(rows=None, cu_seqlens=cu, lengths=LENGTHS)
     for name, history in (
             ("zero", None),
             ("history", torch.randn(count, width - 1, channels,
                                     device=device, dtype=torch.bfloat16))):
-        ref, ref_tails = gdn.causal_conv_reference(
+        phase = gdn.GdnPhase(rows=None, cu_seqlens=cu, lengths=LENGTHS)
+        ref, ref_tails = causal_conv_reference(
             x, weight, LENGTHS, history, bias)
         ker, ker_tails = gdn.causal_conv_kernel(x, weight, phase, history,
                                                 bias)
@@ -88,34 +91,38 @@ def check(backend: str = "triton") -> dict:
     q = torch.randn(rows, hk, dk, device=device, dtype=torch.bfloat16)
     k = torch.randn(rows, hk, dk, device=device, dtype=torch.bfloat16)
     v = torch.randn(rows, hv, dv, device=device, dtype=torch.bfloat16)
-    g = -torch.rand(rows, hv, device=device) * 0.5
-    beta = torch.rand(rows, hv, device=device)
+    ba = torch.randn(rows, 2 * hv, device=device, dtype=torch.bfloat16)
+    b, a = ba.chunk(2, dim=-1)
+    a_log = torch.randn(hv, device=device) * 0.1
+    dt_bias = torch.randn(hv, device=device)
+    g = -a_log.exp() * F.softplus(a.float() + dt_bias)
+    beta = b.float().sigmoid()
     scale = dk ** -0.5
-    # the layer's q, k, and v are column slices of one convolution output
     joined = torch.cat([q.reshape(rows, -1), k.reshape(rows, -1),
                         v.reshape(rows, -1)], dim=-1)
-    key_width = hk * dk
-    sq, sk, sv = joined.split(
-        [key_width, key_width, joined.shape[1] - 2 * key_width], dim=-1)
-    sq = sq.reshape(rows, hk, dk)
-    sk = sk.reshape(rows, hk, dk)
-    sv = sv.reshape(rows, hv, dv)
-    out["strided_inputs_are_contiguous"] = bool(
-        sq.is_contiguous() or sk.is_contiguous() or sv.is_contiguous())
+    strided = torch.cat([joined, joined], dim=-1)[:, :joined.shape[1]]
+    out["strided_inputs_are_contiguous"] = strided.is_contiguous()
     for name, state0 in (
             ("zero", torch.zeros(count, hv, dv, dk, device=device)),
             ("state", torch.randn(count, hv, dv, dk, device=device) * 0.1)):
-        for layout, (a, b, c) in (("contiguous", (q, k, v)),
-                                  ("strided", (sq, sk, sv))):
-            s_ref, s_ker = state0.clone(), state0.clone()
-            ref = gdn.gated_delta_reference(a, b, c, g, beta, s_ref, LENGTHS,
-                                            scale)
-            ker = gdn.gated_delta_kernel(a, b, c, g, beta, s_ker, cu, scale)
+        for layout, mixed in (("contiguous", joined), ("strided", strided)):
+            s_ref = state0.clone()
+            ref = gated_delta_reference(q, k, v, g, beta, s_ref, LENGTHS, scale)
+            pq, pk, pv, pg, pb = fused_post_conv_prep(
+                conv_output=mixed, a=a, b=b, A_log=a_log, dt_bias=dt_bias,
+                num_k_heads=hk, head_k_dim=dk, head_v_dim=dv,
+                apply_l2norm=True, output_g_exp=False)
+            ker, final = gdn.gated_delta_kernel(
+                pq, pk, pv, pg, pb, state0, cu, scale, output_final_state=True)
+            read_only, discarded = gdn.gated_delta_kernel(
+                pq, pk, pv, pg, pb, state0, cu, scale, output_final_state=False)
+            assert discarded is None
+            torch.testing.assert_close(read_only, ker)
             out[f"recurrence_{name}_{layout}"] = {
                 "nan_kernel": int(torch.isnan(ker).sum()),
                 "max_abs_diff": float(
                     (ref.float() - ker.float()).abs().max()),
-                "state_max_abs_diff": float((s_ref - s_ker).abs().max()),
+                "state_max_abs_diff": float((s_ref - final).abs().max()),
             }
 
     # one sequence past the row offset where rows * channels overflows int32
@@ -129,7 +136,7 @@ def check(backend: str = "triton") -> dict:
     long_out, _ = gdn.causal_conv_kernel(big, weight, big_phase, None, bias)
     history = big[long_rows - TAIL_ROWS - (width - 1):
                   long_rows - TAIL_ROWS].unsqueeze(0)
-    ref_tail, _ = gdn.causal_conv_reference(
+    ref_tail, _ = causal_conv_reference(
         big[long_rows - TAIL_ROWS:], weight, (TAIL_ROWS,), history, bias)
     out["conv_long"] = {
         "rows": long_rows, "last_row_offset": long_rows * channels,

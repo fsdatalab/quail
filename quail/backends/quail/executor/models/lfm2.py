@@ -24,11 +24,10 @@ class Lfm2Pipeline(ModelPipeline):
     warm_joins = False
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine, use_gdn_kernels=True):
+                 engine_class=Engine):
         text = getattr(model, "language_model", model)
         self.spec = spec
         self.arena = arena
-        self.use_gdn_kernels = use_gdn_kernels
         self.vllm_config = getattr(model, "quail_vllm_config", None)
         self.layers = text.model.layers
         self.embed = text.model.embed_tokens
@@ -55,6 +54,12 @@ class Lfm2Pipeline(ModelPipeline):
         return (conv.in_proj, conv.out_proj, attn.qkv_proj, attn.out_proj,
                 mlp.w13, mlp.w2)
 
+    def convolutions(self):
+        """Return the convolution weights and activation used by this model."""
+        conv = self.conv_layer.short_conv.conv
+        weight = conv.weight.view(conv.weight.shape[0], conv.weight.shape[2])
+        return ((weight, None, False),)
+
     def _linear(self, x, module):
         x_q, x_s = self.engine.quant(x)
         return self.engine.gemm(x_q, x_s, module)
@@ -65,8 +70,7 @@ class Lfm2Pipeline(ModelPipeline):
         weight = mixer.conv.weight
         taps = weight.view(weight.shape[0], weight.shape[2])
         conv = short_conv_core(
-            (b * gated).contiguous(), taps, phases, self.arena, slot,
-            use_kernels=self.use_gdn_kernels)
+            (b * gated).contiguous(), taps, phases, self.arena, slot)
         return self._linear(c * conv, mixer.out_proj)
 
     def _attention(self, attn, x, positions, chunk):

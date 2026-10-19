@@ -107,7 +107,7 @@ def test_forward_warm_runs_a_classification_chunk(monkeypatch):
     monkeypatch.setattr(warmup, "_warm_row_classes",
                         lambda torch, arena, pipeline, mode: classes.append(mode))
     pipeline = SimpleNamespace(tree_attention=False, warm_tokens=(),
-                               canvas_ids=())
+                               canvas_ids=(), convolutions=lambda: ())
     warmup._forward_warm(None, None, pipeline, None, 2048, join_chunk=True)
     # the row-count classes run on each attention path the model has
     assert classes == ["unified"]
