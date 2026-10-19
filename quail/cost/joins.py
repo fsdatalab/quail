@@ -131,6 +131,8 @@ def stage_work(spec: PricedJoin, anchor: str, n: float, tuples: float,
             sliding_pairs=(stats.window_pairs(pre + frame) - stats.window_pairs(pre)
                            if window else 0.0),
             sliding_kv_read=stats.window_reads(pre) if window else 0.0,
+            state_read=count,
+            state_written=count,
         )
     else:
         scan_sum = prefix_sum + count * frame
@@ -141,6 +143,7 @@ def stage_work(spec: PricedJoin, anchor: str, n: float, tuples: float,
             pairs=(scan_squared + scan_sum) / 2,
             kv_written=scan_sum,
             sliding_pairs=stats.window_pairs(pre + frame) if window else 0.0,
+            state_written=count,
         )
     stream = Work(
         tokens=count * per_anchor * u,
@@ -153,5 +156,6 @@ def stage_work(spec: PricedJoin, anchor: str, n: float, tuples: float,
                                     - stats.window_pairs(pre + frame))
                        if window else 0.0),
         sliding_kv_read=stats.window_reads(pre + frame) if window else 0.0,
+        state_read=count * per_anchor,
     )
     return (start + stream) * frac

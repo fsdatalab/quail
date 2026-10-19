@@ -1,6 +1,8 @@
 from .base import AnswerCanvas, ModelSpec
 from .prompts import TEXT_ANALYSIS_SYSTEM_PROMPT
 
+_LAYER_KINDS = ("sliding_attention",) * 5 + ("full_attention",)
+
 DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     name="diffusion-gemma-26b-a4b-fp8",
     # Active parameters per token, excluding embeddings.
@@ -13,7 +15,7 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     num_q_heads=16,
     num_kv_heads=8,
     d_head=256,
-    full_attention_period=6,
+    layer_kinds=_LAYER_KINDS * 5,
     full_num_kv_heads=2,
     full_d_head=512,
     sliding_window=1024,

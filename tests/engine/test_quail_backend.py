@@ -52,7 +52,9 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
                 NodeMetrics(fresh_tokens=len(indices)))
             outputs.append({
                 "results": {"filter:d": result}, "retained": (),
-                "kv_manager": {"evicted_keys": 1}, "peak_gib": 1.0,
+                "kv_manager": {"evicted_keys": 1},
+                "memory": {"peak_gib": 1.0,
+                           "memory_capacity": {"pages": 16, "slots": 2}},
             })
         return outputs
 
@@ -73,6 +75,8 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     assert result["filters"]["d"] == {0: [True], 1: [False], 2: [True], 3: [False]}
     assert result["fresh_tokens"] == 4
     assert result["kv_manager"]["evicted_keys"] == 2 and result["peak_gib"] == 1.0
+    assert result["memory_capacity"] == {"pages": 32, "slots": 4}
+    assert len(result["memory_workers"]) == 2
 
     arena = FakeArena()
     arena.owned.add(("d", 10))

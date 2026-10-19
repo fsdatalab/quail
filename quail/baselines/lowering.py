@@ -17,6 +17,7 @@ from quail.logical import (
     label_text,
     render_join_frame,
     shared_preamble,
+    without_bos,
 )
 
 
@@ -160,7 +161,9 @@ def lower_extractions(context, extracts) -> list[RequestExtractSpec]:
             tail_text=re.sub(r"\{\d+\}", "", node.call.prompt.tail),
             preamble_token_ids=tuple(
                 context.lowered(node.call.prompt).preamble_token_ids),
-            preamble_text=node.call.prompt.preamble))
+            # vLLM adds the model's beginning-of-text token itself
+            preamble_text=without_bos(node.call.prompt.preamble,
+                                      context.model.bos_text)))
     return extract_specs
 
 
@@ -180,9 +183,11 @@ def request_preamble(context, prompts) -> tuple[tuple[int, ...], str]:
     if not preamble and prompts and context.tokenizer is not None:
         preamble = tuple(context.tokenizer(
             shared_preamble(context.model.turn_prefix)))
-    return tuple(preamble), (
+    # vLLM adds the model's beginning-of-text token to a text prompt
+    return tuple(preamble), without_bos(
         next(iter(preamble_texts), "")
-        or shared_preamble(context.model.turn_prefix)
+        or shared_preamble(context.model.turn_prefix),
+        context.model.bos_text,
     )
 
 

@@ -19,7 +19,7 @@ from quail.progress import Progress, logger, quiet
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass.
-WARMUP_VERSION = 7
+WARMUP_VERSION = 8
 
 # Triton compiles one copy of a kernel for each class of its integer
 # arguments: equal to 1, a multiple of 16, or neither. Quail's row
@@ -48,6 +48,25 @@ def _warm_inputs(budget, question_tokens=16):
     return warm_documents or [document[:max(8, budget - q_max)]], question, document
 
 
+def _warm_convolutions(torch, pipeline, budget):
+    """Compile and load convolution kernels for every private state capacity."""
+    from quail.backends.quail.executor.gdn import GdnPhase, causal_conv_kernel
+
+    # Each sequence uses at least one token of the chunk budget.
+    largest = 1 << (budget - 1).bit_length()
+    for weight, bias, activate in pipeline.convolutions():
+        channels, width = weight.shape
+        history = weight.new_empty((largest, width - 1, channels))
+        history[:1].zero_()
+        x = weight.new_zeros((2, channels))
+        phase = GdnPhase(
+            rows=None, lengths=(2,), cu_seqlens=torch.tensor(
+                [0, 2], dtype=torch.int32, device=weight.device))
+        for power in range(largest.bit_length()):
+            causal_conv_kernel(x, weight, phase, history[:1 << power],
+                               bias, activate)
+
+
 def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                   join_chunk):
     """Run real forward passes over every attention path.
@@ -56,6 +75,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     unpaged causal fast path. join_chunk adds a join chunk and a
     classification chunk.
     """
+    _warm_convolutions(torch, pipeline, budget)
     # a readout of several trailing rows needs a question that long
     trailing = 1 if async_ans is None else async_ans.trailing_rows
     warm_documents, question, document = _warm_inputs(budget, max(16, trailing))
@@ -78,9 +98,11 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                 torch, arena, pipeline,
                 filter_stages([question], async_ans), [body], budget,
                 attention_mode=mode)
-        if not pipeline.canvas_ids:
+        if not pipeline.canvas_ids and getattr(
+                pipeline, "warm_row_classes", True):
             logger.debug("kernels: warming %s attention row classes", mode)
             _warm_row_classes(torch, arena, pipeline, mode)
+    join_chunk = join_chunk and getattr(pipeline, "warm_joins", True)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
         run_stages(

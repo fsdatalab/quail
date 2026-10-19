@@ -13,6 +13,7 @@ import time
 import numpy as np
 
 from quail.backends.quail.coordinator import keyed_shards, merge_results, shard_input
+from quail.backends.quail.executor.memory import merge_memory_reports
 from quail.backends.quail.executor.operators.filter import stop_groups
 from quail.backends.quail.graph import graph_report
 from quail.catalog.pairs import columns_key
@@ -119,7 +120,7 @@ class DistributedQuailExecution:
         return merge_results(nodes, outputs, alias, ids, wall)
 
     def report(self) -> dict:
-        """Sum the workers' KV counters and take the largest peak memory."""
+        """Sum the workers' KV counters and merge their memory reports."""
         totals = {}
         for output in self.outputs:
             for name, value in output["kv_manager"].items():
@@ -130,8 +131,7 @@ class DistributedQuailExecution:
                 else:
                     totals[name] = totals.get(name, 0) + value
         return {"kv_manager": totals,
-                "peak_gib": max((output["peak_gib"] for output in self.outputs),
-                                default=0.0)}
+                **merge_memory_reports([output["memory"] for output in self.outputs])}
 
 
 def execute_distributed_graph(payload, graph: PhysicalGraph, gpus: int,

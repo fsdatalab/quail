@@ -13,8 +13,10 @@ from quail.cost.budgets import tree_attention_allowed
 from quail.specs import (
     DECISION_2_KAI_0_6B_BF16,
     H100_SXM,
+    LFM2_2_6B_BF16,
     MODELS,
     QWEN3_4B_FP8,
+    QWEN3_5_4B_BF16,
     QWEN3_RERANKER_0_6B_BF16,
     QWEN3_RERANKER_4B_BF16,
 )
@@ -24,6 +26,9 @@ def test_backends_support_registered_generative_models_and_refuse_others():
     for model in MODELS.values():
         assert model.arch in supported_archs()
         assert QuailBackend().supports(model, H100_SXM, 1).supported
+
+    assert QuailBackend().supports(QWEN3_5_4B_BF16, H100_SXM, 1).supported
+    assert QuailBackend().supports(LFM2_2_6B_BF16, H100_SXM, 1).supported
 
     spec = replace(QWEN3_4B_FP8, name="other", arch="other")
     with pytest.raises(ValueError, match="other"):

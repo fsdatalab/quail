@@ -10,7 +10,7 @@ tokens join the document's KV after its frame, so the next append
 stage reads them instead of feeding them again; a rewinding stage
 puts its request right after the frame in place of what earlier
 stages appended, as the first stage of a new question does; a stage
-with a discard callback replaces the last tokens an earlier stage
+whose request discards tokens replaces the last tokens an earlier stage
 appended, as a stage that verified only part of what the one before
 fed does. Admission reserves pages for the frame and for what the
 append stages leave in KV, bounded by appended_tokens when the stages
@@ -29,13 +29,38 @@ from quail.backends.quail.executor.admission import DROP, SKIP
 
 
 @dataclass
+class StageRequests:
+    """Token sequences and retention for one document at one stage.
+
+    Attributes:
+        suffixes: Token sequences processed after the document and frame.
+        write_suffix_tokens: Leading tokens to retain from the first suffix.
+            None uses the stage's append setting.
+        read_rows: Trailing output rows to read per suffix. None uses the
+            stage's readout settings.
+        discard: Tokens to remove from the previously appended KV before
+            processing these suffixes.
+    """
+
+    suffixes: Any
+    write_suffix_tokens: int | None = None
+    read_rows: list[int] | None = None
+    discard: int = 0
+
+    def __post_init__(self):
+        from quail.backends.quail.executor.chunk import Suffixes
+
+        self.suffixes = Suffixes.of(self.suffixes)
+
+
+@dataclass
 class Stage:
     """Token requests, answer readout, and advancement condition for one step.
 
     Attributes:
         suffixes: Token sequences processed after each document and frame,
-            or a callback from document key to that document's own
-            sequences, asked when the document enters the stage, so a
+            or a callback from document key to StageRequests,
+            asked when the document enters the stage, so a
             stage can feed what an earlier stage's answer chose for it.
             The callback may return DROP or SKIP as requests does; it
             takes the place of requests, and suffix_tokens bounds it.
@@ -63,10 +88,6 @@ class Stage:
         rewind: Whether the request's tokens follow the frame directly,
             in place of the tokens earlier append stages added, as the
             first stage of a new question over the same document does.
-        discard: Optional callback from document key to how many of the
-            tokens earlier append stages added, counted from the end,
-            this stage's request replaces: the tokens the stage before
-            fed past what it verified.
         label: Name displayed in progress messages.
         paths: Optional trie paths and ancestor references from trie_paths().
         read_mask: Optional mask of the rows read in the sole paths
@@ -89,7 +110,6 @@ class Stage:
     read_rows: Any = None
     single: bool = False
     rewind: bool = False
-    discard: Callable | None = None
     append: bool = False
     label: str = ""
     paths: list | None = None
@@ -253,6 +273,31 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         on_answers=on_answers, stop_groups=stop_groups,
         appended_tokens=appended_tokens, gpu_timing=gpu_timing,
     ).run()
+
+
+def state_share_points(parents, shared, limit=None):
+    """The token counts at which each document's borrowers start.
+
+    Args:
+        parents: Per document, the document it borrows from or None.
+        shared: Per document, the tokens it borrows from its parent.
+        limit: Most counts to keep per document, or None for all. The
+            counts that save the most tokens (borrowers times length)
+            are kept; a borrower at another count computes its prefix.
+
+    Returns:
+        Per document, the sorted distinct counts its borrowers start
+        from; an empty tuple for a document nobody borrows from.
+    """
+    counts = [{} for _ in parents]
+    for parent, count in zip(parents, shared):
+        if parent is not None and count:
+            counts[parent][count] = counts[parent].get(count, 0) + 1
+    points = []
+    for found in counts:
+        keep = sorted(found, key=lambda n: (-found[n] * n, n))
+        points.append(tuple(sorted(keep if limit is None else keep[:limit])))
+    return points
 
 
 @dataclass

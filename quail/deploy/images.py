@@ -4,6 +4,7 @@ Each image mounts the quail package and the bench package, which is
 not in the wheel, so the benchmark runner imports inside a container.
 """
 
+import os
 from importlib.metadata import version
 
 import modal
@@ -17,6 +18,7 @@ CUDA_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 # every kernel cache under one mount, so a volume keeps them warm
 CACHE_ENV = {
     "QUAIL_CACHE_DIR": "/root/.cache/kernels",
+    "FLASHINFER_WORKSPACE_BASE": "/root/.cache/kernels",
     "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
     "VLLM_LOGGING_LEVEL": "WARNING",
     "VLLM_USE_FLASHINFER_SAMPLER": "0",
@@ -33,11 +35,18 @@ CACHE_ENV = {
 }
 
 
+# local variables copied into the image when set
+FORWARDED_ENV = ("QUAIL_GDN_PREFILL",)
+
+
 def _cuda_base() -> modal.Image:
+    # a run picks the Gated DeltaNet prefill kernel from its own shell
+    forwarded = {name: os.environ[name] for name in FORWARDED_ENV
+                 if name in os.environ}
     return (modal.Image.from_registry(CUDA_BASE, add_python="3.12")
             .entrypoint([])
             .apt_install("git")
-            .env(CACHE_ENV))
+            .env(CACHE_ENV | forwarded))
 
 
 def gpu_image(*local_dirs: tuple[str, str],

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+from quail.backends.quail.executor.memory import memory_report
 from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.reranker import FilterRuntime
 from quail.backends.quail.retention import apply_retention
@@ -127,7 +128,7 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
 
 
 def execution_measurements(context: ExecutionContext) -> dict:
-    """Return one GPU's KV counters and peak memory for the query so far."""
+    """Return one GPU's KV counters and memory report for the query so far."""
     gpu = context.state["gpu"]
     arena = gpu.arena
     return {
@@ -137,7 +138,7 @@ def execution_measurements(context: ExecutionContext) -> dict:
             "evicted_pages": arena.evicted_pages,
             "evicted_prefix_tokens": arena.evicted_prefix_tokens,
         },
-        "peak_gib": round(gpu.torch.cuda.max_memory_allocated() / 2**30, 2),
+        "memory": memory_report(gpu),
     }
 
 
@@ -155,7 +156,8 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         arena.free_key(key)
     report = graph_report(graph, result, wall, state["device"],
                           gpu_timing=state.get("gpu_timing", False))
-    report.update(execution_measurements(context))
+    measurements = execution_measurements(context)
+    report.update(kv_manager=measurements["kv_manager"], **measurements["memory"])
     return report
 
 

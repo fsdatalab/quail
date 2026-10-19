@@ -1,5 +1,6 @@
 """Capabilities and entry points for the Quail engine."""
 
+import os
 from typing import Any
 
 from quail.backends.base import GpuContext
@@ -39,6 +40,18 @@ class QuailBackend:
         if gpus not in {1, 2, 4, 8}:
             return SupportResult.reject(
                 "Quail requires 1, 2, 4, or 8 GPUs")
+        prefill = os.environ.get("QUAIL_GDN_PREFILL", "auto")
+        if prefill not in ("auto", "triton", "flashinfer"):
+            return SupportResult.reject(
+                f"QUAIL_GDN_PREFILL={prefill!r} is not triton, flashinfer, "
+                f"or auto")
+        if (prefill == "flashinfer"
+                and "gated_delta_net" in model.layer_kinds
+                and device.name != "h100-sxm"):
+            return SupportResult.reject(
+                f"QUAIL_GDN_PREFILL=flashinfer needs a Hopper GPU, and "
+                f"device {device.name!r} is not one; use triton or auto "
+                f"for {model.name!r}")
         return SupportResult.accept()
 
     def plan(self, region: ModelRegion,

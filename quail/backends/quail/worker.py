@@ -74,8 +74,10 @@ class LoadedGpu:
                                 revision=None if model_path else spec.revision,
                                 answer_token_ids=answer_token_ids,
                                 max_batched_tokens=budget,
-                                moe_backend=spec.moe_backend)
+                                moe_backend=spec.moe_backend,
+                                text_only=spec.vision_tower)
         self.load_model_s = time.perf_counter() - t0
+        self.weights_bytes = int(torch.cuda.memory_allocated())
 
         # cuBLAS allocates its handle outside PyTorch's caching allocator.
         # At the warm-up peak the allocator holds every free byte, so
@@ -87,6 +89,7 @@ class LoadedGpu:
 
         t0 = time.perf_counter()
         full_pages, sliding_pages = budgets.arena_pages(spec, device, budget)
+        self.device = device
         self.arena = KVArena(num_layers=spec.layers,
                              num_pages=full_pages,
                              page_tokens=budgets.PAGE_TOKENS,
@@ -95,8 +98,11 @@ class LoadedGpu:
                              layer_kv=spec.kv_shapes,
                              sliding_layers=spec.sliding_layer_set,
                              sliding_window=spec.sliding_window,
-                             num_sliding_pages=sliding_pages)
+                             num_sliding_pages=sliding_pages,
+                             **checkpoint_arena_args(spec, device, budget,
+                                                     full_pages))
         self.arena_s = time.perf_counter() - t0
+        self.pool_bytes = pool_bytes(self.arena)
 
         t0 = time.perf_counter()
         self.decision_head = None
@@ -123,12 +129,18 @@ class LoadedGpu:
         survives in the arena between queries.
         """
         if arena_pages is not None:
+            slots = checkpoint_arena_args(
+                self.spec, self.device, chunk_tokens, arena_pages[0])
             graphs = self.pipeline.decode_graphs
             if (graphs is not None and tuple(arena_pages)
                     != (self.arena.num_pages, self.arena.num_sliding_pages)):
                 self.torch.cuda.synchronize()
                 graphs.invalidate()
-            self.arena.resize(*arena_pages, free_resident=True)
+            self.arena.resize(*arena_pages, free_resident=True,
+                              **{k: v for k, v in slots.items()
+                                 if k == "num_state_slots"})
+            self.pool_bytes = pool_bytes(self.arena)
+        self.torch.cuda.reset_peak_memory_stats()
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
         if self.decision_head is not None:
@@ -177,6 +189,21 @@ class LoadedGpu:
         self.execution.close()
 
 
+def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages) -> dict:
+    """KVArena arguments for the checkpoint slots; empty without state layers."""
+    if not spec.state_layers:
+        return {}
+    layers = len(spec.state_layers)
+    return {
+        "num_state_slots": budgets.checkpoint_slots(
+            spec, device, chunk_tokens, kv_pages),
+        "gdn_state_shape": (layers, spec.gdn_value_heads,
+                            spec.gdn_value_dim, spec.gdn_key_dim),
+        "conv_state_shape": (layers, spec.conv_width - 1,
+                             spec.conv_state_channels),
+    }
+
+
 def decision_offsets(spec, path) -> tuple[int, ...]:
     """The rows a decision readout reads, as distances before the last row."""
     from gigatoken import Tokenizer
@@ -194,6 +221,28 @@ def decision_offsets(spec, path) -> tuple[int, ...]:
             f"and the last row; layout {spec.prompt_layout!r} gives "
             f"{len(offsets)} rows")
     return offsets
+
+
+def pool_bytes(arena) -> dict:
+    """Return the bytes of an arena's KV pages and checkpoint state.
+
+    Args:
+        arena: A KVArena, or any object with the k, v, gdn_state and
+            conv_state tensors.
+
+    Returns:
+        {"kv": ..., "state": ...} in bytes. State is the Gated DeltaNet
+        recurrent state plus the convolution columns, or 0.
+    """
+    def size(tensor):
+        return 0 if tensor is None else int(
+            tensor.numel() * tensor.element_size())
+
+    return {
+        "kv": sum(size(t) for t in list(arena.k) + list(arena.v)),
+        "state": size(arena.gdn_state) + size(arena.conv_state),
+    }
+
 
 
 def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):

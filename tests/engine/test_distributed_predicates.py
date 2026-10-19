@@ -97,7 +97,8 @@ class FixedWorkers:
                         node, inputs, None)
                 results[node.node_id] = result
             outputs.append({"results": results, "retained": (),
-                            "kv_manager": {"evicted_keys": 2}, "peak_gib": 1.0})
+                            "kv_manager": {"evicted_keys": 2},
+                            "memory": {"peak_gib": 1.0}})
         return outputs
 
 

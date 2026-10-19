@@ -213,6 +213,9 @@ class JoinAdmission:
             one suffix is written into the anchor's own pages.
         answer_dtype: The answer array type, one for every stage or a
             list per stage; None records 0/1 lists.
+        reserve: Optional callable(anchor, borrow) that reserves the anchor's
+            storage before admission. borrow is None or (parent, shared tokens).
+            False leaves the anchor queued; True commits the reservation.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
@@ -232,7 +235,7 @@ class JoinAdmission:
                  answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
-                 stop_groups=None, stop_width=1):
+                 stop_groups=None, stop_width=1, reserve=None):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -310,6 +313,7 @@ class JoinAdmission:
         self._settled = []         # events for anchors that never ran
         self.in_flight = 0         # launched groups not yet reported
         self.blocked_pages = 0
+        self.reserve = reserve
         self.answers = [dict() for _ in range(k)]
         resident = dict(resident or {})
         anchor_partners = dict(anchor_partners or {})
@@ -624,6 +628,9 @@ class JoinAdmission:
                 held.append(a)
                 self.blocked_pages = (
                     need + self._suffix_page_cost(a, 0, 0) - free_pages)
+                break
+            if self.reserve is not None and not self.reserve(a, borrow):
+                held.append(a)
                 break
             temporary_pages += pages
             groups.append((a, 0, 0, end, carried > 0))

@@ -98,7 +98,7 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
                 "unified suffix pages exceed the free KV arena")
         sizes.append(len(specs))
         modes.add(kw["attention_mode"])
-        return SimpleNamespace(specs=specs, tokens=len(specs),
+        return SimpleNamespace(specs=specs, tokens=len(specs), layout=[],
                                attention_mode=kw["attention_mode"],
                                temporary_keys=(), fresh_keys=(),
                                rows_per_answer=None)

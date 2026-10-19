@@ -114,6 +114,8 @@ class ExtractPart(ExecutionPart):
 
     @staticmethod
     def model_inputs(node, inputs, context, sequence=None, nodes=None):
+        if nodes is not None:
+            inputs = inputs[node.node_id]
         # the one input carries the documents' ids, or the rows of an
         # earlier operator over them
         (value,) = inputs.values()

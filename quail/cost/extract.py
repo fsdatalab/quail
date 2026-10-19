@@ -14,7 +14,7 @@ reads the document, question, and previously accepted answer tokens
 from KV.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import repeat
 
 from quail.cost.budgets import parallel_copies
@@ -82,6 +82,7 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
                   shared: int = 0, max_answer_tokens: int, draft_tokens: int,
                   draft_policy: str = "adaptive", round_cost_per_token: float = 0.0,
                   assumptions: ExtractAssumptions | None = None,
+                  recurrent: bool = False,
                   ) -> tuple[Work, float, float]:
     """Return one document's work, its fed tokens, and its readout rows.
 
@@ -100,6 +101,7 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
         round_cost_per_token: One document token's KV read per round, in
             fed tokens, from the extraction plan.
         assumptions: Expected answer length, separate from execution limits.
+        recurrent: Whether rounds replay accepted inputs to advance a checkpoint.
     """
     assumptions = ExtractAssumptions() if assumptions is None else assumptions
     prefix = head_tokens + length
@@ -117,6 +119,9 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     else:
         work = scan(prefix, tail_tokens, window=window)
     context = prefix + tail_tokens
+    if recurrent:
+        work = replace(work, state_read=1 + bool(shared and not resident),
+                       state_written=1 + (not resident))
     fed = float(tail_tokens)
     rows = 1.0
     # each round appends the chosen token and the draft, and reads
@@ -124,10 +129,20 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     round_tokens = 1 + draft_tokens
     rounds = assumptions.rounds(max_answer_tokens, draft_tokens)
     whole = int(rounds)
-    work += decode(context, repeat(round_tokens, whole), window=window)
-    if rounds > whole:
-        work += ask(context + whole * round_tokens, round_tokens,
-                    window=window) * (rounds - whole)
+    if recurrent:
+        for index in range(whole + (rounds > whole)):
+            probability = min(1.0, rounds - index)
+            replay = round_tokens if index else 0
+            step = ask(context + max(0, index - 1) * round_tokens,
+                       replay + round_tokens, window=window)
+            work += replace(step, state_read=1 + bool(replay),
+                            state_written=float(bool(replay))) * probability
+            fed += replay * probability
+    else:
+        work += decode(context, repeat(round_tokens, whole), window=window)
+        if rounds > whole:
+            step = ask(context + whole * round_tokens, round_tokens, window=window)
+            work += replace(step, state_written=step.state_read) * (rounds - whole)
     fed += rounds * round_tokens
     rows += rounds * round_tokens
     return work, fed, rows
@@ -137,7 +152,7 @@ def table_work(lengths, head_tokens: int, tail_tokens: int, *, window: int,
                resident: bool, shared, max_answer_tokens: int,
                draft_tokens: int, draft_policy: str,
                round_cost_per_token: float, assumptions: ExtractAssumptions,
-               memo=None) -> tuple[Work, float, float]:
+               recurrent: bool = False, memo=None) -> tuple[Work, float, float]:
     """Return the work, fed tokens, and readout rows of every document.
 
     The sum runs the draft policy once per document, so a planner
@@ -147,7 +162,7 @@ def table_work(lengths, head_tokens: int, tail_tokens: int, *, window: int,
     """
     key = ("extract_work", id(lengths), id(shared), head_tokens, tail_tokens,
            window, resident, max_answer_tokens, draft_tokens, draft_policy,
-           round_cost_per_token, assumptions)
+           round_cost_per_token, assumptions, recurrent)
     if memo is not None and key in memo:
         return memo[key][2]
     work = Work()
@@ -158,7 +173,7 @@ def table_work(lengths, head_tokens: int, tail_tokens: int, *, window: int,
             resident=resident, shared=0 if shared is None else int(shared[index]),
             max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
             draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
-            assumptions=assumptions)
+            assumptions=assumptions, recurrent=recurrent)
         work += own
         fed += own_fed
         rows += own_rows
@@ -207,7 +222,7 @@ def estimate(expected_rows: float, lengths, head_tokens: int, tail_tokens: int, 
         draft_tokens=draft_tokens, draft_policy=draft_policy,
         round_cost_per_token=round_cost_per_token,
         assumptions=ExtractAssumptions() if assumptions is None else assumptions,
-        memo=memo)
+        recurrent=bool(model.state_layers), memo=memo)
     scale = expected_rows / n
     total = work * scale
     copies = parallel_copies(gpus, min(expected_rows, n))

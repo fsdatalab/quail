@@ -48,6 +48,29 @@ class GigatokenVLLMTokenizer:
 
 
 @contextmanager
+def engine_environment(spec):
+    """Scope vLLM's process selection to construction of one engine."""
+    from vllm import envs
+
+    key = "VLLM_ENABLE_V1_MULTIPROCESSING"
+    previous = os.environ.get(key)
+    # vLLM 0.26 reads process selection from the environment in LLM's
+    # constructor, and caches what it read; its public LLM API has no
+    # per-instance override
+    envs.disable_envs_cache()
+    if spec.vision_tower or spec.canvas_tokens == 1:
+        os.environ[key] = "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+        envs.disable_envs_cache()
+
+
+@contextmanager
 def diffusion_canvas(spec):
     """Initialize a one-token vLLM canvas with Quail's fixed token.
 
@@ -80,25 +103,6 @@ def diffusion_canvas(spec):
     finally:
         diffusion_gemma.DiffusionGemmaRequestStates = original
 
-
-@contextmanager
-def in_process_vllm():
-    """Run vLLM's engine core in this process for one engine's lifetime."""
-    from vllm import envs
-
-    name = "VLLM_ENABLE_V1_MULTIPROCESSING"
-    previous = os.environ.get(name)
-    # vLLM reads the environment once and caches it, process mode included
-    envs.disable_envs_cache()
-    os.environ[name] = "0"
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = previous
-        envs.disable_envs_cache()
 
 
 def _capacity(llm) -> dict:
@@ -135,6 +139,13 @@ def diffusion_kwargs(spec) -> dict:
         # vLLM refuses a request for more logprobs than this
         kwargs["max_logprobs"] = DIFFUSION_LOGPROBS
     return kwargs
+
+
+def text_only_kwargs(spec) -> dict:
+    """Turn off image and video inputs of a checkpoint with a vision tower."""
+    if not spec.vision_tower:
+        return {}
+    return {"limit_mm_per_prompt": {"image": 0, "video": 0}}
 
 
 def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
@@ -239,9 +250,13 @@ class VLLMEngine:
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
-                             else MAX_SEQUENCES),
+                             else min(MAX_SEQUENCES,
+                                      spec.max_num_seqs or MAX_SEQUENCES)),
         }
+        if spec.moe_backend is not None:
+            kwargs["moe_backend"] = spec.moe_backend
         kwargs.update(diffusion_kwargs(spec))
+        kwargs.update(text_only_kwargs(spec))
         return kwargs
 
     def boot(self, spec, allowed_ids: list[int], *,
@@ -273,16 +288,9 @@ class VLLMEngine:
         if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
             RENDERER_REGISTRY.register("gigatoken", *renderer)
 
-        if spec.canvas_tokens == 1:
-            # vLLM's engine core in its own process returns the canvas
-            # row's logprobs unreliably under the step loop on long
-            # prompts (agreement with the in-process engine falls from
-            # 92 to 73 percent on agent traces,
-            # /results/ablations/diffusion_gemma_readout_probe_agent_k0_corpus_mp.json)
-            resources.enter_context(in_process_vllm())
         path = resolve_model_path(spec.hf_name, spec.revision)
         started = time.perf_counter()
-        with diffusion_canvas(spec) as canvas_ids:
+        with engine_environment(spec), diffusion_canvas(spec) as canvas_ids:
             llm = LLM(model=path, **self.llm_kwargs(spec))
             client = resources.enter_context(closing(VLLMClient(llm, {})))
         boot_s = time.perf_counter() - started
@@ -331,7 +339,7 @@ class DefaultVLLMEngine(VLLMEngine):
     label = "vLLM with default settings"
 
     def llm_kwargs(self, spec) -> dict:
-        return diffusion_kwargs(spec)
+        return {**diffusion_kwargs(spec), **text_only_kwargs(spec)}
 
 
 def stock_vllm_backend() -> RequestBackend:

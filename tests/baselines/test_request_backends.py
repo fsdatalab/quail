@@ -1,7 +1,6 @@
 """CPU tests for vLLM and SGLang backend interfaces."""
 
 import asyncio
-import os
 import sys
 from dataclasses import replace
 from types import SimpleNamespace
@@ -241,10 +240,36 @@ def test_sglang_submission_and_cancellation():
 
 
 def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch):
+    import os
+
     from quail.backends.quail.executor.models.diffusion_gemma import canvas_token_ids
-    from quail.baselines.vllm import GigatokenVLLMTokenizer, diffusion_canvas
+    from quail.baselines.vllm import (
+        GigatokenVLLMTokenizer,
+        diffusion_canvas,
+        engine_environment,
+    )
 
     engine = VLLMEngine()
+    key = "VLLM_ENABLE_V1_MULTIPROCESSING"
+    # the environment cache is cleared on entry and exit
+    cleared = []
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(
+        envs=SimpleNamespace(disable_envs_cache=lambda: cleared.append(1))))
+    for previous in (None, "1"):
+        if previous is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, previous)
+        for spec in (replace(QWEN3_4B_FP8, vision_tower=True),
+                     DIFFUSION_GEMMA_26B_FP8):
+            with pytest.raises(RuntimeError, match="boot failed"):
+                with engine_environment(spec):
+                    assert os.environ[key] == "0"
+                    raise RuntimeError("boot failed")
+            assert os.environ.get(key) == previous
+            with engine_environment(QWEN3_4B_FP8):
+                assert os.environ.get(key) == previous
+    assert len(cleared) == 16
     qwen = engine.llm_kwargs(QWEN3_4B_FP8)
     assert qwen["max_num_batched_tokens"] == 25_305
     assert qwen["tokenizer_mode"] == "gigatoken"
@@ -560,22 +585,3 @@ def test_a_request_backend_owns_its_engine_from_boot_to_release(monkeypatch):
     assert backend.execute_request(context) == "warm"
     backend.release_request(context.runtime_state)
     assert adapter.live == [] and context.runtime_state == {}
-
-
-@pytest.mark.parametrize("initial", [None, "1"])
-def test_in_process_vllm_lasts_for_one_engine(monkeypatch, initial):
-    from quail.baselines.vllm import in_process_vllm
-
-    name = "VLLM_ENABLE_V1_MULTIPROCESSING"
-    if initial is None:
-        monkeypatch.delenv(name, raising=False)
-    else:
-        monkeypatch.setenv(name, initial)
-    cleared = []
-    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(
-        envs=SimpleNamespace(disable_envs_cache=lambda: cleared.append(1))))
-    with pytest.raises(RuntimeError, match="boot failed"), in_process_vllm():
-        assert os.environ[name] == "0"
-        raise RuntimeError("boot failed")
-    assert os.environ.get(name) == initial
-    assert len(cleared) == 2

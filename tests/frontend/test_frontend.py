@@ -575,7 +575,7 @@ def test_model_chat_turns_share_the_document_across_operators():
         start, end = ("<|turn>", "<turn|>") if gemma else (
             "<|im_start|>", "<|im_end|>")
         prefix = (
-            ("<bos>" if gemma else "")
+            ("<bos>" if gemma else model.bos_text)
             + start + "system\nYou are an expert at text analysis" + end + "\n"
             + start + "user\nDOCUMENT:\n")
         binder = PromptBinder(model)

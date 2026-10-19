@@ -20,6 +20,18 @@ def shared_preamble(turn_prefix: str, layout: str = "ai-if") -> str:
     return turn_prefix + PROMPT_LAYOUTS[layout].document_label
 
 
+def without_bos(text: str, bos_text: str) -> str:
+    """Drop the beginning-of-text token the text starts with, if any.
+
+    Args:
+        text: A prompt preamble.
+        bos_text: The model's beginning-of-text token, or an empty string.
+    """
+    if bos_text and text.startswith(bos_text):
+        return text[len(bos_text):]
+    return text
+
+
 # Fixed strings for join prompt layout.
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is DOCUMENT {}.)"

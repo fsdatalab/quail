@@ -4,7 +4,7 @@ import pytest
 from helpers.fakes import cpu_staging
 from helpers.kv_checker import Run, Setup, answer, chain, passthrough
 
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stages import Stage, StageRequests, run_stages
 from quail.catalog.tokens import prefix_tree
 
 DOCS = [[1, 2, 3, 4], [5, 6, 7]]
@@ -64,10 +64,12 @@ def test_borrowed_prefix_and_accepted_decode_tokens_survive_rounds(path, monkeyp
     stages = [
         Stage(suffixes=[[32]], frame=frame, single=True, append=True,
               rewind=True, readout=passthrough()),
-        Stage(suffixes=[[41, 42, 43]], frame=frame, single=True, append=True,
+        Stage(suffixes=lambda key: StageRequests(
+                  [[41, 42, 43]], write_suffix_tokens=2, read_rows=[1]),
+              suffix_tokens=3, frame=frame, single=True, append=True,
               readout=passthrough()),
         Stage(suffixes=[[44, 45]], frame=frame, single=True, append=True,
-              discard=lambda key: 1, readout=passthrough()),
+              readout=passthrough()),
         Stage(suffixes=[[52]], frame=[50, 51], single=True, append=True,
               rewind=True, readout=passthrough()),
         Stage(suffixes=[[53]], frame=[50, 51], single=True, append=True,

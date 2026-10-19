@@ -317,7 +317,8 @@ def _spec_for(model, **overrides):
                   sliding_window=model.model.config.sliding_window,
                   num_q_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
                   head_dim=attn.head_dim, d_head=attn.head_dim,
-                  widest_projection=32)
+                  widest_projection=32, hidden=8,
+                  experts_active=8, expert_intermediate=4)
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
@@ -358,7 +359,7 @@ def test_pipeline_layer_order_and_one_row_canvas_attention(monkeypatch):
             spec=_spec_for(_fake_model(torch), sliding_window=512))
     assert seen["workspace"] == "cuda"
     assert not pipeline.tree_attention and not pipeline.gemm_warmup
-    assert pipeline.max_chunk_tokens == (2**31 - 1) // 32
+    assert pipeline.max_chunk_tokens == (2**31 - 1) // (8 * 8)
 
     rows = torch.tensor([3, 4, 5])
     chunk = SimpleNamespace(

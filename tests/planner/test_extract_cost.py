@@ -37,7 +37,8 @@ def _rounds_work(context, round_tokens, rounds):
     whole = int(rounds)
     work = decode(context, [round_tokens] * whole)
     if rounds > whole:
-        work += ask(context + whole * round_tokens, round_tokens) * (rounds - whole)
+        work += (decode(context + whole * round_tokens, [round_tokens])
+                 * (rounds - whole))
     return work
 
 
@@ -105,6 +106,15 @@ def test_cost_uses_plan_limits_and_separate_answer_assumptions():
         100, HEAD, TAIL, window=128, max_answer_tokens=8, draft_tokens=3,
         draft_policy="fixed", assumptions=assumptions)
     assert windowed.sliding_kv_read == pytest.approx(rounds * 127)
+    recurrent, fed, rows = _document(
+        100, max_answer_tokens=8, draft_tokens=3,
+        assumptions=assumptions, recurrent=True)
+    replay = 4 * (rounds - 1)
+    assert recurrent.tokens == pytest.approx(cost.work.tokens + replay)
+    assert fed == pytest.approx(cost.suffix_tokens + replay)
+    assert rows == cost.rows
+    assert recurrent.state_read == pytest.approx(2 + 2 * (rounds - 1))
+    assert recurrent.state_written == pytest.approx(2 + rounds - 1)
 
 
 def test_adaptive_policy_drafts_longer_for_longer_documents():

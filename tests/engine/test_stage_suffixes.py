@@ -4,7 +4,7 @@ import pytest
 from helpers.fakes import cpu_staging
 from helpers.kv_checker import Run, Setup, answer, chain, passthrough
 
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stages import Stage, StageRequests, run_stages
 
 DOCS = [[1, 2, 3, 4], [5, 6, 7], [8, 9, 10, 11, 12], [13, 14]]
 CUE = [40]
@@ -61,17 +61,17 @@ def test_own_suffixes_follow_each_documents_answers(path, monkeypatch):
 
     def second(key):
         d = key[1]
-        return Stage.SKIP if d == 1 else _second(seen[0][d][0])
+        return Stage.SKIP if d == 1 else StageRequests(_second(seen[0][d][0]))
 
     stages = [
         Stage(suffixes=[CUE], readout=passthrough(), decide=keep(0),
               single=True, append=True, label="cue"),
         Stage(suffixes=second, suffix_tokens=2, readout=passthrough(),
               decide=keep(1), label="second"),
-        Stage(suffixes=lambda key: _third(seen[1].get(key[1], [])),
+        Stage(suffixes=lambda key: StageRequests(_third(seen[1].get(key[1], []))),
               suffix_tokens=1, readout=passthrough(), decide=keep(2),
               single=True, append=True, label="third"),
-        Stage(suffixes=lambda key: _fourth(seen[2][key[1]][0]),
+        Stage(suffixes=lambda key: StageRequests(_fourth(seen[2][key[1]][0])),
               suffix_tokens=1, readout=passthrough(), decide=keep(3),
               single=True, append=True, label="fourth"),
     ]
@@ -103,7 +103,7 @@ def test_own_suffix_over_its_most_tokens_is_refused(monkeypatch):
     stages = [
         Stage(suffixes=[CUE], readout=passthrough(), single=True, append=True,
               decide=lambda a, row: True),
-        Stage(suffixes=lambda key: [[50, 51, 52]], suffix_tokens=2,
+        Stage(suffixes=lambda key: StageRequests([[50, 51, 52]]), suffix_tokens=2,
               readout=passthrough(), label="long"),
     ]
     with pytest.raises(ValueError, match="long: a document's suffix has 3"):

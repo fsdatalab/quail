@@ -260,7 +260,9 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
         for a, left in enumerate(lengths[0]):
             for b, right in enumerate(lengths[1]):
                 prefix = 3 + left + 4 if b and capacity == 100 else 3 if a or b else 0
-                expected += ask(prefix, 3 + left + 4 + right + 2 - prefix)
+                # the first pair computes its prompt from nothing resident
+                step = ask if prefix else scan
+                expected += step(prefix, 3 + left + 4 + right + 2 - prefix)
         work, _ = cost.estimate(6)
         assert vars(work) == pytest.approx(vars(expected))
         assert cost.estimate(0)[0] == Work()
@@ -582,7 +584,8 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
                 RerankerBatch([a / 2 + b / 4 for a, b in rows], fresh_tokens=12,
                               cached_tokens=3)))
             results.append({"results": {node.node_id: model.execute(node, inputs)},
-                            "retained": (), "kv_manager": {}, "peak_gib": 0.0})
+                            "retained": (), "kv_manager": {},
+                            "memory": {"peak_gib": 1.0}})
         return results
 
     shards = []
@@ -598,6 +601,8 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     # each GPU scored its own query documents' pairs in the same round
     assert len(rounds) == 1 and sorted(sum(shards, [])) == [0, 1]
     assert all(len(shard) == 1 for shard in shards)
+    assert execution.report()["peak_gib"] == 1.0
+    assert len(execution.report()["memory_workers"]) == 2
     session.close()
 
 
