@@ -30,9 +30,11 @@ import statistics
 
 import modal
 
+from experiments.hybrid import run_filter
+
 try:
     from quail.deploy.images import gpu_image
-    image = gpu_image()
+    image = gpu_image().add_local_python_source("experiments")
 except ImportError:    # a container without the local quail package
     image = None
 
@@ -72,39 +74,6 @@ def _sequences(spec, tokenizer, question=QUESTION):
                         add_special_tokens=False)["input_ids"]
         pairs.append((document, ids))
     return pairs
-
-
-def _run_filter(torch, arena, pipeline, answers, documents, questions, budget,
-                document_done=None):
-    """Run Boolean filter stages over the documents; return bits per document."""
-    from quail.backends.quail.executor.stages import filter_stages, run_stages
-
-    stages = filter_stages(questions, answers)
-    last = len(stages) - 1
-    arena.retention_cap_pages = max(
-        0, arena.n_pages - arena.pages_needed(2 * budget))
-
-    def on_settled(document, survived, row):
-        if arena.is_resident(document):
-            arena.free_key(document)
-
-    def on_chunk(transitions):
-        finished = [(document, stage, passed)
-                    for document, stage, passed in transitions
-                    if not passed or stage == last]
-        if finished:
-            document_done(finished)
-
-    stage_answers, _, _ = run_stages(
-        torch, arena, pipeline, stages, documents, budget,
-        anchor_keys=list(range(len(documents))), on_settled=on_settled,
-        attention_mode="unified", default_attention="unified",
-        on_chunk=on_chunk if document_done is not None else None)
-    bits = {}
-    for stage in stage_answers:
-        for document, row in stage.items():
-            bits.setdefault(document, []).append(int(row[0]))
-    return bits
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
@@ -221,7 +190,7 @@ def quail(model: str) -> dict:
     with torch.inference_mode():
         for document, question in pairs:
             answers = Recording()
-            bits = _run_filter(
+            bits = run_filter(
                 torch, arena, pipeline, answers, [document], [question],
                 BUDGET)
             record["alone"].append(answers.differences[-1])
@@ -230,7 +199,7 @@ def quail(model: str) -> dict:
                 arena.free_key(key)
         answers = Recording()
         order = []
-        bits = _run_filter(
+        bits = run_filter(
             torch, arena, pipeline, answers, [d for d, _ in pairs],
             [pairs[0][1]], BUDGET,
             document_done=lambda done: order.extend(p for p, _, _ in done))
@@ -246,20 +215,20 @@ def quail(model: str) -> dict:
         record["fresh_second"] = []
         for (document, first), (_, other) in zip(pairs, second):
             answers = Recording()
-            _run_filter(torch, arena, pipeline, answers, [document],
+            run_filter(torch, arena, pipeline, answers, [document],
                         [first, other], BUDGET)
             record["chain"].append(answers.differences)
             for key in arena.resident_keys():
                 arena.free_key(key)
             fresh = Recording()
-            _run_filter(torch, arena, pipeline, fresh, [document], [other], BUDGET)
+            run_filter(torch, arena, pipeline, fresh, [document], [other], BUDGET)
             record["fresh_second"].append(fresh.differences[-1])
             for key in arena.resident_keys():
                 arena.free_key(key)
         # every document through both stages in one run
         answers = Recording()
         order = []
-        bits = _run_filter(
+        bits = run_filter(
             torch, arena, pipeline, answers, [d for d, _ in pairs],
             [pairs[0][1], second[0][1]], BUDGET,
             document_done=lambda done: order.extend(p for p, _, _ in done))

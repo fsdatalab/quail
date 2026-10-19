@@ -30,14 +30,10 @@ class Qwen35Pipeline(ModelPipeline):
     gemm_warmup = False
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine, use_gdn_kernels=True,
-                 fused_norms=True):
+                 engine_class=Engine):
         text = getattr(model, "language_model", model)
         self.spec = spec
         self.arena = arena
-        self.use_gdn_kernels = use_gdn_kernels
-        # False runs vLLM's norm modules, which are unfused PyTorch here
-        self.fused_norms = fused_norms
         # vLLM's norms and rotary dispatch read the current config
         self.vllm_config = getattr(model, "quail_vllm_config", None)
         self.layers = text.model.layers
@@ -65,6 +61,12 @@ class Qwen35Pipeline(ModelPipeline):
         return (gdn.in_proj_qkvz, gdn.out_proj, attn.qkv_proj, attn.o_proj,
                 mlp.gate_up_proj, mlp.down_proj)
 
+    def convolutions(self):
+        """Return the convolution weights and activation used by this model."""
+        conv = self.gdn_layer.linear_attn.conv1d
+        weight = conv.weight.view(conv.weight.shape[0], conv.weight.shape[2])
+        return ((weight, conv.bias, True),)
+
     def _linear(self, x, module):
         """Apply the projection using its loaded quantization method."""
         return module.quant_method.apply(module, x, getattr(module, "bias", None))
@@ -82,8 +84,7 @@ class Qwen35Pipeline(ModelPipeline):
             "conv_bias": mixer.conv1d.bias,
             "A_log": mixer.A_log, "dt_bias": mixer.dt_bias,
         }
-        core = gdn_core(self.spec, tensors, phases, self.arena, slot,
-                        use_kernels=self.use_gdn_kernels)
+        core = gdn_core(self.spec, tensors, phases, self.arena, slot)
         rows, heads, width = core.shape
         gated = mixer.norm(core.reshape(-1, width),
                            z.reshape(-1, width))
@@ -117,12 +118,8 @@ class Qwen35Pipeline(ModelPipeline):
 
     def _norm(self, norm, x, residual):
         """One Gemma-style norm with the residual add, as (normed, residual)."""
-        if self.fused_norms:
-            return self.engine.gemma_add_rms_norm(
-                x, residual, norm.weight, norm.variance_epsilon)
-        if residual is None:
-            return norm(x), x
-        return norm(x, residual)
+        return self.engine.gemma_add_rms_norm(
+            x, residual, norm.weight, norm.variance_epsilon)
 
     def forward_chunk(self, chunk):
         from contextlib import nullcontext

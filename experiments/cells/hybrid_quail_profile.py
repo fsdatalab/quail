@@ -28,9 +28,11 @@ from collections import defaultdict
 
 import modal
 
+from experiments.hybrid import run_filter
+
 try:
     from quail.deploy.images import gpu_image
-    image = gpu_image()
+    image = gpu_image().add_local_python_source("experiments")
 except ImportError:    # a container without the local quail package
     image = None
 
@@ -45,39 +47,6 @@ VOLUMES = {"/root/.cache/huggingface": hf_cache,
 DOCUMENTS = 600
 DOCUMENT_TOKENS = 370
 QUESTION = "Is the text above about a person?"
-
-
-def _run_filter(torch, arena, pipeline, answers, documents, questions, budget,
-                document_done=None):
-    """Run Boolean filter stages over the documents; return bits per document."""
-    from quail.backends.quail.executor.stages import filter_stages, run_stages
-
-    stages = filter_stages(questions, answers)
-    last = len(stages) - 1
-    arena.retention_cap_pages = max(
-        0, arena.n_pages - arena.pages_needed(2 * budget))
-
-    def on_settled(document, survived, row):
-        if arena.is_resident(document):
-            arena.free_key(document)
-
-    def on_chunk(transitions):
-        finished = [(document, stage, passed)
-                    for document, stage, passed in transitions
-                    if not passed or stage == last]
-        if finished:
-            document_done(finished)
-
-    stage_answers, _, _ = run_stages(
-        torch, arena, pipeline, stages, documents, budget,
-        anchor_keys=list(range(len(documents))), on_settled=on_settled,
-        attention_mode="unified", default_attention="unified",
-        on_chunk=on_chunk if document_done is not None else None)
-    bits = {}
-    for stage in stage_answers:
-        for document, row in stage.items():
-            bits.setdefault(document, []).append(int(row[0]))
-    return bits
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
@@ -168,8 +137,6 @@ def profile(model: str, backend: str = "triton") -> dict:
             spec, q, k, v, g, beta, load, store, phase, scale)
 
     gdn._kernel_in_batches = batches_by_phase
-    gdn.causal_conv_reference = timed("gdn_convolution_reference",
-                                      gdn.causal_conv_reference)
     mixer = pipeline.gdn_layer.linear_attn
     for name in ("in_proj_qkvz", "in_proj_ba", "norm", "out_proj"):
         for layer in pipeline.layers:
@@ -195,7 +162,7 @@ def profile(model: str, backend: str = "triton") -> dict:
     question = tokenizer("\n" + QUESTION + spec.turn_suffix,
                          add_special_tokens=False)["input_ids"]
     with torch.inference_mode():
-        _run_filter(torch, arena, pipeline, answers, documents[:60],
+        run_filter(torch, arena, pipeline, answers, documents[:60],
                     [question], budget)
         for key in arena.resident_keys():
             arena.free_key(key)
@@ -203,7 +170,7 @@ def profile(model: str, backend: str = "triton") -> dict:
         calls.clear()
         torch.cuda.synchronize()
         started = time.perf_counter()
-        _run_filter(torch, arena, pipeline, answers, documents, [question],
+        run_filter(torch, arena, pipeline, answers, documents, [question],
                     budget)
         torch.cuda.synchronize()
         wall = time.perf_counter() - started
