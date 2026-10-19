@@ -69,22 +69,13 @@ how Quail groups and schedules these operators.
 
 ## Window execution
 
-`Window` computes [window functions](/docs/user-guide/sql/sql-functions#window-functions)
-on the CPU after AI operators finish. It reads projected source columns
-and AI outputs, then adds the requested window columns to each row.
+[Window functions](/docs/user-guide/sql/sql-functions#window-functions)
+run on the CPU and reuse computed AI outputs. They do not call the model
+again, even when several windows read the same row.
 
-For example, imagine a query that classifies each agent step and uses
-`LAG` to return the preceding step's label within the same run. The
-`Project` supplies step IDs, run IDs, step indexes, and computed labels.
-The `Window` groups rows by run ID and sorts each group by step index
-before looking up the preceding label. It does not call the model again.
-
-- Calls with the same partition and order share one sort.
-- A final `Sort` or `Limit` applies result ordering and row limits.
-  [Window rules](/docs/architecture/optimizer#window-rules) can remove
-  a repeated sort or move an eligible limit before window computation.
-- Window queries still evaluate the AI operators even when they have
-  a limit. The limit can reduce window computation, not model work.
+Note that using `LIMIT` can reduce the number of rows processed by window
+functions. It does not reduce the number of rows evaluated by AI functions.
+See [Window rules](/docs/architecture/optimizer#window-rules) for details.
 
 ## Inspect the plan
 
