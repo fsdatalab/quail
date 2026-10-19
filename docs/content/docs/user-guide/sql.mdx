@@ -373,12 +373,8 @@ In Python, `text[start:end]` returns the answer.
 Each question is a separate extraction. On the Quail backend, the
 questions about one document read the same document KV.
 
-These limits apply:
-
-- Extraction support depends on the model. See
-  [Supported models and GPUs](/docs/user-guide/models).
-- `WHERE`, `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result
-  of an extraction.
+`WHERE`, `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result
+of an extraction.
 
 For the Python form, see
 [`ai_extract()`](/docs/user-guide/python-api#ai_extract).
