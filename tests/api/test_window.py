@@ -35,28 +35,33 @@ def _call(function, argument=None, **fields):
                       (("step_index", False, False),), fields.get("name", "w"))
 
 
-def test_window_table_computes_each_function_in_the_tables_row_order():
+def test_window_table_computes_each_function_in_the_last_windows_order():
     table = STEPS.drop_columns(["text"])
     node = Window(node_id="window", inputs=input_ports(()), calls=(
         _call("row_number", name="n"), _call("lag", "cost", name="before"),
         _call("lead", "cost", name="after"), _call("sum", "cost", name="spent"),
         _call("count", "cost", name="costed"), _call("count", name="seen"),
     ), columns=("id", "n", "before", "after", "spent", "costed", "seen"))
+    # the rows come out by partition, then in the window's order
     assert window_table(table, node).to_pydict() == {
-        "id": ["s0", "s1", "s2", "s3", "s4"],
-        "n": [2, 1, 1, 3, 2],
-        "before": [None, None, None, 1.0, 2.0],
-        "after": [4.0, 1.0, 8.0, None, None],
-        "spent": [1.0, 0.0, 2.0, 5.0, 10.0],
-        "costed": [1, 0, 1, 2, 2],
-        "seen": [2, 1, 1, 3, 2],
+        "id": ["s1", "s0", "s3", "s2", "s4"],
+        "n": [1, 2, 3, 1, 2],
+        "before": [None, None, 1.0, None, 2.0],
+        "after": [1.0, 4.0, None, 8.0, None],
+        "spent": [0.0, 1.0, 5.0, 2.0, 10.0],
+        "costed": [0, 1, 2, 1, 2],
+        "seen": [1, 2, 3, 1, 2],
     }
-    # a null partition key is one partition; a descending order reverses
+    # a null partition key is one partition, sorted last; a descending
+    # order reverses; the rows follow the last call's window
     nulls = pa.table({"run_id": [None, "a", None], "step_index": [1, 1, 2]})
     node = Window(node_id="window", inputs=input_ports(()), calls=(
         WindowCall("row_number", None, ("run_id",), (("step_index", True, False),),
-                   "n"),), columns=("n",))
-    assert window_table(nulls, node).to_pydict() == {"n": [2, 1, 1]}
+                   "n"),
+        WindowCall("row_number", None, (), (("step_index", False, False),), "k"),
+    ), columns=("n", "k", "run_id"))
+    assert window_table(nulls, node).to_pydict() == {
+        "n": [2, 1, 1], "k": [1, 2, 3], "run_id": [None, "a", None]}
 
 
 @pytest.fixture
@@ -67,27 +72,37 @@ def session():
         yield session
 
 
-def _query(session):
-    return (session.docs("steps").alias("s")
+def _query(session, order=("s.run_id", "s.step_index"),
+           cols=("s.id", "tone", "previous", "n", "spent"), where=None):
+    steps = session.docs("steps").alias("s")
+    if where is not None:
+        steps = steps.where(where)
+    return (steps
             .ai_classify(prompt("tone: {0}", col("s.text")), ["good", "bad"],
                          name="tone")
             .window(previous=lag("tone").over(**OVER),
                     n=row_number().over(**OVER),
                     spent=sum_("s.cost").over(**OVER))
-            .order_by("s.run_id", "s.step_index")
-            .select("s.id", "tone", "previous", "n", "spent"))
+            .order_by(*order)
+            .select(*cols))
 
 
 def test_windows_run_after_the_model_and_before_the_sort(session):
     built = _query(session)
     assert session.sql(SQL).logical == built.logical
     plan = built.plan()
-    assert [node.node_id for node in plan.nodes][-3:] == ["project", "window", "sort"]
+    # the ORDER BY repeats the window's partition and order, so the
+    # Sort goes and the Window returns its columns
+    assert [node.node_id for node in plan.nodes][-2:] == ["project", "window"]
     (window,) = [node for node in plan.nodes if isinstance(node, Window)]
-    # the sort keys no window output names pass through to the Sort
-    assert window.columns == ("s.id", "tone", "previous", "n", "spent",
-                              "s.run_id", "s.step_index")
+    assert window.columns == ("s.id", "tone", "previous", "n", "spent")
     assert "Window:" in built.explain()
+    by_step = _query(session, order=("s.step_index",), cols=("s.id", "n")).plan()
+    assert [node.node_id for node in by_step.nodes][-3:] == [
+        "project", "window", "sort"]
+    (window,) = [node for node in by_step.nodes if isinstance(node, Window)]
+    # the sort key no window output names passes through to the Sort
+    assert window.columns == ("s.id", "n", "s.step_index")
     labels = ["good", "bad", "good", "bad", "good"]
     rows = _run(built, oracle_executor(Oracle(
         labels=lambda spec, ids: labels[ids[0]], probabilities=True)))
@@ -100,6 +115,26 @@ def test_windows_run_after_the_model_and_before_the_sort(session):
                .ai_filter(prompt("q: {0}", col("s.text")))
                .window(n=row_number().over(**OVER)).limit(2).select("s.id", "n"))
     assert "filter_limit" not in limited.plan().settings
+    # an unpartitioned window gives the first k rows in its order the
+    # same values with or without the rest, so the LIMIT becomes a
+    # top-k before it
+    topped = (session.docs("steps").alias("s")
+              .ai_filter(prompt("q: {0}", col("s.text")))
+              .window(n=row_number().over(order_by=col("s.step_index").desc()))
+              .limit(2).select("s.id", "n"))
+    plan = topped.plan()
+    assert [node.node_id for node in plan.nodes][-3:] == ["project", "top", "window"]
+    assert plan.nodes[-2].fetch == 2 and "filter_limit" not in plan.settings
+    rows = _run(topped, oracle_executor(Oracle(filters=lambda *_: True)))
+    assert rows.to_rows() == [("s3", 1), ("s0", 2)]
+    # a regular predicate on the partition column runs at the scan,
+    # below the model, so the window sees the survivors only
+    filtered = _query(session, cols=("s.id", "n"), where=col("s.run_id") == "a")
+    plan = filtered.plan()
+    assert [str(p) for p in plan.nodes[0].predicates] == ["s.run_id = 'a'"]
+    rows = _run(filtered, oracle_executor(Oracle(
+        labels=lambda spec, ids: "good", probabilities=True)))
+    assert rows.to_rows() == [("s1", 1), ("s0", 2), ("s3", 3)]
     stock = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
                                        backend="stock_vllm"), tokenizer=fake_tok)
     stock.register("steps", session.catalog.get("steps"))

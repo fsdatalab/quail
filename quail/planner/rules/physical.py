@@ -18,9 +18,11 @@ from quail.physical import (
     AiScore,
     Limit,
     PhysicalGraph,
+    PortRef,
     Sort,
     Window,
 )
+from quail.physical.base import input_ports
 from quail.physical.pipelines import build_pipelines
 from quail.planner.graph import retention
 from quail.planner.operators.classify import classify_scoring
@@ -66,6 +68,73 @@ class ShouldPushDownLimit(PhysicalRule):
         else:
             context.settings["filter_limit"] = limit.count
         return None
+
+
+def _window_sort_keys(call) -> tuple:
+    """The Sort keys that order rows as the window call's partition and order do."""
+    return tuple((name, False, False) for name in call.partition) + tuple(call.order)
+
+
+class ShouldEliminateWindowSort(PhysicalRule):
+    """Drop a Sort whose order the Window before it already produced.
+
+    A Window's rows come out in its last call's partition and order, so
+    a Sort over the same keys, with no DISTINCT, OFFSET, or LIMIT, has
+    nothing to do; the Window returns the Sort's columns instead.
+    """
+
+    name = "should_eliminate_window_sort"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        sort = next((node for node in graph.nodes if isinstance(node, Sort)), None)
+        if sort is None or sort.distinct or sort.offset or sort.fetch is not None:
+            return None
+        window = graph.node(sort.inputs[0].source.node_id)
+        if not isinstance(window, Window) or graph.root.node_id != sort.node_id \
+                or sort.keys != _window_sort_keys(window.calls[-1]):
+            return None
+        nodes = tuple(replace(node, columns=sort.columns) if node is window else node
+                      for node in graph.nodes if node is not sort)
+        return PhysicalGraph(nodes, sort.inputs[0].source)
+
+
+class ShouldPushDownLimitThroughWindow(PhysicalRule):
+    """Turn a LIMIT after an unpartitioned window into a top-k before it.
+
+    A window with an ORDER BY and no PARTITION BY gives each row a value
+    that depends on the rows before it only, so the first k rows in that
+    order get the same values whether or not the rest are there. The
+    Limit becomes a Sort with a fetch under the Window. lead reads the
+    row after, so it keeps the Limit.
+    """
+
+    name = "should_push_down_limit_through_window"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        limit = next((node for node in graph.nodes if isinstance(node, Limit)), None)
+        if limit is None or graph.root.node_id != limit.node_id:
+            return None
+        window = graph.node(limit.inputs[0].source.node_id)
+        if not isinstance(window, Window):
+            return None
+        orders = {call.order for call in window.calls}
+        if len(orders) != 1 or not next(iter(orders)) or any(
+                call.partition or call.function == "lead" for call in window.calls):
+            return None
+        below = window.inputs[0].source
+        top = Sort(node_id="top", inputs=input_ports((below,)),
+                   keys=tuple(next(iter(orders))),
+                   columns=graph.node(below.node_id).outputs[0].schema,
+                   fetch=limit.count)
+        nodes = []
+        for node in graph.nodes:
+            if node is limit:
+                continue
+            if node is window:
+                nodes.append(top)
+                node = replace(node, inputs=input_ports((PortRef("top", "rows"),)))
+            nodes.append(node)
+        return PhysicalGraph(tuple(nodes), limit.inputs[0].source)
 
 
 class ShouldRetainKv(PhysicalRule):

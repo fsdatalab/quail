@@ -264,10 +264,12 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     assert ("  logical: should_eliminate_distinct, should_push_down_distinct, "
             "should_push_down_projection, should_push_down_filters, "
             "should_lift_maps") in text
-    assert ("  physical: should_push_down_limit, choose_classify_implementation, "
-            "should_retain_kv, should_share_prefixes, "
-            "choose_attention_algorithm") in text
-    assert ("refine each graph in order: should_push_down_limit, "
+    assert ("  physical: should_eliminate_window_sort, "
+            "should_push_down_limit_through_window, should_push_down_limit, "
+            "choose_classify_implementation, should_retain_kv, "
+            "should_share_prefixes, choose_attention_algorithm") in text
+    assert ("refine each graph in order: should_eliminate_window_sort, "
+            "should_push_down_limit_through_window, should_push_down_limit, "
             "choose_classify_implementation, should_retain_kv, should_share_prefixes, "
             "choose_attention_algorithm") in text
 

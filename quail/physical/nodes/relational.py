@@ -140,7 +140,7 @@ class Window(PhysicalNode):
 
     ``calls`` read input columns and append one column each. ``columns``
     are the output columns, input columns and window names in result
-    order.
+    order. The rows come out in the last call's partition and order.
     """
 
     calls: tuple[WindowCall, ...] = ()

@@ -230,10 +230,10 @@ class AggregateRuntime:
             input_rows=table.num_rows, output_rows=result.num_rows))
 
 
-def _partition_starts(keyed: pa.Table) -> pa.Array:
+def _partition_starts(keys, num_rows: int) -> pa.Array:
     """Flag the rows whose partition keys differ from the row before."""
-    starts = pa.array([True] + [False] * (keyed.num_rows - 1), pa.bool_())
-    for column in keyed.columns:
+    starts = pa.array([True] + [False] * (num_rows - 1), pa.bool_())
+    for column in keys:
         column = column.combine_chunks()
         previous, current = column[:-1], column[1:]
         # a null key equals a null key, and differs from a value
@@ -244,55 +244,78 @@ def _partition_starts(keyed: pa.Table) -> pa.Array:
     return starts
 
 
-def _window_column(table: pa.Table, call) -> pa.Array:
-    """Compute one window call over the table's rows, in the table's order."""
+def _window_columns(table: pa.Table, calls) -> tuple[pa.Array, dict]:
+    """Compute calls that share one partition and order over one sort.
+
+    Returns:
+        The sort order of the table's rows, and each call's column in
+        that order.
+    """
+    partition, order = calls[0].partition, calls[0].order
     keyed = pa.table({
         **{name: _comparable(table.column(name), "PARTITION BY")
-           for name in call.partition},
+           for name in partition},
         **{name: _comparable(table.column(name), "ORDER BY")
-           for name, _, _ in call.order}})
-    order = pc.sort_indices(keyed, sort_keys=[
-        *((name, "ascending", "at_end") for name in call.partition),
+           for name, _, _ in order}})
+    indices = pc.sort_indices(keyed, sort_keys=[
+        *((name, "ascending", "at_end") for name in partition),
         *((name, "descending" if descending else "ascending",
            "at_start" if nulls_first else "at_end")
-          for name, descending, nulls_first in call.order)])
-    starts = _partition_starts(keyed.select(list(call.partition)).take(order))
+          for name, descending, nulls_first in order)])
+    starts = _partition_starts(
+        [keyed.column(name).take(indices) for name in partition], table.num_rows)
     position = pa.array(np.arange(table.num_rows), pa.int64())
     # each row's partition, and the position its partition starts at
     first = pc.take(pc.indices_nonzero(starts),
                     pc.subtract(pc.cumulative_sum(starts.cast(pa.int64())), 1))
-    values = (None if call.argument is None
-              else table.column(call.argument).take(order).combine_chunks())
-    if call.function == "row_number":
-        result = pc.add(pc.subtract(position, first), 1)
-    elif call.function in ("lag", "lead"):
-        null = pa.nulls(1, values.type)
-        if call.function == "lag":
-            shifted, edge = pa.concat_arrays([null, values[:-1]]), starts
+    columns = {}
+    for call in calls:
+        values = (None if call.argument is None
+                  else table.column(call.argument).take(indices).combine_chunks())
+        if call.function == "row_number":
+            result = pc.add(pc.subtract(position, first), 1)
+        elif call.function in ("lag", "lead"):
+            null = pa.nulls(1, values.type)
+            if call.function == "lag":
+                shifted, edge = pa.concat_arrays([null, values[:-1]]), starts
+            else:
+                shifted = pa.concat_arrays([values[1:], null])
+                edge = pa.concat_arrays([starts[1:], pa.array([True])])
+            result = pc.if_else(edge, null[0], shifted)
         else:
-            shifted = pa.concat_arrays([values[1:], null])
-            edge = pa.concat_arrays([starts[1:], pa.array([True])])
-        result = pc.if_else(edge, null[0], shifted)
-    else:
-        counted = (pc.is_valid(values).cast(pa.int64()) if call.function == "count"
-                   and values is not None
-                   else pa.array(np.ones(table.num_rows), pa.int64())
-                   if values is None else pc.fill_null(values, 0))
-        running = pc.cumulative_sum(counted)
-        # the running value before the partition: none for the first one
-        before = pc.if_else(
-            pc.equal(first, 0), pa.scalar(0, running.type),
-            pc.take(running, pc.max_element_wise(pc.subtract(first, 1), 0)))
-        result = pc.subtract(running, before)
-    return pc.take(result, pc.sort_indices(order))
+            counted = (pc.is_valid(values).cast(pa.int64())
+                       if call.function == "count" and values is not None
+                       else pa.array(np.ones(table.num_rows), pa.int64())
+                       if values is None else pc.fill_null(values, 0))
+            running = pc.cumulative_sum(counted)
+            # the running value before the partition: none for the first one
+            before = pc.if_else(
+                pc.equal(first, 0), pa.scalar(0, running.type),
+                pc.take(running, pc.max_element_wise(pc.subtract(first, 1), 0)))
+            result = pc.subtract(running, before)
+        columns[call.name] = result
+    return indices, columns
 
 
 def window_table(table: pa.Table, node) -> pa.Table:
-    """Append the node's window columns and keep its output columns."""
-    columns = {name: table.column(name) for name in table.column_names}
+    """Append the node's window columns and keep its output columns.
+
+    Calls over one partition and order share one sort. The rows come
+    out in the last call's partition and order, which a Sort over the
+    same keys relies on.
+    """
+    groups = {}
     for call in node.calls:
-        columns[call.name] = _window_column(table, call)
-    return pa.table(columns).select(list(node.columns))
+        groups.setdefault((call.partition, call.order), []).append(call)
+    columns = {name: table.column(name) for name in table.column_names}
+    indices = None
+    for calls in groups.values():
+        indices, computed = _window_columns(table, calls)
+        restore = pc.sort_indices(indices)
+        columns.update({name: pc.take(column, restore)
+                        for name, column in computed.items()})
+    result = pa.table(columns).select(list(node.columns))
+    return result if indices is None else result.take(indices)
 
 
 class WindowRuntime:

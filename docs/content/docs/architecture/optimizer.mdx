@@ -109,6 +109,8 @@ built-in rules of the same kind, in registration order.
 | `should_push_down_projection` | Logical | Load only columns the query uses. | No |
 | `should_push_down_filters` | Logical | Move eligible CPU filters and Python functions before joins. | No |
 | `should_lift_maps` | Logical | Offer classification and extraction before and after joins. | Yes |
+| `should_eliminate_window_sort` | Physical | Drop a sort whose order a window already produced. | No |
+| `should_push_down_limit_through_window` | Physical | Turn a limit after an unpartitioned window into a top-k before it. | No |
 | `should_push_down_limit` | Physical | Stop an eligible filter sequence after enough documents pass. | No |
 | `choose_classify_implementation` | Physical | Choose a classification's label scoring method. | Yes |
 | `should_retain_kv` | Physical | Keep selected document KV for later operators. | No |
