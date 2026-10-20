@@ -278,6 +278,17 @@ def validate_query(plan, operators, context, model, device, gpus):
             ),
             constraint="weights_need_more_cards",
             needed=weight_gpus, available=1, unit="cards")
+    needed = budgets.chunk_memory_bytes(model, 1)
+    available = device.mem_bytes * budgets.POOL_FRACTION
+    if needed > available:
+        return Refusal(
+            reasons=(
+                f"{model.name} does not fit {device.name}: even a one-token "
+                "chunk exceeds the memory available for weights, activations, "
+                "and checkpoint reservations",
+            ),
+            constraint="execution_needs_more_memory",
+            needed=needed, available=available, unit="bytes")
     if not budgets.sliding_kv_fits(model, device):
         chunk = budgets.chunk_budget(model, device)
         free = budgets.arena_bytes(model, device, chunk)
