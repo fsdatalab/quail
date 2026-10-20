@@ -278,4 +278,17 @@ def validate_query(plan, operators, context, model, device, gpus):
             ),
             constraint="weights_need_more_cards",
             needed=weight_gpus, available=1, unit="cards")
+    if model.state_layers and budgets.chunk_budget(model, device) == 0:
+        page_bytes = budgets.PAGE_TOKENS * model.kappa
+        needed = (model.checkpoint_bytes + page_bytes
+                  * budgets.pages(budgets.CHECKPOINT_DEFAULT_DOC_TOKENS))
+        available = max(0.0, budgets.hybrid_pool_pages(model, device, 1) * page_bytes)
+        return Refusal(
+            reasons=(
+                f"{model.name} does not fit {device.name}: even a one-token "
+                "chunk leaves too little memory for a document's KV and "
+                "checkpoint after reserving hybrid workspace",
+            ),
+            constraint="hybrid_state_needs_more_memory",
+            needed=needed, available=available, unit="bytes")
     return None

@@ -51,15 +51,39 @@ def pages(tokens: int) -> int:
 
 
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
-    """Effective chunk budget, floored at the compute knee.
+    """Return the chunk budget allowed by the model and device.
 
     The budget is min(memory bound, kernel index cap, the spec's own
-    cap when it has one) before the floor.
+    cap when it has one). Models without recurrent state then apply
+    the compute knee as a floor.
+
+    Hybrid models shrink the budget until checkpoint workspace, two chunks
+    of execution KV, and one retained document with its state fit. The
+    retained document can be as long as a chunk, with a minimum reservation
+    of CHECKPOINT_DEFAULT_DOC_TOKENS for startup. Return zero when even one
+    token cannot fit those allocations.
     """
     b = min(chunk_memory_bound(model, device), kernel_index_cap(model))
     if model.chunk_cap_tokens:
         b = min(b, model.chunk_cap_tokens)
+    if model.state_layers:
+        return _hybrid_chunk_budget(model, device, b)
     return max(b, int(compute_knee(model, device)))
+
+
+def _hybrid_chunk_budget(model: ModelSpec, device: DeviceSpec, maximum: int) -> int:
+    """Return the largest fitting hybrid chunk, or zero if none fits."""
+    lower, upper = 0, max(0, maximum)
+    while lower < upper:
+        chunk = (lower + upper + 1) // 2
+        try:
+            hybrid_arena_pages(model, device, chunk,
+                               max(chunk, CHECKPOINT_DEFAULT_DOC_TOKENS))
+        except ValueError:
+            upper = chunk - 1
+        else:
+            lower = chunk
+    return lower
 
 
 def arena_bytes(model: ModelSpec, device: DeviceSpec,

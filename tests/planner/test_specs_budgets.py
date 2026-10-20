@@ -2,17 +2,80 @@
 
 from dataclasses import replace
 
+import pyarrow as pa
 import pytest
+from helpers.fakes import letter_tokens
 
+import quail
 from quail.cost import budgets
+from quail.planner.plan import Refusal
 from quail.specs import (
+    DEVICES,
     DIFFUSION_GEMMA_26B_FP8,
     H100_SXM,
+    MODELS,
     QWEN3_4B_FP8,
     QWEN3_5_4B_BF16,
     QWEN3_32B_FP8,
     RTX_PRO_6000_BLACKWELL_SERVER,
 )
+
+
+def _hybrid_filter_plan(model, device, body="A good movie."):
+    with quail.Session(
+        quail.EngineConfig(model=model.name, device=device.name),
+        tokenizer=letter_tokens,
+    ) as session:
+        session.register("documents", quail.DocumentProvider.from_table(
+            pa.table({"id": ["1"], "body": [body]}), id_col="id"))
+        return session.sql(
+            "SELECT d.id FROM documents d WHERE "
+            "AI_FILTER(PROMPT('Is it good? {0}', d.body), "
+            "{'selectivity': 0.5})").plan()
+
+
+@pytest.mark.parametrize("name,h100_chunk", [
+    ("qwen3.5-27b-fp8", 61_680),
+    ("qwen3.6-35b-a3b-fp8", 32_768),
+    ("qwen3.8-27b-fp8", 61_680),
+])
+def test_hybrid_chunks_leave_room_for_workspace_and_checkpoints(
+        name, h100_chunk, monkeypatch):
+    model = MODELS[name]
+    assert budgets.chunk_budget(model, H100_SXM) == h100_chunk
+    device = replace(H100_SXM, mem_bytes=48 * 2**30)
+    monkeypatch.setitem(DEVICES, device.name, device)
+    chunk = budgets.chunk_budget(model, device)
+    assert 0 < chunk < h100_chunk
+    full, sliding = budgets.arena_pages(model, device, chunk)
+    slots = budgets.checkpoint_slots(model, device, chunk, full)
+    assert slots >= 1 and sliding == 0
+    allocated = (model.W_resident
+                 + budgets.ACT_RESERVE_CHUNKS * chunk * model.act_per_token
+                 + budgets.checkpoint_pass_bytes(
+                     model, budgets.CHECKPOINT_PASS_QUESTIONS, chunk)
+                 + full * budgets.PAGE_TOKENS * model.kappa
+                 + slots * model.checkpoint_bytes)
+    assert allocated <= device.mem_bytes * budgets.POOL_FRACTION
+    with pytest.raises(ValueError):
+        budgets.arena_pages(model, device, chunk + 1, chunk + 1)
+    assert not isinstance(_hybrid_filter_plan(model, device), Refusal)
+    assert not isinstance(_hybrid_filter_plan(model, device, "x" * (chunk - 256)),
+                          Refusal)
+
+
+def test_hybrid_planning_refuses_when_even_one_token_cannot_fit(monkeypatch):
+    model = MODELS["qwen3.5-27b-fp8"]
+    device = replace(H100_SXM,
+                     mem_bytes=(model.W_mem + 2**30) / budgets.POOL_FRACTION)
+    monkeypatch.setitem(DEVICES, device.name, device)
+    assert budgets.minimum_weight_gpus(model, device) == 1
+    assert budgets.chunk_budget(model, device) == 0
+    plan = _hybrid_filter_plan(model, device)
+    assert isinstance(plan, Refusal)
+    assert plan.constraint == "hybrid_state_needs_more_memory"
+    assert plan.needed > plan.available
+    assert "checkpoint" in plan.reasons[0]
 
 
 def test_model_weights_and_kv_memory_budgets():
