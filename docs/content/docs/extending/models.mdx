@@ -76,14 +76,15 @@ compute rates. Quail represents it with `DeviceSpec`.
 | `name` | The name used in `EngineConfig.device`. |
 | `mem_bytes` | GPU memory capacity in bytes. |
 | `hbm_bw` | GPU memory bandwidth in bytes per second. |
-| `peak_flops` | Peak dense FP8 operations per second. |
+| `fp8_flops` | Peak dense FP8 operations per second. |
 | `bf16_flops` | Peak dense BF16 operations per second. |
+| `fp32_flops` | Peak FP32 operations per second on CUDA cores. |
 | `usd_per_hour` | Modal GPU-only hourly price. |
 | `cuda_name` | Substring of `torch.cuda.get_device_name`. |
 | `modal_gpu` | Modal `gpu=` string, such as `H100!`. |
 
-All values describe one GPU. Use compute rates without structured
-sparsity. The
+All values describe one GPU. All three compute rates are required and
+must be positive. Use rates without structured sparsity. The
 [H100 specification](https://github.com/fsdatalab/quail/blob/main/quail/specs/h100_sxm.py)
 is a complete example.
 

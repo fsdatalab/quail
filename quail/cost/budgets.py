@@ -294,53 +294,6 @@ def arena_tokens(model: ModelSpec, device: DeviceSpec,
 
 # ---- roofline arithmetic
 
-def _projection_shapes(model: ModelSpec):
-    """Return (in_dim, out_dim, layers) of every dense projection.
-
-    `layers` counts the layers that have the projection: the attention
-    projections sit in the layers that store KV, the Gated DeltaNet
-    projections in its layers, and the MLP in every layer.
-    """
-    query_width = 2 if model.attn_output_gate else 1
-    qkv_out = (query_width * model.num_q_heads + 2 * model.num_kv_heads) * model.d_head
-    inter = model.intermediate
-    attention = len(model.attention_layers)
-    shapes = [(model.hidden, qkv_out, attention),
-              (model.num_q_heads * model.d_head, model.hidden, attention),
-              (model.hidden, model.ffn_width, model.layers),
-              (inter, model.hidden, model.layers)]
-    if model.gdn_layers:
-        key_width = model.gdn_key_heads * model.gdn_key_dim
-        value_width = model.gdn_value_heads * model.gdn_value_dim
-        gdn = len(model.gdn_layers)
-        shapes += [(model.hidden,
-                    2 * key_width + 2 * value_width + 2 * model.gdn_value_heads,
-                    gdn),
-                   (value_width, model.hidden, gdn)]
-    if model.short_conv_layers:
-        short = len(model.short_conv_layers)
-        shapes += [(model.hidden, 3 * model.hidden, short),
-                   (model.hidden, model.hidden, short)]
-    return tuple(shapes)
-
-
-def compute_knee(model: ModelSpec, device: DeviceSpec) -> float:
-    """Chunk size (tokens) where the dense projections become compute-bound.
-
-    That is where they cross the roofline ridge.
-    """
-    ridge = device.peak_flops / device.hbm_bw
-    tot_p = tot_io = 0.0
-    for din, dout, layers in _projection_shapes(model):
-        share = layers / model.layers
-        tot_p += share * din * dout
-        tot_io += share * (din + dout)
-    denom = 2.0 * tot_p - ridge * tot_io * ACT_BYTES
-    if denom <= 0:
-        raise ValueError("projections never cross the ridge")
-    return ridge * tot_p * model.w_bytes / denom
-
-
 def _attention_time(model: ModelSpec, device: DeviceSpec,
                     chunk: int, context: int) -> float:
     """Ideal seconds for the attention kernels in one chunk, all layers."""
@@ -348,7 +301,7 @@ def _attention_time(model: ModelSpec, device: DeviceSpec,
     flops = 4.0 * chunk * context * model.num_q_heads * model.d_head
     moved = (context * model.kappa / layers
              + 2.0 * chunk * model.num_q_heads * model.d_head * ACT_BYTES)
-    return max(flops / device.peak_flops,
+    return max(flops / device.arithmetic_bandwidth(model.attention_precision),
                moved / device.hbm_bw) * layers
 
 

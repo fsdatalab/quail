@@ -470,6 +470,37 @@ def test_extraction_settings_survive_plan_serialization(session):
     assert decode_value(RequestExtractSpec, encode_value(request)) == request
 
 
+@pytest.mark.parametrize("model,precision,changes", [
+    ("qwen3.5-4b-bf16", "fp8", False),
+    ("qwen3.5-4b-fp8", "bf16", True),
+    ("qwen3.5-4b-fp8", "fp32", True),
+])
+def test_extraction_cost_uses_each_component_precision(
+        monkeypatch, model, precision, changes):
+    from quail.specs import DEVICES, H100_SXM
+
+    costs = []
+    for multiplier in (1, 2):
+        device = replace(H100_SXM, **{
+            f"{precision}_flops":
+                H100_SXM.arithmetic_bandwidth(precision) * multiplier})
+        monkeypatch.setitem(DEVICES, device.name, device)
+        with quail.Session(
+            EngineConfig(model=model, device=device.name),
+            tokenizer=letter_tokens,
+        ) as session:
+            session.register("contracts", DocumentProvider.from_table(
+                pa.table({"id": [1], "text": [LEASE]}), id_col="id"))
+            plan = _ends(session).plan()
+            node = next(node for node in plan.nodes if isinstance(node, AiExtract))
+            costs.append(node.spec.round_cost_per_token)
+    assert costs[0] > 0
+    if changes:
+        assert costs[1] > costs[0]
+    else:
+        assert costs[0] == costs[1]
+
+
 FIELDS = {"ends": QUESTION, "rent": "What is the rent?"}
 STRUCT_SQL = ("SELECT c.id, AI.EXTRACT(c.text, {'ends': '" + QUESTION
               + "', 'rent': 'What is the rent?'}) AS lease FROM contracts c")

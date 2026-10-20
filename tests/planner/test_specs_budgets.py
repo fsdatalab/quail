@@ -1,6 +1,6 @@
 """Tests for model specs and budget calculations on Qwen3-4B / H100."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pyarrow as pa
 import pytest
@@ -11,6 +11,7 @@ from quail.cost import budgets
 from quail.planner.plan import Refusal
 from quail.specs import (
     B200,
+    DECISION_2_KAI_0_6B_BF16,
     DEVICES,
     DIFFUSION_GEMMA_26B_FP8,
     H100_SXM,
@@ -19,8 +20,22 @@ from quail.specs import (
     QWEN3_4B_FP8,
     QWEN3_5_4B_BF16,
     QWEN3_32B_FP8,
+    QWEN3_RERANKER_0_6B_BF16,
     RTX_PRO_6000_BLACKWELL_SERVER,
+    DeviceSpec,
 )
+
+
+@pytest.mark.parametrize("precision", ("fp8", "bf16", "fp32"))
+def test_device_specs_require_a_positive_rate_for_each_precision(precision):
+    field = f"{precision}_flops"
+    values = asdict(H100_SXM)
+    del values[field]
+    with pytest.raises(TypeError, match=field):
+        DeviceSpec(**values)
+    for rate in (0.0, -1.0, float("nan")):
+        with pytest.raises(ValueError, match=f"h100-sxm: {field}"):
+            replace(H100_SXM, **{field: rate})
 
 
 def _hybrid_filter_plan(model, device, body="A good movie."):
@@ -83,7 +98,6 @@ def test_hybrid_planning_refuses_when_even_one_token_cannot_fit(monkeypatch):
 @pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_5_4B_BF16])
 def test_compute_efficiency_cannot_override_a_chunk_limit(model):
     capped = replace(model, chunk_cap_tokens=16)
-    assert budgets.compute_knee(capped, H100_SXM) > 16
     assert budgets.chunk_budget(capped, H100_SXM) == 16
 
 
@@ -170,29 +184,26 @@ def test_tree_attention_is_refused_for_a_model_with_a_gdn_layer():
     assert not budgets.tree_attention_allowed(hybrid)
 
 
-def _hybrid_projections():
-    """(in, out, layers) of Qwen3.5-4B's dense projections, from its config."""
-    return [(2560, (2 * 16 + 2 * 4) * 256, 8),    # qkv with the query gate
-            (4096, 2560, 8),                       # attention output
-            (2560, 2 * 9216, 32), (9216, 2560, 32),    # MLP
-            (2560, 2 * 2048 + 2 * 4096 + 2 * 32, 24),  # GDN qkv, z, b, a
-            (4096, 2560, 24)]                      # GDN output
+@pytest.mark.parametrize("model", [
+    DECISION_2_KAI_0_6B_BF16, QWEN3_RERANKER_0_6B_BF16,
+])
+def test_small_bf16_models_have_a_usable_chunk_on_l40s(model):
+    assert budgets.chunk_budget(model, L40S) == 65_536
+    assert budgets.arena_tokens(model, L40S) >= 65_536
 
 
-def test_compute_knee_counts_each_projection_in_the_layers_that_have_it():
-    ridge = H100_SXM.peak_flops / H100_SXM.hbm_bw
-    tot_p = sum(layers * i * o for i, o, layers in _hybrid_projections()) / 32
-    tot_io = sum(layers * (i + o) for i, o, layers in _hybrid_projections()) / 32
-    expected = ridge * tot_p * 2.0 / (2.0 * tot_p - ridge * tot_io * 2)
-    assert budgets.compute_knee(QWEN3_5_4B_BF16, H100_SXM) == pytest.approx(
-        expected, rel=1e-12)
+def test_compute_speed_does_not_change_the_chunk_budget():
+    device = replace(L40S, bf16_flops=L40S.bf16_flops * 10)
+    model = DECISION_2_KAI_0_6B_BF16
+    assert budgets.chunk_budget(model, device) == 65_536
+    assert budgets.arena_tokens(model, device) >= 65_536
 
 
 def test_attention_time_covers_only_the_attention_layers():
     model, chunk, context = QWEN3_5_4B_BF16, 1024, 4000
     flops = 4.0 * chunk * context * 16 * 256
     moved = context * 32_768 / 8 + 2.0 * chunk * 16 * 256 * budgets.ACT_BYTES
-    expected = max(flops / H100_SXM.peak_flops, moved / H100_SXM.hbm_bw) * 8
+    expected = max(flops / H100_SXM.bf16_flops, moved / H100_SXM.hbm_bw) * 8
     assert budgets._attention_time(
         model, H100_SXM, chunk, context) == pytest.approx(expected, rel=1e-12)
     # the same layers with all 32 storing KV take 4 times as long

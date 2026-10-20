@@ -18,7 +18,7 @@ B200 = DeviceSpec(
     name="b200",
     mem_bytes=191_503_138_816,
     hbm_bw=8e12,
-    peak_flops=4.5e15,
+    fp8_flops=4.5e15,
     bf16_flops=2.25e15,
     fp32_flops=75e12,
     # GPU-only rate from Modal, checked 2026-10-03

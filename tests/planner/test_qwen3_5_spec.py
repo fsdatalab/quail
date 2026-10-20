@@ -1,6 +1,7 @@
 """Dense and MoE Qwen hybrid specs against checkpoint configs and costs."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from quail.cost.dense_decoder_cost import (
     gdn_projection_params,
     mlp_params,
 )
+from quail.cost.sol import speed_of_light
 from quail.cost.work import Work
 from quail.specs import (
     H100_SXM,
@@ -101,6 +103,19 @@ def test_dense_components_price_gdn_projections_with_the_attention_ones():
     assert parts["attn_proj"].precision == parts["mlp"].precision == "fp8"
     assert fp8.checkpoint_bytes == SPEC.checkpoint_bytes
     assert MODELS[fp8.name] is fp8
+
+
+def test_faster_fp8_only_reduces_fp8_component_compute_time():
+    work = Work(tokens=100, pairs=1000)
+    faster = replace(H100_SXM, fp8_flops=H100_SXM.fp8_flops * 2)
+    original = speed_of_light(work, QWEN3_5_4B_FP8, H100_SXM, 100)
+    changed = speed_of_light(work, QWEN3_5_4B_FP8, faster, 100)
+    for name in ("attn_proj", "mlp"):
+        assert changed.component(name).compute_seconds == pytest.approx(
+            original.component(name).compute_seconds / 2)
+    for name in ("gdn_proj", "gdn_core", "attention", "conv"):
+        assert original.component(name).compute_seconds > 0
+        assert changed.component(name) == original.component(name)
 
 
 def test_vllm_takes_no_images_for_the_vision_checkpoint_only():

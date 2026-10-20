@@ -6,6 +6,8 @@ from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
 from quail.cost.retention import coefficients
+from quail.cost.sol import compute_seconds
+from quail.cost.work import Work
 from quail.physical import (
     Aggregate as PhysicalAggregate,
 )
@@ -291,7 +293,7 @@ def sharing_pays(model, device, *, shared_tokens: int, total_tokens: int,
     """
     if shared_tokens <= 0:
         return False
-    saved = shared_tokens * 2.0 * model.params / device.peak_flops
+    saved = compute_seconds(Work(tokens=shared_tokens), model, device)
     cost = (0.0 if writes_pages
             else total_tokens * model.kappa / device.hbm_bw)
     return saved > cost
