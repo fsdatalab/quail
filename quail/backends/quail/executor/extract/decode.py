@@ -23,6 +23,7 @@ from quail.backends.quail.executor.extract.candidates import (
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.cost.draft_policy import DraftPolicy
+from quail.execution.spans import is_none_answer
 from quail.physical import ExtractSpec
 
 
@@ -31,7 +32,6 @@ class AnswerState:
     """One document's rounds and result for one question."""
 
     asked: bool = False     # the document reached the question's stages
-    none_lp: float = NEG
     best_lp: float = NEG
     written: list = field(default_factory=list)   # the answer's tokens so far
     streams: list = field(default_factory=list)      # the drafts the writing fits
@@ -64,8 +64,8 @@ class Decoder:
     Args:
         vocabulary: The model's vocabulary index.
         gpus: How many likeliest tokens each readout row carries.
-        width: The values in each readout row: none, the stop, then
-            k ids and k log probabilities.
+        width: The values in each readout row: the stop, then k ids
+            and k log probabilities.
         questions: How many questions the pipeline asks.
         spec: Extraction plan carrying the execution settings.
     """
@@ -121,7 +121,7 @@ class Decoder:
         return answer.fed
 
     def lp(self, values) -> tuple:
-        """Return a row's log probabilities by token id, and none's and the stop's."""
+        """Return a row's log probabilities by token id, and the stop's."""
         values = np.asarray(values, dtype=np.float32).reshape(-1)
         k = self.k
         self.scores[self.previous_ids] = NEG
@@ -129,7 +129,7 @@ class Decoder:
         self.scores[ids] = values[-k:]
         self.previous_ids = ids
         self.top = int(ids[np.argmax(self.scores[ids])])
-        return self.scores, float(values[0]), float(values[1])
+        return self.scores, float(values[0])
 
     def verify(self, document: Document, q: int, rows, fed) -> None:
         """Choose the answer's tokens from a round's rows, in order.
@@ -206,9 +206,9 @@ class Decoder:
         lp_draft = np.where(hit.any(axis=1), lps[index, hit.argmax(axis=1)], NEG)
         top_col = lps.argmax(axis=1)
         top, lp_top = ids[index, top_col], lps[index, top_col]
-        stop = values[:, 1]
+        stop = values[:, 0]
         leaves = ((lp_top > np.maximum(lp_draft, stop)) & (top != draft)
-                  & ~vocabulary.is_stop[top] & ~vocabulary.is_none[top])
+                  & ~vocabulary.is_stop[top])
         writes = (lp_draft > stop) & ~leaves
         return int(np.argmin(writes)) if not writes.all() else n
 
@@ -219,25 +219,25 @@ class Decoder:
         writing would leave the document: a token it likes better than
         every continuation and the stop, and that continues no
         position, ends the answer, and at the cue it answers none, as
-        does the model writing none or ending its turn at once. At
-        the cue, the token is the likeliest first token of any
-        position in the document; afterwards, the likeliest continuation
-        of the streams the writing so far fits. The answer also ends
-        when ending the turn is at least as likely as every
-        continuation, when no stream continues, or at the configured
-        answer limit.
+        does the model ending its turn at once. The model's word none
+        is no special case: it leaves a document without the word,
+        and is copied from one with it. At the cue, the token is the
+        likeliest first token of any position in the document;
+        afterwards, the likeliest continuation of the streams the
+        writing so far fits. The answer also ends when ending the turn
+        is at least as likely as every continuation, when no stream
+        continues, or at the configured answer limit.
 
         Returns:
             The token written, or None when the answer ended.
         """
         answer = document.answers[q]
         vocabulary = self.vocabulary
-        lp, none_lp, stop_lp = self.lp(values)
+        lp, stop_lp = self.lp(values)
         if not answer.written:
             starts = first_tokens(vocabulary, lp, document.scan)
-            answer.none_lp = none_lp
             answer.best_lp = starts.best_lp
-            answer.none_wins = (max(none_lp, stop_lp) > answer.best_lp
+            answer.none_wins = (stop_lp > answer.best_lp
                                 or self.leaves(lp, starts.allows(self.top),
                                                answer.best_lp, stop_lp))
             if answer.none_wins:
@@ -291,13 +291,13 @@ class Decoder:
         vocabulary = self.vocabulary
         top = self.top
         return (lp[top] > max(best_lp, stop_lp) and not top_allowed
-                and not vocabulary.is_stop[top] and not vocabulary.is_none[top])
+                and not vocabulary.is_stop[top])
 
     def settle(self, document: Document, q: int) -> None:
         """Set the question's answer for the document: its span, or none.
 
         Among the streams the writing fits, the first position of the
-        document wins.
+        document wins. A span that is the word none alone is none.
         """
         answer = document.answers[q]
         answer.done = True
@@ -313,4 +313,7 @@ class Decoder:
             start += 1
         while end > start and text[end - 1].isspace():
             end -= 1
+        if is_none_answer(text[start:end]):
+            answer.answer, answer.span = None, None
+            return
         answer.answer, answer.span = text[start:end], (start, end)

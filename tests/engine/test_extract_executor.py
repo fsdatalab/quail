@@ -9,6 +9,7 @@ import pyarrow as pa
 import pytest
 from helpers.extract_fakes import (
     LEASE,
+    NONE_HELD,
     NOTHING,
     QUOTED,
     TAIL,
@@ -50,26 +51,22 @@ from quail.specs import DEVICES, MODELS, QWEN3_4B_FP8
 
 @pytest.mark.parametrize(("scores", "stop", "chosen", "done"), [
     ([-1, -1, -9, -10], -8, 1, False),
-    ([-2, -1, -0.5, -10], -8, 1, False),
     ([-2, -1, -9, -10], -1, None, True),
     ([-2, -1, -9, -0.5], -8, None, True),
 ])
-def test_continuation_arrays_handle_duplicates_ties_none_and_stops(
+def test_continuation_arrays_handle_duplicates_ties_and_stops(
         scores, stop, chosen, done):
     tokens = [33, 1, 1]
-    vocabulary = SimpleNamespace(vocab=range(64), is_stop=np.zeros(64, dtype=bool),
-                                 is_none=np.zeros(64, dtype=bool))
+    vocabulary = SimpleNamespace(vocab=range(64), is_stop=np.zeros(64, dtype=bool))
     vocabulary.is_stop[62] = True
-    # a likelier none does not end an answer already begun
-    vocabulary.is_none[40] = True
-    decoder = Decoder(vocabulary, 4, 10, 1, make_spec()[0])
+    decoder = Decoder(vocabulary, 4, 9, 1, make_spec()[0])
     text = "abcdefghij"
     streams = [Stream(at, [0, token], [at + 1, at + 2], text, exhausted=True)
                for at, token in enumerate(tokens)]
     streams.append(Stream(5, [0], [6], text, exhausted=True))
     answer = AnswerState(written=[0], streams=streams)
     document = SimpleNamespace(answers=[answer], text=text)
-    actual = decoder.choose(document, 0, [-20, stop, 33, 1, 40, 50, *scores])
+    actual = decoder.choose(document, 0, [stop, 33, 1, 40, 50, *scores])
     assert actual == (chosen if not done else None)
     assert answer.done == done
     assert answer.written == ([0, chosen] if chosen is not None else [0])
@@ -80,11 +77,11 @@ def test_continuation_arrays_handle_duplicates_ties_none_and_stops(
 
 def test_readout_scores_reset_between_rows_and_keep_token_order():
     _, vocabulary = make_spec()
-    decoder = Decoder(vocabulary, 4, 10, 1, make_spec()[0])
-    scores, none, stop = decoder.lp([-4, -5, 5, 2, 3, 4, -1, -1, -2, -3])
-    assert decoder.top == 5 and none == -4 and stop == -5
+    decoder = Decoder(vocabulary, 4, 9, 1, make_spec()[0])
+    scores, stop = decoder.lp([-5, 5, 2, 3, 4, -1, -1, -2, -3])
+    assert decoder.top == 5 and stop == -5
     assert scores[5] == scores[2] == -1
-    reused, _, _ = decoder.lp([-6, -7, 6, 1, 0, 0, -0.5, -1, -20, -30])
+    reused, _ = decoder.lp([-7, 6, 1, 0, 0, -0.5, -1, -20, -30])
     assert reused is scores
     assert decoder.top == 6
     assert reused[5] == reused[2] == -np.inf
@@ -103,7 +100,7 @@ def test_writing_that_begins_outside_the_document_answers_none(monkeypatch):
         if key[1] != 0:
             return cue_row(key)
         march = tables.encode_ids("March")[0]
-        return model._cue({stray: -0.05, march: -0.5}, -5.0, -6.0)
+        return model._cue({stray: -0.05, march: -0.5}, -6.0)
 
     model._cue_row = straying
     result, stages = run()
@@ -126,7 +123,7 @@ def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
         row = answer_row(key, written)
         if key[1] == 0 and len(written) == 1:
             gold = model._gold_ids(key)
-            return model._cue({stray: -0.05, gold[1]: -1.0}, -9.0, -4.0)
+            return model._cue({stray: -0.05, gold[1]: -1.0}, -4.0)
         return row
 
     model._answer_row = straying
@@ -136,7 +133,8 @@ def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
     assert not stages.documents[0].answers[0].none_wins
 
 
-def test_an_answer_copies_the_quotes_inside_its_span(monkeypatch):
+def _extract_one(monkeypatch, text, gold):
+    """Ask the scripted model one question of one document; return its answer."""
     spec, tables = make_spec()
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = ScriptedModel(tables, {}, {}, 4)
@@ -145,10 +143,10 @@ def test_an_answer_copies_the_quotes_inside_its_span(monkeypatch):
     state = _state(model)
     state.loaded_model.vocabulary = tables
     stages = ExtractionStages(state, [spec], tables, [0],
-                              [tables.encode_ids(QUOTED)], [QUOTED])
+                              [tables.encode_ids(text)], [text])
     key = stages.documents[0].key
-    model.documents[key] = QUOTED
-    model.gold[key] = ' the "Premises" for five years'
+    model.documents[key] = text
+    model.gold[key] = gold
     from quail.backends.quail.executor.stages import run_stages
 
     run_stages(state.torch, state.loaded_model.arena,
@@ -156,9 +154,27 @@ def test_an_answer_copies_the_quotes_inside_its_span(monkeypatch):
                state.chunk_tokens, anchor_keys=stages.keys,
                appended_tokens=stages.appended_tokens)
     stages.finish()
-    asked = stages.documents[0].answers[0]
+    return stages.documents[0].answers[0]
+
+
+def test_an_answer_copies_the_quotes_inside_its_span(monkeypatch):
+    asked = _extract_one(monkeypatch, QUOTED, ' the "Premises" for five years')
     assert asked.answer == 'the "Premises" for five years'
     assert asked.span == (9, 38)
+
+
+def test_a_document_holding_none_can_still_answer_none(monkeypatch):
+    # the model's none starts the document's "None"; ending the turn
+    # after it is no answer, not the span "None"
+    asked = _extract_one(monkeypatch, NONE_HELD, None)
+    assert len(asked.written) == 1 and not asked.none_wins
+    assert asked.answer is None and asked.span is None
+
+
+def test_an_answer_may_begin_with_none(monkeypatch):
+    asked = _extract_one(monkeypatch, NONE_HELD, "None of the parties")
+    assert asked.answer == "None of the parties"
+    assert asked.span == (0, 19)
 
 
 @pytest.mark.parametrize("recurrent", [False, True])
@@ -240,8 +256,8 @@ class ScriptedModel:
     with its space; at each later step it prefers the gold answer's
     next token while the tokens written so far are a prefix of it,
     and ends its turn once the whole answer is written. As in the
-    model's readout, the none and stop values include the
-    probabilities of the none and stop tokens among the top tokens.
+    model's readout, the stop value includes the probabilities of
+    the stop tokens among the top tokens.
     """
 
     def __init__(self, tables, documents, gold, k):
@@ -251,7 +267,7 @@ class ScriptedModel:
         self.k = k
         self.filter_truth = {}      # key -> a filter question's answer
         self.reads = Counter()      # key -> times its prefix was packed
-        self.width = 2 + 2 * k
+        self.width = 1 + 2 * k
         self.cue_token = tables.encode_ids(TAIL)[-1]
         self.kv = {}                # key -> tokens appended after the prefix
         self.prefix_len = {}        # key -> the prefix's tokens
@@ -270,14 +286,12 @@ class ScriptedModel:
         return self._row(list(extras) + [float(i) for i, _ in best]
                          + [v for _, v in best])
 
-    def _cue(self, lps, none_lp, stop_lp):
-        """A row: none, the stop, then the top tokens."""
+    def _cue(self, lps, stop_lp):
+        """A row: the stop, then the top tokens."""
         for token, value in lps.items():
-            if self.tables.is_none[token]:
-                none_lp = np.logaddexp(none_lp, value)
             if self.tables.is_stop[token]:
                 stop_lp = np.logaddexp(stop_lp, value)
-        return self._top(lps, [none_lp, stop_lp])
+        return self._top(lps, [stop_lp])
 
     def _gold_ids(self, key):
         gold = self.gold[key]
@@ -320,7 +334,7 @@ class ScriptedModel:
             return self._answer_row(key, path[cue + 1:])
         if key in self.filter_truth:
             # a filter's question: the row's first value is the answer
-            row = self._cue({}, -9.0, -9.0)
+            row = self._cue({}, -9.0)
             row[:] = float(self.filter_truth[key])
             return row
         raise AssertionError(f"unexpected request {path}")
@@ -337,8 +351,10 @@ class ScriptedModel:
                 lps[index] = -0.5 if tables.vocab[index].startswith("Ġ") else -0.9
             for index in tables.variants.get("the", []):
                 lps[index] = -2.0
-        none_lp = -0.2 if not gold else -5.0
-        return self._cue(lps, none_lp, -6.0)
+        else:
+            # without an answer the model writes none
+            lps[tables.encode_ids(" none")[0]] = -0.2
+        return self._cue(lps, -6.0)
 
     def _answer_row(self, key, written):
         """The answer's next token while the writing fits the gold, then the stop."""
@@ -347,15 +363,15 @@ class ScriptedModel:
         keys = [same_word(tables.vocab[t]) or t for t in gold]
         fed = [same_word(tables.vocab[t]) or t for t in written]
         if fed == keys:
-            return self._cue({}, -9.0, -0.1)
+            return self._cue({}, -0.1)
         if fed == keys[:len(fed)]:
-            return self._cue({gold[len(fed)]: -0.2}, -9.0, -4.0)
-        return self._cue({}, -9.0, -0.5)
+            return self._cue({gold[len(fed)]: -0.2}, -4.0)
+        return self._cue({}, -0.5)
 
 
 def _fake_readout(tables, k):
     """A readout over scripted rows."""
-    width = 2 + 2 * k
+    width = 1 + 2 * k
     value = fake_readout(k=k, width=width, ragged=True, dtype=np.dtype(object))
 
     def submit(rows, rows_per_answer=None):

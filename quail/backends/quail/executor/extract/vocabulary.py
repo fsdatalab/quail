@@ -72,10 +72,6 @@ class Vocabulary:
         self.stop_ids = tuple(sorted(stops))
         self.is_stop = np.zeros(len(self.vocab), dtype=bool)
         self.is_stop[list(self.stop_ids)] = True
-        # the model writes none in any case, with or without its space
-        self.none_ids = tuple(self.variants.get("none") or self.encode_ids("none")[:1])
-        self.is_none = np.zeros(len(self.vocab), dtype=bool)
-        self.is_none[list(self.none_ids)] = True
 
     def options(self, kid: int) -> tuple:
         """Return the tokens that can begin a key's word, and their lengths.

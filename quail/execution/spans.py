@@ -5,6 +5,11 @@ import re
 NONE_ANSWER = "none"
 
 
+def is_none_answer(phrase: str) -> bool:
+    """Return whether a phrase is the word none alone, in any case."""
+    return phrase.strip().casefold().rstrip(".") == NONE_ANSWER
+
+
 def read_phrase(decoded: str) -> str | None:
     """Return the words the model wrote after the phrase cue.
 
@@ -17,7 +22,7 @@ def read_phrase(decoded: str) -> str | None:
         The answer, or None for an empty answer or the word "none".
     """
     phrase = decoded.strip()
-    if not phrase or phrase.casefold().rstrip(".") == NONE_ANSWER:
+    if not phrase or is_none_answer(phrase):
         return None
     return phrase
 
