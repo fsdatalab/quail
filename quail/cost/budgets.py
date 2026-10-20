@@ -3,10 +3,11 @@
 Chunk budget, admission budget, and roofline arithmetic.
 """
 
+from math import ceil
+
 from quail.specs import DeviceSpec, ModelSpec
 
 POOL_FRACTION = 0.95    # fraction of device memory the executor claims
-CHUNK_SLACK = 2         # slack factor on the activation bound
 PAGE_TOKENS = 16        # KV arena page size, tokens
 INT32_MAX = 2**31 - 1
 ACT_BYTES = 2           # bf16 activations, bytes per element
@@ -37,12 +38,25 @@ def kernel_index_cap(model: ModelSpec) -> int:
 
 
 def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
-    """Tokens per chunk the activation memory allows, with slack.
+    """Return the largest chunk that fits its memory reservations, or zero."""
+    available = device.mem_bytes * POOL_FRACTION
+    free = available - model.W_resident
+    lower = 0
+    upper = max(0, int(free // (ACT_RESERVE_CHUNKS * model.act_per_token)))
+    while lower < upper:
+        chunk = (lower + upper + 1) // 2
+        if chunk_memory_bytes(model, chunk) <= available:
+            lower = chunk
+        else:
+            upper = chunk - 1
+    return lower
 
-    Uses resident weights after the full untied output head is discarded.
-    """
-    free = device.mem_bytes * POOL_FRACTION - model.W_resident
-    return int(free // model.act_per_token) // CHUNK_SLACK
+
+def chunk_memory_bytes(model: ModelSpec, chunk_tokens: int) -> float:
+    """Return resident weights, activation memory, and checkpoint reservations."""
+    return (model.W_resident
+            + ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token
+            + checkpoint_memory_bytes(model, chunk_tokens))
 
 
 def pages(tokens: int) -> int:
@@ -53,37 +67,13 @@ def pages(tokens: int) -> int:
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     """Return the chunk budget allowed by the model and device.
 
-    The budget is min(memory bound, kernel index cap, the spec's own
-    cap when it has one). Models without recurrent state then apply
-    the compute knee as a floor.
-
-    Hybrid models shrink the budget until checkpoint workspace, two chunks
-    of execution KV, and one retained document with its state fit. The
-    retained document can be as long as a chunk, with a minimum reservation
-    of CHECKPOINT_DEFAULT_DOC_TOKENS for startup. Return zero when even one
-    token cannot fit those allocations.
+    Memory, kernel indexing, and the model's configured cap are hard limits.
+    Return zero when even one token cannot fit the memory reservations.
     """
     b = min(chunk_memory_bound(model, device), kernel_index_cap(model))
     if model.chunk_cap_tokens:
         b = min(b, model.chunk_cap_tokens)
-    if model.state_layers:
-        return _hybrid_chunk_budget(model, device, b)
-    return max(b, int(compute_knee(model, device)))
-
-
-def _hybrid_chunk_budget(model: ModelSpec, device: DeviceSpec, maximum: int) -> int:
-    """Return the largest fitting hybrid chunk, or zero if none fits."""
-    lower, upper = 0, max(0, maximum)
-    while lower < upper:
-        chunk = (lower + upper + 1) // 2
-        try:
-            hybrid_arena_pages(model, device, chunk,
-                               max(chunk, CHECKPOINT_DEFAULT_DOC_TOKENS))
-        except ValueError:
-            upper = chunk - 1
-        else:
-            lower = chunk
-    return lower
+    return b
 
 
 def arena_bytes(model: ModelSpec, device: DeviceSpec,
@@ -138,6 +128,22 @@ def checkpoint_pass_bytes(model: ModelSpec, questions: int,
 def execution_pages(chunk_tokens: int) -> int:
     """KV pages kept free for two chunks of execution."""
     return 2 * -(-chunk_tokens // PAGE_TOKENS)
+
+
+def checkpoint_memory_bytes(model: ModelSpec, chunk_tokens: int) -> float:
+    """Return workspace, execution KV, and one retained document's KV and state.
+
+    Models without checkpoints reserve zero bytes. A retained document can
+    be as long as a chunk; startup reserves at least the default document
+    length used by the checkpoint pool.
+    """
+    if not model.checkpoint_bytes:
+        return 0
+    document_tokens = max(chunk_tokens, CHECKPOINT_DEFAULT_DOC_TOKENS)
+    reserved_pages = (execution_pages(chunk_tokens) + pages(document_tokens)
+                      + ceil(checkpoint_pages(model)))
+    return (checkpoint_pass_bytes(model, CHECKPOINT_PASS_QUESTIONS, chunk_tokens)
+            + reserved_pages * model.kappa * PAGE_TOKENS)
 
 
 def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec,

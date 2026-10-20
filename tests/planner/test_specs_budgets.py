@@ -73,9 +73,16 @@ def test_hybrid_planning_refuses_when_even_one_token_cannot_fit(monkeypatch):
     assert budgets.chunk_budget(model, device) == 0
     plan = _hybrid_filter_plan(model, device)
     assert isinstance(plan, Refusal)
-    assert plan.constraint == "hybrid_state_needs_more_memory"
+    assert plan.constraint == "execution_needs_more_memory"
     assert plan.needed > plan.available
     assert "checkpoint" in plan.reasons[0]
+
+
+@pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_5_4B_BF16])
+def test_compute_efficiency_cannot_override_a_chunk_limit(model):
+    capped = replace(model, chunk_cap_tokens=16)
+    assert budgets.compute_knee(capped, H100_SXM) > 16
+    assert budgets.chunk_budget(capped, H100_SXM) == 16
 
 
 def test_model_weights_and_kv_memory_budgets():
@@ -219,6 +226,7 @@ def test_dense_arena_budget_has_no_checkpoint_reservation():
 
     model = QWEN3_4B_FP8
     assert model.checkpoint_bytes == 0
+    assert budgets.checkpoint_memory_bytes(model, 1_000) == 0
     assert budgets.checkpoint_slots(model, H100_SXM, 1_000, 5) == 0
     assert checkpoint_arena_args(model, H100_SXM, 1_000, 5) == {}
     assert "checkpoint_pages" not in coefficients(model, H100_SXM)
