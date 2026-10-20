@@ -10,6 +10,7 @@ import pytest
 from helpers.extract_fakes import (
     LEASE,
     NOTHING,
+    QUOTED,
     TAIL,
     TERM,
     make_spec,
@@ -49,18 +50,18 @@ from quail.specs import DEVICES, MODELS, QWEN3_4B_FP8
 
 @pytest.mark.parametrize(("scores", "stop", "chosen", "done"), [
     ([-1, -1, -9, -10], -8, 1, False),
-    ([-2, -1, -0.5, -10], -8, 1, True),
+    ([-2, -1, -0.5, -10], -8, 1, False),
     ([-2, -1, -9, -10], -1, None, True),
     ([-2, -1, -9, -0.5], -8, None, True),
 ])
-def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
+def test_continuation_arrays_handle_duplicates_ties_none_and_stops(
         scores, stop, chosen, done):
     tokens = [33, 1, 1]
-    merged = np.full(64, -1, dtype=np.int64)
-    merged[1] = 40
-    vocabulary = SimpleNamespace(vocab=range(64), merged=merged,
-                                 is_stop=np.zeros(64, dtype=bool), none_id=63)
+    vocabulary = SimpleNamespace(vocab=range(64), is_stop=np.zeros(64, dtype=bool),
+                                 is_none=np.zeros(64, dtype=bool))
     vocabulary.is_stop[62] = True
+    # a likelier none does not end an answer already begun
+    vocabulary.is_none[40] = True
     decoder = Decoder(vocabulary, 4, 10, 1, make_spec()[0])
     text = "abcdefghij"
     streams = [Stream(at, [0, token], [at + 1, at + 2], text, exhausted=True)
@@ -75,9 +76,6 @@ def test_continuation_arrays_handle_duplicates_ties_quotes_and_stops(
     if chosen is not None:
         assert [s.char for s in answer.streams] == [
             index for index, token in enumerate(tokens) if token == chosen]
-    if chosen is not None and done:
-        start = tokens.index(chosen)
-        assert answer.span == (start, start + 2)
 
 
 def test_readout_scores_reset_between_rows_and_keep_token_order():
@@ -138,6 +136,31 @@ def test_writing_that_leaves_the_document_later_ends_the_answer(monkeypatch):
     assert not stages.documents[0].answers[0].none_wins
 
 
+def test_an_answer_copies_the_quotes_inside_its_span(monkeypatch):
+    spec, tables = make_spec()
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(ExtractionStages, "_readout", lambda self, state: readout)
+    state = _state(model)
+    state.loaded_model.vocabulary = tables
+    stages = ExtractionStages(state, [spec], tables, [0],
+                              [tables.encode_ids(QUOTED)], [QUOTED])
+    key = stages.documents[0].key
+    model.documents[key] = QUOTED
+    model.gold[key] = ' the "Premises" for five years'
+    from quail.backends.quail.executor.stages import run_stages
+
+    run_stages(state.torch, state.loaded_model.arena,
+               state.loaded_model.pipeline, stages.stages, stages.prefixes,
+               state.chunk_tokens, anchor_keys=stages.keys,
+               appended_tokens=stages.appended_tokens)
+    stages.finish()
+    asked = stages.documents[0].answers[0]
+    assert asked.answer == 'the "Premises" for five years'
+    assert asked.span == (9, 38)
+
+
 @pytest.mark.parametrize("recurrent", [False, True])
 def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch, recurrent):
     # "five" starts two positions; the draft follows the first, "five
@@ -165,8 +188,8 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch, recurrent):
     stages.finish()
     asked = stages.documents[0].answers[0]
     assert asked.answer == "five years" and asked.span == (13, 23)
-    assert asked.written == tables.encode_ids("five years")
-    five, days, years = (tables.encode_ids(w)[0] for w in ("five", " days", " years"))
+    assert asked.written == tables.encode_ids(" five years")
+    five, days, years = (tables.encode_ids(w)[0] for w in (" five", " days", " years"))
     fed = [(suffix, f) for k, suffix, kept, _, f in model.packed if k == key]
     # the cue, then the two rounds: the second starts where the first
     # verified, one token past the first round's position
@@ -214,9 +237,11 @@ class ScriptedModel:
     """Writes the gold answer: the lines that hold it, its tokens, then stops.
 
     At the cue the model prefers the gold answer's first word, written
-    without its space; at each later step it prefers the gold answer's
+    with its space; at each later step it prefers the gold answer's
     next token while the tokens written so far are a prefix of it,
-    and closes the quote once the whole answer is written.
+    and ends its turn once the whole answer is written. As in the
+    model's readout, the none and stop values include the
+    probabilities of the none and stop tokens among the top tokens.
     """
 
     def __init__(self, tables, documents, gold, k):
@@ -227,8 +252,6 @@ class ScriptedModel:
         self.filter_truth = {}      # key -> a filter question's answer
         self.reads = Counter()      # key -> times its prefix was packed
         self.width = 2 + 2 * k
-        # the phrase cue ends in the quote that follows a space, which
-        # is not the quote that closes an answer
         self.cue_token = tables.encode_ids(TAIL)[-1]
         self.kv = {}                # key -> tokens appended after the prefix
         self.prefix_len = {}        # key -> the prefix's tokens
@@ -249,6 +272,11 @@ class ScriptedModel:
 
     def _cue(self, lps, none_lp, stop_lp):
         """A row: none, the stop, then the top tokens."""
+        for token, value in lps.items():
+            if self.tables.is_none[token]:
+                none_lp = np.logaddexp(none_lp, value)
+            if self.tables.is_stop[token]:
+                stop_lp = np.logaddexp(stop_lp, value)
         return self._top(lps, [none_lp, stop_lp])
 
     def _gold_ids(self, key):
@@ -302,11 +330,11 @@ class ScriptedModel:
         gold = self._gold_ids(key)
         lps = {}
         if gold:
-            # the model writes the first word without its space, and
-            # every other document word is far behind
+            # the model writes the first word with its space after the
+            # cue, and every other document word is far behind
             first = same_word(tables.vocab[gold[0]]) or gold[0]
             for index in tables.variants.get(first, [gold[0]]):
-                lps[index] = -0.5 if not tables.vocab[index].startswith("Ġ") else -0.9
+                lps[index] = -0.5 if tables.vocab[index].startswith("Ġ") else -0.9
             for index in tables.variants.get("the", []):
                 lps[index] = -2.0
         none_lp = -0.2 if not gold else -5.0
@@ -699,7 +727,7 @@ def test_a_second_extraction_reads_the_documents_resident_kv(monkeypatch):
 
 @pytest.mark.parametrize("limit,draft", [(5, 16), (3, 0), (1, 0)])
 def test_extractor_stops_at_the_answer_token_cap(monkeypatch, limit, draft):
-    # a model that never closes the quote keeps writing the document;
+    # a model that never ends its turn keeps writing the document;
     # the answer ends at stages.spec.max_answer_tokens
     long = " ".join(["word"] * 200)
     spec, tables = make_spec(long)

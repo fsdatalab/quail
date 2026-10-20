@@ -38,7 +38,7 @@ class ExtractionStages:
         documents: The table's tokenized documents.
         texts: The table's document texts.
         readout: Optional readout in place of the model's. Its extras
-            are the none token, then the stop tokens as one group.
+            are the none tokens as one group, then the stop tokens as one.
         pipeline_head: The token ids the pipeline shows the documents
             under; an extraction under the same head reads the KV the
             operators before it wrote.
@@ -132,7 +132,7 @@ class ExtractionStages:
         vocabulary = self.vocabulary
         return AsyncTopLogprobs(torch, torch.nn.functional, head,
                                 self.spec.top_tokens,
-                                [vocabulary.none_id, vocabulary.stop_ids],
+                                [vocabulary.none_ids, vocabulary.stop_ids],
                                 ragged=True)
 
     def _prepare(self, index, document_id, text, ids, stored) -> Document:

@@ -12,7 +12,8 @@ LEASE = ("Contract of lease.\nThe lease ends on\nMarch 3, 2027 at noon.\n"
 TERM = "Term: five years"
 NOTHING = "No dates here."
 HEAD = "DOCUMENT:\n"
-TAIL = ' question\nPhrase: "'
+TAIL = " question\nPhrase:"
+QUOTED = 'Lease of the "Premises" for five years.'
 
 
 class FakeTokenizer:
@@ -85,7 +86,7 @@ RANKED = "The lease ends on March 3. The rent is due."
 def make_vocabulary(*extra):
     # a stream writes a run of whitespace as one space, so the
     # vocabulary holds the squeezed texts' tokens too
-    tokenizer = FakeTokenizer([LEASE, TERM, NOTHING, HEAD, TAIL, "March",
+    tokenizer = FakeTokenizer([LEASE, TERM, NOTHING, HEAD, TAIL, QUOTED, "March",
                                "five", RANKED,
                                *(squeezed(text)[0] for text in (LEASE, TERM,
                                                                 NOTHING)),
