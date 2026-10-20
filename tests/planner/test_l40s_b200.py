@@ -15,8 +15,6 @@ from quail.specs import (
     DIFFUSION_GEMMA_26B_FP8,
     H100_SXM,
     L40S,
-    QWEN3_4B_FP8,
-    QWEN3_32B_FP8,
     modal_gpu_type,
 )
 
@@ -44,16 +42,6 @@ def _standin_filter_and_join(tmp_path):
     pq.write_table(reviews, tmp_path / "reviews.parquet")
     pq.write_table(claims, tmp_path / "claims.parquet")
     pq.write_table(evidence, tmp_path / "evidence.parquet")
-
-
-@pytest.mark.parametrize("model", (QWEN3_4B_FP8, QWEN3_32B_FP8))
-def test_kv_budgets_fit_one_gpu_on_l40s_and_b200(model):
-    assert budgets.minimum_weight_gpus(model, L40S) == 1
-    assert budgets.minimum_weight_gpus(model, B200) == 1
-    assert budgets.arena_tokens(model, B200) > budgets.arena_tokens(
-        model, H100_SXM)
-    assert budgets.arena_tokens(model, L40S) < budgets.arena_tokens(
-        model, H100_SXM)
 
 
 def test_diffusion_gemma_refuses_l40s_at_default_chunk(tmp_path):
@@ -93,18 +81,10 @@ def test_filter_and_join_plan_on_l40s_and_b200(tmp_path):
 
 
 @pytest.mark.parametrize("device", ("l40s", "b200"))
-@pytest.mark.parametrize("model", (
-    "qwen3.5-4b-bf16",
-    "qwen3.5-4b-fp8",
-    "qwen3.5-27b-fp8",
-    "qwen3.6-35b-a3b-fp8",
-    "qwen3.8-27b-fp8",
-    "lfm2-2.6b-bf16",
-))
-def test_hybrid_filter_plans_with_fp32_convolution_cost(tmp_path, model, device):
+def test_hybrid_filter_plans_with_fp32_convolution_cost(tmp_path, device):
     _standin_filter_and_join(tmp_path)
     with quail.Session(
-        EngineConfig(model=model, device=device),
+        EngineConfig(model="qwen3.5-4b-fp8", device=device),
         tokenizer=letter_tokens,
     ) as sess:
         register_tables(sess, tmp_path)

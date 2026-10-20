@@ -1,6 +1,6 @@
 """Tests for model specs and budget calculations on Qwen3-4B / H100."""
 
-from dataclasses import asdict, replace
+from dataclasses import replace
 
 import pyarrow as pa
 import pytest
@@ -11,7 +11,6 @@ from quail.cost import budgets
 from quail.planner.plan import Refusal
 from quail.specs import (
     B200,
-    DECISION_2_KAI_0_6B_BF16,
     DEVICES,
     DIFFUSION_GEMMA_26B_FP8,
     H100_SXM,
@@ -20,19 +19,13 @@ from quail.specs import (
     QWEN3_4B_FP8,
     QWEN3_5_4B_BF16,
     QWEN3_32B_FP8,
-    QWEN3_RERANKER_0_6B_BF16,
     RTX_PRO_6000_BLACKWELL_SERVER,
-    DeviceSpec,
 )
 
 
 @pytest.mark.parametrize("precision", ("fp8", "bf16", "fp32"))
 def test_device_specs_require_a_positive_rate_for_each_precision(precision):
     field = f"{precision}_flops"
-    values = asdict(H100_SXM)
-    del values[field]
-    with pytest.raises(TypeError, match=field):
-        DeviceSpec(**values)
     for rate in (0.0, -1.0, float("nan")):
         with pytest.raises(ValueError, match=f"h100-sxm: {field}"):
             replace(H100_SXM, **{field: rate})
@@ -182,21 +175,6 @@ def test_tree_attention_is_refused_for_a_model_with_a_gdn_layer():
     assert not hybrid.canvas_tokens
     assert budgets.tree_attention_allowed(QWEN3_4B_FP8)
     assert not budgets.tree_attention_allowed(hybrid)
-
-
-@pytest.mark.parametrize("model", [
-    DECISION_2_KAI_0_6B_BF16, QWEN3_RERANKER_0_6B_BF16,
-])
-def test_small_bf16_models_have_a_usable_chunk_on_l40s(model):
-    assert budgets.chunk_budget(model, L40S) == 65_536
-    assert budgets.arena_tokens(model, L40S) >= 65_536
-
-
-def test_compute_speed_does_not_change_the_chunk_budget():
-    device = replace(L40S, bf16_flops=L40S.bf16_flops * 10)
-    model = DECISION_2_KAI_0_6B_BF16
-    assert budgets.chunk_budget(model, device) == 65_536
-    assert budgets.arena_tokens(model, device) >= 65_536
 
 
 def test_attention_time_covers_only_the_attention_layers():

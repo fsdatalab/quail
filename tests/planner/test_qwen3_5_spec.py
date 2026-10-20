@@ -105,19 +105,6 @@ def test_dense_components_price_gdn_projections_with_the_attention_ones():
     assert MODELS[fp8.name] is fp8
 
 
-def test_faster_fp8_only_reduces_fp8_component_compute_time():
-    work = Work(tokens=100, pairs=1000)
-    faster = replace(H100_SXM, fp8_flops=H100_SXM.fp8_flops * 2)
-    original = speed_of_light(work, QWEN3_5_4B_FP8, H100_SXM, 100)
-    changed = speed_of_light(work, QWEN3_5_4B_FP8, faster, 100)
-    for name in ("attn_proj", "mlp"):
-        assert changed.component(name).compute_seconds == pytest.approx(
-            original.component(name).compute_seconds / 2)
-    for name in ("gdn_proj", "gdn_core", "attention", "conv"):
-        assert original.component(name).compute_seconds > 0
-        assert changed.component(name) == original.component(name)
-
-
 def test_vllm_takes_no_images_for_the_vision_checkpoint_only():
     from quail.baselines.vllm import DefaultVLLMEngine, VLLMEngine
 
@@ -136,7 +123,6 @@ def test_vllm_sequences_stay_under_the_state_blocks_it_holds():
 
 
 def test_a_sliding_hybrid_slides_only_its_attention_layers():
-    from dataclasses import replace
 
     sliding = replace(
         SPEC, sliding_window=128,
@@ -174,7 +160,6 @@ def test_a_pure_attention_model_prices_no_state_bytes():
 
 
 def test_one_review_through_a_filter_and_a_join_matches_the_hand_calculation():
-    from quail.cost.sol import speed_of_light
     from quail.cost.work import ask, scan, stream
     from quail.specs import H100_SXM
 

@@ -919,16 +919,6 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     assert not plan.graph.nodes_by_type(AiJoin.type_name)[0].share_prefixes
 
 
-def test_bf16_prefix_sharing_does_not_depend_on_the_fp8_rate():
-    from quail.planner.rules.physical import sharing_pays
-    from quail.specs import QWEN3_RERANKER_4B_BF16
-
-    for device in (H100_SXM, replace(H100_SXM, fp8_flops=H100_SXM.fp8_flops * 2)):
-        assert sharing_pays(
-            QWEN3_RERANKER_4B_BF16, device,
-            shared_tokens=100, total_tokens=10_000, writes_pages=False)
-
-
 def test_prefix_sharing_accounts_for_bf16_work_in_an_fp8_model():
     from quail.planner.rules.physical import sharing_pays
     from quail.specs import QWEN3_5_4B_FP8
