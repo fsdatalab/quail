@@ -92,6 +92,26 @@ def test_filter_and_join_plan_on_l40s_and_b200(tmp_path):
                 assert not isinstance(plan, Refusal), f"{device} {query_id}"
 
 
+@pytest.mark.parametrize("device", ("l40s", "b200"))
+@pytest.mark.parametrize("model", (
+    "qwen3.5-4b-bf16",
+    "qwen3.5-4b-fp8",
+    "qwen3.5-27b-fp8",
+    "qwen3.6-35b-a3b-fp8",
+    "qwen3.8-27b-fp8",
+    "lfm2-2.6b-bf16",
+))
+def test_hybrid_filter_plans_with_fp32_convolution_cost(tmp_path, model, device):
+    _standin_filter_and_join(tmp_path)
+    with quail.Session(
+        EngineConfig(model=model, device=device),
+        tokenizer=letter_tokens,
+    ) as sess:
+        register_tables(sess, tmp_path)
+        plan = queries(sess)["IMDB-1"][1]().plan()
+    assert not isinstance(plan, Refusal)
+
+
 def test_run_suite_uses_the_device_hourly_price(tmp_path, monkeypatch):
     captured = {}
 
