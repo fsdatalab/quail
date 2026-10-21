@@ -7,15 +7,14 @@ import pytest
 from quail.logical import (
     Alias,
     ColumnRef,
-    Compare,
     CompileError,
     Filter,
     FilterPredicate,
-    InList,
     Join,
     LogicalPlan,
     ModelCall,
     Project,
+    RegularPredicate,
     Scan,
     SemanticClassify,
     SemanticFilter,
@@ -39,9 +38,10 @@ def _pair_call(kind="boolean"):
 
 
 INVALID_PREDICATES = [
-    (Compare(_filter_call(), ">=", 0.5), "only an AI.SCORE call compares"),
-    (Compare(_filter_call("score"), "=", 0.5), "unsupported AI.SCORE comparison"),
-    (Compare(_filter_call("score"), ">=", 1.5), "between 0 and 1"),
+    (RegularPredicate(_filter_call(), ">=", 0.5), "only an AI.SCORE call compares"),
+    (RegularPredicate(_filter_call("score"), "=", 0.5),
+     "unsupported AI.SCORE comparison"),
+    (RegularPredicate(_filter_call("score"), ">=", 1.5), "between 0 and 1"),
     (_filter_call("score"), "only when compared"),
     (ModelCall(bind_prompt("q {0}", (R,)), "text"), "kind must be one of"),
     (ModelCall(bind_prompt("q {0}", (R,)), "label"), "at least two labels"),
@@ -51,7 +51,7 @@ INVALID_PREDICATES = [
      "tested by a Filter on its"),
     (ModelCall(bind_prompt("q {0}", (R,)), "boolean", ("a", "b")),
      "only an AI.CLASSIFY call has labels"),
-    (InList(ColumnRef("r", "reviews", "tone"), ("a",)),
+    (RegularPredicate(ColumnRef("r", "reviews", "tone"), "in", ("a",)),
      "a model call or a comparison"),
 ]
 
@@ -61,7 +61,7 @@ def test_model_calls_and_predicates_validate_kind_comparison_and_input():
     assert call.aliases() == ("r", "p")
     assert is_score(call)
     assert not is_score(_filter_call())
-    compare = Compare(call, ">=", 0.5)
+    compare = RegularPredicate(call, ">=", 0.5)
     assert model_call(compare) is call
     assert model_call(Alias(call, "s")) is call
 
@@ -76,7 +76,7 @@ def test_model_calls_and_predicates_validate_kind_comparison_and_input():
         else:
             raise AssertionError(f"validated: {expression}")
     with pytest.raises(CompileError, match="lists a value twice"):
-        InList(ColumnRef("r", "reviews", "tone"), ("a", "a")).validate()
+        RegularPredicate(ColumnRef("r", "reviews", "tone"), "in", ("a", "a")).validate()
 
     r = Scan("reviews", "r", "review")
     p = Scan("products", "p", "description")
@@ -91,7 +91,7 @@ def test_operators_walk_lists_each_operator_in_written_order():
     r = Scan("reviews", "r", "review")
     p = Scan("products", "p", "description")
     first = FilterPredicate(_filter_call(), selectivity=0.5)
-    second = FilterPredicate(Compare(_filter_call("score"), ">", 0.2))
+    second = FilterPredicate(RegularPredicate(_filter_call("score"), ">", 0.2))
     joined = SemanticJoin(
         Join(SemanticFilter(r, (first, second)), p), _pair_call()
     )
@@ -121,11 +121,12 @@ def test_operators_walk_lists_each_operator_in_written_order():
     classified = SemanticClassify(SemanticFilter(r, (first,)), named,
                                   "projected_name")
     named_column = ColumnRef("r", "reviews", "projected_name")
-    tested = Filter(Filter(classified, InList(named_column, ("a",))),
-                    InList(named_column, ("b",)))
+    tested = Filter(Filter(classified, RegularPredicate(named_column, "in", ("a",))),
+                    RegularPredicate(named_column, "in", ("b",)))
     hidden_node = SemanticClassify(tested, hidden, "__label_r_3")
     sequence = Filter(hidden_node,
-                   InList(ColumnRef("r", "reviews", "__label_r_3"), ("a",)))
+                   RegularPredicate(ColumnRef("r", "reviews", "__label_r_3"),
+                                    "in", ("a",)))
     joined = SemanticJoin(Join(sequence, p), _pair_call())
     pair_node = SemanticClassify(joined, pair, "pair_label")
     plan = LogicalPlan(Project(pair_node, (
@@ -166,9 +167,9 @@ def test_operators_walk_lists_each_operator_in_written_order():
 
     # a label is tested or returned only above the node computing it
     with pytest.raises(CompileError, match="nothing below computes"):
-        Filter(r, InList(named_column, ("a",))).validate()
+        Filter(r, RegularPredicate(named_column, "in", ("a",))).validate()
     assert sequence.explain_fields() == {
-        "condition": "r.__label_r_3 IN ['a']", "selectivity": None}
+        "condition": "r.__label_r_3 IN ('a')", "selectivity": None}
     with pytest.raises(CompileError, match="needs a SemanticClassify"):
         Project(classified, (Alias(hidden, "x"),)).validate()
     with pytest.raises(CompileError, match="already used"):

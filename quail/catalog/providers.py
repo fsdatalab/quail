@@ -26,8 +26,8 @@ class ScanRequest:
 class TableStatistics:
     """Statistics available without reading table values."""
 
-    row_count: int | None = None
-    byte_count: int | None = None
+    num_rows: int | None = None
+    num_bytes: int | None = None
 
 
 class TableProvider(Protocol):
@@ -80,12 +80,12 @@ class ArrowDatasetProvider:
         return self.dataset.schema
 
     def content_identity(self) -> str:
-        files = tuple(sorted(getattr(self.dataset, "files", ()) or ()))
-        value = repr((files, str(self.dataset.schema))).encode("utf-8")
-        return "arrow:" + hashlib.sha256(value).hexdigest()
+        # a dataset's rows and their order depend on its filter and
+        # file order as well as its files, so each dataset is its own
+        return f"arrow:{id(self.dataset)}"
 
     def statistics(self) -> TableStatistics:
-        return TableStatistics(row_count=int(self.dataset.count_rows()))
+        return TableStatistics(num_rows=int(self.dataset.count_rows()))
 
     def scan(self, request: ScanRequest) -> pa.RecordBatchReader:
         _check_request(self.dataset.schema, request)
@@ -139,8 +139,8 @@ class HuggingFaceProvider:
         )
         split = builder.info.splits.get(self.split)
         count = None if split is None else int(split.num_examples)
-        byte_count = None if split is None else int(split.num_bytes)
-        return TableStatistics(count, byte_count)
+        num_bytes = None if split is None else int(split.num_bytes)
+        return TableStatistics(count, num_bytes)
 
     def scan(self, request: ScanRequest) -> pa.RecordBatchReader:
         _check_request(self.arrow_schema, request)

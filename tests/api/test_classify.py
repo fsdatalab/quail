@@ -6,8 +6,15 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
-from helpers.rerankers import _finish
+from helpers.fakes import (
+    cpu_arena,
+    fake_pack,
+    fake_pipeline,
+    fake_readout,
+    fake_torch,
+    letter_tokens,
+)
+from helpers.oracle import Oracle, finish
 
 import quail
 from bench.quailb import run_output
@@ -16,7 +23,6 @@ from quail.backends.quail.executor.label_stages import label_requests
 from quail.backends.quail.executor.operators.classify import QuailClassifier
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs, answer_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
-from quail.backends.quail.reranker import RerankerBatch
 from quail.baselines.nodes import RequestExecution
 from quail.catalog import DocumentProvider
 from quail.execution.labels import (
@@ -29,6 +35,7 @@ from quail.logical import (
     ColumnRef,
     CompileError,
     LogicalPlan,
+    RegularPredicate,
     Scan,
     bind_classify_prompt,
 )
@@ -38,7 +45,6 @@ from quail.physical import (
     AiJoin,
     ClassifySpec,
     Filter,
-    InList,
     decode_graph,
     encode_graph,
 )
@@ -67,7 +73,7 @@ def test_greedy_decoder_follows_the_likeliest_child_to_a_label():
     # the cue's request, then the run from token 1 to the next choice
     assert decoder.suffixes == [[93], [1]]
     # round 0 feeds the cue, request 0, for both documents
-    assert [decoder.requests(doc) for doc in range(2)] == [[0], [0]]
+    assert [decoder.requests(document) for document in range(2)] == [[0], [0]]
     assert decoder.tokens == 2
     # document 0 follows token 1, document 1 takes the one-token label 4
     decoder.update(0, np.array([-1.0, -9.0, -9.0, -3.0]))
@@ -158,7 +164,7 @@ def test_label_readout_is_log_softmax_over_the_whole_vocabulary(monkeypatch):
 def test_classifier_decodes_one_choice_per_round(monkeypatch):
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=3, estimated_seconds=0.0,
+        expected_rows=3, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
         label_token_ids=IDS, scoring="trie_decode")
     requests = label_requests(spec)
@@ -197,23 +203,20 @@ def test_classifier_decodes_one_choice_per_round(monkeypatch):
         return np.asarray(rows, dtype=np.float32)
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    readout = SimpleNamespace(
-        targets=np.asarray(targets), rows=1,
-        dtype=np.dtype((np.float32, (4,))),
-        submit=lambda rows, rows_per_answer=None: rows,
-        result=lambda rows: rows)
+    readout = fake_readout(targets=np.asarray(targets), rows=1, normalize=True,
+                           dtype=np.dtype((np.float32, (4,))))
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
             arena=cpu_arena(64),
             pipeline=fake_pipeline(forward_chunk=forward),
             label_readout=readout,
             input_staging=SimpleNamespace(fixed_tokens=set()),
-            model=object(),
+            model=object(), model_spec=QWEN3_4B_FP8,
         ),
         torch=fake_torch(),
         chunk_tokens=64,
         answer_rows=object(),
-        async_answers=object(),
+        async_answers=fake_readout(),
     )
     arena = state.loaded_model.arena
     reserved = {}
@@ -269,24 +272,11 @@ def _topic(session, *, accepted=("refund", "shipping")):
     return query.select("d.id", "topic")
 
 
-class _Labels:
-    def __init__(self, labels):
-        self.labels = labels
-        self.calls = []
-
-    def score(self, spec, rows, documents):
-        assert isinstance(spec, ClassifySpec)
-        self.calls.append((spec.name, rows.tolist()))
-        values = np.asarray([
-            spec.labels[0] if spec.name == "kind" else self.labels[row[0]]
-            for row in rows], dtype=object)
-        probabilities = np.asarray([
-            [np.nan] * len(spec.labels) if value is None
-            else [0.8 if label == value else 0.1 for label in spec.labels]
-            for value in values]) if spec.probabilities else None
-        return RerankerBatch(values, fresh_tokens=len(rows), cached_tokens=0,
-                             suffix_tokens=3 * len(rows),
-                             probabilities=probabilities)
+def _labels(labels):
+    """An oracle labeling document i with labels[i]; a "kind" gets its first label."""
+    return Oracle(labels=lambda spec, ids: (spec.labels[0] if spec.name == "kind"
+                                            else labels[ids[0]]),
+                  probabilities=True)
 
 
 def test_classify_plans_filters_and_returns_labels(session):
@@ -295,15 +285,16 @@ def test_classify_plans_filters_and_returns_labels(session):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     (test,) = [n for n in plan.nodes if isinstance(n, Filter)]
     assert classify.spec.labels == ("refund", "shipping", "praise")
-    assert classify.spec.label_token_ids[0] == tuple(_bytes(" refund"))
+    assert classify.spec.label_token_ids[0] == tuple(_bytes("refund"))
     # a tokenizer without decode marks no word start
     assert classify.spec.label_word_starts == tuple(
         (False,) * len(ids) for ids in classify.spec.label_token_ids)
-    assert test.predicate == InList("topic", ("refund", "shipping"))
+    assert test.predicate == RegularPredicate(
+        ColumnRef("d", "documents", "topic"), "in", ("refund", "shipping"))
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
 
-    result = _finish(query, session, _Labels(["refund", "praise"]))
+    result = finish(query, _labels(["refund", "praise"]))
     rows = result.collect()
     assert rows.column("topic").to_pylist() == ["refund"]
     labels = result.answer_tables["classifies"]["topic"]
@@ -314,18 +305,18 @@ def test_classify_plans_filters_and_returns_labels(session):
 
     # a projected label with no filter classifies every document
     plain = _topic(session, accepted=())
-    result = _finish(plain, session, _Labels(["praise", "shipping"]))
+    result = finish(plain, _labels(["praise", "shipping"]))
     assert result.collect().column("topic").to_pylist() == [
         "praise", "shipping"]
 
     # a document whose decoded answer names no label leaves the run
-    result = _finish(plain, session, _Labels(["praise", None]))
+    result = finish(plain, _labels(["praise", None]))
     assert result.collect().column("topic").to_pylist() == ["praise"]
     labels = result.answer_tables["classifies"]["topic"]
     assert labels.column("topic").to_pylist() == ["praise"]
     assert result.report["node_metrics"]["ai-classify:0"]["output_rows"] == 1
 
-    result = _finish(query, session, _Labels([None, "refund"]))
+    result = finish(query, _labels([None, "refund"]))
     assert result.collect().column("topic").to_pylist() == ["refund"]
     (answers,) = result.answer_tables["filters"].values()
     assert answers.column("answer").to_pylist() == [True]
@@ -347,8 +338,7 @@ def test_classify_plans_filters_and_returns_labels(session):
     assert classify.spec.probabilities
     assert classify.spec.scoring != "trie_decode"
     assert plan.nodes[-1].columns == ("d.id", "topic", "topic_probabilities")
-    rows = _finish(probable, session,
-                   _Labels(["praise", "shipping"])).collect()
+    rows = finish(probable, _labels(["praise", "shipping"])).collect()
     assert rows.column("topic_probabilities").to_pylist() == [
         [("refund", 0.1), ("shipping", 0.1), ("praise", 0.8)],
         [("refund", 0.1), ("shipping", 0.8), ("praise", 0.1)]]
@@ -381,20 +371,21 @@ def test_sql_classifies_and_tests_labels(session):
         .label_in("topic", ["refund", "shipping"]).select("d.id", "topic"))
     assert query.logical == built.logical
     (test,) = [n for n in query.plan().nodes if isinstance(n, Filter)]
-    assert test.predicate == InList("topic", ("refund", "shipping"))
+    assert test.predicate == RegularPredicate(
+        ColumnRef("d", "documents", "topic"), "in", ("refund", "shipping"))
     # a filter on the label alone, with a selectivity option
     filtered = session.sql(
         f"SELECT d.id FROM documents d WHERE {call[:-1]}, "
         f"{{'selectivity': 0.5}}) IN ('praise')")
     (predicate,) = filtered.logical.operators().label_filters["d"]
     assert predicate.selectivity == 0.5
-    assert predicate.values == ("praise",)
+    assert predicate.condition.value == ("praise",)
     assert "d" not in filtered.logical.operators().filters
     # equality is membership in one label, on either side
     for form in (f"{call} = 'refund'", f"'refund' = {call}"):
         equal = session.sql(f"SELECT d.id FROM documents d WHERE {form}")
         (predicate,) = equal.logical.operators().label_filters["d"]
-        assert predicate.values == ("refund",)
+        assert predicate.condition.value == ("refund",)
     for bad in (f"SELECT d.id, {call} FROM documents d",
                 f"SELECT d.id FROM documents d WHERE {call} < 'refund'",
                 f"SELECT d.id FROM documents d WHERE {call} IN (1)"):
@@ -414,8 +405,8 @@ def test_frontends_place_classifications_on_their_table(session):
                      "SemanticClassify", "Filter", "Project"]
     topic, kind = plan.operators().classifies
     assert (topic.name, topic.alias, kind.name) == ("topic", "d", "kind")
-    assert plan.root.input.condition == quail.logical.InList(
-        ColumnRef("d", "documents", "kind"), ("complaint",))
+    assert plan.root.input.condition == quail.logical.RegularPredicate(
+        ColumnRef("d", "documents", "kind"), "in", ("complaint",))
     assert plan.operators().labels.tests == {topic.call: [0], kind.call: [1]}
     # projection pushdown reaches the scan through the classifications
     assert push_down_projection(plan.root) is plan.root
@@ -449,12 +440,12 @@ def test_frontends_place_classifications_on_their_table(session):
     assert unused.logical.operators().classifies == ()
     text = _topic(session).explain()
     assert "SemanticClassify: topic" in text
-    assert ("Filter: d.topic IN ['refund', 'shipping'] (selectivity=50%)"
+    assert ("Filter: d.topic IN ('refund', 'shipping') (selectivity=50%)"
             in text.split("SemanticClassify")[0])
     assert "Project: d.id, topic" in text
     assert "AiClassify: topic over d" in text
     assert "rule=trie_decode, labels=3" in text
-    assert "Filter: topic IN ['refund', 'shipping']" in text
+    assert "Filter: d.topic IN ('refund', 'shipping')" in text
 
 
 def _corpus(session, tmp_path, name, column, rows, words):
@@ -473,8 +464,8 @@ def _candidates(session, query):
 
     query.plan()
     context = PlanningContext(
-        model=session.model, device=session.device, gpu_count=1,
-        document_tokens=query._doc_tokens, backend="quail",
+        model=session.model, device=session.device, gpus=1,
+        document_tokens=query._document_tokens, backend="quail",
         tokenizer=session.tokenizer)
     return search_candidates(query._logical_input, context, session.registry)
 
@@ -490,6 +481,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
         "should_eliminate_distinct", "should_push_down_distinct",
         "should_push_down_projection",
         "should_push_down_filters", "should_lift_maps",
+        "should_eliminate_window_sort", "should_push_down_limit_through_window",
         "should_push_down_limit", "choose_classify_implementation", "should_retain_kv",
         "should_share_prefixes", "choose_attention_algorithm"]
     plan = _topic(session).plan()
@@ -527,11 +519,10 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.inputs[0].source.node_id == "ai_join:r"
     assert classify.spec.scoring == "trie_tree"
-    assert classify.spec.expected_inputs == pytest.approx(1.8)
-    assert round(plan.estimated_seconds, 3) == 0.073
-    assert plan.settings["search_seconds"] == plan.estimated_seconds
+    assert classify.spec.expected_rows == pytest.approx(1.8)
+    assert round(plan.estimated_seconds, 3) == 0.385
     (staged,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
-    assert (staged.exec_idx, staged.anchor) == (0, "r")
+    assert (staged.exec_index, staged.anchor) == (0, "r")
     assert classified_above_joins(after._logical_input.root) == frozenset()
     assert classified_above_joins(after.logical.root) == {"r"}
     written_candidate, lifted_candidate = _candidates(session, after)
@@ -547,7 +538,7 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
 
     context = PlanningContext(
         catalog=session.catalog, engine_config=session.config, model=session.model,
-        device=session.device, document_tokens=after._doc_tokens,
+        device=session.device, document_tokens=after._document_tokens,
         tokenizer=session.tokenizer)
     assert pricing.estimated_seconds(
         lifted_candidate.logical_plan, context, session.registry) == (
@@ -579,9 +570,9 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
         "scan:r", "scan:a", "ai_filter:r", "ai-classify:0", "filter:r:1",
         "ai_join:a", "project"]
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    assert (classify.spec.scoring, classify.spec.expected_inputs) == (
+    assert (classify.spec.scoring, classify.spec.expected_rows) == (
         "trie_tree", 30.0)
-    assert round(plan.estimated_seconds, 3) == 0.491
+    assert round(plan.estimated_seconds, 3) == 0.555
     written_candidate, lifted_candidate = _candidates(session, before)
     assert (written_candidate.estimated_seconds
             <= lifted_candidate.estimated_seconds)
@@ -628,12 +619,15 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
         tokenizer=letter_tokens)
     for name in ("documents", "aspects"):
         distributed.register(name, session.catalog.get(name))
-    refused = distributed.sql(
+    # every worker runs the join and the classification as one pipeline
+    spread = distributed.sql(
         f"SELECT d.id, a.id, {stance} AS stance FROM documents d "
         "JOIN aspects a ON AI_FILTER(PROMPT('Does {0} mention {1}?', "
         "d.body, a.aspect))").plan()
-    assert isinstance(refused, Refusal)
-    assert refused.constraint == "joined_classify_pipeline"
+    assert not isinstance(spread, Refusal)
+    (classify,) = [n for n in spread.nodes if isinstance(n, AiClassify)]
+    assert classify.node_id in {member.node_id for member in build_pipelines(
+        spread.graph)[classify.inputs[0].source.node_id]}
     distributed.close()
     # a joined row's label is not tested in WHERE
     with pytest.raises(CompileError, match="one table|filter on a label"):
@@ -721,8 +715,8 @@ def test_streamed_classifications_share_one_pipeline(session):
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
     assert kind.spec.estimated_seconds < topic.spec.estimated_seconds
 
-    scorer = _Labels(["refund", "praise"])
-    result = _finish(query, session, scorer)
+    scorer = _labels(["refund", "praise"])
+    result = finish(query, scorer)
     assert result.collect().to_pydict() == {
         "d.id": [7], "topic": ["refund"], "kind": ["complaint"]}
     labels = result.answer_tables["classifies"]
@@ -737,27 +731,28 @@ def test_streamed_classifications_share_one_pipeline(session):
             split.plan().graph)[topic.node_id]) == (
         topic.node_id, "filter:d:0", "filter:d:1", kind.node_id)
 
+    # a later test on a label runs right after its classification, so
+    # the next classification reads fewer documents
     interleaved = _classify_then_filter(session, later_filters=(
         ("kind", ("complaint",)), ("topic", ("refund",))))
     assert tuple(
         member.node_id for member in build_pipelines(
             interleaved.plan().graph)[topic.node_id]) == (
-        topic.node_id, "filter:d:0", kind.node_id, "filter:d:1", "filter:d:2")
-    scorer = _Labels(["shipping", "praise"])
-    result = _finish(interleaved, session, scorer)
+        topic.node_id, "filter:d:0", "filter:d:2", kind.node_id, "filter:d:1")
+    scorer = _labels(["shipping", "praise"])
+    result = finish(interleaved, scorer)
     assert result.collect().num_rows == 0
-    assert scorer.calls == [("topic", [[0], [1]]), ("kind", [[0]])]
+    # the second test on topic drops the last document before kind
+    assert scorer.calls == [("topic", [[0], [1]])]
 
 
 def test_classify_refusals_and_builder_errors(session):
     query = _topic(session)
-    # a label the classification cannot return matches no row; the
-    # filter is accepted and plans as a test nothing passes
-    none = (session.docs("documents").alias("d").ai_classify(
-        quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
-        name="x").label_in("x", ["c"]).select("d.id"))
-    (test,) = [n for n in none.plan().nodes if isinstance(n, Filter)]
-    assert test.predicate == InList("x", ("c",))
+    # a label the classification cannot return would match no row
+    with pytest.raises(CompileError, match="not among its labels"):
+        (session.docs("documents").alias("d").ai_classify(
+            quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
+            name="x").label_in("x", ["c"]).select("d.id"))
     with pytest.raises(CompileError, match="differ ignoring case"):
         session.docs("documents").alias("d").ai_classify(
             quail.prompt("{0}", quail.col("d.body")), ["a", "A"], name="x")
@@ -890,7 +885,7 @@ def test_trie_paths_cover_every_node_once_and_gather_ancestors():
         label_trie([(1,), ()])
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=1, estimated_seconds=0.0,
+        expected_rows=1, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 93)), labels=("a", "b", "c", "d"),
         label_token_ids=labels, scoring="trie_tree")
     requests = label_requests(spec)
@@ -1067,7 +1062,7 @@ def test_classifier_scores_the_packed_trie(monkeypatch, worded):
     paths = trie_paths(labels, read)
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=2, estimated_seconds=0.0,
+        expected_rows=2, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 93)), labels=("a", "b", "c", "d"),
         label_token_ids=labels, scoring="trie_tree",
         label_word_starts=starts if worded else ())
@@ -1108,22 +1103,21 @@ def test_classifier_scores_the_packed_trie(monkeypatch, worded):
             row += count
         return out
 
-    readout = SimpleNamespace(
-        targets=np.asarray(targets), rows=read_count,
-        dtype=np.dtype((np.float32, (read_count, len(targets)))),
-        submit=submit, result=lambda rows: rows)
+    readout = fake_readout(
+        targets=np.asarray(targets), rows=read_count, normalize=True,
+        dtype=np.dtype((np.float32, (read_count, len(targets)))), submit=submit)
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
             arena=cpu_arena(64),
             pipeline=fake_pipeline(forward_chunk=forward),
             label_readout=readout,
             input_staging=SimpleNamespace(fixed_tokens=set()),
-            model=object(),
+            model=object(), model_spec=QWEN3_4B_FP8,
         ),
         torch=fake_torch(),
         chunk_tokens=64,
         answer_rows=object(),
-        async_answers=object(),
+        async_answers=fake_readout(),
     )
     batch = QuailClassifier(state).classify(
         spec, [[0], [1]], {"d": [[10, 11], [12]]})
@@ -1250,7 +1244,7 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
     settings = AnswerCanvas(rows=4, turn_close_id=6, pad_id=0)
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=2, estimated_seconds=0.0,
+        expected_rows=2, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
         label_token_ids=((1,), (2,)), scoring="letters")
     vocab = 8
@@ -1279,7 +1273,7 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
         return padded
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
-    readout = SimpleNamespace(targets=np.asarray([1, 2]), rows=4,
+    readout = fake_readout(targets=np.asarray([1, 2]), rows=4,
                               dtype=np.dtype((np.float32, (4, 2))),
                               submit=submit, result=lambda rows: rows)
     state = QueryExecutionState(
@@ -1296,7 +1290,7 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
         torch=fake_torch(),
         chunk_tokens=64,
         answer_rows=object(),
-        async_answers=object(),
+        async_answers=fake_readout(),
     )
     documents = {"d": [[9]] * 4 + [[10, 11], [12]]}
     batch = QuailClassifier(state).classify(spec, [[4], [5]], documents)
@@ -1309,3 +1303,31 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
     # the cue and the canvas after the prompt and the frame, once
     assert batch.suffix_tokens == 2 * (1 + 4)
     assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 5)
+
+
+def test_a_label_in_where_names_the_classification_by_its_as_name(session):
+    call = ("AI.CLASSIFY(PROMPT('What is {0} about?', d.body), "
+            "ARRAY['refund', 'shipping', 'praise'])")
+    named = session.sql(
+        f"SELECT d.id, {call} AS topic FROM documents d "
+        f"WHERE topic IN ('refund', 'shipping')")
+    repeated = session.sql(
+        f"SELECT d.id, {call} AS topic FROM documents d "
+        f"WHERE {call} IN ('refund', 'shipping')")
+    assert named.logical == repeated.logical
+    equal = session.sql(
+        f"SELECT d.id, {call} AS topic FROM documents d "
+        f"WHERE HINT(topic = 'refund', {{'selectivity': 0.3}})")
+    assert str(equal.logical.root.input.condition) == "d.topic IN ('refund')"
+    assert equal.logical.root.input.selectivity == 0.3
+    builder = (session.docs("documents").alias("d")
+               .ai_classify(quail.prompt("What is {0} about?", quail.col("d.body")),
+                            ["refund", "shipping", "praise"], name="topic")
+               .where((quail.col("topic") == "refund").hint(selectivity=0.3)))
+    assert builder.select("d.id", "topic").logical == equal.logical
+    with pytest.raises(CompileError, match="== or isin"):
+        builder.where(quail.col("topic").like("re%"))
+    # a name that is also a column of a table in scope is ambiguous
+    with pytest.raises(CompileError, match="both a column"):
+        session.sql(f"SELECT d.id, {call} AS body FROM documents d "
+                    f"WHERE body = 'refund'")

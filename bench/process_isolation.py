@@ -29,7 +29,7 @@ def run_backend_group(
     *,
     data_dir: str,
     model: str,
-    sf: float,
+    scale_factor: float,
     query_ids: Sequence[str],
     run_dir: str,
     ground_truth_collection: str,
@@ -45,7 +45,7 @@ def run_backend_group(
     Args:
         data_dir: Root directory containing scale-factor data directories.
         model: Model name.
-        sf: Dataset scale factor.
+        scale_factor: Dataset scale factor.
         query_ids: Query IDs belonging to one benchmark family.
         run_dir: Directory for this benchmark run.
         ground_truth_collection: Reference label collection, or empty for default.
@@ -89,7 +89,7 @@ def run_backend_group(
                 flush=True,
             )
             suite = run_suite(
-                query_ids, sf=sf,
+                query_ids, scale_factor=scale_factor,
                 config=EngineConfig(
                     gpus=1,
                     model=model,
@@ -99,7 +99,7 @@ def run_backend_group(
                     gpu_timing=gpu_timing,
                     **({} if draws is None else {"canvas_draws": draws}),
                 ),
-                data_dir=Path(data_dir) / f"sf{sf}",
+                data_dir=Path(data_dir) / f"sf{scale_factor}",
                 ground_truth_collection=ground_truth_collection or None,
                 root=root,
                 output_dir=run_dir / name / (suite_name or family),

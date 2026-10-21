@@ -6,8 +6,8 @@ DECISION_2_KAI_0_6B_BF16 = ModelSpec(
     #                        embedding and the decision head excluded
     layers=28,
     hidden=1024,
-    n_q=16,
-    n_kv=8,
+    num_q_heads=16,
+    num_kv_heads=8,
     d_head=128,
     ffn_width=6144,        # gate_up output: 2 x 3072 intermediate
     w_bytes=2.0,           # bf16 weights after conversion

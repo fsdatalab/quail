@@ -304,7 +304,7 @@ def child(arguments: str) -> None:
     from quail_b.benchmark import load_benchmark
 
     args = json.loads(arguments)
-    query_id, sf, modes, top = (args["query_id"], args["sf"], args["modes"],
+    query_id, scale_factor, modes, top = (args["query_id"], args["sf"], args["modes"],
                                 args["top"])
     print(f"quail from {quail.__file__}", flush=True)
     window = {}
@@ -348,8 +348,8 @@ def child(arguments: str) -> None:
                     before.get("reserved_bytes.all.current", 0) / 2**30, 2)
 
     graph_module.GenericRunner = ProfiledRunner
-    suite = load_benchmark([query_id], scale_factor=sf,
-                           data_dir=Path(DATA_DIR) / f"sf{sf}",
+    suite = load_benchmark([query_id], scale_factor=scale_factor,
+                           data_dir=Path(DATA_DIR) / f"sf{scale_factor}",
                            collection_id=args["collection_id"] or None)
     spec = suite.queries[0]
     tables = {relation.table: suite.tables[relation.table]
@@ -412,14 +412,14 @@ def child(arguments: str) -> None:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=VOLUMES)
-def profile_query(query_ids: list[str], sf: float, collection_id: str,
+def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                   model: str, modes: list[str], top: int, repeats: int,
                   tag: str, env: str = "") -> str:
     """Profile each query in fresh processes and return its RESULT lines.
 
     Args:
         query_ids: QUAIL-B query IDs to run.
-        sf: Dataset scale factor.
+        scale_factor: Dataset scale factor.
         collection_id: Reference label collection.
         model: Model name.
         modes: Profiling modes, one per run within each fresh process.
@@ -443,9 +443,17 @@ def profile_query(query_ids: list[str], sf: float, collection_id: str,
             for name, root in order:
                 prefix = (f"{PROFILE_DIR}/{tag}-{query_id}-{model}-{name}"
                           f"-r{repeat}")
-                arguments = json.dumps(dict(
-                    query_id=query_id, sf=sf, collection_id=collection_id,
-                    model=model, modes=modes, top=top, stats_prefix=prefix))
+                arguments = json.dumps(
+                    dict(
+                        query_id=query_id,
+                        scale_factor=scale_factor,
+                        collection_id=collection_id,
+                        model=model,
+                        modes=modes,
+                        top=top,
+                        stats_prefix=prefix,
+                    )
+                )
                 command = [sys.executable, "-c",
                            "import sys, profile_query; "
                            "profile_query.child(sys.argv[1])", arguments]
@@ -472,15 +480,15 @@ def profile_query(query_ids: list[str], sf: float, collection_id: str,
 
 
 @app.local_entrypoint()
-def profile(queries: str = "BIO-5,FEV-11", sf: float = 0.1,
+def profile(queries: str = "BIO-5,FEV-11", scale_factor: float = 0.1,
             model: str = "qwen3-4b-fp8", modes: str = "plain,cprofile",
             top: int = 30, repeats: int = 1, tag: str = "window",
             env: str = ""):
     query_ids = [query.strip() for query in queries.split(",") if query.strip()]
-    data = ensure_data.spawn(sf, query_ids, "")
+    data = ensure_data.spawn(scale_factor, query_ids, "")
     print(f"function call id: {data.object_id} (data)", flush=True)
     collection = data.get()
-    call = profile_query.spawn(query_ids, sf, collection, model,
+    call = profile_query.spawn(query_ids, scale_factor, collection, model,
                                modes.split(","), top, repeats, tag, env)
     print(f"function call id: {call.object_id} (profile {queries})", flush=True)
     for line in call.get().splitlines():

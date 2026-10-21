@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
-from quail.logical.expressions import packed_columns
+from quail.logical.expressions import WindowCall, packed_columns
 
 from ..base import (
     ExecutionLocation,
@@ -32,18 +32,10 @@ class Exchange(PhysicalNode):
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         return (OutputPort(
-            f"ids:{self.anchor}",
-            ValueType.DOCUMENT_IDS,
+            f"rows:{self.anchor}",
+            ValueType.ROWS,
             schema=(self.anchor,),
         ),)
-
-    def attributes(self) -> dict:
-        return {"anchor": self.anchor}
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(node_id=node_id, inputs=inputs, anchor=attributes["anchor"])
-
 
 @dataclass(frozen=True)
 class Recombine(PhysicalNode):
@@ -62,18 +54,6 @@ class Recombine(PhysicalNode):
             ValueType.ROWS,
             schema=self.alias_order,
         ),)
-
-    def attributes(self) -> dict:
-        return {"alias_order": list(self.alias_order)}
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            alias_order=tuple(attributes["alias_order"]),
-        )
-
 
 @dataclass(frozen=True)
 class Project(PhysicalNode):
@@ -106,23 +86,6 @@ class Project(PhysicalNode):
             schema=self.result_columns,
         ),)
 
-    def attributes(self) -> dict:
-        return {"columns": list(self.columns),
-                "structs": [[name, [list(field) for field in fields]]
-                            for name, fields in self.structs]}
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            columns=tuple(attributes["columns"]),
-            structs=tuple(
-                (name, tuple(tuple(field) for field in fields))
-                for name, fields in attributes.get("structs", ())),
-        )
-
-
 @dataclass(frozen=True)
 class Aggregate(PhysicalNode):
     """Group the result rows and compute aggregates on the coordinator.
@@ -146,31 +109,6 @@ class Aggregate(PhysicalNode):
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
-
-    def attributes(self) -> dict:
-        return {
-            "keys": list(self.keys),
-            "aggregates": [list(aggregate) for aggregate in self.aggregates],
-            "having": [list(test) for test in self.having],
-            "columns": list(self.columns),
-        }
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            keys=tuple(attributes["keys"]),
-            aggregates=tuple(
-                (str(name), str(function),
-                 None if argument is None else str(argument))
-                for name, function, argument in attributes["aggregates"]),
-            having=tuple((str(name), str(comparison), value)
-                         for name, comparison, value
-                         in attributes.get("having", ())),
-            columns=tuple(attributes["columns"]),
-        )
-
 
 @dataclass(frozen=True)
 class Sort(PhysicalNode):
@@ -196,29 +134,25 @@ class Sort(PhysicalNode):
     def outputs(self) -> tuple[OutputPort, ...]:
         return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
 
-    def attributes(self) -> dict:
-        return {
-            "keys": [list(key) for key in self.keys],
-            "columns": list(self.columns),
-            "distinct": self.distinct,
-            "offset": self.offset,
-            "fetch": self.fetch,
-        }
+@dataclass(frozen=True)
+class Window(PhysicalNode):
+    """Compute window functions over the result rows on the coordinator.
 
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            keys=tuple((str(column), bool(descending), bool(nulls_first))
-                       for column, descending, nulls_first
-                       in attributes["keys"]),
-            columns=tuple(attributes["columns"]),
-            distinct=bool(attributes.get("distinct", False)),
-            offset=int(attributes.get("offset", 0)),
-            fetch=(None if attributes.get("fetch") is None
-                   else int(attributes["fetch"])),
-        )
+    ``calls`` read input columns and append one column each. ``columns``
+    are the output columns, input columns and window names in result
+    order. The rows come out in the last call's partition and order.
+    """
+
+    calls: tuple[WindowCall, ...] = ()
+    columns: tuple[str, ...] = ()
+
+    type_name: ClassVar[str] = "quail.window"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS, schema=self.columns),)
 
 
 @dataclass(frozen=True)
@@ -234,10 +168,3 @@ class Limit(PhysicalNode):
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
         return (OutputPort("rows", ValueType.ROWS),)
-
-    def attributes(self) -> dict:
-        return {"count": self.count}
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(node_id=node_id, inputs=inputs, count=int(attributes["count"]))

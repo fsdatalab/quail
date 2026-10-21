@@ -19,17 +19,17 @@ FILLER = ("The projector hummed while the reel changed and nobody in "
           "the back row noticed the splice. ")
 
 
-def make_filter_parquet(path, n_docs=200, rates=(0.6, 0.5)):
+def make_filter_parquet(path, num_documents=200, rates=(0.6, 0.5)):
     rng = np.random.default_rng(SEED)
-    flags = rng.random((n_docs, len(rates))) < np.array(rates)
+    flags = rng.random((num_documents, len(rates))) < np.array(rates)
     bodies = []
-    for i in range(n_docs):
+    for i in range(num_documents):
         line = " ".join(
             f"FLAG_{j+1}={'TRUE' if flags[i, j] else 'FALSE'}"
                         for j in range(len(rates)))
         bodies.append(FILLER * 8 + f"\n\n[FLAGS] {line}")
     pq.write_table(pa.table({
-        "id": [f"d{i}" for i in range(n_docs)],
+        "id": [f"d{i}" for i in range(num_documents)],
         "body": bodies}), path)
     return flags
 
@@ -79,7 +79,7 @@ def main():
         backend="quail",
         device="h100-sxm",
     ))
-    sess.register("docs", quail.DocumentProvider.from_parquet(
+    sess.register("documents", quail.DocumentProvider.from_parquet(
         f"{tmp}/docs.parquet", id_col="id"))
     sess.register("reports", quail.DocumentProvider.from_parquet(
         f"{tmp}/reports.parquet", id_col="id"))

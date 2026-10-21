@@ -172,11 +172,11 @@ def classify_identity(spec: PredicateSpec, corpus: dict) -> dict:
     return {**identity, "rows_per_part": ROWS_PER_PART}
 
 
-def corpus_rows(sf: float, spec: PredicateSpec) -> tuple[dict, list[dict]]:
+def corpus_rows(scale_factor: float, spec: PredicateSpec) -> tuple[dict, list[dict]]:
     """Read a corpus manifest and the documents to classify.
 
     Args:
-        sf: Published corpus scale factor.
+        scale_factor: Published corpus scale factor.
         spec: Classification predicate specification.
 
     Returns:
@@ -187,7 +187,7 @@ def corpus_rows(sf: float, spec: PredicateSpec) -> tuple[dict, list[dict]]:
     """
     import pyarrow.parquet as pq
 
-    directory = labels.ROOT / "corpora" / CORPORA[sf]
+    directory = labels.ROOT / "corpora" / CORPORA[scale_factor]
     manifest = json.loads((directory / "manifest.json").read_text())
     table = pq.read_table(directory / f"{spec.left_table}.parquet",
                           columns=["id", spec.left_column])
@@ -197,8 +197,8 @@ def corpus_rows(sf: float, spec: PredicateSpec) -> tuple[dict, list[dict]]:
 
     root = str(labels.ROOT)[:-len(GROUND_TRUTH_ROOT) - 1]
     truth = load_ground_truth(
-        root, scale_factor=sf, corpus_id=CORPORA[sf],
-        collection_id=SOURCES[sf], templates=[JOIN_OF_CLASSIFY[spec.key]])
+        root, scale_factor=scale_factor, corpus_id=CORPORA[scale_factor],
+        collection_id=SOURCES[scale_factor], templates=[JOIN_OF_CLASSIFY[spec.key]])
     join_key = truth.key_for_template(JOIN_OF_CLASSIFY[spec.key])
     pairs = truth.predicates[join_key].true_pairs
     right = pq.read_table(directory / f"{spec.right_table}.parquet",
@@ -486,13 +486,13 @@ QUAIL_CHECK_PREDICTION_TEXT = (
 
 @app.function(image=labels.image, gpu="H100!", memory=98304, timeout=3600,
               volumes=_volumes())
-def quail_check_run(run_dir: str, query_ids: str, sf: float = 0.1) -> dict:
+def quail_check_run(run_dir: str, query_ids: str, scale_factor: float = 0.1) -> dict:
     """Label a Quail run's classified documents with vLLM and the same model.
 
     Args:
         run_dir: The QUAIL-B run directory on the volume, under /results.
         query_ids: Comma-separated query ids the run classified.
-        sf: The run's scale factor.
+        scale_factor: The run's scale factor.
     """
     import pyarrow.parquet as pq
 
@@ -511,17 +511,17 @@ def quail_check_run(run_dir: str, query_ids: str, sf: float = 0.1) -> dict:
                 f"*/{query_id}/classifications-{index}.parquet")
             quail_labels = pq.read_table(path).to_pylist()
             spec = by_template[operator.prompt]
-            _, rows = corpus_rows(sf, spec)
+            _, rows = corpus_rows(scale_factor, spec)
             text = {row["id"]: row[spec.left_column] for row in rows}
             alias = operator.relation
             ids = [row[alias] for row in quail_labels]
-            labeled = judge.label(spec, [text[doc] for doc in ids])
+            labeled = judge.label(spec, [text[document] for document in ids])
             disagreements = []
-            for doc, row, (label, scores) in zip(ids, quail_labels, labeled):
+            for document, row, (label, scores) in zip(ids, quail_labels, labeled):
                 if row["label"] == label:
                     continue
                 disagreements.append({
-                    "id": doc, "quail": row["label"], "vllm": label,
+                    "id": document, "quail": row["label"], "vllm": label,
                     "vllm_margin": max(scores)
                     - scores[spec.labels.index(row["label"])],
                 })
@@ -535,7 +535,7 @@ def quail_check_run(run_dir: str, query_ids: str, sf: float = 0.1) -> dict:
                 "disagreements": disagreements,
             }
     result = {"prediction": QUAIL_CHECK_PREDICTION_TEXT, "run_dir": run_dir,
-              "model": model.name, "sf": sf, "checks": checks}
+              "model": model.name, "sf": scale_factor, "checks": checks}
     labels._atomic_json(QUAIL_CHECK_PATH, result)
     labels.results_vol.commit()
     return result
@@ -626,11 +626,11 @@ def complete_manifest(spec: PredicateSpec, identity: dict,
     return manifest
 
 
-def copy_labels(sf: float, spec: PredicateSpec, source: dict) -> dict:
+def copy_labels(scale_factor: float, spec: PredicateSpec, source: dict) -> dict:
     """Copy sf=1.0 labels by document content into a smaller corpus."""
     import pyarrow.parquet as pq
 
-    manifest, rows = corpus_rows(sf, spec)
+    manifest, rows = corpus_rows(scale_factor, spec)
     identity = classify_identity(spec, manifest)
     table = pq.read_table(source["compact_path"], columns=[
         "left_content_sha256", "right_content_sha256", "label",
@@ -663,7 +663,7 @@ def copy_labels(sf: float, spec: PredicateSpec, source: dict) -> dict:
     return complete_manifest(spec, identity, len(rows))
 
 
-def check_collection(sf: float, collection_id: str) -> dict:
+def check_collection(scale_factor: float, collection_id: str) -> dict:
     """Load each classification query's labels and count its reference rows.
 
     Reads the corpus from the volume, so it works before the corpus is
@@ -678,7 +678,7 @@ def check_collection(sf: float, collection_id: str) -> dict:
     from quail_b.scoring import expected_rows
 
     root = str(labels.ROOT)[:-len(GROUND_TRUTH_ROOT) - 1]
-    directory = labels.ROOT / "corpora" / CORPORA[sf]
+    directory = labels.ROOT / "corpora" / CORPORA[scale_factor]
     counts = {}
     for query_id, spec in queries().items():
         if not spec.info.classifies:
@@ -688,7 +688,7 @@ def check_collection(sf: float, collection_id: str) -> dict:
             columns=list(CORPUS_COLUMNS[relation.table]))
             for relation in spec.info.relations}
         truth = load_ground_truth(
-            root, scale_factor=sf, corpus_id=CORPORA[sf],
+            root, scale_factor=scale_factor, corpus_id=CORPORA[scale_factor],
             collection_id=collection_id,
             templates={operator.prompt
                        for operator in spec.info.ai_operators})
@@ -727,17 +727,22 @@ def finish_run(calls: str, keys: str = "") -> dict:
             spec, classify_identity(spec, manifest), len(rows))
     labels.results_vol.commit()
     collections = {}
-    for sf in (1.0, 0.5, 0.1):
-        if sf != 1.0:
+    for scale_factor in (1.0, 0.5, 0.1):
+        if scale_factor != 1.0:
             for spec in wanted:
-                copy_labels(sf, spec, source[spec.key])
+                copy_labels(scale_factor, spec, source[spec.key])
             labels.results_vol.commit()
         summary = labels.activate_reused_collection(
-            sf, CORPORA[sf], SOURCES[sf], "", new_specs=wanted)
+            scale_factor,
+            CORPORA[scale_factor],
+            SOURCES[scale_factor],
+            "",
+            new_specs=wanted,
+        )
         labels.results_vol.commit()
         summary["classify_queries"] = check_collection(
-            sf, summary["collection_id"])
-        collections[str(sf)] = summary
+            scale_factor, summary["collection_id"])
+        collections[str(scale_factor)] = summary
     result = {
         "prediction": PREDICTION_TEXT,
         "shards": shard_results,
@@ -762,10 +767,10 @@ def check():
 
 
 @app.local_entrypoint()
-def quail_check(run_dir: str, query_ids: str, sf: float = 0.1):
+def quail_check(run_dir: str, query_ids: str, scale_factor: float = 0.1):
     """Compare a Quail run's labels with stock vLLM on the same model."""
     print(QUAIL_CHECK_PREDICTION_TEXT, flush=True)
-    call = quail_check_run.spawn(run_dir, query_ids, sf)
+    call = quail_check_run.spawn(run_dir, query_ids, scale_factor)
     print(f"[classify] quail check function call id: {call.object_id}",
           flush=True)
     result = call.get()

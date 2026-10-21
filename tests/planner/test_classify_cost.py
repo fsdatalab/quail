@@ -6,6 +6,7 @@ from dataclasses import asdict, replace
 import numpy as np
 import pytest
 
+from quail.catalog.tokens import TokenLengths
 from quail.cost.classify import estimate, estimate_suffixes
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.sol import unrounded_seconds
@@ -25,8 +26,8 @@ def _cost(lengths, labels=LABELS, scoring="trie_decode", **kwargs):
     options = dict(lengths=lengths, shared=(), chunk=CHUNK,
                    model=QWEN3_4B_FP8, device=H100_SXM)
     options.update(kwargs)
-    live = options.pop("live", len(lengths))
-    return estimate(scoring, live, HEAD, FRAME, labels, **options)
+    expected_rows = options.pop("expected_rows", len(lengths))
+    return estimate(scoring, expected_rows, HEAD, FRAME, labels, **options)
 
 
 def _head_bytes():
@@ -34,7 +35,7 @@ def _head_bytes():
 
 
 def _readout_seconds(rows, passes):
-    return max(_head_bytes() * rows / H100_SXM.arithmetic_bandwidth("bf16"),
+    return max(_head_bytes() * rows / H100_SXM.gemm_flops("bf16"),
                _head_bytes() * passes / H100_SXM.hbm_bw)
 
 
@@ -58,6 +59,10 @@ def _decode_outcome_work(lengths, runs, window=0, shared=None, resident=False):
         total["pairs"] += sum(fresh)
         contexts = [prompt + sum(fed[:round_]) for round_ in range(1, len(fed))]
         total["kv_read"] += kept + sum(contexts)
+        # The document remains saved while every round reads and writes
+        # the answer's checkpoint. A fresh borrower also reads its parent.
+        total["state_read"] += len(fed) + bool(borrowed and not resident)
+        total["state_written"] += len(fed) + (not resident)
         if window:
             total["sliding_pairs"] += sum(min(i, window) for i in fresh)
             total["sliding_kv_read"] += sum(
@@ -80,7 +85,8 @@ def test_decode_feeds_one_run_per_choice():
 ])
 def test_expected_work_matches_every_label_assignment(lengths, labels, window,
                                                       shared, resident):
-    model = replace(QWEN3_4B_FP8, sliding_window=window, full_attention_period=2)
+    kinds = ("sliding_attention", "full_attention") * 18 if window else ()
+    model = replace(QWEN3_4B_FP8, sliding_window=window, layer_kinds=kinds)
     cost = _cost(lengths, labels, model=model, shared=shared or (),
                  resident=resident)
     runs = decode_round_tokens(labels)
@@ -128,6 +134,8 @@ def test_one_round_rules_are_priced_like_filters():
             prefix = HEAD + length
             # the frame is written first; the request reads it and the document
             work += scan(prefix, FRAME) + stream(prefix + FRAME, [suffix])
+        work = replace(work, state_read=2 * len(lengths),
+                       state_written=2 * len(lengths))
         assert asdict(cost.work) == pytest.approx(asdict(work))
         assert cost.passes == pytest.approx(work.tokens / CHUNK)
         assert cost.seconds == pytest.approx(
@@ -144,6 +152,7 @@ def test_resident_documents_ask_instead_of_scanning():
     for length in (10, 20, 30):
         prefix = HEAD + length
         work += ask(prefix, FRAME) + stream(prefix + FRAME, [1])
+    work = replace(work, state_written=3)
     assert asdict(cost.work) == pytest.approx(asdict(work))
 
 
@@ -165,7 +174,7 @@ def test_one_token_labels_decode_as_a_merged_letters_request():
 
 def test_smaller_chunks_pay_more_weight_reads_without_changing_work():
     device = replace(H100_SXM, peak_flops=float("inf"), bf16_flops=float("inf"),
-                     mamf_fp8_flops=float("inf"))
+                     mamf_fp8_flops=float("inf"), mamf_bf16_flops=float("inf"))
     large = _cost((10, 20, 30), device=device)
     small = _cost((10, 20, 30), device=device, chunk=40)
     assert asdict(small.work) == pytest.approx(asdict(large.work))
@@ -212,15 +221,17 @@ def test_kv_capacity_does_not_enter_the_estimate():
         assert first == second
 
 
-@pytest.mark.parametrize("live", [0, 0.25, 1.8, 7])
-def test_the_estimate_is_linear_in_the_expected_document_count(live):
-    cost = _cost((10,), live=live)
+@pytest.mark.parametrize("expected_rows", [0, 0.25, 1.8, 7])
+def test_the_estimate_is_linear_in_the_expected_document_count(expected_rows):
+    cost = _cost((10,), expected_rows=expected_rows)
     single = _cost((10,))
-    assert cost.rounds == (2 if live else 0)
+    assert cost.rounds == (2 if expected_rows else 0)
     assert asdict(cost.work) == pytest.approx(
-        {key: value * live for key, value in asdict(single.work).items()})
+        {key: value * expected_rows for key, value in asdict(single.work).items()})
     for name in ("seconds", "passes", "suffix_tokens"):
-        assert getattr(cost, name) == pytest.approx(getattr(single, name) * live)
+        assert getattr(cost, name) == pytest.approx(
+            getattr(single, name) * expected_rows
+        )
 
 
 def _decision_readout_seconds(model, rows, passes):
@@ -235,14 +246,26 @@ def test_decision_models_read_option_rows_through_their_head(resident):
     model = DECISION_2_KAI_0_6B_BF16
     assert model.decision_head_dim == 256
     lengths, options = (10, 20, 30), 26
-    cost = estimate_suffixes(HEAD, FRAME, [50], live=len(lengths), lengths=lengths,
-                           shared=(), chunk=CHUNK, model=model, device=H100_SXM,
-                           resident=resident, answer_rows=options + 1)
+    cost = estimate_suffixes(
+        HEAD,
+        FRAME,
+        [50],
+        expected_rows=len(lengths),
+        lengths=lengths,
+        shared=(),
+        chunk=CHUNK,
+        model=model,
+        device=H100_SXM,
+        resident=resident,
+        answer_rows=options + 1,
+    )
     work = Work()
     for length in lengths:
         prefix = HEAD + length
         first = ask(prefix, FRAME) if resident else scan(prefix, FRAME)
         work += first + stream(prefix + FRAME, [50])
+    work = replace(work, state_read=2 * len(lengths),
+                   state_written=len(lengths) * (1 if resident else 2))
     assert asdict(cost.work) == pytest.approx(asdict(work))
     # one row per option block and the prompt's last row, through the
     # fp32 decision head; the vocabulary head is never read
@@ -254,8 +277,8 @@ def test_decision_models_read_option_rows_through_their_head(resident):
     assert cost.seconds < unrounded_seconds(work, model, H100_SXM, CHUNK) + vocabulary
     without_rate = replace(H100_SXM, fp32_flops=0.0)
     with pytest.raises(ValueError, match="fp32"):
-        estimate_suffixes(HEAD, FRAME, [50], live=3, lengths=lengths, shared=(),
-                        chunk=CHUNK, model=model, device=without_rate,
+        estimate_suffixes(HEAD, FRAME, [50], expected_rows=3, lengths=lengths,
+                        shared=(), chunk=CHUNK, model=model, device=without_rate,
                         answer_rows=options + 1)
 
 
@@ -269,7 +292,7 @@ def test_one_token_labels_read_only_their_target_rows():
     targets = 2 * QWEN3_4B_FP8.hidden * 3
     assert cost.seconds == pytest.approx(
         unrounded_seconds(work, QWEN3_4B_FP8, H100_SXM, CHUNK)
-        + max(targets * len(lengths) / H100_SXM.arithmetic_bandwidth("bf16"),
+        + max(targets * len(lengths) / H100_SXM.gemm_flops("bf16"),
               targets * cost.passes / H100_SXM.hbm_bw))
     longer = _cost(lengths, ((10,), (20, 21), (30,)), scoring="letters")
     assert longer.work == cost.work
@@ -291,8 +314,9 @@ def test_classify_and_score_capacity_follow_the_plans_arena_split():
     # documents four times the sliding window: the split gives the
     # every-token pool more pages than the split for unknown lengths
     context = SimpleNamespace(
-        document_tokens={"short": [300] * 8, "long": [4096] * 8}, model=model,
-        device=H100_SXM, canvas_draws=1, memo={})
+        document_tokens={"short": TokenLengths([300] * 8),
+                         "long": TokenLengths([4096] * 8)}, model=model,
+        device=H100_SXM, canvas_draws=1, memo={}, gpus=1)
     planned = budgets.arena_tokens(model, H100_SXM, chunk, 4096)
     assert planned > budgets.arena_tokens(model, H100_SXM, chunk)
     # the longest table's mean, as plan_statistics splits the pools
@@ -302,3 +326,14 @@ def test_classify_and_score_capacity_follow_the_plans_arena_split():
     dense = SimpleNamespace(**{**vars(context), "model": QWEN3_4B_FP8, "memo": {}})
     assert arena_capacity(dense, chunk) == budgets.arena_tokens(
         QWEN3_4B_FP8, H100_SXM, chunk)
+
+
+@pytest.mark.parametrize("num_documents,gpus", [(8, 2), (1, 8), (2, 8)])
+def test_parallel_classification_divides_time_by_the_copies_in_use(
+        num_documents, gpus):
+    lengths = [100] * num_documents
+    serial = _cost(lengths)
+    parallel = _cost(lengths, gpus=gpus)
+    assert parallel.work == serial.work
+    assert parallel.seconds == pytest.approx(
+        serial.seconds / min(num_documents, gpus))

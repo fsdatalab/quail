@@ -14,13 +14,14 @@ from quail.logical.nodes.extract import (
 )
 from quail.logical.nodes.filter import Filter, SemanticFilter
 from quail.logical.nodes.join import Join, SemanticJoin
-from quail.logical.nodes.relational import Aggregate, Project, Result
+from quail.logical.nodes.relational import Aggregate, Project, Result, Window
 from quail.logical.nodes.scan import Scan
 
 __all__ = [
     "APPLY_IDS",
     "APPLY_KINDS",
     "Aggregate",
+    "Window",
     "Apply",
     "Filter",
     "Join",

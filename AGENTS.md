@@ -28,7 +28,11 @@ Write like two engineers talking at a whiteboard.
   then optional Args, Returns, and Raises. Say what the code does, not
   why it was written or what it replaced.
 - Use one name for each concept across the planner, the executor, the
-  docs, and the metrics.
+  docs, and the metrics. `tools/check_names.py` enforces the chosen
+  words; see Names below.
+- Whatever opens a file, a process, or an engine owns it: enter it on
+  an `ExitStack` or in `closing()`, and release it on the failure
+  path as well as the normal one.
 
 # Checks
 
@@ -36,6 +40,7 @@ CI runs these on every pull request. Run them before pushing:
 
     uv run ruff check quail bench calibrate tests experiments tools
     uv run python tools/check_long_strings.py
+    uv run python tools/check_names.py
     uv run vulture
     uv run lint-imports
     uv run pytest -q
@@ -52,6 +57,23 @@ CI runs these on every pull request. Run them before pushing:
   containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a
   prompts module or folder, or plainly HTML or SQL. Docstrings are
   exempt. Shorten long messages and log lines.
+- `tools/check_names.py` reports two names for one concept or one
+  name for two: duplicate function bodies, a parameter passed on
+  under another keyword, identifiers that differ by a synonym, and a
+  variable named for a type it does not hold. `--inventory` lists
+  what the code defines, for finding such names by hand.
+
+## Tests
+
+- An end-to-end test answers the model from `tests/helpers/oracle.py`:
+  `Oracle` holds the planted truth, `oracle_executor` runs a request's
+  graph on it, and `finish` runs a query to its result. Do not add
+  another fake of the executor or the model.
+- A bug fix gets one small regression case, in the test file that
+  already covers that path. Name a test as a sentence stating the
+  behavior, such as `test_a_failed_boot_releases_the_gpu`.
+- A test checks the behavior the user sees, such as the rows returned
+  or the files left behind, not the order of internal calls.
 
 # Names
 
@@ -71,11 +93,42 @@ CI runs these on every pull request. Run them before pushing:
   `device`; neither has a default. `gpus` defaults to 1 and `backend`
   to `"quail"`.
 
+## Names in code
+
+One word per concept, following Spark, DuckDB, and DataFusion where
+they have one. When a concept has no name yet, ask before inventing
+one. `tools/check_names.py` enforces the chosen words:
+
+- `document` and `documents`, not `doc` or `docs` (the public `docs()`
+  API keeps its name).
+- A count is `num_<things>`, such as `num_documents` or `num_pages`,
+  never `n_<things>`, `<thing>_count`, or `number_of_<things>`.
+- `gpus` is the GPU count everywhere: the planner, the executor, the
+  settings, and the metrics. `workers` names worker handles only.
+- `expected_rows` is the rows an operator expects to see, whatever it
+  reads: documents, pairs, or tuples. `survivors` are the ids still in
+  play after an operator.
+- `index` not `idx`, `position` not `pos`, `count` not `cnt`,
+  `tokens` not `toks`, `tokenizer` not `tok`, `seconds` not `secs`,
+  `estimate` not `est`, `config` not `cfg`; `written_position` and
+  `exec_index` for a node's places in the query and the run.
+- `resident` is KV already read; `document_head` is the prompt tokens
+  an operator shows before each document; `run` or `configuration`,
+  never `arm`.
+- Every document operator emits one `rows:<alias>` port carrying
+  `Rows`, and a pair operator emits `rows`. Read ids from `Rows` with
+  `document_ids()`; do not keep a separate ids port.
+- A variable named for a type holds that type: `rows`, `scored`,
+  `labels`, and `answers` hold `Rows`; `table`, `batch`, and
+  `relation` hold Arrow tables.
+
 # Scope
 
 - Filter and join queries on Qwen3 4B fp8, Qwen3 32B fp8,
-  DiffusionGemma 26B-A4B fp8, or Decision-2.0-Kai 0.6B bf16, on one
-  H100 per model copy. No tensor-parallel weight sharding.
+  DiffusionGemma 26B-A4B fp8, Decision-2.0-Kai 0.6B bf16, or the hybrid
+  models Qwen3.5 4B bf16, Qwen3.5 27B fp8, Qwen3.8 27B fp8, and LFM2
+  2.6B bf16, on one H100 per model copy. No tensor-parallel weight
+  sharding.
 - `AI.MAP` is on the roadmap.
   Open-ended generation, speculation, and forking are not supported.
 
@@ -135,6 +188,45 @@ how they release and explain changes.
 - Do not create Modal app names. Attach GPU cells to
   `quail-milestone1` and the worker to `quail-engine`; caches and warm
   state belong to those apps.
+- To check a change, run these 13 queries at scale factor 0.1, with
+  Quail alone. Do not run the full suite; it is slow. Together they
+  cover each AI operator alone, chained with the others, and followed
+  by relational operators:
+  - `IMDB-1`: one filter.
+  - `IMDB-2`: one join.
+  - `IMDB-4`: two filters, then a join.
+  - `FEV-9`: four filters and a chain of three joins.
+  - `IMDB-11`: classify.
+  - `AGENT-5`: three classifies over the same rows.
+  - `IMDB-15`: a classify, a join, then another classify.
+  - `CUAD-1`: extract, one span per row.
+  - `CUAD-4`: extract, several spans per row.
+  - `CUAD-10`: three extracts over the same rows.
+  - `CUAD-15`: a filter, an extract, then sort and limit.
+  - `CUAD-11`: classify, then aggregate.
+  - `SALES-5`: a relational filter, a score, then top 25.
+
+  `bench.quailb_parallel` runs each query family on its own H100, so
+  this set uses five H100s: IMDB, FEV, AGENT, CUAD, and SALES. If a
+  change touches one operator, run only the queries that use it.
+
+  For example:
+
+      queries=IMDB-1,IMDB-2,IMDB-4,FEV-9,IMDB-11,AGENT-5,IMDB-15
+      queries=$queries,CUAD-1,CUAD-4,CUAD-10,CUAD-15,CUAD-11,SALES-5
+      uv run modal run --detach -m bench.quailb_parallel \
+        --model qwen3-4b-fp8 --sf 0.1 --query "$queries" \
+        --no-include-baselines --no-include-sglang \
+        2>&1 | tee "$run_log"
+
+  Run more queries, or a larger scale factor, only when the change
+  targets them or the user asks.
+- Do not run stock vLLM, pipelined vLLM, or SGLang by default.
+  `bench.quailb_parallel` runs them unless told not to, so pass
+  `--no-include-baselines --no-include-sglang`. Run a baseline only
+  for an experiment whose point is to compare Quail with it, or when
+  the user asks. Reuse saved baseline results when the queries, scale
+  factor, and model have not changed.
 - Tee every Modal run to a file; the CLI drops old log lines.
 - Do not save Modal return values to local JSON. Print the function
   call id (`fc-...`) into the tee file, and fetch the result later

@@ -4,7 +4,12 @@ from collections import Counter
 from collections.abc import Mapping
 
 from quail import logical as logical_nodes
-from quail.logical import DEFAULT_SELECTIVITY, LogicalPlan, effective_selectivity
+from quail.logical import (
+    DEFAULT_SELECTIVITY,
+    LogicalPlan,
+    column_name,
+    effective_selectivity,
+)
 from quail.physical import (
     Aggregate,
     AiClassify,
@@ -22,6 +27,7 @@ from quail.physical import (
     Recombine,
     Scan,
     Sort,
+    Window,
 )
 from quail.physical.pipelines import build_pipelines
 from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
@@ -35,7 +41,7 @@ def _number(value):
 
 
 def _prompt(prompt):
-    args = ", ".join(f"{arg.alias}.{arg.column}" for arg in prompt.args)
+    args = ", ".join(column_name(arg) for arg in prompt.args)
     return f"PROMPT({prompt.template!r}, {args})"
 
 
@@ -80,6 +86,8 @@ def logical_tree(logical):
             return
         if isinstance(node, logical_nodes.Aggregate):
             title = f"Aggregate: {node.specification()}"
+        elif isinstance(node, logical_nodes.Window):
+            title = "Window: " + "; ".join(str(call) for call in node.calls)
         elif isinstance(node, logical_nodes.Project):
             fields = node.explain_fields()
             title = f"Project: {', '.join(fields['columns'])}"
@@ -87,7 +95,8 @@ def logical_tree(logical):
                        for name, members in fields.get("structs", {}).items()]
         elif isinstance(node, logical_nodes.Scan):
             title = f"Scan {node.provider} as {node.alias}"
-            columns = ", ".join(dict.fromkeys((node.column, *node.columns)))
+            columns = ", ".join(dict.fromkeys(
+                (column_name(node.column, qualified=False), *node.columns)))
             title += f" [{columns}]"
             if node.predicates:
                 title += " where " + " and ".join(
@@ -116,8 +125,7 @@ def logical_tree(logical):
                        f"labels={list(node.call.labels)}"]
         elif isinstance(node, logical_nodes.SemanticExtract):
             title = f"SemanticExtract: {node.name}, {node.span_name}"
-            details = [f"question={node.call.question!r} "
-                       f"trim={'on' if node.call.trim else 'off'}"]
+            details = [f"question={node.call.question!r}"]
         elif isinstance(node, logical_nodes.Join):
             title = "Join"
             details = ([f"on {condition}" for condition in node.on]
@@ -125,7 +133,7 @@ def logical_tree(logical):
         elif isinstance(node, logical_nodes.Apply):
             title = f"Apply {node.function} ({node.kind}, {node.ids})"
             details = ["columns: " + ", ".join(
-                f"{ref.alias}.{ref.column}" for ref in node.columns)]
+                column_name(column) for column in node.columns)]
         else:
             title = node.type_name
             details = _fields(node.explain_fields(), 0)
@@ -206,29 +214,29 @@ def measured_stages(report) -> dict:
         report: An execution report (QueryResult.report).
 
     Returns:
-        ("filter", alias, written_pos) and ("join", written_pos) keys
+        ("filter", alias, written_position) and ("join", written_position) keys
         mapped to the stage dicts of report["stages"]. Stages saved
-        before written_pos was recorded are left out.
+        before written_position was recorded are left out.
     """
     stages = {}
     for stage in (report or {}).get("stages", ()):
-        written_pos = stage.get("written_pos")
-        if written_pos is None:
+        written_position = stage.get("written_position")
+        if written_position is None:
             continue
         if stage.get("op") == "filter":
-            stages[("filter", stage["alias"], written_pos)] = stage
+            stages[("filter", stage["alias"], written_position)] = stage
         elif stage.get("op") == "join":
-            stages[("join", written_pos)] = stage
+            stages[("join", written_position)] = stage
     return stages
 
 
-def run_summary(report, graph, workers, usd_per_hour=None) -> list:
+def run_summary(report, graph, gpus, usd_per_hour=None) -> list:
     """Return the measured totals of one run as labeled lines.
 
     Args:
         report: The execution report (QueryResult.report).
         graph: The executed physical graph, for the input document count.
-        workers: GPUs the query ran on.
+        gpus: GPUs the query ran on.
         usd_per_hour: Price of one GPU, for the cost per query.
     """
     wall = report.get("wall_s")
@@ -243,7 +251,7 @@ def run_summary(report, graph, workers, usd_per_hour=None) -> list:
     if not pairs:
         # a score over document pairs has no join stage records
         pairs = report.get("evaluated_document_pairs") or 0
-    documents = sum(node.n_docs for node in graph.nodes
+    documents = sum(node.num_documents for node in graph.nodes
                     if isinstance(node, Scan))
     if wall > 0 and pairs:
         items.append(("throughput", f"{_number(pairs / wall)} document "
@@ -256,8 +264,8 @@ def run_summary(report, graph, workers, usd_per_hour=None) -> list:
         tokens += f", {report['cached_tokens']:,} read from KV"
     items.append(("tokens", tokens))
     if usd_per_hour is not None:
-        cost = wall / 3600 * workers * usd_per_hour
-        items.append(("GPU cost", f"${cost:.4f} per query ({workers} GPU at "
+        cost = wall / 3600 * gpus * usd_per_hour
+        items.append(("GPU cost", f"${cost:.4f} per query ({gpus} GPU at "
                       f"${usd_per_hour:.4f}/hour, startup excluded)"))
     width = max(len(label) for label, _ in items)
     return [f"{label.ljust(width)}   {value}" for label, value in items]
@@ -277,13 +285,13 @@ def _estimated_rows(graph):
         inputs = [rows.get(port.source) for port in node.inputs]
         value = None
         if isinstance(node, Scan):
-            value = (node.n_docs if node.expected_docs is None
-                     else node.expected_docs)
+            value = (node.num_documents if node.expected_rows is None
+                     else node.expected_rows)
         elif isinstance(node, AiFilter):
             value = inputs[0] if inputs else None
             if value is not None:
                 value *= effective_selectivity(node.selectivity)
-        elif isinstance(node, (Project, Limit, Sort, Exchange)) \
+        elif isinstance(node, (Project, Limit, Sort, Window, Exchange)) \
                 and len(inputs) == 1:
             value = inputs[0]
             if isinstance(node, Limit) and value is not None:
@@ -349,9 +357,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             source = scans.get(node.alias)
             title = (f"Scan {source.provider} as {node.alias}" if source else
                      f"Scan: {node.alias}")
-            mean = node.total_tokens / node.n_docs if node.n_docs else 0
+            mean = node.total_tokens / node.num_documents if node.num_documents else 0
             details.append(f"tokens={node.total_tokens:,}, "
-                           f"mean_doc_tokens={_number(mean)}")
+                           f"mean_document_tokens={_number(mean)}")
             if source is not None and source.predicates:
                 details.append("where " + " and ".join(
                     str(predicate) for predicate in source.predicates))
@@ -373,6 +381,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 details.append("having " + " and ".join(
                     f"{name} {comparison} {value!r}"
                     for name, comparison, value in node.having))
+        elif isinstance(node, Window):
+            title += ": " + ", ".join(node.columns)
+            details.extend(str(call) for call in node.calls)
         elif isinstance(node, Sort):
             title += ": " + ", ".join(
                 f"{column} {'DESC' if descending else 'ASC'} "
@@ -402,13 +413,13 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                     f"(one document at a time, the rest skipped once "
                     f"one survives)")
             written = filters.get(node.alias, ())
-            label = f"predicate {node.written_pos + 1}"
-            if node.written_pos < len(written):
+            label = f"predicate {node.written_position + 1}"
+            if node.written_position < len(written):
                 label += "  " + _short_prompt(
-                    written[node.written_pos].prompt)
+                    written[node.written_position].prompt)
             predicates.append((label, stage_cells(
-                node.selectivity, node.expected_docs,
-                stages.get(("filter", node.alias, node.written_pos)),
+                node.selectivity, node.expected_rows,
+                stages.get(("filter", node.alias, node.written_position)),
                 "evaluated")))
         elif isinstance(node, AiClassify):
             spec = node.spec
@@ -423,10 +434,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             spec = node.spec
             title += f": {spec.name} over {spec.alias}"
             details.append(f"question={spec.question!r}, "
-                           f"trim={'on' if spec.trim else 'off'}, "
                            f"up to {spec.max_answer_tokens} answer tokens")
         elif isinstance(node, Filter):
-            title += f": {node.predicate.describe()}"
+            title += f": {node.predicate}"
         elif isinstance(node, AiJoin):
             title += f": anchor={node.anchor}"
             source = {"none": "not resident", "filter": "from filters",
@@ -434,19 +444,19 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                           node.anchor_resident, node.anchor_resident)
             keep = "yes" if node.keep_kv else "no"
             details.append(f"KV: anchor={source}, retain after join={keep}")
-            label = (f"join {node.written_pos + 1} {node.semantics} "
+            label = (f"join {node.written_position + 1} {node.semantics} "
                      f"({node.anchor}, {', '.join(node.partners)})")
             if node.pairs_from:
                 label += f" over pairs from {node.pairs_from}"
-            if node.written_pos < len(joins):
+            if node.written_position < len(joins):
                 label += "  " + _short_prompt(
-                    joins[node.written_pos].prompt)
+                    joins[node.written_position].prompt)
             predicates.append((label, stage_cells(
-                node.selectivity, node.expected_tuples,
-                stages.get(("join", node.written_pos)), "tuples")))
+                node.selectivity, node.expected_rows,
+                stages.get(("join", node.written_position)), "tuples")))
         elif isinstance(node, HashJoin):
             title += ": " + " and ".join(
-                f"{node.left}.{left} = {node.right}.{right}"
+                f"{column_name(left)} = {column_name(right)}"
                 for left, right in node.on)
             details.append(
                 f"pairs kept: {node.pair_fraction:.4g} of the cross product")
@@ -455,7 +465,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                       f"{', '.join(node.aliases)}")
             if node.columns:
                 details.append("columns: " + ", ".join(
-                    f"{alias}.{column}" for alias, column in node.columns))
+                    column_name(column) for column in node.columns))
         elif isinstance(node, Exchange):
             title += f": {node.anchor} to the GPU holding its KV"
         elif isinstance(node, Barrier):
@@ -556,6 +566,50 @@ def rule_lines(rules) -> list[str]:
     ]
 
 
+def architecture_lines(model_name: str) -> list[str]:
+    """Return the architecture, weight precision, and kernel path lines.
+
+    The gated delta net recurrence kernel is read from QUAIL_GDN_PREFILL
+    in this process, which is the worker's value when the worker was
+    started from the same shell.
+
+    Args:
+        model_name: A registered model name.
+
+    Returns:
+        Two lines, or none for a name that is not registered.
+    """
+    import os
+    from collections import Counter
+
+    from quail.specs import MODELS
+
+    spec = MODELS.get(model_name)
+    if spec is None:
+        return []
+    kinds = Counter(spec.layer_kinds)
+    layers = (", ".join(f"{count} {kind}" for kind, count in kinds.items())
+              if kinds else f"{spec.layers} layers")
+    gemm = ("fp8 GEMM (DeepGEMM)" if spec.weight_precision == "fp8"
+            else "bf16 GEMM (cuBLAS)")
+    if spec.arch == "qwen3_5":
+        gemm = "vLLM per-layer GEMM"
+        if spec.gdn_weight_precision is not None:
+            gemm += f" (recurrent projections {spec.gdn_weight_precision})"
+    paths = [f"linear layers: {gemm}"]
+    if "full_attention" in kinds or "sliding_attention" in kinds:
+        paths.append("attention: FlashAttention over paged KV")
+    if "gated_delta_net" in kinds:
+        requested = os.environ.get("QUAIL_GDN_PREFILL", "auto")
+        paths.append("gated_delta_net: Triton convolution, "
+                     f"recurrence={requested} (QUAIL_GDN_PREFILL)")
+    if "short_conv" in kinds:
+        paths.append("short_conv: Triton convolution")
+    return [f"architecture={spec.arch} ({layers}), "
+            f"weights={spec.weight_precision}",
+            "kernels: " + "; ".join(paths)]
+
+
 def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
             result=None, usd_per_hour: float | None = None,
             rules=None) -> str:
@@ -582,7 +636,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         return "\n".join(lines)
     lines.append("")
     lines.append(f"physical: backend={physical.backend}, "
-                 f"model={physical.model}, workers={physical.workers}")
+                 f"model={physical.model}, gpus={physical.gpus}")
     if physical.backend == "quail":
         chunk = physical.settings.get("chunk_tokens")
         admission = physical.settings.get("admission_tokens")
@@ -592,14 +646,16 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         if admission is not None:
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
+        lines.extend("  " + line for line in architecture_lines(
+            physical.model))
     lines.append("")
     lines.extend("  " + line for line in physical_tree(
         physical.graph, logical=logical, verbose=verbose,
-        estimates=getattr(physical, "estimates", None),
+        estimates=physical.estimates,
         metrics=None if result is None else result.node_metrics,
         stages=None if result is None else measured_stages(result.report),
     ).splitlines())
-    if getattr(physical, "estimates", None):
+    if physical.estimates:
         lines.append("  est. time is each node's work alone; node times do "
                      "not add up to the plan estimate")
         lines.append("  because chunk packing shares forward passes across "
@@ -608,7 +664,7 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         lines.append("")
         lines.append("run:")
         lines.extend("  " + line for line in run_summary(
-            result.report, physical.graph, physical.workers, usd_per_hour))
+            result.report, physical.graph, physical.gpus, usd_per_hour))
     if verbose:
         lines.append("")
         lines.append("settings:")

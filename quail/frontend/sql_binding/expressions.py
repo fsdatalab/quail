@@ -6,10 +6,13 @@ from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.scope import Scope
+from quail.frontend.sql_binding.predicates import (
+    COLUMN_NODES,
+    column_path,
+    unwrap_function,
+)
 from quail.logical import (
     Alias,
-    ColumnRef,
-    Compare,
     CompileError,
     ExtractStruct,
     FilterPredicate,
@@ -49,101 +52,6 @@ def _score_comparison(node):
     return None
 
 
-_PLAIN_COMPARISONS = {
-    exp.EQ: "=",
-    exp.NEQ: "<>",
-    exp.LT: "<",
-    exp.LTE: "<=",
-    exp.GT: ">",
-    exp.GTE: ">=",
-}
-
-
-_FLIPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "<>": "<>"}
-
-
-def _literal(node):
-    """Return a Python value for a SQL literal, or raise."""
-    if isinstance(node, exp.Literal):
-        if node.is_string:
-            return str(node.this)
-        text = str(node.this)
-        return float(text) if "." in text or "e" in text.lower() else int(text)
-    if isinstance(node, exp.Boolean):
-        return bool(node.this)
-    if (
-        isinstance(node, exp.Neg)
-        and isinstance(node.this, exp.Literal)
-        and not node.this.is_string
-    ):
-        return -_literal(node.this)
-    raise CompileError(
-        f"a column is compared with a number, string, or boolean "
-        f"literal, got {node.sql()}"
-    )
-
-
-def _has_ai_call(term) -> bool:
-    return any(
-        _is_call(node, "AI_FILTER")
-        or _is_call(node, "AI_SCORE")
-        or _is_call(node, "AI_EXTRACT")
-        or isinstance(node, (exp.AIClassify, exp.Exists))
-        for node in term.walk()
-    )
-
-
-def _regular_predicate(b, term) -> RegularPredicate | None:
-    """Parse a plain test of one column, or return None for an AI term.
-
-    Raises:
-        CompileError: The term has no AI call and is not a supported
-            regular predicate.
-    """
-    if _has_ai_call(term):
-        return None
-    node, negated = term, False
-    if isinstance(node, exp.Not):
-        node, negated = node.this, True
-    if (
-        isinstance(node, exp.Is)
-        and isinstance(node.expression, exp.Null)
-        and isinstance(node.this, exp.Column)
-    ):
-        return RegularPredicate(
-            b.resolve_column(node.this), "is not null" if negated else "is null"
-        )
-    if negated:
-        raise CompileError(
-            f"NOT is supported as NOT EXISTS and IS NOT NULL, got NOT {node.sql()}"
-        )
-    if (
-        isinstance(node, exp.In)
-        and isinstance(node.this, exp.Column)
-        and node.expressions
-    ):
-        return RegularPredicate(
-            b.resolve_column(node.this),
-            "in",
-            tuple(_literal(item) for item in node.expressions),
-        )
-    comparison = _PLAIN_COMPARISONS.get(type(node))
-    if comparison is not None:
-        left, right = node.this, node.expression
-        if isinstance(left, exp.Column) and not isinstance(right, exp.Column):
-            return RegularPredicate(b.resolve_column(left), comparison, _literal(right))
-        if isinstance(right, exp.Column) and not isinstance(left, exp.Column):
-            return RegularPredicate(
-                b.resolve_column(right), _FLIPPED[comparison], _literal(left)
-            )
-        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-            return None
-    raise CompileError(
-        f"{term.sql()} is not supported; a regular predicate is =, <>, <, <=, "
-        f">, >=, IN (literals), IS NULL, or IS NOT NULL"
-    )
-
-
 def _label_test(node):
     """Return the AI.CLASSIFY call and tested values of an = or IN test, or None."""
     if isinstance(node, exp.In) and isinstance(node.this, exp.AIClassify):
@@ -162,17 +70,21 @@ def _is_ai_score_comparison(node) -> bool:
 
 
 class ExpressionBinder:
-    def __init__(self, catalog: Catalog, prompts: PromptBinder):
+    def __init__(self, catalog: Catalog, prompts: PromptBinder,
+                 dialect: str = "snowflake"):
         self.catalog = catalog
         self.prompts = prompts
+        self.dialect = dialect
         self.scope = Scope(catalog)
         self.tables = self.scope.tables
         self.regular_predicates: dict[str, list[RegularPredicate]] = {}
-        self.doc_columns = self.scope.doc_columns
+        self.document_columns = self.scope.document_columns
         self.filters: dict[str, list[FilterPredicate]] = {}
         self.label_tests: dict[
             str, list[tuple[ModelCall, tuple[str, ...], float | None]]
         ] = {}
+        # alias -> (RegularPredicate on an answer or span, selectivity)
+        self.extract_tests: dict[str, list[tuple[RegularPredicate, float | None]]] = {}
         self.joins: list[JoinSpec] = []
 
     # ---- scope ------------------------------------------------------
@@ -182,12 +94,34 @@ class ExpressionBinder:
         self.scope.add_table(alias, table.name)
         return alias
 
-    def resolve_column(self, col: exp.Column, scope=None) -> ColumnRef:
-        return self.scope.resolve(col.name, col.table or None, tables=scope,
-                                  shown=col.sql())
+    def resolve_value(self, node, tables=None, function=None, name=None):
+        """Resolve a column, a struct field under one, or LENGTH() of either.
 
-    def note_doc_column(self, ref: ColumnRef) -> None:
-        self.scope.note_doc_column(ref)
+        Args:
+            node: The column or LENGTH(column) expression.
+            tables: (alias, provider) pairs to resolve against instead
+                of the tables in scope.
+            function: The function already parsed off the node, if any.
+            name: The AS name the SELECT list gives the column, if any.
+
+        Raises:
+            CompileError: The node is not a column expression, or its
+                column, field, or function does not resolve.
+        """
+        if function is None:
+            node, function = unwrap_function(node)
+        if not isinstance(node, exp.Column):
+            raise CompileError(f"{node.sql()} is not a column expression")
+        parts = column_path(node)
+        scope = dict(self.tables if tables is None else tables)
+        alias = parts[0] if len(parts) > 1 and parts[0] in scope else None
+        column, *path = parts[1:] if alias is not None else parts
+        return self.scope.resolve_value(column, alias, path=tuple(path),
+                                        function=function, name=name,
+                                        tables=tables, shown=node.sql())
+
+    def note_document_column(self, column) -> None:
+        self.scope.note_document_column(column)
 
     # ---- AI predicate parsing ----------------------------------------
 
@@ -256,11 +190,11 @@ class ExpressionBinder:
         template = str(p_args[0].this)
         refs = []
         for a in p_args[1:]:
-            if not isinstance(a, exp.Column):
+            if not isinstance(a, COLUMN_NODES):
                 raise CompileError(
                     f"PROMPT arguments must be column references, got {a.sql()}"
                 )
-            refs.append(self.resolve_column(a, scope))
+            refs.append(self.resolve_value(a, scope))
         aliases = []
         for r in refs:
             if r.alias not in aliases:
@@ -282,7 +216,7 @@ class ExpressionBinder:
                 kind = "join" if join else "filter"
             prompt = self.prompts.bind(kind, template, tuple(refs))
         for r in refs:
-            self.note_doc_column(r)
+            self.note_document_column(r)
         return prompt, options, aliases
 
     def bind_ai_classify(self, node, scope=None):
@@ -344,9 +278,8 @@ class ExpressionBinder:
     def bind_ai_extract(self, node, name: str) -> tuple:
         """Parse an AI.EXTRACT call and bind its document reference.
 
-        The call is ``AI.EXTRACT(column, {'field': 'question', ...}[,
-        {'trim': false}])``. Each field is its own extraction, named
-        ``name.field``; the one option, trim, applies to every field.
+        The call is ``AI.EXTRACT(column, {'field': 'question', ...})``.
+        Each field is its own extraction, named ``name.field``.
 
         Args:
             node: The AI_EXTRACT call.
@@ -357,9 +290,9 @@ class ExpressionBinder:
             written order.
 
         Raises:
-            CompileError: The column, fields, or options are invalid.
+            CompileError: The column or fields are invalid.
         """
-        ref, fields, options = self._extract_arguments(node)
+        ref, fields = self._extract_arguments(node)
         questions = {}
         for prop in fields.expressions:
             if not isinstance(prop, exp.PropertyEQ):
@@ -375,22 +308,21 @@ class ExpressionBinder:
         struct = ExtractStruct(name, tuple(questions))
         struct.validate()
         return struct, tuple(
-            Alias(self._extract_call(ref, question, options), struct.member(field))
+            Alias(self._extract_call(ref, question), struct.member(field))
             for field, question in questions.items())
 
     def _extract_arguments(self, node) -> tuple:
         """Check an AI.EXTRACT call's arguments and resolve its column.
 
         Returns:
-            The column reference, the object of field questions, and the
-            parsed options.
+            The column reference and the object of field questions.
         """
         args = list(node.expressions)
-        if len(args) not in (2, 3):
+        if len(args) != 2:
             raise CompileError(
-                "AI.EXTRACT takes a document column, an object of field "
-                "questions, and at most one option object")
-        if not isinstance(args[0], exp.Column):
+                "AI.EXTRACT takes a document column and an object of field "
+                "questions")
+        if not isinstance(args[0], COLUMN_NODES):
             raise CompileError(
                 f"AI.EXTRACT's first argument is a document column, "
                 f"got {args[0].sql()}")
@@ -399,53 +331,16 @@ class ExpressionBinder:
                 f"AI.EXTRACT's second argument is an object of field "
                 f"questions such as {{'ends': 'When does the lease end?'}}, "
                 f"got {args[1].sql()}")
-        ref = self.resolve_column(args[0])
-        options = self.parse_extract_options(args[2] if len(args) == 3 else None)
-        return ref, args[1], options
+        ref = self.resolve_value(args[0])
+        return ref, args[1]
 
-    def _extract_call(self, ref, question: str, options: dict) -> ModelCall:
+    def _extract_call(self, ref, question: str) -> ModelCall:
         """Bind one extraction's prompt over the document column."""
         prompt = self.prompts.bind("extract", question, (ref,))
-        self.note_doc_column(ref)
-        call = ModelCall(prompt, "extract", question=question,
-                         trim=options.get("trim", True))
+        self.note_document_column(ref)
+        call = ModelCall(prompt, "extract", question=question)
         call.validate()
         return call
-
-    def parse_extract_options(self, node) -> dict:
-        """Validate and extract the options for AI.EXTRACT.
-
-        Args:
-            node: SQLGlot Struct expression, or None for no options.
-
-        Returns:
-            A dictionary with the supplied trim value.
-
-        Raises:
-            CompileError: The object is malformed, a key is unknown, or a
-                value has the wrong type.
-        """
-        if node is None:
-            return {}
-        if not isinstance(node, exp.Struct):
-            raise CompileError(
-                f"AI.EXTRACT's options are an object like "
-                f"{{'trim': false}}, got {node.sql()}")
-        out = {}
-        for prop in node.expressions:
-            if not isinstance(prop, exp.PropertyEQ):
-                raise CompileError(f"malformed option {prop.sql()}")
-            key = str(prop.this.name).lower()
-            value = prop.expression
-            if key == "trim":
-                if not isinstance(value, exp.Boolean):
-                    raise CompileError(f"{key} is true or false")
-                out[key] = bool(value.this)
-            else:
-                raise CompileError(
-                    f"unknown AI.EXTRACT option {key!r}; the one option is "
-                    f"trim")
-        return out
 
     def bind_ai_value(self, node: exp.Expression) -> ModelCall:
         """Bind a score or classification to its model call."""
@@ -587,7 +482,7 @@ class ExpressionBinder:
         return ModelCall(prompt, "boolean"), options, aliases
 
     def bind_ai_score(self, node, allowed: set, scope=None, join=None):
-        """Parse a compared AI.SCORE call into a Compare, options, and aliases.
+        """Parse a compared AI.SCORE call into a predicate, options, and aliases.
 
         The threshold may be on either side of the comparison.
         """
@@ -607,7 +502,7 @@ class ExpressionBinder:
             scope=scope,
             join=join,
         )
-        expression = Compare(ModelCall(prompt, "score"), comparison, value)
+        expression = RegularPredicate(ModelCall(prompt, "score"), comparison, value)
         return expression, options, aliases
 
 

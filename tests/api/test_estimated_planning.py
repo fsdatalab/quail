@@ -3,6 +3,7 @@
 import threading
 
 import pyarrow as pa
+import pytest
 from helpers.sessions import make_executor
 
 import quail
@@ -12,7 +13,7 @@ DOCS = pa.table({
     "id": [f"d{i}" for i in range(6)],
     "body": ["pad " * (2 * i + 2) for i in range(6)],
 })
-SQL = ("SELECT d.id FROM docs d WHERE "
+SQL = ("SELECT d.id FROM documents d WHERE "
        "AI_FILTER(PROMPT('question {0}', d.body), {'selectivity': 0.5})")
 TRUTH = {"d": {"question": [1, 0, 1, 0, 1, 0]}}
 
@@ -21,23 +22,23 @@ def _session(tokenizer=str.split):
     session = quail.Session(
         quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
         tokenizer=tokenizer)
-    session.register("docs", quail.DocumentProvider.from_table(DOCS, id_col="id"))
+    session.register("documents", quail.DocumentProvider.from_table(DOCS, id_col="id"))
     return session
 
 
 def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
     lengths = [len(body.split()) for body in DOCS["body"].to_pylist()]
     session = _session()
-    estimates = session.inputs.estimate_lengths("docs", "body")
+    estimates = session.inputs.estimate_lengths("documents", "body")
     # tokens per byte is constant here, so the estimate is exact
-    assert estimates == lengths
-    assert session.inputs.estimate_lengths("docs", "body") is estimates
+    assert list(estimates) == lengths
+    assert session.inputs.estimate_lengths("documents", "body") is estimates
     session.close()
     # a larger table repeats the sample's lengths over the row count
     # instead of scanning the column
     monkeypatch.setattr("quail.catalog.inputs.ESTIMATE_SAMPLE", 2)
     session = _session()
-    assert session.inputs.estimate_lengths("docs", "body") == [2, 4] * 3
+    assert list(session.inputs.estimate_lengths("documents", "body")) == [2, 4] * 3
     session.close()
 
     monkeypatch.setattr(execution, "gpu_problem", lambda: None)
@@ -52,7 +53,7 @@ def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
     assert sorted(query.run().to_rows()) == [("d0",), ("d2",), ("d4",)]
     assert query.token_wait_s >= 0.0
     assert not query._token_futures
-    assert list(session.inputs.token_lengths("docs", "body")) == lengths
+    assert list(session.inputs.token_lengths("documents", "body")) == lengths
     again = session.sql(SQL)
     assert "estimated from a" not in again.explain()
     assert again._estimated == ()
@@ -96,7 +97,7 @@ def _table_session(bodies):
     session = quail.Session(
         quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
         tokenizer=str.split)
-    session.register("docs", quail.DocumentProvider.from_table(table, id_col="id"))
+    session.register("documents", quail.DocumentProvider.from_table(table, id_col="id"))
     return session
 
 
@@ -113,6 +114,14 @@ def test_prefix_sharing_and_attention_path_are_decided_from_exact_tokens():
     refined = query.plan()
     sequence = next(n for n in refined.nodes if n.type_name == "quail.ai_filter")
     assert sequence.share_prefixes and sequence.arena_writes
+    # the filter computes the documents' fresh tokens only, and the
+    # plan's estimate drops by the same amount, as it does for an
+    # extraction that borrows
+    before = first.estimates[sequence.node_id]["seconds"]
+    after = refined.estimates[sequence.node_id]["seconds"]
+    assert 0 < after <= before
+    assert refined.estimated_seconds == pytest.approx(
+        first.estimated_seconds - (before - after))
     # nothing left to refine: the plan is stable
     query.wait_for_tokens()
     assert query.plan() is refined
@@ -124,11 +133,14 @@ def test_prefix_sharing_and_attention_path_are_decided_from_exact_tokens():
     header = " ".join(f"h{i}" for i in range(2048))
     session = _table_session([header + f" r{i}" * 8 for i in range(40)])
     query = session.sql(SQL)
-    query.plan()
+    first = query.plan()
     query.wait_for_tokens()
-    sequence = next(n for n in query.plan().nodes
-                 if n.type_name == "quail.ai_filter")
+    refined = query.plan()
+    sequence = next(n for n in refined.nodes if n.type_name == "quail.ai_filter")
     assert sequence.share_prefixes and sequence.attention == "tree"
+    # the readers compute their own tokens only, not the header again
+    assert refined.estimates[sequence.node_id]["seconds"] < (
+        0.5 * first.estimates[sequence.node_id]["seconds"])
     session.close()
 
 

@@ -40,7 +40,7 @@ class QuailModelExecution:
         self.close()
         self.loaded_model = LoadedModelState(
             model=model, arena=arena, pipeline=pipeline,
-            model_spec=getattr(self.context, "model", None),
+            model_spec=self.context.model,
             decision_head=decision_head)
 
     def close(self) -> None:
@@ -89,8 +89,6 @@ class QuailModelExecution:
             # reranker readout, not the document scheduler
             execution = self._reranker_execution(inputs["documents"])
             self.query.gpu_timing = bool(inputs.get("gpu_timing", False))
-            if "score_rows" in inputs:
-                return execution.execute_rows(node, inputs["score_rows"])
             return execution.execute(node, inputs["score_inputs"])
         raise TypeError(
             f"Quail cannot execute physical node {node.type_name!r}")
@@ -101,7 +99,7 @@ class QuailModelExecution:
         if execution is None or execution.documents is not documents:
             execution = RerankerModelExecution(GpuContext(
                 gpu_index=self.context.gpu_index,
-                gpu_count=self.context.gpu_count,
+                gpus=self.context.gpus,
                 model=self.context.model, device=self.context.device,
                 query_settings={
                     "documents": documents,
@@ -110,11 +108,6 @@ class QuailModelExecution:
             ))
             self._reranker = execution
         return execution
-
-    def execute_predicates(self, nodes, inputs) -> dict:
-        """Run consecutive filter or join predicates with resident document KV."""
-        return execution_parts()[nodes[0].type_name].execute_group(
-            self.query, nodes, inputs)
 
     def execute_pipeline(self, pipeline, inputs, context) -> dict:
         """Execute a model pipeline with this executor's loaded state."""

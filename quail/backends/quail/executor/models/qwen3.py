@@ -26,7 +26,7 @@ class Qwen3Pipeline(ModelPipeline):
         attn = self.layers[0].self_attn
         fp8 = attn.qkv_proj.weight.dtype == torch.float8_e4m3fn
         self.engine = engine_class(
-            arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
+            arena, num_q_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
             fp8=fp8, kernels=kernels)
         # The fused kernels compute element offsets in 32-bit ints,

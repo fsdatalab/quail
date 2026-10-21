@@ -29,11 +29,11 @@ def test_scores_sum_prefix_log_probabilities_and_ties_go_first():
     assert winner == 0
 
 
-def _corpus(root, corpus_id, sf, claims):
+def _corpus(root, corpus_id, scale_factor, claims):
     table = {"rows": len(claims), "ordered_rows_full_hash": corpus_id}
     labeling._atomic_json(root / "corpora" / corpus_id / "manifest.json", {
         "corpus_id": corpus_id, "corpus_full_hash": corpus_id + "-full",
-        "scale_factor": sf,
+        "scale_factor": scale_factor,
         "tables": {"claims": table, "reviews": {"rows": 1,
                                                 "ordered_rows_full_hash": "r"}}})
     pq.write_table(pa.table({"id": [c[0] for c in claims],

@@ -1,6 +1,15 @@
 """FP8 experts with fused input and activation quantization."""
 
 
+def init_moe_workspace():
+    """Initialize reusable GPU buffers for vLLM's expert kernels."""
+    import torch
+    from vllm.v1.worker import workspace
+
+    if not workspace.is_workspace_manager_initialized():
+        workspace.init_workspace_manager(torch.device("cuda"))
+
+
 class FP8Experts:
     """Run vLLM's routed matrix multiplications on prequantized input."""
 

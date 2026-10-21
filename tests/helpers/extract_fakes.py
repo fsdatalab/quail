@@ -12,7 +12,9 @@ LEASE = ("Contract of lease.\nThe lease ends on\nMarch 3, 2027 at noon.\n"
 TERM = "Term: five years"
 NOTHING = "No dates here."
 HEAD = "DOCUMENT:\n"
-TAIL = ' question\nPhrase: "'
+TAIL = " question\nPhrase:"
+QUOTED = 'Lease of the "Premises" for five years.'
+NONE_HELD = "None of the parties may assign this Agreement."
 
 
 class FakeTokenizer:
@@ -26,7 +28,7 @@ class FakeTokenizer:
     PIECES = re.compile(r"\n| ?[A-Za-z]+|[0-9]| ?[^\sA-Za-z0-9]| ")
 
     def __init__(self, texts):
-        self.tokens = ['"', "none", "-", "\n", "<|im_end|>", "Phrase", ":",
+        self.tokens = ['"', "none", " none", "-", "\n", "<|im_end|>", "Phrase", ":",
                        " question", "Lines"]
         self.tokens.extend(str(digit) for digit in range(10))
         for text in texts:
@@ -85,7 +87,8 @@ RANKED = "The lease ends on March 3. The rent is due."
 def make_vocabulary(*extra):
     # a stream writes a run of whitespace as one space, so the
     # vocabulary holds the squeezed texts' tokens too
-    tokenizer = FakeTokenizer([LEASE, TERM, NOTHING, HEAD, TAIL, "March",
+    tokenizer = FakeTokenizer([LEASE, TERM, NOTHING, HEAD, TAIL, QUOTED, NONE_HELD,
+                               "March",
                                "five", RANKED,
                                *(squeezed(text)[0] for text in (LEASE, TERM,
                                                                 NOTHING)),
@@ -93,14 +96,14 @@ def make_vocabulary(*extra):
     return Vocabulary(tokenizer)
 
 
-def make_spec(trim=True, *extra):
+def make_spec(*extra):
     tables = make_vocabulary(*extra)
     return ExtractSpec(
         name="ends", aliases=("c",), query_template="{0}",
-        arguments=(("c", "text"),), expected_inputs=3, estimated_seconds=0.0,
+        arguments=(("c", "text"),), expected_rows=3, estimated_seconds=0.0,
         prompt_token_parts=(tuple(tables.encode_ids(HEAD)),
                             tuple(tables.encode_ids(TAIL))),
-        question=QUESTION, trim=trim), tables
+        question=QUESTION, draft_tokens=16, draft_policy="fixed"), tables
 
 
 def squeezed(text: str) -> tuple:

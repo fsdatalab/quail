@@ -5,16 +5,15 @@ from dataclasses import replace
 from pathlib import Path
 
 from .base import ModelSpec
+from .prompts import (
+    QWEN3_PROMPT_FORMAT,
+    QWEN3_RERANKER_PROMPT_FORMAT,
+    QWEN3_TURN_PREFIX,
+    QWEN3_TURN_SUFFIX,
+)
 
 # The FP8 layout the executor's DeepGEMM path reads.
 FP8_BLOCK = [128, 128]
-# The chat turn an AI.EXTRACT prompt closes with, its thinking channel
-# closed; AI.IF prompts stay raw. The turn has no opener, so an
-# extraction's prompt head is the AI.IF preamble and the document KV a
-# filter wrote is the extraction's.
-EXTRACT_TURN_PREFIX = ""
-EXTRACT_TURN_SUFFIX = ("<|im_end|>\n<|im_start|>assistant\n"
-                       "<think>\n\n</think>\n\n")
 
 
 def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
@@ -62,12 +61,12 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
     weight_precision, w_bytes = _weight_precision(hf_name, config)
     layers = config["num_hidden_layers"]
     hidden = config["hidden_size"]
-    n_q = config["num_attention_heads"]
-    n_kv = config["num_key_value_heads"]
-    d_head = config.get("head_dim") or hidden // n_q
+    num_q_heads = config["num_attention_heads"]
+    num_kv_heads = config["num_key_value_heads"]
+    d_head = config.get("head_dim") or hidden // num_q_heads
     intermediate = config["intermediate_size"]
-    per_layer = (hidden * (n_q + 2 * n_kv) * d_head    # qkv_proj
-                 + n_q * d_head * hidden                # o_proj
+    per_layer = (hidden * (num_q_heads + 2 * num_kv_heads) * d_head    # qkv_proj
+                 + num_q_heads * d_head * hidden                # o_proj
                  + 3 * hidden * intermediate            # gate_up, down
                  + 2 * hidden + 2 * d_head)             # four norms
     params = float(layers * per_layer + hidden)
@@ -79,8 +78,8 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
         params=params,
         layers=layers,
         hidden=hidden,
-        n_q=n_q,
-        n_kv=n_kv,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
         d_head=d_head,
         ffn_width=2 * intermediate,
         w_bytes=w_bytes,
@@ -93,11 +92,14 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
         weight_precision=weight_precision,
         arch="qwen3",
     )
-    spec = replace(spec, **fields)
-    if spec.role == "generative":
-        spec = replace(spec, extract_turn_prefix=EXTRACT_TURN_PREFIX,
-                       extract_turn_suffix=EXTRACT_TURN_SUFFIX)
-    return spec
+    role = fields.get("role", spec.role)
+    if role == "generative":
+        spec = replace(spec, turn_prefix=QWEN3_TURN_PREFIX,
+                       turn_suffix=QWEN3_TURN_SUFFIX,
+                       prompt_format=QWEN3_PROMPT_FORMAT)
+    elif role == "reranker":
+        spec = replace(spec, prompt_format=QWEN3_RERANKER_PROMPT_FORMAT)
+    return replace(spec, **fields)
 
 
 def _read_config(hf_name, revision, config, config_file) -> dict:

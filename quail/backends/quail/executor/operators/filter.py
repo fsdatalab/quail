@@ -1,7 +1,7 @@
 """Execute LLM filters and conditions on classification results."""
 
 import numpy as np
-import pyarrow.compute as pc
+import pyarrow as pa
 
 from quail.backends.quail.executor.parts import (
     SingleResultPart,
@@ -11,6 +11,7 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.reranker import filter_scores
+from quail.catalog.selection import group_ids
 from quail.catalog.tokens import (
     DocumentKeys,
     DocumentPrefixes,
@@ -18,6 +19,7 @@ from quail.catalog.tokens import (
 from quail.execution.ids import document_ids as arrow_ids
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.rows import Rows
 from quail.progress import answer_sink
 
 
@@ -31,12 +33,13 @@ def execute_filters(state: QueryExecutionState, nodes, inputs) -> dict:
              for member in nodes]
     if len(parts) == 1 and "document_done" in inputs:
         parts[0].document_done = inputs["document_done"]
-    # Sorted admission would change which rows a limit keeps.
-    tree = (None if inputs.get("limit") is not None else execution_prefix_tree(
-        node, documents, state.loaded_model.arena))
+    # the rows a limit keeps follow admission order, which borrowing
+    # sorts by prefix; a query without ORDER BY promises no rows
+    tree = execution_prefix_tree(node, documents, state.loaded_model.arena)
     return execute_parts(
         state, parts, documents, DocumentKeys(node.alias, ids),
-        keep_kv=nodes[-1].keep_kv, tree=tree, attention=node.attention or "unified",
+        keep_kv=nodes[-1].keep_kv, prefix_tree=tree,
+        attention=node.attention or "unified",
         limit=inputs.get("limit"), stop_groups=inputs.get("stop_groups"),
         paged=node.arena_writes or len(nodes) > 1,
         label=f"filter ({len(nodes)} predicates)")
@@ -49,6 +52,8 @@ class FilterPart(SingleResultPart):
 
     @staticmethod
     def model_inputs(node, inputs, context, sequence=None, nodes=None):
+        if nodes is not None:
+            inputs = inputs[node.node_id]
         return filter_inputs(context.state, node, next(iter(inputs.values())))
 
     @classmethod
@@ -61,7 +66,6 @@ class FilterPart(SingleResultPart):
         self.node = node
         self.ids = ids
         self.canvas_tokens = canvas_tokens
-        self.frame_tokens = 0
         self.stages = filter_stages(
             [list(node.question_token_ids)],
             async_answers)
@@ -74,9 +78,8 @@ class FilterPart(SingleResultPart):
         stages = filter_stages(
             [part.node.question_token_ids for part in parts],
             parts[0].stages[0].readout)
-        for index, (part, stage) in enumerate(zip(parts, stages)):
+        for part, stage in zip(parts, stages):
             part.stages = [stage]
-            part.frame_tokens = len(stage.frame) if index == 0 else 0
 
     def finish(self, every) -> int | None:
         """Record filter answers and leave token accounting to the pipeline."""
@@ -94,42 +97,55 @@ class FilterPart(SingleResultPart):
             pack_s=stats.get("pack_s", 0.0))
 
 
-class LabelGate(SingleResultPart):
-    """Pipeline condition that keeps documents with selected categories."""
+class ConditionGate(SingleResultPart):
+    """Pipeline condition that drops documents whose tested value fails.
+
+    The value is a label a ClassifyPart decoded or an answer or span
+    an ExtractPart copied, read as each document's settles; the
+    pipeline then skips the document's later stages and frees its KV.
+    """
 
     stages = ()
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
-        """Bind a label condition to its classification and input rows."""
-        from quail.backends.quail.executor.operators.classify import ClassifyPart
-
+        """Bind a condition to the part computing its column."""
         node = nodes[0]
-        labeled = next(part for part in reversed(parts)
-                       if isinstance(part, ClassifyPart)
-                       and part.node.spec.name == node.column)
-        source = next(part for part in parts
-                      if part.node.node_id == node.inputs[0].source.node_id)
-        return cls(node, labeled, source)
+        source_id = node.inputs[0].source.node_id
+        producer = next(part for part in reversed(parts)
+                        if node.column in part.tested_columns)
+        source = next(part for part in reversed(parts)
+                      if any(member.node_id == source_id for member in part.nodes))
+        return cls(node, producer, source)
 
-    def __init__(self, node, labeled, source):
+    def __init__(self, node, producer, source):
         self.node = node
-        self.labeled = labeled
-        self.source = source
-        self.predicate = node.predicate
+        self.producer = producer
+        self.source = source  # the part whose rows the Filter reads
         self.position = {document: index
-                         for index, document in enumerate(labeled.ids)}
+                         for index, document in enumerate(producer.ids)}
+        self.accepted = {}
 
     def gate(self, key):
-        label = self.labeled.plan.labels[self.position[key[1]]]
-        return None if self.predicate.accepts(label) else Stage.DROP
+        # values settle as chunks finish, so each is tested as its
+        # document arrives; a repeated value, such as a label, is
+        # evaluated once
+        values = self.producer.tested_values(self.node.column,
+                                             [self.position[key[1]]])
+        value = values[0].as_py()
+        token = tuple(sorted(value.items())) if isinstance(value, dict) else value
+        if token not in self.accepted:
+            self.accepted[token] = bool(self.node.predicate.accepts(
+                pa.table({self.node.column: values}))[0].as_py())
+        return None if self.accepted[token] else Stage.DROP
 
     def finish(self, every):
         return None
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
+        source = self.node.inputs[0].source
         return filter_scores(self.node,
-                             self.source.result_value.outputs["rows"])
+                             self.source.results()[source.node_id].outputs[source.port])
 
 
 def filter_result(node, answers, tokens, document_ids,
@@ -158,7 +174,7 @@ def filter_result(node, answers, tokens, document_ids,
     global_answers = dict(zip(positions[local].tolist(), answers.values()))
     return NodeResult(
         outputs={
-            f"ids:{node.alias}": survivors,
+            f"rows:{node.alias}": Rows({node.alias: survivors}),
             f"filter_answers:{node.alias}": global_answers,
         },
         metrics=NodeMetrics(
@@ -218,12 +234,7 @@ def stop_groups(node, columns, document_ids) -> list | None:
         raise KeyError(
             f"the stop key of {node.alias!r} needs its value columns")
     positions = arrow_ids(document_ids)
-    # a null key value forms one group, like any other value
-    codes = np.column_stack([
-        pc.fill_null(pc.dictionary_encode(columns.column(name).take(positions))
-                     .combine_chunks().indices, -1).to_numpy()
-        for name in node.stop_key])
-    return np.unique(codes, axis=0, return_inverse=True)[1].reshape(-1)
+    return group_ids([columns.column(name).take(positions) for name in node.stop_key])
 
 
 def filter_inputs(state, node, document_ids) -> dict:
@@ -231,7 +242,7 @@ def filter_inputs(state, node, document_ids) -> dict:
     document_ids = id_positions(document_ids)
     return {
         "documents": DocumentPrefixes(
-            state["pre"], state["docs"][node.alias], document_ids
+            node.document_head, state["documents"][node.alias], document_ids
         ),
         "document_ids": document_ids,
         "limit": state["filter_limit"],

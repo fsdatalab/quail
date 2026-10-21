@@ -9,6 +9,17 @@ Precision = Literal["fp8", "bf16", "fp32"]
 # for AI.SCORE; a decision model scores its yes and no options with
 # its own head for AI_FILTER and AI_JOIN.
 Role = Literal["generative", "reranker", "decision"]
+# What a layer keeps for a sequence. Full and sliding attention keep KV
+# (every token, or the last sliding_window tokens); Gated DeltaNet and
+# short convolution keep a fixed-size state that does not grow with
+# the tokens read.
+LayerKind = Literal[
+    "full_attention", "sliding_attention", "gated_delta_net", "short_conv"]
+
+# The recurrent state is kept in fp32 and the convolution columns in
+# bf16.
+GDN_STATE_ELEMENT_BYTES = 4
+CONV_STATE_ELEMENT_BYTES = 2
 
 # Peak per-token activation bytes per hidden dim.
 ACT_BYTES_PER_HIDDEN = 32
@@ -41,13 +52,13 @@ class AnswerCanvas:
 @dataclass(frozen=True)
 class ModelSpec:
     name: str
-    params: float        # P: dense parameter count; 2P FLOPs per token
+    params: float        # active projection parameters per token
     layers: int          # L
     hidden: int          # h
-    n_q: int             # query heads
-    n_kv: int            # KV heads
+    num_q_heads: int             # query heads
+    num_kv_heads: int            # KV heads
     d_head: int          # head dim
-    ffn_width: int       # widest projection's output columns
+    ffn_width: int       # dense or shared gate_up output columns
     #                      (gate_up: 2 x intermediate at Qwen3)
     w_bytes: float       # weight bytes per param (fp8 = 1)
     hf_name: str = ""    # the checkpoint (weights + tokenizer)
@@ -69,11 +80,9 @@ class ModelSpec:
     decision_head_dim: int = 0    # width of a decision model's option
     #                               head (its key, query, and MLP rows);
     #                               the head's FLOPs and bytes follow
-    # Layers that keep every token of KV, when the model mixes them
-    # with sliding layers: every full_attention_period-th layer, with
-    # its own KV geometry. 0 means every layer looks like n_kv x d_head.
-    full_attention_period: int = 0
-    full_n_kv: int = 0         # KV heads of a full-attention layer
+    # KV geometry of the full_attention layers, when it differs from the
+    # sliding layers' num_kv_heads x d_head; 0 means the same as theirs.
+    full_num_kv_heads: int = 0         # KV heads of a full-attention layer
     full_d_head: int = 0       # head dim of a full-attention layer
     sliding_window: int = 0    # tokens the other layers see behind each
     #                            row; 0 means no layer slides
@@ -95,13 +104,11 @@ class ModelSpec:
     #                                        letters rule reads
     turn_prefix: str = ""     # chat-turn text before every prompt
     turn_suffix: str = ""     # chat-turn text after the answer cue
-    extract_turn_prefix: str = ""    # chat-turn text before an AI.EXTRACT
-    #                                  prompt, when it differs from
-    #                                  turn_prefix; a prefix unlike the
-    #                                  AI.IF turn's keeps an extraction
-    #                                  from reading a filter's document KV
-    extract_turn_suffix: str = ""    # chat-turn text between an AI.EXTRACT
-    #                                  prompt's answer template and its cue
+    bos_text: str = ""    # the beginning-of-text token at the start of
+    #                       turn_prefix, for a model whose tokenizer adds it
+    #                       to every prompt: Quail tokenizes without special
+    #                       tokens, so the prefix carries it, and the text
+    #                       sent to vLLM drops it because vLLM adds its own
     prompt_format: str = "raw-v1"    # names the turn layout in run records
     prompt_layout: str = "ai-if"     # the PROMPT_LAYOUTS entry AI.IF
     #                                  prompts are written in
@@ -111,24 +118,133 @@ class ModelSpec:
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);
     #                                   None lets vLLM pick
+    layer_kinds: tuple[LayerKind, ...] = ()    # one kind per layer; required
+    #                                            when sliding_window is set;
+    #                                            empty means every layer is
+    #                                            full_attention
+    vision_tower: bool = False    # the checkpoint ships a vision tower;
+    #                               vLLM must be told to take no images
+    #                               or video, or it builds an image
+    #                               processor that cannot copy Quail's
+    #                               tokenizer
+    max_num_seqs: int = 0    # sequences vLLM may run at once; 0 keeps the
+    #                          engine setting. A hybrid model holds one
+    #                          recurrent-state block per running sequence,
+    #                          and vLLM refuses a larger setting.
+    attn_output_gate: bool = False    # q_proj also emits a gate the width
+    #                                   of the queries, which scales the
+    #                                   attention output
+    # Gated DeltaNet layers, for a model whose layer_kinds name them.
+    # Each layer keeps a (value heads x value dim x key dim) state and
+    # the last conv_width - 1 columns of its convolution input.
+    gdn_key_heads: int = 0
+    gdn_value_heads: int = 0
+    gdn_key_dim: int = 0
+    gdn_value_dim: int = 0
+    gdn_weight_precision: Precision | None = None
+    conv_width: int = 0
+
+    def __post_init__(self):
+        if self.layer_kinds and len(self.layer_kinds) != self.layers:
+            raise ValueError(
+                f"{self.name}: layer_kinds has {len(self.layer_kinds)} "
+                f"entries for {self.layers} layers")
+        if self.sliding_window and not self.layer_kinds:
+            raise ValueError(
+                f"{self.name}: sliding_window needs layer_kinds to say which "
+                f"layers slide")
+
+    def layer_kind(self, layer: int) -> LayerKind:
+        """Return the kind of one layer."""
+        return self.layer_kinds[layer] if self.layer_kinds else "full_attention"
+
+    def keeps_kv(self, layer: int) -> bool:
+        """Whether the layer stores KV; Gated DeltaNet and convolution layers do not."""
+        return self.layer_kind(layer) in ("full_attention", "sliding_attention")
+
+    @property
+    def attention_layers(self) -> tuple[int, ...]:
+        """The layers that store KV."""
+        return tuple(i for i in range(self.layers) if self.keeps_kv(i))
+
+    @property
+    def gdn_layers(self) -> tuple[int, ...]:
+        """The layers that keep a Gated DeltaNet state."""
+        return tuple(i for i in range(self.layers)
+                     if self.layer_kind(i) == "gated_delta_net")
+
+    @property
+    def short_conv_layers(self) -> tuple[int, ...]:
+        """The layers that keep a short convolution's input columns."""
+        return tuple(i for i in range(self.layers)
+                     if self.layer_kind(i) == "short_conv")
+
+    @property
+    def state_layers(self) -> tuple[int, ...]:
+        """The layers that keep state between a document's tokens."""
+        return tuple(i for i in range(self.layers)
+                     if self.layer_kind(i) in ("gated_delta_net", "short_conv"))
+
+    @property
+    def conv_state_channels(self) -> int:
+        """Channels of the convolution input a state layer keeps."""
+        return self.conv_channels if self.gdn_layers else self.hidden
+
+    @property
+    def conv_channels(self) -> int:
+        """Channels of a Gated DeltaNet layer's convolution: q, k, and v joined."""
+        return (2 * self.gdn_key_heads * self.gdn_key_dim
+                + self.gdn_value_heads * self.gdn_value_dim)
+
+    @property
+    def gdn_state_bytes(self) -> int:
+        """Bytes of one layer's recurrent state, a matrix per value head."""
+        return (self.gdn_value_heads * self.gdn_value_dim * self.gdn_key_dim
+                * GDN_STATE_ELEMENT_BYTES)
+
+    @property
+    def conv_state_bytes(self) -> int:
+        """Bytes of one layer's convolution input columns kept between tokens."""
+        return (self.conv_channels * (self.conv_width - 1)
+                * CONV_STATE_ELEMENT_BYTES)
+
+    @property
+    def checkpoint_bytes(self) -> int:
+        """Bytes of the state a sequence leaves in every state layer.
+
+        A Gated DeltaNet layer keeps its state matrix and convolution
+        columns; a short convolution layer keeps its input columns.
+        Zero for a model without either.
+        """
+        return (len(self.gdn_layers) * (self.gdn_state_bytes
+                                        + self.conv_state_bytes)
+                + len(self.short_conv_layers) * self.hidden
+                * (self.conv_width - 1) * CONV_STATE_ELEMENT_BYTES)
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""
-        period = self.full_attention_period
-        return bool(period) and (layer + 1) % period == 0
+        return self.layer_kind(layer) == "full_attention"
 
     @property
     def kv_shapes(self) -> tuple:
         """Per layer, the (KV heads, head dim) its KV stores."""
-        full = (self.full_n_kv or self.n_kv, self.full_d_head or self.d_head)
-        return tuple(full if self.is_full_layer(i) else (self.n_kv, self.d_head)
-                     for i in range(self.layers))
+        full = (self.full_num_kv_heads or self.num_kv_heads,
+                self.full_d_head or self.d_head)
+        return tuple(
+            (0, 0) if not self.keeps_kv(i)
+            else full if self.is_full_layer(i) else (self.num_kv_heads, self.d_head)
+            for i in range(self.layers))
 
     @property
     def widest_projection(self) -> int:
         """Output columns of the widest dense projection in any layer."""
-        return max(self.ffn_width, max(
-            (self.n_q + 2 * n_kv) * d_head for n_kv, d_head in self.kv_shapes))
+        query_width = 2 if self.attn_output_gate else 1
+        attention = max(
+            (query_width * self.num_q_heads + 2 * num_kv_heads) * head
+            for num_kv_heads, head in self.kv_shapes)
+        gdn = (2 * self.gdn_key_heads * self.gdn_key_dim
+               + 2 * self.gdn_value_heads * self.gdn_value_dim)
+        return max(self.ffn_width, attention, gdn)
 
     @property
     def kappa(self) -> float:
@@ -137,8 +253,8 @@ class ModelSpec:
 
     @property
     def kv_elements_per_token(self) -> int:
-        """KV elements per token, dtype-free: 2 * sum of n_kv * d_head."""
-        return 2 * sum(n_kv * d_head for n_kv, d_head in self.kv_shapes)
+        """KV elements per token, dtype-free: 2 * sum of num_kv_heads * d_head."""
+        return 2 * sum(num_kv_heads * d_head for num_kv_heads, d_head in self.kv_shapes)
 
     @property
     def sliding_layer_set(self) -> frozenset:
@@ -146,14 +262,15 @@ class ModelSpec:
         if not self.sliding_window:
             return frozenset()
         return frozenset(i for i in range(self.layers)
-                         if not self.is_full_layer(i))
+                         if self.layer_kind(i) == "sliding_attention")
 
     @property
     def kappa_sliding(self) -> float:
         """KV bytes per token on the sliding layers alone."""
         sliding = self.sliding_layer_set
         return 2 * self.kv_bytes * sum(
-            n_kv * d_head for i, (n_kv, d_head) in enumerate(self.kv_shapes)
+            num_kv_heads * d_head
+            for i, (num_kv_heads, d_head) in enumerate(self.kv_shapes)
             if i in sliding)
 
     @property
@@ -165,13 +282,6 @@ class ModelSpec:
     def turn(self) -> tuple[str, str]:
         """The chat-turn text wrapped around every prompt."""
         return self.turn_prefix, self.turn_suffix
-
-    @property
-    def extract_turn(self) -> tuple[str, str]:
-        """The chat-turn text wrapped around an AI.EXTRACT prompt."""
-        if self.extract_turn_prefix or self.extract_turn_suffix:
-            return self.extract_turn_prefix, self.extract_turn_suffix
-        return self.turn
 
     # W_mem and W_resident are the weight-memory names used throughout
     # the code and the engine wiki.
@@ -199,8 +309,16 @@ class ModelSpec:
 
     @property
     def act_per_token(self) -> float:
-        """Peak activation bytes per batched token."""
-        return ACT_BYTES_PER_HIDDEN * self.hidden
+        """Reserved activation bytes per batched token."""
+        dense = ACT_BYTES_PER_HIDDEN * self.hidden
+        # Triton experts use two BF16 workspaces, plus activation quantization
+        # and routing buffers. They are reused across layers.
+        expert = 2 * self.experts_active * (
+            max(self.hidden, self.expert_intermediate)
+            + max(self.hidden, 2 * self.expert_intermediate)
+            + self.expert_intermediate)
+        routing = 4 * self.experts + 16 * self.experts_active
+        return dense + expert + routing
 
     @property
     def intermediate(self) -> int:
@@ -226,14 +344,13 @@ class DeviceSpec:
     usd_per_hour: float = 0.0    # rental price of one device; 0 means
     #                              no price is known
     price_source: str = ""       # where usd_per_hour was read from
-    mamf_fp8_flops: float = 0.0    # highest fp8 GEMM rate measured
-    #                                (mamf-finder's MAMF); 0 means
-    #                                none was measured
+    mamf_fp8_flops: float = 0.0    # 0 uses the specification rate
+    mamf_bf16_flops: float = 0.0
 
-    @property
-    def gemm_flops(self) -> float:
-        """Return the fp8 GEMM rate: measured when known, else the peak."""
-        return self.mamf_fp8_flops or self.peak_flops
+    def gemm_flops(self, precision: Precision) -> float:
+        """Return measured GEMM throughput, or the specification rate."""
+        measured = {"fp8": self.mamf_fp8_flops, "bf16": self.mamf_bf16_flops}
+        return measured.get(precision, 0.0) or self.arithmetic_bandwidth(precision)
 
     @property
     def attn_flops(self) -> float:
@@ -243,7 +360,7 @@ class DeviceSpec:
     def arithmetic_bandwidth(self, precision: Precision) -> float:
         """Return arithmetic throughput for one component precision."""
         if precision == "fp8":
-            return self.gemm_flops
+            return self.peak_flops
         if precision == "bf16":
             return self.attn_flops
         if precision == "fp32" and self.fp32_flops:

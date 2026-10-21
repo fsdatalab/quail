@@ -35,8 +35,8 @@ class SearchResult(Generic[StateProperty, Step]):
     """All final nondominated records and search accounting."""
 
     candidates: tuple[Candidate[StateProperty, Step], ...]
-    state_count: int
-    generated_count: int
+    num_states: int
+    num_generated: int
 
 
 PriceStep = Callable[
@@ -94,9 +94,9 @@ def search_left_deep(
         states[(relations, frozenset(), initial_property)] = [
             Candidate(base_work, initial_property, tuple(sorted(relations)))]
     generated = len(starts)
-    for applied_count in range(len(edges)):
+    for num_applied in range(len(edges)):
         current = [(key, tuple(frontier)) for key, frontier in states.items()
-                   if len(key[1]) == applied_count]
+                   if len(key[1]) == num_applied]
         for (relations, applied, state_property), frontier in current:
             available = [
                 index for index, ends in enumerate(edges)

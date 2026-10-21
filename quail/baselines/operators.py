@@ -15,10 +15,10 @@ from quail.catalog.pairs import (
 from quail.execution.labels import match_label
 from quail.execution.result import (
     answer_table,
-    extract_answer_table,
     filter_answer_table,
 )
-from quail.execution.spans import line_span, locate_span, read_phrase
+from quail.execution.rows import Rows
+from quail.execution.spans import locate_span, read_phrase
 
 
 def token_list(values) -> list[int]:
@@ -65,8 +65,8 @@ def operator_at_a_time_filter(client, sampling_params, bodies, questions,
         active = next_active
         stages.append({
             "stage": stage_index,
-            "n_in": len(evaluated),
-            "n_out": len(active),
+            "num_in": len(evaluated),
+            "num_out": len(active),
         })
     return {
         "wall_s": time.perf_counter() - started,
@@ -112,8 +112,8 @@ def pipelined_filter(client, sampling_params, bodies, questions, read_answer,
         ]
         stages.append({
             "stage": stage - 1,
-            "n_in": len(evaluated),
-            "n_out": sum(
+            "num_in": len(evaluated),
+            "num_out": sum(
                 bool(result["answers"][(document, stage)])
                 for document in evaluated
             ),
@@ -234,21 +234,18 @@ def choose_documents(client, spec, bodies) -> dict:
     }
 
 
-def classification_table(spec, columns, labels):
+def classification_rows(spec, columns, labels) -> Rows:
     """Build classified rows and remove rows without a matching label."""
-    table = pa.table({
-        **{alias: pa.array(values, pa.int32()) for alias, values in columns.items()},
-        spec.output: pa.array(labels, pa.string()),
-    })
-    return table.filter(table.column(spec.output).is_valid())
+    rows = Rows(columns, pa.table({spec.output: pa.array(labels, pa.string())}))
+    return rows.filter(rows.column(spec.output).is_valid())
 
 
 def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
     """Decode one answer per prompt body and locate it in the document's text.
 
-    Generation stops at the quote that closes the phrase. An answer
+    Generation stops where the model ends its turn. An answer
     the document holds is returned as the document's own text at its
-    span, widened to whole lines when trim is off; "none" gives nulls;
+    span; "none" gives nulls;
     an answer the document does not hold is returned as written, with
     a null span.
 
@@ -266,7 +263,7 @@ def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
         counts, and the generation seconds.
     """
     tail = token_list(spec.tail_token_ids)
-    params = client.decode_params(spec.max_answer_tokens, stop=['"'])
+    params = client.decode_params(spec.max_answer_tokens)
     if body_texts is not None:
         prompts = [body_text + spec.tail_text for body_text in body_texts]
     else:
@@ -283,8 +280,6 @@ def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
             unanswered += 1
         elif span is None:
             unaligned += 1
-        elif not spec.trim:
-            span = line_span(document, span)
         answers.append(phrase if span is None else document[span[0]:span[1]])
         spans.append(span)
     return {
@@ -296,12 +291,6 @@ def extract_documents(client, spec, bodies, texts, body_texts=None) -> dict:
         "unanswered": unanswered,
         "unaligned": unaligned,
     }
-
-
-def extract_answers(spec, document_ids, answers, spans) -> pa.Table:
-    """Return each document's answer and character span."""
-    return extract_answer_table(spec.alias, spec.output, spec.span_output,
-                                document_ids, answers, spans)
 
 
 def allowed_members_by_anchor(anchor, partners, anchor_ids, members, pairs) -> list:
@@ -326,7 +315,7 @@ def join_answers(spec, rows, answers, anchor, partners) -> pa.Table:
             "anchor": anchor,
             "partners": ",".join(partners),
             "semantics": spec.semantics,
-            "written_pos": spec.written_pos,
+            "written_position": spec.written_position,
             **(
                 {"selectivity": spec.selectivity}
                 if spec.selectivity is not None else {}

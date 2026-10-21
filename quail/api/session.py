@@ -12,6 +12,7 @@ from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.planner.plan import EngineConfig, Refusal, RefusalError, resolve_model
+from quail.specs.files import resolve_model_path
 
 
 class Session:
@@ -55,7 +56,7 @@ class Session:
                 unit="configurations",
             ))
         self.catalog = Catalog()
-        self._tok = tokenizer      # injectable for tests
+        self._tokenizer = tokenizer      # injectable for tests
         self.inputs = InputStore(
             self.catalog, tokenizer=lambda: self.tokenizer,
             tokenizer_name="configured tokenizer" if tokenizer else "Gigatoken")
@@ -163,9 +164,10 @@ class Session:
         as bytes; the planner uses it to find the word each label token
         starts.
         """
-        if self._tok is None:
-            self._tok = GigatokenEncoder(self.model.hf_name)
-        return self._tok
+        if self._tokenizer is None:
+            self._tokenizer = GigatokenEncoder(resolve_model_path(
+                self.model.hf_name, self.model.revision, include_weights=False))
+        return self._tokenizer
 
     def register_functions(self, functions: dict) -> None:
         """Register a query's apply() functions once each, by name."""

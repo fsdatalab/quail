@@ -1,4 +1,7 @@
 from .base import AnswerCanvas, ModelSpec
+from .prompts import TEXT_ANALYSIS_SYSTEM_PROMPT
+
+_LAYER_KINDS = ("sliding_attention",) * 5 + ("full_attention",)
 
 DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     name="diffusion-gemma-26b-a4b-fp8",
@@ -9,11 +12,11 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     # Attention runs with softmax scale 1.0. 25 layers slide over a
     # 1024-token window with 256-wide heads; every sixth layer keeps
     # every token with 512-wide heads and two KV heads.
-    n_q=16,
-    n_kv=8,
+    num_q_heads=16,
+    num_kv_heads=8,
     d_head=256,
-    full_attention_period=6,
-    full_n_kv=2,
+    layer_kinds=_LAYER_KINDS * 5,
+    full_num_kv_heads=2,
     full_d_head=512,
     sliding_window=1024,
     # a dense MLP 2112 wide beside 128 experts 704 wide, eight active
@@ -35,9 +38,10 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     # the 16-row canvas vLLM decodes with; the letters rule reads its
     # first row after seeding the turn close and padding behind it
     answer_canvas=AnswerCanvas(rows=16, turn_close_id=106, pad_id=0),
-    turn_prefix="<bos><|turn>user\n",
+    turn_prefix=(f"<bos><|turn>system\n{TEXT_ANALYSIS_SYSTEM_PROMPT}<turn|>\n"
+                 "<|turn>user\n"),
     turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
-    prompt_format="gemma4-chat-nonthinking-v1",
+    prompt_format="gemma4-chat-text-analysis-v1",
     moe_backend="triton",
     # Bound expert workspace and attention buffers for 512-wide heads.
     chunk_cap_tokens=65_536,

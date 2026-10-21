@@ -1,0 +1,43 @@
+---
+title: Python API
+---
+
+The Python builder supports the same query operations as SQL. Start
+with a table registered on a `Session`, call builder functions, and use `select()`
+to create a query. The model runs when you call `run()` or `collect()`.
+
+<Cards>
+  <Card title="AI functions" href="/docs/user-guide/python-api/ai-functions"
+        description="Filter, join, score, classify, and extract with a model." />
+  <Card title="Non-AI functions" href="/docs/user-guide/python-api/non-ai-functions"
+        description="Conditions, text expressions, sorting, aggregates, windows, and Python callbacks." />
+</Cards>
+
+The example below uses an existing `session`. See
+[Sessions](/docs/user-guide/sessions) for session creation and
+[table registration](/docs/user-guide/sessions#registering-tables) for registering inputs.
+
+Import `col` to refer to columns and `prompt` to write model questions:
+
+```python
+from quail import col, prompt
+```
+
+## Example
+
+For example, suppose `reviews` contains review text in `body`, and
+`aspects` contains movie aspects in `aspect`. This query keeps positive
+reviews, then returns each review paired with the aspects it discusses:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .ai_join(
+        session.docs("aspects").alias("a"),
+        prompt('Does the review discuss this aspect?\n\n{0}\n\n{1}',
+               col("r.body"), col("a.aspect")))
+    .select("r.id", "a.aspect")
+)
+result = query.collect()
+```

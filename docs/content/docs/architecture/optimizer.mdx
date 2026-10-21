@@ -86,10 +86,18 @@ conditions for comparison with measured runs. It assumes:
 - Rows that pass filters and joins are determined by answers supplied
   by the caller, such as saved reference answers and classification labels.
 
-For classification, this estimate counts the question and category text
-but excludes the extra steps used to select a label. The optimizer's
-classification estimates include the selected
-[label scoring method](/docs/architecture/execution#label-scoring).
+The estimate includes the work to process each question and confirm
+the supplied answer. Readout is the model's computation of output token
+scores from a hidden state.
+
+- For classification, it counts the question, label names, and answer
+  cue, plus one readout per document. The count is independent of the
+  optimizer's chosen [label scoring method](/docs/architecture/execution#label-scoring).
+- For extraction, it counts the question and one forward pass over the
+  reference answer, with one readout per answer token. Each answer span
+  includes a closing quote token. A missing answer uses only that token.
+- It excludes additional model passes used to find a label or extracted
+  answer during execution.
 
 Report the supplied answers and KV assumptions with the estimate.
 If a measured run produces different answers, it can evaluate different
@@ -105,8 +113,10 @@ built-in rules of the same kind, in registration order.
 | `should_eliminate_distinct` | Logical | Remove DISTINCT when the returned keys are unique. | No |
 | `should_push_down_distinct` | Logical | Stop a table's AI.IF filters after one document per requested key passes. | No |
 | `should_push_down_projection` | Logical | Load only columns the query uses. | No |
-| `should_push_down_filters` | Logical | Move eligible CPU filters and Python functions before joins. | No |
+| `should_push_down_filters` | Logical | Move conditions on labels and extracted answers before joins. | No |
 | `should_lift_maps` | Logical | Offer classification and extraction before and after joins. | Yes |
+| `should_eliminate_window_sort` | Physical | Remove a final sort when the window already returns rows in that order. | No |
+| `should_push_down_limit_through_window` | Physical | Select the first requested rows before computing an eligible window. | No |
 | `should_push_down_limit` | Physical | Stop an eligible filter sequence after enough documents pass. | No |
 | `choose_classify_implementation` | Physical | Choose a classification's label scoring method. | Yes |
 | `should_retain_kv` | Physical | Keep selected document KV for later operators. | No |
@@ -219,8 +229,64 @@ the planner preserves join order and chooses only the unspecified anchors.
 
 ## Physical rules
 
-Physical rules choose execution settings for the graph. They use the
-model and device specifications together with the execution limits below.
+Physical rules rewrite the execution graph and choose its settings.
+Window rules remove work without comparing costs. GPU settings also
+depend on the model, device, and available memory.
+
+### Window rules
+
+Window functions compute values from related result rows after AI
+operators finish. See [Window functions](/docs/user-guide/sql/sql-functions#window-functions)
+for the supported functions and syntax.
+
+#### Remove a repeated sort
+
+`should_eliminate_window_sort` removes a final `Sort` when the preceding
+`Window` already returns rows in exactly the requested order.
+
+For example, imagine a query that numbers reviews with
+`ROW_NUMBER() OVER (ORDER BY r.id)` and ends with `ORDER BY r.id`.
+The window sorts the reviews by ID, so the final sort can be removed.
+
+- The sort keys must match the last window call's partition keys followed
+  by its order keys, including direction and null placement. Partition
+  keys are sorted ascending with nulls last.
+- The `Sort` must directly follow the `Window` and be the graph's final
+  node. A sort that also applies `DISTINCT`, `OFFSET`, or `LIMIT` remains.
+
+Window calls with the same partition and order share one sort during
+execution. The window runtime handles that reuse; it is not a separate
+optimizer rule.
+
+#### Apply a limit before window computation
+
+`should_push_down_limit_through_window` moves a final `Limit` before an
+eligible `Window`. It first sorts the input and selects the requested
+number of rows, then computes window values for those rows.
+
+For example, imagine a query that filters reviews with `AI.IF`, numbers
+them by ID with `ROW_NUMBER`, and requests ten rows. Quail can select
+the first ten passing reviews by ID before assigning their row numbers.
+
+- Every window call must use the same nonempty order and have no
+  partition keys.
+- No call may use `LEAD`, because its last returned row may need a value
+  from a row beyond the limit.
+- The graph must end in a `Limit` directly after the `Window`. A query
+  with an outer `ORDER BY`, `DISTINCT`, or `OFFSET` ends in a `Sort`
+  instead and does not qualify for this rule.
+
+The limit reduces the rows used in window computation. It does not
+stop the AI operators early; they still evaluate the input needed to
+find the first rows in the window's order.
+
+### Stop filters after enough rows pass
+
+`should_push_down_limit` lets the executor stop admitting documents once
+enough rows pass the query's AI filters. The rule requires a single
+pipeline and a final `Limit`. Joins, sorts, aggregates, and windows
+prevent this optimization because they need more than the first
+passing documents.
 
 ### Execution limits
 

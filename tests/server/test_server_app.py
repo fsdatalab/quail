@@ -1,10 +1,13 @@
 """HTTP routes of Quail Server, driven with Starlette's test client."""
 
+import asyncio
 import hashlib
 import io
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
@@ -12,6 +15,7 @@ import pytest
 from helpers import server_fakes
 
 from quail.remote import inputs
+from quail.remote.records import ServerError
 
 pytest.importorskip("starlette")
 
@@ -100,7 +104,7 @@ def test_uploads_are_checked_and_saved_once(make_client):
     assert client.head(f"/v1/inputs/{content_id}").status_code == 200
     server = client.app.state.server
     assert not list(server.inputs_dir.glob("*.tmp"))
-    assert server.store.get_input(content_id).byte_count == len(payload)
+    assert server.store.get_input(content_id).num_bytes == len(payload)
 
 
 def test_capabilities_submission_validation_client_ids_and_hf_inputs(
@@ -233,7 +237,7 @@ def test_http_lifecycle_events_files_and_durable_submissions(make_client):
         table = reader.read_all()
     assert sorted(table.column("r.id").to_pylist()) == ["r0", "r3"]
     answers = client.get(
-        f"/v1/queries/{query_id}/files/answers/filters/r--0.arrow")
+        f"/v1/queries/{query_id}/files/answers/filters/0.arrow")
     assert answers.status_code == 200
     forbidden = client.get(f"/v1/queries/{query_id}/files/../quail.sqlite3")
     assert forbidden.status_code in (400, 404)
@@ -280,3 +284,137 @@ def test_bearer_token_guards_the_api_but_not_the_page(make_client):
     assert client.get("/queries").status_code == 200
 
 
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_a_cancelled_upload_leaves_no_partial_file(make_client, concurrent):
+    client = make_client()
+    server = client.app.state.server
+    payload = ipc_bytes(server_fakes.reviews_table())
+    content_id = hashlib.sha256(payload).hexdigest()
+
+    async def scenario():
+        waiting = asyncio.Event()
+
+        async def paused_body():
+            yield payload[:100]
+            waiting.set()
+            await asyncio.Event().wait()
+
+        async def complete_body():
+            yield payload
+
+        complete = SimpleNamespace(stream=complete_body)
+        task = asyncio.create_task(server.save_upload(
+            SimpleNamespace(stream=paused_body), content_id))
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=2)
+            if concurrent:
+                assert await server.save_upload(complete, content_id) == 201
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert not list(server.inputs_dir.glob("*.tmp"))
+        if not concurrent:
+            assert not list(server.inputs_dir.iterdir())
+            assert await server.save_upload(complete, content_id) == 201
+        assert (server.inputs_dir / f"{content_id}.arrow").read_bytes() == payload
+
+    asyncio.run(scenario())
+
+
+def test_a_retry_waits_for_the_first_submission_to_be_durable(make_client, monkeypatch):
+    client = make_client()
+    content_id = upload(client)
+    server = client.app.state.server
+    server.scheduler.stop()
+    syncing, release = threading.Event(), threading.Event()
+
+    def sync():
+        if not syncing.is_set():
+            syncing.set()
+            assert release.wait(5)
+            raise OSError("volume commit failed")
+
+    server.add_sync(sync)
+    body = submission(content_id, query_id="retry")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first = pool.submit(server.accept, body)
+        assert syncing.wait(5)
+        retry = pool.submit(server.accept, body)
+        queued = pool.submit(server.store.next_queued)
+        try:
+            with pytest.raises(TimeoutError):
+                retry.result(timeout=0.2)
+            assert queued.result(timeout=1) is None
+        finally:
+            release.set()
+        with pytest.raises(ServerError, match="volume commit failed"):
+            first.result(timeout=5)
+        # the retry saw no record of the discarded first attempt
+        assert retry.result(timeout=5).state == "queued"
+
+
+@pytest.mark.parametrize("finish", ["all", "disconnect", "send_error", "cancel"])
+def test_the_result_stream_closes_its_file_however_the_response_ends(
+        make_client, monkeypatch, finish):
+    from contextlib import contextmanager
+
+    from starlette.requests import ClientDisconnect
+
+    client = make_client()
+    query_id = client.post("/v1/queries", json=submission(upload(client))).json()["id"]
+    assert wait_done(client, query_id)["state"] == "succeeded"
+    endpoint = next(route.endpoint for route in client.app.routes
+                    if route.name == "result_stream")
+    open_file = ipc.open_file
+    closed = []
+
+    @contextmanager
+    def tracked_file(path):
+        with open_file(path) as reader:
+            try:
+                yield reader
+            finally:
+                closed.append(path)
+
+    monkeypatch.setattr(ipc, "open_file", tracked_file)
+
+    async def scenario():
+        sent = asyncio.Event()
+        response = await endpoint(SimpleNamespace(
+            path_params={"query_id": query_id}, query_params={"limit": "1"}))
+        assert response.headers["x-quail-rows"] == "1"
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                sent.set()
+                if finish == "send_error":
+                    raise OSError("client disconnected")
+                if finish in {"disconnect", "cancel"}:
+                    await asyncio.Event().wait()
+
+        async def receive():
+            if finish == "disconnect":
+                await sent.wait()
+                return {"type": "http.disconnect"}
+            await asyncio.Event().wait()
+
+        # an ASGI 2.3 server reports a disconnect on receive; 2.4 on send
+        spec = "2.3" if finish == "disconnect" else "2.4"
+        task = asyncio.create_task(response(
+            {"type": "http", "asgi": {"spec_version": spec}}, receive, send))
+        if finish == "cancel":
+            await asyncio.wait_for(sent.wait(), timeout=2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif finish == "send_error":
+            with pytest.raises(ClientDisconnect):
+                await task
+        else:
+            await asyncio.wait_for(task, timeout=5)
+        assert len(closed) == 1
+
+    asyncio.run(scenario())
+    bad = client.get(f"/v1/queries/{query_id}/result", params={"limit": -1})
+    assert bad.status_code == 400

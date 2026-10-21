@@ -148,11 +148,11 @@ def test_session_rules_read_statistics_from_the_context(rule_type):
                 if isinstance(recorder, LogicalRule)
                 else session.registry.register_physical_rule)
     register(recorder)
-    session.register("docs", quail.DocumentProvider.from_table(
+    session.register("documents", quail.DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two three"]}),
         id_col="id"))
     query = session.sql(
-        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
+        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
     query.plan()
     query.wait_for_tokens()
 
@@ -164,7 +164,7 @@ def test_session_rules_read_statistics_from_the_context(rule_type):
     assert context.engine_config is session.config
     assert context.model is session.model
     assert context.device is session.device
-    assert (context.gpu_count, context.backend) == (1, "quail")
+    assert (context.gpus, context.backend) == (1, "quail")
     assert list(context.document_tokens["d"]) == [1, 2]
     assert context.tokenizer is session.tokenizer
     assert dict(context.pair_fractions) == {}

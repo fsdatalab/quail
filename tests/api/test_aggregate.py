@@ -1,5 +1,8 @@
 """GROUP BY, aggregates, and HAVING: the Aggregate node, its runtime, the plan."""
 
+import json
+
+import numpy as np
 import pyarrow as pa
 import pytest
 from helpers.planning import _plan, node_kinds
@@ -196,6 +199,59 @@ def test_aggregate_internal_columns_do_not_replace_user_values():
         columns=("count_all", "mean", "n", "first"))
     assert aggregate_table(table, node).to_pydict() == {
         "count_all": ["a"], "mean": [0.9], "n": [2], "first": [2]}
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("dtype,values", [
+    (pa.int64(), [2**63 - 1, 1]), (pa.int64(), [-2**63, -1]),
+    (pa.uint64(), [2**64 - 1, 1])])
+def test_an_integer_sum_raises_instead_of_wrapping(dtype, values, grouped):
+    table = pa.table({"group": ["a"] * len(values), "value": pa.array(values, dtype)})
+    node = _node(keys=("group",) if grouped else (),
+                 aggregates=(("total", "sum", "value"),), columns=("total",))
+    with pytest.raises(pa.ArrowInvalid):
+        aggregate_table(table, node)
+
+
+@pytest.mark.parametrize("dtype,values,expected", [
+    (pa.int64(), [2**63 - 1, 1, -1, None], 2**63 - 1),
+    (pa.uint64(), [2**64 - 1, 0, None], 2**64 - 1),
+    (pa.int32(), [2**31 - 1, 1, None], 2**31)])
+def test_an_integer_sum_keeps_its_exact_total(dtype, values, expected):
+    table = pa.table({"group": ["a"] * len(values) + ["b"],
+                      "value": pa.array([*values, None], dtype)})
+    node = _node(keys=("group",), aggregates=(("total", "sum", "value"),
+                                              ("n", "count", "value")),
+                 columns=("group", "total", "n"))
+    assert aggregate_table(table, node).to_pylist() == [
+        {"group": "a", "total": expected, "n": len(values) - 1},
+        {"group": "b", "total": None, "n": 0}]
+
+
+@pytest.mark.parametrize("dtype,values,literal,expected", [
+    (pa.int64(), [2**53, 2**53 + 1, None], float(2**53), [1]),
+    (pa.uint64(), [0, 2**63, 2**64 - 1], 2**63, [2]),
+    (pa.float64(), [float(2**53), float(2**53 + 2), None], 2**53 + 1, [1])])
+def test_having_compares_large_values_without_rounding(
+        dtype, values, literal, expected):
+    table = pa.table({"group": range(len(values)), "value": pa.array(values, dtype)})
+    node = _node(keys=("group",), aggregates=(("answer", "max", "value"),),
+                 having=(("answer", ">", literal),), columns=("group", "answer"))
+    assert aggregate_table(table, node).to_pydict() == {
+        "group": expected, "answer": [values[index] for index in expected]}
+
+
+def test_a_numpy_having_literal_and_untyped_nulls_run(session):
+    query = (session.docs("reviews").alias("r")
+             .ai_filter(prompt("q: {0}", col("r.review")))
+             .agg(n=count()).having(count() > np.int64(1)).select("n"))
+    json.dumps(query.plan().to_envelope(session.registry.codecs))
+    assert _run(query, make_executor({"r": {"q:": [1] * 6}})).to_rows() == [(6,)]
+    # a null-typed column has no distinct values to count
+    table = pa.table({"g": ["a", "a"], "v": pa.nulls(2)})
+    node = _node(keys=("g",), aggregates=(("d", "count_distinct", "v"),
+                                          ("s", "sum", "v")), columns=("g", "d", "s"))
+    assert aggregate_table(table, node).to_pylist() == [{"g": "a", "d": 0, "s": None}]
 
 
 @pytest.mark.parametrize("answers, expected", [([1, 1, 1, 0, 1, 1], 5),

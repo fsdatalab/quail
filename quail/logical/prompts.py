@@ -9,13 +9,9 @@ from quail.logical.expressions import (
     Prompt,
     validate_question,
 )
+from quail.specs.prompts import TEXT_ANALYSIS_SYSTEM_PROMPT
 
-# Fixed preamble before every document. Must be a formatting label,
-# not an instruction; instruction text here biases short-document
-# completions. A model's chat-turn text (ModelSpec.turn), when it has
-# any, wraps the whole prompt: its opening piece goes before this
-# preamble and its closing piece after the answer cue, so the user
-# message stays open across the reusable document prefix.
+# The model's turn stays open across the shared document prefix.
 SHARED_PRE = "DOCUMENT:\n"
 
 
@@ -24,11 +20,22 @@ def shared_preamble(turn_prefix: str, layout: str = "ai-if") -> str:
     return turn_prefix + PROMPT_LAYOUTS[layout].document_label
 
 
+def without_bos(text: str, bos_text: str) -> str:
+    """Drop the beginning-of-text token the text starts with, if any.
+
+    Args:
+        text: A prompt preamble.
+        bos_text: The model's beginning-of-text token, or an empty string.
+    """
+    if bos_text and text.startswith(bos_text):
+        return text[len(bos_text):]
+    return text
+
+
 # Fixed strings for join prompt layout.
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is DOCUMENT {}.)"
 JOIN_QUESTION_SEP = "\n\n"                 # anchor note -> question
-DATA_PROCESSING_INSTRUCTION = "You are performing a data processing task."
 TASK_INSTRUCTION = "Evaluate TRUE or FALSE for the following question: "
 ANSWER_CUE = "\nANSWER:"
 
@@ -200,13 +207,13 @@ def canonicalize_template(template: str) -> str:
     return split_frame(template)[1]
 
 
-def _check_placeholders(template: str, n_args: int) -> None:
+def _check_placeholders(template: str, num_args: int) -> None:
     import re
     slots = [int(m) for m in re.findall(r"\{(\d+)\}", template)]
-    if sorted(set(slots)) != list(range(n_args)):
+    if sorted(set(slots)) != list(range(num_args)):
         raise CompileError(
             f"PROMPT placeholders {sorted(set(slots))} do not match "
-            f"{n_args} argument(s): expected {{0}}..{{{n_args - 1}}} "
+            f"{num_args} argument(s): expected {{0}}..{{{num_args - 1}}} "
             f"each used at least once")
 
 
@@ -501,16 +508,17 @@ def bind_score_prompt(template: str, args: tuple,
 
 
 # AI.EXTRACT: the document, the question, the instruction, and the
-# answer template. The answer opens with the phrase field's quote;
-# the model writes the rest.
+# answer template. The prompt ends at the phrase field's name; the
+# model writes the phrase and ends its turn. The phrase has no closing
+# mark of its own, because a document may contain any text mark.
 EXTRACT_QUESTION_LABEL = "\n\nQuestion: "
 EXTRACT_INSTRUCTION = (
     "Copy the words that answer the question from the document. Copy them "
     "exactly. Use the fewest words that answer it. If the document does not "
     "answer the question, write none.")
 EXTRACT_FORMAT = "Answer in this format:"
-EXTRACT_PHRASE_FORMAT = 'Phrase: "<copied words>"'
-EXTRACT_PHRASE_CUE = 'Phrase: "'
+EXTRACT_PHRASE_FORMAT = "Phrase: <copied words>"
+EXTRACT_PHRASE_CUE = "Phrase:"
 def render_extract_question(question: str) -> str:
     """Return the text after the document: question, instruction, and template."""
     lines = [EXTRACT_INSTRUCTION, EXTRACT_FORMAT, EXTRACT_PHRASE_FORMAT]
@@ -624,7 +632,7 @@ QWEN3_RERANKER_INSTRUCTION = (
     "Judge whether the document meets the requirements in the query."
 )
 QWEN3_RERANKER_SYSTEM_TEXT = (
-    f"{DATA_PROCESSING_INSTRUCTION} "
+    f"{TEXT_ANALYSIS_SYSTEM_PROMPT}. "
     "Judge whether the Document meets the requirements based on the Query "
     "and the Instruct provided. Note that the answer can only be \"yes\" "
     "or \"no\"."

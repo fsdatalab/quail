@@ -17,28 +17,10 @@ instead of starting NCCL or gloo.
 """
 
 import json
-from functools import lru_cache
 from pathlib import Path
 
 from quail.backends.quail.executor.moe_configs import write_configs
-from quail.progress import say
-
-
-@lru_cache(maxsize=8)
-def resolve_model_path(model_name: str, revision: str | None = None) -> str:
-    """Download one model revision and return its local directory."""
-    path = Path(model_name).expanduser()
-    if path.is_dir():
-        return str(path.resolve())
-    from huggingface_hub import snapshot_download
-
-    say(f"preparing model files: {model_name}")
-    path = snapshot_download(
-        repo_id=model_name, revision=revision or None,
-        allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt", "*.tiktoken"],
-    )
-    say(f"model files ready: {path}")
-    return path
+from quail.specs.files import resolve_model_path
 
 
 def is_decision2(path) -> bool:
@@ -93,6 +75,10 @@ class _SingleRank:
 
     def __init__(self, torch):
         self.device = torch.device("cuda:0")
+        self.device_group = self
+
+    def size(self):
+        return self.world_size
 
     @property
     def is_first_rank(self):
@@ -141,6 +127,7 @@ def _install_single_rank_groups(torch):
     ps._TP = group
     ps._PP = group
     ps._DP = group
+    ps._EP = group
     ps._PCP = group
     ps._DCP = group
     ps._NODE_COUNT = 1
@@ -154,7 +141,9 @@ def retain_answer_head(torch, model, token_ids):
     if hasattr(model, "quail_answer_token_ids"):
         answer_weights(model, allowed)
         return
-    weight = model.lm_head.weight
+    # a checkpoint with a vision tower keeps its head in the language model
+    owner = model if hasattr(model, "lm_head") else model.language_model
+    weight = owner.lm_head.weight
     indices = torch.tensor(allowed, device=weight.device, dtype=torch.long)
     weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
     model.register_buffer("quail_answer_weights", weights, persistent=False)
@@ -164,7 +153,7 @@ def retain_answer_head(torch, model, token_ids):
     # memory; the model spec prices an untied head into the KV arena.
     model.quail_full_head = weight.detach().to(dtype=torch.bfloat16)
     # lm_head can be the same module as embed_tokens; drop only this reference.
-    model.lm_head = None
+    owner.lm_head = None
 
 
 def full_output_head(model):
@@ -189,13 +178,14 @@ def answer_weights(model, token_ids):
 
 def load_model(model_name: str, revision: str | None = None, *,
                answer_token_ids=None, max_batched_tokens=None,
-               moe_backend=None):
+               moe_backend=None, text_only=False):
     """Load model weights and retain the answer rows and the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
     fused MoE kernels size their scratch buffers from it; a dense model
     ignores it. moe_backend is passed through as vLLM's moe_backend
-    setting (see ModelSpec.moe_backend); None lets vLLM pick.
+    setting (see ModelSpec.moe_backend); None lets vLLM pick. text_only
+    takes no image or video input, for a checkpoint with a vision tower.
     """
     import os
     import tempfile
@@ -225,6 +215,8 @@ def load_model(model_name: str, revision: str | None = None, *,
         args["max_num_batched_tokens"] = int(max_batched_tokens)
     if moe_backend is not None:
         args["moe_backend"] = moe_backend
+    if text_only:
+        args["limit_mm_per_prompt"] = {"image": 0, "video": 0}
     config = EngineArgs(**args).create_engine_config()
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):

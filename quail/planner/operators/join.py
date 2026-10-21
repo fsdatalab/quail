@@ -5,6 +5,7 @@ from quail.logical import (
     is_score,
     join_conditions,
 )
+from quail.logical.expressions import column_name
 from quail.logical.prompts import prompt_aliases
 from quail.physical import AiJoin, Foreign, PortRef
 from quail.physical.base import input_ports
@@ -12,6 +13,11 @@ from quail.planner.operators.common import question_tokens
 from quail.planner.operators.score import ScoreJoinCost, score_statistics
 from quail.planner.prompt_lowering import LoweredPrompt
 
+
+def _priced_key(condition) -> tuple:
+    """Return one equality as (left alias, left key, right alias, right key)."""
+    return (condition.left.alias, column_name(condition.left, qualified=False),
+            condition.right.alias, column_name(condition.right, qualified=False))
 
 def _join_aliases(join) -> list:
     """Return the join's table aliases in placeholder order."""
@@ -42,75 +48,85 @@ def join_specs(joins, pair_fractions=None, canvas: int = 0, *,
             left, right = prompt_aliases(j.prompt)
             head, middle, tail = map(len, parts)
             out.append(PricedJoin(
-                written_pos=i, aliases=(left, right), anchor=left,
+                written_position=i, aliases=(left, right), anchor=left,
                 anchor_free=False, semantics=j.semantics,
                 selectivity=j.selectivity,
                 frame_tokens={left: head + middle, right: 0},
                 label_tokens={left: 0, right: 0}, tail_tokens=tail + canvas,
-                on=tuple((c.left.alias, c.left.column, c.right.alias,
-                          c.right.column) for c in conditions),
+                on=tuple(_priced_key(c) for c in conditions),
                 pair_fraction=fraction,
                 cost=ScoreJoinCost((left, right), cost, fraction)))
             continue
         lowered = context.lowered(j.prompt)
         labels = _label_counts(lowered)
         out.append(PricedJoin(
-            written_pos=i, aliases=tuple(_join_aliases(j)), anchor=j.anchor,
+            written_position=i, aliases=tuple(_join_aliases(j)), anchor=j.anchor,
             anchor_free=(j.anchor is None and j.semantics == "full"),
             semantics=j.semantics, selectivity=j.selectivity,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
             tail_tokens=question_tokens(lowered, canvas),
-            on=tuple((c.left.alias, c.left.column, c.right.alias,
-                      c.right.column) for c in conditions),
+            on=tuple(_priced_key(c) for c in conditions),
             pair_fraction=fraction))
     return out
 
 
-def emit_join(builder, spec, step, anchor, jid, exec_idx):
-    """Append one AI join stage and the functions that supply its pairs."""
+def emit_join(
+    builder, spec, step, anchor, join_id, exec_index, port_by_alias
+) -> tuple:
+    """Append one AI join stage and the functions that supply its pairs.
+
+    Args:
+        builder: The graph builder.
+        spec: The join's PricedJoin.
+        step: The join's step in the chosen sequence.
+        anchor: The anchor alias.
+        join_id: The AiJoin node id.
+        exec_index: The join's position in execution order.
+        port_by_alias: alias -> the port its documents stand at.
+
+    Returns:
+        The anchor's ports after the join, and the port of the pairs a
+        full join keeps, else None.
+    """
     pair_inputs = []
     partners = [a for a in spec.aliases if a != anchor]
     pairs_from = ""
-    if spec.written_pos in builder.pairs_src:
-        producer = builder.pairs_src[spec.written_pos]
+    if spec.written_position in builder.pairs_src:
+        producer = builder.pairs_src[spec.written_position]
         pair_inputs.append(
-            PortRef(producer.node_id, f"pairs:{spec.written_pos}"))
+            PortRef(producer.node_id, f"pairs:{spec.written_position}"))
         pairs_from = producer.node_id
-    for apply in builder.join_applies.get(spec.written_pos, ()):
+    for apply in builder.join_applies.get(spec.written_position, ()):
         # the function's pairs reach the join on their own port
-        aid = f"apply:{apply.function}"
+        apply_id = f"apply:{apply.function}"
         builder.nodes.append(Foreign(
-            node_id=aid,
+            node_id=apply_id,
             inputs=input_ports(tuple(
-                builder.ids_src[a] for a in apply.aliases)),
+                port_by_alias[a] for a in apply.aliases)),
             function=apply.function, kind=apply.kind, ids="pairs",
-            columns=tuple((ref.alias, ref.column)
-                          for ref in apply.columns),
-            aliases=tuple(apply.aliases),
-            written_pos=spec.written_pos))
-        pair_inputs.append(PortRef(aid, f"pairs:{spec.written_pos}"))
-        pairs_from = aid
+            columns=apply.columns, aliases=tuple(apply.aliases),
+            written_position=spec.written_position))
+        pair_inputs.append(PortRef(apply_id, f"pairs:{spec.written_position}"))
+        pairs_from = apply_id
     builder.nodes.append(AiJoin(
-        node_id=jid,
+        node_id=join_id,
         inputs=input_ports(tuple(
-            builder.ids_src[a] for a in [anchor, *partners])
+            port_by_alias[a] for a in [anchor, *partners])
                            + tuple(pair_inputs)),
-        written_pos=spec.written_pos, exec_idx=exec_idx,
+        written_position=spec.written_position, exec_index=exec_index,
         anchor=anchor, partners=tuple(partners),
         semantics=spec.semantics,
         selectivity=spec.selectivity,
-        expected_tuples=round(step.tuples, 1),
+        expected_rows=round(step.tuples, 1),
+        anchor_documents=round(step.anchor_documents, 1),
         anchor_frame_tokens=spec.frame_tokens[anchor],
         pair_tail_tokens=spec.tail_tokens,
+        document_head=tuple(builder.context.lowered(
+            builder.operators.joins[spec.written_position].prompt).preamble_token_ids),
         anchor_resident=step.resident,
         tuple_tokens=round(step.tokens, 1),
         pairs_from=pairs_from))
-    builder.ids_src[anchor] = PortRef(jid, f"ids:{anchor}")
-    if spec.semantics == "full":
-        builder.pairs_edges.append(PortRef(
-            jid, f"join_answers:{spec.written_pos}"
-        ))
-        for a in [anchor] + partners:
-            if a not in builder.out_aliases:
-                builder.out_aliases.append(a)
+    return (PortRef(join_id, f"rows:{anchor}"),
+            PortRef(join_id, f"join_answers:{spec.written_position}")
+            if spec.semantics == "full" else None)

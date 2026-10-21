@@ -12,7 +12,14 @@ from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import (
     IndexRelation,
     build_result_declaration,
+    joined_survivors,
     true_answer_rows,
+)
+from quail.execution.rows import Rows, as_table
+from quail.logical.expressions import (
+    column_name,
+    column_references,
+    evaluate_expression,
 )
 from quail.physical import (
     Barrier,
@@ -33,7 +40,7 @@ class ExchangeRuntime:
             raise TypeError(type(node).__name__)
         if len(inputs) != 1:
             raise ValueError("Exchange takes one survivor input")
-        return NodeResult({f"ids:{node.anchor}": next(iter(inputs.values()))})
+        return NodeResult({f"rows:{node.anchor}": next(iter(inputs.values()))})
 
 
 class BarrierRuntime:
@@ -48,25 +55,15 @@ class BarrierRuntime:
         tables = []
         for port in node.inputs:
             value = inputs[port.name]
-            if port.value_type is ValueType.DOCUMENT_IDS:
+            if port.value_type is ValueType.ROWS:
                 alias = port.source.port.split(":", 1)[1]
                 survivors[alias] = document_ids(value)
             elif port.value_type is ValueType.JOIN_ANSWERS:
                 tables.append(value if isinstance(value, pa.Table)
                               else _join_answers_table(value))
-        for table in tables:
-            table = true_answer_rows(table)
-            for alias in table.column_names:
-                if alias in survivors:
-                    table = table.filter(pc.is_in(
-                        table[alias], value_set=survivors[alias].cast(table[alias].type)
-                    ))
-            for alias in table.column_names:
-                if alias in survivors:
-                    ids = survivors[alias]
-                    survivors[alias] = pc.filter(ids, pc.is_in(
-                        ids, value_set=pc.unique(table[alias]).cast(ids.type)))
-        return NodeResult({f"ids:{alias}": survivors[alias]
+        survivors = joined_survivors(
+            [true_answer_rows(table) for table in tables], survivors)
+        return NodeResult({f"rows:{alias}": Rows({alias: survivors[alias]})
                            for alias in node.aliases})
 
 
@@ -91,20 +88,28 @@ def _pairs_of(value, left: str, right: str) -> np.ndarray:
         [_ids_of(value.column(left)), _ids_of(value.column(right))])
 
 
-def alias_table(alias: str, ids, columns, names):
+def alias_table(alias: str, ids, columns, expressions):
     """The Arrow table an apply() function sees for one alias.
 
     Its first column is the alias's row indices under the alias
-    name; the rest are the requested value columns for those rows.
+    name; the rest are the requested columns for those rows, each
+    named as the query wrote it, such as ``length(body)``.
     """
     ids = document_ids(ids)
     arrays = {alias: ids}
-    for name in names:
-        if columns is None or name not in columns.column_names:
-            raise KeyError(
-                f"column {alias}.{name} is not among the request's relations")
-        arrays[name] = columns.column(name).take(ids)
+    for expression in expressions:
+        arrays[column_name(expression, qualified=False)] = relation_values(
+            columns, expression).take(ids)
     return pa.table(arrays)
+
+
+def relation_values(columns, expression):
+    """Return one key or apply() column's values from the alias's value table."""
+    for ref in column_references(expression):
+        if columns is None or ref.column not in columns.column_names:
+            raise KeyError(f"column {ref.alias}.{ref.column} is not among the "
+                           f"request's relations")
+    return evaluate_expression(expression, columns)
 
 
 def foreign_call(node, values, context):
@@ -134,13 +139,13 @@ def foreign_call(node, values, context):
             f"{node.node_id!r} has no id input for {missing}")
     columns = {alias: context.sources.get(columns_key(alias))
                for alias in node.aliases}
-    names = {alias: [column for owner, column in node.columns
-                     if owner == alias] for alias in node.aliases}
+    expressions = {alias: [column for column in node.columns
+                           if column.alias == alias] for alias in node.aliases}
     counters = dict(calls=0, input_rows=0, output_rows=0)
 
     def call(ids_by_alias):
         tables = {alias: alias_table(alias, ids, columns[alias],
-                                     names[alias])
+                                     expressions[alias])
                   for alias, ids in ids_by_alias.items()}
         counters["calls"] += 1
         counters["input_rows"] += sum(
@@ -186,7 +191,7 @@ def foreign_ids(node, inputs) -> dict:
     """Return the input IDs for a Foreign node, indexed by table alias."""
     values = {}
     for port in node.inputs:
-        if port.source.port.startswith("ids:"):
+        if port.source.port.startswith("rows:"):
             values[port.source.port.split(":", 1)[1]] = inputs[port.name]
     return values
 
@@ -194,9 +199,10 @@ def foreign_ids(node, inputs) -> dict:
 def foreign_outputs(node, result) -> dict:
     """Build a Foreign node's output ports from its function result."""
     if node.ids == "pairs":
-        return {f"pairs:{node.written_pos}":
+        return {f"pairs:{node.written_position}":
                 pair_ids_table(*node.aliases, result)}
-    return {f"ids:{node.aliases[0]}": document_ids(result)}
+    (alias,) = node.aliases
+    return {f"rows:{alias}": Rows({alias: document_ids(result)})}
 
 
 class ForeignRuntime:
@@ -224,19 +230,15 @@ class RecombineRuntime:
             answer_tables = []
             survivors = {}
             for input_port in node.inputs:
-                value = inputs[input_port.name]
+                value = as_table(inputs[input_port.name])
                 if not isinstance(value, pa.Table):
                     raise TypeError(
                         "Recombine inputs must be Arrow tables"
                     )
                 if input_port.value_type is ValueType.JOIN_ANSWERS:
                     answer_tables.append(true_answer_rows(value))
-                elif input_port.value_type is ValueType.DOCUMENT_IDS:
-                    if len(value.column_names) != 1:
-                        raise ValueError(
-                            "a survivor relation needs one alias column"
-                        )
-                    alias = value.column_names[0]
+                elif input_port.value_type is ValueType.ROWS:
+                    alias = input_port.source.port.split(":", 1)[1]
                     survivors[alias] = value.column(alias).combine_chunks()
                 else:
                     raise TypeError(
@@ -276,14 +278,15 @@ class HashJoinRuntime:
         if not isinstance(node, HashJoin):
             raise TypeError(type(node).__name__)
         sides = {}
-        for alias, names in ((node.left, [left for left, _ in node.on]),
-                             (node.right, [right for _, right in node.on])):
+        for alias, keys in ((node.left, [left for left, _ in node.on]),
+                            (node.right, [right for _, right in node.on])):
             port = next(port for port in node.inputs
-                        if port.source.port == f"ids:{alias}")
-            table = alias_table(alias, inputs[port.name],
-                                context.sources.get(columns_key(alias)), names)
-            sides[alias] = (table.column(alias),
-                            [table.column(name) for name in names])
+                        if port.source.port == f"rows:{alias}")
+            ids = document_ids(inputs[port.name])
+            columns = context.sources.get(columns_key(alias))
+            # a key column may carry the alias's name: the ids stay apart
+            sides[alias] = (ids, [relation_values(columns, key).take(ids)
+                                  for key in keys])
         positions = pair_table(node.left, sides[node.left][1],
                                node.right, sides[node.right][1])
         # pair_table pairs row positions; map them back to the ids read
@@ -291,7 +294,7 @@ class HashJoinRuntime:
             alias: pc.take(sides[alias][0], positions.column(alias))
             for alias in (node.left, node.right)})
         return NodeResult(
-            {f"pairs:{node.written_pos}": pairs},
+            {f"pairs:{node.written_position}": pairs},
             NodeMetrics(
                 input_rows=sum(len(ids) for ids, _ in sides.values()),
                 output_rows=pairs.num_rows))

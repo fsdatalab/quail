@@ -35,7 +35,7 @@ DOCS = {"id": ["a", "b"], "body": ["one", "two"]}
 
 
 def _filter_query(session):
-    return (session.docs("docs").alias("d")
+    return (session.docs("documents").alias("d")
             .ai_filter(quail.prompt("useful {0}", quail.col("d.body")))
             .select("d.id"))
 
@@ -47,7 +47,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     }
 
     for backend_name in ("stock_vllm", "pipelined_vllm", "pipelined_sglang"):
-        session = _session(backend_name, docs=DOCS)
+        session = _session(backend_name, documents=DOCS)
         plan = _filter_query(session).plan()
         request_node = next(
             node for node in plan.nodes if isinstance(node, RequestExecution))
@@ -67,10 +67,11 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     boot = {"client": _Client(), "sampling_params": object(), "capacity": CAPACITY}
     monkeypatch.setattr(
         "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids: (boot, {"kind": "cold", "boot_s": 0.1}))
+        lambda self, spec, allowed_ids, *, resources: (
+            boot, {"kind": "cold", "boot_s": 0.1}))
     session = _session(
         "stock_vllm",
-        docs={**DOCS, "key": ["k1", "k2"]},
+        documents={**DOCS, "key": ["k1", "k2"]},
         notes={"id": ["x", "y", "z"], "text": ["p", "q", "r"],
                "key": ["k2", "k1", "k3"]},
     )
@@ -79,7 +80,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     assert result.report["backend_metrics"]["requests"] == 2
     assert result.count() == 0
     query = (
-        session.docs("docs").alias("d")
+        session.docs("documents").alias("d")
         .join(session.docs("notes").alias("n"),
               on=[quail.col("d.key") == quail.col("n.key")])
         .ai_filter(quail.prompt("{0} matches {1}", quail.col("d.body"),
@@ -95,7 +96,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     # aliases before the label column; the join kept no pair here
     boot["client"] = _JoinedClient()
     query = (
-        session.docs("docs").alias("d")
+        session.docs("documents").alias("d")
         .join(session.docs("notes").alias("n"),
               on=[quail.col("d.key") == quail.col("n.key")])
         .ai_filter(quail.prompt("{0} matches {1}", quail.col("d.body"),
@@ -139,7 +140,7 @@ def _join_node(backend_name="stock_vllm"):
         node_id="request-model", backend_name=backend_name, aliases=("r", "p"),
         preamble_token_ids=(3,),
         joins=(RequestJoinSpec(
-            written_pos=0, aliases=("r", "p"), outer_aliases=("r",),
+            written_position=0, aliases=("r", "p"), outer_aliases=("r",),
             anchor="r", semantics="full", selectivity=0.5,
             label_token_ids=(("r", (40,)), ("p", (41,))),
             frame_token_ids=(("r", (30,)), ("p", (31,))),
@@ -161,15 +162,15 @@ def test_filter_and_join_answers_and_suffix_major_fallback():
         filtered = execution.execute(FILTER_NODE, {})
         assert filtered.outputs["filter_answers:d"].to_pydict() == {
             "d": [0, 1], "predicate": [0, 0], "answer": [True, False]}, model.name
-        assert filtered.outputs["ids:d"].to_pylist() == [0], model.name
+        assert filtered.outputs["rows:d"].ids["d"].to_pylist() == [0], model.name
         assert filtered.metrics.evaluated_documents == 2, model.name
 
         joined = execution.execute(_join_node(), {})
         assert joined.outputs["join_answers:0"].to_pydict() == {
             "r": [0, 0, 1, 1], "p": [0, 1, 0, 1],
             "answer": [True, True, False, False]}, model.name
-        assert joined.outputs["ids:r"].to_pylist() == [0], model.name
-        assert joined.outputs["ids:p"].to_pylist() == [0, 1], model.name
+        assert joined.outputs["rows:r"].ids["r"].to_pylist() == [0], model.name
+        assert joined.outputs["rows:p"].ids["p"].to_pylist() == [0, 1], model.name
         assert joined.metrics.evaluated_document_pairs == 4, model.name
 
     class RecordingClient(_Client):
@@ -239,10 +240,36 @@ def test_sglang_submission_and_cancellation():
 
 
 def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch):
+    import os
+
     from quail.backends.quail.executor.models.diffusion_gemma import canvas_token_ids
-    from quail.baselines.vllm import GigatokenVLLMTokenizer, diffusion_canvas
+    from quail.baselines.vllm import (
+        GigatokenVLLMTokenizer,
+        diffusion_canvas,
+        engine_environment,
+    )
 
     engine = VLLMEngine()
+    key = "VLLM_ENABLE_V1_MULTIPROCESSING"
+    # the environment cache is cleared on entry and exit
+    cleared = []
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(
+        envs=SimpleNamespace(disable_envs_cache=lambda: cleared.append(1))))
+    for previous in (None, "1"):
+        if previous is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, previous)
+        for spec in (replace(QWEN3_4B_FP8, vision_tower=True),
+                     DIFFUSION_GEMMA_26B_FP8):
+            with pytest.raises(RuntimeError, match="boot failed"):
+                with engine_environment(spec):
+                    assert os.environ[key] == "0"
+                    raise RuntimeError("boot failed")
+            assert os.environ.get(key) == previous
+            with engine_environment(QWEN3_4B_FP8):
+                assert os.environ.get(key) == previous
+    assert len(cleared) == 16
     qwen = engine.llm_kwargs(QWEN3_4B_FP8)
     assert qwen["max_num_batched_tokens"] == 25_305
     assert qwen["tokenizer_mode"] == "gigatoken"
@@ -281,11 +308,14 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
     monkeypatch.setitem(
         sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer)
     )
+    monkeypatch.setattr(
+        "quail.baselines.vllm.resolve_model_path",
+        lambda name, revision, **kwargs: f"{name}@{revision}")
     loaded = GigatokenVLLMTokenizer.from_pretrained(
-        "Qwen/Qwen3-4B-FP8", truncation_side="right"
+        "Qwen/Qwen3-4B-FP8", truncation_side="right", revision="pinned"
     )
     assert loaded is adapter
-    assert sources == ["Qwen/Qwen3-4B-FP8"]
+    assert sources == ["Qwen/Qwen3-4B-FP8@pinned"]
     assert loaded.truncation_side == "right"
     assert loaded.max_token_id == 1
     assert loaded.max_chars_per_token == 3
@@ -354,20 +384,20 @@ def test_request_backends_classify_with_one_decode_request_per_document():
     result = execution.execute(node, {})
     assert result.outputs["label_answers:kind"].to_pydict() == {
         "d": [0, 1], "kind": ["a", "b"]}
-    assert result.outputs["ids:d"].to_pylist() == [1]
+    assert result.outputs["rows:d"].ids["d"].to_pylist() == [1]
     assert result.outputs["label_in_answers:kind"].to_pydict() == {
         "d": [0, 1], "predicate": [0, 0], "answer": [False, True]}
     assert result.metrics.extension["requests"] == 2
     (step,) = result.metrics.extension["steps"]
-    assert (step["kind"], step["n_in"], step["n_out"]) == ("classify", 2, 1)
+    assert (step["kind"], step["num_in"], step["num_out"]) == ("classify", 2, 1)
     assert (step["generated_tokens"], step["unmatched"]) == (4, 0)
     # two 3-token prompts, and each answer's first token fed back
     assert result.metrics.fresh_tokens == 2 * 3 + 2 * (2 - 1)
     assert step["prompt_tokens"] == 6
     assert result.metrics.extension["prompt_tokens"] == 6
 
-    session = _session("stock_vllm", docs=DOCS)
-    query = (session.docs("docs").alias("d")
+    session = _session("stock_vllm", documents=DOCS)
+    query = (session.docs("documents").alias("d")
              .ai_classify(quail.prompt("kind of {0}", quail.col("d.body")),
                           ["a", "b", "c"], name="kind")
              .label_in("kind", ["b"])
@@ -381,7 +411,7 @@ def test_request_backends_classify_with_one_decode_request_per_document():
     assert not request_node.filters
     project = next(node for node in plan.nodes if isinstance(node, Project))
     assert [port.source.port for port in project.inputs] == [
-        "ids:d", "label_answers:kind"]
+        "rows:d", "label_answers:kind"]
     assert project.columns == ("d.id", "kind")
     session.close()
 
@@ -408,7 +438,7 @@ def test_request_backends_decode_one_request_per_row_the_join_keeps():
     spec = RequestClassifySpec(
         alias="r", output="kind", tail_token_ids=(90,),
         labels=("a", "b", "c"), label_token_ids=((60, 62), (61, 62), (60, 63)),
-        partner="p", join_layout_token_ids=((70,), (71,)), join_written_pos=0)
+        partner="p", join_layout_token_ids=((70,), (71,)), join_written_position=0)
     node = replace(_join_node(), classifies=(spec,))
     client = _JoinedClient()
     execution = _execution({"r": [[10], [11]], "p": [[20], [21]]}, client=client)
@@ -421,11 +451,11 @@ def test_request_backends_decode_one_request_per_row_the_join_keeps():
     assert client.prompts == [(3, 10, 70, 71, 20, 90), (3, 10, 70, 71, 21, 90)]
     assert result.outputs["label_answers:kind"].to_pydict() == {
         "r": [0, 0], "p": [0, 1], "kind": ["a", "b"]}
-    assert result.outputs["ids:r"].to_pylist() == [0]
+    assert result.outputs["rows:r"].ids["r"].to_pylist() == [0]
     join_step, classify_step = result.metrics.extension["steps"]
     assert join_step["kind"] == "join"
     assert (classify_step["alias"], classify_step["partner"]) == ("r", "p")
-    assert (classify_step["n_in"], classify_step["n_out"]) == (2, 2)
+    assert (classify_step["num_in"], classify_step["num_out"]) == (2, 2)
     assert result.metrics.evaluated_document_pairs == 4 + 2
 
 
@@ -469,8 +499,8 @@ def test_request_planner_checks_map_placement(backend_name, operation):
     from quail.planner.plan import Refusal
     from quail.planner.rules.logical import ShouldLiftMaps
 
-    with _session(backend_name, docs=DOCS, partners=DOCS) as session:
-        documents = session.docs("docs").alias("d")
+    with _session(backend_name, documents=DOCS, partners=DOCS) as session:
+        documents = session.docs("documents").alias("d")
         if operation == "classify":
             documents = documents.ai_classify(
                 quail.prompt("kind of {0}", quail.col("d.body")),
@@ -495,7 +525,7 @@ def test_request_planner_checks_map_placement(backend_name, operation):
         assert written["selected"] and written["refusal"] is None
         context = PlanningContext(
             model=session.model, device=session.device,
-            document_tokens=query._doc_tokens, tokenizer=session.tokenizer,
+            document_tokens=query._document_tokens, tokenizer=session.tokenizer,
             backend=backend_name)
         candidate, = session.registry.backend(backend_name).plan(
             ModelRegion(LogicalPlan(lifted)), context)
@@ -508,3 +538,50 @@ def test_request_planner_checks_map_placement(backend_name, operation):
             assert not isinstance(candidate.plan, Refusal)
             assert moved["refusal"] is None
             assert candidate.plan.graph == plan.graph
+
+
+class _Adapter:
+    """An engine adapter whose boot fails until told otherwise."""
+
+    kind = "fake"
+
+    def __init__(self):
+        self.live = []
+        self.fail = True
+
+    def boot(self, spec, allowed_ids, *, resources):
+        client = SimpleNamespace(close=lambda: self.live.remove(client))
+        self.live.append(client)
+        resources.callback(client.close)
+        if self.fail:
+            raise RuntimeError("warmup failed")
+        return {"client": client}, {"kind": "cold"}
+
+
+def test_a_request_backend_owns_its_engine_from_boot_to_release(monkeypatch):
+    monkeypatch.setattr("quail.backends.resources._release_vllm_parallel_state",
+                        lambda: None)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        cuda=SimpleNamespace(is_initialized=lambda: False)))
+    adapter = _Adapter()
+    backend = stock_vllm_backend().__class__("test", adapter, "pipelined")
+    context = SimpleNamespace(
+        registry=built_in_registry(), runtime_state={},
+        request=SimpleNamespace(plan={
+            "model": "qwen3-4b-fp8",
+            "settings": {"true_ids": [1], "false_ids": [2]}}))
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        backend.prepare_request(context)
+    assert adapter.live == [] and context.runtime_state == {}
+
+    adapter.fail = False
+    backend.prepare_request(context)
+    engine = context.runtime_state["engine"]
+    assert len(adapter.live) == 1
+    assert engine.prepared_boot["kind"] == "cold"
+    monkeypatch.setattr("quail.baselines.request.execute_request_graph",
+                        lambda context, backend, settings, boot: boot["kind"])
+    assert backend.execute_request(context) == "cold"
+    assert backend.execute_request(context) == "warm"
+    backend.release_request(context.runtime_state)
+    assert adapter.live == [] and context.runtime_state == {}

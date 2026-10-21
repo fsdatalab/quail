@@ -9,11 +9,16 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.backends.base import GpuContext
-from quail.execution.ids import document_ids, id_positions
+from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.result import DEFAULT_BATCH_ROWS, answer_table, filter_answer_table
+from quail.execution.result import (
+    DEFAULT_BATCH_ROWS,
+    answer_table,
+    filter_answer_table,
+)
+from quail.execution.rows import Rows, rows_of
 from quail.logical import PROBABILITIES_SUFFIX
-from quail.physical import AiClassify, AiScore, ClassifySpec, Filter, InList, ValueType
+from quail.physical import AiClassify, AiScore, ClassifySpec, Filter, ValueType
 from quail.progress import answer_sink
 
 # one kernel per entry of quail.logical.SCORE_COMPARISONS
@@ -32,46 +37,15 @@ def compare_score(scores, comparison: str, threshold: float):
 
 @dataclass(frozen=True)
 class ScoreRows:
-    """Document indices with an optional unexpanded Cartesian product.
-
-    ``origin`` maps each row, or each left document of a product, to
-    its position in the rows this was sharded from. None means the
-    rows are in their original order.
-    """
+    """Document indices with an optional unexpanded Cartesian product."""
 
     columns: tuple[np.ndarray, ...]
     product: bool = False
-    origin: np.ndarray | None = None
 
     def __len__(self):
         if self.product:
             return len(self.columns[0]) * len(self.columns[1])
         return len(self.columns[0])
-
-    def shard(self, count: int) -> list["ScoreRows"]:
-        """Split the rows by first document, so its KV stays on one GPU."""
-        first = self.columns[0]
-        shards = []
-        for worker in range(count):
-            keep = np.flatnonzero(first % count == worker)
-            origin = keep if self.origin is None else self.origin[keep]
-            columns = (
-                (first[keep], *self.columns[1:]) if self.product
-                else tuple(column[keep] for column in self.columns)
-            )
-            shards.append(replace(self, columns=columns, origin=origin))
-        return shards
-
-    def positions(self, start: int, end: int) -> np.ndarray:
-        """Return the original positions of rows start to end."""
-        local = np.arange(start, end, dtype=np.int64)
-        if not self.product:
-            return local if self.origin is None else self.origin[local]
-        width = len(self.columns[1])
-        left = local // width
-        if self.origin is not None:
-            left = self.origin[left]
-        return left * width + local % width
 
     def batches(self, size=DEFAULT_BATCH_ROWS):
         """Yield bounded arrays in input order.
@@ -151,27 +125,16 @@ def probability_column(labels, probabilities) -> pa.MapArray:
         mask=pa.array(np.isnan(probabilities).any(axis=1)))
 
 
-def _score_table(rows, aliases, name, scores, value_type=None) -> pa.Table:
-    arrays = {
-        alias: pa.array(rows[:, index], type=pa.int32())
-        for index, alias in enumerate(aliases)
-    }
-    arrays[name] = pa.array(scores, type=value_type or pa.float64())
-    return pa.table(arrays).replace_schema_metadata({
-        b"quail.kind": b"score_rows",
-        b"quail.aliases": ",".join(aliases).encode("utf-8"),
-    })
+def score_rows(rows, aliases, name, scores, value_type=None) -> Rows:
+    """The rows a score or classification returns: the ids and one value column."""
+    return Rows({alias: rows[:, index] for index, alias in enumerate(aliases)},
+                pa.table({name: pa.array(scores, type=value_type or pa.float64())}))
 
 
 def _ids(value, alias: str) -> np.ndarray:
     if isinstance(value, pa.Table):
         value = value.column(alias)
     return id_positions(value)
-
-
-def _table_aliases(table: pa.Table) -> tuple[str, ...]:
-    metadata = table.schema.metadata or {}
-    return tuple(metadata.get(b"quail.aliases", b"").decode("utf-8").split(","))
 
 
 def _candidate_rows(node, inputs):
@@ -186,14 +149,13 @@ def _candidate_rows(node, inputs):
             pairs = value
             continue
         if port.value_type is ValueType.ROWS:
+            if port.source.port.startswith("rows:"):
+                value = rows_of(value, port.source.port.split(":", 1)[1])
             for alias in spec.aliases:
-                if alias in value.column_names:
-                    by_alias[alias] = _ids(value, alias)
+                if alias in value.ids:
+                    by_alias[alias] = id_positions(value.ids[alias])
                     priors[alias] = value
             continue
-        if port.source.port.startswith("ids:"):
-            alias = port.source.port.split(":", 1)[1]
-            by_alias[alias] = _ids(value, alias)
 
     if len(spec.aliases) == 1:
         return ScoreRows((by_alias[spec.aliases[0]],)), priors
@@ -207,37 +169,6 @@ def _candidate_rows(node, inputs):
         pc.is_in(pairs.column(right), value_set=pa.array(by_alias[right])),
     ))
     return ScoreRows((_ids(selected, left), _ids(selected, right))), priors
-
-
-def attach_prior_columns(table: pa.Table, priors: Mapping[str, pa.Table]):
-    """Carry score columns computed earlier for each alias onto a table.
-
-    Every row of the table names a document that the alias's earlier
-    table also holds, so the lookup by document index never misses.
-    """
-    for alias, prior in priors.items():
-        extra = [
-            name for name in prior.column_names
-            if name not in _table_aliases(prior)
-        ]
-        if not extra:
-            continue
-        positions = pc.index_in(
-            table.column(alias), value_set=prior.column(alias)
-        )
-        for name in extra:
-            table = table.append_column(
-                name, pc.take(prior.column(name), positions)
-            )
-    return table
-
-
-def _batches_with_positions(rows: ScoreRows, size: int):
-    start = 0
-    for batch in rows.batches(size):
-        end = start + len(batch)
-        yield rows.positions(start, end), batch
-        start = end
 
 
 def scored_batch(node, rows, values) -> dict:
@@ -258,31 +189,24 @@ def scored_batch(node, rows, values) -> dict:
     return {**payload, "scores": [round(float(value), 4) for value in values]}
 
 
-def classify_outputs(node, table) -> dict:
-    """Return the label table and, for one alias, the labeled document IDs."""
-    outputs = {"rows": table}
-    if len(node.spec.aliases) == 1:
-        (alias,) = node.spec.aliases
-        outputs[f"ids:{alias}"] = document_ids(table.column(alias))
-    return outputs
+def classify_outputs(node, rows: Rows) -> dict:
+    """Return the label rows on the node's rows port."""
+    return {node.rows_port: rows}
 
 
-def score_in_batches(node, inputs, score_batches, shards: int = 1,
-                     streamed: bool = False) -> NodeResult:
-    """Score the node's candidate rows, in input order.
+def score_in_batches(node, inputs, score_batch, streamed: bool = False) -> NodeResult:
+    """Score the node's candidate rows in bounded batches, in input order.
 
-    Each shard's rows are scored in one call of ``score_batches``. A
-    Cartesian product is scored in batches of DEFAULT_BATCH_ROWS pairs.
+    A Cartesian product is scored in batches of DEFAULT_BATCH_ROWS
+    pairs, built per batch: the whole product may not fit in host
+    memory.
 
     Args:
-        node: The AiScore node.
+        node: The AiScore or AiClassify node.
         inputs: Its input values by port name.
-        score_batches: Callable (node, batches) taking one row batch per
-            shard and returning one NodeResult per batch, each with a
-            "rows" table holding one row per input row in order.
-        shards: Row shards scored side by side; rows that share a first
-            document land in the same shard.
-        streamed: Whether ``score_batches`` sends its answers to the
+        score_batch: Callable (node, rows) returning the batch's
+            NodeResult, with one row per input row in order.
+        streamed: Whether ``score_batch`` sends its answers to the
             answer sink itself. Otherwise each batch's answers are sent
             when the batch is scored.
     """
@@ -292,46 +216,27 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         raise ValueError("AI.SCORE needs a score specification")
     started = time.perf_counter()
     rows, priors = _candidate_rows(node, inputs)
-    parts = rows.shard(shards) if shards > 1 else [rows]
-    width = len(node.spec.aliases)
-    tables = []
-    positions = []
+    scored = []
     metrics = NodeMetrics()
-    # a product's pairs are built per batch: the whole product may not
-    # fit in host memory
-    streams = [_batches_with_positions(
-        part, DEFAULT_BATCH_ROWS if part.product else max(1, len(part)))
-        for part in parts]
-    while streams:
-        rounds = [next(stream, None) for stream in streams]
-        if all(item is None for item in rounds):
-            break
-        batches = [
-            (np.empty(0, dtype=np.int64), np.empty((0, width), dtype=np.int32))
-            if item is None else item
-            for item in rounds
-        ]
-        results = score_batches(node, [batch for _, batch in batches])
-        for (where, batch), result in zip(batches, results):
-            tables.append(result.outputs["rows"])
-            positions.append(where)
-            metrics += result.metrics
-            sink = answer_sink()
-            if sink is not None and not streamed and len(batch):
-                sink(scored_batch(
-                    node, batch,
-                    result.outputs["rows"].column(node.spec.name).to_pylist()))
-    table = pa.concat_tables(tables)
-    order = np.concatenate(positions)
-    if len(order) and np.any(np.diff(order) < 0):
-        table = table.take(pa.array(np.argsort(order, kind="stable")))
-    table = attach_prior_columns(table, priors)
-    outputs = {"rows": table}
+    size = DEFAULT_BATCH_ROWS if rows.product else max(1, len(rows))
+    for batch in rows.batches(size):
+        result = score_batch(node, batch)
+        scored.append(result.outputs[node.rows_port])
+        metrics += result.metrics
+        sink = answer_sink()
+        if sink is not None and not streamed and len(batch):
+            sink(scored_batch(
+                node, batch,
+                result.outputs[node.rows_port].column(node.spec.name).to_pylist()))
+    rows = Rows.concat(scored)
+    for alias, prior in priors.items():
+        rows = rows.joined(prior, alias)
+    outputs = {node.rows_port: rows}
     if isinstance(node.spec, ClassifySpec):
         # a document whose decoded answer names no label leaves the query
-        table = table.filter(pc.is_valid(table.column(node.spec.name)))
-        metrics = replace(metrics, output_rows=table.num_rows)
-        outputs = classify_outputs(node, table)
+        rows = rows.filter(pc.is_valid(rows.column(node.spec.name)))
+        metrics = replace(metrics, output_rows=rows.num_rows)
+        outputs = classify_outputs(node, rows)
     return NodeResult(outputs, replace(
         metrics, wall_s=time.perf_counter() - started,
         extension={**metrics.extension, "output": node.spec.name,
@@ -351,11 +256,7 @@ class RerankerModelExecution:
         node: AiScore,
         inputs: Mapping[str, object],
     ) -> NodeResult:
-        return score_in_batches(
-            node, inputs,
-            lambda node, batches: [self.execute_rows(node, b) for b in batches],
-            streamed=True,
-        )
+        return score_in_batches(node, inputs, self.execute_rows, streamed=True)
 
     def execute_rows(self, node, rows):
         """Compute a score for each supplied row or document pair."""
@@ -371,7 +272,7 @@ class RerankerModelExecution:
             object if isinstance(spec, ClassifySpec) else np.float32))
         sink = answer_sink()
         streams = (sink is not None and len(rows)
-                   and getattr(self.reranker, "streams_answers", False))
+                   and self.reranker.streams_answers)
         extra = {}
         if streams:
             extra["on_answers"] = lambda positions, values: sink(
@@ -382,17 +283,17 @@ class RerankerModelExecution:
         )
         if sink is not None and len(rows) and not streams:
             sink(scored_batch(node, rows, batch.scores))
-        table = _score_table(rows, spec.aliases, spec.name, batch.scores,
-                             _value_type(spec))
+        scored = score_rows(rows, spec.aliases, spec.name, batch.scores,
+                           _value_type(spec))
         if isinstance(spec, ClassifySpec) and spec.probabilities:
-            table = table.append_column(
+            scored = scored.with_column(
                 spec.name + PROBABILITIES_SUFFIX, probability_column(
                     spec.labels,
                     np.full((len(rows), len(spec.labels)), np.nan)
                     if batch.probabilities is None else batch.probabilities))
         count = len(rows)
         return NodeResult(
-            {"rows": table},
+            {node.rows_port: scored},
             NodeMetrics(
                 wall_s=time.perf_counter() - started,
                 input_rows=count,
@@ -420,12 +321,12 @@ class RerankerModelExecution:
         )
 
 
-def _filter_answer_table(node: Filter, table, answers) -> pa.Table:
+def _filter_answer_table(node: Filter, rows: Rows, answers) -> pa.Table:
     """Build one answer row per document using the filter answer schema."""
     alias = node.aliases[0]
     return filter_answer_table(
-        alias, table.column(alias),
-        np.full(table.num_rows, node.written_pos, dtype=np.int32), answers)
+        alias, rows.ids[alias],
+        np.full(rows.num_rows, node.written_position, dtype=np.int32), answers)
 
 
 class FilterRuntime:
@@ -436,51 +337,35 @@ class FilterRuntime:
             raise TypeError(type(node).__name__)
         if len(inputs) != 1:
             raise ValueError("Filter needs one score or label input")
-        table = next(iter(inputs.values()))
-        return filter_scores(node, table)
+        rows = next(iter(inputs.values()))
+        return filter_scores(node, rows)
 
 
-def evaluate_predicate(predicate, column):
-    """Return an Arrow Boolean array indicating which values pass."""
-    if isinstance(predicate, InList):
-        return pc.is_in(column, value_set=pa.array(predicate.values, pa.string()))
-    return compare_score(column, predicate.op, predicate.value)
-
-
-def filter_scores(node, table) -> NodeResult:
-    """Apply a filter to a table of scores or labels."""
-    answers = evaluate_predicate(node.predicate, table.column(node.column))
-    filtered = table.filter(answers)
+def filter_scores(node, rows: Rows) -> NodeResult:
+    """Apply a filter to rows of scores, labels, or answers."""
+    answers = node.predicate.accepts(rows)
+    filtered = rows.filter(answers)
     if len(node.aliases) == 1:
         answer_name = f"filter_answers:{node.aliases[0]}"
-        answer_relation = _filter_answer_table(node, table, answers)
+        answer_relation = _filter_answer_table(node, rows, answers)
     else:
         left, right = node.aliases
-        answer_name = f"join_answers:{node.written_pos}"
+        answer_name = f"join_answers:{node.written_position}"
         answer_relation = answer_table(
-            {
-                left: table.column(left),
-                right: table.column(right),
-            },
+            {left: rows.ids[left], right: rows.ids[right]},
             answers,
             "join_answers",
             metadata={
-                "written_pos": node.written_pos,
+                "written_position": node.written_position,
                 "anchor": left,
                 "partners": right,
                 "semantics": "full",
-                "comparison": node.predicate.op,
+                "comparison": node.predicate.comparison,
                 "threshold": node.predicate.value,
             },
         )
-    outputs = {"rows": filtered, answer_name: answer_relation}
-    if len(node.aliases) == 1:
-        outputs[f"ids:{node.aliases[0]}"] = document_ids(
-            filtered.column(node.aliases[0]))
+    outputs = {node.rows_port: filtered, answer_name: answer_relation}
     return NodeResult(
         outputs,
-        NodeMetrics(
-            input_rows=table.num_rows,
-            output_rows=filtered.num_rows,
-        ),
+        NodeMetrics(input_rows=rows.num_rows, output_rows=filtered.num_rows),
     )

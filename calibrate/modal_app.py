@@ -1,22 +1,4 @@
-r"""Run calibrate's GEMM measurement on Modal.
-
-The measurement runs on the target's Modal GPU and writes to the
-quail-results volume under calibrate/. --gpus N starts N containers at
-once, each on its own GPU, so to_spec can take the fastest GPU:
-
-    mkdir -p results/benchmark
-    log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-calibrate-gemm.log"
-    uv run modal run --detach calibrate/modal_app.py::gemm \
-        --device h100-sxm --gpus 5 --prediction "..." 2>&1 | tee "$log"
-
-Modal picks the physical GPU; each summary records its UUID, and
-to_spec counts each GPU once.
-
-The image is the NGC image the published H100 SXM rows were
-measured with.
-"""
-
-from __future__ import annotations
+"""Measure GEMM MAMF on Modal and save results to quail-results."""
 
 from pathlib import Path
 
@@ -24,17 +6,15 @@ import modal
 
 from calibrate import gemm as gemm_run
 from calibrate import utc_stamp
-from calibrate.targets import TARGETS
+from calibrate.targets import DTYPES, TARGETS
 
 NGC_IMAGE = "nvcr.io/nvidia/pytorch:26.04-py3"
 MAMF_DIR = Path("/opt/mamf-finder")
-VOLUME_DIR = Path("/results")
-ROOT = VOLUME_DIR / "calibrate"
+ROOT = Path("/results/calibrate")
 
 app = modal.App("quail-milestone1")
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
-
-gemm_image = (
+image = (
     modal.Image.from_registry(NGC_IMAGE)
     .pip_install("nvidia-ml-py")
     .run_commands(
@@ -44,44 +24,40 @@ gemm_image = (
 )
 
 
-@app.function(image=gemm_image, gpu="H100!", timeout=3 * 3600,
-              volumes={str(VOLUME_DIR): results_vol})
-def measure_gemm(device: str, stamp: str, published: dict | None,
+@app.function(image=image, gpu="H100!", timeout=3600,
+              volumes={"/results": results_vol})
+def measure_gemm(device: str, stamp: str, precisions: tuple[str, ...],
                  prediction: str) -> dict:
-    """Run calibrate.gemm on this container's GPU, committing each file.
-
-    Args:
-        device: The quail.specs device name.
-        stamp: Names this run's directory.
-        published: The GPU's published fp8 rates and shapes, or None.
-        prediction: The prediction stated before the run.
-    """
-    return gemm_run.run(ROOT, device, stamp, published,
-                        gemm_run.fetch_mamf_finder(MAMF_DIR), prediction,
+    """Measure each precision on one GPU and commit the results and logs."""
+    return gemm_run.run(ROOT, device, stamp, precisions, MAMF_DIR, prediction,
                         on_save=results_vol.commit)
 
 
 @app.local_entrypoint()
-def gemm(device: str = "h100-sxm", gpus: int = 1, prediction: str = ""):
-    """Start the GEMM measurement on gpus GPUs and print each one's headlines.
-
-    Args:
-        device: The calibrate target, by quail.specs device name.
-        gpus: Containers to start, each on its own GPU.
-        prediction: The prediction stated before the run.
-    """
-    target = TARGETS[device]
+def gemm(device: str = "h100-sxm", precision: str = "fp8,bf16", gpus: int = 1,
+         prediction: str = ""):
+    """Measure comma-separated devices and precisions on gpus copies each."""
+    devices = tuple(device.split(","))
+    precisions = tuple(precision.split(","))
+    if (gpus < 1 or not set(devices) <= TARGETS.keys()
+            or not set(precisions) <= DTYPES.keys()):
+        raise ValueError("choose supported devices, precisions, and a positive gpus")
+    if not prediction.strip():
+        raise ValueError("state --prediction before measuring")
     stamp = utc_stamp()
-    print(f"prediction: {prediction or '(none stated)'}", flush=True)
-    calls = {}
-    for i in range(gpus):
-        name = f"{stamp}-g{i}"
-        calls[name] = measure_gemm.with_options(gpu=target.modal_gpu).spawn(
-            device, name, target.published_fp8, prediction)
-        print(f"{name}: function call id {calls[name].object_id}, "
-              f"summary {ROOT / device / 'gemm' / name / 'summary.json'}", flush=True)
-    for name, call in calls.items():
+    print(f"prediction: {prediction}", flush=True)
+    calls = []
+    for name in dict.fromkeys(devices):
+        for index in range(gpus):
+            run_stamp = f"{stamp}-g{index}"
+            call = measure_gemm.with_options(gpu=TARGETS[name]).spawn(
+                name, run_stamp, tuple(dict.fromkeys(precisions)), prediction)
+            calls.append(call)
+            print(f"{name}: function call id {call.object_id}; "
+                  f"summary {ROOT / name / 'gemm' / run_stamp / 'summary.json'}",
+                  flush=True)
+    for call in calls:
         summary = call.get()
-        for run, result in summary["runs"].items():
-            print(f"{name} {summary['gpu'].get('uuid')} {run}: "
-                  f"MAMF {result['mamf']} MSMF {result['msmf']}", flush=True)
+        for precision, run in summary["runs"].items():
+            print(f"{summary['device']} {summary['gpu']['uuid']} {precision}: "
+                  f"MAMF {run['mamf']['tflops']} TFLOPS", flush=True)

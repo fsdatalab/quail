@@ -6,10 +6,11 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from quail.logical.expressions import (
-    Alias,
     ColumnRef,
     CompileError,
     ModelCall,
+    RegularPredicate,
+    aliased_call,
     model_call,
 )
 from quail.logical.nodes import (
@@ -25,23 +26,29 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    Window,
 )
 
 
 @dataclass(frozen=True)
-class LabelFilter:
-    """A Filter on a one-table classification's label, as the planner reads it.
+class ColumnTest:
+    """A Filter on a column a classification or an extraction computes.
 
     Attributes:
-        call: The classification that computes the label.
-        values: The labels the Filter keeps.
+        name: The label column, or the extraction whose answer or
+            span the Filter tests, as the SemanticClassify or
+            SemanticExtract names it.
+        call: The model call that computes the column.
+        condition: The RegularPredicate the Filter applies.
         selectivity: The Filter's selectivity hint, or None.
         position: Its written position among the table's filters,
-            counted after the table's AI.IF predicates.
+            counted after the table's AI.IF predicates, with the label
+            filters before the answer filters.
     """
 
+    name: str
     call: "ModelCall"
-    values: tuple
+    condition: RegularPredicate
     selectivity: Optional[float]
     position: int
 
@@ -70,7 +77,7 @@ def _label_work(classifies, columns, label_filters) -> LabelWork:
     projected = {
         column.expression: column.name
         for column in columns
-        if isinstance(column, Alias) and column.expression.kind == "label"
+        if aliased_call(column, "label") is not None
     }
     names = {node.call: node.name for node in classifies}
     tests = {}
@@ -94,7 +101,7 @@ class LogicalPlan:
     def projection(self) -> Project:
         """Return the projection that supplies result columns."""
         node = self.root
-        while isinstance(node, (Result, Aggregate)):
+        while isinstance(node, (Result, Aggregate, Window)):
             node = node.input
         if not isinstance(node, Project):
             raise CompileError("a query plan needs a projection")
@@ -158,19 +165,31 @@ class LogicalPlan:
             for node in classifies
             if len(node.call.aliases()) == 1
         }
-        label_filters = {
-            alias: tuple(
-                LabelFilter(
-                    call=calls[(alias, node.condition.column.column)],
-                    values=node.condition.values,
-                    selectivity=node.selectivity,
-                    position=len(filters.get(alias, ())) + index,
-                )
-                for index, node in enumerate(tested[alias])
-            )
-            for alias in aliases
-            if alias in tested
-        }
+        label_filters, extract_filters = {}, {}
+        for alias in aliases:
+            labels = [node for node in tested.get(alias, ())
+                      if (alias, node.condition.column.column) in calls]
+            if labels:
+                label_filters[alias] = tuple(
+                    ColumnTest(
+                        name=node.condition.column.column,
+                        call=calls[(alias, node.condition.column.column)],
+                        condition=node.condition,
+                        selectivity=node.selectivity,
+                        position=len(filters.get(alias, ())) + index,
+                    )
+                    for index, node in enumerate(labels))
+            answers = [node for node in tested.get(alias, ()) if node not in labels]
+            if answers:
+                extract_filters[alias] = tuple(
+                    ColumnTest(
+                        name=_extraction(node.condition.column.column, extracts).name,
+                        call=_extraction(node.condition.column.column, extracts).call,
+                        condition=node.condition,
+                        selectivity=node.selectivity,
+                        position=len(filters.get(alias, ())) + len(labels) + index,
+                    )
+                    for index, node in enumerate(answers))
         columns = next(
             (
                 node.columns
@@ -185,10 +204,11 @@ class LogicalPlan:
                 alias: tuple(filters[alias]) for alias in aliases if alias in filters
             },
             label_filters=label_filters,
+            extract_filters=extract_filters,
             joins=tuple(joins),
             applies=tuple(applies),
             projections=tuple(
-                column for column in columns if isinstance(column, Alias)
+                column for column in columns if aliased_call(column) is not None
             ),
             labels=_label_work(classifies, columns, label_filters),
             classifies=tuple(classifies),
@@ -215,16 +235,17 @@ class Operators:
     classifies: tuple = ()  # tuple[SemanticClassify, ...]
     extracts: tuple = ()  # tuple[SemanticExtract, ...]
     label_filters: dict = field(default_factory=dict)
-    #                     alias -> tuple[LabelFilter, ...]
+    #                     alias -> tuple[ColumnTest, ...] on labels
+    extract_filters: dict = field(default_factory=dict)
+    #                     alias -> tuple[ColumnTest, ...] on answers
 
     def all_filters(self) -> dict:
-        """Return alias -> its AI.IF predicates, then its LabelFilters."""
-        aliases = [
-            *self.filters,
-            *(alias for alias in self.label_filters if alias not in self.filters),
-        ]
+        """Return alias -> its AI.IF predicates, then its ColumnTests."""
+        aliases = list(dict.fromkeys(
+            (*self.filters, *self.label_filters, *self.extract_filters)))
         return {
-            alias: (*self.filters.get(alias, ()), *self.label_filters.get(alias, ()))
+            alias: (*self.filters.get(alias, ()), *self.label_filters.get(alias, ()),
+                    *self.extract_filters.get(alias, ()))
             for alias in aliases
         }
 
@@ -247,6 +268,11 @@ class Operators:
             for column in self.projections
             if column.expression not in calls
         )
+
+
+def _extraction(column: str, extracts):
+    """Return the SemanticExtract computing an answer or span column."""
+    return next(node for node in extracts if column in (node.name, node.span_name))
 
 
 def join_outer_input(join: "SemanticJoin") -> "LogicalNode":

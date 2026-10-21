@@ -11,7 +11,7 @@ class PricedJoin:
     """One join with the token counts the cost model prices it by.
 
     Attributes:
-        written_pos: The join's position among the query's joins.
+        written_position: The join's position among the query's joins.
         aliases: Its tables in placeholder order.
         anchor: The table whose document KV the join reuses, or None
             when the search chooses it.
@@ -27,11 +27,11 @@ class PricedJoin:
             alias, right column).
         pair_fraction: The fraction of the cross product the equality
             conditions keep.
-        cost: A score join's own pricing, with work(live); None for a
+        cost: A score join's own pricing, with work(expected_rows); None for a
             join the model answers.
     """
 
-    written_pos: int
+    written_position: int
     aliases: tuple[str, ...]
     anchor: str | None
     anchor_free: bool
@@ -131,6 +131,8 @@ def stage_work(spec: PricedJoin, anchor: str, n: float, tuples: float,
             sliding_pairs=(stats.window_pairs(pre + frame) - stats.window_pairs(pre)
                            if window else 0.0),
             sliding_kv_read=stats.window_reads(pre) if window else 0.0,
+            state_read=count,
+            state_written=count,
         )
     else:
         scan_sum = prefix_sum + count * frame
@@ -141,6 +143,7 @@ def stage_work(spec: PricedJoin, anchor: str, n: float, tuples: float,
             pairs=(scan_squared + scan_sum) / 2,
             kv_written=scan_sum,
             sliding_pairs=stats.window_pairs(pre + frame) if window else 0.0,
+            state_written=count,
         )
     stream = Work(
         tokens=count * per_anchor * u,
@@ -153,5 +156,6 @@ def stage_work(spec: PricedJoin, anchor: str, n: float, tuples: float,
                                     - stats.window_pairs(pre + frame))
                        if window else 0.0),
         sliding_kv_read=stats.window_reads(pre + frame) if window else 0.0,
+        state_read=count * per_anchor,
     )
     return (start + stream) * frac

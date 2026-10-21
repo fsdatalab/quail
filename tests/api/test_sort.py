@@ -2,7 +2,7 @@
 
 import pyarrow as pa
 import pytest
-from helpers.planning import _optimize, _plan, node_kinds, tok
+from helpers.planning import _optimize, _plan, node_kinds, token_lengths, tokenizer
 
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, DocumentProvider
@@ -35,7 +35,7 @@ def _optimize_with(catalog, logical, tokens):
     """Run the built in tree rewrites with the catalog's id columns."""
     context = PlanningContext(
         catalog=catalog, model=QWEN3_4B_FP8, device=H100_SXM,
-        document_tokens=tokens, tokenizer=tok)
+        document_tokens=token_lengths(tokens), tokenizer=tokenizer)
     candidate, = logical_alternatives(logical, built_in_rules(), context)
     return candidate.plan, candidate.rules
 
@@ -86,6 +86,18 @@ def test_sort_runtime_orders_bounds_and_deduplicates_rows():
     assert result.outputs["rows"].to_rows() == [("e",)]
 
 
+@pytest.mark.parametrize("name", ["key_0", "row_position", "column_0"])
+def test_distinct_keeps_a_user_column_named_like_an_internal_one(name):
+    table = pa.table({name: ["a", "a", None, None, "b"], "other": [1, 1, 2, 2, 3]})
+    rows, metrics = _rows(_sort(columns=(name, "other"), distinct=True), table)
+    assert rows == [("a", 1), (None, 2), ("b", 3)]
+    assert (metrics.input_rows, metrics.output_rows) == (5, 3)
+    # signed zeros and NaNs are one value each
+    table = pa.table({"v": [0.0, -0.0, float("nan"), float("nan"), 1.0]})
+    rows, _ = _rows(_sort(columns=("v",), distinct=True), table)
+    assert [0.0, 1.0] == [v for (v,) in rows if v == v] and len(rows) == 3
+
+
 def _filtered(catalog):
     return (docs(catalog, "reviews").alias("r")
             .ai_filter(prompt("flag: {0}", col("r.review")), selectivity=0.5))
@@ -132,7 +144,7 @@ def test_distinct_is_dropped_when_every_tables_id_is_selected(catalog):
     assert not isinstance(optimized.root, Result) or not optimized.root.distinct
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
                       registry=built_in_registry(),
-                      doc_tokens=tokens, tokenizer=tok)
+                      document_tokens=token_lengths(tokens), tokenizer=tokenizer)
     assert node_kinds(plan)[-2:] == ["Project", "Limit"]
     assert plan.settings["filter_limit"] == 3
     # a group's keys name it once, so DISTINCT over them is redundant too
@@ -161,7 +173,7 @@ def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
     assert node.stop_key == ("author",)
     plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
                       registry=built_in_registry(),
-                      doc_tokens=tokens, tokenizer=tok)
+                      document_tokens=token_lengths(tokens), tokenizer=tokenizer)
     ai_filter = next(node for node in plan.nodes if isinstance(node, AiFilter))
     assert ai_filter.stop_key == ("author",)
     text = explain(optimized, plan)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import time
+from contextlib import ExitStack, closing
 
 from quail.backends.quail.executor.models.decision2 import register_backbone
 
@@ -128,6 +129,15 @@ class _RetryingEngine:
         self.prompts[request_id] = (prompt, params)
         self.engine.add_request(request_id, prompt, params)
 
+    def abort_request(self, request_ids):
+        retries = [retry for retry, original in self.retries.items()
+                   if original in request_ids]
+        for retry in retries:
+            del self.retries[retry]
+        for request_id in request_ids:
+            self.prompts.pop(request_id, None)
+        self.engine.abort_request(list(request_ids) + retries)
+
     def step(self):
         ready = []
         for output in self.engine.step():
@@ -188,6 +198,11 @@ class VLLMDecisionClient:
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()
 
+    def close(self):
+        """Stop the engine and its workers."""
+        self.llm.llm_engine.engine_core.shutdown()
+        self.llm = None
+
     def run_filter_sequence(self, params, body_ids, question_ids, read_answer, *,
                          tag="q", body_texts=None, question_texts=None):
         """Pipeline filter stages through the engine's step loop."""
@@ -202,7 +217,8 @@ class VLLMDecisionClient:
             max_num_seqs=self.capacity["max_num_seqs"])
 
 
-def boot_decision(spec, llm_kwargs: dict) -> tuple[dict, dict]:
+def boot_decision(spec, llm_kwargs: dict, *,
+                  resources: ExitStack) -> tuple[dict, dict]:
     """Load a decision checkpoint on the pooling runner.
 
     Each query sets its own pooling parameters from its plan. Prompts
@@ -211,17 +227,16 @@ def boot_decision(spec, llm_kwargs: dict) -> tuple[dict, dict]:
     Args:
         spec: The decision model's ModelSpec.
         llm_kwargs: LLM constructor arguments beyond the model.
+        resources: Owns the engine; closing it stops the engine.
 
     Returns:
-        The engine state and the boot record.
+        The engine settings and the boot record.
     """
     from vllm import LLM
 
-    from quail.backends.quail.executor.model_loading import (
-        engine_args,
-        resolve_model_path,
-    )
+    from quail.backends.quail.executor.model_loading import engine_args
     from quail.baselines.vllm import _capacity
+    from quail.specs.files import resolve_model_path
 
     register()
     path = resolve_model_path(spec.hf_name, spec.revision)
@@ -230,16 +245,17 @@ def boot_decision(spec, llm_kwargs: dict) -> tuple[dict, dict]:
     llm_kwargs["skip_tokenizer_init"] = True
     started = time.perf_counter()
     llm = LLM(runner="pooling", **engine_args(path, ARCHITECTURE), **llm_kwargs)
+    client = resources.enter_context(closing(VLLMDecisionClient(llm, {})))
     boot_s = time.perf_counter() - started
     config = llm.llm_engine.vllm_config
-    capacity = _capacity(llm)
+    capacity = client.capacity
+    capacity.update(_capacity(llm))
     capacity.update(
         enable_prefix_caching=config.cache_config.enable_prefix_caching,
         enable_chunked_prefill=config.scheduler_config.enable_chunked_prefill,
         runner="pooling", architecture=ARCHITECTURE)
     if not capacity["enable_prefix_caching"]:
         raise RuntimeError("vLLM turned prefix caching off for the decision model")
-    client = VLLMDecisionClient(llm, capacity)
     params = pooling_params((1, 0))
     warm = client.generate([{"prompt_token_ids": [0, 0]}], params)
     if not all(math.isfinite(float(v)) for v in warm[0].outputs.data):

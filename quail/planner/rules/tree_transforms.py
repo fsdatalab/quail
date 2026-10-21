@@ -9,11 +9,9 @@ from quail.logical import (
     Alias,
     Apply,
     ColumnRef,
-    Compare,
     Equality,
     Filter,
     FilterPredicate,
-    InList,
     Join,
     LogicalNode,
     LogicalPlan,
@@ -28,26 +26,42 @@ from quail.logical import (
     SemanticFilter,
     SemanticJoin,
     SortKey,
+    Window,
     is_score,
     model_call,
+)
+from quail.logical.expressions import (
+    GetField,
+    ScalarFunction,
+    aliased_call,
+    column_references,
+    source_columns,
 )
 
 
 def _column_refs(expression) -> tuple[ColumnRef, ...]:
-    """Return the column references one logical expression reads."""
-    if isinstance(expression, ColumnRef):
-        return (expression,)
+    """Return the source columns one logical expression reads."""
+    if isinstance(expression, (ColumnRef, GetField, ScalarFunction)):
+        return column_references(expression)
+    if isinstance(expression, Alias) and aliased_call(expression) is None:
+        return column_references(expression.expression)
     if isinstance(expression, FilterPredicate):
         return _column_refs(expression.expression)
-    if isinstance(expression, (ModelCall, Compare, Alias)):
-        return tuple(model_call(expression).prompt.args)
-    if isinstance(expression, (InList, RegularPredicate)):
-        return (expression.column,)
+    if isinstance(expression, (ModelCall, Alias)):
+        return _refs_of(model_call(expression).prompt.args)
+    if isinstance(expression, RegularPredicate):
+        return _column_refs(expression.expression)
     if isinstance(expression, Equality):
-        return (expression.left, expression.right)
+        return _refs_of((expression.left, expression.right))
     if isinstance(expression, SortKey):
         return _column_refs(expression.expression)
     return ()
+
+
+def _refs_of(expressions) -> tuple[ColumnRef, ...]:
+    """Return the source columns several expressions read, in first use order."""
+    return tuple(dict.fromkeys(
+        ref for expression in expressions for ref in _column_refs(expression)))
 
 
 def push_down_projection(root: LogicalNode) -> LogicalNode:
@@ -60,26 +74,40 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     Scan, so the path holds the complete set.
 
     The document column is always tokenized. It is kept as a value too
-    only when the root projection returns it.
+    only when something reads its text: the root projection or a sort
+    key returns it, a score reads it, a scan predicate tests it, an
+    apply() function or a join condition reads it, or an extraction
+    locates its answers in it.
     """
     plan = LogicalPlan(root)
     projection = next((node for node in reversed(plan.walk())
                        if isinstance(node, Project)), None)
     result = plan.result
-    returned = {
+    valued = {
         (ref.alias, ref.column)
         for ref in (projection.output_schema() if projection is not None else ())
     } | {
         (ref.alias, ref.column)
         for key in result.order
         for ref in _column_refs(key)
-    }
-    score_inputs = {
+    } | {
         (ref.alias, ref.column)
         for expression in (projection.columns if projection is not None else ())
-        if isinstance(expression, Alias)
+        if aliased_call(expression) is not None
         for ref in _column_refs(expression)
     }
+    for node in plan.walk():
+        if isinstance(node, Apply):
+            refs = _refs_of(node.columns)
+        elif isinstance(node, Join):
+            refs = _refs_of(node.on)
+        elif isinstance(node, SemanticExtract):
+            refs = _refs_of(node.call.prompt.args)
+        elif isinstance(node, Scan):
+            refs = _refs_of(node.predicates)
+        else:
+            continue
+        valued.update((ref.alias, ref.column) for ref in refs)
 
     def descend(node, needed):
         needed = {alias: dict(columns) for alias, columns in needed.items()}
@@ -93,13 +121,10 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
             for field in node.output_schema()[len(node.input.output_schema()):]:
                 needed.get(field.alias, {}).pop(field.column, None)
         if isinstance(node, Scan):
-            tested = {predicate.column.column for predicate in node.predicates}
             columns = tuple(
                 column for column in needed.get(node.alias, ())
-                if column != node.column
-                or (node.alias, column) in returned
-                or (node.alias, column) in score_inputs
-                or column in tested
+                if column not in source_columns(node.column)
+                or (node.alias, column) in valued
             )
             return node if columns == node.columns else replace(
                 node, columns=columns)
@@ -111,27 +136,13 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     return descend(root, {})
 
 
-def _movable_filter_alias(node) -> str | None:
-    """Return the table a cheap one-table filter reads, or None for other nodes.
-
-    A cheap filter is an Apply returning ids, or a Filter on a label that
-    a SemanticClassify below it computed. An AI.IF filter runs the model
-    and is not moved.
-    """
-    if isinstance(node, Apply) and node.ids != "pairs":
-        return node.aliases[0]
-    if isinstance(node, Filter):
-        return node.condition.column.alias
-    return None
-
-
 def _lets_through(node, alias: str) -> bool:
     """Return whether a filter on one table may move below node.
 
     True for a Join, a full SemanticJoin, a classification of joined
     rows, and any node on another table. False for the table's own
-    sequence, a gate (an exists or anti join), an Apply returning a join's
-    pairs, and any other node.
+    sequence, a gate (an exists or anti join), an Apply reading the
+    table or returning a join's pairs, and any other node.
     """
     if isinstance(node, Join):
         return True
@@ -156,8 +167,8 @@ def _place_filter(filter_node, node, alias: str):
 
     Returns:
         The subtree under node with the filter as low as it goes, or
-        None when a gate, an Apply returning pairs, or the table's own
-        sequence stops it before any Join.
+        None when a gate, an Apply, or the table's own sequence stops
+        it before any Join.
     """
     if isinstance(node, Join):
         left = {field.alias for field in node.left.output_schema()}
@@ -175,15 +186,16 @@ def _place_filter(filter_node, node, alias: str):
 
 
 def push_down_filters(root: LogicalNode) -> LogicalNode | None:
-    """Move every cheap one-table filter below the joins above its table.
+    """Move every Filter on one table below the joins above its table.
 
-    An Apply returning ids and a Filter on a label column read one
-    table, so they commute with the joins, the classifications of
-    joined rows, and the other tables' operators above that table.
-    Each moves to the top of its own table's sequence and keeps its order
-    with the table's other filters. A filter stays where it is when a
-    gate (an exists or anti join) or an Apply returning a join's pairs
-    sits between it and the first Join below.
+    A Filter on a label or answer column tests each row alone, so it
+    commutes with the full joins, the classifications of joined rows,
+    and the other tables' operators above that table. Each moves to
+    the top of its own table's sequence and keeps its order with the
+    table's other filters. A filter stays where it is when a gate (an
+    exists or anti join) or an Apply reading its table sits between it
+    and the first Join below. An Apply never moves: its function sees
+    the rows of the relation it was written on.
 
     Returns:
         The rewritten root, or None when no filter moved.
@@ -195,9 +207,9 @@ def push_down_filters(root: LogicalNode) -> LogicalNode | None:
         children = tuple(visit(child) for child in node.children())
         if children != node.children():
             node = node.with_children(children)
-        alias = _movable_filter_alias(node)
-        if alias is None:
+        if not isinstance(node, Filter):
             return node
+        alias = node.condition.column.alias
         placed = _place_filter(node, node.input, alias)
         if placed is None:
             return node
@@ -238,19 +250,26 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     SemanticExtract of such a table, leaves the table's sequence and
     moves above the topmost join, under the root Project, in scan
     order. A classification or extraction of a table that no join
-    reads stays. The map operators here are SemanticClassify and
-    SemanticExtract. The planner prices the rewritten plan alongside
-    the original plan.
+    reads stays, as does one below an Apply, whose function sees the
+    rows it was written on, and one of a gate's inner table (an exists
+    or anti join's partner), whose filters decide which anchors pass.
+    The map operators here are SemanticClassify and SemanticExtract.
+    The planner prices the rewritten plan alongside the original plan.
 
     Returns:
         The rewritten root, or None when no classification or extraction moved.
     """
-    if isinstance(root, (Result, Aggregate)):
+    if isinstance(root, (Result, Aggregate, Window)):
         rewritten = lift_maps(root.input)
         return None if rewritten is None else root.with_children((rewritten,))
-    joined = {alias for node in LogicalPlan(root).walk()
+    nodes = LogicalPlan(root).walk()
+    fixed = {alias for node in nodes
+             if isinstance(node, SemanticJoin) and node.semantics != "full"
+             for alias in model_call(node.predicate).aliases()
+             if alias != node.anchor}
+    joined = {alias for node in nodes
               if isinstance(node, SemanticJoin)
-              for alias in model_call(node.predicate).aliases()}
+              for alias in model_call(node.predicate).aliases()} - fixed
     sequences = {}
 
     def cut(node):
@@ -263,7 +282,7 @@ def lift_maps(root: LogicalNode) -> LogicalNode | None:
     def visit(node):
         if isinstance(node, Join):
             return replace(node, left=visit(node.left), right=cut(node.right))
-        if isinstance(node, (SemanticJoin, Apply)) or (
+        if isinstance(node, SemanticJoin) or (
                 isinstance(node, SemanticClassify)
                 and len(node.call.aliases()) == 2):
             return node.with_children((visit(node.input),))

@@ -7,6 +7,7 @@ import pytest
 from helpers.fakes import (
     FakeArena,
     fake_pipeline,
+    fake_readout,
     fake_torch,
     keep_even,
     run_graph_on_arena,
@@ -32,46 +33,50 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     from quail.physical import plan_envelope
 
     filtered = AiFilter(
-        node_id="filter:d", inputs=input_ports((PortRef("input:d", "ids:d"),)),
-        alias="d", question_token_ids=(9,), written_pos=0, question_tokens=1,
-        preamble_tokens=1, selectivity=None, expected_docs=4)
+        node_id="filter:d", inputs=input_ports((PortRef("input:d", "rows:d"),)),
+        alias="d", question_token_ids=(9,), written_position=0, question_tokens=1,
+        preamble_tokens=1, selectivity=None, expected_rows=4)
     graph = PhysicalGraph((Scan(node_id="input:d", alias="d", input_id="d"),
-                           filtered), PortRef("filter:d", "ids:d"))
+                           filtered), PortRef("filter:d", "rows:d"))
 
     def round_fn(kind, subs):
-        assert kind == "filters"
+        assert kind == "execute"
         outputs = []
         for sub in subs:
-            indices = sub["doc_index"]["d"]
+            indices = sub["inputs"]["filter:d"]["input:0"].ids["d"].to_pylist()
             from quail.execution.metrics import NodeMetrics, NodeResult
 
             result = NodeResult({
-                "ids:d": [index for index in indices if index % 2 == 0],
+                "rows:d": [index for index in indices if index % 2 == 0],
                 "filter_answers:d": {index: [index % 2 == 0] for index in indices}},
                 NodeMetrics(fresh_tokens=len(indices)))
             outputs.append({
-                "results": {"filter:d": result},
-                "retained": {}, "boot_s": 0.0,
-                "boot_kind": "warm", "boot": {}, "peak_gib": 1.0,
+                "results": {"filter:d": result}, "retained": (),
+                "kv_manager": {"evicted_keys": 1},
+                "memory": {"peak_gib": 1.0,
+                           "memory_capacity": {"pages": 16, "slots": 2}},
             })
         return outputs
 
     registry = built_in_registry()
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": 8192, "true_ids": [1],
-        "false_ids": [2], "pre_ids": [], "filter_limit": None,
-        "order_rule": "by_cost", "docs": {"d": [[1], [2], [3], [4]]},
+        "false_ids": [2], "filter_limit": None,
+        "order_rule": "by_cost", "documents": {"d": [[1], [2], [3], [4]]},
         "joins": [], "filters": {}, "filter_arena_writes": {},
         "shards": {"d": ((0, 2), (1, 3))},
         "physical_plan": plan_envelope(
             backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
-            workers=2, graph=graph, codecs=registry.codecs),
+            gpus=2, graph=graph, codecs=registry.codecs),
     }
     result = execute_distributed_graph(
-        payload, graph, 2, round_fn, MODELS["qwen3-4b-fp8"],
-        DEVICES["h100-sxm"], registry.runtimes, registry)
+        payload, graph, 2, round_fn, DEVICES["h100-sxm"], registry.runtimes,
+        registry)
     assert result["filters"]["d"] == {0: [True], 1: [False], 2: [True], 3: [False]}
     assert result["fresh_tokens"] == 4
+    assert result["kv_manager"]["evicted_keys"] == 2 and result["peak_gib"] == 1.0
+    assert result["memory_capacity"] == {"pages": 32, "slots": 4}
+    assert len(result["memory_workers"]) == 2
 
     arena = FakeArena()
     arena.owned.add(("d", 10))
@@ -82,15 +87,15 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
 
     monkeypatch.setattr("quail.backends.quail.executor.parts.run_stages",
                         fake_run_stages)
-    execution = QuailModelExecution(SimpleNamespace())
+    execution = QuailModelExecution(SimpleNamespace(model=MODELS["qwen3-4b-fp8"]))
     execution.bind_loaded_model(
         model=object(), arena=arena, pipeline=fake_pipeline())
-    execution.bind_query(torch=fake_torch(), async_answers=object(),
+    execution.bind_query(torch=fake_torch(), async_answers=fake_readout(),
                          answer_rows=object(), chunk_tokens=8192)
     result = execution.execute(filtered, {
         "documents": [[1]], "document_ids": [10]})
     assert not arena.owned
-    assert result.outputs["ids:d"].to_pylist() == [10]
+    assert result.outputs["rows:d"].ids["d"].to_pylist() == [10]
 
 
 def _key_columns(r_keys, p_keys):
@@ -145,7 +150,7 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
         # anchors whose pairs all answered FALSE are gone
         kept = [d for d in survivors
                 if any(join_truth[("r", d)][i] for i in allowed[d])]
-        root = result["_outputs"][PortRef("group:0", "ids:r")]
+        root = result["_outputs"][PortRef("group:0", "rows:r")]
         assert sorted(root.column("r").to_pylist()) == kept
 
     # GPU timing sums the chunk events only when asked
@@ -229,7 +234,7 @@ def test_foreign_runs_per_batch_or_once_as_a_barrier_and_are_checked(monkeypatch
     foreign = result["node_metrics"]["apply:keep_even"]
     assert foreign["input_rows"] == len(survivors)
     assert foreign["output_rows"] == len(kept)
-    assert result["_outputs"][PortRef("apply:keep_even", "ids:r")].column(
+    assert result["_outputs"][PortRef("apply:keep_even", "rows:r")].column(
         "r").to_pylist() == kept
     assert result["node_metrics"]["group:0"]["kv_hits"] == len(kept)
 
@@ -281,11 +286,11 @@ def test_predicate_nodes_keep_documents_and_join_frames_in_kv(monkeypatch):
         for node in graph.nodes), graph.root)
     first_join = graph.nodes[-1]
     second_join = replace(
-        first_join, node_id="join:second", written_pos=1, exec_idx=1,
-        inputs=input_ports((PortRef(first_join.node_id, "ids:r"),
-                            PortRef("input:p", "ids:p"))))
+        first_join, node_id="join:second", written_position=1, exec_index=1,
+        inputs=input_ports((PortRef(first_join.node_id, "rows:r"),
+                            PortRef("input:p", "rows:p"))))
     graph = PhysicalGraph((*graph.nodes, second_join),
-                          PortRef(second_join.node_id, "ids:r"))
+                          PortRef(second_join.node_id, "rows:r"))
     graph = plan_kv_retention(graph)
     result, model, filters, joins = run_graph_on_arena(
         monkeypatch, graph, stages=2, shared_prefix=16)

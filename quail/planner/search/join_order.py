@@ -7,14 +7,22 @@ of that KV as the arena holds and recomputes the rest.
 """
 
 import itertools
+import math
 from dataclasses import dataclass
 
+from quail.cost.budgets import parallel_copies
 from quail.cost.joins import PricedJoin
 from quail.cost.joins import stage_work as join_work
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work
 from quail.planner.search.leftdeep import search_left_deep
-from quail.planner.statistics.tables import AliasStats, alias_stats, cross_tuples, thin
+from quail.planner.statistics.tables import (
+    AliasStats,
+    alias_stats,
+    cross_tuples,
+    surviving_documents,
+    thin,
+)
 from quail.planner.validation import anchor_candidates, join_input_tokens
 
 
@@ -32,24 +40,31 @@ class JoinStep:
     """One join as the search priced it in its place in the sequence.
 
     Attributes:
-        written_pos: The join's position among the query's joins.
+        written_position: The join's position among the query's joins.
         anchor: The table whose document KV the join reuses.
         resident: Where that KV comes from: "filter" when a filter
             computed it, "kept" when an earlier join use did, "none"
             when the join computes it.
-        resident_docs: Documents whose KV is resident, else 0.
+        resident_documents: Documents whose KV is resident, else 0.
+        anchor_documents: Expected anchors with at least one candidate
+            partner; the join reads no other anchor.
         tuples: Expected pairs the join evaluates.
         tokens: Expected fresh tokens.
         work: The join's expected Work.
     """
 
-    written_pos: int
+    written_position: int
     anchor: str
     resident: str
-    resident_docs: int
+    resident_documents: int
+    anchor_documents: float
     tuples: float
     tokens: float
     work: Work
+
+    def copy_work(self, gpus: int) -> Work:
+        """Return one model copy's share when the anchors are spread evenly."""
+        return self.work * (1 / parallel_copies(gpus, self.anchor_documents))
 
 
 @dataclass(frozen=True)
@@ -117,25 +132,41 @@ def residency(anchor: str, state: KVState, resident_aliases,
     return "none"
 
 
-def stage_work(spec, anchor, live, lengths, pre, *, resident=False, window=0):
+def anchor_documents(spec, anchor, expected_rows) -> float:
+    """Expected anchors the join reads: those with a candidate partner."""
+    partners = math.prod(expected_rows[alias] for alias in spec.aliases
+                         if alias != anchor)
+    return surviving_documents(expected_rows[anchor], partners, spec.pair_fraction)
+
+
+def stage_work(spec, anchor, expected_rows, lengths, pre, *, resident=False, window=0):
     """Evaluate a prepared join's work at the current survivor counts."""
     if spec.cost is not None:
-        return spec.cost.work(live)
-    return join_work(spec, anchor, live[anchor], cross_tuples(spec, live),
-                     lengths, pre, resident=resident, window=window)
+        return spec.cost.work(expected_rows)
+    return join_work(
+        spec,
+        anchor,
+        anchor_documents(spec, anchor, expected_rows),
+        cross_tuples(spec, expected_rows),
+        lengths,
+        pre,
+        resident=resident,
+        window=window,
+    )
 
 
-def _join_step(spec, anchor, live, lengths, resident, pre, state, window):
+def _join_step(spec, anchor, expected_rows, lengths, resident, pre, state, window):
     """Price one join and return its work, recorded inputs, and next KV state."""
     same_group = (state.group_open and state.pending_anchor == anchor
                   and spec.semantics == "full")
     kind = residency(anchor, state, resident, same_group)
-    work = stage_work(spec, anchor, live, lengths, pre,
+    work = stage_work(spec, anchor, expected_rows, lengths, pre,
                       resident=kind != "none", window=window)
     step = JoinStep(
-        written_pos=spec.written_pos, anchor=anchor, resident=kind,
-        resident_docs=lengths[anchor].count if kind != "none" else 0,
-        tuples=cross_tuples(spec, live), tokens=work.tokens, work=work)
+        written_position=spec.written_position, anchor=anchor, resident=kind,
+        resident_documents=lengths[anchor].count if kind != "none" else 0,
+        anchor_documents=anchor_documents(spec, anchor, expected_rows),
+        tuples=cross_tuples(spec, expected_rows), tokens=work.tokens, work=work)
     next_state = KVState(anchor, spec.semantics == "full",
                          state.used_anchors | {anchor})
     return work, step, next_state
@@ -157,27 +188,37 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
     applied = []
     for spec, anchor in seq:
         # thin in written order, as the search priced it
-        live = dict(live0)
-        for done in sorted(applied, key=lambda s: s.written_pos):
-            thin(live, done)
+        expected_rows = dict(live0)
+        for done in sorted(applied, key=lambda s: s.written_position):
+            thin(expected_rows, done)
         work, step, state = _join_step(
-            spec, anchor, live, lengths, resident, pre, state, model.sliding_window)
+            spec,
+            anchor,
+            expected_rows,
+            lengths,
+            resident,
+            pre,
+            state,
+            model.sliding_window,
+        )
         records.append(step)
         total = total + work
         applied.append(spec)
     return total, records
 
 
-def search_joins(specs, live: dict, lengths: dict, resident,
+def search_joins(specs, expected_rows: dict, lengths: dict, resident,
                  pre: int, chunk_tokens: int, model, device, *,
                  base_work: Work = Work(), fixed_order: bool = False,
                  honor_forced: bool = True,
-                 already_joined=()):
+                 already_joined=(), gpus: int = 1):
     """Search stage order and anchor choice; return the cheapest.
 
     Args:
+        gpus: Model copies the anchors are spread over; the search
+            ranks each sequence by one copy's share of its work.
         specs: One PricedJoin per join in written order.
-        live: alias -> live document count (float; expected at plan
+        expected_rows: alias -> live document count (float; expected at plan
             time).
         lengths: alias -> live documents' token lengths or AliasStats.
         resident: aliases whose prefix KV a filter computes before the
@@ -210,10 +251,13 @@ def search_joins(specs, live: dict, lengths: dict, resident,
         return (seconds, work.tokens, work.pairs, work.kv_written,
                 work.kv_read)
 
+    def copy_work(steps) -> Work:
+        return sum((step.copy_work(gpus) for step in steps), Work())
+
     def run_walk(order_specs, assign):
         seq = list(zip(order_specs, assign))
         work, records = walk(
-            seq, live, lengths, resident, pre, model, device)
+            seq, expected_rows, lengths, resident, pre, model, device)
         return work, records, seq
 
     if fixed_order or (len(specs) == 1 and not already_joined):
@@ -222,11 +266,11 @@ def search_joins(specs, live: dict, lengths: dict, resident,
                 *[_feasible_anchors(s, honor_forced, lengths, pre,
                                     chunk_tokens) for s in specs]):
             work, records, seq = run_walk(list(specs), assign)
-            key = rank(work)
+            key = rank(copy_work(records))
             if best is None or key < best[0]:
                 best = (key, work, records, seq)
         _, work, records, seq = best
-        return JoinSearch(seq=tuple((s.written_pos, a) for s, a in seq),
+        return JoinSearch(seq=tuple((s.written_position, a) for s, a in seq),
                           steps=tuple(records), work=work)
 
     aliases = []
@@ -238,9 +282,9 @@ def search_joins(specs, live: dict, lengths: dict, resident,
     aliases.extend(sorted(seed - set(aliases)))
     live_cache = {}
 
-    def live_for(applied: frozenset):
+    def expected_rows_for(applied: frozenset):
         if applied not in live_cache:
-            state = dict(live)
+            state = dict(expected_rows)
             for i in sorted(applied):
                 thin(state, specs[i])
             live_cache[applied] = state
@@ -248,13 +292,13 @@ def search_joins(specs, live: dict, lengths: dict, resident,
 
     def price_step(index, relations, applied, state_now):
         spec = specs[index]
-        live_now = live_for(applied)
+        expected_rows_now = expected_rows_for(applied)
         for anchor in _feasible_anchors(
                 spec, honor_forced, lengths, pre, chunk_tokens):
             work, step, next_state = _join_step(
-                spec, anchor, live_now, lengths, resident, pre,
+                spec, anchor, expected_rows_now, lengths, resident, pre,
                 state_now, model.sliding_window)
-            yield work, next_state, step
+            yield step.copy_work(gpus), next_state, step
 
     search = search_left_deep(
         aliases, [frozenset(s.aliases) for s in specs], KVState(), Work(),
@@ -266,7 +310,8 @@ def search_joins(specs, live: dict, lengths: dict, resident,
         finals,
         key=lambda c: rank(c.work) + (
             c.relation_order,
-            tuple((s.written_pos, s.anchor) for s in c.steps)))
-    return JoinSearch(seq=tuple((s.written_pos, s.anchor) for s in best.steps),
-                      steps=best.steps, work=best.work,
-                      states=search.state_count, generated=search.generated_count)
+            tuple((s.written_position, s.anchor) for s in c.steps)))
+    return JoinSearch(seq=tuple((s.written_position, s.anchor) for s in best.steps),
+                      steps=best.steps,
+                      work=sum((step.work for step in best.steps), Work()),
+                      states=search.num_states, generated=search.num_generated)

@@ -3,15 +3,18 @@
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from itertools import groupby
 from typing import Any, ClassVar
 
 import numpy as np
 
 from quail.backends.quail.executor.chunk import InputStaging
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stages import Stage, frame_writes, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import prefix_tree
+from quail.logical import effective_selectivity
+from quail.physical import AiFilter, AiJoin, Filter
 from quail.progress import logger
 
 
@@ -53,12 +56,19 @@ class ExecutionPart(ABC):
     """
 
     stages: Sequence[Stage]
+    # the physical nodes the part executes, every member of a group
+    nodes: Sequence = ()
+    # the computed columns a later condition may test
+    tested_columns: tuple = ()
     combine: ClassVar[bool] = False
     execute_group: ClassVar[Callable | None] = None
     gate = None
     document_done = None
     result_value = None
     appended_tokens = 0
+    # the frame tokens the part's first stage writes; 0 when the stage
+    # before it left the same frame
+    frame_tokens = 0
     on_settled = None
     attention = None
 
@@ -103,6 +113,14 @@ class ExecutionPart(ABC):
 class SingleResultPart(ExecutionPart):
     """Prepared work whose execution produces one result."""
 
+    # the physical node the part executes; None for a standalone batch
+    node = None
+
+    @property
+    def nodes(self) -> tuple:
+        """Return the part's physical node, or nothing for a standalone batch."""
+        return () if self.node is None else (self.node,)
+
     @abstractmethod
     def result(self, tokens, gpu_s, chunks, stats) -> Any:
         """Build the result with its measured execution work."""
@@ -117,29 +135,36 @@ class SingleResultPart(ExecutionPart):
         return {self.node.node_id: self.result_value}
 
 
-def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
+def execute_parts(state, parts, prefixes, anchor_keys, *, keep_kv, prefix_tree=None,
                   attention=None, label="", limit=None, stop_groups=None,
                   paged=True, on_answers=None) -> dict:
-    """Run prepared operator work together and collect per-node results."""
+    """Run prepared operator work together and collect per-node results.
+
+    A limit ends the run once that many documents passed every part;
+    documents are admitted only while the ones in flight are expected
+    to fall short of it, by the parts' selectivities.
+    """
     stages = gated_stages(parts)
     paged = paged or state.loaded_model.pipeline.needs_pages
     if keep_kv and not paged:
         raise ValueError("retaining document KV requires arena writes")
-    if tree is not None and not tree.shared_tokens:
-        tree = None
+    if prefix_tree is not None and not prefix_tree.shared_tokens:
+        prefix_tree = None
     settled = next((part.on_settled for part in parts
                     if part.on_settled is not None), None)
     if settled is None:
-        settled = settle_documents(state.loaded_model.arena, keys, prefixes,
+        settled = settle_documents(state.loaded_model.arena, anchor_keys, prefixes,
                                    keep_kv, state.chunk_tokens)
     stats = {}
     every, spans, tokens = run_stages(
         state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
-        stages, prefixes, state.chunk_tokens, anchor_keys=keys,
-        on_settled=settled, prefix_tree=tree, stats=stats, gpu_timing=state.gpu_timing,
+        stages, prefixes, state.chunk_tokens, anchor_keys=anchor_keys,
+        on_settled=settled, prefix_tree=prefix_tree, stats=stats,
+        gpu_timing=state.gpu_timing,
         attention_mode=next((part.attention for part in parts if part.attention),
                             attention),
         staging=input_staging(state), label=label, limit=limit,
+        survival=survival(parts),
         stop_groups=stop_groups, paged=paged,
         on_chunk=transition_reporter(parts), on_answers=on_answers,
         appended_tokens=max(part.appended_tokens for part in parts) or None)
@@ -149,22 +174,26 @@ def execute_parts(state, parts, prefixes, keys, *, keep_kv, tree=None,
 
 
 def gated_stages(parts) -> list:
-    """Combine operator stages and attach intervening conditions.
+    """Combine operator stages and attach conditions to the stages after them.
 
     Args:
         parts: Pipeline parts in execution order. Parts without stages
-            contribute a condition checked before the next stage.
+            contribute a condition checked before the next stage, or
+            before the document completes when no stage follows.
 
     Returns:
         The combined Stage list, with conditions attached to stage requests.
-
-    Raises:
-        ValueError: A trailing condition has no following stage.
     """
     for implementation, group in groupby(parts, type):
         implementation.prepare_group(list(group))
     stages = []
     pending = []
+    for part in parts[1:]:
+        if part.stages and not part.stages[0].rewind:
+            # an operator's first request follows the document, in
+            # place of whatever the operator before it appended, as
+            # the next question of an extraction does
+            part.stages = [replace(part.stages[0], rewind=True), *part.stages[1:]]
     for part in parts:
         if not part.stages:
             pending.append(part.gate)
@@ -183,8 +212,21 @@ def gated_stages(parts) -> list:
             first.requests = guarded
             pending = []
         stages.extend(part.stages)
-    if pending:
-        raise ValueError("a pipeline ends with a gate and no stage after it")
+    if pending and stages:
+        def finish(key, gates=tuple(pending)):
+            for gate in gates:
+                if gate(key) is Stage.DROP:
+                    return Stage.DROP
+            return Stage.SKIP
+
+        # a document that passes the trailing conditions skips this
+        # stage and counts as a survivor, with nothing asked
+        terminal = Stage(suffixes=[], readout=stages[-1].readout, requests=finish)
+        parts[-1].stages = [terminal]
+        stages.append(terminal)
+    writes = frame_writes(stages)
+    for part, (low, high) in zip(parts, _part_slices(parts)):
+        part.frame_tokens = len(stages[low].frame) if low < high and writes[low] else 0
     return stages
 
 
@@ -252,10 +294,19 @@ def complete_parts(parts, every, spans, tokens, stats):
             low)
 
 
+def survival(parts) -> float:
+    """The fraction of documents expected to pass every part, by selectivity."""
+    fraction = 1.0
+    for part in parts:
+        for node in part.nodes:
+            if isinstance(node, (AiFilter, AiJoin, Filter)):
+                fraction *= effective_selectivity(node.selectivity)
+    return fraction
+
+
 def execution_prefix_tree(node, documents, arena):
     """Build the requested prefix tree, or return None if sharing is disabled."""
-    settings = getattr(node, "spec", node)
-    if not settings.share_prefixes:
+    if not node.share_prefixes:
         return None
     return shared_prefix_tree(node.document_aliases[0], documents, arena)
 
@@ -296,7 +347,7 @@ def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int):
     """Return a callback that applies the final operator's KV retention setting."""
     if keep_kv and arena.retention_cap_pages is None:
         arena.retention_cap_pages = max(
-            0, arena.n_pages - arena.pages_needed(2 * budget))
+            0, arena.num_pages - arena.pages_needed(2 * budget))
 
     def settled(anchor, survived, row):
         key = keys[anchor]

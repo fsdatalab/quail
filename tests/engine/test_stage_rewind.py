@@ -32,11 +32,11 @@ def test_each_question_reads_its_frame_right_after_the_document(path, monkeypatc
     cpu_staging(monkeypatch)
     answers = {}
     want = {}
-    for d, doc in enumerate(DOCS):
+    for d, document in enumerate(DOCS):
         rows = []
         for frame in (FIRST, SECOND, SECOND):
-            cue = chain(doc + frame + CUE)
-            step = chain(doc + frame + CUE + STEP)
+            cue = chain(document + frame + CUE)
+            step = chain(document + frame + CUE + STEP)
             answers[cue], answers[step] = answer(cue), answer(step)
             rows += [[answers[cue]], [answers[step]]]
         want[d] = rows

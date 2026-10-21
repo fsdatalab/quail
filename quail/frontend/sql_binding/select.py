@@ -5,11 +5,14 @@ from dataclasses import dataclass, field
 from sqlglot import exp
 
 from quail.frontend.sql_binding.expressions import (
-    _FLIPPED,
-    _PLAIN_COMPARISONS,
     ExpressionBinder,
     _conjuncts,
     _is_call,
+)
+from quail.frontend.sql_binding.predicates import (
+    _FLIPPED,
+    _PLAIN_COMPARISONS,
+    COLUMN_NODES,
 )
 from quail.logical import (
     AggregateCall,
@@ -20,8 +23,10 @@ from quail.logical import (
     ExtractStruct,
     HavingTest,
     SortKey,
+    WindowCall,
     column_name,
 )
+from quail.logical.expressions import aliased_call
 
 
 def _parse_limit(tree) -> int | None:
@@ -68,33 +73,34 @@ def bind_order(
     columns: tuple[ColumnRef | Alias, ...],
     aggregation: Aggregation | None = None,
     structs: tuple[ExtractStruct, ...] = (),
+    windows: tuple[WindowCall, ...] = (),
 ) -> tuple[SortKey, ...]:
     """Bind each ORDER BY term to a projected name or a source column."""
     order = tree.args.get("order")
     if order is None:
         return ()
     struct_names = {struct.name for struct in structs}
-    named = {column.name: column for column in columns if isinstance(column, Alias)}
+    named = {column_name(column): column for column in columns}
     if aggregation is not None:
         named.update(
             {aggregate.name: aggregate for aggregate in aggregation.aggregates}
         )
+    named.update({window.name: window for window in windows})
     keys = []
     for term in order.expressions:
         target = term.this
-        if not isinstance(target, exp.Column):
+        if not isinstance(target, COLUMN_NODES):
             raise CompileError(
                 f"ORDER BY {target.sql()} is not a column; give an "
                 f"expression an AS name in SELECT and order by that name"
             )
-        if not target.table and target.name in struct_names:
+        bare = target.name if isinstance(target, exp.Column) and not target.table \
+            else None
+        if bare in struct_names:
             raise CompileError(
                 f"ORDER BY does not compare the AI.EXTRACT struct column "
-                f"{target.name!r}; extract the field as its own column")
-        if not target.table and target.name in named:
-            expression = named[target.name]
-        else:
-            expression = b.resolve_column(target)
+                f"{bare!r}; extract the field as its own column")
+        expression = named[bare] if bare in named else b.resolve_value(target)
         keys.append(
             SortKey(
                 expression,
@@ -113,6 +119,14 @@ _AGGREGATE_CLASSES = {
     exp.Max: "max",
 }
 
+_WINDOW_CLASSES = {
+    exp.RowNumber: "row_number",
+    exp.Lag: "lag",
+    exp.Lead: "lead",
+    exp.Sum: "sum",
+    exp.Count: "count",
+}
+
 
 @dataclass(frozen=True)
 class BoundSelect:
@@ -121,6 +135,8 @@ class BoundSelect:
     columns: tuple[ColumnRef | Alias, ...]
     aggregation: Aggregation | None
     structs: tuple[ExtractStruct, ...] = ()
+    windows: tuple[WindowCall, ...] = ()
+    output: tuple[str, ...] = ()
 
 
 @dataclass
@@ -133,6 +149,7 @@ class SelectBinder:
     output: list[str] = field(default_factory=list)
     aggregates: list[AggregateCall] = field(default_factory=list)
     structs: list[ExtractStruct] = field(default_factory=list)
+    windows: list[WindowCall] = field(default_factory=list)
 
     def register_argument(self, node: exp.Expression, hidden: str) -> str:
         """Bind an aggregate's or key's expression to a projected column name.
@@ -141,19 +158,23 @@ class SelectBinder:
         ``columns``, an AI expression under the ``hidden`` name.
         """
         b, columns = self.binder, self.columns
-        names = {column.name: column for column in columns if isinstance(column, Alias)}
-        if isinstance(node, exp.Column):
-            if not node.table and node.name in names:
+        names = {column_name(column): column for column in columns}
+        if isinstance(node, COLUMN_NODES):
+            if isinstance(node, exp.Column) and not node.table and node.name in names:
                 return node.name
-            ref = b.resolve_column(node)
-            if ref not in columns:
-                columns.append(ref)
-            return column_name(ref)
+            column = b.resolve_value(node)
+            named = next((c for c in columns if isinstance(c, Alias)
+                          and c.expression == column), None)
+            if named is not None:
+                return named.name
+            if column not in columns:
+                columns.append(column)
+            return column_name(column)
         if not (_is_call(node, "AI_SCORE") or isinstance(node, exp.AIClassify)):
             raise CompileError(f"{node.sql()} is not a column or an AI expression")
         call = b.bind_ai_value(node)
         for name, column in names.items():
-            if column.expression == call:
+            if aliased_call(column) == call:
                 return name
         columns.append(Alias(call, hidden))
         return hidden
@@ -176,11 +197,44 @@ class SelectBinder:
             function, argument = "count_distinct", argument.expressions[0]
         return AggregateCall(function, self.register_argument(argument, hidden), name)
 
+    def bind_window(self, node: exp.Window, name: str, hidden: str) -> WindowCall:
+        """Bind one function OVER (PARTITION BY ... ORDER BY ...) call."""
+        call = node.this
+        function = _WINDOW_CLASSES.get(type(call))
+        if function is None or node.args.get("spec") is not None:
+            raise CompileError(
+                f"{node.sql()} is not supported; a window is ROW_NUMBER, LAG, "
+                f"LEAD, SUM, or COUNT over the partition's rows so far")
+        if call.args.get("offset") is not None or call.args.get("default") is not None:
+            raise CompileError(f"{call.sql()} reads the row before or after only")
+        argument = None
+        if function != "row_number" and not isinstance(call.this, exp.Star):
+            argument = self.register_argument(call.this, f"{hidden}_argument")
+        partition = tuple(
+            self.register_argument(term, f"{hidden}_partition_{index}")
+            for index, term in enumerate(node.args.get("partition_by") or ()))
+        order = node.args.get("order")
+        return WindowCall(function, argument, partition, tuple(
+            (self.register_argument(term.this, f"{hidden}_order_{index}"),
+             bool(term.args.get("desc")), bool(term.args.get("nulls_first")))
+            for index, term in enumerate(order.expressions if order else ())), name)
+
     def bind_projection(self, tree: exp.Select) -> None:
-        """Bind SELECT outputs and collect aggregate inputs."""
+        """Bind SELECT outputs and collect aggregate and window inputs."""
         b, columns = self.binder, self.columns
         for index, e in enumerate(tree.expressions):
             node = e.this if isinstance(e, exp.Alias) else e
+            if isinstance(node, exp.Window):
+                if not isinstance(e, exp.Alias) or not e.alias:
+                    raise CompileError(f"{node.sql()} needs an AS name in SELECT")
+                window = self.bind_window(node, e.alias, f"__window_{index}")
+                self.windows.append(window)
+                self.output.append(window.name)
+                continue
+            if any(isinstance(call, exp.Window) for call in node.walk()):
+                raise CompileError(
+                    "a window in SELECT is a direct function OVER (...) call "
+                    "with an AS name")
             if type(node) in _AGGREGATE_CLASSES:
                 if not isinstance(e, exp.Alias) or not e.alias:
                     raise CompileError(f"{node.sql()} needs an AS name in SELECT")
@@ -264,11 +318,15 @@ class SelectBinder:
                 "each field as its own column")
         keys = self.bind_group(tree)
         tests = self.bind_having(tree)
+        if self.windows and (self.aggregates or keys or tests):
+            raise CompileError(
+                "a window function and GROUP BY in one SELECT are not supported")
         if not self.aggregates and not keys and not tests:
             if len(self.output) != len(set(self.output)):
                 raise CompileError(
                     f"projection names must be unique, got {self.output}")
-            return BoundSelect(tuple(self.columns), None, tuple(self.structs))
+            return BoundSelect(tuple(self.columns), None, tuple(self.structs),
+                               tuple(self.windows), tuple(self.output))
         for name in self.plain:
             if name not in keys:
                 raise CompileError(
@@ -336,11 +394,11 @@ def _compile_projection(b: ExpressionBinder, expressions, structs: list) -> list
                 "AI.SCORE, AI.CLASSIFY, and AI.EXTRACT in SELECT must be "
                 "direct expressions with an AS name"
             )
-        if not isinstance(e, exp.Column):
+        if not isinstance(e, COLUMN_NODES):
             raise CompileError(
                 f"the SELECT list is column selection only, got "
                 f"{e.sql()}: nothing computed, per the projection "
                 f"contract"
             )
-        columns.append(b.resolve_column(e))
+        columns.append(b.resolve_value(e, name=alias or None))
     return columns

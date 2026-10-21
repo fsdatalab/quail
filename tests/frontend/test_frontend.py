@@ -8,6 +8,7 @@ from helpers.fakes import keep_even, same_key
 from quail.catalog import Catalog, DocumentProvider
 from quail.frontend.builder import docs
 from quail.frontend.expressions import col, prompt
+from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
     ANSWER_CUE,
@@ -49,7 +50,7 @@ def catalog(tmp_path):
     return cat
 
 
-def tok(text):
+def tokenizer(text):
     return text.split()
 
 
@@ -99,9 +100,9 @@ def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
     filt = pairs.left
     assert isinstance(filt, SemanticFilter)
     assert filt.predicates[0].selectivity == 0.3
-    assert (filt.input.provider, filt.input.column) == ("reviews", "review")
-    assert (pairs.right.provider, pairs.right.column) == \
-        ("products", "description")
+    assert (filt.input.provider, str(filt.input.column)) == ("reviews", "r.review")
+    assert (pairs.right.provider, str(pairs.right.column)) == \
+        ("products", "p.description")
     # the join template is the per-tuple question and is never canonicalized
     assert join.prompt.template == "Review {0} discusses product {1}"
 
@@ -158,7 +159,7 @@ def test_prompt_layout_and_predicate_order(catalog):
     args = (ColumnRef("a", "reviews", "review"),
             ColumnRef("b", "threads", "thread"))
     p = bind_join_prompt("Does {0} praise {1}?", args)
-    lowered = lower_prompt(p, tok)
+    lowered = lower_prompt(p, tokenizer)
     assert p.template == "Does {0} praise {1}?"
     assert p.preamble == SHARED_PRE
     # the static question is in the anchor frame; only the answer cue
@@ -167,11 +168,11 @@ def test_prompt_layout_and_predicate_order(catalog):
                        "Evaluate TRUE or FALSE for the following "
                        "question: Does {0} praise {1}?")
     assert p.tail == ANSWER_CUE
-    assert lowered.tail_tokens == len(tok(p.tail))
+    assert lowered.tail_tokens == len(tokenizer(p.tail))
     assert join_label(1) == "\n\nDOCUMENT {1}:\n"
     assert [a for a, _, _ in lowered.labels] == ["a", "b"]
-    assert lowered.labels[1][1] == len(tok(join_label(1)))
-    assert lowered.labels[0][2] == len(tok(render_join_frame(p.template, 0)))
+    assert lowered.labels[1][1] == len(tokenizer(join_label(1)))
+    assert lowered.labels[0][2] == len(tokenizer(render_join_frame(p.template, 0)))
     assert render_join_question(p.template) == p.frame
 
     plan = compile_sql("""
@@ -205,9 +206,9 @@ def test_prompt_layout_and_predicate_order(catalog):
                 "This review is negative:" + ANSWER_CUE)
     assert pred.prompt.preamble == SHARED_PRE
     assert pred.prompt.tail == "{0}\n\n" + question
-    lowered = lower_prompt(pred.prompt, tok)
-    assert lowered.preamble_tokens == len(tok(SHARED_PRE))
-    assert lowered.tail_tokens == len(tok(question))
+    lowered = lower_prompt(pred.prompt, tokenizer)
+    assert lowered.preamble_tokens == len(tokenizer(SHARED_PRE))
+    assert lowered.tail_tokens == len(tokenizer(question))
 
 
 TWO_ONS = """
@@ -517,7 +518,7 @@ def test_builder_places_apply_nodes_in_the_logical_tree():
     join = plan.root.input
     assert isinstance(join, SemanticJoin)
     (pairs,) = join_applies(join)
-    assert (pairs.function, pairs.kind, pairs.ids, pairs.written_pos) == (
+    assert (pairs.function, pairs.kind, pairs.ids, pairs.written_position) == (
         "same_key", "barrier", "pairs", 0)
     assert pairs.aliases == ("c", "e")
     assert isinstance(pairs.input, Join)
@@ -541,3 +542,65 @@ def test_builder_places_apply_nodes_in_the_logical_tree():
     with pytest.raises(CompileError, match="ids must be 'pairs'"):
         (base.join(docs(cat, "evidence").alias("e"))
          .apply(same_key, columns=[col("c.url")], ids="preserve"))
+
+
+def test_expression_specs_reject_python_truth_and_stacked_functions(catalog):
+    review = col("r.review")
+    for expression in (review, review == "x", review == col("p.id"),
+                       (review == "x") & (col("r.stars") > 1)):
+        with pytest.raises(TypeError, match="no Python truth value"):
+            bool(expression)
+    with pytest.raises(CompileError, match="cannot be followed"):
+        review.length().field("start")
+    with pytest.raises(CompileError, match="cannot be followed"):
+        review.length().length()
+    # an extraction named with the span suffix is still an extraction
+    plan = (docs(catalog, "reviews").alias("r")
+            .ai_extract("r.review", {"ends": "When?"}, name="x_span")
+            .where(col("x_span.ends") != "")
+            .select("r.id", "x_span"))
+    assert plan.root.input.condition.column.column == "x_span.ends"
+
+
+def test_model_chat_turns_share_the_document_across_operators():
+    from quail.logical.prompts import render_join_prompt_text
+    from quail.specs import MODELS
+
+    refs = (ColumnRef("a", "documents", "text"),
+            ColumnRef("b", "documents", "text"))
+    for model in MODELS.values():
+        if model.role != "generative":
+            continue
+        gemma = model.arch == "diffusion_gemma"
+        start, end = ("<|turn>", "<turn|>") if gemma else (
+            "<|im_start|>", "<|im_end|>")
+        prefix = (
+            ("<bos>" if gemma else model.bos_text)
+            + start + "system\nYou are an expert at text analysis" + end + "\n"
+            + start + "user\nDOCUMENT:\n")
+        binder = PromptBinder(model)
+        bound = [
+            binder.bind("filter", "{0}\nIs it a lease?", refs[:1]),
+            binder.bind("join", "Does {0} refer to {1}?", refs),
+            binder.bind("label", "{0}\nWhat kind?", refs[:1],
+                        labels=("lease", "deed")),
+            binder.bind("label", "Do {0} and {1} match?", refs,
+                        labels=("match", "different")),
+            binder.bind("extract", "When does it end?", refs[:1]),
+        ]
+        for item in bound:
+            assert item.preamble == prefix
+            if item.kind == "join":
+                text = render_join_prompt_text(item, ("Lease", "Deed"), 0)
+            else:
+                text = item.preamble + item.tail.replace("{0}", "Lease")
+            assert text.count(start + "system\n") == 1
+            assert text.count(start + "user\n") == 1
+            assert text.count(end) == 2
+            assert text.count(start + ("model" if gemma else "assistant")) == 1
+            if item.kind == "extract":
+                assert text.endswith("Phrase:")
+            else:
+                assert text.endswith(model.turn_suffix)
+        lowered = lower_prompt(bound[2], lambda text: list(text.encode()))
+        assert lowered.label_prefix == ""

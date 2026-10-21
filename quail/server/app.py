@@ -17,11 +17,11 @@ import hashlib
 import json
 import os
 import time
-import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import pyarrow.ipc as ipc
+from starlette._utils import create_collapsing_task_group
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
@@ -38,14 +38,18 @@ from starlette.routing import Route
 
 from quail.api import RefusalError, Session
 from quail.builtins import built_in_registry
+from quail.execution.result import iter_rows
 from quail.logical import CompileError
+from quail.physical.codec import encode_fields
 from quail.planner.plan import EngineConfig
 from quail.remote.artifacts import (
     ANSWERS_FILE,
     RESULT_FILE,
+    answer_files,
     iter_ipc_stream,
     read_answers,
 )
+from quail.remote.files import published
 from quail.remote.inputs import resolve
 from quail.remote.records import (
     InvalidRequestError,
@@ -228,8 +232,8 @@ class Server:
         if hooks is not None and hooks.tokenizer is not None:
             return hooks.tokenizer
         if engine.model not in self._tokenizers:
-            session = Session(engine, registry=self.registry)
-            self._tokenizers[engine.model] = session.tokenizer
+            with Session(engine, registry=self.registry) as session:
+                self._tokenizers[engine.model] = session.tokenizer
         return self._tokenizers[engine.model]
 
     def compile(self, spec: dict, engine: EngineConfig, inputs: dict,
@@ -279,20 +283,24 @@ class Server:
         paths = self.snapshot_paths(inputs)
         self.compile(spec, engine, inputs, paths)
         config = asdict(engine)
-        existed = query_id is not None and self.store.find(query_id) is not None
-        status = self.store.create(spec=spec, config=config, inputs=inputs,
-                                   timeout_s=float(timeout_s),
-                                   query_id=query_id, session_id=session_id)
-        if existed:
-            return status
-        try:
-            for sync in self._syncs:
-                sync()
-        except Exception as error:
-            self.store.discard(status.id)
-            raise ServerError(
-                f"the submission could not be saved durably: {error}"
-            ) from error
+        # the record is created and made durable under one lock: the
+        # scheduler cannot select it, and a retry of the same id cannot
+        # see it, until the syncs have run or the record is discarded
+        with self.store.submission_lock:
+            existed = query_id is not None and self.store.find(query_id) is not None
+            status = self.store.create(spec=spec, config=config, inputs=inputs,
+                                       timeout_s=float(timeout_s),
+                                       query_id=query_id, session_id=session_id)
+            if existed:
+                return status
+            try:
+                for sync in self._syncs:
+                    sync()
+            except Exception as error:
+                self.store.discard(status.id)
+                raise ServerError(
+                    f"the submission could not be saved durably: {error}"
+                ) from error
         return status
 
     async def wait_status(self, query_id: str, after: int,
@@ -320,9 +328,7 @@ class Server:
     def result_file(self, status: QueryStatus, name: str) -> Path:
         directory = self.result_directory(status)
         files = status.result["files"]
-        allowed = {files["result"], files["report"]}
-        allowed.update(entry["file"] for kind in ("filters", "joins")
-                       for entry in files["answers"][kind])
+        allowed = {files["result"], files["report"], *answer_files(files)}
         if name not in allowed:
             raise InvalidRequestError(f"{name!r} is not a file of this result")
         return directory / name
@@ -346,10 +352,12 @@ class Server:
             async for _ in request.stream():
                 pass
             return 200
-        temporary = self.inputs_dir / f"upload-{uuid.uuid4().hex}.tmp"
         digest = hashlib.sha256()
         size = 0
-        try:
+        path = self.inputs_dir / f"{content_id}.arrow"
+        # published removes the partial file however the upload ends,
+        # a cancelled request included
+        with published(path) as temporary:
             with open(temporary, "wb") as handle:
                 async for chunk in request.stream():
                     size += len(chunk)
@@ -364,16 +372,27 @@ class Server:
             if digest.hexdigest() != content_id:
                 raise InvalidRequestError(
                     "the uploaded bytes do not hash to the given content id")
-            path = self.inputs_dir / f"{content_id}.arrow"
             with ipc.open_file(str(temporary)):
                 pass
-            os.replace(temporary, path)
-        except Exception:
-            if temporary.exists():
-                temporary.unlink()
-            raise
         self.store.put_input(content_id, str(path), size)
         return 201
+
+
+class _ResultStreamResponse(StreamingResponse):
+    """A streamed result file, closed when the response ends however it ends."""
+
+    def __init__(self, path: Path, limit: int | None, rows: int):
+        self._stream = iter_ipc_stream(path, limit)
+        super().__init__(
+            self._stream, media_type=ARROW_STREAM,
+            headers={"x-quail-rows": str(rows if limit is None else min(rows, limit))})
+
+    async def __call__(self, scope, receive, send):
+        with contextlib.closing(self._stream):
+            # a cancelled response waits for its thread-pool read before
+            # the file closes under it
+            async with create_collapsing_task_group() as tasks:
+                tasks.start_soon(super().__call__, scope, receive, send)
 
 
 class _TokenMiddleware:
@@ -393,6 +412,22 @@ class _TokenMiddleware:
         await self.app(scope, receive, send)
 
 
+def _number(request, name: str, default, kind=int):
+    """Return a numeric query parameter, or raise a 400 for a malformed one.
+
+    Raises:
+        InvalidRequestError: The parameter is not a number of the kind.
+    """
+    value = request.query_params.get(name)
+    if value is None:
+        return default
+    try:
+        return kind(value)
+    except ValueError as error:
+        raise InvalidRequestError(
+            f"{name} must be a {kind.__name__}, got {value!r}") from error
+
+
 def _error(error: Exception, status: int | None = None) -> JSONResponse:
     code = status or getattr(error, "status", 500)
     return JSONResponse(
@@ -401,11 +436,11 @@ def _error(error: Exception, status: int | None = None) -> JSONResponse:
 
 
 def _status_response(status: QueryStatus, code: int = 200) -> JSONResponse:
-    return JSONResponse(status.to_dict(), status_code=code)
+    return JSONResponse(encode_fields(status), status_code=code)
 
 
 def _sse_event(status: QueryStatus) -> str:
-    return f"id: {status.revision}\ndata: {json.dumps(status.to_dict())}\n\n"
+    return f"id: {status.revision}\ndata: {json.dumps(encode_fields(status))}\n\n"
 
 
 def create_app(settings: ServerSettings) -> Starlette:
@@ -449,20 +484,24 @@ def create_app(settings: ServerSettings) -> Starlette:
 
     async def list_queries(request):
         requested_limit = request.query_params.get("limit", "50")
-        limit = (None if requested_limit == "all"
-                 else min(int(requested_limit), 500))
+        try:
+            limit = (None if requested_limit == "all"
+                     else min(_number(request, "limit", 50), 500))
+        except ServerError as error:
+            return _error(error)
         session_id = request.query_params.get("session_id")
-        items = [status.to_dict() for status in await run_in_threadpool(
+        items = [encode_fields(status) for status in await run_in_threadpool(
             server.store.list_recent, limit, session_id)]
         return JSONResponse({"queries": items})
 
     async def get_status(request):
         query_id = request.path_params["query_id"]
-        after = request.query_params.get("after")
-        wait = min(float(request.query_params.get("wait", "0")), MAX_WAIT_S)
         try:
+            after = (None if request.query_params.get("after") is None
+                     else _number(request, "after", 0))
+            wait = min(_number(request, "wait", 0.0, float), MAX_WAIT_S)
             if after is not None and wait > 0:
-                status = await server.wait_status(query_id, int(after), wait)
+                status = await server.wait_status(query_id, after, wait)
             else:
                 status = await run_in_threadpool(server.store.get, query_id)
         except ServerError as error:
@@ -513,13 +552,18 @@ def create_app(settings: ServerSettings) -> Starlette:
         """The result rows as an Arrow IPC stream, one batch at a time."""
         query_id = request.path_params["query_id"]
         try:
+            limit = request.query_params.get("limit")
+            limit = None if limit is None else int(limit)
+            if limit is not None and limit < 0:
+                raise ValueError
+        except ValueError:
+            return _error(InvalidRequestError("limit must be a nonnegative integer"))
+        try:
             status = server.store.get(query_id)
             path = server.result_file(status, RESULT_FILE)
         except ServerError as error:
             return _error(error)
-        return StreamingResponse(
-            iter_ipc_stream(path), media_type=ARROW_STREAM,
-            headers={"x-quail-rows": str(status.result["rows"])})
+        return _ResultStreamResponse(path, limit, status.result["rows"])
 
     async def result_file(request):
         query_id = request.path_params["query_id"]
@@ -534,9 +578,9 @@ def create_app(settings: ServerSettings) -> Starlette:
 
     async def saved_answers(request):
         query_id = request.path_params["query_id"]
-        after = max(int(request.query_params.get("after", "0")), 0)
-        limit = min(int(request.query_params.get("limit", "1000")), 10_000)
         try:
+            after = max(_number(request, "after", 0), 0)
+            limit = min(_number(request, "limit", 1000), 10_000)
             status = server.store.get(query_id)
         except ServerError as error:
             return _error(error)
@@ -545,8 +589,8 @@ def create_app(settings: ServerSettings) -> Starlette:
 
     async def rows(request):
         query_id = request.path_params["query_id"]
-        limit = min(int(request.query_params.get("limit", "20")), 1000)
         try:
+            limit = min(_number(request, "limit", 20), 1000)
             status = server.store.get(query_id)
             path = server.result_file(status, RESULT_FILE)
         except ServerError as error:
@@ -554,9 +598,11 @@ def create_app(settings: ServerSettings) -> Starlette:
 
         def read():
             with ipc.open_file(str(path)) as reader:
-                table = reader.read_all().slice(0, limit)
+                table = reader.read_all()[:limit]
+            # text keeps big integers, decimals, dates, and NaN as they are
             return {"columns": table.column_names,
-                    "rows": [list(row.values()) for row in table.to_pylist()],
+                    "rows": [[None if value is None else str(value) for value in row]
+                             for row in iter_rows(table)],
                     "total_rows": status.result["rows"]}
 
         return JSONResponse(await run_in_threadpool(read))

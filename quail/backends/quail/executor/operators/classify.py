@@ -17,14 +17,13 @@ from quail.backends.quail.executor.parts import (
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.reranker import (
     RerankerBatch,
-    _score_table,
-    attach_prior_columns,
     classify_outputs,
     probability_column,
+    score_rows,
     scored_batch,
 )
+from quail.catalog.selection import document_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.selection import document_positions
 from quail.logical import PROBABILITIES_SUFFIX
 from quail.physical import ValueType
 from quail.progress import answer_sink
@@ -43,7 +42,8 @@ class ClassifyBatch(SingleResultPart):
     def finish(self, every) -> int:
         """Finalize labels and count tokens processed after the documents."""
         self.reached = len(every[0]) if every else 0
-        self.suffix_tokens, self.streamed_tokens = self.plan.finish(every)
+        self.suffix_tokens, self.streamed_tokens = self.plan.finish(
+            every, frame_tokens=self.frame_tokens)
         self.stream.finish(range(len(self.plan.labels)),
                            lambda anchor: self.plan.labels[anchor])
         return self.streamed_tokens
@@ -73,7 +73,7 @@ class QuailClassifier:
         Args:
             spec: Classification specification.
             rows: Document IDs to classify, in input order.
-            documents: Tokenized documents indexed by table alias and document ID.
+            documents: Tokenized documents indexed by scored alias and document ID.
             on_answers: Optional callable(row positions, labels) run with each
                 chunk's newly labeled rows.
 
@@ -93,7 +93,7 @@ class QuailClassifier:
         plan.seeds = rows
         part = ClassifyBatch(plan, on_answers, sum(map(len, prefixes)))
         return execute_parts(
-            state, [part], prefixes, keys, keep_kv=False, tree=tree,
+            state, [part], prefixes, keys, keep_kv=False, prefix_tree=tree,
             label=f"classify {spec.name}")[spec.name]
 
 def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
@@ -102,8 +102,8 @@ def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
     plan = ClassifyStages(state, node.spec, len(ids),
                           lambda key: position[key[1]])
     plan.seeds = ids
-    by_node = {part.node.node_id: part for part in parts}
-    priors = [(by_node[port.source.node_id], port.source.port)
+    by_node = {member.node_id: part for part in parts for member in part.nodes}
+    priors = [(by_node[port.source.node_id], port.source)
               for port in node.inputs
               if port.value_type is ValueType.ROWS
               and port.source.node_id in by_node]
@@ -123,8 +123,8 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
     partner_ids = [int(entry[0]) if isinstance(entry, (tuple, list))
                    else int(entry)
                    for entry in join_inputs["partner_indices"][
-                       stage.written_pos]]
-    documents = context.state["docs"][spec.partner]
+                       stage.written_position]]
+    documents = context.state["documents"][spec.partner]
     kept = KeptPairs(join.index(stage))
     partners = JoinPartners(
         ids=partner_ids,
@@ -142,8 +142,7 @@ class ClassifyPart(ClassifyBatch):
     @staticmethod
     def model_inputs(node, inputs, context, sequence=None, nodes=None):
         # scored through the reranker readout over the documents
-        return {"score_inputs": inputs, "documents": context.state["docs"],
-                "pre": context.state.get("pre", [])}
+        return {"score_inputs": inputs, "documents": context.state["documents"]}
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):
@@ -162,7 +161,7 @@ class ClassifyPart(ClassifyBatch):
                  prior_tables=()):
         self.node = node
         self.ids = ids
-        self.priors = priors      # (part, port) of each label table read
+        self.priors = priors      # (part, source port) of each rows input it reads
         self.prior_tables = prior_tables
         self.kept = kept          # KeptPairs, for joined rows
         sink = answer_sink()
@@ -175,6 +174,16 @@ class ClassifyPart(ClassifyBatch):
     def results(self) -> dict:
         return {self.node.node_id: self.result_value}
 
+    @property
+    def tested_columns(self) -> tuple[str, ...]:
+        """The columns a Filter in the pipeline may test."""
+        return (self.node.spec.name,)
+
+    def tested_values(self, column: str, positions) -> pa.Array:
+        """Return the labels decoded so far of the documents at the positions."""
+        return pa.array([self.plan.labels[position] for position in positions],
+                        pa.string())
+
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         spec = self.node.spec
         plan = self.plan
@@ -183,13 +192,14 @@ class ClassifyPart(ClassifyBatch):
             rows = np.asarray(
                 [[self.ids[anchor], plan.partners.ids[partner]]
                  for anchor, partner in pairs], dtype=np.int32).reshape(-1, 2)
-            table = _score_table(rows, spec.aliases, spec.name,
-                                 [plan.pair_labels[pair] for pair in pairs],
-                                 pa.string())
+            scored = score_rows(rows, spec.aliases, spec.name,
+                               [plan.pair_labels[pair] for pair in pairs],
+                               pa.string())
             sink = answer_sink()
             if sink is not None and len(rows):
-                sink(scored_batch(self.node, rows, table))
-            return NodeResult(classify_outputs(self.node, table), NodeMetrics(
+                sink(scored_batch(self.node, rows,
+                                  scored.column(spec.name).to_pylist()))
+            return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
                 input_rows=len(pairs), output_rows=len(pairs),
                 evaluated_document_pairs=len(pairs), fresh_tokens=tokens,
                 gpu_s=gpu_s, chunks=chunks,
@@ -201,20 +211,20 @@ class ClassifyPart(ClassifyBatch):
                    if label is not None]
         rows = np.asarray([[self.ids[index]] for index in labeled],
                           dtype=np.int32).reshape(-1, 1)
-        table = _score_table(rows, spec.aliases, spec.name,
-                             [plan.labels[index] for index in labeled],
-                             pa.string())
+        scored = score_rows(rows, spec.aliases, spec.name,
+                           [plan.labels[index] for index in labeled],
+                           pa.string())
         if plan.probabilities is not None:
-            table = table.append_column(
+            scored = scored.with_column(
                 spec.name + PROBABILITIES_SUFFIX,
                 probability_column(spec.labels, plan.probabilities[labeled]))
         # the labels the parts before it gave these documents, as a
         # classify node on its own carries them from its scores input
-        priors = {spec.aliases[0]: prior for prior in self.prior_tables}
-        priors.update({spec.aliases[0]: part.result_value.outputs[port]
-                       for part, port in self.priors})
-        table = attach_prior_columns(table, priors)
-        return NodeResult(classify_outputs(self.node, table), NodeMetrics(
+        prior_results = (part.results()[port.node_id].outputs[port.port]
+                         for part, port in self.priors)
+        for prior in (*self.prior_tables, *prior_results):
+            scored = scored.joined(prior, spec.aliases[0])
+        return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),
             evaluated_documents=self.reached, fresh_tokens=tokens,
             gpu_s=gpu_s, chunks=chunks,

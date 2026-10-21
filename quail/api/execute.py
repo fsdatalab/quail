@@ -1,5 +1,6 @@
 """Run a query in the current process."""
 
+import atexit
 import os
 import time
 
@@ -12,8 +13,40 @@ from quail.physical import (
 )
 from quail.planner.plan import Refusal, RefusalError
 
+
+class _BackendState:
+    """The engine loaded in this process, for one configuration at a time.
+
+    A configuration is the engine, model, device, and GPU count a plan
+    names. Binding a different one releases the loaded engine first:
+    one model's weights and KV take the GPU.
+    """
+
+    def __init__(self):
+        self.configuration = None
+        self.state = {}
+        self.release = None
+
+    def bind(self, envelope, backend) -> dict:
+        """Return the runtime state for the plan, releasing another engine."""
+        configuration = (getattr(backend, "engine_name", backend.name),
+                         envelope["model"], envelope["device"], envelope["gpus"])
+        if configuration != self.configuration:
+            self.close()
+            self.configuration = configuration
+            self.release = getattr(backend, "release_request", None)
+        return self.state
+
+    def close(self) -> None:
+        if self.release is not None:
+            self.release(self.state)
+        self.state.clear()
+        self.configuration = self.release = None
+
+
 # Loaded models outlive individual sessions.
-_BACKEND_STATE: dict = {}
+_BACKEND_STATE = _BackendState()
+atexit.register(_BACKEND_STATE.close)
 
 def gpu_problem() -> str | None:
     """Return why this process cannot run a model, or None when it can."""
@@ -59,8 +92,8 @@ def _execute_physical(request, registry):
         request=request,
         graph=graph,
         registry=registry,
-        gpu_count=request.gpu_count,
-        runtime_state=_BACKEND_STATE,
+        gpus=request.gpus,
+        runtime_state=_BACKEND_STATE.bind(request.plan, backend),
     ))
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a model backend must return PhysicalResponse")
@@ -99,7 +132,7 @@ def execute_query(query, physical_executor=None, plan=None,
         raise RefusalError(plan)
     plan.graph.validate(runtime_keys=set(query.session.registry.runtimes))
     plan.graph.validate_backend(plan.backend)
-    if plan.workers > 8:
+    if plan.gpus > 8:
         raise NotImplementedError("query execution supports at most 8 GPUs")
     if physical_executor is None:
         # Backend startup must not wait for background tokenization.
@@ -148,6 +181,6 @@ def _prepare_backend(plan, registry) -> None:
         request=PhysicalRequest(envelope, {}),
         graph=plan.graph,
         registry=registry,
-        gpu_count=plan.workers,
-        runtime_state=_BACKEND_STATE,
+        gpus=plan.gpus,
+        runtime_state=_BACKEND_STATE.bind(envelope, backend),
     ))

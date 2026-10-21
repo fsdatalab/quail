@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
+from quail.catalog.tokens import TokenLengths
 from quail.planner.prompt_lowering import LoweredPrompt, lower_prompt
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -20,8 +21,8 @@ class PlanningContext:
 
     model: ModelSpec | None = None
     device: DeviceSpec | None = None
-    gpu_count: int = 1
-    document_tokens: Mapping[str, Any] = field(default_factory=dict)
+    gpus: int = 1
+    document_tokens: Mapping[str, TokenLengths] = field(default_factory=dict)
     backend: str = "quail"
     order: str | None = None
     # the most noise draws a diffusion model averages per letters read
@@ -49,6 +50,7 @@ class PlanningContext:
     # results computed once per query, such as the plan's statistics,
     # shared with the tree rewrites that planned it
     memo: dict = field(default_factory=dict, compare=False, repr=False)
+
 
     def lowered(self, prompt) -> LoweredPrompt:
         """Return the tokenized prompt, reusing an earlier result when available.

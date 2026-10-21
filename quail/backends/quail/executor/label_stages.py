@@ -123,7 +123,7 @@ def document_prefixes(spec, documents, rows) -> list:
     """
     head, _ = spec.prompt_token_parts
     (alias,) = spec.aliases
-    return [concat_tokens(head, documents[alias][doc]) for doc in rows]
+    return [concat_tokens(head, documents[alias][document]) for document in rows]
 
 
 @dataclass
@@ -148,7 +148,7 @@ def _label_readout(state: QueryExecutionState, targets, rows: int, normalize: bo
     readout = state.loaded_model.label_readout
     if (readout is None or list(readout.targets.tolist()) != targets
             or readout.rows != rows
-            or getattr(readout, "normalize", normalize) != normalize):
+            or readout.normalize != normalize):
         torch = state.torch
         head = full_output_head(state.loaded_model.model)
         readout = AsyncLabelLogprobs(
@@ -214,7 +214,7 @@ class ClassifyStages:
             sum(request.read_mask) if request.read_mask is not None
             else max(map(len, request.suffixes)) if read_all else 1)
         # a letters stage on a canvas model reads its canvas's rows
-        answer_canvas = getattr(state.loaded_model.model_spec, "answer_canvas", None)
+        answer_canvas = state.loaded_model.model_spec.answer_canvas
         if spec.scoring == "letters" and answer_canvas is not None:
             self.canvas_rows = answer_canvas.rows
             self.readout_rows = readout_rows = self.canvas_rows
@@ -480,31 +480,35 @@ class ClassifyStages:
                 len(self.request.suffixes), self.readout_rows, -1)
         return self.request.score(logprobs)
 
-    def finish(self, answers) -> tuple[int, int]:
+    def finish(self, answers, *, frame_tokens=None) -> tuple[int, int]:
         """Finalize labels and count tokens processed after the documents.
 
         Args:
             answers: Per-stage mappings from document index to readout values.
+            frame_tokens: The frame tokens each document's request wrote,
+                or None when the classification wrote its whole frame.
 
         Returns:
             A tuple of suffix tokens and total streamed tokens, including frames.
             For pair classification, the first value counts classified pairs
             instead of suffix tokens.
         """
+        if frame_tokens is None:
+            frame_tokens = len(self.stages[0].frame)
         if self.partners is not None:
             streamed = sum(1 + self.block_tokens[partner]
                            for _, partner in self.pair_labels)
             anchors = {anchor for anchor, _ in self.pair_labels}
-            streamed += len(anchors) * len(self.stages[0].frame)
+            streamed += len(anchors) * frame_tokens
             return len(self.pair_labels), streamed
         first = answers[0]
         if self.choice is not None:
-            frame, request = self.choice
+            _, request = self.choice
             for anchor, scores in first.items():
                 if self.labels[anchor] is None:
                     self._choose(anchor, _softmax(np.asarray(scores)), None)
             suffix_tokens = len(first) * len(request)
-            return suffix_tokens, suffix_tokens + len(first) * len(frame)
+            return suffix_tokens, suffix_tokens + len(first) * frame_tokens
         if self.decoder is not None:
             suffix_tokens = self.decoder.tokens
         else:
@@ -515,5 +519,5 @@ class ClassifyStages:
             suffix_tokens = len(first) * read
             if self.draws > 1:
                 suffix_tokens += self.extended * (self.draws - 1) * read
-        return suffix_tokens, suffix_tokens + len(first) * len(self.request.frame)
+        return suffix_tokens, suffix_tokens + len(first) * frame_tokens
 

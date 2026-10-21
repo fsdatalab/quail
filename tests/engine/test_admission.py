@@ -3,7 +3,7 @@
 import random
 
 import pytest
-from helpers.fakes import expected_filter_rows
+from helpers.fakes import expected_filter_rows, fake_readout
 
 from quail.backends.quail.executor.admission import (
     DROP,
@@ -199,13 +199,11 @@ def test_ready_requests_fill_remaining_tokens_without_starving_skipped_requests(
 
 def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
                  pages=64, cap=None, order=(0, 1, 2), attention_mode=None,
-                 docs=None, tree=None, stop_groups=None):
+                 documents=None, tree=None, stop_groups=None):
     """Run a one-question filter over three documents.
 
     By default, document 1 shares its first 32 tokens with document 0.
     """
-    from types import SimpleNamespace
-
     from helpers.fakes import (
         DOC,
         QUESTION,
@@ -223,23 +221,23 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
         monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = FakeModel(truth, {})
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    answers = fake_readout()
     arena = cpu_arena(pages)
     if cap is not None:
         arena.retention_cap_pages = cap
-    if docs is None:
-        docs = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 32, [DOC + 2] * 64]
+    if documents is None:
+        documents = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 32, [DOC + 2] * 64]
     if tree is None:
         tree = PrefixTree(order=list(order), parent=[None, 0, None],
                           shared=[0, 32, 0])
     stats = {}
     from quail.backends.quail.executor.parts import settle_documents
 
-    keys = [("r", d) for d in range(len(docs))]
+    keys = [("r", d) for d in range(len(documents))]
     got, _, tokens = run_stages(
         fake_torch(), arena, pipeline, filter_stages([[QUESTION]], answers),
-        docs, budget, anchor_keys=keys, prefix_tree=tree, limit=limit,
-        on_settled=settle_documents(arena, keys, docs, bool(retain), budget),
+        documents, budget, anchor_keys=keys, prefix_tree=tree, limit=limit,
+        on_settled=settle_documents(arena, keys, documents, bool(retain), budget),
         attention_mode=attention_mode, stats=stats, stop_groups=stop_groups,
         default_attention="unified")
     got = {document: list(row) for document, row in got[0].items()}
@@ -265,13 +263,13 @@ def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
     # attention: the siblings follow their parent in one run, each
     # naming it as the read key, and the other root comes at its place
     # in tree order
-    docs = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 8, [DOC + 2] * 64,
+    documents = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 8, [DOC + 2] * 64,
             [DOC] * 32 + [DOC + 3] * 8]
     tree = PrefixTree(order=[0, 1, 3, 2], parent=[None, 0, None, 0],
                       shared=[0, 32, 0, 32])
     got, tokens, borrowed, arena = _tree_filter(
         monkeypatch, truth={0: [1], 1: [1], 2: [1], 3: [1]}, budget=500,
-        docs=docs, tree=tree, attention_mode="tree")
+        documents=documents, tree=tree, attention_mode="tree")
     assert got == {0: [1], 1: [1], 2: [1], 3: [1]}
     assert tokens == 64 + 8 + 8 + 64 + 4
     assert borrowed == 64
@@ -281,14 +279,14 @@ def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
 
     # a child that is itself a parent packs after its own parent even
     # when its document index is smaller
-    docs = [[DOC] * 48 + [DOC + 1] * 16, [DOC] * 48 + [DOC + 1] * 16 + [5] * 8,
+    documents = [[DOC] * 48 + [DOC + 1] * 16, [DOC] * 48 + [DOC + 1] * 16 + [5] * 8,
             [DOC] * 48]
     tree = PrefixTree(order=[2, 0, 1], parent=[2, 0, None],
                       shared=[48, 64, 0])
     packed.clear()
     got, tokens, borrowed, arena = _tree_filter(
         monkeypatch, truth={0: [1], 1: [1], 2: [1]}, budget=500,
-        docs=docs, tree=tree, attention_mode="tree")
+        documents=documents, tree=tree, attention_mode="tree")
     assert packed == [[(("r", 2), 0, None), (("r", 0), 48, ("r", 2)),
                        (("r", 1), 64, ("r", 0))]]
     assert tokens == 48 + 16 + 8 + 3
@@ -415,7 +413,6 @@ def test_filter_stop_groups_skip_a_queued_child_and_release_its_parent(
 
 
 def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
-    from types import SimpleNamespace
 
     from helpers.fakes import (
         DOC,
@@ -449,7 +446,7 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
                 for spec in chunk.specs for suffix in spec["suffixes"]]
 
     pipeline = fake_pipeline(forward_chunk=forward)
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    answers = fake_readout()
     arena = cpu_arena(64)
     stats = {}
     out, _, tokens = run_stages(
@@ -555,3 +552,18 @@ def test_next_stage_settlement_preserves_the_answered_stage_decision(
     assert sched.report(0, 0, 0, 1, [1]) == AdmissionReport(
         (Settlement(kind, 0, False),), ((0, 0, True),))
     assert sched.done() and sched.survivors == 0
+
+
+def test_a_limit_paces_admission_by_the_parts_survival():
+    # a limit of two survivors at a survival of a half: four anchors
+    # in flight are expected to reach it, so the fifth waits; a drop
+    # settles one and lets the next in
+    sched = JoinAdmission([50] * 8, [[10]], 500, arena_pages=100,
+                          page_tokens=16, limit=2, survival=0.5)
+    assert [a for a, *_ in sched.next_chunk(500)] == [0, 1, 2, 3]
+    assert sched.next_chunk(500) == []
+    sched.report(0, 0, 0, 1, [0])
+    assert [a for a, *_ in sched.next_chunk(500)] == [4]
+    sched.report(1, 0, 0, 1, [1])
+    sched.report(2, 0, 0, 1, [1])
+    assert sched.limit_reached() and sched.next_chunk(500) == []

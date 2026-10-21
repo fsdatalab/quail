@@ -39,8 +39,8 @@ class BoundBuilder:
                                 probabilities=probabilities)
         return self
 
-    def ai_extract(self, c, question, *, name, trim=True):
-        self._inner.ai_extract(c, question, name=name, trim=trim)
+    def ai_extract(self, c, question, *, name):
+        self._inner.ai_extract(c, question, name=name)
         return self
 
     def label_in(self, name, labels, selectivity=None):
@@ -74,6 +74,8 @@ class BoundBuilder:
         self._inner.where(*tests)
         return self
 
+    filter = where
+
     def limit(self, n):
         self._inner.limit(n)
         return self
@@ -92,6 +94,10 @@ class BoundBuilder:
 
     def having(self, *tests):
         self._inner.having(*tests)
+        return self
+
+    def window(self, **calls):
+        self._inner.window(**calls)
         return self
 
     def offset(self, n):

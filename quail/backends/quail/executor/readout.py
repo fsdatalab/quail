@@ -67,6 +67,9 @@ class AsyncAnswers:
     """
 
     dtype = None    # answers arrive as Python lists of bits
+    # the readout contract a stage reads: one trailing row, no normalizer
+    trailing_rows = 1
+    normalize = False
 
     def __init__(self, torch, rows):
         self.torch = torch
@@ -107,6 +110,12 @@ def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
 
 class _HostReadout:
     """Copy readout tensors asynchronously using reusable pinned buffers."""
+
+    # the rows a stage reads at the end of each suffix
+    trailing_rows = 1
+    # whether label scores are normalized over the vocabulary, for
+    # readouts that score labels
+    normalize = False
 
     def __init__(self, torch):
         self.torch = torch
@@ -231,7 +240,7 @@ class AsyncTopLogprobs(_HostReadout):
         torch: Torch module.
         F: Torch functional module.
         head: Full output head with shape (vocabulary, hidden size).
-        k: How many likeliest tokens each row returns.
+        gpus: How many likeliest tokens each row returns.
         extras: Token ids whose log probability every row returns. An
             entry that is a tuple of ids returns one value, the log
             probability of any of them.
@@ -387,6 +396,8 @@ class DecisionRows:
         head: The model's DecisionHead.
         offsets: Distances before the last row, options first, ending in 0.
     """
+
+    normalize = False
 
     def __init__(self, torch, head, offsets):
         self.torch = torch

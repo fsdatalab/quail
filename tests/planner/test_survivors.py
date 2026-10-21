@@ -1,4 +1,4 @@
-from quail.planner.search.live_rows import PairRelation, exact_live_rows
+from quail.planner.search.survivors import PairRelation, exact_survivors
 
 PAIR_SETS = [
     ({("a", "b"): {(0, 0), (1, 1)}, ("b", "c"): {(0, 0)}}, (0,)),
@@ -7,11 +7,11 @@ PAIR_SETS = [
 ]
 
 
-def test_live_rows_for_trees_and_cycles():
+def test_survivors_for_trees_and_cycles():
     for pairs, expected in PAIR_SETS:
-        live = exact_live_rows(
+        survivors = exact_survivors(
             {"a": (0, 1), "b": (0, 1), "c": (0, 1)},
             tuple(PairRelation(left, right, frozenset(rows))
                   for (left, right), rows in pairs.items()),
         )
-        assert live == {"a": expected, "b": expected, "c": expected}, pairs
+        assert survivors == {"a": expected, "b": expected, "c": expected}, pairs

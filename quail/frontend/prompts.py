@@ -45,8 +45,6 @@ class PromptBinder:
         turn = self.turn if self.model is None else self.model.turn
         layout = self.layout if self.model is None else self.model.prompt_layout
         if kind == "extract":
-            if self.model is not None:
-                turn = self.model.extract_turn
             return bind_extract_prompt(args, template, turn)
         if kind == "label":
             return bind_classify_prompt(

@@ -6,7 +6,14 @@ import types
 from types import SimpleNamespace
 
 import pytest
-from helpers.fakes import cpu_arena, cpu_staging, fake_pack, fake_pipeline, fake_torch
+from helpers.fakes import (
+    cpu_arena,
+    cpu_staging,
+    fake_pack,
+    fake_pipeline,
+    fake_readout,
+    fake_torch,
+)
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.admission import JoinAdmission
@@ -48,8 +55,10 @@ def test_spec_geometry_budgets_costs_and_turn_text():
     assert QWEN3_4B_FP8.kv_shapes == ((8, 128),) * 36
     assert QWEN3_4B_FP8.kappa == 147_456.0
     assert SPEC.canvas_tokens == 1
-    assert SPEC.turn == ("<bos><|turn>user\n",
-                         "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
+    assert SPEC.turn == (
+        "<bos><|turn>system\nYou are an expert at text analysis<turn|>\n"
+        "<|turn>user\n",
+        "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
     assert SPEC.canvas_answer_row == 0
     assert budgets.chunk_budget(SPEC, H100_SXM) == SPEC.chunk_cap_tokens
     assert budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM) == \
@@ -67,11 +76,11 @@ def test_spec_geometry_budgets_costs_and_turn_text():
     lowered = lower_prompt(prompt, _tok)
     assert prompt.preamble == turn[0] + SHARED_PRE
     assert prompt.tail.endswith(ANSWER_CUE + turn[1])
-    doc = [7, 8, 9]
-    ids = render_filter_prompt_ids(lowered, doc)
+    document = [7, 8, 9]
+    ids = render_filter_prompt_ids(lowered, document)
     assert ids[:len(_tok(prompt.preamble))] == _tok(prompt.preamble)
     assert ids[-len(_tok(turn[1])):] == _tok(turn[1])
-    assert ids == (_tok(prompt.preamble) + doc
+    assert ids == (_tok(prompt.preamble) + document
                    + _tok(filter_question_text(prompt)))
     assert tuple(_tok(prompt.preamble)) == lowered.preamble_token_ids
 
@@ -89,8 +98,8 @@ def test_spec_geometry_budgets_costs_and_turn_text():
 
 def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
         monkeypatch):
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
-    docs = [[5] * 20, [6] * 30]
+    answers = fake_readout()
+    documents = [[5] * 20, [6] * 30]
     questions = [[40, 41, 42], [40, 41, 43, 44]]
     # the questions' shared preamble is the frame, written once; each
     # stage's suffix is its question past it, and canvas rows follow
@@ -136,7 +145,7 @@ def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     run_stages(
         fake_torch(), arena, paged,
-        filter_stages(questions[:1], answers), docs[:1], 200,
+        filter_stages(questions[:1], answers), documents[:1], 200,
         paged=False,
         default_attention='unified',
         anchor_keys=[('d', 0)])
@@ -270,12 +279,26 @@ class _Engine:
         hidden.copy_(residual * norm.weight)
         return hidden, residual
 
-    def qkv_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
-                            q_weight, k_weight, eps, cos_sin_cache):
-        q = qkv[:, :n_q * head_dim] * q_weight
-        k = qkv[:, n_q * head_dim:(n_q + n_kv) * head_dim] * k_weight
+    def qkv_norm_rope_heads(
+        self,
+        qkv,
+        positions,
+        *,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        q_weight,
+        k_weight,
+        eps,
+        cos_sin_cache,
+    ):
+        q = qkv[:, :num_q_heads * head_dim] * q_weight
+        k = (
+            qkv[:, num_q_heads * head_dim : (num_q_heads + num_kv_heads) * head_dim]
+            * k_weight
+        )
         return (q.contiguous(), k.contiguous(),
-                qkv[:, (n_q + n_kv) * head_dim:].contiguous())
+                qkv[:, (num_q_heads + num_kv_heads) * head_dim:].contiguous())
 
     def gelu_mul_quant(self, gate_up):
         return gate_up, None
@@ -292,9 +315,10 @@ def _spec_for(model, **overrides):
     attn = model.model.layers[0].self_attn
     fields = dict(vocab=50, canvas_tokens=3, canvas_answer_row=1,
                   sliding_window=model.model.config.sliding_window,
-                  n_q=attn.num_heads, n_kv=attn.num_kv_heads,
+                  num_q_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
                   head_dim=attn.head_dim, d_head=attn.head_dim,
-                  widest_projection=32)
+                  widest_projection=32, hidden=8,
+                  experts_active=8, expert_intermediate=4)
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
@@ -335,7 +359,7 @@ def test_pipeline_layer_order_and_one_row_canvas_attention(monkeypatch):
             spec=_spec_for(_fake_model(torch), sliding_window=512))
     assert seen["workspace"] == "cuda"
     assert not pipeline.tree_attention and not pipeline.gemm_warmup
-    assert pipeline.max_chunk_tokens == (2**31 - 1) // 32
+    assert pipeline.max_chunk_tokens == (2**31 - 1) // (8 * 8)
 
     rows = torch.tensor([3, 4, 5])
     chunk = SimpleNamespace(

@@ -106,7 +106,6 @@ class SemanticExtract:
             "name": self.name,
             "expression": _explain(self.call),
             "question": self.call.question,
-            "trim": self.call.trim,
         }
 
 

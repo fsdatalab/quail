@@ -12,7 +12,7 @@ from quail.specs import DeviceSpec, ModelSpec
 
 
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
-               device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
+               device: DeviceSpec, document_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
                registry, tokenizer=None, pair_fractions=None,
                scan_fractions=None,
@@ -25,8 +25,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         plan: The input logical plan.
         model: Model spec.
         device: Device spec.
-        doc_tokens: Per document token counts for each table alias.
-        gpus: GPU count handed to the backend as gpu_count.
+        document_tokens: Per document token counts for each table alias.
+        gpus: GPU count handed to the backend.
         order: Stage order rule, 'by_cost' or 'as_written'; None picks
             the default rule.
         backend: Registered model backend name.
@@ -78,8 +78,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     context = PlanningContext(
         model=model,
         device=device,
-        gpu_count=gpus,
-        document_tokens=doc_tokens,
+        gpus=gpus,
+        document_tokens=document_tokens,
         backend=backend,
         order=order,
         canvas_draws=canvas_draws,
@@ -164,7 +164,7 @@ def search_plan(logical, context, registry, *, logical_candidates=None):
 
 
 def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
-                doc_tokens: dict, gpus: int = 1, backend: str = "quail",
+                document_tokens: dict, gpus: int = 1, backend: str = "quail",
                 registry, order: str | None = None,
                 tokenizer=None, pair_fractions=None,
                 canvas_draws: int = 4,
@@ -180,8 +180,8 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
     context = PlanningContext(
         model=model,
         device=device,
-        gpu_count=gpus,
-        document_tokens=doc_tokens,
+        gpus=gpus,
+        document_tokens=document_tokens,
         backend=backend,
         order=order,
         canvas_draws=canvas_draws,

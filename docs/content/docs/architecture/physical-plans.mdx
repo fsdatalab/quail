@@ -5,6 +5,8 @@ title: Physical plans
 A physical plan specifies which operators execute a query, what data each
 operator receives, and what data it produces. An operator performs one
 part of the query, such as classifying reviews or selecting result columns.
+SQL and Python functions describe what a query requests. Physical operators
+specify how Quail executes that work.
 The plan also records execution settings, such as the
 [attention path](/docs/architecture/execution#attention-paths) used by a model operator.
 
@@ -64,6 +66,16 @@ The arrows show which inputs each operator needs. Compatible operators
 can pass batches to each other before they finish processing all rows.
 See [Execution](/docs/architecture/execution#pipelines-and-batches) for
 how Quail groups and schedules these operators.
+
+## Window execution
+
+[Window functions](/docs/user-guide/sql/sql-functions#window-functions)
+run on the CPU and reuse computed AI outputs. They do not call the model
+again, even when several windows read the same row.
+
+Note that using `LIMIT` can reduce the number of rows processed by window
+functions. It does not reduce the number of rows evaluated by AI functions.
+See [Window rules](/docs/architecture/optimizer#window-rules) for details.
 
 ## Inspect the plan
 

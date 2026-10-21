@@ -1,13 +1,13 @@
 from .base import ModelSpec
-from .qwen3 import EXTRACT_TURN_PREFIX, EXTRACT_TURN_SUFFIX
+from .prompts import QWEN3_PROMPT_FORMAT, QWEN3_TURN_PREFIX, QWEN3_TURN_SUFFIX
 
 QWEN3_4B_FP8 = ModelSpec(
     name="qwen3-4b-fp8",
     params=3.6e9,          # dense params repeatedly used per token
     layers=36,
     hidden=2560,
-    n_q=32,
-    n_kv=8,
+    num_q_heads=32,
+    num_kv_heads=8,
     d_head=128,
     ffn_width=19456,       # gate_up output: 2 x 9728 intermediate
     w_bytes=1.0,           # fp8 weights
@@ -19,6 +19,7 @@ QWEN3_4B_FP8 = ModelSpec(
     vocab=151_936,
     tied_head=True,        # lm_head shares the embedding tensor, so
     #                        nothing moves off the GPU at load
-    extract_turn_prefix=EXTRACT_TURN_PREFIX,
-    extract_turn_suffix=EXTRACT_TURN_SUFFIX,
+    turn_prefix=QWEN3_TURN_PREFIX,
+    turn_suffix=QWEN3_TURN_SUFFIX,
+    prompt_format=QWEN3_PROMPT_FORMAT,
 )

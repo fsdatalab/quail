@@ -7,7 +7,7 @@ from quail.cost.extract import (
     document_work,
     estimate,
 )
-from quail.cost.work import ask, scan
+from quail.cost.work import ask, decode, scan
 from quail.physical import ExtractSpec
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
@@ -18,62 +18,115 @@ CHUNK = 10000
 def _cost(lengths, **kwargs):
     options = dict(chunk=CHUNK, model=QWEN3_4B_FP8, device=H100_SXM,
                    max_answer_tokens=ExtractSpec.max_answer_tokens,
-                   draft_tokens=ExtractSpec.draft_tokens)
+                   draft_tokens=16, draft_policy="fixed")
     options.update(kwargs)
-    live = options.pop("live", len(lengths))
-    return estimate(live, lengths, HEAD, TAIL, **options)
+    expected_rows = options.pop("expected_rows", len(lengths))
+    return estimate(expected_rows, lengths, HEAD, TAIL, **options)
 
 
 
 def _document(length, **kwargs):
-    return document_work(length, HEAD, TAIL,
-                         max_answer_tokens=ExtractSpec.max_answer_tokens,
-                         draft_tokens=ExtractSpec.draft_tokens, **kwargs)
+    options = dict(max_answer_tokens=ExtractSpec.max_answer_tokens,
+                   draft_tokens=16, draft_policy="fixed")
+    options.update(kwargs)
+    return document_work(length, HEAD, TAIL, **options)
+
+
+def _rounds_work(context, round_tokens, rounds):
+    """The decode work of a fractional number of equal rounds."""
+    whole = int(rounds)
+    work = decode(context, [round_tokens] * whole)
+    if rounds > whole:
+        work += (decode(context + whole * round_tokens, [round_tokens])
+                 * (rounds - whole))
+    return work
+
+
+def test_expected_rounds_follow_the_answer_length_curve():
+    assumptions = ExtractAssumptions(answer_tokens=16)
+    assert assumptions.survival(0) == 1.0
+    assert assumptions.survival(16) == pytest.approx((15 / 16) ** 16)
+    # with no draft, a round per token the answer may still have
+    assert assumptions.rounds(64, 0) == pytest.approx(
+        sum((15 / 16) ** r for r in range(63)))
+    # a 17-token round covers most answers of mean 16 in one go
+    rounds = assumptions.rounds(64, 16)
+    assert 1 < rounds < 2
+    assert assumptions.rounds(64, 63) == 1.0
+    assert assumptions.rounds(1, 16) == 0.0
+    assert ExtractAssumptions(answer_tokens=0).rounds(64, 16) == 0.0
+    # longer answers take more rounds; longer drafts fewer
+    assert ExtractAssumptions(answer_tokens=40).rounds(64, 16) > rounds
+    assert assumptions.rounds(64, 32) < rounds
 
 
 def test_a_document_scans_once_then_writes_its_answer_in_rounds():
     work, fed, rows = _document(100)
     context = HEAD + 100 + TAIL
-    answer = 1 + ExtractSpec.draft_tokens
-    expected = scan(HEAD + 100, TAIL) + ask(context, answer)
-    assert work == expected
-    assert fed == TAIL + answer
-    assert rows == 1 + answer
+    round_tokens = 1 + 16
+    rounds = ExtractAssumptions().rounds(ExtractSpec.max_answer_tokens, 16)
+    answer = _rounds_work(context, round_tokens, rounds)
+    assert work == scan(HEAD + 100, TAIL) + answer
+    assert fed == pytest.approx(TAIL + rounds * round_tokens)
+    assert rows == pytest.approx(1 + rounds * round_tokens)
     # resident KV turns the scan into a question over it
     resident, _, _ = _document(100, resident=True)
-    assert resident == ask(HEAD + 100, TAIL) + ask(context, answer)
+    assert resident == ask(HEAD + 100, TAIL) + answer
     assert resident.tokens < work.tokens
+    # a borrowed prefix includes the prompt head
     shared, _, _ = _document(100, shared=80)
-    assert shared == ask(80, HEAD + 100 + TAIL - 80) + ask(context, answer)
-    assert shared.tokens == work.tokens - 80
+    assert shared == ask(HEAD + 80, 100 + TAIL - 80) + answer
+    assert shared.tokens == pytest.approx(work.tokens - 80 - HEAD)
     assert _document(100, resident=True, shared=80)[0] == resident
 
 
 def test_parallel_estimate_preserves_work_and_limits_used_workers():
     one = _cost([100, 100])
-    two = _cost([100, 100], workers=2)
+    two = _cost([100, 100], gpus=2)
     assert two.work == one.work
     assert two.seconds == pytest.approx(one.seconds / 2)
-    assert _cost([100], workers=8).seconds == _cost([100]).seconds
+    assert _cost([100], gpus=8).seconds == _cost([100]).seconds
 
 
 def test_cost_uses_plan_limits_and_separate_answer_assumptions():
     assumptions = ExtractAssumptions(answer_tokens=40)
     cost = _cost([100], max_answer_tokens=8, draft_tokens=3, assumptions=assumptions)
-    # Both rounds read KV. The second also reads the first round's four tokens.
-    assert cost.work.kv_read == 142 + 146
-    assert cost.work.pairs == 142 * 143 / 2 + 4 * 142 + 10 + 4 * 146 + 10
-    assert cost.work.tokens == 150
-    assert cost.suffix_tokens == TAIL + 8
-    assert cost.rows == 9
+    context = HEAD + 100 + TAIL
+    rounds = assumptions.rounds(8, 3)
+    assert rounds == pytest.approx(1 + (39 / 40) ** 4)
+    assert cost.work == scan(HEAD + 100, TAIL) + _rounds_work(context, 4, rounds)
+    assert cost.suffix_tokens == pytest.approx(TAIL + 4 * rounds)
+    assert cost.rows == pytest.approx(1 + 4 * rounds)
     shorter = _cost([100], max_answer_tokens=8, draft_tokens=3,
                     assumptions=ExtractAssumptions(answer_tokens=2))
-    assert shorter.work == scan(HEAD + 100, TAIL) + ask(HEAD + 100 + TAIL, 4)
-    capped = _cost([100], max_answer_tokens=1,
-                   assumptions=assumptions)
+    assert shorter.work.tokens < cost.work.tokens
+    capped = _cost([100], max_answer_tokens=1, assumptions=assumptions)
     assert capped.work == scan(HEAD + 100, TAIL)
     windowed, _, _ = document_work(
         100, HEAD, TAIL, window=128, max_answer_tokens=8, draft_tokens=3,
-        assumptions=assumptions)
-    assert windowed.sliding_kv_read == 2 * 127
-    assert windowed.sliding_pairs == 128 * 142 - 128 * 127 / 2 + 8 * 128
+        draft_policy="fixed", assumptions=assumptions)
+    assert windowed.sliding_kv_read == pytest.approx(rounds * 127)
+    recurrent, fed, rows = _document(
+        100, max_answer_tokens=8, draft_tokens=3,
+        assumptions=assumptions, recurrent=True)
+    replay = 4 * (rounds - 1)
+    assert recurrent.tokens == pytest.approx(cost.work.tokens + replay)
+    assert fed == pytest.approx(cost.suffix_tokens + replay)
+    assert rows == cost.rows
+    assert recurrent.state_read == pytest.approx(2 + 2 * (rounds - 1))
+    assert recurrent.state_written == pytest.approx(2 + rounds - 1)
+
+
+def test_adaptive_policy_drafts_longer_for_longer_documents():
+    # the round's KV read grows with the document, so the policy drafts
+    # more and takes fewer rounds than a fixed short draft; a scan reads
+    # no KV, so the KV read counts the rounds alone
+    per_token = 0.02
+    long, long_fed, _ = _document(8000, draft_tokens=63, draft_policy="adaptive",
+                                  round_cost_per_token=per_token)
+    fixed, fixed_fed, _ = _document(8000, draft_tokens=4, draft_policy="fixed")
+    assert long.kv_read < fixed.kv_read
+    short, short_fed, _ = _document(400, draft_tokens=63, draft_policy="adaptive",
+                                    round_cost_per_token=per_token)
+    # a short document's cheaper KV read earns a shorter draft
+    assert short_fed - TAIL < long_fed - TAIL

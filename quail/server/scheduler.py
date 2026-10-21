@@ -15,7 +15,7 @@ from pathlib import Path
 
 from quail.remote.artifacts import ANSWERS_FILE, Answers, verify_result
 from quail.remote.records import InvalidRequestError, QueryStatus
-from quail.server.executor import Executor, Job
+from quail.server.executor import Executor, Job, error_event
 from quail.server.store import Store
 
 logger = logging.getLogger("quail.server")
@@ -50,7 +50,8 @@ class Scheduler:
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(30)
+            # the loop finishes the active record before the executor goes
+            self._thread.join()
             self._thread = None
         self.executor.close()
 
@@ -92,79 +93,91 @@ class Scheduler:
         except InvalidRequestError:
             # cancelled between next_queued() and begin()
             return self.store.get(query_id)
+        execution = None
+        answers = None
         try:
             job = self._job(status)
-        except Exception as error:
-            self.store.finish(query_id, epoch, "failed", error={
-                "type": type(error).__name__, "message": str(error)})
-            return self.store.get(query_id)
+            last_progress = [0.0]
+            counts = [None]        # the loop's last progress payload
+            written = [0]          # answers_saved on the record
+            answers = Answers(Path(job.artifact_dir) / ANSWERS_FILE)
 
-        last_progress = [0.0]
-        counts = [None]        # the loop's last progress payload
-        written = [0]          # answers_saved on the record
-        answers = Answers(Path(job.artifact_dir) / ANSWERS_FILE)
+            def write_progress(payload):
+                written[0] = answers.count
+                self._apply(query_id, epoch, job.artifact_dir, "progress",
+                            {**payload, "answers_saved": answers.count})
 
-        def write_progress(payload):
-            written[0] = answers.count
-            self._apply(query_id, epoch, job.artifact_dir, "progress",
-                        {**payload, "answers_saved": answers.count})
-
-        def emit(kind, payload):
-            if kind == "answers":
-                # saved at once; the record learns the count on the
-                # progress timer, and a reader fetches what it has not seen
-                answers.append(payload)
-                complete = False
-                payload = counts[0] or {}
-            elif kind == "progress":
-                counts[0] = payload
-                complete = payload.get("total") and (
-                    payload.get("done") == payload.get("total"))
-            if kind in ("answers", "progress"):
-                now = time.monotonic()
-                if not complete and now - last_progress[0] < \
-                        PROGRESS_WRITE_INTERVAL_S:
+            def emit(kind, payload):
+                if kind == "answers":
+                    # saved at once; the record learns the count on the
+                    # progress timer, and a reader fetches what it has not seen
+                    answers.append(payload)
+                    complete = False
+                    payload = counts[0] or {}
+                elif kind == "progress":
+                    counts[0] = payload
+                    complete = payload.get("total") and (
+                        payload.get("done") == payload.get("total"))
+                if kind in ("answers", "progress"):
+                    now = time.monotonic()
+                    if not complete and now - last_progress[0] < \
+                            PROGRESS_WRITE_INTERVAL_S:
+                        return
+                    last_progress[0] = now
+                    write_progress(payload)
                     return
-                last_progress[0] = now
-                write_progress(payload)
-                return
-            if kind in ("finished", "failed") and written[0] != answers.count:
-                # the record's count must be right before it closes
-                write_progress(counts[0] or {})
-            self._apply(query_id, epoch, job.artifact_dir, kind, payload)
+                if kind in ("finished", "failed") and written[0] != answers.count:
+                    # the record's count must be right before it closes
+                    write_progress(counts[0] or {})
+                self._apply(query_id, epoch, job.artifact_dir, kind, payload)
 
-        execution = self.executor.start(job, emit)
-        deadline = time.monotonic() + status.timeout_s
-        while not execution.wait(self.poll_s):
-            current = self.store.get(query_id)
-            if current.done:
-                # Our own finished or failed event closed the record and
-                # the executor is about to report done. Killing it here
-                # would throw away the loaded model for the next query.
-                if not execution.wait(FINISH_GRACE_S):
+            execution = self.executor.start(job, emit)
+            deadline = time.monotonic() + status.timeout_s
+            finished_deadline = None
+            while not execution.wait(self.poll_s):
+                current = self.store.get(query_id)
+                now = time.monotonic()
+                if current.done:
+                    # our own finished or failed event closed the record
+                    # and the executor is about to report done; killing it
+                    # at once would throw away the loaded model
+                    if finished_deadline is None:
+                        finished_deadline = now + FINISH_GRACE_S
+                    if self._stop.is_set() or now >= finished_deadline:
+                        execution.stop()
+                        break
+                    continue
+                if self._stop.is_set():
+                    self.store.finish(query_id, epoch, "interrupted", error={
+                        "type": "Interrupted",
+                        "message": "the server stopped while this query ran"})
                     execution.stop()
-                break
-            if current.cancel_requested:
-                self.store.finish(query_id, epoch, "cancelled", error={
-                    "type": "Cancelled",
-                    "message": "cancelled while executing"})
-                execution.stop()
-                break
-            if time.monotonic() > deadline:
+                    break
+                if current.cancel_requested:
+                    self.store.finish(query_id, epoch, "cancelled", error={
+                        "type": "Cancelled",
+                        "message": "cancelled while executing"})
+                    execution.stop()
+                    break
+                if now > deadline:
+                    self.store.finish(query_id, epoch, "failed", error={
+                        "type": "TimeoutError",
+                        "message": f"execution exceeded the query's "
+                                   f"{status.timeout_s:g} s timeout"})
+                    execution.stop()
+                    break
+            if not self.store.get(query_id).done:
                 self.store.finish(query_id, epoch, "failed", error={
-                    "type": "TimeoutError",
-                    "message": f"execution exceeded the query's "
-                               f"{status.timeout_s:g} s timeout"})
+                    "type": "ExecutorExit",
+                    "message": "the execution ended without a result"})
+        except Exception as error:
+            self.store.finish(query_id, epoch, "failed", error=error_event(error))
+            if execution is not None:
                 execution.stop()
-                break
-        answers.close()
-        final = self.store.get(query_id)
-        if not final.done:
-            self.store.finish(query_id, epoch, "failed", error={
-                "type": "ExecutorExit",
-                "message": "the execution ended without a result"})
-            final = self.store.get(query_id)
-        return final
+        finally:
+            if answers is not None:
+                answers.close()
+        return self.store.get(query_id)
 
     def _apply(self, query_id: str, epoch: int, artifact_dir: str,
                kind: str, payload: dict) -> None:

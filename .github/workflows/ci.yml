@@ -27,6 +27,8 @@ jobs:
         run: uv run --frozen ruff check quail bench calibrate tests experiments tools
       - name: Long string literals
         run: uv run --frozen python tools/check_long_strings.py
+      - name: Names (check_names)
+        run: uv run --frozen python tools/check_names.py
       - name: Dead code (vulture)
         run: uv run --frozen vulture
       - name: Import direction (import-linter)

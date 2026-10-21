@@ -13,8 +13,8 @@ import pyarrow.compute as pc
 
 from quail.catalog.pairs import COLUMNS_PREFIX
 from quail.catalog.tokens import decode_token_documents
-from quail.execution.ids import document_ids
-from quail.execution.result import filter_answer_table
+from quail.execution.result import answer_table, filter_answer_table
+from quail.execution.rows import Rows, rows_of
 from quail.physical import (
     AiFilter,
     OutputPort,
@@ -84,9 +84,9 @@ class PhysicalRequest:
                 if key.startswith(COLUMNS_PREFIX)}
 
     @property
-    def gpu_count(self) -> int:
+    def gpus(self) -> int:
         """Return the GPU count selected by the physical plan."""
-        return int(self.plan["workers"])
+        return int(self.plan["gpus"])
 
 
 @dataclass(frozen=True)
@@ -114,17 +114,6 @@ class PhysicalResponse:
                 from error
 
 
-def _document_ids_table(port: OutputPort, value: Any) -> pa.Table:
-    alias = port.schema[0]
-    schema = pa.schema(
-        [pa.field(alias, pa.int32(), nullable=False)],
-        metadata={
-            b"quail.kind": b"document_ids",
-        },
-    )
-    return pa.Table.from_arrays([document_ids(value)], schema=schema)
-
-
 def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
     """One row per answer a document gave, repeating the document id."""
     lengths = np.fromiter((len(row) for row in value.values()), dtype=np.int64,
@@ -134,7 +123,7 @@ def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
     answers = (np.concatenate([np.asarray(row, dtype=bool) for row in value.values()])
                if len(value) else np.zeros(0, dtype=bool))
     return filter_answer_table(
-        node.alias, documents, np.full(len(documents), node.written_pos), answers)
+        node.alias, documents, np.full(len(documents), node.written_position), answers)
 
 
 def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
@@ -146,7 +135,6 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     """
     anchor = str(value["anchor"])
     partners = tuple(value["partners"])
-    aliases = (anchor, *partners)
     anchor_map = value["anchor_index"]
     partner_map = value["partner_index"]
     streamed = value.get("anchor_partners") or {}
@@ -166,31 +154,22 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
         columns[alias] = pc.take(documents, members)
     # answers arrive as 0/1 integers or booleans; the cast covers both
     answers = pc.cast(pa.array(chain.from_iterable(answer_parts)), pa.bool_())
-    fields = []
-    fields.extend(
-        pa.field(alias, pa.int32(), nullable=False) for alias in aliases
-    )
-    fields.append(pa.field("answer", pa.bool_(), nullable=False))
     metadata = {
-        b"quail.kind": b"join_answers",
-        b"quail.anchor": anchor.encode("utf-8"),
-        b"quail.partners": ",".join(partners).encode("utf-8"),
-        b"quail.semantics": str(value["semantics"]).encode("utf-8"),
-        b"quail.written_pos": str(value["written_pos"]).encode("ascii"),
+        "anchor": anchor, "semantics": value["semantics"],
+        "written_position": value["written_position"],
     }
     if value.get("selectivity") is not None:
-        metadata[b"quail.selectivity"] = str(
-            value["selectivity"]
-        ).encode("ascii")
-    arrays = [columns[alias] for alias in aliases] + [answers]
-    return pa.Table.from_arrays(arrays, schema=pa.schema(fields, metadata))
+        metadata["selectivity"] = value["selectivity"]
+    return answer_table(columns, answers, "join_answers", metadata)
 
 
 def _output_table(node, port: OutputPort, value: Any) -> pa.Table:
+    if isinstance(value, Rows):
+        return value.table()
     if isinstance(value, pa.Table):
         return value
-    if port.value_type is ValueType.DOCUMENT_IDS:
-        return _document_ids_table(port, value)
+    if port.name.startswith("rows:"):
+        return rows_of(value, port.name.split(":", 1)[1]).table()
     if port.value_type is ValueType.FILTER_ANSWERS:
         if not isinstance(node, AiFilter):
             raise TypeError("filter answer output needs a AiFilter node")

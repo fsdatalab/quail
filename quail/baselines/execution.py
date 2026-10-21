@@ -12,9 +12,8 @@ from quail.baselines.nodes import RequestExecution
 from quail.baselines.operators import (
     allowed_members_by_anchor,
     choose_documents,
-    classification_table,
+    classification_rows,
     classify_documents,
-    extract_answers,
     extract_documents,
     filter_answers,
     join_answers,
@@ -32,6 +31,8 @@ from quail.baselines.request_scheduling import (
 )
 from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.result import answer_values
+from quail.execution.rows import Rows, extraction_rows
 from quail.physical import PhysicalNode
 
 
@@ -104,7 +105,7 @@ class RequestModelExecution:
             for alias in node.aliases
         }
         for port in node.inputs:
-            if port.source.port.startswith("ids:"):
+            if port.source.port.startswith("rows:"):
                 alias = port.source.port.split(":", 1)[1]
                 if alias in survivors:
                     # the request steps grow and reorder these lists
@@ -119,7 +120,7 @@ class RequestModelExecution:
         self._execute_extractions(node, survivors, outputs, steps)
 
         for alias in node.aliases:
-            outputs[f"ids:{alias}"] = document_ids(survivors[alias])
+            outputs[f"rows:{alias}"] = Rows({alias: document_ids(survivors[alias])})
         wall_s = time.perf_counter() - started
         return NodeResult(
             outputs,
@@ -128,7 +129,7 @@ class RequestModelExecution:
                 input_rows=sum(len(self.documents[alias]) for alias in node.aliases),
                 output_rows=sum(len(value) for value in survivors.values()),
                 evaluated_documents=sum(
-                    step["requests"] if step["kind"] == "filter" else step["n_in"]
+                    step["requests"] if step["kind"] == "filter" else step["num_in"]
                     for step in steps if not step.get("partner")
                     and step["kind"] != "join"),
                 evaluated_document_pairs=sum(step["requests"] for step in steps
@@ -209,9 +210,9 @@ class RequestModelExecution:
                 kind="filter",
                 alias=spec.alias,
                 submission=self.filter_submission,
-                n_in=len(document_ids),
-                n_out=len(survivors[spec.alias]),
-                doc_cap=result["doc_cap"],
+                num_in=len(document_ids),
+                num_out=len(survivors[spec.alias]),
+                document_cap=result["doc_cap"],
             ))
 
     def _execute_classifications(self, node, survivors, outputs, steps):
@@ -227,12 +228,12 @@ class RequestModelExecution:
                     for document in document_ids])
             # a document whose answer names no label has no label row
             # and leaves the query
-            table = classification_table(
+            labels = classification_rows(
                 spec, {spec.alias: document_ids}, result["labels"])
-            outputs[f"label_answers:{spec.output}"] = table
-            labeled = list(zip(table.column(spec.alias).to_pylist(),
-                               table.column(spec.output).to_pylist()))
-            survivors[spec.alias] = table.column(spec.alias).to_pylist()
+            outputs[f"label_answers:{spec.output}"] = labels
+            labeled = list(zip(labels.ids[spec.alias].to_pylist(),
+                               labels.column(spec.output).to_pylist()))
+            survivors[spec.alias] = labels.ids[spec.alias].to_pylist()
             test_answers = {}
             for index, (position, accepted) in enumerate(spec.tests):
                 kept = set(accepted)
@@ -252,8 +253,8 @@ class RequestModelExecution:
                 kind="classify",
                 alias=spec.alias,
                 output=spec.output,
-                n_in=len(document_ids),
-                n_out=len(survivors[spec.alias]),
+                num_in=len(document_ids),
+                num_out=len(survivors[spec.alias]),
                 unmatched=result["unmatched"],
             ))
 
@@ -330,10 +331,10 @@ class RequestModelExecution:
             # a join over pairs asks each anchor about its own members
             allowed = None
             request_pairs = None
-            if spec.written_pos in self.pairs:
+            if spec.written_position in self.pairs:
                 allowed = allowed_members_by_anchor(
                     anchor, partners, anchor_ids, members,
-                    self.pairs[spec.written_pos])
+                    self.pairs[spec.written_position])
                 request_pairs = [
                     (anchor_index, member_index)
                     for anchor_index, mine in enumerate(allowed)
@@ -371,7 +372,7 @@ class RequestModelExecution:
                     by_alias = {anchor: anchor_id}
                     by_alias.update(zip(partners, members[member_index]))
                     rows.append(tuple(by_alias[alias] for alias in spec.aliases))
-            outputs[f"join_answers:{spec.written_pos}"] = join_answers(
+            outputs[f"join_answers:{spec.written_position}"] = join_answers(
                 spec,
                 rows,
                 answers,
@@ -396,7 +397,7 @@ class RequestModelExecution:
                     survivors[anchor] = sorted(matched)
             steps.append(request_step(result,
                 kind="join",
-                written_pos=spec.written_pos,
+                written_position=spec.written_position,
                 anchor=anchor,
                 partners=list(partners),
                 submission=submission,
@@ -411,8 +412,8 @@ class RequestModelExecution:
                 continue
             # the rows the join kept, each decoded as anchor, note,
             # partner block, and the question
-            answers = outputs[f"join_answers:{spec.join_written_pos}"]
-            kept = answers.filter(answers.column("answer"))
+            answers = outputs[f"join_answers:{spec.join_written_position}"]
+            kept = answers.filter(answer_values(answers))
             pairs = list(zip(kept.column(spec.alias).to_pylist(),
                              kept.column(spec.partner).to_pylist()))
             note, partner_label = (
@@ -424,17 +425,17 @@ class RequestModelExecution:
                     + note + partner_label
                     + token_list(self.documents[spec.partner][partner])
                     for anchor, partner in pairs])
-            table = classification_table(
+            labels = classification_rows(
                 spec, {spec.alias: kept.column(spec.alias),
                        spec.partner: kept.column(spec.partner)}, result["labels"])
-            outputs[f"label_answers:{spec.output}"] = table
+            outputs[f"label_answers:{spec.output}"] = labels
             steps.append(request_step(result,
                 kind="classify",
                 alias=spec.alias,
                 partner=spec.partner,
                 output=spec.output,
-                n_in=len(pairs),
-                n_out=table.num_rows,
+                num_in=len(pairs),
+                num_out=labels.num_rows,
                 unmatched=result["unmatched"],
             ))
 
@@ -459,14 +460,15 @@ class RequestModelExecution:
                 document_texts,
                 body_texts=([preamble_text + text for text in document_texts]
                             if self.submit_text else None))
-            outputs[f"extract_answers:{spec.output}"] = extract_answers(
-                spec, document_ids, result["answers"], result["spans"])
+            outputs[f"extract_answers:{spec.output}"] = extraction_rows(
+                spec.alias, spec.output, spec.span_output, document_ids,
+                result["answers"], result["spans"])
             steps.append(request_step(result,
                 kind="extract",
                 alias=spec.alias,
                 output=spec.output,
-                n_in=len(document_ids),
-                n_out=len(document_ids) - result["unanswered"],
+                num_in=len(document_ids),
+                num_out=len(document_ids) - result["unanswered"],
                 unanswered=result["unanswered"],
                 unaligned=result["unaligned"],
             ))

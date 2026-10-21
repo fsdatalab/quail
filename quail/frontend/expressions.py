@@ -3,11 +3,41 @@
 from dataclasses import dataclass
 from typing import Optional
 
+from quail.logical import CompileError
+
+
+class ExpressionSpec:
+    """A query expression built for where(), join(), or having().
+
+    It has no Python truth value: ``and``, ``or``, and ``not`` would
+    evaluate it in Python and silently drop the test.
+    """
+
+    def __bool__(self):
+        raise TypeError(
+            "query expressions have no Python truth value; combine where() "
+            "tests with & or pass them as separate arguments")
+
 
 @dataclass(frozen=True, eq=False)
-class ColSpec:
+class ColSpec(ExpressionSpec):
+    """A column reference, with the struct fields and function read on it.
+
+    Attributes:
+        alias: The table alias or result struct, or None when unqualified.
+        column: The column or struct field name.
+        path: Struct fields read under the column, such as ``("start",)``
+            of an extraction's span.
+        function: A function applied to the values before a test, such
+            as ``"length"``.
+        name: The result column's name from ``named()``, as SQL's ``AS``.
+    """
+
     alias: Optional[str]
     column: str
+    path: tuple = ()
+    function: Optional[str] = None
+    name: Optional[str] = None
 
     def __eq__(self, other):
         """``col("c.url") == col("e.url")`` is a join condition.
@@ -42,6 +72,62 @@ class ColSpec:
     def is_not_null(self) -> "PredicateSpec":
         return PredicateSpec(self, "is not null")
 
+    def like(self, pattern: str) -> "PredicateSpec":
+        """SQL LIKE: ``%`` matches any text and ``_`` one character."""
+        return PredicateSpec(self, "like", pattern)
+
+    def ilike(self, pattern: str) -> "PredicateSpec":
+        """LIKE ignoring case."""
+        return PredicateSpec(self, "ilike", pattern)
+
+    def contains(self, text: str, ignore_case: bool = False) -> "PredicateSpec":
+        return PredicateSpec(self, "icontains" if ignore_case else "contains", text)
+
+    def startswith(self, text: str) -> "PredicateSpec":
+        return PredicateSpec(self, "starts with", text)
+
+    def endswith(self, text: str) -> "PredicateSpec":
+        return PredicateSpec(self, "ends with", text)
+
+    def rlike(self, pattern: str) -> "PredicateSpec":
+        """Whether a regular expression (RE2 syntax) matches anywhere."""
+        return PredicateSpec(self, "regex", pattern)
+
+    def field(self, name: str) -> "ColSpec":
+        """Read a field of a struct column, such as a span's ``start``."""
+        self._require_no_function()
+        return ColSpec(self.alias, self.column, (*self.path, name))
+
+    def length(self) -> "ColSpec":
+        """The number of characters of each value."""
+        return self._function("length")
+
+    def lower(self) -> "ColSpec":
+        """Each value in lower case."""
+        return self._function("lower")
+
+    def upper(self) -> "ColSpec":
+        """Each value in upper case."""
+        return self._function("upper")
+
+    def trim(self) -> "ColSpec":
+        """Each value without the whitespace around it."""
+        return self._function("trim")
+
+    def _function(self, name: str) -> "ColSpec":
+        self._require_no_function()
+        return ColSpec(self.alias, self.column, self.path, name)
+
+    def named(self, name: str) -> "ColSpec":
+        """Return the column under ``name`` in the result, as SQL's ``AS``."""
+        return ColSpec(self.alias, self.column, self.path, self.function, name)
+
+    def _require_no_function(self) -> None:
+        if self.function is not None:
+            raise CompileError(
+                f"{self.function}() is the last step of a column expression; "
+                "a function cannot be followed by a field or another function")
+
     def asc(self) -> "SortSpec":
         return SortSpec(self)
 
@@ -55,7 +141,7 @@ class ColSpec:
         return SortSpec(self, nulls="last")
 
     def __hash__(self):
-        return hash((self.alias, self.column))
+        return hash((self.alias, self.column, self.path, self.function, self.name))
 
 
 @dataclass(frozen=True)
@@ -87,18 +173,63 @@ class SortSpec:
 
 
 @dataclass(frozen=True)
-class EqualsSpec:
+class EqualsSpec(ExpressionSpec):
     """An unresolved ``col(...) == col(...)`` join condition."""
     left: ColSpec
     right: ColSpec
 
 
 @dataclass(frozen=True)
-class PredicateSpec:
-    """An unresolved regular predicate for ``where()``."""
+class PredicateSpec(ExpressionSpec):
+    """An unresolved regular predicate for ``where()``.
+
+    Attributes:
+        col: The tested column.
+        comparison: One of quail.logical.COLUMN_COMPARISONS.
+        value: The literal or literals compared with.
+        selectivity: Estimated fraction of documents the test keeps,
+            for a test on a label or an answer; None uses 0.2.
+    """
     col: ColSpec
     comparison: str
     value: object = None
+    selectivity: Optional[float] = None
+
+    def __invert__(self) -> "PredicateSpec":
+        """``~col(...).like(...)``: the negated text test."""
+        if self.comparison.startswith("not "):
+            comparison = self.comparison[4:]
+        elif self.comparison in ("is null", "is not null"):
+            comparison = "is not null" if self.comparison == "is null" else "is null"
+        else:
+            comparison = f"not {self.comparison}"
+        return PredicateSpec(self.col, comparison, self.value, self.selectivity)
+
+    def hint(self, *, selectivity: float) -> "PredicateSpec":
+        """``col(...).like(...).hint(selectivity=0.4)``: the fraction kept."""
+        return PredicateSpec(self.col, self.comparison, self.value, selectivity)
+
+    def __and__(self, other) -> "AndSpec":
+        return AndSpec((self,)) & other
+
+    def tests(self) -> tuple:
+        """The tests combined with AND: this one."""
+        return (self,)
+
+
+@dataclass(frozen=True)
+class AndSpec(ExpressionSpec):
+    """Tests combined with AND: ``(col("a") > 1) & col("b").is_null()``."""
+    parts: tuple
+
+    def __and__(self, other) -> "AndSpec":
+        if not isinstance(other, (PredicateSpec, AndSpec)):
+            raise TypeError(f"& combines tests of columns, got {other!r}")
+        return AndSpec((*self.parts, *other.tests()))
+
+    def tests(self) -> tuple:
+        """The tests combined with AND, in written order."""
+        return self.parts
 
 
 @dataclass(frozen=True)
@@ -108,7 +239,7 @@ class PromptSpec:
 
 
 @dataclass(frozen=True)
-class AggSpec:
+class AggSpec(ExpressionSpec):
     """An unresolved aggregate for ``agg()``."""
     function: str
     col: object = None    # ColSpec, a label or score name, or None
@@ -137,9 +268,35 @@ class AggSpec:
     def __hash__(self):
         return hash((self.function, self.col))
 
+    def over(self, partition_by=(), order_by=()) -> "WindowSpec":
+        """Compute the function over each row's partition, as SQL's OVER.
+
+        Args:
+            partition_by: Column names or ``col()`` expressions that
+                group the rows; a string names one column.
+            order_by: Keys ordering each partition, as ``order_by()``
+                takes them; a string names one column.
+        """
+        return WindowSpec(self.function, self.col,
+                          _listed(partition_by), _listed(order_by))
+
+
+def _listed(keys) -> tuple:
+    return (keys,) if isinstance(keys, (str, ExpressionSpec, SortSpec)) \
+        else tuple(keys)
+
 
 @dataclass(frozen=True)
-class HavingSpec:
+class WindowSpec(ExpressionSpec):
+    """An unresolved window function for ``window()``."""
+    function: str
+    col: object    # ColSpec, a label or score name, or None
+    partition: tuple
+    order: tuple
+
+
+@dataclass(frozen=True)
+class HavingSpec(ExpressionSpec):
     """An unresolved ``having()`` test of an aggregate against a number."""
     agg: AggSpec
     comparison: str
@@ -149,6 +306,21 @@ class HavingSpec:
 def count(c=None) -> AggSpec:
     """``count()`` counts rows; ``count("r.id")`` counts non-null values."""
     return AggSpec("count", c)
+
+
+def row_number() -> AggSpec:
+    """The row's position in its partition, from 1; needs ``over()``."""
+    return AggSpec("row_number", None)
+
+
+def lag(c) -> AggSpec:
+    """The column's value on the row before, in the window's order."""
+    return AggSpec("lag", c)
+
+
+def lead(c) -> AggSpec:
+    """The column's value on the row after, in the window's order."""
+    return AggSpec("lead", c)
 
 
 def count_distinct(c) -> AggSpec:

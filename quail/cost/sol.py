@@ -18,10 +18,11 @@ from quail.specs import DeviceSpec, ModelSpec
 
 
 def _latencies(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
-               passes: float) -> tuple[ComponentLatency, ...]:
+               passes: float, rows: float = 0.0, head_rows: int = 0,
+               ) -> tuple[ComponentLatency, ...]:
     """Return the priced decoder components for one work record."""
     return component_latencies(
-        dense_decoder_components(work, model, passes), device)
+        dense_decoder_components(work, model, passes, rows, head_rows), device)
 
 
 def compute_seconds(work: _workload.Work, model: ModelSpec,
@@ -33,18 +34,23 @@ def compute_seconds(work: _workload.Work, model: ModelSpec,
 
 
 def unrounded_seconds(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
-                      chunk_tokens: int) -> float:
-    """Return component time with fractional ideal forward passes."""
+                      chunk_tokens: int, *, rows: float = 0.0,
+                      head_rows: int = 0) -> float:
+    """Return component time with fractional ideal forward passes.
+
+    rows are the answer rows the readout processes, each against
+    head_rows rows of the output head, the whole vocabulary when 0.
+    """
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be at least 1")
     passes = work.tokens / chunk_tokens
-    return sum(component.seconds
-               for component in _latencies(work, model, device, passes))
+    return sum(component.seconds for component in _latencies(
+        work, model, device, passes, rows, head_rows))
 
 
 @dataclass(frozen=True)
 class SpeedOfLight:
-    """The complete bound and its component breakdown."""
+    """The SoL estimate and its component breakdown."""
 
     work: _workload.Work
     passes: int
@@ -103,13 +109,13 @@ class SpeedOfLight:
 
 
 def speed_of_light(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
-                   chunk_tokens: int) -> SpeedOfLight:
-    """Price aggregate query work with ideal query-wide packing."""
+                   chunk_tokens: int, *, rows: float = 0.0) -> SpeedOfLight:
+    """Price aggregate query work and its answer rows with ideal packing."""
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be at least 1")
     passes = math.ceil(work.tokens / chunk_tokens) if work.tokens else 0
     return SpeedOfLight(
         work=work,
         passes=passes,
-        components=_latencies(work, model, device, passes),
+        components=_latencies(work, model, device, passes, rows),
     )

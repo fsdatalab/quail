@@ -82,3 +82,23 @@ html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;
 }
+
+.function-index tbody tr {
+  position: relative;
+}
+
+.function-index tbody a::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+}
+
+.function-index tbody tr:hover,
+.function-index tbody tr:focus-within {
+  background: var(--color-fd-accent);
+}
+
+.function-index tbody tr:focus-within {
+  outline: 2px solid var(--color-fd-ring);
+  outline-offset: -2px;
+}

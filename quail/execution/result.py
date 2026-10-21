@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import itertools
+import weakref
+from collections.abc import Callable, Iterable
 from copy import copy
 from dataclasses import dataclass
 
-import numpy as np
 import pyarrow as pa
 from pyarrow import acero
 from pyarrow import compute as pc
@@ -71,30 +72,55 @@ def document_index_table(columns: dict[str, Iterable[int]],
     return pa.Table.from_arrays(arrays, schema=schema)
 
 
+def free_name(base: str, taken: Iterable[str]) -> str:
+    """Return base, or base behind enough underscores to be unlike every taken name."""
+    taken = set(taken)
+    name = base
+    while name in taken:
+        name = "_" + name
+    return name
+
+
 def answer_table(columns: dict[str, Iterable[int]],
                  answers: Iterable[bool], kind: str,
                  metadata: dict[str, str] | None = None) -> pa.Table:
-    """Build a filter or join answer table."""
+    """Build a filter or join answer table: the id columns, then the answers.
+
+    The answer column comes last, under a name no alias uses.
+    """
     schema = document_index_schema(columns, kind)
     fields = list(schema)
-    fields.append(pa.field("answer", pa.bool_(), nullable=False))
+    fields.append(pa.field(free_name("answer", schema.names), pa.bool_(),
+                           nullable=False))
     schema_metadata = dict(schema.metadata or {})
     for key, value in (metadata or {}).items():
         schema_metadata[f"quail.{key}".encode("utf-8")] = \
             str(value).encode("utf-8")
     schema = pa.schema(fields, metadata=schema_metadata)
     arrays = [pa.array(columns[field.name], type=field.type)
-              for field in schema if field.name != "answer"]
+              for field in list(schema)[:-1]]
     arrays.append(pa.array(answers, type=pa.bool_()))
     return pa.Table.from_arrays(arrays, schema=schema)
 
 
+def answer_values(table: pa.Table) -> pa.ChunkedArray:
+    """Return the answers of an answer table: its last column."""
+    return table.column(table.num_columns - 1)
+
+
+def predicate_positions(table: pa.Table) -> pa.ChunkedArray:
+    """Return the written positions of a filter answer table: its second column."""
+    return table.column(1)
+
+
 def filter_answer_table(alias, documents, positions, answers) -> pa.Table:
-    """Build filter answers with predicate positions and alias metadata."""
+    """Build filter answers: the ids, the predicate positions, then the answers."""
+    predicate = free_name("predicate", (alias,))
     schema = pa.schema(
         [pa.field(alias, pa.int32(), nullable=False),
-         pa.field("predicate", pa.int32(), nullable=False),
-         pa.field("answer", pa.bool_(), nullable=False)],
+         pa.field(predicate, pa.int32(), nullable=False),
+         pa.field(free_name("answer", (alias, predicate)), pa.bool_(),
+                  nullable=False)],
         metadata={b"quail.kind": b"filter_answers",
                   b"quail.alias": alias.encode("utf-8")})
     return pa.Table.from_arrays(
@@ -102,28 +128,12 @@ def filter_answer_table(alias, documents, positions, answers) -> pa.Table:
          pa.array(answers, pa.bool_())], schema=schema)
 
 
-def extract_answer_table(alias, name, span_name, document_ids, answers,
-                         spans) -> pa.Table:
-    """Build extraction answers and nullable character spans."""
-    valid = np.fromiter((span is not None for span in spans), dtype=bool,
-                        count=len(spans))
-    bounds = np.zeros((len(spans), 2), dtype=np.int32)
-    bounds[valid] = np.asarray([span for span in spans if span is not None],
-                               dtype=np.int32).reshape(-1, 2)
-    span_array = pa.StructArray.from_arrays(
-        [pa.array(bounds[:, 0]), pa.array(bounds[:, 1])],
-        names=["start", "end"], mask=pa.array(~valid))
-    return pa.Table.from_arrays(
-        [pa.array(document_ids, pa.int32()), pa.array(answers, pa.string()),
-         span_array], names=[alias, name, span_name])
-
-
 def true_answer_rows(table: pa.Table) -> pa.Table:
     """Select the document-index rows whose answer is true."""
-    if "answer" not in table.schema.names:
+    answers = answer_values(table)
+    if not pa.types.is_boolean(answers.type):
         raise ValueError("answer table has no answer column")
-    aliases = [name for name in table.schema.names if name != "answer"]
-    selected = table.filter(table.column("answer")).select(aliases)
+    selected = table.filter(answers).select(table.column_names[:-1])
     metadata = dict(table.schema.metadata or {})
     metadata[b"quail.kind"] = b"join_answers"
     return selected.replace_schema_metadata(metadata)
@@ -166,6 +176,46 @@ def _inner_join(left: acero.Declaration, left_schema: pa.Schema,
     metadata = dict(left_schema.metadata or {})
     metadata[b"quail.kind"] = b"joined_indices"
     return declaration, pa.schema(fields, metadata=metadata)
+
+
+def joined_survivors(tables: Iterable[pa.Table],
+                     survivors: dict[str, pa.Array]) -> dict[str, pa.Array]:
+    """Keep the ids that take part in a complete join of their relations.
+
+    Relations sharing an alias form one component, joined as a whole,
+    so an id survives only with a partner in every relation at once.
+
+    Args:
+        tables: Relations of the id pairs whose join predicates passed.
+        survivors: alias -> its ids before the joins, in order.
+
+    Returns:
+        alias -> the surviving ids, in their input order with duplicates.
+    """
+    components = []
+    for table in tables:
+        aliases = set(table.column_names)
+        group = [table.cast(document_index_schema(table.column_names, "join_answers"))]
+        apart = []
+        for names, members in components:
+            if aliases & names:
+                aliases |= names
+                group.extend(members)
+            else:
+                apart.append((names, members))
+        components = [*apart, (aliases, group)]
+    kept = dict(survivors)
+    for aliases, group in components:
+        limits = {alias: survivors.get(alias, pc.unique(table[alias]))
+                  for table in group for alias in table.column_names}
+        declaration, _ = build_result_declaration(
+            group, limits, group[0].column_names[0])
+        joined = declaration.to_table(use_threads=False)
+        for alias in aliases & set(survivors):
+            ids = survivors[alias]
+            kept[alias] = pc.filter(ids, pc.is_in(
+                ids, value_set=pc.unique(joined[alias]).cast(ids.type)))
+    return kept
 
 
 def build_result_declaration(
@@ -222,45 +272,64 @@ def build_result_declaration(
 def count_rows(declaration: acero.Declaration) -> int:
     """Count rows inside Acero without returning the rows to Python."""
     options = acero.AggregateNodeOptions(
-        [([], "count_all", None, "row_count")])
+        [([], "count_all", None, "num_rows")])
     count_declaration = acero.Declaration(
         "aggregate", options, [declaration])
     table = count_declaration.to_table()
-    return int(table.column("row_count")[0].as_py())
+    return int(table.column("num_rows")[0].as_py())
 
 
-def execute_stream(declaration: acero.Declaration, schema: pa.Schema,
-                   limit: int | None = None,
-                   batch_rows: int = DEFAULT_BATCH_ROWS,
-                   ) -> pa.RecordBatchReader:
-    """Return bounded Arrow batches from an Acero declaration."""
+def bounded_reader(source: pa.RecordBatchReader, limit: int | None = None,
+                   batch_rows: int = DEFAULT_BATCH_ROWS, *,
+                   schema: pa.Schema | None = None,
+                   project: Callable | None = None) -> pa.RecordBatchReader:
+    """Return a reader of at most limit rows that owns the source reader.
+
+    The source is read only while rows are still wanted, so a limit
+    never reads a batch past itself, and it is closed when the
+    returned reader is closed, exhausted, or dropped unread.
+
+    Args:
+        source: The reader of the rows.
+        limit: Maximum rows to return, or every row when None.
+        batch_rows: Maximum rows in each returned batch.
+        schema: The returned batches' schema, when project changes it.
+        project: A function from a source batch to a returned batch.
+    """
     if batch_rows <= 0:
         raise ValueError("batch_rows must be positive")
     if limit is not None and limit < 0:
         raise ValueError("limit must be nonnegative")
-    source = declaration.to_reader()
 
     def batches():
         remaining = limit
         try:
-            for batch in source:
-                if remaining == 0:
-                    break
-                if remaining is not None and len(batch) > remaining:
-                    batch = batch.slice(0, remaining)
-                offset = 0
-                while offset < len(batch):
-                    length = min(batch_rows, len(batch) - offset)
-                    yield batch.slice(offset, length)
-                    offset += length
-                    if remaining is not None:
-                        remaining -= length
-                        if remaining == 0:
-                            break
+            while remaining is None or remaining > 0:
+                batch = next(source, None)
+                if batch is None:
+                    return
+                if remaining is not None:
+                    batch = batch[:remaining]
+                    remaining -= len(batch)
+                for offset in range(0, len(batch), batch_rows):
+                    part = batch.slice(offset, batch_rows)
+                    yield part if project is None else project(part)
         finally:
-            source.close()
+            close()
 
-    return pa.RecordBatchReader.from_batches(schema, batches())
+    iterator = batches()
+    # a generator never started runs no finally block
+    close = weakref.finalize(iterator, source.close)
+    # the C stream releases the iterator on close; from_batches alone does not
+    return pa.RecordBatchReader.from_stream(pa.RecordBatchReader.from_batches(
+        source.schema if schema is None else schema, iterator))
+
+
+def iter_rows(table: pa.Table):
+    """Yield the rows of a table as tuples, by column position."""
+    if table.num_columns == 0:
+        return itertools.repeat((), table.num_rows)
+    return zip(*(column.to_pylist() for column in table.columns))
 
 
 def projected_column(batch: pa.RecordBatch, alias, values) -> pa.Array:
@@ -312,7 +381,7 @@ class QueryResult:
                  limit: int | None = None,
                  survivor_indices: dict[str, pa.Array] | None = None,
                  true_join_tables: dict[int, pa.Table] | None = None,
-                 row_count: int | None = None):
+                 num_rows: int | None = None):
         self.columns = columns
         self.schema = output_schema
         self.report = report
@@ -327,7 +396,7 @@ class QueryResult:
         self._projection = projection
         self.survivor_indices = survivor_indices or {}
         self.true_join_tables = true_join_tables or {}
-        self._row_count = row_count
+        self._num_rows = num_rows
         self._materialized = None
 
     @classmethod
@@ -347,7 +416,7 @@ class QueryResult:
         result._projection = []
         result.survivor_indices = {}
         result.true_join_tables = {}
-        result._row_count = len(table)
+        result._num_rows = len(table)
         result._materialized = table
         return result
 
@@ -374,30 +443,20 @@ class QueryResult:
         if self._materialized is not None:
             table = self._materialized
             if effective_limit is not None:
-                table = table.slice(0, effective_limit)
+                table = table[:effective_limit]
             return table.to_reader(max_chunksize=batch_rows)
-        indices = execute_stream(
-            self._declaration,
-            self._document_index_schema,
-            effective_limit,
-            batch_rows,
-        )
 
-        def batches():
-            try:
-                for batch in indices:
-                    if not self._projection:
-                        yield batch.select([]).replace_schema_metadata(
-                            self.schema.metadata)
-                        continue
-                    arrays = [projected_column(batch, alias, values)
-                              for alias, values in self._projection]
-                    yield pa.RecordBatch.from_arrays(
-                        arrays, schema=self.schema)
-            finally:
-                indices.close()
+        def project(batch):
+            if not self._projection:
+                return batch.select([]).replace_schema_metadata(self.schema.metadata)
+            return pa.RecordBatch.from_arrays(
+                [projected_column(batch, alias, values)
+                 for alias, values in self._projection], schema=self.schema)
 
-        return pa.RecordBatchReader.from_batches(self.schema, batches())
+        # a threaded Acero reader can stall when closed before its end
+        return bounded_reader(
+            self._declaration.to_reader(use_threads=False), effective_limit,
+            batch_rows, schema=self.schema, project=project)
 
     def collect(self, limit: int | None = None,
                 batch_rows: int = DEFAULT_BATCH_ROWS
@@ -458,21 +517,19 @@ class QueryResult:
 
     def to_rows(self, limit: int | None = None) -> list[tuple]:
         """Collect projected result rows as Python tuples."""
-        table = self.collect(limit=limit)
-        columns = [column.to_pylist() for column in table.columns]
-        return list(zip(*columns))
+        return list(iter_rows(self.collect(limit=limit)))
 
-    def known_count(self) -> int | None:
+    def known_num_rows(self) -> int | None:
         """Return the row count when it is known without running the plan."""
-        return self._row_count
+        return self._num_rows
 
     def count(self) -> int:
         """Return the result row count, computing it when needed."""
-        if self._row_count is None:
+        if self._num_rows is None:
             count = count_rows(self._declaration)
-            self._row_count = (count if self.limit is None
+            self._num_rows = (count if self.limit is None
                                else min(count, self.limit))
-        return self._row_count
+        return self._num_rows
 
     def with_limit(self, limit: int) -> "QueryResult":
         """Return the same result with a smaller row limit."""
@@ -480,8 +537,8 @@ class QueryResult:
             raise ValueError("limit must be positive")
         result = copy(self)
         result.limit = limit if self.limit is None else min(self.limit, limit)
-        if self._row_count is not None:
-            result._row_count = min(self._row_count, result.limit)
+        if self._num_rows is not None:
+            result._num_rows = min(self._num_rows, result.limit)
         return result
 
     def __len__(self) -> int:

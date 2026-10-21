@@ -7,8 +7,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.fakes import letter_tokens
-from helpers.rerankers import _finish, _RowReranker, _run_graph
+from helpers.fakes import fake_readout, letter_tokens
+from helpers.oracle import Oracle, finish
+from helpers.rerankers import _run_graph
 
 import quail
 from quail.backends.quail.executor.stages import Stage
@@ -22,24 +23,25 @@ from quail.backends.quail.reranker import (
     score_in_batches,
 )
 from quail.catalog import Catalog, DocumentProvider
+from quail.catalog.tokens import TokenLengths
+from quail.execution.rows import Rows
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
     compute_subgraph,
 )
 from quail.frontend.sql import compile_sql
-from quail.logical import CompileError, SemanticJoin
+from quail.logical import ColumnRef, CompileError, RegularPredicate, SemanticJoin
 from quail.physical import (
     AiClassify,
     AiScore,
-    ClassifySpec,
-    Comparison,
     Filter,
-    InList,
     decode_graph,
     encode_graph,
 )
+from quail.physical.codec import decode_value, encode_value
 from quail.planner.plan import EngineConfig, Refusal
+from quail.specs import QWEN3_4B_FP8
 
 PROJECTION_SQL = (
     "SELECT d.id, "
@@ -180,7 +182,8 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
     score_filter = next(
         node for node in physical.nodes if isinstance(node, Filter)
     )
-    assert score_filter.predicate == Comparison("score", ">=", 0.7)
+    assert score_filter.predicate == RegularPredicate(
+        ColumnRef("d", "", "score"), ">=", 0.7)
     graph = physical.graph
     decoded = decode_graph(
         encode_graph(graph, session.registry.codecs),
@@ -205,11 +208,11 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
     )
     join = plan.root.input
     assert isinstance(join, SemanticJoin)
-    assert (join.predicate.comparison, join.predicate.threshold) == ("<", 0.8)
-    assert join.predicate.call.aliases() == ("q", "d")
+    assert (join.predicate.comparison, join.predicate.value) == ("<", 0.8)
+    assert join.predicate.expression.aliases() == ("q", "d")
     (predicate,) = plan.operators().filters["d"]
     expression = predicate.expression
-    assert (expression.comparison, expression.threshold) == (">=", 0.5)
+    assert (expression.comparison, expression.value) == (">=", 0.5)
 
 
 def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
@@ -246,18 +249,20 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
     assert score_work(0, 15, 9).tokens == 0
 
     lengths = ([5, 9], [2, 4, 8])
-    summaries = tuple(summarize_alias(values) for values in lengths)
+    summaries = tuple(summarize_alias(TokenLengths(values)) for values in lengths)
     for capacity in (100, 1):
         cost = ScoreCost(
             token_lengths=(3, 4, 2), summaries=summaries,
             mean_tokens=sum(summary.mean for summary in summaries),
             model=QWEN3_4B_FP8, device=H100_SXM, chunk_tokens=8192,
-            capacity=capacity, workers=1, draws=1)
+            capacity=capacity, gpus=1, draws=1)
         expected = Work()
         for a, left in enumerate(lengths[0]):
             for b, right in enumerate(lengths[1]):
                 prefix = 3 + left + 4 if b and capacity == 100 else 3 if a or b else 0
-                expected += ask(prefix, 3 + left + 4 + right + 2 - prefix)
+                # the first pair computes its prompt from nothing resident
+                step = ask if prefix else scan
+                expected += step(prefix, 3 + left + 4 + right + 2 - prefix)
         work, _ = cost.estimate(6)
         assert vars(work) == pytest.approx(vars(expected))
         assert cost.estimate(0)[0] == Work()
@@ -281,13 +286,11 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
 
 
 def test_score_filters_compare_values_and_keep_pair_answers(catalog):
-    node = Filter(node_id="filter", predicate=Comparison("score", ">", 0.5),
-                  aliases=("q", "d"), written_pos=0)
-    table = pa.table({
-        "q": pa.array([0, 0, 1, 1], pa.int32()),
-        "d": pa.array([0, 1, 0, 1], pa.int32()),
-        "score": pa.array([0.9, 0.1, 0.2, 0.8], pa.float64()),
-    })
+    node = Filter(node_id="filter",
+                  predicate=RegularPredicate(ColumnRef("r", "", "score"), ">", 0.5),
+                  aliases=("q", "d"), written_position=0)
+    table = Rows({"q": [0, 0, 1, 1], "d": [0, 1, 0, 1]},
+                 pa.table({"score": pa.array([0.9, 0.1, 0.2, 0.8], pa.float64())}))
     result = FilterRuntime().execute(
         node, {"input:0": table}, ExecutionContext(runtimes={})
     )
@@ -309,7 +312,7 @@ def test_score_filters_compare_values_and_keep_pair_answers(catalog):
         "FROM queries q CROSS JOIN documents d "
         "WHERE AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15"
     )
-    result = _finish(query, session, _RowReranker())
+    result = finish(query, Oracle())
     assert result.collect().to_pylist() == [
         {"q.id": 1, "d.id": 2, "s1": 0.2, "s2": 0.2},
         {"q.id": 2, "d.id": 2, "s1": 0.2, "s2": 0.3},
@@ -324,12 +327,12 @@ def test_score_filters_compare_values_and_keep_pair_answers(catalog):
     physical = query.plan()
     assert sum(isinstance(node, AiScore) for node in physical.nodes) == 1
     assert sum(isinstance(node, Filter) for node in physical.nodes) == 2
-    reranker = _RowReranker()
-    result = _finish(query, session, reranker)
+    oracle = Oracle()
+    result = finish(query, oracle)
     assert result.collect().to_pylist() == [{"d.id": 2, "s": 0.2}]
     assert result.schema.field("s").type == pa.float64()
     assert result.report["estimated_seconds"] > 0
-    assert reranker.calls == 1
+    assert len(oracle.calls) == 1
     session.close()
 
 
@@ -343,11 +346,11 @@ def test_score_filter_order_is_chosen_by_cost_and_honors_override(catalog, model
     for rule, expected in (("by_cost", [1, 0]), ("as_written", [0, 1])):
         query = session.sql(sql, order=rule)
         physical = query.plan()
-        assert [node.written_pos for node in physical.nodes
+        assert [node.written_position for node in physical.nodes
                 if isinstance(node, Filter)] == expected
         assert physical.settings["order_rule"] == rule
         scores = [node for node in physical.nodes if isinstance(node, AiScore)]
-        assert [node.spec.expected_inputs for node in scores] == [2.0, 0.4]
+        assert [node.spec.expected_rows for node in scores] == [2.0, 0.4]
     session.close()
 
 
@@ -364,12 +367,8 @@ def test_score_join_runs_on_its_legal_anchor(catalog):
 
 
 def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
-    class MixedOutputs(_RowReranker):
-        def score(self, spec, rows, documents):
-            if isinstance(spec, ClassifySpec):
-                labels = [spec.labels[int(row[0]) % 2] for row in rows]
-                return RerankerBatch(labels, fresh_tokens=len(rows), cached_tokens=0)
-            return super().score(spec, rows, documents)
+    def mixed():
+        return Oracle(labels=lambda spec, ids: spec.labels[ids[0] % 2])
 
     session = _session(catalog, model="qwen3-4b-fp8", tokenizer=letter_tokens)
     score = "AI.SCORE(PROMPT('Refund? {0}', d.body))"
@@ -391,13 +390,13 @@ def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
             assert sum(type(node) is AiScore for node in physical.nodes) == 1
             if "IN" in predicate:
                 assert any(isinstance(node, Filter)
-                           and node.predicate == InList("topic", ("praise",))
+                           and node.predicate.value == ("praise",)
                            for node in physical.nodes)
             decoded = decode_graph(
                 encode_graph(physical.graph, session.registry.codecs),
                 session.registry.codecs)
             assert decoded == physical.graph
-            result = _finish(query, session, MixedOutputs())
+            result = finish(query, mixed())
             rows = result.collect()
             assert list(zip(rows.column("d.id").to_pylist(),
                             rows.column("topic").to_pylist())) == expected
@@ -410,21 +409,9 @@ def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
         f"SELECT q.id, d.id, {label} AS topic, "
         "AI.SCORE(PROMPT('Relevance {0} {1}', q.text, d.body)) AS relevance "
         "FROM queries q CROSS JOIN documents d")
-    assert _finish(query, session, MixedOutputs()).collect().column(
+    assert finish(query, mixed()).collect().column(
         "topic").to_pylist() == ["refund", "praise", "refund", "praise"]
     session.close()
-
-
-class _StreamingReranker(_RowReranker):
-    """Reports each row's score while scoring, one row at a time."""
-
-    streams_answers = True
-
-    def score(self, spec, rows, documents, on_answers=None):
-        batch = super().score(spec, rows, documents)
-        for position, value in enumerate(batch.scores):
-            on_answers(np.array([position]), [value])
-        return batch
 
 
 def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
@@ -436,17 +423,15 @@ def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
     set_answer_sink(streamed.append)
     try:
         graph, model, _ = _run_graph(
-            session, query, query._prepare_physical(), _RowReranker())
+            session, query, query._prepare_physical(), Oracle())
         score_node = next(
             node for node in graph.nodes if isinstance(node, AiScore))
         inputs = {port.name: np.arange(2, dtype=np.int32)
                   for port in score_node.inputs}
         # a reranker that reports while scoring streams each answer once
-        model.reranker = _StreamingReranker()
-        result = score_in_batches(
-            score_node, inputs,
-            lambda node, batches: [model.execute_rows(node, b) for b in batches],
-            streamed=True)
+        model.reranker = Oracle(streams=True)
+        result = score_in_batches(score_node, inputs, model.execute_rows,
+                                  streamed=True)
     finally:
         set_answer_sink(None)
     session.close()
@@ -457,7 +442,7 @@ def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
         "aliases": ["d"], "rows": [0, 1], "scores": [0.1, 0.2]}
     assert [(entry["rows"], entry["scores"]) for entry in streamed[1:]] == [
         ([0], [0.1]), ([1], [0.2])]
-    assert result.outputs["rows"].column("d").to_pylist() == [0, 1]
+    assert result.outputs["rows:d"].ids["d"].to_pylist() == [0, 1]
 
     rows = ScoreRows((np.arange(100_000), np.arange(100_000)), product=True)
     assert len(rows) == 10_000_000_000
@@ -468,15 +453,8 @@ def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
                                   [[2, 4], [2, 1], [2, 3], [0, 4], [0, 1], [0, 3]])
     empty = ScoreRows((np.empty(0, dtype=np.int32), np.arange(3)), product=True)
     assert list(empty.batches())[0].shape == (0, 2)
-    rows = ScoreRows((np.array([3, 0, 1]), np.array([7, 8])), product=True)
-    even, odd = rows.shard(2)
-    assert even.columns[0].tolist() == [0] and odd.columns[0].tolist() == [3, 1]
-    assert odd.positions(0, 4).tolist() == [0, 1, 4, 5]
-    assert even.positions(0, 2).tolist() == [2, 3]
-    plain = ScoreRows((np.array([3, 0, 1]),))
-    assert [shard.positions(0, len(shard)).tolist() for shard in plain.shard(2)] \
-        == [[1], [0, 2]]
     # a product batch ends on a first-document boundary when partners fit
+    rows = ScoreRows((np.array([3, 0, 1]), np.array([7, 8])), product=True)
     assert [len(batch) for batch in rows.batches(size=5)] == [4, 2]
 
 
@@ -501,6 +479,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     )
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
+            model_spec=QWEN3_4B_FP8,
             arena=object(),
             pipeline=object(),
             model=object(),
@@ -508,9 +487,9 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
         torch=object(),
         answer_rows=object(),
         chunk_tokens=1234,
-        async_answers=object(),
+        async_answers=fake_readout(),
     )
-    monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
+    monkeypatch.setattr(module, "AsyncScores", lambda *args: fake_readout())
 
     state.gpu_timing = True
 
@@ -542,7 +521,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
             model=object(), arena=object(),
             pipeline=SimpleNamespace(canvas_ids=(7,)),
             model_spec=SimpleNamespace(vocab=50)),
-        torch=object(), async_answers=object(), answer_rows=object(),
+        torch=object(), async_answers=fake_readout(), answer_rows=object(),
         chunk_tokens=1234)
 
     def run_stages(torch, arena, pipeline, stages, prefixes, budget, **kwargs):
@@ -575,56 +554,55 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     query = session.sql(_score_sql(True)[1])
     request = query._prepare_physical()
     physical = query.plan()
-    assert (physical.workers, physical.settings["data_parallel_copies"]) == (2, 2)
+    assert (physical.gpus, physical.settings["data_parallel_copies"]) == (2, 2)
     assert not any(isinstance(node, Filter) for node in physical.nodes)
     node = next(node for node in physical.nodes if isinstance(node, AiScore))
     assert node.spec.aliases == ("q", "d")
-    assert node.spec.expected_inputs == 4
+    assert node.spec.expected_rows == 4
     assert node.spec.pair_fraction == 1.0
     assert node.spec.estimated_seconds > 0
     graph = physical.graph
     payload = quail_runtime_payload(request, graph)
-    assert "pre_ids" not in payload and "filter_limit" not in payload
+    assert "filter_limit" not in payload
 
     def run(kind, subs):
+        assert kind == "execute"
         subs = pickle.loads(pickle.dumps(subs))
-        if kind == "filters":
-            assert len(subs) == 2
-            assert all(sub["start_query"] and sub["node_id"] is None
-                       for sub in subs)
-            return [{"peak_gib": 0.0} for _ in subs]
-        assert kind == "scores"
-        assert all(("documents" in sub["inputs"]) == (not rounds) for sub in subs)
         rounds.append(kind)
         results = []
-        for worker, sub in enumerate(subs):
-            rows = sub["inputs"]["score_rows"]
-            assert all(row[0] % 2 == worker for row in rows)
+        for sub in subs:
+            assert sub["nodes"] == (node,)
+            inputs = sub["inputs"][node.node_id]
+            queries = inputs["input:0"].to_pylist()
+            documents = list(inputs["input:1"])
+            shards.append(queries)
+            assert documents == [1, 0]
             model = RerankerModelExecution.__new__(RerankerModelExecution)
-            model.documents = sub["inputs"].get("documents", execution.docs)
-            for alias, documents in model.documents.items():
-                assert [list(doc) for doc in documents] == [
-                    list(doc) for doc in execution.docs[alias]
-                ]
-            model.reranker = _FakeReranker([a / 2 + b / 4 for a, b in rows])
-            results.append(model.execute_rows(node, rows))
+            model.documents = execution.documents
+            model.reranker = SimpleNamespace(streams_answers=False,
+                                             score=lambda spec, rows, documents: (
+                RerankerBatch([a / 2 + b / 4 for a, b in rows], fresh_tokens=12,
+                              cached_tokens=3)))
+            results.append({"results": {node.node_id: model.execute(node, inputs)},
+                            "retained": (), "kv_manager": {},
+                            "memory": {"peak_gib": 1.0}})
         return results
 
-    execution = DistributedQuailExecution(
-        payload, graph, 2, run, session.model, session.device, session.registry
-    )
-    execution.begin()
-    assert execution.started
+    shards = []
+    execution = DistributedQuailExecution(payload, graph, 2, run)
     result = execution.execute(node, {port.name: [1, 0] for port in node.inputs})
-    assert result.outputs["rows"].to_pylist() == [
+    assert result.outputs["rows"].table().to_pylist() == [
         {"q": 1, "d": 1, "score": 0.75},
         {"q": 1, "d": 0, "score": 0.5},
         {"q": 0, "d": 1, "score": 0.25},
         {"q": 0, "d": 0, "score": 0.0},
     ]
     assert result.metrics.evaluated_document_pairs == 4
-    # each GPU scored its own query document's pairs in the same round
-    assert len(rounds) == 1
+    # each GPU scored its own query documents' pairs in the same round
+    assert len(rounds) == 1 and sorted(sum(shards, [])) == [0, 1]
+    assert all(len(shard) == 1 for shard in shards)
+    assert execution.report()["peak_gib"] == 1.0
+    assert len(execution.report()["memory_workers"]) == 2
     session.close()
 
 
@@ -642,6 +620,7 @@ def _shared_store(path, bodies):
 def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     from quail.physical import PhysicalGraph, PortRef, Scan, ScoreSpec
     from quail.physical.base import input_ports
+    from quail.planner.graph.pricing import PlanPricer
     from quail.planner.optimizer.context import PlanningContext
     from quail.planner.optimizer.graph_refinement import apply_plan_rules
     from quail.planner.plan import PhysicalPlan
@@ -651,16 +630,16 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
     def graph(aliases, draws=1):
         spec = ScoreSpec(
             name="score", aliases=aliases, query_template="", arguments=(),
-            expected_inputs=20, estimated_seconds=10.0,
+            expected_rows=20, estimated_seconds=10.0,
             prompt_token_parts=((1,),) * (len(aliases) + 1), draws=draws)
         nodes = tuple(Scan(node_id=f"input:{alias}", alias=alias,
                            input_id=alias) for alias in aliases)
         score = AiScore(
             node_id="score", backend_name="quail", model="qwen3-4b-fp8",
-            inputs=input_ports(tuple(PortRef(f"input:{alias}", f"ids:{alias}")
+            inputs=input_ports(tuple(PortRef(f"input:{alias}", f"rows:{alias}")
                                      for alias in aliases)),
             spec=spec)
-        return PhysicalGraph(nodes + (score,), PortRef("score", "rows"))
+        return PhysicalGraph(nodes + (score,), PortRef("score", score.rows_port))
 
     def scored(rewritten):
         return next(node for node in rewritten.nodes
@@ -673,30 +652,37 @@ def test_prefix_sharing_fires_for_scores_of_one_table(tmp_path):
                           [f"{shared} {9000 + r}" for r in range(20)])
     plain = _shared_store(tmp_path / "plain.arrow",
                           [f"{9000 + r} 1 2" for r in range(20)])
-    context = PlanningContext(model=QWEN3_4B_FP8, device=H100_SXM, gpu_count=2,
+    context = PlanningContext(model=QWEN3_4B_FP8, device=H100_SXM, gpus=2,
                               document_tokens={"d": store.lengths,
                                                "e": plain.lengths},
                               backend="quail")
-    spec = scored(ShouldSharePrefixes().rewrite(graph(("d",)), context))
-    assert spec.share_prefixes
-    # 19 x 400 of 20 x (401 + 2) tokens are borrowed
-    assert spec.estimated_seconds == pytest.approx(10.0 * (1 - 19 * 400 / 8060))
+    def pricer(context):
+        return PlanPricer(context=context, statistics=SimpleNamespace(
+            chunk=1000, stats={}, cap_pages=0), stage_works={}, expected_rows={})
+
+    rewritten = ShouldSharePrefixes().rewrite(graph(("d",)), context)
+    spec = scored(rewritten)
+    # the rule turns sharing on; the pricer prices the score over its
+    # fresh tokens: 19 x 400 of 20 x (401 + 2) tokens are borrowed
+    assert spec.share_prefixes and spec.estimated_seconds == 10.0
+    assert pricer(context)(rewritten)[1]["score"]["seconds"] == pytest.approx(
+        10.0 * (1 - 19 * 400 / 8060))
     # the plan's total moves by the score's change
     unshared = graph(("d",))
     plan = apply_plan_rules(
-        PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", workers=2,
-                     estimated_seconds=12.0, nodes=unshared.nodes,
-                     root=unshared.root),
+        PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", gpus=2,
+                     nodes=unshared.nodes, root=unshared.root,
+                     estimator=pricer(context)),
         (ShouldSharePrefixes(),), context)
-    assert plan.estimated_seconds == pytest.approx(
-        12.0 - 10.0 + spec.estimated_seconds)
+    assert plan.estimated_seconds == pytest.approx(10.0 * (1 - 19 * 400 / 8060))
     # a 256-token canvas and four draws add 2 + 256 + 3 x 257 = 1,029
     # tokens per document that sharing does not save
     canvas = replace(context, model=replace(QWEN3_4B_FP8, canvas_tokens=256))
-    spec = scored(ShouldSharePrefixes().rewrite(graph(("d",), draws=4), canvas))
-    assert spec.estimated_seconds == pytest.approx(
+    rewritten = ShouldSharePrefixes().rewrite(graph(("d",), draws=4), canvas)
+    assert pricer(canvas)(rewritten)[1]["score"]["seconds"] == pytest.approx(
         10.0 * (1 - 19 * 400 / (8020 + 20 * 1029)))
-    assert ScoreSpec.from_mapping(spec.to_dict()) == spec
+    spec = scored(rewritten)
+    assert decode_value(ScoreSpec, encode_value(spec)) == spec
     # documents with nothing in common share nothing
     assert ShouldSharePrefixes().rewrite(graph(("e",)), context) is None
     # a pair score borrows each anchor's KV already
@@ -715,11 +701,12 @@ def test_shared_score_borrows_prefixes_and_reads_the_cue(monkeypatch):
                            prompt_token_parts=((1,), (2, 3)))
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
+            model_spec=QWEN3_4B_FP8,
             model=object(), arena=SimpleNamespace(page_tokens=2),
             pipeline=SimpleNamespace(canvas_ids=())),
-        torch=object(), async_answers=object(), answer_rows=object(),
+        torch=object(), async_answers=fake_readout(), answer_rows=object(),
         chunk_tokens=1234)
-    monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
+    monkeypatch.setattr(module, "AsyncScores", lambda *args: fake_readout())
     seen = []
 
     def run_stages(torch, arena, pipeline, stages, prefixes, budget, **kwargs):
@@ -805,6 +792,7 @@ def test_reranker_prompts_render_stored_documents_and_the_ai_if_frame(catalog):
     )
     from quail.specs import MODELS
 
+    assert QWEN3_RERANKER_SYSTEM_TEXT.startswith("You are an expert at text analysis")
     assert "\n" not in QWEN3_RERANKER_SYSTEM_TEXT
     assert "based on the Query and the Instruct provided." \
         in QWEN3_RERANKER_SYSTEM_TEXT

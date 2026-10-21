@@ -1,20 +1,18 @@
 """Fixed join execution, filter retention, and answer reconstruction."""
 
-import numpy as np
 import pyarrow as pa
 import pytest
 from helpers.fakes import graph_state, letter_tokens
+from helpers.oracle import Oracle
 
 import quail
 from bench import quailb
 from quail.api.execute import execute_query
 from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.reranker import _score_table
-from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.metrics import NodeMetrics
 from quail.execution.types import PhysicalResponse
-from quail.logical.expressions import CompileError
+from quail.logical.expressions import CompileError, column_name
 from quail.physical import (
-    AiClassify,
     AiFilter,
     AiJoin,
     Barrier,
@@ -57,134 +55,35 @@ def register_fever(session):
             table, id_col="id"))
 
 
-class FixedFeverAnswers:
-    # the label a classification gives claims c0, c1, c2
-    labels = ("science", "sport", "science")
+# the label a classification gives claims c0, c1, c2
+FEVER_LABELS = ("science", "sport", "science")
+# the stance a classification gives each (claim, evidence) pair
+FEVER_STANCES = {(0, 0): "supports", (1, 1): "refutes", (2, 0): "supports"}
 
-    def __init__(self, state, capacity, empty):
-        self.state = state
-        self.capacity = capacity
-        self.empty = empty
 
-    def _answers(self, document_ids):
-        answers = {local: [document < 2 and not self.empty]
-                   for local, document in enumerate(document_ids)}
-        live = [document for local, document in enumerate(document_ids)
-                if all(answers[local])]
-        return answers, live
+def _fever_label(spec, ids):
+    if len(ids) == 1:
+        return FEVER_LABELS[ids[0]]
+    # the stances are keyed (claim, evidence) whichever the anchor
+    return FEVER_STANCES.get(ids if spec.anchor.startswith("c") else ids[::-1])
 
-    def _label_table(self, node, ids):
-        # a document whose answer names no label has no row, as the
-        # classify node drops it
-        labeled = [int(document) for document in ids
-                   if self.labels[int(document)] is not None]
-        rows = np.asarray([[document] for document in labeled],
-                          dtype=np.int32).reshape(-1, 1)
-        table = _score_table(
-            rows, node.spec.aliases, node.spec.name,
-            [self.labels[document] for document in labeled], pa.string())
-        return labeled, table
 
-    # the stance a classification gives each (claim, evidence) pair
-    stances = {(0, 0): "supports", (1, 1): "refutes", (2, 0): "supports"}
+def _fever_join(node, assignment):
+    claim = next(value for alias, value in assignment.items() if alias.startswith("c"))
+    evidence = next(value for alias, value in assignment.items()
+                    if alias.startswith("e"))
+    passing = ({(1, 0), (2, 0), (0, 2)} if node.written_position == 1
+               else {(0, 0), (1, 1), (2, 0), (1, 2)})
+    return (claim, evidence) in passing
 
-    def execute_predicates(self, nodes, inputs):
-        results = {}
-        live = set(range(len(inputs["anchor_ids"])))
-        partners = inputs.get("anchor_partners")
-        for index, node in enumerate(nodes):
-            value = self.execute(node, {
-                **inputs, "_live": live,
-                "anchor_partners": (None if partners is None else
-                                    lambda key, stage, j=index: partners(key, j))})
-            results[node.node_id] = value
-            rows = value.metrics.extension["answers"][0]
-            live = {local for local, row in rows.items() if any(row)}
-        return results
 
-    def execute(self, node, inputs):
-        if isinstance(node, AiClassify) and node.spec.partner is not None:
-            # the join's true pairs, labeled from the table above; a
-            # pair without a stance gets no row
-            (answers,) = inputs["score_inputs"].values()
-            pairs = []
-            for local, row in answers["rows"].items():
-                anchor = answers["anchor_index"][local]
-                members = (answers["anchor_partners"] or {}).get(local)
-                for position, bit in enumerate(row):
-                    if not bit:
-                        continue
-                    member = position if members is None else members[position]
-                    (partner,) = answers["partner_index"][member]
-                    pairs.append((int(anchor), int(partner)))
-            # the stances are keyed (claim, evidence) whichever the anchor
-            claim_first = node.spec.anchor.startswith("c")
-            labeled = [pair for pair in pairs
-                       if (pair if claim_first else pair[::-1]) in self.stances]
-            rows = np.asarray(labeled, dtype=np.int32).reshape(-1, 2)
-            table = _score_table(
-                rows, node.spec.aliases, node.spec.name,
-                [self.stances[pair if claim_first else pair[::-1]]
-                 for pair in labeled], pa.string())
-            return NodeResult({"rows": table}, NodeMetrics(
-                input_rows=len(pairs), output_rows=len(labeled)))
-        if isinstance(node, AiClassify):
-            (ids,) = inputs["score_inputs"].values()
-            (alias,) = node.spec.aliases
-            labeled, table = self._label_table(node, ids)
-            return NodeResult(
-                {"rows": table, f"ids:{alias}": labeled},
-                NodeMetrics(input_rows=len(ids), output_rows=len(ids)))
-        if isinstance(node, AiFilter):
-            document_ids = list(inputs["document_ids"])
-            answers, live = self._answers(document_ids)
-            if node.keep_kv:
-                for document in live[:self.capacity]:
-                    self.state["gpu"].arena.retain((node.alias, document), 16)
-            return NodeResult({
-                f"ids:{node.alias}": live,
-                f"filter_answers:{node.alias}": {
-                    document_ids[local]: row for local, row in answers.items()
-                },
-            })
-
-        outputs = {}
-        anchor_ids = inputs["anchor_ids"]
-        live = set(inputs.get("_live", range(len(anchor_ids))))
-        lists_for = inputs.get("anchor_partners")
-        aliases = (node.anchor, *node.partners)
-        claim = next(alias for alias in aliases if alias.startswith("c"))
-        evidence = next(alias for alias in aliases if alias.startswith("e"))
-        passing = ({(1, 0), (2, 0), (0, 2)} if node.written_pos == 1
-                   else {(0, 0), (1, 1), (2, 0), (1, 2)})
-        partners = inputs["partner_indices"][node.written_pos]
-        # a stage over pairs asks each anchor about its own members
-        members = {} if lists_for and node.pairs_from else None
-        rows = {}
-        for local in sorted(live):
-            mine = (range(len(partners)) if members is None
-                    else lists_for(anchor_ids[local], 0))
-            if members is not None:
-                members[local] = list(mine)
-            rows[local] = []
-            for member in mine:
-                assignment = dict(zip(
-                    aliases, (anchor_ids[local], *partners[member])))
-                rows[local].append((assignment[claim], assignment[evidence])
-                                   in passing)
-        live = {local for local, row in rows.items() if any(row)}
-        outputs[f"join_answers:{node.written_pos}"] = {
-            "rows": rows, "anchor_index": anchor_ids,
-            "partner_index": partners, "anchor_partners": members,
-            "anchor": node.anchor,
-            "partners": list(node.partners), "semantics": node.semantics,
-            "selectivity": node.selectivity, "written_pos": node.written_pos,
-        }
-        outputs[f"ids:{node.anchor}"] = [anchor_ids[local] for local in sorted(live)]
-        return NodeResult(outputs, NodeMetrics(
-            gpu_s=0.02, peak_gpu_bytes=128,
-            extension={"answers": [rows], "pack_s": 0.125,
-                       "borrowed_prefix_tokens": 16}))
+def fever_oracle(capacity, empty):
+    """The oracle answering FEVER: c0 and c1 pass every filter unless empty."""
+    return Oracle(
+        filters=lambda alias, document, position: document < 2 and not empty,
+        joins=_fever_join, labels=_fever_label, retain=capacity,
+        join_metrics=NodeMetrics(gpu_s=0.02, peak_gpu_bytes=128, extension={
+            "pack_s": 0.125, "borrowed_prefix_tokens": 16}))
 
 
 def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
@@ -192,43 +91,40 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
     """Return a physical executor that runs the FEVER fakes on one or two GPUs."""
     from quail.backends.quail import worker
     from quail.backends.quail.distributed import execute_distributed_graph
-    from quail.execution.runner import ExecutionContext
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
+    from quail.specs import H100_SXM
 
-    def child(docs):
-        state = graph_state(None, docs)
-        model = FixedFeverAnswers(state, capacity=1, empty=False)
-        state["gpu"].execution = model
+    def child(documents):
+        model = fever_oracle(capacity=1, empty=False)
+        state = graph_state(model, documents)
+        model.arena = state["gpu"].arena
         return worker.ChildState(
-            gpu_index=0, gpu=state["gpu"], registry=session.registry,
-            runtime_context=ExecutionContext(
-                runtimes=session.registry.runtimes, model_execution=model))
+            gpu_index=0, gpu=state["gpu"], registry=session.registry)
 
     def execute(request):
         graph = decode_graph(request.plan["graph"], session.registry.codecs)
-        docs = {node.alias: request.inputs[node.input_id].documents
+        documents = {node.alias: request.inputs[node.input_id].documents
                 for node in graph.nodes if isinstance(node, Scan)}
         extra = check(request, graph) if check else {}
         if gpus == 1:
-            state = graph_state(None, docs)
-            state["gpu"].execution = FixedFeverAnswers(state, capacity, empty)
+            model = fever_oracle(capacity, empty)
+            state = graph_state(model, documents)
+            model.arena = state["gpu"].arena
             state.update(extra, functions=session.registry.functions)
             report = execute_single_graph(state, request.plan["settings"], graph)
             assert not state["gpu"].arena.accounting.owned
             return PhysicalResponse(report.pop("_outputs"), report)
-        children = [child(docs), child(docs)]
+        children = [child(documents), child(documents)]
 
         def round_fn(kind, subs):
-            function = (worker._child_filters if kind == "filters"
-                        else worker._child_joins)
-            return [function(state, sub) for state, sub in zip(children, subs)]
+            assert kind == "execute"
+            return [worker._child_execute(state, sub)
+                    for state, sub in zip(children, subs)]
 
-        monkeypatch.setattr(worker, "_child_boot", lambda state, sub: None)
         report = execute_distributed_graph(
             {**request.plan["settings"], "model": "qwen3-4b-fp8",
-             "docs": docs, **extra, "physical_plan": request.plan},
-            graph, 2, round_fn, QWEN3_4B_FP8, H100_SXM,
-            session.registry.runtimes, session.registry,
+             "documents": documents, **extra, "physical_plan": request.plan},
+            graph, 2, round_fn, H100_SXM, session.registry.runtimes,
+            session.registry,
         )
         assert all(not child.gpu.arena.accounting.owned for child in children)
         for node in graph.nodes:
@@ -322,7 +218,7 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
             "Scan", "AiFilter", "AiClassify", "Project"]
         classify = plan.nodes[2]
         assert classify.inputs[0].source == PortRef(plan.nodes[1].node_id,
-                                                    "ids:c")
+                                                    "rows:c")
         execute = fever_executor(session, monkeypatch, 1, capacity=10)
         rows = execute_query(query, physical_executor=execute).collect()
         assert rows.to_pylist() == [{"c.id": "c0", "topic": "science"},
@@ -340,30 +236,32 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
                      quail.col("e.text")), selectivity=0.5)
                  .select("c.id", "e.id", "topic"))
         plan = query.plan()
+        # the label test rejects half the claims and the filter a tenth,
+        # so the classification goes first; the classification, the
+        # filter on its label, and the sequence run as one pipeline,
+        # and the join joins it only when it anchors on the claims
         assert [type(node).__name__ for node in plan.nodes] == [
-            "Scan", "Scan", "AiFilter", "AiClassify", "Filter", "AiJoin",
+            "Scan", "Scan", "AiClassify", "Filter", "AiFilter", "AiJoin",
             "Project"]
-        # the sequence, the classification, and the filter on its label run as
-        # one pipeline; the join joins it only when it anchors on the
-        # claims
-        test, join, project = plan.nodes[4], plan.nodes[5], plan.nodes[6]
+        test, ask, join, project = plan.nodes[3:7]
         members = tuple(
-            member.node_id for member in build_pipelines(plan.graph)["ai_filter:c"])
-        assert members == (("ai_filter:c", "ai-classify:0", test.node_id)
+            member.node_id for member in build_pipelines(plan.graph)["ai-classify:0"])
+        assert members == (("ai-classify:0", test.node_id, ask.node_id)
                            + ((join.node_id,) if join.anchor == "c" else ()))
         (claims_port,) = [port.source for port in join.inputs
-                          if port.source.port == "ids:c"]
-        assert claims_port == PortRef(test.node_id, "ids:c")
+                          if port.source.port == "rows:c"]
+        assert claims_port == PortRef(ask.node_id, "rows:c")
         assert [port.source.port for port in project.inputs] == [
-            "join_answers:0", "rows"]
+            "join_answers:0", "rows:c"]
         codecs = session.registry.codecs
         assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
         execute = fever_executor(session, monkeypatch, 1, capacity=10)
         result = execute_query(query, physical_executor=execute)
         assert result.collect().to_pylist() == [
             {"c.id": "c0", "e.id": "e0", "topic": "science"}]
+        # the classification ran first, over every claim
         labels = result.answer_tables["classifies"]["topic"]
-        assert labels.column("topic").to_pylist() == ["science", "sport"]
+        assert labels.column("topic").to_pylist() == ["science", "sport", "science"]
 
 
 def test_a_classification_of_joined_rows_follows_its_join(monkeypatch):
@@ -455,7 +353,9 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
             plan = query.plan()
             stage = plan.graph.nodes_by_type(AiJoin.type_name)[0]
             hash_join = plan.graph.node("hash_join:c-e")
-            assert hash_join.on == (("evidence_wiki_url", "id"),)
+            assert [(column_name(left), column_name(right))
+                    for left, right in hash_join.on] == [
+                        ("c.evidence_wiki_url", "e.id")]
             assert hash_join.pair_fraction == 3 / 9
             assert stage.pairs_from == "hash_join:c-e"
             result = execute_query(

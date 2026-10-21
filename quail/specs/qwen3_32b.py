@@ -1,5 +1,5 @@
 from .base import ModelSpec
-from .qwen3 import EXTRACT_TURN_PREFIX, EXTRACT_TURN_SUFFIX
+from .prompts import QWEN3_PROMPT_FORMAT, QWEN3_TURN_PREFIX, QWEN3_TURN_SUFFIX
 
 QWEN3_32B_FP8 = ModelSpec(
     name="qwen3-32b-fp8",
@@ -7,8 +7,8 @@ QWEN3_32B_FP8 = ModelSpec(
     #                         (Qwen3-32B non-embedding param count)
     layers=64,
     hidden=5120,
-    n_q=64,
-    n_kv=8,
+    num_q_heads=64,
+    num_kv_heads=8,
     d_head=128,
     ffn_width=51200,       # gate_up output: 2 x 25600 intermediate
     w_bytes=1.0,           # fp8 weights
@@ -21,6 +21,7 @@ QWEN3_32B_FP8 = ModelSpec(
     #                        for AI.CLASSIFY: about 5,900 KV tokens.
     vocab=151_936,
     tied_head=False,       # separate lm_head, kept for AI.CLASSIFY
-    extract_turn_prefix=EXTRACT_TURN_PREFIX,
-    extract_turn_suffix=EXTRACT_TURN_SUFFIX,
+    turn_prefix=QWEN3_TURN_PREFIX,
+    turn_suffix=QWEN3_TURN_SUFFIX,
+    prompt_format=QWEN3_PROMPT_FORMAT,
 )

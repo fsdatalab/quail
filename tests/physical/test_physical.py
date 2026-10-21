@@ -17,7 +17,7 @@ from quail.catalog import DocumentProvider
 from quail.execution.metrics import NodeResult
 from quail.execution.runtimes import BarrierRuntime
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
-from quail.logical import LogicalPlan
+from quail.logical import ColumnRef, LogicalPlan
 from quail.physical import (
     Barrier,
     ExecutionLocation,
@@ -42,7 +42,7 @@ def test_barrier_preserves_survivor_order_and_duplicates():
     from quail.physical.base import input_ports
 
     node = Barrier(node_id="barrier", aliases=("a", "b"), inputs=input_ports((
-        PortRef("scan:a", "ids:a"), PortRef("scan:b", "ids:b"),
+        PortRef("scan:a", "rows:a"), PortRef("scan:b", "rows:b"),
         PortRef("join", "join_answers:0"))))
     for arrow in (False, True):
         for keep in (False, True):
@@ -52,8 +52,68 @@ def test_barrier_preserves_survivor_order_and_duplicates():
             inputs["input:2"] = pa.table({"a": [1, 3, 2, 9], "b": [7, 8, 7, 8],
                                           "answer": [keep, keep, False, keep]})
             outputs = BarrierRuntime().execute(node, inputs, None).outputs
-            values = [outputs[f"ids:{alias}"].to_pylist() for alias in node.aliases]
+            values = [outputs[f"rows:{alias}"].ids[alias].to_pylist()
+                      for alias in node.aliases]
             assert values == ([[3, 1, 3], [8, 7]] if keep else [[], []])
+
+
+@pytest.mark.parametrize("shape", ["chain", "cycle", "disconnected"])
+def test_barrier_survivors_are_the_ids_of_a_complete_join(shape):
+    """A survivor needs a partner in every join at once, whatever the relation order."""
+    import itertools
+
+    from quail.physical.base import input_ports
+
+    if shape == "disconnected":
+        edges = [("a", "b", [(1, 0)]), ("c", "d", [(0, 1)])]
+        expected = {"a": [1], "b": [0], "c": [0], "d": [1]}
+    else:
+        edges = [("a", "b", [(0, 0), (1, 1)]),
+                 ("b", "c", [(1, 0)] if shape == "chain" else [(0, 0), (1, 1)])]
+        if shape == "cycle":
+            # every id has a partner in each join, but no triangle closes
+            edges.append(("a", "c", [(0, 1), (1, 0)]))
+        expected = ({"a": [1], "b": [1], "c": [0], "d": [0, 1]} if shape == "chain"
+                    else {"a": [], "b": [], "c": [], "d": [0, 1]})
+    for ordered in itertools.permutations(edges):
+        ports = [PortRef(f"scan:{alias}", f"rows:{alias}") for alias in expected]
+        values = [pa.array([0, 1], pa.int32()) for _ in ports]
+        for index, (left, right, pairs) in enumerate(ordered):
+            ports.append(PortRef(f"join:{index}", f"join_answers:{index}"))
+            values.append(pa.table({
+                left: pa.array([pair[0] for pair in pairs], pa.int32()),
+                right: pa.array([pair[1] for pair in pairs], pa.int32()),
+                "answer": [True] * len(pairs)}))
+        node = Barrier(node_id="barrier", aliases=tuple(expected),
+                       inputs=input_ports(tuple(ports)))
+        outputs = BarrierRuntime().execute(
+            node, {f"input:{i}": value for i, value in enumerate(values)}, None).outputs
+        assert {alias: outputs[f"rows:{alias}"].ids[alias].to_pylist()
+                for alias in expected} == expected, ordered
+
+
+@pytest.mark.parametrize("aliases", [("key0", "key1"), ("left", "right"),
+                                     ("right", "left")])
+def test_hash_join_keeps_ids_apart_from_a_key_column_named_like_its_alias(aliases):
+    from types import SimpleNamespace
+
+    from quail.catalog.pairs import columns_key
+    from quail.execution.runtimes.dataflow import HashJoinRuntime
+    from quail.physical import HashJoin
+    from quail.physical.base import input_ports
+
+    left, right = aliases
+    node = HashJoin(
+        node_id="join", left=left, right=right, written_position=0,
+        inputs=input_ports((PortRef("l", f"rows:{left}"),
+                            PortRef("r", f"rows:{right}"))),
+        on=((ColumnRef(left, left, left), ColumnRef(right, right, right)),))
+    context = SimpleNamespace(sources={
+        columns_key(left): pa.table({left: [30, 10, 20]}),
+        columns_key(right): pa.table({right: [20, 40, 10]})})
+    result = HashJoinRuntime().execute(
+        node, {"input:0": pa.array([1, 2]), "input:1": pa.array([0, 2])}, context)
+    assert result.outputs["pairs:0"].to_pydict() == {left: [1, 2], right: [2, 0]}
 
 
 @dataclass(frozen=True)
@@ -67,38 +127,29 @@ class FirstDocuments(PhysicalNode):
 
     @property
     def outputs(self):
-        return (OutputPort(f"ids:{self.alias}", ValueType.DOCUMENT_IDS,
+        return (OutputPort(f"rows:{self.alias}", ValueType.ROWS,
                            schema=(self.alias,)),)
-
-    def attributes(self):
-        return {"alias": self.alias, "count": self.count}
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(node_id=node_id, inputs=inputs, alias=attributes["alias"],
-                   count=int(attributes["count"]))
-
 
 class FirstDocumentsRuntime:
     def execute(self, node, inputs, context):
         documents = next(iter(inputs.values()))
-        return NodeResult({f"ids:{node.alias}": documents[:node.count]})
+        return NodeResult({f"rows:{node.alias}": documents[:node.count]})
 
 
 def local_plan(context, *, count, estimate, source):
     def ids_from(node_id):
-        return (InputPort("input:0", ValueType.DOCUMENT_IDS,
-                          PortRef(node_id, "ids:d"), schema=("d",)),)
+        return (InputPort("input:0", ValueType.ROWS,
+                          PortRef(node_id, "rows:d"), schema=("d",)),)
 
     scan = Scan(node_id="input:d", alias="d", input_id="d",
-                n_docs=len(context.document_tokens["d"]))
+                num_documents=len(context.document_tokens["d"]))
     filtered = FirstDocuments(
         node_id="filter:d", inputs=ids_from("input:d"), alias="d", count=count)
     project = Project(
         node_id="project", inputs=ids_from("filter:d"), columns=("d.id",))
     plan = PhysicalPlan(
         model=context.model.name, device=context.device.name,
-        workers=context.gpu_count, backend="local_filter",
+        gpus=context.gpus, backend="local_filter",
         estimated_seconds=estimate, nodes=(scan, filtered, project),
         settings={"planner_source": source})
     return PhysicalCandidate(plan.graph, plan, estimate)
@@ -110,7 +161,7 @@ class LocalFilterBackend:
     def __init__(self):
         self.called = False
 
-    def supports(self, model, device, gpu_count):
+    def supports(self, model, device, gpus):
         return SupportResult.accept()
 
     def plan(self, region, context):
@@ -149,7 +200,7 @@ class TwoCandidatesBackend:
         self.estimates = (written, alternative)
         self.alternative = None
 
-    def supports(self, model, device, gpu_count):
+    def supports(self, model, device, gpus):
         return SupportResult.accept()
 
     def plan(self, region, context):
@@ -187,11 +238,11 @@ def test_plan_query_keeps_the_cheapest_candidate_and_its_logical_plan(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",
                      device="h100-sxm"),
         tokenizer=str.split, registry=registry)
-    session.register("docs", DocumentProvider.from_table(
+    session.register("documents", DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
         id_col="id", identity="two-candidate-docs"))
     query = session.sql(
-        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
+        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
     plan = query.plan()
     assert plan.settings["planner_source"] == chosen
     written, alternative = rule.seen
@@ -216,11 +267,11 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
         tokenizer=str.split,
         registry=registry,
     )
-    session.register("docs", DocumentProvider.from_table(
+    session.register("documents", DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
         id_col="id", identity="local-filter-docs"))
     query = session.sql(
-        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
+        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
     plan = query.plan()
     envelope = plan.to_envelope(registry.codecs)
 
@@ -233,9 +284,9 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
 
     registry = built_in_registry()
-    scan = Scan(node_id="input:d", alias="d", input_id="d", n_docs=1,
+    scan = Scan(node_id="input:d", alias="d", input_id="d", num_documents=1,
                 shard_ranges=((0, 1),), shard_token_loads=(1,))
-    plan = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
+    plan = PhysicalGraph((scan,), PortRef("input:d", "rows:d"))
     encoded = encode_graph(plan, registry.codecs)
     missing = copy.deepcopy(encoded)
     del missing["nodes"][0]["attributes"]["shard_ranges"]
@@ -261,11 +312,11 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     module.register_quail_extension = register
     monkeypatch.setitem(sys.modules, module.__name__, module)
     registry = built_in_registry()
-    scan = Scan(node_id="input:d", alias="d", input_id="d", n_docs=2)
-    graph = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
+    scan = Scan(node_id="input:d", alias="d", input_id="d", num_documents=2)
+    graph = PhysicalGraph((scan,), PortRef("input:d", "rows:d"))
     request = PhysicalRequest(
         plan_envelope(backend=ExampleBackend.name, model="qwen3-4b-fp8",
-                      device="h100-sxm", workers=1, graph=graph,
+                      device="h100-sxm", gpus=1, graph=graph,
                       codecs=registry.codecs),
         {"d": document_input(pa.array([[1], [2]]))},
     )
@@ -279,17 +330,17 @@ def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
     from quail.explain import physical_tree
     from quail.physical.base import input_ports
 
-    source = Scan(node_id="input:d", alias="d", n_docs=100)
+    source = Scan(node_id="input:d", alias="d", num_documents=100)
     first = FirstDocuments(
         node_id="first", alias="d", count=5,
-        inputs=input_ports((PortRef(source.node_id, "ids:d"),)))
+        inputs=input_ports((PortRef(source.node_id, "rows:d"),)))
     second = FirstDocuments(
         node_id="second", alias="d", count=10,
-        inputs=input_ports((PortRef(source.node_id, "ids:d"),)))
+        inputs=input_ports((PortRef(source.node_id, "rows:d"),)))
     project = Project(
         node_id="project", columns=("d.id",),
-        inputs=input_ports((PortRef(first.node_id, "ids:d"),
-                            PortRef(second.node_id, "ids:d"))))
+        inputs=input_ports((PortRef(first.node_id, "rows:d"),
+                            PortRef(second.node_id, "rows:d"))))
     graph = PhysicalGraph((source, first, second, project),
                           PortRef(project.node_id, "rows"))
     text = physical_tree(graph)
@@ -300,10 +351,10 @@ def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
     assert "count=5" in text and "count=10" in text
     assert "test.first_documents" in text
     assert "input:d" not in text
-    assert "input:d[ids:d]" in physical_tree(graph, verbose=True)
+    assert "input:d[rows:d]" in physical_tree(graph, verbose=True)
 
-    node = Scan(node_id="input:d", alias="d", n_docs=100)
-    graph = PhysicalGraph((node,), PortRef(node.node_id, "ids:d"))
+    node = Scan(node_id="input:d", alias="d", num_documents=100)
+    graph = PhysicalGraph((node,), PortRef(node.node_id, "rows:d"))
     assert "metrics unavailable" in physical_tree(graph, metrics={})
     measured = {node.node_id: NodeMetrics(output_rows=42, wall_s=1.25,
                                          fresh_tokens=200)}

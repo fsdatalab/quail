@@ -66,7 +66,9 @@ def test_expert_fusions_preserve_quantization(rows):
 
     from quail.backends.quail.executor.attention import Engine
 
-    engine = Engine(None, n_q=16, n_kv=8, head_dim=256, rotary=None, fp8=False)
+    engine = Engine(
+        None, num_q_heads=16, num_kv_heads=8, head_dim=256, rotary=None, fp8=False
+    )
     torch.manual_seed(42)
     x = torch.randn(rows, 2816, device="cuda", dtype=torch.bfloat16)
     weights = torch.randn(2, 2816, device="cuda", dtype=torch.bfloat16)
@@ -194,13 +196,13 @@ def quail(prompts, stock_layers):
     spec = MODELS[MODEL]
     model = load_model(spec.hf_name, max_batched_tokens=8192,
                        moe_backend=spec.moe_backend)
-    arena = KVArena(n_layers=spec.layers, n_pages=2048,
-                    page_tokens=PAGE_TOKENS, n_kv=spec.n_kv,
+    arena = KVArena(num_layers=spec.layers, num_pages=2048,
+                    page_tokens=PAGE_TOKENS, num_kv_heads=spec.num_kv_heads,
                     d_head=spec.d_head, dtype=torch.bfloat16,
                     layer_kv=spec.kv_shapes,
                     sliding_layers=spec.sliding_layer_set,
                     sliding_window=spec.sliding_window,
-                    n_sliding_pages=2048)
+                    num_sliding_pages=2048)
     pipeline = build_pipeline(spec, model, arena)
     groups = []
     for index, ids in enumerate(prompts):

@@ -4,7 +4,7 @@ import pytest
 from helpers.fakes import cpu_staging
 from helpers.kv_checker import Run, Setup, answer, chain, passthrough
 
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stages import Stage, StageRequests, run_stages
 
 DOCS = [[1, 2, 3, 4], [5, 6, 7], [8, 9, 10, 11, 12], [13, 14]]
 CUE = [40]
@@ -37,16 +37,16 @@ def test_own_suffixes_follow_each_documents_answers(path, monkeypatch):
     # every suffix a document can be fed, and its answer, planted by hash
     answers = {}
     want = {}
-    for d, doc in enumerate(DOCS):
-        bit = _plant(answers, doc + CUE)
+    for d, document in enumerate(DOCS):
+        bit = _plant(answers, document + CUE)
         if d == 1:
             bits = []
         else:
-            bits = [_plant(answers, doc + CUE + suffix) for suffix in _second(bit)]
+            bits = [_plant(answers, document + CUE + suffix) for suffix in _second(bit)]
         (third,) = _third(bits)
-        bit2 = _plant(answers, doc + CUE + third)
+        bit2 = _plant(answers, document + CUE + third)
         (fourth,) = _fourth(bit2)
-        bit3 = _plant(answers, doc + CUE + third + fourth)
+        bit3 = _plant(answers, document + CUE + third + fourth)
         want[d] = (bit, bits, bit2, bit3)
     setup = Setup(path=path)
     run = Run(setup, answers)
@@ -61,17 +61,17 @@ def test_own_suffixes_follow_each_documents_answers(path, monkeypatch):
 
     def second(key):
         d = key[1]
-        return Stage.SKIP if d == 1 else _second(seen[0][d][0])
+        return Stage.SKIP if d == 1 else StageRequests(_second(seen[0][d][0]))
 
     stages = [
         Stage(suffixes=[CUE], readout=passthrough(), decide=keep(0),
               single=True, append=True, label="cue"),
         Stage(suffixes=second, suffix_tokens=2, readout=passthrough(),
               decide=keep(1), label="second"),
-        Stage(suffixes=lambda key: _third(seen[1].get(key[1], [])),
+        Stage(suffixes=lambda key: StageRequests(_third(seen[1].get(key[1], []))),
               suffix_tokens=1, readout=passthrough(), decide=keep(2),
               single=True, append=True, label="third"),
-        Stage(suffixes=lambda key: _fourth(seen[2][key[1]][0]),
+        Stage(suffixes=lambda key: StageRequests(_fourth(seen[2][key[1]][0])),
               suffix_tokens=1, readout=passthrough(), decide=keep(3),
               single=True, append=True, label="fourth"),
     ]
@@ -89,21 +89,21 @@ def test_own_suffixes_follow_each_documents_answers(path, monkeypatch):
     # each document packs its prefix and cue once, its two second-stage
     # suffixes (3 tokens, none for the skipped document), and one token
     # at each of the two appended stages
-    assert tokens == sum(len(doc) for doc in DOCS) + 4 + 3 * 3 + 4 + 4
+    assert tokens == sum(len(document) for document in DOCS) + 4 + 3 * 3 + 4 + 4
     assert not run.arena.accounting.owned
 
 
 def test_own_suffix_over_its_most_tokens_is_refused(monkeypatch):
     cpu_staging(monkeypatch)
     answers = {}
-    for doc in DOCS:
-        _plant(answers, doc + CUE)
+    for document in DOCS:
+        _plant(answers, document + CUE)
     setup = Setup(path="unified")
     run = Run(setup, answers)
     stages = [
         Stage(suffixes=[CUE], readout=passthrough(), single=True, append=True,
               decide=lambda a, row: True),
-        Stage(suffixes=lambda key: [[50, 51, 52]], suffix_tokens=2,
+        Stage(suffixes=lambda key: StageRequests([[50, 51, 52]]), suffix_tokens=2,
               readout=passthrough(), label="long"),
     ]
     with pytest.raises(ValueError, match="long: a document's suffix has 3"):
