@@ -59,7 +59,7 @@ def flash_attention_version(capability: tuple[int, int]) -> int:
 
 
 def deep_gemm_supported(capability: tuple[int, int]) -> bool:
-    """Whether vLLM 0.26.0 enables DeepGEMM on this CUDA capability.
+    """Whether vLLM 0.29.0 enables DeepGEMM on this CUDA capability.
 
     Matches CudaPlatform.support_deep_gemm: 9.0, 10.x, and 12.x.
     """

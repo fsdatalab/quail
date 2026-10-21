@@ -9,14 +9,14 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "sqlglot==30.17.0",
     "transformers==5.15.0",
-    "huggingface-hub==1.27.0",
+    "huggingface-hub==1.28.0",
     "pyarrow==25.0.1",
     "numpy==2.3.5; sys_platform != 'emscripten' and sys_platform != 'win32'",
     "numpy==2.5.2; sys_platform == 'emscripten' or sys_platform == 'win32'",
     "gigatoken==0.10.0",
     "datasets==5.0.1",
     # same version as the Modal image; vLLM has Linux wheels only
-    "vllm==0.26.0; sys_platform == 'linux'",
+    "vllm==0.29.0; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -81,8 +81,6 @@ exclude = [
 # uv's Python builds include the C headers Triton needs at startup
 python-preference = "only-managed"
 required-version = "==0.12.13"
-# vLLM 0.26.0 requires cutlass-dsl==4.6.0, which fails FA4 split-KV.
-override-dependencies = ["nvidia-cutlass-dsl[cu13]==4.6.2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

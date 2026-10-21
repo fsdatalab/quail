@@ -256,7 +256,7 @@ class VLLMEngine:
     label = "vLLM"
     # prompts are rendered as text and tokenized by vLLM
     reads_document_text = True
-    runtime_package = "vllm==0.26.0"
+    runtime_package = "vllm==0.29.0"
     # a request can decode an answer as text
     scores_labels = True
     # a request returns the logprobs a canvas model's answer is read from
