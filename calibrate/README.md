@@ -49,6 +49,7 @@ without a validated boost clock fail the run. Raw logs are saved on failure.
 Download the selected run directories, then pass them to the converter:
 
 ```bash
+mkdir -p ./calibration
 modal volume get quail-results calibrate/<device>/gemm/<stamp>/ ./calibration/
 uv run python -m calibrate.to_spec ./calibration/
 ```

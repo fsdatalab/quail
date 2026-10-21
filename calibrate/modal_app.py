@@ -1,11 +1,11 @@
 """Measure GEMM MAMF on Modal and save results to quail-results."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import modal
 
 from calibrate import gemm as gemm_run
-from calibrate import utc_stamp
 from calibrate.targets import DTYPES, TARGETS
 
 NGC_IMAGE = "nvcr.io/nvidia/pytorch:26.04-py3"
@@ -44,7 +44,7 @@ def gemm(device: str = "h100-sxm", precision: str = "fp8,bf16", gpus: int = 1,
         raise ValueError("choose supported devices, precisions, and a positive gpus")
     if not prediction.strip():
         raise ValueError("state --prediction before measuring")
-    stamp = utc_stamp()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     print(f"prediction: {prediction}", flush=True)
     calls = []
     for name in dict.fromkeys(devices):
