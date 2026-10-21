@@ -2,13 +2,6 @@
 
 import re
 
-NONE_ANSWER = "none"
-
-
-def is_none_answer(phrase: str) -> bool:
-    """Return whether a phrase is the word none alone, in any case."""
-    return phrase.strip().casefold().rstrip(".") == NONE_ANSWER
-
 
 def read_phrase(decoded: str) -> str | None:
     """Return the words the model wrote after the phrase cue.
@@ -19,12 +12,9 @@ def read_phrase(decoded: str) -> str | None:
         decoded: The text the model wrote after the phrase cue.
 
     Returns:
-        The answer, or None for an empty answer or the word "none".
+        The answer, or None for an empty answer.
     """
-    phrase = decoded.strip()
-    if not phrase or is_none_answer(phrase):
-        return None
-    return phrase
+    return decoded.strip() or None
 
 
 def locate_span(document: str, phrase: str) -> tuple[int, int] | None:

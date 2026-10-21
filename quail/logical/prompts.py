@@ -509,13 +509,14 @@ def bind_score_prompt(template: str, args: tuple,
 
 # AI.EXTRACT: the document, the question, the instruction, and the
 # answer template. The prompt ends at the phrase field's name; the
-# model writes the phrase and ends its turn. The phrase has no closing
-# mark of its own, because a document may contain any text mark.
+# model writes the phrase and ends its turn, at once for no answer. The
+# phrase has no closing mark of its own, because a document may contain
+# any text mark.
 EXTRACT_QUESTION_LABEL = "\n\nQuestion: "
 EXTRACT_INSTRUCTION = (
     "Copy the words that answer the question from the document. Copy them "
     "exactly. Use the fewest words that answer it. If the document does not "
-    "answer the question, write none.")
+    "answer the question, leave the phrase empty.")
 EXTRACT_FORMAT = "Answer in this format:"
 EXTRACT_PHRASE_FORMAT = "Phrase: <copied words>"
 EXTRACT_PHRASE_CUE = "Phrase:"
