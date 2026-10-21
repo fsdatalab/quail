@@ -292,7 +292,7 @@ def test_extract_errors_and_refusals(session):
 def test_span_helpers_read_locate_and_widen_an_answer():
     assert read_phrase(' the "Premises" ') == 'the "Premises"'
     assert read_phrase("March 3, 2027") == "March 3, 2027"
-    for empty in ("", " ", "none", "None.", " none"):
+    for empty in ("", " ", "\n"):
         assert read_phrase(empty) is None
     assert locate_span(LEASE, "March 3, 2027") == (14, 27)
     # case and runs of whitespace are forgiven; the first occurrence wins
@@ -347,7 +347,8 @@ class _PhraseClient(request_tests._Client):
             elif "absent" in text:
                 answer, tokens = "a phrase the document lacks", [1, 2, 3]
             else:
-                answer, tokens = "none", [1]
+                # an empty phrase: the model ends its turn at once
+                answer, tokens = "", [1]
             outputs.append(SimpleNamespace(
                 prompt_token_ids=ids, num_cached_tokens=0,
                 outputs=[SimpleNamespace(text=answer, token_ids=tokens)]))

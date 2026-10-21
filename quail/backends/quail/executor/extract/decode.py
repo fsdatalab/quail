@@ -23,7 +23,6 @@ from quail.backends.quail.executor.extract.candidates import (
 )
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 from quail.cost.draft_policy import DraftPolicy
-from quail.execution.spans import is_none_answer
 from quail.physical import ExtractSpec
 
 
@@ -219,9 +218,8 @@ class Decoder:
         writing would leave the document: a token it likes better than
         every continuation and the stop, and that continues no
         position, ends the answer, and at the cue it answers none, as
-        does the model ending its turn at once. The model's word none
-        is no special case: it leaves a document without the word,
-        and is copied from one with it. At the cue, the token is the
+        does the model ending its turn at once, the empty phrase the
+        prompt asks for when there is no answer. At the cue, the token is the
         likeliest first token of any position in the document;
         afterwards, the likeliest continuation of the streams the
         writing so far fits. The answer also ends when ending the turn
@@ -297,7 +295,7 @@ class Decoder:
         """Set the question's answer for the document: its span, or none.
 
         Among the streams the writing fits, the first position of the
-        document wins. A span that is the word none alone is none.
+        document wins.
         """
         answer = document.answers[q]
         answer.done = True
@@ -313,7 +311,4 @@ class Decoder:
             start += 1
         while end > start and text[end - 1].isspace():
             end -= 1
-        if is_none_answer(text[start:end]):
-            answer.answer, answer.span = None, None
-            return
         answer.answer, answer.span = text[start:end], (start, end)
