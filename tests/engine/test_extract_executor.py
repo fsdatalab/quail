@@ -163,14 +163,6 @@ def test_an_answer_copies_the_quotes_inside_its_span(monkeypatch):
     assert asked.span == (9, 38)
 
 
-def test_a_document_holding_none_can_still_answer_none(monkeypatch):
-    # the model's none starts the document's "None"; ending the turn
-    # after it is no answer, not the span "None"
-    asked = _extract_one(monkeypatch, NONE_HELD, None)
-    assert len(asked.written) == 1 and not asked.none_wins
-    assert asked.answer is None and asked.span is None
-
-
 def test_an_answer_may_begin_with_none(monkeypatch):
     asked = _extract_one(monkeypatch, NONE_HELD, "None of the parties")
     assert asked.answer == "None of the parties"
@@ -351,10 +343,9 @@ class ScriptedModel:
                 lps[index] = -0.5 if tables.vocab[index].startswith("Ġ") else -0.9
             for index in tables.variants.get("the", []):
                 lps[index] = -2.0
-        else:
-            # without an answer the model writes none
-            lps[tables.encode_ids(" none")[0]] = -0.2
-        return self._cue(lps, -6.0)
+            return self._cue(lps, -6.0)
+        # without an answer the model leaves the phrase empty
+        return self._cue({}, -0.2)
 
     def _answer_row(self, key, written):
         """The answer's next token while the writing fits the gold, then the stop."""
