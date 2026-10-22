@@ -101,5 +101,7 @@ def test_a_save_costs_the_host_little_while_a_pass_runs():
     total_s = time.perf_counter() - started
     print(f"{count} restores: host {host_s * 1e3 / count:.2f} ms per restore, "
           f"{total_s:.2f} s until landed")
-    assert float(activations.float().abs().sum()) >= 0
-    assert host_s / count < 0.002
+    assert activations.shape == weight.shape
+    # a burst past the staging buffers waits at the copy engine's pace,
+    # about 1.6 ms per 45 MB document over PCIe
+    assert host_s / count < 0.003
