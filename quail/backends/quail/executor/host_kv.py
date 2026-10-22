@@ -38,8 +38,8 @@ from quail.catalog.tokens import token_array
 
 # device staging buffers a layer group may hold while their copies to
 # the host are in flight; a 300-token document of a 4B model takes
-# about 45 MB
-MAX_STAGING = 16
+# about 45 MB, and the arena leaves a few GB beside its pools
+MAX_STAGING = 48
 # pinned slots for row indices on their way to the device, and the
 # longest prefix a slot holds; a longer one pins its own buffer
 INDEX_SLOTS = 64
@@ -259,6 +259,7 @@ class HostKV:
         self.restored_tokens = 0
         self.skipped_keys = 0
         self.host_s = 0.0
+        self.wait_s = 0.0
 
     def report(self) -> dict:
         """The store's counters for the query so far, and its size."""
@@ -271,6 +272,7 @@ class HostKV:
             "host_kv_restored_tokens": self.restored_tokens,
             "host_kv_skipped_keys": self.skipped_keys,
             "host_kv_s": round(self.host_s, 4),
+            "host_kv_wait_s": round(self.wait_s, 4),
             "host_kv_entries": len(self.entries),
             "host_kv_rows": self.num_rows,
         }
@@ -397,7 +399,7 @@ class HostKV:
         self._next_slot = (index + 1) % INDEX_SLOTS
         event = self._index_events[index]
         if event is not None:
-            event.synchronize()
+            self._wait(event)
         slot = self._index_slots[index, :len(rows)]
         slot.copy_(rows)
         with torch.cuda.stream(stream):
@@ -464,6 +466,12 @@ class HostKV:
         self._fences.append(event)
         return event
 
+    def _wait(self, event):
+        """Wait for an event on the host, counting the time."""
+        started = time.perf_counter()
+        event.synchronize()
+        self.wait_s += time.perf_counter() - started
+
     def fence(self, stream) -> None:
         """Make `stream` wait for every gather queued since the last fence.
 
@@ -490,7 +498,7 @@ class HostKV:
             entry = buffers.popleft()
         elif len(buffers) >= MAX_STAGING:
             entry = buffers.popleft()
-            entry[1].synchronize()
+            self._wait(entry[1])
         else:
             entry = [None, None]
         buffers.append(entry)
