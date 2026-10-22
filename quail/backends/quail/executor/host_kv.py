@@ -190,7 +190,10 @@ class HostKV:
                 if offset % width:
                     return None
                 bases.append(offset // width)
-        return storage.view(-1, width), np.asarray(bases, dtype=np.int64)
+        # the bases live on the device: a copy per save would wait on
+        # the stream's queued passes
+        return storage.view(-1, width), self.torch.tensor(
+            bases, dtype=self.torch.int64, device=self.device)
 
     def rebind(self) -> None:
         """Find the layers again after the arena rebuilt its pools."""
@@ -340,8 +343,7 @@ class HostKV:
                 device=self.device)
             if flat is not None:
                 view, bases = flat
-                index = (rows[:, None] + torch.as_tensor(
-                    bases, device=rows.device)[None, :]).reshape(-1)
+                index = (rows[:, None] + bases[None, :]).reshape(-1)
                 torch.index_select(view, 0, index, out=staging.view(-1, width))
             else:
                 for place, layer in enumerate(layers):
@@ -402,8 +404,7 @@ class HostKV:
             staging = self._from_host(pool[start + origin:start + tokens], compute)
             if flat is not None:
                 view, bases = flat
-                index = (rows[:, None] + torch.as_tensor(
-                    bases, device=rows.device)[None, :]).reshape(-1)
+                index = (rows[:, None] + bases[None, :]).reshape(-1)
                 view.index_copy_(0, index, staging.view(-1, width))
             else:
                 for place, layer in enumerate(layers):
