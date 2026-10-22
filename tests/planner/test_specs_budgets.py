@@ -160,7 +160,7 @@ def _hybrid_projections():
 
 
 def test_compute_knee_counts_each_projection_in_the_layers_that_have_it():
-    ridge = H100_SXM.peak_flops / H100_SXM.hbm_bw
+    ridge = H100_SXM.gemm_flops("bf16") / H100_SXM.hbm_bw
     tot_p = sum(layers * i * o for i, o, layers in _hybrid_projections()) / 32
     tot_io = sum(layers * (i + o) for i, o, layers in _hybrid_projections()) / 32
     expected = ridge * tot_p * 2.0 / (2.0 * tot_p - ridge * tot_io * 2)
@@ -172,7 +172,7 @@ def test_attention_time_covers_only_the_attention_layers():
     model, chunk, context = QWEN3_5_4B_BF16, 1024, 4000
     flops = 4.0 * chunk * context * 16 * 256
     moved = context * 32_768 / 8 + 2.0 * chunk * 16 * 256 * budgets.ACT_BYTES
-    expected = max(flops / H100_SXM.peak_flops, moved / H100_SXM.hbm_bw) * 8
+    expected = max(flops / H100_SXM.attn_flops, moved / H100_SXM.hbm_bw) * 8
     assert budgets._attention_time(
         model, H100_SXM, chunk, context) == pytest.approx(expected, rel=1e-12)
     # the same layers with all 32 storing KV take 4 times as long
@@ -232,3 +232,42 @@ def test_dense_arena_budget_has_no_checkpoint_reservation():
     assert "checkpoint_pages" not in coefficients(model, H100_SXM)
     assert budgets.arena_pages(model, H100_SXM, 10_000)[0] == (
         budgets.arena_tokens(model, H100_SXM, 10_000) // 16)
+
+
+@pytest.mark.parametrize("precision", ["fp8", "bf16"])
+def test_gemm_rates_fall_back_to_specifications_per_precision(precision):
+    device = replace(H100_SXM, mamf_fp8_flops=0, mamf_bf16_flops=0)
+    assert device.gemm_flops(precision) == device.arithmetic_bandwidth(precision)
+    calibrated = replace(device, **{f"mamf_{precision}_flops": 123e12})
+    assert calibrated.gemm_flops(precision) == 123e12
+    assert calibrated.arithmetic_bandwidth(precision) == device.arithmetic_bandwidth(
+        precision)
+
+
+def test_fp8_calibration_leaves_bf16_planning_unchanged(monkeypatch):
+    from quail.planner.rules.physical import sharing_pays
+
+    model = QWEN3_5_4B_BF16
+    before = _hybrid_filter_plan(model, H100_SXM)
+    device = replace(H100_SXM, mamf_fp8_flops=H100_SXM.peak_flops / 4)
+    monkeypatch.setitem(DEVICES, device.name, device)
+    after = _hybrid_filter_plan(model, device)
+    assert after.estimated_seconds == before.estimated_seconds
+    assert budgets.compute_knee(model, device) == budgets.compute_knee(model, H100_SXM)
+    args = dict(shared_tokens=70, total_tokens=1000, writes_pages=False)
+    assert sharing_pays(model, device, **args) == sharing_pays(model, H100_SXM, **args)
+
+
+def test_bf16_calibration_changes_gemms_but_not_attention():
+    from quail.cost.sol import speed_of_light
+    from quail.cost.work import Work
+
+    device = replace(H100_SXM, mamf_fp8_flops=0, mamf_bf16_flops=0)
+    calibrated = replace(device, mamf_bf16_flops=device.attn_flops / 2)
+    work = Work(tokens=1000, pairs=500_000, kv_written=1000, kv_read=0)
+    before = speed_of_light(work, QWEN3_5_4B_BF16, device, 1000)
+    after = speed_of_light(work, QWEN3_5_4B_BF16, calibrated, 1000)
+    assert after.component("attention") == before.component("attention")
+    for name in ("attn_proj", "mlp"):
+        assert after.component(name).compute_seconds == pytest.approx(
+            2 * before.component(name).compute_seconds)
