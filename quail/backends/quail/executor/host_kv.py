@@ -27,6 +27,10 @@ import numpy as np
 
 from quail.catalog.tokens import token_array
 
+# device staging buffers a layer group may hold while their copies to
+# the host are in flight; a 300-token document of a 4B model takes
+# about 45 MB
+MAX_STAGING = 16
 
 def prefix_hash(prefix) -> bytes:
     """Hash a prefix's token ids: the document head, then the document."""
@@ -386,22 +390,22 @@ class HostKV:
     def _staging_for(self, group, shape):
         """A device buffer of `shape` whose last copy to the host has landed.
 
-        Two buffers per group alternate, so the gather of one save
-        runs while the copy of the one before reads the other. The
-        host waits for the older copy when both are in flight, which
-        paces saves at the copy engine's rate instead of filling the
-        device with staging buffers.
+        Buffers are reused once their copy's event has fired, checked
+        without waiting, and a new one is allocated while fewer than
+        MAX_STAGING are in flight. Past that the host waits for the
+        oldest copy, which paces saves at the copy engine's rate
+        instead of filling the device with staging buffers.
         """
         torch = self.torch
-        buffers = self._staging.setdefault(group, [])
-        if len(buffers) < 2:
-            buffers.append([None, None])
-            entry = buffers[-1]
+        buffers = self._staging.setdefault(group, deque())
+        if buffers and (buffers[0][1] is None or buffers[0][1].query()):
+            entry = buffers.popleft()
+        elif len(buffers) >= MAX_STAGING:
+            entry = buffers.popleft()
+            entry[1].synchronize()
         else:
-            entry = buffers.pop(0)
-            buffers.append(entry)
-            if entry[1] is not None:
-                entry[1].synchronize()
+            entry = [None, None]
+        buffers.append(entry)
         numel = 1
         for size in shape:
             numel *= size
