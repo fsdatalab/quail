@@ -67,10 +67,68 @@ Quail supports these SQL clauses with the following limits:
   [window functions](#window-functions). Use `AS` to name a result
   column. AI outputs and window functions require a name. `*` expands
   to all table columns.
-- **`FROM`** names a registered table, with an optional alias.
+- **`FROM`** names a registered table or a [CTE](#with-common-table-expressions),
+  with an optional alias.
 - **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
   `RIGHT`, `FULL`) are not.
 - **`LIMIT`** takes a positive integer.
+
+### WITH (common table expressions)
+
+A common table expression (CTE) is a named query result defined with
+`WITH`. A later query in the same statement reads it like a table, so
+one AI function's output can be the input of another. For example,
+imagine a `contracts` table with columns `id` and `text`. Extract each
+contract's termination clause, then score the clause, not the whole
+contract:
+
+```sql
+WITH clauses AS (
+    SELECT c.id,
+           AI.EXTRACT(c.text, {'terms': 'What is the termination clause?'}) AS clause
+    FROM contracts c
+)
+SELECT x.id,
+       x.clause,
+       AI.SCORE(PROMPT('Can the tenant terminate early? {0}', x.clause.terms)) AS score
+FROM clauses x
+```
+
+Quail runs the statement in stages. Each CTE runs before the queries
+that read it, in written order, and its result is kept as an Arrow
+table for the rest of the statement. The text columns a later stage
+prompts over are tokenized once with the session's tokenizer, like a
+registered table's. A CTE that no later query reads does not run, and
+a CTE read in two places runs once.
+
+A later query reads a CTE's columns by name:
+
+- A selected column keeps its own name, so `SELECT c.id` gives `id`.
+  Any other expression needs an `AS` name.
+- `AI.SCORE` gives a `FLOAT64`, and `AI.CLASSIFY` gives a `STRING`
+  label (with `kind_probabilities` beside `kind` when probabilities
+  were requested).
+- `AI.EXTRACT ... AS clause` gives the struct `clause` and its spans
+  `clause_span`. Read one answer as `x.clause.terms`.
+- Aggregates and window functions keep their `AS` names and types.
+
+A null answer, such as an extraction that found nothing, reaches the
+next AI function as empty text, the same as a null document in a
+registered table. Row identity, nulls, and spans pass through
+unchanged.
+
+`EXPLAIN` shows each stage in order without running the model. A
+stage that reads a CTE which has not run yet is planned on the
+planner's estimate of the CTE's row count and an assumed token count
+per row (the source table's mean for a passed-through column, 32
+tokens for a computed one); `explain()` names the assumption. Query
+time, tokens, and the cost estimate add up every stage, and the
+report keeps each CTE's own numbers under `ctes`. WITH queries run
+locally and on Quail Server alike.
+
+Limits: every CTE and the final `SELECT` needs an AI function;
+`WITH RECURSIVE` and `WITH name (columns) AS` are not supported; a
+CTE reads registered tables and the CTEs written before it.
 
 ### Joins
 
@@ -514,6 +572,7 @@ sort reuse and limit placement.
 
 - `QUALIFY` and window functions outside the [supported list](#supported-functions)
 - `UNION`, `EXCEPT`, `INTERSECT`
+- `WITH RECURSIVE`, and a CTE without an AI function
 - `OR` between conditions
 - `BETWEEN` and arithmetic in column comparisons
 - Queries with no AI function

@@ -50,9 +50,12 @@ from quail.logical.nodes import (
     extracted_above_joins,
 )
 from quail.logical.plan import (
+    Cte,
     LabelWork,
     LogicalPlan,
     Operators,
+    WithPlan,
+    cte_column_names,
     join_applies,
     join_conditions,
     join_outer_input,
@@ -99,6 +102,9 @@ __all__ = [
     "LogicalNode",
     "LogicalPlan",
     "LogicalPlanBuilder",
+    "Cte",
+    "WithPlan",
+    "cte_column_names",
     "ModelCall",
     "Operators",
     "PROBABILITIES_SUFFIX",

@@ -1,6 +1,6 @@
 """Registered tables, their providers, and their tokenized inputs."""
 
-from .inputs import ESTIMATE_SAMPLE, InputStore
+from .inputs import ESTIMATE_SAMPLE, InputStore, LayeredInputs
 from .providers import (
     ArrowDatasetProvider,
     Catalog,
@@ -19,6 +19,7 @@ __all__ = [
     "DocumentProvider",
     "HuggingFaceProvider",
     "InputStore",
+    "LayeredInputs",
     "MemoryTableProvider",
     "ScanRequest",
     "TableProvider",

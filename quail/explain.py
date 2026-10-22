@@ -314,6 +314,11 @@ def _estimated_rows(graph):
     return rows
 
 
+def estimated_rows(plan) -> float | None:
+    """Return the planner's estimate of a plan's result rows, or None."""
+    return _estimated_rows(plan.graph).get(plan.root)
+
+
 def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                   estimates=None, stages=None):
     """Return a physical tree with estimated and measured columns.

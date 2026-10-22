@@ -487,7 +487,7 @@ def test_extract_plans_one_extraction_per_field(session):
         assert session.sql(STRUCT_SQL, dialect=dialect).logical == built.logical
     projection = built.logical.projection
     assert projection.structs == (ExtractStruct("lease", ("ends", "rent")),)
-    assert projection.result_columns() == ("c.id", "lease")
+    assert projection.result_columns() == ("c.id", "lease", "lease_span")
     plan = built.plan()
     extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
     assert [n.spec.name for n in extracts] == ["lease.ends", "lease.rent"]

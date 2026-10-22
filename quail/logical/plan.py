@@ -6,11 +6,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from quail.logical.expressions import (
+    Alias,
     ColumnRef,
     CompileError,
     ModelCall,
     RegularPredicate,
     aliased_call,
+    column_name,
     model_call,
 )
 from quail.logical.nodes import (
@@ -321,3 +323,79 @@ def join_applies(join: "SemanticJoin") -> tuple:
         applies.append(node)
         node = node.input
     return tuple(reversed(applies))
+
+
+def cte_column_names(plan: LogicalPlan) -> tuple[str, ...]:
+    """Return the column names a CTE gives its result, as SQL names them.
+
+    A projected column reference is named by its column alone, so
+    ``SELECT c.id`` gives ``id``; an AS name, a struct column, an
+    aggregate, and a window keep their names.
+
+    Raises:
+        CompileError: A projected expression has no AS name, or two
+            columns would share one name.
+    """
+    expressions = {column_name(column): column
+                   for column in plan.projection.columns}
+    names = []
+    for name in plan.root.result_columns():
+        column = expressions.get(name)
+        if isinstance(column, ColumnRef):
+            name = column.column
+        elif column is not None and not isinstance(column, Alias):
+            raise CompileError(
+                f"{name} in a CTE needs an AS name; a later query reads "
+                f"the column by that name")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise CompileError(
+            f"the CTE returns a column name twice: {names}; give one an AS name")
+    return tuple(names)
+
+
+@dataclass(frozen=True)
+class Cte:
+    """A common table expression: a named query result defined with WITH.
+
+    Attributes:
+        name: The name later queries read the result under.
+        plan: The query that computes the result.
+        reads: The names of the earlier CTEs its scans read.
+    """
+
+    name: str
+    plan: LogicalPlan
+    reads: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WithPlan:
+    """A query with CTEs; each CTE runs before the queries that read it.
+
+    Attributes:
+        ctes: The CTEs in written order. Each reads registered tables
+            and earlier CTEs only.
+        query: The final SELECT.
+        reads: The names of the CTEs the final SELECT's scans read.
+    """
+
+    ctes: tuple[Cte, ...]
+    query: LogicalPlan
+    reads: tuple[str, ...]
+
+    def needed(self) -> tuple[Cte, ...]:
+        """Return the CTEs the final SELECT depends on, in written order.
+
+        A CTE nothing reads, directly or through another CTE, is left
+        out and does not run.
+        """
+        by_name = {cte.name: cte for cte in self.ctes}
+        needed = set()
+        pending = list(self.reads)
+        while pending:
+            name = pending.pop()
+            if name not in needed:
+                needed.add(name)
+                pending.extend(by_name[name].reads)
+        return tuple(cte for cte in self.ctes if cte.name in needed)

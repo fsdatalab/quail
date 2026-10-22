@@ -113,6 +113,13 @@ def execute_query(query, physical_executor=None, plan=None,
         on_execution_ready: Optional callback after backend preparation and
             immediately before query execution.
     """
+    from quail.api.query import WithQuery
+
+    if isinstance(query, WithQuery):
+        if plan is not None:
+            raise TypeError("a WITH query runs the planner's plan for each stage")
+        return query.execute(physical_executor, on_backend_ready,
+                             on_execution_ready)
     total_started = time.perf_counter()
     if plan is not None:
         if isinstance(plan, Refusal) or not hasattr(plan, "graph"):

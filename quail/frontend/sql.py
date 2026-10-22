@@ -1,11 +1,12 @@
 """Parse SQL with SQLGlot and construct a Quail logical plan."""
 
+from collections.abc import Callable
 from enum import StrEnum
 
 import sqlglot
 from sqlglot import exp
 
-from quail.catalog import Catalog
+from quail.catalog import Catalog, MemoryTableProvider
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql_binding.expressions import (
     ExpressionBinder,
@@ -26,8 +27,10 @@ from quail.logical import (
     Alias,
     ColumnRef,
     CompileError,
+    Cte,
     LogicalPlan,
     LogicalPlanBuilder,
+    WithPlan,
     column_name,
     is_score,
 )
@@ -226,19 +229,26 @@ def compile_sql(
     turn: tuple[str, str] = ("", ""),
     layout: str = "ai-if",
     prompts: PromptBinder | None = None,
-) -> LogicalPlan:
-    """Compile AI SQL text into a LogicalPlan.
+    cte_schema: Callable | None = None,
+) -> LogicalPlan | WithPlan:
+    """Compile AI SQL text into a LogicalPlan, or a WithPlan for a WITH query.
 
     Args:
-        sql: A SELECT statement in the chosen dialect.
+        sql: A SELECT statement in the chosen dialect, with optional
+            common table expressions (CTEs) in a WITH clause.
         catalog: Registered tables and their schemas.
         dialect: SQL dialect used to parse the statement.
         turn: Model chat text placed before and after each prompt.
         layout: Prompt layout used by the model.
         prompts: Model-aware prompt binder. Overrides turn and layout.
+        cte_schema: Returns the Arrow schema of a CTE's result from its
+            LogicalPlan and the catalog it reads, so the queries reading
+            the CTE are compiled against its columns. Required for a
+            WITH query.
 
     Returns:
-        The bound logical query plan.
+        The bound logical query plan: a WithPlan when the statement has
+        a WITH clause, a LogicalPlan otherwise.
 
     Raises:
         CompileError: The query is invalid or uses unsupported SQL.
@@ -258,13 +268,68 @@ def compile_sql(
     if not isinstance(tree, exp.Select):
         raise CompileError("the query must be a single SELECT")
     _reject_forbidden(tree)
+    prompts = prompts or PromptBinder(turn=turn, layout=layout)
+    with_ = tree.args.get("with_")
+    if with_ is None:
+        return _compile_select(tree, catalog, prompts, dialect)
+    return _compile_with(tree, with_, catalog, prompts, dialect, cte_schema)
 
+
+def _compile_with(tree, with_, catalog: Catalog, prompts, dialect,
+                  cte_schema) -> WithPlan:
+    """Compile each CTE against the tables and CTEs before it, then the SELECT."""
+    if with_.recursive:
+        raise CompileError(
+            "WITH RECURSIVE is not supported; a CTE reads registered tables "
+            "and the CTEs before it")
+    if cte_schema is None:
+        raise CompileError(
+            "a WITH query needs the schema of each CTE's result; compile it "
+            "through Session.sql()")
+    tree.set("with_", None)
+    tables = Catalog(dict(catalog.providers))
+    ctes = []
+    for cte in with_.expressions:
+        name = cte.alias
+        if cte.args["alias"].columns:
+            raise CompileError(
+                f"WITH {name} (...) column names are not supported; name "
+                f"the columns with AS inside the CTE")
+        body = cte.this
+        if not isinstance(body, exp.Select):
+            raise CompileError(f"the CTE {name!r} must be a SELECT")
+        if body.args.get("with_") is not None:
+            raise CompileError(
+                f"the CTE {name!r} has its own WITH; list every CTE in the "
+                f"outer WITH, each reading the ones before it")
+        if name in catalog:
+            raise CompileError(
+                f"the CTE {name!r} is also a registered table; pick another name")
+        if name in tables:
+            raise CompileError(f"the CTE {name!r} is defined twice")
+        plan = _compile_select(body, tables, prompts, dialect)
+        ctes.append(Cte(name, plan, _cte_reads(plan, tables, catalog)))
+        tables.register(name, MemoryTableProvider(
+            cte_schema(plan, tables).empty_table(), id_col="", identity=f"cte:{name}"))
+    query = _compile_select(tree, tables, prompts, dialect)
+    return WithPlan(tuple(ctes), query, _cte_reads(query, tables, catalog))
+
+
+def _cte_reads(plan: LogicalPlan, tables: Catalog, catalog: Catalog) -> tuple:
+    """Return the CTE names the plan scans: its providers not in the catalog."""
+    return tuple(dict.fromkeys(
+        scan.provider for scan in plan.operators().scans
+        if scan.provider in tables and scan.provider not in catalog))
+
+
+def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,
+                    dialect: SQLDialect) -> LogicalPlan:
+    """Compile one SELECT against the tables in the catalog."""
     limit = _parse_limit(tree)
     offset = _parse_offset(tree)
     distinct = _parse_distinct(tree)
 
-    b = ExpressionBinder(catalog, prompts or PromptBinder(
-        turn=turn, layout=layout), dialect=dialect.value)
+    b = ExpressionBinder(catalog, prompts, dialect=dialect.value)
 
     joins = JoinBinder(b)
     joins.bind_tables(tree)

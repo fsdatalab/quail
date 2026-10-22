@@ -416,3 +416,62 @@ class InputStore:
             self._token_stores[(identity, _column_key(column))] = token_store
         for name, store in column_stores.items():
             self._column_stores[(identity, name)] = store
+
+
+class LayeredInputs:
+    """An InputStore for a query's CTE results, over the session's store.
+
+    A registered table's columns come from the session's store, so
+    their token files are shared with every other query. A CTE's
+    result is a table of this query alone, so its columns live in a
+    store of their own, which the session closes with its own. A CTE
+    that has not run yet is planned on assumed lengths.
+
+    Args:
+        base: The session's InputStore.
+        own: A store over the catalog that also holds the CTE tables.
+        names: The CTE names.
+    """
+
+    def __init__(self, base: InputStore, own: InputStore, names):
+        self._base = base
+        self._own = own
+        self._names = set(names)
+        # name -> callable(column) returning the TokenLengths to plan a
+        # CTE's documents on; an entry is removed once the CTE has run
+        self.assumed_lengths: dict = {}
+        self.tokenizer_name = base.tokenizer_name
+
+    @property
+    def notes(self) -> list:
+        return [*self._base.notes, *self._own.notes]
+
+    def _store(self, provider_name: str) -> InputStore:
+        return self._own if provider_name in self._names else self._base
+
+    def close(self):
+        """Remove the CTE token files; the session's store stays open."""
+        self._own.close()
+
+    def tokenize(self, provider_name, column, projected_columns=(), *,
+                 with_offsets=False) -> ScanInput:
+        return self._store(provider_name).tokenize(
+            provider_name, column, projected_columns, with_offsets=with_offsets)
+
+    def tokenize_async(self, provider_name, column, projected_columns=(), *,
+                       with_offsets=False) -> Future:
+        return self._store(provider_name).tokenize_async(
+            provider_name, column, projected_columns, with_offsets=with_offsets)
+
+    def sample_columns(self, provider_name, columns) -> dict:
+        return self._store(provider_name).sample_columns(provider_name, columns)
+
+    def token_lengths(self, provider_name, column):
+        if provider_name in self.assumed_lengths:
+            return None
+        return self._store(provider_name).token_lengths(provider_name, column)
+
+    def estimate_lengths(self, provider_name, column) -> TokenLengths:
+        if provider_name in self.assumed_lengths:
+            return self.assumed_lengths[provider_name](column)
+        return self._store(provider_name).estimate_lengths(provider_name, column)

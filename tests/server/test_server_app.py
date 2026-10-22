@@ -273,6 +273,20 @@ def test_http_lifecycle_events_files_and_durable_submissions(make_client):
     assert client.get("/v1/queries/d").status_code == 200
 
 
+def test_a_with_query_runs_its_cte_before_the_select_on_the_server(make_client):
+    client = make_client()
+    content_id = upload(client)
+    status = client.post("/v1/queries", json=submission(
+        content_id, sql=server_fakes.WITH_SQL)).json()
+    final = wait_done(client, status["id"])
+    assert final["state"] == "succeeded", final
+    assert "with kept:" in final["plan"]["text"]
+    assert "query (reads kept):" in final["plan"]["text"]
+    rows = client.get(f"/v1/queries/{status['id']}/rows").json()
+    assert rows["columns"] == ["k.id"]
+    assert sorted(row[0] for row in rows["rows"]) == ["r0", "r3", "r4"]
+
+
 def test_bearer_token_guards_the_api_but_not_the_page(make_client):
     client = make_client(token="secret")
     for headers, code in [({}, 401), ({"authorization": "Bearer wrong"}, 401),

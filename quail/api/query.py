@@ -3,24 +3,30 @@
 from __future__ import annotations
 
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import pyarrow as pa
 
 from quail.api.execute import execute_query
-from quail.catalog import inputs
+from quail.catalog import MemoryTableProvider, inputs
 from quail.catalog.pairs import columns_key, estimate_pair_fraction
 from quail.catalog.selection import selected_rows
+from quail.catalog.tokens import TokenLengths
 from quail.execution.metrics import NodeMetrics, scalar_node_metrics
 from quail.execution.projection import projection_for
 from quail.execution.reporting import collect_answers, execution_report
 from quail.execution.result import QueryResult
 from quail.execution.runner import ExecutionContext, GenericRunner
+from quail.execution.schema import cte_table, result_schema
 from quail.execution.types import PhysicalRequest, document_input
-from quail.explain import explain
+from quail.explain import estimated_rows, explain
 from quail.logical import (
+    ColumnRef,
     LogicalPlan,
+    WithPlan,
+    column_name,
+    cte_column_names,
     join_conditions,
     oriented_join_conditions,
 )
@@ -33,7 +39,7 @@ from quail.physical import Scan, encode_graph
 from quail.planner import plan_query, refine_plan
 from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import logical_alternatives
-from quail.planner.plan import Refusal, RefusalError
+from quail.planner.plan import PhysicalPlan, Refusal, RefusalError
 from quail.planner.search.statistics import filter_stop_keys
 
 if TYPE_CHECKING:
@@ -279,11 +285,21 @@ class Query:
                 each node's measured rows, time, and tokens beside the
                 planner's estimates, then the measured totals.
         """
+        result = self.run() if analyze else None
+        return self._explain(result, verbose)
+
+    def _explain(self, result, verbose: bool, assumed=()) -> str:
+        """Return the plan text, with the measurements of result when given.
+
+        Args:
+            result: The QueryResult of running the plan, or None.
+            verbose: Include runtime settings and internal node fields.
+            assumed: Aliases planned on assumed lengths, left out of the
+                note on sampled token counts.
+        """
         # plan() first: it replaces self.logical with the optimized tree
         physical = self.plan()
-        result = None
-        if analyze:
-            result = self.run()
+        if result is not None:
             physical = self._plan
             # the root relation is lazy, so its row count is taken here
             rows = result.count()
@@ -299,9 +315,10 @@ class Query:
                        rules=tuple(registry.rules.values()),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
-        if self._estimated:
+        sampled = [alias for alias in self._estimated if alias not in assumed]
+        if sampled:
             text += ("\n\n  note: token counts for "
-                     + ", ".join(repr(a) for a in self._estimated)
+                     + ", ".join(repr(a) for a in sampled)
                      + f" are estimated from a {inputs.ESTIMATE_SAMPLE} document "
                      "sample")
         return text
@@ -487,3 +504,236 @@ class Query:
          result.true_join_tables, report["stages"]) = collect_answers(
              self.logical, plan, response.outputs, self._document_tokens)
         return result
+
+
+# tokens assumed per row for a CTE column the model computes, such as an
+# extraction answer or a label, when the CTE has not run yet
+ASSUMED_ANSWER_TOKENS = 32
+
+# report fields added up over the CTEs and the final SELECT
+SUMMED_REPORT_FIELDS = (
+    "wall_s", "model_wall_s", "coordinator_wall_s", "fresh_tokens",
+    "cached_tokens", "estimated_seconds", "planning_s", "input_ready_s",
+    "physical_prepare_s", "finish_s", "token_wait_s", "worker_total_s")
+
+
+@dataclass(frozen=True)
+class WithPhysicalPlan:
+    """The physical plan of each CTE the query needs, then of its SELECT.
+
+    Attributes:
+        ctes: (name, PhysicalPlan) pairs in execution order.
+        query: The final SELECT's plan.
+    """
+
+    ctes: tuple
+    query: PhysicalPlan
+
+    @property
+    def plans(self) -> tuple:
+        return (*(plan for _, plan in self.ctes), self.query)
+
+    @property
+    def estimated_seconds(self) -> float:
+        return sum(plan.estimated_seconds for plan in self.plans)
+
+    @property
+    def backend(self) -> str:
+        return self.query.backend
+
+    @property
+    def gpus(self) -> int:
+        return max(plan.gpus for plan in self.plans)
+
+    def to_envelope(self, codecs) -> dict:
+        """Return every stage's envelope under the CTE names and ``query``."""
+        return {"ctes": {name: plan.to_envelope(codecs) for name, plan in self.ctes},
+                "query": self.query.to_envelope(codecs)}
+
+
+class WithQuery:
+    """A query with CTEs: each CTE runs before the queries that read it.
+
+    A CTE's result is kept as an Arrow table in the session's catalog
+    view, its text columns are tokenized like a registered table's,
+    and the queries reading it are planned on it. Before a CTE has
+    run, the queries reading it are planned on its estimated row count
+    and an assumed token count per row, so ``explain()`` never runs
+    the model. ``run()`` executes the CTEs the final SELECT needs, in
+    written order, then the SELECT.
+    """
+
+    def __init__(self, session: "Session", logical: WithPlan,
+                 order: str | None = None):
+        self.session = session
+        self.logical = logical
+        self.order = order
+        self.ctes = {cte.name: cte for cte in logical.needed()}
+        self._view = session.with_ctes(self.ctes)
+        self._schemas = {}
+        for cte in logical.ctes:
+            schema = result_schema(cte.plan, self._view.catalog)
+            self._view.catalog.register(cte.name, MemoryTableProvider(
+                schema.empty_table(), id_col="", identity=f"cte:{cte.name}"))
+            self._schemas[cte.name] = schema
+        self._queries = {}     # stage name -> its Query; "" is the SELECT
+        self._results = {}     # stage name -> its QueryResult, once run
+        for name in self.ctes:
+            self._view.inputs.assumed_lengths[name] = (
+                lambda column, name=name: self._assumed_lengths(name, column))
+
+    def _stages(self) -> tuple:
+        """Return (name, LogicalPlan) of every stage in execution order."""
+        return (*((name, cte.plan) for name, cte in self.ctes.items()),
+                ("", self.logical.query))
+
+    def _stage(self, name: str, fresh: bool = False) -> Query:
+        """Return the Query running one stage over the tables it has now."""
+        if fresh or name not in self._queries:
+            plan = self.logical.query if name == "" else self.ctes[name].plan
+            self._queries[name] = Query(self._view, plan, order=self.order)
+        return self._queries[name]
+
+    def _assumption(self, name: str, column) -> tuple[int, int]:
+        """Return the rows and tokens per row assumed for a CTE's column.
+
+        The rows are the planner's estimate for the CTE, at least one.
+        A column the CTE passes through from a registered table keeps
+        that table's mean estimated token count; a column the model
+        computes is assumed to hold ASSUMED_ANSWER_TOKENS.
+        """
+        physical = self._stage(name).plan()
+        rows = None if isinstance(physical, Refusal) else estimated_rows(physical)
+        if rows is None:
+            rows = sum(len(lengths) for lengths in self._stage(name)._document_tokens
+                       .values())
+        cte = self.ctes[name]
+        names = dict(zip(cte_column_names(cte.plan), cte.plan.root.result_columns()))
+        projected = {column_name(c): c for c in cte.plan.projection.columns}
+        source = projected.get(names.get(column_references(column)[0].column))
+        tokens = ASSUMED_ANSWER_TOKENS
+        if isinstance(source, ColumnRef):
+            lengths = self._view.inputs.estimate_lengths(source.provider, source)
+            tokens = round(sum(lengths) / len(lengths)) if len(lengths) else 0
+        return max(1, round(rows)), tokens
+
+    def _assumed_lengths(self, name: str, column) -> TokenLengths:
+        rows, tokens = self._assumption(name, column)
+        return TokenLengths([tokens] * rows)
+
+    def plan(self):
+        """Plan every stage and return the plans, or the first Refusal.
+
+        A stage reading a CTE that has not run is planned on the
+        assumptions ``explain()`` names.
+        """
+        plans = []
+        for name, _ in self._stages():
+            physical = self._stage(name).plan()
+            if isinstance(physical, Refusal):
+                return physical
+            plans.append((name, physical))
+        return WithPhysicalPlan(tuple(plans[:-1]), plans[-1][1])
+
+    def explain(self, *, verbose: bool = False, analyze: bool = False) -> str:
+        """Return each stage's plan, the CTEs first, then the final SELECT.
+
+        Args:
+            verbose: Include runtime settings and internal node fields.
+            analyze: Run the query first and show each stage's
+                measurements beside its estimates.
+        """
+        results = {}
+        if analyze:
+            self.run()
+            results = self._results
+        parts = []
+        for name, plan in self._stages():
+            reads = self.logical.reads if name == "" else self.ctes[name].reads
+            title = "query" if name == "" else f"with {name}"
+            if reads:
+                title += " (reads " + ", ".join(reads) + ")"
+            pending = {scan.alias: scan for scan in plan.operators().scans
+                       if scan.provider in self.ctes
+                       and scan.provider not in self._results}
+            query = self._stage(name)
+            lines = [title + ":",
+                     query._explain(results.get(name), verbose, assumed=pending)]
+            for alias, scan in pending.items():
+                rows, tokens = self._assumption(scan.provider, scan.column)
+                lines.append(
+                    f"\n  note: {alias!r} reads the CTE {scan.provider!r}, "
+                    f"which has not run; planned on {rows:,} rows of "
+                    f"{tokens:,} tokens each")
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts)
+
+    def execute(self, physical_executor=None, on_backend_ready=None,
+                on_execution_ready=None) -> QueryResult:
+        """Run the CTEs the SELECT needs in written order, then the SELECT.
+
+        Each CTE's result replaces its placeholder in the catalog view,
+        so the next stage is planned on the rows it returned. The final
+        result's report adds every stage's times and tokens up and keeps
+        each CTE's own report under ``ctes``.
+        """
+        reports = {}
+        first = True
+        for name, _ in self._stages():
+            query = self._stage(name, fresh=True)
+            result = execute_query(
+                query, physical_executor=physical_executor,
+                on_backend_ready=on_backend_ready if first else None,
+                on_execution_ready=on_execution_ready if first else None)
+            first = False
+            self._results[name] = result
+            if name == "":
+                break
+            reports[name] = result.report
+            table = cte_table(result.collect(), self._schemas[name])
+            self._view.catalog.providers[name] = MemoryTableProvider(
+                table, id_col="", identity=f"cte:{name}")
+            self._view.inputs.assumed_lengths.pop(name, None)
+        result.report = _summed_report(result.report, reports)
+        return result
+
+    def run(self, plan=None) -> QueryResult:
+        """Execute the query in the current process.
+
+        Args:
+            plan: Must be None; a WITH query runs the planner's plans.
+        """
+        if plan is not None:
+            raise RuntimeError(
+                "a WITH query runs the planner's plan for each stage; "
+                "edited plans are not supported")
+        return execute_query(self)
+
+    def submit(self, **_options):
+        """Submitting needs Quail Server; local queries use run()."""
+        raise RuntimeError(
+            "submit() needs a Session with an endpoint; this session runs "
+            "queries in the current process, so call run() or collect()")
+
+    def execute_stream(self, batch_rows: int = 65_536,
+                       limit: int | None = None) -> pa.RecordBatchReader:
+        """Execute the query and stream Arrow record batches."""
+        return self.run().execute_stream(batch_rows=batch_rows, limit=limit)
+
+    def collect(self, limit: int | None = None,
+                batch_rows: int = 65_536) -> pa.Table:
+        """Execute the query and collect one Arrow table."""
+        return self.run().collect(limit=limit, batch_rows=batch_rows)
+
+
+def _summed_report(report: dict, cte_reports: dict) -> dict:
+    """Return the SELECT's report with every stage's totals added up."""
+    summed = dict(report)
+    for key in SUMMED_REPORT_FIELDS:
+        values = [stage.get(key) for stage in (*cte_reports.values(), report)]
+        values = [value for value in values if value is not None]
+        if values:
+            summed[key] = (round(sum(values), 4) if isinstance(values[0], float)
+                           else sum(values))
+    summed["ctes"] = cte_reports
+    return summed

@@ -4,18 +4,14 @@ from dataclasses import dataclass, field, replace
 from itertools import groupby
 
 from quail.logical import (
-    PROBABILITIES_SUFFIX,
-    SPAN_SUFFIX,
     LogicalPlan,
     classified_above_joins,
-    column_name,
     effective_selectivity,
     extracted_above_joins,
     has_score,
     is_score,
     oriented_join_conditions,
 )
-from quail.logical.expressions import aliased_call
 from quail.physical import (
     AiScore,
     Barrier,
@@ -457,13 +453,7 @@ class GraphBuilder:
         else:
             alias = self.operators.scans[0].alias
             sink_inputs = (port_by_alias[alias],)
-        columns = []
-        for c in self.plan.projection.columns:
-            columns.append(column_name(c))
-            if getattr(aliased_call(c), "probabilities", False):
-                columns.append(c.name + PROBABILITIES_SUFFIX)
-            if aliased_call(c, "extract") is not None:
-                columns.append(c.name + SPAN_SUFFIX)
+        columns = self.plan.projection.column_names()
         score_ports = tuple(PortRef(node.node_id, node.rows_port) for node in self.nodes
                             if isinstance(node, AiScore)
                             and any(node.spec.name == item.name
@@ -471,7 +461,7 @@ class GraphBuilder:
         result_inputs = (*sink_inputs,
                          *(port for port in score_ports if port not in sink_inputs),
                          *row_ports)
-        self.nodes.extend(result_nodes(self.plan.result, result_inputs, tuple(columns),
+        self.nodes.extend(result_nodes(self.plan.result, result_inputs, columns,
                                        self.plan.projection.packing()))
 
     def _finish(self):
