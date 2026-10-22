@@ -481,7 +481,8 @@ def test_planner_places_and_scores_classifications(session, tmp_path):
         "should_eliminate_distinct", "should_push_down_distinct",
         "should_push_down_projection",
         "should_push_down_filters", "should_lift_maps",
-        "should_eliminate_window_sort", "should_push_down_limit_through_window",
+        "should_plan_ai_top_k", "should_eliminate_window_sort",
+        "should_push_down_limit_through_window",
         "should_push_down_limit", "choose_classify_implementation", "should_retain_kv",
         "should_share_prefixes", "choose_attention_algorithm"]
     plan = _topic(session).plan()

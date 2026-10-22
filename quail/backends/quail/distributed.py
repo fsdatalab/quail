@@ -21,7 +21,7 @@ from quail.catalog.tokens import select_documents
 from quail.execution.ids import id_positions
 from quail.execution.rows import Rows
 from quail.execution.runner import ExecutionContext, GenericRunner, compute_subgraph
-from quail.physical import AiFilter, AiJoin, PhysicalGraph, Scan
+from quail.physical import AiFilter, AiJoin, AiTopK, PhysicalGraph, Scan
 from quail.planner import balanced_shards
 
 
@@ -49,8 +49,10 @@ class DistributedQuailExecution:
                                 range(len(documents))),
                     [len(document) for document in documents], gpus))
         self.last_compute = compute_subgraph(graph).nodes[-1].node_id
-        self.limit = (None if any(isinstance(node, AiJoin) for node in graph.nodes)
-                      else payload.get("filter_limit"))
+        self.limit = (
+            None if any(isinstance(node, (AiJoin, AiTopK))
+                        for node in graph.nodes)
+            else payload.get("filter_limit"))
         self.started = False
         self.outputs = []
 

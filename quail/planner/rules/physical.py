@@ -16,6 +16,7 @@ from quail.physical import (
     AiInference,
     AiJoin,
     AiScore,
+    AiTopK,
     Limit,
     PhysicalGraph,
     PortRef,
@@ -26,6 +27,7 @@ from quail.physical.base import input_ports
 from quail.physical.pipelines import build_pipelines
 from quail.planner.graph import retention
 from quail.planner.operators.classify import classify_scoring
+from quail.planner.operators.rank import plan_ai_top_k
 from quail.planner.optimizer.rules import PhysicalRule
 from quail.planner.plan import plan_kv_retention
 from quail.planner.search.statistics import (
@@ -44,9 +46,9 @@ class ShouldPushDownLimit(PhysicalRule):
     every operator of their pipeline. The pushdown keeps the first
     survivors to finish, so it is sound only when those are the rows the
     query returns: the graph ends in a Limit, its documents run through
-    one pipeline, and it has no Sort, PhysicalAggregate, or Window (an
-    ORDER BY, DISTINCT, OFFSET, GROUP BY, or window function needs
-    every survivor) and no AiJoin
+    one pipeline, and it has no Sort, PhysicalAggregate, Window, or
+    AiTopK (an ORDER BY, DISTINCT, OFFSET, GROUP BY, window function,
+    or pairwise rank needs every survivor) and no AiJoin
     (survivors are settled per join round). Otherwise the rule removes
     the setting.
     """
@@ -61,7 +63,7 @@ class ShouldPushDownLimit(PhysicalRule):
         pipelines = {id(members) for members
                      in build_pipelines(graph).values()}
         blocked = len(pipelines) > 1 or any(
-            isinstance(node, (Sort, PhysicalAggregate, Window, AiJoin))
+            isinstance(node, (Sort, PhysicalAggregate, Window, AiJoin, AiTopK))
             for node in graph.nodes)
         if limit is None or blocked:
             context.settings.pop("filter_limit", None)
@@ -135,6 +137,20 @@ class ShouldPushDownLimitThroughWindow(PhysicalRule):
                 node = replace(node, inputs=input_ports((PortRef("top", "rows"),)))
             nodes.append(node)
         return PhysicalGraph(tuple(nodes), limit.inputs[0].source)
+
+
+class ShouldPlanAiTopK(PhysicalRule):
+    """Turn a filtered AI.RANK window into one AiTopK node.
+
+    The node runs quickselect itself, so the graph stays fixed however
+    many comparison rounds the top-k takes. The rule runs before the
+    window sort and limit rules, which do not apply to a pairwise rank.
+    """
+
+    name = "should_plan_ai_top_k"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        return plan_ai_top_k(graph, context)
 
 
 class ShouldRetainKv(PhysicalRule):

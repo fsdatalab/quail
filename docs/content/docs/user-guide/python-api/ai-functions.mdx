@@ -2,8 +2,8 @@
 title: AI functions
 ---
 
-Use AI functions to filter and join documents, score answers, classify
-rows, and extract text. Calling these builder functions creates a query.
+Use AI functions to filter and join documents, score answers, rank rows,
+classify rows, and extract text. Calling these builder functions creates a query.
 The model runs when you call `run()` or `collect()`.
 
 ## Functions
@@ -17,6 +17,8 @@ Select a row to jump to its arguments and examples.
 | [`ai_if(prompt, ...)`](#ai_if) | Keeps documents that satisfy a model question. |
 | [`ai_join(others, prompt, ...)`](#ai_join) | Joins documents using a model question. |
 | [`ai_score(prompt, name=...)`](#ai_score) | Adds a score from 0 to 1 for each document. |
+| [`ai_rank(prompt)`](#ai_rank) | Ranks rows by pairwise comparisons. |
+| [`ai_topk(prompt, k=25)`](#ai_topk) | Keeps the k rows `ai_rank` places first. |
 | [`ai_classify(prompt, labels, ...)`](#ai_classify) | Assigns one of the supplied labels. |
 | [`ai_extract(column, questions, ...)`](#ai_extract) | Copies answers from a document and returns their positions. |
 
@@ -28,7 +30,7 @@ The examples use a `session` with registered tables. See
 Import the column and prompt helpers:
 
 ```python
-from quail import col, prompt
+from quail import ai_rank, col, prompt
 ```
 
 ## ai_if
@@ -97,6 +99,48 @@ query = (
     .order_by(col("refund_score").desc())
     .limit(10)
     .select("r.id", "refund_score")
+)
+```
+
+## ai_rank
+
+`ai_rank(prompt)`
+
+Rank rows by pairwise comparisons of one document column. Pass the
+result to `window()`, then filter the rank with `<` or `<=`. The SQL
+form is [`AI.RANK`](/docs/user-guide/sql/ai-functions#airank).
+
+```python
+query = (
+    session.docs("sales_calls").alias("c")
+    .where(col("c.deal_stage") == "Negotiation")
+    .window(r=ai_rank(prompt(
+        'Which sales call shows the customer closer to committing? {0}',
+        col("c.transcript"))).over())
+    .where(col("r") <= 25)
+    .select("c.id", "r")
+)
+```
+
+`over(partition_by=...)` ranks inside each group. A rank with no `<` or
+`<=` filter is refused.
+
+## ai_topk
+
+`ai_topk(prompt, k=25, partition_by=())`
+
+Keep the k rows `ai_rank` places first. This is the window and the
+`<= k` filter in one call. The rank column is named `__rank` and is
+not returned unless `select()` names it.
+
+```python
+query = (
+    session.docs("sales_calls").alias("c")
+    .where(col("c.deal_stage") == "Negotiation")
+    .ai_topk(prompt(
+        'Which sales call shows the customer closer to committing? {0}',
+        col("c.transcript")), k=25)
+    .select("c.id")
 )
 ```
 

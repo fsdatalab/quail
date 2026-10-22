@@ -7,11 +7,12 @@ from typing import Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.operators import execution_parts
+from quail.backends.quail.executor.operators.rank import execute_rank, score_pairs
 from quail.backends.quail.executor.operators.score import QuailScorer
 from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.reranker import RerankerModelExecution
-from quail.physical import AiClassify, AiScore, PhysicalNode
+from quail.physical import AiClassify, AiScore, AiTopK, PhysicalNode
 
 
 class QuailModelExecution:
@@ -84,6 +85,15 @@ class QuailModelExecution:
         if implementation is not None and implementation.execute_group is not None:
             return implementation.execute_group(
                 self.query, (node,), inputs)[node.node_id]
+        if isinstance(node, AiTopK):
+            execution = self._reranker_execution(inputs["documents"])
+            stats = {}
+            return execute_rank(
+                node, inputs,
+                lambda pairs: score_pairs(
+                    execution.reranker, node.spec, execution.documents,
+                    pairs, stats),
+                stats)
         if isinstance(node, (AiScore, AiClassify)):
             # a score or classification on its own runs through the
             # reranker readout, not the document scheduler

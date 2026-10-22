@@ -100,6 +100,10 @@ class BoundBuilder:
         self._inner.window(**calls)
         return self
 
+    def ai_topk(self, p, k=25, partition_by=()):
+        self._inner.ai_topk(p, k=k, partition_by=partition_by)
+        return self
+
     def offset(self, n):
         self._inner.offset(n)
         return self

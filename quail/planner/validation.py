@@ -8,6 +8,7 @@ from quail.logical import (
     CompileError,
     SemanticClassify,
     SemanticExtract,
+    Window,
     classified_above_joins,
     has_score,
     is_score,
@@ -42,6 +43,69 @@ def score_projections(logical) -> tuple[Alias, ...]:
         expression
         for expression in logical.projection.columns
         if aliased_call(expression, "score") is not None
+    )
+
+
+def rank_calls(plan) -> tuple:
+    """Return the AI.RANK window calls in a logical plan."""
+    return tuple(
+        call
+        for node in plan.walk()
+        if isinstance(node, Window)
+        for call in node.calls
+        if call.function == "ai_rank")
+
+
+def has_rank(plan) -> bool:
+    """Return whether a logical plan ranks rows with AI.RANK."""
+    return bool(rank_calls(plan))
+
+
+def rank_refusal(plan, context) -> Refusal | None:
+    """Check that an AI.RANK query is a filtered top-k over one table.
+
+    A rank with no ``<`` or ``<=`` filter would compare on the order of
+    n log n rows, so it is refused. Mixing the rank with another AI
+    operator is refused too.
+
+    Args:
+        plan: The logical plan.
+        context: The planning context, with the tokenizer.
+
+    Returns:
+        A Refusal, or None when the plan does not rank or the rank can run.
+    """
+    calls = rank_calls(plan)
+    if not calls:
+        return None
+    if context is None or context.tokenizer is None:
+        return _rank_refusal("AI.RANK planning needs the model's tokenizer")
+    if len(calls) != 1:
+        return _rank_refusal("AI.RANK is written once")
+    if calls[0].rank_comparison not in ("<", "<="):
+        return _rank_refusal(
+            "AI.RANK without a < or <= filter on its rank is refused")
+    operators = plan.operators()
+    if len(operators.scans) != 1:
+        return _rank_refusal("AI.RANK reads one table")
+    windows = [
+        call for node in plan.walk() if isinstance(node, Window)
+        for call in node.calls]
+    if any(call.function != "ai_rank" for call in windows):
+        return _rank_refusal("AI.RANK is the only window function in the query")
+    if (operators.joins or operators.filters or operators.applies
+            or operators.labels.calls or operators.extracts or has_score(plan)):
+        return _rank_refusal("AI.RANK cannot be mixed with other AI operators")
+    return None
+
+
+def _rank_refusal(reason: str):
+    return Refusal(
+        reasons=(reason,),
+        constraint="unsupported_rank_query",
+        needed=1,
+        available=0,
+        unit="queries",
     )
 
 
@@ -229,6 +293,9 @@ def score_input_tokens(spec, context) -> tuple[int, int]:
 def validate_query(plan, operators, context, model, device, gpus):
     """Return a refusal for unsupported inference or hardware requirements."""
     labels, applies = operators.labels, operators.applies
+    refusal = rank_refusal(plan, context)
+    if refusal is not None:
+        return refusal
     scored = has_score(plan)
     if scored:
         refusal = score_refusal(plan, context)

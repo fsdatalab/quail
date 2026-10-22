@@ -503,8 +503,9 @@ In Python, use `count(column)`.
 - `SUM` and `COUNT` accumulate one row at a time. Explicit `ROWS` or
   `RANGE` frames are unsupported.
 - A query cannot combine windows with `GROUP BY` or ordinary aggregates.
-  `QUALIFY` and window functions other than those listed above are
-  unsupported.
+  `QUALIFY` is supported for an `AI.RANK` comparison with `<` or `<=`.
+  Other `QUALIFY` expressions, and window functions other than `AI.RANK`
+  and those listed above, are unsupported.
 
 See [Python `window()`](/docs/user-guide/python-api/non-ai-functions#window) for the builder
 form and [Window rules](/docs/architecture/optimizer#window-rules) for
@@ -512,7 +513,7 @@ sort reuse and limit placement.
 
 ## Unsupported SQL
 
-- `QUALIFY` and window functions outside the [supported list](#supported-functions)
+- `QUALIFY` other than an [`AI.RANK`](/docs/user-guide/sql/ai-functions#airank) `<` or `<=` filter, and window functions outside the [supported list](#supported-functions)
 - `UNION`, `EXCEPT`, `INTERSECT`
 - `OR` between conditions
 - `BETWEEN` and arithmetic in column comparisons

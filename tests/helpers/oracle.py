@@ -14,6 +14,7 @@ import pyarrow as pa
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.operators.filter import filter_result
+from quail.backends.quail.executor.operators.rank import execute_rank
 from quail.backends.quail.reranker import (
     RerankerBatch,
     RerankerModelExecution,
@@ -28,6 +29,7 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     AiScore,
+    AiTopK,
     ClassifySpec,
 )
 from quail.specs import H100_SXM, QWEN3_4B_FP8
@@ -47,6 +49,9 @@ class Oracle:
         scores: A callable (spec, ids) -> the score of one row.
         answers: A callable (spec, document) -> the extracted text or
             None; or a sequence indexed by document for every question.
+        comparisons: A callable (spec, first, second) -> the probability
+            that the first document is better. ``first`` and ``second``
+            are document positions.
         probabilities: Whether a classification reports label
             probabilities when its spec asks for them.
         retain: How many of a keep_kv filter's survivors the oracle
@@ -60,12 +65,13 @@ class Oracle:
 
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
                  answers=None, *, probabilities=False, retain=0,
-                 join_metrics=None, streams=False):
+                 join_metrics=None, streams=False, comparisons=None):
         self.filters = filters or {}
         self.joins = joins or {}
         self.labels = labels
         self.scores = scores or (lambda spec, ids: (sum(ids) + 1) / 10)
         self.answers = answers
+        self.comparisons = comparisons
         self.probabilities = probabilities
         self.retain = retain
         self.join_metrics = join_metrics
@@ -84,6 +90,8 @@ class Oracle:
             return self.execute_predicates((node,), inputs)[node.node_id]
         if isinstance(node, AiExtract):
             return self._extract(node, inputs)
+        if isinstance(node, AiTopK):
+            return self._rank(node, inputs)
         if isinstance(node, AiClassify) and node.spec.partner is not None:
             return self._classify_joined(node, inputs)
         if isinstance(node, (AiScore, AiClassify)):
@@ -237,6 +245,18 @@ class Oracle:
         if callable(self.answers):
             return self.answers(spec, document)
         return None if self.answers is None else self.answers[document]
+
+    def _rank(self, node, inputs) -> NodeResult:
+        """Rank with ``comparisons``, or a tie when none was planted."""
+        spec = node.spec
+
+        def ask(pairs):
+            if self.comparisons is None:
+                return [0.5] * len(pairs)
+            return [float(self.comparisons(spec, int(first), int(second)))
+                    for first, second in pairs]
+
+        return execute_rank(node, inputs, ask)
 
     def _reranker(self) -> RerankerModelExecution:
         return RerankerModelExecution(GpuContext(

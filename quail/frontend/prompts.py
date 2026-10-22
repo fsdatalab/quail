@@ -8,6 +8,7 @@ from quail.logical.prompts import (
     bind_extract_prompt,
     bind_join_prompt,
     bind_prompt,
+    bind_rank_prompt,
     bind_score_prompt,
 )
 from quail.specs import ModelSpec
@@ -29,7 +30,7 @@ class PromptBinder:
         """Bind the prompt text for an operator.
 
         Args:
-            kind: Filter, join, score, label, or extract operator kind.
+            kind: Filter, join, score, label, extract, or rank.
             template: Prompt template, or the extraction question.
             args: Document column references in template order.
             labels: Classification labels.
@@ -56,6 +57,8 @@ class PromptBinder:
             binder = bind_join_prompt
         elif kind == "score":
             binder = bind_score_prompt
+        elif kind == "rank":
+            binder = bind_rank_prompt
         else:
             raise ValueError(f"unknown prompt kind {kind!r}")
         return binder(template, args, turn=turn, layout=layout)

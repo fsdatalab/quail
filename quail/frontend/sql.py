@@ -34,7 +34,6 @@ from quail.logical import (
 from quail.logical.expressions import aliased_call
 
 FORBIDDEN = (
-    (exp.Qualify, "QUALIFY"),
     (exp.Union, "UNION"),
     (exp.Except, "EXCEPT"),
     (exp.Intersect, "INTERSECT"),
@@ -66,6 +65,8 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
         replacement = None
         if function == "SCORE":
             replacement = "AI_SCORE("
+        elif function == "RANK":
+            replacement = "AI_RANK("
         elif function == "CLASSIFY":
             replacement = "AI_CLASSIFY("
         elif function == "EXTRACT":
@@ -104,10 +105,11 @@ def _reject_forbidden(tree) -> None:
             "AI_FILTER",
             "AI_SCORE",
             "AI_EXTRACT",
+            "AI_RANK",
         }:
             raise CompileError(
                 f"{name} is not supported; supported AI functions are "
-                "AI_FILTER, AI_SCORE, AI_CLASSIFY, and AI_EXTRACT"
+                "AI_FILTER, AI_SCORE, AI_CLASSIFY, AI_EXTRACT, and AI_RANK"
             )
     # subqueries are legal only as the EXISTS form, checked
     # structurally; any other subquery is refused here
@@ -119,7 +121,7 @@ def _reject_forbidden(tree) -> None:
 
 def _validate_query(
     b: ExpressionBinder, joins: JoinBinder, columns: tuple[ColumnRef | Alias, ...],
-    structs: tuple = (),
+    structs: tuple = (), windows: tuple = (),
 ) -> None:
     """Validate output names and supported combinations of AI operators."""
     for struct in structs:
@@ -185,7 +187,9 @@ def _validate_query(
             "AI.SCORE cannot be mixed with generative AI predicates in one query"
         )
 
-    if not b.joins and not b.filters and not b.label_tests and not projected:
+    ranked = any(call.function == "ai_rank" for call in windows)
+    if not b.joins and not b.filters and not b.label_tests and not projected \
+            and not ranked:
         raise CompileError(
             "the query has no AI predicate; a plain "
             "scan belongs in the database the ids came "
@@ -274,7 +278,7 @@ def compile_sql(
     columns, aggregation = selection.columns, selection.aggregation
     order = bind_order(tree, b, columns, aggregation, selection.structs,
                        selection.windows)
-    _validate_query(b, joins, columns, selection.structs)
+    _validate_query(b, joins, columns, selection.structs, selection.windows)
     named, labels = _bind_label_names(b, columns)
     extracts = {}
     for column in columns:

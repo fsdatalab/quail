@@ -23,6 +23,7 @@ from quail.physical import (
     AiInference,
     AiJoin,
     AiScore,
+    AiTopK,
     PhysicalGraph,
 )
 from quail.physical.pipelines import build_pipelines
@@ -104,7 +105,7 @@ class PlanPricer:
                     work=self.stage_works.get(node.written_position, Work())
                 )
                 entry["seconds"] = self._seconds(price.work)
-            elif isinstance(node, (AiScore, AiClassify, AiExtract)) \
+            elif isinstance(node, (AiScore, AiClassify, AiExtract, AiTopK)) \
                     and node.spec is not None:
                 price = NodePrice(seconds=self._inference_seconds(node, resident))
                 entry["seconds"] = price.seconds

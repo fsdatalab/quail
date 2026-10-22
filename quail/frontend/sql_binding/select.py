@@ -1,6 +1,6 @@
 """Bind projections, grouping, and result ordering."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from sqlglot import exp
 
@@ -199,6 +199,8 @@ class SelectBinder:
 
     def bind_window(self, node: exp.Window, name: str, hidden: str) -> WindowCall:
         """Bind one function OVER (PARTITION BY ... ORDER BY ...) call."""
+        if _is_call(node.this, "AI_RANK"):
+            return self._bind_rank(node, name)
         call = node.this
         function = _WINDOW_CLASSES.get(type(call))
         if function is None or node.args.get("spec") is not None:
@@ -218,6 +220,66 @@ class SelectBinder:
             (self.register_argument(term.this, f"{hidden}_order_{index}"),
              bool(term.args.get("desc")), bool(term.args.get("nulls_first")))
             for index, term in enumerate(order.expressions if order else ())), name)
+
+    def _bind_rank(self, node: exp.Window, name: str) -> WindowCall:
+        """Bind AI.RANK(...) OVER (PARTITION BY ...)."""
+        if node.args.get("order") is not None:
+            raise CompileError(
+                "AI.RANK takes no ORDER BY; filter its rank with < or <=")
+        if name in {call.name for call in self.windows}:
+            raise CompileError(f"the window {name!r} is already defined")
+        prompt, _, aliases = self.binder.bind_ai_call(node.this, "AI_RANK", set())
+        if len(aliases) != 1:
+            raise CompileError("AI.RANK reads one document column")
+        partition = tuple(
+            self.register_argument(term, f"{name}_partition_{index}")
+            for index, term in enumerate(node.args.get("partition_by") or ()))
+        alias = aliases[0]
+        provider = dict(self.binder.tables)[alias]
+        id_column = self.binder.catalog.get(provider).id_col
+        id_name = f"{alias}.{id_column}"
+        if id_name not in {column_name(column) for column in self.columns}:
+            self.columns.append(ColumnRef(alias, provider, id_column))
+        return WindowCall(
+            "ai_rank", None, partition, (), name, prompt=prompt)
+
+    def bind_qualify(self, tree: exp.Select) -> None:
+        """Bind QUALIFY AI.RANK(...) <= k, or QUALIFY rank_name <= k."""
+        qualify = tree.args.get("qualify")
+        if qualify is None:
+            return
+        term = qualify.this
+        comparison = _PLAIN_COMPARISONS.get(type(term))
+        if comparison is None:
+            raise CompileError("QUALIFY filters AI.RANK with < or <=")
+        left, right = term.this, term.expression
+        if not isinstance(right, (exp.Literal, exp.Neg)):
+            if not isinstance(left, (exp.Literal, exp.Neg)):
+                raise CompileError("QUALIFY filters AI.RANK with < or <=")
+            left, right, comparison = right, left, _FLIPPED[comparison]
+        if comparison not in ("<", "<="):
+            raise CompileError("QUALIFY filters AI.RANK with < or <=")
+        bound = _rank_bound(right)
+        if isinstance(left, exp.Window):
+            if any(call.function == "ai_rank" for call in self.windows):
+                raise CompileError("AI.RANK is written once")
+            call = replace(
+                self._bind_rank(left, "__rank"),
+                rank_comparison=comparison, rank_k=bound)
+            self.windows.append(call)
+            return
+        if isinstance(left, exp.Column) and not left.table:
+            index = next((i for i, call in enumerate(self.windows)
+                          if call.name == left.name), None)
+            if index is None or self.windows[index].function != "ai_rank":
+                raise CompileError(
+                    f"QUALIFY {left.name} is not an AI.RANK column of this SELECT")
+            if self.windows[index].rank_comparison:
+                raise CompileError("AI.RANK takes one < or <= filter")
+            self.windows[index] = replace(
+                self.windows[index], rank_comparison=comparison, rank_k=bound)
+            return
+        raise CompileError("QUALIFY filters AI.RANK with < or <=")
 
     def bind_projection(self, tree: exp.Select) -> None:
         """Bind SELECT outputs and collect aggregate and window inputs."""
@@ -311,6 +373,7 @@ class SelectBinder:
     def bind(self, tree: exp.Select) -> BoundSelect:
         """Bind SELECT and its grouping clauses."""
         self.bind_projection(tree)
+        self.bind_qualify(tree)
         if self.structs and (self.aggregates or tree.args.get("group")
                              or tree.args.get("having")):
             raise CompileError(
@@ -338,6 +401,21 @@ class SelectBinder:
                 tuple(keys), tuple(self.aggregates), tuple(self.output), tuple(tests)
             ),
         )
+
+
+def _rank_bound(node) -> int:
+    """Return the positive integer an AI.RANK filter compares with."""
+    if isinstance(node, exp.Neg):
+        raise CompileError("AI.RANK is filtered by a positive integer")
+    if isinstance(node, exp.Literal) and not node.is_string:
+        text = str(node.this)
+        if "." in text or "e" in text.lower():
+            raise CompileError("AI.RANK is filtered by a positive integer")
+        value = int(text)
+        if value <= 0:
+            raise CompileError("AI.RANK is filtered by a positive integer")
+        return value
+    raise CompileError("AI.RANK is filtered by a positive integer")
 
 
 def _number(node):

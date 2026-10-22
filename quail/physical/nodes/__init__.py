@@ -5,6 +5,7 @@ from .extract import AiExtract, ExtractSpec
 from .filter import AiFilter, Filter
 from .inference import AiInference, AiScore, InferenceSpec, ScoreSpec
 from .join import AiJoin, Barrier, Foreign, HashJoin
+from .rank import AiTopK, RankSpec
 from .relational import Aggregate, Exchange, Limit, Project, Recombine, Sort, Window
 from .scan import Scan
 
@@ -16,6 +17,7 @@ __all__ = [
     "AiInference",
     "AiJoin",
     "AiScore",
+    "AiTopK",
     "Barrier",
     "ClassifySpec",
     "Exchange",
@@ -26,6 +28,7 @@ __all__ = [
     "InferenceSpec",
     "Limit",
     "Project",
+    "RankSpec",
     "Recombine",
     "Scan",
     "ScoreSpec",

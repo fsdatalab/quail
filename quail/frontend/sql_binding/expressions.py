@@ -201,6 +201,8 @@ class ExpressionBinder:
                 aliases.append(r.alias)
         if join is None:
             join = len(aliases) > 1
+        if function == "AI_RANK" and len(refs) != 1:
+            raise CompileError("AI.RANK reads one document column")
         if function == "AI_SCORE" and join and template.count("{0}") != 1:
             raise CompileError(
                 "an AI.SCORE pair prompt mentions {0} exactly once, as "
@@ -210,7 +212,9 @@ class ExpressionBinder:
         if classify is not None:
             prompt = self.prompts.bind("label", template, tuple(refs), **classify)
         else:
-            if function == "AI_SCORE":
+            if function == "AI_RANK":
+                kind = "rank"
+            elif function == "AI_SCORE":
                 kind = "score"
             else:
                 kind = "join" if join else "filter"

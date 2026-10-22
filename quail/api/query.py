@@ -25,6 +25,7 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.logical.expressions import (
+    column_name,
     column_references,
     evaluate_expression,
     source_columns,
@@ -35,6 +36,7 @@ from quail.planner.optimizer.context import PlanningContext
 from quail.planner.optimizer.tree_rewrites import logical_alternatives
 from quail.planner.plan import Refusal, RefusalError
 from quail.planner.search.statistics import filter_stop_keys
+from quail.planner.validation import rank_calls
 
 if TYPE_CHECKING:
     from quail.api.session import Session
@@ -429,12 +431,41 @@ class Query:
         for alias, key in filter_stop_keys(self.logical).items():
             for column in key:
                 needed.setdefault(alias, {})[column] = None
+        self._rank_columns(operators, needed)
         tables = {}
         for alias, columns in needed.items():
             store = self._token_inputs[alias]
             tables[columns_key(alias)] = pa.table(
                 {name: store.column(name) for name in columns})
         return tables
+
+    def _rank_columns(self, operators, needed) -> None:
+        """Add the id and partition columns an AI.RANK comparison reads."""
+        for call in rank_calls(self.logical):
+            if call.prompt is None or not call.prompt.args:
+                continue
+            alias = call.prompt.args[0].alias
+            scan = next(
+                (item for item in operators.scans if item.alias == alias),
+                None)
+            if scan is None:
+                continue
+            provider = self.session.catalog.get(scan.provider)
+            needed.setdefault(alias, {})[provider.id_col] = None
+            for name in call.partition:
+                ref = self._partition_source(name)
+                if ref is not None:
+                    needed.setdefault(ref.alias, {})[ref.column] = None
+
+    def _partition_source(self, name):
+        """Return the source column one rank partition name projects."""
+        for column in self.logical.projection.columns:
+            if column_name(column) != name:
+                continue
+            refs = column_references(column)
+            if len(refs) == 1:
+                return refs[0]
+        return None
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
         """Finish the physical graph and attach execution details."""

@@ -2,8 +2,8 @@
 title: AI functions
 ---
 
-Use AI functions to filter and join documents, score answers, assign
-labels, and extract text. The examples use BigQuery syntax. See the
+Use AI functions to filter and join documents, score answers, rank rows,
+assign labels, and extract text. The examples use BigQuery syntax. See the
 [SQL reference](/docs/user-guide/sql) for dialect selection and a first query.
 
 ## Functions
@@ -18,6 +18,7 @@ Square brackets mark optional arguments.
 | [`PROMPT(template, column, ...)`](#prompt) | Combines instructions with document columns. |
 | [`AI.IF(prompt[, options])`](#aiif) | Keeps documents or pairs that satisfy a model question. |
 | [`AI.SCORE(prompt[, options])`](#aiscore) | Returns a score from 0 to 1 for a model question. |
+| [`AI.RANK(prompt) OVER (...)`](#airank) | Ranks rows by pairwise comparisons and keeps the top k. |
 | [`AI.CLASSIFY(input, categories[, options])`](#aiclassify) | Assigns one of the supplied labels. |
 | [`AI.EXTRACT(input, questions)`](#aiextract) | Copies answers from a document and returns their positions. |
 | [`HINT(condition, options)`](#planning-hints) | Sets the estimated pass fraction for a label or answer condition. |
@@ -218,6 +219,60 @@ All [supported models](/docs/user-guide/models) can run `AI.SCORE`:
 Quail computes a repeated score once when it appears in `SELECT` and a
 condition, or in several comparisons. A query cannot combine `AI.SCORE`
 with `AI.IF`.
+
+## AI.RANK
+
+`AI.RANK(PROMPT(...)) OVER (...)` ranks rows by asking the model which
+of two rows better fits a criterion. The prompt states that criterion
+over one column. Quail builds the comparison that shows two rows, with
+the pivot row first so its KV is computed once per round and reused.
+
+A filter on the rank is a top-k. `<= k` keeps k rows and `< k` keeps
+k − 1. Ranks start at 1. A query that writes `AI.RANK` without a `<` or
+`<=` filter is refused, because ranking every row compares on the order
+of n log n pairs. `OVER ()` ranks the whole table. `OVER (PARTITION BY
+...)` ranks inside each group and restarts the ranks at 1.
+
+For example, imagine a `sales_calls` table of call transcripts. Keep
+the 25 calls in negotiation whose customer is closest to buying. This
+is the SALES-6 query, SALES-5 with `AI.RANK` in place of `AI.SCORE`:
+
+```sql
+SELECT c.id
+FROM sales_calls c
+WHERE c.deal_stage = 'Negotiation'
+QUALIFY AI.RANK(PROMPT(
+    'Which sales call shows the customer closer to committing to buying, such as accepting the terms, agreeing to sign, or asking for the contract or paperwork? {0}',
+    c.transcript)) OVER () <= 25
+```
+
+`QUALIFY` filters the rank without adding it to the `SELECT` list. To
+return the rank, name it in `SELECT` and filter that name:
+
+```sql
+SELECT c.id,
+       AI.RANK(PROMPT(
+           'Which sales call shows the customer closer to committing? {0}',
+           c.transcript)) OVER () AS r
+FROM sales_calls c
+QUALIFY r <= 25
+```
+
+Each round compares the remaining rows with one pivot and keeps the
+side that holds the k-th row, then orders those k rows. The expected
+number of comparisons is about 2.7n plus about k log2 k, and `explain()`
+shows it as `expected_comparisons`. A comparison is the probability
+that the first row is better. When that probability is within 0.15 of
+0.5, Quail also asks the reversed order and averages the two answers,
+which cancels a preference for whichever row is shown first. A
+probability of exactly 0.5 is broken by row id, then by document
+position. The pivots come from a fixed seed, so two runs of the same
+input ask the same pairs.
+
+`AI.RANK` reads one table. It is the only window function in the query,
+and it is not combined with `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`,
+`AI.EXTRACT`, or a join. Every model that runs `AI.SCORE` can run
+`AI.RANK`, including the rerankers.
 
 ## AI.CLASSIFY
 

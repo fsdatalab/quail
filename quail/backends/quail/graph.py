@@ -24,6 +24,7 @@ from quail.physical import (
     AiInference,
     AiJoin,
     AiScore,
+    AiTopK,
     Filter,
     PhysicalGraph,
     Scan,
@@ -37,6 +38,7 @@ def quail_runtimes() -> dict:
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
         AiScore.runtime_key: model_runtime,
+        AiTopK.runtime_key: model_runtime,
         AiClassify.runtime_key: model_runtime,
         AiExtract.runtime_key: model_runtime,
         Filter.runtime_key: FilterRuntime(),
@@ -101,7 +103,7 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
         **state,
         "retention": retention,
         "filter_limit": (
-            None if any(isinstance(node, AiJoin)
+            None if any(isinstance(node, (AiJoin, AiTopK))
                         for node in graph.nodes)
             else payload.get("filter_limit")
         ),
