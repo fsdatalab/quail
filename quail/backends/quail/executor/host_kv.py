@@ -12,8 +12,15 @@ matches only a document shown under the same head, tokenized the same
 way. The host pool is a ring over token rows: a new entry takes the
 rows after the newest one and drops the oldest entries in its way.
 Every entry is one contiguous run of rows in each pool, so a save is
-one gather on the compute stream and one copy to the host per layer
-group, and a restore is one copy from the host and one scatter.
+one gather and one copy to the host per layer group, and a restore is
+one copy from the host and one scatter.
+
+A save runs on the store's own stream: the key's rows are complete,
+since a key is freed once its answers were read, and the next forward
+pass waits on the gather (fence) before it may write the pages again.
+So a save never waits on the passes queued ahead of it, and the host
+waits only when every staging buffer is in flight, at the copy
+engine's pace.
 
 A key's rows are saved only once an operator computed or restored them
 (mark_written); pages reserved for a chunk that never ran hold nothing.
@@ -31,6 +38,10 @@ from quail.catalog.tokens import token_array
 # the host are in flight; a 300-token document of a 4B model takes
 # about 45 MB
 MAX_STAGING = 16
+# pinned slots for row indices on their way to the device, and the
+# longest prefix a slot holds; a longer one pins its own buffer
+INDEX_SLOTS = 64
+INDEX_TOKENS = 16384
 
 def prefix_hash(prefix) -> bytes:
     """Hash a prefix's token ids: the document head, then the document."""
@@ -176,11 +187,19 @@ class HostKV:
         self._keys = {}         # arena key -> (prefix hash, prefix tokens)
         self._written = set()   # keys whose prefix rows hold computed KV
         self._fresh = set()     # hashes saved during this query
-        self._staging = {}      # (group, side) -> device staging buffers
+        self._staging = {}      # group -> device staging buffers in flight
+        self._fences = []       # gather events the next pass waits on
+        self._index_slots = None
+        self._index_events = [None] * INDEX_SLOTS
+        self._next_slot = 0
         self._flat = [self._flat_view(layers, width)
                       for layers, width, _ in self._groups]
         self.stream = (torch.cuda.Stream(device=self.device)
                        if self.pinned else None)
+        if self.pinned:
+            self._index_slots = torch.empty(
+                (INDEX_SLOTS, INDEX_TOKENS), dtype=torch.int64, device="cpu",
+                pin_memory=True)
         self.reset_stats()
 
     @staticmethod
@@ -342,34 +361,62 @@ class HostKV:
         if slot is not None:
             self._free_slots.append(slot)
 
-    def _entry_rows(self, key, tokens, sliding):
+    def _entry_rows(self, key, tokens, sliding, stream):
         """Device row indices of the key's prefix in one pool, and its offset.
 
         A sliding pool holds the rows from the window origin on, so the
-        offset says where in the entry those rows sit.
+        offset says where in the entry those rows sit. The rows are
+        copied on `stream`, which reads them.
         """
         arena = self.arena
         if sliding:
             origin = arena.origin(tokens)
             offset = origin - arena.sliding_start(key)
             rows = arena.capacity_rows_sliding(key)[offset:offset + tokens - origin]
-            return self._to_device(rows), origin
-        return self._to_device(arena.capacity_rows(key)[:tokens]), 0
+            return self._to_device(rows, stream), origin
+        return self._to_device(arena.capacity_rows(key)[:tokens], stream), 0
 
-    def _to_device(self, rows):
+    def _to_device(self, rows, stream):
+        """Copy row indices to the device through a pinned slot.
+
+        A pageable copy would wait on the stream's queued work, and a
+        pinned buffer per copy would pin memory each time; the slots
+        pin once and are reused after the copy that read them.
+        """
         if not self.pinned:
             return rows.to(self.device)
-        # a pageable copy would wait on the stream's queued work
-        return rows.pin_memory().to(self.device, non_blocking=True)
+        torch = self.torch
+        if len(rows) > INDEX_TOKENS:
+            with torch.cuda.stream(stream):
+                return rows.pin_memory().to(self.device, non_blocking=True)
+        index = self._next_slot
+        self._next_slot = (index + 1) % INDEX_SLOTS
+        event = self._index_events[index]
+        if event is not None:
+            event.synchronize()
+        slot = self._index_slots[index, :len(rows)]
+        slot.copy_(rows)
+        with torch.cuda.stream(stream):
+            on_device = slot.to(self.device, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(stream)
+        self._index_events[index] = event
+        return on_device
 
     def _save_rows(self, key, start, tokens, slot):
         """Copy the key's first `tokens` rows of every layer to the host."""
+        if not self.pinned:
+            self._gather_and_copy(key, start, tokens, slot)
+            return
+        with self.torch.cuda.stream(self.stream):
+            self._gather_and_copy(key, start, tokens, slot)
+
+    def _gather_and_copy(self, key, start, tokens, slot):
         torch = self.torch
         arena = self.arena
-        compute = torch.cuda.current_stream() if self.pinned else None
         for group, ((layers, width, sliding), pool, flat) in enumerate(zip(
                 self._groups, self.pools, self._flat)):
-            rows, origin = self._entry_rows(key, tokens, sliding)
+            rows, origin = self._entry_rows(key, tokens, sliding, self.stream)
             staging, buffer = self._staging_for(
                 group, (len(rows), len(layers), 2, width))
             if flat is not None:
@@ -380,12 +427,34 @@ class HostKV:
                 for place, layer in enumerate(layers):
                     for side, tensor in enumerate(arena.layer_kv(layer)):
                         staging[:, place, side] = tensor.view(-1, width)[rows]
-            self._to_host(pool[start + origin:start + tokens], staging, compute,
-                          buffer)
+            self._fence_here()
+            self._to_host(pool[start + origin:start + tokens], staging, buffer)
         if slot is not None:
             source = arena.accounting.slots[key]
-            self._to_host(self.gdn_state[slot], arena.gdn_state[source], compute)
-            self._to_host(self.conv_state[slot], arena.conv_state[source], compute)
+            self._to_host(self.gdn_state[slot], arena.gdn_state[source])
+            self._to_host(self.conv_state[slot], arena.conv_state[source])
+            # the slot may be handed to another key and written by the
+            # next pass, so the pass waits for the copy too
+            self._fence_here()
+
+    def _fence_here(self):
+        """Mark the copy stream's position for the next pass to wait on."""
+        if self.stream is None:
+            return
+        event = self.torch.cuda.Event()
+        event.record(self.stream)
+        self._fences.append(event)
+
+    def fence(self, stream) -> None:
+        """Make `stream` wait for every gather queued since the last fence.
+
+        The chunk loop calls this before a forward pass, and restore
+        before its scatter: pages a save is still reading must not be
+        written until it has read them.
+        """
+        fences, self._fences = self._fences, []
+        for event in fences:
+            stream.wait_event(event)
 
     def _staging_for(self, group, shape):
         """A device buffer of `shape` whose last copy to the host has landed.
@@ -413,29 +482,25 @@ class HostKV:
             entry[0] = torch.empty(numel, dtype=self.arena.dtype, device=self.device)
         return entry[0][:numel].view(shape), entry
 
-    def _to_host(self, destination, source, compute, staging=None):
+    def _to_host(self, destination, source, staging=None):
         """Copy a device tensor to the host on the copy stream.
 
         staging is the buffer entry the source came from, which records
         the copy's event so the buffer is reused only after it.
         """
-        if compute is None:
+        if self.stream is None:
             destination.copy_(source)
             return
-        # the gather is in stream order after the pass that wrote the
-        # rows, so the arena may reuse them as soon as it is queued
-        self.stream.wait_stream(compute)
-        with self.torch.cuda.stream(self.stream):
-            destination.copy_(source, non_blocking=True)
+        destination.copy_(source, non_blocking=True)
         if staging is not None:
             staging[1] = self.torch.cuda.Event()
             staging[1].record(self.stream)
-        source.record_stream(self.stream)
 
     def flush(self) -> None:
         """Wait for every copy in flight."""
         if self.stream is not None:
             self.stream.synchronize()
+            self._fences.clear()
 
     # ---- restore -------------------------------------------------------
 
@@ -460,11 +525,14 @@ class HostKV:
         started = time.perf_counter()
         torch = self.torch
         compute = torch.cuda.current_stream() if self.pinned else None
+        if compute is not None:
+            # the pages may be ones a save is still reading
+            self.fence(compute)
         if arena.has_sliding:
             arena.trim_window(key)
         for (layers, width, sliding), pool, flat in zip(
                 self._groups, self.pools, self._flat):
-            rows, origin = self._entry_rows(key, tokens, sliding)
+            rows, origin = self._entry_rows(key, tokens, sliding, compute)
             staging = self._from_host(pool[start + origin:start + tokens], compute)
             if flat is not None:
                 view, bases = flat

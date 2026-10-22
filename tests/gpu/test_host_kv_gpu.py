@@ -64,7 +64,7 @@ def test_a_saved_prefix_restores_bit_for_bit_on_cuda():
 
 def test_a_save_costs_the_host_little_while_a_pass_runs():
     arena = make_arena(pages=8192)
-    host = HostKV(arena, 8 * 2**30, torch)
+    host = HostKV(arena, 16 * 2**30, torch)
     arena.host = host
     tokens, count = 300, 200
     keys = [("d", index) for index in range(count)]

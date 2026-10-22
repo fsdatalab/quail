@@ -628,6 +628,10 @@ class StageExecutor:
             e0 = self.torch.cuda.Event(enable_timing=True)
             e1 = self.torch.cuda.Event(enable_timing=True)
             e0.record()
+        if self.host is not None and self.arena.pinned:
+            # pages freed since the last pass may still be read by a
+            # save: the pass waits for those gathers
+            self.host.fence(self.torch.cuda.current_stream())
         normed = forward_chunk(self.pipeline, self.arena, chunk)
         if self.gpu_timing:
             e1.record()

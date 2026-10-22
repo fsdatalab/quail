@@ -143,6 +143,9 @@ class KVArena:
                 self.num_pages, self.num_sliding_pages, self.num_state_slots):
             return
         page_tokens = self.page_tokens
+        if self.host is not None:
+            # saves still reading the pools finish before they go
+            self.host.flush()
         self.k = self.v = None
         self.gdn_state = self.conv_state = None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
