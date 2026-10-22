@@ -22,6 +22,8 @@ the same methods:
 - attention inputs: layer_kv, paged_kv, block_table, block_table_rows
 - counters: reset_stats, evicted_keys, evicted_pages,
   evicted_prefix_tokens
+- the host store: host, a HostKV that free_key hands a key's prefix
+  rows before they go, or None
 """
 
 import math
@@ -80,6 +82,7 @@ class KVArena:
             raise ValueError("checkpoint slots need the state shapes")
         self.gdn_state_shape = gdn_state_shape
         self.conv_state_shape = conv_state_shape
+        self.host = None      # a HostKV keeping freed prefixes, or None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
         self.reset_stats()
 
@@ -97,6 +100,7 @@ class KVArena:
         # the pools cannot fragment the allocator between each other
         storage = torch.empty(2 * sum(sizes), dtype=self.dtype, device=self.device)
         parts = storage.split([size for size in sizes for _ in range(2)])
+        self.storage = storage
         self.k = [part.view(shape) for part, shape in zip(parts[::2], shapes)]
         self.v = [part.view(shape) for part, shape in zip(parts[1::2], shapes)]
         # one checkpoint per slot: the recurrent state in fp32 and the
@@ -142,6 +146,8 @@ class KVArena:
         self.k = self.v = None
         self.gdn_state = self.conv_state = None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
+        if self.host is not None:
+            self.host.rebind()
 
     # ---- checkpoints ---------------------------------------------------
 
@@ -665,6 +671,8 @@ class KVArena:
         if key in self._holds or key in self._reading:
             self._deferred.add(key)
             return 0
+        if self.host is not None and key in self.accounting.owned:
+            self.host.before_free(key)
         self._window_floor.pop(key, None)
         self._trimmed.discard(key)
         self._rows.pop(key)

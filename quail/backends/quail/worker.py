@@ -13,6 +13,7 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.host_kv import HostKV
 from quail.backends.quail.executor.model_loading import load_model
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import (
@@ -103,6 +104,7 @@ class LoadedGpu:
                                                      full_pages))
         self.arena_s = time.perf_counter() - t0
         self.pool_bytes = pool_bytes(self.arena)
+        self.host_kv_bytes = 0
 
         t0 = time.perf_counter()
         self.decision_head = None
@@ -122,11 +124,14 @@ class LoadedGpu:
         self.async_ans = None
         self.chunk_tokens = None
 
-    def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None):
+    def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None,
+                   host_kv_bytes=0):
         """Attach the answer rows, readout, and chunk budget for one query.
 
         arena_pages resizes the KV pools to the plan's split; nothing
-        survives in the arena between queries.
+        survives in the arena between queries. host_kv_bytes sizes the
+        host store that keeps freed document prefixes between queries;
+        0 keeps none, and a new size starts an empty store.
         """
         if arena_pages is not None:
             slots = checkpoint_arena_args(
@@ -140,6 +145,7 @@ class LoadedGpu:
                               **{k: v for k, v in slots.items()
                                  if k == "num_state_slots"})
             self.pool_bytes = pool_bytes(self.arena)
+        self.configure_host_kv(host_kv_bytes)
         self.torch.cuda.reset_peak_memory_stats()
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
@@ -158,6 +164,20 @@ class LoadedGpu:
             chunk_tokens=chunk_tokens,
             async_scores=async_scores,
         )
+
+    def configure_host_kv(self, host_kv_bytes: int) -> None:
+        """Keep, start, or drop the host store for the given size in bytes."""
+        host_kv_bytes = int(host_kv_bytes or 0)
+        if host_kv_bytes == self.host_kv_bytes:
+            return
+        if self.arena.host is not None:
+            self.arena.host.flush()
+        self.arena.host = (HostKV(self.arena, host_kv_bytes, self.torch)
+                           if host_kv_bytes else None)
+        self.host_kv_bytes = host_kv_bytes
+        if self.arena.host is not None:
+            say(f"host KV store: {self.arena.host.bytes / 2**30:.1f} GiB, "
+                f"{self.arena.host.num_rows} token rows")
 
     def warm(self):
         """Compile and warm kernels once.
@@ -295,16 +315,18 @@ def _single_gpu_context(registry, envelope):
 
 
 def _boot_for_query(runtime_state, backend, gpu_context,
-                    chunk_tokens, true_ids, false_ids, arena_pages=None):
+                    chunk_tokens, true_ids, false_ids, arena_pages=None,
+                    host_kv_bytes=0):
     """Load or reuse the process's GPU, bind a query, warm kernels."""
     gpu, boot = _boot_gpu(runtime_state.pop("gpu", None), backend, gpu_context,
-                          chunk_tokens, true_ids, false_ids, arena_pages)
+                          chunk_tokens, true_ids, false_ids, arena_pages,
+                          host_kv_bytes=host_kv_bytes)
     runtime_state["gpu"] = gpu
     return gpu, boot
 
 
 def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
-              arena_pages=None, *, model_path=None):
+              arena_pages=None, *, model_path=None, host_kv_bytes=0):
     """Prepare a GPU for a query, releasing it when preparation fails.
 
     A gpu of None loads the model; otherwise the loaded GPU is reused.
@@ -319,7 +341,8 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
             gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids,
                             model_path=model_path)
         state["gpu"] = gpu
-        gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
+        gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages,
+                       host_kv_bytes)
         warm_s, warm_tier = gpu.warm()
         boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
         say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
@@ -338,7 +361,7 @@ def prepare_quail_request(context) -> None:
         context.runtime_state, registry.backend(envelope["backend"]),
         _single_gpu_context(registry, envelope), settings["chunk_tokens"],
         settings["true_ids"], settings["false_ids"],
-        settings.get("arena_pages"))
+        settings.get("arena_pages"), settings.get("host_kv_bytes", 0))
     gpu.prepared_boot = boot
 
 
@@ -373,7 +396,7 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
         gpu, boot = _boot_for_query(
             runtime_state, backend, gpu_context, payload["chunk_tokens"],
             payload["true_ids"], payload["false_ids"],
-            payload.get("arena_pages"))
+            payload.get("arena_pages"), payload.get("host_kv_bytes", 0))
     say("running the query")
 
     report = execute_single(gpu, payload, registry, graph)
@@ -455,7 +478,8 @@ def _child_boot(state, sub):
             gpu_index=state.gpu_index, gpus=sub["gpus"],
             model=spec, device=device, query_settings={}),
         sub["chunk_tokens"], sub["true_ids"], sub["false_ids"],
-        sub.get("arena_pages"), model_path=state.model_path)
+        sub.get("arena_pages"), model_path=state.model_path,
+        host_kv_bytes=sub.get("host_kv_bytes", 0))
     return boot
 
 
@@ -598,6 +622,7 @@ def execute_quail_multi(payload, registry, graph):
         "model", "physical_plan", "gpus", "chunk_tokens", "true_ids", "false_ids",
     )}
     setup["arena_pages"] = payload.get("arena_pages")
+    setup["host_kv_bytes"] = payload.get("host_kv_bytes", 0)
     setup.update(registry=registry, model_path=model_path)
     boots = workers.round("boot", [setup] * gpus)
     boot_s = round(time.perf_counter() - started, 2)

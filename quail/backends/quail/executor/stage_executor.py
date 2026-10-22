@@ -172,9 +172,20 @@ class StageExecutor:
         self.appended = [0] * len(self.prefixes)
 
         resident = {}
+        # anchors whose prefix the host store holds: admitted without
+        # their prefix tokens, and restored into their pages on reserve
+        self.host = getattr(self.arena, "host", None) if self.paged else None
+        self.host_hits = {}
+        if self.host is not None:
+            digests = [self.host.register(key, self.prefixes[a],
+                                          self.prefix_lengths[a])
+                       for a, key in enumerate(self.keys)]
         if self.paged:
             for a, key in enumerate(self.keys):
                 if not self.arena.is_resident(key):
+                    if self.host is not None and self.host.holds(digests[a]):
+                        self.host_hits[a] = digests[a]
+                        resident[a] = 0
                     continue
                 if self.arena.prefix_tokens(key) != self.prefix_lengths[a]:
                     # KV an earlier operator left under this key was
@@ -184,7 +195,8 @@ class StageExecutor:
                 resident[a] = self._held_pages(key, self.prefix_lengths[a])
         # Pin resident documents while fresh admissions evict retained KV.
         for a in resident:
-            self.arena.pin(self.keys[a])
+            if a not in self.host_hits:
+                self.arena.pin(self.keys[a])
 
         self.asking = any(stage.requests is not None or stage.own_suffixes
                           for stage in self.stages)
@@ -255,6 +267,7 @@ class StageExecutor:
 
         self._held_parents = set()
         self._reserved_parents = {}
+        self._readmit = False     # an anchor went back to the queue as fresh
         self.spans = []
         self.tokens = 0
         self.pack_s = 0.0
@@ -375,6 +388,15 @@ class StageExecutor:
                 key, prefix, capacity_tokens=prefix + self.capacity_extra,
                 borrow=(self.keys[parent], shared) if shared else None,
                 extension=self._extends, share_points=points):
+            return False
+        digest = self.host_hits.pop(anchor, None)
+        if digest is not None and not self.host.restore(key, digest):
+            # the store dropped the entry since the lookup: the pages
+            # go back and the anchor is admitted again, computing its
+            # prefix
+            self.arena.free_key(key)
+            self.sched.pack_prefix(anchor)
+            self._readmit = True
             return False
         if parent is not None:
             self.arena.read_state((self.keys[parent],))
@@ -616,6 +638,8 @@ class StageExecutor:
             self.spans.append((by_stage, chunk.tokens, e0, e1))
         for key in chunk.fresh_keys:
             self.arena.trim_window(key)
+            if self.host is not None:
+                self.host.mark_written(key)
         # the earlier passes' readouts finished before this forward pass
         # started, so their answers are decided while the GPU runs it;
         # a readout of many rows launches enough kernels to fill the
@@ -652,6 +676,9 @@ class StageExecutor:
                 # parents freed but held for queued children hold the
                 # pages: the children pack their whole prefixes
                 if self.arena.drop_holds(self.held):
+                    continue
+                if self._readmit:
+                    self._readmit = False
                     continue
                 raise AssertionError("nothing buildable and nothing in flight")
             self._run_part(groups)

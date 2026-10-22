@@ -68,6 +68,32 @@ The first query loads the model onto the GPU. Later queries on the
 same session reuse that model, the compiled kernels, and the tokenized
 documents. `sql()` returns a [`Query`](/docs/user-guide/results#read-the-results).
 
+## Keeping KV between queries
+
+Set `host_kv_bytes` to keep document KV in host memory after the
+query that computed it. When the GPU frees a document's KV, Quail
+copies its prefix, the prompt head and the document, into pinned host
+memory first. The next query that reads the same document copies it
+back instead of computing it again. The setting is the host memory
+the store may use, in bytes; the default of 0 keeps nothing.
+
+```python
+config = quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    host_kv_bytes=64 * 2**30,
+)
+```
+
+The store lives as long as the loaded model, so it serves queries on
+one session or one Quail Server. It is keyed by the document's token
+ids under the prompt head, which every `AI.IF`, `AI.CLASSIFY`,
+`AI.EXTRACT`, and join anchor shares, so a document saved by one query
+is reused by any later query over the same table. A join's partner
+documents are not saved. When the store is full, the oldest entries
+make room. The query report counts hits, restored tokens, and host
+time under `kv_manager`; see [Metrics](/docs/user-guide/metrics).
+
 ## Running on Quail Server
 
 Pass a [Quail Server](/docs/user-guide/server) URL as `endpoint`.

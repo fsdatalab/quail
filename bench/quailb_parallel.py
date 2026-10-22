@@ -88,7 +88,7 @@ def _methods(csv: str) -> list[str]:
 def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
                 run_dir, ground_truth_collection, root=None,
                 attention=None, gpu_timing=False,
-                canvas_draws=None) -> str:
+                canvas_draws=None, host_kv_bytes=0) -> str:
     """Run one query family's methods, one child process per group.
 
     Every group runs on the one GPU of this container, in a fresh
@@ -118,6 +118,7 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
             gpu_timing=gpu_timing,
             suite_name=f"{family}{result_name}",
             canvas_draws=canvas_draws,
+            host_kv_bytes=host_kv_bytes,
         )
         process_results.append(process_result)
         suites.update(process_result["suites"])
@@ -172,6 +173,7 @@ def run_query_family(
     gpu_timing: bool = False,
     label_root: str = "",
     canvas_draws: str = "",
+    host_kv_bytes: int = 0,
 ) -> str:
     """Run one query family through the selected benchmark methods.
 
@@ -191,6 +193,8 @@ def run_query_family(
         label_root: Optional local mirror of reference labels.
         canvas_draws: Comma-separated maximum diffusion draw counts. Empty
             keeps the default; multiple counts create separate Quail runs.
+        host_kv_bytes: Host bytes of document KV Quail keeps between the
+            family's queries; 0 keeps none.
 
     Returns:
         Path to the saved family result on the results volume.
@@ -213,6 +217,7 @@ def run_query_family(
             attention=attention or None,
             gpu_timing=gpu_timing,
             canvas_draws=canvas_draws or None,
+            host_kv_bytes=host_kv_bytes,
         )
     finally:
         results_vol.commit()
@@ -316,6 +321,7 @@ def run_all(
     gpu_timing: bool = False,
     label_root: str = "",
     canvas_draws: str = "",
+    host_kv_bytes: int = 0,
 ):
     from quail_b import select_queries
 
@@ -336,6 +342,7 @@ def run_all(
         "sf": scale_factor,
         "attention": attention or None,
         "canvas_draws": canvas_draws or None,
+        "host_kv_bytes": host_kv_bytes,
         "query_ids": list(query_ids),
         "summaries": {},
         "function_call_ids": {},
@@ -372,6 +379,7 @@ def run_all(
                     gpu_timing=gpu_timing,
                     label_root=label_root,
                     canvas_draws=canvas_draws,
+                    host_kv_bytes=host_kv_bytes,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -534,6 +542,7 @@ def main(
     label_root: str = "",
     finish: str = "",
     canvas_draws: str = "",
+    host_kv_bytes: int = 0,
 ):
     if finish:
         # finish an earlier run whose orchestrator died
@@ -562,6 +571,7 @@ def main(
         gpu_timing=gpu_timing,
         label_root=label_root,
         canvas_draws=canvas_draws,
+        host_kv_bytes=host_kv_bytes,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

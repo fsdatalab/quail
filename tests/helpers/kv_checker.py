@@ -13,7 +13,6 @@ from its hash and check that the loop returns it.
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-import numpy as np
 import torch
 
 from helpers.fakes import fake_pipeline, fake_readout, fake_torch
@@ -61,13 +60,17 @@ def chain(tokens):
 
 
 class Pool:
-    """(token, position, hash) per physical row of one KV pool."""
+    """(token, position, hash) per physical row of one KV pool.
 
-    def __init__(self, pages, page_tokens):
-        rows = pages * page_tokens
-        self.token = np.full(rows, -1, dtype=np.int64)
-        self.position = np.full(rows, -1, dtype=np.int64)
-        self.hash = np.full(rows, -1, dtype=np.int64)
+    The three columns are views of one layer's K tensor in the arena,
+    so whatever moves the arena's rows moves these.
+    """
+
+    def __init__(self, k):
+        k.fill_(-1)
+        self.token = k[:, 0, 0].numpy()
+        self.position = k[:, 0, 1].numpy()
+        self.hash = k[:, 0, 2].numpy()
 
 
 class HashModel:
@@ -76,9 +79,8 @@ class HashModel:
     def __init__(self, arena, answers, canvas):
         self.page = arena.page_tokens
         self.window = arena.window
-        self.full = Pool(arena.accounting.num_pages, self.page)
-        self.sliding = (Pool(arena.sliding.num_pages, self.page)
-                        if arena.has_sliding else None)
+        self.full = Pool(arena.layer_kv(0)[0])
+        self.sliding = Pool(arena.layer_kv(1)[0]) if arena.has_sliding else None
         self.answers = answers      # request hash -> answer bit
         self.canvas = canvas
 
@@ -281,16 +283,17 @@ class HashModel:
 
 
 def make_arena(setup):
+    """An arena whose rows hold the checking model's (token, position, hash)."""
     if setup.window is not None:
         return KVArena(num_layers=2, num_pages=setup.pages,
-                       page_tokens=setup.page_tokens, num_kv_heads=1, d_head=1,
-                       dtype=torch.float32, device="cpu",
-                       layer_kv=[(1, 1), (1, 1)], sliding_layers=(1,),
+                       page_tokens=setup.page_tokens, num_kv_heads=1, d_head=3,
+                       dtype=torch.int64, device="cpu",
+                       layer_kv=[(1, 3), (1, 3)], sliding_layers=(1,),
                        sliding_window=setup.window,
                        num_sliding_pages=setup.sliding_pages)
     return KVArena(num_layers=1, num_pages=setup.pages,
-                   page_tokens=setup.page_tokens, num_kv_heads=1, d_head=1,
-                   dtype=torch.float32, device="cpu")
+                   page_tokens=setup.page_tokens, num_kv_heads=1, d_head=3,
+                   dtype=torch.int64, device="cpu")
 
 
 def cpu_torch():

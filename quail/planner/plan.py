@@ -275,6 +275,10 @@ class EngineConfig:
     # one attention path, "tree" or "unified", forced for every filter
     # and join; None lets the planner choose per node
     attention: str | None = None
+    # host memory, in bytes, that keeps document KV the arena frees so
+    # a later operator or query reads it back instead of computing it;
+    # 0 keeps none
+    host_kv_bytes: int = 0
 
 
 def plan_kv_retention(graph: PhysicalGraph) -> PhysicalGraph:

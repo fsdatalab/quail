@@ -78,7 +78,7 @@ def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypa
         TokenLengths(pa.array([100_000], pa.int32()))).squared == 10_000_000_000
     index = store.prefix_index
     with monkeypatch.context() as patch:
-        patch.setattr("quail.catalog.tokens._token_array",
+        patch.setattr("quail.catalog.tokens.token_array",
                       lambda *_: pytest.fail("prefix preparation ran twice"))
         assert prefix_tree(store, 1) is index.tree(1)
         assert prefix_tree(store, 16) is index.tree(16)

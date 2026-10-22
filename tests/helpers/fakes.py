@@ -59,6 +59,7 @@ def bare_arena(arena, pages):
     arena._deferred = set()
     arena._window_floor = {}
     arena._trimmed = set()
+    arena.host = None
     arena._refresh_rows = lambda *args: None
     arena.reset_stats()
     return arena
@@ -378,6 +379,7 @@ class FakeArena:
 
     def __init__(self):
         self.accounting = self
+        self.host = None
         self.owned = set()
         self.retained = set()
 

@@ -649,7 +649,7 @@ def longest_common_prefix(left, right) -> int:
     return limit
 
 
-def _token_array(document):
+def token_array(document):
     """A document's token ids as an int32 array, without a Python list."""
     import numpy as np
 
@@ -722,7 +722,7 @@ class PrefixIndex:
     def __init__(self, documents):
         n = len(documents)
         try:
-            arrays = [_token_array(documents[i]) for i in range(n)]
+            arrays = [token_array(documents[i]) for i in range(n)]
         except (TypeError, ValueError):
             # Test tokenizers may return words instead of integer token IDs.
             arrays = [tuple(documents[i]) for i in range(n)]
