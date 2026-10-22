@@ -119,24 +119,34 @@ def test_a_prefix_nobody_computed_is_not_saved():
     assert not host.holds(renamed)
 
 
-def test_the_store_keeps_the_newest_entries_within_its_bytes():
+def test_a_full_store_keeps_a_query_first_documents_and_drops_older_queries():
     arena = make_arena(pages=16)
     host = attach(arena, entries=2, tokens=6)
     digests = []
-    for document in range(3):
+
+    def save(document, seed):
         key = ("d", document)
-        digests.append(host.register(key, [document] * 6, 6))
+        digests.append(host.register(key, [seed] * 6, 6))
         assert arena.reserve(key, 6, capacity_tokens=8)
-        write_prefix(arena, key, 6, seed=10 * document)
+        write_prefix(arena, key, 6, seed=seed)
         host.mark_written(key)
         arena.free_key(key)
-    assert [host.holds(digest) for digest in digests] == [False, True, True]
-    assert host.report()["host_kv_entries"] == 2
+
+    for document in range(3):
+        save(document, 10 * document)
+    # the third save would drop the first, saved by this query: it is skipped
+    assert [host.holds(digest) for digest in digests] == [True, True, False]
+    assert host.skipped_keys == 1 and host.report()["host_kv_entries"] == 2
     key = ("d", 1)
     assert arena.reserve(key, 6, capacity_tokens=8)
     assert host.restore(key, digests[1])
     assert read_prefix(arena, key, 0, 6)[(1, 0, 5)] == [[115.0, 115.0]]
-    assert not host.restore(("d", 0), digests[0]) and host.misses == 1
+    arena.free_key(key)
+    assert not host.restore(("d", 2), digests[2]) and host.misses == 1
+    # the next query's saves drop the last query's entries, oldest first
+    host.begin_query()
+    save(3, 30)
+    assert [host.holds(digest) for digest in digests] == [False, True, False, True]
 
 
 def test_a_sliding_prefix_restores_its_window_rows_trimmed():

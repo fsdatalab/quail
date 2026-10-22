@@ -90,8 +90,12 @@ one session or one Quail Server. It is keyed by the document's token
 ids under the prompt head, which every `AI.IF`, `AI.CLASSIFY`,
 `AI.EXTRACT`, and join anchor shares, so a document saved by one query
 is reused by any later query over the same table. A join's partner
-documents are not saved. When the store is full, the oldest entries
-make room. The query report counts hits, restored tokens, and host
+documents are not saved. A new query's documents make room by
+dropping earlier queries' entries, oldest first. Once a query has
+filled the store with its own documents, the rest of its documents are
+not saved, so a corpus larger than the store keeps its first documents
+rather than copying every one to the host for nothing. The query
+report counts hits, saved, restored, and skipped documents, and host
 time under `kv_manager`; see [Metrics](/docs/user-guide/metrics).
 
 ## Running on Quail Server

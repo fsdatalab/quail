@@ -51,36 +51,49 @@ class _Ring:
         self.head = 0
         self.entries = deque()
 
-    def take(self, rows: int):
-        """Claim `rows` contiguous rows, returning (start, evicted entries).
+    def plan(self, rows: int):
+        """Where `rows` contiguous rows would go: (start, entries in the way).
 
         The start is None when the ring is too small for the run.
+        Nothing changes until take().
         """
         if rows > self.num_rows or rows <= 0:
             return None, ()
+        head = self.head
         evicted = []
+        index = 0
         while True:
-            if self.head + rows > self.num_rows:
+            if head + rows > self.num_rows:
                 # the run would cross the end: the rows up to it go
                 # unused, and the entries still ahead of the head are
                 # the oldest, so they go
-                while self.entries and self.entries[0][0] >= self.head:
-                    evicted.append(self.entries.popleft())
-                self.head = 0
+                while index < len(self.entries) and self.entries[index][0] >= head:
+                    evicted.append(self.entries[index])
+                    index += 1
+                head = 0
                 continue
-            if not self.entries:
+            if index >= len(self.entries):
                 break
-            oldest = self.entries[0][0]
+            oldest = self.entries[index][0]
             # free rows run from the head to the oldest entry when it
             # sits ahead of the head, else to the end of the ring
-            if oldest >= self.head and oldest - self.head < rows:
-                evicted.append(self.entries.popleft())
+            if oldest >= head and oldest - head < rows:
+                evicted.append(self.entries[index])
+                index += 1
                 continue
             break
-        start = self.head
-        self.head += rows
+        return head, tuple(evicted)
+
+    def take(self, rows: int):
+        """Claim `rows` contiguous rows, returning (start, evicted entries)."""
+        start, evicted = self.plan(rows)
+        if start is None:
+            return None, ()
+        for _ in evicted:
+            self.entries.popleft()
+        self.head = start + rows
         self.entries.append((start, rows))
-        return start, tuple(evicted)
+        return start, evicted
 
     def pop_oldest(self):
         """Drop the oldest entry, returning it or None."""
@@ -158,6 +171,8 @@ class HostKV:
         self._by_start = {}     # ring start -> prefix hash
         self._keys = {}         # arena key -> (prefix hash, prefix tokens)
         self._written = set()   # keys whose prefix rows hold computed KV
+        self._fresh = set()     # hashes saved during this query
+        self._staging = {}      # (group, side) -> device staging buffers
         self._flat = [self._flat_view(layers, width)
                       for layers, width, _ in self._groups]
         self.stream = (torch.cuda.Stream(device=self.device)
@@ -215,6 +230,7 @@ class HostKV:
         self.saved_tokens = 0
         self.restored_keys = 0
         self.restored_tokens = 0
+        self.skipped_keys = 0
         self.host_s = 0.0
 
     def report(self) -> dict:
@@ -226,6 +242,7 @@ class HostKV:
             "host_kv_saved_tokens": self.saved_tokens,
             "host_kv_restored_keys": self.restored_keys,
             "host_kv_restored_tokens": self.restored_tokens,
+            "host_kv_skipped_keys": self.skipped_keys,
             "host_kv_s": round(self.host_s, 4),
             "host_kv_entries": len(self.entries),
             "host_kv_rows": self.num_rows,
@@ -237,6 +254,7 @@ class HostKV:
         """Forget the last query's keys: a key names a document per query."""
         self._keys.clear()
         self._written.clear()
+        self._fresh.clear()
         self.reset_stats()
 
     def register(self, key, prefix, prefix_tokens: int) -> bytes:
@@ -280,23 +298,33 @@ class HostKV:
         if self.num_slots and arena.checkpoint_tokens(key) != prefix_tokens:
             return False
         started = time.perf_counter()
-        start, evicted = self.ring.take(prefix_tokens)
-        if start is None:
+        start, evicted = self.ring.plan(prefix_tokens)
+        # a store smaller than the query's documents keeps the first
+        # ones it saved: a save that would drop one of them would move
+        # the rows for nothing
+        if start is None or any(self._by_start[old_start] in self._fresh
+                                for old_start, _ in evicted):
+            self.skipped_keys += 1
             return False
+        slot = None
+        if self.num_slots and not self._free_slots and not any(
+                self.entries[self._by_start[old_start]][2] is not None
+                for old_start, _ in evicted):
+            oldest = self.ring.entries[0] if self.ring.entries else None
+            if oldest is None or self._by_start[oldest[0]] in self._fresh:
+                self.skipped_keys += 1
+                return False
+            self.ring.pop_oldest()
+            self._forget(oldest[0])
+        self.ring.take(prefix_tokens)
         for old_start, _ in evicted:
             self._forget(old_start)
-        slot = None
         if self.num_slots:
-            while not self._free_slots:
-                oldest = self.ring.pop_oldest()
-                if oldest is None:
-                    self.ring.drop(start)
-                    return False
-                self._forget(oldest[0])
             slot = self._free_slots.pop()
         self._save_rows(key, start, prefix_tokens, slot)
         self.entries[digest] = (start, prefix_tokens, slot)
         self._by_start[start] = digest
+        self._fresh.add(digest)
         self.saved_keys += 1
         self.saved_tokens += prefix_tokens
         self.host_s += time.perf_counter() - started
@@ -335,12 +363,11 @@ class HostKV:
         torch = self.torch
         arena = self.arena
         compute = torch.cuda.current_stream() if self.pinned else None
-        for (layers, width, sliding), pool, flat in zip(
-                self._groups, self.pools, self._flat):
+        for group, ((layers, width, sliding), pool, flat) in enumerate(zip(
+                self._groups, self.pools, self._flat)):
             rows, origin = self._entry_rows(key, tokens, sliding)
-            staging = torch.empty(
-                (len(rows), len(layers), 2, width), dtype=arena.dtype,
-                device=self.device)
+            staging, buffer = self._staging_for(
+                group, (len(rows), len(layers), 2, width))
             if flat is not None:
                 view, bases = flat
                 index = (rows[:, None] + bases[None, :]).reshape(-1)
@@ -349,23 +376,56 @@ class HostKV:
                 for place, layer in enumerate(layers):
                     for side, tensor in enumerate(arena.layer_kv(layer)):
                         staging[:, place, side] = tensor.view(-1, width)[rows]
-            self._to_host(pool[start + origin:start + tokens], staging, compute)
+            self._to_host(pool[start + origin:start + tokens], staging, compute,
+                          buffer)
         if slot is not None:
             source = arena.accounting.slots[key]
             self._to_host(self.gdn_state[slot], arena.gdn_state[source], compute)
             self._to_host(self.conv_state[slot], arena.conv_state[source], compute)
 
-    def _to_host(self, destination, source, compute):
-        """Copy a device tensor to the host on the copy stream."""
+    def _staging_for(self, group, shape):
+        """A device buffer of `shape` whose last copy to the host has landed.
+
+        Two buffers per group alternate, so the gather of one save
+        runs while the copy of the one before reads the other. The
+        host waits for the older copy when both are in flight, which
+        paces saves at the copy engine's rate instead of filling the
+        device with staging buffers.
+        """
+        torch = self.torch
+        buffers = self._staging.setdefault(group, [])
+        if len(buffers) < 2:
+            buffers.append([None, None])
+            entry = buffers[-1]
+        else:
+            entry = buffers.pop(0)
+            buffers.append(entry)
+            if entry[1] is not None:
+                entry[1].synchronize()
+        numel = 1
+        for size in shape:
+            numel *= size
+        if entry[0] is None or entry[0].numel() < numel:
+            entry[0] = torch.empty(numel, dtype=self.arena.dtype, device=self.device)
+        return entry[0][:numel].view(shape), entry
+
+    def _to_host(self, destination, source, compute, staging=None):
+        """Copy a device tensor to the host on the copy stream.
+
+        staging is the buffer entry the source came from, which records
+        the copy's event so the buffer is reused only after it.
+        """
         if compute is None:
             destination.copy_(source)
             return
         # the gather is in stream order after the pass that wrote the
-        # rows, so the arena may reuse them as soon as it is queued;
-        # the staging tensor stays allocated until the copy has read it
+        # rows, so the arena may reuse them as soon as it is queued
         self.stream.wait_stream(compute)
         with self.torch.cuda.stream(self.stream):
             destination.copy_(source, non_blocking=True)
+        if staging is not None:
+            staging[1] = self.torch.cuda.Event()
+            staging[1].record(self.stream)
         source.record_stream(self.stream)
 
     def flush(self) -> None:
