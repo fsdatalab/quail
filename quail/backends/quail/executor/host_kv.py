@@ -36,10 +36,11 @@ import numpy as np
 
 from quail.catalog.tokens import token_array
 
-# device staging buffers a layer group may hold while their copies to
-# the host are in flight; a 300-token document of a 4B model takes
-# about 45 MB, and the arena leaves a few GB beside its pools
-MAX_STAGING = 48
+# device staging buffers a layer group may hold while their copies are
+# in flight; a 300-token document of a 4B model takes about 45 MB, and
+# the arena's pools leave the device little room: 16 buffers slowed
+# IMDB-2 by 4 s and 48 by 42 s through allocator pressure
+MAX_STAGING = 2
 # pinned slots for row indices on their way to the device, and the
 # longest prefix a slot holds; a longer one pins its own buffer
 INDEX_SLOTS = 64
@@ -483,14 +484,14 @@ class HostKV:
         for event in fences:
             stream.wait_event(event)
 
-    def _staging_for(self, group, shape):
-        """A device buffer of `shape` whose last copy to the host has landed.
+    def _staging_for(self, group, shape, dtype=None):
+        """A device buffer of `shape` and `dtype` whose last use has finished.
 
-        Buffers are reused once their copy's event has fired, checked
-        without waiting, and a new one is allocated while fewer than
+        Buffers are reused once their event has fired, checked without
+        waiting, and a new one is allocated while fewer than
         MAX_STAGING are in flight. Past that the host waits for the
-        oldest copy, which paces saves at the copy engine's rate
-        instead of filling the device with staging buffers.
+        oldest, which paces saves at the copy engine's rate instead of
+        filling the device with staging buffers.
         """
         torch = self.torch
         buffers = self._staging.setdefault(group, deque())
@@ -505,8 +506,9 @@ class HostKV:
         numel = 1
         for size in shape:
             numel *= size
-        if entry[0] is None or entry[0].numel() < numel:
-            entry[0] = torch.empty(numel, dtype=self.arena.dtype, device=self.device)
+        dtype = self.arena.dtype if dtype is None else dtype
+        if entry[0] is None or entry[0].numel() < numel or entry[0].dtype != dtype:
+            entry[0] = torch.empty(numel, dtype=dtype, device=self.device)
         return entry[0][:numel].view(shape), entry
 
     def _to_host(self, destination, source, staging=None):
@@ -558,10 +560,11 @@ class HostKV:
             self.fence(compute)
         if arena.has_sliding:
             arena.trim_window(key)
-        for (layers, width, sliding), pool, flat in zip(
-                self._groups, self.pools, self._flat):
+        for group, ((layers, width, sliding), pool, flat) in enumerate(zip(
+                self._groups, self.pools, self._flat)):
             rows, origin = self._entry_rows(key, tokens, sliding, compute)
-            staging = self._from_host(pool[start + origin:start + tokens], compute)
+            staging, buffer = self._from_host(
+                ("restore", group), pool[start + origin:start + tokens], compute)
             if flat is not None:
                 view, bases = flat
                 index = (rows[:, None] + bases[None, :]).reshape(-1)
@@ -571,12 +574,16 @@ class HostKV:
                     for side, tensor in enumerate(arena.layer_kv(layer)):
                         tensor.view(-1, width).index_copy_(
                             0, rows, staging[:, place, side])
+            self._used(buffer, compute)
         if slot is not None:
             target = arena.accounting.slots[key]
-            arena.gdn_state[target].copy_(
-                self._from_host(self.gdn_state[slot], compute))
-            arena.conv_state[target].copy_(
-                self._from_host(self.conv_state[slot], compute))
+            for name, host_pool, device_pool in (
+                    ("gdn", self.gdn_state, arena.gdn_state),
+                    ("conv", self.conv_state, arena.conv_state)):
+                staging, buffer = self._from_host(
+                    ("restore", name), host_pool[slot], compute)
+                device_pool[target].copy_(staging)
+                self._used(buffer, compute)
             arena.record_checkpoint(key, tokens)
         self._written.add(key)
         self.hits += 1
@@ -585,13 +592,24 @@ class HostKV:
         self.host_s += time.perf_counter() - started
         return True
 
-    def _from_host(self, source, compute):
-        """Copy a host tensor to a device staging tensor the compute stream reads."""
+    def _from_host(self, group, source, compute):
+        """Copy a host tensor into a staging buffer the compute stream reads.
+
+        Returns the staging tensor and its buffer entry, which _used
+        marks once the compute stream has read it.
+        """
         if compute is None:
-            return source.clone()
+            return source.clone(), None
         torch = self.torch
+        staging, buffer = self._staging_for(group, tuple(source.shape), source.dtype)
         with torch.cuda.stream(self.stream):
-            staging = source.to(self.device, non_blocking=True)
+            staging.copy_(source, non_blocking=True)
         compute.wait_stream(self.stream)
-        staging.record_stream(compute)
-        return staging
+        return staging, buffer
+
+    def _used(self, buffer, compute):
+        """Record that the compute stream's reads of a restore buffer are queued."""
+        if buffer is None:
+            return
+        buffer[1] = self.torch.cuda.Event()
+        buffer[1].record(compute)
