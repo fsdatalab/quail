@@ -122,6 +122,27 @@ def _distinct_indices(table: pa.Table, columns) -> pa.Array:
     return pc.take(firsts, pc.sort_indices(firsts))
 
 
+def _ordered_indices(table: pa.Table, keys, stop: int | None) -> pa.Array:
+    """Return the row indices in ORDER BY order, only the first ``stop`` if set.
+
+    Rows equal on every key keep their input order.
+    """
+    # internal names stay clear of the user's, and are read by position
+    keyed = {f"key_{index}": _comparable(table.column(column), "ORDER BY")
+             for index, (column, _, _) in enumerate(keys)}
+    sort_keys = [
+        (f"key_{index}", "descending" if descending else "ascending",
+         "at_start" if nulls_first else "at_end")
+        for index, (_, descending, nulls_first) in enumerate(keys)]
+    if stop is None:
+        return pc.sort_indices(pa.table(keyed), sort_keys=sort_keys)
+    # select_k does not keep input order among equal rows; the position does
+    keyed["row_position"] = pa.array(np.arange(table.num_rows), pa.int64())
+    return pc.select_k_unstable(
+        pa.table(keyed), min(stop, table.num_rows),
+        sort_keys=[*sort_keys, ("row_position", "ascending", "at_end")])
+
+
 _AGGREGATE_KERNELS = {
     "count": "count", "count_distinct": "count_distinct", "sum": "sum",
     "avg": "mean", "min": "min", "max": "max",
@@ -344,16 +365,9 @@ class SortRuntime:
         rows = table.num_rows
         if node.distinct:
             table = table.take(_distinct_indices(table, node.columns))
-        if node.keys:
-            keyed = pa.table({
-                column: _comparable(table.column(column), "ORDER BY")
-                for column, _, _ in node.keys})
-            indices = pc.sort_indices(keyed, sort_keys=[
-                (column, "descending" if descending else "ascending",
-                 "at_start" if nulls_first else "at_end")
-                for column, descending, nulls_first in node.keys])
-            table = table.take(indices)
         stop = None if node.fetch is None else node.offset + node.fetch
+        if node.keys:
+            table = table.take(_ordered_indices(table, node.keys, stop))
         table = table[node.offset:stop].select(list(node.columns))
         return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
             input_rows=rows, output_rows=table.num_rows))

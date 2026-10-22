@@ -98,6 +98,21 @@ def test_distinct_keeps_a_user_column_named_like_an_internal_one(name):
     assert [0.0, 1.0] == [v for (v,) in rows if v == v] and len(rows) == 3
 
 
+@pytest.mark.parametrize("name", ["score", "row_position", "key_1"])
+def test_a_bounded_sort_keeps_input_order_among_equal_rows(name):
+    table = pa.table({
+        "r.id": [f"r{index:02d}" for index in range(40)],
+        name: [None if index % 7 == 0 else float(index % 3) for index in range(40)],
+    })
+    keys = ((name, True, True),)
+    everything, _ = _rows(_sort(keys=keys, columns=("r.id",)), table)
+    rows, metrics = _rows(_sort(keys=keys, columns=("r.id",), offset=3, fetch=9),
+                          table)
+    assert rows == everything[3:12]
+    assert rows[:4] == [("r21",), ("r28",), ("r35",), ("r02",)]
+    assert (metrics.input_rows, metrics.output_rows) == (40, 9)
+
+
 def _filtered(catalog):
     return (docs(catalog, "reviews").alias("r")
             .ai_filter(prompt("flag: {0}", col("r.review")), selectivity=0.5))
