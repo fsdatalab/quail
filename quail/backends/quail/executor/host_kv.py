@@ -15,11 +15,13 @@ Every entry is one contiguous run of rows in each pool, so a save is
 one gather and one copy to the host per layer group, and a restore is
 one copy from the host and one scatter.
 
-A save runs on the store's own stream: the key's rows are complete,
-since a key is freed once its answers were read, and the next forward
-pass waits on the gather (fence) before it may write the pages again.
-So a save never waits on the passes queued ahead of it, and the host
-waits only when every staging buffer is in flight, at the copy
+A save runs on the store's own streams: the key's rows are complete,
+since a key is freed once its answers were read, so the gather runs
+on a gather stream and the copy to the host on a copy stream that
+waits for it, and the next forward pass waits on the gathers (fence)
+before it may write the pages again. A gather never waits on the
+passes queued ahead of it nor on the copies queued before it, and the
+host waits only when every staging buffer is in flight, at the copy
 engine's pace.
 
 A key's rows are saved only once an operator computed or restored them
@@ -196,6 +198,8 @@ class HostKV:
                       for layers, width, _ in self._groups]
         self.stream = (torch.cuda.Stream(device=self.device)
                        if self.pinned else None)
+        self.gather_stream = (torch.cuda.Stream(device=self.device)
+                              if self.pinned else None)
         if self.pinned:
             self._index_slots = torch.empty(
                 (INDEX_SLOTS, INDEX_TOKENS), dtype=torch.int64, device="cpu",
@@ -408,15 +412,28 @@ class HostKV:
         if not self.pinned:
             self._gather_and_copy(key, start, tokens, slot)
             return
+        with self.torch.cuda.stream(self.gather_stream):
+            gathered = self._gather(key, tokens)
+            gathered_event = self._fence_here(self.gather_stream)
         with self.torch.cuda.stream(self.stream):
-            self._gather_and_copy(key, start, tokens, slot)
+            self.stream.wait_event(gathered_event)
+            self._copy(key, start, tokens, slot, gathered)
+            if slot is not None:
+                # the slot may be handed to another key and written by
+                # the next pass, so the pass waits for its copy too
+                self._fence_here(self.stream)
 
     def _gather_and_copy(self, key, start, tokens, slot):
+        self._copy(key, start, tokens, slot, self._gather(key, tokens))
+
+    def _gather(self, key, tokens):
+        """Gather the key's prefix rows of each layer group into staging."""
         torch = self.torch
         arena = self.arena
-        for group, ((layers, width, sliding), pool, flat) in enumerate(zip(
-                self._groups, self.pools, self._flat)):
-            rows, origin = self._entry_rows(key, tokens, sliding, self.stream)
+        gathered = []
+        for group, ((layers, width, sliding), flat) in enumerate(zip(
+                self._groups, self._flat)):
+            rows, origin = self._entry_rows(key, tokens, sliding, self.gather_stream)
             staging, buffer = self._staging_for(
                 group, (len(rows), len(layers), 2, width))
             if flat is not None:
@@ -427,23 +444,25 @@ class HostKV:
                 for place, layer in enumerate(layers):
                     for side, tensor in enumerate(arena.layer_kv(layer)):
                         staging[:, place, side] = tensor.view(-1, width)[rows]
-            self._fence_here()
+            gathered.append((origin, staging, buffer))
+        return gathered
+
+    def _copy(self, key, start, tokens, slot, gathered):
+        """Copy the gathered staging and the checkpoint to the entry's rows."""
+        arena = self.arena
+        for pool, (origin, staging, buffer) in zip(self.pools, gathered):
             self._to_host(pool[start + origin:start + tokens], staging, buffer)
         if slot is not None:
             source = arena.accounting.slots[key]
             self._to_host(self.gdn_state[slot], arena.gdn_state[source])
             self._to_host(self.conv_state[slot], arena.conv_state[source])
-            # the slot may be handed to another key and written by the
-            # next pass, so the pass waits for the copy too
-            self._fence_here()
 
-    def _fence_here(self):
-        """Mark the copy stream's position for the next pass to wait on."""
-        if self.stream is None:
-            return
+    def _fence_here(self, stream):
+        """Mark a stream's position for the next pass to wait on."""
         event = self.torch.cuda.Event()
-        event.record(self.stream)
+        event.record(stream)
         self._fences.append(event)
+        return event
 
     def fence(self, stream) -> None:
         """Make `stream` wait for every gather queued since the last fence.
@@ -499,6 +518,7 @@ class HostKV:
     def flush(self) -> None:
         """Wait for every copy in flight."""
         if self.stream is not None:
+            self.gather_stream.synchronize()
             self.stream.synchronize()
             self._fences.clear()
 
