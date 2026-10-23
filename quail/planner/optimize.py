@@ -15,7 +15,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, document_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
                registry, tokenizer=None, pair_fractions=None,
-               scan_fractions=None, scan_maxima=None,
+               scan_fractions=None,
                canvas_draws: int = 4,
                attention: str | None = None, memo=None,
                catalog=None, engine_config=None, logical_candidates=None):
@@ -40,8 +40,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             planning context.
         scan_fractions: alias -> the fraction of its documents the
             regular predicates are expected to keep.
-        scan_maxima: alias -> the longest document its regular
-            predicates keep, in tokens.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
         memo: Results the tree rewrites computed for this plan, such
@@ -89,7 +87,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
         scan_fractions=dict(scan_fractions or {}),
-        scan_maxima=dict(scan_maxima or {}),
         logical_plan=plan,
         memo={} if memo is None else memo,
         catalog=catalog, engine_config=engine_config,

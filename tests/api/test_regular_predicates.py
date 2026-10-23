@@ -112,31 +112,23 @@ def test_regular_predicates_select_documents_before_the_model(session):
 
 
 
-def test_a_document_too_long_for_a_pass_is_refused_only_if_kept():
+def test_a_document_too_long_for_a_pass_does_not_refuse_the_query():
     with quail.Session(CONFIG, tokenizer=fake_tok) as session:
         session.register("reviews", quail.DocumentProvider.from_table(pa.table({
             "id": ["short", "long"],
             "review": ["a short review", "pad " * 200_000],
             "stars": [5, 1],
         }), id_col="id"))
-
-        def plan(sql):
+        # the executor skips the long review, whether or not a WHERE drops it
+        for sql in (
+                "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', "
+                "r.review), {'selectivity': 0.5})",
+                "SELECT r.id, AI.CLASSIFY(PROMPT('What is {0} about?', "
+                "r.review), ['a', 'b']) AS topic FROM reviews r"):
             query = session.sql(sql)
             query.plan()
             query.wait_for_tokens()
-            return query.plan()
-
-        filtered = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', "
-                    "r.review), {'selectivity': 0.5})")
-        labeled = ("SELECT r.id, AI.CLASSIFY(PROMPT('What is {0} about?', "
-                   "r.review), ['a', 'b']) AS topic FROM reviews r")
-        for sql, where in ((filtered, " AND r.stars >= 3"),
-                           (labeled, " WHERE r.stars >= 3")):
-            refused = plan(sql)
-            assert isinstance(refused, Refusal)
-            assert refused.constraint == "suffix_over_chunk"
-            # the WHERE drops the long review, so no kept document is too long
-            assert not isinstance(plan(sql + where), Refusal)
+            assert not isinstance(query.plan(), Refusal)
 
 def test_sql_and_builder_bind_regular_predicates(session):
     plan = session.sql("""

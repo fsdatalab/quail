@@ -38,9 +38,6 @@ class PlanningContext:
     # alias -> the fraction of its documents the regular predicates are
     # expected to keep; aliases without tests are absent
     scan_fractions: Mapping[str, float] = field(default_factory=dict)
-    # alias -> the longest document its regular predicates keep, in
-    # tokens; absent until the lengths and the tested columns are exact
-    scan_maxima: Mapping[str, int] = field(default_factory=dict)
     # the logical plan the graph was planned from; None when the rules
     # run again over a finished plan
     logical_plan: Any = None

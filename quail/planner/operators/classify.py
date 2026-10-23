@@ -52,10 +52,7 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
     capacity = arena_capacity(context, chunk)
     return ClassifyStatistics(
         alias=alias, mean=summary.mean,
-        # a document the regular predicates drop never needs a forward pass
-        longest=min(summary.maximum,
-                    getattr(context, "scan_maxima", {}).get(alias, summary.maximum)),
-        budget=min(chunk, capacity),
+        longest=summary.maximum, budget=min(chunk, capacity),
         chunk=chunk,
         draws=context.canvas_draws if context.model.answer_canvas else 1,
         model=context.model,
@@ -155,14 +152,8 @@ class ClassifyScoring(ClassifyStatistics):
                 f"the {scoring!r} rule cannot decode the labels of "
                 f"{spec.name!r}: one label is a proper prefix of another",
                 1, 0)
-        suffixes = classify_cost.suffix_lengths(scoring, labels, self.canvas_rows,
-                                                starts=starts)
-        # the head, longest document, frame, and longest suffix must fit
-        # together within the forward pass and KV budget
-        need = len(head) + self.longest + len(tail) + max(suffixes)
-        if need > self.budget:
-            raise ClassifyRefusedError.over_budget(
-                f"a document in {self.alias!r}", need, self.budget)
+        # a document too long for the forward pass and KV budget with
+        # its prompt is skipped at execution and gets no label
         return replace(
             spec, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), label_token_ids=labels,
@@ -412,10 +403,6 @@ class ClassifyBuilder(ClassifyStatistics):
         tail, frame, blocks = choice_token_parts(
             self.lower(call.prompt), self.tokenizer)
         request = len(tail) - frame
-        need = len(head) + self.longest + len(tail)
-        if need > self.budget:
-            raise ClassifyRefusedError.over_budget(
-                f"a document in {self.alias!r}", need, self.budget)
         estimated = classify_cost.estimate_suffixes(
             len(head),
             frame,

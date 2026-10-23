@@ -6,7 +6,6 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-import numpy as np
 import pyarrow as pa
 
 from quail.api.execute import execute_query
@@ -85,7 +84,6 @@ class Query:
         self._planning_finished_at = None
         self._replanning_s = 0.0
         self._scan_selectivities = {}
-        self._scan_maxima = {}
         self._pair_selectivities = {}
         self.token_wait_s = 0.0
 
@@ -129,7 +127,6 @@ class Query:
             # the planner estimates what the regular predicates and the join
             # equalities keep from samples; the executor applies them
             scan_fractions = self._scan_fractions(operators.scans)
-            self._scan_maxima = self._kept_maxima(operators.scans)
             pair_fractions = self._pair_fractions(
                 operators.scans, operators.joins)
             self._scan_selectivities = scan_fractions
@@ -143,7 +140,7 @@ class Query:
                 attention=config.attention,
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
-                scan_fractions=scan_fractions, scan_maxima=self._scan_maxima)
+                scan_fractions=scan_fractions)
             candidates = logical_alternatives(
                 self._logical_input,
                 tuple(self.session.registry.logical_rules.values()),
@@ -201,7 +198,7 @@ class Query:
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
-                scan_fractions=scan_fractions, scan_maxima=self._scan_maxima,
+                scan_fractions=scan_fractions,
                 memo=context.memo, catalog=self.session.catalog,
                 engine_config=config, logical_candidates=candidates)
             if not isinstance(self._plan, Refusal):
@@ -263,27 +260,6 @@ class Query:
                 keys([left for left, _ in conditions]),
                 keys([right for _, right in conditions]))
         return fractions
-
-    def _kept_maxima(self, scans) -> dict:
-        """The longest document each tested scan keeps, where lengths are exact.
-
-        A scan's regular predicates can drop a document longer than a
-        forward pass; the planner checks only the documents they keep.
-        """
-        maxima = {}
-        for scan in scans:
-            if not scan.predicates or scan.alias in self._token_futures:
-                continue
-            if self.session.inputs.token_lengths(scan.provider, scan.column) is None:
-                continue
-            tested = [predicate.column.column for predicate in scan.predicates]
-            scan_input = self.session.inputs.tokenize(
-                scan.provider, scan.column, tested)
-            kept = selected_rows(pa.table({name: scan_input.column(name)
-                                           for name in tested}), scan.predicates)
-            lengths = np.asarray(scan_input.lengths)[kept.to_numpy()]
-            maxima[scan.alias] = int(lengths.max()) if len(lengths) else 0
-        return maxima
 
     def _scan_fractions(self, scans) -> dict:
         """Estimated fraction of each tested scan's documents its tests keep."""
@@ -354,7 +330,6 @@ class Query:
         self.token_wait_s += time.perf_counter() - started
         if refine and self._plan is not None:
             started = time.perf_counter()
-            self._scan_maxima = self._kept_maxima(self.logical.operators().scans)
             options = dict(
                 model=self.session.model,
                 device=self.session.device, document_tokens=self._document_tokens,
@@ -368,7 +343,6 @@ class Query:
             if self._plan is self._searched_plan:
                 self._plan = plan_query(
                     self._logical_input, scan_fractions=self._scan_selectivities,
-                    scan_maxima=self._scan_maxima,
                     catalog=self.session.catalog, engine_config=self.session.config,
                     **options)
                 if not isinstance(self._plan, Refusal):
