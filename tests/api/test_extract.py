@@ -422,6 +422,47 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
         "March 3, 2027", None, "five years", "a phrase the document lacks"]
 
 
+
+class _FieldsClient(_PhraseClient):
+    """Runs the fields of each document together, as the vLLM client does."""
+
+    def __init__(self):
+        super().__init__()
+        self.runs = []
+
+    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
+                           answer_tokens, body_texts=None, tail_texts=None):
+        self.runs.append((tail_ids, answer_tokens))
+        return {"wall": 1.5, "outputs": [
+            self.generate([{"prompt_token_ids": body + tail}
+                           for body in body_ids], sampling_params)
+            for tail in tail_ids]}
+
+
+def test_request_backend_runs_the_fields_of_a_document_together():
+    documents = {"c": [request_tests._tokens(text) for text in TEXTS]}
+    specs = tuple(
+        RequestExtractSpec(alias="c", output=output, question=QUESTION,
+                           tail_token_ids=(tail,), max_answer_tokens=limit)
+        for output, tail, limit in (("ends", 90, 7), ("term", 91, 9)))
+    node = RequestExecution(
+        node_id="request-model", backend_name="stock_vllm", aliases=("c",),
+        preamble_token_ids=(3,), extracts=specs)
+    client = _FieldsClient()
+    result = request_tests._execution(
+        documents, client=client, document_texts={"c": TEXTS}).execute(
+            node, {"input:0": [0, 1, 2, 3]})
+    # one run decodes both fields, up to the longer answer limit
+    assert client.runs == [([[90], [91]], 9)]
+    expected = ["March 3, 2027", None, "five years",
+                "a phrase the document lacks"]
+    for output in ("ends", "term"):
+        answers = result.outputs[f"extract_answers:{output}"].to_pydict()
+        assert answers[output] == expected
+    steps = result.metrics.extension["steps"]
+    assert [(step["output"], step["requests"], step["wall_s"])
+            for step in steps] == [("ends", 4, 1.5), ("term", 4, 1.5)]
+
 def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     session = request_tests._session(
         "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})

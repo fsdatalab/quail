@@ -14,7 +14,7 @@ from quail.baselines.operators import (
     choose_documents,
     classification_rows,
     classify_documents,
-    extract_documents,
+    extract_fields,
     filter_answers,
     join_answers,
     operator_at_a_time_filter,
@@ -440,35 +440,44 @@ class RequestModelExecution:
             ))
 
     def _execute_extractions(self, node, survivors, outputs, steps):
-        """Submit extractions and collect their answers."""
+        """Submit extractions and collect their answers.
+
+        The fields of one alias with the same preamble run together, so
+        each document's KV serves all of them.
+        """
+        groups = {}
         for spec in node.extracts:
-            document_ids = list(survivors[spec.alias])
-            texts = self.document_texts.get(spec.alias)
+            preamble = token_list(spec.preamble_token_ids
+                                  or node.preamble_token_ids)
+            preamble_text = spec.preamble_text or node.preamble_text
+            groups.setdefault((spec.alias, tuple(preamble), preamble_text),
+                              []).append(spec)
+        for (alias, preamble, preamble_text), specs in groups.items():
+            document_ids = list(survivors[alias])
+            texts = self.document_texts.get(alias)
             if texts is None:
                 raise ValueError(
-                    f"AI.EXTRACT needs the text of {spec.alias!r}, which "
+                    f"AI.EXTRACT needs the text of {alias!r}, which "
                     f"the scan did not load")
             document_texts = [text_value(texts, document)
                               for document in document_ids]
-            preamble = token_list(spec.preamble_token_ids
-                                   or node.preamble_token_ids)
-            preamble_text = spec.preamble_text or node.preamble_text
-            result = extract_documents(
-                self.client, spec, [
-                    preamble + token_list(self.documents[spec.alias][document])
+            results = extract_fields(
+                self.client, specs, [
+                    list(preamble) + token_list(self.documents[alias][document])
                     for document in document_ids],
                 document_texts,
                 body_texts=([preamble_text + text for text in document_texts]
                             if self.submit_text else None))
-            outputs[f"extract_answers:{spec.output}"] = extraction_rows(
-                spec.alias, spec.output, spec.span_output, document_ids,
-                result["answers"], result["spans"])
-            steps.append(request_step(result,
-                kind="extract",
-                alias=spec.alias,
-                output=spec.output,
-                num_in=len(document_ids),
-                num_out=len(document_ids) - result["unanswered"],
-                unanswered=result["unanswered"],
-                unaligned=result["unaligned"],
-            ))
+            for spec, result in zip(specs, results):
+                outputs[f"extract_answers:{spec.output}"] = extraction_rows(
+                    alias, spec.output, spec.span_output, document_ids,
+                    result["answers"], result["spans"])
+                steps.append(request_step(result,
+                    kind="extract",
+                    alias=alias,
+                    output=spec.output,
+                    num_in=len(document_ids),
+                    num_out=len(document_ids) - result["unanswered"],
+                    unanswered=result["unanswered"],
+                    unaligned=result["unaligned"],
+                ))
