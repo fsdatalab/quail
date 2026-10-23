@@ -1,20 +1,37 @@
 # Quail
 
-Quail (QUery-Aware Inference Layer) is an open-source execution engine
-for AI-SQL. The [Full Stack Data Lab](https://fsdatalab.github.io/)
-at CMU develops Quail.
+**An open-source execution engine for AI functions in SQL.**
 
-With AI-SQL, you write instructions in natural language inside your SQL
-queries. A language model evaluates those instructions for each row.
+[![PyPI](https://img.shields.io/pypi/v/quail-engine)](https://pypi.org/project/quail-engine/)
+[![Docs](https://img.shields.io/badge/docs-fsdatalab.github.io%2Fquail-blue)](https://fsdatalab.github.io/quail)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+Quail (QUery-Aware Inference Layer) runs SQL queries that ask a
+language model about each row, on your own GPUs. The
+[Full Stack Data Lab](https://fsdatalab.github.io/) at CMU develops
+Quail.
 
 ```sql
-SELECT r.id
+SELECT r.id,
+       AI.EXTRACT(r.body, {'actor': 'Which actor does the reviewer name?'}) AS review
 FROM reviews r
 WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 ```
 
+Quail plans the whole query, not one prompt at a time:
+
+- **Cheapest work first.** Quail orders the AI filters by cost, so the
+  later functions read fewer rows.
+- **Each document is computed once.** Every AI function in a query
+  reuses the document's KV, and documents that start with the same
+  text share it.
+- **Inference tuned to each function.** For example, `AI.EXTRACT`
+  copies its drafts from the document, and picks a draft length for
+  each request.
+
 [Documentation](https://fsdatalab.github.io/quail) |
 [Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
+[Blog](https://fsdatalab.github.io/blog/) |
 [QUAIL-B](https://github.com/fsdatalab/quail-bench)
 
 ## Install
@@ -107,7 +124,7 @@ You can use filters and joins evaluated by a language model,
 (`AI.CLASSIFY`), and extracting text that answers a question (`AI.EXTRACT`).
 `AI.MAP` is planned.
 
-You can write queries in two AI-SQL dialects:
+You can write queries in two SQL dialects for AI functions:
 [Snowflake `AI_FILTER`](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
 and
 [BigQuery `AI.IF`](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions),
