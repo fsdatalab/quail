@@ -124,9 +124,8 @@ def test_gpu_copies_and_memory_refusals(catalog):
         assert result.constraint == "weights_need_more_cards"
         assert result.needed > result.available
 
-    r = _plan(logical, {"r": [150_000]})
-    assert isinstance(r, Refusal)
-    assert r.constraint == "suffix_over_chunk"
+    # a document too long for one pass is skipped at execution, not refused
+    assert not isinstance(_plan(logical, {"r": [150_000]}), Refusal)
 
 
 def test_filter_ordering_and_kv_writes(catalog):

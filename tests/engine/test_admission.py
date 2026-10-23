@@ -510,6 +510,18 @@ def test_a_skipped_stage_passes_the_anchor_on_with_nothing_asked():
                       anchor_partners={0: lambda j: SKIP})
 
 
+def test_a_document_too_long_for_a_chunk_or_the_arena_settles_unanswered():
+    # anchor 1 cannot fit a 250-token chunk with its question, anchor 2
+    # cannot fit the 20-page arena; both settle without a chunk
+    sched = JoinAdmission([50, 245, 400, 60], [[10], [10]], 250,
+                          arena_pages=20, page_tokens=16)
+    assert sched.oversized == [1, 2]
+    assert sched.take_settled() == [Settlement("dropped", 1, False),
+                                    Settlement("dropped", 2, False)]
+    groups = sched.next_chunk(20)
+    assert sorted(a for a, *_ in groups) == [0, 3]
+
+
 @pytest.mark.parametrize("custom_decision", [False, True])
 def test_stage_transition_waits_for_launches_and_respects_custom_decision(
         custom_decision):

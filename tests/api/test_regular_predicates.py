@@ -16,6 +16,7 @@ from quail.logical import (
     Scan,
 )
 from quail.logical.expressions import column_expression
+from quail.planner.plan import Refusal
 
 REF = ColumnRef("r", "reviews", "stars")
 
@@ -109,6 +110,25 @@ def test_regular_predicates_select_documents_before_the_model(session):
              .select("r.id"))
     assert _run(built, make_executor(TRUTH)).to_rows() == []
 
+
+
+def test_a_document_too_long_for_a_pass_does_not_refuse_the_query():
+    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+        session.register("reviews", quail.DocumentProvider.from_table(pa.table({
+            "id": ["short", "long"],
+            "review": ["a short review", "pad " * 200_000],
+            "stars": [5, 1],
+        }), id_col="id"))
+        # the executor skips the long review, whether or not a WHERE drops it
+        for sql in (
+                "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', "
+                "r.review), {'selectivity': 0.5})",
+                "SELECT r.id, AI.CLASSIFY(PROMPT('What is {0} about?', "
+                "r.review), ['a', 'b']) AS topic FROM reviews r"):
+            query = session.sql(sql)
+            query.plan()
+            query.wait_for_tokens()
+            assert not isinstance(query.plan(), Refusal)
 
 def test_sql_and_builder_bind_regular_predicates(session):
     plan = session.sql("""
