@@ -79,6 +79,28 @@ def test_extract_prefix_sharing_is_planned_from_exact_document_tokens():
         assert node.spec.share_prefixes
 
 
+
+def test_offsets_are_computed_up_front_only_for_a_scan_of_every_row(
+        session, monkeypatch):
+    requested = []
+    for name in ("tokenize", "tokenize_async"):
+        original = getattr(session.inputs, name)
+
+        def record(*args, original=original, **kwargs):
+            requested.append(kwargs.get("with_offsets", False))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(session.inputs, name, record)
+    head = (f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+            f"FROM contracts c")
+    for where, expected in (("", True), (" WHERE c.id > 1", False)):
+        requested.clear()
+        query = session.sql(head + where, dialect="bq")
+        query.plan()
+        query.wait_for_tokens()
+        # a WHERE leaves the offsets to the extraction, for the rows it keeps
+        assert requested and set(requested) == {expected}
+
 def test_sql_and_builder_extract_the_same_answer_columns(session):
     built = _ends(session)
     for dialect in ('snowflake', 'bq'):
