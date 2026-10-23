@@ -2,7 +2,9 @@
 
 import pytest
 
+from quail.cost import extract as extract_cost
 from quail.cost.extract import (
+    SAMPLE_DOCUMENTS,
     ExtractAssumptions,
     document_work,
     estimate,
@@ -130,3 +132,28 @@ def test_adaptive_policy_drafts_longer_for_longer_documents():
                                     round_cost_per_token=per_token)
     # a short document's cheaper KV read earns a shorter draft
     assert short_fed - TAIL < long_fed - TAIL
+
+
+def test_a_large_table_is_priced_from_a_sample_of_its_documents(monkeypatch):
+    calls = []
+    original = extract_cost.document_work
+
+    def counted(length, *args, **kwargs):
+        calls.append(length)
+        return original(length, *args, **kwargs)
+
+    monkeypatch.setattr(extract_cost, "document_work", counted)
+    # 100 short documents, then 100 long ones, each pattern repeated
+    lengths = ([100] * 100 + [1000] * 100) * 50
+    sampled = _cost(lengths, draft_policy="adaptive")
+    assert len(calls) == SAMPLE_DOCUMENTS
+    # the sample keeps the first and the last document
+    assert calls[0] == lengths[0] and calls[-1] == lengths[-1]
+    calls.clear()
+    exact = _cost(lengths[:SAMPLE_DOCUMENTS], draft_policy="adaptive",
+                  expected_rows=len(lengths))
+    assert len(calls) == SAMPLE_DOCUMENTS
+    # both are means of the same two lengths, so they agree closely
+    assert sampled.seconds == pytest.approx(exact.seconds, rel=0.05)
+    assert sampled.work.tokens == pytest.approx(
+        len(lengths) * (HEAD + 550 + TAIL), rel=0.05)
