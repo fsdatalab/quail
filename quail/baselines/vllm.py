@@ -10,6 +10,7 @@ from quail.baselines.request import RequestBackend
 from quail.baselines.request_scheduling import (
     MAX_BATCHED_TOKENS,
     MAX_SEQUENCES,
+    run_extract_fields,
     run_filter_sequence,
 )
 from quail.specs.files import resolve_model_path
@@ -212,6 +213,25 @@ class VLLMClient:
             max_num_seqs=self.capacity["max_num_seqs"],
             body_texts=body_texts,
             question_texts=question_texts,
+            render_prompt=self.llm._preprocess_cmpl_one,
+        )
+
+    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
+                           answer_tokens, tag="x", body_texts=None,
+                           tail_texts=None):
+        """Decode the fields of each document through the engine's step loop."""
+        return run_extract_fields(
+            self.llm.llm_engine,
+            sampling_params,
+            body_ids,
+            tail_ids,
+            self.capacity["kv_cache_size_tokens"],
+            tag=tag,
+            answer_tokens=answer_tokens,
+            block_size=self.capacity["block_size"],
+            max_num_seqs=self.capacity["max_num_seqs"],
+            body_texts=body_texts,
+            tail_texts=tail_texts,
             render_prompt=self.llm._preprocess_cmpl_one,
         )
 

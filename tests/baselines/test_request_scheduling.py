@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from quail.baselines.request_scheduling import (
+    extract_document_cap,
+    run_extract_fields,
     run_filter_sequence,
     run_filter_sequence_async,
     run_join_grouped,
@@ -183,6 +185,84 @@ def test_filter_sequences_pipeline_refill_fail_and_take_empty_input():
     assert result["requests"] == 0
     assert result["survivors"] == []
 
+
+
+class _FakeStepEngine:
+    """Writes one token of every queued request per step; ends at the second."""
+
+    def __init__(self):
+        self.pending = {}
+        self.events = []
+
+    def add_request(self, request_id, prompt, _sampling_params):
+        self.pending[request_id] = (prompt["prompt_token_ids"], 0)
+        self.events.append(("add", request_id))
+
+    def abort_request(self, request_ids):
+        for request_id in request_ids:
+            self.pending.pop(request_id, None)
+            self.events.append(("abort", request_id))
+
+    def step(self):
+        outputs = []
+        for request_id, (ids, written) in list(self.pending.items()):
+            finished = written == 1
+            if finished:
+                del self.pending[request_id]
+            else:
+                self.pending[request_id] = (ids, 1)
+            self.events.append(("finish" if finished else "token", request_id))
+            outputs.append(SimpleNamespace(
+                request_id=request_id, finished=finished,
+                prompt_token_ids=ids, num_cached_tokens=0,
+                outputs=[SimpleNamespace(token_ids=[1] * (written + 1))]))
+        return outputs
+
+
+def test_extract_fields_compute_each_body_before_its_other_fields():
+    bodies = [[1] * 30, [2] * 30, [3] * 30]
+    tails = [[7], [8], [9]]
+    # each document holds 32 body tokens and three 32-token fields
+    assert extract_document_cap(bodies, tails, 4, 256, block_size=16) == 2
+    assert extract_document_cap(bodies, tails, 4, 10_000, block_size=16,
+                                max_num_seqs=7) == 2
+    assert extract_document_cap([], tails, 4, 160) == 0
+
+    engine = _FakeStepEngine()
+    result = run_extract_fields(engine, object(), bodies, tails, 256,
+                                tag="x", answer_tokens=4, block_size=16)
+    assert result["doc_cap"] == 2
+    events = engine.events
+    for document in range(3):
+        first = events.index(("token", f"x-{document}-0"))
+        for field in (1, 2):
+            assert events.index(("add", f"x-{document}-{field}")) > first
+    # the third document waits until a document has all its answers
+    before = events[:events.index(("add", "x-2-0"))]
+    assert sum(event == "add" for event, _ in before) == 6
+    assert any(all(("finish", f"x-{d}-{f}") in before for f in range(3))
+               for d in range(2))
+    assert [[output.prompt_token_ids for output in field]
+            for field in result["outputs"]] == [
+        [body + tail for body in bodies] for tail in tails]
+    assert not engine.pending
+
+
+def test_a_failed_extract_run_aborts_its_queued_requests(monkeypatch):
+    engine = _FakeStepEngine()
+    step = engine.step
+
+    def fail():
+        if any(event == "finish" for event, _ in engine.events):
+            raise RuntimeError("step failed")
+        return step()
+
+    monkeypatch.setattr(engine, "step", fail)
+    with pytest.raises(RuntimeError, match="step failed"):
+        run_extract_fields(engine, object(), [[1], [2]], [[7], [8]], 100,
+                           tag="x")
+    assert not engine.pending
+    assert any(event == "abort" for event, _ in engine.events)
 
 class _ParityClient:
     def __init__(self):
