@@ -22,6 +22,10 @@ from quail.cost.draft_policy import DraftPolicy
 from quail.cost.sol import unrounded_seconds
 from quail.cost.work import Work, ask, decode, scan
 
+# a larger table is priced from this many evenly spaced documents: the
+# estimate is a mean, and each document runs the draft policy in Python
+SAMPLE_DOCUMENTS = 1024
+
 
 @dataclass(frozen=True)
 class ExtractAssumptions:
@@ -158,7 +162,9 @@ def table_work(lengths, head_tokens: int, tail_tokens: int, *, window: int,
     The sum runs the draft policy once per document, so a planner
     passes its memo to compute it once per table and prompt; the key
     holds the length and shared columns by identity, and the memo
-    keeps them alive so another column cannot reuse an identity.
+    keeps them alive so another column cannot reuse an identity. A
+    table of more than SAMPLE_DOCUMENTS documents sums evenly spaced
+    documents and scales the sum to the table.
     """
     key = ("extract_work", id(lengths), id(shared), head_tokens, tail_tokens,
            window, resident, max_answer_tokens, draft_tokens, draft_policy,
@@ -167,9 +173,13 @@ def table_work(lengths, head_tokens: int, tail_tokens: int, *, window: int,
         return memo[key][2]
     work = Work()
     fed = rows = 0.0
-    for index, length in enumerate(lengths):
+    n = len(lengths)
+    indices = (range(n) if n <= SAMPLE_DOCUMENTS else
+               [i * (n - 1) // (SAMPLE_DOCUMENTS - 1)
+                for i in range(SAMPLE_DOCUMENTS)])
+    for index in indices:
         own, own_fed, own_rows = document_work(
-            int(length), head_tokens, tail_tokens, window=window,
+            int(lengths[index]), head_tokens, tail_tokens, window=window,
             resident=resident, shared=0 if shared is None else int(shared[index]),
             max_answer_tokens=max_answer_tokens, draft_tokens=draft_tokens,
             draft_policy=draft_policy, round_cost_per_token=round_cost_per_token,
@@ -177,6 +187,9 @@ def table_work(lengths, head_tokens: int, tail_tokens: int, *, window: int,
         work += own
         fed += own_fed
         rows += own_rows
+    if n > SAMPLE_DOCUMENTS:
+        scale = n / SAMPLE_DOCUMENTS
+        work, fed, rows = work * scale, fed * scale, rows * scale
     if memo is not None:
         memo[key] = (lengths, shared, (work, fed, rows))
     return work, fed, rows
