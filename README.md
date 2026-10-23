@@ -9,9 +9,7 @@
 
 Quail (QUery-Aware Inference Layer) runs language models over large
 datasets, from SQL, on your own GPUs. It optimizes each query and its
-model inference together. Across the 29 queries of
-[QUAIL-B](https://github.com/fsdatalab/quail-bench), Quail is
-**1.8x faster on average** than well-tuned vLLM baselines, and
+model inference together. Quail is **1.8x faster on average** than well-tuned vLLM baselines, and
 **up to 14x faster** on queries with AI joins
 ([details](https://fsdatalab.github.io/blog/introducing-quail/)).
 
