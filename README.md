@@ -1,6 +1,7 @@
 # Quail
 
-**An open-source execution engine for AI functions in SQL.**
+**An open-source execution engine for AI functions in SQL,** from the
+[Full Stack Data Lab](https://fsdatalab.github.io/) at CMU.
 
 [![PyPI](https://img.shields.io/pypi/v/quail-engine)](https://pypi.org/project/quail-engine/)
 [![Docs](https://img.shields.io/badge/docs-fsdatalab.github.io%2Fquail-blue)](https://fsdatalab.github.io/quail)
@@ -13,8 +14,6 @@ model inference together. Across the 29 queries of
 **1.8x faster on average** than well-tuned vLLM baselines, and
 **up to 14x faster** on queries with AI joins
 ([details](https://fsdatalab.github.io/blog/introducing-quail/)).
-The [Full Stack Data Lab](https://fsdatalab.github.io/) at CMU develops
-Quail.
 
 ```sql
 SELECT r.id,
