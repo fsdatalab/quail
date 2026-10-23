@@ -52,7 +52,10 @@ def classify_statistics(context, alias: str, shared=()) -> "ClassifyStatistics":
     capacity = arena_capacity(context, chunk)
     return ClassifyStatistics(
         alias=alias, mean=summary.mean,
-        longest=summary.maximum, budget=min(chunk, capacity),
+        # a document the regular predicates drop never needs a forward pass
+        longest=min(summary.maximum,
+                    getattr(context, "scan_maxima", {}).get(alias, summary.maximum)),
+        budget=min(chunk, capacity),
         chunk=chunk,
         draws=context.canvas_draws if context.model.answer_canvas else 1,
         model=context.model,

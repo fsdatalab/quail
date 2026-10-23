@@ -16,6 +16,7 @@ from quail.logical import (
     Scan,
 )
 from quail.logical.expressions import column_expression
+from quail.planner.plan import Refusal
 
 REF = ColumnRef("r", "reviews", "stars")
 
@@ -109,6 +110,33 @@ def test_regular_predicates_select_documents_before_the_model(session):
              .select("r.id"))
     assert _run(built, make_executor(TRUTH)).to_rows() == []
 
+
+
+def test_a_document_too_long_for_a_pass_is_refused_only_if_kept():
+    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+        session.register("reviews", quail.DocumentProvider.from_table(pa.table({
+            "id": ["short", "long"],
+            "review": ["a short review", "pad " * 200_000],
+            "stars": [5, 1],
+        }), id_col="id"))
+
+        def plan(sql):
+            query = session.sql(sql)
+            query.plan()
+            query.wait_for_tokens()
+            return query.plan()
+
+        filtered = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', "
+                    "r.review), {'selectivity': 0.5})")
+        labeled = ("SELECT r.id, AI.CLASSIFY(PROMPT('What is {0} about?', "
+                   "r.review), ['a', 'b']) AS topic FROM reviews r")
+        for sql, where in ((filtered, " AND r.stars >= 3"),
+                           (labeled, " WHERE r.stars >= 3")):
+            refused = plan(sql)
+            assert isinstance(refused, Refusal)
+            assert refused.constraint == "suffix_over_chunk"
+            # the WHERE drops the long review, so no kept document is too long
+            assert not isinstance(plan(sql + where), Refusal)
 
 def test_sql_and_builder_bind_regular_predicates(session):
     plan = session.sql("""

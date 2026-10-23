@@ -104,9 +104,11 @@ def plan_statistics(plan: LogicalPlan, *, model: ModelSpec,
     for alias, fraction in (scan_fractions or {}).items():
         if alias in lengths:
             lengths[alias] = scale_alias(lengths[alias], fraction)
+    # a document the regular predicates drop never needs a forward pass
+    maxima = context.scan_maxima
     stats = {
         a: CorpusStats(num_documents=s.count, total_tokens=s.total,
-                       max_document_tokens=s.maximum)
+                       max_document_tokens=min(s.maximum, maxima.get(a, s.maximum)))
         for a, s in lengths.items()
     }
     for s in operators.scans:
