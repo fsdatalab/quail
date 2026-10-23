@@ -171,9 +171,10 @@ def test_an_answer_may_begin_with_none(monkeypatch):
 
 @pytest.mark.parametrize("recurrent", [False, True])
 def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch, recurrent):
-    # "five" starts two positions; the draft follows the first, "five
-    # days", and the model chooses " years" instead: the round ends
-    # there, and the next round feeds " years" in the draft's place
+    # "five" starts two positions that split at once; the fixed draft
+    # follows the first, "five days", and the model chooses " years"
+    # instead: the round ends there, and the next round feeds " years"
+    # in the draft's place
     text = "five days or five years"
     spec, tables = make_spec(text)
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
@@ -212,6 +213,29 @@ def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch, recurrent):
     assert asked.steps == 3
     assert asked.fed_tokens == (len(tables.encode_ids(TAIL)) + len(fed[1][0])
                                 + len(fed[2][0]))
+
+def test_a_draft_follows_the_live_positions_together():
+    # the answer so far fits three positions that agree on one more
+    # token and then split: a cheap round drafts the agreed token and
+    # stops at the split; a long document's round bets on the branch
+    # of the most positions, the earliest at a tie
+    spec, vocabulary = make_spec()
+    adaptive = replace(spec, draft_policy="adaptive")
+    text = "abcdefghijklmnop"
+
+    def answer(*branches):
+        streams = [Stream(3 * i, [0, 7, branch, 5], [1, 2, 3, 4], text,
+                          exhausted=True) for i, branch in enumerate(branches)]
+        return AnswerState(written=[0], streams=streams)
+
+    decoder = Decoder(vocabulary, 4, 9, 1, adaptive)
+    assert decoder.draft(answer(1, 2, 3), rho=3.0) == [0, 7]
+    assert decoder.draft(answer(1, 2, 3), rho=300.0) == [0, 7, 1, 5]
+    assert decoder.draft(answer(1, 2, 2), rho=300.0) == [0, 7, 2, 5]
+    assert decoder.draft(answer(1), rho=3.0) == [0, 7, 1, 5]
+    fixed = Decoder(vocabulary, 4, 9, 1, spec)
+    assert fixed.draft(answer(1, 2, 3)) == [0, 7, 1, 5]
+
 
 def test_rows_with_one_live_stream_are_decided_together(monkeypatch):
     # with one live stream, a round's rows are decided at once; the

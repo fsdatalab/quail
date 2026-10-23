@@ -4,7 +4,8 @@ The answer is decoded after the phrase cue as a decoder writes it, but
 each token is chosen among the tokens that continue some position of
 the document: the span is the document's own text wherever the
 model's writing leads. Each round feeds the chosen token and the
-document's next tokens as a draft, and the rows after them verify it.
+document's next tokens along the positions the writing fits as a
+draft, and the rows after them verify it.
 The answer ends where the model would end its turn, or where its
 writing would leave the document.
 """
@@ -93,12 +94,16 @@ class Decoder:
     def draft(self, answer: AnswerState, rho: float = 0.0, q: int = 0) -> list:
         """Return the tokens the next round feeds: the chosen token, then a draft.
 
-        The draft is the document's next tokens along the first
-        position the writing fits; the rows after them verify it, so a
-        round writes as many tokens as the model would have chosen one
-        at a time. Its length is the plan's, or under the adaptive
-        policy the length that costs the least per written token for
-        this document's KV read and the answer so far.
+        The draft is the document's next tokens along the positions the
+        writing fits, read together: while they agree it is their
+        common text, and where they split it follows the continuation
+        of the most positions, the earliest breaking a tie. The rows
+        after the draft verify it, so a round writes as many tokens as
+        the model would have chosen one at a time. Its length is the
+        plan's, or under the adaptive policy the length that costs the
+        least per written token for this document's KV read, the
+        answer so far, and the share of positions the draft follows
+        past each split.
 
         Args:
             answer: The answer's state.
@@ -106,16 +111,28 @@ class Decoder:
             q: The question's index.
         """
         at = len(answer.written)
-        stream = min(answer.streams, key=lambda s: s.char)
-        length = self.spec.draft_tokens
+        room = self.spec.draft_tokens
         if self.policies is not None:
-            length = self.policies[q].draft_length(rho, at, len(answer.streams))
-        draft = []
-        for i in range(length):
-            token = stream.next(at + i, self.vocabulary)
-            if token is None:
+            room = min(room, self.spec.max_answer_tokens - at - 1)
+        followed = answer.streams
+        draft, agreement, odds = [], [], 1.0
+        for i in range(max(room, 0)):
+            ensure_tokens(followed, at + i, self.vocabulary)
+            branches = {}
+            for stream in followed:
+                if at + i < len(stream.stream):
+                    branches.setdefault(stream.stream[at + i], []).append(stream)
+            if not branches:
                 break
+            token, kept = max(branches.items(), key=lambda item: (
+                len(item[1]), -min(stream.char for stream in item[1])))
+            odds *= len(kept) / len(followed)
             draft.append(token)
+            agreement.append(odds)
+            followed = kept
+        if self.policies is not None:
+            length = self.policies[q].draft_length(rho, at, agreement)
+            draft = draft[:length]
         answer.fed = [answer.written[-1], *draft]
         return answer.fed
 
@@ -149,17 +166,11 @@ class Decoder:
         answer.steps += 1
         answer.discard = 0
         rows = np.asarray(rows)
-        # a draft along one of several live positions tells the policy
-        # whether that position was the answer's source
-        num_streams = (
-            len(answer.streams) if answer.written and len(fed) > 1 else 1
-        )
         accepted = 0
         if answer.written and len(answer.streams) == 1:
             accepted = self.accepted(answer, rows, fed)
             rows = rows[accepted:]
         if accepted:
-            self.observe(q, num_streams, True)
             written = min(accepted, self.spec.max_answer_tokens - len(answer.written))
             answer.written.extend(fed[1:written + 1])
             if len(answer.written) >= self.spec.max_answer_tokens:
@@ -170,15 +181,9 @@ class Decoder:
             if answer.done:
                 return
             after = accepted + i + 1
-            if after == 1 and num_streams > 1:
-                self.observe(q, num_streams, token == fed[1])
             if after < len(fed) and token != fed[after]:
                 answer.discard = len(fed) - after
                 return
-
-    def observe(self, q: int, num_streams: int, accepted: bool) -> None:
-        if self.policies is not None and num_streams > 1:
-            self.policies[q].observe(num_streams, accepted)
 
     def accepted(self, answer: AnswerState, rows: np.ndarray, fed) -> int:
         """Return how many leading rows write the draft token fed after them.
