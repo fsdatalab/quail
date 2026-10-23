@@ -22,8 +22,8 @@ WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 
 How Quail is faster:
 
-- **Cheapest work first.** Quail orders the AI filters by cost, so the
-  later functions read fewer rows.
+- **Cheapest work first.** Quail orders the AI functions of a query by
+  cost, so the later functions read fewer rows.
 - **Each document is computed once.** Every AI function in a query
   reuses the document's KV, and documents that start with the same
   text share it.
