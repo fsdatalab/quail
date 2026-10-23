@@ -148,10 +148,14 @@ class Query:
             self.logical = candidates[0].plan
             scans = {}
             offset_aliases = set()
+            # an alias some plan scans without predicates reads every row
+            whole_aliases = set()
             for candidate in candidates:
                 operators = candidate.plan.operators()
                 offset_aliases.update(alias for extract in operators.extracts
                                       for alias in extract.call.aliases())
+                whole_aliases.update(scan.alias for scan in operators.scans
+                                     if not scan.predicates)
                 for scan in operators.scans:
                     previous = scans.get(scan.alias, scan)
                     scans[scan.alias] = replace(scan, columns=tuple(dict.fromkeys(
@@ -162,7 +166,11 @@ class Query:
             locates_answers = getattr(backend, "locates_answers_in_text", False)
             for s in scans.values():
                 columns = s.columns
-                with_offsets = locates_answers and s.alias in offset_aliases
+                # the extraction computes the offsets of the rows the
+                # predicates keep; computing them for every row of a
+                # large table costs far more than tokenizing it
+                with_offsets = (locates_answers and s.alias in offset_aliases
+                                and s.alias in whole_aliases)
                 if reads_text:
                     columns = tuple(dict.fromkeys(
                         (*columns, *source_columns(s.column))))
