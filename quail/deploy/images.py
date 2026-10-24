@@ -62,7 +62,7 @@ def gpu_image(*local_dirs: tuple[str, str],
     image = _cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
-    image = image.add_local_python_source("quail", "bench")
+    image = image.add_local_python_source("quail", "bench", "experiments")
     for local, remote in local_dirs:
         image = image.add_local_dir(local, remote_path=remote)
     return image
