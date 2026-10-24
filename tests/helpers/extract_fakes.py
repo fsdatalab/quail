@@ -80,6 +80,12 @@ class FakeTokenizer:
                 if token.startswith("Ġ") else token)
         return self.ids.get(text, -1)
 
+    def decode(self, ids, skip_special_tokens=False):
+        pieces = [self.tokens[index] for index in ids]
+        if skip_special_tokens:
+            pieces = [piece for piece in pieces if piece != "<|im_end|>"]
+        return "".join(pieces)
+
 
 RANKED = "The lease ends on March 3. The rent is due."
 

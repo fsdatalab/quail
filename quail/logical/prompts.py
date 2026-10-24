@@ -7,6 +7,7 @@ from quail.logical.expressions import (
     LABEL_PREFIX,
     CompileError,
     Prompt,
+    validate_instruction,
     validate_question,
 )
 from quail.specs.prompts import TEXT_ANALYSIS_SYSTEM_PROMPT
@@ -558,6 +559,52 @@ def bind_extract_prompt(args: tuple, question: str,
              + EXTRACT_PHRASE_CUE)
     return Prompt(template="{0}", args=tuple(args), preamble=preamble,
                   tail="{0}" + after, kind="extract")
+
+
+# AI.MAP: the document, the instruction, and the answer cue. The
+# prompt ends at the cue; the model writes the answer freely and ends
+# its turn. The document's KV stays query independent: every text that
+# depends on the instruction follows it.
+MAP_INSTRUCTION_LABEL = "\n\nInstruction: "
+MAP_ANSWER_CUE = "Answer:"
+
+
+def render_map_instruction(instruction: str) -> str:
+    """Return the text after the document: the instruction alone."""
+    return MAP_INSTRUCTION_LABEL + instruction
+
+
+def bind_map_prompt(args: tuple, instruction: str,
+                    turn: tuple[str, str] = ("", "")) -> Prompt:
+    """Bind an AI.MAP prompt over one document column.
+
+    The prompt is the document label, the document, the instruction,
+    the model's turn text, and the cue that opens the answer.
+
+    Args:
+        args: One column reference.
+        instruction: The instruction the answer is written for.
+        turn: Chat text before the prompt and after the instruction.
+            Without it, a line break separates the instruction and the
+            cue.
+
+    Returns:
+        A Prompt whose template is ``{0}`` and whose tail is the text
+        after the document.
+
+    Raises:
+        CompileError: The prompt reads more than one column, or the
+            instruction is empty.
+    """
+    if len(args) != 1:
+        raise CompileError("AI.MAP reads one document column")
+    validate_instruction(instruction)
+    preamble = turn[0] + SHARED_PRE
+    # the cue opens the model's turn; without turn text it opens a line
+    after = (render_map_instruction(instruction) + (turn[1] or "\n")
+             + MAP_ANSWER_CUE)
+    return Prompt(template="{0}", args=tuple(args), preamble=preamble,
+                  tail="{0}" + after, kind="map")
 
 
 def bind_join_prompt(template: str, args: tuple,

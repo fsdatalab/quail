@@ -104,8 +104,8 @@ See [Quail Server](https://fsdatalab.github.io/quail/docs/user-guide/server).
 
 You can use filters and joins evaluated by a language model,
 `EXISTS` / `NOT EXISTS`, numeric scores (`AI.SCORE`), classification
-(`AI.CLASSIFY`), and extracting text that answers a question (`AI.EXTRACT`).
-`AI.MAP` is planned.
+(`AI.CLASSIFY`), extracting text that answers a question (`AI.EXTRACT`),
+and writing free-form text for an instruction (`AI.MAP`).
 
 You can write queries in two AI-SQL dialects:
 [Snowflake `AI_FILTER`](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)

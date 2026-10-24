@@ -13,6 +13,7 @@ from quail.logical import (
     extracted_above_joins,
     has_score,
     is_score,
+    mapped_above_joins,
     oriented_join_conditions,
 )
 from quail.logical.expressions import aliased_call
@@ -40,6 +41,7 @@ from quail.planner.operators.classify import (
 from quail.planner.operators.extract import emit_extract
 from quail.planner.operators.filter import emit_filter
 from quail.planner.operators.join import emit_join
+from quail.planner.operators.map import emit_map
 from quail.planner.operators.score import (
     ScoreLowering,
     emit_projected_scores,
@@ -51,7 +53,13 @@ from quail.planner.optimizer.context import PlanningContext
 from quail.planner.plan import PhysicalPlan, Refusal
 from quail.planner.search.operator_order import choose_operator_order
 from quail.planner.search.statistics import filter_stop_keys
-from quail.planner.search.table_steps import ASK, CLASSIFY, EXTRACT, resident_after
+from quail.planner.search.table_steps import (
+    ASK,
+    CLASSIFY,
+    EXTRACT,
+    MAP,
+    resident_after,
+)
 from quail.planner.statistics.tables import summarize_alias
 from quail.planner.validation import (
     ClassifyRefusedError,
@@ -158,6 +166,7 @@ class GraphBuilder:
         self.classified = {alias for _, alias in self.operators.labels.calls}
         self.after_joins = classified_above_joins(plan.root)
         self.extract_after = extracted_above_joins(plan.root)
+        self.map_after = mapped_above_joins(plan.root)
         self.projected_scores = score_projections(plan)
         self.alias_applies = {}
         self.join_applies = {}
@@ -275,6 +284,8 @@ class GraphBuilder:
                 kinds.add(CLASSIFY)
             if s.alias not in self.extract_after:
                 kinds.add(EXTRACT)
+            if s.alias not in self.map_after:
+                kinds.add(MAP)
             port_by_alias[s.alias], rows = self._emit_steps(
                 s.alias,
                 float(stats[s.alias].num_documents),
@@ -293,7 +304,7 @@ class GraphBuilder:
         Args:
             alias: The table.
             expected_rows: The documents the first step reads.
-            kinds: The step kinds to emit: ASK, CLASSIFY, EXTRACT.
+            kinds: The step kinds to emit: ASK, CLASSIFY, EXTRACT, MAP.
             port: The port the documents stand at before the steps.
 
         Returns:
@@ -325,6 +336,10 @@ class GraphBuilder:
                 port, rows = emit_classify(
                     self, alias, expected_rows, positions, port
                 )
+                row_ports += rows
+            elif kind == MAP:
+                port, rows = emit_map(self, alias, expected_rows, positions, port,
+                                      resident=resident)
                 row_ports += rows
             else:
                 port, rows = emit_extract(self, alias, expected_rows, positions, port,
@@ -405,7 +420,7 @@ class GraphBuilder:
         # classifications after the joins run over the documents the joins
         # matched: a document with at least one true pair, expected as the
         # join selectivity times the partners it met, at most every document
-        for alias in sorted(self.after_joins | self.extract_after):
+        for alias in sorted(self.after_joins | self.extract_after | self.map_after):
             met = sum(
                 effective_selectivity(join.selectivity)
                 * (self.pair_fractions or {}).get(position, 1.0)
@@ -419,6 +434,8 @@ class GraphBuilder:
                 kinds.add(CLASSIFY)
             if alias in self.extract_after:
                 kinds.add(EXTRACT)
+            if alias in self.map_after:
+                kinds.add(MAP)
             port_by_alias[alias], rows = self._emit_steps(
                 alias, self.operator_order.expected_rows[alias] * min(1.0, met), kinds,
                 port_by_alias[alias])

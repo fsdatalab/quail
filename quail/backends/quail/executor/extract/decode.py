@@ -83,13 +83,6 @@ class Decoder:
                           for _ in range(questions)]
                          if spec.draft_policy == "adaptive" else None)
 
-    def rows(self, row) -> np.ndarray:
-        """Return a stage's answer as its rows of readout values."""
-        values = np.asarray(row)
-        if values.dtype == object:
-            values = np.asarray(values.reshape(-1)[0], dtype=np.float32)
-        return values.reshape(-1, self.width)
-
     def draft(self, answer: AnswerState, rho: float = 0.0, q: int = 0) -> list:
         """Return the tokens the next round feeds: the chosen token, then a draft.
 

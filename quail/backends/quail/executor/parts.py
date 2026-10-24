@@ -13,6 +13,7 @@ from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.stages import Stage, frame_writes, run_stages
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.catalog.tokens import prefix_tree
+from quail.execution.rows import Rows
 from quail.logical import effective_selectivity
 from quail.physical import AiFilter, AiJoin, Filter
 from quail.progress import logger
@@ -108,6 +109,24 @@ class ExecutionPart(ABC):
     @abstractmethod
     def results(self) -> dict:
         """Return completed results keyed by node or output name."""
+
+
+class DocumentAnswerPart(ExecutionPart):
+    """A part over one table's documents, fed their ids or an operator's rows."""
+
+    @staticmethod
+    def model_inputs(node, inputs, context, upstream=None, nodes=None):
+        if nodes is not None:
+            inputs = inputs[node.node_id]
+        # the one input carries the documents' ids, or the rows of an
+        # earlier operator over them
+        (value,) = inputs.values()
+        ids = (value.ids[node.spec.alias].to_numpy() if isinstance(value, Rows)
+               else np.asarray(value, dtype=np.int64))
+        return {"document_ids": ids,
+                "documents": context.state["documents"],
+                "texts": context.state.get("texts", {}),
+                "limit": context.state.get("filter_limit")}
 
 
 class SingleResultPart(ExecutionPart):

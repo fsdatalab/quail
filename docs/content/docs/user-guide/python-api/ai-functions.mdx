@@ -19,6 +19,7 @@ Select a row to jump to its arguments and examples.
 | [`ai_score(prompt, name=...)`](#ai_score) | Adds a score from 0 to 1 for each document. |
 | [`ai_classify(prompt, labels, ...)`](#ai_classify) | Assigns one of the supplied labels. |
 | [`ai_extract(column, questions, ...)`](#ai_extract) | Copies answers from a document and returns their positions. |
+| [`ai_map(column, instruction, ...)`](#ai_map) | Writes an answer to the instruction for each document. |
 
 </div>
 
@@ -192,6 +193,37 @@ set the expected fraction of documents that pass.
 
 See [`AI.EXTRACT`](/docs/user-guide/sql/ai-functions#aiextract) for output examples
 and supported queries.
+
+## ai_map
+
+`ai_map(c, instruction, *, name)`
+
+`ai_map()` returns the text the model writes for an instruction over
+each document. Unlike `ai_extract()`, the answer is not restricted to
+words copied from the document. Pass the document column as a string
+such as `"r.text"`, or use `col("r.text")`. Set `name` to the result
+column you want, and include it in `select()`.
+
+For example, imagine you registered a `reviews` table with an `id`
+column and the review text in `text`. Summarize the negative arguments
+of each review:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_map("r.text", "Summarize the negative arguments the reviewer makes.",
+            name="negatives")
+    .select("r.id", "negatives")
+)
+```
+
+You get `r.id` and `negatives`, a string column with the model's
+answer; it is empty when the model writes nothing. Each `ai_map()`
+call is a separate map; the maps of one document read the same
+document KV. `where()` cannot test a map's answer.
+
+See [`AI.MAP`](/docs/user-guide/sql/ai-functions#aimap) for output
+examples and supported queries.
 
 See [Non-AI functions](/docs/user-guide/python-api/non-ai-functions)
 for conditions on AI outputs, sorting, aggregation, and result collection.

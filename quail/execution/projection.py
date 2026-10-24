@@ -35,10 +35,12 @@ def projection_for(logical, token_inputs, documents):
                        *(key.expression for key in logical.result.order))
         if column_references(column)}
     model_calls = {node.name: node.call
-                   for node in (*operators.classifies, *operators.extracts)}
+                   for node in (*operators.classifies, *operators.extracts,
+                                *operators.maps)}
     model_calls.update({node.span_name: node.call for node in operators.extracts})
     model_calls.update({column.name: call for column in logical.projection.columns
-                        if (call := aliased_call(column, "label", "extract", "score"))
+                        if (call := aliased_call(column, "label", "extract",
+                                                 "score", "map"))
                         is not None})
 
     def project(node, value, labels=None):

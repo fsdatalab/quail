@@ -27,6 +27,7 @@ from quail.logical.nodes import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     Window,
 )
 from quail.logical.plan import (
@@ -73,6 +74,7 @@ class LogicalPlanBuilder:
         regular_predicates: tuple = (),
         extracts: tuple = (),
         extract_filters: tuple = (),
+        maps: tuple = (),
     ) -> None:
         """Add one table with its filters, applies, classifications, and extractions.
 
@@ -95,6 +97,8 @@ class LogicalPlanBuilder:
             extract_filters: (RegularPredicate, selectivity) per Filter
                 on an extraction's answer or span column, in written
                 order. Each sits right above the extraction it tests.
+            maps: (call, name) per AI.MAP, in order. They sit above
+                the extractions.
 
         Raises:
             CompileError: The alias is taken, a label filter names a
@@ -157,6 +161,8 @@ class LogicalPlanBuilder:
             raise CompileError(
                 f"the filter {tests[0][0]} tests an extraction the query "
                 f"does not return")
+        for call, name in maps:
+            node = SemanticMap(node, call, name)
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:

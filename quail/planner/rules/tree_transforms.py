@@ -25,6 +25,7 @@ from quail.logical import (
     SemanticExtract,
     SemanticFilter,
     SemanticJoin,
+    SemanticMap,
     SortKey,
     Window,
     is_score,
@@ -221,43 +222,44 @@ def push_down_filters(root: LogicalNode) -> LogicalNode | None:
 
 
 def _label_sequence(node) -> tuple:
-    """Split a table's sequence at its classifications and extractions.
+    """Split a table's sequence at its classifications, extractions, and maps.
 
     Returns:
-        The node below the table's lowest SemanticClassify or
-        SemanticExtract, and the SemanticClassify, label filter, and
-        SemanticExtract nodes above it, lowest first.
+        The node below the table's lowest SemanticClassify,
+        SemanticExtract, or SemanticMap, and the SemanticClassify,
+        label filter, SemanticExtract, and SemanticMap nodes above it,
+        lowest first.
     """
     lifted = []
-    while isinstance(node, (SemanticClassify, SemanticExtract, Filter)):
+    while isinstance(node, (SemanticClassify, SemanticExtract, SemanticMap,
+                            Filter)):
         lifted.append(node)
         node = node.input
     return node, tuple(reversed(lifted))
 
 
 def _sequence_alias(node) -> str:
-    """Return the table alias a classification, extraction, or label filter reads."""
-    if isinstance(node, (SemanticClassify, SemanticExtract)):
+    """Return the table alias a classification, extraction, map, or filter reads."""
+    if isinstance(node, (SemanticClassify, SemanticExtract, SemanticMap)):
         return node.alias
     return node.condition.column.alias
 
 
 def lift_maps(root: LogicalNode) -> LogicalNode | None:
-    """Move every joined table's classifications and extractions above the joins.
+    """Move every joined table's per-document operators above the joins.
 
     Each one-table SemanticClassify of a table that a SemanticJoin
     reads, with the Filters on its label column, and each
-    SemanticExtract of such a table, leaves the table's sequence and
-    moves above the topmost join, under the root Project, in scan
-    order. A classification or extraction of a table that no join
-    reads stays, as does one below an Apply, whose function sees the
-    rows it was written on, and one of a gate's inner table (an exists
-    or anti join's partner), whose filters decide which anchors pass.
-    The map operators here are SemanticClassify and SemanticExtract.
-    The planner prices the rewritten plan alongside the original plan.
+    SemanticExtract and SemanticMap of such a table, leaves the
+    table's sequence and moves above the topmost join, under the root
+    Project, in scan order. One of a table that no join reads stays,
+    as does one below an Apply, whose function sees the rows it was
+    written on, and one of a gate's inner table (an exists or anti
+    join's partner), whose filters decide which anchors pass. The
+    planner prices the rewritten plan alongside the original plan.
 
     Returns:
-        The rewritten root, or None when no classification or extraction moved.
+        The rewritten root, or None when no operator moved.
     """
     if isinstance(root, (Result, Aggregate, Window)):
         rewritten = lift_maps(root.input)

@@ -11,7 +11,7 @@ from quail.backends.quail.executor.extract import (
     load_vocabulary,
 )
 from quail.backends.quail.executor.parts import (
-    ExecutionPart,
+    DocumentAnswerPart,
     execute_parts,
     gpu_seconds,
     shared_prefix_tree,
@@ -19,7 +19,7 @@ from quail.backends.quail.executor.parts import (
 )
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.rows import Rows, extraction_rows
+from quail.execution.rows import extraction_rows
 from quail.physical import AiExtract
 
 
@@ -106,25 +106,11 @@ def extraction_results(nodes, stages, document_ids, *, fresh, own,
     return results
 
 
-class ExtractPart(ExecutionPart):
+class ExtractPart(DocumentAnswerPart):
     """Extraction stages and per-question results for the shared executor."""
 
     combine = True
     execute_group = staticmethod(execute_extractions)
-
-    @staticmethod
-    def model_inputs(node, inputs, context, sequence=None, nodes=None):
-        if nodes is not None:
-            inputs = inputs[node.node_id]
-        # the one input carries the documents' ids, or the rows of an
-        # earlier operator over them
-        (value,) = inputs.values()
-        ids = (value.ids[node.spec.alias].to_numpy() if isinstance(value, Rows)
-               else np.asarray(value, dtype=np.int64))
-        return {"document_ids": ids,
-                "documents": context.state["documents"],
-                "texts": context.state.get("texts", {}),
-                "limit": context.state.get("filter_limit")}
 
     @classmethod
     def prepare(cls, state, nodes, ids, parts, inputs, context):

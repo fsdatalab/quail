@@ -20,6 +20,7 @@ Square brackets mark optional arguments.
 | [`AI.SCORE(prompt[, options])`](#aiscore) | Returns a score from 0 to 1 for a model question. |
 | [`AI.CLASSIFY(input, categories[, options])`](#aiclassify) | Assigns one of the supplied labels. |
 | [`AI.EXTRACT(input, questions)`](#aiextract) | Copies answers from a document and returns their positions. |
+| [`AI.MAP(input, instruction)`](#aimap) | Writes an answer to the instruction for each document. |
 | [`HINT(condition, options)`](#planning-hints) | Sets the estimated pass fraction for a label or answer condition. |
 
 </div>
@@ -408,6 +409,49 @@ set the expected fraction of documents that pass, or pass
 
 For the Python form, see
 [`ai_extract()`](/docs/user-guide/python-api/ai-functions#ai_extract).
+
+## AI.MAP
+
+`AI.MAP` returns the text the model writes for an instruction over each
+document. Unlike `AI.EXTRACT`, the answer is not restricted to words
+copied from the document. For example, imagine a `reviews` table with
+review text in `text`. Summarize the negative arguments of each review:
+
+```sql
+SELECT r.id,
+       AI.MAP(r.text,
+              'Summarize the negative arguments the reviewer makes.')
+       AS negatives
+FROM reviews r;
+```
+
+The result column is a `STRING` with the model's answer; it is empty
+when the model writes nothing. A map in `SELECT` requires a column
+alias with `AS`. The call must be a separate item, rather than part of
+a larger expression.
+
+### Arguments
+
+`AI.MAP(input, instruction)`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `input` | `STRING` column | The document to read. |
+| `instruction` | `STRING` | The instruction the answer is written for. |
+
+Each instruction is a separate map. On the Quail backend, the
+instructions about one document read the same document KV, and the
+answer is decoded greedily, up to 256 tokens.
+
+### Limits
+
+- Use a model that supports `AI.MAP`. See
+  [Supported models and GPUs](/docs/user-guide/models).
+- `WHERE` cannot test a map's answer.
+- `ORDER BY` and `GROUP BY` over a map's answer run on the result rows.
+
+For the Python form, see
+[`ai_map()`](/docs/user-guide/python-api/ai-functions#ai_map).
 
 ## Planning hints
 

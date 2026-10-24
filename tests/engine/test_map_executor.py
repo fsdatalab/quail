@@ -1,0 +1,169 @@
+"""The Quail executor's AI.MAP: its decode rounds on a scripted model."""
+
+from types import SimpleNamespace
+
+import numpy as np
+from helpers.extract_fakes import HEAD, LEASE, TAIL, make_vocabulary
+from helpers.fakes import fake_pack
+
+from quail.backends.quail.executor import chunk as chunk_mod
+from quail.backends.quail.executor.map.stages import MapStages
+from quail.backends.quail.executor.operators.map import execute_maps
+from quail.backends.quail.executor.stages import run_stages
+from quail.physical import AiMap, MapSpec
+from tests.engine.test_extract_executor import ScriptedModel, _fake_readout, _state
+
+
+def make_map_spec(tables, **settings) -> MapSpec:
+    return MapSpec(
+        name="summary", aliases=("c",), query_template="{0}",
+        arguments=(("c", "text"),), expected_rows=3, estimated_seconds=0.0,
+        prompt_token_parts=(tuple(tables.encode_ids(HEAD)),
+                            tuple(tables.encode_ids(TAIL))),
+        instruction="Summarize the document.", **settings)
+
+
+def _map_one(monkeypatch, text, gold, *extra, recurrent=False, **settings):
+    """Put one instruction to one document; return its settled answer."""
+    tables = make_vocabulary(text, *([gold] if gold else []), *extra)
+    spec = make_map_spec(tables, **settings)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
+    state = _state(model, recurrent=recurrent)
+    state.loaded_model.vocabulary = tables
+    stages = MapStages(state, [spec], tables, [0], [tables.encode_ids(text)])
+    key = stages.documents[0].key
+    model.documents[key] = text
+    model.gold[key] = gold
+    run_stages(state.torch, state.loaded_model.arena,
+               state.loaded_model.pipeline, stages.stages, stages.prefixes,
+               state.chunk_tokens, anchor_keys=stages.keys,
+               appended_tokens=stages.appended_tokens)
+    stages.finish()
+    return stages.documents[0].answers[0], model, key
+
+
+def test_a_map_writes_text_the_document_does_not_contain(monkeypatch):
+    # the answer mixes document words with new ones; every round feeds
+    # the chosen token, with a draft only where the document continues it
+    gold = "The lease ends March 3"
+    asked, _, _ = _map_one(monkeypatch, LEASE, gold)
+    assert asked.answer == gold
+    assert asked.done
+
+
+def test_a_draft_copied_from_the_document_settles_in_few_rounds(monkeypatch):
+    # the answer is a run of document text: after its first token the
+    # draft copies the rest, so one round verifies the whole run
+    gold = "March 3, 2027 at noon"
+    asked, _, _ = _map_one(monkeypatch, LEASE, gold, draft_tokens=15)
+    assert asked.answer == gold
+    written = len(asked.written)
+    # the cue chooses the first token; one round copies the rest; one
+    # round reads the stop
+    assert asked.steps <= 3, (asked.steps, written)
+
+
+def test_without_a_draft_each_round_writes_one_token(monkeypatch):
+    gold = "March 3, 2027 at noon"
+    asked, _, _ = _map_one(monkeypatch, LEASE, gold, draft_tokens=0)
+    assert asked.answer == gold
+    assert asked.steps == len(asked.written) + 1
+
+
+def test_an_immediate_turn_end_writes_an_empty_answer(monkeypatch):
+    asked, _, _ = _map_one(monkeypatch, LEASE, None)
+    assert asked.answer == ""
+    assert asked.written == []
+
+
+def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch):
+    # " five" occurs twice; the draft copies " days" after the first,
+    # and the model chooses " years": the round ends there, and the
+    # next round feeds " years" in the draft's place
+    text = "or five days or five years"
+    asked, model, key = _map_one(monkeypatch, text, "five years")
+    assert asked.answer == "five years"
+    tables = model.tables
+    five, days, years = (tables.encode_ids(w)[0] for w in (" five", " days", " years"))
+    fed = [suffix for k, suffix, _, _, _ in model.packed if k == key]
+    assert fed[1][:2] == [five, days]
+    assert fed[2][:1] == [years]
+
+
+def test_the_answer_stops_at_the_limit(monkeypatch):
+    gold = "March 3, 2027 at noon"
+    asked, _, _ = _map_one(monkeypatch, LEASE, gold, max_answer_tokens=3,
+                           draft_tokens=0)
+    assert len(asked.written) == 3
+    assert asked.done
+
+
+def test_a_recurrent_model_replays_accepted_tokens(monkeypatch):
+    gold = "March 3, 2027"
+    asked, _, _ = _map_one(monkeypatch, LEASE, gold, recurrent=True)
+    assert asked.answer == gold
+
+
+def test_two_maps_share_one_document_read(monkeypatch):
+    # two instructions over one table run as one stage list: the
+    # second rewinds past the first's answer and reads the resident KV
+    text = LEASE
+    gold = "March 3, 2027"
+    tables = make_vocabulary(text, gold)
+    spec = make_map_spec(tables)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
+    model = ScriptedModel(tables, {}, {}, 4)
+    readout = _fake_readout(tables, 4)
+    monkeypatch.setattr(MapStages, "_readout", lambda self, state: readout)
+    state = _state(model)
+    state.loaded_model.vocabulary = tables
+    seen = {}
+    original = MapStages.__init__
+
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        for document in self.documents:
+            model.documents[document.key] = text
+            model.gold[document.key] = gold
+        seen["stages"] = self
+
+    monkeypatch.setattr(MapStages, "__init__", init)
+
+    def node(name):
+        from dataclasses import replace
+        return AiMap(node_id=f"ai-map:{name}", backend_name="quail",
+                     model="qwen3-4b-fp8", spec=replace(spec, name=name))
+
+    inputs = {"document_ids": [0], "documents": {"c": [tables.encode_ids(text)]},
+              "texts": {"c": [text]}}
+    results = execute_maps(state, [node("first"), node("second")], inputs)
+    stages = seen["stages"]
+    first = results["ai-map:first"].outputs["rows:c"]
+    second = results["ai-map:second"].outputs["rows:c"]
+    assert first.column("first").to_pylist() == [gold]
+    assert second.column("second").to_pylist() == [gold]
+    # the document's prefix was packed once for both instructions
+    assert model.reads[stages.documents[0].key] == 1
+
+
+def test_map_answers_need_the_document_tokens_or_text():
+    tables = make_vocabulary()
+    spec = make_map_spec(tables)
+    state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
+    try:
+        MapStages(state, [spec], tables, [0], None)
+    except ValueError as error:
+        assert "tokens or the text" in str(error)
+    else:
+        raise AssertionError("MapStages accepted a document without tokens")
+
+
+def test_readout_rows_unwrap_object_arrays():
+    from quail.backends.quail.executor.readout import readout_rows
+
+    values = np.empty(1, dtype=object)
+    values[0] = np.arange(18, dtype=np.float32)
+    assert readout_rows(values, 9).shape == (2, 9)

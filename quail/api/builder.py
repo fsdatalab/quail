@@ -43,6 +43,10 @@ class BoundBuilder:
         self._inner.ai_extract(c, question, name=name)
         return self
 
+    def ai_map(self, c, instruction, *, name):
+        self._inner.ai_map(c, instruction, name=name)
+        return self
+
     def label_in(self, name, labels, selectivity=None):
         self._inner.label_in(name, labels, selectivity=selectivity)
         return self

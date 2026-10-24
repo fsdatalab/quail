@@ -129,8 +129,8 @@ one. `tools/check_names.py` enforces the chosen words:
   models Qwen3.5 4B bf16, Qwen3.5 27B fp8, Qwen3.8 27B fp8, and LFM2
   2.6B bf16, on one H100 per model copy. No tensor-parallel weight
   sharding.
-- `AI.MAP` is on the roadmap.
-  Open-ended generation, speculation, and forking are not supported.
+- `AI.MAP` writes a free-form answer per document, decoded greedily
+  with document-lookup drafts. Sampling and forking are not supported.
 
 # What Quail builds on and learns from
 

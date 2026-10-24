@@ -14,6 +14,11 @@ from quail.logical.nodes.extract import (
 )
 from quail.logical.nodes.filter import Filter, SemanticFilter
 from quail.logical.nodes.join import Join, SemanticJoin
+from quail.logical.nodes.map import (
+    SemanticMap,
+    mapped_above_joins,
+    semantic_maps,
+)
 from quail.logical.nodes.relational import Aggregate, Project, Result, Window
 from quail.logical.nodes.scan import Scan
 
@@ -33,8 +38,11 @@ __all__ = [
     "SemanticExtract",
     "SemanticFilter",
     "SemanticJoin",
+    "SemanticMap",
     "classifications",
     "classified_above_joins",
     "extracted_above_joins",
     "extractions",
+    "mapped_above_joins",
+    "semantic_maps",
 ]

@@ -290,7 +290,7 @@ DEFAULT_SELECTIVITY = 0.2
 SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 
 
-MODEL_CALL_KINDS = ("boolean", "score", "label", "extract")
+MODEL_CALL_KINDS = ("boolean", "score", "label", "extract", "map")
 
 
 def effective_selectivity(selectivity: Optional[float]) -> float:
@@ -324,6 +324,8 @@ class ModelCall:
     probabilities: bool = False
     # an "extract" call only: the question the answer is copied for
     question: str = ""
+    # a "map" call only: the instruction the answer is written for
+    instruction: str = ""
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -342,10 +344,14 @@ class ModelCall:
             raise CompileError("only an AI.CLASSIFY call has labels")
         if self.kind != "extract" and self.question:
             raise CompileError("only an AI.EXTRACT call has a question")
+        if self.kind != "map" and self.instruction:
+            raise CompileError("only an AI.MAP call has an instruction")
         if self.kind == "label":
             validate_labels(self.labels, self.descriptions)
         elif self.kind == "extract":
             validate_question(self.question)
+        elif self.kind == "map":
+            validate_instruction(self.instruction)
 
 
 def validate_question(question: str) -> None:
@@ -356,6 +362,16 @@ def validate_question(question: str) -> None:
     """
     if not isinstance(question, str) or not question.strip():
         raise CompileError("AI.EXTRACT needs a question with at least one word")
+
+
+def validate_instruction(instruction: str) -> None:
+    """Check an AI.MAP instruction: text with at least one word.
+
+    Raises:
+        CompileError: The instruction is empty or not a string.
+    """
+    if not isinstance(instruction, str) or not instruction.strip():
+        raise CompileError("AI.MAP needs an instruction with at least one word")
 
 
 @dataclass(frozen=True)
@@ -706,6 +722,10 @@ def validate_predicate(expression) -> None:
             raise CompileError(
                 "an AI.EXTRACT answer is a result column, not a predicate"
             )
+        if expression.kind == "map":
+            raise CompileError(
+                "an AI.MAP answer is a result column, not a predicate"
+            )
         return
     raise CompileError(
         f"a predicate is a model call or a comparison of an AI.SCORE call, "
@@ -752,9 +772,9 @@ def _explain(expression) -> str:
         call = aliased_call(expression)
         if call is None:
             return f"{column_name(expression.expression)} AS {expression.name}"
-        if call.kind in ("label", "extract"):
-            # the SemanticClassify or SemanticExtract below computes
-            # the column
+        if call.kind in ("label", "extract", "map"):
+            # the SemanticClassify, SemanticExtract, or SemanticMap
+            # below computes the column
             return expression.name
         return f"{_explain(call)} AS {expression.name}"
     if isinstance(expression, (ColumnRef, GetField, ScalarFunction)):
@@ -763,6 +783,8 @@ def _explain(expression) -> str:
         return f"AI.CLASSIFY({expression.prompt.template!r}, {list(expression.labels)})"
     if expression.kind == "extract":
         return f"AI.EXTRACT({expression.prompt.template!r}, {expression.question!r})"
+    if expression.kind == "map":
+        return f"AI.MAP({expression.prompt.template!r}, {expression.instruction!r})"
     function = "AI.SCORE" if expression.kind == "score" else "AI.IF"
     return f"{function}({expression.prompt.template!r})"
 
