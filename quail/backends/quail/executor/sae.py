@@ -410,7 +410,9 @@ class SaeMaxAccumulator:
         """Return a settled handle's nonzero (feature, strength) mappings."""
         event, host = handle
         event.synchronize()
-        values = host.numpy()
+        # one memcpy out of the pinned slab: reading page-locked memory
+        # in place costs milliseconds per row
+        values = host.numpy().copy()
         kept = np.flatnonzero(values > 0.0)
         return [{"feature": int(feature), "strength": float(values[feature])}
                 for feature in kept]
