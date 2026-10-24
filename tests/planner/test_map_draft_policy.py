@@ -66,3 +66,25 @@ def test_slack_lengthens_the_draft():
     assert idle > busy
     assert policy.copy_length(5.0, 1, slack=15.0) >= policy.copy_length(
         5.0, 1, slack=0.0)
+
+
+def test_copy_misses_shrink_the_copied_draft():
+    policy = MapDraftPolicy(cap=15, max_answer_tokens=256,
+                            expected_answer_tokens=64)
+    seeded = policy.copy_length(17.0, 10, slack=0.0)
+    for _ in range(100):
+        policy.observe_copy(False)
+    assert policy.copy_rate() < 0.1
+    assert policy.copy_length(17.0, 10, slack=0.0) <= 1
+    assert seeded > 1
+
+
+def test_a_full_pass_prices_a_round_at_its_dispatch():
+    # with the KV read riding other rows' compute, long drafts no
+    # longer pay for themselves at middling odds
+    policy = MapDraftPolicy(cap=15, max_answer_tokens=256,
+                            expected_answer_tokens=64)
+    busy = policy.chain_length(4.0, 10, [0.5] * 15, slack=0.0)
+    tail = policy.chain_length(17.0, 10, [0.5] * 15, slack=15.0)
+    assert busy <= 2
+    assert tail > busy

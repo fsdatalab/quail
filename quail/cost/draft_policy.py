@@ -157,6 +157,13 @@ class ExtractDraftPolicy:
         self.accepts[b] += accepted
 
 
+# a round's own cost when the pass is compute bound, in fed tokens:
+# the KV read rides other rows' compute there, so saving a round saves
+# only its dispatch and readout, not the read rho prices
+BUSY_ROUND_TOKENS = 4.0
+# the seed of the copy acceptance rate: a model that is quoting tends
+# to keep quoting, and the rate is corrected from verified rounds
+COPY_RATE_SEED = 0.8
 # the acceptance odds are learned per range of distinct continuations
 FAN_BUCKETS = (1, 2, 4, 8)
 _FAN_LOGS = [math.log1p(b) for b in FAN_BUCKETS]
@@ -203,6 +210,11 @@ class MapDraftPolicy:
         cells = len(MATCH_ORDERS) * len(FAN_BUCKETS) * _SOURCES
         self.trials = np.zeros(cells, dtype=np.int64)
         self.accepts = np.zeros(cells, dtype=np.int64)
+        # copied drafts' verified tokens: unlike an extraction, a map's
+        # answer may leave the document at any token, so a copy is a
+        # per-token bet like a chain hop
+        self.copy_trials = 0
+        self.copy_accepts = 0
 
     def cell(self, match: NgramMatch) -> int:
         """Return the acceptance table's cell for one cache match."""
@@ -227,19 +239,29 @@ class MapDraftPolicy:
     def _room(self, written: int) -> int:
         return min(self.cap, self.max_answer_tokens - written - 1)
 
+    def copy_rate(self) -> float:
+        """Return P(the model writes a copied draft's next token)."""
+        return ((PRIOR_WEIGHT * COPY_RATE_SEED + self.copy_accepts)
+                / (PRIOR_WEIGHT + self.copy_trials))
+
+    def observe_copy(self, accepted: bool) -> None:
+        """Record whether a copied draft token was written."""
+        self.copy_trials += 1
+        self.copy_accepts += accepted
+
     def copy_length(self, rho: float, written: int, slack: float) -> int:
         """Return the draft length for a round copying from the document.
 
-        A copied draft writes while the answer goes on: the model is
-        either copying this run or it is not, and the odds it is are
-        carried by the answer-length curve alone.
+        A copied draft writes while the model keeps quoting the
+        document and the answer goes on; the quoting odds are learned
+        per token from the verified rounds.
 
         Args:
             rho: The round's KV read, in fed tokens.
             written: The answer's tokens so far.
             slack: Fed tokens the current passes carry for free.
         """
-        return self._best_length(rho, written, None, slack)
+        return self._best_length(rho, written, self.copy_rate(), slack)
 
     def chain_length(self, rho: float, written: int, rates, slack: float) -> int:
         """Return how many of a chained draft's tokens to feed.
@@ -251,38 +273,42 @@ class MapDraftPolicy:
                 bounds the draft.
             slack: Fed tokens the current passes carry for free.
         """
-        return self._best_length(rho, written, rates, slack)
+        room = min(self._room(written), len(rates))
+        if room <= 0:
+            return 0
+        return self._best_length(rho, written, rates, slack, room=room)
 
-    def _best_length(self, rho: float, written: int, rates, slack: float) -> int:
+    def _best_length(self, rho: float, written: int, rates, slack: float,
+                     room: int | None = None) -> int:
         """Return the draft length with the least cost per written token.
 
         The first slack draft tokens ride a pass below the ridge, so
         they cost nothing; each one past the slack costs one token.
-        Draft token j writes when the answer goes on and, for a
-        chained draft, every hop through j wrote; a copied draft's
-        hops write together. The arrays are at most cap plus one long,
-        so plain loops beat array allocation here.
+        Draft token j writes when the answer goes on and every hop
+        through j wrote. The arrays are at most cap plus one long, so
+        plain loops beat array allocation here.
 
         Args:
             rho: The round's KV read, in fed tokens.
             written: The answer's tokens so far.
-            rates: Each hop's acceptance odds for a chained draft, its
-                length bounding the draft; None for a copied draft.
+            rates: Each hop's acceptance odds, in hop order; a float is
+                one rate for every hop, as a copied draft has.
             slack: Fed tokens the current passes carry for free.
+            room: The most tokens the draft may have; None derives it
+                from the answer limit.
         """
-        room = self._room(written)
-        if rates is not None:
-            room = min(room, len(rates))
+        if room is None:
+            room = self._room(written)
         if room <= 0:
             return 0
+        uniform = rates if isinstance(rates, float) else None
         levels = self.curve.levels()
         base = levels[written]
         writes = 1.0
         chained = 1.0
         best, best_cost = 0, rho + 1.0
         for gamma in range(1, room + 1):
-            if rates is not None:
-                chained *= rates[gamma - 1]
+            chained *= uniform if uniform is not None else rates[gamma - 1]
             # survival at gamma tokens past written, 1 past a dead base
             writes += chained * (levels[written + gamma] / base if base > 0
                                  else 1.0)

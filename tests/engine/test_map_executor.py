@@ -212,3 +212,15 @@ def test_a_sibling_answer_seeds_the_cache_draft(monkeypatch):
     assert stages.decoder.cache.entries
     # the cache drafts were verified, so the policy recorded trials
     assert stages.decoder.policies[0].trials.sum() > 0
+
+
+def test_rejected_copies_teach_the_policy_to_stop_drafting(monkeypatch):
+    # every written token is in the document, but the model never
+    # follows the document's continuation: the copy rate falls and the
+    # rounds stop paying for long drafts
+    text = "red one red two red three red four red five red six"
+    gold = "red red red red red red red red red red red red"
+    asked, _, _ = _map_one(monkeypatch, text, gold, draft_tokens=15,
+                           max_answer_tokens=24)
+    # each round feeds the chosen token and at most a few draft tokens
+    assert asked.fed_tokens <= 3 * asked.steps + 24

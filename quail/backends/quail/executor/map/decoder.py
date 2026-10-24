@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from quail.backends.quail.executor.vocabulary import Vocabulary
-from quail.cost.draft_policy import MapDraftPolicy
+from quail.cost.draft_policy import BUSY_ROUND_TOKENS, MapDraftPolicy
 from quail.cost.ngram_cache import MATCH_ORDERS, NgramCache
 from quail.physical import MapSpec
 
@@ -99,22 +99,30 @@ class MapDecoder:
         policy = None if self.policies is None else self.policies[q]
         room = min(self.spec.draft_tokens,
                    self.spec.max_answer_tokens - len(answer.written) - 1)
+        # in a full pass the KV read rides other rows' compute, so a
+        # round's own cost is its dispatch, not the read
+        rho = document.rho if slack > 0 else BUSY_ROUND_TOKENS
         if room > 0:
             at = self._source_position(answer, document)
             if at is not None:
                 length = room if policy is None else policy.copy_length(
-                    document.rho, len(answer.written), slack)
+                    rho, len(answer.written), slack)
                 draft = [int(token)
                          for token in document.tokens[at + 1:at + 1 + length]]
                 cells = [None] * len(draft)
             elif policy is not None:
-                draft, cells = self._chain(answer, document, policy, room, slack)
+                if slack <= 0:
+                    # a long chain cannot pay for itself in a full pass
+                    room = min(room, 4)
+                draft, cells = self._chain(answer, document, policy, room, rho,
+                                           slack)
         answer.fed = [answer.written[-1], *draft]
         answer.cells = cells
         return answer.fed
 
     def _chain(self, answer: MapAnswer, document: MapDocument,
-               policy: MapDraftPolicy, room: int, slack: float) -> tuple:
+               policy: MapDraftPolicy, room: int, rho: float,
+               slack: float) -> tuple:
         """Return a draft chained from the cache, and each hop's cell.
 
         The chain stops once the hops' combined odds fall below 2%:
@@ -136,8 +144,7 @@ class MapDecoder:
             cells.append(cell)
             rates.append(rate)
             context.append(match.token)
-        length = policy.chain_length(document.rho, len(answer.written), rates,
-                                     slack)
+        length = policy.chain_length(rho, len(answer.written), rates, slack)
         return tokens[:length], cells[:length]
 
     def _source_position(self, answer: MapAnswer,
@@ -224,7 +231,9 @@ class MapDecoder:
             for j, cell in enumerate(answer.cells):
                 if j > hits or (j == hits and not missed):
                     break
-                if cell is not None:
+                if cell is None:
+                    policy.observe_copy(j < hits)
+                else:
                     policy.observe(cell, j < hits)
         answer.cells = []
         self.cache.add(answer.written, document.index, start=answer.cached)
