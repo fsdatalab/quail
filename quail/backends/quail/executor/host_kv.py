@@ -351,11 +351,11 @@ class HostKV:
             return PENDING
         return self._save(key, digest, prefix_tokens)
 
-    def flush_pending(self, patient: bool = False, until=None) -> dict:
+    def flush_pending(self, wait: bool = False, until=None) -> dict:
         """Run queued saves whose staging blocks have come free.
 
         Saves run in the order they were queued, each when every layer
-        group has a block free, or waited for when patient. With
+        group has a block free, or waited for with `wait`. With
         `until`, the queue is flushed through that key. Returns each
         saved key's gather event (None on the CPU); a key whose entry
         appeared meanwhile is dropped with a None event too.
@@ -363,7 +363,7 @@ class HostKV:
         events = {}
         if not self._pending:
             return events
-        with self._patience(patient):
+        with self._patience(wait):
             for key in list(self._pending):
                 if not self._staging_free("save"):
                     break
@@ -375,8 +375,8 @@ class HostKV:
         return events
 
     @contextmanager
-    def _patience(self, patient):
-        was, self._patient = self._patient, self._patient or patient
+    def _patience(self, wait):
+        was, self._patient = self._patient, self._patient or wait
         try:
             yield
         finally:

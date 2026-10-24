@@ -237,7 +237,7 @@ def test_a_freed_key_keeps_its_pages_until_its_save_has_landed():
             events.append(_Event())
             return events[-1]
 
-        def flush_pending(self, patient=False, until=None):
+        def flush_pending(self, wait=False, until=None):
             return {}
 
     arena.host = Store()
@@ -274,9 +274,9 @@ def test_a_save_with_no_staging_block_waits_in_the_queue_with_its_pages():
             queue.append(key)
             return PENDING
 
-        def flush_pending(self, patient=False, until=None):
+        def flush_pending(self, wait=False, until=None):
             flushed = {}
-            while queue and (patient or blocks[0]):
+            while queue and (wait or blocks[0]):
                 key = queue.pop(0)
                 blocks[0] = max(0, blocks[0] - 1)
                 events[key] = _Event()

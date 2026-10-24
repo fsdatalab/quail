@@ -445,10 +445,10 @@ class KVArena:
         elif event is not None:
             event.synchronize()
 
-    def _flush_pending(self, patient=False, until=None) -> int:
+    def _flush_pending(self, wait=False, until=None) -> int:
         """Run the store's queued saves; returns the pages freed on the way."""
         freed = 0
-        for key, event in self.host.flush_pending(patient, until).items():
+        for key, event in self.host.flush_pending(wait, until).items():
             if key not in self._draining:
                 continue
             if event is None:
@@ -468,7 +468,7 @@ class KVArena:
         """
         freed = 0
         if self.host is not None:
-            freed += self._flush_pending(patient=wait)
+            freed += self._flush_pending(wait=wait)
         for key, event in list(self._draining.items()):
             if event is PENDING:
                 if not wait:
@@ -486,7 +486,7 @@ class KVArena:
         """Run and wait for the oldest save in flight and free its key's pages."""
         for key, event in self._draining.items():
             if event is PENDING:
-                freed = self._flush_pending(patient=True, until=key)
+                freed = self._flush_pending(wait=True, until=key)
                 event = self._draining.get(key)
                 if event is None:
                     return freed
