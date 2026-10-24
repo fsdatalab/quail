@@ -161,4 +161,13 @@ class MapStages(AnswerStages):
             "steps": sum(answer.steps for answer in states),
             "answer_tokens": sum(len(answer.written) for answer in states),
             "suffix_tokens": sum(answer.fed_tokens for answer in states),
+            **self._draft_counts(q),
         }
+
+    def _draft_counts(self, q: int) -> dict:
+        """Return the instruction's chained-draft trials and accepts."""
+        if self.decoder.policies is None:
+            return {"draft_trials": 0, "draft_accepts": 0}
+        policy = self.decoder.policies[q]
+        return {"draft_trials": int(policy.trials.sum()),
+                "draft_accepts": int(policy.accepts.sum())}
