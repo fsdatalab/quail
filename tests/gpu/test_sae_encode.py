@@ -110,13 +110,20 @@ def test_a_transposed_checkpoint_weight_still_encodes_correctly():
     _agreeing_rows(fused_index, fused_value, plain_index, plain_value)
 
 
-def test_fused_max_into_matches_the_torch_path():
+def _maxima(encoder, rows):
+    """Per-feature maxima over the rows, as the accumulator folds them."""
+    buffer = torch.zeros(NUM_FEATURES, device="cuda")
+    indices, strengths = encoder.top_features(rows)
+    buffer.scatter_reduce_(0, indices.reshape(-1).long(),
+                           strengths.reshape(-1), reduce="amax")
+    return buffer
+
+
+def test_fused_maxima_match_the_torch_path():
     fused, plain = _encoders()
     hidden = torch.randn(200, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    fused_buffer = torch.zeros(NUM_FEATURES, device="cuda")
-    plain_buffer = torch.zeros(NUM_FEATURES, device="cuda")
-    fused.max_into(hidden, fused_buffer)
-    plain.max_into(hidden, plain_buffer)
+    fused_buffer = _maxima(fused, hidden)
+    plain_buffer = _maxima(plain, hidden)
     fused_set = set(fused_buffer.nonzero().flatten().tolist())
     plain_set = set(plain_buffer.nonzero().flatten().tolist())
     # over 200 tokens a few boundary features may differ per token
@@ -147,8 +154,7 @@ def test_the_accumulator_splits_document_and_question_rows():
     # call; the other document's stays until its own settle
     assert ("r", 0) not in accumulator.document_max
     assert ("r", 1) in accumulator.document_max
-    expected = torch.zeros(NUM_FEATURES, device="cuda")
-    plain.max_into(stream[:8], expected)
+    expected = _maxima(plain, stream[:8])
     kept = {item["feature"] for item in features}
     reference = set(expected.nonzero().flatten().tolist())
     assert kept == reference

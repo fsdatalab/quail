@@ -244,18 +244,6 @@ class SaeEncoder:
         indices, strengths = self.top_features(rows)
         return self.torch.cat([indices.float(), strengths], dim=1)
 
-    def max_into(self, rows, buffer) -> None:
-        """Fold the rows' per-token top-k strengths into a per-feature maximum.
-
-        Args:
-            rows: Hidden states, (count, hidden).
-            buffer: A (sae_num_features,) fp32 buffer, folded in place.
-        """
-        for start in range(0, rows.shape[0], BLOCK_ROWS):
-            index, values = self.top_features(rows[start:start + BLOCK_ROWS])
-            buffer.scatter_reduce_(0, index.reshape(-1).long(),
-                                   values.reshape(-1), reduce="amax")
-
 
 class SaeFeaturesReadout(_HostReadout):
     """Encode the answer rows' residual stream, for the pooling 'last'.
@@ -357,23 +345,31 @@ class SaeMaxAccumulator:
                                 dtype=self.torch.float32)
 
     def observe(self, stream, chunk) -> None:
-        """Fold one chunk's rows into the document and question maxima."""
+        """Fold one chunk's rows into the document and question maxima.
+
+        The whole chunk encodes in one call, and each span's strengths
+        fold under a mask instead of a boolean-indexed subset: a masked
+        strength contributes 0, which amax over nonnegative strengths
+        ignores. Nothing here reads a data-dependent shape, so the
+        observer never synchronizes with the forward pass.
+        """
+        indices, strengths = self.encoder.top_features(stream)
+        indices = indices.to(self.torch.int64)
         positions = chunk.positions
         for key, row0, _suffix_row, row1 in chunk.row_spans:
             if row1 == row0:
                 continue
-            rows = stream[row0:row1]
-            inside = positions[row0:row1] < self.document_tokens(key)
-            document_rows = rows[inside]
-            if document_rows.shape[0]:
-                if key not in self.document_max:
-                    self.document_max[key] = self._buffer()
-                self.encoder.max_into(document_rows, self.document_max[key])
-            question_rows = rows[~inside]
-            if question_rows.shape[0]:
-                if key not in self.tail_max:
-                    self.tail_max[key] = self._buffer()
-                self.encoder.max_into(question_rows, self.tail_max[key])
+            inside = (positions[row0:row1]
+                      < self.document_tokens(key)).unsqueeze(1)
+            span_indices = indices[row0:row1].reshape(-1)
+            span_strengths = strengths[row0:row1]
+            for buffers, mask in ((self.document_max, inside),
+                                  (self.tail_max, ~inside)):
+                if key not in buffers:
+                    buffers[key] = self._buffer()
+                buffers[key].scatter_reduce_(
+                    0, span_indices, (span_strengths * mask).reshape(-1),
+                    reduce="amax")
 
     def settle(self, key):
         """Return the handle of one document's combined maxima for one call.
