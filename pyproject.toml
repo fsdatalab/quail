@@ -1,7 +1,7 @@
 [project]
 name = "quail-engine"
-version = "0.1.0"
-description = "Quail: a declarative query engine for AI.IF and AI_JOIN"
+version = "0.2.0"
+description = "An open-source inference engine for AI functions in SQL"
 readme = "README.md"
 license = "MIT"
 # The Modal image and tested vLLM build use Python 3.12

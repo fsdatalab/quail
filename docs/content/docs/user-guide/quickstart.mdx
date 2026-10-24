@@ -12,7 +12,9 @@ uv pip install quail-engine
 ```
 
 Quail requires Python 3.12 and a CUDA GPU (local or on
-[Modal](/docs/user-guide/models#no-local-gpu-use-modal)).
+[Modal](/docs/user-guide/models#no-local-gpu-use-modal)). On a local GPU, it
+also needs the CUDA toolkit with `nvcc` and a C compiler: Quail compiles its
+GPU kernels the first time it runs.
 
 ## Run an AI filter
 
