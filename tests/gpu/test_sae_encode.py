@@ -64,6 +64,36 @@ def test_fused_top_features_match_the_torch_path(rows):
     fused_index, fused_value = fused.top_features(hidden)
     plain_index, plain_value = plain.top_features(hidden)
     assert fused_index.shape == plain_index.shape == (rows, KEEP)
+    # if every row overflowed the candidate buffer, the fused call
+    # answered from the torch path and the comparison checks nothing
+    assert fused.overflow_rows < rows
+    _agreeing_rows(fused_index, fused_value, plain_index, plain_value)
+
+
+def test_a_transposed_checkpoint_weight_still_encodes_correctly():
+    """The checkpoint's W_enc is a transposed view.
+
+    Its inner stride is num_features, while the fused kernels index the
+    weight with an inner stride of one, so the encoder must make it
+    contiguous.
+    """
+    import torch.nn.functional as functional
+
+    from quail.backends.quail.executor.sae import SaeEncoder
+
+    torch.manual_seed(7)
+    weight = (torch.randn(HIDDEN, NUM_FEATURES, device="cuda")
+              / HIDDEN ** 0.5).to(torch.bfloat16).t()
+    assert not weight.is_contiguous()
+    bias = torch.randn(NUM_FEATURES, device="cuda") * 0.01
+    fused = SaeEncoder(torch, functional, weight, bias, KEEP,
+                       kernels="quail")
+    plain = SaeEncoder(torch, functional, weight, bias, KEEP,
+                       kernels="vllm")
+    hidden = torch.randn(63, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    fused_index, fused_value = fused.top_features(hidden)
+    plain_index, plain_value = plain.top_features(hidden)
+    assert fused.overflow_rows < 63
     _agreeing_rows(fused_index, fused_value, plain_index, plain_value)
 
 

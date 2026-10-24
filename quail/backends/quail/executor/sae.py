@@ -117,13 +117,18 @@ class SaeEncoder:
                  kernels: str | None = None):
         self.torch = torch
         self.F = F
-        self.weight = weight    # (sae_num_features, hidden) bf16
-        self.bias = bias        # (sae_num_features,) fp32
+        # the checkpoint stores W_enc as a transposed view; the fused
+        # kernels index it with an inner stride of one
+        self.weight = weight.contiguous()    # (sae_num_features, hidden) bf16
+        self.bias = bias                     # (sae_num_features,) fp32
         self.keep = keep
         self.num_features = weight.shape[0]
         self.engine = engine
         self.kernels = (kernels if kernels is not None
                         else getattr(engine, "kernels", "vllm"))
+        # rows the last fused call handed to the torch path; stays 0 on
+        # the torch-only path
+        self.overflow_rows = 0
 
     @classmethod
     def load(cls, torch, F, spec, engine=None):
@@ -224,6 +229,7 @@ class SaeEncoder:
         strengths, position = torch.topk(out_value, self.keep, dim=1)
         indices = torch.gather(out_index, 1, position)
         overflowed = (counters > CANDIDATE_CAP).nonzero(as_tuple=True)[0]
+        self.overflow_rows = int(overflowed.numel())
         if overflowed.numel():
             pre = self._pre(rows[overflowed])
             values, index = torch.topk(pre, self.keep, dim=1)
