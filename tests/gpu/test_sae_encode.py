@@ -26,8 +26,13 @@ def _encoders():
     from quail.backends.quail.executor.sae import SaeEncoder
 
     torch.manual_seed(7)
+    # spread the feature scales over two decades so the pre-activation
+    # distribution is heavy-tailed like a real SAE's; with a flat
+    # Gaussian, hundreds of values crowd the top-k boundary bin and
+    # every row overflows the fused path's candidate buffer
+    scales = torch.logspace(-1.0, 1.0, NUM_FEATURES, device="cuda")
     weight = (torch.randn(NUM_FEATURES, HIDDEN, device="cuda")
-              / HIDDEN ** 0.5).to(torch.bfloat16)
+              / HIDDEN ** 0.5 * scales[:, None]).to(torch.bfloat16)
     bias = torch.randn(NUM_FEATURES, device="cuda") * 0.01
     fused = SaeEncoder(torch, functional, weight, bias, KEEP,
                        kernels="quail")
@@ -66,7 +71,7 @@ def test_fused_top_features_match_the_torch_path(rows):
     assert fused_index.shape == plain_index.shape == (rows, KEEP)
     # if every row overflowed the candidate buffer, the fused call
     # answered from the torch path and the comparison checks nothing
-    assert fused.overflow_rows < rows
+    assert fused.overflow_rows == 0
     _agreeing_rows(fused_index, fused_value, plain_index, plain_value)
 
 
@@ -82,8 +87,9 @@ def test_a_transposed_checkpoint_weight_still_encodes_correctly():
     from quail.backends.quail.executor.sae import SaeEncoder
 
     torch.manual_seed(7)
+    scales = torch.logspace(-1.0, 1.0, NUM_FEATURES, device="cuda")
     weight = (torch.randn(HIDDEN, NUM_FEATURES, device="cuda")
-              / HIDDEN ** 0.5).to(torch.bfloat16).t()
+              / HIDDEN ** 0.5 * scales[None, :]).to(torch.bfloat16).t()
     assert not weight.is_contiguous()
     bias = torch.randn(NUM_FEATURES, device="cuda") * 0.01
     fused = SaeEncoder(torch, functional, weight, bias, KEEP,
@@ -93,7 +99,7 @@ def test_a_transposed_checkpoint_weight_still_encodes_correctly():
     hidden = torch.randn(63, HIDDEN, device="cuda", dtype=torch.bfloat16)
     fused_index, fused_value = fused.top_features(hidden)
     plain_index, plain_value = plain.top_features(hidden)
-    assert fused.overflow_rows < 63
+    assert fused.overflow_rows == 0
     _agreeing_rows(fused_index, fused_value, plain_index, plain_value)
 
 
