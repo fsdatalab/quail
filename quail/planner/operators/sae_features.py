@@ -36,7 +36,7 @@ def sae_features_spec(context, call, name, expected_rows, resident=False):
     cost = SaeFeaturesCost(
         token_lengths=(len(prompt.preamble_token_ids),
                        len(prompt.tail_token_ids)),
-        summary=summary, reading=call.reading, model=model,
+        summary=summary, pooling=call.pooling, model=model,
         device=context.device, chunk_tokens=chunk, gpus=context.gpus)
     _work, seconds = cost.estimate(expected_rows, resident=resident)
     from quail.physical import SaeFeaturesSpec
@@ -46,7 +46,7 @@ def sae_features_spec(context, call, name, expected_rows, resident=False):
         expected_rows=expected_rows, estimated_seconds=seconds,
         prompt_token_parts=(tuple(prompt.preamble_token_ids),
                             tuple(prompt.tail_token_ids)),
-        reading=call.reading)
+        pooling=call.pooling)
 
 
 def emit_sae_features(builder, alias, expected_rows, names, port,
@@ -54,7 +54,7 @@ def emit_sae_features(builder, alias, expected_rows, names, port,
     """Read the features of the alias's documents, one node per call.
 
     The feature calls of a table run in one pipeline: a document is
-    read once for all of them, and with reading 'max' each document's
+    read once for all of them, and with pooling 'max' each document's
     maxima are kept, so a later call encodes only its question tokens.
 
     Args:

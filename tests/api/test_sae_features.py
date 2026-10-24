@@ -34,10 +34,10 @@ def session():
     value.close()
 
 
-def _features_query(session, reading="last"):
+def _features_query(session, pooling="last"):
     return (session.docs("reviews").alias("r")
             .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
-                             reading=reading, name="features")
+                             pooling=pooling, name="features")
             .select("r.id", "features"))
 
 
@@ -65,10 +65,10 @@ def test_the_spec_loads_the_sae_and_stops_at_layer_11():
 
 
 def test_features_plan_names_the_reading_and_round_trips(session):
-    query = _features_query(session, reading="max")
+    query = _features_query(session, pooling="max")
     plan = query.plan()
     (node,) = [n for n in plan.nodes if isinstance(n, AiSaeFeatures)]
-    assert node.spec.reading == "max"
+    assert node.spec.pooling == "max"
     assert node.spec.name == "features"
     assert node.rows_port == "rows:r"
     assert node.spec.estimated_seconds > 0
@@ -93,10 +93,10 @@ def test_features_run_returns_the_lists_and_the_answer_table(session):
 def test_three_feature_calls_share_the_documents(session):
     query = (session.docs("reviews").alias("r")
              .ai_sae_features(quail.prompt(QUESTION, quail.col("r.body")),
-                              reading="max", name="first_features")
+                              pooling="max", name="first_features")
              .ai_sae_features(quail.prompt("{0}\n\nWhat tone?",
                                            quail.col("r.body")),
-                              reading="max", name="second_features")
+                              pooling="max", name="second_features")
              .select("r.id", "first_features", "second_features"))
     plan = query.plan()
     nodes = [n for n in plan.nodes if isinstance(n, AiSaeFeatures)]
@@ -116,15 +116,15 @@ def test_three_feature_calls_share_the_documents(session):
 def test_sql_binds_the_reading_and_rejects_a_bad_one(session):
     query = session.sql(
         "SELECT r.id, AI.SAE_FEATURES(PROMPT('{0}\\n\\nWhat is this review "
-        "about?', r.body), reading => 'max') AS features FROM reviews r")
+        "about?', r.body), pooling => 'max') AS features FROM reviews r")
     (node,) = [n for n in query.plan().nodes
                if isinstance(n, AiSaeFeatures)]
-    assert node.spec.reading == "max"
+    assert node.spec.pooling == "max"
     with pytest.raises(CompileError, match="one of"):
         session.sql(
             "SELECT r.id, AI.SAE_FEATURES(PROMPT('{0} topic', r.body), "
-            "reading => 'mean') AS features FROM reviews r")
-    with pytest.raises(CompileError, match="reading"):
+            "pooling => 'mean') AS features FROM reviews r")
+    with pytest.raises(CompileError, match="pooling"):
         session.sql(
             "SELECT r.id, AI.SAE_FEATURES(PROMPT('{0} topic', r.body)) "
             "AS features FROM reviews r")
@@ -150,7 +150,7 @@ def test_a_model_without_an_sae_refuses_features_and_the_reverse(session):
 
 def test_speed_of_light_prices_the_encode(session):
     estimate = quail.speed_of_light_estimate(
-        _features_query(session, reading="max"),
+        _features_query(session, pooling="max"),
         answer=lambda prompt, assignment: True)
     encode = estimate.latency.component("sae_encode")
     assert encode.seconds > 0
@@ -158,7 +158,7 @@ def test_speed_of_light_prices_the_encode(session):
     assert stage["operator"] == "AI.SAE_FEATURES"
     # 'last' encodes one token per row, so its encode work is smaller
     last = quail.speed_of_light_estimate(
-        _features_query(session, reading="last"),
+        _features_query(session, pooling="last"),
         answer=lambda prompt, assignment: True)
     assert (last.work.sae_encoded < estimate.work.sae_encoded)
 
@@ -172,7 +172,7 @@ def test_the_cost_model_charges_resident_calls_the_question_only():
     summary = summarize_alias(
         SimpleNamespace(arrow_array=pa.array([400, 600])), 0, memo={})
     cost = SaeFeaturesCost(
-        token_lengths=(10, 20), summary=summary, reading="max",
+        token_lengths=(10, 20), summary=summary, pooling="max",
         model=QWEN3_5_2B_SAE_BF16, device=H100_SXM, chunk_tokens=8192,
         gpus=1)
     fresh_work, fresh_seconds = cost.estimate(2.0)

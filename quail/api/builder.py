@@ -43,8 +43,8 @@ class BoundBuilder:
         self._inner.ai_extract(c, question, name=name)
         return self
 
-    def ai_sae_features(self, p, *, reading, name):
-        self._inner.ai_sae_features(p, reading=reading, name=name)
+    def ai_sae_features(self, p, *, pooling, name):
+        self._inner.ai_sae_features(p, pooling=pooling, name=name)
         return self
 
     def label_in(self, name, labels, selectivity=None):

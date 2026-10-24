@@ -348,32 +348,32 @@ class ExpressionBinder:
         """Parse an AI.SAE_FEATURES call and bind its document reference.
 
         The call is ``AI.SAE_FEATURES(PROMPT('template', column),
-        reading => 'last')``; the reading is 'last' or 'max'.
+        pooling => 'last')``; the pooling is 'last' or 'max'.
         """
         args = list(node.expressions)
-        reading = None
+        pooling = None
         if len(args) == 2 and isinstance(args[1], exp.Kwarg):
             kwarg = args.pop()
-            if str(kwarg.this.name).lower() != "reading":
+            if str(kwarg.this.name).lower() != "pooling":
                 raise CompileError(
-                    f"AI.SAE_FEATURES takes reading => 'last' or 'max', "
+                    f"AI.SAE_FEATURES takes pooling => 'last' or 'max', "
                     f"got {kwarg.this.name}")
             value = kwarg.expression
             if not (isinstance(value, exp.Literal) and value.is_string):
                 raise CompileError(
-                    "AI.SAE_FEATURES reading must be the string 'last' "
+                    "AI.SAE_FEATURES pooling must be the string 'last' "
                     "or 'max'")
-            reading = str(value.this)
-        if reading is None:
+            pooling = str(value.this)
+        if pooling is None:
             raise CompileError(
-                "AI.SAE_FEATURES takes PROMPT(...) and reading => "
+                "AI.SAE_FEATURES takes PROMPT(...) and pooling => "
                 "'last' or 'max'")
         call = exp.Anonymous(this="AI_SAE_FEATURES", expressions=args)
         prompt, _, aliases = self.bind_ai_call(
             call, "AI_SAE_FEATURES", set(), join=False)
         if len(aliases) != 1:
             raise CompileError("AI.SAE_FEATURES reads one document column")
-        model_call = ModelCall(prompt, "features", reading=reading)
+        model_call = ModelCall(prompt, "features", pooling=pooling)
         model_call.validate()
         return model_call
 

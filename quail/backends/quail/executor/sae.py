@@ -1,8 +1,8 @@
-"""The SAE encoder for AI.SAE_FEATURES: weights, encode, and readings.
+"""The SAE encoder for AI.SAE_FEATURES: weights, encode, and poolings.
 
 The encode follows the published SAE: per token with hidden state h,
 pre = h @ W_enc.T + b_enc, keep the sae_keep largest values, and set
-the rest and any negatives to 0. The reading 'last' encodes each
+the rest and any negatives to 0. The pooling 'last' encodes each
 answer row through a readout; 'max' encodes every chunk row through
 the pipeline's row observer and keeps each document's per-feature
 maxima across the pipeline's feature calls.
@@ -259,7 +259,7 @@ class SaeEncoder:
 
 
 class SaeFeaturesReadout(_HostReadout):
-    """Encode the answer rows' residual stream, for the reading 'last'.
+    """Encode the answer rows' residual stream, for the pooling 'last'.
 
     result() returns a (rows, 2 * keep) fp32 array: each row's feature
     indices, then their strengths. The dtype carries the row width, so
@@ -291,7 +291,7 @@ def unpack_features(row, keep: int) -> list:
 
 
 class SaeMaxAccumulator:
-    """Per-document maxima of per-token top-k strengths, for the reading 'max'.
+    """Per-document maxima of per-token top-k strengths, for the pooling 'max'.
 
     observe() runs inside forward_chunk over every chunk row. A row
     whose position is inside its document's prefix folds into the

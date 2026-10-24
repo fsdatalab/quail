@@ -37,9 +37,9 @@ class SemanticSaeFeatures:
         return self.call.aliases()[0]
 
     @property
-    def reading(self) -> str:
+    def pooling(self) -> str:
         """Which tokens become a row's list: 'last' or 'max'."""
-        return self.call.reading
+        return self.call.pooling
 
     def children(self) -> tuple[LogicalNode, ...]:
         return (self.input,)
@@ -91,7 +91,7 @@ class SemanticSaeFeatures:
         return {
             "name": self.name,
             "expression": _explain(self.call),
-            "reading": self.reading,
+            "pooling": self.pooling,
         }
 
 

@@ -447,13 +447,13 @@ class Search:
     def features_stage(self, alias, node, rows, first, stages):
         """Read the live rows' SAE features; every row survives.
 
-        The reading 'last' encodes one token per row; 'max' encodes the
+        The pooling 'last' encodes one token per row; 'max' encodes the
         prompt's tokens, the documents' once across the alias's feature
         calls because their maxima are kept.
         """
         tail = self.lower(node.call.prompt).tail_tokens
         stage_work = self.question_work(alias, rows, tail, first)
-        if node.reading == "last":
+        if node.pooling == "last":
             encoded = float(len(rows))
         else:
             tokens = self.aliases[alias].tokens

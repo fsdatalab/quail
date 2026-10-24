@@ -82,7 +82,7 @@ class SaeFeaturesPart(SingleResultPart):
         keys = DocumentKeys(alias, self.ids)
         self.accumulator = None
         self._pipeline = None
-        if spec.reading == "max":
+        if spec.pooling == "max":
             if accumulator is None:
                 table = documents[alias]
                 lengths = {}
@@ -158,7 +158,7 @@ class SaeFeaturesPart(SingleResultPart):
             gpu_s=gpu_s, chunks=chunks,
             extension={
                 "output": spec.name, "aliases": list(spec.aliases),
-                "reading": spec.reading,
+                "pooling": spec.pooling,
                 "input_rows": self.reached,
                 "suffix_tokens": len(spec.prompt_token_parts[1]),
                 "borrowed_prefix_tokens": stats.get("borrowed_tokens", 0),

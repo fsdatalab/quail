@@ -177,7 +177,7 @@ class Query:
         self._scores[name] = Alias(call, name)
         return self
 
-    def ai_sae_features(self, p: PromptSpec, *, reading: str,
+    def ai_sae_features(self, p: PromptSpec, *, pooling: str,
                         name: str) -> "Query":
         """Add a named column of the prompt's sparse autoencoder features.
 
@@ -187,7 +187,7 @@ class Query:
 
         Args:
             p: A prompt over one document column.
-            reading: Which tokens become a row's list: "last" reads the
+            pooling: Which tokens become a row's list: "last" reads the
                 final prompt token; "max" takes each feature's largest
                 strength over every prompt token.
             name: The feature list column's name, without a dot.
@@ -205,7 +205,7 @@ class Query:
         bound = self._prompts.bind("features", p.template, refs)
         for ref in refs:
             self._note_document_column(ref)
-        call = ModelCall(bound, "features", reading=reading)
+        call = ModelCall(bound, "features", pooling=pooling)
         call.validate()
         self._features[name] = Alias(call, name)
         return self

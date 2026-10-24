@@ -1,9 +1,9 @@
 """Work and time estimates for SAE feature calls.
 
 A feature call runs prefill over each document and its question tail,
-then encodes the reading's tokens with the model's sparse autoencoder.
+then encodes the pooling's tokens with the model's sparse autoencoder.
 The encode is priced by the dense decoder's sae_encode component from
-Work.sae_encoded. The reading 'last' encodes one token per row; 'max'
+Work.sae_encoded. The pooling 'last' encodes one token per row; 'max'
 encodes every prompt token, and each document's maxima are kept, so a
 later prompt over the same rows encodes only its question tokens.
 """
@@ -24,7 +24,7 @@ class SaeFeaturesCost:
     Attributes:
         token_lengths: Token counts of the head and the question tail.
         summary: The document length summary of the read alias.
-        reading: 'last' or 'max'.
+        pooling: 'last' or 'max'.
         model: The model spec, with the SAE fields set.
         device: The device spec.
         chunk_tokens: The chunk budget.
@@ -33,7 +33,7 @@ class SaeFeaturesCost:
 
     token_lengths: tuple[int, ...]
     summary: object
-    reading: str
+    pooling: str
     model: ModelSpec
     device: DeviceSpec
     chunk_tokens: int
@@ -48,7 +48,7 @@ class SaeFeaturesCost:
             resident: Whether the documents' KV is already read, by a
                 step of the same pipeline before this one. The call
                 then pays only its question tails and, with the
-                reading 'max', encodes only its question tokens.
+                pooling 'max', encodes only its question tokens.
         """
         fixed = sum(self.token_lengths)
         mean = self.summary.mean
@@ -62,7 +62,7 @@ class SaeFeaturesCost:
             variance=self.summary.variance if not resident else 0.0,
             prefix_tokens=prefix, groups=groups,
             shared_tokens=shared, copies=self.gpus)
-        if self.reading == "last":
+        if self.pooling == "last":
             encoded = expected_rows
         else:
             encoded = expected_rows * (fixed + (0.0 if resident else mean))

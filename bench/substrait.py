@@ -88,7 +88,7 @@ def build_query(session, info: PlanInfo, selectivity=None,
             elif isinstance(item, SaeFeatures):
                 query = query.ai_sae_features(
                     quail.prompt(item.prompt, document(alias)),
-                    reading=item.reading, name=item.output)
+                    pooling=item.pooling, name=item.output)
             elif isinstance(item, Filter):
                 query = query.ai_filter(
                     quail.prompt(item.prompt, document(alias)),

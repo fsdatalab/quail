@@ -8,7 +8,7 @@ from typing import Any, ClassVar, Mapping
 from ..base import PhysicalNode
 from .inference import AiInference, InferenceSpec
 
-SAE_READINGS = ("last", "max")
+SAE_POOLINGS = ("last", "max")
 
 
 @dataclass(frozen=True)
@@ -17,23 +17,23 @@ class SaeFeaturesSpec(InferenceSpec):
 
     The prompt token parts are the head before the document and the
     question tail after it. The call generates no text: the engine runs
-    prefill, encodes the reading's tokens with the model's sparse
+    prefill, encodes the pooling's tokens with the model's sparse
     autoencoder, and returns the nonzero features as a
     ``list<struct<feature: int32, strength: float32>>`` column.
 
     Attributes:
-        reading: Which tokens become a row's list. ``last`` encodes the
+        pooling: Which tokens become a row's list. ``last`` encodes the
             final prompt token. ``max`` takes each feature's largest
             strength over every prompt token, with the document tokens'
             maxima kept across the prompts that share the document head.
     """
 
-    reading: str = "last"
+    pooling: str = "last"
 
     def __post_init__(self):
-        if self.reading not in SAE_READINGS:
+        if self.pooling not in SAE_POOLINGS:
             raise ValueError(
-                f"reading is one of {SAE_READINGS}, got {self.reading!r}")
+                f"pooling is one of {SAE_POOLINGS}, got {self.pooling!r}")
 
 
 @dataclass(frozen=True)
@@ -59,5 +59,5 @@ class AiSaeFeatures(AiInference):
     def explain_fields(self) -> Mapping[str, Any]:
         return {
             **super().explain_fields(),
-            "reading": None if self.spec is None else self.spec.reading,
+            "pooling": None if self.spec is None else self.spec.pooling,
         }

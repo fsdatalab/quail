@@ -291,8 +291,8 @@ SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 
 
 MODEL_CALL_KINDS = ("boolean", "score", "label", "extract", "features")
-# the token readings of an AI.SAE_FEATURES call
-SAE_READINGS = ("last", "max")
+# the token poolings of an AI.SAE_FEATURES call
+SAE_POOLINGS = ("last", "max")
 
 
 def effective_selectivity(selectivity: Optional[float]) -> float:
@@ -328,7 +328,7 @@ class ModelCall:
     question: str = ""
     # a "features" call only: which tokens become the row's feature
     # list, "last" or "max"
-    reading: str = ""
+    pooling: str = ""
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -347,16 +347,16 @@ class ModelCall:
             raise CompileError("only an AI.CLASSIFY call has labels")
         if self.kind != "extract" and self.question:
             raise CompileError("only an AI.EXTRACT call has a question")
-        if self.kind != "features" and self.reading:
-            raise CompileError("only an AI.SAE_FEATURES call has a reading")
+        if self.kind != "features" and self.pooling:
+            raise CompileError("only an AI.SAE_FEATURES call has a pooling")
         if self.kind == "label":
             validate_labels(self.labels, self.descriptions)
         elif self.kind == "extract":
             validate_question(self.question)
-        elif self.kind == "features" and self.reading not in SAE_READINGS:
+        elif self.kind == "features" and self.pooling not in SAE_POOLINGS:
             raise CompileError(
-                f"AI.SAE_FEATURES reading must be one of {SAE_READINGS}, "
-                f"got {self.reading!r}")
+                f"AI.SAE_FEATURES pooling must be one of {SAE_POOLINGS}, "
+                f"got {self.pooling!r}")
 
 
 def validate_question(question: str) -> None:
@@ -780,7 +780,7 @@ def _explain(expression) -> str:
         return f"AI.EXTRACT({expression.prompt.template!r}, {expression.question!r})"
     if expression.kind == "features":
         return (f"AI.SAE_FEATURES({expression.prompt.template!r}, "
-                f"reading={expression.reading!r})")
+                f"pooling={expression.pooling!r})")
     function = "AI.SCORE" if expression.kind == "score" else "AI.IF"
     return f"{function}({expression.prompt.template!r})"
 
