@@ -149,12 +149,13 @@ def test_the_accumulator_splits_document_and_question_rows():
                                device="cuda"),
         row_spans=((("r", 0), 0, 6, 8), (("r", 1), 8, 12, 14)))
     accumulator.observe(stream, chunk)
-    features = SaeMaxAccumulator.features_of(accumulator.settle(("r", 0)))
+    indices, _strengths = SaeMaxAccumulator.features_of(
+        accumulator.settle(("r", 0)))
     # the settled document's buffer was freed after the only registered
     # call; the other document's stays until its own settle
     assert ("r", 0) not in accumulator.document_max
     assert ("r", 1) in accumulator.document_max
     expected = _maxima(plain, stream[:8])
-    kept = {item["feature"] for item in features}
+    kept = set(indices.tolist())
     reference = set(expected.nonzero().flatten().tolist())
     assert kept == reference

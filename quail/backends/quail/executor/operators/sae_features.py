@@ -11,7 +11,7 @@ from quail.backends.quail.executor.sae import (
     unpack_features,
 )
 from quail.backends.quail.executor.stages import Stage
-from quail.backends.quail.reranker import classify_outputs, score_rows
+from quail.backends.quail.reranker import classify_outputs
 from quail.catalog.tokens import DocumentKeys
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
@@ -20,6 +20,26 @@ from quail.physical import ValueType
 # the Arrow type of one feature list
 FEATURE_LIST = pa.list_(
     pa.struct([("feature", pa.int32()), ("strength", pa.float32())]))
+
+
+def _feature_column(pairs) -> pa.ListArray:
+    """Build the feature-list column from (indices, strengths) pairs.
+
+    The column assembles from concatenated arrays: a 'max' document can
+    hold thousands of features, so per-feature Python objects would
+    dominate the harvest.
+    """
+    lengths = [len(indices) for indices, _strengths in pairs]
+    offsets = np.zeros(len(pairs) + 1, dtype=np.int64)
+    np.cumsum(lengths, out=offsets[1:])
+    empty = (np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32))
+    values = pa.StructArray.from_arrays(
+        [pa.array(np.concatenate([indices for indices, _ in pairs or [empty]]),
+                  pa.int32()),
+         pa.array(np.concatenate([strengths for _, strengths in
+                                  pairs or [empty]]), pa.float32())],
+        names=["feature", "strength"])
+    return pa.ListArray.from_arrays(pa.array(offsets, pa.int32()), values)
 
 
 class SaeFeaturesPart(SingleResultPart):
@@ -161,9 +181,10 @@ class SaeFeaturesPart(SingleResultPart):
                     if value is not None]
         rows = np.asarray([[self.ids[index]] for index in answered],
                           dtype=np.int32).reshape(-1, 1)
-        listed = score_rows(rows, spec.aliases, spec.name,
-                            [self.values[index] for index in answered],
-                            FEATURE_LIST)
+        (alias,) = spec.aliases
+        listed = Rows({alias: rows[:, 0]}, pa.table({
+            spec.name: _feature_column(
+                [self.values[index] for index in answered])}))
         prior_results = (part.results()[port.node_id].outputs[port.port]
                          for part, port in self.priors)
         for prior in (*self.prior_tables, *prior_results):

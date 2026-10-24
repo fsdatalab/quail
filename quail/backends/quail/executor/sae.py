@@ -269,17 +269,18 @@ class SaeFeaturesReadout(_HostReadout):
         return self._copy(self.encoder.packed_top_features(stream))
 
 
-def unpack_features(row, keep: int) -> list:
-    """Return one packed readout row as (feature, strength) mappings.
+def unpack_features(row, keep: int) -> tuple:
+    """Return one packed readout row as (feature indices, strengths) arrays.
 
     Zero strengths are left out: the SAE keeps at most ``keep`` features,
-    and a padded row carries zeros past the nonzero ones.
+    and a padded row carries zeros past the nonzero ones. Arrays, not
+    mappings: a 'max' document can hold thousands of features, and the
+    Arrow column builds from the arrays without per-feature objects.
     """
-    indices = row[:keep].astype(np.int64)
-    strengths = row[keep:2 * keep]
+    indices = row[:keep].astype(np.int32)
+    strengths = row[keep:2 * keep].astype(np.float32)
     kept = strengths > 0.0
-    return [{"feature": int(feature), "strength": float(strength)}
-            for feature, strength in zip(indices[kept], strengths[kept])]
+    return indices[kept], strengths[kept]
 
 
 class _PinnedRows:
@@ -406,16 +407,13 @@ class SaeMaxAccumulator:
         return event, host
 
     @staticmethod
-    def features_of(handle) -> list:
-        """Return a settled handle's nonzero (feature, strength) mappings."""
+    def features_of(handle) -> tuple:
+        """Return a settled handle's nonzero (indices, strengths) arrays."""
         event, host = handle
         event.synchronize()
-        # one memcpy out of the pinned slab: reading page-locked memory
-        # in place costs milliseconds per row
-        values = host.numpy().copy()
+        values = host.numpy()
         kept = np.flatnonzero(values > 0.0)
-        return [{"feature": int(feature), "strength": float(values[feature])}
-                for feature in kept]
+        return kept.astype(np.int32), values[kept]
 
 
 def sae_encoder(state) -> SaeEncoder:

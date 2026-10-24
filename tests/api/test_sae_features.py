@@ -189,5 +189,6 @@ def test_unpack_features_drops_zero_strengths():
     import numpy as np
 
     row = np.array([3, 5, 0, 1.5, 0.5, 0.0], dtype=np.float32)
-    assert unpack_features(row, 3) == [
-        {"feature": 3, "strength": 1.5}, {"feature": 5, "strength": 0.5}]
+    indices, strengths = unpack_features(row, 3)
+    assert indices.tolist() == [3, 5]
+    assert strengths.tolist() == [1.5, 0.5]
