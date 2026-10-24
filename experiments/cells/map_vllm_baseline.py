@@ -69,7 +69,7 @@ def _run_one(client, prompts, cap) -> dict:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=14400,
               volumes=VOLUMES)
 def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
-                      only: str = "") -> str:
+                      only: str = "", speculative: str = "") -> str:
     """Run the map configurations on stock vLLM; return the result's path.
 
     Args:
@@ -77,6 +77,8 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
         scale_factor: The corpus scale factor.
         only: Comma-separated configuration names to run; empty runs
             all four.
+        speculative: vLLM speculation to turn on, as "ngram:<tokens>"
+            (QUAIL_VLLM_SPECULATIVE); empty runs without speculation.
     """
     import os
 
@@ -87,6 +89,10 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
     # vLLM directly set it: a spawned core would not see the gigatoken
     # tokenizer registration
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    if speculative:
+        os.environ["QUAIL_VLLM_SPECULATIVE"] = speculative
+    else:
+        os.environ.pop("QUAIL_VLLM_SPECULATIVE", None)
 
     spec = MODELS[model]
     directory = _ensure_tables(scale_factor,
@@ -95,6 +101,7 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
     chosen = {name.strip() for name in only.split(",") if name.strip()}
     measurements = {
         "engine": "stock vLLM, operator-at-a-time submission",
+        "speculative": speculative or None,
         "model": model, "scale_factor": scale_factor, "runs": {},
     }
     with ExitStack() as resources:
@@ -114,7 +121,8 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
             run["usd_per_query"] = run["wall_s"] / 3600 * H100_USD_PER_HOUR
             measurements["runs"][name] = run
             print(json.dumps({name: run}, default=str), flush=True)
-    out = Path(RESULT_DIR) / f"map_vllm_{model}_sf{scale_factor}_{stamp}.json"
+    tag = f"_{speculative.replace(':', '')}" if speculative else ""
+    out = Path(RESULT_DIR) / f"map_vllm{tag}_{model}_sf{scale_factor}_{stamp}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(measurements, indent=2, default=str))
     results_vol.commit()
@@ -124,7 +132,8 @@ def map_vllm_baseline(model: str = "qwen3-4b-fp8", scale_factor: float = 0.1,
 
 @app.local_entrypoint()
 def launch_baseline(model: str = "qwen3-4b-fp8", sf: float = 0.1,
-                    only: str = ""):
-    call = map_vllm_baseline.spawn(model=model, scale_factor=sf, only=only)
+                    only: str = "", speculative: str = ""):
+    call = map_vllm_baseline.spawn(model=model, scale_factor=sf, only=only,
+                                   speculative=speculative)
     print(f"function call id: {call.object_id}")
     print(call.get())
