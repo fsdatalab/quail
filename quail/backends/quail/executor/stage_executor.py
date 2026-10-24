@@ -628,6 +628,10 @@ class StageExecutor:
             e0 = self.torch.cuda.Event(enable_timing=True)
             e1 = self.torch.cuda.Event(enable_timing=True)
             e0.record()
+        if self.host is not None and self.arena.pinned:
+            # restores scatter on the store's stream: the pass waits
+            # for the ones it reads
+            self.host.fence(self.torch.cuda.current_stream())
         normed = forward_chunk(self.pipeline, self.arena, chunk)
         if self.gpu_timing:
             e1.record()

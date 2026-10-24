@@ -19,18 +19,20 @@ the copy engine, both on the store's stream. The key's rows are
 complete, since a key is freed once its answers were read, and the
 arena keeps the pages until the gather has read them
 (KVArena.reclaim), so nothing waits: not the host, not the next pass.
-A restore is the reverse: the copy engine fills a staging block on
-the store's stream and the compute stream scatters it into the pages
-the arena reserved, ahead of the pass that reads them. A kernel
-writing host memory directly would need no staging, but it holds the
-SMs for the whole transfer and slowed the passes beside it; the copy
-engine does not. Staging blocks are few and reused once their copy
-has landed. When none is free, the save waits in a queue with its
-pages still held (the arena's pages are the queue) and runs when the
-chunk loop next reclaims and a block has come free, so the store
-never paces a running query; a restore with no block free is a miss.
-At a query's end the arena frees every document at once with the
-GPU idle, so those saves wait for a block instead (patient).
+A restore is the reverse on a second stream: the copy engine fills
+a staging block and the scatter into the pages the arena reserved
+follows it there, so the block is free again at the link's pace; the
+compute stream waits on the scatters (fence) before the pass that
+reads the pages. A kernel writing host memory directly would need no
+staging, but it holds the SMs for the whole transfer and slowed the
+passes beside it; the copy engine does not. Staging blocks are few
+and reused once their copy has landed. When none is free, a save
+waits in a queue with its pages still held (the arena's pages are the
+queue) and runs when the chunk loop next reclaims and a block has
+come free, so the store never paces a running query; a restore waits
+for a block, since the pass needs its rows anyway. At a query's end
+the arena frees every document at once with the GPU idle, so those
+saves wait for a block too (patient).
 
 A key's rows are saved only once an operator computed or restored them
 (mark_written); pages reserved for a chunk that never ran hold nothing.
@@ -202,6 +204,9 @@ class HostKV:
         self._pending = {}      # key -> (digest, prefix tokens), saves queued
         self.stream = (torch.cuda.Stream(device=self.device)
                        if self.pinned else None)
+        self.restore_stream = (torch.cuda.Stream(device=self.device)
+                               if self.pinned else None)
+        self._fences = []       # restore events the next pass waits on
         self._index_slots = None
         self._index_events = [None] * INDEX_SLOTS
         self._next_slot = 0
@@ -608,6 +613,14 @@ class HostKV:
         """Wait for every copy in flight."""
         if self.stream is not None:
             self.stream.synchronize()
+            self.restore_stream.synchronize()
+            self._fences.clear()
+
+    def fence(self, stream) -> None:
+        """Make `stream` wait for every restore queued since the last fence."""
+        fences, self._fences = self._fences, []
+        for event in fences:
+            stream.wait_event(event)
 
     # ---- restore -------------------------------------------------------
 
@@ -625,10 +638,6 @@ class HostKV:
         if entry is None:
             self.misses += 1
             return False
-        if not self._staging_free("restore"):
-            self.busy_keys += 1
-            self.misses += 1
-            return False
         start, tokens, slot = entry
         arena = self.arena
         if arena.accounting.tokens[key] != tokens:
@@ -636,30 +645,20 @@ class HostKV:
                 f"{key!r} holds {arena.accounting.tokens[key]} tokens; the "
                 f"saved prefix has {tokens}")
         started = time.perf_counter()
-        torch = self.torch
-        compute = torch.cuda.current_stream() if self.pinned else None
+        with self._patience(True):
+            self._staging_free("restore")
         if arena.has_sliding:
             arena.trim_window(key)
-        for group, ((layers, width, sliding), pool) in enumerate(
-                zip(self._groups, self.pools)):
-            rows, origin = self._entry_rows(key, tokens, sliding, compute)
-            staging, block = self._staging_block(
-                "restore", group, (len(rows), len(layers), 2, width))
-            source = pool[start + origin:start + tokens]
-            if compute is None:
-                staging.copy_(source)
-            else:
-                with torch.cuda.stream(self.stream):
-                    staging.copy_(source, non_blocking=True)
-                compute.wait_stream(self.stream)
-            self._scatter(key, tokens, group, staging, rows)
-            self._mark(block, compute)
+        if not self.pinned:
+            self._restore_rows(key, start, tokens, slot, None)
+        else:
+            torch = self.torch
+            with torch.cuda.stream(self.restore_stream):
+                self._restore_rows(key, start, tokens, slot, self.restore_stream)
+                event = torch.cuda.Event()
+                event.record(self.restore_stream)
+            self._fences.append(event)
         if slot is not None:
-            device_slot = arena.accounting.slots[key]
-            arena.gdn_state[device_slot].copy_(self.gdn_state[slot],
-                                               non_blocking=self.pinned)
-            arena.conv_state[device_slot].copy_(self.conv_state[slot],
-                                                non_blocking=self.pinned)
             arena.record_checkpoint(key, tokens)
         self._written.add(key)
         self.hits += 1
@@ -667,3 +666,22 @@ class HostKV:
         self.restored_tokens += tokens
         self.host_s += time.perf_counter() - started
         return True
+
+    def _restore_rows(self, key, start, tokens, slot, stream):
+        """Copy the entry's rows into staging and scatter them into the pages."""
+        arena = self.arena
+        for group, ((layers, width, sliding), pool) in enumerate(
+                zip(self._groups, self.pools)):
+            rows, origin = self._entry_rows(key, tokens, sliding, stream)
+            staging, block = self._staging_block(
+                "restore", group, (len(rows), len(layers), 2, width))
+            staging.copy_(pool[start + origin:start + tokens],
+                          non_blocking=self.pinned)
+            self._scatter(key, tokens, group, staging, rows)
+            self._mark(block, stream)
+        if slot is not None:
+            device_slot = arena.accounting.slots[key]
+            arena.gdn_state[device_slot].copy_(self.gdn_state[slot],
+                                               non_blocking=self.pinned)
+            arena.conv_state[device_slot].copy_(self.conv_state[slot],
+                                                non_blocking=self.pinned)
