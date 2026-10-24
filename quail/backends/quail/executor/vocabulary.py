@@ -1,10 +1,11 @@
-"""The vocabulary index an extraction reads: each token's word and its spellings.
+"""The vocabulary index a decoded answer reads: each token's word and spellings.
 
 A document token may be written without its leading space, in another
 case, or as a prefix token followed by the rest of the word. The index
 groups the vocabulary by word so a document's positions can be
 matched against a row's likeliest tokens by word, and it names the
-tokens that close an answer.
+tokens that close an answer. AI.EXTRACT reads the word index; AI.MAP
+reads the stop tokens and the tokenizer.
 """
 
 import numpy as np
@@ -23,7 +24,7 @@ def same_word(token) -> str:
 
 
 class Vocabulary:
-    """One model's tokenizer and the vocabulary index its extractions read.
+    """One model's tokenizer and the vocabulary index its decoded answers read.
 
     Args:
         tokenizer: A Gigatoken encoder or a tokenizer supplied by the caller.
@@ -68,7 +69,8 @@ class Vocabulary:
         if tokenizer.eos_token_id is not None:
             stops.add(int(tokenizer.eos_token_id))
         if not stops:
-            raise ValueError("AI.EXTRACT needs a turn close or an end-of-text token")
+            raise ValueError(
+                "a decoded answer needs a turn close or an end-of-text token")
         self.stop_ids = tuple(sorted(stops))
         self.is_stop = np.zeros(len(self.vocab), dtype=bool)
         self.is_stop[list(self.stop_ids)] = True
@@ -166,6 +168,6 @@ def load_vocabulary(state) -> Vocabulary:
 
         spec = loaded.model_spec
         path = resolve_model_path(spec.hf_name, spec.revision)
-        say(f"loading the tokenizer of {spec.name} for AI.EXTRACT")
+        say(f"loading the tokenizer of {spec.name} for decoded answers")
         loaded.vocabulary = Vocabulary(GigatokenEncoder(path), spec.turn_suffix)
     return loaded.vocabulary

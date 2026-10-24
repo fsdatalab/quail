@@ -8,7 +8,7 @@ from helpers.fakes import fake_pack
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.map.stages import MapStages
-from quail.backends.quail.executor.operators.map import execute_maps
+from quail.backends.quail.executor.operators.map import MapPart
 from quail.backends.quail.executor.stages import run_stages
 from quail.physical import AiMap, MapSpec
 from tests.engine.test_extract_executor import ScriptedModel, _fake_readout, _state
@@ -141,7 +141,7 @@ def test_two_maps_share_one_document_read(monkeypatch):
 
     inputs = {"document_ids": [0], "documents": {"c": [tables.encode_ids(text)]},
               "texts": {"c": [text]}}
-    results = execute_maps(state, [node("first"), node("second")], inputs)
+    results = MapPart.execute_group(state, [node("first"), node("second")], inputs)
     stages = seen["stages"]
     first = results["ai-map:first"].outputs["rows:c"]
     second = results["ai-map:second"].outputs["rows:c"]

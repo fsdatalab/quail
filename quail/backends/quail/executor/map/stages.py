@@ -11,12 +11,12 @@ them.
 import numpy as np
 
 from quail.backends.quail.executor.decoding import AnswerStages
-from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.backends.quail.executor.map.decode import (
+from quail.backends.quail.executor.map.decoder import (
     MapAnswer,
     MapDecoder,
     MapDocument,
 )
+from quail.backends.quail.executor.vocabulary import Vocabulary
 from quail.catalog.tokens import concat_tokens
 
 

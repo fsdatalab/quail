@@ -12,12 +12,12 @@ import numpy as np
 
 from quail.backends.quail.executor.decoding import AnswerStages
 from quail.backends.quail.executor.extract.candidates import DocumentTokens
-from quail.backends.quail.executor.extract.decode import (
+from quail.backends.quail.executor.extract.decoder import (
     AnswerState,
     Decoder,
     Document,
 )
-from quail.backends.quail.executor.extract.vocabulary import Vocabulary
+from quail.backends.quail.executor.vocabulary import Vocabulary
 from quail.catalog.tokens import concat_tokens
 
 
@@ -53,6 +53,9 @@ class ExtractionStages(AnswerStages):
         self.pipeline_head = (None if pipeline_head is None
                               else [int(t) for t in pipeline_head])
         self.vocabulary = vocabulary
+        if texts is None:
+            raise ValueError(
+                f"AI.EXTRACT needs the text of {self.specs[0].alias!r}")
         positions = (document_ids if document_positions is None
                      else document_positions)
         shown = [text.as_py() if hasattr(text, "as_py") else str(text)

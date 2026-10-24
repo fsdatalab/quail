@@ -24,14 +24,12 @@ from quail.backends.quail.distributed import (
 )
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.extract.candidates import Stream
-from quail.backends.quail.executor.extract.decode import AnswerState, Decoder
+from quail.backends.quail.executor.extract.decoder import AnswerState, Decoder
 from quail.backends.quail.executor.extract.stages import ExtractionStages
-from quail.backends.quail.executor.extract.vocabulary import same_word
-from quail.backends.quail.executor.operators.extract import (
-    execute_extractions,
-)
+from quail.backends.quail.executor.operators.extract import ExtractPart
 from quail.backends.quail.executor.readout import split_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
+from quail.backends.quail.executor.vocabulary import same_word
 from quail.backends.quail.graph import execute_single_graph
 from quail.backends.quail.worker import ChildState, _child_execute
 from quail.builtins import built_in_registry
@@ -431,12 +429,12 @@ def _setup(monkeypatch, documents=None, token_documents=None,
               "texts": {"c": documents}, "gpu_timing": gpu_timing}
 
     def run(name="ends", keep_kv=False):
-        result = execute_extractions(
+        result = ExtractPart.execute_group(
             state, [replace(node(name), keep_kv=keep_kv)], inputs)[node(name).node_id]
         return result, stages_seen["stages"]
 
     def run_pipeline(*names):
-        results = execute_extractions(state, [node(name) for name in names],
+        results = ExtractPart.execute_group(state, [node(name) for name in names],
                                       inputs)
         return results, stages_seen["stages"]
 

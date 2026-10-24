@@ -1,4 +1,4 @@
-"""The shared stage shape of operators that decode an answer in rounds.
+"""What operators that decode an answer in rounds share.
 
 An extraction and a map put each of their questions to a document the
 same way: the question's tail is the frame of its stages, written
@@ -8,16 +8,32 @@ Each question is the tail stage, whose row chooses the answer's first
 token, then up to the configured answer limit in rounds, each feeding
 the chosen token and a draft and verifying the draft against every
 row. The operators differ in how a token is chosen and drafted, which
-their decoders define.
+their decoders (extract/decoder.py, map/decoder.py) define.
+
+AnswerStages is the shared stage shape, and AnswerPart the shared
+execution part: it builds the stages over a pipeline's documents, runs
+them as one group, and turns each question's settled answers into its
+node's rows and metrics.
 """
 
+import time
+from dataclasses import replace
 from functools import partial
 
 import numpy as np
 
 from quail.backends.quail.executor.model_loading import full_output_head
+from quail.backends.quail.executor.parts import (
+    DocumentAnswerPart,
+    execute_parts,
+    gpu_seconds,
+    shared_prefix_tree,
+    stage_spans,
+)
 from quail.backends.quail.executor.readout import AsyncTopLogprobs, readout_rows
 from quail.backends.quail.executor.stages import Stage, StageRequests
+from quail.backends.quail.executor.vocabulary import load_vocabulary
+from quail.execution.metrics import NodeMetrics, NodeResult
 
 
 class AnswerStages:
@@ -181,3 +197,148 @@ class AnswerStages:
         """Return the indices of the documents the questions were asked of."""
         return [index for index, document in enumerate(self.documents)
                 if document.answers[0].asked]
+
+
+class AnswerPart(DocumentAnswerPart):
+    """One pipeline of decoded-answer nodes, run as one stage group.
+
+    A subclass names its node_type, its stages_type (an AnswerStages),
+    and its operator for messages and progress labels, and builds each
+    node's rows from the settled answers (_answer_rows).
+    """
+
+    combine = True
+    node_type = None
+    stages_type = None
+    operator = ""
+
+    @classmethod
+    def execute_group(cls, state, nodes, inputs) -> dict:
+        """Run the pipeline's questions over its documents as one stage run.
+
+        Each document is read once and asked every node's question
+        while its KV is resident. The first node is charged the
+        documents' tokens and the wall time. Each question is charged
+        its own suffix tokens and GPU time.
+
+        Args:
+            state: The loaded model and current query state.
+            nodes: The pipeline's nodes, in order.
+            inputs: The documents' ids, the tokenized documents and
+                texts by alias, the query's shared preamble, and the
+                gpu_timing setting.
+
+        Returns:
+            Node id -> NodeResult with the node's answer table.
+        """
+        state.gpu_timing = bool(inputs.get("gpu_timing", False))
+        started = time.perf_counter()
+        part = cls(state, nodes, inputs["document_ids"], inputs)
+        stages = part.answer_stages
+        tree = (shared_prefix_tree(nodes[0].spec.name, stages.prefixes,
+                                   state.loaded_model.arena)
+                if nodes[0].spec.share_prefixes else None)
+        results = execute_parts(
+            state, [part], stages.prefixes, stages.keys,
+            keep_kv=nodes[-1].keep_kv, prefix_tree=tree,
+            limit=inputs.get("limit"),
+            label=f"{stages.operator} "
+                  f"{', '.join(node.spec.name for node in nodes)}")
+        first = nodes[0].node_id
+        results[first] = replace(results[first], metrics=replace(
+            results[first].metrics, wall_s=time.perf_counter() - started))
+        return results
+
+    @classmethod
+    def prepare(cls, state, nodes, ids, parts, inputs, context):
+        """Prepare consecutive questions over the preceding operator's documents.
+
+        Raises:
+            ValueError: A document uses a different prompt or token sequence.
+        """
+        first = parts[0].node if parts else nodes[0]
+        part = cls(state, nodes, ids, {
+            "documents": context.state["documents"],
+            "texts": context.state.get("texts", {}),
+            "pipeline_head": first.document_head})
+        alias = part.node.spec.alias
+        for document, document_id in zip(part.answer_stages.documents, part.ids):
+            if document.key != (alias, document_id):
+                raise ValueError(
+                    f"{cls.operator} {part.node.spec.name!r} shows document "
+                    f"{document_id} of {alias!r} unlike the pipeline before it")
+        return part
+
+    def __init__(self, state, nodes, ids, inputs):
+        self.nodes = list(nodes)
+        self.node = self.nodes[0]
+        self.ids = np.asarray(ids, dtype=np.int64)
+        if any(not isinstance(node, self.node_type) for node in nodes):
+            raise TypeError(
+                f"a {self.operator} pipeline holds "
+                f"{self.node_type.__name__} nodes only")
+        alias = self.node.spec.alias
+        self.answer_stages = self.stages_type(
+            state, [node.spec for node in nodes], load_vocabulary(state),
+            self.ids, inputs["documents"][alias],
+            inputs.get("texts", {}).get(alias),
+            pipeline_head=inputs.get("pipeline_head", self.node.document_head),
+            document_positions=inputs.get("document_positions"))
+        self.stages = self.answer_stages.stages
+        self._results = {}
+
+    @property
+    def appended_tokens(self) -> int:
+        return self.answer_stages.appended_tokens
+
+    def _answer_rows(self, node, q: int, kept, document_ids):
+        """Return one node's rows from its settled answers."""
+        raise NotImplementedError
+
+    def finish(self, every) -> int:
+        """Settle every answer; return the tokens the questions fed."""
+        self.answer_stages.finish()
+        self.counts = [self.answer_stages.counts(q)
+                       for q in range(len(self.nodes))]
+        return sum(count["suffix_tokens"] for count in self.counts)
+
+    def complete(self, fresh, spans, stats, offset):
+        """Build each question's answer table and attribute its GPU work.
+
+        The first node is charged the run's fresh tokens less the
+        later questions' suffix tokens, the packing time, and the
+        borrowed prefix tokens; each later node its own suffix tokens.
+        """
+        per_question = len(self.stages) // len(self.nodes)
+        kept = self.answer_stages.asked()
+        document_ids = self.ids[kept]
+        counts = self.counts
+        later = sum(count["suffix_tokens"] for count in counts[1:])
+        results = {}
+        for q, node in enumerate(self.nodes):
+            start = offset + q * per_question
+            selected = stage_spans(spans, start, start + per_question)
+            first = q == 0
+            results[node.node_id] = NodeResult(
+                {node.rows_port: self._answer_rows(node, q, kept, document_ids)},
+                NodeMetrics(
+                    input_rows=len(document_ids),
+                    output_rows=len(document_ids),
+                    evaluated_documents=len(document_ids),
+                    fresh_tokens=(fresh - later if first
+                                  else counts[q]["suffix_tokens"]),
+                    gpu_s=gpu_seconds(selected), chunks=len(selected),
+                    extension={
+                        "output": node.spec.name,
+                        "aliases": list(node.spec.aliases),
+                        "input_rows": len(document_ids), **counts[q],
+                        "borrowed_prefix_tokens": (
+                            stats.get("borrowed_tokens", 0) if first else 0),
+                        "pack_s": (round(stats.get("pack_s", 0.0), 3)
+                                   if first else 0.0)}))
+        self._results = results
+        self.result_value = self._results[self.node.node_id]
+
+    def results(self) -> dict:
+        """Return the answer table and metrics for each question."""
+        return self._results

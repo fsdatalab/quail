@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.cost.map_draft_policy import MapDraftPolicy
+from quail.backends.quail.executor.vocabulary import Vocabulary
+from quail.cost.draft_policy import MapDraftPolicy
 from quail.cost.ngram_cache import MATCH_ORDERS, NgramCache
 from quail.physical import MapSpec
 

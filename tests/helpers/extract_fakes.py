@@ -2,7 +2,7 @@
 
 import re
 
-from quail.backends.quail.executor.extract.vocabulary import Vocabulary
+from quail.backends.quail.executor.vocabulary import Vocabulary
 from quail.physical import ExtractSpec
 
 NEG = float("-inf")

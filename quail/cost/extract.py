@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 from itertools import repeat
 
 from quail.cost.budgets import parallel_copies
-from quail.cost.draft_policy import DraftPolicy
+from quail.cost.draft_policy import ExtractDraftPolicy
 from quail.cost.sol import unrounded_seconds
 from quail.cost.work import Work, ask, decode, scan
 
@@ -111,7 +111,8 @@ def document_work(length: int, head_tokens: int, tail_tokens: int, *,
     prefix = head_tokens + length
     if draft_policy == "adaptive":
         # the policy's first-round choice for this document, with one stream
-        policy = DraftPolicy(draft_tokens, max_answer_tokens, assumptions.answer_tokens)
+        policy = ExtractDraftPolicy(draft_tokens, max_answer_tokens,
+                                    assumptions.answer_tokens)
         draft_tokens = policy.draft_length(
             round_cost_per_token * (prefix + tail_tokens), 1, num_streams=1)
     if resident:

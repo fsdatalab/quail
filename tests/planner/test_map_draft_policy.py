@@ -1,6 +1,6 @@
 """The map draft policy and the n-gram cache it drafts from."""
 
-from quail.cost.map_draft_policy import MapDraftPolicy
+from quail.cost.draft_policy import MapDraftPolicy
 from quail.cost.ngram_cache import MAX_CONTINUATIONS, NgramCache, NgramMatch
 
 
