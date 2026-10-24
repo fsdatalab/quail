@@ -50,7 +50,11 @@ Qwen3 4B and DiffusionGemma run every IMDB, BIO, FEV, LEP, and AGENT query. Qwen
 | B200 | Qwen3 32B | `/results/benchmarks/quailb/20261017T145741Z-2106faa7` | 5 queries finished |
 | L40S | Qwen3 32B | `/results/benchmarks/quailb/20261017T200744Z-b3bd1b3e` | stock vLLM cannot fit one token |
 | H100 | DiffusionGemma 26B | `/results/benchmarks/quailb/20261017T040833Z-c0e42adc` | stock vLLM omitted TRUE/FALSE scores |
+| H100 | DiffusionGemma 26B | `/results/benchmarks/quailb/20261024T150444Z-e3303d05` | Quail finished 43 queries; baselines off |
 | B200 | DiffusionGemma 26B | `/results/benchmarks/quailb/20261017T145741Z-c2afc552` | Quail FlashAttention 4 rejects head dim 256 |
+| B200 | DiffusionGemma 26B | `/results/benchmarks/quailb/20261024T150444Z-c7a9c717` | Quail warmup dies on head dim 512, TMEM |
+| B200 | DiffusionGemma 26B | `/results/benchmarks/quailb/20261024T154540Z-ef369227` | Quail warmup dies on head dim 256, SplitKV |
+| B200 | DiffusionGemma 26B | `/results/benchmarks/quailb/20261024T155537Z-6372ad9e` | Quail finished; stock vLLM cannot pickle the tokenizer |
 | L40S | DiffusionGemma 26B | | skipped: sliding KV does not fit, and FlashAttention 4 does not run here |
 
 L40S at 0.37× H100 means an L40S query time at least 2.70× the H100 time. B200 at 2.3× means an H100 query time at most 2.3× the B200 time.
@@ -212,4 +216,12 @@ L40S Qwen3 32B does not finish the suite. Quail skips BIO-1 and AGENT-1 because 
 
 H100 DiffusionGemma has no three-engine comparison. Stock vLLM omitted the TRUE/FALSE scores and the suite died while Quail was still running. Volume `/results/benchmarks/quailb/20261017T040833Z-c0e42adc`.
 
-B200 DiffusionGemma has no comparison. Quail warmup failed because FlashAttention 4 on that GPU rejects `seqused_k` for head dimension 256. Stock vLLM never started. Volume `/results/benchmarks/quailb/20261017T145741Z-c2afc552`.
+B200 DiffusionGemma has no comparison. On vLLM 0.26, Quail warmup failed because FlashAttention 4 rejects `seqused_k` for head dimension 256. Stock vLLM never started. Volume `/results/benchmarks/quailb/20261017T145741Z-c2afc552`.
+
+The 2026-10-24 rerun uses vLLM 0.29.0 and the 128-token page gather for head dimension 256. Quail still died in warmup, on IMDB-1, before a query finished. Stock vLLM did not start. During weight load, vLLM logged that FlashAttention 4 on Blackwell does not support head size 512 because of TMEM capacity and would default to FlashAttention 2. Kernel compile then died in `FlashAttentionForwardSm100` on `assert self.tmem_total <= self.tmem_alloc_cols`. The head-256 kernel had started compiling. The page-size assert did not appear. Volume `/results/benchmarks/quailb/20261024T150444Z-c7a9c717`.
+
+The same day's H100 Quail-only rerun finished. All 43 queries completed and none failed. Parallel wall time was 771.3 s. Baselines were off, so there is still no three-engine comparison. Volume `/results/benchmarks/quailb/20261024T150444Z-e3303d05`.
+
+A later B200 retry sends the 512-wide layers through Triton unified attention and keeps the page gather for head dimension 256. Quail still died in warmup, before a query finished. Stock vLLM did not start. The TMEM assert did not appear. The raising frame is `BlackwellFusedMultiHeadAttentionForward` on `SM100 forward with head_dim=256 does not support SplitKV`. Volume `/results/benchmarks/quailb/20261024T154540Z-ef369227`.
+
+The next B200 retry passes `num_splits=1` on the head-256 call. Quail finished every family. Stock vLLM then died while booting, on `TypeError: cannot pickle 'builtins.SentencePieceTokenizer' object`, and the orchestrator returned that error. Volume `/results/benchmarks/quailb/20261024T155537Z-6372ad9e`.

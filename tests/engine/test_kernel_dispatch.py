@@ -58,6 +58,103 @@ def test_attention_dispatch_covers_l40s_and_b200(monkeypatch):
         assert recorded["seqused_k"] is lengths
 
 
+class _Rows:
+    def __init__(self, head_dim):
+        self.shape = (4, 16, head_dim)
+
+    def contiguous(self):
+        return self
+
+
+def test_b200_sends_a_512_wide_head_to_triton(monkeypatch):
+    calls = {"fa": [], "triton": []}
+
+    def fake_attention(*args, **kwargs):
+        calls["fa"].append(kwargs)
+        return "fa-out", None
+
+    def fake_triton(**kwargs):
+        calls["triton"].append(kwargs)
+
+    flash = ModuleType("vllm.vllm_flash_attn")
+    flash.flash_attn_varlen_func = fake_attention
+    triton = ModuleType("vllm.v1.attention.ops.triton_unified_attention")
+    triton.unified_attention = fake_triton
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", flash)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.attention.ops.triton_unified_attention",
+        triton)
+    out = object()
+    engine = Engine.__new__(Engine)
+    engine.torch = SimpleNamespace(empty_like=lambda query: out)
+    engine.fa_version = 4
+    table, lengths = object(), object()
+    result = engine._paged(
+        _Rows(512), "k", "v", "cu", 8, lengths, 32, table,
+        causal=True, softmax_scale=1.0, window=None)
+    assert result is out
+    assert calls["fa"] == []
+    recorded = calls["triton"][0]
+    assert recorded["k"] == "k"
+    assert recorded["v"] == "v"
+    assert recorded["out"] is out
+    assert recorded["block_table"] is table
+    assert recorded["seqused_k"] is lengths
+    assert recorded["cu_seqlens_q"] == "cu"
+    assert recorded["max_seqlen_q"] == 8
+    assert recorded["max_seqlen_k"] == 32
+    assert recorded["causal"] is True
+    assert recorded["softmax_scale"] == 1.0
+    assert recorded["window_size"] == (-1, -1)
+    assert recorded["softcap"] == 0
+    assert recorded["q_descale"] is None
+
+    calls["fa"].clear()
+    calls["triton"].clear()
+    engine.fa_version = 3
+    assert engine._paged(
+        _Rows(512), "k", "v", "cu", 8, lengths, 32, table,
+        causal=True, softmax_scale=1.0, window=None) == "fa-out"
+    assert calls["triton"] == []
+    assert calls["fa"][0]["fa_version"] == 4
+
+    calls["fa"].clear()
+    engine.fa_version = 4
+    assert engine._paged(
+        _Rows(256), "k", "v", "cu", 8, lengths, 32, table,
+        causal=True, softmax_scale=1.0, window=None) == "fa-out"
+    assert calls["triton"] == []
+    assert calls["fa"][0]["fa_version"] == 4
+
+
+def test_b200_head_256_requests_a_single_split(monkeypatch):
+    recorded = {}
+
+    def fake_attention(*args, **kwargs):
+        recorded.clear()
+        recorded.update(kwargs)
+        return "out", None
+
+    module = ModuleType("vllm.vllm_flash_attn")
+    module.flash_attn_varlen_func = fake_attention
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", module)
+    engine = Engine.__new__(Engine)
+    engine.fa_version = 4
+    wide = SimpleNamespace(shape=(4, 128, 8, 256))
+    engine._fa(wide, wide, wide, None, None, 8, 128, True)
+    assert recorded["fa_version"] == 4
+    assert recorded["num_splits"] == 1
+
+    narrow = SimpleNamespace(shape=(4, 16, 8, 128))
+    engine._fa(narrow, narrow, narrow, None, None, 8, 32, True)
+    assert "num_splits" not in recorded
+
+    engine.fa_version = 3
+    engine._fa(wide, wide, wide, None, None, 8, 128, True)
+    assert "num_splits" not in recorded
+
+
 def test_fp8_gemm_uses_triton_block_mm_without_deep_gemm(monkeypatch):
     recorded = {}
 

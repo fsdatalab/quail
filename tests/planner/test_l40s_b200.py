@@ -61,7 +61,7 @@ def test_diffusion_gemma_refuses_l40s_at_default_chunk(tmp_path):
         register_tables(sess, tmp_path)
         plan = queries(sess)["IMDB-1"][1]().plan()
     assert isinstance(plan, Refusal)
-    assert plan.constraint == "sliding_kv_needs_more_memory"
+    assert plan.constraint == "flash_attention_4_unsupported"
     assert plan.needed > plan.available
     assert "l40s" in plan.reasons[0]
 
@@ -89,7 +89,11 @@ def test_hybrid_filter_plans_with_fp32_convolution_cost(tmp_path, device):
     ) as sess:
         register_tables(sess, tmp_path)
         plan = queries(sess)["IMDB-1"][1]().plan()
-    assert not isinstance(plan, Refusal)
+    if device == "l40s":
+        assert isinstance(plan, Refusal)
+        assert plan.constraint == "flash_attention_4_unsupported"
+    else:
+        assert not isinstance(plan, Refusal)
 
 
 def test_run_suite_uses_the_device_hourly_price(tmp_path, monkeypatch):
