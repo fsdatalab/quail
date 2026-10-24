@@ -401,8 +401,31 @@ class StageExecutor:
             key = self.keys[a]
             f = self.prefix_lengths[a]
             frame = self.frames[j]
-            append = self.stages[j].append
+            stage = self.stages[j]
+            append = stage.append
             request = self.own.get((j, a))
+            if (request is not None and not carried and append
+                    and stage.single and end - start == 1
+                    and not self.writes[j] and not stage.rewind
+                    and stage.read_all_rows and stage.paths is None
+                    and stage.canvas is None and request.read_rows is None
+                    and self.read_rows[j] is None
+                    and self.read_masks[j] is None):
+                # a decode round: the document's own one suffix, kept
+                # after the path earlier rounds appended; the general
+                # bookkeeping below reduces to this
+                path = max(0, self.appended[a] - request.discard)
+                sufs = request.suffixes
+                total = int(sufs.lengths[0])
+                kept = (total if request.write_suffix_tokens is None
+                        else request.write_suffix_tokens)
+                appended[a] = path + kept
+                specs.append(dict(
+                    key=key, prefix=None, f=f + len(frame) + path,
+                    suffixes=sufs, read_all_rows=True,
+                    write_suffix_tokens=kept, single=True))
+                entries.append((j, total))
+                continue
             # a written frame, or a rewinding stage, replaces any path
             # an earlier stage kept
             rewinds = self.writes[j] or self.stages[j].rewind
