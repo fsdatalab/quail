@@ -553,12 +553,23 @@ class StageExecutor:
         groups = entry.groups[entry.at:entry.at + entry.step]
         values, position = entry.values, entry.positions
         transitions = []
+        group_rows = []
+        prepared = {}
         for a, j, start, end, _ in groups:
             key = self.readouts.group_key[j]
             if self.writes[j] and start == 0 and not self._merged(j, start, end):
                 position[key] += 1        # the frame entry's answer means nothing
             count = end - start
             rows = values[key][position[key]:position[key] + count]
+            position[key] += count
+            group_rows.append(rows)
+            if self.stages[j].prepare is not None:
+                anchors, stage_rows = prepared.setdefault(j, ([], []))
+                anchors.append(a)
+                stage_rows.append(rows)
+        for j, (anchors, stage_rows) in prepared.items():
+            self.stages[j].prepare(anchors, stage_rows)
+        for (a, j, start, end, _), rows in zip(groups, group_rows):
             if self.stages[j].own_suffixes and end == self.sched.num_partners(a, j):
                 # the request was packed; a repeating stage asks anew
                 del self.own[(j, a)]
@@ -568,7 +579,6 @@ class StageExecutor:
             for settlement in result.settlements:
                 self._event(settlement)
             transitions.extend(result.transitions)
-            position[key] += count
         entry.at += len(groups)
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)

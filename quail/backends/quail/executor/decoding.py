@@ -105,14 +105,20 @@ class AnswerStages:
         return [
             Stage(suffixes=[[last]], frame=frame, rewind=True,
                   readout=self.readout, decide=partial(self._tail_decide, q),
+                  prepare=self._stage_prepare(q, tail=True),
                   single=True, append=True, label=f"{name} tail"),
             Stage(suffixes=partial(self._step_suffix, q),
                   suffix_tokens=(1 + self.spec.draft_tokens)
                   * (2 if self.recurrent else 1), frame=frame,
                   readout=self.readout, decide=partial(self._step_decide, q),
+                  prepare=self._stage_prepare(q, tail=False),
                   read_all_rows=True, single=True, append=True, repeats=True,
                   label=f"{name} rounds"),
         ]
+
+    def _stage_prepare(self, q: int, tail: bool):
+        """Return a stage's prepare callback, or None to decide per document."""
+        return None
 
     @property
     def appended_tokens(self) -> int:

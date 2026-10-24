@@ -78,6 +78,10 @@ class Stage:
         decide: Optional callback from document index and answer row to a
             Boolean. True advances the document or retains it at the final
             stage. Without a callback, any true answer is sufficient.
+        prepare: Optional callback from the document indices of a
+            chunk's groups at this stage and their answer rows, called
+            once per chunk before decide or suffixes is asked for any
+            of them, so a stage decides and drafts a chunk at once.
         read_all_rows: Whether to read every suffix row rather than its last.
         read_rows: Optional count of trailing rows to read per suffix,
             overriding read_all_rows. None takes the readout's
@@ -112,6 +116,7 @@ class Stage:
     frame: list = field(default_factory=list)
     requests: Callable | None = None
     decide: Callable | None = None
+    prepare: Callable | None = None
     read_all_rows: bool = False
     read_rows: Any = None
     single: bool = False

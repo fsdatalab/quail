@@ -263,6 +263,36 @@ class MapDraftPolicy:
         """
         return self._best_length(rho, written, self.copy_rate(), slack)
 
+    def copy_lengths(self, rho: np.ndarray, written: np.ndarray, slack: float,
+                     room: np.ndarray) -> np.ndarray:
+        """Return copy_length for many rounds at once.
+
+        Args:
+            rho: Each round's KV read, in fed tokens.
+            written: Each answer's tokens so far.
+            slack: Fed tokens the current passes carry for free.
+            room: The most tokens each draft may have.
+
+        Returns:
+            Per round, the draft length with the least cost per written
+            token, as _best_length picks it.
+        """
+        gamma = np.arange(1, self.cap + 1)
+        levels = np.asarray(self.curve.levels())
+        base = levels[written]
+        ahead = levels[np.minimum(written[:, None] + gamma[None, :],
+                                  self.max_answer_tokens)]
+        ratio = np.where(base[:, None] > 0, ahead / np.where(base > 0, base, 1.0)
+                         [:, None], 1.0)
+        chained = self.copy_rate() ** gamma
+        writes = 1.0 + np.cumsum(chained[None, :] * ratio, axis=1)
+        extra = np.maximum(gamma - slack, 0.0)
+        cost = (rho[:, None] + 1.0 + extra[None, :]) / writes
+        cost[gamma[None, :] > room[:, None]] = np.inf
+        best = np.argmin(cost, axis=1) + 1
+        best[np.min(cost, axis=1) >= rho + 1.0] = 0
+        return best
+
     def chain_length(self, rho: float, written: int, rates, slack: float) -> int:
         """Return how many of a chained draft's tokens to feed.
 
