@@ -167,6 +167,11 @@ def quail() -> dict:
     class Recording(SaeFeaturesReadout):
         """Packs each answer row's features and its raw residual."""
 
+        def __init__(self, torch_module, recording_encoder):
+            super().__init__(torch_module, recording_encoder)
+            self.dtype = np.dtype(
+                (np.float32, 2 * recording_encoder.keep + hidden))
+
         def submit(self, stream):
             packed = self.torch.cat(
                 [self.encoder.packed_top_features(stream), stream.float()],

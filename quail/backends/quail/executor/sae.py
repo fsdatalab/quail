@@ -256,15 +256,16 @@ class SaeFeaturesReadout(_HostReadout):
     """Encode the answer rows' residual stream, for the reading 'last'.
 
     result() returns a (rows, 2 * keep) fp32 array: each row's feature
-    indices, then their strengths.
+    indices, then their strengths. The dtype carries the row width, so
+    the scheduler's answer array holds one vector per answer.
     """
 
-    dtype = np.float32
     trailing_rows = 1
 
     def __init__(self, torch, encoder: SaeEncoder):
         super().__init__(torch)
         self.encoder = encoder
+        self.dtype = np.dtype((np.float32, 2 * encoder.keep))
 
     def submit(self, stream):
         return self._copy(self.encoder.packed_top_features(stream))
