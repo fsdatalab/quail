@@ -368,7 +368,9 @@ class HostKV:
         events = {}
         if not self._pending:
             return events
-        with self._patience(wait):
+        # a query's end and a resize flush outside the pass's inference
+        # mode, and the staging blocks were made inside it
+        with self._patience(wait), self.torch.inference_mode():
             for key in list(self._pending):
                 if not self._staging_free("save"):
                     break
@@ -593,7 +595,7 @@ class HostKV:
                 self.conv_state[slot].copy_(arena.conv_state[device_slot])
             return None
         stream = self.stream
-        with torch.cuda.stream(stream):
+        with torch.cuda.stream(stream), torch.inference_mode():
             gathered = [self._gather(key, tokens, group, stream)
                         for group in range(len(self.pools))]
             if slot is not None:
@@ -653,7 +655,7 @@ class HostKV:
             self._restore_rows(key, start, tokens, slot, None)
         else:
             torch = self.torch
-            with torch.cuda.stream(self.restore_stream):
+            with torch.cuda.stream(self.restore_stream), torch.inference_mode():
                 self._restore_rows(key, start, tokens, slot, self.restore_stream)
                 event = torch.cuda.Event()
                 event.record(self.restore_stream)
