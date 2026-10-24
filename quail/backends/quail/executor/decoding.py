@@ -350,7 +350,9 @@ class AnswerPart(DocumentAnswerPart):
                                    if first else 0.0),
                         "host_s": stats.get("host_s") if first else None,
                         "readout_gpu_s": (stats.get("readout_gpu_s")
-                                          if first else None)}))
+                                          if first else None),
+                        "idle_gpu_s": (stats.get("idle_gpu_s")
+                                       if first else None)}))
         self._results = results
         self.result_value = self._results[self.node.node_id]
 

@@ -231,7 +231,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             at the end of the run. False returns no timing spans.
         stats: When given, receives borrowed_tokens, pack_s (the host
             seconds spent building chunks), host_s (host seconds per
-            loop phase), and, with gpu_timing, readout_gpu_s.
+            loop phase, wait being the time blocked on a readout), and,
+            with gpu_timing, readout_gpu_s and idle_gpu_s (the stream
+            idle between a pass and its readout).
         limit: Stop admitting documents once this many survived the
             last stage; the rest never run.
         survival: The fraction of documents expected to survive every

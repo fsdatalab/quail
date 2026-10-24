@@ -270,8 +270,8 @@ class StageExecutor:
         self.pack_s = 0.0
         # host seconds per phase of the loop, and the readouts' GPU
         # event pairs, for telling host-bound passes from GPU-bound
-        self.host_s = {"admit": 0.0, "launch": 0.0, "report": 0.0,
-                       "submit": 0.0}
+        self.host_s = {"admit": 0.0, "launch": 0.0, "wait": 0.0,
+                       "report": 0.0, "submit": 0.0}
         self.readout_spans = []
         self.outstanding = []     # PendingAnswers in launch order
         self.split_answers = any(s.append and s.own_suffixes for s in stages)
@@ -545,7 +545,10 @@ class StageExecutor:
 
     def _report(self, entry):
         if entry.values is None:
+            # waits for the pass's readout, so this is GPU time, not host
+            started = time.perf_counter()
             entry.values = self.readouts.results(entry.handles)
+            self.host_s["wait"] += time.perf_counter() - started
             entry.positions = np.zeros(len(self.readouts), dtype=np.int64)
         groups = entry.groups[entry.at:entry.at + entry.step]
         values, position = entry.values, entry.positions
@@ -668,13 +671,18 @@ class StageExecutor:
             self._report_next()
         reported = time.perf_counter()
         self.host_s["report"] += reported - started
+        if self.gpu_timing:
+            e2 = self.torch.cuda.Event(enable_timing=True)
+            e2.record()
         handles = self.readouts.submit(
             normed, entries, chunk.rows_per_answer)
         self.host_s["submit"] += time.perf_counter() - reported
         if self.gpu_timing:
-            e2 = self.torch.cuda.Event(enable_timing=True)
-            e2.record()
-            self.readout_spans.append((e1, e2))
+            e3 = self.torch.cuda.Event(enable_timing=True)
+            e3.record()
+            # e1 to e2 is the stream idle until the host submits the
+            # readout; e2 to e3 is the readout
+            self.readout_spans.append((e1, e2, e3))
         self.outstanding.append(PendingAnswers(part, handles))
 
     def run(self):
@@ -734,6 +742,9 @@ class StageExecutor:
             self.torch.cuda.synchronize()
             if self.stats is not None:
                 self.stats["readout_gpu_s"] = round(sum(
-                    e1.elapsed_time(e2) for e1, e2 in self.readout_spans)
+                    e2.elapsed_time(e3) for _, e2, e3 in self.readout_spans)
+                    / 1000.0, 3)
+                self.stats["idle_gpu_s"] = round(sum(
+                    e1.elapsed_time(e2) for e1, e2, _ in self.readout_spans)
                     / 1000.0, 3)
         return self.sched.answers, self.spans, self.tokens
