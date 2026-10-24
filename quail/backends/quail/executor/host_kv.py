@@ -26,7 +26,9 @@ writing host memory directly would need no staging, but it holds the
 SMs for the whole transfer and slowed the passes beside it; the copy
 engine does not. Staging blocks are few and reused once their copy
 has landed; when none is free, a save is skipped and a restore
-becomes a miss, so the store never paces the query.
+becomes a miss, so the store never paces a running query. At a
+query's end the arena frees every document at once with the GPU
+idle, so those saves wait for a block instead (patient).
 
 A key's rows are saved only once an operator computed or restored them
 (mark_written); pages reserved for a chunk that never ran hold nothing.
@@ -35,6 +37,7 @@ A key's rows are saved only once an operator computed or restored them
 import hashlib
 import time
 from collections import deque
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -191,6 +194,7 @@ class HostKV:
         self._flat = [self._flat_view(layers, width)
                       for layers, width, _ in self._groups]
         self._staging = {}      # (direction, group) -> [[tensor, event], ...]
+        self._patient = False   # wait for a staging block instead of skipping
         self.stream = (torch.cuda.Stream(device=self.device)
                        if self.pinned else None)
         self._index_slots = None
@@ -428,16 +432,32 @@ class HostKV:
 
     # ---- staging blocks on the device ------------------------------------
 
+    @contextmanager
+    def patient(self):
+        """Wait for a staging block instead of skipping, while the GPU is idle."""
+        self._patient = True
+        try:
+            yield
+        finally:
+            self._patient = False
+
     def _staging_free(self, direction) -> bool:
-        """Whether every layer group has a staging block free to use."""
+        """Whether every layer group has a staging block free to use.
+
+        When patient, a group with none free waits for its oldest copy.
+        """
         if not self.pinned:
             return True
         for group in range(len(self._groups)):
             blocks = self._staging.setdefault((direction, group), [])
             if len(blocks) < MAX_STAGING:
                 continue
-            if not any(block[1] is None or block[1].query() for block in blocks):
+            if any(block[1] is None or block[1].query() for block in blocks):
+                continue
+            if not self._patient:
                 return False
+            self._wait(blocks[0][1])
+            blocks.append(blocks.pop(0))
         return True
 
     def _staging_block(self, direction, group, shape):

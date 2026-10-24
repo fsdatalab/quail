@@ -387,6 +387,10 @@ class FakeArena:
     def reclaim(self, wait=False):
         return 0
 
+    def free_all(self):
+        for key in list(self.owned):
+            self.free_key(key)
+
     @property
     def retained_pages(self):
         return len(self.retained)

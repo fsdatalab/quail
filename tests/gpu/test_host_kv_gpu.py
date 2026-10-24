@@ -83,15 +83,26 @@ def test_a_save_costs_the_host_little_while_a_pass_runs():
     for _ in range(20):
         activations = activations @ weight
     started = time.perf_counter()
-    for key in keys:
+    # a burst past the staging blocks skips, as a query's settles do
+    for key in keys[:100]:
         arena.free_key(key)
+    burst = host.saved_keys + host.busy_keys
+    # at a query's end the frees wait for blocks instead
+    with host.patient():
+        for key in keys[100:]:
+            arena.free_key(key)
     host_s = time.perf_counter() - started
     arena.reclaim(wait=True)
     total_s = time.perf_counter() - started
     print(f"\n{count} saves of {tokens} tokens: host {host_s * 1e3 / count:.2f} ms "
           f"per save, {total_s:.2f} s until the copies landed, "
           f"store host_s {host.host_s:.3f} s")
-    assert host.saved_keys == count and arena.free_pages == 8192
+    assert burst == 100 and host.busy_keys > 0
+    assert host.saved_keys + host.busy_keys == count and arena.free_pages == 8192
+    saved = [key for key in keys if host.holds(host._keys[key][0])]
+    assert len(saved) == host.saved_keys >= 100
+    keys = saved
+    count = len(keys)
     # restores: the same keys, pages reserved again
     for _ in range(20):
         activations = activations @ weight

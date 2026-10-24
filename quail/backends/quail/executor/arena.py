@@ -137,9 +137,7 @@ class KVArena:
         """
         if free_resident:
             self.drop_holds()
-            for key in self.resident_keys():
-                self.free_key(key)
-            self.reclaim(wait=True)
+            self.free_all()
         if self.accounting.owned:
             raise RuntimeError("the arena holds keys; free them before resizing")
         if (num_pages, num_sliding_pages, num_state_slots) == (
@@ -421,6 +419,22 @@ class KVArena:
     def pin(self, key):
         self._undrain(key)
         self.accounting.pin(key)
+
+    def free_all(self) -> None:
+        """Free every resident key, saving each to the host store, and reclaim.
+
+        Nothing runs on the GPU between queries, so the saves wait for
+        staging blocks instead of being skipped.
+        """
+        if self.host is None:
+            for key in self.resident_keys():
+                self.free_key(key)
+            self.reclaim(wait=True)
+            return
+        with self.host.patient():
+            for key in self.resident_keys():
+                self.free_key(key)
+            self.reclaim(wait=True)
 
     def _undrain(self, key):
         """A draining key is used again: it keeps its pages, once its save read them."""
