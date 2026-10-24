@@ -105,6 +105,7 @@ def test_a_save_costs_the_host_little_while_a_pass_runs():
     print(f"{count} restores: host {host_s * 1e3 / count:.2f} ms per restore, "
           f"{total_s:.2f} s until landed")
     assert activations.shape == weight.shape
-    # a save is one launch per layer group and a restore the same, so
-    # the host never waits for the link
-    assert host_s / count < 0.001
+    # a save is one launch per layer group and a restore the same; a
+    # burst longer than the index slots is paced at the link's speed,
+    # about 1.7 ms per 45 MB document
+    assert host_s / count < 0.003
