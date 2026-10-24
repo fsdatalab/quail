@@ -10,7 +10,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, closing
-from itertools import chain
+from itertools import chain, count
 from numbers import Integral
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -69,6 +69,7 @@ class InputStore:
 
     def __init__(self, catalog: Catalog, *, tokenizer, tokenizer_name: str):
         self.catalog = catalog
+        self._parent = None
         self._tokenizer = tokenizer
         self.tokenizer_name = tokenizer_name
         self.notes = []            # tokenizer picks etc., for reports
@@ -76,7 +77,10 @@ class InputStore:
         self._token_stores = {}
         self._replaced_token_stores = []
         self._column_stores = {}
-        self.num_stores = 0
+        self._store_numbers = count(1)
+        # provider -> callable(column) giving the TokenLengths to plan a
+        # table on before it exists, such as a CTE's result
+        self._assumed_lengths = {}
         self._token_directory = None
         self._corpus_tokenizers = {}
         self._length_estimates = {}
@@ -86,6 +90,29 @@ class InputStore:
     @property
     def tokenizer(self):
         return self._tokenizer()
+
+    def over(self, catalog: Catalog, assumed_lengths: dict) -> "InputStore":
+        """Create a scoped store that borrows registered inputs from this store.
+
+        The caller closes the returned store. Its intermediate token files
+        are separate; closing it leaves the parent's files available.
+        """
+        store = InputStore(catalog, tokenizer=self._tokenizer,
+                           tokenizer_name=self.tokenizer_name)
+        store._parent = self
+        store._assumed_lengths = assumed_lengths
+        return store
+
+    def pending(self, provider_name: str) -> bool:
+        """Return whether a relation has a schema but no rows yet."""
+        return provider_name in self._assumed_lengths
+
+    def _owner(self, provider_name: str) -> "InputStore":
+        if (self._parent is not None and provider_name in self._parent.catalog
+                and self.catalog.get(provider_name) is
+                self._parent.catalog.get(provider_name)):
+            return self._parent
+        return self
 
     def close(self):
         """Wait for background tokenization and remove the token files."""
@@ -124,6 +151,12 @@ class InputStore:
         columns reads only those columns from the provider and does not
         tokenize the documents again.
         """
+        owner = self._owner(provider_name)
+        if owner is not self:
+            return owner.tokenize(provider_name, column, projected_columns,
+                                  with_offsets=with_offsets)
+        if self.pending(provider_name):
+            raise RuntimeError(f"relation {provider_name!r} is not materialized")
         with self._lock:
             return self._tokenize(provider_name, column, projected_columns,
                                   with_offsets)
@@ -174,6 +207,10 @@ class InputStore:
     def tokenize_async(self, provider_name: str, column,
                        projected_columns=(), *, with_offsets=False) -> Future:
         """Start tokenize() on a background thread and return its Future."""
+        owner = self._owner(provider_name)
+        if owner is not self:
+            return owner.tokenize_async(provider_name, column, projected_columns,
+                                        with_offsets=with_offsets)
         return self._background_executor().submit(
             self.tokenize, provider_name, column, projected_columns,
             with_offsets=with_offsets)
@@ -208,6 +245,11 @@ class InputStore:
 
     def token_lengths(self, provider_name: str, column):
         """Return the exact token counts when the column is tokenized."""
+        owner = self._owner(provider_name)
+        if owner is not self:
+            return owner.token_lengths(provider_name, column)
+        if self.pending(provider_name):
+            return None
         identity = self.catalog.get(provider_name).content_identity()
         store = self._token_stores.get((identity, _column_key(column)))
         return None if store is None else store.lengths
@@ -221,6 +263,11 @@ class InputStore:
         provider that reports no row count is scanned for its byte
         lengths, which the sample's tokens per byte scale.
         """
+        owner = self._owner(provider_name)
+        if owner is not self:
+            return owner.estimate_lengths(provider_name, column)
+        if self.pending(provider_name):
+            return self._assumed_lengths[provider_name](column)
         provider = self.catalog.get(provider_name)
         key = (provider.content_identity(), _column_key(column))
         if key in self._length_estimates:
@@ -277,16 +324,16 @@ class InputStore:
             self._corpus_tokenizers[key] = (tokenizer, token_type)
         return self._corpus_tokenizers[key]
 
-    def _store_path(self) -> str:
+    def _directory(self) -> TemporaryDirectory:
         if self._token_directory is None:
             self._token_directory = TemporaryDirectory(
                 prefix="quail-tokens-"
             )
-        self.num_stores += 1
-        return str(
-            Path(self._token_directory.name)
-            / f"input-{self.num_stores}.arrow"
-        )
+        return self._token_directory
+
+    def _store_path(self) -> str:
+        return str(Path(self._directory().name)
+                   / f"input-{next(self._store_numbers)}.arrow")
 
     def _pick_tokenizer(self, reader, provider_name: str,
                         column):

@@ -52,6 +52,8 @@ def test_window_table_computes_each_function_in_the_last_windows_order():
         "costed": [0, 1, 2, 1, 2],
         "seen": [1, 2, 3, 1, 2],
     }
+    # a window over no rows returns no rows
+    assert window_table(table.slice(0, 0), node).num_rows == 0
     # a null partition key is one partition, sorted last; a descending
     # order reverses; the rows follow the last call's window
     nulls = pa.table({"run_id": [None, "a", None], "step_index": [1, 1, 2]})

@@ -334,3 +334,14 @@ def test_unnest_needs_named_feature_lists_and_their_fields(session):
     for name, sql in bad.items():
         with pytest.raises(CompileError):
             session.sql(sql)
+
+
+def test_a_cte_can_unnest_features_for_the_query_that_reads_it(session):
+    query = session.sql(
+        f"WITH unnested AS (SELECT r.id, f.feature FROM reviews r, {UNNEST} "
+        f"WHERE f.strength > 1) "
+        f"SELECT feature, COUNT(*) AS n FROM unnested GROUP BY feature "
+        f"ORDER BY feature")
+    rows = finish(query, _unnest_oracle()).collect()
+    assert [row["n"] for row in rows.to_pylist()] == [1, 1]
+    assert rows.column(0).to_pylist() == [1, 2]

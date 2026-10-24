@@ -17,6 +17,7 @@ from .relational import (
 )
 from .sae_features import AiSaeFeatures, SaeFeaturesSpec
 from .scan import Scan
+from .stage import QueryStage
 
 __all__ = [
     "Aggregate",
@@ -41,6 +42,7 @@ __all__ = [
     "Recombine",
     "Scan",
     "SaeFeaturesSpec",
+    "QueryStage",
     "ScoreSpec",
     "Sort",
     "Window",

@@ -928,6 +928,7 @@ class Query:
                 sae_features=tuple((column.expression, column.name)
                                    for column in featured
                                    if column.expression.aliases() == (alias,)),
+                schema=self._catalog.get(provider).schema(),
             )
         for join in self._joins:
             logical.add_join(join)

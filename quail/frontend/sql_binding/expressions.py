@@ -553,6 +553,8 @@ def _conjuncts(node) -> list:
         if isinstance(n, exp.And):
             stack.append(n.expression)
             stack.append(n.this)
+        elif isinstance(n, exp.Paren) and isinstance(n.this, exp.And):
+            stack.append(n.this)
         else:
             terms.append(n)
     return terms  # the pop order above yields written order

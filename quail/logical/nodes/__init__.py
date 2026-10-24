@@ -22,6 +22,7 @@ from quail.logical.nodes.sae_features import (
 )
 from quail.logical.nodes.scan import Scan
 from quail.logical.nodes.unnest import Unnest
+from quail.logical.nodes.with_cte import WithCTE
 
 __all__ = [
     "APPLY_IDS",
@@ -37,6 +38,7 @@ __all__ = [
     "Project",
     "Result",
     "Scan",
+    "WithCTE",
     "SemanticClassify",
     "SemanticExtract",
     "SemanticFilter",

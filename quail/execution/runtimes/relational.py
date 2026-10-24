@@ -260,7 +260,8 @@ class AggregateRuntime:
 
 def _partition_starts(keys, num_rows: int) -> pa.Array:
     """Flag the rows whose partition keys differ from the row before."""
-    starts = pa.array([True] + [False] * (num_rows - 1), pa.bool_())
+    starts = pa.array([True] * min(num_rows, 1) + [False] * (num_rows - 1),
+                      pa.bool_())
     for column in keys:
         column = column.combine_chunks()
         previous, current = column[:-1], column[1:]
@@ -268,7 +269,8 @@ def _partition_starts(keys, num_rows: int) -> pa.Array:
         differs = pc.or_kleene(
             pc.fill_null(pc.not_equal(current, previous), False),
             pc.xor(pc.is_null(current), pc.is_null(previous)))
-        starts = pc.or_(starts, pa.concat_arrays([pa.array([True]), differs]))
+        starts = pc.or_(starts, pa.concat_arrays(
+            [pa.array([True]), differs])[:num_rows])
     return starts
 
 
@@ -309,7 +311,9 @@ def _window_columns(table: pa.Table, calls) -> tuple[pa.Array, dict]:
             else:
                 shifted = pa.concat_arrays([values[1:], null])
                 edge = pa.concat_arrays([starts[1:], pa.array([True])])
-            result = pc.if_else(edge, null[0], shifted)
+            # over no rows the shifted array still holds the one null
+            rows = table.num_rows
+            result = pc.if_else(edge[:rows], null[0], shifted[:rows])
         else:
             counted = (pc.is_valid(values).cast(pa.int64())
                        if call.function == "count" and values is not None

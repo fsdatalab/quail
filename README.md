@@ -1,13 +1,19 @@
-<img src="docs/assets/quail-logo.svg" alt="Quail logo" width="96">
+<p align="center">
+  <img src="docs/assets/quail-logo.svg" alt="Quail logo" width="112">
+</p>
 
-# Quail
+<h1 align="center">Quail</h1>
 
-**An open-source execution engine for AI functions in SQL,** from the
-[Full Stack Data Lab](https://fsdatalab.github.io/) at CMU.
+<p align="center">
+  <b>An open-source inference engine for AI functions in SQL</b><br>
+  from the <a href="https://fsdatalab.github.io/">Full Stack Data Lab</a> at CMU
+</p>
 
-[![PyPI](https://img.shields.io/pypi/v/quail-engine)](https://pypi.org/project/quail-engine/)
-[![Docs](https://img.shields.io/badge/docs-fsdatalab.github.io%2Fquail-blue)](https://fsdatalab.github.io/quail)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+<p align="center">
+  <a href="https://pypi.org/project/quail-engine/"><img src="https://img.shields.io/pypi/v/quail-engine" alt="PyPI"></a>
+  <a href="https://fsdatalab.github.io/quail"><img src="https://img.shields.io/badge/docs-fsdatalab.github.io%2Fquail-blue" alt="Docs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
+</p>
 
 Quail (QUery-Aware Inference Layer) runs LLMs over large datasets,
 from SQL, on your own GPUs. Quail's secret sauce is to optimize LLM
@@ -31,7 +37,7 @@ WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 ## Install
 
 Install [quail-engine from PyPI](https://pypi.org/project/quail-engine/).
-The package is named `quail-engine`; in Python, import `quail`.
+In Python, import `quail`.
 
 ```bash
 uv pip install quail-engine

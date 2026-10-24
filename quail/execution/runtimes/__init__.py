@@ -18,6 +18,7 @@ from quail.execution.runtimes.relational import (
     SortRuntime,
     WindowRuntime,
 )
+from quail.execution.runtimes.stage import QueryStageRuntime
 from quail.execution.runtimes.unnest import UnnestRuntime
 from quail.physical import (
     Aggregate,
@@ -28,6 +29,7 @@ from quail.physical import (
     HashJoin,
     Limit,
     Project,
+    QueryStage,
     Recombine,
     Scan,
     Sort,
@@ -58,6 +60,7 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
     """Return runtimes for the backend independent physical nodes."""
     return {
         Scan.runtime_key: ScanRuntime(),
+        QueryStage.runtime_key: QueryStageRuntime(),
         Barrier.runtime_key: BarrierRuntime(),
         Exchange.runtime_key: ExchangeRuntime(),
         Foreign.runtime_key: ForeignRuntime(),
