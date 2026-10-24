@@ -70,6 +70,24 @@ def _tick(timing, key, t0):
     return time.perf_counter()
 
 
+_ZERO_LENGTHS = np.zeros(1, dtype=np.int64)
+
+
+def _span_rows(spans) -> np.ndarray:
+    """Join half-open integer spans into one array of their rows."""
+    if not spans:
+        return np.empty(0, dtype=np.int64)
+    starts = np.fromiter((span[0] for span in spans), dtype=np.int64,
+                         count=len(spans))
+    stops = np.fromiter((span[1] for span in spans), dtype=np.int64,
+                        count=len(spans))
+    lengths = stops - starts
+    ends = np.cumsum(lengths)
+    total = int(ends[-1])
+    return (np.repeat(starts - (ends - lengths), lengths)
+            + np.arange(total, dtype=np.int64))
+
+
 def _concatenate(parts):
     """Join int64 arrays, or give an empty one when there is nothing to join."""
     return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
@@ -124,10 +142,18 @@ class Suffixes:
     __slots__ = ("ids", "lengths", "offsets")
 
     def __init__(self, ids, lengths):
-        self.ids = np.asarray(ids, dtype=np.int64)
-        self.lengths = np.asarray(lengths, dtype=np.int64)
-        self.offsets = np.zeros(len(self.lengths) + 1, dtype=np.int64)
-        np.cumsum(self.lengths, out=self.offsets[1:])
+        self.ids = (ids if isinstance(ids, np.ndarray)
+                    and ids.dtype == np.int64 else
+                    np.asarray(ids, dtype=np.int64))
+        if len(lengths) == 1:
+            # a decode round's one suffix skips the cumulative sums
+            length = int(lengths[0])
+            self.lengths = np.array([length], dtype=np.int64)
+            self.offsets = np.array([0, length], dtype=np.int64)
+        else:
+            self.lengths = np.asarray(lengths, dtype=np.int64)
+            self.offsets = np.zeros(len(self.lengths) + 1, dtype=np.int64)
+            np.cumsum(self.lengths, out=self.offsets[1:])
         if self.offsets[-1] != len(self.ids):
             raise ValueError(
                 f"{len(self.ids)} suffix tokens for lengths summing to "
@@ -136,6 +162,11 @@ class Suffixes:
     @classmethod
     def of(cls, sequences):
         """Flatten token sequences, each possibly made of parts."""
+        if (len(sequences) == 1 and isinstance(sequences[0], list)
+                and len(sequences[0]) < 64):
+            # a decode round's one short suffix skips the parts walk
+            return cls(np.array(sequences[0], dtype=np.int64),
+                       [len(sequences[0])])
         lengths = [len(sequence) for sequence in sequences]
         arrays = [_int64(part) for sequence in sequences
                   for part in _token_parts(sequence) if len(part)]
@@ -258,8 +289,8 @@ class _PoolBuilder:
     def __init__(self):
         self.page_rows = []
         self.lengths = []
-        self.src = []
-        self.dst = []
+        self.src_spans = []     # (first row, last row + 1) per scatter
+        self.dst = []           # the pool rows each span writes
         self.tail_src = []
         self.tail_dst = []
 
@@ -276,19 +307,19 @@ class _PoolBuilder:
         skip = first - logical_start
         if r0 + skip >= r1:
             return
-        self.src.append(np.arange(r0 + skip, r1, dtype=np.int64))
+        self.src_spans.append((r0 + skip, r1))
         offset = first - view.start
-        self.dst.append(view.rows[offset:offset + (r1 - r0 - skip)].numpy())
+        self.dst.append(view.rows[offset:offset + (r1 - r0 - skip)])
 
     def scatter_suffix(self, view, temp, s0, s1, f, remainder, page_tokens):
         """Map suffix rows to temporary pages and copy any retained partial page."""
         suffix_tokens = s1 - s0
-        self.src.append(np.arange(s0, s1, dtype=np.int64))
+        self.src_spans.append((s0, s1))
         self.dst.append(temp.rows[remainder:remainder + suffix_tokens].numpy())
         if remainder:
             anchor_page = view.pages[(f - view.start) // page_tokens]
-            base = anchor_page * page_tokens
-            self.tail_src.append(np.arange(base, base + remainder, dtype=np.int64))
+            base = int(anchor_page) * page_tokens
+            self.tail_src.append((base, base + remainder))
             self.tail_dst.append(temp.rows[:remainder].numpy())
 
     def build(self, arena, stage, torch, staging, index):
@@ -303,9 +334,11 @@ class _PoolBuilder:
             table = stage(f"block_table{tag}", block_table, torch.int32).view(
                 len(self.page_rows), width)
         return dict(
-            src=stage(f"unified_src{tag}", _concatenate(self.src), torch.int64),
-            dst=stage(f"unified_dst{tag}", _concatenate(self.dst), torch.int64),
-            tail_src=(stage(f"tail_src{tag}", _concatenate(self.tail_src),
+            src=stage(f"unified_src{tag}", _span_rows(self.src_spans),
+                      torch.int64),
+            dst=stage(f"unified_dst{tag}", _concatenate(self.dst),
+                      torch.int64),
+            tail_src=(stage(f"tail_src{tag}", _span_rows(self.tail_src),
                             torch.int64) if self.tail_src else None),
             tail_dst=(stage(f"tail_dst{tag}", _concatenate(self.tail_dst),
                             torch.int64) if self.tail_dst else None),
@@ -393,7 +426,32 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     unified_groups = []
     # call C: path rows reading their off-path ancestor rows
     node_q, node_k, node_cu_q, node_cu_k = [], [], [0], [0]
+    plain_rounds = (not tree_path and not canvas
+                    and not getattr(arena, "has_sliding", False))
     for g in groups:
+        sufs0 = g["suffixes"]
+        if (plain_rounds and g.get("prefix") is None
+                and isinstance(sufs0, Suffixes) and len(sufs0) == 1
+                and g.get("read_all_rows") and g.get("paths") is None
+                and g.get("canvas") is None and g.get("read_rows") is None
+                and g.get("read_mask") is None
+                and arena.is_resident(g["key"])):
+            # a decode round: one kept suffix over resident KV, every
+            # row read; the general bookkeeping below reduces to this
+            f = g["f"]
+            total = int(sufs0.lengths[0])
+            row0 = num_tokens
+            id_parts.append(sufs0.ids)
+            rows = np.arange(total, dtype=np.int64)
+            position.append(f + rows)
+            finals.append(row0 + rows)
+            cu_a.append(np.array([row0 + total], dtype=np.int64))
+            rows_per_answer.append(sufs0.lengths)
+            multi_row = True
+            num_tokens = row0 + total
+            layout.append((g["key"], 1))
+            unified_groups.append((g["key"], f, row0, total))
+            continue
         fresh = g.get("prefix") is not None
         f = g["f"]
         key = g["key"]
@@ -459,11 +517,19 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 f"{width}-row canvas")
         # every suffix's rows at once: positions restart at f for each
         # suffix, and a canvas continues its suffix's positions
-        widths = sufs.lengths + width
-        total = int(widths.sum())
-        ends = np.cumsum(widths)
-        begins = ends - widths
-        within = np.arange(total, dtype=np.int64) - np.repeat(begins, widths)
+        if n == 1 and not width:
+            # a decode round's one suffix needs no cumulative arithmetic
+            total = int(sufs.lengths[0])
+            within = np.arange(total, dtype=np.int64)
+            ends = sufs.lengths
+            begins = _ZERO_LENGTHS
+        else:
+            widths = sufs.lengths + width
+            total = int(widths.sum())
+            ends = np.cumsum(widths)
+            begins = ends - widths
+            within = (np.arange(total, dtype=np.int64)
+                      - np.repeat(begins, widths))
         if n and width:
             # row answer_row of each canvas carries the answer
             past = within - np.repeat(sufs.lengths, widths)
@@ -648,6 +714,23 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
         try:
             for spec in unified_groups:
+                if type(spec) is tuple:
+                    # a decode round packed by the fast path above:
+                    # contiguous rows scattered straight into its key's
+                    # capacity rows
+                    key, f, r0, count = spec
+                    rows_np = arena.capacity_rows(key).numpy()
+                    end = f + count
+                    if end > len(rows_np):
+                        raise ValueError(
+                            f"group {key!r} keeps suffix KV but its pages "
+                            f"hold {len(rows_np)} rows, not {end}")
+                    pool = pools[0]
+                    pool.src_spans.append((r0, r0 + count))
+                    pool.dst.append(rows_np[f:end])
+                    pool.add_sequence(arena.owned_pages(key), end)
+                    cu_q.append(cu_q[-1] + count)
+                    continue
                 key = spec["key"]
                 f = spec["f"]
                 r0, r1 = spec["row0"], spec["row1"]
@@ -656,21 +739,29 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 if spec["fresh"]:
                     fresh_keys.append(key)
                 count = r1 - r0
+                # numpy views of the cached row tables slice without
+                # a copy; 20,000 torch slices a pass do not
                 views = [_PoolView(
-                    arena.capacity_rows(key), arena.owned_pages(key), 0)]
+                    arena.capacity_rows(key).numpy(),
+                    arena.owned_pages(key), 0)]
                 if sliding:
                     views.append(_PoolView(
-                        arena.capacity_rows_sliding(key),
+                        arena.capacity_rows_sliding(key).numpy(),
                         arena.owned_sliding_pages(key),
                         arena.sliding_start(key)))
-                direct = len(begins) == 1 and all(
-                    logical_start + count - view.start <= view.rows.numel()
-                    for view in views)
+                if len(views) == 1:
+                    direct = (len(begins) == 1 and logical_start + count
+                              <= len(views[0].rows))
+                else:
+                    direct = len(begins) == 1 and all(
+                        logical_start + count - view.start
+                        <= len(view.rows)
+                        for view in views)
                 suffix_total = int((ends - begins).sum())
                 if spec["keeps"] and not direct:
                     raise ValueError(
                         f"group {key!r} keeps suffix KV but its pages hold "
-                        f"{views[0].rows.numel()} rows, not "
+                        f"{len(views[0].rows)} rows, not "
                         f"{logical_start + count}")
                 if direct:
                     for pool, view in zip(pools, views):
