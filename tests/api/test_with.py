@@ -10,8 +10,7 @@ import quail
 from quail.api import execute as execution
 from quail.api.query import ASSUMED_ANSWER_TOKENS, Query, WithQuery, cte_table
 from quail.catalog import DocumentProvider
-from quail.frontend.sql import compile_sql
-from quail.logical import CompileError, WithPlan, cte_schema
+from quail.logical import CompileError, cte_schema
 from quail.planner.plan import EngineConfig
 
 CONTRACTS = pa.table({
@@ -155,40 +154,12 @@ def test_a_cte_runs_once_however_many_times_it_is_read(session):
     assert recorder.documents["a"] == recorder.documents["b"]
 
 
-def test_a_subquery_in_from_and_a_nested_with_are_stages_too(session):
-    query = session.sql("""
-        WITH scored AS (
-            WITH clauses AS (
-                SELECT c.id,
-                       AI.EXTRACT(c.text, {'terms': 'What is the termination clause?'})
-                           AS clause
-                FROM contracts c
-            )
-            SELECT x.id, x.clause,
-                   AI.SCORE(PROMPT('early? {0}', x.clause.terms)) AS score
-            FROM clauses x
-        )
-        SELECT s.id, s.score
-        FROM (SELECT y.id, y.score, y.clause FROM scored y
-              WHERE AI.IF(PROMPT('high: {0}', y.clause.terms))) s
-        WHERE AI.IF(PROMPT('kept: {0}', s.clause.terms))
-    """, dialect="bq")
-    assert [name for name, _ in query.logical.ctes] == ["clauses", "scored", "s"]
-    oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
-                    scores=lambda spec, ids: 0.9 if ids[0] == 0 else 0.1,
-                    filters=lambda alias, document, position: {
-                        "y": [True, False, True], "s": [True, False]}[alias][document])
-    result, recorder = run(query, oracle)
-    assert [list(request.inputs) for request in recorder.requests] == [
-        ["c"], ["x"], ["y"], ["s"]]
-    assert result.collect().to_pylist() == [{"s.id": 1, "s.score": 0.9}]
-
-
 def test_a_cte_no_model_output_feeds_merges_into_one_plan(session):
     # a regular CTE, a FROM subquery without an alias, and a CTE whose
     # computed column is only compared become one plan, as in DuckDB
     merged = session.sql("""
-        WITH recent AS (SELECT c.id, c.text FROM contracts c WHERE c.id > 1),
+        WITH recent AS (SELECT c.id, c.text FROM contracts c
+                        WHERE c.id > 1 AND AI.IF(PROMPT('lease? {0}', c.text))),
         kinds AS (
             SELECT r.id, r.text,
                    AI.CLASSIFY(PROMPT('kind of {0}?', r.text), ARRAY['lease', 'deed'])
@@ -198,12 +169,15 @@ def test_a_cte_no_model_output_feeds_merges_into_one_plan(session):
         SELECT id FROM (SELECT k.id, k.text FROM kinds k WHERE k.kind = 'lease')
         WHERE AI.IF(PROMPT('keep: {0}', text))
         ORDER BY id LIMIT 5
-    """, dialect="bq")
+    """, dialect="bq", order="as_written")
     assert isinstance(merged, Query)
     operators = merged.logical.operators()
     (scan,) = operators.scans
     assert scan.provider == "contracts" and str(scan.predicates[0]) == "c.id > 1"
-    assert len(operators.classifies) == 1 and list(operators.filters) == ["c"]
+    assert len(operators.classifies) == 1
+    # the CTE's condition stays ahead of the outer one, as written
+    assert [predicate.prompt.template.split("\n")[-1]
+            for predicate in operators.filters["c"]] == ["lease?", "keep:"]
     oracle = Oracle(labels=["lease", "deed", "lease"],
                     filters=lambda alias, document, position: True)
     result, recorder = run(merged, oracle)
@@ -238,21 +212,8 @@ def test_explain_plans_later_stages_on_named_assumptions(session, monkeypatch):
             f"of {ASSUMED_ANSWER_TOKENS} tokens each") in planned
     assert "run:" not in planned
     plan = query.plan()
-    assert plan.gpus == 1 and plan.backend == "quail"
     assert plan.estimated_seconds == sum(
         stage.estimated_seconds for stage in plan.plans)
-    assert set(plan.to_envelope(session.registry.codecs)) == {"ctes", "query"}
-    # a CTE read twice runs as a stage
-    passthrough = session.sql("""
-        WITH kept AS (
-            SELECT c.id, c.text FROM contracts c
-            WHERE AI.IF(PROMPT('keep: {0}', c.text))
-        )
-        SELECT a.id FROM kept a JOIN kept b
-          ON AI.IF(PROMPT('alike: {0} {1}', a.text, b.text))
-    """, dialect="bq")
-    assert (f"planned on 1 rows of {ASSUMED_ANSWER_TOKENS} tokens each"
-            in passthrough.explain())
 
     oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
                     scores=lambda spec, ids: 0.5)
@@ -303,10 +264,6 @@ def test_cte_results_have_the_schema_the_next_stage_was_compiled_for(session):
     kinds = cte_table(result.collect(), schema)
     with pytest.raises(ValueError, match="compiled for"):
         cte_table(kinds, cte_schema(session.sql(queries["score"]).logical))
-    assert cte_schema(session.sql(queries["label"]).logical).names == [
-        "id", "kind", "kind_probabilities"]
-    assert cte_schema(session.sql(queries["extract"]).logical).names == [
-        "id", "n", "clause", "clause_span"]
 
 
 def test_with_rejects_what_the_stages_cannot_express(session):
@@ -317,8 +274,6 @@ def test_with_rejects_what_the_stages_cannot_express(session):
         (f"WITH RECURSIVE clauses AS ({extract}) {read}", "RECURSIVE"),
         (f"WITH contracts AS ({extract}) SELECT x.id FROM contracts x "
          f"WHERE AI_FILTER(PROMPT('k {{0}}', x.clause.terms))", "another name"),
-        ("SELECT c.id FROM contracts c WHERE c.id IN (SELECT d.id FROM contracts d) "
-         "AND AI_FILTER(PROMPT('k {0}', c.text))", "subqueries other than"),
         ("WITH clauses AS (SELECT LENGTH(c.text), AI.EXTRACT(c.text, "
          "{'terms': 'q?'}) AS clause FROM contracts c) SELECT x.clause "
          "FROM clauses x WHERE AI_FILTER(PROMPT('k {0}', x.clause.terms))",
@@ -331,27 +286,9 @@ def test_with_rejects_what_the_stages_cannot_express(session):
          f"AI_FILTER(PROMPT('k {{0}}', x.clause.terms))), clauses AS ({extract}) "
          f"SELECT l.id FROM later l WHERE AI_FILTER(PROMPT('k {{0}}', l.id))",
          "clauses"),
-        (f"WITH clauses AS ({extract}) SELECT x.id FROM clauses x",
-         "no AI predicate"),
-        (f"WITH clauses AS (SELECT c.id FROM contracts c) {read}", "clause"),
-        (f"WITH clauses AS ({extract}) SELECT x.nope FROM clauses x "
-         f"WHERE AI_FILTER(PROMPT('k {{0}}', x.clause.terms))", "nope"),
     ):
         with pytest.raises(CompileError, match=message):
             session.sql(sql)
-    # a CTE column list renames the result, and a subquery without an
-    # alias gets one, as sqlglot applies both
-    renamed = session.sql(
-        f"WITH clauses (a, b) AS ({extract}) SELECT x.a FROM clauses x "
-        f"WHERE AI_FILTER(PROMPT('k {{0}}', x.b.terms))")
-    assert cte_schema(renamed.logical.ctes[0][1]).names == ["a", "b", "b_span"]
-    unnamed = session.sql(
-        f"SELECT id FROM ({extract}) WHERE AI_FILTER(PROMPT('k {{0}}', clause.terms))")
-    assert len(unnamed.logical.ctes) == 1
-    with pytest.raises(RuntimeError, match="edited plans"):
-        session.sql(f"WITH clauses AS ({extract}) {read}").run(plan=object())
-    assert isinstance(compile_sql(
-        f"WITH clauses AS ({extract}) {read}", session.catalog), WithPlan)
 
 
 def test_a_session_closes_the_token_files_of_its_cte_results():

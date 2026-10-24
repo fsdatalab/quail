@@ -18,6 +18,7 @@ from quail.catalog import Catalog, MemoryTableProvider
 from quail.frontend.prompts import PromptBinder
 from quail.frontend.sql_binding.expressions import (
     ExpressionBinder,
+    _conjuncts,
 )
 from quail.frontend.sql_binding.predicates import column_path
 from quail.frontend.sql_binding.relations import (
@@ -321,12 +322,21 @@ def _compile_stages(tree: exp.Select, tables: Catalog, prompts, dialect,
     """
     scopes = _scopes(tree)
     staged = _staged(scopes)
+    # a merge appends a CTE's WHERE after its reader's; the CTE's runs first
+    for position, scope in enumerate(scopes):
+        for term in _conjuncts(scope.expression.args["where"].this) \
+                if scope.expression.args.get("where") else ():
+            term.meta["stage"] = position
     # the merged CTEs, which a detached stage may still read
     pool = [cte for cte in tree.find_all(exp.CTE)
             if not any(cte is scope.expression.parent for scope in staged)]
     for scope in staged:
         _compile_stage(scope, pool, tables, prompts, dialect, ctes)
     tree = merge_subqueries(eliminate_ctes(tree))
+    if tree.args.get("where"):
+        tree.set("where", exp.Where(this=exp.and_(*sorted(
+            _conjuncts(tree.args["where"].this),
+            key=lambda term: term.meta.get("stage", 0)), copy=False)))
     for scope in _scopes(tree):
         if not scope.is_root:
             _compile_stage(scope, (), tables, prompts, dialect, ctes)
