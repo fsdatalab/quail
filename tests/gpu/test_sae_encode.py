@@ -154,8 +154,11 @@ def test_the_accumulator_splits_document_and_question_rows():
     # call; the other document's stays until its own settle
     assert ("r", 0) not in accumulator.document_slot
     assert ("r", 1) in accumulator.document_slot
-    order, lengths, indices, _strengths = accumulator.harvest([handle])
-    assert order.tolist() == [0] and lengths.tolist() == [len(indices)]
+    # the slab is still filling, so a non-waiting harvest reads nothing
+    assert accumulator.harvest([handle], completed_only=True)[0].size == 0
+    taken, lengths, indices, _strengths = accumulator.harvest(
+        [handle], completed_only=False)
+    assert taken.tolist() == [0] and lengths.tolist() == [len(indices)]
     expected = _maxima(plain, stream[:8])
     kept = set(indices.tolist())
     reference = set(expected.nonzero().flatten().tolist())

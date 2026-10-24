@@ -91,7 +91,8 @@ class SaeFeaturesPart(SingleResultPart):
         self.priors = priors
         self.prior_tables = prior_tables
         self.values = [None] * len(self.ids)
-        self.handles = [None] * len(self.ids)
+        self.pending = {}        # anchor -> settled handle not yet read
+        self.harvested = []      # (anchors, lengths, indices, strengths)
         self.reached = 0
         torch = state.torch
         encoder = sae_encoder(state)
@@ -117,7 +118,7 @@ class SaeFeaturesPart(SingleResultPart):
             self.accumulator.register_call()
 
             def decide(anchor, row):
-                self.handles[anchor] = self.accumulator.settle(keys[anchor])
+                self.pending[anchor] = self.accumulator.settle(keys[anchor])
                 self.reached += 1
                 return True
         else:
@@ -138,9 +139,30 @@ class SaeFeaturesPart(SingleResultPart):
         return ()
 
     def finish(self, every) -> int:
-        """Return the suffix token count; results are read in result()."""
+        """Read the settled maxima that have landed; return the suffix tokens."""
+        self._harvest(completed_only=True)
         head, tail = self.node.spec.prompt_token_parts
         return self.reached * len(tail)
+
+    def _harvest(self, *, completed_only: bool) -> None:
+        """Unpack pending handles slab by slab, never waiting mid-run.
+
+        finish() runs between chunks, so it reads only slabs whose
+        copies have landed and the GPU keeps working underneath;
+        result() reads the rest once the pipeline is done.
+        """
+        if self.accumulator is None or not self.pending:
+            return
+        anchors = np.fromiter(self.pending, np.int64, len(self.pending))
+        taken, lengths, indices, strengths = self.accumulator.harvest(
+            [self.pending[anchor] for anchor in anchors],
+            completed_only=completed_only)
+        if not taken.size:
+            return
+        read = anchors[taken]
+        self.harvested.append((read, lengths, indices, strengths))
+        for anchor in read.tolist():
+            del self.pending[anchor]
 
     def complete(self, tokens, spans, stats, offset):
         # the part that set the observer releases it once the run ends
@@ -152,11 +174,12 @@ class SaeFeaturesPart(SingleResultPart):
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         spec = self.node.spec
         if self.accumulator is not None:
-            answered = [index for index, handle in enumerate(self.handles)
-                        if handle is not None]
-            order, lengths, indices, strengths = self.accumulator.harvest(
-                [self.handles[index] for index in answered])
-            answered = [answered[position] for position in order]
+            self._harvest(completed_only=False)
+            batches = self.harvested or [(np.empty(0, np.int64),) * 2 + (
+                np.empty(0, np.int32), np.empty(0, np.float32))]
+            answered, lengths, indices, strengths = (
+                np.concatenate(column) for column in zip(*batches))
+            answered = answered.tolist()
         else:
             answered = [index for index, value in enumerate(self.values)
                         if value is not None]

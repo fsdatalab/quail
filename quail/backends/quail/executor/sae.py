@@ -305,6 +305,7 @@ class _PinnedSlabs:
         self.width = width
         self.rows_per_slab = rows_per_slab
         self.slabs = []
+        self.last_event = []    # per slab, the event of its latest copy
         self._next = rows_per_slab
 
     def take(self) -> tuple:
@@ -313,9 +314,19 @@ class _PinnedSlabs:
             self.slabs.append(self.torch.empty(
                 (self.rows_per_slab, self.width), dtype=self.torch.float32,
                 pin_memory=True))
+            self.last_event.append(None)
             self._next = 0
         self._next += 1
         return len(self.slabs) - 1, self._next - 1
+
+    def complete(self, slab: int) -> bool:
+        """Whether the slab is full and its latest copy has landed.
+
+        Copies queue on one stream, so the latest event's completion
+        covers every row of the slab.
+        """
+        full = slab < len(self.slabs) - 1 or self._next == self.rows_per_slab
+        return full and self.last_event[slab].query()
 
 
 class _Staging:
@@ -504,6 +515,7 @@ class SaeMaxAccumulator:
             host.copy_(matrix[source], non_blocking=True)
         event = torch.cuda.Event()
         event.record()
+        self._pinned.last_event[slab] = event
         if tail is not None:
             self._slots.release(tail)
         self.settled[key] = self.settled.get(key, 0) + 1
@@ -511,40 +523,47 @@ class SaeMaxAccumulator:
             self._slots.release(self.document_slot.pop(key))
         return event, slab, row
 
-    def harvest(self, handles) -> tuple:
-        """Return (order, lengths, indices, strengths) of settled handles.
+    def harvest(self, handles, *, completed_only: bool) -> tuple:
+        """Return (taken, lengths, indices, strengths) of settled handles.
 
         Each slab's rows unpack in one pass over a view of the slab, so
-        the results come out slab by slab: ``order`` lists the handle
+        the results come out slab by slab: ``taken`` lists the handle
         positions in that sequence, and ``lengths`` gives each one's
-        feature count in the same sequence. Call it once the pipeline
-        is done; a handle whose copy is still in flight is waited on.
+        feature count in the same sequence. With ``completed_only``,
+        only slabs that are full and whose copies have landed are read,
+        so the call never waits and can run while chunks are in
+        flight; without it, every handle is read, waiting on each
+        slab's latest copy.
         """
         count = len(handles)
         slabs = np.fromiter((handle[1] for handle in handles), np.int64, count)
         rows = np.fromiter((handle[2] for handle in handles), np.int64, count)
-        for event, _slab, _row in handles:
-            event.synchronize()
         order = np.lexsort((rows, slabs))
         slabs, rows = slabs[order], rows[order]
-        lengths = np.zeros(count, dtype=np.int64)
-        indices, strengths = [], []
+        taken, lengths, indices, strengths = [], [], [], []
         starts = np.flatnonzero(np.diff(slabs, prepend=-1))
         for start, stop in zip(starts, (*starts[1:], count)):
-            block = self._pinned.slabs[slabs[start]].numpy()
+            slab = slabs[start]
+            if completed_only:
+                if not self._pinned.complete(slab):
+                    continue
+            else:
+                self._pinned.last_event[slab].synchronize()
+            block = self._pinned.slabs[slab].numpy()
             group = rows[start:stop]
             if group[-1] - group[0] == stop - start - 1:
                 view = block[group[0]:group[-1] + 1]
             else:
                 view = block[group]
             row_ids, columns = np.nonzero(view > 0.0)
-            lengths[start:stop] = np.bincount(row_ids, minlength=stop - start)
+            taken.append(order[start:stop])
+            lengths.append(np.bincount(row_ids, minlength=stop - start))
             indices.append(columns.astype(np.int32))
             strengths.append(view[row_ids, columns])
-        return (order, lengths,
-                np.concatenate(indices) if indices else np.empty(0, np.int32),
-                np.concatenate(strengths) if strengths
-                else np.empty(0, np.float32))
+        return tuple(
+            np.concatenate(parts) if parts else np.empty(0, dtype)
+            for parts, dtype in ((taken, np.int64), (lengths, np.int64),
+                                 (indices, np.int32), (strengths, np.float32)))
 
 
 def sae_encoder(state) -> SaeEncoder:
