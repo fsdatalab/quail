@@ -188,22 +188,43 @@ def quail() -> dict:
         BUDGET, anchor_keys=[("sae", index) for index in range(len(prompts))],
         attention_mode="unified", default_attention="unified")
     keep = encoder.keep
+    plain = SaeEncoder(torch, functional, encoder.weight, encoder.bias,
+                       keep, kernels="vllm")
+
+    def feature_set(index_tensor, value_tensor):
+        return {int(feature) for feature, value in
+                zip(index_tensor.flatten().tolist(),
+                    value_tensor.flatten().tolist()) if value > 0}
+
     errors, overlaps, matches = [], [], 0
+    fused_against_torch, torch_against_reference = [], []
     for index in range(len(prompts)):
         row = np.asarray(stage_answers[0][index])[0]
         strengths = row[keep:2 * keep]
-        kept = sorted(int(feature) for feature, value in
-                      zip(row[:keep].astype(np.int64), strengths)
-                      if value > 0)
+        kept = {int(feature) for feature, value in
+                zip(row[:keep].astype(np.int64), strengths) if value > 0}
         residual = row[2 * keep:2 * keep + hidden]
         expected = np.asarray(reference_record["hidden"][index],
                               dtype=np.float32)
         errors.append(float(np.linalg.norm(residual - expected)
                             / max(np.linalg.norm(expected), 1e-6)))
         reference_set = set(reference_record["features"][index])
-        overlap = len(reference_set & set(kept)) / max(len(reference_set), 1)
-        overlaps.append(overlap)
-        matches += int(set(kept) == reference_set)
+        overlaps.append(len(reference_set & kept)
+                        / max(len(reference_set), 1))
+        matches += int(kept == reference_set)
+        # decompose: the torch path over the same residual isolates the
+        # fused kernels; the torch path over the reference hidden
+        # isolates the forward-pass difference
+        own = torch.tensor(residual, device="cuda").reshape(1, hidden)
+        torch_set = feature_set(*plain.top_features(own))
+        fused_against_torch.append(
+            len(kept & torch_set) / max(len(torch_set), 1))
+        reference_hidden = torch.tensor(expected, device="cuda").reshape(
+            1, hidden)
+        reference_torch = feature_set(*plain.top_features(reference_hidden))
+        torch_against_reference.append(
+            len(reference_torch & reference_set)
+            / max(len(reference_set), 1))
     record = {
         "model": MODEL, "prompts": len(prompts),
         "model_memory_bytes": model_memory_bytes,
@@ -211,6 +232,9 @@ def quail() -> dict:
         "hidden_relative_error_max": float(np.max(errors)),
         "top_feature_set_match_share": matches / len(prompts),
         "mean_feature_overlap": float(np.mean(overlaps)),
+        "fused_vs_torch_overlap": float(np.mean(fused_against_torch)),
+        "quail_encoder_on_reference_hidden_overlap": float(
+            np.mean(torch_against_reference)),
     }
     with open(f"/results/ablations/{MODEL}-agreement-quail.json", "w") as out:
         json.dump(record, out)
