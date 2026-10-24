@@ -1,4 +1,12 @@
-"""Capture short tree-attention forwards in persistent CUDA buffers."""
+"""Capture tree-attention forwards in persistent CUDA buffers.
+
+A chunk that fits a captured graph is copied into the graph's input
+buffers, padded to the graph's rows, and replayed: the forward then
+costs no kernel launches on the host. Every bucket's graph reads the
+same buffers and writes the same output rows, and the graphs share
+one memory pool, so the captures cost one set of inputs and one
+forward's temporaries however many buckets there are.
+"""
 
 import time
 from dataclasses import dataclass
@@ -7,13 +15,26 @@ from quail.backends.quail.executor.chunk import Chunk
 from quail.progress import logger
 
 
+def _default_buckets() -> tuple:
+    """Row buckets: finer where chunks are small, so little is padded."""
+    return (tuple(range(64, 1025, 64)) + tuple(range(1152, 2049, 128))
+            + tuple(range(2304, 4097, 256)))
+
+
 @dataclass(frozen=True)
 class DecodeGraphConfig:
-    """Capture shapes owned by one worker's decode graphs."""
+    """Capture shapes owned by one worker's decode graphs.
 
-    row_buckets: tuple[int, ...] = (32, 64, 128, 256, 512, 1024, 2048)
+    Attributes:
+        row_buckets: The rows each captured graph holds, increasing; a
+            chunk replays the smallest bucket that holds its rows.
+        max_context_tokens: The most resident tokens a sequence reads.
+        max_query_tokens: The longest query a captured chunk may hold.
+    """
+
+    row_buckets: tuple[int, ...] = _default_buckets()
     max_context_tokens: int = 65536
-    max_query_tokens: int = 32
+    max_query_tokens: int = 4096
 
     def __post_init__(self):
         if (not isinstance(self.row_buckets, tuple) or not self.row_buckets
@@ -27,6 +48,13 @@ class DecodeGraphConfig:
                 or self.max_query_tokens < 1):
             raise ValueError(
                 "capture context and query limits must be positive integers")
+
+    def bucket(self, tokens: int) -> int | None:
+        """Return the smallest bucket holding this many rows, or None."""
+        for rows in self.row_buckets:
+            if rows >= tokens:
+                return rows
+        return None
 
 
 def configured_graphs() -> DecodeGraphConfig:
@@ -49,16 +77,19 @@ def configured_graphs() -> DecodeGraphConfig:
 
 
 class DecodeBuffers:
-    """Fixed GPU inputs for a bounded tree-attention batch.
+    """Fixed GPU inputs for tree-attention batches of up to rows rows.
 
-    Padding has no KV writes and no resident context. Every padded
-    query forms a separate sequence so it cannot affect real rows.
+    A graph captured over the first n rows reads views of these
+    buffers, so one set serves every bucket. Padding has no KV writes
+    and no resident context. Every padded query forms a separate
+    sequence so it cannot affect real rows.
     """
 
     def __init__(self, torch, rows, page_tokens, *,
                  config: DecodeGraphConfig | None = None, device="cuda"):
         config = DecodeGraphConfig() if config is None else config
         self.rows = rows
+        self.config = config
         self.indices = torch.arange(rows + 1, dtype=torch.int32, device=device)
 
         def zeros(shape, dtype=torch.int64):
@@ -75,16 +106,21 @@ class DecodeBuffers:
         self.table = zeros((rows, (config.max_context_tokens + page_tokens - 1)
                             // page_tokens), torch.int32)
         self.source = zeros(rows, torch.int32)
-        self.chunk = Chunk(
-            input_ids=self.ids, positions=self.positions,
-            final_indices=self.indices[:-1].to(torch.int64),
+        self.chunk = self.view(rows)
+
+    def view(self, rows) -> Chunk:
+        """A chunk over the first rows rows of the buffers."""
+        config = self.config
+        return Chunk(
+            input_ids=self.ids[:rows], positions=self.positions[:rows],
+            final_indices=self.indices[:rows].to(self.ids.dtype),
             meta=dict(layer=0, canvas=None, unified=None,
-                      kv_src=self.src, kv_dst=self.dst,
-                      cu_a=self.cu_a, max_a=config.max_query_tokens,
-                      reads=dict(rows=self.read_rows, cu_q=self.cu_q,
-                                 max_q=config.max_query_tokens, used=self.used,
-                                 max_used=config.max_context_tokens, table=self.table,
-                                 source=self.source)),
+                      kv_src=self.src[:rows], kv_dst=self.dst[:rows],
+                      cu_a=self.cu_a[:rows + 1], max_a=config.max_query_tokens,
+                      reads=dict(rows=self.read_rows[:rows], cu_q=self.cu_q[:rows + 1],
+                                 max_q=config.max_query_tokens, used=self.used[:rows],
+                                 max_used=config.max_context_tokens,
+                                 table=self.table[:rows], source=self.source[:rows])),
             attention_mode="tree", tokens=rows, layout=[])
 
     def synthetic(self, page):
@@ -97,53 +133,46 @@ class DecodeBuffers:
         self.table.fill_(page)
         self.source.copy_(self.indices[:-1])
 
-    def _bounds(self, target, source, count):
+    def _bounds(self, target, source, count, rows):
         sequences = source.numel() - 1
-        padding = self.rows - count
-        target.fill_(self.rows)
+        padding = rows - count
+        target = target[:rows + 1]
+        target.fill_(rows)
         target[:sequences + 1].copy_(source)
         target[sequences:sequences + padding + 1].copy_(
             self.indices[:padding + 1] + count)
 
-    def copy(self, chunk):
-        """Copy real inputs and clear the unused rows of a captured batch."""
+    def copy(self, chunk, rows=None):
+        """Copy real inputs into the first rows rows, clearing the unused ones."""
+        rows = self.rows if rows is None else rows
         n = chunk.tokens
         reads = chunk.meta["reads"]
         m = reads["rows"].numel()
         sequences = reads["used"].numel()
-        self.ids.zero_()
+        self.ids[:rows].zero_()
         self.ids[:n].copy_(chunk.input_ids)
-        self.positions.zero_()
+        self.positions[:rows].zero_()
         self.positions[:n].copy_(chunk.positions)
-        self._bounds(self.cu_a, chunk.meta["cu_a"], n)
-        self._bounds(self.cu_q, reads["cu_q"], m)
-        self.read_rows.zero_()
+        self._bounds(self.cu_a, chunk.meta["cu_a"], n, rows)
+        self._bounds(self.cu_q, reads["cu_q"], m, rows)
+        self.read_rows[:rows].zero_()
         self.read_rows[:m].copy_(reads["rows"])
-        self.used.zero_()
+        self.used[:rows].zero_()
         self.used[:sequences].copy_(reads["used"])
         # Entries beyond used/page_tokens are never read by FlashAttention.
         self.table[:sequences, :reads["table"].shape[1]].copy_(reads["table"])
-        self.source.fill_(-1)
+        self.source[:rows].fill_(-1)
         self.source[:n].copy_(reads["source"])
-        self.src.zero_()
-        self.dst.fill_(-1)
+        self.src[:rows].zero_()
+        self.dst[:rows].fill_(-1)
         if chunk.meta["kv_src"] is not None:
             writes = chunk.meta["kv_src"].numel()
             self.src[:writes].copy_(chunk.meta["kv_src"])
             self.dst[:writes].copy_(chunk.meta["kv_dst"])
 
 
-@dataclass
-class CapturedDecode:
-    """A graph and its persistent inputs and output."""
-
-    buffers: DecodeBuffers
-    graph: object
-    output: object
-
-
 class DecodeGraphs:
-    """Warm and replay bounded decode graphs for one pipeline and KV arena.
+    """Capture and replay bounded tree-attention graphs for one pipeline and KV arena.
 
     Calls use the worker's current stream. Output rows are copied before
     returning so a subsequent replay can reuse the graph's output storage.
@@ -153,7 +182,11 @@ class DecodeGraphs:
         self._config = configured_graphs() if config is None else config
         self.pipeline = pipeline
         self.enabled = True
-        self.graphs = []
+        self.graphs = {}        # bucket rows -> its captured graph
+        self.views = {}         # bucket rows -> the chunk its graph reads
+        self.buffers = None
+        self.output = None      # every graph writes its rows here
+        self.pool = None
         self.storage = None
         self.replays = 0
         self.capture_s = 0.0
@@ -166,10 +199,14 @@ class DecodeGraphs:
     def invalidate(self):
         """Release graphs before replacing their KV allocation."""
         self.graphs.clear()
+        self.views.clear()
+        self.buffers = None
+        self.output = None
+        self.pool = None
         self.storage = None
 
     def prepare(self):
-        """Capture supported shapes using scratch KV, once per allocation."""
+        """Capture every bucket using scratch KV, once per allocation."""
         engine = self.pipeline.engine
         arena, torch = engine.arena, engine.torch
         if (not self.enabled or not self.pipeline.tree_attention
@@ -193,17 +230,27 @@ class DecodeGraphs:
                 v[start:start + arena.page_tokens].zero_()
             stream.wait_stream(current)
             with torch.cuda.stream(stream), torch.inference_mode():
-                for rows in self.config.row_buckets:
-                    buffers = DecodeBuffers(torch, rows, arena.page_tokens,
-                                            config=self.config)
-                    buffers.synthetic(page)
-                    for _ in range(3):
-                        self.pipeline.forward_chunk(buffers.chunk)
+                self.buffers = DecodeBuffers(torch, self.config.row_buckets[-1],
+                                             arena.page_tokens, config=self.config)
+                self.buffers.synthetic(page)
+                self.pool = torch.cuda.graph_pool_handle()
+                for index, rows in enumerate(self.config.row_buckets):
+                    # the graph reads the view's tensors by address, so
+                    # the view lives as long as the graph
+                    chunk = self.views[rows] = self.buffers.view(rows)
+                    # the first capture warms every kernel; the rest
+                    # need one pass at their own shape
+                    for _ in range(3 if index == 0 else 1):
+                        out = self.pipeline.forward_chunk(chunk)
+                    if self.output is None:
+                        self.output = torch.empty(
+                            (self.buffers.rows, *out.shape[1:]), dtype=out.dtype,
+                            device=out.device)
                     stream.synchronize()
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, stream=stream):
-                        output = self.pipeline.forward_chunk(buffers.chunk)
-                    self.graphs.append(CapturedDecode(buffers, graph, output))
+                    with torch.cuda.graph(graph, pool=self.pool, stream=stream):
+                        self.output[:rows].copy_(self.pipeline.forward_chunk(chunk))
+                    self.graphs[rows] = graph
             current.wait_stream(stream)
             stream.synchronize()
         except Exception:
@@ -239,10 +286,11 @@ class DecodeGraphs:
     def forward(self, chunk):
         """Replay a matching graph, falling back to the ordinary forward."""
         if self.supports(chunk):
-            for captured in self.graphs:
-                if captured.buffers.rows >= chunk.tokens:
-                    captured.buffers.copy(chunk)
-                    captured.graph.replay()
-                    self.replays += 1
-                    return captured.output.index_select(0, chunk.final_indices)
+            rows = self.config.bucket(chunk.tokens)
+            graph = self.graphs.get(rows)
+            if graph is not None:
+                self.buffers.copy(chunk, rows)
+                graph.replay()
+                self.replays += 1
+                return self.output.index_select(0, chunk.final_indices)
         return self.pipeline.forward_chunk(chunk)

@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.backends.quail.executor.cuda_graphs import DecodeBuffers, DecodeGraphs
+from quail.backends.quail.executor.cuda_graphs import (
+    DecodeBuffers,
+    DecodeGraphConfig,
+    DecodeGraphs,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -77,7 +81,7 @@ def test_unsupported_batches_fall_back(unsupported):
         case "unified":
             source.attention_mode = "unified"
         case "many_tokens":
-            source.tokens = 513
+            source.tokens = 4097
         case "new_arena":
             arena.k = []
     assert graphs.forward(source) == "eager"
@@ -87,12 +91,14 @@ def test_unsupported_batches_fall_back(unsupported):
 def test_replay_returns_independent_output_storage():
     source = chunk()
     arena = SimpleNamespace(k=[], page_tokens=16)
-    graphs = DecodeGraphs(SimpleNamespace(engine=SimpleNamespace(arena=arena)))
+    config = DecodeGraphConfig(row_buckets=(8,))
+    graphs = DecodeGraphs(SimpleNamespace(engine=SimpleNamespace(arena=arena)),
+                          config=config)
     graphs.storage = arena.k
+    graphs.buffers = DecodeBuffers(torch, 8, 16, config=config, device="cpu")
     output = torch.arange(8 * 3).reshape(8, 3)
-    graphs.graphs = [SimpleNamespace(
-        buffers=DecodeBuffers(torch, 8, 16, device="cpu"),
-        graph=SimpleNamespace(replay=lambda: None), output=output)]
+    graphs.output = output
+    graphs.graphs = {8: SimpleNamespace(replay=lambda: None)}
     actual = graphs.forward(source)
     expected = output[[2, 4]].clone()
     output.zero_()
