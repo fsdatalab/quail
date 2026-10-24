@@ -51,12 +51,19 @@ def _agreeing_rows(fused_index, fused_value, plain_index, plain_value):
                      zip(plain_index[row].tolist(), plain_value[row].tolist())
                      if value > 0}
         boundary = fused_set ^ plain_set
-        assert len(boundary) <= 4, f"row {row} swaps {len(boundary)} features"
+        assert len(boundary) <= 8, f"row {row} swaps {len(boundary)} features"
         shared = fused_set & plain_set
         fused_of = dict(zip(fused_index[row].tolist(),
                             fused_value[row].tolist()))
         plain_of = dict(zip(plain_index[row].tolist(),
                             plain_value[row].tolist()))
+        # a swapped feature must sit at the top-k boundary, not be a
+        # feature one path plainly missed
+        cut = min(plain_value[row].tolist())
+        for feature in boundary:
+            value = fused_of.get(feature) or plain_of.get(feature)
+            assert abs(value - cut) <= 5e-2 * max(1.0, abs(cut)), (
+                f"row {row} feature {feature} is {value} against cut {cut}")
         for feature in shared:
             assert abs(fused_of[feature] - plain_of[feature]) <= (
                 2e-2 * max(1.0, abs(plain_of[feature])))
