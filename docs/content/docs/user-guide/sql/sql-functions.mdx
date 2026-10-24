@@ -108,6 +108,9 @@ A later query reads a CTE column by its name:
 When an extraction finds no answer, the next AI function reads empty
 text.
 
+A subquery in `FROM` works the same way as a CTE. Give it an alias,
+and read its columns through that alias.
+
 Quail runs each CTE once, before the queries that read it.
 `explain()` shows the plan of each CTE and of the final query, and
 does not run them.
@@ -115,7 +118,7 @@ does not run them.
 Limits:
 
 - Each CTE and the final query must use an AI function.
-- A CTE can read registered tables and the CTEs written before it.
+- A CTE can read registered tables and the CTEs defined before it.
 - `WITH RECURSIVE` is not supported. Column lists such as
   `WITH clauses (a, b) AS` are not supported.
 

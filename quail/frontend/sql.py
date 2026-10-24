@@ -5,6 +5,7 @@ from enum import StrEnum
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import Scope, ScopeType, traverse_scope
 
 from quail.catalog import Catalog, MemoryTableProvider
 from quail.frontend.prompts import PromptBinder
@@ -112,12 +113,13 @@ def _reject_forbidden(tree) -> None:
                 f"{name} is not supported; supported AI functions are "
                 "AI_FILTER, AI_SCORE, AI_CLASSIFY, and AI_EXTRACT"
             )
-    # subqueries are legal only as the EXISTS form, checked
-    # structurally; any other subquery is refused here
+    # a subquery is legal in FROM, where it runs as its own stage, and
+    # as the EXISTS form, checked structurally; any other is refused
     for sub in tree.find_all(exp.Subquery):
-        raise CompileError(
-            "subqueries other than [NOT] EXISTS (SELECT 1 ...) are not supported"
-        )
+        if not isinstance(sub.parent, (exp.From, exp.Join)):
+            raise CompileError(
+                "subqueries other than in FROM and [NOT] EXISTS (SELECT 1 ...) "
+                "are not supported")
 
 
 def _validate_query(
@@ -235,7 +237,8 @@ def compile_sql(
 
     Args:
         sql: A SELECT statement in the chosen dialect, with optional
-            common table expressions (CTEs) in a WITH clause.
+            common table expressions (CTEs) in WITH clauses and
+            subqueries in FROM.
         catalog: Registered tables and their schemas.
         dialect: SQL dialect used to parse the statement.
         turn: Model chat text placed before and after each prompt.
@@ -243,12 +246,12 @@ def compile_sql(
         prompts: Model-aware prompt binder. Overrides turn and layout.
         cte_schema: Returns the Arrow schema of a CTE's result from its
             LogicalPlan and the catalog it reads, so the queries reading
-            the CTE are compiled against its columns. Required for a
-            WITH query.
+            the CTE are compiled against its columns. Required when the
+            statement has a CTE or a subquery in FROM.
 
     Returns:
         The bound logical query plan: a WithPlan when the statement has
-        a WITH clause, a LogicalPlan otherwise.
+        a CTE or a subquery in FROM, a LogicalPlan otherwise.
 
     Raises:
         CompileError: The query is invalid or uses unsupported SQL.
@@ -268,58 +271,78 @@ def compile_sql(
     if not isinstance(tree, exp.Select):
         raise CompileError("the query must be a single SELECT")
     _reject_forbidden(tree)
+    for with_ in tree.find_all(exp.With):
+        if with_.recursive:
+            raise CompileError(
+                "WITH RECURSIVE is not supported; a CTE reads registered "
+                "tables and the CTEs before it")
     prompts = prompts or PromptBinder(turn=turn, layout=layout)
-    with_ = tree.args.get("with_")
-    if with_ is None:
+    # sqlglot lists each CTE and FROM subquery before the query reading
+    # it, and the statement last; an EXISTS body compiles with its query
+    scopes = [scope for scope in traverse_scope(tree)
+              if scope.scope_type is not ScopeType.SUBQUERY]
+    if len(scopes) == 1:
         return _compile_select(tree, catalog, prompts, dialect)
-    return _compile_with(tree, with_, catalog, prompts, dialect, cte_schema)
-
-
-def _compile_with(tree, with_, catalog: Catalog, prompts, dialect,
-                  cte_schema) -> WithPlan:
-    """Compile each CTE against the tables and CTEs before it, then the SELECT."""
-    if with_.recursive:
-        raise CompileError(
-            "WITH RECURSIVE is not supported; a CTE reads registered tables "
-            "and the CTEs before it")
     if cte_schema is None:
         raise CompileError(
-            "a WITH query needs the schema of each CTE's result; compile it "
-            "through Session.sql()")
-    tree.set("with_", None)
+            "a WITH query or a subquery in FROM needs the schema of each "
+            "stage's result; compile it through Session.sql()")
     tables = Catalog(dict(catalog.providers))
     ctes = []
-    for cte in with_.expressions:
-        name = cte.alias
-        if cte.args["alias"].columns:
-            raise CompileError(
-                f"WITH {name} (...) column names are not supported; name "
-                f"the columns with AS inside the CTE")
-        body = cte.this
-        if not isinstance(body, exp.Select):
-            raise CompileError(f"the CTE {name!r} must be a SELECT")
-        if body.args.get("with_") is not None:
-            raise CompileError(
-                f"the CTE {name!r} has its own WITH; list every CTE in the "
-                f"outer WITH, each reading the ones before it")
+    for scope in scopes:
+        reads = tuple(dict.fromkeys(
+            _stage_name(source) for _, source in scope.selected_sources.values()
+            if isinstance(source, Scope)))
+        plan = _compile_select(_stage_select(scope), tables, prompts, dialect)
+        if scope.is_root:
+            return WithPlan(tuple(ctes), plan, reads)
+        name = _stage_name(scope)
         if name in catalog:
             raise CompileError(
                 f"the CTE {name!r} is also a registered table; pick another name")
         if name in tables:
             raise CompileError(f"the CTE {name!r} is defined twice")
-        plan = _compile_select(body, tables, prompts, dialect)
-        ctes.append(Cte(name, plan, _cte_reads(plan, tables, catalog)))
+        ctes.append(Cte(name, plan, reads))
         tables.register(name, MemoryTableProvider(
-            cte_schema(plan, tables).empty_table(), id_col="", identity=f"cte:{name}"))
-    query = _compile_select(tree, tables, prompts, dialect)
-    return WithPlan(tuple(ctes), query, _cte_reads(query, tables, catalog))
+            cte_schema(plan, tables).empty_table(), id_col="",
+            identity=f"cte:{name}"))
+    raise AssertionError("traverse_scope lists the statement's scope last")
 
 
-def _cte_reads(plan: LogicalPlan, tables: Catalog, catalog: Catalog) -> tuple:
-    """Return the CTE names the plan scans: its providers not in the catalog."""
-    return tuple(dict.fromkeys(
-        scan.provider for scan in plan.operators().scans
-        if scan.provider in tables and scan.provider not in catalog))
+def _stage_name(scope: Scope) -> str:
+    """Return the name a CTE's or a FROM subquery's result is read under.
+
+    Raises:
+        CompileError: The subquery has no alias, or the CTE lists
+            column names.
+    """
+    owner = scope.expression.parent
+    name = owner.alias
+    if not name:
+        raise CompileError(
+            f"a subquery in FROM needs an alias: ({scope.expression.sql()}) AS name")
+    if owner.args["alias"].columns:
+        raise CompileError(
+            f"WITH {name} (...) column names are not supported; name "
+            f"the columns with AS inside the CTE")
+    return name
+
+
+def _stage_select(scope: Scope) -> exp.Select:
+    """Return a scope's SELECT with its CTEs and FROM subqueries as tables.
+
+    The CTEs compile as their own stages, so the WITH clause comes off.
+    Each FROM subquery is replaced by a reference to the table its
+    stage returns, named by the subquery's alias.
+    """
+    select = scope.expression
+    if not isinstance(select, exp.Select):
+        raise CompileError(f"{select.sql()} must be a SELECT")
+    select.set("with_", None)
+    for subquery in list(select.find_all(exp.Subquery)):
+        if isinstance(subquery.parent, (exp.From, exp.Join)):
+            subquery.replace(exp.table_(subquery.alias, alias=subquery.alias))
+    return select
 
 
 def _compile_select(tree: exp.Select, catalog: Catalog, prompts: PromptBinder,

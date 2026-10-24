@@ -158,6 +158,37 @@ def test_a_cte_runs_once_however_many_times_it_is_read(session):
     assert recorder.documents["a"] == recorder.documents["b"]
 
 
+def test_a_subquery_in_from_and_a_nested_with_are_stages_too(session):
+    query = session.sql("""
+        WITH scored AS (
+            WITH clauses AS (
+                SELECT c.id,
+                       AI.EXTRACT(c.text, {'terms': 'What is the termination clause?'})
+                           AS clause
+                FROM contracts c
+            )
+            SELECT x.id, x.clause,
+                   AI.SCORE(PROMPT('early? {0}', x.clause.terms)) AS score
+            FROM clauses x
+        )
+        SELECT s.id, s.score
+        FROM (SELECT y.id, y.score, y.clause FROM scored y
+              WHERE AI.IF(PROMPT('high: {0}', y.clause.terms))) s
+        WHERE AI.IF(PROMPT('kept: {0}', s.clause.terms))
+    """, dialect="bq")
+    assert [cte.name for cte in query.logical.ctes] == ["clauses", "scored", "s"]
+    assert [cte.reads for cte in query.logical.ctes] == [(), ("clauses",), ("scored",)]
+    assert query.logical.reads == ("s",)
+    oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
+                    scores=lambda spec, ids: 0.9 if ids[0] == 0 else 0.1,
+                    filters=lambda alias, document, position: {
+                        "y": [True, False, True], "s": [True, False]}[alias][document])
+    result, recorder = run(query, oracle)
+    assert [list(request.inputs) for request in recorder.requests] == [
+        ["c"], ["x"], ["y"], ["s"]]
+    assert result.collect().to_pylist() == [{"s.id": 1, "s.score": 0.9}]
+
+
 def test_an_empty_cte_result_gives_an_empty_result(session):
     query = session.sql("""
         WITH kept AS (
@@ -262,8 +293,10 @@ def test_with_rejects_what_the_stages_cannot_express(session):
         (f"WITH clauses AS ({extract}), clauses AS ({extract}) {read}",
          "defined twice"),
         (f"WITH contracts AS ({extract}) {read}", "registered table"),
-        (f"WITH clauses AS (WITH nested AS ({extract}) SELECT * FROM nested) {read}",
-         "its own WITH"),
+        (f"SELECT x.id FROM ({extract}) WHERE "
+         f"AI_FILTER(PROMPT('k {{0}}', x.clause.terms))", "needs an alias"),
+        ("SELECT c.id FROM contracts c WHERE c.id IN (SELECT d.id FROM contracts d) "
+         "AND AI_FILTER(PROMPT('k {0}', c.text))", "subqueries other than"),
         (f"WITH clauses AS (SELECT LENGTH(c.text), AI.EXTRACT(c.text, "
          f"{{'terms': 'q?'}}) AS clause FROM contracts c) {read}", "AS name"),
         (f"WITH clauses AS (SELECT c.id, d.id FROM contracts c JOIN contracts d "

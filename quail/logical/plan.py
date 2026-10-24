@@ -358,6 +358,8 @@ def cte_column_names(plan: LogicalPlan) -> tuple[str, ...]:
 class Cte:
     """A common table expression: a named query result defined with WITH.
 
+    A subquery in FROM is a Cte too, named by its alias.
+
     Attributes:
         name: The name later queries read the result under.
         plan: The query that computes the result.
@@ -374,7 +376,7 @@ class WithPlan:
     """A query with CTEs; each CTE runs before the queries that read it.
 
     Attributes:
-        ctes: The CTEs in written order. Each reads registered tables
+        ctes: The CTEs in dependency order. Each reads registered tables
             and earlier CTEs only.
         query: The final SELECT.
         reads: The names of the CTEs the final SELECT's scans read.
