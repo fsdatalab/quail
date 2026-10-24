@@ -1,20 +1,31 @@
+<img src="docs/assets/quail-logo.svg" alt="Quail logo" width="96">
+
 # Quail
 
-Quail (QUery-Aware Inference Layer) is an open-source execution engine
-for AI-SQL. The [Full Stack Data Lab](https://fsdatalab.github.io/)
-at CMU develops Quail.
+**An open-source execution engine for AI functions in SQL,** from the
+[Full Stack Data Lab](https://fsdatalab.github.io/) at CMU.
 
-With AI-SQL, you write instructions in natural language inside your SQL
-queries. A language model evaluates those instructions for each row.
+[![PyPI](https://img.shields.io/pypi/v/quail-engine)](https://pypi.org/project/quail-engine/)
+[![Docs](https://img.shields.io/badge/docs-fsdatalab.github.io%2Fquail-blue)](https://fsdatalab.github.io/quail)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+Quail (QUery-Aware Inference Layer) runs LLMs over large datasets,
+from SQL, on your own GPUs. Quail's secret sauce is to optimize LLM
+inference and memory management for each query as a whole. This makes
+Quail lightning fast: **1.8x faster on average** than well-tuned vLLM
+baselines, and **up to 14x faster** on queries with AI joins
+([details](https://fsdatalab.github.io/blog/introducing-quail/))!
 
 ```sql
-SELECT r.id
+SELECT r.id,
+       AI.EXTRACT(r.body, {'actor': 'Which actor does the reviewer name?'}) AS review
 FROM reviews r
 WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 ```
 
 [Documentation](https://fsdatalab.github.io/quail) |
 [Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
+[Blog](https://fsdatalab.github.io/blog/) |
 [QUAIL-B](https://github.com/fsdatalab/quail-bench)
 
 ## Install
@@ -107,7 +118,7 @@ You can use filters and joins evaluated by a language model,
 (`AI.CLASSIFY`), and extracting text that answers a question (`AI.EXTRACT`).
 `AI.MAP` is planned.
 
-You can write queries in two AI-SQL dialects:
+You can write queries in two SQL dialects for AI functions:
 [Snowflake `AI_FILTER`](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
 and
 [BigQuery `AI.IF`](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions),
