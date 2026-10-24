@@ -31,6 +31,7 @@ import math
 
 import numpy as np
 
+from quail.backends.quail.executor.host_kv import PENDING
 from quail.backends.quail.executor.pages import PageArena, _evict_event
 from quail.progress import answer_sink
 
@@ -439,18 +440,40 @@ class KVArena:
     def _undrain(self, key):
         """A draining key is used again: it keeps its pages, once its save read them."""
         event = self._draining.pop(key, None)
-        if event is not None:
+        if event is PENDING:
+            self.host.cancel_pending(key)
+        elif event is not None:
             event.synchronize()
+
+    def _flush_pending(self, patient=False, until=None) -> int:
+        """Run the store's queued saves; returns the pages freed on the way."""
+        freed = 0
+        for key, event in self.host.flush_pending(patient, until).items():
+            if key not in self._draining:
+                continue
+            if event is None:
+                del self._draining[key]
+                freed += self._free_now(key)
+            else:
+                self._draining[key] = event
+        return freed
 
     def reclaim(self, wait: bool = False) -> int:
         """Free the pages of draining keys whose save has landed.
 
         A freed key whose save is still reading its pages keeps them
-        until the save's event fires. With wait, every save is waited
-        for. Returns the pages freed.
+        until the save's event fires, and one whose save waits for a
+        staging block keeps them until it has run. With wait, every
+        save is run and waited for. Returns the pages freed.
         """
         freed = 0
+        if self.host is not None:
+            freed += self._flush_pending(patient=wait)
         for key, event in list(self._draining.items()):
+            if event is PENDING:
+                if not wait:
+                    continue
+                raise RuntimeError(f"{key!r} is still queued after a flush")
             if not event.query():
                 if not wait:
                     break
@@ -460,8 +483,13 @@ class KVArena:
         return freed
 
     def reclaim_oldest(self) -> int:
-        """Wait for the oldest save in flight and free its key's pages."""
+        """Run and wait for the oldest save in flight and free its key's pages."""
         for key, event in self._draining.items():
+            if event is PENDING:
+                freed = self._flush_pending(patient=True, until=key)
+                event = self._draining.get(key)
+                if event is None:
+                    return freed
             event.synchronize()
             del self._draining[key]
             return self._free_now(key)
@@ -733,6 +761,7 @@ class KVArena:
         if self.host is not None and key in self.accounting.owned:
             event = self.host.before_free(key)
             if event is not None:
+                # an event, or PENDING until a staging block is free
                 self._draining[key] = event
                 return 0
         return self._free_now(key)

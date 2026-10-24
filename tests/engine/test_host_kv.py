@@ -3,7 +3,12 @@
 import pytest
 
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.host_kv import HostKV, _Ring, prefix_hash
+from quail.backends.quail.executor.host_kv import (
+    PENDING,
+    HostKV,
+    _Ring,
+    prefix_hash,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -232,6 +237,9 @@ def test_a_freed_key_keeps_its_pages_until_its_save_has_landed():
             events.append(_Event())
             return events[-1]
 
+        def flush_pending(self, patient=False, until=None):
+            return {}
+
     arena.host = Store()
     key = ("d", 0)
     assert arena.reserve(key, 6, capacity_tokens=8)
@@ -253,3 +261,49 @@ def test_a_freed_key_keeps_its_pages_until_its_save_has_landed():
     # the oldest save alone, or every save, is waited for
     assert arena.reclaim_oldest() == 2 and events[2].waited and not events[3].waited
     assert arena.reclaim(wait=True) == 2 and events[3].waited and not arena._draining
+
+
+def test_a_save_with_no_staging_block_waits_in_the_queue_with_its_pages():
+    arena = make_arena()
+    events = {}
+    queue = []
+    blocks = [0]    # staging blocks free for the next flush
+
+    class Store:
+        def before_free(self, key):
+            queue.append(key)
+            return PENDING
+
+        def flush_pending(self, patient=False, until=None):
+            flushed = {}
+            while queue and (patient or blocks[0]):
+                key = queue.pop(0)
+                blocks[0] = max(0, blocks[0] - 1)
+                events[key] = _Event()
+                flushed[key] = events[key]
+                if key == until:
+                    break
+            return flushed
+
+        def cancel_pending(self, key):
+            queue.remove(key)
+
+    arena.host = Store()
+    keys = [("d", index) for index in range(3)]
+    for key in keys:
+        assert arena.reserve(key, 4, capacity_tokens=4)
+        arena.free_key(key)
+    assert arena.free_pages == 5 and queue == keys
+    # a reclaim runs what fits and frees nothing until a save lands
+    blocks[0] = 1
+    assert arena.reclaim() == 0 and queue == keys[1:]
+    events[keys[0]].fired = True
+    assert arena.reclaim() == 1 and queue == keys[1:]
+    # a key used again leaves the queue with its rows
+    assert arena.reserve(keys[2], 4, capacity_tokens=4)
+    assert queue == [keys[1]] and keys[2] not in arena._draining
+    arena.free_key(keys[2])
+    # the oldest save in flight is run patiently and waited for
+    assert arena.reclaim_oldest() == 1 and events[keys[1]].waited
+    assert arena.reclaim(wait=True) == 1 and not arena._draining
+    assert arena.free_pages == 8

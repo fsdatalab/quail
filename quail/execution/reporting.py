@@ -28,6 +28,7 @@ def execution_report(plan, metrics, notes, coordinator_wall):
         coordinator_wall_s=round(coordinator_wall, 2),
         fresh_tokens=out["fresh_tokens"],
         cached_tokens=out.get("cached_tokens"),
+        restored_tokens=out.get("restored_tokens", 0),
         stages=[],
         peak_gib=out.get("peak_gib"),
         order_rule=plan.settings.get("order_rule"),

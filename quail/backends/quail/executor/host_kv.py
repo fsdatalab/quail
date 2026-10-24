@@ -25,10 +25,12 @@ the arena reserved, ahead of the pass that reads them. A kernel
 writing host memory directly would need no staging, but it holds the
 SMs for the whole transfer and slowed the passes beside it; the copy
 engine does not. Staging blocks are few and reused once their copy
-has landed; when none is free, a save is skipped and a restore
-becomes a miss, so the store never paces a running query. At a
-query's end the arena frees every document at once with the GPU
-idle, so those saves wait for a block instead (patient).
+has landed. When none is free, the save waits in a queue with its
+pages still held (the arena's pages are the queue) and runs when the
+chunk loop next reclaims and a block has come free, so the store
+never paces a running query; a restore with no block free is a miss.
+At a query's end the arena frees every document at once with the
+GPU idle, so those saves wait for a block instead (patient).
 
 A key's rows are saved only once an operator computed or restored them
 (mark_written); pages reserved for a chunk that never ran hold nothing.
@@ -51,6 +53,8 @@ INDEX_TOKENS = 4096
 # staging blocks per layer group and direction; a 300-token document
 # of a 4B model takes about 45 MB, so 8 each way is about 720 MB
 MAX_STAGING = 8
+# before_free's answer for a save queued until a staging block is free
+PENDING = "pending"
 
 
 def prefix_hash(prefix) -> bytes:
@@ -195,6 +199,7 @@ class HostKV:
                       for layers, width, _ in self._groups]
         self._staging = {}      # (direction, group) -> [[tensor, event], ...]
         self._patient = False   # wait for a staging block instead of skipping
+        self._pending = {}      # key -> (digest, prefix tokens), saves queued
         self.stream = (torch.cuda.Stream(device=self.device)
                        if self.pinned else None)
         self._index_slots = None
@@ -289,6 +294,8 @@ class HostKV:
 
     def begin_query(self) -> None:
         """Forget the last query's keys: a key names a document per query."""
+        if self._pending:
+            raise RuntimeError("saves are still queued from the last query")
         self._keys.clear()
         self._written.clear()
         self._fresh.clear()
@@ -323,8 +330,10 @@ class HostKV:
         """Save a registered key's prefix rows before the arena frees them.
 
         The key must be resident. Returns the event the save's gather
-        records, which the arena waits on before it reuses the pages,
-        or None when nothing was saved or the copies ran at once.
+        records, which the arena waits on before it reuses the pages;
+        PENDING when every staging block is busy, in which case the
+        pages stay the key's until flush_pending saves it; or None when
+        nothing is saved or the copies ran at once.
         """
         named = self._keys.get(key)
         if named is None or key not in self._written:
@@ -336,12 +345,50 @@ class HostKV:
             return None
         if self.num_slots and arena.checkpoint_tokens(key) != prefix_tokens:
             return None
-        started = time.perf_counter()
         if not self._staging_free("save"):
-            # every staging block is still on its way to the host: the
-            # document is saved the next time it is freed
             self.busy_keys += 1
-            return None
+            self._pending[key] = (digest, prefix_tokens)
+            return PENDING
+        return self._save(key, digest, prefix_tokens)
+
+    def flush_pending(self, patient: bool = False, until=None) -> dict:
+        """Run queued saves whose staging blocks have come free.
+
+        Saves run in the order they were queued, each when every layer
+        group has a block free, or waited for when patient. With
+        `until`, the queue is flushed through that key. Returns each
+        saved key's gather event (None on the CPU); a key whose entry
+        appeared meanwhile is dropped with a None event too.
+        """
+        events = {}
+        if not self._pending:
+            return events
+        with self._patience(patient):
+            for key in list(self._pending):
+                if not self._staging_free("save"):
+                    break
+                digest, prefix_tokens = self._pending.pop(key)
+                events[key] = (None if digest in self.entries
+                               else self._save(key, digest, prefix_tokens))
+                if key == until:
+                    break
+        return events
+
+    @contextmanager
+    def _patience(self, patient):
+        was, self._patient = self._patient, self._patient or patient
+        try:
+            yield
+        finally:
+            self._patient = was
+
+    def cancel_pending(self, key) -> None:
+        """A queued key is used again: it keeps its rows and is not saved."""
+        self._pending.pop(key, None)
+
+    def _save(self, key, digest, prefix_tokens):
+        """Take ring rows and a slot for the key and queue its copies."""
+        started = time.perf_counter()
         start, evicted = self.ring.plan(prefix_tokens)
         # a store smaller than the query's documents keeps the first
         # ones it saved: a save that would drop one of them would move
